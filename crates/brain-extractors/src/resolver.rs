@@ -160,10 +160,19 @@ pub enum ResolutionTier {
 }
 
 /// Successful resolution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Resolution {
     pub entity_id: EntityId,
     pub tier: ResolutionTier,
+    /// The resolver's confidence in this match, in `[0.0, 1.0]`. The
+    /// deterministic identity tiers (exact / alias / coref / created)
+    /// carry `1.0`; the score-based tiers surface their real match
+    /// score — trigram Jaccard for fuzzy, cosine for embedding, and the
+    /// disambiguator's own confidence for a confirmed ambiguous-band
+    /// match. Consumed by the per-mention resolution audit so a logged
+    /// derivation records how strong the match was, not just which tier
+    /// fired.
+    pub confidence: f32,
 }
 
 /// Errors the resolver can surface to the worker. Most are storage-level;
@@ -971,6 +980,7 @@ pub fn resolve_or_create_with_deps(
         return Ok(Resolution {
             entity_id: id,
             tier: ResolutionTier::Exact,
+            confidence: 1.0,
         });
     }
 
@@ -985,6 +995,7 @@ pub fn resolve_or_create_with_deps(
         return Ok(Resolution {
             entity_id: id,
             tier: ResolutionTier::Alias,
+            confidence: 1.0,
         });
     }
 
@@ -1007,6 +1018,7 @@ pub fn resolve_or_create_with_deps(
             return Ok(Resolution {
                 entity_id: id,
                 tier: ResolutionTier::Exact,
+                confidence: 1.0,
             });
         }
     }
@@ -1033,13 +1045,14 @@ pub fn resolve_or_create_with_deps(
                     _ => best = Some((cid, score)),
                 }
             }
-            if let Some((cid, _)) = best {
+            if let Some((cid, score)) = best {
                 // The surface form is now associated with this entity;
                 // re-runs of the same string hit tier 2 directly.
                 entity_add_alias(wtxn, cid, surface_form.to_string(), now_unix_nanos)?;
                 return Ok(Resolution {
                     entity_id: cid,
                     tier: ResolutionTier::Alias,
+                    confidence: score,
                 });
             }
         }
@@ -1087,6 +1100,7 @@ pub fn resolve_or_create_with_deps(
                     return Ok(Resolution {
                         entity_id: cid,
                         tier: ResolutionTier::Alias,
+                        confidence: 1.0,
                     });
                 }
             }
@@ -1148,6 +1162,7 @@ pub fn resolve_or_create_with_deps(
                     return Ok(Resolution {
                         entity_id: cid,
                         tier: ResolutionTier::Alias,
+                        confidence: 1.0,
                     });
                 }
             }
@@ -1214,6 +1229,7 @@ pub fn resolve_or_create_with_deps(
                             return Ok(Resolution {
                                 entity_id: cid,
                                 tier: ResolutionTier::Alias,
+                                confidence: 1.0,
                             });
                         }
                     }
@@ -1234,7 +1250,7 @@ pub fn resolve_or_create_with_deps(
     let mut partial_match: Option<(EntityId, f32)> = None;
     if let Some(deps) = embed_deps {
         match tier_embedding(deps, staged, scope, type_id, surface_form, wtxn) {
-            Ok(EmbeddingProbe::AutoAlias { entity_id, .. }) => {
+            Ok(EmbeddingProbe::AutoAlias { entity_id, score }) => {
                 // A high cosine alone is not proof of identity: two
                 // distinct same-type entities ("Japan" vs "Tokyo", both
                 // Places) can sit above the auto-alias threshold and the
@@ -1274,6 +1290,7 @@ pub fn resolve_or_create_with_deps(
                         return Ok(Resolution {
                             entity_id: entity,
                             tier: ResolutionTier::Disambiguated,
+                            confidence,
                         });
                     }
                     // No disambiguator, or it declined to commit either
@@ -1290,6 +1307,7 @@ pub fn resolve_or_create_with_deps(
                         return Ok(Resolution {
                             entity_id,
                             tier: ResolutionTier::Embedding,
+                            confidence: score,
                         });
                     }
                 }
@@ -1335,6 +1353,7 @@ pub fn resolve_or_create_with_deps(
                 return Ok(Resolution {
                     entity_id: entity,
                     tier: ResolutionTier::Disambiguated,
+                    confidence,
                 });
             }
             MatchVerdict::Rejected => {
@@ -1449,6 +1468,7 @@ pub fn resolve_or_create_with_deps(
     Ok(Resolution {
         entity_id: new_id,
         tier: ResolutionTier::Created,
+        confidence: 1.0,
     })
 }
 

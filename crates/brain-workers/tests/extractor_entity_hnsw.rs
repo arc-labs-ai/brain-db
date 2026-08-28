@@ -31,11 +31,15 @@ use brain_index::entity_hnsw::{EntityHnswIndex, EntityHnswParams};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_llm::client::{model_id_hash, LlmFuture};
 use brain_llm::{LlmClient, LlmRequest, LlmResponse};
+use brain_metadata::tables::audit::{
+    resolution_outcome, ResolutionAudit, ENTITY_RESOLUTION_AUDIT_TABLE,
+};
 use brain_metadata::MetadataDb;
 use brain_ops::{OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_workers::{ExtractorWorker, Worker, WorkerContext};
 use parking_lot::RwLock as PLRwLock;
+use redb::ReadableTable;
 use std::collections::HashMap;
 use std::sync::Mutex as StdMutex;
 
@@ -268,6 +272,13 @@ impl Fixture {
 
     fn hnsw_len(&self) -> usize {
         self.entity_hnsw.read().len()
+    }
+
+    /// Every per-mention resolution audit row, in no particular order.
+    fn resolution_audit_rows(&self) -> Vec<ResolutionAudit> {
+        let rtxn = self.metadata.read_txn().unwrap();
+        let t = rtxn.open_table(ENTITY_RESOLUTION_AUDIT_TABLE).unwrap();
+        t.iter().unwrap().map(|r| r.unwrap().1.value()).collect()
     }
 }
 
@@ -511,5 +522,103 @@ async fn real_embeddings_merge_the_paraphrase_and_keep_the_distinct_team() {
         names,
         vec![DIEGOS_TEAM.to_string(), BILLING_TEAM.to_string()],
         "real embeddings: the paraphrase folds in, the distinct team does not",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Per-mention resolution audit — every mention→entity resolution on the
+// extractor apply path lands one row in ENTITY_RESOLUTION_AUDIT_TABLE, so a
+// derivation is queryable (the acceptance suite's "all derivations logged").
+// ---------------------------------------------------------------------------
+
+/// Minting a fresh entity for a mention writes one `CREATED` resolution row,
+/// carrying the surface, the new entity's id, and full (1.0) confidence.
+#[tokio::test(flavor = "current_thread")]
+async fn created_mention_writes_a_resolution_audit_row() {
+    let fixture = build_fixture();
+    encode(&fixture, 1, "the billing team owns invoicing").await;
+
+    let entities = fixture.live_entities();
+    assert_eq!(entities.len(), 1, "one entity minted: {entities:?}");
+    let minted = entities[0].0;
+
+    let rows = fixture.resolution_audit_rows();
+    assert_eq!(rows.len(), 1, "exactly one resolution row: {rows:?}");
+    let row = &rows[0];
+    assert_eq!(row.candidate_name, BILLING_TEAM);
+    assert_eq!(row.outcome, resolution_outcome::CREATED);
+    assert_eq!(row.resolved_entity(), Some(minted));
+    assert!(
+        (row.confidence - 1.0).abs() < f32::EPSILON,
+        "a created entity resolves at full confidence: {}",
+        row.confidence,
+    );
+}
+
+/// Re-resolving the same surface in a later memory hits the exact tier and
+/// APPENDS a second row (append-only history), rather than overwriting the
+/// first. Both rows point at the same entity.
+#[tokio::test(flavor = "current_thread")]
+async fn exact_reresolution_appends_a_row_preserving_history() {
+    let fixture = build_fixture();
+    encode(&fixture, 1, "the billing team owns invoicing").await;
+    encode(&fixture, 2, "the billing team fixed a bug").await;
+
+    let entities = fixture.live_entities();
+    assert_eq!(entities.len(), 1, "still one entity: {entities:?}");
+    let entity = entities[0].0;
+
+    let mut rows = fixture.resolution_audit_rows();
+    assert_eq!(rows.len(), 2, "two resolutions, two rows: {rows:?}");
+    for r in &rows {
+        assert_eq!(r.candidate_name, BILLING_TEAM);
+        assert_eq!(r.resolved_entity(), Some(entity));
+    }
+    // Order is audit-id (time) ordered on insert; sort by outcome to assert
+    // the pair {CREATED, TIER_1_EXACT} regardless of iteration order.
+    rows.sort_by_key(|r| r.outcome);
+    assert_eq!(rows[0].outcome, resolution_outcome::TIER_1_EXACT);
+    assert_eq!(rows[1].outcome, resolution_outcome::CREATED);
+}
+
+/// A paraphrase that clears the cosine threshold is confirmed by the wired
+/// disambiguator and folds onto the existing entity — logged as a `TIER_4_LLM`
+/// resolution carrying the disambiguator's own confidence (0.95), proving the
+/// real match score is threaded through to the audit rather than defaulted.
+#[tokio::test(flavor = "current_thread")]
+async fn paraphrase_logs_disambiguated_outcome_with_real_confidence() {
+    let fixture = build_fixture();
+    encode(&fixture, 1, "the billing team owns invoicing").await;
+    encode(
+        &fixture,
+        2,
+        "the billing platform team shipped the migration",
+    )
+    .await;
+
+    let entities = fixture.live_entities();
+    assert_eq!(entities.len(), 1, "paraphrase folds in: {entities:?}");
+    let entity = entities[0].0;
+
+    let rows = fixture.resolution_audit_rows();
+    assert_eq!(rows.len(), 2, "two resolutions, two rows: {rows:?}");
+
+    let created = rows
+        .iter()
+        .find(|r| r.outcome == resolution_outcome::CREATED)
+        .expect("the first surface mints an entity");
+    assert_eq!(created.candidate_name, BILLING_TEAM);
+    assert_eq!(created.resolved_entity(), Some(entity));
+
+    let folded = rows
+        .iter()
+        .find(|r| r.outcome == resolution_outcome::TIER_4_LLM)
+        .expect("the paraphrase is confirmed by the disambiguator");
+    assert_eq!(folded.candidate_name, BILLING_PLATFORM_TEAM);
+    assert_eq!(folded.resolved_entity(), Some(entity));
+    assert!(
+        (folded.confidence - 0.95).abs() < 1e-4,
+        "the disambiguator's confidence is threaded through: {}",
+        folded.confidence,
     );
 }

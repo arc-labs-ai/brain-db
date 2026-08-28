@@ -67,7 +67,9 @@ use brain_extractors::{
 use brain_metadata::audit_write;
 use brain_metadata::relation::types::relation_type_intern_or_get;
 use brain_metadata::schema::predicate::predicate_intern_or_get;
-use brain_metadata::tables::audit::{extraction_status, ExtractionAudit};
+use brain_metadata::tables::audit::{
+    extraction_status, resolution_outcome, ExtractionAudit, ResolutionAudit,
+};
 use brain_metadata::tables::edge::{
     self, derived_by, origin, zero_disambiguator, EdgeData, EDGES_REVERSE_TABLE, EDGES_TABLE,
 };
@@ -77,7 +79,9 @@ use brain_metadata::tables::extractor_audit::{
 };
 use brain_metadata::tables::predicate::{PREDICATES_TABLE, PREDICATE_EMBEDDINGS_TABLE};
 use brain_metadata::tables::relation::RELATION_TYPE_EMBEDDINGS_TABLE;
-use brain_metadata::{hype_has_vectors, pipeline_has_extracted};
+use brain_metadata::{
+    entity_get_inside_wtxn, hype_has_vectors, pipeline_has_extracted, resolution_audit_write,
+};
 use brain_ops::apply::encode_helpers::{
     fetch_extractor_context, ExtractorContextFetchConfig, DEFAULT_EXTRACTOR_CONTEXT_TOP_M,
 };
@@ -3015,7 +3019,7 @@ fn run_apply_body(
     }
     for key in &surface_order {
         let em = best_by_surface[key];
-        let (entity_id, tier) = resolve_entity_mention(
+        let (entity_id, tier, confidence) = resolve_entity_mention(
             &wtxn,
             source_scope,
             em,
@@ -3024,6 +3028,26 @@ fn run_apply_body(
             &mut staged,
             disambiguation,
         )?;
+        // Log this mention→entity resolution as a derivation. Emitted here,
+        // after per-surface dedup, so a surface that several tiers proposed is
+        // resolved — and audited — exactly once. The entity_type_id is read
+        // back from the resolved row inside the txn so the audit records the
+        // referent's actual type (cross-type resolution can differ from the
+        // mention's hinted type). Best-effort, append-only; see
+        // `emit_resolution_audit`.
+        let resolved_type_id = entity_get_inside_wtxn(&wtxn, entity_id)
+            .ok()
+            .flatten()
+            .map_or(0, |e| e.entity_type.raw());
+        emit_resolution_audit(
+            &wtxn,
+            &em.text,
+            resolved_type_id,
+            entity_id,
+            tier,
+            confidence,
+            now,
+        );
         // Stage journal (S8 entity resolution). The resolver's own logs
         // never carry `memory_id`, so a resolve verdict couldn't be tied
         // back to the encode that triggered it. Log it here, where
@@ -3896,7 +3920,7 @@ fn resolve_entity_mention(
     embed_deps: Option<&EmbeddingDeps>,
     staged: &mut StagedEntityVectors,
     disambiguation: &mut Disambiguation<'_>,
-) -> Result<(EntityId, ResolutionTier), ApplyError> {
+) -> Result<(EntityId, ResolutionTier, f32), ApplyError> {
     let res = resolve_or_create_with_deps(
         wtxn,
         scope,
@@ -3909,7 +3933,7 @@ fn resolve_entity_mention(
         disambiguation,
     )
     .map_err(ApplyError::from)?;
-    Ok((res.entity_id, res.tier))
+    Ok((res.entity_id, res.tier, res.confidence))
 }
 
 fn resolution_tier_to_metric(tier: ResolutionTier) -> ResolverOutcome {
@@ -3920,6 +3944,61 @@ fn resolution_tier_to_metric(tier: ResolutionTier) -> ResolverOutcome {
         ResolutionTier::Embedding => ResolverOutcome::Embedding,
         ResolutionTier::Disambiguated => ResolverOutcome::Disambiguated,
         ResolutionTier::Created => ResolverOutcome::Create,
+    }
+}
+
+/// Map a resolver tier to the durable `resolution_outcome` byte written on a
+/// per-mention resolution audit row. `Alias` maps to `TIER_1_EXACT`: an alias
+/// hit (including the trigram-fuzzy and coref tiers, which alias the surface
+/// onto the matched entity) is an exact match against the alias index, so it
+/// belongs with the tier-1 exact-identity bucket. The resolver always resolves
+/// or mints an entity at this site, so the `AMBIGUOUS` / `NOT_RESOLVED`
+/// outcomes never arise here — they exist for callers that can abstain.
+fn resolution_tier_to_outcome(tier: ResolutionTier) -> u8 {
+    match tier {
+        ResolutionTier::Exact | ResolutionTier::Alias => resolution_outcome::TIER_1_EXACT,
+        ResolutionTier::Fuzzy => resolution_outcome::TIER_2_FUZZY,
+        ResolutionTier::Embedding => resolution_outcome::TIER_3_EMBEDDING,
+        ResolutionTier::Disambiguated => resolution_outcome::TIER_4_LLM,
+        ResolutionTier::Created => resolution_outcome::CREATED,
+    }
+}
+
+/// Append one per-mention resolution audit row inside the extraction write txn
+/// (no extra fsync — it rides the existing commit). A mention→entity
+/// resolution is a derivation, so the acceptance suite's "all derivations
+/// logged" line requires it to be queryable via `GET /v1/audit?by=resolution`.
+///
+/// Best-effort: a write failure is logged and swallowed, never failing the
+/// extraction — matching the extraction-audit emission and the sibling
+/// post-commit fan-outs. The row is append-only (a fresh `AuditId` per call),
+/// so re-extracting the same memory adds rows rather than overwriting, which
+/// preserves the resolution history.
+fn emit_resolution_audit(
+    wtxn: &redb::WriteTransaction,
+    candidate_name: &str,
+    entity_type_id: u32,
+    resolved: EntityId,
+    tier: ResolutionTier,
+    confidence: f32,
+    now: u64,
+) {
+    let mut audit = ResolutionAudit::new(
+        AuditId::new(),
+        candidate_name.to_string(),
+        entity_type_id,
+        resolution_tier_to_outcome(tier),
+        confidence,
+        now,
+    );
+    audit.resolved_entity_bytes = Some(resolved.to_bytes());
+    if let Err(e) = resolution_audit_write(wtxn, &audit) {
+        warn!(
+            target: "brain_workers::extractor",
+            surface = %candidate_name,
+            error = %e,
+            "resolution audit write failed; skipping (extraction unaffected)",
+        );
     }
 }
 
@@ -5036,6 +5115,26 @@ fn resolve_statement_subject(
             disambiguation,
         )
         .map_err(ApplyError::from)?;
+        // Coined-subject resolution is a mention→entity derivation not covered
+        // by the pass-1 entity-mention loop (this surface was never filed as an
+        // EntityMention), so log it here. The other branches above are an
+        // entity_map cache hit (already audited when first resolved), a
+        // self-entity routing (deterministic, not a tier decision), or a
+        // cross-type exact reuse (deterministic exact-name match) — none is a
+        // fresh tiered resolution.
+        let resolved_type_id = entity_get_inside_wtxn(wtxn, res.entity_id)
+            .ok()
+            .flatten()
+            .map_or(0, |e| e.entity_type.raw());
+        emit_resolution_audit(
+            wtxn,
+            text,
+            resolved_type_id,
+            res.entity_id,
+            res.tier,
+            res.confidence,
+            now,
+        );
         entity_map.insert(text.to_string(), res.entity_id);
         res.entity_id
     };
@@ -5152,6 +5251,22 @@ fn resolve_relation_endpoint(
             disambiguation,
         )
         .map_err(ApplyError::from)?;
+        // A relation / statement-object endpoint resolved through the gauntlet
+        // is a mention→entity derivation; log it (same rationale and branch
+        // exclusions as `resolve_statement_subject`).
+        let resolved_type_id = entity_get_inside_wtxn(wtxn, res.entity_id)
+            .ok()
+            .flatten()
+            .map_or(0, |e| e.entity_type.raw());
+        emit_resolution_audit(
+            wtxn,
+            text,
+            resolved_type_id,
+            res.entity_id,
+            res.tier,
+            res.confidence,
+            now,
+        );
         entity_map.insert(text.to_string(), res.entity_id);
         res.entity_id
     };

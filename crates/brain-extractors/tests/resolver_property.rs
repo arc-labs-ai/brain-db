@@ -245,8 +245,9 @@ fn alias_lookup_normalises_case() {
     }
     for variant in ["priya", "PRIYA", "Priya", "  PrIyA  "] {
         let wtxn = db.write_txn().unwrap();
-        let Resolution { entity_id, tier } =
-            resolve_or_create(&wtxn, test_scope(), variant, "brain:Person", 0.7, NOW + 1).unwrap();
+        let Resolution {
+            entity_id, tier, ..
+        } = resolve_or_create(&wtxn, test_scope(), variant, "brain:Person", 0.7, NOW + 1).unwrap();
         wtxn.commit().unwrap();
         assert_eq!(entity_id, target, "{variant} should resolve to target");
         assert_eq!(tier, ResolutionTier::Alias, "{variant} should be tier-2");
