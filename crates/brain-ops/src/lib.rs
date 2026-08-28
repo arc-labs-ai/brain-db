@@ -58,12 +58,14 @@ pub use metrics::{
     CausalSkipReason, ConfidenceSweepMetrics, ConfidenceSweepMetricsSnapshot, ExtractorItemKind,
     ExtractorMetrics, ExtractorMetricsSnapshot, ForgetCascadeMetrics, ForgetCascadeMetricsSnapshot,
     IdempotencyOutcome, LlmCacheMetrics, LlmCacheMetricsSnapshot, LlmCacheModelCounts,
-    LlmCacheSweepMetrics, LlmCacheSweepMetricsSnapshot, PerPhaseSnapshot, ResolverOutcome,
-    SchemaMigrationMetrics, SchemaMigrationMetricsSnapshot, StatementEmbedMetrics,
-    StatementEmbedMetricsSnapshot, SubmitOutcome, TemporalEdgeMetrics, TemporalEdgeMetricsSnapshot,
-    TemporalSkipReason, TierKind, TierStatus, WorkerBucketSnapshot, WorkerHistogram,
-    WorkerHistogramSnapshot, WriterMetrics, WriterMetricsSnapshot, ITEM_KIND_LABELS,
-    RESOLVER_OUTCOME_LABELS, TIER_LABELS, TIER_STATUS_LABELS,
+    LlmCacheSweepMetrics, LlmCacheSweepMetricsSnapshot, PerPhaseSnapshot, QueryMetrics,
+    QueryMetricsSnapshot, QueryOutcome, ResolverOutcome, RetrieverKind, RetrieverMetrics,
+    RetrieverMetricsSnapshot, SchemaMigrationMetrics, SchemaMigrationMetricsSnapshot,
+    StatementEmbedMetrics, StatementEmbedMetricsSnapshot, SubmitOutcome, TemporalEdgeMetrics,
+    TemporalEdgeMetricsSnapshot, TemporalSkipReason, TierKind, TierStatus, WorkerBucketSnapshot,
+    WorkerHistogram, WorkerHistogramSnapshot, WriterMetrics, WriterMetricsSnapshot,
+    ITEM_KIND_LABELS, QUERY_OUTCOME_LABELS, RESOLVER_OUTCOME_LABELS, RETRIEVER_LABELS, TIER_LABELS,
+    TIER_STATUS_LABELS,
 };
 pub use state::access_buffer::{AccessBuffer, DEFAULT_ACCESS_BUFFER_CAPACITY};
 pub use write::{

@@ -864,6 +864,13 @@ pub struct ShardHandle {
     /// unconditional (drains an empty STATEMENTS table on substrate-
     /// only shards). `/metrics` exposition reads this directly.
     confidence_sweep_metrics: Arc<brain_ops::ConfidenceSweepMetrics>,
+    /// Read-path per-retriever metrics. Always wired — recall runs on
+    /// every shard. Shared by `Arc` with the shard's `OpsContext`, which
+    /// records into it after each `execute`; `/metrics` reads it here.
+    retriever_metrics: Arc<brain_ops::RetrieverMetrics>,
+    /// End-to-end RECALL (query) metrics. Same shared-by-`Arc` shape as
+    /// [`Self::retriever_metrics`].
+    query_metrics: Arc<brain_ops::QueryMetrics>,
 }
 
 impl ShardHandle {
@@ -888,6 +895,8 @@ impl ShardHandle {
             llm_cache_sweep_metrics: None,
             statement_embed_metrics: Arc::new(brain_ops::StatementEmbedMetrics::new()),
             confidence_sweep_metrics: Arc::new(brain_ops::ConfidenceSweepMetrics::new()),
+            retriever_metrics: Arc::new(brain_ops::RetrieverMetrics::new()),
+            query_metrics: Arc::new(brain_ops::QueryMetrics::new()),
         }
     }
 
@@ -960,6 +969,21 @@ impl ShardHandle {
     #[must_use]
     pub fn confidence_sweep_metrics(&self) -> Arc<brain_ops::ConfidenceSweepMetrics> {
         self.confidence_sweep_metrics.clone()
+    }
+
+    /// Read-only handle to the read-path per-retriever metric state.
+    /// Always wired — recall runs on every shard. `/metrics` exposition
+    /// reads this directly.
+    #[must_use]
+    pub fn retriever_metrics(&self) -> Arc<brain_ops::RetrieverMetrics> {
+        self.retriever_metrics.clone()
+    }
+
+    /// Read-only handle to the end-to-end RECALL (query) metric state.
+    /// Always wired. `/metrics` exposition reads this directly.
+    #[must_use]
+    pub fn query_metrics(&self) -> Arc<brain_ops::QueryMetrics> {
+        self.query_metrics.clone()
     }
 
     /// Per-shard event feed. Cloning the Receiver shares the underlying
@@ -1994,6 +2018,16 @@ pub fn spawn_shard(
     let confidence_sweep_metrics_for_handle: Arc<brain_ops::ConfidenceSweepMetrics> =
         Arc::new(brain_ops::ConfidenceSweepMetrics::new());
     let confidence_sweep_metrics_for_closure = confidence_sweep_metrics_for_handle.clone();
+    // Read-path metric families are unconditionally constructed: recall
+    // runs on every shard. One `Arc` is injected into the shard's
+    // `OpsContext` (the RECALL handler records into it) and the twin is
+    // stashed on `ShardHandle` for `/metrics` exposition.
+    let retriever_metrics_for_handle: Arc<brain_ops::RetrieverMetrics> =
+        Arc::new(brain_ops::RetrieverMetrics::new());
+    let retriever_metrics_for_closure = retriever_metrics_for_handle.clone();
+    let query_metrics_for_handle: Arc<brain_ops::QueryMetrics> =
+        Arc::new(brain_ops::QueryMetrics::new());
+    let query_metrics_for_closure = query_metrics_for_handle.clone();
     // Clone the process-wide dispatcher Arc into the executor closure.
     // The CachingDispatcher<CpuDispatcher> built once in main.rs is
     // shared across every shard so the BERT weights live in memory
@@ -2578,7 +2612,11 @@ pub fn spawn_shard(
                 .with_memory_text_dispatcher(memory_text_dispatcher_for_ops)
                 .with_statement_text_dispatcher(statement_text_dispatcher_for_ops)
                 .with_cross_encoder(cross_encoder_for_closure)
-                .with_wal_sink(Some(wal_sink_for_ops)),
+                .with_wal_sink(Some(wal_sink_for_ops))
+                .with_recall_metrics(
+                    retriever_metrics_for_closure.clone(),
+                    query_metrics_for_closure.clone(),
+                ),
             );
 
             // Spawn the per-shard fanout task: drains the in-process
@@ -3387,6 +3425,8 @@ pub fn spawn_shard(
         llm_cache_sweep_metrics: Some(llm_cache_sweep_metrics_for_handle),
         statement_embed_metrics: statement_embed_metrics_for_handle,
         confidence_sweep_metrics: confidence_sweep_metrics_for_handle,
+        retriever_metrics: retriever_metrics_for_handle,
+        query_metrics: query_metrics_for_handle,
     };
     let joiner = ShardJoiner {
         shard_id,

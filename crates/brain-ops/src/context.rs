@@ -23,6 +23,7 @@ use brain_rerank::RerankService;
 use parking_lot::{Mutex, RwLock};
 
 use crate::index::text_indexer::{MemoryTextDispatcher, StatementTextDispatcher};
+use crate::metrics::{QueryMetrics, RetrieverMetrics};
 use crate::state::access_buffer::AccessBuffer;
 use crate::subscribe::{EventBus, EventEnvelope, SubscriptionRegistry};
 use crate::txn::TxnStore;
@@ -211,6 +212,18 @@ pub struct OpsContext {
     /// commit and WAL append loses the matching subscribe event for
     /// that op, not the underlying typed-graph data.
     pub wal_sink: Option<Arc<dyn WalSink>>,
+    /// Per-shard read-path retriever metric family. Shared by `Arc`
+    /// with `brain-server`'s `/metrics` exposition. The RECALL handler
+    /// records per-lane invocations / candidates / latency here after
+    /// `execute` returns — the hot fan-out loop is untouched. Always
+    /// present (recall runs on every shard); tests get a fresh zeroed
+    /// instance.
+    pub retriever_metrics: Arc<RetrieverMetrics>,
+    /// Per-shard end-to-end RECALL metric family. Same shared-by-`Arc`
+    /// shape as [`Self::retriever_metrics`]; recorded once per served
+    /// recall with the end-to-end latency, effective fusion `k`, rerank
+    /// flag, and answer shape.
+    pub query_metrics: Arc<QueryMetrics>,
 }
 
 impl OpsContext {
@@ -249,6 +262,8 @@ impl OpsContext {
             graph_retriever,
             cross_encoder: CrossEncoderSlot::Disabled,
             wal_sink: None,
+            retriever_metrics: Arc::new(RetrieverMetrics::new()),
+            query_metrics: Arc::new(QueryMetrics::new()),
         }
     }
 
@@ -413,6 +428,22 @@ impl OpsContext {
     #[must_use]
     pub fn with_wal_sink(mut self, sink: Option<Arc<dyn WalSink>>) -> Self {
         self.wal_sink = sink;
+        self
+    }
+
+    /// Install the shared read-path metric families. The server calls
+    /// this once at shard startup with the same `Arc`s it stashes on
+    /// the `ShardHandle`, so the RECALL handler and `/metrics`
+    /// exposition observe one counter set. Tests that don't care keep
+    /// the fresh zeroed instances from [`Self::new`].
+    #[must_use]
+    pub fn with_recall_metrics(
+        mut self,
+        retriever_metrics: Arc<RetrieverMetrics>,
+        query_metrics: Arc<QueryMetrics>,
+    ) -> Self {
+        self.retriever_metrics = retriever_metrics;
+        self.query_metrics = query_metrics;
         self
     }
 

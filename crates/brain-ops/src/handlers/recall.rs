@@ -14,6 +14,7 @@
 //! side before the merge.
 
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use brain_core::{EntityId, MemoryId, SessionId, Slot, SubjectRef};
 use brain_index::RankedItemId;
@@ -41,6 +42,7 @@ use crate::grounded::{
     grounded_answer_walk, project_statement_slot, AnswerKind, GroundedAnswer, GroundedValue,
     SLOT_PROJECTION_STRONG_FLOOR,
 };
+use crate::metrics::{QueryOutcome, RetrieverKind};
 use crate::txn::BufferedEncode;
 
 /// Upper bound on the safety cap for returned items (`max_results`).
@@ -103,6 +105,11 @@ pub async fn handle_recall(
     mut req: RecallRequest,
     ctx: &OpsContext,
 ) -> Result<RecallResponseFrame, OpError> {
+    // End-to-end wall clock for the query metric family. One `Instant`
+    // per recall (cheap), covering the whole read — fan-out, grounding
+    // overlay, membership shaping, and abstention — not just the
+    // executor's fan-out window. Recorded once, at each return point.
+    let recall_started = Instant::now();
     // Did the caller ask for a specific result count? `0` means "no count, use
     // the server default"; any non-zero value is an explicit caller cap. We
     // capture this BEFORE normalising `max_results` below, because the keyed
@@ -172,12 +179,15 @@ pub async fn handle_recall(
     // `trace` is `Some` only when the caller opted in (`req.trace`); it carries
     // the read pipeline's per-stage observability the executor already computed
     // and otherwise discards. It rides through to the final frame untouched.
-    let (memories, trace) = retrieve_memories(&req, ctx, anchor, cue_vec.as_ref()).await?;
+    let (memories, trace, metric_sample) =
+        retrieve_memories(&req, ctx, anchor, cue_vec.as_ref()).await?;
 
     let Some(cue_vec) = cue_vec else {
         // No cue embedding → no grounding overlay, so no committed shape; the
         // answer cardinality falls back to the member count.
-        return Ok(recall_frame(memories, None, trace));
+        let frame = recall_frame(memories, None, trace);
+        record_recall_metrics(ctx, recall_started, &metric_sample, frame.answer_kind);
+        return Ok(frame);
     };
 
     let grounded = best_grounded_for_cue(&req, ctx, &cue_vec)?;
@@ -244,7 +254,103 @@ pub async fn handle_recall(
         apply_kind_presence_abstention(membership, anchor, &grounded, any_belongs)
     };
 
-    Ok(recall_frame(membership, committed_shape, trace))
+    let frame = recall_frame(membership, committed_shape, trace);
+    record_recall_metrics(ctx, recall_started, &metric_sample, frame.answer_kind);
+    Ok(frame)
+}
+
+/// Lightweight always-on read-path stats the executor already MEASURED,
+/// extracted from `QueryMetadata` so the RECALL handler can RECORD them
+/// into the retriever / query metric families after the answer is
+/// shaped. Kept small (one `Vec` of at most three lanes, no per-item
+/// detail) so surfacing it up the call adds no hot-path allocation of
+/// consequence — the fan-out loop itself is untouched.
+struct RecallMetricSample {
+    /// One entry per retriever lane that was actually invoked (skipped
+    /// lanes are omitted — they never ran): `(kind, elapsed_ms,
+    /// candidates)`.
+    per_lane: Vec<(RetrieverKind, f64, u64)>,
+    /// The effective fusion `k` the engine fused at this execution.
+    effective_fusion_k: u32,
+    /// Whether the cross-encoder rerank stage actually reordered the
+    /// fused list (loaded and applied — not merely present).
+    rerank_invoked: bool,
+}
+
+impl RecallMetricSample {
+    /// Extract the always-on stats from the executor's returned
+    /// metadata. Populated on every recall (not gated on `trace_detail`)
+    /// — the per-lane latency / total / outcome vectors and the
+    /// `effective_fusion_k` / `rerank` fields are always filled.
+    fn from_metadata(meta: &QueryMetadata) -> Self {
+        let mut per_lane = Vec::with_capacity(meta.retriever_outcomes.len());
+        for outcome in &meta.retriever_outcomes {
+            // A skipped lane never ran, so it isn't an invocation.
+            if matches!(outcome.status, RetrieverStatus::Skipped(_)) {
+                continue;
+            }
+            let elapsed_ms = meta
+                .retriever_latencies_ms
+                .iter()
+                .find(|(r, _)| *r == outcome.retriever)
+                .map(|(_, ms)| *ms)
+                .unwrap_or(0.0);
+            let candidates = meta
+                .retriever_total_results
+                .iter()
+                .find(|(r, _)| *r == outcome.retriever)
+                .map(|(_, c)| *c as u64)
+                .unwrap_or(0);
+            per_lane.push((retriever_kind(outcome.retriever), elapsed_ms, candidates));
+        }
+        let rerank_invoked = matches!(meta.rerank, Some(RerankOutcome::Applied { .. }));
+        Self {
+            per_lane,
+            effective_fusion_k: meta.effective_fusion_k,
+            rerank_invoked,
+        }
+    }
+}
+
+/// Map the planner's retriever discriminant onto the metric-family
+/// label enum. Total — the planner has exactly these three lanes.
+fn retriever_kind(retriever: Retriever) -> RetrieverKind {
+    match retriever {
+        Retriever::Semantic => RetrieverKind::Semantic,
+        Retriever::Lexical => RetrieverKind::Lexical,
+        Retriever::Graph => RetrieverKind::Graph,
+    }
+}
+
+/// Map the wire answer shape onto the query-metric outcome label.
+fn query_outcome(answer_kind: AnswerKindWire) -> QueryOutcome {
+    match answer_kind {
+        AnswerKindWire::Single => QueryOutcome::Single,
+        AnswerKindWire::Many => QueryOutcome::Many,
+        AnswerKindWire::None => QueryOutcome::None,
+    }
+}
+
+/// Record the read-path metrics for one served recall. Runs on EVERY
+/// recall (both return paths), post-hoc: a handful of atomic adds plus
+/// a per-lane and two query histogram observes. No lock, no allocation
+/// beyond the already-built `per_lane` sample.
+fn record_recall_metrics(
+    ctx: &OpsContext,
+    started: Instant,
+    sample: &RecallMetricSample,
+    answer_kind: AnswerKindWire,
+) {
+    for &(kind, elapsed_ms, candidates) in &sample.per_lane {
+        ctx.retriever_metrics.record(kind, elapsed_ms, candidates);
+    }
+    let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
+    ctx.query_metrics.record(
+        latency_ms,
+        sample.effective_fusion_k,
+        sample.rerank_invoked,
+        query_outcome(answer_kind),
+    );
 }
 
 /// Honest abstention by structural anchor — unconditional, no flag/knob (FIX C).
@@ -1954,7 +2060,7 @@ async fn retrieve_memories(
     ctx: &OpsContext,
     entity_anchor: Option<EntityId>,
     cue_vec: Option<&[f32; brain_embed::VECTOR_DIM]>,
-) -> Result<(Vec<MemoryResult>, Option<RecallTrace>), OpError> {
+) -> Result<(Vec<MemoryResult>, Option<RecallTrace>, RecallMetricSample), OpError> {
     let planner_req = build_planner_request(req, ctx.executor.caller_space, entity_anchor);
 
     let plan = retrieval_plan(&planner_req).map_err(map_plan_error)?;
@@ -2071,6 +2177,14 @@ async fn retrieve_memories(
         None
     };
 
+    // Always-on read-path metric sample. Extracted from the same
+    // `result.metadata` the executor already produced (per-lane
+    // latency / totals / outcomes, effective fusion k, rerank flag) —
+    // populated on every recall, not just `req.trace`. The RECALL
+    // handler records it into the retriever / query metric families
+    // once the answer shape is known.
+    let metric_sample = RecallMetricSample::from_metadata(&result.metadata);
+
     let memory_results = project_memory_results(&result, req, ctx)?;
 
     // In-txn read-your-writes: overlay the txn's pending ENCODE
@@ -2098,7 +2212,7 @@ async fn retrieve_memories(
         ctx.access_buffer.record(MemoryId::from_raw(r.memory_id));
     }
 
-    Ok((memory_results, trace))
+    Ok((memory_results, trace, metric_sample))
 }
 
 /// Structure the executor's `QueryMetadata` into the wire `RecallTrace` the

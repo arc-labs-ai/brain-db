@@ -369,6 +369,52 @@ async fn metrics_emits_hnsw_counts() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn metrics_emits_retriever_and_query_series() {
+    // The retriever_* / query_* families are always wired (recall runs
+    // on every shard), so their series are present at startup with zero
+    // values even before any recall is served — the v1 acceptance gate
+    // requires them emitted and consistent.
+    let server = start_admin_with_shards(1).await;
+    let (code, body) = http_get(server.admin_addr, "/metrics").await;
+    assert_eq!(code, 200);
+
+    for retriever in ["semantic", "lexical", "graph"] {
+        let needle =
+            format!("brain_retriever_invocations_total{{shard=\"0\",retriever=\"{retriever}\"}}");
+        assert!(body.contains(&needle), "missing {needle}; body:\n{body}");
+        let needle =
+            format!("brain_retriever_candidates_total{{shard=\"0\",retriever=\"{retriever}\"}}");
+        assert!(body.contains(&needle), "missing {needle}");
+    }
+    assert!(
+        body.contains("brain_retriever_latency_ms_bucket{shard=\"0\",retriever=\"semantic\","),
+        "missing brain_retriever_latency_ms histogram; body:\n{body}"
+    );
+
+    assert!(
+        body.contains("brain_query_total{shard=\"0\"}"),
+        "missing brain_query_total; body:\n{body}"
+    );
+    assert!(
+        body.contains("brain_query_rerank_invoked_total{shard=\"0\"}"),
+        "missing brain_query_rerank_invoked_total"
+    );
+    for outcome in ["single", "many", "none"] {
+        let needle = format!("brain_query_outcome_total{{shard=\"0\",outcome=\"{outcome}\"}}");
+        assert!(body.contains(&needle), "missing {needle}");
+    }
+    assert!(
+        body.contains("brain_query_latency_ms_bucket{shard=\"0\","),
+        "missing brain_query_latency_ms histogram"
+    );
+    assert!(
+        body.contains("brain_query_fusion_k_bucket{shard=\"0\","),
+        "missing brain_query_fusion_k histogram"
+    );
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn metrics_increments_connections_total_on_accept() {
     let server = start_admin_with_shards(1).await;
     let conn_addr = server.conn_addr.expect("conn_addr");

@@ -756,6 +756,60 @@ fn handle_recall_no_txn_fuses_retrieval_lanes() {
 }
 
 // ---------------------------------------------------------------------------
+// A served recall advances the retriever_* / query_* metric families. The
+// executor already measured the per-lane stats + effective fusion k + rerank
+// flag; the handler records them post-hoc from the returned metadata plus the
+// final answer shape. This confirms the recording fires on the normal (no
+// txn, no trace) path — the v1 acceptance gate requires these emitted.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn recall_records_retriever_and_query_metrics() {
+    run_in_glommio(|| async {
+        let mut fix = build_fixture();
+        let _mid = encode(&fix, [0xC1; 16], "beta", MemoryKindWire::Episodic).await;
+        fix.reindex_lexical();
+
+        // Baseline: fresh fixture, nothing recorded yet.
+        let q0 = fix.ctx.query_metrics.snapshot();
+        assert_eq!(q0.total, 0, "no recall served yet");
+
+        let frame = brain_ops::recall::handle_recall(recall_req("beta", 5), &fix.ctx)
+            .await
+            .expect("retrieval recall");
+        assert!(
+            !frame.memories.is_empty(),
+            "expected a hit for the recording"
+        );
+
+        let q1 = fix.ctx.query_metrics.snapshot();
+        assert_eq!(q1.total, 1, "one recall must advance brain_query_total");
+        assert_eq!(q1.latency_ms.count, 1, "end-to-end latency observed once");
+        assert_eq!(q1.fusion_k.count, 1, "effective fusion-k observed once");
+        // The hit returns Single or Many depending on membership; either way
+        // exactly one outcome slot advanced and it is not `none`.
+        let outcomes_total: u64 = q1.outcome_total.iter().sum();
+        assert_eq!(outcomes_total, 1, "exactly one outcome recorded");
+        // QueryOutcome::None is index 2.
+        assert_eq!(q1.outcome_total[2], 0, "a hit is never the none outcome");
+
+        // The semantic + lexical lanes both run on this cue (real HNSW +
+        // reindexed lexical), so their invocation counters advance.
+        let r1 = fix.ctx.retriever_metrics.snapshot();
+        // RetrieverKind: semantic=0, lexical=1, graph=2.
+        assert_eq!(
+            r1.invocations_total[0], 1,
+            "semantic lane invoked once; got {r1:?}"
+        );
+        assert_eq!(r1.invocations_total[1], 1, "lexical lane invoked once");
+        assert_eq!(
+            r1.latency_ms[0].count, 1,
+            "semantic latency observed once per invocation"
+        );
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Opt-in per-stage trace. `trace = false` leaves the frame's `trace` field
 // `None` (zero-cost, unchanged payload); `trace = true` populates a
 // `RecallTrace` from the pipeline's already-computed metadata: one entry per
