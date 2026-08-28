@@ -161,6 +161,64 @@ where
         .expect("test executor join")
 }
 
+/// Count how many of the known `(memory, extractor)` pairs have a
+/// `Completed` checkpoint. This is the test's **independent** view of
+/// progress — read straight from the durable `worker_checkpoints` table,
+/// never from the worker's in-memory counters — so it can cross-check the
+/// worker's own `completed` accounting for the exactly-once property.
+fn count_completed(metadata: &SharedMetadataDb, ids: &[MemoryId], ext_ids: &[ExtractorId]) -> u64 {
+    let mut n = 0u64;
+    for id in ids {
+        for e in ext_ids {
+            if checkpoint_completed(metadata, *id, e.raw()) {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// Assert every known `(memory, extractor)` pair ended `Completed`.
+fn assert_all_pairs_completed(
+    metadata: &SharedMetadataDb,
+    ids: &[MemoryId],
+    ext_ids: &[ExtractorId],
+    ctx: &str,
+) {
+    for id in ids {
+        for e in ext_ids {
+            assert!(
+                checkpoint_completed(metadata, *id, e.raw()),
+                "pair ({id:?}, ext={}) not Completed [{ctx}]",
+                e.raw()
+            );
+        }
+    }
+}
+
+/// Deterministic splitmix64 PRNG. Seeded so a chaos scenario replays
+/// byte-for-byte — a green run stays green; a failure reproduces from the
+/// printed seed. No external `rand` dependency, no wall-clock, no
+/// thread-scheduling non-determinism.
+struct Rng(u64);
+
+impl Rng {
+    fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    /// Uniform in `[lo, hi]` (inclusive). `lo <= hi`.
+    fn range(&mut self, lo: usize, hi: usize) -> usize {
+        lo + (self.next_u64() as usize % (hi - lo + 1))
+    }
+}
+
 // ===========================================================================
 // Tests.
 // ===========================================================================
@@ -377,5 +435,301 @@ fn idle_worker_run_cycle_is_a_noop() {
         let processed = run_cycle(&worker, ctx.clone()).await;
         assert_eq!(processed, 0, "no run submitted → nothing processed");
         assert!(!worker.progress().running);
+    });
+}
+
+// ===========================================================================
+// Chaos: exactly-once under repeated interruption (§19.01 durability bar,
+// §19.06 "backfill resumable on interrupt").
+//
+// Crash-injection method: a "crash" is `drop(worker); drop(ctx);
+// drop(metadata)` — the whole in-memory run state and every open handle go
+// away — followed by re-opening the SAME redb path and re-submitting the
+// SAME `BackfillRequest`. Only the durable `worker_checkpoints` rows survive
+// the drop, exactly as they would across a real process restart.
+//
+// Exactly-once instrumentation: two mutually-checking observers.
+//   1. `worker_completed_sum` — the sum, across every restart segment, of
+//      that segment's final `progress().completed`. A segment's `completed`
+//      counts only pairs *freshly* driven to `Completed` in that segment
+//      (resume-skips land in `skipped_already_completed`, not `completed`),
+//      so the sum over all segments is the number of first-time completions.
+//   2. `count_completed(...)` — an independent scan of the durable
+//      checkpoint table.
+// Exactly-once holds iff `worker_completed_sum == final_table_completed ==
+// total`. A duplicate process inflates the worker sum above the table count
+// (and above `total`); a dropped/skipped pair leaves the table count below
+// `total`. Either divergence fails the assert rather than being smoothed
+// over.
+// ===========================================================================
+
+/// One randomized crash-resume scenario. Seeds `n_mem` memories over
+/// `n_ext` extractors with `batch_size` chosen so a run spans several
+/// cycles, then drives the worker in short bursts punctuated by crashes
+/// (drop + reopen the same redb) until the run completes. Asserts the
+/// exactly-once invariant across all restarts.
+async fn run_chaos_scenario(n_mem: u64, n_ext: u32, batch: usize, seed: u64) {
+    let label = format!("(n_mem={n_mem}, n_ext={n_ext}, batch={batch}, seed={seed:#x})");
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("meta.redb");
+    let ext_ids: Vec<ExtractorId> = (1..=n_ext).map(ExtractorId).collect();
+    let total = n_mem * u64::from(n_ext);
+
+    // Seed the memories once into the persistent redb, then drop the handle.
+    let ids: Vec<MemoryId> = {
+        let (_ctx, metadata) = build_ctx(&db_path);
+        (0..n_mem).map(|s| seed_memory(&metadata, s)).collect()
+    };
+
+    // The request is built once and re-submitted verbatim (same BackfillId)
+    // on every resume — a restart re-issues the identical admin request.
+    let req = BackfillRequest::new(BackfillRange::All, ext_ids.clone()).dry_run();
+
+    let mut rng = Rng::new(seed);
+    let mut worker_completed_sum = 0u64;
+    let mut prev_table_completed = 0u64;
+
+    // A single uninterrupted segment walks every memory exactly once, so
+    // `total.div_ceil(batch) + 2` cycles always finishes from any resume
+    // state. Early segments crash after 1..=3 cycles (many interruption
+    // points); once the soft budget of crash-happy segments is spent, the
+    // remaining segments run `full_cycles` so the scenario deterministically
+    // terminates for every seed rather than relying on a lucky draw.
+    let full_cycles = (total as usize).div_ceil(batch) + 2;
+    let soft_segments = (total as usize) + 6;
+    let max_segments = soft_segments + 3;
+
+    let mut finished = false;
+    for seg in 0..max_segments {
+        let cycles = if seg < soft_segments {
+            rng.range(1, 3)
+        } else {
+            full_cycles
+        };
+
+        let (ctx, metadata) = build_ctx(&db_path);
+        let worker = BackfillWorker::new().with_config(small_batch_config(batch));
+        worker.submit(req.clone());
+
+        let mut seg_completed = 0u64;
+        let mut seg_finished = false;
+        for _ in 0..cycles {
+            run_cycle(&worker, ctx.clone()).await;
+            let p = worker.progress();
+            // `completed` accumulates across cycles *within* this segment;
+            // the final read is this segment's fresh-completion total.
+            seg_completed = p.completed;
+            if !p.running {
+                seg_finished = true;
+                break;
+            }
+        }
+        worker_completed_sum += seg_completed;
+
+        // Independent, between-crash check on the durable table: the count of
+        // Completed pairs never regresses and never exceeds `total`.
+        let table_completed = count_completed(&metadata, &ids, &ext_ids);
+        assert!(
+            table_completed >= prev_table_completed,
+            "Completed checkpoints regressed {prev_table_completed} -> {table_completed} {label}"
+        );
+        assert!(
+            table_completed <= total,
+            "more Completed checkpoints ({table_completed}) than pairs ({total}) {label}"
+        );
+        prev_table_completed = table_completed;
+
+        // Crash: every handle to the redb goes away; only the on-disk
+        // checkpoints survive into the next segment.
+        drop(worker);
+        drop(ctx);
+        drop(metadata);
+
+        if seg_finished {
+            finished = true;
+            break;
+        }
+    }
+
+    assert!(
+        finished,
+        "backfill never completed within {max_segments} restart segments {label}"
+    );
+
+    // Exactly-once: the worker freshly completed each pair once (sum), and
+    // the durable table holds exactly one Completed row per pair. The two
+    // independent observers must agree, and both must equal `total`.
+    let final_metadata: SharedMetadataDb =
+        Arc::new(brain_metadata::MetadataDb::open(&db_path).unwrap());
+    let final_table_completed = count_completed(&final_metadata, &ids, &ext_ids);
+    assert_eq!(
+        worker_completed_sum, total,
+        "worker completed {worker_completed_sum} fresh pairs, expected exactly {total} \
+         (>{total} = a pair processed twice, <{total} = a pair skipped) {label}"
+    );
+    assert_eq!(
+        final_table_completed, total,
+        "durable table holds {final_table_completed} Completed pairs, expected {total} {label}"
+    );
+    assert_eq!(
+        worker_completed_sum, final_table_completed,
+        "worker fresh-completion count and durable Completed count diverged {label}"
+    );
+    assert_all_pairs_completed(&final_metadata, &ids, &ext_ids, &label);
+}
+
+#[test]
+fn chaos_exactly_once_under_repeated_interruption() {
+    // A spread of grid shapes and batch bounds, each with a fixed seed so the
+    // crash schedule is deterministic and reproducible. Every scenario spans
+    // multiple cycles (batch < total pairs) and is interrupted many times.
+    glommio_run(|| async {
+        let scenarios: [(u64, u32, usize, u64); 16] = [
+            (4, 1, 2, 0x0000_0001),
+            (5, 2, 3, 0x0000_0002),
+            (6, 3, 4, 0x0000_0003),
+            (3, 2, 2, 0x0000_0004),
+            (8, 2, 3, 0x0000_0005),
+            (4, 3, 5, 0x0000_0006),
+            (7, 1, 2, 0x0000_0007),
+            (5, 3, 4, 0x0000_0008),
+            (6, 2, 5, 0x1234_5678),
+            (3, 4, 2, 0x9ABC_DEF0),
+            (9, 1, 3, 0xDEAD_BEEF),
+            (4, 2, 7, 0xCAFE_F00D),
+            (10, 2, 4, 0x0BAD_C0DE),
+            (5, 4, 3, 0xFEED_FACE),
+            (2, 3, 2, 0xA5A5_5A5A),
+            (7, 3, 6, 0x1357_9BDF),
+        ];
+        for (n_mem, n_ext, batch, seed) in scenarios {
+            run_chaos_scenario(n_mem, n_ext, batch, seed).await;
+        }
+    });
+}
+
+#[test]
+fn chaos_crash_mid_memory_completes_all_extractors_on_resume() {
+    // A crash *inside* a memory's extractor loop (some of its per-pair
+    // checkpoints committed, the rest not, cursor un-advanced) must, on
+    // resume, drive every remaining extractor of that memory to Completed —
+    // none dropped at the batch boundary (bug #6), now under a real crash.
+    //
+    // We reconstruct the exact durable state such a crash leaves: memory 0's
+    // first `pre` extractors are Completed, the rest of the grid is untouched.
+    glommio_run(|| async {
+        let cases: [(u64, u32, usize, u32); 4] = [
+            (1, 3, 2, 1), // one memory, 3 extractors, batch 2, crashed after ext 1
+            (2, 3, 2, 2), // crashed after 2 of 3 extractors of memory 0
+            (3, 4, 3, 1),
+            (2, 4, 2, 3),
+        ];
+        for (n_mem, n_ext, batch, pre) in cases {
+            let label = format!("(n_mem={n_mem}, n_ext={n_ext}, batch={batch}, pre={pre})");
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("meta.redb");
+            let ext_ids: Vec<ExtractorId> = (1..=n_ext).map(ExtractorId).collect();
+            let total = n_mem * u64::from(n_ext);
+
+            let ids: Vec<MemoryId> = {
+                let (_ctx, metadata) = build_ctx(&db_path);
+                let ids: Vec<MemoryId> = (0..n_mem).map(|s| seed_memory(&metadata, s)).collect();
+                // Durable state a mid-memory crash leaves: memory 0's first
+                // `pre` extractors committed Completed; cursor never advanced.
+                let wtxn = metadata.write_txn().unwrap();
+                for e in 1..=pre {
+                    worker_checkpoints::mark_completed(
+                        &wtxn,
+                        WORKER_ID,
+                        &item_key(ids[0], e),
+                        now_unix_nanos(),
+                    )
+                    .unwrap();
+                }
+                wtxn.commit().unwrap();
+                ids
+            };
+
+            // Resume with a fresh worker over the same redb.
+            let (ctx, metadata) = build_ctx(&db_path);
+            let worker = BackfillWorker::new().with_config(small_batch_config(batch));
+            let req = BackfillRequest::new(BackfillRange::All, ext_ids.clone()).dry_run();
+            worker.submit(req);
+
+            drive_to_completion(&worker, &ctx, 128).await;
+
+            let p = worker.progress();
+            assert!(!p.running, "run should finish after resume {label}");
+            assert_all_pairs_completed(&metadata, &ids, &ext_ids, &label);
+            assert_eq!(
+                p.skipped_already_completed,
+                u64::from(pre),
+                "exactly the pre-crash extractors of memory 0 are skipped {label}"
+            );
+            assert_eq!(
+                p.completed,
+                total - u64::from(pre),
+                "every remaining pair (incl. the rest of memory 0) is freshly completed {label}"
+            );
+        }
+    });
+}
+
+#[test]
+fn chaos_cancel_then_resubmit_resumes_remaining_pairs() {
+    // Cancel is not a durable veto: it stops the in-memory run within a
+    // cycle, but the per-pair checkpoints already committed persist. A
+    // resubmit of the SAME request resumes from those checkpoints — the
+    // already-Completed pairs are skipped, only the remainder is processed.
+    // This documents the actual cancel-then-resubmit contract (resume, not
+    // restart-from-zero, and not a permanent block).
+    glommio_run(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, metadata) = build_ctx(&dir.path().join("meta.redb"));
+        let ids: Vec<MemoryId> = (0..5).map(|s| seed_memory(&metadata, s)).collect();
+        let ext_ids = vec![ExtractorId(1), ExtractorId(2)];
+        let total = (ids.len() * ext_ids.len()) as u64;
+
+        // batch 2 = one memory (two extractors) per cycle.
+        let worker = BackfillWorker::new().with_config(small_batch_config(2));
+        let req = BackfillRequest::new(BackfillRange::All, ext_ids.clone()).dry_run();
+        let id = worker.submit(req.clone());
+
+        // Process two memories, then cancel.
+        run_cycle(&worker, ctx.clone()).await;
+        run_cycle(&worker, ctx.clone()).await;
+        assert!(worker.progress().running);
+        let done_before = worker.progress().completed;
+        assert_eq!(
+            done_before, 4,
+            "two memories × two extractors done pre-cancel"
+        );
+
+        assert!(worker.cancel(id), "cancel flags the in-flight run");
+        run_cycle(&worker, ctx.clone()).await; // observes cancel, finalises
+        let pc = worker.progress();
+        assert!(!pc.running, "cancelled run is finalised");
+        assert_eq!(pc.completed, done_before, "no pair processed after cancel");
+        assert_eq!(
+            count_completed(&metadata, &ids, &ext_ids),
+            done_before,
+            "only the pre-cancel pairs are checkpointed Completed"
+        );
+
+        // Resubmit the same request: resumes from checkpoints.
+        worker.submit(req.clone());
+        drive_to_completion(&worker, &ctx, 64).await;
+        let pr = worker.progress();
+        assert!(!pr.running);
+        assert_eq!(
+            pr.completed,
+            total - done_before,
+            "resubmit re-runs only the not-yet-completed pairs"
+        );
+        assert_eq!(
+            pr.skipped_already_completed, done_before,
+            "the pre-cancel pairs are skipped on resume, not re-run"
+        );
+        assert_all_pairs_completed(&metadata, &ids, &ext_ids, "cancel-then-resubmit");
     });
 }
