@@ -1477,4 +1477,100 @@ mod tests {
             "with all writes committed the checkpoint advances durable_lsn to the WAL tail",
         );
     }
+
+    /// One gap case: `n_data` Encode records are WAL-durable (LSN
+    /// `1..=n_data`) but only the first `watermark` (`1 <= watermark <
+    /// n_data`) have committed to redb. A snapshot stamps CHECKPOINT_END
+    /// while records `watermark+1..=n_data` are still uncommitted.
+    ///
+    /// Asserts the watermark contract holds end-to-end:
+    /// - the checkpoint's `durable_lsn` equals the redb-committed watermark
+    ///   (`< n_data`, strictly below the WAL tail);
+    /// - recovery seeded with that `durable_lsn` REPLAYS every
+    ///   WAL-durable-but-redb-uncommitted record (`watermark+1..=n_data`)
+    ///   and skips exactly the `watermark` truly-committed ones — never
+    ///   silently dropping a WAL-durable record.
+    fn assert_watermark_gap_replays(n_data: u64, watermark: u64) {
+        use brain_storage::recovery::MetadataSink;
+        assert!(
+            (1..n_data).contains(&watermark),
+            "gap case requires 1 <= watermark < n_data (got n_data={n_data}, watermark={watermark})",
+        );
+        let (_tmp, wal_dir, uuid, arena_path) = snapshot_with_watermark(n_data, watermark);
+
+        // Pass 1 (fresh sink): CHECKPOINT_END carries durable_lsn = watermark.
+        let mut arena = ArenaFile::open(&arena_path, uuid, 16).expect("reopen arena");
+        let mut sink = brain_storage::recovery::InMemoryMetadataSink::new();
+        let (report1, _alloc) =
+            brain_storage::recovery::recover(&mut arena, &wal_dir, uuid, &mut sink)
+                .expect("recover pass 1");
+        assert_eq!(
+            sink.durable_lsn(),
+            watermark,
+            "n_data={n_data}: durable_lsn must equal the redb-committed watermark",
+        );
+        assert!(
+            sink.durable_lsn() < report1.next_lsn.saturating_sub(1),
+            "n_data={n_data}: durable_lsn ({}) must be strictly below the WAL tail ({})",
+            sink.durable_lsn(),
+            report1.next_lsn.saturating_sub(1),
+        );
+
+        // Pass 2 (sink seeded with the checkpoint's durable_lsn): every
+        // uncommitted record is replayed; exactly `watermark` are skipped.
+        let mut arena2 = ArenaFile::open(&arena_path, uuid, 16).expect("reopen arena 2");
+        let mut sink2 =
+            brain_storage::recovery::InMemoryMetadataSink::with_durable_lsn(sink.durable_lsn());
+        let (report2, _alloc2) =
+            brain_storage::recovery::recover(&mut arena2, &wal_dir, uuid, &mut sink2)
+                .expect("recover pass 2");
+        for lsn in (watermark + 1)..=n_data {
+            assert!(
+                sink2.applied().contains_key(&lsn),
+                "n_data={n_data}, watermark={watermark}: LSN {lsn} \
+                 (WAL-durable, redb-uncommitted) must be REPLAYED",
+            );
+        }
+        assert_eq!(
+            report2.records_skipped, watermark,
+            "n_data={n_data}, watermark={watermark}: only records at/below the \
+             watermark may be skipped",
+        );
+    }
+
+    /// The S5 scenario, swept across several deterministic watermark/tail
+    /// gaps: for each `(n_data, watermark)` the checkpoint's durable_lsn is
+    /// the redb-committed watermark and recovery replays every uncommitted
+    /// record. Extends the single-case
+    /// `checkpoint_durable_lsn_is_redb_watermark_not_wal_tail` with wider
+    /// coverage of the gap size.
+    #[test]
+    fn checkpoint_watermark_gap_replays_uncommitted_records() {
+        for (n_data, watermark) in [(3, 1), (4, 2), (4, 3), (5, 1), (5, 4), (6, 3), (8, 5)] {
+            assert_watermark_gap_replays(n_data, watermark);
+        }
+    }
+
+    /// Randomized watermark/tail gaps over a handful of deterministic seeds:
+    /// the same replay-never-skip invariant must hold for arbitrary gap
+    /// positions, not just the hand-picked ones above.
+    #[test]
+    fn checkpoint_watermark_gap_replays_uncommitted_records_randomized() {
+        // Deterministic xorshift64* — reproducible, no dependency.
+        let mut state: u64 = 0x1234_5678_9ABC_DEF0;
+        let mut next = || {
+            let mut x = state;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            state = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        };
+        for _ in 0..10 {
+            // n_data in 3..=9; watermark in 1..n_data.
+            let n_data = 3 + next() % 7;
+            let watermark = 1 + next() % (n_data - 1);
+            assert_watermark_gap_replays(n_data, watermark);
+        }
+    }
 }
