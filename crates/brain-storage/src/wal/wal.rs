@@ -1339,4 +1339,387 @@ mod tests {
             wal.shutdown().await.unwrap();
         });
     }
+
+    // ===================================================================
+    // Rollover stress / chaos (§19.01 recovery + durability).
+    //
+    // These push the segment-rollover concurrency fix hard: many
+    // concurrent appenders on one Glommio executor, segment caps tiny
+    // enough to force a rollover every 1–4 records, driven by a
+    // deterministic seeded RNG so a failure reproduces from its seed.
+    // ===================================================================
+
+    /// Deterministic splitmix64 — no wall-clock, no `rand` crate, so a
+    /// failing scenario reproduces verbatim from its seed.
+    struct SplitMix64(u64);
+
+    impl SplitMix64 {
+        fn new(seed: u64) -> Self {
+            Self(seed)
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        /// Uniform-ish integer in `[lo, hi]` inclusive.
+        fn range(&mut self, lo: u64, hi: u64) -> u64 {
+            debug_assert!(hi >= lo);
+            lo + self.next_u64() % (hi - lo + 1)
+        }
+    }
+
+    fn record_with_kind(kind: WalRecordKind, payload_bytes: usize) -> WalRecord {
+        let mut r = record_with_payload_size(payload_bytes);
+        r.kind = kind;
+        r
+    }
+
+    /// One appender task's plan: which record kind, payload size, and how
+    /// many records it will append.
+    #[derive(Clone, Copy)]
+    struct TaskSpec {
+        kind: WalRecordKind,
+        payload: usize,
+        count: u64,
+    }
+
+    /// Spawn one `spawn_local` appender per `TaskSpec` against a shared
+    /// `Wal`, run them concurrently to completion, then `shutdown_in_place`.
+    /// Returns every assigned LSN (sorted) and the final `active_segment_seq`.
+    ///
+    /// All appenders share one single-threaded executor, so they interleave
+    /// only at `.await` points — exactly the window the rollover fix
+    /// serializes. The returned LSN multiset is the ground truth for the
+    /// distinct/contiguous invariant; `final_seq` is checked against the
+    /// deterministic packing to catch spurious (empty-segment) rollovers.
+    fn run_concurrent_appenders(
+        dir: &std::path::Path,
+        shard: [u8; 16],
+        cfg: WalConfig,
+        specs: Vec<TaskSpec>,
+    ) -> (Vec<u64>, u64) {
+        use std::rc::Rc;
+        let dir = dir.to_owned();
+        glommio_run(move || async move {
+            let wal = Rc::new(Wal::create_with_config(&dir, shard, cfg).await.unwrap());
+
+            let mut tasks = Vec::new();
+            for spec in specs {
+                let w = wal.clone();
+                tasks.push(glommio::spawn_local(async move {
+                    let mut got = Vec::with_capacity(spec.count as usize);
+                    for _ in 0..spec.count {
+                        let lsn = w
+                            .append(record_with_kind(spec.kind, spec.payload))
+                            .await
+                            .unwrap();
+                        got.push(lsn.raw());
+                    }
+                    got
+                }));
+            }
+
+            let mut all = Vec::new();
+            for t in tasks {
+                all.extend(t.await);
+            }
+            all.sort_unstable();
+
+            let final_seq = wal.active_segment_seq();
+            wal.shutdown_in_place().await.unwrap();
+            (all, final_seq)
+        })
+    }
+
+    /// **Stress 1 — high concurrency + tiny segments, seeded scenarios.**
+    ///
+    /// For each seed: 4–8 appenders, each writing a random record count,
+    /// against a segment cap sized to hold only `per_seg` (1–4) records.
+    /// Asserts, per scenario:
+    ///   - no panic (rollover races don't hit the old `expect()` on a
+    ///     taken committer),
+    ///   - every LSN `1..=N` assigned exactly once — no dup, no gap,
+    ///   - the segment count equals the deterministic packing
+    ///     `ceil(N / per_seg)` — real rollovers only, no spurious
+    ///     empty-segment rollovers and none skipped,
+    ///   - recovery (`WalReader`) reads back `1..=N` in order with no
+    ///     straddling boundary gap.
+    #[test]
+    fn rollover_stress_high_concurrency_tiny_segments() {
+        // 12 seeded scenarios. Seeds are arbitrary but fixed; a failure
+        // prints the seed so it reproduces exactly.
+        for scenario in 0..12u64 {
+            let seed = 0xA5A5_0000_0000_0001u64
+                .wrapping_mul(scenario.wrapping_add(1))
+                .rotate_left(scenario as u32 & 63);
+            let mut rng = SplitMix64::new(seed);
+
+            let payload = [32usize, 48, 64][(rng.range(0, 2)) as usize];
+            let rb = record_with_payload_size(payload).encoded_len();
+            let per_seg = rng.range(1, 4); // records that fit per segment
+                                           // capacity_bytes must hold exactly `per_seg` records:
+                                           // per_seg*rb <= capacity < (per_seg+1)*rb.
+            let capacity_bytes = (per_seg * rb as u64) + rng.range(0, rb as u64 - 1);
+            let cap = WAL_SEGMENT_HEADER_LEN + capacity_bytes as usize;
+            let cfg = WalConfig {
+                group_commit: GroupCommitConfig::default(),
+                max_segment_bytes: cap,
+            };
+
+            let task_count = rng.range(4, 8);
+            let mut specs = Vec::new();
+            let mut n: u64 = 0;
+            for _ in 0..task_count {
+                let count = rng.range(15, 30);
+                n += count;
+                specs.push(TaskSpec {
+                    kind: WalRecordKind::Encode,
+                    payload,
+                    count,
+                });
+            }
+
+            let dir = tempfile::tempdir().unwrap();
+            let (lsns, final_seq) = run_concurrent_appenders(dir.path(), uuid(40), cfg, specs);
+
+            // Distinct + contiguous: exactly 1..=N once each.
+            assert_eq!(
+                lsns,
+                (1..=n).collect::<Vec<_>>(),
+                "seed {seed:#x}: LSNs not distinct+contiguous \
+                 (payload={payload} rb={rb} per_seg={per_seg} cap={cap} N={n})"
+            );
+
+            // Deterministic packing: one segment per `per_seg` records, no
+            // spurious rollovers (which would leave empty segments and push
+            // final_seq higher), none skipped (which would pack too many).
+            let expected_segments = n.div_ceil(per_seg);
+            assert_eq!(
+                final_seq + 1,
+                expected_segments,
+                "seed {seed:#x}: segment count {} != expected {} \
+                 (spurious or missed rollover) per_seg={per_seg} N={n}",
+                final_seq + 1,
+                expected_segments
+            );
+            assert!(
+                final_seq >= 8,
+                "seed {seed:#x}: only {final_seq} rollovers — scenario not stressful"
+            );
+
+            // Recovery reads every record back in order across all
+            // boundaries; a dup or straddling gap surfaces as LsnGap.
+            let reader = WalReader::open(dir.path(), uuid(40)).unwrap();
+            let recovered: Vec<u64> = reader.into_iter().map(|r| r.unwrap().lsn.raw()).collect();
+            assert_eq!(
+                recovered,
+                (1..=n).collect::<Vec<_>>(),
+                "seed {seed:#x}: recovery did not yield 1..=N in order"
+            );
+        }
+    }
+
+    /// **Stress 2 — rollover interleaved with a checkpoint-shaped appender.**
+    ///
+    /// The original race was the writer's drain and the snapshot worker's
+    /// CHECKPOINT records both appending across a rollover boundary. Here a
+    /// dedicated task appends `CheckpointBegin`/`CheckpointEnd`-kind records
+    /// concurrently with several data appenders, all straddling tiny-segment
+    /// boundaries. The wal layer stamps LSNs identically regardless of kind,
+    /// so the same distinct/contiguous/recovery invariants must hold.
+    ///
+    /// Limitation: these are checkpoint-*kind* records with opaque payloads,
+    /// not fully-formed CHECKPOINT payloads (the snapshot worker lives above
+    /// the wal layer). What is faithfully reproduced is the concurrency shape
+    /// — a second independent appender racing the writer through rollovers.
+    #[test]
+    fn rollover_interleaved_with_checkpoint_appender() {
+        for scenario in 0..8u64 {
+            let seed = 0xC4EC_C001_0000_0001u64
+                .wrapping_mul(scenario.wrapping_add(1))
+                .rotate_left((scenario as u32).wrapping_mul(7) & 63);
+            let mut rng = SplitMix64::new(seed);
+
+            let payload = [32usize, 40, 56][(rng.range(0, 2)) as usize];
+            let rb = record_with_payload_size(payload).encoded_len();
+            let per_seg = rng.range(1, 3);
+            let capacity_bytes = (per_seg * rb as u64) + rng.range(0, rb as u64 - 1);
+            let cap = WAL_SEGMENT_HEADER_LEN + capacity_bytes as usize;
+            let cfg = WalConfig {
+                group_commit: GroupCommitConfig::default(),
+                max_segment_bytes: cap,
+            };
+
+            // 3–5 data appenders + one checkpoint-shaped appender that
+            // alternates begin/end via its own kind (payload fixed so it
+            // packs with the same `per_seg`).
+            let data_tasks = rng.range(3, 5);
+            let mut specs = Vec::new();
+            let mut n: u64 = 0;
+            for _ in 0..data_tasks {
+                let count = rng.range(12, 24);
+                n += count;
+                specs.push(TaskSpec {
+                    kind: WalRecordKind::Encode,
+                    payload,
+                    count,
+                });
+            }
+            let ckpt_count = rng.range(10, 20);
+            n += ckpt_count;
+            // CheckpointBegin and CheckpointEnd are both substrate kinds; a
+            // single kind is enough to exercise the concurrent-appender race
+            // and keeps `per_seg` packing uniform.
+            specs.push(TaskSpec {
+                kind: WalRecordKind::CheckpointEnd,
+                payload,
+                count: ckpt_count,
+            });
+
+            let dir = tempfile::tempdir().unwrap();
+            let (lsns, final_seq) = run_concurrent_appenders(dir.path(), uuid(41), cfg, specs);
+
+            assert_eq!(
+                lsns,
+                (1..=n).collect::<Vec<_>>(),
+                "seed {seed:#x}: data+checkpoint appenders must assign \
+                 distinct, contiguous LSNs (per_seg={per_seg} N={n})"
+            );
+            let expected_segments = n.div_ceil(per_seg);
+            assert_eq!(
+                final_seq + 1,
+                expected_segments,
+                "seed {seed:#x}: segment count {} != expected {}",
+                final_seq + 1,
+                expected_segments
+            );
+
+            let reader = WalReader::open(dir.path(), uuid(41)).unwrap();
+            let recovered: Vec<u64> = reader.into_iter().map(|r| r.unwrap().lsn.raw()).collect();
+            assert_eq!(
+                recovered,
+                (1..=n).collect::<Vec<_>>(),
+                "seed {seed:#x}: recovery did not yield 1..=N in order"
+            );
+        }
+    }
+
+    /// **Stress 3 — recovery after rollover under load, incl. torn tail.**
+    ///
+    /// Runs a concurrent-rollover scenario, then exercises the reopen /
+    /// recovery path three ways:
+    ///   1. clean reopen: `WalReader` yields `1..=N` in order (full record
+    ///      recovery across every boundary),
+    ///   2. torn tail: a partial trailing write is appended to the active
+    ///      (highest-seq) segment; the reader treats it as a clean end and
+    ///      still yields exactly `1..=N` (`last_decoded_lsn == N`),
+    ///   3. truncating reopen: `Wal::open_existing` at the pre-torn offset
+    ///      physically drops the garbage and resumes appends at `N+1`, and a
+    ///      subsequent read yields `1..=N+1` with no gap.
+    #[test]
+    fn recovery_after_rollover_under_load_handles_torn_tail() {
+        let seed = 0xD00D_FEED_1234_5678u64;
+        let mut rng = SplitMix64::new(seed);
+
+        let payload = 48usize;
+        let rb = record_with_payload_size(payload).encoded_len();
+        let per_seg = rng.range(1, 3);
+        let capacity_bytes = (per_seg * rb as u64) + rng.range(0, rb as u64 - 1);
+        let cap = WAL_SEGMENT_HEADER_LEN + capacity_bytes as usize;
+        let cfg = WalConfig {
+            group_commit: GroupCommitConfig::default(),
+            max_segment_bytes: cap,
+        };
+
+        let mut specs = Vec::new();
+        let mut n: u64 = 0;
+        for _ in 0..rng.range(4, 6) {
+            let count = rng.range(15, 25);
+            n += count;
+            specs.push(TaskSpec {
+                kind: WalRecordKind::Encode,
+                payload,
+                count,
+            });
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let (lsns, final_seq) = run_concurrent_appenders(dir.path(), uuid(42), cfg, specs);
+        assert_eq!(lsns, (1..=n).collect::<Vec<_>>(), "seed {seed:#x}");
+        assert!(final_seq >= 8, "seed {seed:#x}: expected many rollovers");
+
+        // (1) Clean reopen: full record recovery across every boundary.
+        {
+            let reader = WalReader::open(dir.path(), uuid(42)).unwrap();
+            let recovered: Vec<u64> = reader.into_iter().map(|r| r.unwrap().lsn.raw()).collect();
+            assert_eq!(recovered, (1..=n).collect::<Vec<_>>(), "clean recovery");
+        }
+
+        // Capture the active segment's clean, durable size before we
+        // simulate a crash torn tail on it.
+        let active_path = segment_path(dir.path(), final_seq);
+        let clean_size = std::fs::metadata(&active_path).unwrap().len();
+        assert!(clean_size >= WAL_SEGMENT_HEADER_LEN as u64);
+
+        // (2) Append a partial trailing write (shorter than a record header)
+        // to mimic a crash mid-append. On the last segment this is a torn
+        // final write — the reader drops it and stops cleanly at N.
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&active_path)
+                .unwrap();
+            f.write_all(&[0xFFu8; 16]).unwrap();
+            f.sync_all().unwrap();
+        }
+        {
+            let mut reader = WalReader::open(dir.path(), uuid(42)).unwrap();
+            let recovered: Vec<u64> = reader.by_ref().map(|r| r.unwrap().lsn.raw()).collect();
+            assert_eq!(
+                recovered,
+                (1..=n).collect::<Vec<_>>(),
+                "torn tail must be dropped, not misread"
+            );
+            assert_eq!(reader.last_decoded_lsn(), Some(n));
+        }
+
+        // (3) Truncating reopen: open_existing physically drops the garbage
+        // past the recovered tail, resumes appends at N+1.
+        let dir_path = dir.path().to_owned();
+        let ap = active_path.clone();
+        glommio_run(move || async move {
+            let wal = Wal::open_existing(
+                &dir_path,
+                uuid(42),
+                n + 1,      // next_lsn recovery would compute
+                clean_size, // recovered_tail_offset: before the torn bytes
+                cfg,
+            )
+            .await
+            .expect("reopen after torn tail");
+            assert_eq!(wal.next_lsn(), n + 1);
+            // The active segment shrank back to its clean size — the torn
+            // bytes are gone before any new append follows them.
+            assert_eq!(std::fs::metadata(&ap).unwrap().len(), clean_size);
+
+            let lsn = wal.append(record_with_payload_size(payload)).await.unwrap();
+            assert_eq!(lsn, Lsn(n + 1));
+            wal.shutdown_in_place().await.unwrap();
+        });
+
+        // Final recovery: 1..=N+1 contiguous, torn bytes never resurfaced.
+        let reader = WalReader::open(dir.path(), uuid(42)).unwrap();
+        let recovered: Vec<u64> = reader.into_iter().map(|r| r.unwrap().lsn.raw()).collect();
+        assert_eq!(
+            recovered,
+            (1..=n + 1).collect::<Vec<_>>(),
+            "post-truncation recovery must yield 1..=N+1"
+        );
+    }
 }
