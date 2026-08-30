@@ -85,6 +85,18 @@ pub(crate) struct ConnState {
     /// a `TXN_BEGIN` was sent we sweep, so a txn that did open is never
     /// missed even if its response never made it back.
     pub(crate) opened_txn: bool,
+    /// Per-connection transaction affinity: which shard each `txn_id` was
+    /// begun on. A delegated (`act_as`) `TXN_BEGIN` routes to the target
+    /// space's shard, but `TXN_COMMIT` / `TXN_ABORT` carry no `act_as` and
+    /// would otherwise route to the connection's own bound shard — a
+    /// different shard on a multi-shard deployment, where the txn was never
+    /// begun (the commit fails as `TxnNotFound`). The `TxnStore` is
+    /// per-shard, so a txn's whole lifecycle must land on one shard. This
+    /// map records the begin-time shard and pins the commit/abort to it.
+    /// Entries are retained after commit/abort so an idempotent retry of a
+    /// delegated `TXN_COMMIT` still routes to the shard holding the cached
+    /// replay response; the map is dropped with the connection.
+    pub(crate) txn_shards: std::collections::HashMap<[u8; 16], u16>,
 }
 
 impl ConnState {
@@ -95,6 +107,7 @@ impl ConnState {
             negotiated_version: 0,
             last_revocation_check: Instant::now(),
             opened_txn: false,
+            txn_shards: std::collections::HashMap::new(),
         }
     }
 }
@@ -398,9 +411,34 @@ pub(crate) fn dispatch_frame(frame: Frame, state: &mut ConnState, topology: &Top
     // idempotency domain; memory-bearing requests route to the memory's
     // shard; everything else lands on the principal's bound shard.
     let routing = topology.routing.load_full();
-    let target_shard =
+    let mut target_shard =
         pick_target_shard(&req, bound_shard, &routing, brain_protocol::act_as_of(&req))
             .unwrap_or(bound_shard);
+    // Transaction shard affinity. A txn's `TxnStore` lives on the shard the
+    // `TXN_BEGIN` landed on; a delegated begin routes to the target space's
+    // shard (via `pick_target_shard`'s `act_as` branch), but the matching
+    // `TXN_COMMIT` / `TXN_ABORT` carry no `act_as`, so without pinning they
+    // route to the connection's own bound shard and miss the txn entirely
+    // (`TxnNotFound`) whenever those two shards differ. Record the begin-time
+    // shard here and route the commit/abort back to it. A non-delegated txn
+    // (begin and commit both on the bound shard) is unaffected — the lookup
+    // returns the same shard the fallthrough would have picked.
+    match &req {
+        RequestBody::TxnBegin(r) => {
+            state.txn_shards.insert(r.txn_id, target_shard);
+        }
+        RequestBody::TxnCommit(r) => {
+            if let Some(&shard) = state.txn_shards.get(&r.txn_id) {
+                target_shard = shard;
+            }
+        }
+        RequestBody::TxnAbort(r) => {
+            if let Some(&shard) = state.txn_shards.get(&r.txn_id) {
+                target_shard = shard;
+            }
+        }
+        _ => {}
+    }
     // Capture the effective-identity selector for the dispatch task, which
     // builds the effective caller and records the delegation on the span.
     let act_as = brain_protocol::act_as_of(&req).cloned();
@@ -1014,6 +1052,30 @@ mod tests {
         }
     }
 
+    /// Like [`test_topology`] but with a routing table spanning
+    /// `shard_count` shards, so delegated-op routing can land on a shard
+    /// other than the connection's bound one.
+    fn test_topology_shards(shard_count: u16) -> Topology {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let auth_store = Arc::new(
+            crate::auth::AuthStore::open(tmp.path().join("api_keys.redb"))
+                .expect("open auth store"),
+        );
+        std::mem::forget(tmp);
+        Topology {
+            shards: Arc::new(Vec::new()),
+            routing: Arc::new(arc_swap::ArcSwap::from_pointee(
+                RoutingTable::new(shard_count, std::collections::HashMap::new()).unwrap(),
+            )),
+            server_caps: Arc::new(ServerCapabilities::v1_default(
+                "brain-server/test",
+                vec![AuthMethod::Token],
+            )),
+            request_metrics: Arc::new(crate::metrics::request::RequestMetrics::new()),
+            auth_store,
+        }
+    }
+
     fn build_hello_frame() -> Frame {
         let hello = HelloPayload {
             client_id: "tester/0.1".to_owned(),
@@ -1277,6 +1339,152 @@ mod tests {
         }
         // The re-check refreshed the anchor, so the next op stays on the cheap path.
         assert!(state.last_revocation_check.elapsed() < REVOCATION_RECHECK_WINDOW);
+    }
+
+    /// A delegated (`act_as`) transaction whose target space lands on a
+    /// different shard than the connection's bound shard: the `TXN_BEGIN`
+    /// routes to the target space's shard, and the subsequent
+    /// `TXN_COMMIT` / `TXN_ABORT` — which carry no `act_as` — must be
+    /// pinned to that same shard rather than falling back to the bound
+    /// shard (where the txn was never begun, yielding `TxnNotFound`).
+    #[test]
+    fn delegated_txn_commit_abort_pin_to_begin_shard() {
+        const SHARDS: u16 = 8;
+        let topo = test_topology_shards(SHARDS);
+        // Mint a key that holds ACT_AS and may act as "target-ns".
+        let minted = topo
+            .auth_store
+            .mint(
+                space_id_bytes(2),
+                [0u8; 16],
+                "acme".into(),
+                space_id_bytes(7),
+                bits::STANDARD_SPACE | bits::ACT_AS,
+                vec!["target-ns".to_owned()],
+                1,
+            )
+            .unwrap();
+        let mut state = establish(&topo, minted.secret_bytes.clone());
+        let bound_shard = match &state.phase {
+            ConnPhase::Established { bound_shard, .. } => *bound_shard,
+            _ => panic!("not established"),
+        };
+
+        // Find an act_as target space that routes to a shard other than
+        // the connection's bound shard, so the bug is actually exercised.
+        let routing = topo.routing.load_full();
+        let namespace = "target-ns";
+        let (space_sel, target_shard) = (0..10_000)
+            .map(|i| format!("space-{i}"))
+            .map(|s| {
+                let shard = routing.shard_for_space(SpaceId::derive_from_string(namespace, &s));
+                (s, shard)
+            })
+            .find(|(_, shard)| *shard != bound_shard)
+            .expect("some target space must hash to a non-bound shard across 8 shards");
+        assert_ne!(
+            target_shard, bound_shard,
+            "test precondition: target must differ from bound shard"
+        );
+
+        let txn_id = [0x5a; 16];
+        let act_as = brain_protocol::ActAs {
+            namespace: namespace.to_owned(),
+            space_id: space_sel,
+        };
+
+        // TXN_BEGIN with act_as → routes to the target space's shard and
+        // records the affinity.
+        let begin = RequestBody::TxnBegin(brain_protocol::envelope::request::TxnBeginRequest {
+            txn_id,
+            timeout_seconds: 30,
+            act_as: Some(act_as),
+        });
+        let frame = Frame::new(Opcode::TxnBegin.as_u16(), FLAG_EOS, 1, begin.encode());
+        match dispatch_frame(frame, &mut state, &topo) {
+            Action::OpDispatch(op) => {
+                assert_eq!(
+                    op.target_shard, target_shard,
+                    "TXN_BEGIN must route to the delegated target's shard"
+                );
+            }
+            _ => panic!("expected OpDispatch for TXN_BEGIN"),
+        }
+        assert_eq!(state.txn_shards.get(&txn_id), Some(&target_shard));
+
+        // TXN_COMMIT carries no act_as → must be pinned to the begin shard,
+        // NOT the bound shard.
+        let commit =
+            RequestBody::TxnCommit(brain_protocol::envelope::request::TxnCommitRequest { txn_id });
+        let frame = Frame::new(Opcode::TxnCommit.as_u16(), FLAG_EOS, 3, commit.encode());
+        match dispatch_frame(frame, &mut state, &topo) {
+            Action::OpDispatch(op) => {
+                assert_eq!(
+                    op.target_shard, target_shard,
+                    "TXN_COMMIT must be pinned to the shard TXN_BEGIN landed on"
+                );
+                assert_ne!(op.target_shard, bound_shard);
+            }
+            _ => panic!("expected OpDispatch for TXN_COMMIT"),
+        }
+
+        // A retried commit under the same txn_id still routes to the begin
+        // shard — the affinity entry is retained so the cached replay
+        // response is reachable.
+        let commit =
+            RequestBody::TxnCommit(brain_protocol::envelope::request::TxnCommitRequest { txn_id });
+        let frame = Frame::new(Opcode::TxnCommit.as_u16(), FLAG_EOS, 5, commit.encode());
+        match dispatch_frame(frame, &mut state, &topo) {
+            Action::OpDispatch(op) => assert_eq!(op.target_shard, target_shard),
+            _ => panic!("expected OpDispatch for retried TXN_COMMIT"),
+        }
+
+        // TXN_ABORT for the same txn is likewise pinned to the begin shard.
+        let abort =
+            RequestBody::TxnAbort(brain_protocol::envelope::request::TxnAbortRequest { txn_id });
+        let frame = Frame::new(Opcode::TxnAbort.as_u16(), FLAG_EOS, 7, abort.encode());
+        match dispatch_frame(frame, &mut state, &topo) {
+            Action::OpDispatch(op) => {
+                assert_eq!(
+                    op.target_shard, target_shard,
+                    "TXN_ABORT must be pinned to the shard TXN_BEGIN landed on"
+                );
+            }
+            _ => panic!("expected OpDispatch for TXN_ABORT"),
+        }
+    }
+
+    /// A commit for a txn_id this connection never began falls through to
+    /// the bound shard (no affinity entry) — unchanged prior behavior.
+    #[test]
+    fn unknown_txn_commit_falls_through_to_bound_shard() {
+        const SHARDS: u16 = 8;
+        let topo = test_topology_shards(SHARDS);
+        let minted = topo
+            .auth_store
+            .mint(
+                space_id_bytes(2),
+                [0u8; 16],
+                "acme".into(),
+                space_id_bytes(7),
+                bits::STANDARD_SPACE,
+                Vec::new(),
+                1,
+            )
+            .unwrap();
+        let mut state = establish(&topo, minted.secret_bytes.clone());
+        let bound_shard = match &state.phase {
+            ConnPhase::Established { bound_shard, .. } => *bound_shard,
+            _ => panic!("not established"),
+        };
+        let commit = RequestBody::TxnCommit(brain_protocol::envelope::request::TxnCommitRequest {
+            txn_id: [0x11; 16],
+        });
+        let frame = Frame::new(Opcode::TxnCommit.as_u16(), FLAG_EOS, 1, commit.encode());
+        match dispatch_frame(frame, &mut state, &topo) {
+            Action::OpDispatch(op) => assert_eq!(op.target_shard, bound_shard),
+            _ => panic!("expected OpDispatch"),
+        }
     }
 
     /// Unknown opcode returns BadOpcode but the connection stays
