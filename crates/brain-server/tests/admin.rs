@@ -51,6 +51,14 @@ use connection::{
 use routing::RoutingTable;
 use shard::{spawn_shard, ShardHandle, ShardJoiner, ShardSpawnConfig};
 
+use brain_metadata::api_keys::bits as perm_bits;
+use brain_ops::{DispatchOutcome, RequestCaller};
+use brain_protocol::envelope::request::{
+    EncodeRequest, MemoryListRequest, RequestBody as WireRequestBody,
+};
+use brain_protocol::envelope::response::ResponseBody as WireResponseBody;
+use brain_protocol::ops::memory::{MemoryListDirWire, MemoryListSortWire, MemoryListTimeAxisWire};
+
 struct TestStubDispatcher;
 impl Dispatcher for TestStubDispatcher {
     fn embed(&self, _: &str) -> Result<[f32; VECTOR_DIM], EmbedError> {
@@ -1222,4 +1230,138 @@ fn base64_url(bytes: &[u8]) -> String {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine as _;
     URL_SAFE_NO_PAD.encode(bytes)
+}
+
+// ---------------------------------------------------------------------------
+// DELETE /v1/spaces/{id} — cascade delete
+// ---------------------------------------------------------------------------
+
+/// Authed DELETE against a gated `/v1/*` route. Returns (status, body).
+async fn http_delete_authed(addr: SocketAddr, path: &str) -> (u16, String) {
+    http_send(addr, "DELETE", path).await
+}
+
+/// A FULL-permission operator caller scoped to `(namespace, space)`.
+fn full_caller(space: brain_core::SpaceId, namespace: &str) -> RequestCaller {
+    RequestCaller::from_scope(
+        space,
+        [0u8; 16],
+        [0u8; 16],
+        namespace.to_owned(),
+        perm_bits::FULL,
+    )
+}
+
+/// Drive one fully-decoded op through a shard's dispatch, asserting a
+/// single-frame response.
+async fn dispatch_single(
+    shard: &ShardHandle,
+    caller: RequestCaller,
+    req: WireRequestBody,
+) -> WireResponseBody {
+    match shard
+        .dispatch_op(req, caller, tracing::Span::none())
+        .await
+        .expect("dispatch")
+    {
+        DispatchOutcome::Single(b) => b,
+        DispatchOutcome::Stream(_) => panic!("unexpected streaming response"),
+    }
+}
+
+/// Encode one memory into `(namespace, space)` via in-process dispatch.
+async fn encode_into(shard: &ShardHandle, caller: RequestCaller, text: &str) {
+    let req = WireRequestBody::Encode(EncodeRequest {
+        text: text.into(),
+        session_id: 1,
+        request_id: *uuid::Uuid::now_v7().as_bytes(),
+        txn_id: None,
+        occurred_at_unix_nanos: None,
+        act_as: None,
+        wait: brain_protocol::WaitMode::Ack,
+        allow_duplicates: false,
+    });
+    match dispatch_single(shard, caller, req).await {
+        WireResponseBody::Encode(_) => {}
+        other => panic!("expected Encode response, got {other:?}"),
+    }
+}
+
+/// Count the active (non-tombstoned) memories a caller can enumerate in its
+/// own `(namespace, space)`.
+async fn count_active_memories(shard: &ShardHandle, caller: RequestCaller) -> usize {
+    let req = WireRequestBody::MemoryList(MemoryListRequest {
+        sort: MemoryListSortWire::Created,
+        dir: MemoryListDirWire::Desc,
+        limit: 100,
+        cursor: Vec::new(),
+        kinds: Vec::new(),
+        include_tombstoned: false,
+        time_axis: MemoryListTimeAxisWire::Created,
+        from_unix_nanos: 0,
+        to_unix_nanos: 0,
+        salience_min: 0.0,
+        salience_max: 1.0,
+        text_contains: String::new(),
+        act_as: None,
+    });
+    match dispatch_single(shard, caller, req).await {
+        WireResponseBody::MemoryList(frame) => frame.items.len(),
+        other => panic!("expected MemoryList response, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn space_delete_cascades_content() {
+    let server = start_admin_with_shards(1).await;
+    let namespace = "space-delete-ns";
+    let space = brain_core::SpaceId::new();
+    let caller = full_caller(space, namespace);
+
+    // Seed a couple of memories under the target space.
+    encode_into(&server.handles[0], caller.clone(), "the sky is blue today").await;
+    encode_into(&server.handles[0], caller.clone(), "coffee tastes bitter").await;
+
+    // Pre-condition: the space holds the seeded content.
+    let before = count_active_memories(&server.handles[0], caller.clone()).await;
+    assert_eq!(before, 2, "expected two seeded memories before delete");
+
+    // Cascade-delete the space over the admin plane.
+    let path = format!("/v1/spaces/{space}?namespace={namespace}", space = space.0);
+    let (code, body) = http_delete_authed(server.admin_addr, &path).await;
+    assert_eq!(code, 200, "expected 200; body:\n{body}");
+
+    let report: serde_json::Value = serde_json::from_str(&body).expect("json body");
+    assert_eq!(report["deleted"].as_bool(), Some(true), "body = {body}");
+    assert_eq!(report["shards"].as_u64(), Some(1), "body = {body}");
+    assert_eq!(
+        report["memories_forgotten"].as_u64(),
+        Some(2),
+        "expected both memories forgotten; body = {body}"
+    );
+
+    // Post-condition: the cascade emptied the space.
+    let after = count_active_memories(&server.handles[0], caller).await;
+    assert_eq!(after, 0, "space should be empty after cascade delete");
+
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn space_delete_rejects_malformed_id() {
+    let server = start_admin_with_shards(1).await;
+    let (code, body) =
+        http_delete_authed(server.admin_addr, "/v1/spaces/not-a-uuid?namespace=test").await;
+    assert_eq!(code, 400, "malformed id must 400; body:\n{body}");
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn space_delete_requires_namespace() {
+    let server = start_admin_with_shards(1).await;
+    let space = brain_core::SpaceId::new();
+    let path = format!("/v1/spaces/{space}", space = space.0);
+    let (code, body) = http_delete_authed(server.admin_addr, &path).await;
+    assert_eq!(code, 400, "missing namespace must 400; body:\n{body}");
+    server.stop().await;
 }
