@@ -113,6 +113,22 @@ impl ForgetCascadeWorker {
         self.queue.len()
     }
 
+    /// Reject a job whose `kind` the cascade has no implementation for.
+    /// Currently only [`ForgetCascadeKind::Revert`] — see the call site
+    /// for why a lossless inverse is not yet possible. Returns
+    /// [`WorkerError::Unimplemented`] so the caller surfaces the job
+    /// loudly rather than dropping it on the floor.
+    fn ensure_supported(job: &ForgetCascadeJob) -> Result<(), WorkerError> {
+        if matches!(job.kind, ForgetCascadeKind::Revert) {
+            return Err(WorkerError::Unimplemented(format!(
+                "forget-cascade revert for memory {:?} is not implemented \
+                 (the forward cascade writes no undo log to invert)",
+                job.memory_id
+            )));
+        }
+        Ok(())
+    }
+
     async fn drive_one_batch(&self, ctx: &WorkerContext) -> Result<usize, WorkerError> {
         let mut processed = 0usize;
         let started = Instant::now();
@@ -131,15 +147,16 @@ impl ForgetCascadeWorker {
                     break;
                 }
             };
-            if matches!(job.kind, ForgetCascadeKind::Revert) {
-                tracing::warn!(
-                    target: "brain_workers::forget_cascade",
-                    memory_id = ?job.memory_id,
-                    "cascade revert requested; v1 implementation pending — job dropped",
-                );
-                processed += 1;
-                continue;
-            }
+            // A Revert job (soft-FORGET reversal within grace) has no
+            // lossless implementation yet: the forward cascade writes no
+            // undo log, so once Apply has dropped the forgotten memory
+            // from every evidence list there is no reverse index to
+            // rediscover which statements/relations cited it, and the
+            // per-evidence confidence + extractor-id the cascade removed
+            // are stored nowhere else. Surface it as a structured error
+            // (the scheduler counts + logs it) instead of silently
+            // dropping the job — an unhandled job must never vanish.
+            Self::ensure_supported(&job)?;
             // Use the FORGET wall-clock as `now` for the noisy-OR
             // recompute. A cascade running minutes after the FORGET
             // must re-derive against the FORGET timestamp, not the
@@ -437,6 +454,33 @@ mod tests {
         })
         .unwrap();
         assert_eq!(w.queue_depth(), 1);
+    }
+
+    #[test]
+    fn revert_job_surfaces_unimplemented_error_not_silent_drop() {
+        // A Revert job has no lossless implementation yet; the worker
+        // must surface it as a structured error (the scheduler counts +
+        // logs it) rather than warn-and-drop it silently.
+        let job = ForgetCascadeJob {
+            memory_id: MemoryId::pack(0, 7, 1),
+            mode: ForgetCascadeMode::Soft,
+            kind: ForgetCascadeKind::Revert,
+            forgot_at_unix_nanos: NOW,
+        };
+        let err = ForgetCascadeWorker::ensure_supported(&job)
+            .expect_err("revert must not be treated as supported");
+        assert!(matches!(err, WorkerError::Unimplemented(_)));
+    }
+
+    #[test]
+    fn apply_job_is_supported() {
+        let job = ForgetCascadeJob {
+            memory_id: MemoryId::pack(0, 8, 1),
+            mode: ForgetCascadeMode::Hard,
+            kind: ForgetCascadeKind::Apply,
+            forgot_at_unix_nanos: NOW,
+        };
+        assert!(ForgetCascadeWorker::ensure_supported(&job).is_ok());
     }
 
     #[test]
