@@ -4,6 +4,7 @@
 
 pub mod admin;
 pub mod capabilities;
+pub mod cursor;
 pub mod encode;
 pub mod encode_vector_direct;
 pub mod entity;

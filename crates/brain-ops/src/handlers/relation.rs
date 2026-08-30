@@ -506,7 +506,7 @@ pub async fn handle_relation_list_from(
     req: RelationListFromRequest,
     ctx: &OpsContext,
 ) -> Result<RelationListFromResponseFrame, OpError> {
-    let (items, count) = run_list(
+    let (items, count, next_cursor) = run_list(
         ctx,
         EntityId::from(req.from_entity),
         &req.relation_type_filter,
@@ -518,7 +518,7 @@ pub async fn handle_relation_list_from(
     )?;
     Ok(RelationListFromResponseFrame {
         items,
-        next_cursor: Vec::new(),
+        next_cursor,
         cumulative_count: count,
         is_final: true,
     })
@@ -528,7 +528,7 @@ pub async fn handle_relation_list_to(
     req: RelationListToRequest,
     ctx: &OpsContext,
 ) -> Result<RelationListToResponseFrame, OpError> {
-    let (items, count) = run_list(
+    let (items, count, next_cursor) = run_list(
         ctx,
         EntityId::from(req.to_entity),
         &req.relation_type_filter,
@@ -540,7 +540,7 @@ pub async fn handle_relation_list_to(
     )?;
     Ok(RelationListToResponseFrame {
         items,
-        next_cursor: Vec::new(),
+        next_cursor,
         cumulative_count: count,
         is_final: true,
     })
@@ -556,15 +556,13 @@ fn run_list(
     limit: u32,
     cursor: &[u8],
     from_side: bool,
-) -> Result<(Vec<RelationView>, u32), OpError> {
+) -> Result<(Vec<RelationView>, u32, Vec<u8>), OpError> {
     if limit == 0 || limit > LIST_LIMIT_MAX {
         return Err(OpError::InvalidRequest("limit must be in 1..=1000".into()));
     }
-    if !cursor.is_empty() {
-        return Err(OpError::InvalidRequest(
-            "RELATION_LIST cursor pagination lands in phase 23".into(),
-        ));
-    }
+    let scope =
+        brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_space);
+    let resume_after = crate::handlers::cursor::decode_opt(scope, cursor)?;
 
     let rtxn = ctx
         .executor
@@ -592,7 +590,7 @@ fn run_list(
                         version,
                     });
                 }
-                return Ok((Vec::new(), 0));
+                return Ok((Vec::new(), 0, Vec::new()));
             }
         }
     };
@@ -600,10 +598,10 @@ fn run_list(
     let filter = RelationListFilter {
         relation_type,
         current_only: !include_superseded && !include_tombstoned,
-        limit: limit as usize,
+        // Fetch the full candidate window (up to the list ceiling); pagination
+        // is applied below over the ordered set.
+        limit: LIST_LIMIT_MAX as usize,
     };
-    let scope =
-        brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_space);
     let mut rows = if from_side {
         relation_list_from(&rtxn, scope, entity, &filter).map_err(map_relation_op_error)?
     } else {
@@ -615,12 +613,20 @@ fn run_list(
         rows.retain(|r| !r.tombstoned);
     }
 
-    let mut out = Vec::with_capacity(rows.len());
-    for r in &rows {
+    // Order by the immutable relation id so pages are stable across requests,
+    // then slice one page out via the shared cursor helper.
+    rows.sort_by_key(|r| r.id.to_bytes());
+    let (page, next_cursor) =
+        crate::handlers::cursor::paginate(scope, rows, resume_after, limit as usize, |r| {
+            r.id.to_bytes()
+        });
+
+    let mut out = Vec::with_capacity(page.len());
+    for r in &page {
         out.push(project_view(&rtxn, r)?);
     }
     let count = out.len() as u32;
-    Ok((out, count))
+    Ok((out, count, next_cursor))
 }
 
 // ---------------------------------------------------------------------------

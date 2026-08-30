@@ -710,11 +710,9 @@ pub async fn handle_statement_list(
     if req.limit == 0 || req.limit > LIST_LIMIT_MAX {
         return Err(OpError::InvalidRequest("limit must be in 1..=1000".into()));
     }
-    if !req.cursor.is_empty() {
-        return Err(OpError::InvalidRequest(
-            "STATEMENT_LIST cursor pagination lands in phase 23".into(),
-        ));
-    }
+    let scope =
+        brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_space);
+    let resume_after = crate::handlers::cursor::decode_opt(scope, &req.cursor)?;
     // Wire filter byte: `0` = no filter; any non-zero byte is the
     // `brain_core` kind byte + 1 (so `1=Fact … 6=Directive`, `7+ = Custom`).
     let kind = match req.kind {
@@ -727,7 +725,7 @@ pub async fn handle_statement_list(
         Some(EntityId::from(req.subject))
     };
 
-    let (items_storage, count) = {
+    let (items_storage, count, next_cursor) = {
         let rtxn = ctx
             .executor
             .metadata
@@ -778,10 +776,11 @@ pub async fn handle_statement_list(
             } else {
                 None
             },
-            limit: req.limit as usize,
+            // Fetch the full candidate window (up to the list ceiling), not
+            // just one page: pagination is applied below over the ordered set
+            // so `next_cursor` can reflect whether more rows remain.
+            limit: LIST_LIMIT_MAX as usize,
         };
-        let scope =
-            brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_space);
         let mut rows = statement_list(&rtxn, scope, &filter).map_err(OpError::from)?;
 
         // Wire-level filters not pushed into statement_list.
@@ -811,17 +810,25 @@ pub async fn handle_statement_list(
             });
         }
 
-        let mut out = Vec::with_capacity(rows.len());
-        for s in &rows {
+        // Order by the immutable statement id so pages are stable across
+        // requests, then slice one page out via the shared cursor helper.
+        rows.sort_by_key(|s| s.id.to_bytes());
+        let (page, next_cursor) =
+            crate::handlers::cursor::paginate(scope, rows, resume_after, req.limit as usize, |s| {
+                s.id.to_bytes()
+            });
+
+        let mut out = Vec::with_capacity(page.len());
+        for s in &page {
             out.push(project_view(&rtxn, s)?);
         }
         let count = out.len() as u32;
-        (out, count)
+        (out, count, next_cursor)
     };
 
     Ok(StatementListResponseFrame {
         items: items_storage,
-        next_cursor: Vec::new(),
+        next_cursor,
         cumulative_count: count,
         is_final: true,
     })

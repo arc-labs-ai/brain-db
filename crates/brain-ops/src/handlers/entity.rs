@@ -689,11 +689,9 @@ pub async fn handle_entity_list(
             "entity_type_id filter is required in v1.0 ENTITY_LIST".into(),
         ));
     }
-    if !req.cursor.is_empty() {
-        return Err(OpError::InvalidRequest(
-            "ENTITY_LIST cursor pagination lands in phase 16.7.6".into(),
-        ));
-    }
+    let scope =
+        brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_space);
+    let resume_after = crate::handlers::cursor::decode_opt(scope, &req.cursor)?;
     let type_id = EntityTypeId(req.entity_type_id);
     let name_prefix_norm = if req.name_prefix.is_empty() {
         None
@@ -708,15 +706,12 @@ pub async fn handle_entity_list(
             .metadata
             .read_txn()
             .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
-        entity_list_by_type(
-            &rtxn,
-            brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_space),
-            type_id,
-        )
-        .map_err(OpError::from)?
+        entity_list_by_type(&rtxn, scope, type_id).map_err(OpError::from)?
     };
 
-    let mut items: Vec<EntityListItem> = entities
+    // Materialize the full scope-walled candidate set, then order it by the
+    // immutable entity id so pages are stable across requests before slicing.
+    let mut matching: Vec<_> = entities
         .into_iter()
         .filter(|e| {
             if !req.include_tombstoned && e.flags & 1 != 0 {
@@ -735,17 +730,24 @@ pub async fn handle_entity_list(
             }
             true
         })
-        .take(req.limit as usize)
+        .collect();
+    matching.sort_by_key(|e| e.id.to_bytes());
+
+    let (page, next_cursor) =
+        crate::handlers::cursor::paginate(scope, matching, resume_after, req.limit as usize, |e| {
+            e.id.to_bytes()
+        });
+
+    let items: Vec<EntityListItem> = page
+        .iter()
         .map(|e| EntityListItem {
-            entity: entity_to_view(&e),
+            entity: entity_to_view(e),
         })
         .collect();
-
     let cumulative_count = items.len() as u32;
-    // Single-frame snapshot; streamed batches land later.
     let frame = EntityListResponseFrame {
-        items: std::mem::take(&mut items),
-        next_cursor: Vec::new(),
+        items,
+        next_cursor,
         cumulative_count,
         is_final: true,
     };
