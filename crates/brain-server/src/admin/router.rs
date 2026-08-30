@@ -22,8 +22,8 @@ use http::{Method, Request, Response};
 use hyper::body::Incoming;
 
 use crate::admin::handlers::{
-    api_keys, audit, config, diagnostics, extract, healthz, metrics, readyz, rebuild, shard,
-    snapshot, space, worker,
+    api_keys, audit, backfill, config, diagnostics, extract, healthz, metrics, readyz, rebuild,
+    shard, snapshot, space, worker,
 };
 use crate::admin::AdminState;
 
@@ -131,6 +131,31 @@ fn attach_v1_routes(r: Router<Incoming>, state: Arc<AdminState>) -> Router<Incom
         "/v1/extract/backfill",
         state.clone(),
         extract::handle,
+    );
+
+    // ──────── /v1/backfill (resumable worker) ─────────────────────────
+    // Distinct from /v1/extract/backfill above (one-shot re-enqueue):
+    // these drive the durable, checkpointed, cancellable BackfillWorker.
+    let r = with_state(
+        r,
+        Method::POST,
+        "/v1/backfill",
+        state.clone(),
+        backfill::submit,
+    );
+    let r = with_state(
+        r,
+        Method::GET,
+        "/v1/backfill",
+        state.clone(),
+        backfill::status,
+    );
+    let r = with_state_prefix(
+        r,
+        Method::DELETE,
+        "/v1/backfill/",
+        state.clone(),
+        backfill::cancel,
     );
 
     // ──────── /v1/workers ──────────────────────────────────────────────

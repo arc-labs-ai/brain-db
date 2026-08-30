@@ -61,7 +61,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use brain_core::{MemoryId, ShardId, SlotVersion};
+use brain_core::{BackfillId, BackfillProgress, BackfillRequest, MemoryId, ShardId, SlotVersion};
 use brain_embed::{Dispatcher, VECTOR_DIM};
 use brain_index::entity_hnsw::{EntityHnswIndex, EntityHnswParams};
 use brain_index::hype_hnsw::HypeHnswIndex;
@@ -210,6 +210,28 @@ pub(crate) enum ShardRequest {
     ExtractBackfill {
         selector: brain_protocol::BackfillSelector,
         reply_tx: Sender<Result<ExtractBackfillReport, String>>,
+    },
+    /// Submit a resumable backfill run to this shard's `BackfillWorker`
+    /// (admin `POST /v1/backfill`). Distinct from `ExtractBackfill`,
+    /// which is a one-shot synchronous re-enqueue: this drives the
+    /// durable, checkpointed, cancellable worker. The `Err(String)`
+    /// reply is returned when the worker isn't provisioned on this
+    /// shard, surfaced to the HTTP layer as a 500.
+    BackfillSubmit {
+        request: BackfillRequest,
+        reply_tx: Sender<Result<BackfillId, String>>,
+    },
+    /// Flag the in-flight resumable backfill run matching `id` for
+    /// cancellation (admin `DELETE /v1/backfill/<id>`). Reply is
+    /// `Ok(true)` iff a matching run was flagged.
+    BackfillCancel {
+        id: BackfillId,
+        reply_tx: Sender<Result<bool, String>>,
+    },
+    /// Snapshot this shard's most-recent resumable backfill progress
+    /// (admin `GET /v1/backfill`).
+    BackfillProgressSnapshot {
+        reply_tx: Sender<Result<BackfillProgress, String>>,
     },
     /// Auto-abort every Active txn owned by `connection_id`. Fanned out
     /// by the connection layer the moment a TCP/TLS connection drops
@@ -774,6 +796,9 @@ pub enum ShardError {
     #[error("snapshot operation failed: {0}")]
     Snapshot(String),
 
+    #[error("backfill control failed: {0}")]
+    Backfill(String),
+
     #[error("audit query failed: {0}")]
     AuditQuery(String),
 
@@ -1275,6 +1300,56 @@ impl ShardHandle {
             .await
             .map_err(|_| ShardError::ShardDisconnected)?
             .map_err(ShardError::Snapshot)
+    }
+
+    /// Submit a resumable backfill run to this shard's `BackfillWorker`
+    /// and return its id. Backs the admin `POST /v1/backfill` route.
+    /// Errors if the worker isn't provisioned on this shard.
+    pub async fn backfill_submit(
+        &self,
+        request: BackfillRequest,
+    ) -> Result<BackfillId, ShardError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.tx
+            .send_async(ShardRequest::BackfillSubmit { request, reply_tx })
+            .await
+            .map_err(|_| ShardError::ShardDisconnected)?;
+        reply_rx
+            .recv_async()
+            .await
+            .map_err(|_| ShardError::ShardDisconnected)?
+            .map_err(ShardError::Backfill)
+    }
+
+    /// Flag this shard's in-flight resumable backfill run matching `id`
+    /// for cancellation. Backs the admin `DELETE /v1/backfill/<id>`
+    /// route. Returns `true` iff a matching run was flagged.
+    pub async fn backfill_cancel(&self, id: BackfillId) -> Result<bool, ShardError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.tx
+            .send_async(ShardRequest::BackfillCancel { id, reply_tx })
+            .await
+            .map_err(|_| ShardError::ShardDisconnected)?;
+        reply_rx
+            .recv_async()
+            .await
+            .map_err(|_| ShardError::ShardDisconnected)?
+            .map_err(ShardError::Backfill)
+    }
+
+    /// Snapshot this shard's most-recent resumable backfill progress.
+    /// Backs the admin `GET /v1/backfill` route.
+    pub async fn backfill_progress(&self) -> Result<BackfillProgress, ShardError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.tx
+            .send_async(ShardRequest::BackfillProgressSnapshot { reply_tx })
+            .await
+            .map_err(|_| ShardError::ShardDisconnected)?;
+        reply_rx
+            .recv_async()
+            .await
+            .map_err(|_| ShardError::ShardDisconnected)?
+            .map_err(ShardError::Backfill)
     }
 
     /// Trigger an immediate full HNSW rebuild. Returns the new
@@ -3857,6 +3932,47 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
                     warn!(
                         shard_id = shard.shard_id,
                         "ExtractBackfill reply dropped (caller gone)"
+                    );
+                }
+            }
+            ShardRequest::BackfillSubmit { request, reply_tx } => {
+                // Reach the same per-shard worker handle the (now-rejected)
+                // wire op used to: the `Arc<dyn BackfillControl>` threaded
+                // onto the executor context at shard construction. `submit`
+                // is a synchronous `&self` push onto worker-owned state, so
+                // no borrow crosses the reply `.await`.
+                let out = match shard.ops.executor.backfill_handle.as_ref() {
+                    Some(handle) => Ok(handle.submit(request)),
+                    None => Err("backfill worker not provisioned on this shard".to_owned()),
+                };
+                if reply_tx.send_async(out).await.is_err() {
+                    warn!(
+                        shard_id = shard.shard_id,
+                        "BackfillSubmit reply dropped (caller gone)"
+                    );
+                }
+            }
+            ShardRequest::BackfillCancel { id, reply_tx } => {
+                let out = match shard.ops.executor.backfill_handle.as_ref() {
+                    Some(handle) => Ok(handle.cancel(id)),
+                    None => Err("backfill worker not provisioned on this shard".to_owned()),
+                };
+                if reply_tx.send_async(out).await.is_err() {
+                    warn!(
+                        shard_id = shard.shard_id,
+                        "BackfillCancel reply dropped (caller gone)"
+                    );
+                }
+            }
+            ShardRequest::BackfillProgressSnapshot { reply_tx } => {
+                let out = match shard.ops.executor.backfill_handle.as_ref() {
+                    Some(handle) => Ok(handle.progress()),
+                    None => Err("backfill worker not provisioned on this shard".to_owned()),
+                };
+                if reply_tx.send_async(out).await.is_err() {
+                    warn!(
+                        shard_id = shard.shard_id,
+                        "BackfillProgressSnapshot reply dropped (caller gone)"
                     );
                 }
             }

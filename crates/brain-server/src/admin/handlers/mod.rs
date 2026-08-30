@@ -10,6 +10,7 @@
 
 pub mod api_keys;
 pub mod audit;
+pub mod backfill;
 pub mod config;
 pub mod diagnostics;
 pub mod extract;

@@ -305,10 +305,11 @@ mod tests {
             }
 
             // Backfill control is part of the same HTTP-only admin plane
-            // (`POST /v1/extract/backfill`); the wire opcode must reject the
-            // same way — NOT dangle on `NotYetImplemented`. Pinned explicitly
-            // so a future split of the shared match arm can't silently
-            // regress it back to "coming later".
+            // (the resumable worker is driven from `/v1/backfill`); the wire
+            // opcode must reject the same way — NOT dangle on
+            // `NotYetImplemented`, and NOT drive the worker over the wire.
+            // Pinned explicitly so a future split of the shared match arm
+            // can't silently regress it.
             let backfill = brain_protocol::envelope::request::RequestBody::AdminBackfill(
                 brain_protocol::envelope::request::AdminBackfillRequest {
                     scope: brain_protocol::envelope::request::BackfillScope::All,
