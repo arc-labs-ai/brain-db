@@ -114,7 +114,7 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        linux_main::run(cfg, dispatcher, log_handle)
+        linux_main::run(cfg, dispatcher, log_handle, args.config)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -212,6 +212,7 @@ mod linux_main {
         cfg: Config,
         dispatcher: Arc<dyn brain_embed::Dispatcher>,
         log_handle: crate::logging::LoggingHandle,
+        config_path: std::path::PathBuf,
     ) -> ExitCode {
         // Build the configured Summarizer (default
         // `DisabledSummarizer`). Construction happens once and the
@@ -360,13 +361,19 @@ mod linux_main {
             //   - admin   → `/v1/*`                  on `admin_addr` (loopback default)
             // Both share the same ShutdownSignal so a single ctrl-c brings
             // them down together.
-            let admin_state = Arc::new(crate::admin::AdminState::new(
-                topology.shards.clone(),
-                connection_metrics.clone(),
-                Arc::new(cfg.clone()),
-                request_metrics.clone(),
-                topology.auth_store.clone(),
-            ));
+            let admin_state = Arc::new(
+                crate::admin::AdminState::new(
+                    topology.shards.clone(),
+                    connection_metrics.clone(),
+                    Arc::new(cfg.clone()),
+                    request_metrics.clone(),
+                    topology.auth_store.clone(),
+                )
+                .with_reload(config_path, {
+                    let h = log_handle.clone();
+                    Arc::new(move |level: &str| h.set_level(level))
+                }),
+            );
 
             let public = crate::admin::AdminServer::public(
                 cfg.server.metrics_addr,

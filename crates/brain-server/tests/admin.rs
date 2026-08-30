@@ -571,6 +571,84 @@ async fn unknown_path_returns_404() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_get_returns_json() {
+    // (a) GET /v1/config works: returns the loaded config as JSON.
+    let server = start_admin_only().await;
+    let (code, body) = http_get_authed(server.admin_addr, "/v1/config").await;
+    assert_eq!(code, 200, "GET /v1/config should 200; body:\n{body}");
+    assert!(
+        body.contains("\"monitoring\""),
+        "expected monitoring section; body:\n{body}"
+    );
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_reload_unavailable_without_path() {
+    // The test harness constructs AdminState without a config file path
+    // (Config::for_tests has no file behind it), so reload reports
+    // unavailable rather than acting on a non-existent file.
+    let server = start_admin_only().await;
+    let (code, body) = http_post_authed(server.admin_addr, "/v1/config/reload").await;
+    assert_eq!(code, 503, "reload w/o path should 503; body:\n{body}");
+    assert!(
+        body.contains("config file path"),
+        "expected path detail; body:\n{body}"
+    );
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_set_boot_fixed_key_returns_501() {
+    // A boot-fixed key returns an honest 501 naming the key, not a no-op
+    // success that pretends to apply a change nothing reads.
+    let server = start_admin_only().await;
+    let (code, body) = http_post_authed(
+        server.admin_addr,
+        "/v1/config?key=storage.shard_count&value=8",
+    )
+    .await;
+    assert_eq!(code, 501, "boot-fixed set should 501; body:\n{body}");
+    assert!(
+        body.contains("storage.shard_count") && body.contains("restart"),
+        "expected key + restart hint; body:\n{body}"
+    );
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_set_missing_key_returns_400() {
+    let server = start_admin_only().await;
+    let (code, body) = http_post_authed(server.admin_addr, "/v1/config").await;
+    assert_eq!(code, 400, "missing key should 400; body:\n{body}");
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_set_level_missing_value_returns_400() {
+    let server = start_admin_only().await;
+    let (code, body) =
+        http_post_authed(server.admin_addr, "/v1/config?key=monitoring.logging.level").await;
+    assert_eq!(code, 400, "missing value should 400; body:\n{body}");
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_set_level_unavailable_without_handle() {
+    // The level key is runtime-settable, but the harness wires no logging
+    // handle, so the endpoint reports the capability unavailable rather
+    // than 200-ing a change it cannot apply.
+    let server = start_admin_only().await;
+    let (code, body) = http_post_authed(
+        server.admin_addr,
+        "/v1/config?key=monitoring.logging.level&value=debug",
+    )
+    .await;
+    assert_eq!(code, 503, "set level w/o handle should 503; body:\n{body}");
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rebuild_ann_alias_still_works() {
     // Back-compat: POST /v1/rebuild-ann rebuilds the memory HNSW and
     // returns 201 with an entries/elapsed body.
