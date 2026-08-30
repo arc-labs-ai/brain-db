@@ -45,12 +45,13 @@ pub use audit::ops::{
 };
 pub use db::{MetadataDb, MetadataDbError};
 pub use entity::ops::{
-    entity_add_alias, entity_get, entity_get_inside_wtxn, entity_get_resolved,
-    entity_get_resolved_with_chain, entity_inbound_reference_count, entity_iter_live_for_gc,
-    entity_list_by_type, entity_lookup_by_alias, entity_lookup_by_canonical_name, entity_put,
-    entity_remove_alias, entity_rename, entity_resolve_canonical_all_types,
-    entity_resolve_canonical_all_types_wtxn, entity_resolve_scored, entity_tombstone,
-    entity_update, normalize_name, EntityGcCandidate, EntityOpError, MERGE_REDIRECT_MAX_HOPS,
+    backfill_entity_by_type_index, entity_add_alias, entity_get, entity_get_inside_wtxn,
+    entity_get_resolved, entity_get_resolved_with_chain, entity_inbound_reference_count,
+    entity_iter_live_for_gc, entity_list_by_type, entity_list_by_type_page, entity_lookup_by_alias,
+    entity_lookup_by_canonical_name, entity_put, entity_remove_alias, entity_rename,
+    entity_resolve_canonical_all_types, entity_resolve_canonical_all_types_wtxn,
+    entity_resolve_scored, entity_tombstone, entity_update, normalize_name, EntityGcCandidate,
+    EntityListFilter, EntityListPage, EntityOpError, MERGE_REDIRECT_MAX_HOPS,
     READ_RESOLVE_TRIGRAM_FLOOR,
 };
 pub use entity::review::{

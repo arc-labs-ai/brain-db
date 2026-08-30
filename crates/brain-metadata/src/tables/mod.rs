@@ -105,7 +105,7 @@ pub fn materialize_all_tables(wtxn: &::redb::WriteTransaction) -> Result<(), ::r
     use contradiction::STATEMENT_CONTRADICTION_AUDIT_TABLE;
     use edge::{EDGES_REVERSE_TABLE, EDGES_TABLE};
     use entity::{
-        ENTITIES_TABLE, ENTITY_ALIASES_TABLE, ENTITY_BY_CANONICAL_NAME_TABLE,
+        ENTITIES_TABLE, ENTITY_ALIASES_TABLE, ENTITY_BY_CANONICAL_NAME_TABLE, ENTITY_BY_TYPE_TABLE,
         ENTITY_MENTIONS_TABLE, ENTITY_TRIGRAMS_TABLE, ENTITY_VECTORS_TABLE,
     };
     use entity_type::ENTITY_TYPES_TABLE;
@@ -158,6 +158,7 @@ pub fn materialize_all_tables(wtxn: &::redb::WriteTransaction) -> Result<(), ::r
     let _ = wtxn.open_table(ENTITY_ALIASES_TABLE)?;
     let _ = wtxn.open_table(ENTITY_TRIGRAMS_TABLE)?;
     let _ = wtxn.open_table(ENTITY_MENTIONS_TABLE)?;
+    let _ = wtxn.open_table(ENTITY_BY_TYPE_TABLE)?;
     let _ = wtxn.open_table(ENTITY_VECTORS_TABLE)?;
     let _ = wtxn.open_table(EXTRACTION_QUEUE_TABLE)?;
     let _ = wtxn.open_table(EXTRACTORS_TABLE)?;

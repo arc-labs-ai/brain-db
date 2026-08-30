@@ -135,7 +135,19 @@ pub fn open_or_init_schema(db: &Database) -> Result<u32, SchemaError> {
         }
     }
     crate::tables::materialize_all_tables(&wtxn)?;
+    // Build the by-(scope, type) entity listing index from the primary
+    // rows if a pre-index DB is being opened. Idempotent — a no-op once
+    // the index holds any row. Derived data, rebuilt like the in-RAM
+    // indexes, so it is index construction, not a format migration.
+    let backfilled = crate::entity::ops::backfill_entity_by_type_index(&wtxn)?;
     wtxn.commit()?;
+
+    if backfilled > 0 {
+        tracing::info!(
+            entities_indexed = backfilled,
+            "backfilled entity_by_type listing index for pre-index DB"
+        );
+    }
 
     if fresh {
         tracing::info!(

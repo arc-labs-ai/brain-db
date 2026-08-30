@@ -17,8 +17,8 @@
 use brain_core::{Entity, EntityAttributes, EntityId, EntityTypeId, RequestId};
 use brain_metadata::entity::merge::MergeActor;
 use brain_metadata::entity::ops::{
-    entity_get, entity_get_resolved_with_chain, entity_list_by_type, entity_lookup_by_alias,
-    entity_lookup_by_canonical_name,
+    entity_get, entity_get_resolved_with_chain, entity_list_by_type_page, entity_lookup_by_alias,
+    entity_lookup_by_canonical_name, EntityListFilter,
 };
 use brain_metadata::entity::trigram::{
     candidates_for_query, extract_trigrams, jaccard, trigrams_of_components,
@@ -693,52 +693,50 @@ pub async fn handle_entity_list(
         brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_space);
     let resume_after = crate::handlers::cursor::decode_opt(scope, &req.cursor)?;
     let type_id = EntityTypeId(req.entity_type_id);
-    let name_prefix_norm = if req.name_prefix.is_empty() {
-        None
-    } else {
-        Some(brain_metadata::entity::ops::normalize_name(
-            &req.name_prefix,
-        ))
+    let filter = EntityListFilter {
+        include_tombstoned: req.include_tombstoned,
+        include_merged: req.include_merged,
+        mention_count_min: req.mention_count_min,
+        name_prefix_norm: if req.name_prefix.is_empty() {
+            None
+        } else {
+            Some(brain_metadata::entity::ops::normalize_name(
+                &req.name_prefix,
+            ))
+        },
     };
-    let entities = {
+
+    // Keyset page directly off the (scope, type) index: the walk applies
+    // every wire filter and resumes strictly past the cursor id, so a page
+    // costs one page — not the whole (scope, type) bucket re-scanned per
+    // request. Ascending EntityId order matches the cursor's resume order.
+    let page = {
         let rtxn = ctx
             .executor
             .metadata
             .read_txn()
             .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
-        entity_list_by_type(&rtxn, scope, type_id).map_err(OpError::from)?
+        entity_list_by_type_page(
+            &rtxn,
+            scope,
+            type_id,
+            &filter,
+            resume_after,
+            req.limit as usize,
+        )
+        .map_err(OpError::from)?
     };
 
-    // Materialize the full scope-walled candidate set, then order it by the
-    // immutable entity id so pages are stable across requests before slicing.
-    let mut matching: Vec<_> = entities
-        .into_iter()
-        .filter(|e| {
-            if !req.include_tombstoned && e.flags & 1 != 0 {
-                return false;
-            }
-            if !req.include_merged && e.is_merged() {
-                return false;
-            }
-            if e.mention_count < req.mention_count_min {
-                return false;
-            }
-            if let Some(prefix) = &name_prefix_norm {
-                if !e.normalized_name.starts_with(prefix.as_str()) {
-                    return false;
-                }
-            }
-            true
-        })
-        .collect();
-    matching.sort_by_key(|e| e.id.to_bytes());
-
-    let (page, next_cursor) =
-        crate::handlers::cursor::paginate(scope, matching, resume_after, req.limit as usize, |e| {
-            e.id.to_bytes()
-        });
+    let next_cursor = if page.has_more {
+        page.last_id
+            .map(|id| crate::handlers::cursor::encode(scope, id))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
 
     let items: Vec<EntityListItem> = page
+        .rows
         .iter()
         .map(|e| EntityListItem {
             entity: entity_to_view(e),
