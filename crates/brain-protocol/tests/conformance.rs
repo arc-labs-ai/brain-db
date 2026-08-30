@@ -2350,6 +2350,10 @@ fn corpus() -> Vec<Case> {
     };
     let entity_get_merged_resp = EntityGetResponse {
         entity: entity_merged_away,
+        // The returned view is the merged-away record itself (entity_id ==
+        // the requested id, still carrying merged_into), so no redirect hop
+        // was walked to reach it — the chain is empty.
+        resolved_from: Vec::new(),
     };
     cases.push(resp_case(
         "resp_entity_get_merged",

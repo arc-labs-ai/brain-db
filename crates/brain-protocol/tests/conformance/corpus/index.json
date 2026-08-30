@@ -621,7 +621,7 @@
     "name": "resp_entity_get_merged",
     "opcode": "0x01B1",
     "kind": "response",
-    "payload_len": 314
+    "payload_len": 329
   },
   {
     "name": "req_relation_get",
