@@ -26,9 +26,13 @@
 //! {"backfill_id":"<hex>","shards":<N>,"progress":[{"shard":0, …}, …]}
 //! ```
 //!
-//! Per-shard errors are logged and kept off the response body (matching
-//! `extract.rs`); a route only fails with `500` when *every* shard
-//! errored.
+//! Fan-out is partial-tolerant. A submit that some shards accept and
+//! others reject is a *partial success*, not a silent one: the response
+//! carries a top-level `"errors":[…]` array of the per-shard failures and
+//! its status is `207 Multi-Status`, so an operator can see the skipped
+//! shards rather than reading `200 OK` over a half-applied run. The route
+//! only fails outright with `500` when *every* shard errored; a clean
+//! all-shards submit stays `200 OK` with no `errors` key.
 
 use std::sync::Arc;
 
@@ -109,13 +113,70 @@ pub async fn submit(
         ));
     }
 
-    let body = format!(
-        "{{\"backfill_id\":\"{id}\",\"shards\":{n},\"progress\":{progress}}}\n",
+    // At least one shard accepted. A clean fan-out is `200 OK`; a partial
+    // one (some shards rejected the submit) is `207 Multi-Status` carrying
+    // the per-shard failures, so the operator sees the skipped shards.
+    let status = if shard_errors.is_empty() {
+        StatusCode::OK
+    } else {
+        StatusCode::MULTI_STATUS
+    };
+    let body = submit_body_json(run_id, state.shards.len(), &submitted, &shard_errors);
+    Ok(json_response(status, body))
+}
+
+/// Render the full submit response body: the run id, shard count, the
+/// per-shard progress array, and — only when the fan-out was partial — a
+/// top-level `"errors"` array of the shards whose submit was rejected.
+/// A clean all-shards submit renders no `errors` key.
+fn submit_body_json(
+    run_id: BackfillId,
+    shard_count: usize,
+    submitted: &[(usize, Option<BackfillProgress>)],
+    shard_errors: &[String],
+) -> String {
+    let mut body = format!(
+        "{{\"backfill_id\":\"{id}\",\"shards\":{n},\"progress\":{progress}",
         id = hex_id(run_id),
-        n = state.shards.len(),
-        progress = submit_progress_array_json(run_id, &submitted),
+        n = shard_count,
+        progress = submit_progress_array_json(run_id, submitted),
     );
-    Ok(json_response(StatusCode::OK, body))
+    if !shard_errors.is_empty() {
+        body.push_str(",\"errors\":");
+        body.push_str(&errors_array_json(shard_errors));
+    }
+    body.push_str("}\n");
+    body
+}
+
+/// Render `["shard i: …", …]`, JSON-escaping each message so an error's
+/// `Display` can never break out of the string and corrupt the document.
+fn errors_array_json(errors: &[String]) -> String {
+    let items: Vec<String> = errors.iter().map(|e| json_string(e)).collect();
+    format!("[{}]", items.join(","))
+}
+
+/// Minimal JSON string escaping (the two mandatory escapes plus control
+/// characters). Kept local so per-shard error text is always emitted safely.
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                use std::fmt::Write as _;
+                write!(&mut out, "\\u{:04x}", c as u32).expect("string write into String");
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// `GET /v1/backfill` — snapshot each shard's most-recent run progress.
@@ -492,6 +553,69 @@ mod tests {
         // A fully-populated progress renders no `null` — the degraded
         // path is the only source of nulls here.
         assert!(!s.contains("null"), "no degraded fields when all ok: {s}");
+    }
+
+    #[test]
+    fn submit_body_surfaces_partial_shard_errors() {
+        // The specific defect: a fan-out that some shards accept and one
+        // rejects must NOT render as a clean success. The rejected shard's
+        // message has to appear in a top-level "errors" array so the
+        // handler can return 207 instead of a silent 200.
+        let run_id = BackfillId::from_bytes([5u8; 16]);
+        let ok = BackfillProgress {
+            request_id: Some(run_id),
+            completed: 3,
+            failed: 0,
+            skipped_already_completed: 0,
+            last_processed_memory_id: Some(MemoryId::from_raw(7)),
+            running: true,
+            eta: None,
+        };
+        let submitted = vec![(0usize, Some(ok))];
+        let shard_errors = vec!["shard 1: worker mailbox closed".to_owned()];
+        let body = submit_body_json(run_id, 2, &submitted, &shard_errors);
+
+        assert!(body.contains("\"backfill_id\":"), "{body}");
+        assert!(body.contains("\"shards\":2"), "{body}");
+        // The accepted shard still reports real progress.
+        assert!(body.contains("\"shard\":0"), "{body}");
+        assert!(body.contains("\"completed\":3"), "{body}");
+        // The rejected shard is surfaced, not swallowed.
+        assert!(
+            body.contains("\"errors\":[\"shard 1: worker mailbox closed\"]"),
+            "partial failure must surface the rejected shard: {body}"
+        );
+    }
+
+    #[test]
+    fn submit_body_errors_are_json_escaped() {
+        // A raw error Display carrying a quote or backslash must not break
+        // out of the JSON string.
+        let run_id = BackfillId::from_bytes([6u8; 16]);
+        let submitted: Vec<(usize, Option<BackfillProgress>)> = vec![(0usize, None)];
+        let shard_errors = vec!["shard 1: bad \"key\"\\path".to_owned()];
+        let body = submit_body_json(run_id, 2, &submitted, &shard_errors);
+        assert!(
+            body.contains(r#"["shard 1: bad \"key\"\\path"]"#),
+            "error text must be JSON-escaped: {body}"
+        );
+    }
+
+    #[test]
+    fn submit_body_omits_errors_key_when_clean() {
+        // A clean all-shards fan-out stays a plain success body — no
+        // errors key, so 200 OK stays semantically accurate.
+        let run_id = BackfillId::from_bytes([7u8; 16]);
+        let p = BackfillProgress {
+            request_id: Some(run_id),
+            ..BackfillProgress::default()
+        };
+        let submitted = vec![(0usize, Some(p))];
+        let body = submit_body_json(run_id, 1, &submitted, &[]);
+        assert!(
+            !body.contains("\"errors\""),
+            "no errors key when clean: {body}"
+        );
     }
 
     #[test]
