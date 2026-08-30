@@ -21,7 +21,8 @@
 use brain_core::Relation;
 use brain_core::{Cardinality, EntityId, RelationId, RelationTypeId, RequestId};
 use brain_metadata::relation::ops::{
-    relation_get, relation_list_from, relation_list_to, RelationListFilter, RelationOpError,
+    relation_get, relation_list_from_page, relation_list_to_page, RelationListFilter,
+    RelationOpError,
 };
 use brain_metadata::relation::traversal::{
     traverse, TraversalConfig, TraversalDirection, MAX_DEPTH,
@@ -562,7 +563,13 @@ fn run_list(
     }
     let scope =
         brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_space);
-    let resume_after = crate::handlers::cursor::decode_opt(scope, cursor)?;
+    let filter_sig = relation_list_filter_signature(
+        type_filter,
+        include_superseded,
+        include_tombstoned,
+        from_side,
+    );
+    let resume_key = decode_relation_cursor(cursor, scope, &filter_sig)?;
 
     let rtxn = ctx
         .executor
@@ -598,35 +605,121 @@ fn run_list(
     let filter = RelationListFilter {
         relation_type,
         current_only: !include_superseded && !include_tombstoned,
-        // Fetch the full candidate window (up to the list ceiling); pagination
-        // is applied below over the ordered set.
-        limit: LIST_LIMIT_MAX as usize,
+        // The page fn takes its page size as an explicit argument; the
+        // struct field is unused on this path.
+        limit: 0,
     };
-    let mut rows = if from_side {
-        relation_list_from(&rtxn, scope, entity, &filter).map_err(map_relation_op_error)?
+
+    // Page directly from the edge index: seek strictly past the cursor,
+    // apply tombstone / current filters in the walk, and return one page
+    // plus whether more remain. No 1000-row window, so relations past
+    // 1000 are reachable and each page costs one page's worth of scan.
+    let page = if from_side {
+        relation_list_from_page(
+            &rtxn,
+            scope,
+            entity,
+            &filter,
+            include_tombstoned,
+            resume_key.as_deref(),
+            limit as usize,
+        )
     } else {
-        relation_list_to(&rtxn, scope, entity, &filter).map_err(map_relation_op_error)?
-    };
-
-    // Wire-level filters not pushed into list_*.
-    if !include_tombstoned {
-        rows.retain(|r| !r.tombstoned);
+        relation_list_to_page(
+            &rtxn,
+            scope,
+            entity,
+            &filter,
+            include_tombstoned,
+            resume_key.as_deref(),
+            limit as usize,
+        )
     }
+    .map_err(map_relation_op_error)?;
 
-    // Order by the immutable relation id so pages are stable across requests,
-    // then slice one page out via the shared cursor helper.
-    rows.sort_by_key(|r| r.id.to_bytes());
-    let (page, next_cursor) =
-        crate::handlers::cursor::paginate(scope, rows, resume_after, limit as usize, |r| {
-            r.id.to_bytes()
-        });
-
-    let mut out = Vec::with_capacity(page.len());
-    for r in &page {
+    let mut out = Vec::with_capacity(page.rows.len());
+    for r in &page.rows {
         out.push(project_view(&rtxn, r)?);
     }
     let count = out.len() as u32;
+    let next_cursor = match (page.has_more, page.last_key) {
+        (true, Some(k)) => encode_relation_cursor(scope, &filter_sig, &k),
+        _ => Vec::new(),
+    };
     Ok((out, count, next_cursor))
+}
+
+// ---------------------------------------------------------------------------
+// RELATION_LIST_{FROM,TO} keyset-pagination cursor.
+//
+// Opaque bytes on the wire (a `bytes` field — the manifest is unchanged
+// and no SDK parses it). Carries the owning scope (tenant reject), a
+// signature of the query filters + direction (a mid-pagination change or
+// a from/to mixup fails closed), and the raw edge-table key of the last
+// row so the next page seeks strictly past it in-store.
+// ---------------------------------------------------------------------------
+
+const RELATION_CURSOR_VERSION: u8 = 2;
+/// `version(1) + namespace_id(4) + space_id(16) + filter_sig(8)` then the
+/// variable-length raw edge key.
+const RELATION_CURSOR_HEADER: usize = 1 + 4 + 16 + 8;
+
+fn relation_list_filter_signature(
+    type_filter: &str,
+    include_superseded: bool,
+    include_tombstoned: bool,
+    from_side: bool,
+) -> [u8; 8] {
+    let mut h = blake3::Hasher::new();
+    h.update(&(type_filter.len() as u32).to_le_bytes());
+    h.update(type_filter.as_bytes());
+    h.update(&[
+        u8::from(include_superseded),
+        u8::from(include_tombstoned),
+        u8::from(from_side),
+    ]);
+    let full = h.finalize();
+    let mut out = [0u8; 8];
+    out.copy_from_slice(&full.as_bytes()[..8]);
+    out
+}
+
+fn encode_relation_cursor(scope: brain_metadata::RowScope, sig: &[u8; 8], key: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(RELATION_CURSOR_HEADER + key.len());
+    out.push(RELATION_CURSOR_VERSION);
+    out.extend_from_slice(&scope.namespace_id.to_le_bytes());
+    out.extend_from_slice(&scope.space_id_bytes);
+    out.extend_from_slice(sig);
+    out.extend_from_slice(key);
+    out
+}
+
+fn decode_relation_cursor(
+    cursor: &[u8],
+    scope: brain_metadata::RowScope,
+    sig: &[u8; 8],
+) -> Result<Option<Vec<u8>>, OpError> {
+    if cursor.is_empty() {
+        return Ok(None);
+    }
+    // The raw edge key is always non-empty, so a valid cursor is strictly
+    // longer than the header.
+    if cursor.len() <= RELATION_CURSOR_HEADER || cursor[0] != RELATION_CURSOR_VERSION {
+        return Err(OpError::InvalidRequest("malformed cursor".into()));
+    }
+    let mut ns = [0u8; 4];
+    ns.copy_from_slice(&cursor[1..5]);
+    if u32::from_le_bytes(ns) != scope.namespace_id || cursor[5..21] != scope.space_id_bytes {
+        return Err(OpError::InvalidRequest(
+            "cursor does not belong to the caller's tenant".into(),
+        ));
+    }
+    if cursor[21..29] != *sig {
+        return Err(OpError::InvalidRequest(
+            "stale_cursor: filters changed between pages".into(),
+        ));
+    }
+    Ok(Some(cursor[RELATION_CURSOR_HEADER..].to_vec()))
 }
 
 // ---------------------------------------------------------------------------

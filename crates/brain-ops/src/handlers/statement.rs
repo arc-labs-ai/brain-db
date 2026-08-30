@@ -34,7 +34,8 @@ use brain_metadata::schema::predicate::{
 };
 use brain_metadata::schema::store::schema_active;
 use brain_metadata::statement::{
-    evidence_overflow_load, statement_get, statement_history, statement_list, StatementListFilter,
+    evidence_overflow_load, statement_get, statement_history, statement_list_page,
+    StatementListCursor, StatementListFilter, StatementPageExtra,
 };
 use brain_planner::WriterError;
 use brain_protocol::envelope::response::EventType;
@@ -712,7 +713,8 @@ pub async fn handle_statement_list(
     }
     let scope =
         brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_space);
-    let resume_after = crate::handlers::cursor::decode_opt(scope, &req.cursor)?;
+    let filter_sig = statement_list_filter_signature(&req);
+    let resume_after = decode_statement_cursor(&req.cursor, scope, &filter_sig)?;
     // Wire filter byte: `0` = no filter; any non-zero byte is the
     // `brain_core` kind byte + 1 (so `1=Fact … 6=Directive`, `7+ = Custom`).
     let kind = match req.kind {
@@ -776,53 +778,53 @@ pub async fn handle_statement_list(
             } else {
                 None
             },
-            // Fetch the full candidate window (up to the list ceiling), not
-            // just one page: pagination is applied below over the ordered set
-            // so `next_cursor` can reflect whether more rows remain.
-            limit: LIST_LIMIT_MAX as usize,
+            // `statement_list_page` takes its page size as an explicit
+            // argument; the struct field is unused on this path.
+            limit: 0,
         };
-        let mut rows = statement_list(&rtxn, scope, &filter).map_err(OpError::from)?;
-
-        // Wire-level filters not pushed into statement_list.
-        if !req.include_tombstoned {
-            rows.retain(|s| !s.tombstoned);
-        }
-        if req.time_range_start_unix_nanos != 0 || req.time_range_end_unix_nanos != 0 {
-            let lo = req.time_range_start_unix_nanos;
-            let hi = if req.time_range_end_unix_nanos == 0 {
-                u64::MAX
+        // Tombstone and time-range are not index columns; push them into
+        // the page walk so a page is exactly the wire-visible rows and
+        // `has_more` is exact (never a short page hiding a full next one).
+        let time_range =
+            if req.time_range_start_unix_nanos != 0 || req.time_range_end_unix_nanos != 0 {
+                let lo = req.time_range_start_unix_nanos;
+                let hi = if req.time_range_end_unix_nanos == 0 {
+                    u64::MAX
+                } else {
+                    req.time_range_end_unix_nanos
+                };
+                Some((lo, hi))
             } else {
-                req.time_range_end_unix_nanos
+                None
             };
-            rows.retain(|s| match s.kind {
-                StatementKind::Event => s
-                    .event_at_unix_nanos
-                    .map(|t| t >= lo && t <= hi)
-                    .unwrap_or(false),
-                _ => {
-                    // An unset valid_from defaults to extracted_at (the fact
-                    // became true no later than when it was ingested), not the
-                    // epoch; an unset valid_to is open-ended (still valid).
-                    let from = s.valid_from_unix_nanos.unwrap_or(s.extracted_at_unix_nanos);
-                    let to = s.valid_to_unix_nanos.unwrap_or(u64::MAX);
-                    from <= hi && to >= lo
-                }
-            });
-        }
+        let extra = StatementPageExtra {
+            include_tombstoned: req.include_tombstoned,
+            time_range,
+        };
 
-        // Order by the immutable statement id so pages are stable across
-        // requests, then slice one page out via the shared cursor helper.
-        rows.sort_by_key(|s| s.id.to_bytes());
-        let (page, next_cursor) =
-            crate::handlers::cursor::paginate(scope, rows, resume_after, req.limit as usize, |s| {
-                s.id.to_bytes()
-            });
+        // Page directly from the store: seek strictly past the cursor,
+        // apply every predicate in the walk, and return one page plus
+        // whether more remain. No 1000-row window, so rows past 1000 are
+        // reachable and each page costs one page's worth of scan.
+        let page = statement_list_page(
+            &rtxn,
+            scope,
+            &filter,
+            &extra,
+            resume_after,
+            req.limit as usize,
+        )
+        .map_err(OpError::from)?;
 
-        let mut out = Vec::with_capacity(page.len());
-        for s in &page {
+        let mut out = Vec::with_capacity(page.rows.len());
+        for s in &page.rows {
             out.push(project_view(&rtxn, s)?);
         }
         let count = out.len() as u32;
+        let next_cursor = match (page.has_more, page.last) {
+            (true, Some(c)) => encode_statement_cursor(scope, &filter_sig, &c),
+            _ => Vec::new(),
+        };
         (out, count, next_cursor)
     };
 
@@ -862,6 +864,100 @@ fn split_qname(q: &str) -> Result<(&str, &str), OpError> {
         .split_once(':')
         .ok_or_else(|| OpError::InvalidRequest("predicate missing ':' separator".into()))?;
     Ok((ns, name))
+}
+
+// ---------------------------------------------------------------------------
+// STATEMENT_LIST keyset-pagination cursor.
+//
+// The cursor is opaque bytes on the wire (a `bytes` field — the manifest
+// is unchanged and no SDK parses it). It carries the owning scope so a
+// token minted for one tenant is rejected against another, a signature of
+// the query filters so a mid-pagination filter change fails closed rather
+// than mis-resuming, and the last row's exact index position so the next
+// page seeks strictly past it in-store (no in-memory window, rows past
+// 1000 reachable).
+// ---------------------------------------------------------------------------
+
+const STATEMENT_CURSOR_VERSION: u8 = 2;
+/// `version(1) + namespace_id(4) + space_id(16) + filter_sig(8)`
+/// `+ id(16) + kind(1) + predicate_id(4) + is_current(1) + bucket(1)`.
+const STATEMENT_CURSOR_LEN: usize = 1 + 4 + 16 + 8 + 16 + 1 + 4 + 1 + 1;
+
+fn statement_list_filter_signature(req: &StatementListRequest) -> [u8; 8] {
+    let mut h = blake3::Hasher::new();
+    h.update(&req.subject);
+    h.update(&(req.predicate.len() as u32).to_le_bytes());
+    h.update(req.predicate.as_bytes());
+    h.update(&[
+        req.kind,
+        u8::from(req.only_current),
+        u8::from(req.include_tombstoned),
+    ]);
+    h.update(&req.min_confidence.to_le_bytes());
+    h.update(&req.time_range_start_unix_nanos.to_le_bytes());
+    h.update(&req.time_range_end_unix_nanos.to_le_bytes());
+    let full = h.finalize();
+    let mut out = [0u8; 8];
+    out.copy_from_slice(&full.as_bytes()[..8]);
+    out
+}
+
+fn encode_statement_cursor(
+    scope: brain_metadata::RowScope,
+    sig: &[u8; 8],
+    c: &StatementListCursor,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(STATEMENT_CURSOR_LEN);
+    out.push(STATEMENT_CURSOR_VERSION);
+    out.extend_from_slice(&scope.namespace_id.to_le_bytes());
+    out.extend_from_slice(&scope.space_id_bytes);
+    out.extend_from_slice(sig);
+    out.extend_from_slice(&c.id);
+    out.push(c.kind);
+    out.extend_from_slice(&c.predicate_id.to_le_bytes());
+    out.push(c.is_current);
+    out.push(c.confidence_bucket);
+    out
+}
+
+fn decode_statement_cursor(
+    cursor: &[u8],
+    scope: brain_metadata::RowScope,
+    sig: &[u8; 8],
+) -> Result<Option<StatementListCursor>, OpError> {
+    if cursor.is_empty() {
+        return Ok(None);
+    }
+    if cursor.len() != STATEMENT_CURSOR_LEN || cursor[0] != STATEMENT_CURSOR_VERSION {
+        return Err(OpError::InvalidRequest("malformed cursor".into()));
+    }
+    let mut ns = [0u8; 4];
+    ns.copy_from_slice(&cursor[1..5]);
+    if u32::from_le_bytes(ns) != scope.namespace_id || cursor[5..21] != scope.space_id_bytes {
+        return Err(OpError::InvalidRequest(
+            "cursor does not belong to the caller's tenant".into(),
+        ));
+    }
+    if cursor[21..29] != *sig {
+        return Err(OpError::InvalidRequest(
+            "stale_cursor: filters changed between pages".into(),
+        ));
+    }
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&cursor[29..45]);
+    let kind = cursor[45];
+    let mut pred = [0u8; 4];
+    pred.copy_from_slice(&cursor[46..50]);
+    let predicate_id = u32::from_le_bytes(pred);
+    let is_current = cursor[50];
+    let confidence_bucket = cursor[51];
+    Ok(Some(StatementListCursor {
+        id,
+        kind,
+        predicate_id,
+        is_current,
+        confidence_bucket,
+    }))
 }
 
 fn decode_tombstone_reason(byte: u8) -> Result<TombstoneReason, OpError> {

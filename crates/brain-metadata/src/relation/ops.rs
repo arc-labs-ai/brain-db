@@ -285,6 +285,170 @@ fn list_directional(
     Ok(out)
 }
 
+/// One page of a keyset-paginated directional relation listing.
+pub struct RelationPage {
+    /// The relations on this page, in edge-index scan order
+    /// (`(kind, other_endpoint, relation_id)` byte order).
+    pub rows: Vec<Relation>,
+    /// `true` when at least one more wire-visible relation exists past
+    /// the last row on this page.
+    pub has_more: bool,
+    /// Raw edge-table key of the last emitted row — the opaque resume
+    /// point the caller folds into the next cursor. `None` on an empty
+    /// page (nothing to resume after).
+    pub last_key: Option<Vec<u8>>,
+}
+
+/// Keyset (seek) page over relations where `entity` is the `from`
+/// endpoint. See [`list_directional_page`].
+pub fn relation_list_from_page(
+    rtxn: &ReadTransaction,
+    scope: RowScope,
+    entity: EntityId,
+    filter: &RelationListFilter,
+    include_tombstoned: bool,
+    after_key: Option<&[u8]>,
+    limit: usize,
+) -> Result<RelationPage, RelationOpError> {
+    list_directional_page(
+        rtxn,
+        scope,
+        entity,
+        filter,
+        include_tombstoned,
+        after_key,
+        limit,
+        /* outgoing */ true,
+    )
+}
+
+/// Keyset (seek) page over relations where `entity` is the `to`
+/// endpoint. See [`list_directional_page`].
+pub fn relation_list_to_page(
+    rtxn: &ReadTransaction,
+    scope: RowScope,
+    entity: EntityId,
+    filter: &RelationListFilter,
+    include_tombstoned: bool,
+    after_key: Option<&[u8]>,
+    limit: usize,
+) -> Result<RelationPage, RelationOpError> {
+    list_directional_page(
+        rtxn,
+        scope,
+        entity,
+        filter,
+        include_tombstoned,
+        after_key,
+        limit,
+        /* outgoing */ false,
+    )
+}
+
+/// Page directly from the edge index: range the anchor's contiguous
+/// keyspace, resume strictly past `after_key` when present, and apply
+/// every wire-visible predicate (scope wall, `current_only`,
+/// `include_tombstoned`, relation-type) *inside* the walk. Collects at
+/// most `limit` admitted rows, then peeks one further admitted row to
+/// set `has_more` — so a page is never short while a full next page
+/// exists, and rows past the former 1000-row window are reachable.
+///
+/// Unlike the whole-window [`list_directional`], cost is proportional to
+/// one page, not to (pages × window), and the returned `last_key` is the
+/// real edge-table key of the last row so the next seek is exact even
+/// under concurrent writes.
+#[allow(clippy::too_many_arguments)]
+fn list_directional_page(
+    rtxn: &ReadTransaction,
+    scope: RowScope,
+    entity: EntityId,
+    filter: &RelationListFilter,
+    include_tombstoned: bool,
+    after_key: Option<&[u8]>,
+    limit: usize,
+    outgoing: bool,
+) -> Result<RelationPage, RelationOpError> {
+    use std::ops::Bound;
+
+    let anchor = NodeRef::Entity(entity);
+    let kind_filter = filter.relation_type.map(EdgeKindRef::Typed);
+    let (prefix, hi) = edge::range_bounds(anchor, kind_filter);
+
+    let table = if outgoing {
+        rtxn.open_table(EDGES_TABLE)?
+    } else {
+        rtxn.open_table(EDGES_REVERSE_TABLE)?
+    };
+    let sidecar = rtxn.open_table(RELATION_METADATA_TABLE)?;
+
+    let lo_bound: Bound<&[u8]> = match after_key {
+        Some(k) => Bound::Excluded(k),
+        None => Bound::Included(prefix.as_slice()),
+    };
+    let hi_bound: Bound<&[u8]> = Bound::Included(hi.as_slice());
+
+    let mut rows = Vec::new();
+    let mut has_more = false;
+    let mut last_key: Option<Vec<u8>> = None;
+
+    for entry in table.range::<&[u8]>((lo_bound, hi_bound))? {
+        let (k, v) = entry?;
+        let raw = k.value();
+        let key = edge::EdgeKey::decode(raw)?;
+        // The range prefix already isolates the anchor; re-check
+        // defensively so a corrupt key can never surface a foreign row.
+        if key.from != anchor {
+            continue;
+        }
+        if let Some(want) = kind_filter {
+            if key.kind != want {
+                continue;
+            }
+        }
+        // Only typed edges are relations; ignore any substrate Builtin /
+        // Mentions edge that happens to anchor here.
+        if !matches!(key.kind, EdgeKindRef::Typed(_)) {
+            let _ = v;
+            continue;
+        }
+        let id = RelationId::from(key.disambiguator);
+        let Some(meta) = sidecar.get(&key.disambiguator)?.map(|g| g.value()) else {
+            continue;
+        };
+        // Unconditional scope wall — the shared edge table is not
+        // re-keyed by scope, so the sidecar is the authority.
+        if meta.namespace_id != scope.namespace_id || meta.space_id_bytes != scope.space_id_bytes {
+            continue;
+        }
+        if filter.current_only && !meta.is_current() {
+            continue;
+        }
+        if !include_tombstoned && meta.is_tombstoned() {
+            continue;
+        }
+        if let Some(want) = filter.relation_type {
+            if meta.relation_type_id != want.raw() {
+                continue;
+            }
+        }
+
+        // Admitted. If the page is already full, this row proves a next
+        // page exists — stop without emitting it.
+        if rows.len() == limit {
+            has_more = true;
+            break;
+        }
+        last_key = Some(raw.to_vec());
+        rows.push(relation_from_metadata(id, &meta));
+    }
+
+    Ok(RelationPage {
+        rows,
+        has_more,
+        last_key,
+    })
+}
+
 /// Returns ids of all relations that cite `memory_id` as evidence.
 pub fn relations_with_evidence(
     rtxn: &ReadTransaction,

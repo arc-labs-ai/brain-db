@@ -448,12 +448,18 @@ pub fn walk_incoming(
     range_scan(&t, to, kind_filter)
 }
 
-fn range_scan(
-    table: &ReadOnlyTable<&'static [u8], EdgeData>,
-    anchor: NodeRef,
-    kind_filter: Option<EdgeKindRef>,
-) -> Result<Vec<EdgeRow>, EdgeOpError> {
-    let (lo, hi) = match kind_filter {
+/// Inclusive `(lower_prefix, upper)` byte bounds for a scan of every
+/// edge anchored at `anchor`, optionally narrowed to a single `kind`.
+///
+/// The lower bound is the raw anchor (or anchor+kind) prefix; the upper
+/// bound saturates the remaining `(to, disambiguator)` suffix with
+/// `0xFF` so an inclusive range covers every row under the prefix.
+/// Exposed so a keyset-paginated walk can seek strictly past a resume
+/// key (`Bound::Excluded(after_key)`) while keeping the same upper
+/// bound — see `relation::ops::list_directional_page`.
+#[must_use]
+pub fn range_bounds(anchor: NodeRef, kind_filter: Option<EdgeKindRef>) -> (Vec<u8>, Vec<u8>) {
+    match kind_filter {
         Some(k) => {
             let prefix = EdgeKey::from_kind_prefix(anchor, k);
             let mut hi = prefix.clone();
@@ -470,7 +476,15 @@ fn range_scan(
             );
             (prefix, hi)
         }
-    };
+    }
+}
+
+fn range_scan(
+    table: &ReadOnlyTable<&'static [u8], EdgeData>,
+    anchor: NodeRef,
+    kind_filter: Option<EdgeKindRef>,
+) -> Result<Vec<EdgeRow>, EdgeOpError> {
+    let (lo, hi) = range_bounds(anchor, kind_filter);
 
     let mut out = Vec::new();
     for entry in table.range::<&[u8]>(lo.as_slice()..=hi.as_slice())? {

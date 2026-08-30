@@ -464,6 +464,94 @@ fn statement_list_pages_cover_every_row_once() {
     });
 }
 
+/// Regression: keyset pagination must reach rows past the former
+/// 1000-row in-memory window. The old handler fetched a fixed
+/// `LIST_LIMIT_MAX`-row window from the store and paginated it in memory,
+/// so any row beyond 1000 was unreachable and every page re-fetched +
+/// re-sorted the whole window. Insert > 1000 statements under one subject
+/// and prove every one is emitted, exactly once, across the full walk.
+#[test]
+fn statement_list_pages_past_one_thousand() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        fix.intern_namespace("acme");
+        let c = || caller("acme");
+
+        let subject = create_entity(&fix, c(), 1_000_000, "BigSubject").await;
+        const BIG: u32 = 1050; // strictly past the 1000-row ceiling.
+        let mut expected = BTreeSet::new();
+        for i in 0..BIG {
+            let id = create_statement(
+                &fix,
+                c(),
+                i,
+                subject,
+                &format!("acme:attr{i}"),
+                &format!("value {i}"),
+            )
+            .await;
+            expected.insert(id);
+        }
+        assert_eq!(expected.len(), BIG as usize, "creates must be distinct");
+
+        let page_limit: u32 = 250;
+        let mut pages: Vec<Vec<[u8; 16]>> = Vec::new();
+        let mut cursor = Vec::new();
+        loop {
+            let page = statement_page(&fix, c(), subject, page_limit, cursor).await;
+            let next = page.next_cursor.clone();
+            pages.push(page.ids);
+            if next.is_empty() {
+                break;
+            }
+            cursor = next;
+        }
+        assert_tiles(&pages, page_limit as usize, &expected);
+        // Must have needed more than four full pages of 250 — i.e. we
+        // genuinely paged past 1000.
+        let total: usize = pages.iter().map(Vec::len).sum();
+        assert_eq!(total, BIG as usize, "every row past 1000 reachable");
+        assert!(pages.len() >= 5, "should span > 1000 rows across pages");
+    });
+}
+
+/// Same reachability guarantee for the relation edge-index walk.
+#[test]
+fn relation_list_from_pages_past_one_thousand() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        fix.intern_namespace("acme");
+        let c = || caller("acme");
+
+        let from = create_entity(&fix, c(), 1_000_000, "BigFrom").await;
+        const BIG: u32 = 1050;
+        let mut expected = BTreeSet::new();
+        for i in 0..BIG {
+            let to = create_entity(&fix, c(), 2_000_000 + i, &format!("To {i}")).await;
+            let id = create_relation(&fix, c(), i, from, to, "acme:knows").await;
+            expected.insert(id);
+        }
+        assert_eq!(expected.len(), BIG as usize, "creates must be distinct");
+
+        let page_limit: u32 = 250;
+        let mut pages: Vec<Vec<[u8; 16]>> = Vec::new();
+        let mut cursor = Vec::new();
+        loop {
+            let page = relation_from_page(&fix, c(), from, page_limit, cursor).await;
+            let next = page.next_cursor.clone();
+            pages.push(page.ids);
+            if next.is_empty() {
+                break;
+            }
+            cursor = next;
+        }
+        assert_tiles(&pages, page_limit as usize, &expected);
+        let total: usize = pages.iter().map(Vec::len).sum();
+        assert_eq!(total, BIG as usize, "every relation past 1000 reachable");
+        assert!(pages.len() >= 5, "should span > 1000 rows across pages");
+    });
+}
+
 #[test]
 fn relation_list_from_pages_cover_every_row_once() {
     run_in_glommio(|| async {

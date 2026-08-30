@@ -39,8 +39,9 @@ pub use evidence::{
     read_evidence_ids_w, reclaim_evidence_overflow,
 };
 pub use list::{
-    statement_history, statement_list, statements_citing_memory, statements_contradicting,
-    StatementListFilter, DEFAULT_LIST_LIMIT,
+    statement_history, statement_list, statement_list_page, statements_citing_memory,
+    statements_contradicting, StatementListCursor, StatementListFilter, StatementPage,
+    StatementPageExtra, DEFAULT_LIST_LIMIT,
 };
 pub use supersede::{
     statement_create_with_decision, statement_supersede, JudgeError, JudgeFuture, JudgeVerdict,
