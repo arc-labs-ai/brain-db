@@ -555,13 +555,21 @@ impl SemanticRetriever for BrainSemanticRetriever {
     }
 
     fn vector_for(&self, id: brain_core::MemoryId) -> Option<[f32; SEMANTIC_VECTOR_DIM]> {
-        // hnsw_rs exposes no by-id vector reconstruct, so recover the memory's
-        // embedding from its stored text — the same passage the index was built
-        // from. Bounded cost: this is called only for the entity-graph walk's
-        // candidates (a small, capped set), to cue-condition them by cosine to
-        // the query. A missing text row yields `None` → the candidate keeps its
-        // structural graph score (the caller decides how to treat that).
+        // The exact embedding was persisted by-id at ENCODE, so resolve it from
+        // the artifact store first — a single point lookup, no model forward
+        // pass — exactly as the brute-force lane does. This is called for each
+        // entity-graph walk candidate (a small, capped set) to cue-condition it
+        // by cosine to the query; re-embedding every one on the read hot path
+        // burns the BGE model needlessly.
         let rtxn = self.metadata.read_txn().ok()?;
+        if let Some(v) = crate::memory_artifact::get_artifact_vector(&rtxn, id.to_be_bytes()) {
+            return Some(v);
+        }
+        // Fallback — a fresh-this-run miss (the artifact row for a memory
+        // encoded this process hasn't been point-persisted yet): reconstruct
+        // from the stored text, the same passage the index was built from. A
+        // missing text row yields `None` → the candidate keeps its structural
+        // graph score (the caller decides how to treat that).
         let table = rtxn
             .open_table(brain_metadata::tables::text::TEXTS_TABLE)
             .ok()?;

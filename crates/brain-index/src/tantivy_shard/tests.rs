@@ -347,3 +347,42 @@ fn open_ignores_incomplete_rebuild_and_creates_fresh() {
     assert!(live.exists());
     assert!(!rebuild.exists());
 }
+
+// ---------------------------------------------------------------------------
+// Commit-generation counter — the signal the retriever uses to skip redundant
+// reloads. The indexer bumps it after each commit; a clone (the indexer holds
+// one, the retriever reads the shard's) must share the same value.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn commit_generation_starts_at_zero_and_is_shared_across_clones() {
+    let dir = TempDir::new().expect("tempdir");
+    let shard = TantivyShard::open(dir.path()).expect("open").shard;
+
+    assert_eq!(shard.memory_text.commit_generation(), 0, "starts at 0");
+    assert_eq!(shard.statements.commit_generation(), 0, "starts at 0");
+
+    // The indexer works through a clone of the handle; the retriever reads the
+    // shard's own handle. A bump on the clone must be visible on the original.
+    let indexer_handle = shard.memory_text.clone();
+    indexer_handle.bump_commit_generation();
+    assert_eq!(indexer_handle.commit_generation(), 1);
+    assert_eq!(
+        shard.memory_text.commit_generation(),
+        1,
+        "clones share one counter",
+    );
+
+    // Each index scope carries its own counter — a memory commit must not
+    // make the statements reader think it needs to reload.
+    assert_eq!(
+        shard.statements.commit_generation(),
+        0,
+        "per-scope counters are independent",
+    );
+
+    // The bare counter handle the drain loop keeps bumps the same value.
+    let counter = indexer_handle.commit_generation_counter();
+    counter.fetch_add(1, std::sync::atomic::Ordering::Release);
+    assert_eq!(shard.memory_text.commit_generation(), 2);
+}

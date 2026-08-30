@@ -1001,3 +1001,90 @@ fn hnsw_lane_excludes_tombstoned_and_preserves_live_recall() {
         assert!(ids2.contains(id), "{id:?} admitted with include_tombstoned");
     }
 }
+
+// ---------------------------------------------------------------------------
+// vector_for — resolve the stored embedding by id instead of re-embedding on
+// the read hot path. The entity-graph walk calls this per candidate; a
+// re-embed here burns the BGE model needlessly.
+// ---------------------------------------------------------------------------
+
+/// A vector the fixed test embedder never returns (it returns `one_hot(0)`),
+/// so an exact match proves the value came from the by-id artifact store.
+fn stored_vec() -> [f32; VECTOR_DIM] {
+    let mut v = [0.0f32; VECTOR_DIM];
+    for (i, slot) in v.iter_mut().enumerate() {
+        *slot = ((i % 7) as f32).mul_add(0.125, 0.5);
+    }
+    v
+}
+
+#[test]
+fn vector_for_resolves_stored_vector_by_id_not_by_embedding() {
+    let (_dir, metadata) = fresh_metadata();
+    let id = MemoryId::pack(0, 1, 0);
+    // Persist the exact ENCODE-time vector by id (the artifact bundle, which
+    // `get_artifact_vector` resolves). No TEXTS row is written, so the only
+    // way to answer is the by-id lookup — a re-embed would have nothing to
+    // read anyway, and would return `one_hot(0)` if it fell through.
+    {
+        let wtxn = metadata.write_txn().expect("wtxn");
+        crate::memory_artifact::merge_memory_artifact(&wtxn, id.to_be_bytes(), |b| {
+            b.vector = stored_vec().to_vec();
+        })
+        .expect("store artifact vector");
+        wtxn.commit().expect("commit");
+    }
+    let retriever = build_retriever(metadata);
+    let got = retriever.vector_for(id).expect("vector resolves by id");
+    assert_eq!(
+        got,
+        stored_vec(),
+        "vector_for must return the stored vector verbatim",
+    );
+    assert_ne!(
+        got,
+        one_hot(0),
+        "resolving by id must not fall through to the embedder",
+    );
+}
+
+#[test]
+fn vector_for_falls_back_to_embedding_when_artifact_absent() {
+    use brain_metadata::tables::text::TEXTS_TABLE;
+    let (_dir, metadata) = fresh_metadata();
+    let id = MemoryId::pack(0, 2, 0);
+    // No artifact vector for this id — only a TEXTS row. This is the
+    // fresh-this-run miss: the by-id store has nothing yet, so vector_for
+    // reconstructs from the stored text via the embedder.
+    {
+        let wtxn = metadata.write_txn().expect("wtxn");
+        {
+            let mut t = wtxn.open_table(TEXTS_TABLE).expect("open texts");
+            t.insert(&id.to_be_bytes(), b"some passage".as_slice())
+                .expect("insert text");
+        }
+        wtxn.commit().expect("commit");
+    }
+    let retriever = build_retriever(metadata);
+    let got = retriever
+        .vector_for(id)
+        .expect("vector resolves via fallback");
+    assert_eq!(
+        got,
+        one_hot(0),
+        "fallback path embeds the stored text (fixed embedder returns one_hot(0))",
+    );
+}
+
+#[test]
+fn vector_for_returns_none_when_neither_artifact_nor_text_present() {
+    let (_dir, metadata) = fresh_metadata();
+    let retriever = build_retriever(metadata);
+    // An id with no artifact vector and no TEXTS row: nothing to resolve or
+    // embed, so the candidate keeps its structural graph score (caller's
+    // decision) rather than a fabricated vector.
+    assert!(
+        retriever.vector_for(MemoryId::pack(0, 9, 0)).is_none(),
+        "no by-id vector and no text ⇒ None",
+    );
+}

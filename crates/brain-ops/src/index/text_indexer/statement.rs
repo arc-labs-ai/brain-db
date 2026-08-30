@@ -3,6 +3,7 @@
 //! Hooks the statement create / supersede / tombstone / retract
 //! post-commit pipelines into `statements.tantivy/`.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -119,8 +120,9 @@ pub fn spawn_statement_text_indexer_local(
 ) -> Result<glommio::Task<()>, IndexerError> {
     let writer = build_writer(&handle)?;
     let fields = StatementFields::resolve(&handle)?;
+    let commit_gen = handle.commit_generation_counter();
     Ok(glommio::spawn_local(async move {
-        run_loop(writer, fields, rx, policy, shutdown, control).await;
+        run_loop(writer, fields, commit_gen, rx, policy, shutdown, control).await;
     }))
 }
 
@@ -149,7 +151,8 @@ pub async fn run_statement_text_indexer(
             return;
         }
     };
-    run_loop(writer, fields, rx, policy, shutdown, control).await;
+    let commit_gen = handle.commit_generation_counter();
+    run_loop(writer, fields, commit_gen, rx, policy, shutdown, control).await;
 }
 
 fn build_writer(handle: &IndexHandle) -> Result<IndexWriter, IndexerError> {
@@ -212,6 +215,7 @@ async fn wait_next<T: 'static>(
 async fn run_loop(
     mut writer: IndexWriter,
     fields: StatementFields,
+    mut commit_gen: Arc<AtomicU64>,
     rx: Receiver<StatementTextOp>,
     policy: CommitPolicy,
     shutdown: Receiver<()>,
@@ -236,7 +240,7 @@ async fn run_loop(
                     batch += 1;
                 }
                 if batch >= policy.n_writes {
-                    if commit_with_retry(&mut writer).is_err() {
+                    if commit_with_retry(&mut writer, &commit_gen).is_err() {
                         return;
                     }
                     batch = 0;
@@ -258,13 +262,13 @@ async fn run_loop(
                     }
                 }
                 if batch > 0 {
-                    let _ = commit_with_retry(&mut writer);
+                    let _ = commit_with_retry(&mut writer, &commit_gen);
                 }
                 return;
             }
             NextOp::DeadlineHit => {
                 if batch > 0 {
-                    if commit_with_retry(&mut writer).is_err() {
+                    if commit_with_retry(&mut writer, &commit_gen).is_err() {
                         return;
                     }
                     batch = 0;
@@ -280,8 +284,12 @@ async fn run_loop(
                 batch = 0;
                 let _ = ack.send_async(()).await;
                 match super::wait_while_paused(&control, &shutdown).await {
-                    Some(w) => {
+                    Some((w, gen)) => {
                         writer = w;
+                        // Adopt the reopened index's counter so post-resume
+                        // commits bump the generation the swapped-in retriever
+                        // now watches.
+                        commit_gen = gen;
                         last_commit = Instant::now();
                     }
                     None => return,
@@ -357,9 +365,12 @@ pub fn confidence_bucket(confidence: f32) -> u64 {
     ))
 }
 
-fn commit_with_retry(writer: &mut IndexWriter) -> Result<(), ()> {
+fn commit_with_retry(writer: &mut IndexWriter, commit_gen: &AtomicU64) -> Result<(), ()> {
     match attempt_commit(writer) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            commit_gen.fetch_add(1, Ordering::Release);
+            Ok(())
+        }
         Err(first) => {
             warn!(
                 target: "brain_ops::text_indexer",
@@ -367,7 +378,10 @@ fn commit_with_retry(writer: &mut IndexWriter) -> Result<(), ()> {
                 "statement text indexer commit failed; retrying",
             );
             match attempt_commit(writer) {
-                Ok(()) => Ok(()),
+                Ok(()) => {
+                    commit_gen.fetch_add(1, Ordering::Release);
+                    Ok(())
+                }
                 Err(second) => {
                     error!(
                         target: "brain_ops::text_indexer",

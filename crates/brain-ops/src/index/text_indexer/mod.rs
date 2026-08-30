@@ -76,9 +76,12 @@ pub(crate) fn build_indexer_writer(
 /// stays paused). Ops remain buffered in the op channel throughout and are
 /// drained after resume.
 ///
-/// Returns `Some(writer)` on `Resume` and `None` on shutdown. A shutdown
-/// observed *while paused* returns `None` without a final commit — there is
-/// no writer to commit through. In the shard this is unreachable: the
+/// Returns `Some((writer, commit_generation))` on `Resume` and `None` on
+/// shutdown. The returned counter is the reopened index's commit generation —
+/// the drain loop must adopt it so post-rebuild commits bump the counter the
+/// swapped-in retriever now watches (the pre-rebuild counter is stale). A
+/// shutdown observed *while paused* returns `None` without a final commit —
+/// there is no writer to commit through. In the shard this is unreachable: the
 /// rebuild dance (`Quiesce` … `Resume`) runs to completion within one
 /// single-threaded main-loop turn, so the shard's own teardown signal cannot
 /// interleave between them; the arm exists for the standalone-task tests and
@@ -87,7 +90,10 @@ pub(crate) fn build_indexer_writer(
 pub(crate) async fn wait_while_paused(
     control: &flume::Receiver<IndexerControl>,
     shutdown: &flume::Receiver<()>,
-) -> Option<tantivy::IndexWriter> {
+) -> Option<(
+    tantivy::IndexWriter,
+    std::sync::Arc<std::sync::atomic::AtomicU64>,
+)> {
     use futures_lite::FutureExt;
     loop {
         let ctrl = async { Some(control.recv_async().await) };
@@ -99,8 +105,9 @@ pub(crate) async fn wait_while_paused(
             Some(Ok(IndexerControl::Resume { handle, ack })) => match build_indexer_writer(&handle)
             {
                 Ok(w) => {
+                    let counter = handle.commit_generation_counter();
                     let _ = ack.send_async(()).await;
-                    return Some(w);
+                    return Some((w, counter));
                 }
                 Err(e) => {
                     tracing::error!(

@@ -3,6 +3,7 @@
 //! Hooks the ENCODE / FORGET post-commit pipelines into
 //! `memory_text.tantivy/`.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -142,8 +143,9 @@ pub fn spawn_memory_text_indexer_local(
 ) -> Result<glommio::Task<()>, IndexerError> {
     let writer = build_writer(&handle)?;
     let fields = MemoryFields::resolve(&handle)?;
+    let commit_gen = handle.commit_generation_counter();
     Ok(glommio::spawn_local(async move {
-        run_loop(writer, fields, rx, policy, shutdown, control).await;
+        run_loop(writer, fields, commit_gen, rx, policy, shutdown, control).await;
     }))
 }
 
@@ -173,7 +175,8 @@ pub async fn run_memory_text_indexer(
             return;
         }
     };
-    run_loop(writer, fields, rx, policy, shutdown, control).await;
+    let commit_gen = handle.commit_generation_counter();
+    run_loop(writer, fields, commit_gen, rx, policy, shutdown, control).await;
 }
 
 fn build_writer(handle: &IndexHandle) -> Result<IndexWriter, IndexerError> {
@@ -254,6 +257,7 @@ async fn wait_next<T: 'static>(
 async fn run_loop(
     mut writer: IndexWriter,
     fields: MemoryFields,
+    mut commit_gen: Arc<AtomicU64>,
     rx: Receiver<MemoryTextOp>,
     policy: CommitPolicy,
     shutdown: Receiver<()>,
@@ -283,13 +287,13 @@ async fn run_loop(
                     // the delete and force-merge so the memory's plaintext is
                     // physically evicted from the on-disk segments now, not on
                     // some incidental future merge (invariant #6).
-                    if purge_hard_forget(&mut writer).await.is_err() {
+                    if purge_hard_forget(&mut writer, &commit_gen).await.is_err() {
                         return;
                     }
                     batch = 0;
                     last_commit = Instant::now();
                 } else if batch >= policy.n_writes {
-                    if commit_with_retry(&mut writer).is_err() {
+                    if commit_with_retry(&mut writer, &commit_gen).is_err() {
                         return;
                     }
                     batch = 0;
@@ -314,13 +318,13 @@ async fn run_loop(
                     }
                 }
                 if batch > 0 {
-                    let _ = commit_with_retry(&mut writer);
+                    let _ = commit_with_retry(&mut writer, &commit_gen);
                 }
                 return;
             }
             NextOp::DeadlineHit => {
                 if batch > 0 {
-                    if commit_with_retry(&mut writer).is_err() {
+                    if commit_with_retry(&mut writer, &commit_gen).is_err() {
                         return;
                     }
                     batch = 0;
@@ -342,8 +346,12 @@ async fn run_loop(
                 // Park until Resume hands us a writer on the reopened index
                 // (or teardown). `rx` keeps buffering ops meanwhile.
                 match super::wait_while_paused(&control, &shutdown).await {
-                    Some(w) => {
+                    Some((w, gen)) => {
                         writer = w;
+                        // Adopt the reopened index's counter: the retriever was
+                        // swapped onto the same new index, so post-resume
+                        // commits must bump the generation it now watches.
+                        commit_gen = gen;
                         last_commit = Instant::now();
                     }
                     None => return,
@@ -422,9 +430,12 @@ fn kind_to_u64(kind: MemoryKind) -> u64 {
 /// that observes this task's completion outside teardown and fail-stops the
 /// shard is not yet wired (follow-up); today the dead loop is only noticed at
 /// the next shutdown join or by a rebuild's control ack failing.
-fn commit_with_retry(writer: &mut IndexWriter) -> Result<(), ()> {
+fn commit_with_retry(writer: &mut IndexWriter, commit_gen: &AtomicU64) -> Result<(), ()> {
     match attempt_commit(writer) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            commit_gen.fetch_add(1, Ordering::Release);
+            Ok(())
+        }
         Err(first) => {
             warn!(
                 target: "brain_ops::text_indexer",
@@ -432,7 +443,10 @@ fn commit_with_retry(writer: &mut IndexWriter) -> Result<(), ()> {
                 "memory text indexer commit failed; retrying",
             );
             match attempt_commit(writer) {
-                Ok(()) => Ok(()),
+                Ok(()) => {
+                    commit_gen.fetch_add(1, Ordering::Release);
+                    Ok(())
+                }
                 Err(second) => {
                     error!(
                         target: "brain_ops::text_indexer",
@@ -470,8 +484,8 @@ fn attempt_commit(writer: &mut IndexWriter) -> Result<(), TantivyError> {
 /// merge still reclaims the bytes. Only a failed commit terminates the
 /// drain loop (`Err(())`), matching [`commit_with_retry`].
 #[cfg(target_os = "linux")]
-async fn purge_hard_forget(writer: &mut IndexWriter) -> Result<(), ()> {
-    commit_with_retry(writer)?;
+async fn purge_hard_forget(writer: &mut IndexWriter, commit_gen: &AtomicU64) -> Result<(), ()> {
+    commit_with_retry(writer, commit_gen)?;
 
     let with_deletes: Vec<SegmentId> = match writer.index().searchable_segment_metas() {
         Ok(metas) => metas

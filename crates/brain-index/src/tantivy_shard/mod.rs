@@ -7,6 +7,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -67,16 +68,59 @@ impl LexicalScope {
 /// cheap and shares the same underlying tokenizer / directory
 /// references — required for the indexer worker
 /// and the retriever to hold independent handles.
+///
+/// `commit_generation` is a monotonic counter the indexer bumps after every
+/// successful tantivy commit; because it is an `Arc`, every clone of a handle
+/// shares the same counter. The retriever reads it to decide whether the
+/// writer has committed since its last `IndexReader::reload()` — reloading
+/// only when the generation advanced instead of on every query, while still
+/// serving every committed write (read-your-commits, invariant #7).
 #[derive(Clone)]
 pub struct IndexHandle {
     pub index: Index,
     pub scope: LexicalScope,
+    commit_generation: Arc<AtomicU64>,
+}
+
+impl IndexHandle {
+    /// Build a handle with a fresh commit-generation counter (starts at 0).
+    #[must_use]
+    pub fn new(index: Index, scope: LexicalScope) -> Self {
+        Self {
+            index,
+            scope,
+            commit_generation: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Current commit generation. Advances by one on every successful commit
+    /// against this index (see [`bump_commit_generation`](Self::bump_commit_generation)).
+    #[must_use]
+    pub fn commit_generation(&self) -> u64 {
+        self.commit_generation.load(Ordering::Acquire)
+    }
+
+    /// A shared reference to this handle's commit-generation counter, so the
+    /// indexer's drain loop can bump it without holding the whole handle.
+    #[must_use]
+    pub fn commit_generation_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.commit_generation)
+    }
+
+    /// Record that a commit has landed: advance the generation so readers
+    /// sharing this counter know to reload. `Release` pairs with the
+    /// retriever's `Acquire` read so the committed segments are visible once
+    /// the new generation is.
+    pub fn bump_commit_generation(&self) {
+        self.commit_generation.fetch_add(1, Ordering::Release);
+    }
 }
 
 impl std::fmt::Debug for IndexHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IndexHandle")
             .field("scope", &self.scope)
+            .field("commit_generation", &self.commit_generation())
             .finish()
     }
 }
@@ -215,14 +259,8 @@ impl TantivyShard {
             .register(BRAIN_TOKENIZER_NAME, build_analyzer());
 
         let shard = Arc::new(TantivyShard {
-            memory_text: IndexHandle {
-                index: memory_index,
-                scope: LexicalScope::MemoryText,
-            },
-            statements: IndexHandle {
-                index: statements_index,
-                scope: LexicalScope::StatementText,
-            },
+            memory_text: IndexHandle::new(memory_index, LexicalScope::MemoryText),
+            statements: IndexHandle::new(statements_index, LexicalScope::StatementText),
         });
 
         Ok(TantivyShardStartup {

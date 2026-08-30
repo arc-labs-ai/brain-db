@@ -6,6 +6,7 @@
 //! `brain-server::shard::spawn`).
 
 use std::ops::{Bound, RangeInclusive};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use brain_core::StatementKind;
@@ -124,6 +125,12 @@ struct RetrieverInner {
     shard: Arc<TantivyShard>,
     memory_reader: IndexReader,
     statements_reader: IndexReader,
+    /// The `IndexHandle::commit_generation` each cached reader was last
+    /// `reload()`ed at. `u64::MAX` is the "never reloaded" sentinel — no real
+    /// generation reaches it, so the first query on this bundle always
+    /// reloads. Bumped only forward, matching the writer's monotonic counter.
+    memory_reloaded_gen: AtomicU64,
+    statements_reloaded_gen: AtomicU64,
 }
 
 impl RetrieverInner {
@@ -142,6 +149,8 @@ impl RetrieverInner {
             shard,
             memory_reader,
             statements_reader,
+            memory_reloaded_gen: AtomicU64::new(u64::MAX),
+            statements_reloaded_gen: AtomicU64::new(u64::MAX),
         })
     }
 }
@@ -194,18 +203,33 @@ impl LexicalRetriever for TantivyLexicalRetriever {
         // `swap_shard` publishes a new bundle without invalidating this
         // guard, so the query runs entirely against one consistent index.
         let inner = self.inner.load();
-        let (handle, reader) = match scope {
-            LexicalScope::MemoryText => (&inner.shard.memory_text, &inner.memory_reader),
-            LexicalScope::StatementText => (&inner.shard.statements, &inner.statements_reader),
+        let (handle, reader, reloaded_gen) = match scope {
+            LexicalScope::MemoryText => (
+                &inner.shard.memory_text,
+                &inner.memory_reader,
+                &inner.memory_reloaded_gen,
+            ),
+            LexicalScope::StatementText => (
+                &inner.shard.statements,
+                &inner.statements_reader,
+                &inner.statements_reloaded_gen,
+            ),
         };
-        // Tantivy's default `ReloadPolicy::OnCommitWithDelay` may
-        // lag behind the writer's commits by up to ~50 ms. We
-        // call `reload()` synchronously so callers see a
-        // consistent view of all committed writes (the idempotency
-        // contract: identical results between commits).
-        reader
-            .reload()
-            .map_err(|e| LexicalError::Internal(format!("reader reload: {e}")))?;
+        // Tantivy's default `ReloadPolicy::OnCommitWithDelay` may lag behind
+        // the writer's commits by up to ~50 ms, so this path used to
+        // `reload()` on every query to guarantee read-your-commits. That is
+        // pure overhead when nothing has committed since the last reload. The
+        // indexer bumps `commit_generation` after each commit; reload only
+        // when it has advanced past the generation this reader last saw, then
+        // record the new value. The cached searcher still reflects every
+        // committed write (invariant #7), without a reload per query.
+        let current_gen = handle.commit_generation();
+        if reloaded_gen.load(Ordering::Acquire) != current_gen {
+            reader
+                .reload()
+                .map_err(|e| LexicalError::Internal(format!("reader reload: {e}")))?;
+            reloaded_gen.store(current_gen, Ordering::Release);
+        }
         let searcher = reader.searcher();
         let q = build_query(query, handle, scope)?;
         let collector = TopDocs::with_limit(config.top_k.max(1)).order_by_score();
