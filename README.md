@@ -328,9 +328,8 @@ Work that isn't done yet. Kept flat on purpose — no milestone tags, no version
 
 - **Resolver tier 4 (LLM).** Tiers 1–3 (exact+alias / fuzzy / embedding) ship today; an LLM-assisted tier for ambiguous entity disambiguation is planned.
 - **Per-statement-kind retention policies.** Retention today is decay-based per-kind; explicit policies (e.g. per-namespace TTL) are planned.
-- **`ADMIN_BACKFILL` / `ADMIN_CANCEL` wire opcodes.** Backfill is operational via direct enqueue today; an operator-facing wire surface is planned.
 - **`SCHEMA_DROP` opcode.** In-place schema downgrade — today's revert is a manual runbook step.
-- **Cascade audit rows + soft-cascade revert.** FORGET cascade itself works; an audit log of cascaded writes plus a revert path is planned.
+- **FORGET-cascade audit rows + soft-cascade revert.** The queryable audit log records per-call extraction and per-mention resolution derivations (`GET /v1/audit`); a dedicated audit of *cascaded* FORGET writes plus a revert path is still planned.
 - **Per-row stale-extraction flag.** Stale (schema-version-behind) statements are counted via a metric today; a durable per-row flag needs a row-schema bump.
 - **Streaming retrieval query results.** `limit > 100` would stream across multiple `QueryResponse` frames — today's response is single-frame.
 - **Retrieval + transactional read-your-writes, richer lensing.** RECALL inside a transaction already overlays pending writes on committed data; deeper lens layering across statements + relations is planned.
