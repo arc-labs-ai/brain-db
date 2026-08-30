@@ -634,3 +634,83 @@ fn quiesce_releases_lock_and_resume_rebuilds_writer() {
         task.await;
     })
 }
+
+/// Failure-path counterpart to the test above. If the writer rebuild on
+/// `Resume` fails, the drain loop MUST NOT ack success. A success ack makes
+/// the shard's rebuild orchestrator report the live-swap succeeded, while this
+/// loop terminates and drops its op-channel receiver — after which every later
+/// ENCODE/FORGET silently loses its lexical write forever (invariant #7). The
+/// correct behavior: drop the ack sender so the orchestrator's `await_ack`
+/// observes the closed channel and the rebuild fails loudly.
+#[test]
+fn resume_writer_rebuild_failure_drops_ack_instead_of_faking_success() {
+    use crate::index::text_indexer::IndexerControl;
+
+    run_in_glommio(|| async {
+        let (dir, handle) = fresh_shard();
+        // N=1 so the pre-quiesce op commits immediately.
+        let policy = CommitPolicy::new(1, Duration::from_secs(60));
+
+        let (dispatcher, rx) = MemoryTextDispatcher::default_channel();
+        let (_stop_tx, stop_rx) = flume::bounded::<()>(1);
+        let (control_tx, control_rx) = flume::bounded::<IndexerControl>(2);
+        let task = glommio::spawn_local(async move {
+            let _stop_tx = _stop_tx;
+            run_memory_text_indexer(handle, rx, policy, stop_rx, control_rx).await;
+        });
+
+        // Land one op so the loop is genuinely running a live writer.
+        dispatcher
+            .dispatch(MemoryTextOp::Upsert {
+                id: MemoryId::pack(0, 1, 0),
+                text: "alpha".into(),
+                space: SpaceId::new(),
+                kind: MemoryKind::Episodic,
+                created_at_unix_ms: 0,
+                session: 0,
+            })
+            .await;
+
+        // Quiesce: the indexer drops its writer (releasing the lock) and acks.
+        let (ack_tx, ack_rx) = flume::bounded::<()>(1);
+        control_tx
+            .send_async(IndexerControl::Quiesce { ack: ack_tx })
+            .await
+            .expect("send quiesce");
+        ack_rx.recv_async().await.expect("quiesce ack");
+
+        // Steal the per-directory writer lock and HOLD it for the duration, so
+        // the indexer's `Resume` writer rebuild is guaranteed to fail with a
+        // tantivy lock error (the same lock the quiesce just released).
+        let reopened = TantivyShard::open(dir.path()).expect("reopen").shard;
+        let lock_hog = reopened
+            .memory_text
+            .index
+            .writer_with_num_threads::<TantivyDocument>(1, 50_000_000)
+            .expect("steal writer lock while indexer is quiesced");
+
+        // Resume with a handle whose writer rebuild will fail. The loop must
+        // NOT ack success: it drops the ack sender, so this recv returns Err
+        // (mirrors the shard's `await_ack` reporting rebuild failure).
+        let (ack_tx, ack_rx) = flume::bounded::<()>(1);
+        control_tx
+            .send_async(IndexerControl::Resume {
+                handle: reopened.memory_text.clone(),
+                ack: ack_tx,
+            })
+            .await
+            .expect("send resume");
+        assert!(
+            ack_rx.recv_async().await.is_err(),
+            "resume with a failed writer rebuild must drop the ack sender \
+             (fail loudly), never ack success",
+        );
+
+        // The drain loop terminated cleanly (returned None from the paused
+        // wait) rather than parking forever or wedging.
+        drop(control_tx);
+        task.await;
+        drop(lock_hog);
+        drop(dispatcher);
+    })
+}

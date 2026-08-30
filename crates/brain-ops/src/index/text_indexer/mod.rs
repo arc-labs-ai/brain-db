@@ -108,9 +108,15 @@ pub(crate) async fn wait_while_paused(
                         error = %e,
                         "indexer resume: writer rebuild failed; terminating drain loop",
                     );
-                    // Ack so the orchestrator does not block; the loop
-                    // terminates — the shard treats a dead indexer as fatal.
-                    let _ = ack.send_async(()).await;
+                    // Do NOT ack success. A success ack would make the
+                    // rebuild orchestrator's `await_ack` return `Ok`, so the
+                    // rebuild reports success — yet this drain loop is about to
+                    // terminate and drop its op-channel receiver, after which
+                    // every later ENCODE/FORGET silently discards its lexical
+                    // write forever (invariant #7). Dropping the ack sender
+                    // instead closes the ack channel, so `await_ack` observes
+                    // the drop and the rebuild fails loudly.
+                    drop(ack);
                     return None;
                 }
             },

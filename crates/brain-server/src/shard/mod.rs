@@ -2068,23 +2068,40 @@ impl Shard {
         let start = std::time::Instant::now();
 
         // 1. Quiesce both indexers (release the per-directory writer locks).
+        //    The FIRST quiesce may `?` — nothing is quiesced yet, so an early
+        //    return leaves both indexers running. But the instant an indexer
+        //    quiesces it drops its writer and parks; a quiesced indexer left
+        //    un-resumed is wedged forever and the write path stalls silently
+        //    (invariant #7). So from here on NOTHING may `?` before the resume
+        //    region — every fallible step is recorded and surfaced only after
+        //    resume runs.
         quiesce_indexer(self.memory_text_control.as_ref(), "memory_text").await?;
-        quiesce_indexer(self.statement_text_control.as_ref(), "statements").await?;
 
-        // 2. Rebuild both on-disk indexes from authoritative redb. Capture
-        //    the result but do not early-return: the indexers must be
-        //    resumed on a valid index no matter what, or lexical writes
-        //    would silently stall (invariant #7).
+        // memory_text is now quiesced. Record — never `?` — the rest.
+        let quiesce_err = quiesce_indexer(self.statement_text_control.as_ref(), "statements")
+            .await
+            .err();
+
+        // 2. Rebuild both on-disk indexes from authoritative redb. Skip the
+        //    rebuild if the statement indexer never quiesced: it still holds
+        //    the per-directory writer lock, so the on-disk replace could not
+        //    complete cleanly. Resume is still guaranteed below regardless.
         let metadata = self.ops.executor.metadata.as_ref();
-        let rebuild_result: Result<u64, String> = (|| {
-            let mem =
-                brain_ops::index::text_indexer::rebuild_memory_text(&self.tantivy_dir, metadata)
-                    .map_err(|e| format!("memory text rebuild: {e}"))?;
-            let stmt =
-                brain_ops::index::text_indexer::rebuild_statements(&self.tantivy_dir, metadata)
-                    .map_err(|e| format!("statement text rebuild: {e}"))?;
-            Ok(mem.rows_processed + stmt.rows_processed)
-        })();
+        let rebuild_result: Result<u64, String> = if quiesce_err.is_some() {
+            Ok(0)
+        } else {
+            (|| {
+                let mem = brain_ops::index::text_indexer::rebuild_memory_text(
+                    &self.tantivy_dir,
+                    metadata,
+                )
+                .map_err(|e| format!("memory text rebuild: {e}"))?;
+                let stmt =
+                    brain_ops::index::text_indexer::rebuild_statements(&self.tantivy_dir, metadata)
+                        .map_err(|e| format!("statement text rebuild: {e}"))?;
+                Ok(mem.rows_processed + stmt.rows_processed)
+            })()
+        };
 
         // 3. Reopen the shard from disk. `TantivyShard::open` reconciles any
         //    interrupted swap, so even a mid-rebuild failure yields a valid
@@ -2092,19 +2109,24 @@ impl Shard {
         let reopened = brain_index::TantivyShard::open(&self.tantivy_dir)
             .map_err(|e| format!("reopen tantivy after rebuild: {e}"));
 
+        // Capture — never swallow — the retriever swap error. A failed swap
+        // leaves the retriever's cached readers bound to the pre-rebuild
+        // `Index`, whose segment files the completed on-disk rebuild has
+        // already deleted: reads would serve from unlinked segments (stale /
+        // vanishing data), exactly what invariant #7 forbids. So a swap
+        // failure must fail-stop the rebuild, not merely log.
+        let mut swap_err: Option<String> = None;
         let resume_handles = match &reopened {
             // Swap the read side and resume onto the reopened index.
             Ok(startup) => {
                 let new_shard = startup.shard.clone();
                 if let Err(e) = self.lexical_retriever.swap_shard(new_shard.clone()) {
-                    // Retriever swap failed: fall back to resuming the
-                    // indexers on the same reopened shard anyway so writes
-                    // keep flowing; surface the error below.
                     tracing::error!(
                         shard_id = self.shard_id,
                         error = %e,
                         "lexical retriever swap failed during tantivy rebuild",
                     );
+                    swap_err = Some(format!("lexical retriever swap after rebuild: {e}"));
                 }
                 Some((new_shard.memory_text.clone(), new_shard.statements.clone()))
             }
@@ -2118,20 +2140,43 @@ impl Shard {
                 .map(|s| (s.memory_text.clone(), s.statements.clone())),
         };
 
-        // 4. Resume both indexers on the resolved handles.
+        // 4. Resume both indexers on the resolved handles. This region MUST
+        //    run on every exit path above: a quiesced indexer that is never
+        //    resumed stays parked with its writer dropped and stalls the write
+        //    path silently. Record resume failures too — but never let a
+        //    failed first resume skip the second (each indexer must be revived
+        //    independently).
+        let mut resume_err: Option<String> = None;
         if let Some((mem_handle, stmt_handle)) = resume_handles {
-            resume_indexer(self.memory_text_control.as_ref(), mem_handle, "memory_text").await?;
-            resume_indexer(
+            if let Err(e) =
+                resume_indexer(self.memory_text_control.as_ref(), mem_handle, "memory_text").await
+            {
+                resume_err.get_or_insert(e);
+            }
+            if let Err(e) = resume_indexer(
                 self.statement_text_control.as_ref(),
                 stmt_handle,
                 "statements",
             )
-            .await?;
+            .await
+            {
+                resume_err.get_or_insert(e);
+            }
         }
 
-        // Now surface any earlier failure.
+        // Both indexers are resumed (or their revival failure recorded). Only
+        // now surface the first failure, in dependency order, as fail-stop.
+        if let Some(e) = quiesce_err {
+            return Err(e);
+        }
         let entries = rebuild_result?;
         reopened.map(|_| ())?;
+        if let Some(e) = swap_err {
+            return Err(e);
+        }
+        if let Some(e) = resume_err {
+            return Err(e);
+        }
 
         tracing::info!(
             shard_id = self.shard_id,

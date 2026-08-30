@@ -416,10 +416,12 @@ fn kind_to_u64(kind: MemoryKind) -> u64 {
 /// deletes since the failed `commit()` remain in the
 /// `IndexWriter` buffer per tantivy semantics.
 ///
-/// Returns `Err(())` on the **second** failure, signalling that
-/// the caller should terminate the drain loop. The shard
-/// supervisor sees the drop of the dispatcher's receiver and
-/// alerts (text indexing failure is shard-fatal).
+/// Returns `Err(())` on the **second** failure, signalling that the caller
+/// should terminate the drain loop. Text indexing is correctness, not
+/// best-effort, so a dead indexer is shard-fatal. NOTE: a runtime supervisor
+/// that observes this task's completion outside teardown and fail-stops the
+/// shard is not yet wired (follow-up); today the dead loop is only noticed at
+/// the next shutdown join or by a rebuild's control ack failing.
 fn commit_with_retry(writer: &mut IndexWriter) -> Result<(), ()> {
     match attempt_commit(writer) {
         Ok(()) => Ok(()),
