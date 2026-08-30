@@ -288,3 +288,74 @@ fn graph_fetch_edge_expansion_excludes_foreign_tenant() {
         assert_ne!(own_rel, foreign_rel);
     })
 }
+
+/// A hand-forged GRAPH_FETCH cursor: correct version + flags for
+/// [`fetch_request`] (include_statements only), but an embedded stmt-key that
+/// names the reserved `ns=0/space=0` floor instead of the caller's scope.
+///
+/// Wire layout (opaque bytes on the wire): `[version(1)][flags(1)]` then the
+/// serialized `STATEMENTS_BY_SUBJECT` key `ns(4)+space(16)+subject(16)+
+/// kind(1)+predicate(4)+is_current(1)+statement_id(16)` = 58 bytes. All key
+/// bytes left zero → the floor.
+fn forged_zero_scope_cursor() -> Vec<u8> {
+    const FLAG_STATEMENTS: u8 = 0b0001;
+    let mut cur = vec![0u8; 60];
+    cur[0] = 1; // CURSOR_VERSION
+    cur[1] = FLAG_STATEMENTS; // matches fetch_request()'s flags
+    cur
+}
+
+/// Regression for the cross-tenant leak: before the cursor was bound to the
+/// caller's tenant, `decode_cursor` accepted any well-formed cursor and used
+/// its embedded key as the scan lower bound. A forged cursor claiming the
+/// reserved `ns=0/space=0` floor widened the range to every tenant sorting
+/// below the caller and emitted their statement text/values.
+///
+/// Here B's namespace is interned first so it takes the lower id and sorts
+/// beneath A on the shared statement index — exactly the rows a `(0,0)` floor
+/// would sweep in. The forged cursor MUST be rejected, and A's clean page
+/// MUST never contain B's secret statement value.
+#[test]
+fn graph_fetch_forged_zero_scope_cursor_rejected_and_no_leak() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        // Intern B first → lower namespace id → sorts below A.
+        fix.intern_namespace("evil");
+        fix.intern_namespace("acme");
+        let a = caller("acme", ACME_SPACE);
+        let b = caller("evil", EVIL_SPACE);
+
+        // A's own statemented entity.
+        let alpha = create_entity(&fix, a.clone(), [1; 16], "Alpha Public").await;
+        create_statement(&fix, a.clone(), [2; 16], alpha, "lead").await;
+
+        // B's secret statement — the row a forged floor would leak.
+        let beta = create_entity(&fix, b.clone(), [3; 16], "BetaSecret").await;
+        create_statement(
+            &fix,
+            b.clone(),
+            [4; 16],
+            beta,
+            "BetaSecret Confidential Salary",
+        )
+        .await;
+
+        // A legitimate first-page fetch never carries B's secret value.
+        let clean = fetch(&fix, a.clone()).await;
+        assert!(
+            !clean.nodes.iter().any(|n| n.label.contains("Confidential")),
+            "B's statement value leaked into A's clean page: {:?}",
+            clean.nodes
+        );
+
+        // The forged out-of-tenant cursor is rejected outright — it never
+        // becomes a scan floor, so B's rows cannot surface.
+        let mut req = fetch_request();
+        req.cursor = forged_zero_scope_cursor();
+        let outcome = dispatch(RequestBody::GraphFetch(req), a, &fix.ctx).await;
+        assert!(
+            outcome.is_err(),
+            "TENANT BREACH: forged ns=0/space=0 cursor must be rejected, got {outcome:?}"
+        );
+    })
+}
