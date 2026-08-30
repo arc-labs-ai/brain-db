@@ -344,6 +344,7 @@ async fn recall_inside_txn_returns_committed_pipeline_hits() {
         RequestBody::TxnBegin(TxnBeginRequest {
             txn_id,
             timeout_seconds: 30,
+            act_as: None,
         }),
     )
     .await;
@@ -500,6 +501,7 @@ async fn txn_recall_invariants_hold_across_request_shapes() {
                 RequestBody::TxnBegin(TxnBeginRequest {
                     txn_id: id,
                     timeout_seconds: 30,
+                    act_as: None,
                 }),
             )
             .await;

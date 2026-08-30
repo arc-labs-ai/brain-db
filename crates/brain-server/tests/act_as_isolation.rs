@@ -43,7 +43,7 @@ use brain_protocol::envelope::request::{
     EncodeRequest, RecallRequest, RequestBody, SubscribeRequest, SubscriptionFilter,
 };
 use brain_protocol::envelope::response::{ErrorCodeWire, ResponseBody};
-use brain_protocol::{ActAs, EventType, Frame};
+use brain_protocol::{ActAs, EventType, Frame, TxnBeginRequest, TxnCommitRequest};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -256,6 +256,63 @@ fn act_as(namespace: &str, space: &str) -> ActAs {
         namespace: namespace.to_string(),
         space_id: space.to_string(),
     }
+}
+
+/// Open a transaction as `act_as` (when `Some`), returning the opcode/body so a
+/// caller can assert either success (`TxnBeginResp`) or a denial (`Error`).
+async fn txn_begin_as(
+    client: &mut TcpStream,
+    stream_id: u32,
+    txn_id: [u8; 16],
+    act_as: Option<ActAs>,
+) -> (u16, ResponseBody) {
+    let req = TxnBeginRequest {
+        txn_id,
+        timeout_seconds: 60,
+        act_as,
+    };
+    round_trip(client, stream_id, RequestBody::TxnBegin(req)).await
+}
+
+/// Buffer an ENCODE into an open transaction, returning the reserved
+/// `memory_id`. Runs as the connection's own identity (no per-op `act_as`) —
+/// the delegation fixed at begin governs where the committed row lands.
+async fn encode_in_txn(
+    client: &mut TcpStream,
+    stream_id: u32,
+    txn_id: [u8; 16],
+    text: &str,
+) -> u128 {
+    let req = EncodeRequest {
+        text: text.into(),
+        session_id: 0,
+        request_id: *uuid::Uuid::now_v7().as_bytes(),
+        txn_id: Some(txn_id),
+        occurred_at_unix_nanos: None,
+        act_as: None,
+        wait: brain_protocol::WaitMode::Ack,
+        allow_duplicates: false,
+    };
+    let (opcode, body) = round_trip(client, stream_id, RequestBody::Encode(req)).await;
+    match body {
+        ResponseBody::Encode(r) if opcode == Opcode::EncodeResp.as_u16() => r.memory_id,
+        other => panic!("encode-in-txn failed: opcode=0x{opcode:04x} body={other:?}"),
+    }
+}
+
+/// Commit an open transaction (never carries `act_as`).
+async fn txn_commit(client: &mut TcpStream, stream_id: u32, txn_id: [u8; 16]) {
+    let (opcode, body) = round_trip(
+        client,
+        stream_id,
+        RequestBody::TxnCommit(TxnCommitRequest { txn_id }),
+    )
+    .await;
+    assert_eq!(
+        opcode,
+        Opcode::TxnCommitResp.as_u16(),
+        "expected TxnCommitResp, got 0x{opcode:04x}: {body:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -722,6 +779,117 @@ async fn subscribe_act_as_outside_allowlist_is_denied() {
         act_as: Some(act_as("tenant_x", "space-x")),
     };
     let (opcode, body) = round_trip(&mut svc, 1, RequestBody::Subscribe(req)).await;
+    assert_eq!(
+        opcode,
+        Opcode::Error.as_u16(),
+        "expected an Error frame, got 0x{opcode:04x}: {body:?}"
+    );
+    match body {
+        ResponseBody::Error(e) => assert_eq!(
+            e.code,
+            ErrorCodeWire::ActAsDenied,
+            "expected ActAsDenied, got {:?}: {}",
+            e.code,
+            e.message
+        ),
+        other => panic!("expected Error body, got {other:?}"),
+    }
+
+    server.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Delegated transactions (act_as on TXN_BEGIN)
+// ---------------------------------------------------------------------------
+
+/// A transaction begun with `act_as` commits its buffered writes under the
+/// delegated identity — the shared-pool gateway model at the transaction level.
+/// One service-principal connection opens a txn on behalf of a tenant, buffers
+/// a write as its own identity, and commits (TXN_COMMIT never carries
+/// `act_as`); the committed memory must be reachable by the tenant's effective
+/// identity and invisible to the connection's own identity.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn txn_begun_with_act_as_commits_under_delegated_identity() {
+    let server = start(1).await; // one shard → begin/commit collocated
+
+    let svc_space = *uuid::Uuid::now_v7().as_bytes();
+    let svc_token = server.mint_with_may_act(
+        "svc",
+        svc_space,
+        brain_metadata::api_keys::bits::ACT_AS | brain_metadata::api_keys::bits::STANDARD_SPACE,
+        vec!["tenant_txn".to_string()],
+    );
+
+    let mut svc = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect svc");
+    handshake_as(&mut svc, &svc_token).await;
+
+    let txn_id = *uuid::Uuid::now_v7().as_bytes();
+
+    // BEGIN as tenant_txn.
+    let (opcode, body) =
+        txn_begin_as(&mut svc, 1, txn_id, Some(act_as("tenant_txn", "space-txn"))).await;
+    assert_eq!(
+        opcode,
+        Opcode::TxnBeginResp.as_u16(),
+        "delegated TXN_BEGIN should succeed, got 0x{opcode:04x}: {body:?}"
+    );
+
+    // Buffer a write (as the connection's own identity), then COMMIT (which
+    // carries no act_as). The delegation fixed at begin must still steer it.
+    let mem = encode_in_txn(
+        &mut svc,
+        3,
+        txn_id,
+        "tenant_txn secret: the pager code is 8080",
+    )
+    .await;
+    txn_commit(&mut svc, 5, txn_id).await;
+
+    // The delegated identity sees the committed memory.
+    let delegated_ids = recall_ids_as(
+        &mut svc,
+        7,
+        "pager code secret",
+        Some(act_as("tenant_txn", "space-txn")),
+    )
+    .await;
+    assert!(
+        delegated_ids.contains(&mem),
+        "delegated identity's RECALL must find the txn-committed memory {mem}; got {delegated_ids:?}"
+    );
+
+    // The connection's OWN identity (act_as = None) must NOT — proving the
+    // write landed in the delegated space, not the committing connection's.
+    let own_ids = recall_ids_as(&mut svc, 9, "pager code secret", None).await;
+    assert!(
+        !own_ids.contains(&mem),
+        "TENANCY BREACH: the committing connection's own identity saw the delegated txn write {mem}; got {own_ids:?}"
+    );
+
+    server.stop().await;
+}
+
+/// R1 at the transaction boundary: a principal WITHOUT the `ACT_AS` grant that
+/// opens a txn with an `act_as` selector is hard-rejected with `ActAsDenied` —
+/// the same gate ENCODE enforces, reached through TXN_BEGIN's own dispatch arm.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn txn_begin_act_as_without_grant_is_denied() {
+    let server = start(1).await;
+
+    let space = [0xC5u8; 16];
+    // FULL deliberately excludes ACT_AS.
+    let token = server.mint("plain", space, brain_metadata::api_keys::bits::FULL);
+
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
+    handshake_as(&mut client, &token).await;
+
+    let txn_id = *uuid::Uuid::now_v7().as_bytes();
+    let (opcode, body) =
+        txn_begin_as(&mut client, 1, txn_id, Some(act_as("tenant_a", "space-a"))).await;
     assert_eq!(
         opcode,
         Opcode::Error.as_u16(),

@@ -136,6 +136,7 @@ fn txn_committed_memory_is_stamped_with_caller_namespace() {
                 RequestBody::TxnBegin(TxnBeginRequest {
                     txn_id,
                     timeout_seconds: 60,
+                    act_as: None,
                 }),
                 c(),
                 &fix.ctx,

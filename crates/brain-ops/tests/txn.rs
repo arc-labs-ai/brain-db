@@ -337,6 +337,7 @@ async fn begin(fix: &Fixture, txn_id: [u8; 16], timeout_seconds: u32) -> TxnBegi
             RequestBody::TxnBegin(TxnBeginRequest {
                 txn_id,
                 timeout_seconds,
+                act_as: None,
             }),
             brain_ops::RequestCaller::for_tests(),
             &fix.ctx,
@@ -925,6 +926,7 @@ async fn begin_with_connection(
             RequestBody::TxnBegin(TxnBeginRequest {
                 txn_id,
                 timeout_seconds,
+                act_as: None,
             }),
             caller,
             &fix.ctx,
@@ -1296,6 +1298,7 @@ fn foreign_connection_cannot_read_pending_writes() {
                 RequestBody::TxnBegin(TxnBeginRequest {
                     txn_id: txn,
                     timeout_seconds: 60,
+                    act_as: None,
                 }),
                 caller_on(CONN_A),
                 &fix.ctx,
@@ -1355,6 +1358,7 @@ fn foreign_connection_cannot_write_into_txn() {
             RequestBody::TxnBegin(TxnBeginRequest {
                 txn_id: txn,
                 timeout_seconds: 60,
+                act_as: None,
             }),
             caller_on(CONN_A),
             &fix.ctx,
@@ -1399,6 +1403,7 @@ fn foreign_connection_cannot_commit_or_abort_txn() {
             RequestBody::TxnBegin(TxnBeginRequest {
                 txn_id: txn,
                 timeout_seconds: 60,
+                act_as: None,
             }),
             caller_on(CONN_A),
             &fix.ctx,

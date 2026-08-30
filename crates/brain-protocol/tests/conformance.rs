@@ -3161,10 +3161,11 @@ fn corpus() -> Vec<Case> {
     let txn_begin_req = TxnBeginRequest {
         txn_id: TXN_ID,
         timeout_seconds: 45,
+        act_as: None,
     };
     cases.push(req_case(
         "req_txn_begin",
-        RequestBody::TxnBegin(txn_begin_req),
+        RequestBody::TxnBegin(txn_begin_req.clone()),
         &txn_begin_req,
     ));
     // COMMIT and ABORT are byte-identical single-field maps; the opcode is the

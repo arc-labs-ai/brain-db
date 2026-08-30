@@ -326,6 +326,7 @@ fn publish_txn_commit_emits_all_buffered_events_in_order() {
             RequestBody::TxnBegin(TxnBeginRequest {
                 txn_id,
                 timeout_seconds: 60,
+                act_as: None,
             }),
             brain_ops::RequestCaller::for_tests(),
             &fix.ctx,

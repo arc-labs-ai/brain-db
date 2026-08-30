@@ -69,6 +69,22 @@ pub enum TxnFinalResponse {
     Abort(TxnFinalAbort),
 }
 
+/// Effective identity every write buffered in a transaction commits as.
+///
+/// Captured once, at `TXN_BEGIN`, from the authorized `act_as` selector the
+/// begin carried (delegation is fixed for the life of the txn). `TXN_COMMIT`
+/// arrives under the connection's own key-bound identity — it carries no
+/// `act_as` of its own — so the commit path reads the frozen identity from
+/// here to submit the buffered writes as the delegated `(namespace, space)`
+/// rather than the committing connection's identity. The three fields mirror
+/// the per-request `ExecutorContext` caller triple.
+#[derive(Debug, Clone)]
+pub struct DelegatedIdentity {
+    pub space_id: brain_core::SpaceId,
+    pub namespace: brain_core::NamespaceId,
+    pub space_string: String,
+}
+
 pub struct TxnEntry {
     pub state: TxnState,
     pub started_at_unix_nanos: u64,
@@ -76,6 +92,9 @@ pub struct TxnEntry {
     pub timeout_seconds: u32,
     pub final_response: Option<TxnFinalResponse>,
     pub buffer: Option<TxnBuffer>,
+    /// Frozen delegated identity for a txn begun with `act_as`. `None` for a
+    /// non-delegated txn, which commits as the connection's own identity.
+    pub delegated: Option<DelegatedIdentity>,
     /// Wire-level session that opened this txn. The connection layer
     /// fans out [`TxnStore::abort_orphaned_for_connection`] when this
     /// session's TCP/TLS connection drops, so buffered work doesn't
@@ -402,6 +421,23 @@ pub async fn handle_txn_begin(
         });
     }
 
+    // Freeze the delegated identity when the begin carried an `act_as`.
+    // Authorization (R1: the ACT_AS grant, R2: the `may_act` allowlist) has
+    // already run in the dispatch layer before this handler is reached, and by
+    // this point `ctx.executor` carries the resolved effective identity — the
+    // same triple the direct delegated-write path (ENCODE with `act_as`) runs
+    // under. TXN_COMMIT arrives with no `act_as`, so we capture the identity
+    // here and the commit reads it back rather than re-deriving one.
+    let delegated = if req.act_as.is_some() {
+        Some(DelegatedIdentity {
+            space_id: ctx.executor.caller_space,
+            namespace: ctx.executor.caller_namespace,
+            space_string: ctx.executor.caller_space_string.clone(),
+        })
+    } else {
+        None
+    };
+
     let expires_at = now.saturating_add(u64::from(timeout_seconds) * 1_000_000_000);
     let entry = TxnEntry {
         state: TxnState::Active,
@@ -410,6 +446,7 @@ pub async fn handle_txn_begin(
         timeout_seconds,
         final_response: None,
         buffer: Some(TxnBuffer::default()),
+        delegated,
         connection_id,
     };
     entries.insert(req.txn_id, entry);
@@ -428,7 +465,7 @@ pub async fn handle_txn_commit(
     let store = &*ctx.txn_store;
 
     // Take the buffer + mark in-progress while we apply (under lock).
-    let (buffer, started_at) = {
+    let (buffer, started_at, delegated) = {
         let mut entries = store.entries.lock();
         let now = now_unix_nanos();
         TxnStore::sweep_expired_locked(&mut entries, now);
@@ -453,7 +490,9 @@ pub async fn handle_txn_commit(
         }
         let buf = entry.buffer.take().ok_or(OpError::TxnExpired)?;
         let started_at = entry.started_at_unix_nanos;
-        (buf, started_at)
+        // The identity frozen at begin. `None` for a non-delegated txn.
+        let delegated = entry.delegated.clone();
+        (buf, started_at, delegated)
     };
 
     let ops_applied = buffer.ops_count();
@@ -488,8 +527,22 @@ pub async fn handle_txn_commit(
     // instead of silently returning the cached ack.
     let write_id = write_id_from_txn(req.txn_id);
     let request_hash = hash_txn_commit_request(req.txn_id, &phases);
-    let write = crate::write::Write::from_phases(write_id, ctx.executor.caller_space, phases)
-        .with_namespace(ctx.executor.caller_namespace)
+    // A txn begun with `act_as` commits every buffered write as the delegated
+    // identity frozen at begin — not the identity of the connection that
+    // happens to issue the commit. A non-delegated txn commits as the
+    // committing connection's own key-bound identity (the two coincide when a
+    // txn is opened and committed on one plain connection).
+    let (space_id, namespace, space_string) = match &delegated {
+        Some(d) => (d.space_id, d.namespace, d.space_string.clone()),
+        None => (
+            ctx.executor.caller_space,
+            ctx.executor.caller_namespace,
+            ctx.executor.caller_space_string.clone(),
+        ),
+    };
+    let write = crate::write::Write::from_phases(write_id, space_id, phases)
+        .with_namespace(namespace)
+        .with_space_string(space_string)
         .with_request_hash(request_hash);
     let real_writer = crate::handlers::link::downcast_writer_pub(ctx)?;
     match real_writer.submit(write).await {

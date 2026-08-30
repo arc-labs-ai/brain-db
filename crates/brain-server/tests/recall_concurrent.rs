@@ -298,6 +298,7 @@ async fn concurrent_txn_and_non_txn_recalls_route_correctly() {
                         // single shard executor (heavy + slow under emulation);
                         // txn expiry mid-test would surface as an error frame.
                         timeout_seconds: 120,
+                        act_as: None,
                     }),
                 )
                 .await;
