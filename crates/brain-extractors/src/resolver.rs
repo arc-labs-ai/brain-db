@@ -20,8 +20,19 @@
 //!    score is at or above [`EMBED_RESOLVE_THRESHOLD`], add the
 //!    surface form as an alias and return that EntityId. This catches
 //!    paraphrases trigrams miss (e.g. "Stripe Inc." vs
-//!    "Stripe Payments").
-//! 5. **Create** — mint a fresh UUIDv7 EntityId, intern the type if
+//!    "Stripe Payments"). A candidate that lands in the lower,
+//!    ambiguous partial-match band is not aliased outright — it goes
+//!    to the disambiguator (tier 5) for a second opinion.
+//! 5. **Disambiguate (second opinion)** — when the embedding probe
+//!    lands a candidate in the ambiguous partial-match band, ask the
+//!    pluggable disambiguator whether it is the same entity. The
+//!    backend is LLM-driven today (via [`brain_llm::LlmClient`];
+//!    heuristics or a classifier could slot in later). A confirmed
+//!    match aliases the surface form and returns
+//!    ([`ResolutionTier::Disambiguated`]); an explicit rejection, or an
+//!    uncertain / absent disambiguator, falls through to create. This
+//!    tier is live today, not planned.
+//! 6. **Create** — mint a fresh UUIDv7 EntityId, intern the type if
 //!    needed, embed the canonical name (when an HNSW is wired), write
 //!    the entity row + the durable vector row, and STAGE the HNSW
 //!    insert in a [`StagedEntityVectors`] the caller flushes after its
@@ -33,17 +44,17 @@
 //!
 //! Determinism comes from the lookup contract: given the same DB
 //! state + same surface form, the resolver always returns the same
-//! EntityId. Tier-5 creates use UUIDv7 (time + random), so two
+//! EntityId. Tier-6 creates use UUIDv7 (time + random), so two
 //! independent resolves of the same brand-new surface form against
 //! the same DB produce different IDs only if both observe a
-//! tier-1/2/3/4 miss — which is the intended split-brain semantics
+//! tier-1/2/3/4/5 miss — which is the intended split-brain semantics
 //! for two simultaneous extractions.
 //!
 //! The embedding threshold defaults to 0.78 cosine, carried on
 //! [`EmbeddingDeps::embed_threshold`]; the shard ferries
 //! `[extractors.resolver] embed_threshold` there. Callers that have no
-//! HNSW or no embedder pass `None` for either and the tier silently
-//! skips — the gauntlet still flows through tier-1/2/3/5 unchanged.
+//! HNSW or no embedder pass `None` for either and tiers 4–5 silently
+//! skip — the gauntlet still flows through tier-1/2/3/6 unchanged.
 
 use std::collections::HashSet;
 use std::sync::Arc;

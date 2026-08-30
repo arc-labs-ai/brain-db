@@ -7,7 +7,7 @@
   <a href="#status"><img src="https://img.shields.io/badge/status-pre--release%20v0.1.0-orange.svg" alt="Status"></a>
   <a href="#tech-stack"><img src="https://img.shields.io/badge/language-Rust-orange.svg" alt="Rust"></a>
   <a href="#platform-support"><img src="https://img.shields.io/badge/platform-Linux-lightgrey.svg" alt="Linux"></a>
-  <a href="spec/"><img src="https://img.shields.io/badge/spec-148%20files-blue.svg" alt="Spec"></a>
+  <a href="spec/"><img src="https://img.shields.io/badge/spec-149%20files-blue.svg" alt="Spec"></a>
 </p>
 
 # Brain
@@ -316,7 +316,6 @@ Work that isn't done yet. Kept flat on purpose — no milestone tags, no version
 
 ### Outstanding work
 
-- **Green test baseline.** A handful of pre-existing failures remain in the recall/txn/encode test-harness family — tests that return zero hits in the harness while recall works correctly in the live server and the eval rig.
 - **Acceptance suite on reference hardware.** The end-to-end harness lives in the `brain-eval` rig (`brain-eval acceptance --scale 1m` / `soak`) — latency, throughput, recall@K, system scenarios, restart-recovery. It runs; what's left is a quiet run on reference hardware (16-core x86_64, 64 GiB RAM, NVMe SSD) with the wall-time numbers captured against [`spec/19_benchmarks/02_performance_targets.md`](spec/19_benchmarks/02_performance_targets.md).
 - **Classifier inference latency on reference hardware.** The GLiNER forward pass (DeBERTa-v3 backbone → projection → label MLP → BiLSTM → markerV0 span head → einsum scoring → sigmoid decode) is implemented, validated against real weights, and dispatched live. On the dev box (aarch64, opt-level=2) it runs ~60–80 ms per short memory against a §11/01 p99 budget of 15 ms; because classification is enqueued off the ENCODE hot path this isn't a blocker, but the reference-hardware number (x86_64, opt-level=3 + LTO, optionally the `mkl` candle feature) hasn't been captured.
 - **Live LLM provider validation.** Anthropic and OpenAI clients are wired through a mock-client integration suite; a pass with real API keys and real cost accounting is still needed.
@@ -326,7 +325,6 @@ Work that isn't done yet. Kept flat on purpose — no milestone tags, no version
 
 ### Planned improvements
 
-- **Resolver tier 4 (LLM).** Tiers 1–3 (exact+alias / fuzzy / embedding) ship today; an LLM-assisted tier for ambiguous entity disambiguation is planned.
 - **Per-statement-kind retention policies.** Retention today is decay-based per-kind; explicit policies (e.g. per-namespace TTL) are planned.
 - **`SCHEMA_DROP` opcode.** In-place schema downgrade — today's revert is a manual runbook step.
 - **FORGET-cascade audit rows + soft-cascade revert.** The queryable audit log records per-call extraction and per-mention resolution derivations (`GET /v1/audit`); a dedicated audit of *cascaded* FORGET writes plus a revert path is still planned.
@@ -371,7 +369,7 @@ These directions (offloading, storage-compute split, IVF+PQ, range sharding, dec
 - **Subscribe by similarity's initial snapshot is out of scope.** A `SUBSCRIBE` with a `similar_to` vector filter delivers live events whose memory is cosine-similar (≥ threshold) to a reference memory; the reference vector is resolved once at registration by re-embedding the reference's stored text, and the per-event cosine gate runs network-side. The `include_history` snapshot ignores `similar_to` (it applies the other filters only); a bad/tombstoned/out-of-space reference is rejected with `InvalidArgument`.
 - **No hot on-demand tantivy reindex.** The lexical index rebuilds automatically from authoritative redb at startup whenever `open` reports corruption or a schema mismatch (an operator can force this by removing the index dir and restarting). A live reindex-without-restart call needs the writer quiesced, since the rebuild swaps the index directory. The vector (HNSW) index does have an on-demand rebuild (`POST /v1/rebuild-ann`).
 - **Statement-level semantic retrieval is scoped to typed-graph reads.** The `StatementEmbed`-populated statement HNSW is searched (`SemanticScope::Both`) for typed-graph `QUERY` and entity-anchored `RECALL`, but plain (non-anchored) `RECALL` stays memory-only by design — its projector surfaces only memory hits, so statement candidates there would be pure overhead.
-- **Consolidation by vector clustering falls back to windowing without an arena source.** The consolidation worker clusters each recency bucket by vector cosine (`cluster_by_similarity`), resolving candidate vectors by id; it degrades to the older window-based grouping only when no vector source is available (e.g. a bootstrap shard).
+- **Consolidation clusters by vector cosine over live redb vectors.** The consolidation worker clusters each recency bucket by vector cosine (`cluster_by_similarity`), resolving each candidate's write-time vector by id from the live redb artifact store (`get_artifact_vector`) — not the recovery-only mmap arena. A candidate whose stored vector can't be read (forgotten / never produced) is dropped fail-soft, never mis-clustered.
 - **Per-row stale-extraction flags aren't durable.** Stale (schema-version-behind) statements are counted via metrics only; a durable per-row flag needs a row-schema bump. Re-extraction itself is already handled by the schema-migration worker.
 - **Slot-version free-list reclamation isn't on the live path.** The `SlotAllocator` (free-list + version-bump-on-realloc) is implemented and exercised by recovery, but the writer mints slots via a `next_slot` atomic and live occupancy is read from redb — so the allocator's free-list reclamation isn't wired into the write path (its unit tests are `#[ignore]`'d). The slot version itself is still enforced via the `MemoryId` encoding; only physical slot *reuse* is deferred.
 
@@ -383,7 +381,7 @@ None of the above are bugs — they're scope boundaries, listed so they're not m
 
 | Topic | Location |
 |---|---|
-| **Specification** (148 files, 20 sections, normative) | [`spec/`](spec/) |
+| **Specification** (149 files, 21 sections, normative) | [`spec/`](spec/) |
 | Spec entry point + glossary + doc map | [`spec/00_overview/`](spec/00_overview/00_index.md) |
 | System architecture + design wedges | [`spec/01_architecture/`](spec/01_architecture/00_purpose.md) |
 | Data model (Memory / Entity / Statement / Relation) | [`spec/02_data_model/`](spec/02_data_model/00_purpose.md) |
@@ -416,7 +414,7 @@ brain/
 │   ├── brain-plugins/      Plugin surface (enricher + connector)
 │   ├── brain-http/         HTTP transport for the admin listener
 │   └── brain-server/       Server binary
-└── spec/                   The 148-file specification (authoritative)
+└── spec/                   The 149-file specification (authoritative)
 ```
 
 ---

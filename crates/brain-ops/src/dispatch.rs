@@ -7,8 +7,12 @@
 //! compile until the corresponding arm is added — the bug-prevention
 //! guarantee we want.
 //!
-//! Stub handlers return `OpError::NotYetImplemented` until a real
-//! implementation replaces each one.
+//! The dispatcher is complete: every data-plane and typed-graph
+//! variant routes to a real handler. `OpError::NotYetImplemented` now
+//! marks only the two arms this crate deliberately does not own — the
+//! connection-lifecycle ops handled by the network layer
+//! (`brain-server`) and, on non-Linux builds, the SUBSCRIBE stub that
+//! stands in for the io_uring-backed streaming path.
 
 use brain_core::SpaceId;
 use brain_metadata::api_keys::bits as perm_bits;
@@ -403,7 +407,7 @@ pub async fn dispatch(
         | RequestBody::Ping(_)
         | RequestBody::ClientPong(_)
         | RequestBody::CancelStream(_) => Err(OpError::NotYetImplemented(
-            "connection-lifecycle op — Phase 9 (server)",
+            "connection-lifecycle op — owned by the network layer (server)",
         )),
 
         // -----------------------------------------------------------

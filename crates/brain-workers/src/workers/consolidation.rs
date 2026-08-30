@@ -18,22 +18,20 @@
 //!
 //! ## Clustering
 //!
-//! Consolidation clusters recent Episodic memories in the same context
-//! by vector cosine similarity (DBSCAN-style density clustering per the
-//! spec). Each candidate's write-time vector is resolved by id from the
-//! arena via [`SpaceVectorSource::vector_at`] — a verified, fail-soft
-//! read that returns `None` for a stale, tombstoned, or hard-forgotten
-//! slot (invariant #4). Those candidates are dropped, never
-//! mis-clustered. The surviving `(memory_id, vector)` pairs are grouped
-//! by [`cluster_by_similarity`] (single-linkage over cosine, dropping
-//! groups below `min_cluster_size`), and each returned cluster is
-//! consolidated independently.
-//!
-//! When no vector source is wired (a bootstrap / no-arena shard, or a
-//! test harness that doesn't inject one), the worker falls back to
-//! **window-based grouping**: within a (context, recency_window) bucket
-//! it treats the oldest `min_cluster_size` candidates as a single
-//! cluster. The worker never hard-depends on the arena.
+//! Consolidation always clusters recent Episodic memories in the same
+//! context by vector cosine similarity (DBSCAN-style density clustering
+//! per the spec). Each candidate's write-time vector is resolved by id
+//! from the live redb artifact store via
+//! [`brain_ops::memory_artifact::get_artifact_vector`] — the
+//! authoritative in-run vector source, not the memory-mapped arena
+//! (which is populated only by WAL recovery and is empty for memories
+//! encoded in the current run). A candidate whose stored vector can't
+//! be read (stale, tombstoned, hard-forgotten, or never produced) is
+//! dropped fail-soft, never mis-clustered. The surviving
+//! `(memory_id, vector)` pairs are grouped by [`cluster_by_similarity`]
+//! (single-linkage over cosine, dropping groups below
+//! `min_cluster_size`), and each returned cluster is consolidated
+//! independently.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::future::Future;

@@ -84,19 +84,21 @@ pub struct RealWriterHandle {
     /// worker drains the channel and writes SimilarTo edges back into
     /// the unified edge tables. `None` means the worker isn't wired
     /// for this build (gated by config); enqueue becomes a no-op.
-    // TODO(part-3): make non-optional when auto-edge is unconditionally
-    // wired at shard spawn.
+    // A real shard wires this at spawn; the field stays `Option` only
+    // for unit-test writers that run without a shard or with the
+    // AutoEdgeWorker not provisioned.
     auto_edge_tx: Option<flume::Sender<AutoEdgeEnqueue>>,
     /// Optional non-blocking sender feeding the per-shard
     /// ExtractorWorker. Each successful ENCODE enqueues
     /// `(memory_id, text)` post-WAL-fsync + post-commit + post-HNSW;
     /// the worker drains the channel and runs the three-tier
-    /// extractor pipeline against the text. `None` means the worker
-    /// isn't wired (gated by config); enqueue becomes a no-op. The
+    /// extractor pipeline against the text. `None` means the writer
+    /// runs without a shard (unit tests); enqueue becomes a no-op. The
     /// `Arc<str>` keeps the payload cheap to push and avoids the
     /// worker re-reading text from the metadata DB on a hot path.
-    // TODO(part-3): make non-optional when extractor pool is unconditionally
-    // wired at shard spawn (entity HNSW + statement HNSW dependencies land then).
+    // Extraction is always-on, so a real shard always wires this at
+    // spawn; the field stays `Option` only for unit-test writers that
+    // run without a shard.
     extractor_tx: Option<flume::Sender<ExtractorEnqueue>>,
     /// Optional non-blocking sender feeding the per-shard
     /// TemporalEdgeWorker. Each successful ENCODE enqueues
