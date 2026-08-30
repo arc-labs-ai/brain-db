@@ -97,24 +97,62 @@ impl BackfillWorker {
 
     /// Submit a backfill request. Returns the request id. The
     /// worker picks it up on its next tick.
+    ///
+    /// Idempotent by request id: submitting a `BackfillId` that is
+    /// already in flight (the current run) or already queued (pending)
+    /// is a no-op — the id is returned but nothing is enqueued a second
+    /// time. This keeps the admin fan-out safe (one id is submitted to
+    /// every shard, and a retry of that fan-out never double-queues a
+    /// run) without ever blocking a genuine resume: once a run has
+    /// finalised and left `current`, re-submitting its id enqueues a
+    /// fresh pass that resumes from the durable checkpoints.
     pub fn submit(&self, request: BackfillRequest) -> BackfillId {
         let id = request.request_id;
-        self.state.pending.lock().push_back(request);
+        // Lock order matches `dequeue_if_idle` (current before pending)
+        // so the two can never deadlock.
+        let current = self.state.current.lock();
+        let mut pending = self.state.pending.lock();
+        let already_present = current
+            .as_ref()
+            .is_some_and(|r| r.request.request_id == id)
+            || pending.iter().any(|r| r.request_id == id);
+        if !already_present {
+            pending.push_back(request);
+        }
         id
     }
 
-    /// Cancel the in-flight request matching `request_id`. Returns
-    /// `true` if the cancel flag was flipped, `false` if no such
-    /// request is running.
+    /// Cancel the request matching `request_id`. Returns `true` if the
+    /// cancel took effect on this shard — either the in-flight run's
+    /// cancel flag was flipped, or a not-yet-started run was removed
+    /// from the pending queue — and `false` if no such request is
+    /// known here.
+    ///
+    /// A `DELETE` issued before the worker's next tick lands while the
+    /// run is still only pending; dropping it from the queue there
+    /// stops it from ever being promoted and executed. Cancelling a
+    /// pending run is not a durable veto: it removes the queued request
+    /// but records no permanent block, so a later re-submit of the same
+    /// id is honoured (resuming from checkpoints, as after an in-flight
+    /// cancel).
     pub fn cancel(&self, request_id: BackfillId) -> bool {
+        // Lock order matches `dequeue_if_idle`/`submit` (current before
+        // pending).
         let mut current = self.state.current.lock();
+        let mut acted = false;
         if let Some(running) = current.as_mut() {
             if running.request.request_id == request_id {
                 running.cancelled = true;
-                return true;
+                acted = true;
             }
         }
-        false
+        let mut pending = self.state.pending.lock();
+        let before = pending.len();
+        pending.retain(|req| req.request_id != request_id);
+        if pending.len() != before {
+            acted = true;
+        }
+        acted
     }
 
     /// Snapshot of the worker's progress on the most-recent run.
@@ -500,6 +538,108 @@ mod tests {
         let w = BackfillWorker::new();
         let unknown = BackfillId::new();
         assert!(!w.cancel(unknown));
+    }
+
+    #[test]
+    fn cancel_removes_pending_run_before_first_tick() {
+        // A DELETE issued before the worker's next tick must drop the
+        // still-pending run so it never starts.
+        let w = BackfillWorker::new();
+        let req = BackfillRequest::new(BackfillRange::All, vec![ExtractorId(1)]);
+        let id = w.submit(req);
+        assert_eq!(w.state.pending.lock().len(), 1);
+
+        assert!(w.cancel(id), "cancel of a pending run reports it acted");
+        assert_eq!(
+            w.state.pending.lock().len(),
+            0,
+            "the pending run is dropped from the queue"
+        );
+
+        // Promotion finds nothing to run.
+        assert!(w.dequeue_if_idle().is_none());
+        assert!(w.state.current.lock().is_none());
+    }
+
+    #[test]
+    fn cancel_pending_leaves_other_runs_queued() {
+        let w = BackfillWorker::new();
+        let keep = w.submit(BackfillRequest::new(BackfillRange::All, vec![ExtractorId(1)]));
+        let drop_id = w.submit(BackfillRequest::new(BackfillRange::All, vec![ExtractorId(2)]));
+        assert_eq!(w.state.pending.lock().len(), 2);
+
+        assert!(w.cancel(drop_id));
+        let pending = w.state.pending.lock();
+        assert_eq!(pending.len(), 1, "only the cancelled run is removed");
+        assert_eq!(pending.front().map(|r| r.request_id), Some(keep));
+    }
+
+    #[test]
+    fn cancel_pending_does_not_block_resubmit() {
+        // Cancelling a pending run records no durable veto: the same id
+        // can be re-submitted afterwards.
+        let w = BackfillWorker::new();
+        let req = BackfillRequest::new(BackfillRange::All, vec![ExtractorId(1)]);
+        let id = req.request_id;
+        w.submit(req.clone());
+        assert!(w.cancel(id));
+        assert_eq!(w.state.pending.lock().len(), 0);
+
+        w.submit(req);
+        assert_eq!(
+            w.state.pending.lock().len(),
+            1,
+            "the same id can be re-queued after a pending cancel"
+        );
+    }
+
+    #[test]
+    fn submit_is_idempotent_by_request_id_while_pending() {
+        // Submitting the same BackfillId twice while it is still queued
+        // is a harmless no-op — the fan-out to every shard is safe to
+        // retry.
+        let w = BackfillWorker::new();
+        let req = BackfillRequest::new(BackfillRange::All, vec![ExtractorId(1)]);
+        let id = req.request_id;
+        let first = w.submit(req.clone());
+        let second = w.submit(req);
+        assert_eq!(first, id);
+        assert_eq!(second, id);
+        assert_eq!(
+            w.state.pending.lock().len(),
+            1,
+            "the duplicate submit did not enqueue a second copy"
+        );
+    }
+
+    #[test]
+    fn submit_distinct_ids_both_queue() {
+        let w = BackfillWorker::new();
+        let a = w.submit(BackfillRequest::new(BackfillRange::All, vec![ExtractorId(1)]));
+        let b = w.submit(BackfillRequest::new(BackfillRange::All, vec![ExtractorId(2)]));
+        assert_ne!(a, b);
+        assert_eq!(w.state.pending.lock().len(), 2);
+    }
+
+    #[test]
+    fn submit_while_running_same_id_is_noop() {
+        // A run already promoted to `current` must not be re-queued by a
+        // duplicate submit of its id.
+        let w = BackfillWorker::new();
+        let req = BackfillRequest::new(BackfillRange::All, vec![ExtractorId(1)]);
+        w.submit(req.clone());
+        // Promote it to the in-flight slot.
+        assert!(w.dequeue_if_idle().is_some());
+        assert!(w.state.current.lock().is_some());
+        assert_eq!(w.state.pending.lock().len(), 0);
+
+        // Re-submitting the in-flight id does nothing.
+        w.submit(req);
+        assert_eq!(
+            w.state.pending.lock().len(),
+            0,
+            "an in-flight id is not re-queued"
+        );
     }
 
     #[test]

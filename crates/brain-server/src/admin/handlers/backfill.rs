@@ -64,7 +64,14 @@ pub async fn submit(
     // One id spans every shard; submit is idempotent by request id.
     let run_id = BackfillId::new();
 
-    let mut progress: Vec<(usize, BackfillProgress)> = Vec::with_capacity(state.shards.len());
+    // A shard that ACCEPTED the submit contributes its element to the
+    // response even if the follow-up progress read fails — the run is
+    // live on that shard, so losing the snapshot must not lose the id.
+    // Its progress degrades to `null` (a `None` element) rather than
+    // being dropped or counted as a total failure. Only a shard whose
+    // *submit* itself errored is a shard error.
+    let mut submitted: Vec<(usize, Option<BackfillProgress>)> =
+        Vec::with_capacity(state.shards.len());
     let mut shard_errors: Vec<String> = Vec::new();
     for (idx, shard) in state.shards.iter().enumerate() {
         let request = BackfillRequest {
@@ -76,10 +83,14 @@ pub async fn submit(
         };
         match shard.backfill_submit(request).await {
             Ok(_id) => match shard.backfill_progress().await {
-                Ok(p) => progress.push((idx, p)),
+                Ok(p) => submitted.push((idx, Some(p))),
                 Err(e) => {
-                    warn!(shard = idx, error = %e, "backfill_progress after submit failed");
-                    shard_errors.push(format!("shard {idx}: {e}"));
+                    warn!(
+                        shard = idx,
+                        error = %e,
+                        "backfill_progress after submit failed; reporting null progress",
+                    );
+                    submitted.push((idx, None));
                 }
             },
             Err(e) => {
@@ -89,8 +100,9 @@ pub async fn submit(
         }
     }
 
-    if progress.is_empty() && !shard_errors.is_empty() {
-        // Per-shard detail already logged; keep it off the wire.
+    if submitted.is_empty() {
+        // No shard accepted the submit. Per-shard detail already logged;
+        // keep it off the wire.
         return Ok(text_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "backfill submit failed on every shard\n",
@@ -101,7 +113,7 @@ pub async fn submit(
         "{{\"backfill_id\":\"{id}\",\"shards\":{n},\"progress\":{progress}}}\n",
         id = hex_id(run_id),
         n = state.shards.len(),
-        progress = progress_array_json(&progress),
+        progress = submit_progress_array_json(run_id, &submitted),
     );
     Ok(json_response(StatusCode::OK, body))
 }
@@ -204,6 +216,36 @@ fn progress_array_json(progress: &[(usize, BackfillProgress)]) -> String {
             obj.push_str(&progress_fields_json(p));
             obj.push('}');
             obj
+        })
+        .collect();
+    format!("[{}]", items.join(","))
+}
+
+/// Render the submit response's per-shard progress array from
+/// `(shard, Option<progress>)` elements. A `Some` element renders like
+/// [`progress_array_json`]; a `None` element (submit succeeded but the
+/// follow-up progress read failed) still contributes its shard, with the
+/// run id preserved and every progress metric rendered `null` — the run
+/// is live on that shard, only the snapshot is unavailable.
+fn submit_progress_array_json(
+    run_id: BackfillId,
+    submitted: &[(usize, Option<BackfillProgress>)],
+) -> String {
+    let items: Vec<String> = submitted
+        .iter()
+        .map(|(idx, p)| match p {
+            Some(p) => {
+                let mut obj = format!("{{\"shard\":{idx},");
+                obj.push_str(&progress_fields_json(p));
+                obj.push('}');
+                obj
+            }
+            None => format!(
+                "{{\"shard\":{idx},\"request_id\":\"{id}\",\"running\":null,\
+                 \"completed\":null,\"failed\":null,\"skipped_already_completed\":null,\
+                 \"last_processed_memory_id\":null,\"eta_secs\":null}}",
+                id = hex_id(run_id),
+            ),
         })
         .collect();
     format!("[{}]", items.join(","))
@@ -394,6 +436,62 @@ mod tests {
         assert!(s.contains("\"skipped_already_completed\":7"));
         assert!(s.contains("\"last_processed_memory_id\":99"));
         assert!(s.contains("\"eta_secs\":5"));
+    }
+
+    #[test]
+    fn submit_array_keeps_id_on_null_progress_shard() {
+        // A shard whose submit succeeded but whose progress read failed
+        // must still appear in the array (progress null), and every
+        // successful shard renders its metrics as before.
+        let run_id = BackfillId::from_bytes([3u8; 16]);
+        let ok = BackfillProgress {
+            request_id: Some(run_id),
+            completed: 5,
+            failed: 0,
+            skipped_already_completed: 1,
+            last_processed_memory_id: Some(MemoryId::from_raw(12)),
+            running: true,
+            eta: None,
+        };
+        let submitted = vec![(0usize, Some(ok)), (1usize, None)];
+        let s = submit_progress_array_json(run_id, &submitted);
+
+        // Both shards present.
+        assert!(s.contains("\"shard\":0"), "{s}");
+        assert!(s.contains("\"shard\":1"), "{s}");
+        // Successful shard carries real metrics.
+        assert!(s.contains("\"completed\":5"), "{s}");
+        assert!(s.contains("\"last_processed_memory_id\":12"), "{s}");
+        // Degraded shard keeps the run id and nulls the metrics — it is
+        // NOT dropped and does NOT surface as a failure.
+        let expected_id = hex_id(run_id);
+        assert_eq!(
+            s.matches(&expected_id).count(),
+            2,
+            "both shards echo the run id: {s}"
+        );
+        assert!(s.contains("\"completed\":null"), "{s}");
+        assert!(s.contains("\"running\":null"), "{s}");
+    }
+
+    #[test]
+    fn submit_array_all_shards_ok() {
+        let run_id = BackfillId::from_bytes([4u8; 16]);
+        let p = BackfillProgress {
+            request_id: Some(run_id),
+            completed: 2,
+            failed: 0,
+            skipped_already_completed: 0,
+            last_processed_memory_id: Some(MemoryId::from_raw(1)),
+            running: true,
+            eta: Some(std::time::Duration::from_secs(3)),
+        };
+        let submitted = vec![(0usize, Some(p))];
+        let s = submit_progress_array_json(run_id, &submitted);
+        assert!(s.contains("\"shard\":0"), "{s}");
+        // A fully-populated progress renders no `null` — the degraded
+        // path is the only source of nulls here.
+        assert!(!s.contains("null"), "no degraded fields when all ok: {s}");
     }
 
     #[test]
