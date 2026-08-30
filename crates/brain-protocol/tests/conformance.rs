@@ -78,16 +78,16 @@ use brain_protocol::{
     RelationSupersedeRequest, RelationSupersedeResponse, RelationTombstoneRequest,
     RelationTombstoneResponse, RelationTraverseRequest, RelationTraverseResponseFrame,
     RelationView, RequestBody, ResolutionOutcomeWire, ResponseBody, RetrieverNameWire,
-    SchemaGetRequest, SchemaGetResponse, SchemaListItemWire, SchemaListRequest,
-    SchemaListResponseFrame, SchemaReplaceRequest, SchemaReplaceResponse, SchemaUploadRequest,
-    SchemaUploadResponse, SchemaValidateRequest, SchemaValidateResponse, SchemaValidationErrorWire,
-    ServerPingResponse, SessionCreateRequest, SessionCreateResponse, SessionDeleteRequest,
-    SessionDeleteResponse, SessionListRequest, SessionListResponse, SessionView, SimilarityFilter,
-    SpaceCreateRequest, SpaceCreateResponse, SpaceDeleteRequest, SpaceDeleteResponse,
-    SpaceListRequest, SpaceListResponse, SpaceView, StageKind, StatementCreateRequest,
-    StatementCreateResponse, StatementGetRequest, StatementGetResponse, StatementHistoryRequest,
-    StatementHistoryResponseFrame, StatementKindWire, StatementListRequest,
-    StatementListResponseFrame, StatementObjectWire, StatementRetractRequest,
+    SchemaDropRequest, SchemaDropResponse, SchemaGetRequest, SchemaGetResponse, SchemaListItemWire,
+    SchemaListRequest, SchemaListResponseFrame, SchemaReplaceRequest, SchemaReplaceResponse,
+    SchemaUploadRequest, SchemaUploadResponse, SchemaValidateRequest, SchemaValidateResponse,
+    SchemaValidationErrorWire, ServerPingResponse, SessionCreateRequest, SessionCreateResponse,
+    SessionDeleteRequest, SessionDeleteResponse, SessionListRequest, SessionListResponse,
+    SessionView, SimilarityFilter, SpaceCreateRequest, SpaceCreateResponse, SpaceDeleteRequest,
+    SpaceDeleteResponse, SpaceListRequest, SpaceListResponse, SpaceView, StageKind,
+    StatementCreateRequest, StatementCreateResponse, StatementGetRequest, StatementGetResponse,
+    StatementHistoryRequest, StatementHistoryResponseFrame, StatementKindWire,
+    StatementListRequest, StatementListResponseFrame, StatementObjectWire, StatementRetractRequest,
     StatementRetractResponse, StatementSupersedeRequest, StatementSupersedeResponse,
     StatementTombstoneRequest, StatementTombstoneResponse, StatementValueWire, StatementView,
     SubscribeRequest, SubscriptionEvent, SubscriptionFilter, TransitionKind, TraversalPathWire,
@@ -3064,6 +3064,22 @@ fn corpus() -> Vec<Case> {
         RequestBody::SchemaReplace(schema_replace_req.clone()),
         &schema_replace_req,
     ));
+    // Surgical single-declaration narrow. `target_kind` is 1
+    // (relation_type) — deliberately not the 0 (predicate) default — so a
+    // fixture that hard-codes the discriminant is visible, and `force` is
+    // `true` to pin the confirmation flag in a non-default state.
+    let schema_drop_req = SchemaDropRequest {
+        namespace: "org".into(),
+        target_kind: 1,
+        target_name: "mentors".into(),
+        force: true,
+        request_id: RID,
+    };
+    cases.push(req_case(
+        "req_schema_drop",
+        RequestBody::SchemaDrop(schema_drop_req.clone()),
+        &schema_drop_req,
+    ));
 
     // ---- Schema responses ----
     //
@@ -3150,6 +3166,24 @@ fn corpus() -> Vec<Case> {
         "resp_schema_replace",
         ResponseBody::SchemaReplace(schema_replace_resp.clone()),
         &schema_replace_resp,
+    ));
+    // `dropped` (true) and `live_rows` (5, non-zero) are the fields unique
+    // to DROP — a force-drop that left five rows orphaned. `target_kind`
+    // (1) / `target_name` echo the request; `schema_version` (4) is the
+    // new active version after the narrow.
+    let schema_drop_resp = SchemaDropResponse {
+        namespace: "org".into(),
+        schema_version: 4,
+        target_kind: 1,
+        target_name: "mentors".into(),
+        dropped: true,
+        live_rows: 5,
+        validation_errors: Vec::new(),
+    };
+    cases.push(resp_case(
+        "resp_schema_drop",
+        ResponseBody::SchemaDrop(schema_drop_resp.clone()),
+        &schema_drop_resp,
     ));
 
     // ---- Transaction requests ----
@@ -3437,6 +3471,8 @@ fn required_families() -> Vec<(&'static str, Opcode)> {
         ("graph.relation_create_resp", Opcode::RelationCreateResp),
         ("schema.upload", Opcode::SchemaUploadReq),
         ("schema.upload_resp", Opcode::SchemaUploadResp),
+        ("schema.drop", Opcode::SchemaDropReq),
+        ("schema.drop_resp", Opcode::SchemaDropResp),
         ("procedural.materialize", Opcode::MaterializeProceduralReq),
         (
             "procedural.materialize_resp",

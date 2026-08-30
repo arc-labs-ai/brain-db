@@ -894,6 +894,56 @@ pub fn predicate_drop_schema_declared(
     Ok(count)
 }
 
+/// Drop a single schema-declared predicate row identified by
+/// `(namespace, name)`. The scoped counterpart to
+/// [`predicate_drop_schema_declared`]: `SCHEMA_DROP` narrows one
+/// declaration instead of wiping the whole namespace.
+///
+/// Returns `Some(id)` when a schema-declared predicate with that qname
+/// existed and was removed, `None` when no schema-declared predicate
+/// with that qname exists. An implicit-from-write row sharing the qname
+/// is deliberately left untouched — the declared vocabulary is the only
+/// thing `SCHEMA_DROP` narrows, and an open-vocab row is not part of it.
+/// The embedding row is left in place (a harmless orphan), matching
+/// [`predicate_drop_schema_declared`].
+pub fn predicate_drop_one(
+    wtxn: &WriteTransaction,
+    namespace: &str,
+    name: &str,
+) -> Result<Option<PredicateId>, PredicateOpError> {
+    validate_namespace(namespace)?;
+    validate_name(name)?;
+
+    let q = qname(namespace, name);
+    let victim: Option<u32> = {
+        let idx = wtxn.open_table(PREDICATES_BY_QNAME_TABLE)?;
+        let id = idx.get(q.as_str())?.map(|g| g.value());
+        drop(idx);
+        match id {
+            Some(id) => {
+                let t = wtxn.open_table(PREDICATES_TABLE)?;
+                let row: Option<PredicateDefinition> = t.get(&id)?.map(|g| g.value());
+                match row {
+                    Some(r) if r.origin().is_schema_declared() => Some(id),
+                    _ => None,
+                }
+            }
+            None => None,
+        }
+    };
+    if let Some(id) = victim {
+        {
+            let mut t = wtxn.open_table(PREDICATES_TABLE)?;
+            t.remove(&id)?;
+        }
+        {
+            let mut idx = wtxn.open_table(PREDICATES_BY_QNAME_TABLE)?;
+            idx.remove(q.as_str())?;
+        }
+    }
+    Ok(victim.map(PredicateId::from))
+}
+
 // ---------------------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------------------

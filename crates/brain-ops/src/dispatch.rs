@@ -572,6 +572,9 @@ pub async fn dispatch(
                 .await
                 .map(|b| single(ResponseBody::SchemaReplace(b)))
         }
+        RequestBody::SchemaDrop(r) => crate::handlers::schema_drop::handle_schema_drop(r, ctx)
+            .await
+            .map(|b| single(ResponseBody::SchemaDrop(b))),
 
         // Extractor introspection (read-only).
         RequestBody::ExtractorList(r) => {
@@ -703,6 +706,9 @@ fn enforce_permission(caller: &RequestCaller, req: &RequestBody) -> Result<(), O
         // able to drop or narrow an existing namespace.
         RequestBody::SchemaUpload(_) => (perm_bits::SCHEMA_UPLOAD, "SCHEMA_UPLOAD"),
         RequestBody::SchemaReplace(_) => (perm_bits::ADMIN, "SCHEMA_REPLACE"),
+        // SCHEMA_DROP narrows a declaration destructively — admin, like
+        // SCHEMA_REPLACE. A routine upload key must not narrow a namespace.
+        RequestBody::SchemaDrop(_) => (perm_bits::ADMIN, "SCHEMA_DROP"),
         RequestBody::SchemaGet(_) | RequestBody::SchemaList(_) | RequestBody::SchemaValidate(_) => {
             (perm_bits::RECALL, "SCHEMA_READ")
         }

@@ -168,6 +168,13 @@ pub enum Opcode {
     ExtractorListReq = 0x0124,
     ExtractorListResp = 0x01A4,
 
+    // Single-declaration schema drop (admin-only). Narrows the active
+    // schema set by removing one declared predicate / relation_type,
+    // paired with the associative-merge `SchemaUpload` and the
+    // namespace-wide `SchemaReplace`.
+    SchemaDropReq = 0x0125,
+    SchemaDropResp = 0x01A5,
+
     // Destructive schema replace (admin-only). Tombstones every
     // schema-declared predicate / relation_type / extractor row in
     // the namespace before running the new schema's apply path.
@@ -427,6 +434,9 @@ impl Opcode {
             0x0124 => Self::ExtractorListReq,
             0x01A4 => Self::ExtractorListResp,
 
+            0x0125 => Self::SchemaDropReq,
+            0x01A5 => Self::SchemaDropResp,
+
             0x0127 => Self::SchemaReplaceReq,
             0x01A7 => Self::SchemaReplaceResp,
 
@@ -477,17 +487,23 @@ impl Opcode {
     /// backfill-control opcodes (`ADMIN_BACKFILL`,
     /// `ADMIN_BACKFILL_CANCEL`) landed.
     ///
-    /// `SchemaReplace` (`0x0127` / `0x01A7`) is admin-only by design — the
-    /// destructive namespace reset — but its low byte falls outside the
-    /// typed-graph admin range, so it is called out explicitly. The
-    /// additive `SchemaUpload`/`SchemaGet`/`SchemaList`/`SchemaValidate`
-    /// and the `Extractor*` introspection ops are intentionally *not*
-    /// admin.
+    /// `SchemaReplace` (`0x0127` / `0x01A7`) and `SchemaDrop` (`0x0125` /
+    /// `0x01A5`) are admin-only by design — the destructive namespace
+    /// reset and the single-declaration narrow — but their low bytes fall
+    /// outside the typed-graph admin range, so they are called out
+    /// explicitly. The additive
+    /// `SchemaUpload`/`SchemaGet`/`SchemaList`/`SchemaValidate` and the
+    /// `Extractor*` introspection ops are intentionally *not* admin.
     #[inline]
     #[must_use]
     pub fn is_admin(self) -> bool {
-        matches!(self, Opcode::SchemaReplaceReq | Opcode::SchemaReplaceResp)
-            || (self.namespace() == 0x00 && matches!(self.low_byte(), 0x60..=0x6F | 0xE0..=0xEF))
+        matches!(
+            self,
+            Opcode::SchemaReplaceReq
+                | Opcode::SchemaReplaceResp
+                | Opcode::SchemaDropReq
+                | Opcode::SchemaDropResp
+        ) || (self.namespace() == 0x00 && matches!(self.low_byte(), 0x60..=0x6F | 0xE0..=0xEF))
             || (self.namespace() == 0x01 && matches!(self.low_byte(), 0x70..=0x7F | 0xF0..=0xFF))
     }
 
@@ -642,6 +658,9 @@ mod tests {
         // Typed-graph — extractor governance
         (0x0124, Opcode::ExtractorListReq),
         (0x01A4, Opcode::ExtractorListResp),
+        // Typed-graph — single-declaration schema drop
+        (0x0125, Opcode::SchemaDropReq),
+        (0x01A5, Opcode::SchemaDropResp),
         // Typed-graph — destructive schema replace
         (0x0127, Opcode::SchemaReplaceReq),
         (0x01A7, Opcode::SchemaReplaceResp),
@@ -782,6 +801,10 @@ mod tests {
         assert!(Opcode::SchemaReplaceResp.is_admin());
         assert!(!Opcode::SchemaUploadReq.is_admin());
         assert!(!Opcode::SchemaUploadResp.is_admin());
+        // SCHEMA_DROP narrows one declaration — admin-only for the same
+        // reason, low byte likewise outside the typed-graph admin range.
+        assert!(Opcode::SchemaDropReq.is_admin());
+        assert!(Opcode::SchemaDropResp.is_admin());
     }
 
     #[test]

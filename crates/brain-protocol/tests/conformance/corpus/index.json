@@ -774,6 +774,12 @@
     "payload_len": 148
   },
   {
+    "name": "req_schema_drop",
+    "opcode": "0x0125",
+    "kind": "request",
+    "payload_len": 83
+  },
+  {
     "name": "resp_schema_get",
     "opcode": "0x01A1",
     "kind": "response",
@@ -796,6 +802,12 @@
     "opcode": "0x01A7",
     "kind": "response",
     "payload_len": 65
+  },
+  {
+    "name": "resp_schema_drop",
+    "opcode": "0x01A5",
+    "kind": "response",
+    "payload_len": 103
   },
   {
     "name": "req_txn_begin",

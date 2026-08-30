@@ -1,0 +1,9 @@
+{
+  "namespace": "org",
+  "schema_version": 4,
+  "target_kind": 1,
+  "target_name": "mentors",
+  "dropped": true,
+  "live_rows": 5,
+  "validation_errors": []
+}

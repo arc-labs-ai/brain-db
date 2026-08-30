@@ -457,6 +457,71 @@ pub fn relation_type_drop_schema_declared(
     Ok(count)
 }
 
+/// Resolve a relation_type id by `(namespace, name)` inside a write
+/// txn. The write-txn counterpart to [`relation_type_lookup_by_qname`],
+/// mirroring [`crate::schema::predicate::predicate_id_by_qname`]; lets a
+/// composing handler resolve the id and mutate in one transaction.
+pub fn relation_type_id_by_qname(
+    wtxn: &WriteTransaction,
+    namespace: &str,
+    name: &str,
+) -> Result<Option<RelationTypeId>, RelationTypeOpError> {
+    validate_namespace(namespace)?;
+    validate_name(name)?;
+    let q = qname(namespace, name);
+    let idx = wtxn.open_table(RELATION_TYPES_BY_QNAME_TABLE)?;
+    let found = idx
+        .get(q.as_str())?
+        .map(|g| RelationTypeId::from(g.value()));
+    Ok(found)
+}
+
+/// Drop a single schema-declared relation_type row identified by
+/// `(namespace, name)`. The scoped counterpart to
+/// [`relation_type_drop_schema_declared`], used by `SCHEMA_DROP` to
+/// narrow one declaration instead of wiping the namespace.
+///
+/// Returns `Some(id)` when a schema-declared relation_type with that
+/// qname existed and was removed, `None` otherwise. An
+/// implicit-from-write row sharing the qname is left untouched.
+pub fn relation_type_drop_one(
+    wtxn: &WriteTransaction,
+    namespace: &str,
+    name: &str,
+) -> Result<Option<RelationTypeId>, RelationTypeOpError> {
+    validate_namespace(namespace)?;
+    validate_name(name)?;
+
+    let q = qname(namespace, name);
+    let victim: Option<u32> = {
+        let idx = wtxn.open_table(RELATION_TYPES_BY_QNAME_TABLE)?;
+        let id = idx.get(q.as_str())?.map(|g| g.value());
+        drop(idx);
+        match id {
+            Some(id) => {
+                let t = wtxn.open_table(RELATION_TYPES_TABLE)?;
+                let row: Option<RelationTypeDefinition> = t.get(&id)?.map(|g| g.value());
+                match row {
+                    Some(r) if r.origin().is_schema_declared() => Some(id),
+                    _ => None,
+                }
+            }
+            None => None,
+        }
+    };
+    if let Some(id) = victim {
+        {
+            let mut t = wtxn.open_table(RELATION_TYPES_TABLE)?;
+            t.remove(&id)?;
+        }
+        {
+            let mut idx = wtxn.open_table(RELATION_TYPES_BY_QNAME_TABLE)?;
+            idx.remove(q.as_str())?;
+        }
+    }
+    Ok(victim.map(RelationTypeId::from))
+}
+
 // ---------------------------------------------------------------------------
 // Embeddings.
 // ---------------------------------------------------------------------------

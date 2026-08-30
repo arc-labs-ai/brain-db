@@ -152,6 +152,7 @@ pub enum ResponseBody {
     SchemaList(SchemaListResponseFrame),
     SchemaValidate(SchemaValidateResponse),
     SchemaReplace(SchemaReplaceResponse),
+    SchemaDrop(SchemaDropResponse),
 
     // Extractor introspection (read-only).
     /// Single-frame snapshot in v1.
@@ -244,6 +245,7 @@ impl ResponseBody {
             Self::SchemaList(_) => Opcode::SchemaListResp,
             Self::SchemaValidate(_) => Opcode::SchemaValidateResp,
             Self::SchemaReplace(_) => Opcode::SchemaReplaceResp,
+            Self::SchemaDrop(_) => Opcode::SchemaDropResp,
             Self::ExtractorList(_) => Opcode::ExtractorListResp,
             Self::QueryExplain(_) => Opcode::QueryExplainResp,
             Self::QueryTrace(_) => Opcode::QueryTraceResp,
@@ -351,6 +353,7 @@ impl ResponseBody {
             Self::SchemaList(r) => to_cbor_bytes(r),
             Self::SchemaValidate(r) => to_cbor_bytes(r),
             Self::SchemaReplace(r) => to_cbor_bytes(r),
+            Self::SchemaDrop(r) => to_cbor_bytes(r),
             Self::ExtractorList(r) => to_cbor_bytes(r),
             Self::QueryExplain(r) => to_cbor_bytes(r),
             Self::QueryTrace(r) => to_cbor_bytes(r),
@@ -437,6 +440,7 @@ impl ResponseBody {
             Opcode::SchemaListResp => Self::SchemaList(from_cbor_bytes(bytes)?),
             Opcode::SchemaValidateResp => Self::SchemaValidate(from_cbor_bytes(bytes)?),
             Opcode::SchemaReplaceResp => Self::SchemaReplace(from_cbor_bytes(bytes)?),
+            Opcode::SchemaDropResp => Self::SchemaDrop(from_cbor_bytes(bytes)?),
             Opcode::ExtractorListResp => Self::ExtractorList(from_cbor_bytes(bytes)?),
             Opcode::QueryExplainResp => Self::QueryExplain(from_cbor_bytes(bytes)?),
             Opcode::QueryTraceResp => Self::QueryTrace(from_cbor_bytes(bytes)?),

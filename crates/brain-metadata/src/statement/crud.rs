@@ -517,6 +517,45 @@ pub fn remove_from_predicate_index(
     Ok(())
 }
 
+/// Count non-tombstoned statement rows in `namespace_id` that key on
+/// `predicate_id`, capped at `limit` (pass `usize::MAX` for an exact
+/// count). Walks the by-predicate index across every space in the
+/// namespace and dereferences each hit to the primary row so
+/// tombstoned rows don't count. Used by `SCHEMA_DROP`'s in-use safety
+/// gate — dropping a predicate that still has live statements requires
+/// the caller's explicit `force`.
+pub fn statement_live_count_by_predicate(
+    wtxn: &WriteTransaction,
+    namespace_id: u32,
+    predicate_id: PredicateId,
+    limit: usize,
+) -> Result<usize, StatementOpError> {
+    if limit == 0 {
+        return Ok(0);
+    }
+    let want = predicate_id.raw();
+    let index = wtxn.open_table(STATEMENTS_BY_PREDICATE_TABLE)?;
+    let primary = wtxn.open_table(STATEMENTS_TABLE)?;
+    let mut count = 0usize;
+    for entry in index.iter()? {
+        let (k, v) = entry?;
+        let (k_ns, _space, k_pred, _kind, _bucket, _sid) = k.value();
+        if k_ns != namespace_id || k_pred != want {
+            continue;
+        }
+        let sid = v.value();
+        if let Some(row) = primary.get(&sid)?.map(|g| g.value()) {
+            if row.tombstoned == 0 {
+                count += 1;
+                if count >= limit {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(count)
+}
+
 /// Re-key a still-current statement's predicate-bucket entry after its
 /// confidence changed. No-op when the coarse bucket is unchanged — this
 /// is the index-churn gate that mirrors the >0.05 confidence threshold
@@ -1046,6 +1085,70 @@ mod tests {
         );
         s.event_at_unix_nanos = Some(when);
         s
+    }
+
+    #[test]
+    fn live_count_by_predicate_counts_only_non_tombstoned() {
+        let (_dir, mut db) = open_db();
+        let subj = make_entity(&mut db, "priya");
+        let obj = make_entity(&mut db, "manager-role");
+        let pred = intern_fact_entity_pred(&mut db, "reports_to");
+        let ns = test_scope().namespace_id;
+
+        // No statements yet.
+        {
+            let wtxn = db.write_txn().unwrap();
+            assert_eq!(
+                statement_live_count_by_predicate(&wtxn, ns, pred, usize::MAX).unwrap(),
+                0
+            );
+        }
+
+        // One live statement on the predicate.
+        let sid = {
+            let wtxn = db.write_txn().unwrap();
+            let s = fresh_fact(subj, pred, obj);
+            let id = statement_create(&wtxn, test_scope(), SessionId::DEFAULT, &s, T0).unwrap();
+            wtxn.commit().unwrap();
+            id
+        };
+        {
+            let wtxn = db.write_txn().unwrap();
+            assert_eq!(
+                statement_live_count_by_predicate(&wtxn, ns, pred, usize::MAX).unwrap(),
+                1
+            );
+            // A different predicate id sees nothing.
+            assert_eq!(
+                statement_live_count_by_predicate(&wtxn, ns, PredicateId::from(pred.raw() + 7), 1)
+                    .unwrap(),
+                0
+            );
+            // A different namespace sees nothing.
+            assert_eq!(
+                statement_live_count_by_predicate(&wtxn, ns + 1, pred, usize::MAX).unwrap(),
+                0
+            );
+            // The cap short-circuits at the first hit.
+            assert_eq!(
+                statement_live_count_by_predicate(&wtxn, ns, pred, 1).unwrap(),
+                1
+            );
+        }
+
+        // Tombstoning removes it from the live count.
+        {
+            let wtxn = db.write_txn().unwrap();
+            statement_tombstone(&wtxn, sid, TombstoneReason::UserRequest, T0 + 1).unwrap();
+            wtxn.commit().unwrap();
+        }
+        {
+            let wtxn = db.write_txn().unwrap();
+            assert_eq!(
+                statement_live_count_by_predicate(&wtxn, ns, pred, usize::MAX).unwrap(),
+                0
+            );
+        }
     }
 
     #[test]

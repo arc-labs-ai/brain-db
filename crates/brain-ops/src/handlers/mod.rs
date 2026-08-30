@@ -23,6 +23,7 @@ pub mod recall;
 pub mod registry_cascade;
 pub mod relation;
 pub mod schema;
+pub mod schema_drop;
 pub mod schema_replace;
 pub mod session;
 pub mod space;

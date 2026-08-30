@@ -133,6 +133,36 @@ pub const DEFAULT_LIST_LIMIT: usize = 1_000;
 // Read paths.
 // ---------------------------------------------------------------------------
 
+/// Count non-tombstoned relation rows in `namespace_id` that key on
+/// `relation_type_id`, capped at `limit` (pass `usize::MAX` for an
+/// exact count). Used by `SCHEMA_DROP`'s in-use safety gate — dropping
+/// a relation_type that still has live relations requires the caller's
+/// explicit `force`.
+pub fn relation_live_count_by_type(
+    wtxn: &WriteTransaction,
+    namespace_id: u32,
+    relation_type_id: RelationTypeId,
+    limit: usize,
+) -> Result<usize, RelationOpError> {
+    if limit == 0 {
+        return Ok(0);
+    }
+    let want = relation_type_id.raw();
+    let t = wtxn.open_table(RELATION_METADATA_TABLE)?;
+    let mut count = 0usize;
+    for entry in t.iter()? {
+        let (_, v) = entry?;
+        let row: RelationMetadata = v.value();
+        if row.namespace_id == namespace_id && row.relation_type_id == want && row.tombstoned == 0 {
+            count += 1;
+            if count >= limit {
+                break;
+            }
+        }
+    }
+    Ok(count)
+}
+
 /// Fetch a relation by id. Returns `None` if absent.
 pub fn relation_get(
     rtxn: &ReadTransaction,
