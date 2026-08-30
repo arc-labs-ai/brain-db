@@ -34,18 +34,15 @@ use tracing::{error, info};
 ///
 /// The HNSW targets rebuild in place under their write lock, so the
 /// rebuild is immediately visible on the serve path (see the per-target
-/// helpers below). The tantivy targets are different: an on-disk tantivy
-/// rebuild is a directory rename-swap that the live retriever's cached
-/// `IndexReader` (bound to the `Index` opened at spawn) never observes,
-/// and it would race the text-indexer drain task's persistent
-/// `IndexWriter` (which holds tantivy's exclusive writer lock for the
-/// shard's whole life). A hot tantivy rebuild is a cross-cutting refactor
-/// (worker-pause + writer-close + reopen + swappable retriever/dispatcher
-/// handles) that this route does not attempt; instead the tantivy targets
-/// parse and report [`requires_restart`](Self::requires_restart) so the
-/// admin route answers with a clear "restart to rebuild" response rather
-/// than silently doing nothing. Tantivy is rebuilt from authoritative
-/// redb at boot (see `tantivy_recovery`).
+/// helpers below). The tantivy targets rebuild live too, via the shard's
+/// quiesce → rebuild → swap dance (`Shard::do_rebuild_tantivy`): the
+/// running indexers drop their writers to release tantivy's exclusive
+/// per-directory lock, the on-disk indexes are rebuilt from authoritative
+/// redb and atomically swapped, the shard is reopened, and the retriever's
+/// cached readers + the indexer writers are live-swapped onto the rebuilt
+/// indexes — without a read ever observing a partial or stale-mixed index
+/// (invariant #7). Tantivy is also rebuilt from authoritative redb at boot
+/// when a directory is missing or stale (see `tantivy_recovery`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RebuildTarget {
     /// The memory HNSW (semantic recall). Rebuilt from the redb-backed
@@ -63,15 +60,16 @@ pub(crate) enum RebuildTarget {
     StatementQuestionHnsw,
     /// Rebuild every HNSW target above, in turn. The report aggregates
     /// the per-target entry counts (sum) and the total elapsed time.
-    /// Excludes the tantivy targets, which cannot be rebuilt live.
+    /// Excludes the tantivy targets, which have their own live dance
+    /// (`Shard::do_rebuild_tantivy`); request them explicitly.
     All,
-    /// The `memory_text.tantivy/` lexical index. Rebuilt from
-    /// authoritative redb — but only safely at shard startup, so the
-    /// admin route reports [`requires_restart`](Self::requires_restart)
-    /// rather than swapping live.
+    /// The `memory_text.tantivy/` lexical index. Rebuilt live from
+    /// authoritative redb via the shard's quiesce → rebuild → swap dance
+    /// (`Shard::do_rebuild_tantivy`), which reconstructs both lexical
+    /// indexes to keep the reopen + retriever swap atomic.
     TantivyMemory,
-    /// The `statements.tantivy/` lexical index. Same live-swap
-    /// constraint as [`TantivyMemory`](Self::TantivyMemory).
+    /// The `statements.tantivy/` lexical index. Rebuilt live alongside
+    /// [`TantivyMemory`](Self::TantivyMemory) by the same dance.
     TantivyStatement,
 }
 
@@ -93,17 +91,6 @@ impl RebuildTarget {
             }
             _ => None,
         }
-    }
-
-    /// True for targets whose on-disk index cannot be rebuilt while the
-    /// shard is serving. The live retriever's cached reader is bound to
-    /// the `Index` opened at spawn and the text-indexer holds tantivy's
-    /// exclusive writer lock for the shard's life, so a directory swap
-    /// would be invisible to reads and race the writer. The admin route
-    /// turns this into a clear "restart the shard" response; restarting
-    /// rebuilds tantivy from authoritative redb on boot.
-    pub(crate) fn requires_restart(self) -> bool {
-        matches!(self, Self::TantivyMemory | Self::TantivyStatement)
     }
 }
 
@@ -457,16 +444,5 @@ mod tests {
         // Bare "tantivy" is ambiguous (which lexical index?) → unknown.
         assert_eq!(RebuildTarget::from_query("tantivy"), None);
         assert_eq!(RebuildTarget::from_query(""), None);
-    }
-
-    #[test]
-    fn rebuild_target_requires_restart_only_for_tantivy() {
-        assert!(RebuildTarget::TantivyMemory.requires_restart());
-        assert!(RebuildTarget::TantivyStatement.requires_restart());
-        assert!(!RebuildTarget::MemoryHnsw.requires_restart());
-        assert!(!RebuildTarget::EntityHnsw.requires_restart());
-        assert!(!RebuildTarget::HypeHnsw.requires_restart());
-        assert!(!RebuildTarget::StatementQuestionHnsw.requires_restart());
-        assert!(!RebuildTarget::All.requires_restart());
     }
 }

@@ -1630,6 +1630,22 @@ struct Shard {
     /// memory's text on disk and keyword-searchable.
     memory_text_task: Option<(flume::Sender<()>, glommio::Task<()>)>,
     statement_text_task: Option<(flume::Sender<()>, glommio::Task<()>)>,
+    /// Concrete lexical retriever handle, kept alongside the
+    /// `Arc<dyn LexicalRetriever>` in `ops` so the hot tantivy rebuild
+    /// (`do_rebuild_tantivy`) can atomically swap its open-index bundle
+    /// via [`TantivyLexicalRetriever::swap_shard`] without disturbing the
+    /// stable trait handle every reader holds.
+    lexical_retriever: Arc<brain_index::TantivyLexicalRetriever>,
+    /// Shard directory — root of the `memory_text.tantivy/` and
+    /// `statements.tantivy/` index directories the hot rebuild
+    /// reconstructs from authoritative redb and swaps in place.
+    tantivy_dir: std::path::PathBuf,
+    /// Control-plane senders to the two text indexers, used by the hot
+    /// rebuild to `Quiesce` (drop the writer, release the per-directory
+    /// lock) and `Resume` (rebuild the writer on the reopened index).
+    /// `None` when the corresponding indexer failed to spawn.
+    memory_text_control: Option<flume::Sender<brain_ops::index::text_indexer::IndexerControl>>,
+    statement_text_control: Option<flume::Sender<brain_ops::index::text_indexer::IndexerControl>>,
 }
 
 /// Load a page of `ExtractionAudit` rows from the primary audit table
@@ -2011,16 +2027,191 @@ impl Shard {
                     elapsed_ms: start.elapsed().as_millis() as u64,
                 })
             }
-            // Tantivy cannot be rebuilt live (see `RebuildTarget` docs). The
-            // admin route short-circuits these targets with a
-            // "requires restart" response before reaching the shard; this
-            // arm is a defensive backstop for any direct programmatic call
-            // so the request fails loudly rather than silently no-opping.
-            T::TantivyMemory | T::TantivyStatement => Err(format!(
-                "target {target:?} cannot be rebuilt live; restart the shard \
-                 to rebuild tantivy from authoritative redb on boot"
-            )),
+            // Tantivy rebuilds live via the quiesce → rebuild → swap dance.
+            T::TantivyMemory | T::TantivyStatement => self.do_rebuild_tantivy(target).await,
         }
+    }
+
+    /// Hot-rebuild the two tantivy (lexical) indexes from authoritative
+    /// redb while the shard keeps serving, then live-swap the read side
+    /// and the indexer writers onto the rebuilt indexes.
+    ///
+    /// A tantivy index cannot be rebuilt in place: the running indexer
+    /// holds tantivy's exclusive per-directory writer lock, and the
+    /// retriever's cached readers are bound to the `Index` opened at spawn.
+    /// The dance below resolves both:
+    ///
+    /// 1. **Quiesce** both indexers — each drops its writer, releasing the
+    ///    lock; ops keep buffering on their channels.
+    /// 2. **Rebuild** both on-disk indexes from redb into `<live>.rebuild`
+    ///    and atomically rename them over `<live>` (the offline rebuild the
+    ///    boot path already uses; it is safe now that no writer holds the
+    ///    live lock).
+    /// 3. **Reopen** the shard from disk and **swap** the retriever's
+    ///    open-index bundle onto it in one atomic publish.
+    /// 4. **Resume** both indexers with fresh writers on the reopened
+    ///    index; their buffered ops re-drain idempotently.
+    ///
+    /// Both indexes are rebuilt regardless of the requested `target`: the
+    /// reopen + retriever swap are whole-shard, and reconstructing both
+    /// from redb keeps the swap atomic and lossless (a quiesced indexer
+    /// discards its uncommitted batch, which is only safe when that index
+    /// is itself reconstructed from the authoritative rows). At no instant
+    /// does a read observe a partial or stale-mixed index: the whole method
+    /// runs on the single-threaded shard main loop, so no read is dispatched
+    /// between quiesce and resume, and the retriever swap is atomic
+    /// (invariant #7).
+    async fn do_rebuild_tantivy(
+        &self,
+        target: rebuild::RebuildTarget,
+    ) -> Result<RebuildReport, String> {
+        let start = std::time::Instant::now();
+
+        // 1. Quiesce both indexers (release the per-directory writer locks).
+        quiesce_indexer(self.memory_text_control.as_ref(), "memory_text").await?;
+        quiesce_indexer(self.statement_text_control.as_ref(), "statements").await?;
+
+        // 2. Rebuild both on-disk indexes from authoritative redb. Capture
+        //    the result but do not early-return: the indexers must be
+        //    resumed on a valid index no matter what, or lexical writes
+        //    would silently stall (invariant #7).
+        let metadata = self.ops.executor.metadata.as_ref();
+        let rebuild_result: Result<u64, String> = (|| {
+            let mem =
+                brain_ops::index::text_indexer::rebuild_memory_text(&self.tantivy_dir, metadata)
+                    .map_err(|e| format!("memory text rebuild: {e}"))?;
+            let stmt =
+                brain_ops::index::text_indexer::rebuild_statements(&self.tantivy_dir, metadata)
+                    .map_err(|e| format!("statement text rebuild: {e}"))?;
+            Ok(mem.rows_processed + stmt.rows_processed)
+        })();
+
+        // 3. Reopen the shard from disk. `TantivyShard::open` reconciles any
+        //    interrupted swap, so even a mid-rebuild failure yields a valid
+        //    index (the completed rebuild or the restored prior one).
+        let reopened = brain_index::TantivyShard::open(&self.tantivy_dir)
+            .map_err(|e| format!("reopen tantivy after rebuild: {e}"));
+
+        let resume_handles = match &reopened {
+            // Swap the read side and resume onto the reopened index.
+            Ok(startup) => {
+                let new_shard = startup.shard.clone();
+                if let Err(e) = self.lexical_retriever.swap_shard(new_shard.clone()) {
+                    // Retriever swap failed: fall back to resuming the
+                    // indexers on the same reopened shard anyway so writes
+                    // keep flowing; surface the error below.
+                    tracing::error!(
+                        shard_id = self.shard_id,
+                        error = %e,
+                        "lexical retriever swap failed during tantivy rebuild",
+                    );
+                }
+                Some((new_shard.memory_text.clone(), new_shard.statements.clone()))
+            }
+            // Reopen failed: fall back to the pre-rebuild handle so the
+            // indexers can still resume (writes keep flowing); the read
+            // side keeps its prior bundle.
+            Err(_) => self
+                .ops
+                .tantivy
+                .as_ref()
+                .map(|s| (s.memory_text.clone(), s.statements.clone())),
+        };
+
+        // 4. Resume both indexers on the resolved handles.
+        if let Some((mem_handle, stmt_handle)) = resume_handles {
+            resume_indexer(self.memory_text_control.as_ref(), mem_handle, "memory_text").await?;
+            resume_indexer(
+                self.statement_text_control.as_ref(),
+                stmt_handle,
+                "statements",
+            )
+            .await?;
+        }
+
+        // Now surface any earlier failure.
+        let entries = rebuild_result?;
+        reopened.map(|_| ())?;
+
+        tracing::info!(
+            shard_id = self.shard_id,
+            ?target,
+            entries,
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            "tantivy indexes rebuilt live and swapped",
+        );
+        Ok(RebuildReport {
+            entries: entries as usize,
+            elapsed_ms: start.elapsed().as_millis() as u64,
+        })
+    }
+}
+
+/// How long the hot rebuild waits for an indexer to acknowledge a control
+/// message before giving up. Generous: the ack rides the same
+/// single-threaded executor and is normally near-instant; the bound only
+/// guards against a dead/wedged indexer task.
+const INDEXER_CONTROL_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Send `Quiesce` to an indexer (if it is running) and await its ack. The
+/// indexer drops its writer, releasing tantivy's per-directory lock, so the
+/// rebuild can replace the directory. A `None` control channel means the
+/// indexer never spawned — nothing holds the lock, so this is a no-op.
+#[cfg(target_os = "linux")]
+async fn quiesce_indexer(
+    control: Option<&flume::Sender<brain_ops::index::text_indexer::IndexerControl>>,
+    label: &str,
+) -> Result<(), String> {
+    let Some(control) = control else {
+        return Ok(());
+    };
+    let (ack_tx, ack_rx) = flume::bounded::<()>(1);
+    control
+        .send_async(brain_ops::index::text_indexer::IndexerControl::Quiesce { ack: ack_tx })
+        .await
+        .map_err(|_| format!("{label} indexer control channel closed (quiesce)"))?;
+    await_ack(&ack_rx, label, "quiesce").await
+}
+
+/// Send `Resume` with a fresh handle on the reopened index and await the
+/// ack. The indexer rebuilds its writer against `handle` and resumes
+/// draining. A `None` control channel is a no-op.
+#[cfg(target_os = "linux")]
+async fn resume_indexer(
+    control: Option<&flume::Sender<brain_ops::index::text_indexer::IndexerControl>>,
+    handle: brain_index::IndexHandle,
+    label: &str,
+) -> Result<(), String> {
+    let Some(control) = control else {
+        return Ok(());
+    };
+    let (ack_tx, ack_rx) = flume::bounded::<()>(1);
+    control
+        .send_async(brain_ops::index::text_indexer::IndexerControl::Resume {
+            handle,
+            ack: ack_tx,
+        })
+        .await
+        .map_err(|_| format!("{label} indexer control channel closed (resume)"))?;
+    await_ack(&ack_rx, label, "resume").await
+}
+
+/// Await a control ack with a bounded timeout so a dead indexer task can
+/// never wedge the rebuild indefinitely.
+#[cfg(target_os = "linux")]
+async fn await_ack(ack_rx: &flume::Receiver<()>, label: &str, phase: &str) -> Result<(), String> {
+    // `Err` = the deadline elapsed; `Ok(false)` = the ack sender was
+    // dropped (the indexer task died). Only `Ok(true)` is a real ack.
+    let res = glommio::timer::timeout(INDEXER_CONTROL_ACK_TIMEOUT, async {
+        Ok::<bool, glommio::GlommioError<()>>(ack_rx.recv_async().await.is_ok())
+    })
+    .await;
+    if matches!(res, Ok(true)) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{label} indexer {phase} ack timed out or task died"
+        ))
     }
 }
 
@@ -2222,10 +2413,15 @@ pub fn spawn_shard(
     // indexer workers will write to. Constructing it here (outside the
     // closure) propagates the failure through `spawn_shard`'s `Result`
     // just like the open above.
-    let lexical_retriever: Arc<dyn brain_index::LexicalRetriever> = Arc::new(
+    // Keep the concrete retriever so the hot rebuild can call
+    // `swap_shard`; hand `OpsContext` the trait object cloned from it, so
+    // the read path and the rebuild path share one retriever instance.
+    let lexical_retriever_concrete: Arc<brain_index::TantivyLexicalRetriever> = Arc::new(
         brain_index::TantivyLexicalRetriever::new(tantivy_shard.clone())
             .map_err(|source| ShardError::LexicalRetrieverInitFailed { source })?,
     );
+    let lexical_retriever: Arc<dyn brain_index::LexicalRetriever> =
+        lexical_retriever_concrete.clone();
 
     // ---- 5. Spawn the Glommio executor + build the rest of the stack -----
     let (tx, rx) = flume::bounded::<ShardRequest>(cfg.channel_capacity);
@@ -2402,6 +2598,10 @@ pub fn spawn_shard(
     // The closure can no longer downgrade lexical retrieval to `None`.
     let tantivy_for_closure = tantivy_shard.clone();
     let lexical_retriever_for_closure = lexical_retriever.clone();
+    // Concrete retriever + shard dir, captured for the shard's hot
+    // tantivy rebuild (`do_rebuild_tantivy`).
+    let lexical_retriever_concrete_for_closure = lexical_retriever_concrete.clone();
+    let tantivy_dir_for_closure = dir.clone();
     // WAL open/create runs *inside* the Glommio executor closure below —
     // it needs the executor's io_uring reactor to `.await`, and it depends
     // on `next_lsn_after_recovery` / `recovered_tail_offset` produced by the
@@ -2793,6 +2993,14 @@ pub fn spawn_shard(
             // lexical indexes before the executor drops pending tasks.
             let mut __memory_text_task: Option<(flume::Sender<()>, glommio::Task<()>)> = None;
             let mut __statement_text_task: Option<(flume::Sender<()>, glommio::Task<()>)> = None;
+            // Control-plane senders for the hot tantivy rebuild. `Some`
+            // only when the matching indexer spawned.
+            let mut __memory_text_control: Option<
+                flume::Sender<brain_ops::index::text_indexer::IndexerControl>,
+            > = None;
+            let mut __statement_text_control: Option<
+                flume::Sender<brain_ops::index::text_indexer::IndexerControl>,
+            > = None;
             let (memory_text_dispatcher_for_ops, statement_text_dispatcher_for_ops) = {
                 let policy = brain_ops::index::text_indexer::CommitPolicy::new(
                     index_spawn_cfg.tantivy_commit_n.max(1),
@@ -2803,14 +3011,20 @@ pub fn spawn_shard(
                     let (dispatcher, receiver) =
                         brain_ops::index::text_indexer::MemoryTextDispatcher::default_channel();
                     let (stop_tx, stop_rx) = flume::bounded::<()>(1);
+                    // Control channel is unbounded-ish (cap 4): the rebuild
+                    // sends at most a Quiesce then a Resume at a time.
+                    let (control_tx, control_rx) =
+                        flume::bounded::<brain_ops::index::text_indexer::IndexerControl>(4);
                     match brain_ops::index::text_indexer::memory::spawn_memory_text_indexer_local(
                         tantivy_for_ops.memory_text.clone(),
                         receiver,
                         policy,
                         stop_rx,
+                        control_rx,
                     ) {
                         Ok(task) => {
                             __memory_text_task = Some((stop_tx, task));
+                            __memory_text_control = Some(control_tx);
                             Some(Arc::new(dispatcher))
                         }
                         Err(err) => {
@@ -2828,14 +3042,18 @@ pub fn spawn_shard(
                     let (dispatcher, receiver) =
                         brain_ops::index::text_indexer::StatementTextDispatcher::default_channel();
                     let (stop_tx, stop_rx) = flume::bounded::<()>(1);
+                    let (control_tx, control_rx) =
+                        flume::bounded::<brain_ops::index::text_indexer::IndexerControl>(4);
                     match brain_ops::index::text_indexer::statement::spawn_statement_text_indexer_local(
                         tantivy_for_ops.statements.clone(),
                         receiver,
                         policy,
                         stop_rx,
+                        control_rx,
                     ) {
                         Ok(task) => {
                             __statement_text_task = Some((stop_tx, task));
+                            __statement_text_control = Some(control_tx);
                             Some(Arc::new(dispatcher))
                         }
                         Err(err) => {
@@ -3790,6 +4008,10 @@ pub fn spawn_shard(
                 wal_drain_task: Some(__wal_drain_task),
                 memory_text_task: __memory_text_task,
                 statement_text_task: __statement_text_task,
+                lexical_retriever: lexical_retriever_concrete_for_closure,
+                tantivy_dir: tantivy_dir_for_closure,
+                memory_text_control: __memory_text_control,
+                statement_text_control: __statement_text_control,
             };
             shard_main_loop(shard, rx).await;
         })

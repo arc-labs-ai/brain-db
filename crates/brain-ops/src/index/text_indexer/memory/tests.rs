@@ -44,12 +44,16 @@ fn spawn_drain(
 ) -> (MemoryTextDispatcher, glommio::Task<()>) {
     let (dispatcher, rx) = MemoryTextDispatcher::default_channel();
     let (stop_tx, stop_rx) = flume::bounded::<()>(1);
+    let (_control_tx, control_rx) = flume::bounded::<crate::index::text_indexer::IndexerControl>(1);
     let task = glommio::spawn_local(async move {
         // Held for the task's lifetime so the loop never observes a
         // shutdown signal: these tests drive the drop-of-Sender
         // (`Disconnected`) path, which must keep working unchanged.
         let _stop_tx = stop_tx;
-        run_memory_text_indexer(handle, rx, policy, stop_rx).await;
+        // Held so the control channel never closes and the loop keeps
+        // serving ops; the rebuild-control path has its own tests.
+        let _control_tx = _control_tx;
+        run_memory_text_indexer(handle, rx, policy, stop_rx, control_rx).await;
     });
     (dispatcher, task)
 }
@@ -508,5 +512,125 @@ fn end_to_end_indexer_to_retriever() {
             TantivyLexicalRetriever::new(TantivyShard::open(dir.path()).expect("reopen").shard)
                 .expect("retriever"),
         );
+    })
+}
+
+/// The live-rebuild control plane: `Quiesce` drops the writer (releasing
+/// tantivy's exclusive per-directory lock so the shard can rebuild + swap
+/// the index), and `Resume` rebuilds the writer on the reopened index and
+/// resumes draining. This exercises the indexer half of the hot tantivy
+/// rebuild dance end-to-end on the production Glommio runtime.
+#[test]
+fn quiesce_releases_lock_and_resume_rebuilds_writer() {
+    use crate::index::text_indexer::IndexerControl;
+
+    /// Poll until the index reports `want` hits for `query` or give up.
+    async fn await_hits(index: &tantivy::Index, query: &str, want: usize) {
+        for _ in 0..400 {
+            if count_hits(index, query) == want {
+                return;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        panic!("timed out waiting for {want} hit(s) for {query:?}");
+    }
+
+    run_in_glommio(|| async {
+        let (dir, handle) = fresh_shard();
+        // N=1 so every op commits immediately — no interval races.
+        let policy = CommitPolicy::new(1, Duration::from_secs(60));
+
+        let (dispatcher, rx) = MemoryTextDispatcher::default_channel();
+        let (_stop_tx, stop_rx) = flume::bounded::<()>(1);
+        let (control_tx, control_rx) = flume::bounded::<IndexerControl>(2);
+        let task = glommio::spawn_local(async move {
+            let _stop_tx = _stop_tx;
+            run_memory_text_indexer(handle, rx, policy, stop_rx, control_rx).await;
+        });
+
+        // 1. Normal operation: alpha lands.
+        dispatcher
+            .dispatch(MemoryTextOp::Upsert {
+                id: MemoryId::pack(0, 1, 0),
+                text: "alpha".into(),
+                space: SpaceId::new(),
+                kind: MemoryKind::Episodic,
+                created_at_unix_ms: 0,
+                session: 0,
+            })
+            .await;
+        {
+            let idx = TantivyShard::open(dir.path()).expect("open").shard;
+            await_hits(&idx.memory_text.index, "alpha", 1).await;
+        }
+
+        // 2. Quiesce: the indexer drops its writer and acks.
+        let (ack_tx, ack_rx) = flume::bounded::<()>(1);
+        control_tx
+            .send_async(IndexerControl::Quiesce { ack: ack_tx })
+            .await
+            .expect("send quiesce");
+        ack_rx.recv_async().await.expect("quiesce ack");
+
+        // 3. Lock released: an external writer opens on the SAME dir (this
+        //    would fail with a LockFailure if the indexer still held it).
+        //    Write beta through it, mimicking the rebuild populating the dir.
+        {
+            let shard = TantivyShard::open(dir.path())
+                .expect("reopen for rebuild")
+                .shard;
+            let idx = &shard.memory_text.index;
+            let mut w = idx
+                .writer_with_num_threads(1, 50_000_000)
+                .expect("writer lock must be free after quiesce");
+            let schema = idx.schema();
+            let mut doc = TantivyDocument::default();
+            doc.add_bytes(schema.get_field("memory_id").unwrap(), &2u128.to_be_bytes());
+            doc.add_text(schema.get_field("text").unwrap(), "beta");
+            let a: [u8; 16] = SpaceId::new().into();
+            doc.add_bytes(schema.get_field("space_id").unwrap(), &a);
+            doc.add_u64(schema.get_field("kind").unwrap(), 0);
+            doc.add_u64(schema.get_field("created_at").unwrap(), 0);
+            doc.add_u64(schema.get_field("session").unwrap(), 0);
+            w.add_document(doc).expect("add beta");
+            w.commit().expect("commit beta");
+        }
+
+        // 4. Resume against a freshly reopened handle.
+        let resumed = TantivyShard::open(dir.path())
+            .expect("reopen for resume")
+            .shard;
+        let (ack_tx, ack_rx) = flume::bounded::<()>(1);
+        control_tx
+            .send_async(IndexerControl::Resume {
+                handle: resumed.memory_text.clone(),
+                ack: ack_tx,
+            })
+            .await
+            .expect("send resume");
+        ack_rx.recv_async().await.expect("resume ack");
+
+        // 5. Post-resume ops index against the new writer.
+        dispatcher
+            .dispatch(MemoryTextOp::Upsert {
+                id: MemoryId::pack(0, 3, 0),
+                text: "gamma".into(),
+                space: SpaceId::new(),
+                kind: MemoryKind::Episodic,
+                created_at_unix_ms: 0,
+                session: 0,
+            })
+            .await;
+        await_hits(&resumed.memory_text.index, "gamma", 1).await;
+
+        // beta (external rebuild write) survived and gamma (resumed
+        // indexer) is present — the writer genuinely rebuilt on the new
+        // index, not the old one.
+        assert_eq!(count_hits(&resumed.memory_text.index, "beta"), 1);
+        assert_eq!(count_hits(&resumed.memory_text.index, "gamma"), 1);
+
+        drop(dispatcher);
+        drop(control_tx);
+        task.await;
     })
 }

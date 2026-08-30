@@ -681,18 +681,18 @@ async fn rebuild_index_each_target_returns_201() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn rebuild_index_tantivy_targets_require_restart() {
-    // Tantivy (lexical) indexes cannot be rebuilt live; the route must
-    // answer 501 with an actionable "restart" message rather than silently
-    // no-opping or rebuilding into a directory the live reader never sees.
+async fn rebuild_index_tantivy_targets_rebuild_live() {
+    // Tantivy (lexical) indexes rebuild live via the shard's quiesce →
+    // rebuild → swap dance; the route must answer 201 with an entries
+    // report, not the old "restart the shard" 501 stopgap.
     let server = start_admin_with_shards(1).await;
     for target in ["tantivy_memory", "tantivy_statement"] {
         let path = format!("/v1/rebuild?index={target}");
         let (code, body) = http_post_authed(server.admin_addr, &path).await;
-        assert_eq!(code, 501, "tantivy target {target} must 501; body:\n{body}");
+        assert_eq!(code, 201, "tantivy target {target} must 201; body:\n{body}");
         assert!(
-            body.contains("restart"),
-            "target {target} body should point at restart:\n{body}"
+            body.contains("\"entries\""),
+            "target {target} body:\n{body}"
         );
     }
     server.stop().await;

@@ -114,17 +114,20 @@ pub enum LexicalError {
 // TantivyLexicalRetriever — production impl.
 // ---------------------------------------------------------------------------
 
-/// Production `LexicalRetriever` impl. Holds an `Arc<TantivyShard>`
-/// plus cached `IndexReader` per scope; readers auto-refresh on
-/// commit per tantivy's default `ReloadPolicy::OnCommit`.
-pub struct TantivyLexicalRetriever {
+/// The swappable inner state of [`TantivyLexicalRetriever`]: the open
+/// `TantivyShard` plus a cached `IndexReader` per scope. Bundled behind
+/// one `ArcSwap` so a hot rebuild can replace the shard *and* both
+/// readers in a single atomic publish — a reader is bound to the `Index`
+/// it was opened from, so a new post-rebuild index needs fresh readers,
+/// never a `reload()` of the old ones.
+struct RetrieverInner {
     shard: Arc<TantivyShard>,
     memory_reader: IndexReader,
     statements_reader: IndexReader,
 }
 
-impl TantivyLexicalRetriever {
-    pub fn new(shard: Arc<TantivyShard>) -> Result<Self, LexicalError> {
+impl RetrieverInner {
+    fn build(shard: Arc<TantivyShard>) -> Result<Self, LexicalError> {
         let memory_reader = shard
             .memory_text
             .index
@@ -143,6 +146,41 @@ impl TantivyLexicalRetriever {
     }
 }
 
+/// Production `LexicalRetriever` impl. Holds its `TantivyShard` + cached
+/// `IndexReader`s behind an [`arc_swap::ArcSwap`] so the whole open-index
+/// bundle can be replaced atomically by a hot rebuild
+/// ([`swap_shard`](Self::swap_shard)) without disturbing the stable
+/// `Arc<dyn LexicalRetriever>` handle every consumer already holds. Each
+/// `retrieve` loads the current bundle once; a concurrent swap publishes
+/// the next bundle without ever exposing a torn or empty state, so reads
+/// see either the complete pre-rebuild index or the complete post-rebuild
+/// index — never stale-mixed data (invariant #7).
+pub struct TantivyLexicalRetriever {
+    inner: arc_swap::ArcSwap<RetrieverInner>,
+}
+
+impl TantivyLexicalRetriever {
+    pub fn new(shard: Arc<TantivyShard>) -> Result<Self, LexicalError> {
+        Ok(Self {
+            inner: arc_swap::ArcSwap::from_pointee(RetrieverInner::build(shard)?),
+        })
+    }
+
+    /// Atomically replace the open index bundle with readers opened from
+    /// `shard`. Called by the shard's hot-rebuild dance after the on-disk
+    /// index directory has been rebuilt from authoritative redb and
+    /// swapped into place, and the shard reopened. The new readers are
+    /// fully built *before* the publish, so a build failure leaves the
+    /// prior bundle serving untouched and the swap is all-or-nothing:
+    /// `retrieve` calls straddling this point see either the old complete
+    /// index or the new complete index, never a partial view.
+    pub fn swap_shard(&self, shard: Arc<TantivyShard>) -> Result<(), LexicalError> {
+        let next = RetrieverInner::build(shard)?;
+        self.inner.store(Arc::new(next));
+        Ok(())
+    }
+}
+
 impl LexicalRetriever for TantivyLexicalRetriever {
     fn retrieve(
         &self,
@@ -152,9 +190,13 @@ impl LexicalRetriever for TantivyLexicalRetriever {
     ) -> Result<Vec<RankedItem>, LexicalError> {
         validate_filters_for_scope(&query.filters, scope)?;
 
+        // Load the current bundle once for the whole call. A concurrent
+        // `swap_shard` publishes a new bundle without invalidating this
+        // guard, so the query runs entirely against one consistent index.
+        let inner = self.inner.load();
         let (handle, reader) = match scope {
-            LexicalScope::MemoryText => (&self.shard.memory_text, &self.memory_reader),
-            LexicalScope::StatementText => (&self.shard.statements, &self.statements_reader),
+            LexicalScope::MemoryText => (&inner.shard.memory_text, &inner.memory_reader),
+            LexicalScope::StatementText => (&inner.shard.statements, &inner.statements_reader),
         };
         // Tantivy's default `ReloadPolicy::OnCommitWithDelay` may
         // lag behind the writer's commits by up to ~50 ms. We

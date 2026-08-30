@@ -589,3 +589,110 @@ fn empty_query_returns_empty_result() {
         .expect("retrieve");
     assert!(result.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// Hot swap (swap_shard) — the read side of the live tantivy rebuild.
+// ---------------------------------------------------------------------------
+
+/// After `swap_shard`, `retrieve` serves the new index's content and no
+/// longer the old — the atomic publish flips the whole bundle (shard +
+/// both readers) without ever exposing a mixed view.
+#[test]
+fn swap_shard_flips_reads_to_the_new_index() {
+    // Old index: one memory "alpha".
+    let (_dir_a, shard_a, retriever) = fresh();
+    let alpha = MemoryId::pack(0, 1, 0);
+    write_memory(
+        &shard_a,
+        alpha,
+        "alpha",
+        SpaceId::new(),
+        MemoryKind::Episodic,
+        0,
+    );
+    let hits = retriever
+        .retrieve(
+            &term_query("alpha"),
+            LexicalScope::MemoryText,
+            &LexicalRetrieverConfig::default(),
+        )
+        .expect("retrieve alpha");
+    assert_eq!(hits.len(), 1, "old index serves alpha before swap");
+    assert_eq!(hits[0].id, RankedItemId::Memory(alpha));
+
+    // New index in a separate directory: one memory "beta".
+    let dir_b = TempDir::new().expect("tempdir b");
+    let shard_b = TantivyShard::open(dir_b.path()).expect("open b").shard;
+    let beta = MemoryId::pack(1, 2, 0);
+    write_memory(
+        &shard_b,
+        beta,
+        "beta",
+        SpaceId::new(),
+        MemoryKind::Episodic,
+        0,
+    );
+
+    retriever.swap_shard(shard_b).expect("swap");
+
+    // Post-swap: beta is visible, alpha is gone. Never an error, never a
+    // stale-mixed result (invariant #7).
+    let after_beta = retriever
+        .retrieve(
+            &term_query("beta"),
+            LexicalScope::MemoryText,
+            &LexicalRetrieverConfig::default(),
+        )
+        .expect("retrieve beta");
+    assert_eq!(after_beta.len(), 1, "new index serves beta after swap");
+    assert_eq!(after_beta[0].id, RankedItemId::Memory(beta));
+
+    let after_alpha = retriever
+        .retrieve(
+            &term_query("alpha"),
+            LexicalScope::MemoryText,
+            &LexicalRetrieverConfig::default(),
+        )
+        .expect("retrieve alpha after swap");
+    assert!(
+        after_alpha.is_empty(),
+        "old index content is gone after swap",
+    );
+}
+
+/// A second swap composes: reads always reflect the most recently
+/// published bundle.
+#[test]
+fn swap_shard_is_repeatable() {
+    let (_dir_a, shard_a, retriever) = fresh();
+    write_memory(
+        &shard_a,
+        MemoryId::pack(0, 1, 0),
+        "first",
+        SpaceId::new(),
+        MemoryKind::Episodic,
+        0,
+    );
+
+    for (i, term) in ["second", "third"].iter().enumerate() {
+        let dir = TempDir::new().expect("tempdir");
+        let shard = TantivyShard::open(dir.path()).expect("open").shard;
+        write_memory(
+            &shard,
+            MemoryId::pack(0, i as u64 + 2, 0),
+            term,
+            SpaceId::new(),
+            MemoryKind::Episodic,
+            0,
+        );
+        retriever.swap_shard(shard).expect("swap");
+        let hits = retriever
+            .retrieve(
+                &term_query(term),
+                LexicalScope::MemoryText,
+                &LexicalRetrieverConfig::default(),
+            )
+            .expect("retrieve");
+        assert_eq!(hits.len(), 1, "reads reflect the latest swap for {term}");
+    }
+}

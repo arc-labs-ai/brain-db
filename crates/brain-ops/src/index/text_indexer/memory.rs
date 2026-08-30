@@ -138,11 +138,12 @@ pub fn spawn_memory_text_indexer_local(
     rx: Receiver<MemoryTextOp>,
     policy: CommitPolicy,
     shutdown: Receiver<()>,
+    control: Receiver<super::IndexerControl>,
 ) -> Result<glommio::Task<()>, IndexerError> {
     let writer = build_writer(&handle)?;
     let fields = MemoryFields::resolve(&handle)?;
     Ok(glommio::spawn_local(async move {
-        run_loop(writer, fields, rx, policy, shutdown).await;
+        run_loop(writer, fields, rx, policy, shutdown, control).await;
     }))
 }
 
@@ -156,6 +157,7 @@ pub async fn run_memory_text_indexer(
     rx: Receiver<MemoryTextOp>,
     policy: CommitPolicy,
     shutdown: Receiver<()>,
+    control: Receiver<super::IndexerControl>,
 ) {
     let writer = match build_writer(&handle) {
         Ok(w) => w,
@@ -171,7 +173,7 @@ pub async fn run_memory_text_indexer(
             return;
         }
     };
-    run_loop(writer, fields, rx, policy, shutdown).await;
+    run_loop(writer, fields, rx, policy, shutdown, control).await;
 }
 
 fn build_writer(handle: &IndexHandle) -> Result<IndexWriter, IndexerError> {
@@ -198,6 +200,10 @@ enum NextOp<T> {
     /// needs the final commit. Waiting for the channel to close would
     /// mean waiting on refcount discipline; an explicit signal does not.
     Shutdown,
+    /// The shard's live-rebuild dance sent a control message (quiesce /
+    /// resume). Handled between ops so the writer lock is released and
+    /// reacquired at a batch boundary.
+    Control(super::IndexerControl),
 }
 
 /// Wait for the next op or the commit deadline. Glommio-only — both
@@ -209,6 +215,7 @@ enum NextOp<T> {
 async fn wait_next<T: 'static>(
     rx: &Receiver<T>,
     shutdown: &Receiver<()>,
+    control: &Receiver<super::IndexerControl>,
     remaining: Duration,
 ) -> NextOp<T> {
     use futures_lite::FutureExt;
@@ -224,11 +231,23 @@ async fn wait_next<T: 'static>(
         let _ = shutdown.recv_async().await;
         NextOp::Shutdown
     };
+    let ctrl = async {
+        match control.recv_async().await {
+            Ok(msg) => NextOp::Control(msg),
+            // Control channel closed: the rebuild plane is gone. Not a
+            // teardown signal on its own — keep serving ops; fall through
+            // to a benign deadline so the select never resolves here.
+            Err(_) => {
+                glommio::timer::sleep(remaining).await;
+                NextOp::DeadlineHit
+            }
+        }
+    };
     let timer = async {
         glommio::timer::sleep(remaining).await;
         NextOp::DeadlineHit
     };
-    recv.or(stop).or(timer).await
+    recv.or(stop).or(ctrl).or(timer).await
 }
 
 #[cfg(target_os = "linux")]
@@ -238,6 +257,7 @@ async fn run_loop(
     rx: Receiver<MemoryTextOp>,
     policy: CommitPolicy,
     shutdown: Receiver<()>,
+    control: Receiver<super::IndexerControl>,
 ) {
     let mut batch: usize = 0;
     let mut last_commit = Instant::now();
@@ -246,7 +266,7 @@ async fn run_loop(
         let deadline = last_commit + policy.interval;
         let remaining = deadline.saturating_duration_since(Instant::now());
 
-        match wait_next(&rx, &shutdown, remaining).await {
+        match wait_next(&rx, &shutdown, &control, remaining).await {
             NextOp::Op(op) => {
                 let is_hard_forget = matches!(op, MemoryTextOp::Forget { hard: true, .. });
                 if let Err(err) = apply_op(&mut writer, &fields, &op) {
@@ -306,6 +326,34 @@ async fn run_loop(
                     batch = 0;
                 }
                 last_commit = Instant::now();
+            }
+            NextOp::Control(super::IndexerControl::Quiesce { ack }) => {
+                // Release the live-dir writer lock so the shard's rebuild
+                // dance can replace the on-disk index. The uncommitted batch
+                // is discarded, not flushed: every op it held was applied
+                // after its redb commit, so the authoritative rows are in
+                // redb and the rebuild reconstructs them (and any op still
+                // buffered in `rx` re-drains after Resume). Committing here
+                // would only write into the directory about to be renamed
+                // away.
+                drop(writer);
+                batch = 0;
+                let _ = ack.send_async(()).await;
+                // Park until Resume hands us a writer on the reopened index
+                // (or teardown). `rx` keeps buffering ops meanwhile.
+                match super::wait_while_paused(&control, &shutdown).await {
+                    Some(w) => {
+                        writer = w;
+                        last_commit = Instant::now();
+                    }
+                    None => return,
+                }
+            }
+            NextOp::Control(super::IndexerControl::Resume { ack, .. }) => {
+                // Resume without a preceding Quiesce: nothing to do (the
+                // writer is already live). Ack so the orchestrator does not
+                // block on a protocol misstep.
+                let _ = ack.send_async(()).await;
             }
         }
     }
