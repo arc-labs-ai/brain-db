@@ -1997,6 +1997,15 @@ impl Shard {
                     elapsed_ms: start.elapsed().as_millis() as u64,
                 })
             }
+            // Tantivy cannot be rebuilt live (see `RebuildTarget` docs). The
+            // admin route short-circuits these targets with a
+            // "requires restart" response before reaching the shard; this
+            // arm is a defensive backstop for any direct programmatic call
+            // so the request fails loudly rather than silently no-opping.
+            T::TantivyMemory | T::TantivyStatement => Err(format!(
+                "target {target:?} cannot be rebuilt live; restart the shard \
+                 to rebuild tantivy from authoritative redb on boot"
+            )),
         }
     }
 }

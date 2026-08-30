@@ -7,8 +7,11 @@
 //! - `POST /v1/rebuild?index=<target>[&shard=N]` → 201 +
 //!   `{"index":"<target>","entries":N,"elapsed_ms":N,"shard":N}` —
 //!   rebuild any derived index from authoritative redb state. Unknown
-//!   `index` → 400. Targets: `memory_hnsw`, `entity_hnsw`, `hype_hnsw`,
-//!   `statement_question_hnsw`, `all`.
+//!   `index` → 400. HNSW targets rebuild live: `memory_hnsw`,
+//!   `entity_hnsw`, `hype_hnsw`, `statement_question_hnsw`, `all`. The
+//!   tantivy (lexical) targets `tantivy_memory` / `tantivy_statement`
+//!   cannot be rebuilt live and answer `501` with a "restart the shard"
+//!   message (restart rebuilds tantivy from authoritative redb on boot).
 
 use std::sync::Arc;
 
@@ -86,9 +89,24 @@ pub async fn handle_index(
         return Ok(text_response(
             StatusCode::BAD_REQUEST,
             "unknown index: expected one of memory_hnsw, entity_hnsw, \
-             hype_hnsw, statement_question_hnsw, all\n",
+             hype_hnsw, statement_question_hnsw, all, tantivy_memory, \
+             tantivy_statement\n",
         ));
     };
+    // Tantivy indexes cannot be rebuilt while the shard is serving: the
+    // lexical retriever's cached reader is bound to the `Index` opened at
+    // spawn and the text-indexer holds tantivy's exclusive writer lock for
+    // the shard's life, so a directory swap would be invisible to reads and
+    // race the writer. Answer with a clear, actionable response instead of
+    // silently doing nothing — restarting the shard rebuilds tantivy from
+    // authoritative redb on boot (see `tantivy_recovery`).
+    if target.requires_restart() {
+        return Ok(text_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "tantivy indexes cannot be rebuilt live; restart the shard to \
+             rebuild the lexical index from authoritative redb on boot\n",
+        ));
+    }
     let shard_id = match query::shard_required(&query_str) {
         Ok(id) => id,
         Err(msg) => return Ok(text_response(StatusCode::BAD_REQUEST, &format!("{msg}\n"))),
