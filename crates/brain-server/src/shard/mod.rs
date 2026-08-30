@@ -1001,6 +1001,20 @@ impl ShardHandle {
         !self.tx.is_disconnected()
     }
 
+    /// Number of [`ShardRequest`]s queued on this shard's request
+    /// channel but not yet drained by the executor loop — the
+    /// dispatch-queue depth.
+    ///
+    /// Because the shard is single-writer (the executor drains the
+    /// channel serially), this is the count of requests waiting their
+    /// turn. It reads the flume channel length directly, without a
+    /// round-trip through the executor, so it is safe to call from the
+    /// admin (Tokio) side and cheap enough for a per-scrape gauge.
+    #[must_use]
+    pub fn queue_depth(&self) -> usize {
+        self.tx.len()
+    }
+
     /// Read-only handle to the AutoEdgeWorker metric
     /// state for this shard. `None` when the worker was disabled in
     /// spawn config (no-schema deployments / tests).
@@ -4632,6 +4646,34 @@ mod tests {
     #[test]
     fn wal_ready_ok_yields_ok() {
         assert!(interpret_wal_ready(Ok(Ok(()))).is_ok());
+    }
+
+    #[test]
+    fn queue_depth_tracks_undrained_requests() {
+        // The dispatch-queue depth reflects requests queued on the
+        // request channel but not yet drained by the executor. With no
+        // receiver draining, each send accumulates.
+        let (tx, rx) = flume::unbounded::<ShardRequest>();
+        let handle = ShardHandle::new_for_test(0, tx);
+        assert_eq!(handle.queue_depth(), 0);
+
+        let (reply_tx, _reply_rx) = flume::bounded(1);
+        handle
+            .tx
+            .send(ShardRequest::Ping { reply_tx })
+            .expect("send ping");
+        assert_eq!(handle.queue_depth(), 1);
+
+        let (reply_tx, _reply_rx) = flume::bounded(1);
+        handle
+            .tx
+            .send(ShardRequest::HnswSnapshot { reply_tx })
+            .expect("send snapshot");
+        assert_eq!(handle.queue_depth(), 2);
+
+        // Draining one request drops the depth.
+        let _ = rx.recv().expect("drain one");
+        assert_eq!(handle.queue_depth(), 1);
     }
 
     #[test]
