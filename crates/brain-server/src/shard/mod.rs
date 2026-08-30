@@ -3550,6 +3550,34 @@ pub fn spawn_shard(
                     .expect("register AuditLogSweeper");
             }
 
+            // StaleExtractionDetector — counts statements whose
+            // `schema_version` trails the active schema and exposes the
+            // total via metrics so operators can see extraction drift after
+            // a narrowing SCHEMA_UPLOAD. On by default (read-only counting
+            // sweep, hourly cadence); its own `defaults_for` config carries
+            // the enabled flag, so the scheduler honours it. Without
+            // registration the stale-statement count is never emitted.
+            {
+                let worker =
+                    brain_workers::workers::stale_extraction_detector::StaleExtractionDetector::new();
+                scheduler
+                    .register(Arc::new(worker), ops.clone())
+                    .expect("register StaleExtractionDetector");
+            }
+
+            // EntityGcWorker — tombstones orphaned entities past a grace
+            // window (default 30d). Off by default: `EntityGcWorker::new()`
+            // ships disabled and its `defaults_for(EntityGc)` config carries
+            // `enabled = false`, so the scheduler leaves it idle until an
+            // operator opts in. Provisioned unconditionally so it *can* run
+            // when enabled; without registration it could never run at all.
+            {
+                let worker = brain_workers::workers::entity_gc::EntityGcWorker::new();
+                scheduler
+                    .register(Arc::new(worker), ops.clone())
+                    .expect("register EntityGcWorker");
+            }
+
             // AmbiguityResolverWorker — promotes / expires entries in the
             // entity-merge review queue using the per-shard entity HNSW +
             // embedder. Without it ambiguous resolutions accumulate and
