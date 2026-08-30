@@ -395,9 +395,24 @@ impl SubscriptionRegistry {
             .subscribe_shard(target_shard)
             .ok_or(OpError::ShardOutOfRange(target_shard))?;
 
+        // `from_lsn` is the precise resume mechanism ("continue from
+        // where I left off"); `include_history` is the coarse "replay
+        // the history still retained, then go live" flag. An explicit
+        // `from_lsn` always wins; when the client only asked for
+        // `include_history` (no `from_lsn`), replay everything still in
+        // the WAL by anchoring at LSN 0 — the retained-history-then-live
+        // cutover the WAL-tail semantic already implements. Without this
+        // mapping `include_history` would be silently ignored.
+        let effective_from_lsn = req.from_lsn.or({
+            if req.include_history {
+                Some(0)
+            } else {
+                None
+            }
+        });
         // Optional replay info — `None` when the client subscribed
         // to the live tail only.
-        let replay = if let Some(from_lsn) = req.from_lsn {
+        let replay = if let Some(from_lsn) = effective_from_lsn {
             let locator = self
                 .hub
                 .wal_locator(target_shard)

@@ -575,6 +575,26 @@ fn dispatcher_with_from_lsn_returns_lsn_too_old() {
     })
 }
 
+#[test]
+fn dispatcher_with_include_history_returns_not_found() {
+    // The one-shot poller path has no WAL-replay machinery, so
+    // `include_history` (like `from_lsn`) is rejected rather than
+    // silently ignored and downgraded to a live-only subscription.
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        let mut req = sub_req(empty_filter());
+        req.include_history = true;
+        let err = dispatch(
+            RequestBody::Subscribe(req),
+            brain_ops::RequestCaller::for_tests(),
+            &fix.ctx,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.error_code(), ErrorCode::NotFound);
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Backpressure (1).
 // ---------------------------------------------------------------------------

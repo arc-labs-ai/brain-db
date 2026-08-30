@@ -727,6 +727,95 @@ async fn subscribe_from_lsn_replays_historical_encodes() {
     server.stop().await;
 }
 
+/// `include_history: true` with no explicit `from_lsn` must replay the
+/// retained WAL history, exactly as `from_lsn: Some(_)` does. Encodes
+/// two memories BEFORE any subscriber exists (so they live only in the
+/// WAL, not a live listener's buffer), then subscribes with
+/// `include_history: true` / `from_lsn: None` and asserts the historical
+/// events arrive. Before `include_history` was wired, the flag was
+/// silently ignored and this subscription would have started at the live
+/// tail, seeing nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subscribe_include_history_replays_historical_encodes() {
+    let server = start_with_shards(1).await;
+    let space_id = *uuid::Uuid::now_v7().as_bytes();
+
+    // ENCODE two memories with no subscriber attached — durable only in
+    // the WAL, so this exercises replay, not a live-tail path.
+    let mut writer = TcpStream::connect(server.addr).await.expect("writer");
+    complete_handshake(&mut writer, &server.mint(space_id)).await;
+    for (i, text) in ["gamma", "delta"].iter().enumerate() {
+        let stream_id = ((i * 2) + 1) as u32; // 1, 3 — odd client streams
+        send_frame(
+            &mut writer,
+            Frame::new(
+                Opcode::EncodeReq.as_u16(),
+                FLAG_EOS,
+                stream_id,
+                RequestBody::Encode(encode_request(text, MemoryKindWire::Episodic)).encode(),
+            ),
+        )
+        .await;
+        let resp = read_one_frame(&mut writer).await.expect("encode resp");
+        assert_eq!(
+            resp.header.opcode_u16(),
+            Opcode::EncodeResp.as_u16(),
+            "encode {text} expected EncodeResp, got 0x{:02x}",
+            resp.header.opcode_u16(),
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Subscribe with include_history=true and NO from_lsn — the flag
+    // alone must trigger retained-history replay.
+    let mut sub = TcpStream::connect(server.addr).await.expect("sub");
+    complete_handshake(&mut sub, &server.mint(space_id)).await;
+    let sub_stream = 11u32;
+    send_frame(
+        &mut sub,
+        Frame::new(
+            Opcode::SubscribeReq.as_u16(),
+            FLAG_EOS,
+            sub_stream,
+            RequestBody::Subscribe(SubscribeRequest {
+                filter: own_filter(space_id),
+                include_history: true,
+                from_lsn: None,
+                max_inflight: 100,
+                act_as: None,
+            })
+            .encode(),
+        ),
+    )
+    .await;
+
+    let mut replayed_events = 0;
+    for _ in 0..10 {
+        let Some(frame) = read_event_within(&mut sub, Duration::from_secs(3)).await else {
+            break;
+        };
+        if frame.header.opcode_u16() == Opcode::Error.as_u16() {
+            let body = ResponseBody::decode(Opcode::Error, &frame.payload).expect("decode");
+            panic!("got Error frame from include_history replay: {body:?}");
+        }
+        if frame.header.opcode_u16() == Opcode::SubscribeEvent.as_u16()
+            && frame.header.stream_id_u32() == sub_stream
+            && frame.header.flags_u8() & FLAG_EOS == 0
+        {
+            replayed_events += 1;
+            if replayed_events >= 2 {
+                break;
+            }
+        }
+    }
+    assert!(
+        replayed_events >= 2,
+        "expected >=2 replayed SUBSCRIBE_EVENT frames from include_history, got {replayed_events}"
+    );
+
+    server.stop().await;
+}
+
 /// `spaces` filter — encodes from space A and B; subscriber listening
 /// only to space A receives ONLY A's events even though B's events
 /// hit the same shard. Without this filter, a multi-tenant shard

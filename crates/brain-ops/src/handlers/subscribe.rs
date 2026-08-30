@@ -896,14 +896,19 @@ impl SubscriptionRegistry {
     /// Validate the request, allocate a stream id, install the entry,
     /// and return a receiver primed at the bus's current tail.
     pub fn register(&self, req: &SubscribeRequest) -> Result<SubscriptionHandle, OpError> {
-        if req.from_lsn.is_some() {
-            // LsnTooOld until WAL replay is wired. We
+        if req.from_lsn.is_some() || req.include_history {
+            // This one-shot poller only tails live events; it has no
+            // WAL-replay machinery (that lives in the connection-layer
+            // path, see the module doc §21). Both `from_lsn` (resume)
+            // and `include_history` (replay retained history) ask for
+            // history, so reject them here rather than silently
+            // ignoring the flag and returning live-only events. We
             // surface it as `NotFound { what: "wal_segment", ... }`
             // which maps to the same wire `NotFound` family.
             return Err(OpError::NotFound {
                 what: "wal_segment",
-                detail: "subscribe: historical replay (from_lsn) is not yet \
-                         supported. Omit from_lsn to subscribe to the live tail."
+                detail: "subscribe: historical replay (from_lsn / include_history) is not yet \
+                         supported on this path. Omit both to subscribe to the live tail."
                     .into(),
             });
         }
