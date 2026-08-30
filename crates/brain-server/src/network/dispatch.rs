@@ -92,11 +92,8 @@ pub(crate) struct ConnState {
     /// different shard on a multi-shard deployment, where the txn was never
     /// begun (the commit fails as `TxnNotFound`). The `TxnStore` is
     /// per-shard, so a txn's whole lifecycle must land on one shard. This
-    /// map records the begin-time shard and pins the commit/abort to it.
-    /// Entries are retained after commit/abort so an idempotent retry of a
-    /// delegated `TXN_COMMIT` still routes to the shard holding the cached
-    /// replay response; the map is dropped with the connection.
-    pub(crate) txn_shards: std::collections::HashMap<[u8; 16], u16>,
+    /// router records the begin-time shard and pins the commit/abort to it.
+    pub(crate) txn_shards: TxnShardRouter,
 }
 
 impl ConnState {
@@ -107,8 +104,89 @@ impl ConnState {
             negotiated_version: 0,
             last_revocation_check: Instant::now(),
             opened_txn: false,
-            txn_shards: std::collections::HashMap::new(),
+            txn_shards: TxnShardRouter::new(),
         }
+    }
+}
+
+/// Bound on the terminated-txn retry window kept per connection. Sized to
+/// comfortably cover in-flight retries of recently-committed transactions
+/// without letting a long-lived pooled connection accumulate a route entry
+/// per transaction for its whole lifetime.
+const TERMINATED_TXN_ROUTE_WINDOW: usize = 256;
+
+/// Per-connection `txn_id` → begin-shard routing table.
+///
+/// Split into two tiers so the state a pooled, long-lived connection carries
+/// is bounded regardless of how many transactions it runs:
+///
+/// - `active`: transactions begun on this connection and not yet terminated.
+///   Entries live only for the transaction's lifetime; a terminal
+///   `TXN_COMMIT` / `TXN_ABORT` moves the entry out.
+/// - `terminated`: a bounded FIFO window of recently-terminated txns. Retained
+///   only briefly so an idempotent retry of a delegated `TXN_COMMIT` /
+///   `TXN_ABORT` still routes to the shard holding the cached replay response.
+///   Oldest entries are evicted once the window is full, so this tier can never
+///   grow past [`TERMINATED_TXN_ROUTE_WINDOW`].
+pub(crate) struct TxnShardRouter {
+    active: std::collections::HashMap<[u8; 16], u16>,
+    terminated: std::collections::HashMap<[u8; 16], u16>,
+    terminated_order: std::collections::VecDeque<[u8; 16]>,
+}
+
+impl TxnShardRouter {
+    pub(crate) fn new() -> Self {
+        Self {
+            active: std::collections::HashMap::new(),
+            terminated: std::collections::HashMap::new(),
+            terminated_order: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// Record the shard a `TXN_BEGIN` landed on.
+    pub(crate) fn begin(&mut self, txn_id: [u8; 16], shard: u16) {
+        self.active.insert(txn_id, shard);
+    }
+
+    /// Resolve the begin-shard for a `txn_id`, checking active transactions
+    /// first and then the bounded terminated-retry window.
+    pub(crate) fn route(&self, txn_id: &[u8; 16]) -> Option<u16> {
+        self.active
+            .get(txn_id)
+            .or_else(|| self.terminated.get(txn_id))
+            .copied()
+    }
+
+    /// Retire a transaction on terminal `TXN_COMMIT` / `TXN_ABORT`: drop it
+    /// from the unbounded active tier and, if it was active, park its route in
+    /// the bounded terminated window so a delegated retry still routes home. A
+    /// terminal op for an already-terminated (or never-begun) txn is a no-op
+    /// against the active tier and leaves the window untouched.
+    pub(crate) fn terminate(&mut self, txn_id: &[u8; 16]) {
+        if let Some(shard) = self.active.remove(txn_id) {
+            self.push_terminated(*txn_id, shard);
+        }
+    }
+
+    fn push_terminated(&mut self, txn_id: [u8; 16], shard: u16) {
+        // Re-terminating an entry already in the window (e.g. a duplicate
+        // terminal that raced the active removal) refreshes the route without
+        // double-counting it in the eviction order.
+        if self.terminated.insert(txn_id, shard).is_none() {
+            self.terminated_order.push_back(txn_id);
+            while self.terminated_order.len() > TERMINATED_TXN_ROUTE_WINDOW {
+                if let Some(evicted) = self.terminated_order.pop_front() {
+                    self.terminated.remove(&evicted);
+                }
+            }
+        }
+    }
+
+    /// Total routing entries currently held (active + terminated window).
+    /// Test/introspection helper; the terminated tier is bounded by
+    /// [`TERMINATED_TXN_ROUTE_WINDOW`].
+    pub(crate) fn len(&self) -> usize {
+        self.active.len() + self.terminated.len()
     }
 }
 
@@ -425,17 +503,22 @@ pub(crate) fn dispatch_frame(frame: Frame, state: &mut ConnState, topology: &Top
     // returns the same shard the fallthrough would have picked.
     match &req {
         RequestBody::TxnBegin(r) => {
-            state.txn_shards.insert(r.txn_id, target_shard);
+            state.txn_shards.begin(r.txn_id, target_shard);
         }
         RequestBody::TxnCommit(r) => {
-            if let Some(&shard) = state.txn_shards.get(&r.txn_id) {
+            if let Some(shard) = state.txn_shards.route(&r.txn_id) {
                 target_shard = shard;
             }
+            // Terminal op: evict the active entry (moving it into the bounded
+            // retry window) so a pooled connection running many txns cannot
+            // grow the routing table without bound.
+            state.txn_shards.terminate(&r.txn_id);
         }
         RequestBody::TxnAbort(r) => {
-            if let Some(&shard) = state.txn_shards.get(&r.txn_id) {
+            if let Some(shard) = state.txn_shards.route(&r.txn_id) {
                 target_shard = shard;
             }
+            state.txn_shards.terminate(&r.txn_id);
         }
         _ => {}
     }
@@ -1410,7 +1493,7 @@ mod tests {
             }
             _ => panic!("expected OpDispatch for TXN_BEGIN"),
         }
-        assert_eq!(state.txn_shards.get(&txn_id), Some(&target_shard));
+        assert_eq!(state.txn_shards.route(&txn_id), Some(target_shard));
 
         // TXN_COMMIT carries no act_as → must be pinned to the begin shard,
         // NOT the bound shard.
@@ -1452,6 +1535,70 @@ mod tests {
             }
             _ => panic!("expected OpDispatch for TXN_ABORT"),
         }
+    }
+
+    /// Regression: the per-connection txn→shard router must not grow without
+    /// bound across many begin/commit cycles on a single long-lived (pooled)
+    /// connection. Each terminal commit evicts the active entry; the retained
+    /// retry window is capped at `TERMINATED_TXN_ROUTE_WINDOW`.
+    #[test]
+    fn txn_router_does_not_grow_unbounded_across_many_cycles() {
+        let mut router = TxnShardRouter::new();
+        for i in 0..100_000u32 {
+            let mut txn_id = [0u8; 16];
+            txn_id[..4].copy_from_slice(&i.to_le_bytes());
+            router.begin(txn_id, (i % 8) as u16);
+            // Terminal commit: the entry must leave the active tier.
+            router.terminate(&txn_id);
+            assert!(
+                router.len() <= TERMINATED_TXN_ROUTE_WINDOW,
+                "router grew to {} entries at cycle {i} — should stay <= {}",
+                router.len(),
+                TERMINATED_TXN_ROUTE_WINDOW
+            );
+        }
+        // After 100k cycles the router holds only the bounded retry window,
+        // not one entry per transaction.
+        assert_eq!(router.len(), TERMINATED_TXN_ROUTE_WINDOW);
+    }
+
+    /// A committed txn's route survives one commit into the bounded retry
+    /// window so an idempotent delegated retry still pins to the begin shard;
+    /// the active tier no longer holds it.
+    #[test]
+    fn txn_route_survives_commit_into_retry_window() {
+        let mut router = TxnShardRouter::new();
+        let txn_id = [0x11; 16];
+        router.begin(txn_id, 5);
+        assert_eq!(router.route(&txn_id), Some(5));
+        router.terminate(&txn_id);
+        // Retry after terminal still routes home (from the retry window).
+        assert_eq!(router.route(&txn_id), Some(5));
+        // But the entry no longer occupies the unbounded active tier.
+        assert_eq!(router.active.len(), 0);
+        assert_eq!(router.terminated.len(), 1);
+    }
+
+    /// The retry window evicts oldest-first, so a route pushed out of the
+    /// window no longer resolves while recent ones still do.
+    #[test]
+    fn txn_retry_window_evicts_oldest_first() {
+        let mut router = TxnShardRouter::new();
+        // Fill the window plus one, all begun-then-terminated.
+        for i in 0..=(TERMINATED_TXN_ROUTE_WINDOW as u32) {
+            let mut txn_id = [0u8; 16];
+            txn_id[..4].copy_from_slice(&i.to_le_bytes());
+            router.begin(txn_id, 3);
+            router.terminate(&txn_id);
+        }
+        // The very first txn was evicted; the last remains.
+        let mut first = [0u8; 16];
+        first[..4].copy_from_slice(&0u32.to_le_bytes());
+        let mut last = [0u8; 16];
+        last[..4].copy_from_slice(&(TERMINATED_TXN_ROUTE_WINDOW as u32).to_le_bytes());
+        assert_eq!(router.route(&first), None, "oldest entry must be evicted");
+        assert_eq!(router.route(&last), Some(3), "newest entry must survive");
+        assert_eq!(router.len(), TERMINATED_TXN_ROUTE_WINDOW);
     }
 
     /// A commit for a txn_id this connection never began falls through to
