@@ -112,9 +112,7 @@ impl BackfillWorker {
         // so the two can never deadlock.
         let current = self.state.current.lock();
         let mut pending = self.state.pending.lock();
-        let already_present = current
-            .as_ref()
-            .is_some_and(|r| r.request.request_id == id)
+        let already_present = current.as_ref().is_some_and(|r| r.request.request_id == id)
             || pending.iter().any(|r| r.request_id == id);
         if !already_present {
             pending.push_back(request);
@@ -564,8 +562,14 @@ mod tests {
     #[test]
     fn cancel_pending_leaves_other_runs_queued() {
         let w = BackfillWorker::new();
-        let keep = w.submit(BackfillRequest::new(BackfillRange::All, vec![ExtractorId(1)]));
-        let drop_id = w.submit(BackfillRequest::new(BackfillRange::All, vec![ExtractorId(2)]));
+        let keep = w.submit(BackfillRequest::new(
+            BackfillRange::All,
+            vec![ExtractorId(1)],
+        ));
+        let drop_id = w.submit(BackfillRequest::new(
+            BackfillRange::All,
+            vec![ExtractorId(2)],
+        ));
         assert_eq!(w.state.pending.lock().len(), 2);
 
         assert!(w.cancel(drop_id));
@@ -615,8 +619,14 @@ mod tests {
     #[test]
     fn submit_distinct_ids_both_queue() {
         let w = BackfillWorker::new();
-        let a = w.submit(BackfillRequest::new(BackfillRange::All, vec![ExtractorId(1)]));
-        let b = w.submit(BackfillRequest::new(BackfillRange::All, vec![ExtractorId(2)]));
+        let a = w.submit(BackfillRequest::new(
+            BackfillRange::All,
+            vec![ExtractorId(1)],
+        ));
+        let b = w.submit(BackfillRequest::new(
+            BackfillRange::All,
+            vec![ExtractorId(2)],
+        ));
         assert_ne!(a, b);
         assert_eq!(w.state.pending.lock().len(), 2);
     }
