@@ -94,9 +94,11 @@ pub fn statement_history(
         let sid_bytes = v.value();
         let m_row: Option<StatementMetadata> = s_table.get(&sid_bytes)?.map(|g| g.value());
         if let Some(m) = m_row {
-            if let Some(s) = statement_from_metadata(&m) {
-                out.push(s);
-            }
+            // A PRESENT chain row that fails to decode is corruption, not
+            // absence (genuine absence is the `None` from the get above). Fail-
+            // stop rather than silently drop it from the history (invariant #7).
+            let s = statement_from_metadata(&m).ok_or(StatementOpError::DecodeFailed)?;
+            out.push(s);
         }
     }
     Ok(out)
@@ -275,9 +277,11 @@ pub fn statement_list(
                     continue;
                 }
             }
-            if let Some(s) = statement_from_metadata(&m) {
-                out.push(s);
-            }
+            // A PRESENT row that survives the filters but fails to decode is
+            // corruption, not absence (genuine absence is the `None` from the
+            // get above). Fail-stop rather than silently drop it (invariant #7).
+            let s = statement_from_metadata(&m).ok_or(StatementOpError::DecodeFailed)?;
+            out.push(s);
         }
     }
     Ok(out)
@@ -1026,5 +1030,45 @@ mod tests {
             !seen.contains(&absent.to_bytes()),
             "genuinely absent row must be skipped"
         );
+    }
+
+    /// Non-paged live path (`statement_list`, the one graph/grounded RECALL
+    /// walks). A PRESENT primary row whose object blob no longer decodes is
+    /// corruption, not absence: `statement_list` must fail-stop with
+    /// `DecodeFailed` (invariant #7) rather than silently omit the row — the
+    /// same discipline the paged walk already enforces.
+    #[test]
+    fn statement_list_fails_stop_on_undecodable_present_row() {
+        let (_dir, db) = open_db();
+        let subj = make_entity(&db, "subject");
+        let pred = intern_cumulative_pred(&db, "knows");
+
+        let mut created: Vec<StatementId> = Vec::new();
+        for i in 0..3 {
+            let obj = make_entity(&db, &format!("obj{i}"));
+            created.push(create(&db, &fact(subj, pred, obj, 0.9)));
+        }
+
+        // Corrupt one row's object blob in place, leaving the row PRESENT so
+        // `statement_from_metadata` returns `None` on a present row.
+        let victim = created[1];
+        {
+            let wtxn = db.write_txn().unwrap();
+            {
+                let mut t = wtxn.open_table(STATEMENTS_TABLE).unwrap();
+                let mut m = t.get(&victim.to_bytes()).unwrap().unwrap().value();
+                m.object_blob = vec![0xFF, 0xFF, 0xFF, 0xFF];
+                t.insert(&victim.to_bytes(), &m).unwrap();
+            }
+            wtxn.commit().unwrap();
+        }
+
+        let filter = history_filter(Some(subj), None);
+        let rtxn = db.read_txn().unwrap();
+        match statement_list(&rtxn, test_scope(), &filter) {
+            Err(StatementOpError::DecodeFailed) => {}
+            Err(other) => panic!("expected DecodeFailed, got {other:?}"),
+            Ok(_) => panic!("undecodable present row must fail-stop, not skip"),
+        }
     }
 }
