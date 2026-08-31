@@ -1074,6 +1074,13 @@ pub fn entity_update(
     let normalized_old = normalize_name(&current.canonical_name);
     let normalized_new = normalize_name(&next.canonical_name);
     let canonical_changed = normalized_old != normalized_new;
+    // A type change re-buckets every secondary-index row. All of the
+    // secondary indexes (canonical-name, alias, trigram) key on the
+    // entity's type_id, so a type change alone — even with an unchanged
+    // name and alias set — strands their rows under the OLD type_id. When
+    // the type changes we must re-key the canonical-name row and fully
+    // re-index the alias + trigram sets, not just apply the string delta.
+    let type_changed = current.entity_type_id != next.entity_type.raw();
 
     if canonical_changed {
         // Old canonical_name moves into aliases. The constructor
@@ -1084,8 +1091,13 @@ pub fn entity_update(
             next.aliases.push(current.canonical_name.clone());
         }
         next.embedding_version = current.embedding_version + 1;
+    }
 
-        // Update canonical-name index.
+    // Re-key the canonical-name index whenever the canonical name OR the
+    // entity type changed. The row is keyed on (scope, type_id, name), so
+    // a type change alone would otherwise leave the row under the old
+    // type_id and make lookups under the new type miss.
+    if canonical_changed || type_changed {
         let mut t = wtxn.open_table(ENTITY_BY_CANONICAL_NAME_TABLE)?;
         t.remove(&(
             scope.namespace_id,
@@ -1122,7 +1134,7 @@ pub fn entity_update(
     // By-(scope, type) listing index follows a type change. Scope is
     // immutable, so only a type change moves the row between type buckets;
     // the trailing EntityId is unchanged.
-    if current.entity_type_id != next.entity_type.raw() {
+    if type_changed {
         let mut t = wtxn.open_table(ENTITY_BY_TYPE_TABLE)?;
         t.remove(&(
             scope.namespace_id,
@@ -1141,28 +1153,45 @@ pub fn entity_update(
         )?;
     }
 
-    // Alias delta. Compare on normalized forms.
+    // Alias index. Compare on normalized forms. When the type changed
+    // every alias row must move type buckets, so we drop the FULL old set
+    // (under the old type_id) and insert the FULL new set (under the new
+    // type_id); a string delta would leave unchanged aliases stranded
+    // under the old type. When the type is unchanged, apply the delta.
     let old_norms: HashSet<String> = current.aliases.iter().map(|a| normalize_name(a)).collect();
     let new_norms: HashSet<String> = next.aliases.iter().map(|a| normalize_name(a)).collect();
 
     {
+        // On a type change, remove the full old set and insert the full
+        // new set so every alias row moves type buckets; otherwise apply
+        // the string delta between the two sets.
+        let removed: Vec<&String> = if type_changed {
+            old_norms.iter().collect()
+        } else {
+            old_norms.difference(&new_norms).collect()
+        };
+        let added: Vec<&String> = if type_changed {
+            new_norms.iter().collect()
+        } else {
+            new_norms.difference(&old_norms).collect()
+        };
         let mut t = wtxn.open_table(ENTITY_ALIASES_TABLE)?;
-        for removed in old_norms.difference(&new_norms) {
+        for r in removed {
             t.remove(&(
                 scope.namespace_id,
                 scope.space_id_bytes,
                 current.entity_type_id,
-                removed.as_str(),
+                r.as_str(),
                 current.entity_id_bytes,
             ))?;
         }
-        for added in new_norms.difference(&old_norms) {
+        for a in added {
             t.insert(
                 &(
                     scope.namespace_id,
                     scope.space_id_bytes,
                     next.entity_type.raw(),
-                    added.as_str(),
+                    a.as_str(),
                     next.id.to_bytes(),
                 ),
                 &(),
@@ -1170,18 +1199,28 @@ pub fn entity_update(
         }
     }
 
-    // Trigram delta. The entity's old trigram set is
-    // derived from current.canonical_name + current.aliases; the new
-    // set from next.canonical_name + next.aliases. Remove `old - new`,
-    // add `new - old`.
+    // Trigram index. The entity's old trigram set is derived from
+    // current.canonical_name + current.aliases; the new set from
+    // next.canonical_name + next.aliases. When the type changed, every
+    // trigram row moves type buckets, so drop the FULL old set (under the
+    // old type) and add the FULL new set (under the new type). When the
+    // type is unchanged, apply the delta: remove `old - new`, add
+    // `new - old`.
     let old_trigrams =
         crate::entity::trigram::trigrams_of_components(&current.canonical_name, &current.aliases);
     let new_trigrams =
         crate::entity::trigram::trigrams_of_components(&next.canonical_name, &next.aliases);
-    let to_remove: std::collections::HashSet<[u8; 3]> =
-        old_trigrams.difference(&new_trigrams).copied().collect();
-    let to_add: std::collections::HashSet<[u8; 3]> =
-        new_trigrams.difference(&old_trigrams).copied().collect();
+    let (to_remove, to_add): (
+        std::collections::HashSet<[u8; 3]>,
+        std::collections::HashSet<[u8; 3]>,
+    ) = if type_changed {
+        (old_trigrams.clone(), new_trigrams.clone())
+    } else {
+        (
+            old_trigrams.difference(&new_trigrams).copied().collect(),
+            new_trigrams.difference(&old_trigrams).copied().collect(),
+        )
+    };
     crate::entity::trigram::remove_entity_trigrams(
         wtxn,
         scope,
@@ -2228,6 +2267,103 @@ mod tests {
         let projects = entity_list_by_type(&rtxn, test_scope(), EntityTypeId(7)).unwrap();
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0].id, id);
+    }
+
+    /// A type change with an UNCHANGED canonical name and alias set must
+    /// still re-key every resolver index — canonical-name, alias, and
+    /// trigram all key on the entity's type_id, so a type change alone
+    /// strands their rows under the old type_id. Before the fix the
+    /// canonical/alias/trigram re-key ran only when the name string
+    /// changed, leaving stale rows that resolved under the OLD type and
+    /// nothing under the NEW one. This exercises exactly that path: retype
+    /// with identical name/aliases and assert every lookup follows.
+    #[test]
+    fn entity_update_type_change_rekeys_name_alias_trigram_indexes() {
+        use crate::entity::trigram::{extract_trigrams, lookup_candidates_by_trigram};
+
+        let dir = TempDir::new().unwrap();
+        let db = fresh_db(&dir);
+
+        // Register a second type to move into.
+        {
+            use crate::tables::entity_type::{EntityTypeDefinition, ENTITY_TYPES_TABLE};
+            let wtxn = db.write_txn().unwrap();
+            {
+                let mut t = wtxn.open_table(ENTITY_TYPES_TABLE).unwrap();
+                let row =
+                    EntityTypeDefinition::new(EntityTypeId(7), "Project".into(), Vec::new(), NOW);
+                t.insert(&7u32, &row).unwrap();
+            }
+            wtxn.commit().unwrap();
+        }
+
+        let mut e = person_entity("Chameleon");
+        e.aliases.push("Cham Leon".into());
+        let id = e.id;
+        {
+            let wtxn = db.write_txn().unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        // Retype only — canonical name and aliases are byte-identical.
+        {
+            let wtxn = db.write_txn().unwrap();
+            let mut next: Entity = e.clone();
+            next.entity_type = EntityTypeId(7);
+            entity_update(&wtxn, &next, LATER).unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        let rtxn = db.read_txn().unwrap();
+        let scope = test_scope();
+
+        // Canonical-name index follows the type.
+        assert_eq!(
+            entity_lookup_by_canonical_name(&rtxn, scope, EntityTypeId(7), "Chameleon").unwrap(),
+            Some(id),
+            "canonical-name resolves under the new type"
+        );
+        assert_eq!(
+            entity_lookup_by_canonical_name(&rtxn, scope, EntityType::PERSON_ID, "Chameleon")
+                .unwrap(),
+            None,
+            "canonical-name must not remain under the old type"
+        );
+
+        // Alias index follows the type.
+        assert_eq!(
+            entity_lookup_by_alias(&rtxn, scope, EntityTypeId(7), "Cham Leon").unwrap(),
+            vec![id],
+            "alias resolves under the new type"
+        );
+        assert!(
+            entity_lookup_by_alias(&rtxn, scope, EntityType::PERSON_ID, "Cham Leon")
+                .unwrap()
+                .is_empty(),
+            "alias must not remain under the old type"
+        );
+
+        // Trigram index follows the type: every trigram of the canonical
+        // name and the alias resolves under the new type and none under the
+        // old one.
+        for tg in extract_trigrams("chameleon")
+            .into_iter()
+            .chain(extract_trigrams("cham leon"))
+        {
+            let under_new =
+                lookup_candidates_by_trigram(&rtxn, scope, EntityTypeId(7), tg).unwrap();
+            assert!(
+                under_new.contains(&id),
+                "trigram {tg:?} must resolve under the new type"
+            );
+            let under_old =
+                lookup_candidates_by_trigram(&rtxn, scope, EntityType::PERSON_ID, tg).unwrap();
+            assert!(
+                !under_old.contains(&id),
+                "trigram {tg:?} must not remain under the old type"
+            );
+        }
     }
 
     /// Tombstoning must NOT tear the row out of the by-type index — unlike
