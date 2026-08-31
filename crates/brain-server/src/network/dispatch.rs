@@ -115,15 +115,18 @@ impl ConnState {
 /// per transaction for its whole lifetime.
 const TERMINATED_TXN_ROUTE_WINDOW: usize = 256;
 
-/// Backstop bound on the active tier — transactions begun on this connection
-/// whose terminal outcome has not (yet) been confirmed. A begin that is never
-/// followed by an observed terminal — a client that vanished mid-transaction,
-/// or a txn that expired server-side without the connection ever seeing a
-/// terminal frame — would otherwise leak one entry for the connection's whole
-/// lifetime. When the tier reaches this cap a fresh `TXN_BEGIN` evicts the
-/// oldest-begun entry. Sized well above any realistic count of *concurrently
-/// open* transactions on one connection (bounded by the stream cap), so the
-/// eviction only ever reclaims abandoned/leaked routes, never a live one.
+/// Hard cap on the active tier — transactions begun on this connection whose
+/// terminal outcome has not (yet) been confirmed. Open transactions are NOT
+/// bounded by the stream cap: `TXN_BEGIN` releases its stream permit at ack
+/// while the transaction stays open, so a pooled connection (notably a
+/// wildcard-`may_act` gateway) can hold arbitrarily many genuinely-open txns.
+/// A live route can never be evicted — dropping one would make a later
+/// `TXN_COMMIT` / `TXN_ABORT` misroute to the bound shard (`TxnNotFound`,
+/// losing the buffered writes). So when the active tier is full a fresh
+/// `TXN_BEGIN` is instead REJECTED with `TransactionLimitExceeded`; only
+/// confirmed-terminated / begin-rejected routes ever leave the tier (via
+/// [`TxnShardRouter::apply_outcome`]). Sized well above any realistic count of
+/// concurrently-open transactions on one connection.
 const ACTIVE_TXN_ROUTE_CAP: usize = 1024;
 
 /// Outcome of a dispatched transaction op, reported back to the router by the
@@ -158,9 +161,10 @@ pub(crate) enum TxnRouteOutcomeKind {
 ///   has not been confirmed. A terminal `TXN_COMMIT` / `TXN_ABORT` moves an
 ///   entry out *only once the shard confirms it* (see [`TxnRouteOutcome`]) —
 ///   never at dispatch time — so a mid-flight or failed terminal keeps its
-///   route long enough for a retry to resolve. The tier is bounded by
-///   [`ACTIVE_TXN_ROUTE_CAP`] with oldest-begun eviction as a backstop against
-///   abandoned / expired transactions that never produce a client terminal.
+///   route long enough for a retry to resolve. The tier is hard-capped at
+///   [`ACTIVE_TXN_ROUTE_CAP`]: a live route is never evicted (that would
+///   misroute a later commit/abort), so a `TXN_BEGIN` that would exceed the cap
+///   is rejected rather than admitted — see [`TxnShardRouter::begin`].
 /// - `terminated`: a bounded FIFO window of confirmed-terminated txns. Retained
 ///   only briefly so an idempotent retry of a delegated `TXN_COMMIT` /
 ///   `TXN_ABORT` still routes to the shard holding the cached replay response.
@@ -187,27 +191,35 @@ impl TxnShardRouter {
         }
     }
 
-    /// Record the shard a `TXN_BEGIN` landed on. Enforces the active-tier
-    /// backstop cap by evicting the oldest-begun still-active route when full.
-    pub(crate) fn begin(&mut self, txn_id: [u8; 16], shard: u16) {
+    /// Record the shard a `TXN_BEGIN` landed on, enforcing the active-tier
+    /// hard cap.
+    ///
+    /// Returns `true` when the route was recorded (dispatch the begin) and
+    /// `false` when the active tier is full of live, unconfirmed routes (reject
+    /// the begin — the caller surfaces `TransactionLimitExceeded`). A live route
+    /// is NEVER evicted to make room: evicting one would make its later
+    /// `TXN_COMMIT` / `TXN_ABORT` fail to resolve and misroute to the bound
+    /// shard, losing the buffered writes. Re-recording an already-active
+    /// `txn_id` (an idempotent re-begin) is always accepted — it updates the
+    /// existing entry rather than growing the tier.
+    #[must_use]
+    pub(crate) fn begin(&mut self, txn_id: [u8; 16], shard: u16) -> bool {
+        let known = self.active.contains_key(&txn_id);
+        if !known && self.active.len() >= ACTIVE_TXN_ROUTE_CAP {
+            // Full of genuinely-open transactions. Reject rather than evict a
+            // live route; only terminated/rejected routes free up capacity.
+            return false;
+        }
         if self.active.insert(txn_id, shard).is_none() {
             self.active_order.push_back(txn_id);
         }
-        // Backstop: reclaim the oldest still-active route so an abandoned or
-        // expired txn that never produced a terminal cannot leak indefinitely.
-        while self.active.len() > ACTIVE_TXN_ROUTE_CAP {
-            match self.active_order.pop_front() {
-                // Skip stale order entries (already terminated/removed).
-                Some(oldest) if self.active.remove(&oldest).is_some() => break,
-                Some(_) => continue,
-                None => break,
-            }
-        }
-        // Keep the order deque from accumulating stale ids without bound on a
-        // high-churn connection: once it dwarfs the live set, drop the dead ids.
+        // Keep the order deque from accumulating stale ids (terminated txns
+        // whose id lingers here) without bound on a high-churn connection:
+        // once it dwarfs the live set, drop the dead ids.
         if self.active_order.len() > self.active.len().saturating_mul(2) + ACTIVE_TXN_ROUTE_CAP {
             self.active_order.retain(|id| self.active.contains_key(id));
         }
+        true
     }
 
     /// Resolve the begin-shard for a `txn_id`, checking active transactions
@@ -581,7 +593,19 @@ pub(crate) fn dispatch_frame(frame: Frame, state: &mut ConnState, topology: &Top
     // returns the same shard the fallthrough would have picked.
     match &req {
         RequestBody::TxnBegin(r) => {
-            state.txn_shards.begin(r.txn_id, target_shard);
+            // Reject at the active-route cap instead of evicting a live txn
+            // route. A pooled wildcard-`may_act` connection can hold more open
+            // txns than the stream cap (the begin releases its stream permit at
+            // ack while the txn stays open); dropping the oldest live route to
+            // admit a new begin would strand that txn's later commit/abort on
+            // the wrong shard (`TxnNotFound`, losing its buffered writes).
+            if !state.txn_shards.begin(r.txn_id, target_shard) {
+                return Action::Inline(error_frame(
+                    stream_id,
+                    ErrorCode::TransactionLimitExceeded,
+                    "too many concurrent open transactions on this connection",
+                ));
+            }
         }
         RequestBody::TxnCommit(r) => {
             if let Some(shard) = state.txn_shards.route(&r.txn_id) {
@@ -1722,7 +1746,7 @@ mod tests {
         for i in 0..100_000u32 {
             let mut txn_id = [0u8; 16];
             txn_id[..4].copy_from_slice(&i.to_le_bytes());
-            router.begin(txn_id, (i % 8) as u16);
+            assert!(router.begin(txn_id, (i % 8) as u16));
             // Confirmed terminal: the entry leaves the active tier and parks
             // in the bounded retry window.
             router.confirm_terminated(&txn_id);
@@ -1738,19 +1762,25 @@ mod tests {
         assert_eq!(router.len(), TERMINATED_TXN_ROUTE_WINDOW);
     }
 
-    /// FIX (2): the active tier is bounded even when transactions never
-    /// produce a client terminal — an abandoned / begin-rejected / expired txn
-    /// that only ever gets a `TXN_BEGIN`. Without a confirmed terminal these
-    /// entries used to leak for the connection's whole lifetime; the
-    /// oldest-begun backstop cap now reclaims them.
+    /// The active tier is bounded even when transactions never produce a client
+    /// terminal — an abandoned / expired txn that only ever gets a `TXN_BEGIN`.
+    /// A live route is never evicted to make room: once the tier is full, every
+    /// further begin is rejected, so the tier never exceeds the cap and the
+    /// order deque never accumulates stale ids without bound.
     #[test]
     fn active_tier_bounded_across_abandoned_begins() {
         let mut router = TxnShardRouter::new();
         for i in 0..(ACTIVE_TXN_ROUTE_CAP as u32 * 4) {
             let mut txn_id = [0u8; 16];
             txn_id[..4].copy_from_slice(&i.to_le_bytes());
-            // Only ever a begin — no terminal is confirmed.
-            router.begin(txn_id, (i % 8) as u16);
+            // Only ever a begin — no terminal is confirmed. Accepted until the
+            // tier fills, rejected thereafter (never evicting a live route).
+            let accepted = router.begin(txn_id, (i % 8) as u16);
+            assert_eq!(
+                accepted,
+                (i as usize) < ACTIVE_TXN_ROUTE_CAP,
+                "begin {i} acceptance must flip exactly at the cap"
+            );
             assert!(
                 router.len() <= ACTIVE_TXN_ROUTE_CAP,
                 "active tier grew to {} at begin {i} — should stay <= {}",
@@ -1760,8 +1790,139 @@ mod tests {
         }
         assert_eq!(router.active.len(), ACTIVE_TXN_ROUTE_CAP);
         assert_eq!(router.terminated.len(), 0);
-        // The order deque cannot accumulate stale ids without bound either.
-        assert!(router.active_order.len() <= ACTIVE_TXN_ROUTE_CAP * 3 + ACTIVE_TXN_ROUTE_CAP);
+        // Rejected begins never push onto the order deque, so it exactly tracks
+        // the live set here.
+        assert_eq!(router.active_order.len(), ACTIVE_TXN_ROUTE_CAP);
+    }
+
+    /// The active tier full of live routes rejects a *new* begin (never
+    /// evicting a live route), still admits an idempotent re-begin of an
+    /// already-active txn, and — the point of the fix — every one of the
+    /// existing open transactions still routes to its own begin shard.
+    #[test]
+    fn active_tier_full_rejects_new_begin_and_keeps_live_routes() {
+        let mut router = TxnShardRouter::new();
+        // Fill the active tier to the cap with distinct open txns, each pinned
+        // to a distinct-per-id shard so a misroute would be observable.
+        for i in 0..(ACTIVE_TXN_ROUTE_CAP as u32) {
+            let mut txn_id = [0u8; 16];
+            txn_id[..4].copy_from_slice(&i.to_le_bytes());
+            assert!(
+                router.begin(txn_id, (i % 8) as u16),
+                "begin {i} must be accepted while the tier is below the cap"
+            );
+        }
+        assert_eq!(router.active.len(), ACTIVE_TXN_ROUTE_CAP);
+
+        // A brand-new txn is rejected — the tier is full of live routes.
+        let fresh = [0xFE; 16];
+        assert!(
+            !router.begin(fresh, 1),
+            "a new begin at the cap must be rejected, not admitted by eviction"
+        );
+        assert_eq!(
+            router.route(&fresh),
+            None,
+            "the rejected begin left no route"
+        );
+        assert_eq!(router.active.len(), ACTIVE_TXN_ROUTE_CAP);
+
+        // An idempotent re-begin of an already-active txn is still accepted: it
+        // updates the existing entry rather than growing the tier.
+        let mut existing = [0u8; 16];
+        existing[..4].copy_from_slice(&0u32.to_le_bytes());
+        assert!(
+            router.begin(existing, 0),
+            "re-begin of an active txn must be accepted (no growth)"
+        );
+        assert_eq!(router.active.len(), ACTIVE_TXN_ROUTE_CAP);
+
+        // Every existing open txn still resolves to its own begin shard — none
+        // was evicted to admit the (rejected) new begin.
+        for i in 0..(ACTIVE_TXN_ROUTE_CAP as u32) {
+            let mut txn_id = [0u8; 16];
+            txn_id[..4].copy_from_slice(&i.to_le_bytes());
+            assert_eq!(
+                router.route(&txn_id),
+                Some((i % 8) as u16),
+                "live txn {i} must still route to its begin shard after a rejected begin"
+            );
+        }
+    }
+
+    /// End-to-end at the dispatcher: once the connection's active tier is full,
+    /// a fresh `TXN_BEGIN` is rejected with `TransactionLimitExceeded` (a
+    /// structured error, not a panic and not a misroute), while a `TXN_COMMIT`
+    /// for an already-open txn still routes to that txn's begin shard.
+    #[test]
+    fn txn_begin_rejected_with_transaction_limit_at_cap() {
+        let topo = test_topology_shards(8);
+        let minted = topo
+            .auth_store
+            .mint(
+                space_id_bytes(2),
+                [0u8; 16],
+                "acme".into(),
+                space_id_bytes(7),
+                bits::STANDARD_SPACE,
+                Vec::new(),
+                1,
+            )
+            .unwrap();
+        let mut state = establish(&topo, minted.secret_bytes.clone());
+        let bound_shard = match &state.phase {
+            ConnPhase::Established { bound_shard, .. } => *bound_shard,
+            _ => panic!("not established"),
+        };
+
+        // Pre-fill the active tier to the cap with non-delegated open txns (all
+        // pinned to the bound shard, as a real non-act_as begin would be).
+        let mut first_open = [0u8; 16];
+        first_open[..4].copy_from_slice(&0u32.to_le_bytes());
+        for i in 0..(ACTIVE_TXN_ROUTE_CAP as u32) {
+            let mut txn_id = [0u8; 16];
+            txn_id[..4].copy_from_slice(&i.to_le_bytes());
+            assert!(state.txn_shards.begin(txn_id, bound_shard));
+        }
+
+        // A fresh begin over the wire is rejected with a structured error.
+        let begin = RequestBody::TxnBegin(brain_protocol::envelope::request::TxnBeginRequest {
+            txn_id: [0xFE; 16],
+            timeout_seconds: 30,
+            act_as: None,
+        });
+        let frame = Frame::new(Opcode::TxnBegin.as_u16(), FLAG_EOS, 1, begin.encode());
+        match dispatch_frame(frame, &mut state, &topo) {
+            Action::Inline(reply) => {
+                assert_eq!(reply.header.opcode_u16(), Opcode::Error.as_u16());
+                match ResponseBody::decode(Opcode::Error, &reply.payload) {
+                    Ok(ResponseBody::Error(e)) => assert_eq!(
+                        e.code,
+                        ErrorCodeWire::from(ErrorCode::TransactionLimitExceeded),
+                        "a begin at the cap must fail as TransactionLimitExceeded"
+                    ),
+                    other => panic!("expected an Error body, got {other:?}"),
+                }
+            }
+            _ => panic!("expected an Inline error rejecting the over-cap begin"),
+        }
+        // The rejected begin recorded no route.
+        assert_eq!(state.txn_shards.route(&[0xFE; 16]), None);
+        assert_eq!(state.txn_shards.active.len(), ACTIVE_TXN_ROUTE_CAP);
+
+        // A commit for a still-open txn is unaffected — it routes to that txn's
+        // begin shard, never misrouted or dropped.
+        let commit = RequestBody::TxnCommit(brain_protocol::envelope::request::TxnCommitRequest {
+            txn_id: first_open,
+        });
+        let frame = Frame::new(Opcode::TxnCommit.as_u16(), FLAG_EOS, 3, commit.encode());
+        match dispatch_frame(frame, &mut state, &topo) {
+            Action::OpDispatch(op) => assert_eq!(
+                op.target_shard, bound_shard,
+                "an open txn's commit must still route to its begin shard"
+            ),
+            _ => panic!("expected OpDispatch for a live txn's commit"),
+        }
     }
 
     /// FIX (2): a definitively-rejected `TXN_BEGIN` drops its optimistic route
@@ -1771,7 +1932,7 @@ mod tests {
     fn begin_rejected_drops_active_route() {
         let mut router = TxnShardRouter::new();
         let txn_id = [0x33; 16];
-        router.begin(txn_id, 4);
+        assert!(router.begin(txn_id, 4));
         assert_eq!(router.route(&txn_id), Some(4));
         router.apply_outcome(TxnRouteOutcome {
             txn_id,
@@ -1792,7 +1953,7 @@ mod tests {
     fn active_route_survives_terminal_churn_of_other_txns() {
         let mut router = TxnShardRouter::new();
         let a = [0xAA; 16];
-        router.begin(a, 5);
+        assert!(router.begin(a, 5));
 
         // Many other transactions begin and confirm-terminate, filling and
         // churning the bounded retry window several times over.
@@ -1800,7 +1961,7 @@ mod tests {
             let mut txn_id = [0u8; 16];
             txn_id[..4].copy_from_slice(&i.to_le_bytes());
             txn_id[15] = 0xBB; // keep distinct from `a`
-            router.begin(txn_id, 6);
+            assert!(router.begin(txn_id, 6));
             router.confirm_terminated(&txn_id);
         }
 
@@ -1820,7 +1981,7 @@ mod tests {
     fn txn_route_survives_commit_into_retry_window() {
         let mut router = TxnShardRouter::new();
         let txn_id = [0x11; 16];
-        router.begin(txn_id, 5);
+        assert!(router.begin(txn_id, 5));
         assert_eq!(router.route(&txn_id), Some(5));
         router.confirm_terminated(&txn_id);
         // Retry after terminal still routes home (from the retry window).
@@ -1839,7 +2000,7 @@ mod tests {
         for i in 0..=(TERMINATED_TXN_ROUTE_WINDOW as u32) {
             let mut txn_id = [0u8; 16];
             txn_id[..4].copy_from_slice(&i.to_le_bytes());
-            router.begin(txn_id, 3);
+            assert!(router.begin(txn_id, 3));
             router.confirm_terminated(&txn_id);
         }
         // The very first txn was evicted; the last remains.
