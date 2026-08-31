@@ -612,6 +612,71 @@ pub fn rekey_predicate_index(
     Ok(())
 }
 
+/// Insert a statement's `statements_by_predicate` entry when it (re-)joins
+/// the live set — the FORGET-cascade revert path re-activating a row it
+/// tombstoned. Bucketed by `confidence`. Mirrors the create-path insert in
+/// [`insert_new_statement`] step 3. Idempotent: re-inserting the same key
+/// is a redb overwrite of an identical value.
+pub fn add_to_predicate_index(
+    wtxn: &WriteTransaction,
+    scope: RowScope,
+    predicate_id: u32,
+    kind: u8,
+    confidence: f32,
+    statement_id_bytes: &[u8; 16],
+) -> Result<(), StatementOpError> {
+    let mut t = wtxn.open_table(STATEMENTS_BY_PREDICATE_TABLE)?;
+    t.insert(
+        &(
+            scope.namespace_id,
+            scope.space_id_bytes,
+            predicate_id,
+            kind,
+            confidence_bucket(confidence),
+            *statement_id_bytes,
+        ),
+        statement_id_bytes,
+    )?;
+    Ok(())
+}
+
+/// Flip a statement's `by_subject` index entry from non-current
+/// (`is_current = 0`) back to current (`1`). The inverse of
+/// [`flip_by_subject_to_noncurrent`], used by the FORGET-cascade revert
+/// path when it un-tombstones a row.
+pub fn flip_by_subject_to_current(
+    wtxn: &WriteTransaction,
+    scope: RowScope,
+    subject_entity_bytes: [u8; 16],
+    kind: u8,
+    predicate_id: u32,
+    statement_id_bytes: &[u8; 16],
+) -> Result<(), StatementOpError> {
+    let mut bys = wtxn.open_table(STATEMENTS_BY_SUBJECT_TABLE)?;
+    bys.remove(&(
+        scope.namespace_id,
+        scope.space_id_bytes,
+        subject_entity_bytes,
+        kind,
+        predicate_id,
+        0u8,
+        *statement_id_bytes,
+    ))?;
+    bys.insert(
+        &(
+            scope.namespace_id,
+            scope.space_id_bytes,
+            subject_entity_bytes,
+            kind,
+            predicate_id,
+            1u8,
+            *statement_id_bytes,
+        ),
+        statement_id_bytes,
+    )?;
+    Ok(())
+}
+
 /// Recompute a statement's confidence via noisy-OR over its evidence,
 /// **iff** the evidence carries per-entry metadata. Wire callers send
 /// `EvidenceRef::Inline` with `confidence_milli = 0` (per-entry metadata

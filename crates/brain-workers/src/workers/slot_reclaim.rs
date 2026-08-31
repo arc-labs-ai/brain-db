@@ -41,6 +41,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use brain_core::MemoryId;
 use brain_metadata::tables::edge::{EDGES_REVERSE_TABLE, EDGES_TABLE};
+use brain_metadata::tables::forget_undo::FORGET_UNDO_LOG_TABLE;
 use brain_metadata::tables::memory::MEMORIES_TABLE;
 use brain_metadata::tables::statement::STATEMENTS_BY_EVIDENCE_TABLE;
 use brain_metadata::tables::text::TEXTS_TABLE;
@@ -268,6 +269,14 @@ fn reclaim_one(
         // (removes 0) when the memory owns none.
         brain_metadata::hype_vectors_delete_memory(&wtxn, id)
             .map_err(|e| WorkerError::Ops(format!("reclaim hype delete: {e:?}")))?;
+
+        // Grace has expired for this memory, so its soft-FORGET cascade is
+        // now irreversible: drop every undo-log row keyed on it. This is the
+        // one place the undo journal is reaped, so a memory that is never
+        // restored can't leak undo rows, and a restore attempted after grace
+        // finds nothing to replay. Idempotent (removes 0) for a hard FORGET,
+        // which wrote no undo rows.
+        strip_undo_rows(&wtxn, id)?;
     }
 
     wtxn.commit()
@@ -370,6 +379,34 @@ fn strip_evidence_rows(
         by_evidence
             .remove(&(namespace_id, space_id_bytes, mem, stmt))
             .map_err(|e| WorkerError::Ops(format!("STATEMENTS_BY_EVIDENCE remove: {e:?}")))?;
+    }
+    Ok(())
+}
+
+/// Remove every `FORGET_UNDO_LOG` row keyed on the reclaimed memory —
+/// `(memory, *)`. Called at grace expiry so a soft FORGET becomes
+/// irreversible and its undo journal can't leak. Idempotent (removes 0)
+/// for a hard FORGET, which wrote no undo rows.
+fn strip_undo_rows(wtxn: &redb::WriteTransaction, id: MemoryId) -> Result<(), WorkerError> {
+    let mem = id.to_be_bytes();
+    let lo = (mem, [0u8; 16]);
+    let hi = (mem, [0xFFu8; 16]);
+    let mut undo = wtxn
+        .open_table(FORGET_UNDO_LOG_TABLE)
+        .map_err(|e| WorkerError::Ops(format!("open FORGET_UNDO_LOG: {e:?}")))?;
+    // Only the trailing dependent-id varies across the prefix; collect it
+    // and rebuild the full key on removal.
+    let victims: Vec<[u8; 16]> = undo
+        .range(lo..=hi)
+        .map_err(|e| WorkerError::Ops(format!("FORGET_UNDO_LOG range: {e:?}")))?
+        .map(|entry| match entry {
+            Ok((k, _)) => Ok(k.value().1),
+            Err(e) => Err(WorkerError::Ops(format!("FORGET_UNDO_LOG row: {e:?}"))),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for dep in victims {
+        undo.remove(&(mem, dep))
+            .map_err(|e| WorkerError::Ops(format!("FORGET_UNDO_LOG remove: {e:?}")))?;
     }
     Ok(())
 }
@@ -628,5 +665,58 @@ mod tests {
             .get(&id.to_be_bytes())
             .unwrap()
             .is_some());
+    }
+
+    /// Grace-expiry reclamation must also reap the memory's soft-FORGET
+    /// undo-log rows, so a post-grace forget is irreversible and the undo
+    /// journal never leaks.
+    #[test]
+    fn reclaim_reaps_forget_undo_rows_after_grace() {
+        use brain_metadata::tables::forget_undo::{
+            outcome, record_kind, ForgetUndoRecord, FORGET_UNDO_LOG_TABLE,
+        };
+        let (_dir, db) = open_shared();
+        let id = MemoryId::pack(1, 7, 0);
+        let mem = id.to_be_bytes();
+        let tombstoned_at = 10_000u64;
+        seed_soft_forgotten(&db, id, tombstoned_at);
+
+        // Seed two undo rows keyed on this memory (a statement + a relation).
+        let dep_a = [0x11u8; 16];
+        let dep_b = [0x22u8; 16];
+        {
+            let wtxn = db.write_txn().unwrap();
+            {
+                let mut t = wtxn.open_table(FORGET_UNDO_LOG_TABLE).unwrap();
+                let rec = ForgetUndoRecord {
+                    record_kind: record_kind::STATEMENT,
+                    dropped_memory_id_bytes: mem,
+                    dropped_confidence_milli: 900,
+                    dropped_timestamp_unix_nanos: 1_000,
+                    dropped_extractor_id: 0,
+                    prior_confidence: 0.9,
+                    prior_is_current: 1,
+                    prior_tombstone_reason: 0,
+                    prior_overflow_id_bytes: None,
+                    outcome: outcome::TOMBSTONED,
+                    grace_expiry_unix_nanos: tombstoned_at + 100,
+                };
+                t.insert(&(mem, dep_a), &rec).unwrap();
+                let mut rel = rec.clone();
+                rel.record_kind = record_kind::RELATION;
+                t.insert(&(mem, dep_b), &rel).unwrap();
+            }
+            wtxn.commit().unwrap();
+        }
+
+        // Grace expired → reclaim.
+        let reclaimed = reclaim_one(&db, id, tombstoned_at + 1).unwrap();
+        assert!(reclaimed);
+
+        // Undo rows for this memory are gone.
+        let rtxn = db.read_txn().unwrap();
+        let t = rtxn.open_table(FORGET_UNDO_LOG_TABLE).unwrap();
+        assert!(t.get(&(mem, dep_a)).unwrap().is_none());
+        assert!(t.get(&(mem, dep_b)).unwrap().is_none());
     }
 }

@@ -14,6 +14,7 @@ pub mod extraction_queue;
 pub mod extractor;
 pub mod extractor_audit;
 pub mod fingerprint;
+pub mod forget_undo;
 pub mod hype;
 pub mod idempotency;
 pub mod kind;
@@ -113,6 +114,7 @@ pub fn materialize_all_tables(wtxn: &::redb::WriteTransaction) -> Result<(), ::r
     use extractor::{EXTRACTORS_BY_QNAME_TABLE, EXTRACTORS_TABLE};
     use extractor_audit::EXTRACTOR_PIPELINE_AUDIT_TABLE;
     use fingerprint::FINGERPRINTS_TABLE;
+    use forget_undo::FORGET_UNDO_LOG_TABLE;
     use idempotency::IDEMPOTENCY_TABLE;
     use kind::{KINDS_BY_BYTE_TABLE, KINDS_TABLE};
     use memory::{MEMORIES_BY_SPACE_TIMELINE_TABLE, MEMORIES_TABLE};
@@ -165,6 +167,7 @@ pub fn materialize_all_tables(wtxn: &::redb::WriteTransaction) -> Result<(), ::r
     let _ = wtxn.open_table(EXTRACTORS_BY_QNAME_TABLE)?;
     let _ = wtxn.open_table(EXTRACTOR_PIPELINE_AUDIT_TABLE)?;
     let _ = wtxn.open_table(FINGERPRINTS_TABLE)?;
+    let _ = wtxn.open_table(FORGET_UNDO_LOG_TABLE)?;
     let _ = wtxn.open_table(IDEMPOTENCY_TABLE)?;
     let _ = wtxn.open_table(KINDS_TABLE)?;
     let _ = wtxn.open_table(KINDS_BY_BYTE_TABLE)?;
