@@ -17,6 +17,15 @@
 //! `POST /v1/extract/backfill` does: non-owning shards find nothing and
 //! report zero, which keeps the handler correct under routing overrides
 //! without the admin plane needing the routing table.
+//!
+//! Fan-out is partial-tolerant. A delete that some shards apply and others
+//! reject is a *partial success*, not a silent one: the response carries a
+//! top-level `"errors":[…]` array of the per-shard failures and its status
+//! is `207 Multi-Status`, so an operator can see the skipped shards rather
+//! than reading `200 OK` over a half-applied cascade. The route stays
+//! `200 OK` only when every shard's dispatch succeeded, and still fails
+//! outright with `500` on a total miss (errors, and nothing found or
+//! forgotten on any shard).
 
 use std::sync::Arc;
 
@@ -129,21 +138,91 @@ async fn delete(req: Request<Incoming>, state: Arc<AdminState>) -> Response<Resp
     }
 
     if !shard_errors.is_empty() && !existed && memories_forgotten == 0 {
-        // Per-shard detail is already logged; keep it off the wire.
+        // Total miss: some shard errored and no shard found or forgot
+        // anything, so the cascade accomplished nothing. Per-shard detail is
+        // already logged; keep it off the wire.
         return text_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "space cascade delete failed\n",
         );
     }
 
+    // The cascade applied somewhere (existed or forgot rows on at least one
+    // shard). A clean fan-out is `200 OK`; a partial one (some shards errored)
+    // is `207 Multi-Status` carrying the per-shard failures, so the operator
+    // sees the skipped shards rather than reading a silent success.
     let deleted = existed || memories_forgotten > 0;
-    let body = format!(
-        "{{\"space_id\":\"{space_id}\",\"deleted\":{deleted},\
-         \"memories_forgotten\":{memories_forgotten},\"shards\":{n}}}\n",
-        space_id = space_id.0,
-        n = state.shards.len(),
+    let status = if shard_errors.is_empty() {
+        StatusCode::OK
+    } else {
+        StatusCode::MULTI_STATUS
+    };
+    let body = delete_body_json(
+        space_id,
+        deleted,
+        memories_forgotten,
+        state.shards.len(),
+        &shard_errors,
     );
-    json_response(StatusCode::OK, body)
+    json_response(status, body)
+}
+
+/// Render the full delete response body: the space id, the `deleted` flag,
+/// the summed `memories_forgotten` count, the shard count, and — only when
+/// the fan-out was partial — a top-level `"errors"` array of the shards
+/// whose dispatch was rejected. A clean all-shards fan-out renders no
+/// `errors` key.
+fn delete_body_json(
+    space_id: brain_core::SpaceId,
+    deleted: bool,
+    memories_forgotten: u64,
+    shard_count: usize,
+    shard_errors: &[String],
+) -> String {
+    let mut body = format!(
+        "{{\"space_id\":\"{space_id}\",\"deleted\":{deleted},\
+         \"memories_forgotten\":{memories_forgotten},\"shards\":{shard_count}}}",
+        space_id = space_id.0,
+    );
+    if !shard_errors.is_empty() {
+        // Splice the errors array in just before the closing brace.
+        body.pop();
+        body.push_str(",\"errors\":");
+        body.push_str(&errors_array_json(shard_errors));
+        body.push('}');
+    }
+    body.push('\n');
+    body
+}
+
+/// Render `["shard i: …", …]`, JSON-escaping each message so an error's
+/// `Display` can never break out of the string and corrupt the document.
+fn errors_array_json(errors: &[String]) -> String {
+    let items: Vec<String> = errors.iter().map(|e| json_string(e)).collect();
+    format!("[{}]", items.join(","))
+}
+
+/// Minimal JSON string escaping (the two mandatory escapes plus control
+/// characters). Kept local so per-shard error text is always emitted safely.
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                use std::fmt::Write as _;
+                write!(&mut out, "\\u{:04x}", c as u32).expect("string write into String");
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Pull the `namespace=<name>` value out of a query string. Returns the
@@ -173,5 +252,57 @@ mod tests {
     fn namespace_param_absent() {
         assert_eq!(namespace_param(""), None);
         assert_eq!(namespace_param("foo=1"), None);
+    }
+
+    fn sample_space_id() -> brain_core::SpaceId {
+        brain_core::SpaceId(Uuid::from_bytes([7u8; 16]))
+    }
+
+    #[test]
+    fn delete_body_surfaces_partial_shard_errors() {
+        // The specific defect: the owning shard applied the cascade
+        // (deleted=true) while another shard's dispatch errored. That must
+        // NOT render as a clean success — the rejected shard's message has to
+        // appear in a top-level "errors" array so the handler can return 207
+        // instead of a silent 200 OK "deleted":true.
+        let shard_errors = vec!["shard 1: dispatch failed".to_owned()];
+        let body = delete_body_json(sample_space_id(), true, 4, 2, &shard_errors);
+
+        assert!(body.contains("\"deleted\":true"), "{body}");
+        assert!(body.contains("\"memories_forgotten\":4"), "{body}");
+        assert!(body.contains("\"shards\":2"), "{body}");
+        // The rejected shard is surfaced, not swallowed.
+        assert!(
+            body.contains("\"errors\":[\"shard 1: dispatch failed\"]"),
+            "partial failure must surface the rejected shard: {body}"
+        );
+        // The errors array sits inside the object, before the close brace.
+        assert!(body.trim_end().ends_with("]}"), "{body}");
+    }
+
+    #[test]
+    fn delete_body_errors_are_json_escaped() {
+        // A raw error Display carrying a quote or backslash must not break
+        // out of the JSON string.
+        let shard_errors = vec!["shard 1: bad \"key\"\\path".to_owned()];
+        let body = delete_body_json(sample_space_id(), true, 0, 2, &shard_errors);
+        assert!(
+            body.contains(r#"["shard 1: bad \"key\"\\path"]"#),
+            "error text must be JSON-escaped: {body}"
+        );
+    }
+
+    #[test]
+    fn delete_body_omits_errors_key_when_clean() {
+        // A clean all-shards fan-out stays a plain success body — no errors
+        // key, so 200 OK stays semantically accurate.
+        let body = delete_body_json(sample_space_id(), true, 9, 3, &[]);
+        assert!(
+            !body.contains("\"errors\""),
+            "no errors key when clean: {body}"
+        );
+        assert!(body.contains("\"deleted\":true"), "{body}");
+        assert!(body.contains("\"memories_forgotten\":9"), "{body}");
+        assert!(body.contains("\"shards\":3"), "{body}");
     }
 }
