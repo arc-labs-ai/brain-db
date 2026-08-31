@@ -96,12 +96,31 @@ pub fn sweep_superseded_statements(
 
     if dry_run {
         summary.dry_run_would_delete = victims.len() as u64;
-    } else {
-        let mut t = wtxn.open_table(STATEMENTS_TABLE)?;
-        for key in &victims {
-            t.remove(key)?;
-            summary.deleted += 1;
-        }
+        return Ok(summary);
+    }
+
+    // Phase 2: re-read each victim under the same write txn and tear it
+    // down through `reclaim_one`, which strips EVERY secondary index
+    // (by_subject both bits + the id-ordered twin, by_predicate + its
+    // id-ordered twin, by_object_entity, by_evidence, evidence_overflow)
+    // and honours the dense-chain invariant. A superseded victim always
+    // carries `superseded_by_bytes`, so it is mid-chain by definition and
+    // `reclaim_one` correctly KEEPS its chain entry (removing it would
+    // punch a hole in the dense 1..=N range). A bare primary `remove`
+    // here would orphan all of those secondary rows.
+    for key in &victims {
+        let row = {
+            let t = wtxn.open_table(STATEMENTS_TABLE)?;
+            let guard = t.get(key)?;
+            guard.map(|g| g.value())
+        };
+        let Some(row) = row else {
+            // Vanished between scan and now (another writer / replay).
+            summary.skipped += 1;
+            continue;
+        };
+        reclaim_one(wtxn, &row)?;
+        summary.deleted += 1;
     }
     Ok(summary)
 }
@@ -885,6 +904,276 @@ mod reclaim_tests {
         assert_eq!(summary.scanned, 0);
         let rtxn = db.read_txn().unwrap();
         assert!(statement_get(&rtxn, id).unwrap().is_some());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests — superseded-statement retention sweep.
+// ---------------------------------------------------------------------------
+
+#[cfg(all(test, not(miri)))]
+mod supersession_sweep_tests {
+    use super::*;
+    use crate::entity::ops::{entity_put, normalize_name};
+    use crate::schema::predicate::predicate_intern;
+    use crate::statement::crud::{statement_create, statement_get};
+    use crate::tables::scope::RowScope;
+    use brain_core::{
+        Entity, EntityId, EntityType, EvidenceEntry, EvidenceRef, ExtractorId, MemoryId,
+        PredicateId, Statement, StatementObject, SubjectRef, INLINE_EVIDENCE_CAP,
+    };
+    use smallvec::SmallVec;
+
+    const T0: u64 = 1_700_000_000_000_000_000;
+    const RETENTION_NS: u64 = 30 * 24 * 60 * 60 * 1_000_000_000;
+    const RETENTION_SECONDS: u64 = 30 * 24 * 60 * 60;
+
+    fn test_scope() -> RowScope {
+        RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xAB; 16])
+    }
+
+    fn open_db() -> (tempfile::TempDir, crate::MetadataDb) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::MetadataDb::open(dir.path().join("md.redb")).unwrap();
+        (dir, db)
+    }
+
+    fn make_entity(db: &mut crate::MetadataDb, name: &str) -> EntityId {
+        let id = EntityId::new();
+        let e = Entity::new_active(
+            id,
+            EntityType::PERSON_ID,
+            name.to_string(),
+            normalize_name(name),
+            T0,
+        );
+        let wtxn = db.write_txn().unwrap();
+        entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
+        wtxn.commit().unwrap();
+        id
+    }
+
+    fn intern_stateful_fact(db: &mut crate::MetadataDb, name: &str) -> PredicateId {
+        let wtxn = db.write_txn().unwrap();
+        let id = predicate_intern(
+            &wtxn,
+            "test",
+            name,
+            Some(StatementKind::Fact),
+            1, // object: Entity
+            1,
+            "",
+            true, // stateful → auto-supersedes prior fact
+            T0,
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+        id
+    }
+
+    fn fact_with_evidence(
+        subject: EntityId,
+        predicate: PredicateId,
+        object: EntityId,
+        mem: MemoryId,
+    ) -> Statement {
+        let mut s = Statement::new_root(
+            brain_core::StatementId::new(),
+            StatementKind::Fact,
+            SubjectRef::Entity(subject),
+            predicate,
+            StatementObject::Entity(object),
+            0.9,
+            EvidenceRef::default(),
+            ExtractorId::from(0),
+            T0,
+            1,
+        );
+        let mut sv = SmallVec::<[EvidenceEntry; INLINE_EVIDENCE_CAP]>::new();
+        sv.push(EvidenceEntry::from_parts(
+            mem,
+            0.8,
+            T0,
+            ExtractorId::from(0),
+        ));
+        s.evidence = EvidenceRef::Inline(Box::new(sv));
+        s
+    }
+
+    /// Regression: sweeping a superseded statement must strip every
+    /// secondary index, not just the primary row. Before the fix the bare
+    /// primary `remove` orphaned by_subject (both bits + id-twin),
+    /// by_predicate id-twin, by_object_entity, and by_evidence.
+    #[test]
+    fn sweep_strips_all_secondary_indexes_no_orphans() {
+        let (_d, mut db) = open_db();
+        let subj = make_entity(&mut db, "subj-sweep");
+        let o1 = make_entity(&mut db, "o1-sweep");
+        let o2 = make_entity(&mut db, "o2-sweep");
+        let p = intern_stateful_fact(&mut db, "p_sweep");
+        let mem = MemoryId::pack(7, brain_core::SessionId::DEFAULT.into(), 0);
+        let f1 = fact_with_evidence(subj, p, o1, mem);
+        let f2 = fact_with_evidence(subj, p, o2, mem);
+
+        let wtxn = db.write_txn().unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &f1, T0).unwrap();
+        wtxn.commit().unwrap();
+        // f2 auto-supersedes f1 (stateful predicate): f1 gets
+        // superseded_by set and valid_to = f2.extracted_at (T0).
+        let wtxn = db.write_txn().unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &f2, T0).unwrap();
+        wtxn.commit().unwrap();
+
+        // Sweep past retention: cutoff = now - retention = T0, so f1's
+        // valid_to (T0) qualifies.
+        let now = T0 + RETENTION_NS;
+        let wtxn = db.write_txn().unwrap();
+        let summary =
+            sweep_superseded_statements(&wtxn, RETENTION_SECONDS, now, 256, false).unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(summary.deleted, 1, "only the superseded f1 is swept");
+
+        let rtxn = db.read_txn().unwrap();
+        let sc = test_scope();
+        let f1_id = f1.id.to_bytes();
+
+        // Primary row gone; f2 (the live tail) survives.
+        assert!(statement_get(&rtxn, f1.id).unwrap().is_none());
+        assert!(statement_get(&rtxn, f2.id).unwrap().is_some());
+
+        // by_subject: no orphan for f1 under either current-bit.
+        let bys = rtxn.open_table(STATEMENTS_BY_SUBJECT_TABLE).unwrap();
+        for bit in [0u8, 1u8] {
+            assert!(
+                bys.get(&(
+                    sc.namespace_id,
+                    sc.space_id_bytes,
+                    subj.to_bytes(),
+                    StatementKind::Fact.as_u8(),
+                    p.raw(),
+                    bit,
+                    f1_id,
+                ))
+                .unwrap()
+                .is_none(),
+                "by_subject bit={bit} orphan for swept id"
+            );
+        }
+        // by_subject id-ordered twin.
+        let bys_id = rtxn.open_table(STATEMENTS_BY_SUBJECT_ID_TABLE).unwrap();
+        assert!(
+            bys_id
+                .get(&(sc.namespace_id, sc.space_id_bytes, subj.to_bytes(), f1_id))
+                .unwrap()
+                .is_none(),
+            "by_subject_id twin orphan for swept id"
+        );
+        // by_predicate id-ordered twin.
+        let byp_id = rtxn.open_table(STATEMENTS_BY_PREDICATE_ID_TABLE).unwrap();
+        assert!(
+            byp_id
+                .get(&(sc.namespace_id, sc.space_id_bytes, p.raw(), f1_id))
+                .unwrap()
+                .is_none(),
+            "by_predicate_id twin orphan for swept id"
+        );
+        // by_object_entity.
+        let byo = rtxn.open_table(STATEMENTS_BY_OBJECT_ENTITY_TABLE).unwrap();
+        assert!(
+            byo.get(&(
+                sc.namespace_id,
+                sc.space_id_bytes,
+                o1.to_bytes(),
+                StatementKind::Fact.as_u8(),
+                f1_id,
+            ))
+            .unwrap()
+            .is_none(),
+            "by_object_entity orphan for swept id"
+        );
+        // by_evidence.
+        let bye = rtxn.open_table(STATEMENTS_BY_EVIDENCE_TABLE).unwrap();
+        assert!(
+            bye.get(&(sc.namespace_id, sc.space_id_bytes, mem.to_be_bytes(), f1_id,))
+                .unwrap()
+                .is_none(),
+            "by_evidence orphan for swept id"
+        );
+        // Dense-chain invariant: f1 is mid-chain (superseded), so its
+        // chain entry (version 1) is KEPT as a tombstone.
+        let chain = rtxn.open_table(STATEMENT_CHAIN_TABLE).unwrap();
+        assert!(
+            chain
+                .get(&(
+                    sc.namespace_id,
+                    sc.space_id_bytes,
+                    f1.chain_root.to_bytes(),
+                    1u32,
+                ))
+                .unwrap()
+                .is_some(),
+            "mid-chain entry must survive the sweep to keep 1..=N dense"
+        );
+    }
+
+    /// `retention_seconds == 0` disables the sweep entirely.
+    #[test]
+    fn sweep_disabled_is_noop() {
+        let (_d, mut db) = open_db();
+        let subj = make_entity(&mut db, "subj-noop");
+        let o1 = make_entity(&mut db, "o1-noop");
+        let o2 = make_entity(&mut db, "o2-noop");
+        let p = intern_stateful_fact(&mut db, "p_noop");
+        let mem = MemoryId::pack(9, brain_core::SessionId::DEFAULT.into(), 0);
+        let f1 = fact_with_evidence(subj, p, o1, mem);
+        let f2 = fact_with_evidence(subj, p, o2, mem);
+        let wtxn = db.write_txn().unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &f1, T0).unwrap();
+        wtxn.commit().unwrap();
+        let wtxn = db.write_txn().unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &f2, T0).unwrap();
+        wtxn.commit().unwrap();
+
+        let wtxn = db.write_txn().unwrap();
+        let summary =
+            sweep_superseded_statements(&wtxn, 0, T0 + RETENTION_NS * 100, 256, false).unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(summary.deleted, 0);
+        assert_eq!(summary.scanned, 0);
+        let rtxn = db.read_txn().unwrap();
+        assert!(statement_get(&rtxn, f1.id).unwrap().is_some());
+    }
+
+    /// A dry run counts victims without mutating any table.
+    #[test]
+    fn sweep_dry_run_counts_without_mutating() {
+        let (_d, mut db) = open_db();
+        let subj = make_entity(&mut db, "subj-dry");
+        let o1 = make_entity(&mut db, "o1-dry");
+        let o2 = make_entity(&mut db, "o2-dry");
+        let p = intern_stateful_fact(&mut db, "p_dry");
+        let mem = MemoryId::pack(11, brain_core::SessionId::DEFAULT.into(), 0);
+        let f1 = fact_with_evidence(subj, p, o1, mem);
+        let f2 = fact_with_evidence(subj, p, o2, mem);
+        let wtxn = db.write_txn().unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &f1, T0).unwrap();
+        wtxn.commit().unwrap();
+        let wtxn = db.write_txn().unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &f2, T0).unwrap();
+        wtxn.commit().unwrap();
+
+        let now = T0 + RETENTION_NS;
+        let wtxn = db.write_txn().unwrap();
+        let summary =
+            sweep_superseded_statements(&wtxn, RETENTION_SECONDS, now, 256, true).unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(summary.dry_run_would_delete, 1);
+        assert_eq!(summary.deleted, 0);
+        let rtxn = db.read_txn().unwrap();
+        assert!(
+            statement_get(&rtxn, f1.id).unwrap().is_some(),
+            "dry run must not delete"
+        );
     }
 }
 
