@@ -38,9 +38,10 @@ pub mod writer;
 
 // Module-level re-exports so external callers (brain-server, brain-planner)
 // can write `brain_ops::encode::*` rather than `brain_ops::handlers::encode::*`.
+pub use handlers::restore::{handle_admin_restore, AdminRestoreOutcome};
 pub use handlers::{
     encode, encode_vector_direct, entity, extractor_admin, forget, link, plan, query, reason,
-    recall, relation, schema, statement, subscribe, txn,
+    recall, relation, restore, schema, statement, subscribe, txn,
 };
 
 pub use brain_planner::PlannerContext;

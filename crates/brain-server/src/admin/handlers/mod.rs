@@ -15,6 +15,7 @@ pub mod config;
 pub mod diagnostics;
 pub mod extract;
 pub mod healthz;
+pub mod memory;
 pub mod metrics;
 pub mod readyz;
 pub mod rebuild;

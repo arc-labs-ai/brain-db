@@ -130,6 +130,7 @@ mod tag {
     pub const ENTITY_RENAMED: u8 = 15;
     pub const ENTITIES_UNMERGED: u8 = 16;
     pub const ENTITY_MERGED: u8 = 17;
+    pub const MEMORY_RESTORED: u8 = 18;
     pub const SLOTS_RECLAIMED: u8 = 19;
     pub const MERGE_PROPOSAL_APPROVED: u8 = 20;
     pub const MERGE_PROPOSAL_REJECTED: u8 = 21;
@@ -190,6 +191,11 @@ fn write_phase_ack(out: &mut Vec<u8>, pa: &PhaseAck) {
             out.push(tag::TOMBSTONED);
             write_tombstone_target(out, target);
             write_u64(out, *tombstoned_at_unix_nanos);
+        }
+        PhaseAck::MemoryRestored { id, already_active } => {
+            out.push(tag::MEMORY_RESTORED);
+            write_memory_id(out, *id);
+            out.push(u8::from(*already_active));
         }
         PhaseAck::Superseded(target, replacement) => {
             out.push(tag::SUPERSEDED);
@@ -298,6 +304,11 @@ fn read_phase_ack(c: &mut Cursor<'_>) -> Result<PhaseAck, CodecError> {
                 target,
                 tombstoned_at_unix_nanos,
             }
+        }
+        tag::MEMORY_RESTORED => {
+            let id = read_memory_id(c)?;
+            let already_active = c.u8()? != 0;
+            PhaseAck::MemoryRestored { id, already_active }
         }
         tag::SUPERSEDED => {
             let target = read_supersede_target(c)?;

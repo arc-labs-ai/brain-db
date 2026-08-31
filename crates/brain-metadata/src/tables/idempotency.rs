@@ -51,6 +51,7 @@ pub mod response_kind {
     pub const UPDATE_CONTEXT: u8 = 6;
     pub const TXN_BEGIN: u8 = 7;
     pub const TXN_COMMIT: u8 = 8;
+    pub const RESTORE: u8 = 9;
 }
 
 // ---------------------------------------------------------------------------

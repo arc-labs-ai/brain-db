@@ -242,6 +242,19 @@ pub(crate) enum ShardRequest {
         connection_id: [u8; 16],
         reply_tx: Sender<usize>,
     },
+    /// Restore (un-tombstone) a soft-forgotten memory on this shard
+    /// (admin `POST /v1/memories/{id}/restore`). Validates the id + owning
+    /// namespace, rejects a hard-forgotten or past-grace memory, submits a
+    /// WAL-durable `Phase::RestoreMemory` through the shard writer, and
+    /// (via the writer's post-commit fan-out) enqueues the FORGET-cascade
+    /// revert. The admin handler fans this out to every shard; a non-owning
+    /// shard reports `NotFound`. The `Err(String)` reply is a real failure
+    /// (writer / metadata error), surfaced to HTTP as `500`.
+    RestoreMemory {
+        memory_id: brain_core::MemoryId,
+        namespace: String,
+        reply_tx: Sender<Result<brain_ops::AdminRestoreOutcome, String>>,
+    },
     /// Query the historical audit tables (`GET /v1/audit`). Runs on the
     /// shard executor, which owns the `metadata.redb` handle. Reads one
     /// index page (`limit` rows, resuming after `cursor`) and returns
@@ -1307,6 +1320,32 @@ impl ShardHandle {
         let (reply_tx, reply_rx) = flume::bounded(1);
         self.tx
             .send_async(ShardRequest::ExtractBackfill { selector, reply_tx })
+            .await
+            .map_err(|_| ShardError::ShardDisconnected)?;
+        reply_rx
+            .recv_async()
+            .await
+            .map_err(|_| ShardError::ShardDisconnected)?
+            .map_err(ShardError::Snapshot)
+    }
+
+    /// Restore (un-tombstone) a soft-forgotten memory on this shard.
+    /// Backs the admin `POST /v1/memories/{id}/restore` route. The admin
+    /// handler fans this out to every shard; a shard that doesn't own the
+    /// id reports [`brain_ops::AdminRestoreOutcome::NotFound`]. `Err` is a
+    /// real per-shard failure (writer / metadata error).
+    pub async fn restore_memory(
+        &self,
+        memory_id: brain_core::MemoryId,
+        namespace: String,
+    ) -> Result<brain_ops::AdminRestoreOutcome, ShardError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.tx
+            .send_async(ShardRequest::RestoreMemory {
+                memory_id,
+                namespace,
+                reply_tx,
+            })
             .await
             .map_err(|_| ShardError::ShardDisconnected)?;
         reply_rx
@@ -4324,6 +4363,19 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
                     );
                 }
             }
+            ShardRequest::RestoreMemory {
+                memory_id,
+                namespace,
+                reply_tx,
+            } => {
+                let out = run_restore_memory(&shard, memory_id, &namespace).await;
+                if reply_tx.send_async(out).await.is_err() {
+                    warn!(
+                        shard_id = shard.shard_id,
+                        "RestoreMemory reply dropped (caller gone)"
+                    );
+                }
+            }
             ShardRequest::BackfillSubmit { request, reply_tx } => {
                 // Reach the same per-shard worker handle the (now-rejected)
                 // wire op used to: the `Arc<dyn BackfillControl>` threaded
@@ -4699,6 +4751,40 @@ const BACKFILL_YIELD_INTERVAL: usize = 256;
 #[inline]
 fn backfill_should_yield(rows_examined: usize) -> bool {
     rows_examined != 0 && rows_examined.is_multiple_of(BACKFILL_YIELD_INTERVAL)
+}
+
+/// Restore (un-tombstone) a soft-forgotten memory on this shard. Runs
+/// inside the shard executor. A non-owning shard (the id routes
+/// elsewhere) short-circuits to `NotFound` so the admin fan-out reports a
+/// clean miss rather than an error. The grace window matches the
+/// slot-reclamation worker's ([`brain_workers::workers::slot_reclaim::DEFAULT_FORGET_GRACE`]),
+/// so restore-eligibility and reclamation coincide.
+async fn run_restore_memory(
+    shard: &Shard,
+    memory_id: brain_core::MemoryId,
+    namespace: &str,
+) -> Result<brain_ops::AdminRestoreOutcome, String> {
+    // Cheap shard-belongs check: an id that routes elsewhere is a clean
+    // miss on this shard (the admin handler fans out to every shard).
+    if memory_id.shard() != shard.shard_id {
+        return Ok(brain_ops::AdminRestoreOutcome::NotFound);
+    }
+    let grace_nanos =
+        u64::try_from(brain_workers::workers::slot_reclaim::DEFAULT_FORGET_GRACE.as_nanos())
+            .unwrap_or(u64::MAX);
+    let now_unix_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    brain_ops::handle_admin_restore(
+        &shard.ops,
+        memory_id,
+        namespace,
+        grace_nanos,
+        now_unix_nanos,
+    )
+    .await
+    .map_err(|e| format!("restore: {e}"))
 }
 
 /// Walk the per-shard `memories` + `texts` redb tables and push each

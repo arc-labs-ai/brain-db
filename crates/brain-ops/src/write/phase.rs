@@ -208,6 +208,15 @@ pub enum Phase {
         at_unix_nanos: u64,
     },
 
+    /// Un-tombstone a soft-forgotten memory — the reverse of a soft
+    /// `Tombstone(Memory)`. Re-sets ACTIVE, clears `tombstoned_at`,
+    /// re-inserts the timeline entry, and restores the dedup fingerprint.
+    /// The admin restore trigger builds this after validating the memory
+    /// is soft-forgotten and still within grace; the writer's post-commit
+    /// fan-out enqueues the FORGET-cascade revert so dependent statements
+    /// and relations are re-attached too.
+    RestoreMemory { id: MemoryId, at_unix_nanos: u64 },
+
     /// Supersede a versioned row by another. Statements and relations
     /// support this; memories don't (memories use Tombstone + a new
     /// UpsertMemory to "replace").
@@ -452,6 +461,13 @@ pub enum PhaseAck {
         target: TombstoneTarget,
         tombstoned_at_unix_nanos: u64,
     },
+    /// A soft-forgotten memory was un-tombstoned. `already_active` is true
+    /// on an idempotent no-op (the row was never tombstoned) — the apply
+    /// made no change.
+    MemoryRestored {
+        id: MemoryId,
+        already_active: bool,
+    },
     Superseded(SupersedeTarget, SupersedeReplacementId),
     SalienceUpdated,
     KindUpdated,
@@ -534,6 +550,7 @@ impl Phase {
             Self::Link { .. } => "link",
             Self::Unlink { .. } => "unlink",
             Self::Tombstone { .. } => "tombstone",
+            Self::RestoreMemory { .. } => "restore_memory",
             Self::Supersede { .. } => "supersede",
             Self::UpdateSalience { .. } => "update_salience",
             Self::UpdateKind { .. } => "update_kind",

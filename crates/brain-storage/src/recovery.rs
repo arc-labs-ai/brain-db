@@ -483,7 +483,10 @@ fn apply_to_arena(
         | WalPayload::TxnAbort(_)
         | WalPayload::RelationLink(_)
         | WalPayload::RelationSupersede(_)
-        | WalPayload::RelationTombstone(_) => Ok(()),
+        | WalPayload::RelationTombstone(_)
+        // A soft FORGET never zeroed the arena slot (soft keeps the
+        // vector until grace), so un-tombstoning it touches redb only.
+        | WalPayload::RestoreMemory(_) => Ok(()),
         // typed-graph records: substrate apply-paths ignore these.
         // Phases 16+ hydrate typed-graph state via their own sinks. Sub-task 15.2.
         WalPayload::PhaseBody(r) => {

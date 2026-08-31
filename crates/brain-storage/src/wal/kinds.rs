@@ -86,6 +86,14 @@ pub enum WalRecordKind {
     SessionCreate = 0x62,
     /// 0x63 — session registry row deleted.
     SessionDelete = 0x63,
+
+    // ---- Memory-lifecycle extension (v1-minor, additive) ----
+    /// 0x64 — un-tombstone a soft-forgotten memory (FORGET soft-cascade
+    /// revert). Carries a first-class typed payload (not an opaque body),
+    /// the mirror of [`Self::Forget`]: recovery re-activates the row,
+    /// clears `tombstoned_at`, re-inserts the timeline entry, and restores
+    /// the dedup fingerprint — idempotently.
+    RestoreMemory = 0x64,
 }
 
 impl WalRecordKind {
@@ -130,6 +138,7 @@ impl WalRecordKind {
             0x61 => Self::SpaceDelete,
             0x62 => Self::SessionCreate,
             0x63 => Self::SessionDelete,
+            0x64 => Self::RestoreMemory,
             _ => return None,
         })
     }
@@ -187,6 +196,8 @@ pub const ALL_KINDS: &[WalRecordKind] = &[
     WalRecordKind::SpaceDelete,
     WalRecordKind::SessionCreate,
     WalRecordKind::SessionDelete,
+    // Memory-lifecycle extension.
+    WalRecordKind::RestoreMemory,
 ];
 
 #[cfg(test)]
@@ -228,7 +239,7 @@ mod tests {
         assert_eq!(WalRecordKind::from_u8(0x23), None);
         assert_eq!(WalRecordKind::from_u8(0x41), None); // extractor toggle removed
         assert_eq!(WalRecordKind::from_u8(0x52), None); // beyond 0x51 stage-completed
-        assert_eq!(WalRecordKind::from_u8(0x64), None); // beyond the registry block
+        assert_eq!(WalRecordKind::from_u8(0x65), None); // beyond RestoreMemory (0x64)
         assert_eq!(WalRecordKind::from_u8(128), None); // reserved for v2+
         assert_eq!(WalRecordKind::from_u8(255), None);
     }
@@ -240,8 +251,8 @@ mod tests {
         let seen: std::collections::HashSet<u8> = ALL_KINDS.iter().map(|k| k.as_u8()).collect();
         assert_eq!(
             seen.len(),
-            34,
-            "15 substrate + 15 opaque-body + 4 registry = 34 kinds"
+            35,
+            "15 substrate + 15 opaque-body + 4 registry + 1 memory-lifecycle = 35 kinds"
         );
         for v in 1..=15u8 {
             assert!(
@@ -251,7 +262,7 @@ mod tests {
         }
         for v in [
             0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x20, 0x21, 0x22, 0x30, 0x31, 0x32, 0x40, 0x50,
-            0x51, 0x60, 0x61, 0x62, 0x63,
+            0x51, 0x60, 0x61, 0x62, 0x63, 0x64,
         ] {
             assert!(
                 seen.contains(&v),

@@ -15,8 +15,8 @@
 
 use brain_storage::recovery::MetadataSinkError;
 use brain_storage::wal::payload::{
-    EncodePayload, ForgetMode, ForgetPayload, MigrateEmbeddingPayload, SalienceUpdate,
-    UpdateKindPayload, UpdateSaliencePayload, UpdateSessionPayload,
+    EncodePayload, ForgetMode, ForgetPayload, MigrateEmbeddingPayload, RestorePayload,
+    SalienceUpdate, UpdateKindPayload, UpdateSaliencePayload, UpdateSessionPayload,
 };
 use redb::ReadableTable;
 
@@ -306,6 +306,110 @@ impl MetadataDb {
             {
                 let entry = IdempotencyEntry::new(
                     response_kind::FORGET,
+                    Some(key),
+                    Vec::new(),
+                    [0u8; 32],
+                    timestamp_ns,
+                    lsn,
+                );
+                let mut t = wtxn.open_table(IDEMPOTENCY_TABLE).map_err(transient)?;
+                t.insert(&<[u8; 16]>::from(p.request_id), &entry)
+                    .map_err(transient)?;
+            }
+
+            self.bump_next_lsn_in_txn(&wtxn, lsn)?;
+        }
+        wtxn.commit().map_err(transient)?;
+        Ok(())
+    }
+
+    pub(super) fn apply_restore_memory(
+        &self,
+        lsn: u64,
+        timestamp_ns: u64,
+        p: &RestorePayload,
+    ) -> Result<(), MetadataSinkError> {
+        let wtxn = self.db.begin_write().map_err(transient)?;
+        {
+            let key = p.memory_id.to_be_bytes();
+
+            // Invert exactly what the soft-FORGET redb end-state produced
+            // (see `apply_forget`): re-set ACTIVE, drop `tombstoned_at`,
+            // re-insert the timeline-index entry, and re-insert the dedup
+            // FINGERPRINTS row. All of these are idempotent, so a re-replay
+            // after a crash between commit and checkpoint is a structural
+            // no-op — restoring an already-active memory changes nothing.
+            //
+            // A hard-forgotten row is never the subject of a RestoreMemory
+            // record (hard forget is irreversible and purges the text +
+            // artifact), so if we ever see one here we leave it untouched:
+            // resurrecting the flags over purged data would be a zombie.
+            struct RowCoords {
+                namespace_id: u32,
+                space_id_bytes: [u8; 16],
+                created_at_unix_nanos: u64,
+                session_id: u64,
+                memory_id_bytes: [u8; 16],
+                content_hash: Option<[u8; 32]>,
+            }
+            let coords: Option<RowCoords> = {
+                let mut t = wtxn.open_table(MEMORIES_TABLE).map_err(transient)?;
+                let existing = t.get(&key).map_err(transient)?.map(|a| a.value());
+                match existing {
+                    Some(mut mem) if mem.flags & flags::HARD_FORGOTTEN == 0 => {
+                        let captured = RowCoords {
+                            namespace_id: mem.namespace_id,
+                            space_id_bytes: mem.space_id_bytes,
+                            created_at_unix_nanos: mem.created_at_unix_nanos,
+                            session_id: mem.session_id,
+                            memory_id_bytes: mem.memory_id_bytes,
+                            content_hash: mem.content_hash,
+                        };
+                        mem.flags |= flags::ACTIVE;
+                        mem.tombstoned_at_unix_nanos = None;
+                        t.insert(&key, &mem).map_err(transient)?;
+                        Some(captured)
+                    }
+                    _ => None,
+                }
+            };
+
+            if let Some(c) = coords {
+                // Re-insert the timeline-index entry so the restored memory
+                // is once again a temporal predecessor for future encodes.
+                {
+                    let mut t = wtxn
+                        .open_table(MEMORIES_BY_SPACE_TIMELINE_TABLE)
+                        .map_err(transient)?;
+                    let tkey = space_timeline_key(
+                        c.namespace_id,
+                        c.space_id_bytes,
+                        c.created_at_unix_nanos,
+                        c.session_id,
+                        c.memory_id_bytes,
+                    );
+                    t.insert(tkey.as_slice(), ()).map_err(transient)?;
+                }
+
+                // Restore the dedup FINGERPRINTS row the forget evicted, so a
+                // re-encode of the same text once again folds onto this
+                // memory. Only present when the original encode opted in.
+                if let Some(hash) = c.content_hash {
+                    let fp_key = fingerprint_key(
+                        brain_core::SpaceId::from(c.space_id_bytes),
+                        brain_core::SessionId(c.session_id),
+                        &hash,
+                    );
+                    let entry = FingerprintEntry::new(p.memory_id, timestamp_ns);
+                    let mut t = wtxn.open_table(FINGERPRINTS_TABLE).map_err(transient)?;
+                    t.insert(&fp_key, &entry).map_err(transient)?;
+                }
+            }
+
+            // Idempotency entry.
+            {
+                let entry = IdempotencyEntry::new(
+                    response_kind::RESTORE,
                     Some(key),
                     Vec::new(),
                     [0u8; 32],

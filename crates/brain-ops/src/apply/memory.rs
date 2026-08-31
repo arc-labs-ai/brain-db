@@ -233,6 +233,17 @@ pub fn apply_tombstone_memory(
     row.tombstoned_at_unix_nanos = Some(*at_unix_nanos);
     row.flags &= !brain_metadata::tables::memory::flags::ACTIVE;
 
+    // Hard forget sets the HARD_FORGOTTEN flag + forgot_at so the state is
+    // irreversible and self-describing: the FORGET-revert path checks this
+    // bit to refuse resurrecting a memory whose plaintext + artifacts have
+    // been purged (invariant #6). This converges the live apply with the
+    // recovery replay (crates/brain-metadata apply_forget), which already
+    // stamps the same fields, so a crash mid-forget replays identically.
+    if matches!(mode, crate::write::phase::TombstoneMode::Hard) {
+        row.flags |= brain_metadata::tables::memory::flags::HARD_FORGOTTEN;
+        row.forgot_at_unix_nanos = Some(*at_unix_nanos);
+    }
+
     let created_at = row.created_at_unix_nanos;
     let namespace_id = row.namespace_id;
     let space_bytes = row.space_id_bytes;
@@ -310,6 +321,126 @@ pub fn apply_tombstone_memory(
     Ok(PhaseAck::Tombstoned {
         target: *target,
         tombstoned_at_unix_nanos: *at_unix_nanos,
+    })
+}
+
+/// Apply [`Phase::RestoreMemory`] — reverse a soft `Tombstone(Memory)`.
+///
+/// Re-sets the ACTIVE flag, clears `tombstoned_at`, re-inserts the
+/// timeline-index entry, and restores the dedup fingerprint the forget
+/// evicted. Idempotent: restoring an already-active memory is a no-op
+/// (`already_active = true`) so a recovery replay after the live commit
+/// changes nothing. A hard-forgotten memory is irreversible (invariant
+/// #6): the caller validates that before submitting, and apply refuses it
+/// defensively so a stray restore can never resurrect purged plaintext.
+pub fn apply_restore_memory(
+    wtxn: &WriteTransaction,
+    phase: &Phase,
+    write: &Write,
+) -> Result<PhaseAck, ApplyError> {
+    let Phase::RestoreMemory { id, at_unix_nanos } = phase else {
+        return Err(ApplyError::PhaseMisShape("expected RestoreMemory"));
+    };
+    let _ = at_unix_nanos;
+
+    let mut row = {
+        let memories_t = wtxn
+            .open_table(MEMORIES_TABLE)
+            .map_err(|e| ApplyError::Storage(format!("open MEMORIES: {e:?}")))?;
+        let row_guard = memories_t
+            .get(&id.to_be_bytes())
+            .map_err(|e| ApplyError::Storage(format!("MEMORIES get: {e:?}")))?;
+        let Some(guard) = row_guard else {
+            return Err(ApplyError::NotFound {
+                what: "memory",
+                detail: format!("{id:?}"),
+            });
+        };
+        guard.value()
+    };
+
+    // Tenant wall (authoritative, inside the write txn) — same guard the
+    // tombstone apply uses: a row owned by another space reads as NotFound
+    // so restore can never touch another tenant's memory by id.
+    if row.space_id_bytes != <[u8; 16]>::from(write.space_id) {
+        return Err(ApplyError::NotFound {
+            what: "memory",
+            detail: format!("{id:?}"),
+        });
+    }
+
+    // Hard forget is irreversible; refuse to resurrect a purged memory.
+    if row.flags & brain_metadata::tables::memory::flags::HARD_FORGOTTEN != 0 {
+        return Err(ApplyError::Invariant(
+            "cannot restore a hard-forgotten memory (invariant #6)".to_owned(),
+        ));
+    }
+
+    // Already active → idempotent no-op (recovery replay after the live
+    // commit, or a redundant restore). No mutation, no index churn.
+    if row.flags & brain_metadata::tables::memory::flags::ACTIVE != 0 {
+        return Ok(PhaseAck::MemoryRestored {
+            id: *id,
+            already_active: true,
+        });
+    }
+
+    // Re-activate: set ACTIVE, drop tombstoned_at.
+    row.flags |= brain_metadata::tables::memory::flags::ACTIVE;
+    row.tombstoned_at_unix_nanos = None;
+
+    let created_at = row.created_at_unix_nanos;
+    let namespace_id = row.namespace_id;
+    let space_bytes = row.space_id_bytes;
+    let ctx_raw = row.session_id;
+    let mid_bytes = row.memory_id_bytes;
+    let dedup_hash = row.content_hash;
+
+    // Persist the re-activated row.
+    {
+        let mut memories_t = wtxn
+            .open_table(MEMORIES_TABLE)
+            .map_err(|e| ApplyError::Storage(format!("open MEMORIES: {e:?}")))?;
+        memories_t
+            .insert(&id.to_be_bytes(), row)
+            .map_err(|e| ApplyError::Storage(format!("MEMORIES insert (restore): {e:?}")))?;
+    }
+
+    // Re-insert the timeline-index entry the tombstone removed so the
+    // restored memory is once again a temporal predecessor.
+    {
+        let mut timeline_t = wtxn
+            .open_table(MEMORIES_BY_SPACE_TIMELINE_TABLE)
+            .map_err(|e| ApplyError::Storage(format!("open TIMELINE: {e:?}")))?;
+        let key = space_timeline_key(namespace_id, space_bytes, created_at, ctx_raw, mid_bytes);
+        timeline_t
+            .insert(key.as_slice(), ())
+            .map_err(|e| ApplyError::Storage(format!("TIMELINE insert (restore): {e:?}")))?;
+    }
+
+    // Restore the dedup fingerprint the forget evicted so a re-encode of
+    // the same text once again folds onto this memory. Only present when
+    // the original encode opted into content-hash dedup.
+    if let Some(hash) = dedup_hash {
+        use brain_metadata::tables::fingerprint::{
+            fingerprint_key, FingerprintEntry, FINGERPRINTS_TABLE,
+        };
+        let key = fingerprint_key(
+            brain_core::SpaceId::from(space_bytes),
+            SessionId(ctx_raw),
+            &hash,
+        );
+        let entry = FingerprintEntry::new(*id, created_at);
+        let mut fp_t = wtxn
+            .open_table(FINGERPRINTS_TABLE)
+            .map_err(|e| ApplyError::Storage(format!("open FINGERPRINTS: {e:?}")))?;
+        fp_t.insert(&key, entry)
+            .map_err(|e| ApplyError::Storage(format!("FINGERPRINTS insert (restore): {e:?}")))?;
+    }
+
+    Ok(PhaseAck::MemoryRestored {
+        id: *id,
+        already_active: false,
     })
 }
 
@@ -890,5 +1021,165 @@ mod tests {
             assert_eq!(row.flags & brain_metadata::tables::memory::flags::ACTIVE, 0);
             assert_eq!(row.tombstoned_at_unix_nanos, Some(1_700_000_001_000));
         }
+    }
+
+    fn soft_tombstone(id: MemoryId) -> Phase {
+        Phase::Tombstone {
+            target: TombstoneTarget::Memory {
+                id,
+                mode: crate::write::phase::TombstoneMode::Soft,
+            },
+            reason: 1,
+            at_unix_nanos: 1_700_000_001_000,
+        }
+    }
+
+    fn restore(id: MemoryId) -> Phase {
+        Phase::RestoreMemory {
+            id,
+            at_unix_nanos: 1_700_000_002_000,
+        }
+    }
+
+    #[test]
+    fn restore_reactivates_soft_tombstoned_memory() {
+        let (_dir, db) = open_db();
+        let id = MemoryId::pack(0, 1, 0);
+        let space = SpaceId::new();
+        let write = fresh_write_for(space);
+
+        // Upsert + soft-forget.
+        {
+            let wtxn = db.write_txn().unwrap();
+            apply_upsert_memory(&wtxn, &fixture_phase(id), &write).unwrap();
+            apply_tombstone_memory(&wtxn, &soft_tombstone(id), &write).unwrap();
+            wtxn.commit().unwrap();
+        }
+        // Confirm tombstoned + timeline gone.
+        {
+            let rtxn = db.read_txn().unwrap();
+            let row = rtxn
+                .open_table(MEMORIES_TABLE)
+                .unwrap()
+                .get(&id.to_be_bytes())
+                .unwrap()
+                .unwrap()
+                .value();
+            assert_eq!(row.flags & brain_metadata::tables::memory::flags::ACTIVE, 0);
+        }
+
+        // Restore.
+        {
+            let wtxn = db.write_txn().unwrap();
+            let ack = apply_restore_memory(&wtxn, &restore(id), &write).unwrap();
+            assert!(matches!(
+                ack,
+                PhaseAck::MemoryRestored {
+                    already_active: false,
+                    ..
+                }
+            ));
+            wtxn.commit().unwrap();
+        }
+
+        // ACTIVE re-set, tombstoned_at cleared, timeline entry back.
+        let rtxn = db.read_txn().unwrap();
+        let row = rtxn
+            .open_table(MEMORIES_TABLE)
+            .unwrap()
+            .get(&id.to_be_bytes())
+            .unwrap()
+            .unwrap()
+            .value();
+        assert!(row.flags & brain_metadata::tables::memory::flags::ACTIVE != 0);
+        assert_eq!(row.tombstoned_at_unix_nanos, None);
+        let timeline_t = rtxn.open_table(MEMORIES_BY_SPACE_TIMELINE_TABLE).unwrap();
+        let key = space_timeline_key(
+            brain_core::NamespaceId::SYSTEM.raw(),
+            space_id_bytes(space),
+            row.created_at_unix_nanos,
+            row.session_id,
+            id.to_be_bytes(),
+        );
+        assert!(timeline_t.get(key.as_slice()).unwrap().is_some());
+    }
+
+    #[test]
+    fn restore_already_active_is_idempotent_noop() {
+        let (_dir, db) = open_db();
+        let id = MemoryId::pack(0, 1, 0);
+        let space = SpaceId::new();
+        let write = fresh_write_for(space);
+        {
+            let wtxn = db.write_txn().unwrap();
+            apply_upsert_memory(&wtxn, &fixture_phase(id), &write).unwrap();
+            wtxn.commit().unwrap();
+        }
+        // Restore of a never-tombstoned memory: no-op success.
+        let wtxn = db.write_txn().unwrap();
+        let ack = apply_restore_memory(&wtxn, &restore(id), &write).unwrap();
+        assert!(matches!(
+            ack,
+            PhaseAck::MemoryRestored {
+                already_active: true,
+                ..
+            }
+        ));
+        wtxn.commit().unwrap();
+    }
+
+    #[test]
+    fn restore_refuses_hard_forgotten() {
+        let (_dir, db) = open_db();
+        let id = MemoryId::pack(0, 1, 0);
+        let space = SpaceId::new();
+        let write = fresh_write_for(space);
+        let hard = Phase::Tombstone {
+            target: TombstoneTarget::Memory {
+                id,
+                mode: crate::write::phase::TombstoneMode::Hard,
+            },
+            reason: 1,
+            at_unix_nanos: 1_700_000_001_000,
+        };
+        {
+            let wtxn = db.write_txn().unwrap();
+            apply_upsert_memory(&wtxn, &fixture_phase(id), &write).unwrap();
+            apply_tombstone_memory(&wtxn, &hard, &write).unwrap();
+            wtxn.commit().unwrap();
+        }
+        // The hard tombstone stamped HARD_FORGOTTEN; restore must refuse.
+        let wtxn = db.write_txn().unwrap();
+        let err = apply_restore_memory(&wtxn, &restore(id), &write).unwrap_err();
+        assert!(matches!(err, ApplyError::Invariant(_)));
+    }
+
+    #[test]
+    fn restore_missing_memory_not_found() {
+        let (_dir, db) = open_db();
+        let write = fresh_write_for(SpaceId::default());
+        let wtxn = db.write_txn().unwrap();
+        let err =
+            apply_restore_memory(&wtxn, &restore(MemoryId::pack(0, 999, 0)), &write).unwrap_err();
+        assert!(matches!(err, ApplyError::NotFound { what: "memory", .. }));
+    }
+
+    #[test]
+    fn restore_refuses_cross_tenant() {
+        let (_dir, db) = open_db();
+        let id = MemoryId::pack(0, 1, 0);
+        let space_a = SpaceId::new();
+        let space_b = SpaceId::new();
+        let write_a = fresh_write_for(space_a);
+        {
+            let wtxn = db.write_txn().unwrap();
+            apply_upsert_memory(&wtxn, &fixture_phase(id), &write_a).unwrap();
+            apply_tombstone_memory(&wtxn, &soft_tombstone(id), &write_a).unwrap();
+            wtxn.commit().unwrap();
+        }
+        // B tries to restore A's id — reads as NotFound (tenant wall).
+        let wtxn = db.write_txn().unwrap();
+        let err = apply_restore_memory(&wtxn, &restore(id), &fresh_write_for(space_b)).unwrap_err();
+        assert!(matches!(err, ApplyError::NotFound { what: "memory", .. }));
     }
 }

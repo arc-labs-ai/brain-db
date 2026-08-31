@@ -22,6 +22,7 @@ pub mod reason;
 pub mod recall;
 pub mod registry_cascade;
 pub mod relation;
+pub mod restore;
 pub mod schema;
 pub mod schema_drop;
 pub mod schema_replace;

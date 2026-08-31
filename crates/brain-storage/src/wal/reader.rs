@@ -989,9 +989,9 @@ mod tests {
 
         let path = segment_path(dir.path(), 0);
         let mut bytes = std::fs::read(&path).unwrap();
-        // Record 2 (index 2) type byte → 0x64 (reserved-future, invalid).
+        // Record 2 (index 2) type byte → 0x7F (reserved-future, invalid).
         let type_off = record_offset(&records, 2) + 8;
-        bytes[type_off] = 0x64;
+        bytes[type_off] = 0x7F;
         std::fs::write(&path, &bytes).unwrap();
 
         let mut reader = WalReader::open(dir.path(), uuid(20)).unwrap();
@@ -1132,7 +1132,7 @@ mod tests {
         let mut bytes = std::fs::read(&path).unwrap();
         // Corrupt record index 1's type byte in the non-last segment.
         let type_off = record_offset(&seg0, 1) + 8;
-        bytes[type_off] = 0x64;
+        bytes[type_off] = 0x7F;
         std::fs::write(&path, &bytes).unwrap();
 
         let mut reader = WalReader::open(dir.path(), uuid(25)).unwrap();
@@ -1143,7 +1143,7 @@ mod tests {
                 err,
                 WalReadError::RecordError {
                     in_segment: 0,
-                    source: WalRecordError::UnknownRecordType(0x64),
+                    source: WalRecordError::UnknownRecordType(0x7F),
                     ..
                 }
             ),

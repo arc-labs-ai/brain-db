@@ -131,6 +131,7 @@ impl MetadataSink for MetadataDb {
             WalPayload::RelationLink(p) => self.apply_relation_link(lsn, timestamp_ns, p),
             WalPayload::RelationSupersede(p) => self.apply_relation_supersede(lsn, timestamp_ns, p),
             WalPayload::RelationTombstone(p) => self.apply_relation_tombstone(lsn, p),
+            WalPayload::RestoreMemory(p) => self.apply_restore_memory(lsn, timestamp_ns, p),
         }
     }
 }
@@ -218,8 +219,8 @@ mod tests {
     use brain_storage::wal::payload::{
         CheckpointBeginPayload, CheckpointEndPayload, EdgePayload, EncodePayload, ForgetMode,
         ForgetPayload, ForgetReason, LinkPayload, MigrateEmbeddingPayload, ReclaimPayload,
-        SalienceReason, SalienceUpdate, TxnBeginPayload, UnlinkPayload, UpdateKindPayload,
-        UpdateSaliencePayload, UpdateSessionPayload, WalPayload,
+        RestorePayload, SalienceReason, SalienceUpdate, TxnBeginPayload, UnlinkPayload,
+        UpdateKindPayload, UpdateSaliencePayload, UpdateSessionPayload, WalPayload,
     };
     use std::path::PathBuf;
 
@@ -410,6 +411,107 @@ mod tests {
             mode,
             reason: ForgetReason::ClientRequest,
         }
+    }
+
+    fn restore_payload(id: MemoryId, byte: u8) -> RestorePayload {
+        RestorePayload {
+            memory_id: id,
+            request_id: rid(byte),
+            space_id: brain_core::SpaceId::default(),
+        }
+    }
+
+    /// RESTORE_MEMORY replay must reverse a soft FORGET: re-set ACTIVE and
+    /// clear tombstoned_at, honoring invariant #1 (the un-tombstone is WAL-
+    /// durable). Replaying the same record twice is a structural no-op
+    /// (idempotent recovery), and the record is never emitted for a
+    /// hard-forgotten memory.
+    #[test]
+    fn restore_replay_reactivates_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MetadataDb::open(db_path(&dir)).unwrap();
+        let enc = sample_encode(1, 1);
+        let id = enc.memory_id;
+        let key = id.to_be_bytes();
+        db.apply(1, TS, &WalPayload::Encode(enc)).unwrap();
+
+        // Soft forget, then restore.
+        db.apply(
+            2,
+            TS + 1,
+            &WalPayload::Forget(forget_payload(id, 2, ForgetMode::Soft)),
+        )
+        .unwrap();
+        db.apply(
+            3,
+            TS + 2,
+            &WalPayload::RestoreMemory(restore_payload(id, 3)),
+        )
+        .unwrap();
+
+        let check_active = |db: &MetadataDb| {
+            let rtxn = db.read_txn().unwrap();
+            let m = rtxn
+                .open_table(MEMORIES_TABLE)
+                .unwrap()
+                .get(&key)
+                .unwrap()
+                .unwrap()
+                .value();
+            assert_ne!(m.flags & flags::ACTIVE, 0, "restore must re-set ACTIVE");
+            assert_eq!(
+                m.tombstoned_at_unix_nanos, None,
+                "restore clears tombstoned_at"
+            );
+            assert_eq!(m.flags & flags::HARD_FORGOTTEN, 0);
+        };
+        check_active(&db);
+
+        // Idempotent replay: applying the restore again changes nothing.
+        db.apply(
+            3,
+            TS + 2,
+            &WalPayload::RestoreMemory(restore_payload(id, 3)),
+        )
+        .unwrap();
+        check_active(&db);
+    }
+
+    /// A restore against a hard-forgotten memory is a defensive no-op:
+    /// hard FORGET is irreversible (invariant #6). The record is never
+    /// emitted for one in production; recovery must not resurrect it.
+    #[test]
+    fn restore_replay_leaves_hard_forgotten_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MetadataDb::open(db_path(&dir)).unwrap();
+        let enc = sample_encode(1, 1);
+        let id = enc.memory_id;
+        let key = id.to_be_bytes();
+        db.apply(1, TS, &WalPayload::Encode(enc)).unwrap();
+        db.apply(
+            2,
+            TS + 1,
+            &WalPayload::Forget(forget_payload(id, 2, ForgetMode::Hard)),
+        )
+        .unwrap();
+
+        db.apply(
+            3,
+            TS + 2,
+            &WalPayload::RestoreMemory(restore_payload(id, 3)),
+        )
+        .unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        let m = rtxn
+            .open_table(MEMORIES_TABLE)
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .unwrap()
+            .value();
+        assert_eq!(m.flags & flags::ACTIVE, 0, "hard-forgotten stays inactive");
+        assert_ne!(m.flags & flags::HARD_FORGOTTEN, 0);
     }
 
     /// Seed a MEMORY_ARTIFACTS + MEMORY_VECTORS row for `id`. Recovery's

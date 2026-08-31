@@ -519,6 +519,26 @@ impl RealWriterHandle {
                     "submit: post-commit forget cascade enqueue attempt",
                 );
             }
+            // RestoreMemory fans out to the FORGET-cascade *revert*. The
+            // memory row is un-tombstoned by the phase apply above; this
+            // enqueue drives `cascade_revert_forget`, which replays the soft
+            // FORGET's undo journal to re-attach dependent statements and
+            // relations. Soft mode by construction — only a soft FORGET
+            // journals undo records, so only a soft FORGET is reversible.
+            if let Phase::RestoreMemory { id, at_unix_nanos } = phase {
+                let job = crate::writer::ForgetCascadeJob {
+                    memory_id: *id,
+                    mode: crate::writer::ForgetCascadeMode::Soft,
+                    kind: crate::writer::ForgetCascadeKind::Revert,
+                    forgot_at_unix_nanos: *at_unix_nanos,
+                };
+                let enqueued = super::try_enqueue_forget_cascade(self, job);
+                tracing::debug!(
+                    memory_id = ?id,
+                    enqueued,
+                    "submit: post-commit forget cascade revert enqueue attempt",
+                );
+            }
             // UpsertSchema fans out to the SchemaMigrationWorker. The
             // OUTSIDE_ACTIVE_SCHEMA flag-sweep was previously inline
             // inside the upload wtxn; moving it post-commit keeps the
@@ -973,7 +993,10 @@ fn phase_to_envelope(
         // ContextUpdated / EmbeddingUpdated don't trigger a wire event
         // because subscribers don't filter on them; ReclaimSlots is an
         // internal-ish maintenance op.
-        Phase::UpdateSalience { .. }
+        // RestoreMemory publishes no memory-subscribe event — it is an
+        // admin-plane lifecycle op, not a client write with a wire surface.
+        Phase::RestoreMemory { .. }
+        | Phase::UpdateSalience { .. }
         | Phase::UpdateKind { .. }
         | Phase::UpdateSession { .. }
         | Phase::UpdateEmbedding { .. }
@@ -1305,6 +1328,76 @@ mod tests {
             shared.is_tombstoned(id),
             "HNSW must mark the memory_id tombstoned after Phase::Tombstone(Memory)"
         );
+    }
+
+    #[tokio::test]
+    async fn submit_restore_reactivates_and_enqueues_revert_cascade() {
+        // The acked trigger: a RestoreMemory write un-tombstones the memory
+        // (WAL-durable) AND enqueues a ForgetCascadeJob{kind: Revert} so the
+        // dependent graph is re-attached. This asserts both halves.
+        let (_dir, mut writer, shared) = build_writer_with_shared();
+        let (tx, rx) = flume::unbounded::<crate::writer::ForgetCascadeJob>();
+        writer.set_forget_cascade_sender(tx);
+
+        let id = MemoryId::pack(0, 1, 0);
+        let space = SpaceId::new();
+        let upsert = Phase::UpsertMemory {
+            id,
+            text: "hi".into(),
+            vector: Box::new([0.5_f32; VECTOR_DIM]),
+            kind: MemoryKind::Episodic,
+            salience: brain_core::Salience::default(),
+            session_id: SessionId(0),
+            created_at_unix_nanos: 0,
+            arena_slot: 1,
+            embedding_model_fp: [0; 16],
+            content_hash: None,
+            occurred_at_unix_nanos: None,
+            deduplicate: false,
+        };
+        writer
+            .submit(Write::single(WriteId::new(), space, upsert))
+            .await
+            .unwrap();
+
+        // Soft forget → Apply cascade job.
+        let tomb = Phase::Tombstone {
+            target: TombstoneTarget::Memory {
+                id,
+                mode: crate::write::phase::TombstoneMode::Soft,
+            },
+            reason: 0,
+            at_unix_nanos: 1_700_000_001_000,
+        };
+        writer
+            .submit(Write::single(WriteId::new(), space, tomb))
+            .await
+            .unwrap();
+        assert!(shared.is_tombstoned(id));
+        let apply_job = rx.try_recv().expect("forget cascade apply job");
+        assert_eq!(apply_job.kind, crate::writer::ForgetCascadeKind::Apply);
+
+        // Restore → the memory is active again AND a Revert job is enqueued.
+        let restore = Phase::RestoreMemory {
+            id,
+            at_unix_nanos: 1_700_000_002_000,
+        };
+        let ack = writer
+            .submit(Write::single(WriteId::new(), space, restore))
+            .await
+            .expect("restore submit");
+        assert!(matches!(
+            ack.single_phase(),
+            PhaseAck::MemoryRestored {
+                already_active: false,
+                ..
+            }
+        ));
+        let revert_job = rx.try_recv().expect("forget cascade revert job");
+        assert_eq!(revert_job.kind, crate::writer::ForgetCascadeKind::Revert);
+        assert_eq!(revert_job.memory_id, id);
+        assert_eq!(revert_job.mode, crate::writer::ForgetCascadeMode::Soft);
+        assert_eq!(revert_job.forgot_at_unix_nanos, 1_700_000_002_000);
     }
 
     /// Regression: fresh-DB encode with `deduplicate=true` used to

@@ -22,8 +22,8 @@ use http::{Method, Request, Response};
 use hyper::body::Incoming;
 
 use crate::admin::handlers::{
-    api_keys, audit, backfill, config, diagnostics, extract, healthz, metrics, readyz, rebuild,
-    shard, snapshot, space, worker,
+    api_keys, audit, backfill, config, diagnostics, extract, healthz, memory, metrics, readyz,
+    rebuild, shard, snapshot, space, worker,
 };
 use crate::admin::AdminState;
 
@@ -224,6 +224,18 @@ fn attach_v1_routes(r: Router<Incoming>, state: Arc<AdminState>) -> Router<Incom
         "/v1/spaces/",
         state.clone(),
         space::by_id,
+    );
+
+    // ──────── /v1/memories ─────────────────────────────────────────────
+    // POST /v1/memories/{id}/restore — un-tombstone a soft-forgotten
+    // memory (FORGET soft-cascade revert). Prefix route; the handler
+    // parses the `{id}/restore` tail.
+    let r = with_state_prefix(
+        r,
+        Method::POST,
+        "/v1/memories/",
+        state.clone(),
+        memory::restore::handle,
     );
 
     // ──────── /v1/shards ───────────────────────────────────────────────
