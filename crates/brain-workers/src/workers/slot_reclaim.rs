@@ -42,6 +42,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use brain_core::MemoryId;
 use brain_metadata::tables::edge::{EDGES_REVERSE_TABLE, EDGES_TABLE};
 use brain_metadata::tables::memory::MEMORIES_TABLE;
+use brain_metadata::tables::statement::STATEMENTS_BY_EVIDENCE_TABLE;
 use brain_metadata::tables::text::TEXTS_TABLE;
 use redb::ReadableTable;
 use tracing::trace;
@@ -196,7 +197,11 @@ fn reclaim_one(
     let wtxn = metadata
         .write_txn()
         .map_err(|e| WorkerError::Ops(format!("reclaim_one write_txn: {e:?}")))?;
-    let did_remove = {
+    // Scope of the reclaimed memory, captured before the row is
+    // removed so the residual reverse-index sweep can range-scan the
+    // memory's `(namespace, space)` prefix. `Some` iff the row was
+    // reclaimed.
+    let reclaimed_scope = {
         let mut memories = wtxn
             .open_table(MEMORIES_TABLE)
             .map_err(|e| WorkerError::Ops(format!("open MEMORIES: {e:?}")))?;
@@ -210,20 +215,30 @@ fn reclaim_one(
         //   - tombstoned_at unset (defensive; covers a future
         //     ADMIN_RESTORE) → false.
         //   - tombstoned_at >= cutoff (set-once but defensive) → false.
-        let eligible = matches!(
-            row.as_ref().and_then(|m| m.tombstoned_at_unix_nanos),
-            Some(ts) if ts < cutoff_nanos
-        );
-        if eligible {
+        let scope = row.as_ref().and_then(|m| {
+            (matches!(m.tombstoned_at_unix_nanos, Some(ts) if ts < cutoff_nanos))
+                .then_some((m.namespace_id, m.space_id_bytes))
+        });
+        if scope.is_some() {
             memories
                 .remove(key)
                 .map_err(|e| WorkerError::Ops(format!("memories remove: {e:?}")))?;
         }
-        eligible
+        scope
     };
+    let did_remove = reclaimed_scope.is_some();
 
-    if did_remove {
+    if let Some((namespace_id, space_id_bytes)) = reclaimed_scope {
         purge_adjacent_edges(&wtxn, id)?;
+
+        // Defensive backstop for the STATEMENTS_BY_EVIDENCE reverse
+        // index. FORGET's cascade strips a soft-forgotten memory's rows
+        // at tombstone time, but a hard FORGET (immediate reclaim) and
+        // any pre-existing orphan can leave rows whose primary memory is
+        // now gone. Range-scan the memory's `(scope, memory)` prefix and
+        // delete every residual row so a dangling reverse-index entry
+        // can never point at a reclaimed memory.
+        strip_evidence_rows(&wtxn, namespace_id, space_id_bytes, id)?;
 
         // Soft FORGET deliberately keeps the plaintext + write-artifact
         // bundle recoverable during the grace window (only a hard FORGET
@@ -315,6 +330,47 @@ fn purge_adjacent_edges(wtxn: &redb::WriteTransaction, id: MemoryId) -> Result<(
         }
     }
 
+    Ok(())
+}
+
+/// Remove every residual `STATEMENTS_BY_EVIDENCE` row keyed on the
+/// reclaimed memory — `(namespace_id, space_id_bytes, memory, *)`.
+///
+/// The FORGET cascade already strips these when a soft-forgotten
+/// memory's statements are updated, so this is a defensive backstop: it
+/// covers a hard FORGET (which reclaims immediately, bypassing the
+/// grace-window cascade for orphaning) and any pre-existing orphan rows
+/// left by earlier code paths. `remove` on the collected keys is a
+/// no-op if the row is already gone, so it never double-errors.
+fn strip_evidence_rows(
+    wtxn: &redb::WriteTransaction,
+    namespace_id: u32,
+    space_id_bytes: [u8; 16],
+    id: MemoryId,
+) -> Result<(), WorkerError> {
+    let mem = id.to_be_bytes();
+    let lo = (namespace_id, space_id_bytes, mem, [0u8; 16]);
+    let hi = (namespace_id, space_id_bytes, mem, [0xFFu8; 16]);
+    let mut by_evidence = wtxn
+        .open_table(STATEMENTS_BY_EVIDENCE_TABLE)
+        .map_err(|e| WorkerError::Ops(format!("open STATEMENTS_BY_EVIDENCE: {e:?}")))?;
+    // Only the trailing statement-id varies across the prefix; collect
+    // it and rebuild the full key on removal.
+    let victims: Vec<[u8; 16]> = by_evidence
+        .range(lo..=hi)
+        .map_err(|e| WorkerError::Ops(format!("STATEMENTS_BY_EVIDENCE range: {e:?}")))?
+        .map(|entry| match entry {
+            Ok((k, _)) => Ok(k.value().3),
+            Err(e) => Err(WorkerError::Ops(format!(
+                "STATEMENTS_BY_EVIDENCE row: {e:?}"
+            ))),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for stmt in victims {
+        by_evidence
+            .remove(&(namespace_id, space_id_bytes, mem, stmt))
+            .map_err(|e| WorkerError::Ops(format!("STATEMENTS_BY_EVIDENCE remove: {e:?}")))?;
+    }
     Ok(())
 }
 
@@ -457,6 +513,100 @@ mod tests {
                 .is_none(),
             "raw memory-vector row must be purged after grace"
         );
+    }
+
+    /// Regression: reclamation must strip any residual
+    /// STATEMENTS_BY_EVIDENCE rows keyed on the reclaimed memory, so a
+    /// hard-forgotten memory (immediate reclaim) or a pre-existing
+    /// orphan can never leave a dangling reverse-index entry whose
+    /// primary memory is gone. Mirrors the RELATION_BY_EVIDENCE cleanup.
+    #[test]
+    fn reclaim_strips_residual_statement_evidence_rows() {
+        use brain_metadata::tables::scope::RowScope;
+
+        let (_dir, db) = open_shared();
+        let id = MemoryId::pack(1, 7, 0);
+        let tombstoned_at = 10_000u64;
+        seed_soft_forgotten(&db, id, tombstoned_at);
+
+        // The seeded memory carries the SYSTEM/default scope. Plant two
+        // residual evidence rows keyed on it (as if a cascade had been
+        // skipped), plus a row for an UNRELATED memory that must survive.
+        let scope = RowScope::new(NamespaceId::SYSTEM, SpaceId::default());
+        let other = MemoryId::pack(2, 8, 0);
+        let stmt_a = [0x11u8; 16];
+        let stmt_b = [0x22u8; 16];
+        {
+            let wtxn = db.write_txn().unwrap();
+            {
+                let mut t = wtxn.open_table(STATEMENTS_BY_EVIDENCE_TABLE).unwrap();
+                t.insert(
+                    &(
+                        scope.namespace_id,
+                        scope.space_id_bytes,
+                        id.to_be_bytes(),
+                        stmt_a,
+                    ),
+                    &(),
+                )
+                .unwrap();
+                t.insert(
+                    &(
+                        scope.namespace_id,
+                        scope.space_id_bytes,
+                        id.to_be_bytes(),
+                        stmt_b,
+                    ),
+                    &(),
+                )
+                .unwrap();
+                t.insert(
+                    &(
+                        scope.namespace_id,
+                        scope.space_id_bytes,
+                        other.to_be_bytes(),
+                        stmt_a,
+                    ),
+                    &(),
+                )
+                .unwrap();
+            }
+            wtxn.commit().unwrap();
+        }
+
+        let reclaimed = reclaim_one(&db, id, tombstoned_at + 1).unwrap();
+        assert!(reclaimed, "an eligible tombstone must be reclaimed");
+
+        let rtxn = db.read_txn().unwrap();
+        let t = rtxn.open_table(STATEMENTS_BY_EVIDENCE_TABLE).unwrap();
+        // No residual rows remain for the reclaimed memory.
+        let lo = (
+            scope.namespace_id,
+            scope.space_id_bytes,
+            id.to_be_bytes(),
+            [0u8; 16],
+        );
+        let hi = (
+            scope.namespace_id,
+            scope.space_id_bytes,
+            id.to_be_bytes(),
+            [0xFFu8; 16],
+        );
+        assert_eq!(
+            t.range(lo..=hi).unwrap().count(),
+            0,
+            "reclaim must strip residual evidence rows for the reclaimed memory"
+        );
+        // The unrelated memory's row is untouched.
+        assert!(t
+            .get(&(
+                scope.namespace_id,
+                scope.space_id_bytes,
+                other.to_be_bytes(),
+                stmt_a
+            ))
+            .unwrap()
+            .is_some());
     }
 
     /// Reclamation is not eligible before grace expires (cutoff <= tombstoned).

@@ -45,7 +45,7 @@ use crate::tables::relation::{RELATION_BY_EVIDENCE_TABLE, RELATION_METADATA_TABL
 use crate::tables::scope::RowScope;
 use crate::tables::statement::{
     EvidenceEntryRow, EvidenceOverflow, StatementMetadata, EVIDENCE_OVERFLOW_TABLE,
-    STATEMENTS_TABLE,
+    STATEMENTS_BY_EVIDENCE_TABLE, STATEMENTS_TABLE,
 };
 
 /// Default confidence threshold below which a statement that
@@ -193,12 +193,30 @@ pub fn cascade_forget_to_statements(
     {
         let mut table = wtxn.open_table(STATEMENTS_TABLE)?;
         let mut overflow_table = wtxn.open_table(EVIDENCE_OVERFLOW_TABLE)?;
+        // Reverse evidence index. Every affected statement had the
+        // forgotten memory in its evidence list, so it owns a
+        // `(scope, forgotten_memory, statement_id)` row here. Strip it
+        // in the same pass — mirroring the relation twin's cleanup of
+        // RELATION_BY_EVIDENCE — so graph enrichment (memory_list
+        // graph_counts, recall include_graph) stops counting the
+        // statement as sourced-by the forgotten memory the instant the
+        // FORGET commits, not only after slot reclamation.
+        let mut by_evidence = wtxn.open_table(STATEMENTS_BY_EVIDENCE_TABLE)?;
         for AffectedStatement {
             mut row,
             remaining,
             prior_overflow_id,
         } in affected
         {
+            let scope = row.scope();
+            // `remove` on an absent key is a benign no-op, so this never
+            // double-errors if the row was already stripped.
+            by_evidence.remove(&(
+                scope.namespace_id,
+                scope.space_id_bytes,
+                memory_bytes,
+                row.statement_id_bytes,
+            ))?;
             let kind = StatementKind::from_u8(row.kind);
             // A previously-overflowed statement that drops back to ≤
             // INLINE_EVIDENCE_CAP entries collapses onto the inline
@@ -831,7 +849,9 @@ mod statement_cascade_overflow_tests {
     use crate::schema::predicate::predicate_intern;
     use crate::statement::evidence::{pack_evidence_ids, read_evidence_ids};
     use crate::statement::statement_create;
-    use crate::tables::statement::{StatementMetadata, EVIDENCE_OVERFLOW_TABLE, STATEMENTS_TABLE};
+    use crate::tables::statement::{
+        StatementMetadata, EVIDENCE_OVERFLOW_TABLE, STATEMENTS_BY_EVIDENCE_TABLE, STATEMENTS_TABLE,
+    };
     use crate::MetadataDb;
     use brain_core::{
         Entity, EntityType, EvidenceRef, ExtractorId, PredicateId, SessionId, Statement,
@@ -1008,6 +1028,103 @@ mod statement_cascade_overflow_tests {
         let rtxn = db.read_txn().unwrap();
         let t = rtxn.open_table(EVIDENCE_OVERFLOW_TABLE).unwrap();
         assert_eq!(t.iter().unwrap().count(), 0);
+    }
+
+    fn evidence_row_present(db: &MetadataDb, mem: MemoryId, stmt: StatementId) -> bool {
+        let sc = test_scope();
+        let rtxn = db.read_txn().unwrap();
+        let t = rtxn.open_table(STATEMENTS_BY_EVIDENCE_TABLE).unwrap();
+        t.get(&(
+            sc.namespace_id,
+            sc.space_id_bytes,
+            mem.to_be_bytes(),
+            stmt.to_bytes(),
+        ))
+        .unwrap()
+        .is_some()
+    }
+
+    #[test]
+    fn cascade_strips_evidence_row_when_statement_kept() {
+        // Regression: the STATEMENTS_BY_EVIDENCE reverse index must lose
+        // the (forgotten_memory, statement) row the instant FORGET
+        // commits — mirroring RELATION_BY_EVIDENCE — so graph enrichment
+        // stops counting the statement as sourced-by the forgotten
+        // memory during the tombstone-grace window.
+        let (_dir, mut db) = open_db();
+        let subj = make_subject(&mut db, "ada-strip-kept");
+        let pred = intern_pred(&mut db, "knows_strip_kept");
+
+        // Two inline evidence ids; forget one → statement survives.
+        let memory_ids = ids(2);
+        let ev = pack_ids_for_test(&mut db, memory_ids.clone());
+        assert!(matches!(ev, EvidenceRef::Inline(_)));
+        let stmt = make_statement(&mut db, subj, pred, ev);
+
+        // Both reverse-index rows present before the cascade.
+        assert!(evidence_row_present(&db, memory_ids[0], stmt));
+        assert!(evidence_row_present(&db, memory_ids[1], stmt));
+
+        let wtxn = db.write_txn().unwrap();
+        let summary =
+            cascade_forget_to_statements(&wtxn, memory_ids[0], 0.2, 100, NOW + 1).unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(summary.evidence_dropped, 1);
+        assert_eq!(summary.tombstoned, 0);
+
+        // Forgotten memory's row is gone; the survivor's row stays.
+        assert!(!evidence_row_present(&db, memory_ids[0], stmt));
+        assert!(evidence_row_present(&db, memory_ids[1], stmt));
+    }
+
+    #[test]
+    fn cascade_strips_evidence_row_when_statement_tombstoned() {
+        // Sole-evidence case: the statement tombstones, and its lone
+        // reverse-index row must also be removed.
+        let (_dir, mut db) = open_db();
+        let subj = make_subject(&mut db, "ada-strip-tomb");
+        let pred = intern_pred(&mut db, "knows_strip_tomb");
+
+        let memory_ids = ids(1);
+        let ev = pack_ids_for_test(&mut db, memory_ids.clone());
+        let stmt = make_statement(&mut db, subj, pred, ev);
+        assert!(evidence_row_present(&db, memory_ids[0], stmt));
+
+        let wtxn = db.write_txn().unwrap();
+        let summary =
+            cascade_forget_to_statements(&wtxn, memory_ids[0], 0.2, 100, NOW + 1).unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(summary.tombstoned, 1);
+
+        assert!(!evidence_row_present(&db, memory_ids[0], stmt));
+    }
+
+    #[test]
+    fn cascade_strips_evidence_row_from_overflow_form() {
+        // Overflow-backed evidence: forgetting one id must still strip
+        // that id's reverse-index row while the survivors remain.
+        let (_dir, mut db) = open_db();
+        let subj = make_subject(&mut db, "ada-strip-over");
+        let pred = intern_pred(&mut db, "knows_strip_over");
+
+        let memory_ids = ids(9);
+        let ev = pack_ids_for_test(&mut db, memory_ids.clone());
+        assert!(matches!(ev, EvidenceRef::Overflow(_)));
+        let stmt = make_statement(&mut db, subj, pred, ev);
+        for mid in &memory_ids {
+            assert!(evidence_row_present(&db, *mid, stmt));
+        }
+
+        let wtxn = db.write_txn().unwrap();
+        cascade_forget_to_statements(&wtxn, memory_ids[4], 0.2, 100, NOW + 1).unwrap();
+        wtxn.commit().unwrap();
+
+        assert!(!evidence_row_present(&db, memory_ids[4], stmt));
+        for (i, mid) in memory_ids.iter().enumerate() {
+            if i != 4 {
+                assert!(evidence_row_present(&db, *mid, stmt));
+            }
+        }
     }
 
     #[test]
