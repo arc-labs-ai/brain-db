@@ -2066,117 +2066,98 @@ impl Shard {
         target: rebuild::RebuildTarget,
     ) -> Result<RebuildReport, String> {
         let start = std::time::Instant::now();
-
-        // 1. Quiesce both indexers (release the per-directory writer locks).
-        //    The FIRST quiesce may `?` — nothing is quiesced yet, so an early
-        //    return leaves both indexers running. But the instant an indexer
-        //    quiesces it drops its writer and parks; a quiesced indexer left
-        //    un-resumed is wedged forever and the write path stalls silently
-        //    (invariant #7). So from here on NOTHING may `?` before the resume
-        //    region — every fallible step is recorded and surfaced only after
-        //    resume runs.
-        quiesce_indexer(self.memory_text_control.as_ref(), "memory_text").await?;
-
-        // memory_text is now quiesced. Record — never `?` — the rest.
-        let quiesce_err = quiesce_indexer(self.statement_text_control.as_ref(), "statements")
-            .await
-            .err();
-
-        // 2. Rebuild both on-disk indexes from authoritative redb. Skip the
-        //    rebuild if the statement indexer never quiesced: it still holds
-        //    the per-directory writer lock, so the on-disk replace could not
-        //    complete cleanly. Resume is still guaranteed below regardless.
         let metadata = self.ops.executor.metadata.as_ref();
-        let rebuild_result: Result<u64, String> = if quiesce_err.is_some() {
-            Ok(0)
-        } else {
-            (|| {
-                let mem = brain_ops::index::text_indexer::rebuild_memory_text(
-                    &self.tantivy_dir,
-                    metadata,
-                )
-                .map_err(|e| format!("memory text rebuild: {e}"))?;
-                let stmt =
-                    brain_ops::index::text_indexer::rebuild_statements(&self.tantivy_dir, metadata)
-                        .map_err(|e| format!("statement text rebuild: {e}"))?;
-                Ok(mem.rows_processed + stmt.rows_processed)
-            })()
-        };
 
-        // 3. Reopen the shard from disk. `TantivyShard::open` reconciles any
-        //    interrupted swap, so even a mid-rebuild failure yields a valid
-        //    index (the completed rebuild or the restored prior one).
-        let reopened = brain_index::TantivyShard::open(&self.tantivy_dir)
-            .map_err(|e| format!("reopen tantivy after rebuild: {e}"));
+        // The quiesce → rebuild → reopen/swap → resume orchestration lives in
+        // `drive_tantivy_rebuild`, which guarantees BOTH indexers are resumed
+        // on every exit path — including one whose own quiesce ack timed out
+        // while its drain loop had already dropped its writer and parked. A
+        // quiesced-but-never-resumed indexer is wedged forever and every later
+        // ENCODE/FORGET silently loses its lexical op (invariant #7). The
+        // middle closure runs synchronously between quiesce and resume.
+        let entries = drive_tantivy_rebuild(
+            self.memory_text_control.as_ref(),
+            self.statement_text_control.as_ref(),
+            |mem_quiesced, stmt_quiesced| {
+                // 2. Rebuild each on-disk index from authoritative redb, gated
+                //    on ITS OWN indexer having quiesced: an un-quiesced indexer
+                //    still holds the per-directory writer lock, so the on-disk
+                //    replace could not complete cleanly. Resume is still
+                //    guaranteed for both below regardless.
+                let rebuild_result: Result<u64, String> = (|| {
+                    let mem = if mem_quiesced {
+                        brain_ops::index::text_indexer::rebuild_memory_text(
+                            &self.tantivy_dir,
+                            metadata,
+                        )
+                        .map_err(|e| format!("memory text rebuild: {e}"))?
+                        .rows_processed
+                    } else {
+                        0
+                    };
+                    let stmt = if stmt_quiesced {
+                        brain_ops::index::text_indexer::rebuild_statements(
+                            &self.tantivy_dir,
+                            metadata,
+                        )
+                        .map_err(|e| format!("statement text rebuild: {e}"))?
+                        .rows_processed
+                    } else {
+                        0
+                    };
+                    Ok(mem + stmt)
+                })();
 
-        // Capture — never swallow — the retriever swap error. A failed swap
-        // leaves the retriever's cached readers bound to the pre-rebuild
-        // `Index`, whose segment files the completed on-disk rebuild has
-        // already deleted: reads would serve from unlinked segments (stale /
-        // vanishing data), exactly what invariant #7 forbids. So a swap
-        // failure must fail-stop the rebuild, not merely log.
-        let mut swap_err: Option<String> = None;
-        let resume_handles = match &reopened {
-            // Swap the read side and resume onto the reopened index.
-            Ok(startup) => {
-                let new_shard = startup.shard.clone();
-                if let Err(e) = self.lexical_retriever.swap_shard(new_shard.clone()) {
-                    tracing::error!(
-                        shard_id = self.shard_id,
-                        error = %e,
-                        "lexical retriever swap failed during tantivy rebuild",
-                    );
-                    swap_err = Some(format!("lexical retriever swap after rebuild: {e}"));
+                // 3. Reopen the shard from disk and swap the retriever's cached
+                //    readers onto it. `TantivyShard::open` reconciles any
+                //    interrupted swap, so even a mid-rebuild failure yields a
+                //    valid index (the completed rebuild or the restored prior
+                //    one). Capture — never swallow — the swap error: a failed
+                //    swap leaves the retriever bound to the pre-rebuild `Index`
+                //    whose segment files the completed on-disk rebuild has
+                //    already deleted, so reads would serve from unlinked
+                //    segments (stale / vanishing data), exactly what invariant
+                //    #7 forbids. A swap failure must therefore fail-stop.
+                let reopened = brain_index::TantivyShard::open(&self.tantivy_dir)
+                    .map_err(|e| format!("reopen tantivy after rebuild: {e}"));
+                let mut swap_err: Option<String> = None;
+                let (reopen_err, resume_handles) = match &reopened {
+                    Ok(startup) => {
+                        let new_shard = startup.shard.clone();
+                        if let Err(e) = self.lexical_retriever.swap_shard(new_shard.clone()) {
+                            tracing::error!(
+                                shard_id = self.shard_id,
+                                error = %e,
+                                "lexical retriever swap failed during tantivy rebuild",
+                            );
+                            swap_err = Some(format!("lexical retriever swap after rebuild: {e}"));
+                        }
+                        (
+                            None,
+                            Some((new_shard.memory_text.clone(), new_shard.statements.clone())),
+                        )
+                    }
+                    // Reopen failed: fall back to the pre-rebuild handles so the
+                    // indexers can still resume (writes keep flowing); the read
+                    // side keeps its prior bundle.
+                    Err(e) => (
+                        Some(e.clone()),
+                        self.ops
+                            .tantivy
+                            .as_ref()
+                            .map(|s| (s.memory_text.clone(), s.statements.clone())),
+                    ),
+                };
+
+                RebuildMiddle {
+                    rebuild_result,
+                    reopen_err,
+                    swap_err,
+                    resume_handles,
                 }
-                Some((new_shard.memory_text.clone(), new_shard.statements.clone()))
-            }
-            // Reopen failed: fall back to the pre-rebuild handle so the
-            // indexers can still resume (writes keep flowing); the read
-            // side keeps its prior bundle.
-            Err(_) => self
-                .ops
-                .tantivy
-                .as_ref()
-                .map(|s| (s.memory_text.clone(), s.statements.clone())),
-        };
-
-        // 4. Resume both indexers on the resolved handles. This region MUST
-        //    run on every exit path above: a quiesced indexer that is never
-        //    resumed stays parked with its writer dropped and stalls the write
-        //    path silently. Record resume failures too — but never let a
-        //    failed first resume skip the second (each indexer must be revived
-        //    independently).
-        let mut resume_err: Option<String> = None;
-        if let Some((mem_handle, stmt_handle)) = resume_handles {
-            if let Err(e) =
-                resume_indexer(self.memory_text_control.as_ref(), mem_handle, "memory_text").await
-            {
-                resume_err.get_or_insert(e);
-            }
-            if let Err(e) = resume_indexer(
-                self.statement_text_control.as_ref(),
-                stmt_handle,
-                "statements",
-            )
-            .await
-            {
-                resume_err.get_or_insert(e);
-            }
-        }
-
-        // Both indexers are resumed (or their revival failure recorded). Only
-        // now surface the first failure, in dependency order, as fail-stop.
-        if let Some(e) = quiesce_err {
-            return Err(e);
-        }
-        let entries = rebuild_result?;
-        reopened.map(|_| ())?;
-        if let Some(e) = swap_err {
-            return Err(e);
-        }
-        if let Some(e) = resume_err {
-            return Err(e);
-        }
+            },
+        )
+        .await?;
 
         tracing::info!(
             shard_id = self.shard_id,
@@ -2197,6 +2178,96 @@ impl Shard {
 /// single-threaded executor and is normally near-instant; the bound only
 /// guards against a dead/wedged indexer task.
 const INDEXER_CONTROL_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Middle phase of the hot tantivy rebuild, produced by the caller between
+/// quiesce and resume: the on-disk rebuild outcome plus the reopen/swap
+/// results and the handles to resume the indexers onto.
+#[cfg(target_os = "linux")]
+struct RebuildMiddle {
+    /// Rows reindexed across the (possibly-skipped) memory + statement
+    /// rebuilds, or the first rebuild error.
+    rebuild_result: Result<u64, String>,
+    /// Error reopening the shard from disk after the rebuild, if any.
+    reopen_err: Option<String>,
+    /// Error swapping the retriever onto the reopened index, if any.
+    swap_err: Option<String>,
+    /// Handles to resume both indexers onto — the reopened index, or the
+    /// pre-rebuild fallback. `None` only when no index is available at all.
+    resume_handles: Option<(brain_index::IndexHandle, brain_index::IndexHandle)>,
+}
+
+/// Drive the quiesce → rebuild → reopen/swap → resume dance for the two
+/// lexical indexers, returning the rows reindexed or the first fail-stop.
+///
+/// The ordering is invariant #7's load-bearing part: once an indexer receives
+/// `Quiesce` it drops its writer and parks, so a quiesced-but-never-resumed
+/// indexer is wedged forever and every later ENCODE/FORGET silently loses its
+/// lexical op. Therefore NOTHING between the first quiesce and the resume
+/// region may short-circuit — the bug this replaced `?`-returned on the FIRST
+/// quiesce, stranding an already-parked `memory_text` indexer whenever its ack
+/// timed out. Instead BOTH quiesce results are recorded (never `?`), `middle`
+/// runs synchronously to rebuild/reopen/swap, and BOTH indexers are resumed
+/// independently — even the one whose own quiesce ack failed (the `Quiesce`
+/// was still delivered; the indexer parked and is alive to be resumed). Only
+/// after both are resumed are the recorded failures surfaced, in dependency
+/// order, as fail-stop.
+#[cfg(target_os = "linux")]
+async fn drive_tantivy_rebuild<M>(
+    memory_control: Option<&flume::Sender<brain_ops::index::text_indexer::IndexerControl>>,
+    statement_control: Option<&flume::Sender<brain_ops::index::text_indexer::IndexerControl>>,
+    middle: M,
+) -> Result<u64, String>
+where
+    M: FnOnce(bool, bool) -> RebuildMiddle,
+{
+    // 1. Quiesce both indexers (release the per-directory writer locks).
+    //    Record — never `?` — BOTH quiesce results. An early return here would
+    //    strand an already-parked indexer with its writer dropped.
+    let mem_quiesce_err = quiesce_indexer(memory_control, "memory_text").await.err();
+    let stmt_quiesce_err = quiesce_indexer(statement_control, "statements").await.err();
+
+    // 2-3. Rebuild each on-disk index (gated on its own quiesce), reopen the
+    //       shard, and swap the retriever — all synchronous, no `?`.
+    let RebuildMiddle {
+        rebuild_result,
+        reopen_err,
+        swap_err,
+        resume_handles,
+    } = middle(mem_quiesce_err.is_none(), stmt_quiesce_err.is_none());
+
+    // 4. Resume BOTH indexers on the resolved handles, independently: a failed
+    //    first resume must never skip the second. This region runs on every
+    //    path above so no quiesced indexer is left parked.
+    let mut resume_err: Option<String> = None;
+    if let Some((mem_handle, stmt_handle)) = resume_handles {
+        if let Err(e) = resume_indexer(memory_control, mem_handle, "memory_text").await {
+            resume_err.get_or_insert(e);
+        }
+        if let Err(e) = resume_indexer(statement_control, stmt_handle, "statements").await {
+            resume_err.get_or_insert(e);
+        }
+    }
+
+    // Both indexers are resumed (or their revival failure recorded). Only now
+    // surface the first failure, in dependency order, as fail-stop.
+    if let Some(e) = mem_quiesce_err {
+        return Err(e);
+    }
+    if let Some(e) = stmt_quiesce_err {
+        return Err(e);
+    }
+    let entries = rebuild_result?;
+    if let Some(e) = reopen_err {
+        return Err(e);
+    }
+    if let Some(e) = swap_err {
+        return Err(e);
+    }
+    if let Some(e) = resume_err {
+        return Err(e);
+    }
+    Ok(entries)
+}
 
 /// Send `Quiesce` to an indexer (if it is running) and await its ack. The
 /// indexer drops its writer, releasing tantivy's per-directory lock, so the
@@ -5008,6 +5079,136 @@ mod tests {
             8,
             "fanout lag must accumulate skipped-event counts, not be swallowed"
         );
+    }
+
+    /// Regression: a delivered-but-unacked FIRST quiesce must NOT strand the
+    /// `memory_text` indexer. Before the fix `do_rebuild_tantivy` `?`-returned
+    /// on the first quiesce, skipping the whole resume region — so a
+    /// `memory_text` indexer that received `Quiesce` (dropped its writer,
+    /// parked) but whose ack never arrived was left parked forever, silently
+    /// losing every later ENCODE/FORGET lexical op (invariant #7). The drive
+    /// helper must instead resume BOTH indexers and only then surface the
+    /// quiesce failure as fail-stop.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn first_quiesce_failure_still_resumes_memory_text() {
+        use brain_ops::index::text_indexer::IndexerControl;
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        glommio::LocalExecutorBuilder::default()
+            .name("rebuild-quiesce-test")
+            .spawn(|| async move {
+                // Two control channels standing in for the two live indexers.
+                let (mem_tx, mem_rx) = flume::bounded::<IndexerControl>(4);
+                let (stmt_tx, stmt_rx) = flume::bounded::<IndexerControl>(4);
+
+                // memory_text fake: on `Quiesce` it records receipt and DROPS
+                // its ack without acking — modelling a delivered-but-timed-out
+                // quiesce (the drain loop parked with its writer dropped). It
+                // stays alive to receive `Resume`, proving it can be revived.
+                let mem_quiesced = Rc::new(Cell::new(false));
+                let mem_resumed = Rc::new(Cell::new(false));
+                let mem_task = {
+                    let mem_quiesced = mem_quiesced.clone();
+                    let mem_resumed = mem_resumed.clone();
+                    glommio::spawn_local(async move {
+                        while let Ok(ctl) = mem_rx.recv_async().await {
+                            match ctl {
+                                IndexerControl::Quiesce { ack } => {
+                                    mem_quiesced.set(true);
+                                    drop(ack); // parked; never acks
+                                }
+                                IndexerControl::Resume { ack, .. } => {
+                                    mem_resumed.set(true);
+                                    let _ = ack.send(());
+                                    break;
+                                }
+                            }
+                        }
+                    })
+                };
+
+                // statements fake: acks both quiesce and resume normally.
+                let stmt_resumed = Rc::new(Cell::new(false));
+                let stmt_task = {
+                    let stmt_resumed = stmt_resumed.clone();
+                    glommio::spawn_local(async move {
+                        while let Ok(ctl) = stmt_rx.recv_async().await {
+                            match ctl {
+                                IndexerControl::Quiesce { ack } => {
+                                    let _ = ack.send(());
+                                }
+                                IndexerControl::Resume { ack, .. } => {
+                                    stmt_resumed.set(true);
+                                    let _ = ack.send(());
+                                    break;
+                                }
+                            }
+                        }
+                    })
+                };
+
+                // Real handles to resume onto (a fresh empty on-disk shard).
+                let dir = TempDir::new().expect("tempdir");
+                let shard = brain_index::TantivyShard::open(dir.path())
+                    .expect("open tantivy shard")
+                    .shard;
+                let mem_handle = shard.memory_text.clone();
+                let stmt_handle = shard.statements.clone();
+
+                // Record which per-index rebuilds the middle was asked to run.
+                let mem_rebuild_run = Rc::new(Cell::new(false));
+                let stmt_rebuild_run = Rc::new(Cell::new(false));
+                let result = {
+                    let mem_rebuild_run = mem_rebuild_run.clone();
+                    let stmt_rebuild_run = stmt_rebuild_run.clone();
+                    drive_tantivy_rebuild(Some(&mem_tx), Some(&stmt_tx), move |mem_ok, stmt_ok| {
+                        mem_rebuild_run.set(mem_ok);
+                        stmt_rebuild_run.set(stmt_ok);
+                        RebuildMiddle {
+                            rebuild_result: Ok(0),
+                            reopen_err: None,
+                            swap_err: None,
+                            resume_handles: Some((mem_handle, stmt_handle)),
+                        }
+                    })
+                    .await
+                };
+
+                // The rebuild fail-stops (the first quiesce never acked)...
+                assert!(
+                    result.is_err(),
+                    "rebuild must fail-stop when the first quiesce ack does not arrive",
+                );
+                // ...yet memory_text is still RESUMED, not stranded parked...
+                assert!(
+                    mem_quiesced.get(),
+                    "memory_text quiesce must have been delivered",
+                );
+                assert!(
+                    mem_resumed.get(),
+                    "memory_text must be resumed even though its quiesce ack failed",
+                );
+                // ...and statements was quiesced + resumed normally.
+                assert!(stmt_resumed.get(), "statement indexer must be resumed");
+                // The memory-text on-disk rebuild was SKIPPED (its indexer
+                // never quiesced), while the statement rebuild was allowed.
+                assert!(
+                    !mem_rebuild_run.get(),
+                    "memory rebuild must be skipped when its indexer did not quiesce",
+                );
+                assert!(
+                    stmt_rebuild_run.get(),
+                    "statement rebuild must run when its indexer quiesced",
+                );
+
+                mem_task.await;
+                stmt_task.await;
+            })
+            .expect("spawn test executor")
+            .join()
+            .expect("join test executor");
     }
 
     #[test]
