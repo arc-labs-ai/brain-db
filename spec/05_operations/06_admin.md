@@ -191,11 +191,11 @@ QUOTA_SET: configures per-agent limits (max memories, max contexts, max RPS).
 ADMIN_RESTORE_FORGOTTEN(memory_id) → RestoreResponse
 ```
 
-Undoes a Soft FORGET within the grace period. The memory's tombstone flag is cleared; it becomes searchable again.
+Undoes a Soft FORGET within the grace period. Served on the admin HTTP plane as `POST /v1/memories/{id}/restore`. It un-tombstones the memory (making it searchable again) and replays the forget undo log to reverse the soft cascade: for each dependent statement / relation the cascade touched it re-attaches the stripped evidence, re-adds the reverse-index row, recomputes confidence, and un-tombstones rows still carrying reason `SourceMemoryForgotten`. Replay is idempotent — each consumed undo row is deleted in-txn, so a re-run is a structural no-op. See [`../10_metadata/00_purpose.md`](../10_metadata/00_purpose.md) (the additive undo log) for the mechanism.
 
 Fails if:
-- The memory was hard-forgotten (data is gone).
-- The grace period has expired (reclamation already happened).
+- The memory was hard-forgotten (no undo log was written — the data is gone).
+- The grace period has expired (slot reclamation already reaped the undo rows; a post-grace forget is irreversible).
 
 This is admin-only because it can resurrect data the agent expected to be gone. Compliance-sensitive.
 
