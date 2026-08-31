@@ -883,6 +883,94 @@ mod tests {
     }
 
     #[test]
+    fn replay_maintains_new_statement_and_entity_indexes() {
+        // Coverage guard: WAL replay of an EntityCreate + StatementCreate
+        // into a FRESH redb (the apply_* path, NOT backfill-on-open) must
+        // maintain the additive id-ordered / by-type indexes exactly as the
+        // live CRUD path does. Backfill only covers pre-index DBs; the replay
+        // apply path is what re-populates them after a crash, so it must write
+        // these indexes itself.
+        use crate::recovery::phase_bodies::{encode_statement_create, StatementCreateBody};
+        use crate::statement::statement_get;
+        use crate::tables::entity::ENTITY_BY_TYPE_TABLE;
+        use crate::tables::statement::{
+            metadata_from_statement, STATEMENTS_BY_PREDICATE_ID_TABLE,
+            STATEMENTS_BY_SUBJECT_ID_TABLE,
+        };
+
+        let dir = TempDir::new().unwrap();
+        let db = fresh_db(&dir);
+        let scope = test_scope();
+
+        // 1. Replay the subject entity via the create apply path (not entity_put).
+        let subject_entity = person_entity("Replay Subject");
+        let subject_id = subject_entity.id;
+        let entity_body =
+            encode_entity_create(&EntityMetadata::from_entity(&subject_entity, scope));
+        db.apply_entity_create(30, &entity_body).unwrap();
+
+        // 2. Replay a schemaless statement about that subject.
+        let s = schemaless_statement(subject_id);
+        let sid = s.id;
+        let stmt_body = encode_statement_create(&StatementCreateBody {
+            meta: metadata_from_statement(&s, scope),
+            predicate_intern_hint: Some(("app".into(), "knows".into())),
+        });
+        db.apply_statement_create(31, &stmt_body).unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+
+        // The replayed statement's predicate was interned away from the
+        // PredicateId(0) placeholder; read it back to key the predicate index.
+        let got = statement_get(&rtxn, sid)
+            .unwrap()
+            .expect("statement present");
+        let predicate_id = got.predicate.raw();
+
+        // by_subject_id index row for the replayed statement.
+        let bysi = rtxn.open_table(STATEMENTS_BY_SUBJECT_ID_TABLE).unwrap();
+        assert!(
+            bysi.get(&(
+                scope.namespace_id,
+                scope.space_id_bytes,
+                subject_id.to_bytes(),
+                sid.to_bytes(),
+            ))
+            .unwrap()
+            .is_some(),
+            "replay must write STATEMENTS_BY_SUBJECT_ID_TABLE"
+        );
+
+        // by_predicate_id index row for the replayed statement.
+        let bypi = rtxn.open_table(STATEMENTS_BY_PREDICATE_ID_TABLE).unwrap();
+        assert!(
+            bypi.get(&(
+                scope.namespace_id,
+                scope.space_id_bytes,
+                predicate_id,
+                sid.to_bytes(),
+            ))
+            .unwrap()
+            .is_some(),
+            "replay must write STATEMENTS_BY_PREDICATE_ID_TABLE"
+        );
+
+        // by-(scope, type) listing index row for the replayed entity.
+        let byt = rtxn.open_table(ENTITY_BY_TYPE_TABLE).unwrap();
+        assert!(
+            byt.get(&(
+                scope.namespace_id,
+                scope.space_id_bytes,
+                EntityType::PERSON_ID.raw(),
+                subject_id.to_bytes(),
+            ))
+            .unwrap()
+            .is_some(),
+            "replay must write ENTITY_BY_TYPE_TABLE"
+        );
+    }
+
+    #[test]
     fn statement_tombstone_replays_and_is_idempotent() {
         use crate::recovery::phase_bodies::{
             encode_statement_create, encode_statement_tombstone, StatementCreateBody,
