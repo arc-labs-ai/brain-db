@@ -878,10 +878,16 @@ fn split_qname(q: &str) -> Result<(&str, &str), OpError> {
 // 1000 reachable).
 // ---------------------------------------------------------------------------
 
-const STATEMENT_CURSOR_VERSION: u8 = 2;
-/// `version(1) + namespace_id(4) + space_id(16) + filter_sig(8)`
-/// `+ id(16) + kind(1) + predicate_id(4) + is_current(1) + bucket(1)`.
-const STATEMENT_CURSOR_LEN: usize = 1 + 4 + 16 + 8 + 16 + 1 + 4 + 1 + 1;
+// v3 drops the mutable discriminant columns (kind / predicate_id /
+// is_current / confidence_bucket) that v2 carried: the page walk now
+// resumes on the immutable statement id alone, so those columns are dead
+// weight and, worse, encoded a resume position that could move. Bumping
+// the internal discriminator makes any v2 cursor still in flight decode as
+// malformed rather than mis-resume. This is the opaque `bytes` cursor's
+// own layout version, not a wire/protocol version.
+const STATEMENT_CURSOR_VERSION: u8 = 3;
+/// `version(1) + namespace_id(4) + space_id(16) + filter_sig(8) + id(16)`.
+const STATEMENT_CURSOR_LEN: usize = 1 + 4 + 16 + 8 + 16;
 
 fn statement_list_filter_signature(req: &StatementListRequest) -> [u8; 8] {
     let mut h = blake3::Hasher::new();
@@ -913,10 +919,6 @@ fn encode_statement_cursor(
     out.extend_from_slice(&scope.space_id_bytes);
     out.extend_from_slice(sig);
     out.extend_from_slice(&c.id);
-    out.push(c.kind);
-    out.extend_from_slice(&c.predicate_id.to_le_bytes());
-    out.push(c.is_current);
-    out.push(c.confidence_bucket);
     out
 }
 
@@ -945,19 +947,7 @@ fn decode_statement_cursor(
     }
     let mut id = [0u8; 16];
     id.copy_from_slice(&cursor[29..45]);
-    let kind = cursor[45];
-    let mut pred = [0u8; 4];
-    pred.copy_from_slice(&cursor[46..50]);
-    let predicate_id = u32::from_le_bytes(pred);
-    let is_current = cursor[50];
-    let confidence_bucket = cursor[51];
-    Ok(Some(StatementListCursor {
-        id,
-        kind,
-        predicate_id,
-        is_current,
-        confidence_bucket,
-    }))
+    Ok(Some(StatementListCursor { id }))
 }
 
 fn decode_tombstone_reason(byte: u8) -> Result<TombstoneReason, OpError> {

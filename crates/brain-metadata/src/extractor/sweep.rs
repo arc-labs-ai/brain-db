@@ -17,7 +17,8 @@ use crate::tables::audit::{
 use crate::tables::statement::{
     confidence_bucket, statement_from_metadata, tombstone_reason, StatementMetadata,
     STATEMENTS_BY_EVENT_TIME_TABLE, STATEMENTS_BY_EVIDENCE_TABLE,
-    STATEMENTS_BY_OBJECT_ENTITY_TABLE, STATEMENTS_BY_PREDICATE_TABLE, STATEMENTS_BY_SUBJECT_TABLE,
+    STATEMENTS_BY_OBJECT_ENTITY_TABLE, STATEMENTS_BY_PREDICATE_ID_TABLE,
+    STATEMENTS_BY_PREDICATE_TABLE, STATEMENTS_BY_SUBJECT_ID_TABLE, STATEMENTS_BY_SUBJECT_TABLE,
     STATEMENTS_TABLE, STATEMENT_CHAIN_TABLE,
 };
 
@@ -267,6 +268,9 @@ fn reclaim_one(wtxn: &WriteTransaction, row: &StatementMetadata) -> Result<(), S
             1u8,
             id_bytes,
         ))?;
+        // Immutable id-ordered pagination twin.
+        let mut t = wtxn.open_table(STATEMENTS_BY_SUBJECT_ID_TABLE)?;
+        t.remove(&(ns, ag, row.subject_entity_bytes, id_bytes))?;
     }
 
     // 3. by_predicate.
@@ -280,6 +284,9 @@ fn reclaim_one(wtxn: &WriteTransaction, row: &StatementMetadata) -> Result<(), S
             confidence_bucket(row.confidence),
             id_bytes,
         ))?;
+        // Immutable id-ordered pagination twin.
+        let mut t = wtxn.open_table(STATEMENTS_BY_PREDICATE_ID_TABLE)?;
+        t.remove(&(ns, ag, row.predicate_id, id_bytes))?;
     }
 
     // 4. by_object_entity — only when the object is an Entity.

@@ -68,6 +68,39 @@ pub const STATEMENTS_BY_PREDICATE_TABLE: TableDefinition<
     [u8; 16],
 > = TableDefinition::new("statements_by_predicate");
 
+/// `(namespace_id, space_id_bytes, EntityId, statement_id)` → `()`.
+///
+/// Subject-anchored listing index whose *only* varying column is the
+/// immutable statement id (a UUIDv7). Unlike [`STATEMENTS_BY_SUBJECT_TABLE`]
+/// — whose key embeds the mutable `is_current` bit — a row here never
+/// changes position when it is superseded, tombstoned, or has its
+/// confidence recomputed. That makes it the resume structure for keyset
+/// pagination: paging strictly past the last emitted id can neither gap a
+/// row that moved nor re-emit one, because ids do not move. `is_current` /
+/// `kind` / `predicate` / tombstone / confidence / time are applied as
+/// in-walk filters against the primary row instead of as key columns.
+/// Derived data, rebuilt on open like the in-RAM indexes.
+#[allow(clippy::type_complexity)]
+pub const STATEMENTS_BY_SUBJECT_ID_TABLE: TableDefinition<
+    'static,
+    (u32, [u8; 16], [u8; 16], [u8; 16]),
+    (),
+> = TableDefinition::new("statements_by_subject_id");
+
+/// `(namespace_id, space_id_bytes, predicate_id, statement_id)` → `()`.
+///
+/// Predicate-anchored twin of [`STATEMENTS_BY_SUBJECT_ID_TABLE`]: id-ordered
+/// within a `(scope, predicate)` cell, so its key is immutable across a
+/// confidence recompute (the mutable `confidence_bucket` that
+/// [`STATEMENTS_BY_PREDICATE_TABLE`] keys on is not present here). Resume
+/// point for predicate-anchored keyset pagination.
+#[allow(clippy::type_complexity)]
+pub const STATEMENTS_BY_PREDICATE_ID_TABLE: TableDefinition<
+    'static,
+    (u32, [u8; 16], u32, [u8; 16]),
+    (),
+> = TableDefinition::new("statements_by_predicate_id");
+
 /// `(namespace_id, space_id_bytes, EntityId, kind, statement_id)` →
 /// `StatementId.to_bytes()`. Walk this when answering "what statements have
 /// X as object?". The trailing statement_id keeps the index multi-value.

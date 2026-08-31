@@ -48,8 +48,8 @@ use crate::tables::relation::{RelationMetadata, RELATION_METADATA_TABLE};
 use crate::tables::scope::RowScope;
 use crate::tables::statement::{
     encode_object, StatementMetadata, STATEMENTS_BY_EVENT_TIME_TABLE,
-    STATEMENTS_BY_OBJECT_ENTITY_TABLE, STATEMENTS_BY_SUBJECT_TABLE, STATEMENTS_TABLE,
-    STATEMENT_CHAIN_TABLE,
+    STATEMENTS_BY_OBJECT_ENTITY_TABLE, STATEMENTS_BY_SUBJECT_ID_TABLE, STATEMENTS_BY_SUBJECT_TABLE,
+    STATEMENTS_TABLE, STATEMENT_CHAIN_TABLE,
 };
 
 // ---------------------------------------------------------------------------
@@ -667,6 +667,7 @@ fn reroute_statements(
     let mut records: Vec<StatementReroute> = Vec::with_capacity(rows.len());
     let mut st = wtxn.open_table(STATEMENTS_TABLE)?;
     let mut bys = wtxn.open_table(STATEMENTS_BY_SUBJECT_TABLE)?;
+    let mut bysi = wtxn.open_table(STATEMENTS_BY_SUBJECT_ID_TABLE)?;
     let mut byo = wtxn.open_table(STATEMENTS_BY_OBJECT_ENTITY_TABLE)?;
     let mut byt = wtxn.open_table(STATEMENTS_BY_EVENT_TIME_TABLE)?;
     let mut cht = wtxn.open_table(STATEMENT_CHAIN_TABLE)?;
@@ -709,6 +710,9 @@ fn reroute_statements(
                 ),
                 &m.statement_id_bytes,
             )?;
+            // Move the immutable id-ordered pagination twin to the survivor.
+            bysi.remove(&(ns, ag, merged_b, m.statement_id_bytes))?;
+            bysi.insert(&(ns, ag, survivor_bytes, m.statement_id_bytes), &())?;
 
             if m.kind == StatementKind::Event.as_u8() {
                 if let Some(event_at) = m.event_at_unix_nanos {
@@ -765,6 +769,7 @@ fn reverse_statement_reroutes(
 
     let mut st = wtxn.open_table(STATEMENTS_TABLE)?;
     let mut bys = wtxn.open_table(STATEMENTS_BY_SUBJECT_TABLE)?;
+    let mut bysi = wtxn.open_table(STATEMENTS_BY_SUBJECT_ID_TABLE)?;
     let mut byo = wtxn.open_table(STATEMENTS_BY_OBJECT_ENTITY_TABLE)?;
     let mut byt = wtxn.open_table(STATEMENTS_BY_EVENT_TIME_TABLE)?;
     let mut cht = wtxn.open_table(STATEMENT_CHAIN_TABLE)?;
@@ -804,6 +809,9 @@ fn reverse_statement_reroutes(
                 ),
                 &m.statement_id_bytes,
             )?;
+            // Reverse the immutable id-ordered pagination twin's move.
+            bysi.remove(&(ns, ag, survivor_b, m.statement_id_bytes))?;
+            bysi.insert(&(ns, ag, merged_b, m.statement_id_bytes), &())?;
 
             if m.kind == StatementKind::Event.as_u8() {
                 if let Some(event_at) = m.event_at_unix_nanos {

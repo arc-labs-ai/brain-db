@@ -12,9 +12,10 @@ use redb::{ReadTransaction, ReadableTable, WriteTransaction};
 use crate::tables::statement::{
     confidence_bucket, metadata_from_statement, statement_from_metadata, tombstone_reason,
     EvidenceOverflow, StatementMetadata, EVIDENCE_OVERFLOW_TABLE, STATEMENTS_BY_EVENT_TIME_TABLE,
-    STATEMENTS_BY_EVIDENCE_TABLE, STATEMENTS_BY_OBJECT_ENTITY_TABLE, STATEMENTS_BY_PREDICATE_TABLE,
-    STATEMENTS_BY_SUBJECT_TABLE, STATEMENTS_TABLE, STATEMENT_CHAIN_TABLE,
-    STATEMENT_EMBED_QUEUE_TABLE,
+    STATEMENTS_BY_EVIDENCE_TABLE, STATEMENTS_BY_OBJECT_ENTITY_TABLE,
+    STATEMENTS_BY_PREDICATE_ID_TABLE, STATEMENTS_BY_PREDICATE_TABLE,
+    STATEMENTS_BY_SUBJECT_ID_TABLE, STATEMENTS_BY_SUBJECT_TABLE, STATEMENTS_TABLE,
+    STATEMENT_CHAIN_TABLE, STATEMENT_EMBED_QUEUE_TABLE,
 };
 
 use super::supersede::statement_supersede;
@@ -363,6 +364,12 @@ pub(super) fn insert_new_statement(
             ),
             &m.statement_id_bytes,
         )?;
+        // Immutable id-ordered twin used for keyset pagination resume. Its
+        // key carries no mutable column, so a later supersession /
+        // confidence recompute never relocates the row out from under a
+        // paging cursor.
+        let mut t = wtxn.open_table(STATEMENTS_BY_SUBJECT_ID_TABLE)?;
+        t.insert(&(ns, ag, m.subject_entity_bytes, m.statement_id_bytes), &())?;
     }
 
     // 3. by_predicate.
@@ -379,6 +386,9 @@ pub(super) fn insert_new_statement(
             ),
             &m.statement_id_bytes,
         )?;
+        // Immutable id-ordered twin (see the by_subject_id note above).
+        let mut t = wtxn.open_table(STATEMENTS_BY_PREDICATE_ID_TABLE)?;
+        t.insert(&(ns, ag, m.predicate_id, m.statement_id_bytes), &())?;
     }
 
     // 4. by_object_entity — only if object is Entity.
@@ -894,6 +904,69 @@ fn predicate_get_via(
     let t = wtxn.open_table(PREDICATES_TABLE)?;
     let row: Option<PredicateDefinition> = t.get(&id.raw())?.map(|g| g.value());
     Ok(row.as_ref().map(PredicateDefinition::to_predicate))
+}
+
+/// One-time construction of the immutable id-ordered pagination indexes
+/// ([`STATEMENTS_BY_SUBJECT_ID_TABLE`] and
+/// [`STATEMENTS_BY_PREDICATE_ID_TABLE`]) from the authoritative primary
+/// rows, for a DB written before these indexes existed. Idempotent: a
+/// no-op once the predicate-id index holds any row (every live statement
+/// writes it, so a non-empty index is never stale-missing).
+///
+/// These indexes are derived data — like the in-RAM HNSW rebuilt from the
+/// primary rows at boot — so reconstructing them is index construction,
+/// not a format migration. Runs inside the caller's open-time write txn.
+/// Uses redb-native errors to match [`crate::tables::materialize_all_tables`].
+/// Returns the number of primary rows scanned into the indexes.
+pub fn backfill_statement_id_indexes(wtxn: &WriteTransaction) -> Result<usize, redb::Error> {
+    // Already populated → the common (already-migrated) boot. The
+    // predicate-id index gets a row for every live statement, so it is the
+    // authoritative sentinel (the subject-id index skips memory subjects).
+    {
+        let idx = wtxn.open_table(STATEMENTS_BY_PREDICATE_ID_TABLE)?;
+        if idx.iter()?.next().is_some() {
+            return Ok(0);
+        }
+    }
+    // Collect keys first so the primary read iterator is dropped before the
+    // indexes are opened for write (borrow discipline).
+    struct Row {
+        ns: u32,
+        ag: [u8; 16],
+        subject: [u8; 16],
+        predicate_id: u32,
+        id: [u8; 16],
+        subject_kind: u8,
+    }
+    let rows: Vec<Row> = {
+        let primary = wtxn.open_table(STATEMENTS_TABLE)?;
+        let mut rs = Vec::new();
+        for entry in primary.iter()? {
+            let (_, v) = entry?;
+            let m = v.value();
+            rs.push(Row {
+                ns: m.namespace_id,
+                ag: m.space_id_bytes,
+                subject: m.subject_entity_bytes,
+                predicate_id: m.predicate_id,
+                id: m.statement_id_bytes,
+                subject_kind: m.subject_kind,
+            });
+        }
+        rs
+    };
+    let n = rows.len();
+    let mut bysi = wtxn.open_table(STATEMENTS_BY_SUBJECT_ID_TABLE)?;
+    let mut bypi = wtxn.open_table(STATEMENTS_BY_PREDICATE_ID_TABLE)?;
+    for r in rows {
+        // Mirror the insert gate: memory subjects are by-subject-indexed
+        // too, only `pending` (subject_kind == 1) is skipped.
+        if r.subject_kind != 1 {
+            bysi.insert(&(r.ns, r.ag, r.subject, r.id), &())?;
+        }
+        bypi.insert(&(r.ns, r.ag, r.predicate_id, r.id), &())?;
+    }
+    Ok(n)
 }
 
 // ---------------------------------------------------------------------------

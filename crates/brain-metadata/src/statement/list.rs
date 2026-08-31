@@ -9,8 +9,9 @@ use brain_core::{EntityId, MemoryId, PredicateId, StatementId, StatementKind};
 use redb::{ReadTransaction, ReadableTable};
 
 use crate::tables::statement::{
-    confidence_bucket, statement_from_metadata, StatementMetadata, STATEMENTS_BY_PREDICATE_TABLE,
-    STATEMENTS_BY_SUBJECT_TABLE, STATEMENTS_TABLE, STATEMENT_CHAIN_TABLE,
+    statement_from_metadata, StatementMetadata, STATEMENTS_BY_PREDICATE_ID_TABLE,
+    STATEMENTS_BY_PREDICATE_TABLE, STATEMENTS_BY_SUBJECT_ID_TABLE, STATEMENTS_BY_SUBJECT_TABLE,
+    STATEMENTS_TABLE, STATEMENT_CHAIN_TABLE,
 };
 
 use super::crud::statement_get;
@@ -286,30 +287,26 @@ pub fn statement_list(
 // Keyset (seek) pagination.
 // ---------------------------------------------------------------------------
 
-/// The exact position of one statement inside whichever secondary index
-/// the current filter selects. It is the resume point for keyset
-/// pagination: the trailing `id` plus the discriminant key columns
-/// (`kind`, `predicate_id`, `is_current`, `confidence_bucket`) let the
-/// next page rebuild the row's full index key and seek strictly past it
-/// — without a point lookup back into the primary table, so a boundary
-/// row hard-forgotten between two page fetches can never strand the walk.
+/// The resume point for keyset pagination: the immutable statement id of
+/// the last emitted row.
+///
+/// Every anchored page walk (subject, predicate, or unanchored) orders by
+/// the statement id — a UUIDv7 that never changes for the life of the row.
+/// Seeking strictly past this id can therefore neither gap a row that was
+/// superseded / retracted / had its confidence recomputed between two page
+/// fetches (its ordering position does not move) nor re-emit one. Mutable
+/// attributes (`is_current`, `confidence`, `kind`, `predicate`, tombstone,
+/// time) are applied as in-walk filters against the primary row, never as
+/// cursor key columns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StatementListCursor {
     pub id: [u8; 16],
-    pub kind: u8,
-    pub predicate_id: u32,
-    pub is_current: u8,
-    pub confidence_bucket: u8,
 }
 
 impl StatementListCursor {
     fn from_row(m: &StatementMetadata) -> Self {
         Self {
             id: m.statement_id_bytes,
-            kind: m.kind,
-            predicate_id: m.predicate_id,
-            is_current: m.is_current,
-            confidence_bucket: confidence_bucket(m.confidence),
         }
     }
 }
@@ -385,6 +382,13 @@ fn statement_row_admits(
             return false;
         }
     }
+    // Predicate is no longer a resume-key column on the paged walk (it
+    // pages by immutable id), so narrow on the row here.
+    if let Some(want_pred) = filter.predicate {
+        if m.predicate_id != want_pred.raw() {
+            return false;
+        }
+    }
     if let Some((lo, hi)) = extra.time_range {
         if !statement_time_admits(m, lo, hi) {
             return false;
@@ -396,18 +400,22 @@ fn statement_row_admits(
 /// Keyset (seek) page over the statements matching `filter`, resuming
 /// strictly past `after` when present.
 ///
-/// Dispatches to the same secondary index as [`statement_list`], but
-/// pages directly from the store: it seeks past the cursor's exact index
-/// key (rebuilt from `after`'s discriminant columns) instead of
+/// Pages directly from the store over an **immutable** id-ordered index
+/// (subject → [`STATEMENTS_BY_SUBJECT_ID_TABLE`], predicate →
+/// [`STATEMENTS_BY_PREDICATE_ID_TABLE`], unanchored → the id-keyed primary
+/// table), seeking strictly past the cursor's statement id instead of
 /// materializing a fixed window and slicing it in memory. So rows beyond
 /// the old 1000-row ceiling are reachable and each page costs one page's
 /// worth of scan, not (pages × window).
 ///
-/// Rows come back in the selected index's native key order (stable
-/// across pages as long as the underlying rows do not change). Every
-/// wire-visible predicate — including tombstone and time filters that
-/// are not index columns — is applied in-walk so `has_more` and the
-/// returned `last` are exact.
+/// Because the resume ordering is the statement id — which never changes
+/// for the life of a row — a row that is superseded, retracted, or has its
+/// confidence recomputed *between* two page fetches keeps its ordering
+/// position: it can neither be gapped (relocated behind the cursor) nor
+/// re-emitted. Every mutable, wire-visible predicate (`is_current`,
+/// confidence, kind, predicate, tombstone, time) is applied in-walk
+/// against the primary row via [`statement_row_admits`], so `has_more`
+/// and the returned `last` are exact.
 pub fn statement_list_page(
     rtxn: &ReadTransaction,
     scope: RowScope,
@@ -461,37 +469,25 @@ pub fn statement_list_page(
 
     match (filter.subject, filter.predicate) {
         (Some(subject), _) => {
-            // Subject-anchored index: (ns, ag, subject, kind, pred,
-            // is_current, id). Resume strictly past the cursor's rebuilt
-            // key; kind / predicate narrowing stays an in-loop filter so
-            // one bound shape covers every subject query.
-            let by_subject = rtxn.open_table(STATEMENTS_BY_SUBJECT_TABLE)?;
+            // Subject-anchored immutable index: (ns, ag, subject, id).
+            // Its only varying column is the immutable statement id, so a
+            // supersession / confidence recompute between pages cannot
+            // relocate a row out from under the cursor. Resume strictly
+            // past the cursor id; every discriminant (kind / predicate /
+            // is_current / tombstone / confidence / time) is an in-walk
+            // filter on the primary row via `statement_row_admits`.
+            let by_subject_id = rtxn.open_table(STATEMENTS_BY_SUBJECT_ID_TABLE)?;
             let subj = subject.to_bytes();
-            let lo_key = (ns, ag, subj, 0u8, 0u32, 0u8, [0u8; 16]);
-            let hi_key = (ns, ag, subj, u8::MAX, u32::MAX, 1u8, [0xffu8; 16]);
+            let lo_key = (ns, ag, subj, [0u8; 16]);
+            let hi_key = (ns, ag, subj, [0xffu8; 16]);
             let lo_bound = match after {
-                Some(c) => {
-                    Bound::Excluded((ns, ag, subj, c.kind, c.predicate_id, c.is_current, c.id))
-                }
+                Some(c) => Bound::Excluded((ns, ag, subj, c.id)),
                 None => Bound::Included(lo_key),
             };
-            for entry in by_subject.range((lo_bound, Bound::Included(hi_key)))? {
-                let (k, v) = entry?;
-                let (_, _, _, k_kind, k_pred, is_current_bit, _) = k.value();
-                if filter.current_only && is_current_bit == 0 {
-                    continue;
-                }
-                if let Some(want) = filter.kind {
-                    if k_kind != want.as_u8() {
-                        continue;
-                    }
-                }
-                if let Some(want) = filter.predicate {
-                    if k_pred != want.raw() {
-                        continue;
-                    }
-                }
-                let Some(m) = s_table.get(&v.value())?.map(|g| g.value()) else {
+            for entry in by_subject_id.range((lo_bound, Bound::Included(hi_key)))? {
+                let (k, _) = entry?;
+                let (_, _, _, id) = k.value();
+                let Some(m) = s_table.get(&id)?.map(|g| g.value()) else {
                     continue;
                 };
                 if try_push!(m) {
@@ -500,25 +496,22 @@ pub fn statement_list_page(
             }
         }
         (None, Some(predicate)) => {
-            // Predicate-anchored index: (ns, ag, pred, kind,
-            // confidence_bucket, id).
-            let by_predicate = rtxn.open_table(STATEMENTS_BY_PREDICATE_TABLE)?;
+            // Predicate-anchored immutable index: (ns, ag, pred, id). Same
+            // id-ordered resume discipline as the subject path — the
+            // mutable confidence bucket is a per-row filter, not a key
+            // column, so a recompute between pages never gaps or dups.
+            let by_predicate_id = rtxn.open_table(STATEMENTS_BY_PREDICATE_ID_TABLE)?;
             let pred = predicate.raw();
-            let lo_key = (ns, ag, pred, 0u8, 0u8, [0u8; 16]);
-            let hi_key = (ns, ag, pred, u8::MAX, u8::MAX, [0xffu8; 16]);
+            let lo_key = (ns, ag, pred, [0u8; 16]);
+            let hi_key = (ns, ag, pred, [0xffu8; 16]);
             let lo_bound = match after {
-                Some(c) => Bound::Excluded((ns, ag, pred, c.kind, c.confidence_bucket, c.id)),
+                Some(c) => Bound::Excluded((ns, ag, pred, c.id)),
                 None => Bound::Included(lo_key),
             };
-            for entry in by_predicate.range((lo_bound, Bound::Included(hi_key)))? {
-                let (k, v) = entry?;
-                let (_, _, _, k_kind, _, _) = k.value();
-                if let Some(want) = filter.kind {
-                    if k_kind != want.as_u8() {
-                        continue;
-                    }
-                }
-                let Some(m) = s_table.get(&v.value())?.map(|g| g.value()) else {
+            for entry in by_predicate_id.range((lo_bound, Bound::Included(hi_key)))? {
+                let (k, _) = entry?;
+                let (_, _, _, id) = k.value();
+                let Some(m) = s_table.get(&id)?.map(|g| g.value()) else {
                     continue;
                 };
                 if try_push!(m) {
@@ -644,4 +637,295 @@ fn load_active_facts_for_subject_predicate(
         }
     }
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Tests — keyset pagination under mid-page mutation.
+//
+// These exercise the exact defect the immutable-id resume closes: a row
+// that changes a formerly-key column (is_current on the by-subject index,
+// confidence bucket on the by-predicate index) between two page fetches.
+// Under the old mutable-column cursor such a row was silently gapped or
+// duplicated; under id-order resume it appears exactly once.
+// ---------------------------------------------------------------------------
+#[cfg(all(test, not(miri)))]
+mod tests {
+    use super::super::crud::{rekey_predicate_index, statement_create};
+    use super::super::supersede::statement_supersede;
+    use super::*;
+    use crate::schema::predicate::predicate_intern;
+    use crate::tables::statement::STATEMENTS_TABLE;
+    use brain_core::{
+        Entity, EntityType, EvidenceRef, ExtractorId, SessionId, StatementObject, SubjectRef,
+    };
+
+    const T0: u64 = 1_700_000_000_000_000_000;
+
+    fn test_scope() -> RowScope {
+        RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xAB; 16])
+    }
+
+    fn open_db() -> (tempfile::TempDir, crate::MetadataDb) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::MetadataDb::open(dir.path().join("md.redb")).unwrap();
+        (dir, db)
+    }
+
+    fn make_entity(db: &crate::MetadataDb, name: &str) -> EntityId {
+        let id = EntityId::new();
+        let normalized = crate::entity::ops::normalize_name(name);
+        let e = Entity::new_active(id, EntityType::PERSON_ID, name.to_string(), normalized, T0);
+        let wtxn = db.write_txn().unwrap();
+        crate::entity::ops::entity_put(&wtxn, test_scope(), SessionId::DEFAULT, &e).unwrap();
+        wtxn.commit().unwrap();
+        id
+    }
+
+    /// Fact / Entity-object predicate. `is_stateful=false` keeps it
+    /// cumulative, so many rows for one (subject, predicate) stay current.
+    fn intern_cumulative_pred(db: &crate::MetadataDb, name: &str) -> PredicateId {
+        let wtxn = db.write_txn().unwrap();
+        let id = predicate_intern(
+            &wtxn,
+            "test",
+            name,
+            Some(StatementKind::Fact),
+            /* object: Entity */ 1,
+            /* schema_version */ 1,
+            "",
+            /* is_stateful */ false,
+            T0,
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+        id
+    }
+
+    fn fact(
+        subject: EntityId,
+        predicate: PredicateId,
+        object: EntityId,
+        confidence: f32,
+    ) -> Statement {
+        Statement::new_root(
+            StatementId::new(),
+            StatementKind::Fact,
+            SubjectRef::Entity(subject),
+            predicate,
+            StatementObject::Entity(object),
+            confidence,
+            EvidenceRef::default(),
+            ExtractorId::from(0),
+            T0,
+            1,
+        )
+    }
+
+    fn create(db: &crate::MetadataDb, s: &Statement) -> StatementId {
+        let wtxn = db.write_txn().unwrap();
+        let id = statement_create(&wtxn, test_scope(), SessionId::DEFAULT, s, T0).unwrap();
+        wtxn.commit().unwrap();
+        id
+    }
+
+    fn history_filter(
+        subject: Option<EntityId>,
+        predicate: Option<PredicateId>,
+    ) -> StatementListFilter {
+        StatementListFilter {
+            subject,
+            predicate,
+            kind: None,
+            current_only: false,
+            min_confidence: None,
+            limit: 0,
+        }
+    }
+
+    /// Walk every remaining page from `after`, appending each row id.
+    fn drain_pages(
+        db: &crate::MetadataDb,
+        filter: &StatementListFilter,
+        mut after: Option<StatementListCursor>,
+        page_size: usize,
+        out: &mut Vec<[u8; 16]>,
+    ) {
+        let extra = StatementPageExtra::default();
+        loop {
+            let rtxn = db.read_txn().unwrap();
+            let page =
+                statement_list_page(&rtxn, test_scope(), filter, &extra, after, page_size).unwrap();
+            for s in &page.rows {
+                out.push(s.id.to_bytes());
+            }
+            if !page.has_more {
+                break;
+            }
+            after = page.last;
+        }
+    }
+
+    fn assert_each_once(seen: &[[u8; 16]], expected: &[[u8; 16]]) {
+        use std::collections::BTreeSet;
+        let unique: BTreeSet<[u8; 16]> = seen.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            seen.len(),
+            "a row appeared on two pages (dup)"
+        );
+        let want: BTreeSet<[u8; 16]> = expected.iter().copied().collect();
+        assert_eq!(&unique, &want, "pages did not tile the full set (gap)");
+    }
+
+    /// by_subject path: superseding an *uncollected* still-current
+    /// cumulative row between pages flips its `is_current` 1→0. On the old
+    /// cursor (which resumed including `is_current`) that relocated the row
+    /// behind the cursor and it was silently gapped. Id-order resume keeps
+    /// it in place.
+    #[test]
+    fn subject_history_page_survives_mid_page_supersession() {
+        let (_dir, db) = open_db();
+        let subj = make_entity(&db, "subject");
+        let pred = intern_cumulative_pred(&db, "knows");
+
+        // Five cumulative (distinct-object) Facts, all current.
+        let mut created: Vec<StatementId> = Vec::new();
+        for i in 0..5 {
+            let obj = make_entity(&db, &format!("obj{i}"));
+            created.push(create(&db, &fact(subj, pred, obj, 0.9)));
+        }
+
+        let filter = history_filter(Some(subj), None);
+        let mut seen: Vec<[u8; 16]> = Vec::new();
+
+        // Page 1 (limit 2).
+        let page1 = {
+            let rtxn = db.read_txn().unwrap();
+            statement_list_page(
+                &rtxn,
+                test_scope(),
+                &filter,
+                &StatementPageExtra::default(),
+                None,
+                2,
+            )
+            .unwrap()
+        };
+        assert_eq!(page1.rows.len(), 2);
+        assert!(page1.has_more);
+        for s in &page1.rows {
+            seen.push(s.id.to_bytes());
+        }
+        let collected: std::collections::BTreeSet<[u8; 16]> =
+            page1.rows.iter().map(|s| s.id.to_bytes()).collect();
+
+        // Supersede an uncollected, still-current row.
+        let victim = *created
+            .iter()
+            .find(|id| !collected.contains(&id.to_bytes()))
+            .expect("an uncollected row exists");
+        let replacement_obj = make_entity(&db, "replacement");
+        let replacement = fact(subj, pred, replacement_obj, 0.9);
+        let replacement_id = {
+            let wtxn = db.write_txn().unwrap();
+            let id = statement_supersede(
+                &wtxn,
+                test_scope(),
+                SessionId::DEFAULT,
+                victim,
+                &replacement,
+                T0,
+            )
+            .unwrap();
+            wtxn.commit().unwrap();
+            id
+        };
+
+        // Continue paging from page 1's cursor.
+        drain_pages(&db, &filter, page1.last, 2, &mut seen);
+
+        // Every original row (the superseded one included, as history) plus
+        // the replacement must appear exactly once.
+        let mut expected: Vec<[u8; 16]> = created.iter().map(|id| id.to_bytes()).collect();
+        expected.push(replacement_id.to_bytes());
+        assert_each_once(&seen, &expected);
+        assert!(
+            seen.contains(&victim.to_bytes()),
+            "superseded uncollected row was gapped"
+        );
+    }
+
+    /// by_predicate path: recomputing an already-collected row's confidence
+    /// upward between pages moved it across a bucket boundary. On the old
+    /// cursor (which resumed including `confidence_bucket`) that relocated
+    /// the row ahead of the cursor and it was emitted a second time. Id-order
+    /// resume keeps it in place.
+    #[test]
+    fn predicate_history_page_survives_mid_page_confidence_recompute() {
+        let (_dir, db) = open_db();
+        let pred = intern_cumulative_pred(&db, "linked");
+
+        // Five rows sharing the predicate, distinct subjects (so all stay
+        // current), across distinct confidence buckets.
+        let confidences = [0.1_f32, 0.3, 0.5, 0.7, 0.9];
+        let mut created: Vec<StatementId> = Vec::new();
+        for (i, c) in confidences.iter().enumerate() {
+            let subj = make_entity(&db, &format!("s{i}"));
+            let obj = make_entity(&db, &format!("o{i}"));
+            created.push(create(&db, &fact(subj, pred, obj, *c)));
+        }
+
+        let filter = history_filter(None, Some(pred));
+        let mut seen: Vec<[u8; 16]> = Vec::new();
+
+        // Page 1 (limit 2) — id order, so the two earliest-created rows.
+        let page1 = {
+            let rtxn = db.read_txn().unwrap();
+            statement_list_page(
+                &rtxn,
+                test_scope(),
+                &filter,
+                &StatementPageExtra::default(),
+                None,
+                2,
+            )
+            .unwrap()
+        };
+        assert_eq!(page1.rows.len(), 2);
+        assert!(page1.has_more);
+        for s in &page1.rows {
+            seen.push(s.id.to_bytes());
+        }
+
+        // Recompute a page-1 row's confidence into a higher bucket, exactly
+        // as the confidence sweep does (primary row + predicate index).
+        let victim = page1.rows[0].id;
+        {
+            let wtxn = db.write_txn().unwrap();
+            let old_conf = {
+                let mut t = wtxn.open_table(STATEMENTS_TABLE).unwrap();
+                let mut m = t.get(&victim.to_bytes()).unwrap().unwrap().value();
+                let old = m.confidence;
+                m.confidence = 0.99;
+                t.insert(&victim.to_bytes(), &m).unwrap();
+                old
+            };
+            rekey_predicate_index(
+                &wtxn,
+                test_scope(),
+                pred.raw(),
+                StatementKind::Fact.as_u8(),
+                old_conf,
+                0.99,
+                &victim.to_bytes(),
+            )
+            .unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        drain_pages(&db, &filter, page1.last, 2, &mut seen);
+
+        let expected: Vec<[u8; 16]> = created.iter().map(|id| id.to_bytes()).collect();
+        assert_each_once(&seen, &expected);
+    }
 }

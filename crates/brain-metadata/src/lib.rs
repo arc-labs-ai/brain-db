@@ -113,12 +113,12 @@ pub use schema::store::{
     SchemaStoreError,
 };
 pub use statement::{
-    allocate_evidence_overflow, evidence_overflow_load, pack_evidence_entries, pack_evidence_ids,
-    read_evidence_entries_w, read_evidence_ids, read_evidence_ids_w, reclaim_evidence_overflow,
-    statement_create, statement_get, statement_history, statement_list, statement_list_page,
-    statement_retract, statement_supersede, statement_tombstone, statements_contradicting,
-    StatementListCursor, StatementListFilter, StatementOpError, StatementPage, StatementPageExtra,
-    DEFAULT_LIST_LIMIT,
+    allocate_evidence_overflow, backfill_statement_id_indexes, evidence_overflow_load,
+    pack_evidence_entries, pack_evidence_ids, read_evidence_entries_w, read_evidence_ids,
+    read_evidence_ids_w, reclaim_evidence_overflow, statement_create, statement_get,
+    statement_history, statement_list, statement_list_page, statement_retract, statement_supersede,
+    statement_tombstone, statements_contradicting, StatementListCursor, StatementListFilter,
+    StatementOpError, StatementPage, StatementPageExtra, DEFAULT_LIST_LIMIT,
 };
 pub use system_schema::{seed_system_schema, SystemSchemaError, SYSTEM_SCHEMA_SOURCE};
 pub use tables::extractor_audit::{

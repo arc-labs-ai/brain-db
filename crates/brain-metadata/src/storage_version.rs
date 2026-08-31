@@ -140,12 +140,23 @@ pub fn open_or_init_schema(db: &Database) -> Result<u32, SchemaError> {
     // the index holds any row. Derived data, rebuilt like the in-RAM
     // indexes, so it is index construction, not a format migration.
     let backfilled = crate::entity::ops::backfill_entity_by_type_index(&wtxn)?;
+    // Build the immutable id-ordered statement pagination indexes from the
+    // primary rows if a pre-index DB is being opened. Idempotent — a no-op
+    // once the index holds any row. Derived data, rebuilt like the in-RAM
+    // indexes, so it is index construction, not a format migration.
+    let statement_ids_backfilled = crate::statement::backfill_statement_id_indexes(&wtxn)?;
     wtxn.commit()?;
 
     if backfilled > 0 {
         tracing::info!(
             entities_indexed = backfilled,
             "backfilled entity_by_type listing index for pre-index DB"
+        );
+    }
+    if statement_ids_backfilled > 0 {
+        tracing::info!(
+            statements_indexed = statement_ids_backfilled,
+            "backfilled statement id-ordered pagination indexes for pre-index DB"
         );
     }
 

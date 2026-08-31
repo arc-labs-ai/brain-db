@@ -27,8 +27,8 @@ pub mod tombstone;
 // sub-modules.
 pub use contradiction::{contradiction_audit_list_pending, contradiction_audit_record};
 pub use crud::{
-    allocate_evidence_overflow, evidence_overflow_load, rekey_predicate_index,
-    remove_from_predicate_index, statement_create, statement_get,
+    allocate_evidence_overflow, backfill_statement_id_indexes, evidence_overflow_load,
+    rekey_predicate_index, remove_from_predicate_index, statement_create, statement_get,
 };
 pub use embed_queue::{
     statement_embed_queue_len, statement_embed_queue_peek, statement_embed_queue_remove,

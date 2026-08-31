@@ -132,9 +132,9 @@ pub fn materialize_all_tables(wtxn: &::redb::WriteTransaction) -> Result<(), ::r
     use space::SPACES_TABLE;
     use statement::{
         EVIDENCE_OVERFLOW_TABLE, STATEMENTS_BY_EVENT_TIME_TABLE, STATEMENTS_BY_EVIDENCE_TABLE,
-        STATEMENTS_BY_OBJECT_ENTITY_TABLE, STATEMENTS_BY_PREDICATE_TABLE,
-        STATEMENTS_BY_SUBJECT_TABLE, STATEMENTS_TABLE, STATEMENT_CHAIN_TABLE,
-        STATEMENT_EMBED_QUEUE_TABLE,
+        STATEMENTS_BY_OBJECT_ENTITY_TABLE, STATEMENTS_BY_PREDICATE_ID_TABLE,
+        STATEMENTS_BY_PREDICATE_TABLE, STATEMENTS_BY_SUBJECT_ID_TABLE, STATEMENTS_BY_SUBJECT_TABLE,
+        STATEMENTS_TABLE, STATEMENT_CHAIN_TABLE, STATEMENT_EMBED_QUEUE_TABLE,
     };
     use statement_question::STATEMENT_QUESTION_VECTORS_TABLE;
     use text::TEXTS_TABLE;
@@ -191,7 +191,9 @@ pub fn materialize_all_tables(wtxn: &::redb::WriteTransaction) -> Result<(), ::r
     let _ = wtxn.open_table(SLOT_VERSIONS_TABLE)?;
     let _ = wtxn.open_table(STATEMENTS_TABLE)?;
     let _ = wtxn.open_table(STATEMENTS_BY_SUBJECT_TABLE)?;
+    let _ = wtxn.open_table(STATEMENTS_BY_SUBJECT_ID_TABLE)?;
     let _ = wtxn.open_table(STATEMENTS_BY_PREDICATE_TABLE)?;
+    let _ = wtxn.open_table(STATEMENTS_BY_PREDICATE_ID_TABLE)?;
     let _ = wtxn.open_table(STATEMENTS_BY_OBJECT_ENTITY_TABLE)?;
     let _ = wtxn.open_table(STATEMENTS_BY_EVENT_TIME_TABLE)?;
     let _ = wtxn.open_table(STATEMENTS_BY_EVIDENCE_TABLE)?;
