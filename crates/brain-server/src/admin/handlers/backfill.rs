@@ -26,13 +26,15 @@
 //! {"backfill_id":"<hex>","shards":<N>,"progress":[{"shard":0, …}, …]}
 //! ```
 //!
-//! Fan-out is partial-tolerant. A submit that some shards accept and
-//! others reject is a *partial success*, not a silent one: the response
-//! carries a top-level `"errors":[…]` array of the per-shard failures and
-//! its status is `207 Multi-Status`, so an operator can see the skipped
-//! shards rather than reading `200 OK` over a half-applied run. The route
-//! only fails outright with `500` when *every* shard errored; a clean
-//! all-shards submit stays `200 OK` with no `errors` key.
+//! Fan-out is partial-tolerant across all three routes. A submit that
+//! some shards accept and others reject — likewise a status read or a
+//! cancel that some shards fail — is a *partial success*, not a silent
+//! one: the response carries a top-level `"errors":[…]` array of the
+//! per-shard failures and its status is `207 Multi-Status`, so an operator
+//! can see the skipped shards rather than reading `200 OK` over a
+//! half-applied run. A route only fails outright with `500` when *every*
+//! shard errored; a clean all-shards fan-out stays `200 OK` with no
+//! `errors` key.
 
 use std::sync::Arc;
 
@@ -203,12 +205,39 @@ pub async fn status(
         ));
     }
 
-    let body = format!(
-        "{{\"shards\":{n},\"progress\":{progress}}}\n",
-        n = state.shards.len(),
-        progress = progress_array_json(&progress),
+    // At least one shard reported. A clean fan-out is `200 OK`; a partial one
+    // (some shards failed the progress read) is `207 Multi-Status` carrying the
+    // per-shard failures, so the operator sees the shards that were dropped
+    // from the snapshot rather than reading a `200 OK` that silently omits them.
+    let status = if shard_errors.is_empty() {
+        StatusCode::OK
+    } else {
+        StatusCode::MULTI_STATUS
+    };
+    let body = status_body_json(state.shards.len(), &progress, &shard_errors);
+    Ok(json_response(status, body))
+}
+
+/// Render the status response body: the shard count, the per-shard progress
+/// array, and — only when the fan-out was partial — a top-level `"errors"`
+/// array of the shards whose progress read failed. A clean all-shards read
+/// renders no `errors` key.
+fn status_body_json(
+    shard_count: usize,
+    progress: &[(usize, BackfillProgress)],
+    shard_errors: &[String],
+) -> String {
+    let mut body = format!(
+        "{{\"shards\":{n},\"progress\":{progress}",
+        n = shard_count,
+        progress = progress_array_json(progress),
     );
-    Ok(json_response(StatusCode::OK, body))
+    if !shard_errors.is_empty() {
+        body.push_str(",\"errors\":");
+        body.push_str(&errors_array_json(shard_errors));
+    }
+    body.push_str("}\n");
+    body
 }
 
 /// `DELETE /v1/backfill/<id>` — flag the run `<id>` for cancellation on
@@ -249,17 +278,44 @@ pub async fn cancel(
         ));
     }
 
+    // At least one shard was reached. A clean fan-out is `200 OK`; a partial one
+    // (some shards failed the cancel) is `207 Multi-Status` carrying the
+    // per-shard failures, so the operator sees the shards that may still be
+    // running rather than reading a `200 OK` that silently drops them.
+    let status = if shard_errors.is_empty() {
+        StatusCode::OK
+    } else {
+        StatusCode::MULTI_STATUS
+    };
+    let body = cancel_body_json(id, &cancelled, &shard_errors);
+    Ok(json_response(status, body))
+}
+
+/// Render the cancel response body: the run id, the aggregate
+/// `any_cancelled`, the per-shard cancelled flags, and — only when the fan-out
+/// was partial — a top-level `"errors"` array of the shards whose cancel
+/// failed. A clean all-shards cancel renders no `errors` key.
+fn cancel_body_json(
+    id: BackfillId,
+    cancelled: &[(usize, bool)],
+    shard_errors: &[String],
+) -> String {
     let any = cancelled.iter().any(|(_, flag)| *flag);
     let per_shard: Vec<String> = cancelled
         .iter()
         .map(|(idx, flag)| format!("{{\"shard\":{idx},\"cancelled\":{flag}}}"))
         .collect();
-    let body = format!(
-        "{{\"backfill_id\":\"{id}\",\"any_cancelled\":{any},\"cancelled\":[{list}]}}\n",
+    let mut body = format!(
+        "{{\"backfill_id\":\"{id}\",\"any_cancelled\":{any},\"cancelled\":[{list}]",
         id = hex_id(id),
         list = per_shard.join(","),
     );
-    Ok(json_response(StatusCode::OK, body))
+    if !shard_errors.is_empty() {
+        body.push_str(",\"errors\":");
+        body.push_str(&errors_array_json(shard_errors));
+    }
+    body.push_str("}\n");
+    body
 }
 
 /// Simple (hyphen-less) hex of a run id. `DELETE` accepts either form
@@ -615,6 +671,112 @@ mod tests {
         assert!(
             !body.contains("\"errors\""),
             "no errors key when clean: {body}"
+        );
+    }
+
+    #[test]
+    fn status_body_surfaces_partial_shard_errors() {
+        // The defect for the status route: a fan-out where one shard's
+        // progress read fails must NOT render as a clean success. The failing
+        // shard's message has to appear in a top-level "errors" array so the
+        // handler can return 207 instead of a silent 200 that drops it.
+        let p = BackfillProgress {
+            request_id: Some(BackfillId::from_bytes([8u8; 16])),
+            completed: 9,
+            failed: 0,
+            skipped_already_completed: 0,
+            last_processed_memory_id: Some(MemoryId::from_raw(4)),
+            running: true,
+            eta: None,
+        };
+        let progress = vec![(0usize, p)];
+        let shard_errors = vec!["shard 1: worker mailbox closed".to_owned()];
+        let body = status_body_json(2, &progress, &shard_errors);
+
+        assert!(body.contains("\"shards\":2"), "{body}");
+        // The reachable shard still reports real progress.
+        assert!(body.contains("\"shard\":0"), "{body}");
+        assert!(body.contains("\"completed\":9"), "{body}");
+        // The failing shard is surfaced, not swallowed.
+        assert!(
+            body.contains("\"errors\":[\"shard 1: worker mailbox closed\"]"),
+            "partial failure must surface the failing shard: {body}"
+        );
+    }
+
+    #[test]
+    fn status_body_omits_errors_key_when_clean() {
+        // A clean all-shards read stays a plain success body — no errors key,
+        // so 200 OK stays semantically accurate.
+        let progress = vec![(0usize, BackfillProgress::default())];
+        let body = status_body_json(1, &progress, &[]);
+        assert!(
+            !body.contains("\"errors\""),
+            "no errors key when clean: {body}"
+        );
+    }
+
+    #[test]
+    fn status_body_errors_are_json_escaped() {
+        // A raw error Display carrying a quote or backslash must not break out
+        // of the JSON string.
+        let progress = vec![(0usize, BackfillProgress::default())];
+        let shard_errors = vec!["shard 1: bad \"key\"\\path".to_owned()];
+        let body = status_body_json(2, &progress, &shard_errors);
+        assert!(
+            body.contains(r#"["shard 1: bad \"key\"\\path"]"#),
+            "error text must be JSON-escaped: {body}"
+        );
+    }
+
+    #[test]
+    fn cancel_body_surfaces_partial_shard_errors() {
+        // The defect for the cancel route: a fan-out where one shard's cancel
+        // fails must NOT render as a clean success. The failing shard's message
+        // has to appear in a top-level "errors" array so the handler can return
+        // 207 instead of a silent 200 that drops it (leaving that shard's run
+        // possibly still live).
+        let id = BackfillId::from_bytes([0xAu8; 16]);
+        let cancelled = vec![(0usize, true)];
+        let shard_errors = vec!["shard 1: worker mailbox closed".to_owned()];
+        let body = cancel_body_json(id, &cancelled, &shard_errors);
+
+        assert!(body.contains("\"backfill_id\":"), "{body}");
+        assert!(body.contains("\"any_cancelled\":true"), "{body}");
+        // The reachable shard still reports its flag.
+        assert!(body.contains("{\"shard\":0,\"cancelled\":true}"), "{body}");
+        // The failing shard is surfaced, not swallowed.
+        assert!(
+            body.contains("\"errors\":[\"shard 1: worker mailbox closed\"]"),
+            "partial failure must surface the failing shard: {body}"
+        );
+    }
+
+    #[test]
+    fn cancel_body_omits_errors_key_when_clean() {
+        // A clean all-shards cancel stays a plain success body — no errors key,
+        // so 200 OK stays semantically accurate.
+        let id = BackfillId::from_bytes([0xBu8; 16]);
+        let cancelled = vec![(0usize, false), (1usize, true)];
+        let body = cancel_body_json(id, &cancelled, &[]);
+        assert!(
+            !body.contains("\"errors\""),
+            "no errors key when clean: {body}"
+        );
+        assert!(body.contains("\"any_cancelled\":true"), "{body}");
+    }
+
+    #[test]
+    fn cancel_body_errors_are_json_escaped() {
+        // A raw error Display carrying a quote or backslash must not break out
+        // of the JSON string.
+        let id = BackfillId::from_bytes([0xCu8; 16]);
+        let cancelled = vec![(0usize, true)];
+        let shard_errors = vec!["shard 1: bad \"key\"\\path".to_owned()];
+        let body = cancel_body_json(id, &cancelled, &shard_errors);
+        assert!(
+            body.contains(r#"["shard 1: bad \"key\"\\path"]"#),
+            "error text must be JSON-escaped: {body}"
         );
     }
 
