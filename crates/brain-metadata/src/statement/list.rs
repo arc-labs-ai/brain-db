@@ -445,24 +445,31 @@ pub fn statement_list_page(
 
     let s_table = rtxn.open_table(STATEMENTS_TABLE)?;
 
-    // Push one admitted row; returns true when the page is now full and a
-    // further admitted row was seen (so the caller should stop).
+    // Push one admitted row; evaluates to `Ok(true)` when the page is now
+    // full and a further admitted row was seen (so the caller should stop).
+    //
+    // Every `$m` handed here is a PRESENT primary row (the id-index entry it
+    // came from was already resolved through `s_table.get`; a genuinely
+    // absent row is skipped at that call site before reaching this macro). A
+    // present row that fails to decode is corruption, not absence — so we
+    // fail-stop with `DecodeFailed` rather than silently skipping it and
+    // advancing the cursor past it, which would hide the corruption and drop
+    // the row from every future page (invariant #7: no silent corruption).
     macro_rules! try_push {
         ($m:expr) => {{
             let m: StatementMetadata = $m;
             if statement_row_admits(&m, ns, ag, filter, extra) {
                 if rows.len() == limit {
                     has_more = true;
-                    true
+                    Ok::<bool, StatementOpError>(true)
                 } else {
+                    let s = statement_from_metadata(&m).ok_or(StatementOpError::DecodeFailed)?;
                     last = Some(StatementListCursor::from_row(&m));
-                    if let Some(s) = statement_from_metadata(&m) {
-                        rows.push(s);
-                    }
-                    false
+                    rows.push(s);
+                    Ok::<bool, StatementOpError>(false)
                 }
             } else {
-                false
+                Ok::<bool, StatementOpError>(false)
             }
         }};
     }
@@ -490,7 +497,7 @@ pub fn statement_list_page(
                 let Some(m) = s_table.get(&id)?.map(|g| g.value()) else {
                     continue;
                 };
-                if try_push!(m) {
+                if try_push!(m)? {
                     break;
                 }
             }
@@ -514,7 +521,7 @@ pub fn statement_list_page(
                 let Some(m) = s_table.get(&id)?.map(|g| g.value()) else {
                     continue;
                 };
-                if try_push!(m) {
+                if try_push!(m)? {
                     break;
                 }
             }
@@ -528,7 +535,7 @@ pub fn statement_list_page(
             };
             for entry in s_table.range::<[u8; 16]>((lo_bound, Bound::Unbounded))? {
                 let (_, v) = entry?;
-                if try_push!(v.value()) {
+                if try_push!(v.value())? {
                     break;
                 }
             }
@@ -927,5 +934,97 @@ mod tests {
 
         let expected: Vec<[u8; 16]> = created.iter().map(|id| id.to_bytes()).collect();
         assert_each_once(&seen, &expected);
+    }
+
+    /// A PRESENT primary row whose object blob no longer decodes is
+    /// corruption, not absence. Pagination must fail-stop (invariant #7:
+    /// no silent corruption) rather than silently skip the row and advance
+    /// the cursor past it — which would hide the corruption and drop the
+    /// row from every future page.
+    #[test]
+    fn paginate_fails_stop_on_undecodable_present_row() {
+        let (_dir, db) = open_db();
+        let subj = make_entity(&db, "subject");
+        let pred = intern_cumulative_pred(&db, "knows");
+
+        let mut created: Vec<StatementId> = Vec::new();
+        for i in 0..3 {
+            let obj = make_entity(&db, &format!("obj{i}"));
+            created.push(create(&db, &fact(subj, pred, obj, 0.9)));
+        }
+
+        // Corrupt one row's object blob in place, leaving the row PRESENT:
+        // `decode_object` now fails, so `statement_from_metadata` returns
+        // `None` on a present row.
+        let victim = created[1];
+        {
+            let wtxn = db.write_txn().unwrap();
+            {
+                let mut t = wtxn.open_table(STATEMENTS_TABLE).unwrap();
+                let mut m = t.get(&victim.to_bytes()).unwrap().unwrap().value();
+                m.object_blob = vec![0xFF, 0xFF, 0xFF, 0xFF];
+                t.insert(&victim.to_bytes(), &m).unwrap();
+            }
+            wtxn.commit().unwrap();
+        }
+
+        let filter = history_filter(Some(subj), None);
+        let rtxn = db.read_txn().unwrap();
+        let result = statement_list_page(
+            &rtxn,
+            test_scope(),
+            &filter,
+            &StatementPageExtra::default(),
+            None,
+            10,
+        );
+        match result {
+            Err(StatementOpError::DecodeFailed) => {}
+            Err(other) => panic!("expected DecodeFailed, got {other:?}"),
+            Ok(_) => panic!("undecodable present row must fail-stop, not skip"),
+        }
+    }
+
+    /// A genuinely ABSENT primary row (an id-index entry that outlived its
+    /// primary row — the legitimately-swept / removed shape) is a benign
+    /// skip: pagination returns the remaining rows with no error and never
+    /// surfaces the absent one.
+    #[test]
+    fn paginate_skips_genuinely_absent_row() {
+        let (_dir, db) = open_db();
+        let subj = make_entity(&db, "subject");
+        let pred = intern_cumulative_pred(&db, "knows");
+
+        let mut created: Vec<StatementId> = Vec::new();
+        for i in 0..3 {
+            let obj = make_entity(&db, &format!("obj{i}"));
+            created.push(create(&db, &fact(subj, pred, obj, 0.9)));
+        }
+
+        // Remove one primary row, leaving its id-index entries dangling.
+        let absent = created[1];
+        {
+            let wtxn = db.write_txn().unwrap();
+            {
+                let mut t = wtxn.open_table(STATEMENTS_TABLE).unwrap();
+                t.remove(&absent.to_bytes()).unwrap();
+            }
+            wtxn.commit().unwrap();
+        }
+
+        let filter = history_filter(Some(subj), None);
+        let mut seen: Vec<[u8; 16]> = Vec::new();
+        drain_pages(&db, &filter, None, 2, &mut seen);
+
+        let expected: Vec<[u8; 16]> = created
+            .iter()
+            .filter(|id| **id != absent)
+            .map(|id| id.to_bytes())
+            .collect();
+        assert_each_once(&seen, &expected);
+        assert!(
+            !seen.contains(&absent.to_bytes()),
+            "genuinely absent row must be skipped"
+        );
     }
 }
