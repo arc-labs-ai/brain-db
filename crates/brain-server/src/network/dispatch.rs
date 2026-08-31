@@ -115,21 +115,64 @@ impl ConnState {
 /// per transaction for its whole lifetime.
 const TERMINATED_TXN_ROUTE_WINDOW: usize = 256;
 
+/// Backstop bound on the active tier — transactions begun on this connection
+/// whose terminal outcome has not (yet) been confirmed. A begin that is never
+/// followed by an observed terminal — a client that vanished mid-transaction,
+/// or a txn that expired server-side without the connection ever seeing a
+/// terminal frame — would otherwise leak one entry for the connection's whole
+/// lifetime. When the tier reaches this cap a fresh `TXN_BEGIN` evicts the
+/// oldest-begun entry. Sized well above any realistic count of *concurrently
+/// open* transactions on one connection (bounded by the stream cap), so the
+/// eviction only ever reclaims abandoned/leaked routes, never a live one.
+const ACTIVE_TXN_ROUTE_CAP: usize = 1024;
+
+/// Outcome of a dispatched transaction op, reported back to the router by the
+/// per-op task once the shard has actually answered. Drives route lifetime:
+/// a route is only demoted or dropped on a *confirmed* outcome, never
+/// optimistically at dispatch time (a commit that is lost, times out, or is
+/// rejected before reaching the shard leaves its route in place so an
+/// idempotent retry still resolves it).
+pub(crate) struct TxnRouteOutcome {
+    pub(crate) txn_id: [u8; 16],
+    pub(crate) kind: TxnRouteOutcomeKind,
+}
+
+pub(crate) enum TxnRouteOutcomeKind {
+    /// A `TXN_COMMIT` / `TXN_ABORT` reached a definitive terminal state — the
+    /// shard acked it, or reported the txn already gone (`TxnNotFound` /
+    /// `TxnExpired`). Demote the route into the bounded retry window so an
+    /// idempotent retry still reaches the shard holding the replay response.
+    ConfirmedTerminal,
+    /// A `TXN_BEGIN` was definitively rejected by the shard (it never opened).
+    /// Drop the optimistically-recorded route so it doesn't sit in the active
+    /// tier until the backstop cap reclaims it.
+    BeginRejected,
+}
+
 /// Per-connection `txn_id` → begin-shard routing table.
 ///
 /// Split into two tiers so the state a pooled, long-lived connection carries
 /// is bounded regardless of how many transactions it runs:
 ///
-/// - `active`: transactions begun on this connection and not yet terminated.
-///   Entries live only for the transaction's lifetime; a terminal
-///   `TXN_COMMIT` / `TXN_ABORT` moves the entry out.
-/// - `terminated`: a bounded FIFO window of recently-terminated txns. Retained
+/// - `active`: transactions begun on this connection whose terminal outcome
+///   has not been confirmed. A terminal `TXN_COMMIT` / `TXN_ABORT` moves an
+///   entry out *only once the shard confirms it* (see [`TxnRouteOutcome`]) —
+///   never at dispatch time — so a mid-flight or failed terminal keeps its
+///   route long enough for a retry to resolve. The tier is bounded by
+///   [`ACTIVE_TXN_ROUTE_CAP`] with oldest-begun eviction as a backstop against
+///   abandoned / expired transactions that never produce a client terminal.
+/// - `terminated`: a bounded FIFO window of confirmed-terminated txns. Retained
 ///   only briefly so an idempotent retry of a delegated `TXN_COMMIT` /
 ///   `TXN_ABORT` still routes to the shard holding the cached replay response.
 ///   Oldest entries are evicted once the window is full, so this tier can never
 ///   grow past [`TERMINATED_TXN_ROUTE_WINDOW`].
 pub(crate) struct TxnShardRouter {
     active: std::collections::HashMap<[u8; 16], u16>,
+    /// Begin-order of active `txn_id`s, for oldest-begun backstop eviction.
+    /// May hold ids no longer in `active` (a confirmed terminal removes from
+    /// the map but not from here); such stale ids are skipped on eviction and
+    /// compacted out when the deque outgrows the live set.
+    active_order: std::collections::VecDeque<[u8; 16]>,
     terminated: std::collections::HashMap<[u8; 16], u16>,
     terminated_order: std::collections::VecDeque<[u8; 16]>,
 }
@@ -138,14 +181,33 @@ impl TxnShardRouter {
     pub(crate) fn new() -> Self {
         Self {
             active: std::collections::HashMap::new(),
+            active_order: std::collections::VecDeque::new(),
             terminated: std::collections::HashMap::new(),
             terminated_order: std::collections::VecDeque::new(),
         }
     }
 
-    /// Record the shard a `TXN_BEGIN` landed on.
+    /// Record the shard a `TXN_BEGIN` landed on. Enforces the active-tier
+    /// backstop cap by evicting the oldest-begun still-active route when full.
     pub(crate) fn begin(&mut self, txn_id: [u8; 16], shard: u16) {
-        self.active.insert(txn_id, shard);
+        if self.active.insert(txn_id, shard).is_none() {
+            self.active_order.push_back(txn_id);
+        }
+        // Backstop: reclaim the oldest still-active route so an abandoned or
+        // expired txn that never produced a terminal cannot leak indefinitely.
+        while self.active.len() > ACTIVE_TXN_ROUTE_CAP {
+            match self.active_order.pop_front() {
+                // Skip stale order entries (already terminated/removed).
+                Some(oldest) if self.active.remove(&oldest).is_some() => break,
+                Some(_) => continue,
+                None => break,
+            }
+        }
+        // Keep the order deque from accumulating stale ids without bound on a
+        // high-churn connection: once it dwarfs the live set, drop the dead ids.
+        if self.active_order.len() > self.active.len().saturating_mul(2) + ACTIVE_TXN_ROUTE_CAP {
+            self.active_order.retain(|id| self.active.contains_key(id));
+        }
     }
 
     /// Resolve the begin-shard for a `txn_id`, checking active transactions
@@ -157,15 +219,30 @@ impl TxnShardRouter {
             .copied()
     }
 
-    /// Retire a transaction on terminal `TXN_COMMIT` / `TXN_ABORT`: drop it
-    /// from the unbounded active tier and, if it was active, park its route in
-    /// the bounded terminated window so a delegated retry still routes home. A
-    /// terminal op for an already-terminated (or never-begun) txn is a no-op
-    /// against the active tier and leaves the window untouched.
-    pub(crate) fn terminate(&mut self, txn_id: &[u8; 16]) {
+    /// Apply a confirmed transaction outcome reported by the per-op task.
+    pub(crate) fn apply_outcome(&mut self, outcome: TxnRouteOutcome) {
+        match outcome.kind {
+            TxnRouteOutcomeKind::ConfirmedTerminal => self.confirm_terminated(&outcome.txn_id),
+            TxnRouteOutcomeKind::BeginRejected => self.remove_active(&outcome.txn_id),
+        }
+    }
+
+    /// Retire a transaction on a *confirmed* terminal `TXN_COMMIT` /
+    /// `TXN_ABORT`: drop it from the active tier and, if it was active, park
+    /// its route in the bounded terminated window so a delegated retry still
+    /// routes home. A confirmation for an already-terminated (or never-begun)
+    /// txn is a no-op against the active tier and leaves the window untouched.
+    pub(crate) fn confirm_terminated(&mut self, txn_id: &[u8; 16]) {
         if let Some(shard) = self.active.remove(txn_id) {
             self.push_terminated(*txn_id, shard);
         }
+    }
+
+    /// Drop a route from the active tier without parking it in the retry
+    /// window — used when a `TXN_BEGIN` was definitively rejected and the txn
+    /// never opened, so there is no replay response to route a retry to.
+    pub(crate) fn remove_active(&mut self, txn_id: &[u8; 16]) {
+        self.active.remove(txn_id);
     }
 
     fn push_terminated(&mut self, txn_id: [u8; 16], shard: u16) {
@@ -183,7 +260,8 @@ impl TxnShardRouter {
     }
 
     /// Total routing entries currently held (active + terminated window).
-    /// Test/introspection helper; the terminated tier is bounded by
+    /// Test/introspection helper; the active tier is bounded by
+    /// [`ACTIVE_TXN_ROUTE_CAP`] and the terminated tier by
     /// [`TERMINATED_TXN_ROUTE_WINDOW`].
     pub(crate) fn len(&self) -> usize {
         self.active.len() + self.terminated.len()
@@ -509,16 +587,18 @@ pub(crate) fn dispatch_frame(frame: Frame, state: &mut ConnState, topology: &Top
             if let Some(shard) = state.txn_shards.route(&r.txn_id) {
                 target_shard = shard;
             }
-            // Terminal op: evict the active entry (moving it into the bounded
-            // retry window) so a pooled connection running many txns cannot
-            // grow the routing table without bound.
-            state.txn_shards.terminate(&r.txn_id);
+            // The route is NOT evicted here: a terminal dispatched is not a
+            // terminal confirmed. If this commit is lost, times out, or is
+            // rejected before the shard applies it, the txn stays Active and a
+            // retry must still route home. The per-op task reports the shard's
+            // actual outcome back via `TxnRouteOutcome`, and only a confirmed
+            // terminal demotes the route into the bounded retry window.
         }
         RequestBody::TxnAbort(r) => {
             if let Some(shard) = state.txn_shards.route(&r.txn_id) {
                 target_shard = shard;
             }
-            state.txn_shards.terminate(&r.txn_id);
+            // Same as commit: demotion waits for the confirmed outcome.
         }
         _ => {}
     }
@@ -715,11 +795,18 @@ fn on_bye(frame: Frame) -> Action {
 /// Single-frame ops return a one-element `Vec`. Streaming ops (PLAN /
 /// REASON) return one frame per emitted body, with `is_final = true`
 /// on the last frame only.
-pub(crate) async fn run_op_dispatch(op: OpDispatch, shards: Arc<Vec<ShardHandle>>) -> Vec<Frame> {
+pub(crate) async fn run_op_dispatch(
+    op: OpDispatch,
+    shards: Arc<Vec<ShardHandle>>,
+    txn_route_tx: Option<flume::Sender<TxnRouteOutcome>>,
+) -> Vec<Frame> {
     let stream_id = op.stream_id;
     let shard = match shards.get(op.target_shard as usize) {
         Some(s) => s,
         None => {
+            // The op never reached a shard, so any txn route it carries stays
+            // active (unconfirmed): no outcome is reported. A retry that lands
+            // on a valid shard will still resolve the route.
             return vec![error_frame(
                 stream_id,
                 ErrorCode::ShardUnavailable,
@@ -791,10 +878,25 @@ pub(crate) async fn run_op_dispatch(op: OpDispatch, shards: Arc<Vec<ShardHandle>
             request_span.record("span_id", span_ctx.span_id().to_string());
         }
     }
-    match shard
+    // Capture the txn identity before the request is consumed by dispatch, so
+    // the confirmed outcome can be reported back to the router once the shard
+    // answers. Only txn ops carry a kind; everything else reports nothing.
+    let txn_kind = txn_route_tx.as_ref().and_then(|_| txn_req_kind(&op.req));
+
+    let result = shard
         .dispatch_op(op.req, caller, request_span.clone())
-        .await
-    {
+        .await;
+
+    // Report the confirmed transaction outcome to the per-connection router.
+    // Absent a confirmation (transient failure, disconnect, unreachable shard)
+    // the route is deliberately left in the active tier so a retry resolves it.
+    if let (Some(tx), Some(kind)) = (txn_route_tx.as_ref(), txn_kind) {
+        if let Some(outcome) = classify_txn_route_outcome(kind, &result) {
+            let _ = tx.send(outcome);
+        }
+    }
+
+    match result {
         Ok(outcome) => match outcome {
             brain_ops::DispatchOutcome::Single(body) => {
                 vec![build_response_frame(stream_id, true, body)]
@@ -814,6 +916,79 @@ pub(crate) async fn run_op_dispatch(op: OpDispatch, shards: Arc<Vec<ShardHandle>
             "shard is no longer accepting requests",
         )],
         Err(DispatchError::Op(e)) => vec![error_frame_from_op_error(stream_id, &e)],
+    }
+}
+
+/// The transaction identity of a request, if it is a txn lifecycle op.
+/// Captured before `dispatch_op` consumes the request body so the router can
+/// be updated from the shard's actual outcome.
+enum TxnReqKind {
+    Begin([u8; 16]),
+    Commit([u8; 16]),
+    Abort([u8; 16]),
+}
+
+fn txn_req_kind(req: &RequestBody) -> Option<TxnReqKind> {
+    match req {
+        RequestBody::TxnBegin(r) => Some(TxnReqKind::Begin(r.txn_id)),
+        RequestBody::TxnCommit(r) => Some(TxnReqKind::Commit(r.txn_id)),
+        RequestBody::TxnAbort(r) => Some(TxnReqKind::Abort(r.txn_id)),
+        _ => None,
+    }
+}
+
+/// Map a dispatched txn op's shard result to the route-lifetime action, if any.
+///
+/// - A committed/aborted txn that the shard acked, or reports already gone
+///   (`TxnNotFound` / `TxnExpired`), is a confirmed terminal: demote the route.
+/// - A begin the shard *definitively* rejected (a client/logic error, not a
+///   transient infra failure) never opened: drop its optimistic route.
+/// - Every other failure (transient overload / internal / retrieval error, a
+///   shard disconnect) is left unreported so the route stays active for a retry.
+fn classify_txn_route_outcome(
+    kind: TxnReqKind,
+    result: &Result<brain_ops::DispatchOutcome, DispatchError>,
+) -> Option<TxnRouteOutcome> {
+    match kind {
+        TxnReqKind::Commit(txn_id) | TxnReqKind::Abort(txn_id) => {
+            let confirmed = match result {
+                Ok(_) => true,
+                Err(DispatchError::Op(e)) => matches!(
+                    e.error_code(),
+                    brain_ops::error::ErrorCode::TxnNotFound
+                        | brain_ops::error::ErrorCode::TxnExpired
+                ),
+                Err(DispatchError::ShardDisconnected) => false,
+            };
+            confirmed.then_some(TxnRouteOutcome {
+                txn_id,
+                kind: TxnRouteOutcomeKind::ConfirmedTerminal,
+            })
+        }
+        TxnReqKind::Begin(txn_id) => match result {
+            // Begin succeeded: the route stays active for the txn's lifetime.
+            Ok(_) => None,
+            Err(e) if is_transient_dispatch_error(e) => None,
+            // Definitive rejection: the txn never opened — drop the route.
+            Err(_) => Some(TxnRouteOutcome {
+                txn_id,
+                kind: TxnRouteOutcomeKind::BeginRejected,
+            }),
+        },
+    }
+}
+
+/// Whether a dispatch failure is transient — the op may have (or may yet)
+/// take effect on a retry, so a txn route it carries must be retained.
+fn is_transient_dispatch_error(e: &DispatchError) -> bool {
+    match e {
+        DispatchError::ShardDisconnected => true,
+        DispatchError::Op(op) => matches!(
+            op.error_code(),
+            brain_ops::error::ErrorCode::Overloaded
+                | brain_ops::error::ErrorCode::RetrievalUnavailable
+                | brain_ops::error::ErrorCode::InternalError
+        ),
     }
 }
 
@@ -1548,8 +1723,9 @@ mod tests {
             let mut txn_id = [0u8; 16];
             txn_id[..4].copy_from_slice(&i.to_le_bytes());
             router.begin(txn_id, (i % 8) as u16);
-            // Terminal commit: the entry must leave the active tier.
-            router.terminate(&txn_id);
+            // Confirmed terminal: the entry leaves the active tier and parks
+            // in the bounded retry window.
+            router.confirm_terminated(&txn_id);
             assert!(
                 router.len() <= TERMINATED_TXN_ROUTE_WINDOW,
                 "router grew to {} entries at cycle {i} — should stay <= {}",
@@ -1562,6 +1738,81 @@ mod tests {
         assert_eq!(router.len(), TERMINATED_TXN_ROUTE_WINDOW);
     }
 
+    /// FIX (2): the active tier is bounded even when transactions never
+    /// produce a client terminal — an abandoned / begin-rejected / expired txn
+    /// that only ever gets a `TXN_BEGIN`. Without a confirmed terminal these
+    /// entries used to leak for the connection's whole lifetime; the
+    /// oldest-begun backstop cap now reclaims them.
+    #[test]
+    fn active_tier_bounded_across_abandoned_begins() {
+        let mut router = TxnShardRouter::new();
+        for i in 0..(ACTIVE_TXN_ROUTE_CAP as u32 * 4) {
+            let mut txn_id = [0u8; 16];
+            txn_id[..4].copy_from_slice(&i.to_le_bytes());
+            // Only ever a begin — no terminal is confirmed.
+            router.begin(txn_id, (i % 8) as u16);
+            assert!(
+                router.len() <= ACTIVE_TXN_ROUTE_CAP,
+                "active tier grew to {} at begin {i} — should stay <= {}",
+                router.len(),
+                ACTIVE_TXN_ROUTE_CAP
+            );
+        }
+        assert_eq!(router.active.len(), ACTIVE_TXN_ROUTE_CAP);
+        assert_eq!(router.terminated.len(), 0);
+        // The order deque cannot accumulate stale ids without bound either.
+        assert!(router.active_order.len() <= ACTIVE_TXN_ROUTE_CAP * 3 + ACTIVE_TXN_ROUTE_CAP);
+    }
+
+    /// FIX (2): a definitively-rejected `TXN_BEGIN` drops its optimistic route
+    /// immediately (not only when the backstop cap reclaims it), and does not
+    /// leave a phantom entry in the retry window.
+    #[test]
+    fn begin_rejected_drops_active_route() {
+        let mut router = TxnShardRouter::new();
+        let txn_id = [0x33; 16];
+        router.begin(txn_id, 4);
+        assert_eq!(router.route(&txn_id), Some(4));
+        router.apply_outcome(TxnRouteOutcome {
+            txn_id,
+            kind: TxnRouteOutcomeKind::BeginRejected,
+        });
+        assert_eq!(router.route(&txn_id), None);
+        assert_eq!(router.len(), 0);
+    }
+
+    /// FIX (1): a still-active route survives the terminal churn of *other*
+    /// transactions. This is the exact regression: a commit dispatched but not
+    /// confirmed (lost / timed-out / rejected before the shard applied it) left
+    /// its route in the small terminated window, where 256 later terminals of
+    /// unrelated txns evicted it — so a retry misrouted to the bound shard and
+    /// hit `TxnNotFound`. With demotion gated on a confirmed terminal, an
+    /// unconfirmed route stays in the active tier, untouched by that churn.
+    #[test]
+    fn active_route_survives_terminal_churn_of_other_txns() {
+        let mut router = TxnShardRouter::new();
+        let a = [0xAA; 16];
+        router.begin(a, 5);
+
+        // Many other transactions begin and confirm-terminate, filling and
+        // churning the bounded retry window several times over.
+        for i in 0..(TERMINATED_TXN_ROUTE_WINDOW as u32 * 3) {
+            let mut txn_id = [0u8; 16];
+            txn_id[..4].copy_from_slice(&i.to_le_bytes());
+            txn_id[15] = 0xBB; // keep distinct from `a`
+            router.begin(txn_id, 6);
+            router.confirm_terminated(&txn_id);
+        }
+
+        // `a` was never confirmed terminal, so its route is still resolvable.
+        assert_eq!(
+            router.route(&a),
+            Some(5),
+            "an unconfirmed route must survive churn of other terminals"
+        );
+        assert!(router.active.contains_key(&a));
+    }
+
     /// A committed txn's route survives one commit into the bounded retry
     /// window so an idempotent delegated retry still pins to the begin shard;
     /// the active tier no longer holds it.
@@ -1571,10 +1822,10 @@ mod tests {
         let txn_id = [0x11; 16];
         router.begin(txn_id, 5);
         assert_eq!(router.route(&txn_id), Some(5));
-        router.terminate(&txn_id);
+        router.confirm_terminated(&txn_id);
         // Retry after terminal still routes home (from the retry window).
         assert_eq!(router.route(&txn_id), Some(5));
-        // But the entry no longer occupies the unbounded active tier.
+        // But the entry no longer occupies the active tier.
         assert_eq!(router.active.len(), 0);
         assert_eq!(router.terminated.len(), 1);
     }
@@ -1589,7 +1840,7 @@ mod tests {
             let mut txn_id = [0u8; 16];
             txn_id[..4].copy_from_slice(&i.to_le_bytes());
             router.begin(txn_id, 3);
-            router.terminate(&txn_id);
+            router.confirm_terminated(&txn_id);
         }
         // The very first txn was evicted; the last remains.
         let mut first = [0u8; 16];
@@ -1658,5 +1909,206 @@ mod tests {
             Action::CloseWith(_) => panic!("F-3 regression: connection closed on unknown opcode"),
             _ => panic!("expected Action::Inline(ERROR)"),
         }
+    }
+
+    fn test_scope() -> RequestScope {
+        RequestScope {
+            space_id: SpaceId::from([0u8; 16]),
+            org_id: [0u8; 16],
+            user_id: [0u8; 16],
+            namespace: "acme".to_owned(),
+            permissions: 0,
+            may_act: Vec::new(),
+            key_hash: [0u8; 32],
+        }
+    }
+
+    /// Regression for FIX (1): dispatching a `TXN_COMMIT` must NOT demote the
+    /// route at dispatch time. Previously `terminate()` ran synchronously here,
+    /// parking the route in the small retry window before the terminal outcome
+    /// was known; the route must instead stay in the active tier until the
+    /// shard confirms the terminal.
+    #[test]
+    fn txn_commit_dispatch_does_not_demote_route() {
+        let topo = test_topology_shards(8);
+        let minted = topo
+            .auth_store
+            .mint(
+                space_id_bytes(2),
+                [0u8; 16],
+                "acme".into(),
+                space_id_bytes(7),
+                bits::STANDARD_SPACE,
+                Vec::new(),
+                1,
+            )
+            .unwrap();
+        let mut state = establish(&topo, minted.secret_bytes.clone());
+        let txn_id = [0x7e; 16];
+
+        let begin = RequestBody::TxnBegin(brain_protocol::envelope::request::TxnBeginRequest {
+            txn_id,
+            timeout_seconds: 30,
+            act_as: None,
+        });
+        let frame = Frame::new(Opcode::TxnBegin.as_u16(), FLAG_EOS, 1, begin.encode());
+        assert!(matches!(
+            dispatch_frame(frame, &mut state, &topo),
+            Action::OpDispatch(_)
+        ));
+        assert!(state.txn_shards.active.contains_key(&txn_id));
+
+        let commit =
+            RequestBody::TxnCommit(brain_protocol::envelope::request::TxnCommitRequest { txn_id });
+        let frame = Frame::new(Opcode::TxnCommit.as_u16(), FLAG_EOS, 3, commit.encode());
+        assert!(matches!(
+            dispatch_frame(frame, &mut state, &topo),
+            Action::OpDispatch(_)
+        ));
+        assert!(
+            state.txn_shards.active.contains_key(&txn_id),
+            "route must stay active until the terminal is confirmed"
+        );
+        assert_eq!(
+            state.txn_shards.terminated.len(),
+            0,
+            "the commit dispatch must not demote the route into the retry window"
+        );
+
+        // Only the confirmed terminal (reported by the per-op task) demotes it.
+        state.txn_shards.apply_outcome(TxnRouteOutcome {
+            txn_id,
+            kind: TxnRouteOutcomeKind::ConfirmedTerminal,
+        });
+        assert!(!state.txn_shards.active.contains_key(&txn_id));
+        assert!(
+            state.txn_shards.route(&txn_id).is_some(),
+            "a confirmed terminal keeps the route reachable in the retry window"
+        );
+    }
+
+    /// FIX (1): a commit that never reaches a shard (here the target shard is
+    /// out of range) reports no confirmed terminal, so its route is left active
+    /// for a retry rather than being dropped.
+    #[tokio::test]
+    async fn commit_that_never_reaches_shard_reports_no_terminal() {
+        let (tx, rx) = flume::unbounded::<TxnRouteOutcome>();
+        let op = OpDispatch {
+            stream_id: 3,
+            req: RequestBody::TxnCommit(brain_protocol::envelope::request::TxnCommitRequest {
+                txn_id: [0x9c; 16],
+            }),
+            target_shard: 0,
+            scope: test_scope(),
+            connection_id: [0u8; 16],
+            act_as: None,
+        };
+        // Empty shard vec → target shard 0 is out of range → ShardUnavailable,
+        // and crucially no terminal is confirmed on the outcome channel.
+        let frames = run_op_dispatch(op, Arc::new(Vec::new()), Some(tx)).await;
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].header.opcode_u16(), Opcode::Error.as_u16());
+        assert!(
+            rx.try_recv().is_err(),
+            "a commit that never reached a shard must not confirm a terminal"
+        );
+    }
+
+    #[test]
+    fn classify_commit_success_confirms_terminal() {
+        let out = classify_txn_route_outcome(
+            TxnReqKind::Commit([1u8; 16]),
+            &Ok(brain_ops::DispatchOutcome::Single(ResponseBody::TxnCommit(
+                brain_protocol::envelope::response::TxnCommitResponse {
+                    txn_id: [1u8; 16],
+                    committed_at_unix_nanos: 1,
+                    operations_applied: 0,
+                },
+            ))),
+        );
+        assert!(matches!(
+            out,
+            Some(TxnRouteOutcome {
+                kind: TxnRouteOutcomeKind::ConfirmedTerminal,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn classify_commit_transient_failure_keeps_route() {
+        let out = classify_txn_route_outcome(
+            TxnReqKind::Commit([1u8; 16]),
+            &Err(DispatchError::Op(brain_ops::error::OpError::Overloaded(
+                "shedding".into(),
+            ))),
+        );
+        assert!(out.is_none(), "an overloaded shard is a transient failure");
+        let out = classify_txn_route_outcome(
+            TxnReqKind::Abort([1u8; 16]),
+            &Err(DispatchError::ShardDisconnected),
+        );
+        assert!(out.is_none(), "a disconnect is a transient failure");
+    }
+
+    #[test]
+    fn classify_commit_txn_gone_confirms_terminal() {
+        for e in [
+            brain_ops::error::OpError::TxnNotFound,
+            brain_ops::error::OpError::TxnExpired,
+        ] {
+            let out = classify_txn_route_outcome(
+                TxnReqKind::Commit([1u8; 16]),
+                &Err(DispatchError::Op(e)),
+            );
+            assert!(
+                matches!(
+                    out,
+                    Some(TxnRouteOutcome {
+                        kind: TxnRouteOutcomeKind::ConfirmedTerminal,
+                        ..
+                    })
+                ),
+                "a txn the shard reports gone is a confirmed terminal"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_begin_rejection_vs_transient_vs_success() {
+        // Definitive rejection (idempotency conflict) drops the route.
+        let out = classify_txn_route_outcome(
+            TxnReqKind::Begin([1u8; 16]),
+            &Err(DispatchError::Op(brain_ops::error::OpError::Conflict(
+                "dup".into(),
+            ))),
+        );
+        assert!(matches!(
+            out,
+            Some(TxnRouteOutcome {
+                kind: TxnRouteOutcomeKind::BeginRejected,
+                ..
+            })
+        ));
+        // Transient begin failure keeps the optimistic route.
+        let out = classify_txn_route_outcome(
+            TxnReqKind::Begin([1u8; 16]),
+            &Err(DispatchError::Op(brain_ops::error::OpError::Overloaded(
+                "busy".into(),
+            ))),
+        );
+        assert!(out.is_none());
+        // Successful begin keeps the route active for the txn's lifetime.
+        let out = classify_txn_route_outcome(
+            TxnReqKind::Begin([1u8; 16]),
+            &Ok(brain_ops::DispatchOutcome::Single(ResponseBody::TxnBegin(
+                brain_protocol::envelope::response::TxnBeginResponse {
+                    txn_id: [1u8; 16],
+                    timeout_seconds: 30,
+                    started_at_unix_nanos: 1,
+                },
+            ))),
+        );
+        assert!(out.is_none());
     }
 }

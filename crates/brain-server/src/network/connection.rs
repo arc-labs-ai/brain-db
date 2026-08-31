@@ -44,7 +44,7 @@ pub use crate::dispatch::Topology;
 
 use crate::dispatch::{
     build_server_ping_frame, dispatch_frame, error_frame, run_op_dispatch, Action, CancelSubscribe,
-    ConnState, IdleTimer, SubscribeStart, Tick,
+    ConnState, IdleTimer, SubscribeStart, Tick, TxnRouteOutcome,
 };
 use crate::shard::ShardHandle;
 use crate::subscribe::{
@@ -671,6 +671,14 @@ where
     // tasks + memory without limit. `acquire`/release is the only state.
     let op_limiter = Arc::new(Semaphore::new(limits.max_concurrent_streams.max(1) as usize));
 
+    // Confirmed transaction outcomes flow back here from the per-op tasks. A
+    // txn route is demoted / dropped only when the shard's real answer arrives
+    // on this channel — never optimistically at dispatch time — so a lost or
+    // mid-flight commit keeps its route long enough for a retry to resolve it.
+    // The receiver-loop retains the sender for the connection's lifetime, so
+    // `recv_async` never observes a closed channel.
+    let (txn_outcome_tx, txn_outcome_rx) = flume::unbounded::<TxnRouteOutcome>();
+
     // Return helper so every exit path surfaces the session id the
     // caller needs for the disconnect-time txn sweep.
     macro_rules! exit {
@@ -784,6 +792,19 @@ where
                                 let shards = topology.shards.clone();
                                 let request_metrics = topology.request_metrics.clone();
                                 let tx = frame_tx.clone();
+                                // Only txn lifecycle ops report a route outcome;
+                                // hand the sender to the task only for those so
+                                // the common path pays no clone.
+                                let txn_outcome_tx = if matches!(
+                                    op.req,
+                                    brain_protocol::envelope::request::RequestBody::TxnBegin(_)
+                                        | brain_protocol::envelope::request::RequestBody::TxnCommit(_)
+                                        | brain_protocol::envelope::request::RequestBody::TxnAbort(_)
+                                ) {
+                                    Some(txn_outcome_tx.clone())
+                                } else {
+                                    None
+                                };
                                 let op_idx = crate::metrics::request::op_index(&op.req);
                                 let op_label = op_idx
                                     .and_then(|i| crate::metrics::request::OP_LABELS.get(i))
@@ -811,7 +832,8 @@ where
                                                 idx,
                                             )
                                         });
-                                        let frames = run_op_dispatch(op, shards).await;
+                                        let frames =
+                                            run_op_dispatch(op, shards, txn_outcome_tx).await;
                                         if let (Some(timer), Some(last)) = (timer, frames.last()) {
                                             let status = response_status(last);
                                             timer.record(status);
@@ -895,6 +917,16 @@ where
                         metrics.record_close(CloseReason::Fatal);
                         exit!(Err(e));
                     }
+                }
+            }
+            // A per-op task confirmed a transaction outcome: update the router
+            // so a committed txn's route is demoted into the bounded retry
+            // window (and a rejected begin's route is dropped). Placed last in
+            // the biased select so frame reading is never starved; outcomes
+            // arrive only as in-flight ops finish, so this can't busy-loop.
+            outcome = txn_outcome_rx.recv_async() => {
+                if let Ok(outcome) = outcome {
+                    state.txn_shards.apply_outcome(outcome);
                 }
             }
         }
