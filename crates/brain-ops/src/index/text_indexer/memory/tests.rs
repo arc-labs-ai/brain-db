@@ -515,6 +515,121 @@ fn end_to_end_indexer_to_retriever() {
     })
 }
 
+/// Regression: the retriever is built *before* the indexer commits — the
+/// production spawn order (the read side is constructed from the opened
+/// `TantivyShard`, then the indexer worker starts writing to the same
+/// shard). A freshly-committed doc must become visible to a subsequent
+/// `retrieve` on that already-live retriever. This is the exact-token
+/// known-answer failure mode: `end_to_end_indexer_to_retriever` builds the
+/// retriever *after* every commit, so its first query always reloads off
+/// the sentinel and can never catch a reload-gating decoupling. Here the
+/// retriever is live across the commit, so the only way the doc surfaces is
+/// if the indexer's commit bumped the same `commit_generation` counter the
+/// retriever watches — the read-your-commits contract (invariant #7).
+#[test]
+fn live_retriever_observes_commit_via_shared_generation() {
+    run_in_glommio(|| async {
+        use brain_index::{
+            LexicalQuery, LexicalRetriever, LexicalRetrieverConfig, LexicalScope, RankedItemId,
+            TantivyLexicalRetriever,
+        };
+
+        let dir = TempDir::new().expect("tempdir");
+        let startup = TantivyShard::open(dir.path()).expect("open");
+        let shard = startup.shard.clone();
+
+        // Read side built FIRST, from the same shard the indexer will write to
+        // — mirrors `brain-server::shard::spawn`.
+        let retriever = TantivyLexicalRetriever::new(shard.clone()).expect("retriever");
+
+        // Now start the real indexer worker on the same shard's handle.
+        let handle = shard.memory_text.clone();
+        // N high, short interval — commits land via the time-based flush, the
+        // production default shape (n=256, ms=1000) that a small corpus never
+        // fills by count.
+        let policy = CommitPolicy::new(256, Duration::from_millis(50));
+        let (dispatcher, task) = spawn_drain(handle, policy);
+
+        // Fifty near-duplicate prose docs, each carrying one unique nonce
+        // token — the exact shape of the known-answer regression eval.
+        let nonces: Vec<String> = (0..50).map(|i| format!("nonce{i:04}zdq")).collect();
+        let ids: Vec<MemoryId> = (0..50).map(|i| MemoryId::pack(0, 1000 + i, 0)).collect();
+        for (i, (id, nonce)) in ids.iter().zip(&nonces).enumerate() {
+            dispatcher
+                .dispatch(MemoryTextOp::Upsert {
+                    id: *id,
+                    text: format!(
+                        "the quarterly planning meeting covered roadmap and staffing {nonce} \
+                         and the team agreed on next steps for item {i}"
+                    ),
+                    space: SpaceId::new(),
+                    kind: MemoryKind::Episodic,
+                    created_at_unix_ms: 0,
+                    session: 0,
+                })
+                .await;
+        }
+
+        // Poll the LIVE retriever (never rebuilt) until it observes the last
+        // doc's nonce — proves the commit bumped the generation the retriever
+        // watches and the reader reloaded.
+        let cfg = LexicalRetrieverConfig::default();
+        let last_nonce = nonces.last().unwrap().clone();
+        let last_id = *ids.last().unwrap();
+        let mut observed = false;
+        for _ in 0..400 {
+            let hits = retriever
+                .retrieve(
+                    &LexicalQuery {
+                        terms: vec![last_nonce.clone()],
+                        ..Default::default()
+                    },
+                    LexicalScope::MemoryText,
+                    &cfg,
+                )
+                .expect("retrieve");
+            if hits
+                .iter()
+                .any(|h| h.id == RankedItemId::Memory(last_id))
+            {
+                observed = true;
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            observed,
+            "live retriever never observed the committed doc — reload gating \
+             decoupled from the indexer's commit generation",
+        );
+
+        // Every nonce must resolve to exactly its own doc as the top hit: the
+        // exact-token lexical signal isolates the true document out of 50
+        // near-duplicates.
+        for (id, nonce) in ids.iter().zip(&nonces) {
+            let hits = retriever
+                .retrieve(
+                    &LexicalQuery {
+                        terms: vec![nonce.clone()],
+                        ..Default::default()
+                    },
+                    LexicalScope::MemoryText,
+                    &cfg,
+                )
+                .expect("retrieve");
+            assert!(!hits.is_empty(), "nonce {nonce} returned no lexical hit");
+            assert_eq!(
+                hits[0].id,
+                RankedItemId::Memory(*id),
+                "nonce {nonce} must rank its own doc first",
+            );
+        }
+
+        drop(dispatcher);
+        task.await;
+    })
+}
+
 /// The live-rebuild control plane: `Quiesce` drops the writer (releasing
 /// tantivy's exclusive per-directory lock so the shard can rebuild + swap
 /// the index), and `Resume` rebuilds the writer on the reopened index and

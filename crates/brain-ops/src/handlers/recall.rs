@@ -498,6 +498,22 @@ const STRONG_SEMANTIC_SUPPORT: f32 = 0.6;
 /// calibrated against the read fixtures, full-eval sweep is the follow-up.
 const STRONG_HYPE_SUPPORT: f32 = 0.6;
 
+/// The cosine gap below which BGE-small cannot reliably distinguish two
+/// passages (or two cue↔hypothetical-question matches). BGE-small cosines are
+/// compressed, so a corpus of near-duplicate passages that differ only in one
+/// exact token scores within a hair on cosine (measured ~0.727–0.739 across a
+/// 50-way near-duplicate probe). Ordering such a set by that cosine alone is
+/// query-independent and strands the one document the cue's exact token
+/// matches. `order_by_answer_relevance` therefore quantises the two cosine-
+/// scale signals (HyPE answer-relevance, passage cosine) at this resolution:
+/// members within half a bucket of the best are treated as indistinguishable,
+/// and the RRF `fused_score` — which carries the lexical / graph evidence a
+/// cosine cannot — breaks the tie. A genuine cosine gap (larger than this)
+/// still decides, so a real topical / answer signal is never overridden by
+/// lexical coverage. Not per-corpus tuned: it is the model's discriminative
+/// floor, comfortably above the observed near-duplicate spread.
+const TOPICAL_COSINE_RESOLUTION: f32 = 0.05;
+
 /// Count the INDEPENDENT lanes that confirm a memory belongs to the cue — the
 /// ONE unifying corroboration signal the read path keys its belonging decisions
 /// on (FIX A/B/C). Each lane is a distinct, independently-computed source of
@@ -578,9 +594,92 @@ fn order_by_answer_relevance(
         return out;
     }
     let h = |m: &MemoryResult| hype.get(&m.memory_id).copied().unwrap_or(0.0);
-    // Flat / absent HyPE: no answer-relevance signal to discriminate the members,
-    // so keep the incoming (cosine / assembly) order — the lexical/paraphrase
-    // no-regression guarantee.
+    let c = |m: &MemoryResult| {
+        cos.get(&m.memory_id)
+            .copied()
+            .unwrap_or_else(|| m.similarity_score.max(0.0))
+    };
+    let f = |m: &MemoryResult| m.fused_score;
+
+    // ── EXACT-TOKEN LEAD ────────────────────────────────────────────────────
+    // A UNIQUE original-query lexical hit — exactly one member carries the cue's
+    // exact token — is a high-precision exact-match signal that neither cosine,
+    // HyPE, nor even the RRF fused_score reliably surfaces. On a dense near-
+    // duplicate corpus the one document carrying the cue's exact token scores
+    // within a hair of its neighbours on cosine (measured: 50 near-duplicates all
+    // at ~0.73), its HyPE is sub-floor noise, and the semantic-rank spread buries
+    // its small lexical bump in fused_score — yet it is the ONE document that
+    // answers the cue. Lead with it, then the RRF fused order, then cosine.
+    //
+    // Three guards confine this to the genuine exact-match case so diverse
+    // corpora never regress:
+    //   * UNIQUENESS — a low-specificity term matches many members (all tagged
+    //     Lexical), so `sole` is `None` and this path is skipped; PRF-expanded
+    //     lexical tags are already stripped from `contributing_retrievers`, so
+    //     only a genuine original-query match counts.
+    //   * NO STANDOUT ANSWER-LEAD — no member's HyPE clearly leads the rest. This
+    //     is measured as FLATNESS (top HyPE minus second-best HyPE below the
+    //     resolution), NOT magnitude: BGE-small cosines are so compressed that
+    //     even a random nonce cue scores ≥ the support floor against SOME
+    //     generated question, so an absolute floor would never engage. A genuine
+    //     answerable cue instead makes one member's answer-lead STAND OUT from
+    //     the pack; when it does, the standard answer-relevance ordering below
+    //     leads with that member instead.
+    //   * TOPICALLY COMPETITIVE — the unique hit's own passage cosine is within
+    //     BGE's discriminative resolution of the best member, so a real topical
+    //     answer that clearly out-cosines a stray one-word lexical coincidence
+    //     still wins (the coverage-bias guard), computed per-member rather than
+    //     on the whole set's spread (robust to a few low-cosine members).
+    let best_c = out.iter().map(&c).fold(f32::NEG_INFINITY, f32::max);
+    let (best_h, second_h) = {
+        let (mut b, mut s) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+        for m in &out {
+            let v = h(m);
+            if v > b {
+                s = b;
+                b = v;
+            } else if v > s {
+                s = v;
+            }
+        }
+        (b, s)
+    };
+    let answer_lead_stands_out = (best_h - second_h) >= TOPICAL_COSINE_RESOLUTION;
+    if !answer_lead_stands_out {
+        let lexical_members: Vec<u128> = out
+            .iter()
+            .filter(|m| {
+                m.contributing_retrievers
+                    .contains(&RetrieverNameWire::Lexical)
+            })
+            .map(|m| m.memory_id)
+            .collect();
+        if let [sole] = lexical_members.as_slice() {
+            let sole = *sole;
+            let sole_cos = out
+                .iter()
+                .find(|m| m.memory_id == sole)
+                .map(&c)
+                .unwrap_or(0.0);
+            if (best_c - sole_cos) < TOPICAL_COSINE_RESOLUTION {
+                out.sort_by(|a, b| {
+                    // The unique exact-token match (`true`) ranks first.
+                    (b.memory_id == sole)
+                        .cmp(&(a.memory_id == sole))
+                        .then_with(|| f(b).partial_cmp(&f(a)).unwrap_or(std::cmp::Ordering::Equal))
+                        .then_with(|| c(b).partial_cmp(&c(a)).unwrap_or(std::cmp::Ordering::Equal))
+                });
+                return out;
+            }
+        }
+        // No qualifying unique lexical hit — fall through to standard ordering.
+    }
+
+    // ── STANDARD ANSWER-RELEVANCE ORDERING ──────────────────────────────────
+    // Answer-relevance (HyPE) is the PRIMARY key, topical cosine the SECONDARY
+    // tiebreak. Flat / absent HyPE carries no answer-relevance signal, so the
+    // incoming (cosine / assembly) order is preserved verbatim — the
+    // lexical/paraphrase no-regression guarantee.
     let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
     for m in &out {
         let v = h(m);
@@ -590,11 +689,6 @@ fn order_by_answer_relevance(
     if (hi - lo) <= f32::EPSILON {
         return out;
     }
-    let c = |m: &MemoryResult| {
-        cos.get(&m.memory_id)
-            .copied()
-            .unwrap_or_else(|| m.similarity_score.max(0.0))
-    };
     // Stable sort: equal (hype, cos) members keep their incoming relative order.
     out.sort_by(|a, b| {
         h(b).partial_cmp(&h(a))
@@ -3817,6 +3911,15 @@ mod tests {
         }
     }
 
+    /// Like [`mr`] but with an explicit RRF `fused_score` — for the ordering
+    /// tests that exercise the fused tiebreak within a cosine bucket.
+    fn mr_fused(id: u128, lanes: &[RetrieverNameWire], fused: f32) -> MemoryResult {
+        MemoryResult {
+            fused_score: fused,
+            ..mr(id, lanes)
+        }
+    }
+
     use RetrieverNameWire::{Graph, Lexical, Semantic};
 
     #[test]
@@ -4056,8 +4159,8 @@ mod tests {
     #[test]
     fn answer_relevance_flat_hype_falls_back_to_cosine_order() {
         // No HyPE signal (empty map) → no answer-relevance discrimination, so the
-        // incoming (cosine / assembly) order is preserved verbatim: the
-        // lexical/paraphrase no-regression guarantee.
+        // members order by topical cosine: distinct cosines (gaps well beyond one
+        // bucket) decide, so the highest-cosine member leads.
         let out = vec![mr(1, &[Semantic]), mr(2, &[Semantic]), mr(3, &[Semantic])];
         let cos: HashMap<u128, f32> = [(1u128, 0.90), (2u128, 0.70), (3u128, 0.40)]
             .into_iter()
@@ -4066,18 +4169,137 @@ mod tests {
         assert_eq!(
             got.iter().map(|m| m.memory_id).collect::<Vec<_>>(),
             vec![1, 2, 3],
-            "empty HyPE preserves the incoming order"
+            "empty HyPE → order by topical cosine when the gaps are real"
         );
 
-        // A present-but-FLAT HyPE (all equal) is equally non-discriminating → also
-        // preserves the incoming order, never re-sorts on cosine alone.
+        // A present-but-FLAT HyPE (all equal) is equally non-discriminating → the
+        // incoming (assembly) order is preserved verbatim (the lexical/paraphrase
+        // no-regression guarantee); this is NOT the exact-token regime (the cosine
+        // gap is real, so the flat-corpus path does not engage).
         let out = vec![mr(3, &[Semantic]), mr(1, &[Semantic])];
         let flat: HashMap<u128, f32> = [(3u128, 0.5), (1u128, 0.5)].into_iter().collect();
         let got = order_by_answer_relevance(out, &flat, &cos);
         assert_eq!(
             got.iter().map(|m| m.memory_id).collect::<Vec<_>>(),
             vec![3, 1],
-            "flat HyPE preserves the incoming order"
+            "flat HyPE + real cosine gap → incoming order preserved"
+        );
+    }
+
+    #[test]
+    fn answer_relevance_near_duplicate_cosine_defers_to_fused_lexical() {
+        // The exact-token regression at the unit level: three near-duplicate
+        // passages whose cosines sit within one bucket (0.727–0.739, BGE-small
+        // compression) and whose HyPE is flat. Pure-cosine ordering is query-
+        // independent and strands the exact-token match. Because all three tie on
+        // both the answer-relevance and topical-cosine buckets, the RRF
+        // `fused_score` — which carries the lexical rank-1 exact match — decides.
+        // Only id 2 was surfaced by the lexical lane (its nonce), so it leads even
+        // though it does NOT have the highest raw cosine.
+        let out = vec![
+            mr_fused(1, &[Semantic], 0.016),
+            mr_fused(2, &[Semantic, Lexical], 0.048),
+            mr_fused(3, &[Semantic], 0.015),
+        ];
+        let flat: HashMap<u128, f32> = [(1u128, 0.31), (2u128, 0.30), (3u128, 0.32)]
+            .into_iter()
+            .collect();
+        let cos: HashMap<u128, f32> = [(1u128, 0.739), (2u128, 0.727), (3u128, 0.733)]
+            .into_iter()
+            .collect();
+        let got = order_by_answer_relevance(out, &flat, &cos);
+        assert_eq!(
+            got[0].memory_id, 2,
+            "within a cosine bucket the exact lexical (fused) match must lead",
+        );
+    }
+
+    #[test]
+    fn answer_relevance_unique_lexical_leads_within_flat_bucket() {
+        // The exact-token known-answer case, faithful to the live measurement: a
+        // dense near-duplicate corpus where every member sits in one cosine bucket
+        // (~0.73) with flat HyPE, and the target's RRF `fused_score` is NOT the
+        // highest (the semantic-rank spread buries the small lexical bump). The
+        // target is the UNIQUE original-query lexical hit, so it must lead within
+        // the bucket even though a Semantic-only neighbour has a higher fused
+        // score.
+        let out = vec![
+            mr_fused(1, &[Semantic], 0.141),
+            mr_fused(2, &[Semantic], 0.118),
+            mr_fused(3, &[Semantic, Lexical], 0.108), // target, lower fused
+            mr_fused(4, &[Semantic], 0.107),
+        ];
+        let flat: HashMap<u128, f32> = [(1u128, 0.30), (2u128, 0.30), (3u128, 0.30), (4u128, 0.30)]
+            .into_iter()
+            .collect();
+        let cos: HashMap<u128, f32> = [(1u128, 0.738), (2u128, 0.735), (3u128, 0.733), (4u128, 0.735)]
+            .into_iter()
+            .collect();
+        let got = order_by_answer_relevance(out, &flat, &cos);
+        assert_eq!(
+            got[0].memory_id, 3,
+            "the unique exact-token lexical match leads within the flat cosine bucket",
+        );
+    }
+
+    #[test]
+    fn answer_relevance_non_unique_lexical_does_not_hijack() {
+        // Precision guard: when a low-specificity term matches MANY members (all
+        // tagged Lexical), the exact-match key is inert — no unique hit — so
+        // ordering falls back to fused_score within the bucket. id 1 (highest
+        // fused) leads; the several lexical hits do not collectively hijack.
+        let out = vec![
+            mr_fused(1, &[Semantic], 0.141),
+            mr_fused(2, &[Semantic, Lexical], 0.118),
+            mr_fused(3, &[Semantic, Lexical], 0.108),
+        ];
+        let flat: HashMap<u128, f32> = [(1u128, 0.30), (2u128, 0.30), (3u128, 0.30)]
+            .into_iter()
+            .collect();
+        let cos: HashMap<u128, f32> = [(1u128, 0.738), (2u128, 0.735), (3u128, 0.733)]
+            .into_iter()
+            .collect();
+        let got = order_by_answer_relevance(out, &flat, &cos);
+        assert_eq!(
+            got[0].memory_id, 1,
+            "non-unique lexical coverage must not hijack the lead over the top fused member",
+        );
+    }
+
+    #[test]
+    fn answer_relevance_unique_lexical_yields_to_real_cosine_gap() {
+        // The exact-match tiebreak sits BELOW the cosine bucket: a genuine topical
+        // gap (a better cosine bucket) still wins over a unique lexical hit in a
+        // worse bucket. id 1 (cos 0.80) leads over the unique-lexical id 2 (0.55).
+        let out = vec![
+            mr_fused(1, &[Semantic], 0.10),
+            mr_fused(2, &[Semantic, Lexical], 0.20),
+        ];
+        let cos: HashMap<u128, f32> = [(1u128, 0.80), (2u128, 0.55)].into_iter().collect();
+        let got = order_by_answer_relevance(out, &HashMap::new(), &cos);
+        assert_eq!(
+            got[0].memory_id, 1,
+            "a real cosine gap outranks a unique lexical hit in a worse bucket",
+        );
+    }
+
+    #[test]
+    fn answer_relevance_real_cosine_gap_beats_fused_coverage() {
+        // Guard against coverage bias: a genuine topical-cosine gap (larger than
+        // one bucket) must NOT be overridden by a lexical coverage hit. id 1 is the
+        // clear topical answer (cos 0.80); id 2 is a distractor a common term
+        // surfaced lexically (higher fused) but with a much lower cosine (0.55).
+        // The cosine bucket separates them, so id 1 leads — the lexical signal only
+        // breaks ties, it never overrides a real topical gap.
+        let out = vec![
+            mr_fused(1, &[Semantic], 0.016),
+            mr_fused(2, &[Semantic, Lexical], 0.048),
+        ];
+        let cos: HashMap<u128, f32> = [(1u128, 0.80), (2u128, 0.55)].into_iter().collect();
+        let got = order_by_answer_relevance(out, &HashMap::new(), &cos);
+        assert_eq!(
+            got[0].memory_id, 1,
+            "a real cosine gap wins over higher lexical-coverage fused_score",
         );
     }
 
