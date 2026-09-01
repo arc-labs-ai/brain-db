@@ -19,13 +19,14 @@ Request/response body schemas for every opcode in the `0x0120–0x012F` schema r
 
 | Opcode | Name | Section | Status |
 |---|---|---|---|
-| `0x0120` | `SCHEMA_UPLOAD` | "SCHEMA_UPLOAD" | spec-only |
-| `0x0121` | `SCHEMA_GET` | "SCHEMA_GET" | spec-only |
-| `0x0122` | `SCHEMA_LIST` | "SCHEMA_LIST" | spec-only |
-| `0x0123` | `SCHEMA_VALIDATE` | "SCHEMA_VALIDATE" | spec-only |
-| `0x0124` | `EXTRACTOR_LIST` | "EXTRACTOR_LIST" | spec-only |
+| `0x0120` | `SCHEMA_UPLOAD` | "SCHEMA_UPLOAD" | implemented |
+| `0x0121` | `SCHEMA_GET` | "SCHEMA_GET" | implemented |
+| `0x0122` | `SCHEMA_LIST` | "SCHEMA_LIST" | implemented |
+| `0x0123` | `SCHEMA_VALIDATE` | "SCHEMA_VALIDATE" | implemented |
+| `0x0124` | `EXTRACTOR_LIST` | "EXTRACTOR_LIST" | implemented |
+| `0x0127` | `SCHEMA_REPLACE` | "SCHEMA_REPLACE" | implemented |
 
-Responses live at `0x01A0–0x01A6` (low byte with high bit set).
+Responses live at `0x01A0–0x01A7` (low byte with high bit set).
 
 All payloads follow the CBOR field-schema conventions in [`./08_typed_graph_frames.md`](./08_typed_graph_frames.md).
 
@@ -192,7 +193,7 @@ runtime (no wire op). `EXTRACTOR_LIST` remains for read-only introspection.
 
 ### Schema authorization
 
-All schema-namespace opcodes (`0x0120–0x0123`) require **admin** permissions in the agent's `AgentPermissions` (see [`04_handshake.md`](./04_handshake.md)). `SCHEMA_GET`, `SCHEMA_LIST`, `EXTRACTOR_LIST` are readable by any authenticated agent.
+All schema-namespace opcodes (`0x0120–0x0123`) require **admin** permissions in the agent's `AgentPermissions` (see [`04_handshake.md`](./04_handshake.md)). `SCHEMA_GET`, `SCHEMA_LIST`, `EXTRACTOR_LIST` are readable by any authenticated agent. `SCHEMA_REPLACE` (`0x0127`) is admin-only and destructive; the handler rejects the call unless `force_drop_existing` is exactly `true` (see [`./03_opcodes.md`](./03_opcodes.md) §2.1).
 
 Unauthorized requests return substrate `ErrorCategory::Authorization` with code `AdminPermissionRequired`.
 
@@ -321,7 +322,7 @@ pub struct EntityTombstonedEvent {
 }
 ```
 
-#### Statement events (spec-only)
+#### Statement events
 
 ```rust
 pub struct StatementCreatedEvent {
@@ -344,7 +345,7 @@ pub struct StatementTombstonedEvent {
 }
 ```
 
-#### Relation events (spec-only)
+#### Relation events
 
 ```rust
 pub struct RelationCreatedEvent {
@@ -379,7 +380,7 @@ pub struct ExtractionFailedEvent {
 }
 ```
 
-#### Schema events (spec-only)
+#### Schema events
 
 ```rust
 pub struct SchemaUpdatedEvent {
@@ -585,8 +586,8 @@ Cross-references:
 
 | Opcode | Name | Section | Status |
 |---|---|---|---|
-| `0x0161` | `QUERY_EXPLAIN` | "QUERY_EXPLAIN" | spec-only |
-| `0x0162` | `QUERY_TRACE` | "QUERY_TRACE" | spec-only |
+| `0x0161` | `QUERY_EXPLAIN` | "QUERY_EXPLAIN" | implemented |
+| `0x0162` | `QUERY_TRACE` | "QUERY_TRACE" | implemented |
 
 Responses live at `0x01E1–0x01E2`.
 

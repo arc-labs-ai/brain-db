@@ -291,7 +291,7 @@ Maintenance: entity-embedding worker re-embeds on entity create or rename.
 
 The embedded representation: `subject.canonical_name + " " + predicate.name + " " + object_text`. Compact and captures the statement's semantic core.
 
-Parameters: M=32, ef_construction=200, ef_search=128 (similar to memory HNSW; statements may be ~0.1–1x as many as memories depending on extraction density).
+Parameters: M=32, ef_construction=200, ef_search=128 (tuned higher than the memory HNSW; statements may be ~0.1–1x as many as memories depending on extraction density).
 
 Maintenance: statement-embedding worker re-embeds on statement create or update.
 
