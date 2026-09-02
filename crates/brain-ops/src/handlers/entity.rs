@@ -76,6 +76,21 @@ fn entity_id_in_caller_scope(ctx: &OpsContext, id: EntityId) -> bool {
     }
 }
 
+/// Read an entity's `(namespace_id, space_id_bytes, entity_type_id)` in a
+/// single lookup against a caller-provided read txn. Used by the resolver's
+/// tier-3 scope+type filter so it can screen many HNSW hits under one txn
+/// (rather than opening one per hit). Returns `None` on a missing row or read
+/// error — the caller treats that as fail-closed and drops the candidate.
+fn entity_scope_and_type(
+    rtxn: &redb::ReadTransaction,
+    id: EntityId,
+) -> Option<(u32, [u8; 16], u32)> {
+    use brain_metadata::tables::entity::{EntityMetadata, ENTITIES_TABLE};
+    let t = rtxn.open_table(ENTITIES_TABLE).ok()?;
+    let m: EntityMetadata = t.get(&id.to_bytes()).ok().flatten().map(|g| g.value())?;
+    Some((m.namespace_id, m.space_id_bytes, m.entity_type_id))
+}
+
 /// Upper bound on the alias count of a single entity. Otherwise bounded
 /// only by the 16 MiB payload cap; an explicit cap rejects a crafted
 /// oversized alias list with a clear `InvalidRequest` instead of
@@ -1032,20 +1047,40 @@ async fn resolve_via_embedding(
         .embed(&to_embed)
         .map_err(|e| OpError::Internal(format!("resolver embed: {e}")))?;
 
-    // The per-shard entity HNSW mixes every tenant's entities, so a raw hit
-    // may belong to another `(namespace, space)`. Filter each in-band hit
-    // through the caller's scope wall (same guard the read/get paths use) so
-    // tier 3 can never resolve across tenants — resolution is per-(namespace,
-    // agent). Over-fetch a little so scope-filtering can't starve the top-k.
-    // Entity-type filtering is a further spec refinement the index doesn't yet
-    // support; the threshold keeps cross-type near-collisions out of band.
+    // The per-shard entity HNSW mixes every tenant's entities and types, so a
+    // raw hit may belong to another `(namespace, space)` or a different entity
+    // type. Over-fetch, then filter every hit through the caller's scope wall
+    // AND the entity-type hint under a SINGLE read txn — the tenant wall is
+    // unconditional (resolution is per-(namespace, agent)), and the type hint
+    // stops a Person lookup aliasing onto a same-scope Organization neighbour.
+    // Mirrors the extraction resolver's embedding-tier filter.
     let hits = index.search(&vector, EMBEDDING_TOP_K * 4);
-    let in_band: Vec<(EntityId, f32)> = hits
-        .into_iter()
-        .filter(|(_, score)| *score >= EMBEDDING_THRESHOLD)
-        .filter(|(id, _)| entity_id_in_caller_scope(ctx, *id))
-        .take(EMBEDDING_TOP_K)
-        .collect();
+    let caller_ns = ctx.executor.caller_namespace.raw();
+    let caller_space = <[u8; 16]>::from(ctx.executor.caller_space);
+    let type_hint = req.entity_type_hint; // 0 == no hint (accept any type)
+    let rtxn = ctx
+        .executor
+        .metadata
+        .read_txn()
+        .map_err(|e| OpError::Internal(format!("resolver read_txn: {e}")))?;
+    let mut in_band: Vec<(EntityId, f32)> = Vec::with_capacity(EMBEDDING_TOP_K);
+    for (id, score) in hits {
+        if score < EMBEDDING_THRESHOLD {
+            continue;
+        }
+        let Some((ns, space, ty)) = entity_scope_and_type(&rtxn, id) else {
+            continue; // missing row → fail-closed (drop)
+        };
+        let scope_ok = ns == caller_ns && space == caller_space;
+        let type_ok = type_hint == 0 || ty == type_hint;
+        if scope_ok && type_ok {
+            in_band.push((id, score));
+            if in_band.len() == EMBEDDING_TOP_K {
+                break;
+            }
+        }
+    }
+    drop(rtxn);
 
     match in_band.as_slice() {
         [] => Ok(None),
