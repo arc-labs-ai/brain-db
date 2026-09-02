@@ -140,6 +140,10 @@ pub async fn handle_entity_create(
         }
     };
 
+    // Embed + index the new entity so tier-3 resolution can find it without
+    // waiting for a rebuild (best-effort; the entity is already durable).
+    index_entity_embedding(ctx, created_id, &req.canonical_name);
+
     // Emit ENTITY_CREATED event post-commit.
     emit_graph_event(
         ctx,
@@ -972,10 +976,37 @@ async fn create_fallback_entity(
         .with_namespace(ctx.executor.caller_namespace);
     let ack = real_writer.submit(write).await.map_err(map_writer_err)?;
     match ack.single_phase() {
-        PhaseAck::UpsertedEntity(eid) => Ok(*eid),
+        PhaseAck::UpsertedEntity(eid) => {
+            let eid = *eid;
+            // Index the fresh entity so an immediate tier-3 re-resolve finds it.
+            index_entity_embedding(ctx, eid, &req.candidate_name);
+            Ok(eid)
+        }
         other => Err(OpError::Internal(format!(
             "unexpected phase ack for resolver create-fallback: {other:?}"
         ))),
+    }
+}
+
+/// Best-effort: embed the entity's canonical name and insert it into the
+/// per-shard entity vector index, so tier-3 (embedding) resolution can reach an
+/// explicitly-created entity without waiting for a rebuild. Mirrors the
+/// extraction path, which stages entity vectors into the same index; the stored
+/// vector is the name embedding, matching the rebuild path. A missing index
+/// (tests) or an embed error is a no-op — the entity is already durable, just
+/// tier-3-unreachable until a rebuild.
+fn index_entity_embedding(ctx: &OpsContext, entity_id: EntityId, canonical_name: &str) {
+    let Some(index) = ctx.entity_vector_index.as_ref() else {
+        return;
+    };
+    match ctx.executor.embedder.embed(canonical_name) {
+        Ok(vector) => index.insert(entity_id, &vector),
+        Err(e) => tracing::warn!(
+            target: "brain_ops::write_trace",
+            ?entity_id,
+            error = %e,
+            "entity embed for tier-3 index failed; entity durable but tier-3-unreachable until rebuild",
+        ),
     }
 }
 
@@ -1001,13 +1032,19 @@ async fn resolve_via_embedding(
         .embed(&to_embed)
         .map_err(|e| OpError::Internal(format!("resolver embed: {e}")))?;
 
-    // The entity HNSW is scored purely by cosine; entity-type filtering is a
-    // spec refinement the index doesn't yet support, so tier 3 relies on the
-    // threshold to keep cross-type near-collisions out of band.
-    let hits = index.search(&vector, EMBEDDING_TOP_K);
+    // The per-shard entity HNSW mixes every tenant's entities, so a raw hit
+    // may belong to another `(namespace, space)`. Filter each in-band hit
+    // through the caller's scope wall (same guard the read/get paths use) so
+    // tier 3 can never resolve across tenants — resolution is per-(namespace,
+    // agent). Over-fetch a little so scope-filtering can't starve the top-k.
+    // Entity-type filtering is a further spec refinement the index doesn't yet
+    // support; the threshold keeps cross-type near-collisions out of band.
+    let hits = index.search(&vector, EMBEDDING_TOP_K * 4);
     let in_band: Vec<(EntityId, f32)> = hits
         .into_iter()
         .filter(|(_, score)| *score >= EMBEDDING_THRESHOLD)
+        .filter(|(id, _)| entity_id_in_caller_scope(ctx, *id))
+        .take(EMBEDDING_TOP_K)
         .collect();
 
     match in_band.as_slice() {

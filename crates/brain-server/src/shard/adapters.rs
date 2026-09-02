@@ -89,6 +89,24 @@ impl brain_index::EntityVectorIndex for ShardEntityVectorIndex {
         }
         guard.search(vector, k).unwrap_or_default()
     }
+
+    fn insert(&self, entity_id: brain_core::EntityId, vector: &[f32]) {
+        let Ok(vector) = <&[f32; VECTOR_DIM]>::try_from(vector) else {
+            return;
+        };
+        let mut guard = self.index.write();
+        if guard.contains(entity_id) {
+            return;
+        }
+        if let Err(e) = guard.insert(entity_id, vector) {
+            tracing::warn!(
+                target: "brain_server::shard",
+                ?entity_id,
+                error = %e,
+                "entity-HNSW insert failed; entity is durable but tier-3-unreachable until a rebuild",
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

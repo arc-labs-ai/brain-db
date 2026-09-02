@@ -408,6 +408,14 @@ impl EntityHnswIndex {
 pub trait EntityVectorIndex: Send + Sync {
     /// Top-`k` nearest live entities to `query` (cosine, descending).
     fn search(&self, query: &[f32], k: usize) -> Vec<(EntityId, f32)>;
+
+    /// Insert `(entity_id, vector)` into the index unless the entity is already
+    /// present. Best-effort: a wrong-width vector or an insert error leaves the
+    /// entity durable but tier-3-unreachable until a rebuild (implementations
+    /// log and move on rather than failing the caller's write). Lets the write
+    /// path keep explicitly-created entities embedding-resolvable, matching the
+    /// extraction path which already stages entity vectors into the index.
+    fn insert(&self, entity_id: EntityId, vector: &[f32]);
 }
 
 // ---------------------------------------------------------------------------
