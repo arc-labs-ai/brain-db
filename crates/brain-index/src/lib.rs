@@ -41,7 +41,8 @@ pub mod tombstones;
 pub use arena_reader::{null_arena_reader, ArenaReader, NullArenaReader};
 
 pub use entity_hnsw::{
-    EntityHnswError, EntityHnswIndex, EntityHnswParams, RebuildReport as EntityRebuildReport,
+    EntityHnswError, EntityHnswIndex, EntityHnswParams, EntityVectorIndex,
+    RebuildReport as EntityRebuildReport,
 };
 pub use graph_retriever::{
     proximity_score, validate_depth as validate_graph_depth, Direction, GraphAnchor, GraphError,

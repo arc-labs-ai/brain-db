@@ -58,6 +58,40 @@ use redb::ReadableTable;
 use crate::shard::snapshot_manifest::{blake3_hex, FileDigest, SnapshotManifest, MANIFEST_FILE};
 
 // ---------------------------------------------------------------------------
+// EntityVectorIndex — expose the per-shard entity HNSW to the resolver's
+// tier-3 embedding tie-break (brain-ops queries through the trait object).
+// ---------------------------------------------------------------------------
+
+/// Adapts the shard's `Arc<RwLock<EntityHnswIndex>>` to the object-safe
+/// [`brain_index::EntityVectorIndex`] the resolve handler holds. Reads under a
+/// short lock and returns an empty result on a wrong-width query or an empty
+/// index, matching the resolver's "no in-band hit ⇒ create fallback" contract.
+pub(crate) struct ShardEntityVectorIndex {
+    index: std::sync::Arc<parking_lot::RwLock<brain_index::entity_hnsw::EntityHnswIndex>>,
+}
+
+impl ShardEntityVectorIndex {
+    pub(crate) fn new(
+        index: std::sync::Arc<parking_lot::RwLock<brain_index::entity_hnsw::EntityHnswIndex>>,
+    ) -> Self {
+        Self { index }
+    }
+}
+
+impl brain_index::EntityVectorIndex for ShardEntityVectorIndex {
+    fn search(&self, query: &[f32], k: usize) -> Vec<(brain_core::EntityId, f32)> {
+        let Ok(vector) = <&[f32; VECTOR_DIM]>::try_from(query) else {
+            return Vec::new();
+        };
+        let guard = self.index.read();
+        if guard.is_empty() {
+            return Vec::new();
+        }
+        guard.search(vector, k).unwrap_or_default()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RebuildSource — scan the shard's arena for occupied/non-tombstoned slots.
 // ---------------------------------------------------------------------------
 

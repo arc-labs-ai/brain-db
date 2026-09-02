@@ -396,6 +396,20 @@ impl EntityHnswIndex {
     }
 }
 
+/// Read-only entity vector search as the resolve handler (tier 3) needs it.
+///
+/// Abstracts the concrete per-shard [`EntityHnswIndex`] behind an object-safe
+/// trait so `brain-ops` can query the index without owning its lock or the
+/// `hnsw_rs` types. The query is a plain `&[f32]` (the caller's embedding, of
+/// [`VECTOR_DIM`]); implementations return `(entity, cosine)` pairs descending
+/// by score and yield an empty vec when the index is empty or the query is the
+/// wrong width — the resolver treats "no in-band hit" and "no index" the same
+/// (fall through to the create fallback).
+pub trait EntityVectorIndex: Send + Sync {
+    /// Top-`k` nearest live entities to `query` (cosine, descending).
+    fn search(&self, query: &[f32], k: usize) -> Vec<(EntityId, f32)>;
+}
+
 // ---------------------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------------------

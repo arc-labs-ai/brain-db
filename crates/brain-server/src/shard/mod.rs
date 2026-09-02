@@ -3340,6 +3340,9 @@ pub fn spawn_shard(
                 .with_classifier_config(classifier_config)
                 .with_llm_cache(llm_cache_for_ops)
                 .with_tantivy(Some(tantivy_for_ops))
+                .with_entity_vector_index(std::sync::Arc::new(
+                    self::adapters::ShardEntityVectorIndex::new(entity_hnsw_for_shard.clone()),
+                ))
                 .with_memory_text_dispatcher(memory_text_dispatcher_for_ops)
                 .with_statement_text_dispatcher(statement_text_dispatcher_for_ops)
                 .with_cross_encoder(cross_encoder_for_closure)

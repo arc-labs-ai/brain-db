@@ -16,7 +16,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use brain_extractors::{ClassifierConfig, ExtractorRegistry};
-use brain_index::{GraphRetriever, LexicalRetriever, SemanticRetriever, TantivyShard};
+use brain_index::{
+    EntityVectorIndex, GraphRetriever, LexicalRetriever, SemanticRetriever, TantivyShard,
+};
 use brain_metadata::LlmCacheDb;
 use brain_planner::{ExecutorContext, PlannerContext};
 use brain_rerank::RerankService;
@@ -182,6 +184,11 @@ pub struct OpsContext {
     /// the moment the shard spawns; the retriever just dispatches
     /// into it.
     pub graph_retriever: Arc<dyn GraphRetriever>,
+    /// Per-shard entity vector index for the resolver's tier-3 embedding
+    /// tie-break. `None` until the shard-spawn path wires it via
+    /// [`OpsContext::with_entity_vector_index`]; when absent the resolver
+    /// skips tier 3 and falls through to the create fallback.
+    pub entity_vector_index: Option<Arc<dyn EntityVectorIndex>>,
     /// Per-shard cross-encoder (W2.2 rerank pass). Shared across
     /// shards because the model is read-only and CPU-heavy.
     ///
@@ -260,11 +267,21 @@ impl OpsContext {
             lexical_retriever,
             semantic_retriever,
             graph_retriever,
+            entity_vector_index: None,
             cross_encoder: CrossEncoderSlot::Disabled,
             wal_sink: None,
             retriever_metrics: Arc::new(RetrieverMetrics::new()),
             query_metrics: Arc::new(QueryMetrics::new()),
         }
+    }
+
+    /// Wire the per-shard entity vector index for the resolver's tier-3
+    /// embedding tie-break. The shard-spawn path calls this with an adapter
+    /// over its `EntityHnswIndex`; left unset (tests), tier 3 is skipped.
+    #[must_use]
+    pub fn with_entity_vector_index(mut self, index: Arc<dyn EntityVectorIndex>) -> Self {
+        self.entity_vector_index = Some(index);
+        self
     }
 
     /// Override the bounded poll window for the one-shot subscribe

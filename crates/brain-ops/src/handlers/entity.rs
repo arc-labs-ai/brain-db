@@ -14,7 +14,10 @@
 //! These handlers do **not** touch the entity HNSW or emit
 //! subscription events. Both wire in later.
 
+use std::sync::Arc;
+
 use brain_core::{Entity, EntityAttributes, EntityId, EntityTypeId, RequestId};
+use brain_index::EntityVectorIndex;
 use brain_metadata::entity::merge::MergeActor;
 use brain_metadata::entity::ops::{
     entity_get, entity_get_resolved_with_chain, entity_list_by_type_page, entity_lookup_by_alias,
@@ -42,6 +45,12 @@ use crate::write::{Phase, PhaseAck, TombstoneTarget, Write, WriteId};
 
 // Default grace window for ENTITY_MERGE — 7 days.
 const DEFAULT_MERGE_GRACE_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Resolver tier-3 (embedding) tunables. Spec defaults
+/// (`spec/11_extractors/03_resolver.md`): search the entity HNSW for the top-5
+/// nearest and resolve to a unique candidate whose cosine clears 0.78.
+const EMBEDDING_TOP_K: usize = 5;
+const EMBEDDING_THRESHOLD: f32 = 0.78;
 
 /// Whether `id`'s primary row belongs to the caller's `(namespace,
 /// space)` scope. The brain-core [`Entity`] returned by `entity_get`
@@ -901,19 +910,26 @@ pub async fn handle_entity_resolve(
         });
     }
 
-    // No match at tiers 1+2. Tier 3 (embedding) requires the entity HNSW
-    // wired through ExecutorContext (deferred). Tier 5 (create) only
-    // fires if allow_create=true.
+    // No match at tiers 1+2. Tier 3 (embedding HNSW tie-break) resolves when
+    // the candidate embedding lands a unique entity above threshold; multiple
+    // in-band hits are Ambiguous. Skipped when no entity vector index is wired
+    // (tests) — then we fall straight through to the create fallback.
+    if let Some(index) = ctx.entity_vector_index.as_ref() {
+        if let Some(resp) = resolve_via_embedding(ctx, &req, index).await? {
+            return Ok(resp);
+        }
+    }
+
+    // Tier 5 — create fallback. Per spec the resolver auto-creates a new entity
+    // on a clean no-match and returns `Created`. The wire's `allow_create=false`
+    // lets a caller opt out of creation, in which case we report `NotFound`.
     if req.allow_create {
-        // Stub — defer create-fallback to the caller.
-        // Returning NotFound here so clients explicitly call
-        // ENTITY_CREATE if they want creation; auto-create lands when
-        // the resolver's tier 5 wires statement extraction.
+        let created = create_fallback_entity(ctx, &req).await?;
         return Ok(EntityResolveResponse {
-            outcome: ResolutionOutcomeWire::NotFound,
-            tier: 0,
-            confidence: 0.0,
-            resolved_entity: [0; 16],
+            outcome: ResolutionOutcomeWire::Created,
+            tier: 5,
+            confidence: 1.0,
+            resolved_entity: created.to_bytes(),
             candidate_ids: Vec::new(),
             audit_id: [0; 16],
         });
@@ -926,6 +942,93 @@ pub async fn handle_entity_resolve(
         candidate_ids: Vec::new(),
         audit_id: [0; 16],
     })
+}
+
+/// Tier-5 create fallback: mint a new entity for the unresolved candidate and
+/// return its id. Mirrors [`handle_entity_create`]'s write-submit path so the
+/// resolver's auto-create is durable and idempotent by `request_id`.
+async fn create_fallback_entity(
+    ctx: &OpsContext,
+    req: &EntityResolveRequest,
+) -> Result<EntityId, OpError> {
+    let now = crate::txn::now_unix_nanos_pub();
+    let id = EntityId::new();
+    let entity_type = EntityTypeId(req.entity_type_hint);
+    let normalized = normalize_name(&req.candidate_name);
+
+    let real_writer = downcast_writer_pub(ctx)?;
+    let write_id = WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
+    let phase = Phase::UpsertEntity {
+        id,
+        ty: entity_type,
+        session: brain_core::SessionId::from(0u64),
+        canonical: req.candidate_name.clone(),
+        normalized,
+        aliases: Vec::new(),
+        attributes: EntityAttributes::from(Vec::new()),
+        created_at_unix_nanos: now,
+    };
+    let write = Write::single(write_id, ctx.executor.caller_space, phase)
+        .with_namespace(ctx.executor.caller_namespace);
+    let ack = real_writer.submit(write).await.map_err(map_writer_err)?;
+    match ack.single_phase() {
+        PhaseAck::UpsertedEntity(eid) => Ok(*eid),
+        other => Err(OpError::Internal(format!(
+            "unexpected phase ack for resolver create-fallback: {other:?}"
+        ))),
+    }
+}
+
+/// Tier-3 embedding tie-break: embed `candidate + context_snippet`, search the
+/// per-shard entity vector index, and resolve to the unique candidate above
+/// `EMBEDDING_THRESHOLD`. Multiple in-band hits are `Ambiguous`; zero returns
+/// `None` so the caller falls through to the create fallback.
+async fn resolve_via_embedding(
+    ctx: &OpsContext,
+    req: &EntityResolveRequest,
+    index: &Arc<dyn EntityVectorIndex>,
+) -> Result<Option<EntityResolveResponse>, OpError> {
+    // Spec: embed "candidate + first ~100 chars of context".
+    let ctx_snippet: String = req.resolution_context.chars().take(100).collect();
+    let to_embed = if ctx_snippet.is_empty() {
+        req.candidate_name.clone()
+    } else {
+        format!("{} {}", req.candidate_name, ctx_snippet)
+    };
+    let vector = ctx
+        .executor
+        .embedder
+        .embed(&to_embed)
+        .map_err(|e| OpError::Internal(format!("resolver embed: {e}")))?;
+
+    // The entity HNSW is scored purely by cosine; entity-type filtering is a
+    // spec refinement the index doesn't yet support, so tier 3 relies on the
+    // threshold to keep cross-type near-collisions out of band.
+    let hits = index.search(&vector, EMBEDDING_TOP_K);
+    let in_band: Vec<(EntityId, f32)> = hits
+        .into_iter()
+        .filter(|(_, score)| *score >= EMBEDDING_THRESHOLD)
+        .collect();
+
+    match in_band.as_slice() {
+        [] => Ok(None),
+        [(id, score)] => Ok(Some(EntityResolveResponse {
+            outcome: ResolutionOutcomeWire::Resolved,
+            tier: 3,
+            confidence: *score,
+            resolved_entity: id.to_bytes(),
+            candidate_ids: Vec::new(),
+            audit_id: [0; 16],
+        })),
+        many => Ok(Some(EntityResolveResponse {
+            outcome: ResolutionOutcomeWire::Ambiguous,
+            tier: 3,
+            confidence: many[0].1,
+            resolved_entity: [0; 16],
+            candidate_ids: many.iter().map(|(id, _)| id.to_bytes()).collect(),
+            audit_id: [0; 16],
+        })),
+    }
 }
 
 // ---------------------------------------------------------------------------
