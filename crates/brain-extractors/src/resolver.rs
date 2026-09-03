@@ -1520,12 +1520,19 @@ fn tier_embedding(
         .embedder
         .embed(surface_form)
         .map_err(|e| format!("embedder failed: {e}"))?;
+    // Over-fetch: the per-shard entity HNSW mixes tenants + types, and the
+    // scope+type filter below runs AFTER the search. Fetching only
+    // EMBED_RESOLVE_TOP_K would let a same-tenant alias ranked just past the
+    // top-k be starved out by foreign/wrong-type neighbours (→ a missed alias
+    // → entity fragmentation). Pull a wider pool so the filter has same-scope
+    // candidates to keep. Bounded by the entity HNSW's ef_search (64).
+    let pool = EMBED_RESOLVE_TOP_K * 4;
     let mut hits = {
         let hnsw = deps.hnsw.read();
         if hnsw.is_empty() {
             Vec::new()
         } else {
-            hnsw.search(&vector, EMBED_RESOLVE_TOP_K)
+            hnsw.search(&vector, pool)
                 .map_err(|e| format!("hnsw search failed: {e}"))?
         }
     };
@@ -1534,11 +1541,11 @@ fn tier_embedding(
     // `wtxn`, so they're legitimate candidates for a later surface in the
     // same memory. Scan them alongside the index hits and re-sort.
     if !staged.is_empty() {
-        hits.extend(staged.probe(&vector, EMBED_RESOLVE_TOP_K));
+        hits.extend(staged.probe(&vector, pool));
         hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         let mut seen = HashSet::with_capacity(hits.len());
         hits.retain(|(id, _)| seen.insert(*id));
-        hits.truncate(EMBED_RESOLVE_TOP_K);
+        hits.truncate(pool);
     }
     if hits.is_empty() {
         return Ok(EmbeddingProbe::None);
