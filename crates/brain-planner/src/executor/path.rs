@@ -173,6 +173,15 @@ fn resolve_endpoint(
             if ctx.index.is_tombstoned(id) {
                 return Ok(HashSet::new());
             }
+            // Tenant wall: the caller must not seed a traversal with another
+            // tenant's memory id. The per-shard edge graph is tenant-blind at
+            // the id level, so a foreign seed would let the BFS read a foreign
+            // tenant's subgraph text. An out-of-scope (or missing) id yields an
+            // empty endpoint — indistinguishable from tombstoned, so it leaks
+            // nothing (not even existence).
+            if !ctx.memory_in_caller_scope(id) {
+                return Ok(HashSet::new());
+            }
             let mut s = HashSet::with_capacity(1);
             s.insert(id);
             Ok(s)
@@ -184,7 +193,16 @@ fn resolve_endpoint(
             let hits =
                 ctx.index
                     .search_active(&vector, ENDPOINT_RECALL_K, Some(ENDPOINT_RECALL_EF));
-            Ok(hits.into_iter().map(|(id, _)| id).collect())
+            // The shard HNSW is tenant-blind; keep only the caller's own
+            // memories as endpoints so a text seed can't anchor on a
+            // foreign-tenant memory.
+            let mut out = HashSet::new();
+            for (id, _) in hits {
+                if ctx.memory_in_caller_scope(id) {
+                    out.insert(id);
+                }
+            }
+            Ok(out)
         }
         PlanState::ByVector { .. } => Err(ExecError::Unsupported(
             "PLAN endpoint ByVector — wire vector window not yet exposed to the executor",

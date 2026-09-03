@@ -204,6 +204,32 @@ impl ExecutorContext {
         self.caller_space_string = space_string;
         self
     }
+
+    /// Does memory `id` belong to the caller's `(namespace, space)`?
+    ///
+    /// The per-shard memory-edge graph and HNSW are keyed by id alone (tenant-
+    /// blind), so any traversal/recall path that seeds or projects a raw memory
+    /// id must re-verify its owner scope here — otherwise a caller could reach
+    /// another tenant's memory by id. Reads the owner scope from
+    /// `MEMORIES_TABLE` and compares BOTH halves. Fail-closed: a missing row or
+    /// any read error returns `false` (deny), never a wrong-tenant true.
+    #[must_use]
+    pub fn memory_in_caller_scope(&self, id: MemoryId) -> bool {
+        let Ok(rtxn) = self.metadata.read_txn() else {
+            return false;
+        };
+        let Ok(table) = rtxn.open_table(brain_metadata::tables::memory::MEMORIES_TABLE) else {
+            return false;
+        };
+        match table.get(&id.to_be_bytes()) {
+            Ok(Some(guard)) => {
+                let row = guard.value();
+                row.namespace_id == self.caller_namespace.raw()
+                    && row.space_id_bytes == <[u8; 16]>::from(self.caller_space)
+            }
+            _ => false,
+        }
+    }
 }
 
 // ExecutorContext is intentionally `!Send + !Sync`: WriterHandle is

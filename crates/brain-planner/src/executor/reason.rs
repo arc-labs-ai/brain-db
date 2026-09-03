@@ -343,6 +343,12 @@ fn resolve_base(plan: &ReasonPlan, ctx: &ExecutorContext, trace: bool) -> Resolv
             if ctx.index.is_tombstoned(id) {
                 return Ok((HashMap::new(), Vec::new(), ReasonTraceBase::default()));
             }
+            // Tenant wall: a foreign-tenant seed id would let REASON aggregate
+            // over another tenant's subgraph. Out-of-scope (or missing) → empty
+            // base, indistinguishable from tombstoned (leaks nothing).
+            if !ctx.memory_in_caller_scope(id) {
+                return Ok((HashMap::new(), Vec::new(), ReasonTraceBase::default()));
+            }
             let mut map = HashMap::with_capacity(1);
             map.insert(id, 1.0_f32);
             let base_trace = if trace {
@@ -368,7 +374,14 @@ fn resolve_base(plan: &ReasonPlan, ctx: &ExecutorContext, trace: bool) -> Resolv
                 .max_supporting
                 .saturating_add(plan.aggregation.max_contradicting)
                 .max(1);
-            let hits = ctx.index.search_active(&vector, k, Some(BASE_RECALL_EF));
+            let hits: Vec<(MemoryId, f32)> = ctx
+                .index
+                .search_active(&vector, k, Some(BASE_RECALL_EF))
+                .into_iter()
+                // The shard HNSW is tenant-blind; keep only the caller's own
+                // memories as base candidates.
+                .filter(|(id, _)| ctx.memory_in_caller_scope(*id))
+                .collect();
             let base_trace = if trace {
                 let ids: Vec<MemoryId> = hits.iter().map(|(id, _)| *id).collect();
                 let texts = fetch_trace_texts(&ids, ctx);
