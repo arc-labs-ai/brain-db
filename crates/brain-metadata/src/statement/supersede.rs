@@ -11,8 +11,8 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use brain_core::{StatementId, StatementKind};
 use brain_core::{Statement, SubjectRef};
+use brain_core::{StatementId, StatementKind};
 use redb::{ReadTransaction, ReadableTable, WriteTransaction};
 
 use crate::tables::scope::RowScope;
@@ -257,5 +257,3 @@ pub trait StatementJudge: Send + Sync {
         rtxn: &'a ReadTransaction,
     ) -> JudgeFuture<'a>;
 }
-
-

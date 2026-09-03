@@ -4245,9 +4245,14 @@ mod tests {
         let flat: HashMap<u128, f32> = [(1u128, 0.30), (2u128, 0.30), (3u128, 0.30), (4u128, 0.30)]
             .into_iter()
             .collect();
-        let cos: HashMap<u128, f32> = [(1u128, 0.738), (2u128, 0.735), (3u128, 0.733), (4u128, 0.735)]
-            .into_iter()
-            .collect();
+        let cos: HashMap<u128, f32> = [
+            (1u128, 0.738),
+            (2u128, 0.735),
+            (3u128, 0.733),
+            (4u128, 0.735),
+        ]
+        .into_iter()
+        .collect();
         let got = order_by_answer_relevance(out, &flat, &cos);
         assert_eq!(
             got[0].memory_id, 3,

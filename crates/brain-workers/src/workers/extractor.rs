@@ -8776,8 +8776,8 @@ mod registry_refresh_tests {
         // Worker wired with rebuild deps (no classifier model / LLM router
         // needed for a pattern extractor).
         let (_tx, rx) = flume::unbounded();
-        let worker = ExtractorWorker::new(rx)
-            .with_registry_rebuild_deps(MaterializeDeps::default());
+        let worker =
+            ExtractorWorker::new(rx).with_registry_rebuild_deps(MaterializeDeps::default());
 
         // Boot-time registry is empty (nothing declared yet).
         assert_eq!(
@@ -8853,8 +8853,8 @@ mod registry_refresh_tests {
             shutdown: Arc::new(AtomicBool::new(false)),
         };
         let (_tx, rx) = flume::unbounded();
-        let worker = ExtractorWorker::new(rx)
-            .with_registry_rebuild_deps(MaterializeDeps::default());
+        let worker =
+            ExtractorWorker::new(rx).with_registry_rebuild_deps(MaterializeDeps::default());
 
         // Persist an extractor but leave the flag unset: rebuild must not run,
         // so the (empty) boot-time registry stays untouched.

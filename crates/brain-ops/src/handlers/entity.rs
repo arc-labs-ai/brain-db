@@ -976,7 +976,8 @@ async fn create_fallback_entity(
     let normalized = normalize_name(&req.candidate_name);
 
     let real_writer = downcast_writer_pub(ctx)?;
-    let write_id = WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
+    let write_id =
+        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let phase = Phase::UpsertEntity {
         id,
         ty: entity_type,

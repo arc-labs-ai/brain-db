@@ -471,8 +471,7 @@ async fn shard_registry_with_real_gliner_persists_entities() {
         model_router: None,
         llm_cache: None,
     };
-    let (registry, errors) =
-        brain_extractors::build_registry_from_definitions(&defs, &deps);
+    let (registry, errors) = brain_extractors::build_registry_from_definitions(&defs, &deps);
     assert!(errors.is_empty(), "registry build errors: {errors:?}");
     assert_eq!(
         registry.iter_enabled().count(),

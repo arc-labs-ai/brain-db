@@ -588,10 +588,7 @@ fn live_retriever_observes_commit_via_shared_generation() {
                     &cfg,
                 )
                 .expect("retrieve");
-            if hits
-                .iter()
-                .any(|h| h.id == RankedItemId::Memory(last_id))
-            {
+            if hits.iter().any(|h| h.id == RankedItemId::Memory(last_id)) {
                 observed = true;
                 break;
             }
