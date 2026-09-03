@@ -51,9 +51,11 @@ pub async fn handle_get_capabilities(
 
     // Snapshot the registry under one read lock — three booleans
     // out, no need to hold the lock for the I/O steps below.
+    // Extraction is always-on (C0): the bits report whether an extractor of
+    // each tier is present (and, for LLM, actually wired). There is no per-tier
+    // enable/disable gate.
     let (pattern_extractor, classifier_extractor, llm_extractor) = {
         let registry = ctx.extractor_registry.read();
-        let gate = registry.tier_gate();
         let mut pattern = false;
         let mut classifier = false;
         let mut llm = false;
@@ -71,11 +73,7 @@ pub async fn handle_get_capabilities(
                 }
             }
         }
-        (
-            pattern && gate.pattern.is_enabled(),
-            classifier && gate.classifier.is_enabled(),
-            llm && gate.llm.is_enabled(),
-        )
+        (pattern, classifier, llm)
     };
 
     // Per-shard schema namespaces. A failure here downgrades to "no

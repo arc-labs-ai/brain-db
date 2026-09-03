@@ -55,14 +55,14 @@ use brain_core::{
 };
 use brain_core::{StatementKind, StatementObject, StatementValue, SubjectRef};
 use brain_extractors::{
-    build_registry_with_gate,
+    build_registry_from_definitions,
     resolver::{
         resolve_or_create_with_deps, Disambiguation, EmbeddingDeps, EntityDisambiguator,
         PendingVerdict, PrecomputedVerdicts, ResolutionTier, ResolverError, StagedEntityVectors,
     },
     EntityMention, ExtractedItem, ExtractionContext, ExtractionFailureClass, ExtractionResult,
     ExtractionStatus, Extractor, ExtractorContext, ExtractorRegistry, MaterializeDeps,
-    StatementMention, TemporalExtractor, TierGate, TriggerDecision, SYSTEM_NAMESPACE,
+    StatementMention, TemporalExtractor, TriggerDecision, SYSTEM_NAMESPACE,
 };
 use brain_metadata::audit_write;
 use brain_metadata::relation::types::relation_type_intern_or_get;
@@ -281,8 +281,6 @@ pub struct RegistryRebuildDeps {
     /// upload can add entity types), so the value carried here is only
     /// the startup fallback for that one field.
     pub deps: MaterializeDeps,
-    /// Deploy-time `extractors.{pattern,classifier,llm}.enabled` gate.
-    pub gate: TierGate,
 }
 
 impl ExtractorWorker {
@@ -313,8 +311,8 @@ impl ExtractorWorker {
     /// registry refreshes live. Tests and substrate deployments that
     /// don't exercise schema-driven extractor changes leave it unset.
     #[must_use]
-    pub fn with_registry_rebuild_deps(mut self, deps: MaterializeDeps, gate: TierGate) -> Self {
-        self.rebuild_deps = Some(RegistryRebuildDeps { deps, gate });
+    pub fn with_registry_rebuild_deps(mut self, deps: MaterializeDeps) -> Self {
+        self.rebuild_deps = Some(RegistryRebuildDeps { deps });
         self
     }
 
@@ -642,7 +640,7 @@ async fn do_extractor_cycle(
 /// row doesn't rebuild every cycle; a fresh upload re-flips it.
 ///
 /// No lock is held across an `.await`: the whole rebuild is synchronous
-/// (redb reads + `build_registry_with_gate`), and the write-lock swap is
+/// (redb reads + `build_registry_from_definitions`), and the write-lock swap is
 /// a single move. Single-writer-per-shard means the handler that sets
 /// the flag and this consumer never run concurrently.
 fn maybe_rebuild_registry(worker: &ExtractorWorker, ctx: &WorkerContext) {
@@ -687,7 +685,7 @@ fn maybe_rebuild_registry(worker: &ExtractorWorker, ctx: &WorkerContext) {
 
     let mut deps = rebuild.deps.clone();
     deps.entity_type_qnames = Arc::new(entity_types);
-    let (mut reg, errors) = build_registry_with_gate(&defs, &deps, rebuild.gate);
+    let (mut reg, errors) = build_registry_from_definitions(&defs, &deps);
     if !errors.is_empty() {
         // A genuinely-broken definition (bad JSON blob, unknown kind).
         // Operator LLM misconfigurations register as degraded extractors,
@@ -8732,7 +8730,7 @@ mod registry_refresh_tests {
     use std::sync::Arc;
 
     use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
-    use brain_extractors::{MaterializeDeps, TierGate};
+    use brain_extractors::MaterializeDeps;
     use brain_index::{IndexParams, SharedHnsw};
     use brain_metadata::MetadataDb;
     use brain_ops::RealWriterHandle;
@@ -8779,7 +8777,7 @@ mod registry_refresh_tests {
         // needed for a pattern extractor).
         let (_tx, rx) = flume::unbounded();
         let worker = ExtractorWorker::new(rx)
-            .with_registry_rebuild_deps(MaterializeDeps::default(), TierGate::all_enabled());
+            .with_registry_rebuild_deps(MaterializeDeps::default());
 
         // Boot-time registry is empty (nothing declared yet).
         assert_eq!(
@@ -8856,7 +8854,7 @@ mod registry_refresh_tests {
         };
         let (_tx, rx) = flume::unbounded();
         let worker = ExtractorWorker::new(rx)
-            .with_registry_rebuild_deps(MaterializeDeps::default(), TierGate::all_enabled());
+            .with_registry_rebuild_deps(MaterializeDeps::default());
 
         // Persist an extractor but leave the flag unset: rebuild must not run,
         // so the (empty) boot-time registry stays untouched.

@@ -2663,8 +2663,6 @@ pub fn spawn_shard(
     // `ShardError::ExtractorInitFailed` (hard spawn failure); a tier whose
     // dep (GLiNER model / LLM client) is absent materialises degraded and
     // emits `SkippedDisabled` audit rows rather than failing to spawn.
-    let tier_gate = brain_extractors::TierGate::all_enabled();
-    let tier_gate_for_closure = tier_gate;
     // The extraction pipeline (worker + queue drain) is always provisioned:
     // extraction is a non-configurable always-on capability.
     let extractor_pipeline_enabled = true;
@@ -3102,11 +3100,8 @@ pub fn spawn_shard(
                 // Stash a clone for the worker's live rebuild path; the
                 // build below only borrows it.
                 extractor_rebuild_deps = materialize_deps.clone();
-                let (mut reg, errors) = brain_extractors::build_registry_with_gate(
-                    &defs,
-                    &materialize_deps,
-                    tier_gate_for_closure,
-                );
+                let (mut reg, errors) =
+                    brain_extractors::build_registry_from_definitions(&defs, &materialize_deps);
                 if !errors.is_empty() {
                     // An extractor tier that fails to materialise is a hard
                     // spawn failure, not a silent degrade: a shard serving
@@ -4031,11 +4026,8 @@ pub fn spawn_shard(
                     });
                 // Give the worker the deps to rebuild the registry live when a
                 // SCHEMA_UPLOAD declares a new extractor — no restart needed.
-                // The tier gate is the same one the boot-time build used.
-                extractor_worker = extractor_worker.with_registry_rebuild_deps(
-                    extractor_rebuild_deps.clone(),
-                    tier_gate_for_closure,
-                );
+                extractor_worker = extractor_worker
+                    .with_registry_rebuild_deps(extractor_rebuild_deps.clone());
                 if let Some(d) = entity_disambiguator_for_worker.clone() {
                     extractor_worker = extractor_worker.with_entity_disambiguator(d);
                 }
