@@ -34,9 +34,9 @@ use brain_metadata::recovery::phase_bodies::{
     encode_entity_unmerge, encode_entity_update, encode_schema_update, encode_session_create,
     encode_session_delete, encode_space_create, encode_space_delete, encode_statement_create,
     encode_statement_supersede, encode_statement_tombstone, EntityMergeBody, EntityRenameBody,
-    EntityTombstoneBody, EntityUnmergeBody, EntityUpdateBody, SchemaUpdateBody, SessionCreateBody,
-    SessionDeleteBody, SpaceCreateBody, SpaceDeleteBody, StatementCreateBody,
-    StatementSupersedeBody, StatementTombstoneBody,
+    EntityTombstoneBody, EntityUnmergeBody, EntityUpdateBody, SchemaDropTargetBody,
+    SchemaUpdateBody, SessionCreateBody, SessionDeleteBody, SpaceCreateBody, SpaceDeleteBody,
+    StatementCreateBody, StatementSupersedeBody, StatementTombstoneBody,
 };
 use brain_metadata::tables::entity::EntityMetadata;
 use brain_metadata::tables::statement::metadata_from_statement;
@@ -467,6 +467,8 @@ pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> 
             version,
             blob,
             created_at_unix_nanos,
+            replace_all,
+            drops,
             ..
         } => {
             let body = encode_schema_update(&SchemaUpdateBody {
@@ -474,6 +476,14 @@ pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> 
                 version: *version,
                 blob: blob.clone(),
                 created_at_unix_nanos: *created_at_unix_nanos,
+                replace_all: *replace_all,
+                drops: drops
+                    .iter()
+                    .map(|(kind, name)| SchemaDropTargetBody {
+                        kind: *kind,
+                        name: name.clone(),
+                    })
+                    .collect(),
             });
             Some(WalPayload::PhaseBody(PhaseBodyRecord::new(
                 WalRecordKind::SchemaUpdate,
@@ -713,6 +723,8 @@ mod tests {
             declared_relation_types: vec![],
             declared_entity_types: vec![],
             created_at_unix_nanos: 1_700_000_000_000,
+            replace_all: false,
+            drops: vec![],
         };
         let w = write_for(phase.clone());
         let WalPayload::PhaseBody(rec) = phase_to_wal_payload(&phase, &w).expect("should map")

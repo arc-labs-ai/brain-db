@@ -21,20 +21,12 @@
 //! a typo in a client can't accidentally wipe a deployment's schema.
 
 use brain_core::RequestId;
-use brain_metadata::extractor::ops::extractor_drop_namespace;
-use brain_metadata::relation::types::relation_type_drop_schema_declared;
-use brain_metadata::schema::predicate::predicate_drop_schema_declared;
-use brain_metadata::schema::store::schema_upload;
-use brain_metadata::tables::idempotency::{
-    response_kind, IdempotencyEntry, DEFAULT_TTL_NANOS, IDEMPOTENCY_TABLE,
-};
 use brain_protocol::schema::{parse_schema, validate};
 use brain_protocol::{SchemaReplaceRequest, SchemaReplaceResponse};
-use redb::ReadableTable;
 
 use crate::context::OpsContext;
 use crate::error::OpError;
-use crate::write::WriteId;
+use crate::write::{Phase, PhaseAck, Write, WriteId};
 
 /// Handle a `SCHEMA_REPLACE` request. Admin-only at the dispatch
 /// layer; this function trusts the caller to be authorised.
@@ -123,143 +115,60 @@ pub async fn handle_schema_replace(
         )));
     }
 
-    // 4. Idempotency key + request digest, derived exactly like the
-    //    unified write path (`WriteId::from_request` + a per-op BLAKE3
-    //    request hash). A retried SCHEMA_REPLACE carries the same
-    //    `request_id`; folding the effective space into the key keeps the
-    //    cache per-tenant so `act_as` can't leak a cached ack across a
-    //    tenancy boundary.
+    // 4. Route the destructive replace through the unified submit(Write)
+    //    path so it is WAL-durable and replayed on recovery: the WAL is the
+    //    source of truth, and a redb-only mutation is silently lost if redb is
+    //    ever rebuilt from the WAL. The `UpsertSchema` apply (with
+    //    `replace_all`) drops every declared predicate / relation type /
+    //    extractor in the namespace and then uploads the new document inside
+    //    one wtxn — atomic, so a failing upload leaves the prior schema
+    //    intact. submit also supplies the WriteId idempotency replay and the
+    //    post-commit OUTSIDE_ACTIVE_SCHEMA flag sweep this handler used to
+    //    hand-roll.
+    let now = crate::txn::now_unix_nanos_pub();
+    let from_version = crate::handlers::schema::current_active(ctx, &namespace)?.unwrap_or(0);
+    let real_writer = crate::handlers::link::downcast_writer_pub(ctx)?;
     let write_id =
         WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_schema_replace_request(&req);
-
-    // 5. Atomic idempotency-check + drop-then-replace + stamp inside one
-    //    redb wtxn. The idempotency row commits in the SAME transaction
-    //    as the schema mutation, so a same-`request_id` retry after a
-    //    lost ACK replays the cached response instead of re-running the
-    //    destructive drop+re-upload, and a same-`request_id`/different-doc
-    //    retry returns `Conflict` — both without ever touching the
-    //    declared rows a second time.
-    let now = crate::txn::now_unix_nanos_pub();
-    let wtxn = ctx
-        .executor
-        .metadata
-        .write_txn()
-        .map_err(|e| OpError::Internal(format!("write_txn: {e}")))?;
-
-    // 5a. Consult the durable idempotency table before mutating anything.
-    //     A live (non-expired) row with a matching hash replays; a
-    //     mismatching hash is a conflict; both drop the wtxn untouched.
-    let cached_entry: Option<IdempotencyEntry> = {
-        let idem_table = wtxn
-            .open_table(IDEMPOTENCY_TABLE)
-            .map_err(|e| OpError::Internal(format!("open IDEMPOTENCY_TABLE: {e}")))?;
-        let guard = idem_table
-            .get(write_id.to_bytes())
-            .map_err(|e| OpError::Internal(format!("idempotency get: {e}")))?;
-        guard.map(|row| row.value())
-    };
-    if let Some(entry) = cached_entry {
-        if !entry.is_expired(now, DEFAULT_TTL_NANOS) {
-            if entry.request_hash != request_hash {
-                return Err(OpError::Conflict(format!(
-                    "schema_replace: request_id replay with different params (namespace {namespace:?})"
-                )));
-            }
-            return decode_replace_response(&entry.response_payload);
-        }
-    }
-
-    // 5b. Destructive drop of the namespace's declared vocabulary. Entity
-    //     types stay put (global, shared across namespaces).
-    let mut dropped: usize = 0;
-    dropped += predicate_drop_schema_declared(&wtxn, &namespace)
-        .map_err(|e| OpError::Internal(format!("predicate drop: {e}")))?;
-    dropped += relation_type_drop_schema_declared(&wtxn, &namespace)
-        .map_err(|e| OpError::Internal(format!("relation_type drop: {e}")))?;
-    dropped += extractor_drop_namespace(&wtxn, &namespace)
-        .map_err(|e| OpError::Internal(format!("extractor drop: {e}")))?;
-
-    // 5c. Persist the new schema version row and fan its declarations out
-    //     through the same apply path SCHEMA_UPLOAD uses. With the prior
-    //     declared rows gone, the apply runs against a clean slate and
-    //     won't trip the constraint-mismatch check. `schema_upload`
-    //     internally calls `apply_schema_definitions` so we don't invoke
-    //     it twice.
-    let new_version = schema_upload(&wtxn, &validated, now)
-        .map_err(|e| OpError::Internal(format!("schema_upload: {e}")))?;
-
-    let response = SchemaReplaceResponse {
-        namespace,
-        schema_version: new_version,
-        dropped_count: dropped as u32,
-        validation_errors: Vec::new(),
-    };
-
-    // 5d. Stamp the durable idempotency row in the same wtxn so the
-    //     replay-guard commits atomically with the effect.
-    let idem_entry = IdempotencyEntry {
-        response_kind: response_kind::UNKNOWN,
-        memory_id_bytes: None,
-        response_payload: encode_replace_response(&response)?,
-        request_hash,
+    let phase = Phase::UpsertSchema {
+        namespace: namespace.clone(),
+        // Informational; apply recomputes the assigned version. Set to the
+        // next version so the WAL body carries the value recovery's
+        // skip-if-(namespace,version)-exists check compares against.
+        version: from_version.saturating_add(1),
+        blob: req.schema_document.as_bytes().to_vec(),
+        declared_predicates: Vec::new(),
+        declared_relation_types: Vec::new(),
+        declared_entity_types: Vec::new(),
         created_at_unix_nanos: now,
-        lsn: 0,
+        // REPLACE: drop all declared vocabulary before the (additive) upload.
+        replace_all: true,
+        drops: Vec::new(),
     };
-    {
-        let mut idem_table = wtxn
-            .open_table(IDEMPOTENCY_TABLE)
-            .map_err(|e| OpError::Internal(format!("open IDEMPOTENCY_TABLE: {e}")))?;
-        idem_table
-            .insert(write_id.to_bytes(), &idem_entry)
-            .map_err(|e| OpError::Internal(format!("idempotency insert: {e}")))?;
-    }
+    let write =
+        Write::single(write_id, ctx.executor.caller_space, phase).with_request_hash(request_hash);
+    let ack = real_writer
+        .submit(write)
+        .await
+        .map_err(crate::handlers::schema::map_writer_err)?;
+    let (schema_version, dropped_count) = match ack.single_phase() {
+        PhaseAck::UpsertedSchema {
+            version, dropped, ..
+        } => (*version, *dropped),
+        other => {
+            return Err(OpError::Internal(format!(
+                "submit(UpsertSchema) returned unexpected PhaseAck: {other:?}"
+            )))
+        }
+    };
 
-    wtxn.commit()
-        .map_err(|e| OpError::Internal(format!("commit: {e}")))?;
-
-    // Post-commit: kick off the OUTSIDE_ACTIVE_SCHEMA flag-sweep, exactly
-    // as the additive SCHEMA_UPLOAD path does from `writer::submit`'s
-    // post-commit fan-out. SCHEMA_REPLACE commits its own wtxn above and
-    // never flows through `submit()`, so without this the destructive
-    // drop-then-replace leaves every statement on a just-dropped predicate
-    // carrying its old flag state forever — old-schema statements are
-    // never marked stale, violating the acceptance-suite provenance
-    // guarantee that "statements from old schema are marked stale after
-    // schema update".
-    //
-    // Scope note: re-*extraction* of those statements against the new
-    // vocabulary is deliberately NOT attempted here — that depends on the
-    // EXTRACT_BACKFILL worker machinery (a separate WIP feature). We only
-    // re-align the advisory stale flag; full re-extraction is deferred to
-    // the backfill worker.
-    //
-    // Idempotent on replay: a same-request_id retry short-circuits at the
-    // idempotency check (5a) and never reaches this point, so it can't
-    // double-enqueue. The sweep itself is idempotent regardless — it
-    // converges every row to its correct flag state however many times it
-    // runs.
-    if let Some(real) = ctx
-        .executor
-        .writer
-        .as_any()
-        .downcast_ref::<crate::writer::RealWriterHandle>()
-    {
-        let job = crate::writer::SchemaFlagSweepJob {
-            namespace: response.namespace.clone(),
-            new_version: response.schema_version,
-            enqueued_at_unix_nanos: now,
-        };
-        let enqueued = crate::writer::try_enqueue_schema_flag_sweep(real, job);
-        tracing::debug!(
-            namespace = %response.namespace,
-            new_version = response.schema_version,
-            enqueued,
-            "schema_replace: post-commit schema flag-sweep enqueue attempt",
-        );
-    }
-
-    Ok(response)
+    Ok(SchemaReplaceResponse {
+        namespace,
+        schema_version,
+        dropped_count,
+        validation_errors: Vec::new(),
+    })
 }
 
 /// BLAKE3 over the canonical SCHEMA_REPLACE request fields. Excludes
@@ -276,27 +185,12 @@ fn hash_schema_replace_request(req: &SchemaReplaceRequest) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
-/// Encode a `SchemaReplaceResponse` for the idempotency table's opaque
-/// `response_payload`. Replayed verbatim on a matching-request retry.
-fn encode_replace_response(resp: &SchemaReplaceResponse) -> Result<Vec<u8>, OpError> {
-    let mut buf = Vec::new();
-    ciborium::into_writer(resp, &mut buf)
-        .map_err(|e| OpError::Internal(format!("encode cached schema_replace response: {e}")))?;
-    Ok(buf)
-}
-
-/// Decode a cached `SchemaReplaceResponse` from the idempotency table.
-fn decode_replace_response(bytes: &[u8]) -> Result<SchemaReplaceResponse, OpError> {
-    ciborium::from_reader(bytes)
-        .map_err(|e| OpError::Internal(format!("decode cached schema_replace response: {e}")))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
     use brain_index::{IndexParams, SharedHnsw};
-    use brain_metadata::schema::store::schema_active;
+    use brain_metadata::schema::store::{schema_active, schema_upload};
     use brain_metadata::MetadataDb;
     use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
     use std::sync::Arc;

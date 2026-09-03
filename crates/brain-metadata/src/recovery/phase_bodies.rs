@@ -173,11 +173,23 @@ pub struct StatementTombstoneBody {
     pub at_unix_nanos: u64,
 }
 
-/// `SchemaUpdate` (0x40) body. The schema DSL source text and its
-/// upload timestamp. Recovery re-parses, validates, and re-applies the
-/// declaration the same way the live `SCHEMA_UPLOAD` apply path does —
-/// storing the source rather than a pre-parsed form keeps replay
-/// authoritative against the parser that the running binary ships.
+/// One destructive drop target carried on a [`SchemaUpdateBody`] (SCHEMA_DROP).
+/// `kind` matches `brain_protocol::schema_drop_target` (0 = predicate,
+/// 1 = relation_type); `name` is the local (unqualified) target name.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
+#[archive(check_bytes)]
+pub struct SchemaDropTargetBody {
+    pub kind: u8,
+    pub name: String,
+}
+
+/// `SchemaUpdate` (0x40) body — the single WAL record behind every schema
+/// mutation (UPLOAD / REPLACE / DROP). The schema DSL source text and its
+/// upload timestamp, plus the destructive delta that REPLACE / DROP apply
+/// *before* the (additive) upload. Recovery re-parses, validates, applies the
+/// delta, then re-uploads the same way the live apply path does — storing the
+/// source rather than a pre-parsed form keeps replay authoritative against the
+/// parser that the running binary ships.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
 #[archive(check_bytes)]
 pub struct SchemaUpdateBody {
@@ -192,6 +204,13 @@ pub struct SchemaUpdateBody {
     /// `version` because replay reconstructs schema state in LSN order).
     pub blob: Vec<u8>,
     pub created_at_unix_nanos: u64,
+    /// REPLACE mode: drop *all* declared predicates / relation types /
+    /// extractors in the namespace before the upload (the destructive
+    /// escape hatch). `false` for plain UPLOAD and for targeted DROP.
+    pub replace_all: bool,
+    /// DROP mode: specific declared targets to remove before the upload.
+    /// Empty for UPLOAD and REPLACE.
+    pub drops: Vec<SchemaDropTargetBody>,
 }
 
 // ---------------------------------------------------------------------------
@@ -538,6 +557,8 @@ mod tests {
             version: 3,
             blob: b"entity Person { name: text }".to_vec(),
             created_at_unix_nanos: 1_700_000_000_000_000_777,
+            replace_all: false,
+            drops: Vec::new(),
         };
         let bytes = encode_schema_update(&body);
         let got = decode_schema_update(&bytes).unwrap();
@@ -618,6 +639,8 @@ mod tests {
             version: 3,
             blob: b"entity Person { name: text }".to_vec(),
             created_at_unix_nanos: 1_700_000_000_000_000_777,
+            replace_all: false,
+            drops: Vec::new(),
         };
         let bytes = encode_schema_update(&body);
         let got = decode_from_misaligned(&bytes, decode_schema_update);

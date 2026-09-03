@@ -562,6 +562,7 @@ impl RealWriterHandle {
                     PhaseAck::UpsertedSchema {
                         namespace: ns,
                         version,
+                        ..
                     } if ns == namespace => Some(*version),
                     _ => None,
                 });

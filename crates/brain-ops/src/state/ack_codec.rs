@@ -177,10 +177,15 @@ fn write_phase_ack(out: &mut Vec<u8>, pa: &PhaseAck) {
             out.extend_from_slice(&id.to_bytes());
             write_u32(out, *ver);
         }
-        PhaseAck::UpsertedSchema { namespace, version } => {
+        PhaseAck::UpsertedSchema {
+            namespace,
+            version,
+            dropped,
+        } => {
             out.push(tag::UPSERTED_SCHEMA);
             write_string(out, namespace);
             write_u32(out, *version);
+            write_u32(out, *dropped);
         }
         PhaseAck::Linked => out.push(tag::LINKED),
         PhaseAck::Unlinked => out.push(tag::UNLINKED),
@@ -293,7 +298,12 @@ fn read_phase_ack(c: &mut Cursor<'_>) -> Result<PhaseAck, CodecError> {
         tag::UPSERTED_SCHEMA => {
             let namespace = c.string()?;
             let version = c.u32()?;
-            PhaseAck::UpsertedSchema { namespace, version }
+            let dropped = c.u32()?;
+            PhaseAck::UpsertedSchema {
+                namespace,
+                version,
+                dropped,
+            }
         }
         tag::LINKED => PhaseAck::Linked,
         tag::UNLINKED => PhaseAck::Unlinked,
@@ -697,6 +707,7 @@ mod tests {
         let pa = PhaseAck::UpsertedSchema {
             namespace: "acme".into(),
             version: 7,
+            dropped: 3,
         };
         let decoded = round_trip(ack_with(vec![pa.clone()]));
         assert_eq!(decoded.phase_acks, vec![pa]);

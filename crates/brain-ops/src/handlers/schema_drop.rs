@@ -30,20 +30,16 @@
 
 use brain_core::RequestId;
 use brain_metadata::relation::ops::relation_live_count_by_type;
-use brain_metadata::relation::types::{relation_type_drop_one, relation_type_id_by_qname};
-use brain_metadata::schema::predicate::{predicate_drop_one, predicate_id_by_qname};
-use brain_metadata::schema::store::{schema_active_row, schema_upload};
+use brain_metadata::relation::types::relation_type_id_by_qname;
+use brain_metadata::schema::predicate::predicate_id_by_qname;
+use brain_metadata::schema::store::schema_active_row;
 use brain_metadata::statement::crud::statement_live_count_by_predicate;
-use brain_metadata::tables::idempotency::{
-    response_kind, IdempotencyEntry, DEFAULT_TTL_NANOS, IDEMPOTENCY_TABLE,
-};
 use brain_protocol::schema::{validate, Schema, SchemaItem};
 use brain_protocol::{schema_drop_target, SchemaDropRequest, SchemaDropResponse};
-use redb::ReadableTable;
 
 use crate::context::OpsContext;
 use crate::error::OpError;
-use crate::write::WriteId;
+use crate::write::{Phase, PhaseAck, Write, WriteId};
 
 /// Cap on the in-use scan: the safety gate only needs to know "any live
 /// rows?", so it stops at the first hit rather than counting an entire
@@ -91,70 +87,33 @@ pub async fn handle_schema_drop(
     let namespace = req.namespace.clone();
     let caller_ns_id = ctx.executor.caller_namespace.raw();
 
-    // 3. Idempotency key + request digest, derived exactly like
-    //    SCHEMA_REPLACE. A retried SCHEMA_DROP carries the same
-    //    `request_id`; folding the effective space into the key keeps the
-    //    cache per-tenant so `act_as` can't leak a cached ack across a
-    //    tenancy boundary.
-    let write_id =
-        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
-    let request_hash = hash_schema_drop_request(&req);
-
-    // 4. Atomic idempotency-check + narrow + re-version + stamp inside one
-    //    redb wtxn.
+    // 3. Read-only pre-checks against committed state. The actual narrow +
+    //    re-version is then applied through the unified submit(Write) path so
+    //    it is WAL-durable and replayed on recovery (the WAL is the source of
+    //    truth; a redb-only mutation is lost if redb is ever rebuilt from it).
     let now = crate::txn::now_unix_nanos_pub();
-    let wtxn = ctx
-        .executor
-        .metadata
-        .write_txn()
-        .map_err(|e| OpError::Internal(format!("write_txn: {e}")))?;
 
-    // 4a. Consult the durable idempotency table before mutating anything.
-    let cached_entry: Option<IdempotencyEntry> = {
-        let idem_table = wtxn
-            .open_table(IDEMPOTENCY_TABLE)
-            .map_err(|e| OpError::Internal(format!("open IDEMPOTENCY_TABLE: {e}")))?;
-        let guard = idem_table
-            .get(write_id.to_bytes())
-            .map_err(|e| OpError::Internal(format!("idempotency get: {e}")))?;
-        guard.map(|row| row.value())
-    };
-    if let Some(entry) = cached_entry {
-        if !entry.is_expired(now, DEFAULT_TTL_NANOS) {
-            if entry.request_hash != request_hash {
-                return Err(OpError::Conflict(format!(
-                    "schema_drop: request_id replay with different params (namespace {namespace:?})"
-                )));
-            }
-            return decode_drop_response(&entry.response_payload);
-        }
-    }
-
-    // 4b. Load the active schema version's document. No active version →
-    //     nothing is declared, so the target cannot be dropped: a no-op
-    //     success (dropped = false), mirroring FORGET's leniency on an
-    //     already-absent target. Single-writer-per-shard means this read of
-    //     committed state can't race the wtxn's own writes.
-    let active_row = {
+    // 3a. Load the active schema document. No active version → nothing is
+    //     declared, so the target cannot be dropped: a no-op success,
+    //     mirroring FORGET's leniency on an already-absent target.
+    let (current_version, mut schema): (u32, Schema) = {
         let rtxn = ctx
             .executor
             .metadata
             .read_txn()
             .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
-        schema_active_row(&rtxn, &namespace)
+        let Some(active_row) = schema_active_row(&rtxn, &namespace)
             .map_err(|e| OpError::Internal(format!("schema_active_row: {e}")))?
+        else {
+            return Ok(not_declared_response(&req, 0));
+        };
+        let schema: Schema = serde_json::from_slice(&active_row.source)
+            .map_err(|e| OpError::Internal(format!("decode stored schema document: {e}")))?;
+        (active_row.version, schema)
     };
-    let Some(active_row) = active_row else {
-        return Ok(not_declared_response(&req, 0));
-    };
-    let current_version = active_row.version;
-    let mut schema: Schema = serde_json::from_slice(&active_row.source)
-        .map_err(|e| OpError::Internal(format!("decode stored schema document: {e}")))?;
 
-    // 4c. Find the declared item. Absent → no-op success (idempotent
-    //     re-drop). A declared row that exists only in the storage tables
-    //     but not the version document is not something SCHEMA_DROP
-    //     narrows — the document is the authority for "what is declared".
+    // 3b. Find the declared item in the document (the authority for "what is
+    //     declared"). Absent → no-op success (idempotent re-drop).
     let target_kind = req.target_kind;
     let target_name = req.target_name.as_str();
     let item_idx = schema
@@ -171,34 +130,49 @@ pub async fn handle_schema_drop(
         return Ok(not_declared_response(&req, current_version));
     };
 
-    // 4d. In-use safety gate. Count live (non-tombstoned) rows keyed on the
-    //     target; if any exist and `force` is unset, reject without
-    //     mutating anything.
-    let live_rows = match target_kind {
-        schema_drop_target::PREDICATE => {
-            match predicate_id_by_qname(&wtxn, &namespace, target_name)
-                .map_err(|e| OpError::Internal(format!("predicate_id_by_qname: {e}")))?
-            {
-                Some(pid) => {
-                    statement_live_count_by_predicate(&wtxn, caller_ns_id, pid, LIVE_ROW_SCAN_CAP)
-                        .map_err(|e| OpError::Internal(format!("live statement count: {e}")))?
+    // 3c. In-use safety gate. Count live (non-tombstoned) rows keyed on the
+    //     target; reject if any exist and `force` is unset. These helpers take
+    //     a write txn but only read — open one for the reads and drop it
+    //     (rolling back, writing nothing) before submit opens its own.
+    //     Single-writer-per-shard means no other writer runs in between, so the
+    //     gate can't go stale.
+    let live_rows = {
+        let wtxn = ctx
+            .executor
+            .metadata
+            .write_txn()
+            .map_err(|e| OpError::Internal(format!("write_txn: {e}")))?;
+        let n = match target_kind {
+            schema_drop_target::PREDICATE => {
+                match predicate_id_by_qname(&wtxn, &namespace, target_name)
+                    .map_err(|e| OpError::Internal(format!("predicate_id_by_qname: {e}")))?
+                {
+                    Some(pid) => statement_live_count_by_predicate(
+                        &wtxn,
+                        caller_ns_id,
+                        pid,
+                        LIVE_ROW_SCAN_CAP,
+                    )
+                    .map_err(|e| OpError::Internal(format!("live statement count: {e}")))?,
+                    None => 0,
                 }
-                None => 0,
             }
-        }
-        schema_drop_target::RELATION_TYPE => {
-            match relation_type_id_by_qname(&wtxn, &namespace, target_name)
-                .map_err(|e| OpError::Internal(format!("relation_type_id_by_qname: {e}")))?
-            {
-                Some(rid) => {
-                    relation_live_count_by_type(&wtxn, caller_ns_id, rid, LIVE_ROW_SCAN_CAP)
-                        .map_err(|e| OpError::Internal(format!("live relation count: {e}")))?
+            schema_drop_target::RELATION_TYPE => {
+                match relation_type_id_by_qname(&wtxn, &namespace, target_name)
+                    .map_err(|e| OpError::Internal(format!("relation_type_id_by_qname: {e}")))?
+                {
+                    Some(rid) => {
+                        relation_live_count_by_type(&wtxn, caller_ns_id, rid, LIVE_ROW_SCAN_CAP)
+                            .map_err(|e| OpError::Internal(format!("live relation count: {e}")))?
+                    }
+                    None => 0,
                 }
-                None => 0,
             }
-        }
-        // Unreachable: guarded at step 1.
-        _ => 0,
+            // Unreachable: guarded at step 1.
+            _ => 0,
+        };
+        drop(wtxn); // read-only: roll back, write nothing.
+        n
     };
     if live_rows > 0 && !req.force {
         return Err(OpError::Conflict(format!(
@@ -209,95 +183,65 @@ pub async fn handle_schema_drop(
         )));
     }
 
-    // 4e. Drop the single declared row from the typed-graph tables.
-    let removed = match target_kind {
-        schema_drop_target::PREDICATE => predicate_drop_one(&wtxn, &namespace, target_name)
-            .map_err(|e| OpError::Internal(format!("predicate drop: {e}")))?
-            .is_some(),
-        schema_drop_target::RELATION_TYPE => relation_type_drop_one(&wtxn, &namespace, target_name)
-            .map_err(|e| OpError::Internal(format!("relation_type drop: {e}")))?
-            .is_some(),
-        _ => false,
-    };
-
-    // 4f. Narrow the document and persist it as a new version through the
-    //     same apply path SCHEMA_UPLOAD / SCHEMA_REPLACE use. Removing the
-    //     item from the document is what keeps the re-apply from
-    //     re-creating it; the stored `source` DSL text is dropped because
-    //     it would still mention the removed type.
+    // 4. Narrow the document and route the drop through submit(Write). The
+    //    narrowed document (item removed, DSL source cleared) is carried as
+    //    serde_json — it has no DSL text to re-parse — and the `drops` delta
+    //    tells apply which typed-graph table row to remove. Live apply and WAL
+    //    recovery reconstruct identical narrowed state; submit also supplies
+    //    the WriteId idempotency replay and the post-commit flag sweep this
+    //    handler used to hand-roll.
     schema.items.remove(item_idx);
     schema.source = None;
     let validated = validate(&schema).map_err(|errs| {
-        // A narrow that leaves the document invalid is an internal
-        // inconsistency (e.g. a relation_type referencing a just-removed
-        // entity type — not possible for the two droppable kinds). Surface
-        // it structurally rather than as a hard error.
         OpError::Internal(format!(
             "schema_drop: narrowed document failed re-validation: {} error(s)",
             errs.len()
         ))
     })?;
-    let new_version = schema_upload(&wtxn, &validated, now)
-        .map_err(|e| OpError::Internal(format!("schema_upload: {e}")))?;
+    let narrowed_json = serde_json::to_vec(validated.as_schema())
+        .map_err(|e| OpError::Internal(format!("encode narrowed schema: {e}")))?;
 
-    let response = SchemaDropResponse {
+    let real_writer = crate::handlers::link::downcast_writer_pub(ctx)?;
+    let write_id =
+        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
+    let request_hash = hash_schema_drop_request(&req);
+    let phase = Phase::UpsertSchema {
         namespace: namespace.clone(),
-        schema_version: new_version,
+        version: current_version.saturating_add(1),
+        blob: narrowed_json,
+        declared_predicates: Vec::new(),
+        declared_relation_types: Vec::new(),
+        declared_entity_types: Vec::new(),
+        created_at_unix_nanos: now,
+        replace_all: false,
+        drops: vec![(target_kind, req.target_name.clone())],
+    };
+    let write =
+        Write::single(write_id, ctx.executor.caller_space, phase).with_request_hash(request_hash);
+    let ack = real_writer
+        .submit(write)
+        .await
+        .map_err(crate::handlers::schema::map_writer_err)?;
+    let (schema_version, dropped_n) = match ack.single_phase() {
+        PhaseAck::UpsertedSchema {
+            version, dropped, ..
+        } => (*version, *dropped),
+        other => {
+            return Err(OpError::Internal(format!(
+                "submit(UpsertSchema) returned unexpected PhaseAck: {other:?}"
+            )))
+        }
+    };
+
+    Ok(SchemaDropResponse {
+        namespace,
+        schema_version,
         target_kind,
         target_name: req.target_name.clone(),
-        dropped: removed,
+        dropped: dropped_n > 0,
         live_rows: live_rows as u32,
         validation_errors: Vec::new(),
-    };
-
-    // 4g. Stamp the durable idempotency row in the same wtxn so the
-    //     replay-guard commits atomically with the effect.
-    let idem_entry = IdempotencyEntry {
-        response_kind: response_kind::UNKNOWN,
-        memory_id_bytes: None,
-        response_payload: encode_drop_response(&response)?,
-        request_hash,
-        created_at_unix_nanos: now,
-        lsn: 0,
-    };
-    {
-        let mut idem_table = wtxn
-            .open_table(IDEMPOTENCY_TABLE)
-            .map_err(|e| OpError::Internal(format!("open IDEMPOTENCY_TABLE: {e}")))?;
-        idem_table
-            .insert(write_id.to_bytes(), &idem_entry)
-            .map_err(|e| OpError::Internal(format!("idempotency insert: {e}")))?;
-    }
-
-    wtxn.commit()
-        .map_err(|e| OpError::Internal(format!("commit: {e}")))?;
-
-    // Post-commit: kick off the OUTSIDE_ACTIVE_SCHEMA flag-sweep, exactly
-    // as SCHEMA_UPLOAD / SCHEMA_REPLACE do. The narrow bumped the active
-    // version, so every statement still keyed on the just-dropped predicate
-    // must be re-marked stale against the new active schema. Re-extraction
-    // is deferred to the backfill worker, same as SCHEMA_REPLACE.
-    if let Some(real) = ctx
-        .executor
-        .writer
-        .as_any()
-        .downcast_ref::<crate::writer::RealWriterHandle>()
-    {
-        let job = crate::writer::SchemaFlagSweepJob {
-            namespace: response.namespace.clone(),
-            new_version: response.schema_version,
-            enqueued_at_unix_nanos: now,
-        };
-        let enqueued = crate::writer::try_enqueue_schema_flag_sweep(real, job);
-        tracing::debug!(
-            namespace = %response.namespace,
-            new_version = response.schema_version,
-            enqueued,
-            "schema_drop: post-commit schema flag-sweep enqueue attempt",
-        );
-    }
-
-    Ok(response)
+    })
 }
 
 /// A `SCHEMA_DROP` that matched no declared type: a success no-op. The
@@ -337,21 +281,6 @@ fn hash_schema_drop_request(req: &SchemaDropRequest) -> [u8; 32] {
     h.update(b"\0");
     h.update(&[u8::from(req.force)]);
     *h.finalize().as_bytes()
-}
-
-/// Encode a `SchemaDropResponse` for the idempotency table's opaque
-/// `response_payload`. Replayed verbatim on a matching-request retry.
-fn encode_drop_response(resp: &SchemaDropResponse) -> Result<Vec<u8>, OpError> {
-    let mut buf = Vec::new();
-    ciborium::into_writer(resp, &mut buf)
-        .map_err(|e| OpError::Internal(format!("encode cached schema_drop response: {e}")))?;
-    Ok(buf)
-}
-
-/// Decode a cached `SchemaDropResponse` from the idempotency table.
-fn decode_drop_response(bytes: &[u8]) -> Result<SchemaDropResponse, OpError> {
-    ciborium::from_reader(bytes)
-        .map_err(|e| OpError::Internal(format!("decode cached schema_drop response: {e}")))
 }
 
 #[cfg(test)]
@@ -635,14 +564,27 @@ mod tests {
         assert!(first.dropped);
         assert_eq!(first.schema_version, 2);
 
-        // Replay: must return the cached response and not bump again.
+        // Replay after a completed drop: the predicate is already gone, so the
+        // retry is a safe no-op success at the same version — nothing left to
+        // drop and no re-narrow. This is the spec's idempotency contract
+        // (retries are *safe*, "already done → success", like FORGET's
+        // was_already_forgotten and already-tombstoned entities), not a
+        // byte-cached echo of the first response.
         let second = handle_schema_drop(
             drop_req(schema_drop_target::PREDICATE, "prefers", false, rid),
             &ctx,
         )
         .await
         .expect("replay");
-        assert_eq!(first, second, "replay returns the cached response verbatim");
+        assert!(
+            !second.dropped,
+            "replay of a completed drop reports nothing left to drop"
+        );
+        assert_eq!(
+            second.schema_version, 2,
+            "replay must not bump the version again"
+        );
+        assert_eq!(second.target_name, first.target_name);
         assert_eq!(active(&metadata), Some(2), "replay must not re-narrow");
     }
 

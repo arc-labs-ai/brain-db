@@ -172,6 +172,15 @@ pub enum Phase {
         declared_relation_types: Vec<String>,
         declared_entity_types: Vec<String>,
         created_at_unix_nanos: u64,
+        /// REPLACE mode: drop *all* declared predicates / relation types /
+        /// extractors in the namespace before the (additive) upload. `false`
+        /// for plain UPLOAD and targeted DROP.
+        replace_all: bool,
+        /// DROP mode: specific declared targets to remove before the upload,
+        /// as `(kind, local_name)` where `kind` matches
+        /// `brain_protocol::schema_drop_target` (0 = predicate,
+        /// 1 = relation_type). Empty for UPLOAD and REPLACE.
+        drops: Vec<(u8, String)>,
     },
 
     /// Write one edge row (forward + auto-mirror for symmetric kinds).
@@ -449,6 +458,11 @@ pub enum PhaseAck {
     UpsertedSchema {
         namespace: String,
         version: u32,
+        /// Count of declared rows the destructive delta removed before the
+        /// upload (REPLACE / DROP); `0` for a plain additive UPLOAD. Lets the
+        /// REPLACE handler report an accurate `dropped_count` without a
+        /// pre-submit re-scan.
+        dropped: u32,
     },
     Linked,
     Unlinked,

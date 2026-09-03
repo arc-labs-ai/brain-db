@@ -147,6 +147,9 @@ pub async fn handle_schema_upload(
         declared_relation_types: Vec::new(),
         declared_entity_types: Vec::new(),
         created_at_unix_nanos: now,
+        // Plain UPLOAD is additive: no destructive delta.
+        replace_all: false,
+        drops: Vec::new(),
     };
     let write =
         Write::single(write_id, ctx.executor.caller_space, phase).with_request_hash(request_hash);
@@ -408,7 +411,8 @@ fn check_document_cap(doc: &str) -> Result<(), OpError> {
 /// Map `WriterError` from `submit(UpsertSchema)` back into the wire
 /// taxonomy. Internal failures bubble as `OpError::Internal`; on a
 /// genuine conflict from idempotency we surface `OpError::Conflict`.
-fn map_writer_err(err: WriterError) -> OpError {
+/// Shared by the REPLACE / DROP handlers, which submit the same phase.
+pub(crate) fn map_writer_err(err: WriterError) -> OpError {
     match err {
         WriterError::Conflict(msg) => OpError::Conflict(msg),
         WriterError::Overloaded => OpError::Overloaded("writer overloaded".into()),
@@ -444,7 +448,7 @@ fn caller_may_read_namespace(caller_name: &str, requested: &str) -> bool {
     requested == caller_name || requested == SYSTEM_SCHEMA_NAMESPACE
 }
 
-fn current_active(ctx: &OpsContext, namespace: &str) -> Result<Option<u32>, OpError> {
+pub(crate) fn current_active(ctx: &OpsContext, namespace: &str) -> Result<Option<u32>, OpError> {
     let rtxn = ctx
         .executor
         .metadata
