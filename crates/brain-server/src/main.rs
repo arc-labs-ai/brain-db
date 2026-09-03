@@ -78,6 +78,19 @@ fn main() -> ExitCode {
         }
     };
 
+    // Install the process-wide retrieval tuning from the parsed `[retrieval]`
+    // section before any shard or read path runs. This replaces the former
+    // bespoke `BRAIN_*` env reads at the fusion / retriever / RECALL call
+    // sites; the generic `BRAIN__RETRIEVAL__*` override already applied during
+    // `Config::load`, so TOML is the single source of truth.
+    let _ = brain_core::RetrievalTuning {
+        fusion_method: cfg.retrieval.fusion_method.clone(),
+        hype_rrf: cfg.retrieval.hype_rrf,
+        ef_occupancy_scaling: cfg.retrieval.ef_occupancy_scaling,
+        autocut: cfg.retrieval.autocut,
+    }
+    .install();
+
     // Apply the configured formatter + level immediately, so the startup
     // logs below already honor `[monitoring.logging]`. OTel is attached
     // later, from inside the Tokio runtime (its exporter needs one).

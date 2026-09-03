@@ -42,6 +42,8 @@ pub struct Config {
     #[serde(default)]
     pub index: IndexConfig,
     #[serde(default)]
+    pub retrieval: RetrievalConfig,
+    #[serde(default)]
     pub monitoring: MonitoringConfig,
     /// Operator admin-plane config. The admin HTTP listener (key mint /
     /// revoke / stats) is gated on `token`; without it the listener refuses
@@ -603,6 +605,44 @@ fn default_tantivy_commit_n() -> usize {
 }
 fn default_tantivy_commit_ms() -> u64 {
     brain_ops::index::text_indexer::DEFAULT_COMMIT_MS
+}
+
+/// `[retrieval]` TOML section. Deploy-time read-path tuning that was
+/// previously read via bespoke `BRAIN_*` env vars deep in the planner /
+/// retriever / RECALL handler. Every field defaults to the historical
+/// env-unset behaviour, so the section may be omitted entirely. The generic
+/// `BRAIN__RETRIEVAL__FIELD` override applies like any other section.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RetrievalConfig {
+    /// Rank-fusion strategy: `"rrf"` (default), `"relative"`, or `"zscore"`.
+    #[serde(default = "default_fusion_method")]
+    pub fusion_method: String,
+    /// HyPE joins the semantic lane as its own RRF rank list rather than a
+    /// non-displacing append. Default false.
+    #[serde(default)]
+    pub hype_rrf: bool,
+    /// Scale the memory probe's `ef_search` by index occupancy. Default false.
+    #[serde(default)]
+    pub ef_occupancy_scaling: bool,
+    /// Relative-drop autocut of the ranked result tail. Default false.
+    #[serde(default)]
+    pub autocut: bool,
+}
+
+impl Default for RetrievalConfig {
+    fn default() -> Self {
+        Self {
+            fusion_method: default_fusion_method(),
+            hype_rrf: false,
+            ef_occupancy_scaling: false,
+            autocut: false,
+        }
+    }
+}
+
+fn default_fusion_method() -> String {
+    "rrf".to_string()
 }
 
 /// `[workers.auto_edge]` TOML section. Controls the substrate
@@ -1388,6 +1428,7 @@ impl Config {
             extractors: ExtractorsConfig::default(),
             workers: WorkersConfig::default(),
             index: IndexConfig::default(),
+            retrieval: RetrievalConfig::default(),
             monitoring: MonitoringConfig::default(),
             admin: AdminConfig {
                 // Non-empty so the admin listener boots in tests; admin

@@ -2796,12 +2796,10 @@ fn retriever_name_wire(r: Retriever) -> RetrieverNameWire {
     }
 }
 
-/// Env gate for autocut (`BRAIN_AUTOCUT`). Default OFF.
+/// Deploy-time gate for autocut (`[retrieval] autocut`). Default OFF.
+/// Sourced from the parsed config installed at boot.
 fn autocut_enabled() -> bool {
-    matches!(
-        std::env::var("BRAIN_AUTOCUT").ok().as_deref(),
-        Some("1" | "true" | "TRUE" | "on" | "ON")
-    )
+    brain_core::RetrievalTuning::active().autocut
 }
 
 /// Smallest count autocut will ever return when there is at least one hit —

@@ -17,7 +17,10 @@ pub mod ids;
 pub mod migration;
 pub mod nodes;
 pub mod resolution;
+pub mod retrieval_config;
 pub mod worker_state;
+
+pub use retrieval_config::RetrievalTuning;
 
 pub use edges::{
     edge::{Edge, EdgeKind, EdgeOrigin},

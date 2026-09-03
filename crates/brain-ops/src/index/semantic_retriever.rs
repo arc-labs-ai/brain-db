@@ -701,10 +701,7 @@ fn memory_row_passes(
 /// of being pinned to the tail. Default OFF: the non-displacing append is the
 /// proven-non-regressive baseline; this lane is measured before defaulting.
 fn hype_rrf_enabled() -> bool {
-    matches!(
-        std::env::var("BRAIN_HYPE_RRF").ok().as_deref(),
-        Some("1" | "true" | "TRUE" | "on" | "ON")
-    )
+    brain_core::RetrievalTuning::active().hype_rrf
 }
 
 /// Weight of the HyPE-agreement term in the bounded additive boost. Small by
@@ -773,13 +770,11 @@ fn merge_memory_hits(direct: &mut Vec<RankedItem>, hype: Vec<(MemoryId, f32)>, t
     }
 }
 
-/// Env gate for occupancy-scaled `ef_search` (`BRAIN_EF_OCCUPANCY`). Default
-/// OFF — the planner's configured ef is used verbatim.
+/// Deploy-time gate for occupancy-scaled `ef_search`
+/// (`[retrieval] ef_occupancy_scaling`). Default OFF — the planner's
+/// configured ef is used verbatim. Sourced from the parsed config.
 fn ef_occupancy_enabled() -> bool {
-    matches!(
-        std::env::var("BRAIN_EF_OCCUPANCY").ok().as_deref(),
-        Some("1" | "true" | "TRUE" | "on" | "ON")
-    )
+    brain_core::RetrievalTuning::active().ef_occupancy_scaling
 }
 
 /// Scale `ef_search` to the index occupancy for size-invariant recall.

@@ -29,6 +29,21 @@ cache_size = 10000
 batch_window_ms = 5
 model = "bge-small-en-v1.5"
 
+# Deploy-time read-path tuning. All fields default to the baseline shown here;
+# the section may be omitted entirely. Override per the usual env convention,
+# e.g. BRAIN__RETRIEVAL__FUSION_METHOD=relative.
+[retrieval]
+# Rank-fusion strategy: "rrf" (default, score-scale-invariant), "relative",
+# or "zscore".
+fusion_method = "rrf"
+# HyPE joins the semantic lane as its own RRF rank list rather than a
+# non-displacing append.
+hype_rrf = false
+# Scale the memory probe's ef_search by index occupancy.
+ef_occupancy_scaling = false
+# Relative-drop autocut of the ranked result tail.
+autocut = false
+
 [workers]
 decay_interval_sec = 3600
 snapshot_interval_sec = 21600
