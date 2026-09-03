@@ -65,7 +65,11 @@ fn validate_identifier(
             },
         });
     }
-    if s.len() > max {
+    // Bounded by Unicode code points, not bytes, so a multibyte name
+    // (作用于, wirkt_gegen) isn't clipped far below the stated char limit —
+    // matching the predicate-name validator. 64 code points is ≤ 256 bytes,
+    // so it stays within the wire identifier bound.
+    if s.chars().count() > max {
         return Err(RelationTypeOpError::InvalidIdentifier {
             reason: match label {
                 "namespace" => "namespace exceeds 32 chars",

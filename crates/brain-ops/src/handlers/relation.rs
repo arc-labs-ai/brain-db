@@ -847,7 +847,7 @@ fn validate_qname(q: &str) -> Result<(), OpError> {
     }
     if q.len() > QNAME_MAX {
         return Err(OpError::InvalidRequest(format!(
-            "relation_type qname exceeds {QNAME_MAX} chars"
+            "relation_type qname exceeds {QNAME_MAX} bytes"
         )));
     }
     if !q.contains(':') {

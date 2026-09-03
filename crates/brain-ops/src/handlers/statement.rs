@@ -848,7 +848,7 @@ fn validate_predicate_qname(q: &str) -> Result<(), OpError> {
     }
     if q.len() > PREDICATE_QNAME_MAX {
         return Err(OpError::InvalidRequest(format!(
-            "predicate qname exceeds {PREDICATE_QNAME_MAX} chars"
+            "predicate qname exceeds {PREDICATE_QNAME_MAX} bytes"
         )));
     }
     if !q.contains(':') {
