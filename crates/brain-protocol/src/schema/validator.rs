@@ -299,7 +299,7 @@ fn check_type_name(name: &str, item_label: &str, errors: &mut ValidationErrors) 
     } else if name.len() > TYPE_NAME_MAX_LEN {
         errors.push(ValidationError {
             code: ValidationErrorCode::NameTooLong,
-            message: format!("{item_label} name {name:?} exceeds {TYPE_NAME_MAX_LEN} chars"),
+            message: format!("{item_label} name {name:?} exceeds {TYPE_NAME_MAX_LEN} bytes"),
             source_span: None,
         });
     }
@@ -334,7 +334,7 @@ fn check_attribute_decl(attr: &AttributeDecl, owner_label: &str, errors: &mut Va
         errors.push(ValidationError {
             code: ValidationErrorCode::NameTooLong,
             message: format!(
-                "{owner_label}.{}: attribute name exceeds {ATTRIBUTE_NAME_MAX_LEN} chars",
+                "{owner_label}.{}: attribute name exceeds {ATTRIBUTE_NAME_MAX_LEN} bytes",
                 attr.name
             ),
             source_span: None,
