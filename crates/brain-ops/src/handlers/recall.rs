@@ -198,9 +198,22 @@ pub async fn handle_recall(
     // (topical adjacency) lacks. Computed ONCE here and threaded into both the
     // membership ordering and the kind-presence abstention gate, so the two agree
     // on which members genuinely answer.
+    // HyPE questions are stored query-side (embed_query, with the BGE query
+    // prefix — see workers/hype.rs), so the cue must be embedded the SAME way
+    // for the answer-lead cosine to be in-distribution. The plain `cue_vec`
+    // above (correct for passage search + grounding) would score the cue across
+    // a prefix gap against the prefixed question vectors, silently weakening the
+    // answer-lead signal. Embed a prefixed cue just for this probe; fall back to
+    // the plain cue if the prefixed embed fails (array is Copy — `cue_vec` stays
+    // valid for later use).
+    let hype_cue_vec = ctx
+        .executor
+        .embedder
+        .embed_query(&req.cue_text)
+        .unwrap_or(cue_vec);
     let hype_scores: HashMap<u128, f32> = ctx
         .semantic_retriever
-        .hype_scores_for_query(&cue_vec, RECALL_CANDIDATE_POOL as usize)
+        .hype_scores_for_query(&hype_cue_vec, RECALL_CANDIDATE_POOL as usize)
         .into_iter()
         .map(|(id, s)| (id.raw(), s))
         .collect();
