@@ -200,7 +200,15 @@ impl BrainSemanticRetriever {
         // the lane. Done while the read txn + table are still open so the
         // filter reuses one transaction.
         if let Some(hype) = self.hype_index.as_ref() {
-            let raw = hype.read().search(vector, config.top_k).unwrap_or_default();
+            // Thread the planner-escalated ef into the companion probe too —
+            // otherwise it silently falls back to the index default (64) and
+            // can't widen its beam on large/low-selectivity shards the way the
+            // sibling memory probe does. Clamped to the index's ef_search_max
+            // (500), which equals the planner cap, so this never errors.
+            let raw = hype
+                .read()
+                .search_with_ef(vector, config.top_k, Some(config.ef_search))
+                .unwrap_or_default();
             let filtered: Vec<(MemoryId, f32)> = raw
                 .into_iter()
                 .filter(|(id, score)| {
@@ -411,7 +419,15 @@ impl BrainSemanticRetriever {
             let kind_filter = filters.memory_kind.map(memory_kind_to_u8);
             let created_range = filters.created_at_ms.clone();
             let session_filter = filters.session_ids.clone();
-            let raw = hype.read().search(vector, config.top_k).unwrap_or_default();
+            // Thread the planner-escalated ef into the companion probe too —
+            // otherwise it silently falls back to the index default (64) and
+            // can't widen its beam on large/low-selectivity shards the way the
+            // sibling memory probe does. Clamped to the index's ef_search_max
+            // (500), which equals the planner cap, so this never errors.
+            let raw = hype
+                .read()
+                .search_with_ef(vector, config.top_k, Some(config.ef_search))
+                .unwrap_or_default();
             let filtered: Vec<(MemoryId, f32)> = raw
                 .into_iter()
                 .filter(|(id, score)| {
@@ -469,9 +485,14 @@ impl BrainSemanticRetriever {
         // for. Each hit's `StatementId` is mapped back to its evidence memory
         // by the RECALL projector.
         if let Some(bridge) = self.statement_question_index.as_ref() {
+            // Thread the planner-escalated ef into the question-bridge probe
+            // too, matching the primary statement probe above (which already
+            // passes config.ef_search); the default-64 fallback would leave
+            // the bridge unable to widen its beam. Clamped to ef_search_max
+            // (500) = the planner cap, so it never errors.
             let raw = bridge
                 .read()
-                .search(vector, config.top_k)
+                .search_with_ef(vector, config.top_k, Some(config.ef_search))
                 .unwrap_or_default();
             // Retrieval boosting only needs "which statement is relevant", not
             // which slot — the slot is consumed by the separate slot-projection
