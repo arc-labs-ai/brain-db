@@ -255,6 +255,9 @@ impl ArenaFile {
             return Err(ArenaOpenError::FallocateFailed(io::Error::last_os_error()));
         }
 
+        // SAFETY: `fd` is valid (owned by `file`, kept alive past the mmap) and
+        // `file_size` is exactly the length just grown via fallocate above, so
+        // the mapping covers only backed pages.
         let base = unsafe { mmap_rw(fd, file_size)? };
         apply_madvise(base, file_size);
 
@@ -321,6 +324,9 @@ impl ArenaFile {
         })?;
 
         let fd = file.as_raw_fd();
+        // SAFETY: `fd` is valid (owned by `file`, kept alive past the mmap) and
+        // `file_size` is the existing file's length, so the mapping covers only
+        // backed pages.
         let base = unsafe { mmap_rw(fd, file_size)? };
         apply_madvise(base, file_size);
 
