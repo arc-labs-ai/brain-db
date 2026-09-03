@@ -413,8 +413,10 @@ pub struct ShardSpawnConfig {
     pub pin_cpu: Option<usize>,
     /// Root data directory. Per-shard subdir is `<data_dir>/<shard_id>/`.
     pub data_dir: PathBuf,
-    /// Initial arena capacity in slots. The arena grows on demand via
-    /// `ArenaFile::grow_to` (not yet wired).
+    /// Initial arena capacity in slots. The arena is recovery-only (live
+    /// vectors live in redb), so it is populated during WAL replay, which
+    /// grows it on demand via `ArenaFile::grow_to` to fit the whole
+    /// recovered dataset regardless of this initial size.
     pub arena_initial_capacity_slots: u64,
     /// WAL configuration (group commit window, segment size limit, ...).
     pub wal_config: WalConfig,

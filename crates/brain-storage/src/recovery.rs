@@ -29,7 +29,7 @@ use std::path::Path;
 use brain_core::TxnId;
 
 use crate::arena::allocator::SlotAllocator;
-use crate::arena::file::ArenaFile;
+use crate::arena::file::{ArenaFile, ArenaGrowError};
 use crate::arena::slot::{flags, VECTOR_DIM};
 use crate::wal::payload::{
     ConsolidatePayload, EncodePayload, ForgetMode, ForgetPayload, MigrateEmbeddingPayload,
@@ -155,8 +155,13 @@ pub enum RecoveryError {
         source: WalPayloadError,
     },
 
-    #[error("arena slot {idx} out of range (capacity {capacity}) at LSN {lsn}")]
-    ArenaOutOfCapacity { idx: u64, capacity: u64, lsn: u64 },
+    #[error("failed to grow arena to fit slot {idx} at LSN {lsn}: {source}")]
+    ArenaGrow {
+        idx: u64,
+        lsn: u64,
+        #[source]
+        source: ArenaGrowError,
+    },
 
     #[error("vector dimension mismatch at LSN {lsn}: expected {expected}, got {found}")]
     VectorDimMismatch {
@@ -508,7 +513,7 @@ fn write_encoded_slot(
 ) -> Result<(), RecoveryError> {
     let lsn = record.lsn.raw();
     let slot_idx = p.memory_id.slot();
-    check_slot_in_range(arena, slot_idx, lsn)?;
+    ensure_slot_capacity(arena, slot_idx, lsn)?;
     check_vector_dim(&p.vector, lsn)?;
 
     let slot = arena.slot_mut(slot_idx);
@@ -531,7 +536,7 @@ fn mark_slot_tombstoned(
 ) -> Result<(), RecoveryError> {
     let lsn = record.lsn.raw();
     let slot_idx = p.memory_id.slot();
-    check_slot_in_range(arena, slot_idx, lsn)?;
+    ensure_slot_capacity(arena, slot_idx, lsn)?;
     let slot = arena.slot_mut(slot_idx);
     slot.set_flag(flags::TOMBSTONED, true);
     slot.metadata.last_modified_at_unix_nanos = record.timestamp_ns;
@@ -556,7 +561,7 @@ fn reclaim_slot(
     p: &ReclaimPayload,
 ) -> Result<(), RecoveryError> {
     let lsn = record.lsn.raw();
-    check_slot_in_range(arena, p.slot_id, lsn)?;
+    ensure_slot_capacity(arena, p.slot_id, lsn)?;
     let slot = arena.slot_mut(p.slot_id);
     slot.metadata.slot_version = p.new_version;
     slot.metadata.flags = 0;
@@ -572,7 +577,7 @@ fn write_consolidated_slot(
 ) -> Result<(), RecoveryError> {
     let lsn = record.lsn.raw();
     let slot_idx = p.new_memory_id.slot();
-    check_slot_in_range(arena, slot_idx, lsn)?;
+    ensure_slot_capacity(arena, slot_idx, lsn)?;
     check_vector_dim(&p.vector, lsn)?;
 
     let slot = arena.slot_mut(slot_idx);
@@ -595,7 +600,7 @@ fn migrate_slot_vector(
 ) -> Result<(), RecoveryError> {
     let lsn = record.lsn.raw();
     let slot_idx = p.memory_id.slot();
-    check_slot_in_range(arena, slot_idx, lsn)?;
+    ensure_slot_capacity(arena, slot_idx, lsn)?;
     check_vector_dim(&p.new_vector, lsn)?;
     let slot = arena.slot_mut(slot_idx);
     if !p.new_vector.is_empty() {
@@ -607,15 +612,36 @@ fn migrate_slot_vector(
     Ok(())
 }
 
-fn check_slot_in_range(arena: &ArenaFile, slot_idx: u64, lsn: u64) -> Result<(), RecoveryError> {
-    if slot_idx >= arena.capacity_slots() {
-        return Err(RecoveryError::ArenaOutOfCapacity {
-            idx: slot_idx,
-            capacity: arena.capacity_slots(),
-            lsn,
-        });
+/// Ensure the arena can address `slot_idx`, growing it on demand if not.
+///
+/// The arena is populated only during recovery (live writes keep vectors in
+/// redb), so on the first restart it opens at its small initial capacity and
+/// this is where it must expand to fit the whole replayed dataset. Without
+/// this a shard that ever wrote more memories than the initial slot count
+/// could never recover. Capacity is doubled until `slot_idx` is addressable
+/// (amortized: `O(log n)` grows over the run, each an `mremap`), matching the
+/// "grows on demand via `ArenaFile::grow_to`" contract the arena was built
+/// for.
+fn ensure_slot_capacity(
+    arena: &mut ArenaFile,
+    slot_idx: u64,
+    lsn: u64,
+) -> Result<(), RecoveryError> {
+    let needed = slot_idx.saturating_add(1);
+    if needed <= arena.capacity_slots() {
+        return Ok(());
     }
-    Ok(())
+    let mut target = arena.capacity_slots().max(1);
+    while target < needed {
+        target = target.saturating_mul(2);
+    }
+    arena
+        .grow_to(target)
+        .map_err(|source| RecoveryError::ArenaGrow {
+            idx: slot_idx,
+            lsn,
+            source,
+        })
 }
 
 fn check_vector_dim(vector: &[f32], lsn: u64) -> Result<(), RecoveryError> {
@@ -1184,10 +1210,13 @@ mod tests {
     }
 
     #[test]
-    fn out_of_range_slot_errors() {
+    fn out_of_range_slot_grows_arena_to_fit() {
         let dir = tempfile::tempdir().unwrap();
         let wal_dir = fresh_wal_dir(&dir);
-        // Encode with slot=9999 against a 16-slot arena.
+        // Encode with slot=9999 against a 16-slot arena. The arena is
+        // recovery-only, so this is the first time it's populated; recovery
+        // must grow it to fit rather than refuse (a shard that ever wrote
+        // more than the initial slot count would otherwise be unrecoverable).
         let mut rec = encode_record(0);
         let WalPayload::Encode(mut payload) = rec.typed_payload().unwrap() else {
             unreachable!()
@@ -1204,14 +1233,21 @@ mod tests {
 
         let mut arena = fresh_arena(&dir, 16);
         let mut sink = InMemoryMetadataSink::new();
-        let err = recover(&mut arena, &wal_dir, uuid(1), &mut sink).unwrap_err();
-        match err {
-            RecoveryError::ArenaOutOfCapacity { idx, capacity, .. } => {
-                assert_eq!(idx, 9999);
-                assert_eq!(capacity, 16);
-            }
-            other => panic!("expected ArenaOutOfCapacity, got {other:?}"),
-        }
+        let (report, _alloc) = recover(&mut arena, &wal_dir, uuid(1), &mut sink).unwrap();
+
+        assert_eq!(report.records_replayed, 1);
+        // Grew by doubling from 16 until slot 9999 (needs capacity ≥ 10000)
+        // was addressable: 16 → … → 16384.
+        assert!(
+            arena.capacity_slots() >= 10000,
+            "arena should have grown to fit slot 9999, got {}",
+            arena.capacity_slots()
+        );
+        assert_eq!(arena.capacity_slots(), 16384);
+        // The replayed slot is live with the right version.
+        let slot = arena.slot(9999);
+        assert_eq!(slot.metadata.flags & flags::OCCUPIED, flags::OCCUPIED);
+        assert_eq!(slot.metadata.slot_version, 1);
     }
 
     // ----- typed-graph -----------------------------------------------
