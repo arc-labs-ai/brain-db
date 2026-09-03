@@ -289,8 +289,8 @@ pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> 
 
         // Statement supersession rides the PhaseBody envelope; the new
         // statement is fully built (predicate resolved) so its row is
-        // carried inline. Relation supersession falls through to the
-        // None group below — not WAL-mapped yet.
+        // carried inline. (Relation supersession is WAL-mapped by its own
+        // first-class RelationSupersede arm below.)
         Phase::Supersede {
             target: SupersedeTarget::Statement(old_id),
             replacement: SupersedeReplacement::Statement(new_statement),

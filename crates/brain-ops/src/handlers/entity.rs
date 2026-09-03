@@ -781,15 +781,16 @@ pub async fn handle_entity_list(
 }
 
 // ---------------------------------------------------------------------------
-// ENTITY_RESOLVE (tiers 1+2 only — tier 3 / 4 deferred until
-// the entity HNSW + LLM backends are wired into the shard runtime)
+// ENTITY_RESOLVE — tiers 1 (exact/alias), 2 (trigram fuzzy), 3 (embedding
+// HNSW tie-break), and 5 (create fallback under allow_create). Tier 4 (LLM
+// disambiguation) is the extraction resolver's, not this wire path's.
 // ---------------------------------------------------------------------------
 //
-// Wire ENTITY_RESOLVE is a read operation: it returns the wire's richer
-// outcome surface (Resolved | Ambiguous | NotFound) without mutating state.
-// The writer-side `Phase::Resolve` is intentionally separate — it serves
-// the extractor pipeline's resolve-or-create primitive (always succeeds,
-// auto-aliases the surface form into the matched entity).
+// Wire ENTITY_RESOLVE returns the wire outcome surface (Resolved | Ambiguous |
+// Created | NotFound). It is read-only except tier 5, which mints a new entity
+// via a Phase::UpsertEntity write when allow_create is set and no tier matched.
+// The extractor pipeline runs its own resolve-or-create primitive
+// (resolve_or_create_with_deps) separately.
 
 pub async fn handle_entity_resolve(
     req: EntityResolveRequest,
