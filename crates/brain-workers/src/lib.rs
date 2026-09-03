@@ -21,7 +21,6 @@
 
 pub mod config;
 pub mod context;
-pub mod env;
 pub mod error;
 pub mod metrics;
 pub mod scheduler;
@@ -31,7 +30,6 @@ pub mod workers;
 
 pub use config::{WorkerConfig, WorkerKind};
 pub use context::WorkerContext;
-pub use env::{parse_enabled, parse_interval_override, parse_positive_seconds};
 pub use error::WorkerError;
 pub use metrics::{MetricsSnapshot, WorkerMetrics};
 pub use scheduler::{WorkerHandle, WorkerScheduler};

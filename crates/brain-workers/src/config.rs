@@ -28,8 +28,8 @@ pub enum WorkerKind {
     SupersessionSweeper,
     /// Physically reclaims retracted statement rows (and their
     /// secondary-index + evidence-overflow entries) once the retract
-    /// grace period elapses. **Off by default** — operators opt in via
-    /// `BRAIN_STATEMENT_RECLAIM_ENABLED`. Closes the
+    /// grace period elapses. **Off by default** — enabled via the
+    /// worker's `[workers.<w>].enabled` TOML knob (C2). Closes the
     /// tombstone-grace-then-reclaim loop on the statement side, the way
     /// slot reclamation does for memories.
     StatementReclaim,
