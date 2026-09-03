@@ -357,9 +357,22 @@ async fn handle_link_in_txn(
             .map_err(|e| {
                 OpError::ExecError(brain_planner::ExecError::MetadataReadFailed(e.to_string()))
             })?;
-        let s = table.get(source.to_be_bytes()).ok().flatten().is_some();
-        let t = table.get(target.to_be_bytes()).ok().flatten().is_some();
-        (s, t)
+        // Scope the existence probe: a foreign-tenant id must read as absent,
+        // not present, so this in-txn preview can't be used as a cross-tenant
+        // existence oracle. (The link mutation is already walled at apply time
+        // — apply/edge.rs checks both endpoints' space — this closes the probe.)
+        let in_scope = |id: MemoryId| {
+            table
+                .get(id.to_be_bytes())
+                .ok()
+                .flatten()
+                .map(|g| g.value())
+                .is_some_and(|row| {
+                    row.namespace_id == ctx.executor.caller_namespace.raw()
+                        && row.space_id_bytes == <[u8; 16]>::from(ctx.executor.caller_space)
+                })
+        };
+        (in_scope(source), in_scope(target))
     };
     let (src_pending, tgt_pending) =
         ctx.txn_store

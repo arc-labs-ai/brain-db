@@ -305,7 +305,18 @@ async fn handle_forget_in_txn(
                 .map_err(|e| {
                     OpError::ExecError(brain_planner::ExecError::MetadataReadFailed(e.to_string()))
                 })?;
-            table.get(memory_id.to_be_bytes()).ok().flatten().is_some()
+            // Scope the existence probe: a foreign-tenant id reads as absent so
+            // this in-txn preview can't be a cross-tenant existence oracle (the
+            // forget itself is scope-walled at apply time; this closes the probe).
+            table
+                .get(memory_id.to_be_bytes())
+                .ok()
+                .flatten()
+                .map(|g| g.value())
+                .is_some_and(|row| {
+                    row.namespace_id == ctx.executor.caller_namespace.raw()
+                        && row.space_id_bytes == <[u8; 16]>::from(ctx.executor.caller_space)
+                })
         };
 
         let (pending, tombstoned) =
