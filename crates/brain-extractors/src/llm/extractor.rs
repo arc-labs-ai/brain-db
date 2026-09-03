@@ -1521,7 +1521,7 @@ impl Extractor for LlmExtractor {
                                 // The first call already billed real provider
                                 // spend; carry it onto the failure so the
                                 // worker's per-cycle budget gate counts it
-                                // (§21: both calls counted in cost_micro_usd).
+                                // (both calls counted in cost_micro_usd).
                                 return ExtractionResult::failure(
                                     llm_error_reason(&e),
                                     started,
@@ -1544,7 +1544,7 @@ impl Extractor for LlmExtractor {
                                 // help, so it's permanent (terminal, no retry loop).
                                 // Both calls billed real spend; carry the summed
                                 // cost onto the failure so the worker's per-cycle
-                                // budget gate counts it (§21: both calls counted
+                                // budget gate counts it (both calls counted
                                 // in cost_micro_usd) — else a malformed prompt
                                 // burns two API calls every cycle unbounded.
                                 return ExtractionResult::failure(

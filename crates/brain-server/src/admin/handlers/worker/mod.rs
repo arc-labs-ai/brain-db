@@ -17,7 +17,7 @@ pub use control::control;
 pub use list::list;
 
 /// C0 always-on workers: the write/read-coherence and correctness set
-/// that must never be pausable. Per CLAUDE.md §4, extraction (and the
+/// that must never be pausable: extraction (and the
 /// downstream typed-graph correctness workers it feeds) is C0 — a
 /// graph-populating step that cannot be toggled at deploy time or at
 /// runtime without silently breaking graph-backed reads. Control

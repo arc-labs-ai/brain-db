@@ -23,8 +23,7 @@
 //!   real, live-today implementation. This handler exists only to
 //!   satisfy the shared `brain-ops` dispatch surface and shares its
 //!   filter parsing (`ParsedFilter`) with the real path; it is not
-//!   itself reachable from a real client connection. See
-//!   `spec/05_operations/05_subscribe.md` §21 for the full picture.
+//!   itself reachable from a real client connection.
 //! - **Backpressure**: a lagged subscriber returns
 //!   [`broadcast::error::RecvError::Lagged`], which is surfaced as
 //!   `OpError::Overloaded` from the dispatcher path; the registry's
@@ -899,7 +898,7 @@ impl SubscriptionRegistry {
         if req.from_lsn.is_some() || req.include_history {
             // This one-shot poller only tails live events; it has no
             // WAL-replay machinery (that lives in the connection-layer
-            // path, see the module doc §21). Both `from_lsn` (resume)
+            // path, see the module doc). Both `from_lsn` (resume)
             // and `include_history` (replay retained history) ask for
             // history, so reject them here rather than silently
             // ignoring the flag and returning live-only events. We

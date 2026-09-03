@@ -12,7 +12,7 @@
 //! driven by the real `ShardSnapshotSource` in brain-server), giving a
 //! fast memory-index cold-start. What is NOT yet wired is full-shard
 //! snapshot orchestration — the arena + metadata-redb + WAL-tail reflink
-//! bundle and its `manifest.json` (see spec/08_storage/06_snapshots.md),
+//! bundle and its `manifest.json`,
 //! and therefore the checkpoint-then-copy sequencing.
 //!
 //! The worker ships the **shape + retention policy** as a pluggable seam

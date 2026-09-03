@@ -1341,7 +1341,7 @@ mod tests {
     }
 
     // ===================================================================
-    // Rollover stress / chaos (§19.01 recovery + durability).
+    // Rollover stress / chaos: recovery + durability under segment rollover.
     //
     // These push the segment-rollover concurrency fix hard: many
     // concurrent appenders on one Glommio executor, segment caps tiny

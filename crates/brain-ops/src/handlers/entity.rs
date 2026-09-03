@@ -46,8 +46,7 @@ use crate::write::{Phase, PhaseAck, TombstoneTarget, Write, WriteId};
 // Default grace window for ENTITY_MERGE — 7 days.
 const DEFAULT_MERGE_GRACE_SECS: u64 = 7 * 24 * 60 * 60;
 
-/// Resolver tier-3 (embedding) tunables. Spec defaults
-/// (`spec/11_extractors/03_resolver.md`): search the entity HNSW for the top-5
+/// Resolver tier-3 (embedding) tunables: search the entity HNSW for the top-5
 /// nearest and resolve to a unique candidate whose cosine clears 0.78.
 const EMBEDDING_TOP_K: usize = 5;
 const EMBEDDING_THRESHOLD: f32 = 0.78;

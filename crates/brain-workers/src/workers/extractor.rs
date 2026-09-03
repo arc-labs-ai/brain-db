@@ -1167,8 +1167,8 @@ async fn drain_batch(
             _ => None,
         };
 
-    // Extraction and HyPE are independent, unordered async stages (spec
-    // §05/17a). `build_neighborhood` resolves the entities a memory mentions
+    // Extraction and HyPE are independent, unordered async stages.
+    // `build_neighborhood` resolves the entities a memory mentions
     // against the *persisted* registry, not this batch's just-written graph,
     // so HyPE needs only the memory text — it does not depend on extraction's
     // output. Run the two LLM round-trips CONCURRENTLY instead of
@@ -1255,7 +1255,7 @@ async fn run_hype_pass(worker: &ExtractorWorker, ctx: &WorkerContext, items: &[E
         return;
     };
     let cycle_budget = worker.knobs.llm_budget_per_cycle_micro_usd;
-    // Per-memory HyPE generation is independent (spec §05/17a): fan the LLM
+    // Per-memory HyPE generation is independent: fan the LLM
     // calls out concurrently so a whole micro-batch costs ~one round-trip
     // instead of N serial ones. Every future runs on this single glommio task
     // and interleaves only at await points — the network round-trips overlap
@@ -3434,7 +3434,7 @@ fn run_apply_body(
                         "apply: statement kind/time",
                     );
 
-                    // Axis-faithful entity-object routing (spec §02 data model).
+                    // Axis-faithful entity-object routing per the data model.
                     // `StatementObject::Entity` is a first-class statement object:
                     // `manages`, `is_a`, `met_with`, `traveled_to` are entity-object
                     // *statements*, read from the subject. Only a `kind=Relation`

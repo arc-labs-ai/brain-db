@@ -3448,7 +3448,7 @@ fn project_memory_results(
         // down, so a fused hit could otherwise carry a foreign-tenant OR
         // foreign-space memory into the answer. Re-check the row's own owner
         // scope here — both halves — so no lane can leak across the namespace or
-        // the space boundary (spec §20: space is a hard wall, and every
+        // the space boundary (space is a hard tenant wall, and every
         // id-keyed read re-verifies `(namespace_id, space_id)`).
         if row.namespace_id != ctx.executor.caller_namespace.raw() {
             continue;

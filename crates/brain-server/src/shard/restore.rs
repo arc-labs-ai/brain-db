@@ -12,7 +12,7 @@
 //! the HNSW from the restored arena.
 //!
 //! Restore is same-shard only: the bundle's `shard_uuid` must equal the
-//! target shard's UUID (spec §08/06 §7). Every bundle file is BLAKE3-
+//! target shard's UUID. Every bundle file is BLAKE3-
 //! verified against the manifest before anything is overwritten, so a
 //! corrupt bundle is rejected before the live data dir is touched.
 
