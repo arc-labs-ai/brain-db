@@ -1756,7 +1756,11 @@ fn build_neighborhood(ctx: &WorkerContext, scope: brain_metadata::RowScope, text
 /// phrase ("brain:works_at" -> "works at") so the HyPE prompt reads naturally.
 /// This is prompt rendering only — not a matching heuristic.
 fn humanize_qname(qname: &str) -> String {
-    let name = qname.split(':').next_back().unwrap_or(qname);
+    // First-colon split (`namespace:rest`), consistent with every other qname
+    // parse site — a qname is `namespace:name` where `name` is a colon-free
+    // identifier, so this equals last-segment for well-formed input and is
+    // consistent (not divergent) for anything malformed.
+    let name = qname.split_once(':').map_or(qname, |(_, n)| n);
     name.replace('_', " ")
 }
 
