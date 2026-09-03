@@ -45,9 +45,8 @@ pub use list::{
     StatementPageExtra, DEFAULT_LIST_LIMIT,
 };
 pub use supersede::{
-    statement_create_with_decision, statement_supersede, JudgeError, JudgeFuture, JudgeVerdict,
-    StatementJudge, StatementSimilarityCandidate, StatementSimilaritySource, SupersedeDecision,
-    TieredSupersedeDecider, TieredThresholds,
+    statement_supersede, JudgeError, JudgeFuture, JudgeVerdict, StatementJudge,
+    StatementSimilarityCandidate, StatementSimilaritySource,
 };
 pub use tombstone::{statement_retract, statement_tombstone};
 
