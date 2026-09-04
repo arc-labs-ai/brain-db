@@ -4225,12 +4225,34 @@ const CANDIDATE_PREDICATE_K: usize = 20;
 /// `is_declared` is intentionally ignored: BOTH declared and open-vocab
 /// existing predicates are valid reuse targets — the goal is convergence on
 /// whatever name already exists, not schema enforcement.
+/// Epsilon grid for candidate-cosine ranking. Cosines within one step are
+/// treated as tied so float noise doesn't reshuffle the block across cycles.
+const CANDIDATE_TIE_EPS: f32 = 1e-6;
+
+/// Total-order comparator for candidate ranking: higher cosine first (quantized
+/// to [`CANDIDATE_TIE_EPS`] so sub-epsilon noise collapses to one bucket), ties
+/// broken by the older (lower) predicate id.
+///
+/// This MUST be a total order. The previous form was an epsilon *band*
+/// (`|a-b| <= eps ? by-id : by-score`), which is non-transitive — `a ~ b` and
+/// `b ~ c` yet `a !~ c` — so `slice::sort_by` panics with "comparison function
+/// does not correctly implement a total order" and takes the shard down.
+/// Quantizing both scores to the same integer grid restores transitivity.
+/// NaN cannot reach here: callers filter to `sim > 0.0` first.
+fn candidate_cmp(
+    a: (f32, brain_core::PredicateId),
+    b: (f32, brain_core::PredicateId),
+) -> std::cmp::Ordering {
+    let qa = (a.0 / CANDIDATE_TIE_EPS).round() as i64;
+    let qb = (b.0 / CANDIDATE_TIE_EPS).round() as i64;
+    qb.cmp(&qa).then_with(|| a.1.cmp(&b.1))
+}
+
 fn select_candidate_predicates(
     query: &[f32],
     candidates: &[brain_metadata::schema::predicate::PredicateConsolidationCandidate],
     k: usize,
 ) -> Vec<String> {
-    const TIE_EPS: f32 = 1e-6;
     let mut scored: Vec<(f32, brain_core::PredicateId, &str)> = candidates
         .iter()
         .filter(|(_, name, _, _)| !name.starts_with("behavior_"))
@@ -4243,15 +4265,7 @@ fn select_candidate_predicates(
             }
         })
         .collect();
-    scored.sort_by(|a, b| {
-        // Higher cosine first; within an epsilon the older (lower) id wins so
-        // the block is deterministic across cycles.
-        if (a.0 - b.0).abs() <= TIE_EPS {
-            a.1.cmp(&b.1)
-        } else {
-            b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
-        }
-    });
+    scored.sort_by(|a, b| candidate_cmp((a.0, a.1), (b.0, b.1)));
     scored
         .into_iter()
         .take(k)
@@ -5373,6 +5387,43 @@ enum ApplyError {
 
 #[cfg(test)]
 mod tests {
+    /// `candidate_cmp` must be a TOTAL order: `slice::sort_by` panics on any
+    /// comparator that isn't ("comparison function does not correctly implement
+    /// a total order"), which previously crashed the whole shard. The prior
+    /// epsilon-*band* form is non-transitive, so an epsilon-chain of scores
+    /// (each neighbour within TIE_EPS, endpoints far apart) trips the panic.
+    /// This builds such a chain, shuffles it, and sorts — it must not panic and
+    /// must come out consistently ordered.
+    #[test]
+    fn candidate_cmp_is_a_total_order_on_an_epsilon_chain() {
+        // 200 scores stepping by 0.6 * TIE_EPS: each adjacent pair is within
+        // one epsilon (a "tie"), but far-apart pairs are many epsilons apart.
+        let step = super::CANDIDATE_TIE_EPS * 0.6;
+        let mut v: Vec<(f32, PredicateId)> = (0..200u32)
+            .map(|i| (0.5 + i as f32 * step, PredicateId::from(200 - i)))
+            .collect();
+        // Interleave so the input isn't already sorted (forces real comparisons).
+        v.rotate_left(97);
+        for i in (0..v.len()).step_by(3) {
+            if i + 1 < v.len() {
+                v.swap(i, i + 1);
+            }
+        }
+        // Under the old band comparator this panics; with the quantized total
+        // order it sorts cleanly.
+        v.sort_by(|a, b| super::candidate_cmp(*a, *b));
+
+        // Sanity: non-increasing on the quantized score, ties by ascending id.
+        for w in v.windows(2) {
+            let qa = (w[0].0 / super::CANDIDATE_TIE_EPS).round() as i64;
+            let qb = (w[1].0 / super::CANDIDATE_TIE_EPS).round() as i64;
+            assert!(qa >= qb, "quantized score must be non-increasing");
+            if qa == qb {
+                assert!(w[0].1 <= w[1].1, "within a bucket, id must ascend");
+            }
+        }
+    }
+
     fn __ts() -> brain_metadata::RowScope {
         brain_metadata::RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xA1; 16])
     }
