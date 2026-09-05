@@ -326,8 +326,6 @@ Work that isn't done yet. Kept flat on purpose — no milestone tags, no version
 ### Planned improvements
 
 - **Per-statement-kind retention policies.** Retention today is decay-based per-kind; explicit policies (e.g. per-namespace TTL) are planned.
-- **`SCHEMA_DROP` opcode.** In-place schema downgrade — today's revert is a manual runbook step.
-- **FORGET-cascade audit rows + soft-cascade revert.** The queryable audit log records per-call extraction and per-mention resolution derivations (`GET /v1/audit`); a dedicated audit of *cascaded* FORGET writes plus a revert path is still planned.
 - **Per-row stale-extraction flag.** Stale (schema-version-behind) statements are counted via a metric today; a durable per-row flag needs a row-schema bump.
 - **Streaming retrieval query results.** `limit > 100` would stream across multiple `QueryResponse` frames — today's response is single-frame.
 - **Retrieval + transactional read-your-writes, richer lensing.** RECALL inside a transaction already overlays pending writes on committed data; deeper lens layering across statements + relations is planned.
