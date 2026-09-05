@@ -92,7 +92,7 @@ TRAVERSE numbers assume default `max_branching_factor = 1000` per [`../13_retrie
 
 ### 2.5 typed graph — deferred targets
 
-- **ENTITY_RESOLVE (tier 3 — embedding HNSW)** lands when the entity HNSW is wired into the resolver. Target placeholder per the phase-16 doc: p50 ≤ 5 ms at 100K, ≤ 50 ms at 1M. Final numbers set here.
+- **ENTITY_RESOLVE (tier 3 — embedding HNSW)** is wired into the resolver (embed-on-create + top-k entity-HNSW search under a scope+type filter); what remains is the reference-hardware measurement, like every other §19.02 target. Target per the phase-16 doc: p50 ≤ 5 ms at 100K, ≤ 50 ms at 1M — final numbers captured on reference hardware.
 - **ENTITY_RESOLVE (tier 4 — LLM)** lands here with the LLM extractor. Latency is gated by the model + cache hit-rate; target is "tail under 1 s with cache warm, queued under 5 s cold."
 - **Statement HNSW semantic search** — gated on the embedding worker populating the HNSW. Brain writes / reads the table inline; the semantic-search target lands with the worker.
 - **Cross-shard RELATION_TRAVERSE** — gated on the query router. Brain ships same-shard only.
