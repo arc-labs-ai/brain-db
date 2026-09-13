@@ -11,11 +11,14 @@ on:
 permissions:
   contents: read
 
-# Cancel a stale run when a newer commit lands on the same branch/PR —
-# no point finishing a CI run for a diff that's already superseded.
+# Cancel a stale PR run when a newer commit lands — no point finishing CI for a
+# diff that's already superseded. Pushes to the release branches (main, dev) are
+# NOT cancelled: a rapid burst of pushes during release prep would otherwise kill
+# each in-flight run before it finishes, so CI never reaches green even though
+# nothing is broken. Those runs must complete.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
