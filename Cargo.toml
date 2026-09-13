@@ -30,6 +30,11 @@ version = "0.1.0" # x-release-please-version
 rust-version = "1.95"
 license = "Apache-2.0"
 repository = "https://github.com/arc-labs-ai/brain-db"
+# This repo ships the server (as a git tag + Docker image), not crates.io
+# packages — the SDKs live in sibling repos. Gate every member crate against an
+# accidental `cargo publish`; flip a specific crate's inherited value if one is
+# ever intended for crates.io.
+publish = false
 
 # Centralize dependency versions here. Crates inherit with `dep.workspace = true`.
 [workspace.dependencies]

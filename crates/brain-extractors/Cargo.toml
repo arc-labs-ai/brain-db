@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+publish.workspace = true
 description = "Extractor framework (pattern / classifier / llm) for the Brain knowledge layer."
 
 [dependencies]

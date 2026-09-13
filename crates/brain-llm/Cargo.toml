@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+publish.workspace = true
 description = "LLM transport clients (Anthropic, OpenAI) for Brain's LLM extractor tier."
 
 [dependencies]
