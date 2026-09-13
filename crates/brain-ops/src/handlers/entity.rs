@@ -51,6 +51,18 @@ const DEFAULT_MERGE_GRACE_SECS: u64 = 7 * 24 * 60 * 60;
 const EMBEDDING_TOP_K: usize = 5;
 const EMBEDDING_THRESHOLD: f32 = 0.78;
 
+/// Lexical corroboration floor for a tier-3 embedding hit. Raw name embeddings
+/// are noisy — two unrelated short names ("Zelda", "Alice") sit close enough in
+/// BGE space to clear the cosine floor, which would silently alias distinct
+/// entities. Neither signal alone is trusted: an embedding hit only resolves if
+/// the candidate also shares this much trigram-Jaccard with the matched entity's
+/// name/aliases. That admits misspellings and variants (moderate overlap on both
+/// axes) while rejecting semantically-near-but-lexically-disjoint names (which
+/// score ~0 here and fall through to NotFound / create-fallback). The floor sits
+/// well below tier-2's standalone 0.85 bar because it is corroboration, not a
+/// standalone match.
+const EMBEDDING_LEXICAL_CORROBORATION: f32 = 0.3;
+
 /// Whether `id`'s primary row belongs to the caller's `(namespace,
 /// space)` scope. The brain-core [`Entity`] returned by `entity_get`
 /// drops the scope (brain-core has no slot for it), so the tenant wall
@@ -1059,6 +1071,8 @@ async fn resolve_via_embedding(
     let caller_ns = ctx.executor.caller_namespace.raw();
     let caller_space = <[u8; 16]>::from(ctx.executor.caller_space);
     let type_hint = req.entity_type_hint; // 0 == no hint (accept any type)
+    let candidate_norm = normalize_name(&req.candidate_name);
+    let candidate_trigrams = extract_trigrams(&candidate_norm);
     let rtxn = ctx
         .executor
         .metadata
@@ -1074,11 +1088,23 @@ async fn resolve_via_embedding(
         };
         let scope_ok = ns == caller_ns && space == caller_space;
         let type_ok = type_hint == 0 || ty == type_hint;
-        if scope_ok && type_ok {
-            in_band.push((id, score));
-            if in_band.len() == EMBEDDING_TOP_K {
-                break;
-            }
+        if !(scope_ok && type_ok) {
+            continue;
+        }
+        // Lexical corroboration: a raw-embedding hit alone aliases unrelated
+        // short names, so require the candidate to also share trigrams with the
+        // matched entity's surface forms. Missing row → fail-closed (drop).
+        let Some(cand_entity) = entity_get(&rtxn, id).map_err(OpError::from)? else {
+            continue;
+        };
+        let cand_trigrams =
+            trigrams_of_components(&cand_entity.canonical_name, &cand_entity.aliases);
+        if jaccard(&candidate_trigrams, &cand_trigrams) < EMBEDDING_LEXICAL_CORROBORATION {
+            continue;
+        }
+        in_band.push((id, score));
+        if in_band.len() == EMBEDDING_TOP_K {
+            break;
         }
     }
     drop(rtxn);
