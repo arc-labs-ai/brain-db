@@ -189,7 +189,6 @@ pub mod tombstone_reason {
 /// Mirrors `brain_core::EvidenceEntry`; uses `confidence_milli`
 /// (u16) so the rkyv-archived shape is fixed-width and cache-friendly.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct EvidenceEntryRow {
     pub memory_id_bytes: [u8; 16],
     pub confidence_milli: u16,
@@ -229,7 +228,6 @@ impl EvidenceEntryRow {
 /// empty. Stable byte layout so readers can skim past the payload
 /// without a full deserialize when only the discriminant matters.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 struct StatementValueBlob {
     /// `1=Text / 2=Integer / 3=Float / 4=Bool / 5=UnixNanos / 6=Blob`.
     discriminant: u8,
@@ -302,7 +300,6 @@ impl StatementValueBlob {
 /// - `3` = `Memory(MemoryId)` — payload in `memory_bytes`.
 /// - `4` = `Statement(StatementId)` — payload in `statement_bytes`.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 struct StatementObjectBlob {
     discriminant: u8,
     entity_bytes: [u8; 16],
@@ -367,7 +364,7 @@ impl StatementObjectBlob {
 #[must_use]
 pub fn encode_object(o: &StatementObject) -> Vec<u8> {
     let blob = StatementObjectBlob::from_object(o);
-    rkyv::to_bytes::<_, 256>(&blob)
+    rkyv::to_bytes::<rkyv::rancor::Error>(&blob)
         .expect("StatementObjectBlob is rkyv-serializable")
         .into_vec()
 }
@@ -377,9 +374,10 @@ pub fn encode_object(o: &StatementObject) -> Vec<u8> {
 /// out of range — caller surfaces as `Storage` corruption.
 #[must_use]
 pub fn decode_object(bytes: &[u8]) -> Option<StatementObject> {
-    let mut aligned = rkyv::AlignedVec::with_capacity(bytes.len());
+    let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(bytes.len());
     aligned.extend_from_slice(bytes);
-    let blob: StatementObjectBlob = rkyv::from_bytes::<StatementObjectBlob>(&aligned).ok()?;
+    let blob: StatementObjectBlob =
+        rkyv::from_bytes::<StatementObjectBlob, rkyv::rancor::Error>(&aligned).ok()?;
     blob.to_object()
 }
 
@@ -398,7 +396,6 @@ pub fn confidence_bucket(c: f32) -> u8 {
 /// Primary statement record. Carries every schema field in
 /// rkyv-archived form.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct StatementMetadata {
     pub statement_id_bytes: [u8; 16],
     /// Owning namespace (tenant) — the outer half of the
@@ -568,7 +565,6 @@ impl_redb_rkyv_value!(StatementMetadata, "brain_metadata::StatementMetadata");
 /// `INLINE_EVIDENCE_CAP = 8` inline budget. Four parallel vectors per
 /// — one entry across all = one `EvidenceEntry`.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct EvidenceOverflow {
     pub overflow_id_bytes: [u8; 16],
     pub memory_ids: Vec<[u8; 16]>,

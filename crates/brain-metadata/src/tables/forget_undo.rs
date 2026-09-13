@@ -73,7 +73,6 @@ pub mod outcome {
 /// `dropped_memory_id_bytes` is meaningful (relation evidence carries no
 /// per-entry confidence / extractor), and the other three are zero.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct ForgetUndoRecord {
     /// [`record_kind`] discriminant — statement vs relation.
     pub record_kind: u8,

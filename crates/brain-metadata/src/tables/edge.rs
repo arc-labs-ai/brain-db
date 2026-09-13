@@ -97,7 +97,6 @@ pub mod derived_by {
 
 /// Per-edge metadata stored in both the forward and reverse tables.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct EdgeData {
     pub weight: f32,
     pub origin: u8,
@@ -131,9 +130,9 @@ impl redb::Value for EdgeData {
     where
         Self: 'a,
     {
-        let mut buf = rkyv::AlignedVec::with_capacity(data.len());
+        let mut buf = rkyv::util::AlignedVec::<16>::with_capacity(data.len());
         buf.extend_from_slice(data);
-        rkyv::from_bytes::<EdgeData>(&buf)
+        rkyv::from_bytes::<EdgeData, rkyv::rancor::Error>(&buf)
             .expect("EdgeData bytes failed rkyv validation; redb file is corrupt")
     }
 
@@ -142,7 +141,7 @@ impl redb::Value for EdgeData {
         Self: 'a,
         Self: 'b,
     {
-        rkyv::to_bytes::<_, 256>(value)
+        rkyv::to_bytes::<rkyv::rancor::Error>(value)
             .expect("EdgeData is rkyv-serializable")
             .into_vec()
     }

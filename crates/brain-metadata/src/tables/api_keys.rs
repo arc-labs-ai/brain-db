@@ -56,7 +56,6 @@ pub mod permissions {
 /// here; `key_hash` is the BLAKE3 of the secret bytes that the holder
 /// presents on AUTH.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq, Eq)]
-#[archive(check_bytes)]
 pub struct ApiKeyRow {
     /// BLAKE3 of the raw secret. Also the primary key — duplicated in
     /// the value so range scans don't need a join.

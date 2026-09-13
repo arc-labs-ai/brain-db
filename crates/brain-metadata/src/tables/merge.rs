@@ -64,7 +64,6 @@ pub mod conflict_outcome {
 /// attribute values). The merge path treats these as opaque bytes; the
 /// schema validator gets typed access.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct AttributeConflictRecord {
     pub attribute_key: String,
     pub survivor_value_blob: Vec<u8>,
@@ -87,7 +86,6 @@ pub struct AttributeConflictRecord {
 /// row `version`; `old_version` / `new_version` capture that so unmerge
 /// restores the exact prior value and rewrites the chain-table key back.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct StatementReroute {
     pub statement_id_bytes: [u8; 16],
     /// `1` iff the subject was re-pointed merged → survivor.
@@ -109,7 +107,6 @@ pub struct StatementReroute {
 /// survivor-side edge rows and relink the original merged-side ones
 /// exactly, without recomputing symmetric canonicalisation.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct RelationReroute {
     pub relation_id_bytes: [u8; 16],
     pub old_from_bytes: [u8; 16],
@@ -132,7 +129,6 @@ pub struct RelationReroute {
 /// `statements_rerouted` / `relations_rerouted` count re-routed graph
 /// rows; the id lists themselves live in the overflow table.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct MergeRecord {
     pub merge_id_bytes: [u8; 16],
     pub survivor_bytes: [u8; 16],
@@ -270,7 +266,6 @@ impl MergeRecord {
 /// to a few thousand re-routed ids; redb's per-value 1 MiB cap drives
 /// the chunking.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct MergeAuditOverflow {
     pub rerouted_statement_ids: Vec<[u8; 16]>,
     pub rerouted_relation_ids: Vec<[u8; 16]>,

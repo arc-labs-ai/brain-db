@@ -67,7 +67,6 @@ pub const LLM_RESPONSE_TTL_TABLE: TableDefinition<'static, LlmTtlKey, ()> =
 /// schema-validated output type. The framing layer here doesn't peek
 /// inside.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct LlmResponse {
     /// rkyv-encoded typed response. The LLM extractor defines the shape.
     pub response_blob: Vec<u8>,

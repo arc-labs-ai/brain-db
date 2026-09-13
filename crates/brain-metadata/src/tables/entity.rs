@@ -151,7 +151,6 @@ pub mod mention_context {
 /// `aliases` is a typed `Vec<String>`. `attributes` remains an opaque
 /// blob until the schema DSL defines the typed `Value` union.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct EntityMetadata {
     pub entity_id_bytes: [u8; 16],
     /// Owning namespace (tenant) — the outer half of the
@@ -327,7 +326,6 @@ impl From<&EntityMetadata> for Entity {
 
 /// Per-mention metadata: how an entity appears in a given memory.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct MentionMetadata {
     pub mentioned_at_unix_nanos: u64,
     pub mention_context: u8,

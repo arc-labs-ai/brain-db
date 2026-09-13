@@ -381,7 +381,6 @@ pub enum BadMemoryKind {
 /// setter would add ceremony for no benefit. Typed wrappers for the
 /// brain-core types come via getter methods (`memory_id()`, etc.).
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct MemoryMetadata {
     // -- Identity --
     pub memory_id_bytes: [u8; 16],
@@ -608,14 +607,14 @@ impl redb::Value for MemoryMetadata {
     where
         Self: 'a,
     {
-        // `#[archive(check_bytes)]` enables validation, which includes an
-        // alignment check; redb returns bytes at arbitrary alignment, so
-        // we copy into an AlignedVec first. Corrupt bytes here indicate
-        // a broken redb file (much bigger problem than a single row),
-        // so panic is the right failure mode.
-        let mut buf = rkyv::AlignedVec::with_capacity(data.len());
+        // rkyv validation (the `bytecheck` feature, auto-derived in 0.8)
+        // includes an alignment check; redb returns bytes at arbitrary
+        // alignment, so we copy into an AlignedVec first. Corrupt bytes here
+        // indicate a broken redb file (much bigger problem than a single
+        // row), so panic is the right failure mode.
+        let mut buf = rkyv::util::AlignedVec::<16>::with_capacity(data.len());
         buf.extend_from_slice(data);
-        rkyv::from_bytes::<MemoryMetadata>(&buf)
+        rkyv::from_bytes::<MemoryMetadata, rkyv::rancor::Error>(&buf)
             .expect("MemoryMetadata bytes failed rkyv validation; redb file is corrupt")
     }
 
@@ -626,7 +625,7 @@ impl redb::Value for MemoryMetadata {
     {
         // 256-byte scratch is roomy for the ~140-byte struct; rkyv grows
         // if needed.
-        rkyv::to_bytes::<_, 256>(value)
+        rkyv::to_bytes::<rkyv::rancor::Error>(value)
             .expect("MemoryMetadata is rkyv-serializable")
             .into_vec()
     }

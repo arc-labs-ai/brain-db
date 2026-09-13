@@ -107,7 +107,7 @@ base64 = "0.22"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 # Serialization
-rkyv = { version = "0.7", features = ["validation"] }
+rkyv = { version = "0.8", features = ["bytecheck"] }
 bytemuck = { version = "1", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_repr = "0.1"

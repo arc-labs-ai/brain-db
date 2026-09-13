@@ -11,7 +11,6 @@ pub const ENTITY_TYPES_TABLE: TableDefinition<'static, u32, EntityTypeDefinition
     TableDefinition::new("entity_types");
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct EntityTypeDefinition {
     pub entity_type_id: u32,
     pub name: String,
