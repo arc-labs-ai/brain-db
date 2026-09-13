@@ -26,7 +26,6 @@ pub const SCHEMA_ACTIVE_VERSIONS_TABLE: TableDefinition<'static, &str, u32> =
 pub const VALIDATOR_VERSION: u32 = 1;
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct SchemaVersionRow {
     pub namespace: String,
     pub version: u32,

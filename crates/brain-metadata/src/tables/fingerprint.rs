@@ -47,7 +47,6 @@ pub const FINGERPRINTS_TABLE: TableDefinition<'static, [u8; 56], FingerprintEntr
 /// Value row in `FINGERPRINTS_TABLE`. Compact: just the MemoryId of
 /// the Active memory and a timestamp for diagnostics.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[archive(check_bytes)]
 pub struct FingerprintEntry {
     /// `MemoryId` of the Active memory whose text hashes to this
     /// row's content_hash. Stored as the 16-byte big-endian wire
@@ -92,9 +91,9 @@ impl redb::Value for FingerprintEntry {
         // happen to land on an 8-byte boundary. Copy into an
         // AlignedVec first, matching IdempotencyEntry / MemoryMetadata
         // / EdgeData / CheckpointMeta which all hit the same hazard.
-        let mut buf = rkyv::AlignedVec::with_capacity(data.len());
+        let mut buf = rkyv::util::AlignedVec::<16>::with_capacity(data.len());
         buf.extend_from_slice(data);
-        rkyv::from_bytes::<FingerprintEntry>(&buf)
+        rkyv::from_bytes::<FingerprintEntry, rkyv::rancor::Error>(&buf)
             .expect("FingerprintEntry bytes failed rkyv validation; redb file is corrupt")
     }
 
@@ -103,7 +102,7 @@ impl redb::Value for FingerprintEntry {
         Self: 'a,
         Self: 'b,
     {
-        rkyv::to_bytes::<_, 64>(value)
+        rkyv::to_bytes::<rkyv::rancor::Error>(value)
             .expect("invariant: serialize")
             .into_vec()
     }

@@ -61,7 +61,6 @@ pub const EXTRACTOR_AUDIT_BY_TIME_TABLE: TableDefinition<'static, (u64, [u8; 16]
     TableDefinition::new("extractor_audit_by_time");
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct ExtractionAudit {
     pub audit_id_bytes: [u8; 16],
     pub memory_id_bytes: [u8; 16],
@@ -87,7 +86,6 @@ pub struct ExtractionAudit {
 }
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[archive(check_bytes)]
 pub struct OutputRef {
     /// One of `output_kind::*` byte values.
     pub kind: u8,
@@ -220,7 +218,6 @@ pub mod resolution_outcome {
 }
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct ResolutionAudit {
     pub audit_id_bytes: [u8; 16],
     pub candidate_name: String,

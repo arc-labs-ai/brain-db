@@ -121,7 +121,6 @@ impl SchemaOrigin {
 /// Implicit-from-write rows are how Brain supports open-vocabulary
 /// STATEMENT_CREATE without a schema declaration.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct PredicateDefinition {
     pub predicate_id: u32,
     pub namespace: String,

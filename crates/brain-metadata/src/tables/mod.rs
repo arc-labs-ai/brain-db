@@ -64,9 +64,9 @@ macro_rules! impl_redb_rkyv_value {
             where
                 Self: 'a,
             {
-                let mut buf = ::rkyv::AlignedVec::with_capacity(data.len());
+                let mut buf = ::rkyv::util::AlignedVec::<16>::with_capacity(data.len());
                 buf.extend_from_slice(data);
-                ::rkyv::from_bytes::<$ty>(&buf).expect(concat!(
+                ::rkyv::from_bytes::<$ty, ::rkyv::rancor::Error>(&buf).expect(concat!(
                     stringify!($ty),
                     " bytes failed rkyv validation; redb file is corrupt"
                 ))
@@ -77,7 +77,7 @@ macro_rules! impl_redb_rkyv_value {
                 Self: 'a,
                 Self: 'b,
             {
-                ::rkyv::to_bytes::<_, 256>(value)
+                ::rkyv::to_bytes::<::rkyv::rancor::Error>(value)
                     .expect(concat!(stringify!($ty), " is rkyv-serializable"))
                     .into_vec()
             }

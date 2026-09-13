@@ -49,7 +49,6 @@ pub const MODEL_FINGERPRINTS_TABLE: TableDefinition<'static, [u8; 16], ModelInfo
 ///   may bump it on each ENCODE; the maintenance worker reconciles by
 ///   scanning `memories`.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct ModelInfo {
     pub model_name: String,
     pub seen_at_unix_nanos: u64,
@@ -81,9 +80,9 @@ impl redb::Value for ModelInfo {
     {
         // rkyv 0.7's validation includes alignment; redb returns bytes
         // at arbitrary alignment, so copy into an AlignedVec first.
-        let mut buf = rkyv::AlignedVec::with_capacity(data.len());
+        let mut buf = rkyv::util::AlignedVec::<16>::with_capacity(data.len());
         buf.extend_from_slice(data);
-        rkyv::from_bytes::<ModelInfo>(&buf)
+        rkyv::from_bytes::<ModelInfo, rkyv::rancor::Error>(&buf)
             .expect("ModelInfo bytes failed rkyv validation; redb file is corrupt")
     }
 
@@ -92,7 +91,7 @@ impl redb::Value for ModelInfo {
         Self: 'a,
         Self: 'b,
     {
-        rkyv::to_bytes::<_, 256>(value)
+        rkyv::to_bytes::<rkyv::rancor::Error>(value)
             .expect("ModelInfo is rkyv-serializable")
             .into_vec()
     }

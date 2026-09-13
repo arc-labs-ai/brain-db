@@ -30,7 +30,6 @@ pub const EXTRACTORS_BY_QNAME_TABLE: TableDefinition<'static, &str, u32> =
 /// brain-extractors decodes it when materialising the runtime
 /// extractor at MetadataDb::open / `SCHEMA_UPLOAD` time.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct ExtractorDefinition {
     pub extractor_id: u32,
     pub namespace: String,

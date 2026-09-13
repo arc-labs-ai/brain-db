@@ -108,7 +108,6 @@ pub mod tier_status {
 /// Counts of items the worker resolved + committed for one memory.
 /// Mirrors the `ExtractedItem` discriminants in `brain_extractors`.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[archive(check_bytes)]
 pub struct ExtractorItemCounts {
     pub entities: u32,
     pub statements: u32,
@@ -135,7 +134,6 @@ impl ExtractorItemCounts {
 
 /// Per-memory dispatch audit row.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct ExtractorPipelineAuditEntry {
     pub memory_id_bytes: [u8; 16],
     pub extracted_at_unix_nanos: u64,

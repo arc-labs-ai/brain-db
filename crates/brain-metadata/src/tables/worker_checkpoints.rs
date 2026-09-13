@@ -51,7 +51,6 @@ pub mod status {
 
 /// Per-item checkpoint row.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct WorkerCheckpointRow {
     /// One of [`status::PENDING`] / `STARTED` / `COMPLETED` / `FAILED`.
     pub status: u8,
