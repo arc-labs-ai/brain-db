@@ -1,11 +1,13 @@
 //! Statement physical-reclamation (GC) worker.
 //!
-//! Periodic low-priority worker that hard-deletes retracted statement
-//! rows — and every secondary-index + evidence-overflow entry they own
-//! — once the retract grace period has elapsed. This closes the
-//! tombstone-grace-then-reclaim loop on the statement side: memories
-//! reclaim via slot reclamation, entities via entity GC, and statements
-//! here.
+//! Periodic low-priority worker that runs the statement side of the
+//! tombstone-grace-then-reclaim loop in two passes each tick: first it
+//! soft-tombstones statements whose per-kind retention TTL has elapsed
+//! (`retention:` on the predicate → `TombstoneReason::RetentionExpired`),
+//! then it hard-deletes past-grace tombstoned rows — retracted or
+//! retention-expired — along with every secondary-index + evidence-overflow
+//! entry they own. Memories reclaim via slot reclamation, entities via
+//! entity GC, and statements here.
 //!
 //! **Off by default** (`enabled == false`). Retracted rows stay in redb
 //! (invisible to retrieval — the lexical index drop and tombstone filter
@@ -13,12 +15,14 @@
 //! `[workers.statement_reclaim] enabled`. The grace window and cadence
 //! are tunable through the same config section.
 //!
-//! Only rows carrying the durable `TombstoneReason::Retract` marker are
-//! eligible — plain tombstones (kept for audit) and superseded rows
-//! (kept forever for chain history) are never touched. See
-//! [`brain_metadata::extractor::sweep::reclaim_retracted_statements`]
-//! for the table-by-table delete and the dense-chain invariant the
-//! reclaim honours.
+//! Rows carrying the durable `TombstoneReason::Retract` or
+//! `TombstoneReason::RetentionExpired` marker are eligible for hard-reclaim —
+//! plain tombstones (kept for audit) and superseded rows (kept forever for
+//! chain history) are never touched. See
+//! [`brain_metadata::extractor::sweep::sweep_expired_by_retention`] for the
+//! retention soft-tombstone pass and
+//! [`brain_metadata::extractor::sweep::reclaim_retracted_statements`] for the
+//! table-by-table delete and the dense-chain invariant the reclaim honours.
 //!
 //! No WAL record: like the supersession sweeper, the redb commit is the
 //! durability point. Reclaim is idempotent re-derivation — a row gone
