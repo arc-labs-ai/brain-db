@@ -436,6 +436,7 @@ pub async fn recall_gather_namespace(
 ///     (a namespace-wide subject typically resolves on one shard), preferring an
 ///     anchor-scoped answer on a near-tie — so a grounded commit fires even when
 ///     the subject's facts live on a shard other than the coordinator.
+///
 /// The anchor travels with the winning grounded answer's shard.
 pub fn merge_namespace_partials(partials: Vec<NamespaceRecallPartial>) -> MergedNamespaceRecall {
     let mut pools: Vec<Vec<MemoryResult>> = Vec::with_capacity(partials.len());

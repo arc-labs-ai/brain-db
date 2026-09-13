@@ -145,7 +145,7 @@ pub(crate) enum ShardRequest {
         parent_span: tracing::Span,
     },
     /// Namespace-wide RECALL — Phase C stage 1 (per shard). Runs the associative
-    /// + typed-graph fan-out over THIS shard's spaces (widened to the caller's
+    /// and typed-graph fan-out over THIS shard's spaces (widened to the caller's
     /// whole namespace) and returns the raw candidate pool WITHOUT any
     /// membership shaping, so the connection layer can merge every shard's pool
     /// and shape once globally. Fanned out to all shards.
