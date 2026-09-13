@@ -1,14 +1,13 @@
-//! LexicalRetriever criterion benches against §16/02 §2.9
-//! (phase 22.8).
+//! LexicalRetriever criterion benches.
 //!
 //! Three benches:
 //!
-//! 1. Memory scope, single-term query (`§2.9` target p50 10 ms).
-//! 2. Memory scope, multi-term + filter (`§2.9` target p50 15 ms).
-//! 3. Statement scope, single-term query (`§2.9` target p50 10 ms).
+//! 1. Memory scope, single-term query (target p50 10 ms).
+//! 2. Memory scope, multi-term + filter (target p50 15 ms).
+//! 3. Statement scope, single-term query (target p50 10 ms).
 //!
-//! Corpus scale: 10K docs (regression detector). Spec-stated
-//! 100K / 1M scales are validated by phase 14's acceptance suite;
+//! Corpus scale: 10K docs (regression detector). The full
+//! 100K / 1M scales are validated by the acceptance suite;
 //! this bench catches per-query regressions in CI.
 //!
 //! Run:
@@ -21,7 +20,7 @@
 use std::sync::Arc;
 
 use brain_core::StatementKind;
-use brain_core::{AgentId, MemoryId, MemoryKind, StatementId};
+use brain_core::{MemoryId, MemoryKind, SpaceId, StatementId};
 use brain_index::{
     LexicalFilters, LexicalQuery, LexicalRetriever, LexicalRetrieverConfig, LexicalScope,
     TantivyLexicalRetriever, TantivyShard,
@@ -43,7 +42,7 @@ fn build_memory_corpus() -> (TempDir, Arc<TantivyShard>) {
     let schema = shard.memory_text.index.schema();
     let mem_id = schema.get_field("memory_id").unwrap();
     let text = schema.get_field("text").unwrap();
-    let agent = schema.get_field("agent_id").unwrap();
+    let space = schema.get_field("space_id").unwrap();
     let kind = schema.get_field("kind").unwrap();
     let created = schema.get_field("created_at").unwrap();
 
@@ -52,7 +51,7 @@ fn build_memory_corpus() -> (TempDir, Arc<TantivyShard>) {
         .index
         .writer_with_num_threads(1, 200_000_000)
         .expect("writer");
-    let agent_bytes: [u8; 16] = AgentId::new().into();
+    let space_bytes: [u8; 16] = SpaceId::new().into();
 
     for i in 0..CORPUS {
         let mut doc = TantivyDocument::default();
@@ -65,7 +64,7 @@ fn build_memory_corpus() -> (TempDir, Arc<TantivyShard>) {
             i
         );
         doc.add_text(text, &body);
-        doc.add_bytes(agent, &agent_bytes);
+        doc.add_bytes(space, &space_bytes);
         doc.add_u64(kind, 0);
         doc.add_u64(created, (i as u64) * 1000);
         writer.add_document(doc).expect("add");
@@ -97,7 +96,7 @@ fn build_statement_corpus() -> (TempDir, Arc<TantivyShard>) {
         let mut doc = TantivyDocument::default();
         let id = StatementId::new();
         doc.add_bytes(stmt_id, &id.to_bytes());
-        doc.add_text(subj, &format!("Subject {}", i));
+        doc.add_text(subj, format!("Subject {}", i));
         doc.add_text(pred_name, "lives_in");
         doc.add_u64(pred_id, 1);
         let object_text = if i % 100 == 0 {

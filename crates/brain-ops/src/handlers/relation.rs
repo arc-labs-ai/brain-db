@@ -1,6 +1,5 @@
 //! Relation wire-op handlers — `RELATION_CREATE / _GET / _SUPERSEDE /
-//! _TOMBSTONE / _LIST_FROM / _LIST_TO / _TRAVERSE` (
-//! phase 18.7).
+//! _TOMBSTONE / _LIST_FROM / _LIST_TO / _TRAVERSE`.
 //!
 //! Each handler:
 //!
@@ -16,26 +15,26 @@
 //!    TOMBSTONE).
 //! 8. Projects brain-core `Relation` → wire `RelationView`.
 //!
-//! Phase 18.7 handlers do NOT yet handle cross-shard relation reads
-//! or the relation embedding worker — both deferred per the §20
-//! open questions.
+//! These handlers do NOT yet handle cross-shard relation reads
+//! or the relation embedding worker — both deferred.
 
 use brain_core::Relation;
 use brain_core::{Cardinality, EntityId, RelationId, RelationTypeId, RequestId};
 use brain_metadata::relation::ops::{
-    relation_get, relation_list_from, relation_list_to, RelationListFilter, RelationOpError,
+    relation_get, relation_list_from_page, relation_list_to_page, RelationListFilter,
+    RelationOpError,
 };
 use brain_metadata::relation::traversal::{
     traverse, TraversalConfig, TraversalDirection, MAX_DEPTH,
 };
 use brain_metadata::relation::types::{
     relation_type_get, relation_type_intern_or_get, relation_type_lookup_by_qname,
-    RelationTypeOpError,
 };
 use brain_metadata::schema::store::schema_active;
 use brain_planner::WriterError;
+use brain_protocol::envelope::response::EventType;
 use brain_protocol::{
-    KnowledgeEventPayload, RelationCreateRequest, RelationCreateResponse, RelationCreatedEvent,
+    GraphEventPayload, RelationCreateRequest, RelationCreateResponse, RelationCreatedEvent,
     RelationGetRequest, RelationGetResponse, RelationListFromRequest,
     RelationListFromResponseFrame, RelationListToRequest, RelationListToResponseFrame,
     RelationSupersedeRequest, RelationSupersedeResponse, RelationSupersededEvent,
@@ -43,12 +42,11 @@ use brain_protocol::{
     RelationTraverseRequest, RelationTraverseResponseFrame, RelationView, TraversalPathWire,
     TraversalStepWire,
 };
-use brain_protocol::envelope::response::EventType;
 use redb::ReadableTable;
 
 use crate::context::OpsContext;
 use crate::error::OpError;
-use crate::handlers::entity::emit_knowledge_event;
+use crate::handlers::entity::emit_graph_event;
 use crate::handlers::link::downcast_writer_pub;
 use crate::write::{
     Phase, PhaseAck, SupersedeReplacement, SupersedeReplacementId, SupersedeTarget,
@@ -59,6 +57,34 @@ const REASON_MAX: usize = 4096;
 const QNAME_MAX: usize = 96;
 const LIST_LIMIT_MAX: u32 = 1000;
 const TRAVERSE_MAX_NODES: u32 = 1000;
+
+/// Whether relation `id`'s sidecar row belongs to the caller's
+/// `(namespace, space)` scope. `relation_get` returns a brain-core
+/// `Relation` with the scope dropped, so the tenant wall is enforced
+/// here by re-reading the sidecar's `namespace_id` / `space_id_bytes`.
+/// Fail-closed: a missing row or read error denies.
+fn relation_id_in_caller_scope(ctx: &OpsContext, id: RelationId) -> bool {
+    use brain_metadata::tables::relation::{RelationMetadata, RELATION_METADATA_TABLE};
+    let Ok(rtxn) = ctx.executor.metadata.read_txn() else {
+        return false;
+    };
+    let Ok(t) = rtxn.open_table(RELATION_METADATA_TABLE) else {
+        return false;
+    };
+    let row: Option<RelationMetadata> = t.get(&id.to_bytes()).ok().flatten().map(|g| g.value());
+    match row {
+        Some(m) => {
+            m.namespace_id == ctx.executor.caller_namespace.raw()
+                && m.space_id_bytes == <[u8; 16]>::from(ctx.executor.caller_space)
+        }
+        None => false,
+    }
+}
+// Upper bound on the `relation_types` filter of a traverse request. Each
+// entry costs a per-qname schema-registry lookup, so cap the count to
+// bound per-request I/O against a crafted payload. Mirrors RECALL's
+// `MAX_PREDICATE_FILTER` rationale.
+const MAX_RELATION_TYPE_FILTER: usize = 256;
 
 // ---------------------------------------------------------------------------
 // RELATION_CREATE
@@ -77,58 +103,64 @@ pub async fn handle_relation_create(
     let now = crate::txn::now_unix_nanos_pub();
     let (namespace, name) = split_qname(&req.relation_type)?;
 
-    // Resolve the relation-type qname (strict vs schemaless dispatch)
-    // and intern-on-demand for the schemaless case BEFORE submit, so
-    // the `RelationTypeNotInSchema` and intern errors keep their
-    // structured wire shape. The lookup runs in a short-lived wtxn that
-    // commits the intern; the create itself then submits via the
-    // unified writer.
+    // Resolve the relation-type qname (strict vs schemaless dispatch).
+    //
+    // Strict mode (active schema in namespace): look up the declared
+    // relation_type via rtxn — same shape as the pre-fold path, the
+    // wire error (`RelationTypeNotInSchema`) keeps its structured
+    // surface for clients.
+    //
+    // Schemaless mode (no active schema): if the qname is already
+    // interned (a prior write registered it), reuse its row; otherwise
+    // pass an intern hint on the Phase and let apply do the work
+    // inside the main submit wtxn. The pre-refactor code ran a
+    // separate intern wtxn here, paying an extra fsync per schemaless
+    // RELATION_CREATE — folding it into apply halves the cost.
     //
     // The unified apply path calls `relation_create` which preserves
     // the single-conflict cardinality auto-supersede short-circuit:
     // when exactly one existing current relation conflicts on the
     // cardinality axis, the helper internally supersedes it with the
-    // pre-minted id rather than erroring. The wire response shape
-    // (just `relation_id`) doesn't distinguish fresh-create from
-    // auto-supersede — both return the pre-minted id — so no extra
-    // ack projection is needed.
-    let rt = {
-        let mut db_guard = ctx.executor.metadata.lock();
-        let wtxn = db_guard
-            .write_txn()
-            .map_err(|e| OpError::Internal(format!("write_txn: {e}")))?;
-        let active_version = schema_active_in_wtxn_rel(&wtxn, namespace)?;
-        let rt = if let Some(version) = active_version {
-            let rt =
-                relation_type_lookup_by_qname_wtxn(&wtxn, namespace, name)?.ok_or_else(|| {
-                    OpError::RelationTypeNotInSchema {
-                        type_name: req.relation_type.clone(),
-                        namespace: namespace.to_string(),
-                        version,
-                    }
+    // pre-minted id rather than erroring.
+    let (resolved_ty, resolved_is_symmetric, intern_hint) = {
+        let rtxn = ctx
+            .executor
+            .metadata
+            .read_txn()
+            .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
+        let active_version = schema_active(&rtxn, namespace)
+            .map_err(|e| OpError::Internal(format!("schema_active: {e}")))?;
+        if let Some(version) = active_version {
+            let rt = relation_type_lookup_by_qname(&rtxn, namespace, name)
+                .map_err(OpError::from)?
+                .ok_or_else(|| OpError::RelationTypeNotInSchema {
+                    type_name: req.relation_type.clone(),
+                    namespace: namespace.to_string(),
+                    version,
                 })?;
-            if !rt_active_for_schema_wtxn(&wtxn, namespace, version)?.contains(&rt.id) {
+            if !rt_active_for_schema_rtxn(&rtxn, namespace, version)?.contains(&rt.id) {
                 return Err(OpError::RelationTypeNotInSchema {
                     type_name: req.relation_type.clone(),
                     namespace: namespace.to_string(),
                     version,
                 });
             }
-            rt
+            (rt.id, rt.is_symmetric, None)
         } else {
-            match relation_type_lookup_by_qname_wtxn(&wtxn, namespace, name)? {
-                Some(rt) => rt,
-                None => {
-                    let _ = relation_type_intern_or_get(&wtxn, namespace, name, 0, now)
-                        .map_err(map_relation_type_op_error)?;
-                    relation_type_lookup_by_qname_wtxn(&wtxn, namespace, name)?
-                        .expect("just-interned relation type vanished")
-                }
+            match relation_type_lookup_by_qname(&rtxn, namespace, name).map_err(OpError::from)? {
+                Some(rt) => (rt.id, rt.is_symmetric, None),
+                None => (
+                    // Sentinel id; apply replaces it via
+                    // `relation_type_intern_or_get`.
+                    RelationTypeId::from(0u32),
+                    // Open-vocab default for is_symmetric. Apply re-reads
+                    // the row after intern to pick up any concurrent
+                    // SCHEMA_UPLOAD's declared symmetry.
+                    false,
+                    Some((namespace.to_string(), name.to_string())),
+                ),
             }
-        };
-        wtxn.commit()
-            .map_err(|e| OpError::Internal(format!("commit: {e}")))?;
-        rt
+        }
     };
 
     // Mint id pre-submit (mirrors encode.rs MemoryId pre-allocation).
@@ -151,24 +183,28 @@ pub async fn handle_relation_create(
     };
 
     let real_writer = downcast_writer_pub(ctx)?;
-    let write_id = WriteId::from_request(RequestId::from(req.request_id));
+    let write_id =
+        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_relation_create_request(&req);
     let phase = Phase::UpsertRelation {
         id: new_id,
-        ty: rt.id,
+        ty: resolved_ty,
+        session: brain_core::SessionId::from(req.session_id),
         from: EntityId::from(req.from_entity),
         to: EntityId::from(req.to_entity),
         confidence: req.confidence,
         evidence_memories,
-        is_symmetric: rt.is_symmetric,
+        is_symmetric: resolved_is_symmetric,
         extractor: brain_core::ExtractorId::from(req.extractor_id),
         extracted_at_unix_nanos: extracted_at,
         properties_blob: req.properties_blob.clone(),
         valid_from_unix_nanos: valid_from_phase,
         valid_to_unix_nanos: valid_to_phase,
+        relation_type_intern_hint: intern_hint,
     };
-    let write =
-        Write::single(write_id, ctx.executor.caller_agent, phase).with_request_hash(request_hash);
+    let write = Write::single(write_id, ctx.executor.caller_space, phase)
+        .with_namespace(ctx.executor.caller_namespace)
+        .with_request_hash(request_hash);
     let ack = real_writer.submit(write).await.map_err(map_writer_err)?;
     // Pull the id from the ack — on an idempotency replay the writer
     // returns the cached ack whose id is the *original* (potentially
@@ -182,12 +218,14 @@ pub async fn handle_relation_create(
         }
     };
 
-    emit_knowledge_event(
+    emit_graph_event(
         ctx,
         EventType::RelationCreated,
-        KnowledgeEventPayload::RelationCreated(RelationCreatedEvent {
+        GraphEventPayload::RelationCreated(RelationCreatedEvent {
             relation_id: stored_id.to_bytes(),
-            relation_type: rt.canonical(),
+            // The wire request's `relation_type` is already the
+            // canonical "namespace:name" form (validated above).
+            relation_type: req.relation_type.clone(),
             from: req.from_entity,
             to: req.to_entity,
         }),
@@ -210,8 +248,9 @@ pub async fn handle_relation_get(
 ) -> Result<RelationGetResponse, OpError> {
     let id = RelationId::from(req.relation_id);
 
-    let db_guard = ctx.executor.metadata.lock();
-    let rtxn = db_guard
+    let rtxn = ctx
+        .executor
+        .metadata
         .read_txn()
         .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
 
@@ -221,6 +260,15 @@ pub async fn handle_relation_get(
             what: "relation",
             detail: format!("{id:?}"),
         })?;
+
+    // Tenant wall (unconditional): a relation named by a foreign
+    // `(namespace, space)`'s id reads as NotFound.
+    if !relation_id_in_caller_scope(ctx, id) {
+        return Err(OpError::NotFound {
+            what: "relation",
+            detail: format!("{id:?}"),
+        });
+    }
 
     let mut returned_via_supersession = false;
     if req.follow_supersession {
@@ -267,8 +315,9 @@ pub async fn handle_relation_supersede(
     // commits the intern; the supersede itself then submits via the
     // unified writer.
     let rt = {
-        let mut db_guard = ctx.executor.metadata.lock();
-        let wtxn = db_guard
+        let wtxn = ctx
+            .executor
+            .metadata
             .write_txn()
             .map_err(|e| OpError::Internal(format!("write_txn: {e}")))?;
         let active_version = schema_active_in_wtxn_rel(&wtxn, namespace)?;
@@ -294,7 +343,7 @@ pub async fn handle_relation_supersede(
                 Some(rt) => rt,
                 None => {
                     let _ = relation_type_intern_or_get(&wtxn, namespace, name, 0, now)
-                        .map_err(map_relation_type_op_error)?;
+                        .map_err(OpError::from)?;
                     relation_type_lookup_by_qname_wtxn(&wtxn, namespace, name)?
                         .expect("just-interned relation type vanished")
                 }
@@ -305,23 +354,33 @@ pub async fn handle_relation_supersede(
         rt
     };
 
-    // Pre-submit existence check so a missing `old_relation_id` keeps
-    // its `NotFound { what: "relation", .. }` wire shape — submit-path
-    // failures collapse to `WriterError::Internal`.
-    peek_relation_exists(ctx, old_id)?;
+    // Pre-submit existence + ownership check so a missing OR foreign
+    // `old_relation_id` keeps its `NotFound { what: "relation", .. }`
+    // wire shape (submit-path failures collapse to
+    // `WriterError::Internal`). Scope-aware: another tenant's relation is
+    // indistinguishable from a missing one. The apply-layer wall
+    // re-checks atomically.
+    if !relation_id_in_caller_scope(ctx, old_id) {
+        return Err(OpError::NotFound {
+            what: "relation",
+            detail: format!("{old_id:?}"),
+        });
+    }
 
     let new_relation = build_relation_from_create(&req.new_relation, &rt, now)?;
 
     let real_writer = downcast_writer_pub(ctx)?;
-    let write_id = WriteId::from_request(RequestId::from(req.request_id));
+    let write_id =
+        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_relation_supersede_request(&req);
     let phase = Phase::Supersede {
         target: SupersedeTarget::Relation(old_id),
         replacement: SupersedeReplacement::Relation(Box::new(new_relation)),
         at_unix_nanos: now,
     };
-    let write =
-        Write::single(write_id, ctx.executor.caller_agent, phase).with_request_hash(request_hash);
+    let write = Write::single(write_id, ctx.executor.caller_space, phase)
+        .with_namespace(ctx.executor.caller_namespace)
+        .with_request_hash(request_hash);
     let ack = real_writer.submit(write).await.map_err(map_writer_err)?;
     // Pull the replacement id from the ack — on idempotency replay the
     // cached ack carries the originally-stored id, which won't match
@@ -340,8 +399,9 @@ pub async fn handle_relation_supersede(
     // the version stamped inside the wtxn; reading post-commit avoids
     // duplicating the supersession bookkeeping in the handler.
     let version = {
-        let db_guard = ctx.executor.metadata.lock();
-        let rtxn = db_guard
+        let rtxn = ctx
+            .executor
+            .metadata
             .read_txn()
             .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
         let new = relation_get(&rtxn, new_id)
@@ -350,10 +410,10 @@ pub async fn handle_relation_supersede(
         new.version
     };
 
-    emit_knowledge_event(
+    emit_graph_event(
         ctx,
         EventType::RelationSuperseded,
-        KnowledgeEventPayload::RelationSuperseded(RelationSupersededEvent {
+        GraphEventPayload::RelationSuperseded(RelationSupersededEvent {
             old_relation_id: old_id.to_bytes(),
             new_relation_id: new_id.to_bytes(),
         }),
@@ -381,13 +441,21 @@ pub async fn handle_relation_tombstone(
     let id = RelationId::from(req.relation_id);
     let now = crate::txn::now_unix_nanos_pub();
 
-    // Pre-submit existence check — submit-path failures collapse into
-    // WriterError::Internal, so peek first to keep the missing-id
-    // case structured as OpError::NotFound.
-    peek_relation_exists(ctx, id)?;
+    // Pre-submit existence + ownership check — submit-path failures
+    // collapse into WriterError::Internal, so check first to keep the
+    // missing-id case structured as OpError::NotFound. Scope-aware:
+    // another tenant's relation is indistinguishable from a missing one.
+    // The apply-layer wall re-checks atomically.
+    if !relation_id_in_caller_scope(ctx, id) {
+        return Err(OpError::NotFound {
+            what: "relation",
+            detail: format!("{id:?}"),
+        });
+    }
 
     let real_writer = downcast_writer_pub(ctx)?;
-    let write_id = WriteId::from_request(RequestId::from(req.request_id));
+    let write_id =
+        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_relation_tombstone_request(&req);
     let phase = Phase::Tombstone {
         target: TombstoneTarget::Relation(id),
@@ -397,8 +465,9 @@ pub async fn handle_relation_tombstone(
         reason: 0,
         at_unix_nanos: now,
     };
-    let write =
-        Write::single(write_id, ctx.executor.caller_agent, phase).with_request_hash(request_hash);
+    let write = Write::single(write_id, ctx.executor.caller_space, phase)
+        .with_namespace(ctx.executor.caller_namespace)
+        .with_request_hash(request_hash);
     let ack = real_writer.submit(write).await.map_err(map_writer_err)?;
     // Pull the tombstone timestamp from the ack so idempotency replays
     // return the originally-stored value rather than today's clock.
@@ -414,10 +483,10 @@ pub async fn handle_relation_tombstone(
         }
     };
 
-    emit_knowledge_event(
+    emit_graph_event(
         ctx,
         EventType::RelationTombstoned,
-        KnowledgeEventPayload::RelationTombstoned(RelationTombstonedEvent {
+        GraphEventPayload::RelationTombstoned(RelationTombstonedEvent {
             relation_id: id.to_bytes(),
             reason: req.reason,
         }),
@@ -438,7 +507,7 @@ pub async fn handle_relation_list_from(
     req: RelationListFromRequest,
     ctx: &OpsContext,
 ) -> Result<RelationListFromResponseFrame, OpError> {
-    let (items, count) = run_list(
+    let (items, count, next_cursor) = run_list(
         ctx,
         EntityId::from(req.from_entity),
         &req.relation_type_filter,
@@ -450,7 +519,7 @@ pub async fn handle_relation_list_from(
     )?;
     Ok(RelationListFromResponseFrame {
         items,
-        next_cursor: Vec::new(),
+        next_cursor,
         cumulative_count: count,
         is_final: true,
     })
@@ -460,7 +529,7 @@ pub async fn handle_relation_list_to(
     req: RelationListToRequest,
     ctx: &OpsContext,
 ) -> Result<RelationListToResponseFrame, OpError> {
-    let (items, count) = run_list(
+    let (items, count, next_cursor) = run_list(
         ctx,
         EntityId::from(req.to_entity),
         &req.relation_type_filter,
@@ -472,7 +541,7 @@ pub async fn handle_relation_list_to(
     )?;
     Ok(RelationListToResponseFrame {
         items,
-        next_cursor: Vec::new(),
+        next_cursor,
         cumulative_count: count,
         is_final: true,
     })
@@ -488,18 +557,23 @@ fn run_list(
     limit: u32,
     cursor: &[u8],
     from_side: bool,
-) -> Result<(Vec<RelationView>, u32), OpError> {
+) -> Result<(Vec<RelationView>, u32, Vec<u8>), OpError> {
     if limit == 0 || limit > LIST_LIMIT_MAX {
         return Err(OpError::InvalidRequest("limit must be in 1..=1000".into()));
     }
-    if !cursor.is_empty() {
-        return Err(OpError::InvalidRequest(
-            "RELATION_LIST cursor pagination lands in phase 23".into(),
-        ));
-    }
+    let scope =
+        brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_space);
+    let filter_sig = relation_list_filter_signature(
+        type_filter,
+        include_superseded,
+        include_tombstoned,
+        from_side,
+    );
+    let resume_key = decode_relation_cursor(cursor, scope, &filter_sig)?;
 
-    let db_guard = ctx.executor.metadata.lock();
-    let rtxn = db_guard
+    let rtxn = ctx
+        .executor
+        .metadata
         .read_txn()
         .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
 
@@ -513,7 +587,7 @@ fn run_list(
         // matching rows are possible).
         let active_version = schema_active(&rtxn, ns)
             .map_err(|e| OpError::Internal(format!("schema_active: {e}")))?;
-        match relation_type_lookup_by_qname(&rtxn, ns, name).map_err(map_relation_type_op_error)? {
+        match relation_type_lookup_by_qname(&rtxn, ns, name).map_err(OpError::from)? {
             Some(rt) => Some(rt.id),
             None => {
                 if let Some(version) = active_version {
@@ -523,7 +597,7 @@ fn run_list(
                         version,
                     });
                 }
-                return Ok((Vec::new(), 0));
+                return Ok((Vec::new(), 0, Vec::new()));
             }
         }
     };
@@ -531,25 +605,121 @@ fn run_list(
     let filter = RelationListFilter {
         relation_type,
         current_only: !include_superseded && !include_tombstoned,
-        limit: limit as usize,
+        // The page fn takes its page size as an explicit argument; the
+        // struct field is unused on this path.
+        limit: 0,
     };
-    let mut rows = if from_side {
-        relation_list_from(&rtxn, entity, &filter).map_err(map_relation_op_error)?
+
+    // Page directly from the edge index: seek strictly past the cursor,
+    // apply tombstone / current filters in the walk, and return one page
+    // plus whether more remain. No 1000-row window, so relations past
+    // 1000 are reachable and each page costs one page's worth of scan.
+    let page = if from_side {
+        relation_list_from_page(
+            &rtxn,
+            scope,
+            entity,
+            &filter,
+            include_tombstoned,
+            resume_key.as_deref(),
+            limit as usize,
+        )
     } else {
-        relation_list_to(&rtxn, entity, &filter).map_err(map_relation_op_error)?
-    };
-
-    // Wire-level filters not pushed into list_*.
-    if !include_tombstoned {
-        rows.retain(|r| !r.tombstoned);
+        relation_list_to_page(
+            &rtxn,
+            scope,
+            entity,
+            &filter,
+            include_tombstoned,
+            resume_key.as_deref(),
+            limit as usize,
+        )
     }
+    .map_err(map_relation_op_error)?;
 
-    let mut out = Vec::with_capacity(rows.len());
-    for r in &rows {
+    let mut out = Vec::with_capacity(page.rows.len());
+    for r in &page.rows {
         out.push(project_view(&rtxn, r)?);
     }
     let count = out.len() as u32;
-    Ok((out, count))
+    let next_cursor = match (page.has_more, page.last_key) {
+        (true, Some(k)) => encode_relation_cursor(scope, &filter_sig, &k),
+        _ => Vec::new(),
+    };
+    Ok((out, count, next_cursor))
+}
+
+// ---------------------------------------------------------------------------
+// RELATION_LIST_{FROM,TO} keyset-pagination cursor.
+//
+// Opaque bytes on the wire (a `bytes` field — the manifest is unchanged
+// and no SDK parses it). Carries the owning scope (tenant reject), a
+// signature of the query filters + direction (a mid-pagination change or
+// a from/to mixup fails closed), and the raw edge-table key of the last
+// row so the next page seeks strictly past it in-store.
+// ---------------------------------------------------------------------------
+
+const RELATION_CURSOR_VERSION: u8 = 2;
+/// `version(1) + namespace_id(4) + space_id(16) + filter_sig(8)` then the
+/// variable-length raw edge key.
+const RELATION_CURSOR_HEADER: usize = 1 + 4 + 16 + 8;
+
+fn relation_list_filter_signature(
+    type_filter: &str,
+    include_superseded: bool,
+    include_tombstoned: bool,
+    from_side: bool,
+) -> [u8; 8] {
+    let mut h = blake3::Hasher::new();
+    h.update(&(type_filter.len() as u32).to_le_bytes());
+    h.update(type_filter.as_bytes());
+    h.update(&[
+        u8::from(include_superseded),
+        u8::from(include_tombstoned),
+        u8::from(from_side),
+    ]);
+    let full = h.finalize();
+    let mut out = [0u8; 8];
+    out.copy_from_slice(&full.as_bytes()[..8]);
+    out
+}
+
+fn encode_relation_cursor(scope: brain_metadata::RowScope, sig: &[u8; 8], key: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(RELATION_CURSOR_HEADER + key.len());
+    out.push(RELATION_CURSOR_VERSION);
+    out.extend_from_slice(&scope.namespace_id.to_le_bytes());
+    out.extend_from_slice(&scope.space_id_bytes);
+    out.extend_from_slice(sig);
+    out.extend_from_slice(key);
+    out
+}
+
+fn decode_relation_cursor(
+    cursor: &[u8],
+    scope: brain_metadata::RowScope,
+    sig: &[u8; 8],
+) -> Result<Option<Vec<u8>>, OpError> {
+    if cursor.is_empty() {
+        return Ok(None);
+    }
+    // The raw edge key is always non-empty, so a valid cursor is strictly
+    // longer than the header.
+    if cursor.len() <= RELATION_CURSOR_HEADER || cursor[0] != RELATION_CURSOR_VERSION {
+        return Err(OpError::InvalidRequest("malformed cursor".into()));
+    }
+    let mut ns = [0u8; 4];
+    ns.copy_from_slice(&cursor[1..5]);
+    if u32::from_le_bytes(ns) != scope.namespace_id || cursor[5..21] != scope.space_id_bytes {
+        return Err(OpError::InvalidRequest(
+            "cursor does not belong to the caller's tenant".into(),
+        ));
+    }
+    if cursor[21..29] != *sig {
+        return Err(OpError::InvalidRequest(
+            "stale_cursor: filters changed between pages".into(),
+        ));
+    }
+    Ok(Some(cursor[RELATION_CURSOR_HEADER..].to_vec()))
 }
 
 // ---------------------------------------------------------------------------
@@ -570,6 +740,11 @@ pub async fn handle_relation_traverse(
             "max_nodes must be in 1..={TRAVERSE_MAX_NODES}"
         )));
     }
+    if req.relation_types.len() > MAX_RELATION_TYPE_FILTER {
+        return Err(OpError::InvalidRequest(format!(
+            "relation_types must have <= {MAX_RELATION_TYPE_FILTER} entries"
+        )));
+    }
     let direction = match req.direction {
         0 => TraversalDirection::Outgoing,
         1 => TraversalDirection::Incoming,
@@ -581,8 +756,9 @@ pub async fn handle_relation_traverse(
         }
     };
 
-    let db_guard = ctx.executor.metadata.lock();
-    let rtxn = db_guard
+    let rtxn = ctx
+        .executor
+        .metadata
         .read_txn()
         .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
 
@@ -595,7 +771,7 @@ pub async fn handle_relation_traverse(
         let (ns, name) = split_qname(qname)?;
         let active_version = schema_active(&rtxn, ns)
             .map_err(|e| OpError::Internal(format!("schema_active: {e}")))?;
-        match relation_type_lookup_by_qname(&rtxn, ns, name).map_err(map_relation_type_op_error)? {
+        match relation_type_lookup_by_qname(&rtxn, ns, name).map_err(OpError::from)? {
             Some(rt) => type_ids.push(rt.id),
             None => {
                 if let Some(version) = active_version {
@@ -617,6 +793,7 @@ pub async fn handle_relation_traverse(
     };
     let paths = traverse(
         &rtxn,
+        brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_space),
         EntityId::from(req.start_entity),
         &type_ids,
         direction,
@@ -670,7 +847,7 @@ fn validate_qname(q: &str) -> Result<(), OpError> {
     }
     if q.len() > QNAME_MAX {
         return Err(OpError::InvalidRequest(format!(
-            "relation_type qname exceeds {QNAME_MAX} chars"
+            "relation_type qname exceeds {QNAME_MAX} bytes"
         )));
     }
     if !q.contains(':') {
@@ -748,7 +925,7 @@ fn project_view(rtxn: &redb::ReadTransaction, r: &Relation) -> Result<RelationVi
 
 fn type_qname(rtxn: &redb::ReadTransaction, id: RelationTypeId) -> Result<String, OpError> {
     let rt = relation_type_get(rtxn, id)
-        .map_err(map_relation_type_op_error)?
+        .map_err(OpError::from)?
         .ok_or_else(|| {
             OpError::Internal(format!("relation references missing relation_type {id:?}"))
         })?;
@@ -757,7 +934,7 @@ fn type_qname(rtxn: &redb::ReadTransaction, id: RelationTypeId) -> Result<String
 
 /// `relation_type_lookup_by_qname` takes `&ReadTransaction`, but our
 /// validation runs inside a `WriteTransaction`. Inline a wtxn-friendly
-/// variant — mirrors `predicate_lookup_by_qname_wtxn` (17.7).
+/// variant — mirrors `predicate_lookup_by_qname_wtxn`.
 fn relation_type_lookup_by_qname_wtxn(
     wtxn: &redb::WriteTransaction,
     namespace: &str,
@@ -790,7 +967,7 @@ fn relation_type_lookup_by_qname_wtxn(
 }
 
 /// Active schema version for `namespace` inside a write txn. Mirrors
-/// the same helper in `knowledge_statement.rs` — relation handlers
+/// the same helper in `statement.rs` — relation handlers
 /// run a different write path so we keep the helpers local rather
 /// than re-export through a shared module.
 fn schema_active_in_wtxn_rel(
@@ -798,11 +975,9 @@ fn schema_active_in_wtxn_rel(
     namespace: &str,
 ) -> Result<Option<u32>, OpError> {
     use brain_metadata::tables::schema_version::SCHEMA_ACTIVE_VERSIONS_TABLE;
-    let active = match wtxn.open_table(SCHEMA_ACTIVE_VERSIONS_TABLE) {
-        Ok(t) => t,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-        Err(e) => return Err(OpError::Internal(format!("open schema_active: {e}"))),
-    };
+    let active = wtxn
+        .open_table(SCHEMA_ACTIVE_VERSIONS_TABLE)
+        .map_err(|e| OpError::Internal(format!("open schema_active: {e}")))?;
     let g = active
         .get(&namespace)
         .map_err(|e| OpError::Internal(format!("schema_active lookup: {e}")))?;
@@ -841,26 +1016,38 @@ fn rt_active_for_schema_wtxn(
     Ok(out)
 }
 
-/// Confirm the relation row exists. Returns `OpError::NotFound` with
-/// the stable `what: "relation"` discriminant when the id has never
-/// been written. Used pre-submit so a missing relation keeps its
-/// wire-level NotFound shape instead of collapsing into Internal via
-/// WriterError.
-fn peek_relation_exists(ctx: &OpsContext, id: RelationId) -> Result<(), OpError> {
-    let db_guard = ctx.executor.metadata.lock();
-    let rtxn = db_guard
-        .read_txn()
-        .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
-    if relation_get(&rtxn, id)
-        .map_err(map_relation_op_error)?
-        .is_none()
+/// rtxn variant of `rt_active_for_schema_wtxn`. The fold of the
+/// intern micro-wtxn moved relation-type vocabulary resolution off
+/// the write-txn path; the strict-mode check still needs the active
+/// set, just now via a read txn.
+fn rt_active_for_schema_rtxn(
+    rtxn: &redb::ReadTransaction,
+    namespace: &str,
+    version: u32,
+) -> Result<std::collections::HashSet<RelationTypeId>, OpError> {
+    use brain_metadata::tables::relation_type::{
+        RelationTypeDefinition, RelationTypeOrigin, RELATION_TYPES_TABLE,
+    };
+    let t = rtxn
+        .open_table(RELATION_TYPES_TABLE)
+        .map_err(|e| OpError::Internal(format!("open relation_types: {e}")))?;
+    let mut out = std::collections::HashSet::new();
+    for entry in t
+        .iter()
+        .map_err(|e| OpError::Internal(format!("relation_types iter: {e}")))?
     {
-        return Err(OpError::NotFound {
-            what: "relation",
-            detail: format!("{id:?}"),
-        });
+        let (k, v) = entry.map_err(|e| OpError::Internal(format!("relation_types entry: {e}")))?;
+        let row: RelationTypeDefinition = v.value();
+        if row.namespace != namespace {
+            continue;
+        }
+        if let RelationTypeOrigin::SchemaDeclared { version: v_decl } = row.origin() {
+            if v_decl == version {
+                out.insert(RelationTypeId::from(k.value()));
+            }
+        }
     }
-    Ok(())
+    Ok(out)
 }
 
 /// BLAKE3 over the canonical RELATION_CREATE request fields. Excludes
@@ -881,6 +1068,7 @@ fn hash_relation_create_request(req: &RelationCreateRequest) -> [u8; 32] {
     h.update(&req.confidence.to_le_bytes());
     h.update(&req.valid_from_unix_nanos.to_le_bytes());
     h.update(&req.valid_to_unix_nanos.to_le_bytes());
+    h.update(&req.session_id.to_le_bytes());
     *h.finalize().as_bytes()
 }
 
@@ -930,21 +1118,12 @@ fn map_writer_err(err: WriterError) -> OpError {
     OpError::ExecError(brain_planner::ExecError::WriterFailed(err))
 }
 
-fn map_relation_type_op_error(err: RelationTypeOpError) -> OpError {
-    match err {
-        RelationTypeOpError::InvalidIdentifier { reason } => {
-            OpError::InvalidRequest(format!("relation_type identifier: {reason}"))
-        }
-        RelationTypeOpError::AlreadyExists { qname, existing_id } => OpError::Conflict(format!(
-            "relation_type {qname:?} already exists with id {existing_id:?}"
-        )),
-        RelationTypeOpError::Storage(e) => OpError::Internal(format!("redb storage: {e}")),
-        RelationTypeOpError::Table(e) => OpError::Internal(format!("redb table: {e}")),
-    }
-}
+// relation_type error classification lives in `OpError`'s `From` impl
+// (crate::error). `map_relation_op_error` stays local — its
+// CardinalityViolation arm needs the handler's cardinality helpers.
 
 /// Human-readable cardinality label for the wire `CardinalityViolation`
-/// error variant. Stable strings — SDKs key off them.
+/// error variant. Stable strings — clients key off them.
 fn cardinality_kind_str(c: Cardinality) -> &'static str {
     match c {
         Cardinality::OneToOne => "OneToOne",
@@ -1002,13 +1181,17 @@ fn map_relation_op_error(err: RelationOpError) -> OpError {
             existing: conflicting as u32,
             limit: cardinality_limit(variant),
         },
+        // Declared `from` / `to` entity type violated. Same layer as
+        // the cardinality arm above; surfaced as an invalid request
+        // because the client fixes it by picking a conforming endpoint.
+        e @ RelationOpError::EndpointTypeViolation { .. } => OpError::InvalidRequest(e.to_string()),
         RelationOpError::Storage(e) => OpError::Internal(format!("redb storage: {e}")),
         RelationOpError::Table(e) => OpError::Internal(format!("redb table: {e}")),
         RelationOpError::EdgeOp(e) => OpError::Internal(format!("edge op: {e}")),
         RelationOpError::EdgeKey(e) => {
             OpError::Internal(format!("edge key decode (corruption?): {e}"))
         }
-        RelationOpError::RelationTypeOp(e) => map_relation_type_op_error(e),
+        RelationOpError::RelationTypeOp(e) => OpError::from(e),
         RelationOpError::EntityOp(e) => {
             OpError::Internal(format!("entity op forwarded from relation_ops: {e}"))
         }

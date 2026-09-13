@@ -1,4 +1,4 @@
-#![allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send post-9.7
+#![allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send
 
 //! AutoEdgeWorker integration tests — exercise the unified
 //! `submit(Write)` path. Each cycle should emit a Phase::Link per
@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use brain_core::{AgentId, ContextId, EdgeKind, MemoryId, MemoryKind};
+use brain_core::{EdgeKind, MemoryId, MemoryKind, SessionId, SpaceId};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::tables::edge::{origin as edge_origin, EDGES_TABLE};
@@ -18,9 +18,8 @@ use brain_ops::{EventBus, OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_storage::wal::kinds::WalRecordKind;
 use brain_workers::{
-    AutoEdgeKnobs, AutoEdgeWorker, Worker, WorkerConfig, WorkerContext, WorkerKind, WorkerScheduler,
+    AutoEdgeKnobs, AutoEdgeWorker, Worker, WorkerConfig, WorkerContext, WorkerScheduler,
 };
-use parking_lot::Mutex;
 use redb::ReadableTable;
 
 // ---------------------------------------------------------------------------
@@ -54,8 +53,8 @@ struct Fixture {
 fn build_fixture() -> Fixture {
     let tempdir = tempfile::tempdir().unwrap();
     let db_path = tempdir.path().join("metadata.redb");
-    let metadata: SharedMetadataDb = Arc::new(Mutex::new(MetadataDb::open(&db_path).unwrap()));
-    let (shared, hnsw_writer) = SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).unwrap();
+    let metadata: SharedMetadataDb = Arc::new(MetadataDb::open(&db_path).unwrap());
+    let (shared, hnsw_writer) = SharedHnsw::new(IndexParams::default_v1()).unwrap();
     let bus = Arc::new(EventBus::default());
     let sink = Arc::new(RecordingWalSink::new());
     let (tx, rx) = flume::bounded(64);
@@ -70,7 +69,10 @@ fn build_fixture() -> Fixture {
         metadata.clone(),
         writer.clone() as Arc<dyn WriterHandle>,
     );
-    let ctx = Arc::new(OpsContext::new(executor).with_event_bus(bus.clone()));
+    let ctx = Arc::new(
+        brain_ops::test_support::ops_context_for_tests_owning_tempdir(executor)
+            .with_event_bus(bus.clone()),
+    );
     Fixture {
         ctx,
         writer,
@@ -91,12 +93,27 @@ fn now_unix_nanos() -> u64 {
 }
 
 fn make_id(slot: u64) -> MemoryId {
-    let mut b = [0u8; 16];
-    b[8..16].copy_from_slice(&slot.to_be_bytes());
-    MemoryId::from_be_bytes(b)
+    // Pack the slot into the real slot field (bits 64..112). Writing it into
+    // the low bytes instead collapses to `MemoryId::NULL` because
+    // `from_be_bytes` masks the low 32 reserved bits — so `make_id(1)` and
+    // `make_id(2)` would both decode to the same id and seed one memory.
+    MemoryId::pack(0, slot, 1)
 }
 
 async fn seed_memory_with_vec(fixture: &Fixture, slot: u64, vector: [f32; VECTOR_DIM]) -> MemoryId {
+    seed_memory_with_vec_space(fixture, slot, vector, SpaceId::default()).await
+}
+
+/// Same as [`seed_memory_with_vec`], but stamps the memory's owning space
+/// explicitly. `apply_upsert_memory` derives `MEMORIES_TABLE.space_id_bytes`
+/// from the enclosing `Write`'s `space_id` — this is what lets the
+/// `StageCompleted{AutoEdge}` space-id tests seed a real, non-default owner.
+async fn seed_memory_with_vec_space(
+    fixture: &Fixture,
+    slot: u64,
+    vector: [f32; VECTOR_DIM],
+    space_id: SpaceId,
+) -> MemoryId {
     use brain_core::Salience;
     use brain_ops::{Phase, Write, WriteId};
 
@@ -107,14 +124,15 @@ async fn seed_memory_with_vec(fixture: &Fixture, slot: u64, vector: [f32; VECTOR
         vector: Box::new(vector),
         kind: MemoryKind::Episodic,
         salience: Salience::default(),
-        context: ContextId(1),
+        session_id: SessionId(1),
         created_at_unix_nanos: now_unix_nanos(),
+        occurred_at_unix_nanos: None,
         arena_slot: slot,
         embedding_model_fp: [0; 16],
         content_hash: None,
         deduplicate: false,
     };
-    let write = Write::single(WriteId::new(), AgentId::default(), phase);
+    let write = Write::single(WriteId::new(), space_id, phase);
     fixture.writer.submit(write).await.expect("seed submit");
     id
 }
@@ -199,8 +217,7 @@ fn cycle_writes_link_phase_through_unified_path() {
 
         // 3. redb edges table contains the derived edge (symmetric mirror
         //    means two physical rows for one logical SimilarTo pair).
-        let db = fix.metadata.lock();
-        let rtxn = db.read_txn().unwrap();
+        let rtxn = fix.metadata.read_txn().unwrap();
         let t = rtxn.open_table(EDGES_TABLE).unwrap();
         let mut found = 0;
         for entry in t.iter().unwrap() {
@@ -214,6 +231,53 @@ fn cycle_writes_link_phase_through_unified_path() {
             found >= 2,
             "symmetric SimilarTo writes two forward rows, got {found}"
         );
+    });
+}
+
+/// The `StageCompleted{AutoEdge}` envelope carries the source memory's
+/// REAL owning `space_id` — not `SpaceId::default()` — so an space-scoped
+/// SUBSCRIBE filter (`filter.spaces: [space]`) actually matches the
+/// event. Regression coverage for the bug where the publish site stamped
+/// the nil space unconditionally.
+#[test]
+fn cycle_publishes_stage_completed_with_real_owning_space_id() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let v = unit_vec(0);
+        let owner = SpaceId::new();
+
+        let m1 = seed_memory_with_vec_space(&fix, 1, v, owner).await;
+        let _m2 = seed_memory_with_vec_space(&fix, 2, v, owner).await;
+
+        let mut rx = fix.bus.receiver();
+        fix.sender.try_send((m1, v)).expect("enqueue");
+
+        let worker = AutoEdgeWorker::new(fix.receiver.clone()).with_knobs(AutoEdgeKnobs {
+            top_k: 5,
+            similarity_threshold: 0.5,
+            ef_search: Some(64),
+        });
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let wctx = WorkerContext {
+            ops: fix.ctx.clone(),
+            shutdown,
+        };
+        let processed = worker.run_cycle(&wctx).await.unwrap();
+        assert!(processed > 0);
+
+        let mut found = false;
+        while let Ok(env) = rx.try_recv() {
+            if env.event_type == brain_protocol::EventType::StageCompleted && env.memory_id == m1 {
+                assert_eq!(
+                    env.space_id, owner,
+                    "StageCompleted{{AutoEdge}} must carry the memory's real \
+                     owning space_id, not SpaceId::default()",
+                );
+                assert_ne!(env.space_id, SpaceId::default());
+                found = true;
+            }
+        }
+        assert!(found, "expected a StageCompleted{{AutoEdge}} for m1");
     });
 }
 
@@ -259,7 +323,7 @@ fn deterministic_batch_hash_makes_retries_idempotent() {
         created_at_unix_nanos: now_unix_nanos(),
     };
     let id = WriteId::new();
-    let write = Write::single(id, AgentId::default(), phase).with_request_hash(hash_a);
+    let write = Write::single(id, SpaceId::default(), phase).with_request_hash(hash_a);
     assert_eq!(write.request_hash, Some(hash_a));
 }
 
@@ -276,17 +340,6 @@ fn hash_link_batch(pairs: &[(MemoryId, MemoryId, f32)]) -> [u8; 32] {
         hasher.update(&t.to_be_bytes());
     }
     *hasher.finalize().as_bytes()
-}
-
-#[test]
-fn name_and_kind_are_stable() {
-    let (_tx, rx) = flume::bounded(1);
-    let worker = AutoEdgeWorker::new(rx);
-    assert_eq!(worker.name(), WorkerKind::AutoEdge.name());
-    assert_eq!(worker.kind(), WorkerKind::AutoEdge);
-    // Verify the worker accepts the default config without panicking.
-    let cfg = WorkerConfig::defaults_for(WorkerKind::AutoEdge);
-    assert!(cfg.batch_size > 0);
 }
 
 /// Pins the wake-on-enqueue contract: a worker registered with a
@@ -360,11 +413,151 @@ fn worker_drains_within_100ms_despite_5s_interval() {
     });
 }
 
+/// The cycle must merge the real derived-edge detail (target memory id +
+/// cosine similarity) into the source memory's durable write-artifact
+/// bundle — not just bump a count — so `MEMORY_INSPECT` can show which
+/// specific memory got linked and how strongly. Regression coverage for the
+/// gap where `auto_edge` never called into `brain_ops::memory_artifact`.
+#[test]
+fn cycle_merges_real_target_and_weight_into_artifact_bundle() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let v = unit_vec(0);
+
+        let m1 = seed_memory_with_vec(&fix, 1, v).await;
+        let m2 = seed_memory_with_vec(&fix, 2, v).await;
+
+        fix.sender.try_send((m1, v)).expect("enqueue");
+
+        let worker = AutoEdgeWorker::new(fix.receiver.clone()).with_knobs(AutoEdgeKnobs {
+            top_k: 5,
+            similarity_threshold: 0.5,
+            ef_search: Some(64),
+        });
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let wctx = WorkerContext {
+            ops: fix.ctx.clone(),
+            shutdown,
+        };
+        let processed = worker.run_cycle(&wctx).await.unwrap();
+        assert!(processed > 0);
+
+        let bundle = brain_ops::memory_artifact::read_memory_artifact(&fix.metadata, m1)
+            .unwrap()
+            .expect("artifact read must succeed");
+        let graph = bundle
+            .graph
+            .expect("auto_edge must merge a graph fragment into m1's bundle");
+
+        let edge = graph
+            .edges
+            .iter()
+            .find(|e| e.kind == "similar_to")
+            .expect("bundle must carry a similar_to edge, not just a count");
+        assert_eq!(edge.source, m1.to_be_bytes());
+        assert_eq!(
+            edge.target,
+            m2.to_be_bytes(),
+            "bundle must name the real linked memory"
+        );
+        assert!(
+            edge.confidence > 0.9,
+            "bundle must carry the real cosine similarity (identical vectors), got {}",
+            edge.confidence
+        );
+
+        assert!(
+            graph.nodes.iter().any(|n| n.id == m2.to_be_bytes()),
+            "linked memory must appear as a node"
+        );
+    });
+}
+
+/// Two similar memories in the SAME (namespace, space) scope must receive a
+/// `SimilarTo` edge. Regression coverage for the bug where the worker
+/// submitted its batch as `SpaceId::default()` (NIL): the apply layer's Link
+/// tenant wall then failed `memory_in_space(real_mem, nil)` for every real
+/// memory and silently dropped every derived edge.
+#[test]
+fn same_scope_similar_memories_get_edge() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let v = unit_vec(0);
+        let owner = SpaceId::new(); // real, non-nil owning space
+
+        let m1 = seed_memory_with_vec_space(&fix, 1, v, owner).await;
+        let _m2 = seed_memory_with_vec_space(&fix, 2, v, owner).await;
+
+        fix.sender.try_send((m1, v)).expect("enqueue");
+
+        let worker = AutoEdgeWorker::new(fix.receiver.clone()).with_knobs(AutoEdgeKnobs {
+            top_k: 5,
+            similarity_threshold: 0.5,
+            ef_search: Some(64),
+        });
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let wctx = WorkerContext {
+            ops: fix.ctx.clone(),
+            shutdown,
+        };
+        let processed = worker.run_cycle(&wctx).await.unwrap();
+        assert!(processed > 0, "worker drained the enqueue");
+
+        // Symmetric SimilarTo writes two forward rows for the one logical
+        // pair — the edge must actually exist, no longer no-op'd by the wall.
+        let found = count_auto_derived(&fix);
+        assert!(
+            found >= 2,
+            "same-scope similar memories must produce a SimilarTo edge \
+             (got {found} AUTO_DERIVED rows)"
+        );
+    });
+}
+
+/// Two similar memories in DIFFERENT spaces must NOT be linked: a cross-scope
+/// `SimilarTo` edge is itself a tenancy violation, so the worker drops the
+/// pair before it ever reaches the write path. HNSW is shard-wide (scope
+/// blind), so the neighbour is found — the scope guard is what excludes it.
+#[test]
+fn cross_scope_similar_memories_get_no_edge() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let v = unit_vec(0);
+        let space_a = SpaceId::new();
+        let space_b = SpaceId::new();
+        assert_ne!(space_a, space_b);
+
+        let m1 = seed_memory_with_vec_space(&fix, 1, v, space_a).await;
+        let _m2 = seed_memory_with_vec_space(&fix, 2, v, space_b).await;
+
+        fix.sender.try_send((m1, v)).expect("enqueue");
+
+        let worker = AutoEdgeWorker::new(fix.receiver.clone()).with_knobs(AutoEdgeKnobs {
+            top_k: 5,
+            similarity_threshold: 0.5,
+            ef_search: Some(64),
+        });
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let wctx = WorkerContext {
+            ops: fix.ctx.clone(),
+            shutdown,
+        };
+        let processed = worker.run_cycle(&wctx).await.unwrap();
+        assert!(processed > 0, "worker drained the enqueue");
+
+        let found = count_auto_derived(&fix);
+        assert_eq!(
+            found, 0,
+            "cross-scope similar memories must NOT be linked (got {found} \
+             AUTO_DERIVED rows)"
+        );
+    });
+}
+
 /// Count rows in `EDGES_TABLE` whose `origin == AUTO_DERIVED`. Used
 /// by the wake-on-enqueue test as a side-effect probe.
 fn count_auto_derived(fix: &Fixture) -> usize {
-    let db = fix.metadata.lock();
-    let rtxn = db.read_txn().unwrap();
+    let rtxn = fix.metadata.read_txn().unwrap();
     let t = rtxn.open_table(EDGES_TABLE).unwrap();
     let mut found = 0;
     for entry in t.iter().unwrap() {

@@ -4,19 +4,14 @@
 //! Wires together the planner, storage, metadata, embedder, and
 //! index. Idempotency lives at this layer.
 //!
-//! See `spec/05_operations/` for the authoritative design.
-//!
-//! ## Sub-task 7.1 surface
+//! ## Surface
 //!
 //! - [`OpsContext`] — handle bag (currently a thin wrapper over
-//!   `brain_planner::ExecutorContext`; later sub-tasks add fields).
+//!   `brain_planner::ExecutorContext`; later work adds fields).
 //! - [`OpError`] + [`ErrorCode`] error taxonomy
 //!   with `error_code()` + `retryable()` mappings.
 //! - [`dispatch()`] — top-level async entry; exhaustive `match` over
 //!   `RequestBody`.
-//!
-//! Handler bodies (sub-tasks 7.3–7.10) are stubs returning
-//! `OpError::NotYetImplemented`.
 
 #![allow(
     clippy::module_name_repetitions,
@@ -26,12 +21,16 @@
 #![forbid(unsafe_code)]
 
 pub mod apply;
+pub mod clock;
 pub mod context;
 pub mod dispatch;
 pub mod error;
+pub mod grounded;
 pub mod handlers;
 pub mod index;
+pub mod memory_artifact;
 pub mod metrics;
+pub mod precision;
 pub mod state;
 #[doc(hidden)]
 pub mod test_support;
@@ -40,42 +39,48 @@ pub mod writer;
 
 // Module-level re-exports so external callers (brain-server, brain-planner)
 // can write `brain_ops::encode::*` rather than `brain_ops::handlers::encode::*`.
+pub use handlers::restore::{handle_admin_restore, AdminRestoreOutcome};
 pub use handlers::{
-    encode, entity, extractor_admin, forget, link, plan, query, reason, recall, relation, schema,
-    statement, subscribe, txn,
+    encode, encode_vector_direct, entity, extractor_admin, forget, link, plan, query, reason,
+    recall, relation, restore, schema, statement, subscribe, txn,
 };
 
 pub use brain_planner::PlannerContext;
-pub use context::OpsContext;
-pub use dispatch::{dispatch, RequestCaller};
+pub use context::{CrossEncoderSlot, OpsContext};
+pub use dispatch::{dispatch, DispatchOutcome, RequestCaller};
 pub use error::{ErrorCode, OpError};
-pub use handlers::subscribe::{
-    parse_filter, EventBus, EventEnvelope, LsnAllocator, ParsedFilter, SubscriptionHandle,
-    SubscriptionRegistry, DEFAULT_EVENT_CHANNEL_CAPACITY,
+pub use handlers::recall::{
+    merge_namespace_partials, merge_recall_pools, MergedNamespaceRecall, NamespaceRecallPartial,
 };
-pub use handlers::txn::{TxnState, TxnStore};
+pub use handlers::subscribe::{
+    parse_filter, EventBus, EventEnvelope, LsnAllocator, ParsedFilter, SimilarityMatch,
+    SubscriptionHandle, SubscriptionRegistry, DEFAULT_EVENT_CHANNEL_CAPACITY,
+};
+pub use handlers::txn::{TxnId, TxnState, TxnStore};
 pub use metrics::{
     AmbiguityResolverMetrics, AmbiguityResolverMetricsSnapshot, ApplyErrorSnapshot,
     AutoEdgeMetrics, AutoEdgeMetricsSnapshot, CausalEdgeMetrics, CausalEdgeMetricsSnapshot,
     CausalSkipReason, ConfidenceSweepMetrics, ConfidenceSweepMetricsSnapshot, ExtractorItemKind,
     ExtractorMetrics, ExtractorMetricsSnapshot, ForgetCascadeMetrics, ForgetCascadeMetricsSnapshot,
     IdempotencyOutcome, LlmCacheMetrics, LlmCacheMetricsSnapshot, LlmCacheModelCounts,
-    LlmCacheSweepMetrics, LlmCacheSweepMetricsSnapshot, PerPhaseSnapshot, ResolverOutcome,
-    SchemaMigrationMetrics, SchemaMigrationMetricsSnapshot, StatementEmbedMetrics,
-    StatementEmbedMetricsSnapshot, SubmitOutcome, TemporalEdgeMetrics, TemporalEdgeMetricsSnapshot,
-    TemporalSkipReason, TierKind, TierStatus, WorkerBucketSnapshot, WorkerHistogram,
-    WorkerHistogramSnapshot, WriterMetrics, WriterMetricsSnapshot, ITEM_KIND_LABELS,
-    RESOLVER_OUTCOME_LABELS, TIER_LABELS, TIER_STATUS_LABELS,
+    LlmCacheSweepMetrics, LlmCacheSweepMetricsSnapshot, PerPhaseSnapshot, QueryMetrics,
+    QueryMetricsSnapshot, QueryOutcome, ResolverOutcome, RetrieverKind, RetrieverMetrics,
+    RetrieverMetricsSnapshot, SchemaMigrationMetrics, SchemaMigrationMetricsSnapshot,
+    StatementEmbedMetrics, StatementEmbedMetricsSnapshot, SubmitOutcome, TemporalEdgeMetrics,
+    TemporalEdgeMetricsSnapshot, TemporalSkipReason, TierKind, TierStatus, WorkerBucketSnapshot,
+    WorkerHistogram, WorkerHistogramSnapshot, WriterMetrics, WriterMetricsSnapshot,
+    ITEM_KIND_LABELS, QUERY_OUTCOME_LABELS, RESOLVER_OUTCOME_LABELS, RETRIEVER_LABELS, TIER_LABELS,
+    TIER_STATUS_LABELS,
 };
 pub use state::access_buffer::{AccessBuffer, DEFAULT_ACCESS_BUFFER_CAPACITY};
-pub use state::schema_gate::SchemaGate;
 pub use write::{
     AllocatedId, EvidenceRefPhase, IdKind, Phase, PhaseAck, SupersedeReplacement,
     SupersedeReplacementId, SupersedeTarget, TombstoneTarget, Write, WriteAck, WriteId,
 };
 pub use writer::{
     AutoEdgeEnqueue, CausalEdgeEnqueue, ExtractorEnqueue, ForgetCascadeJob, ForgetCascadeKind,
-    ForgetCascadeMode, RealWriterHandle, SchemaFlagSweepJob, TemporalEdgeEnqueue,
+    ForgetCascadeMode, RealWriterHandle, RedbCommittedWatermark, SchemaFlagSweepJob,
+    TemporalEdgeEnqueue,
 };
 
 #[cfg(test)]
@@ -239,10 +244,9 @@ mod tests {
 
         let tempdir = tempfile::tempdir().unwrap();
         let db_path = tempdir.path().join("metadata.redb");
-        let metadata: SharedMetadataDb = Arc::new(parking_lot::Mutex::new(
-            brain_metadata::MetadataDb::open(&db_path).unwrap(),
-        ));
-        let (shared, _writer) = SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).unwrap();
+        let metadata: SharedMetadataDb =
+            Arc::new(brain_metadata::MetadataDb::open(&db_path).unwrap());
+        let (shared, _writer) = SharedHnsw::new(IndexParams::default_v1()).unwrap();
         let executor = ExecutorContext::new(
             Arc::new(NopDispatcher) as Arc<dyn Dispatcher>,
             shared,
@@ -254,19 +258,19 @@ mod tests {
         // construct a fresh context per test — leaking the dir for a
         // few µs is fine.
         std::mem::forget(tempdir);
-        OpsContext::new(executor)
+        crate::test_support::ops_context_for_tests_owning_tempdir(executor)
     }
 
     fn encode_req() -> brain_protocol::envelope::request::EncodeRequest {
         brain_protocol::envelope::request::EncodeRequest {
             text: "hi".into(),
-            context_id: 1,
-            kind: brain_protocol::envelope::request::MemoryKindWire::Episodic,
-            salience_hint: 0.5,
-            edges: vec![],
+            session_id: 1,
             request_id: [1; 16],
             txn_id: None,
-            deduplicate: false,
+            occurred_at_unix_nanos: None,
+            act_as: None,
+            wait: brain_protocol::WaitMode::Ack,
+            allow_duplicates: false,
         }
     }
 
@@ -274,14 +278,14 @@ mod tests {
     fn dispatch_encode_routes_to_handler() {
         use crate::test_support::run_in_glommio;
         run_in_glommio(|| async {
-            // 7.3 wired the real ENCODE handler. The unified path needs
+            // The real ENCODE handler runs here. The unified path needs
             // a `RealWriterHandle`; the `NopWriter` fixture fails the
             // downcast with `OpError::Internal`, which is sufficient to
             // prove the dispatcher reaches `handle_encode` rather than
             // a stub. Either of those error shapes confirms routing.
             let ctx = fake_context();
             let req = brain_protocol::envelope::request::RequestBody::Encode(encode_req());
-            match dispatch(req, RequestCaller::anonymous(), &ctx).await {
+            match dispatch(req, RequestCaller::for_tests(), &ctx).await {
                 Err(OpError::ExecError(_)) | Err(OpError::Internal(_)) => {}
                 other => panic!("expected ExecError or Internal from NopWriter, got {other:?}"),
             }
@@ -289,7 +293,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_admin_variant_returns_not_yet_implemented() {
+    fn dispatch_substrate_admin_variant_rejected_as_http_only() {
         use crate::test_support::run_in_glommio;
         run_in_glommio(|| async {
             let ctx = fake_context();
@@ -298,9 +302,32 @@ mod tests {
                     detail: brain_protocol::envelope::request::StatsDetail::Summary,
                 },
             );
-            match dispatch(req, RequestCaller::anonymous(), &ctx).await {
-                Err(OpError::NotYetImplemented(msg)) => assert!(msg.contains("admin")),
-                other => panic!("expected NotYetImplemented, got {other:?}"),
+            // Substrate admin ops are served over the HTTP admin listener, not
+            // the wire — dispatch rejects them with a clear InvalidRequest.
+            match dispatch(req, RequestCaller::for_tests(), &ctx).await {
+                Err(OpError::InvalidRequest(msg)) => assert!(msg.contains("admin")),
+                other => panic!("expected InvalidRequest (admin is HTTP-only), got {other:?}"),
+            }
+
+            // Backfill control is part of the same HTTP-only admin plane
+            // (the resumable worker is driven from `/v1/backfill`); the wire
+            // opcode must reject the same way — NOT dangle on
+            // `NotYetImplemented`, and NOT drive the worker over the wire.
+            // Pinned explicitly so a future split of the shared match arm
+            // can't silently regress it.
+            let backfill = brain_protocol::envelope::request::RequestBody::AdminBackfill(
+                brain_protocol::envelope::request::AdminBackfillRequest {
+                    scope: brain_protocol::envelope::request::BackfillScope::All,
+                    extractor_ids: vec![1],
+                    dry_run: true,
+                    request_id: [0u8; 16],
+                },
+            );
+            match dispatch(backfill, RequestCaller::for_tests(), &ctx).await {
+                Err(OpError::InvalidRequest(msg)) => assert!(msg.contains("admin")),
+                other => {
+                    panic!("expected InvalidRequest for AdminBackfill (HTTP-only), got {other:?}")
+                }
             }
         })
     }

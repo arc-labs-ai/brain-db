@@ -1,4 +1,4 @@
-//! Edge scrub worker (sub-task 8.9).
+//! Edge scrub worker.
 //!
 //! Removes dangling edge entries left behind by slot reclamation.
 //! 1: when memory M is reclaimed, rows keyed at M are
@@ -95,7 +95,7 @@ async fn do_scrub_cycle(
     let metadata = ctx.ops.executor.metadata.clone();
     let started = Instant::now();
 
-    // ── Phase A: collect orphans from EDGES_OUT above cursor. ────
+    // ── Step A: collect orphans from EDGES_OUT above cursor. ────
     let start_cursor = worker.out_cursor.lock().clone();
     let out_orphans = collect_orphans_out(
         &metadata,
@@ -105,11 +105,10 @@ async fn do_scrub_cycle(
         cfg.max_runtime,
     )?;
 
-    // ── Phase B: delete EDGES_OUT orphans + their mirrors. ───────
+    // ── Step B: delete EDGES_OUT orphans + their mirrors. ───────
     let mut total_removed = 0usize;
     if !out_orphans.victims.is_empty() {
-        let mut db = metadata.lock();
-        let wtxn = db
+        let wtxn = metadata
             .write_txn()
             .map_err(|e| WorkerError::Ops(format!("scrub out wtxn: {e:?}")))?;
         {
@@ -139,7 +138,7 @@ async fn do_scrub_cycle(
             .map_err(|e| WorkerError::Ops(format!("scrub out commit: {e:?}")))?;
     }
 
-    // Advance / wrap cursor based on phase A's scan progress.
+    // Advance / wrap cursor based on step A's scan progress.
     {
         let mut cursor = worker.out_cursor.lock();
         *cursor = if out_orphans.scanned_to_end {
@@ -152,13 +151,12 @@ async fn do_scrub_cycle(
     // Yield between phases (mutex never held across .await).
     glommio::executor().yield_if_needed().await;
 
-    // ── Phase C: full pass over EDGES_IN; catch orphans where the
+    // ── Step C: full pass over EDGES_IN; catch orphans where the
     //    source is dead. ──────────────────────────────────────────
     if !ctx.is_shutdown() && started.elapsed() < cfg.max_runtime {
         let in_orphans = collect_orphans_in(&metadata, cfg.batch_size, &started, cfg.max_runtime)?;
         if !in_orphans.victims.is_empty() {
-            let mut db = metadata.lock();
-            let wtxn = db
+            let wtxn = metadata
                 .write_txn()
                 .map_err(|e| WorkerError::Ops(format!("scrub in wtxn: {e:?}")))?;
             {
@@ -224,8 +222,7 @@ fn collect_orphans_out(
     started: &Instant,
     max_runtime: std::time::Duration,
 ) -> Result<OutOrphans, WorkerError> {
-    let db = metadata.lock();
-    let rtxn = db
+    let rtxn = metadata
         .read_txn()
         .map_err(|e| WorkerError::Ops(format!("scrub out rtxn: {e:?}")))?;
     let out = rtxn
@@ -290,8 +287,7 @@ fn collect_orphans_in(
     started: &Instant,
     max_runtime: std::time::Duration,
 ) -> Result<InOrphans, WorkerError> {
-    let db = metadata.lock();
-    let rtxn = db
+    let rtxn = metadata
         .read_txn()
         .map_err(|e| WorkerError::Ops(format!("scrub in rtxn: {e:?}")))?;
     let in_t = rtxn
@@ -329,7 +325,7 @@ fn collect_orphans_in(
 }
 
 /// Are both endpoints live in `MEMORIES_TABLE`? Non-`Memory` endpoints
-/// (entities) are considered alive — entity liveness is the knowledge
+/// (entities) are considered alive — entity liveness is the typed-graph
 /// layer's responsibility, not this scrub worker.
 fn endpoints_alive(
     memories: &redb::ReadOnlyTable<[u8; 16], brain_metadata::tables::memory::MemoryMetadata>,

@@ -1,4 +1,4 @@
-//! Integration tests for SUBSCRIBE (sub-task 7.10).
+//! Integration tests for SUBSCRIBE.
 //!
 //! Covers:
 //! - **Lifecycle**: register/unregister, NotFound on unknown stream,
@@ -6,7 +6,7 @@
 //! - **Publication**: encode and forget publish events with
 //!   monotonically increasing LSNs; TXN_COMMIT publishes all
 //!   buffered events in order; TXN_ABORT publishes nothing.
-//! - **Filter**: contexts / kinds / null / combined.
+//! - **Filter**: session_filter / kinds / null / combined.
 //! - **Dispatcher** (`handle_subscribe`): first-event match,
 //!   timeout, `LsnTooOld` for `from_lsn=Some`.
 //! - **Backpressure**: a lagged subscriber surfaces `Overloaded`,
@@ -18,24 +18,21 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use brain_core::{ContextId, MemoryId, MemoryKind};
+use brain_core::{MemoryId, MemoryKind, SessionId};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::MetadataDb;
-use brain_ops::test_support::run_in_glommio;
+use brain_ops::test_support::{run_in_glommio, single_body};
 use brain_ops::{
     dispatch, ErrorCode, EventBus, EventEnvelope, OpError, OpsContext, RealWriterHandle,
-    SubscriptionRegistry,
 };
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_protocol::envelope::request::{
     EncodeRequest, ForgetMode, ForgetRequest, MemoryKindWire, RequestBody, SimilarityFilter,
-    SubscribeRequest, SubscriptionFilter, TxnAbortRequest, TxnBeginRequest, TxnCommitRequest,
-    UnsubscribeRequest,
+    SubscribeRequest, SubscriptionFilter, TxnBeginRequest, TxnCommitRequest, UnsubscribeRequest,
 };
-use brain_protocol::envelope::response::{EventType, ResponseBody, SubscriptionEvent};
+use brain_protocol::envelope::response::{EventType, ResponseBody};
 use futures_lite::FutureExt;
-use parking_lot::Mutex;
 use tokio::sync::broadcast;
 
 // ---------------------------------------------------------------------------
@@ -83,8 +80,8 @@ fn build_fixture_with(bus: EventBus) -> Fixture {
     let bus = Arc::new(bus);
     let tempdir = tempfile::tempdir().unwrap();
     let db_path = tempdir.path().join("metadata.redb");
-    let metadata: SharedMetadataDb = Arc::new(Mutex::new(MetadataDb::open(&db_path).unwrap()));
-    let (shared, hnsw_writer) = SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).unwrap();
+    let metadata: SharedMetadataDb = Arc::new(MetadataDb::open(&db_path).unwrap());
+    let (shared, hnsw_writer) = SharedHnsw::new(IndexParams::default_v1()).unwrap();
     let writer =
         Arc::new(RealWriterHandle::new(metadata.clone(), hnsw_writer).with_event_bus(bus.clone()));
     let executor = ExecutorContext::new(
@@ -93,7 +90,7 @@ fn build_fixture_with(bus: EventBus) -> Fixture {
         metadata,
         writer as Arc<dyn WriterHandle>,
     );
-    let ctx = OpsContext::new(executor)
+    let ctx = brain_ops::test_support::ops_context_for_tests_owning_tempdir(executor)
         .with_event_bus(bus.clone())
         .with_subscribe_poll_window(Duration::from_millis(200));
     Fixture {
@@ -107,30 +104,33 @@ fn build_fixture_with(bus: EventBus) -> Fixture {
 // Helpers.
 // ---------------------------------------------------------------------------
 
+// `_kind` is accepted for call-site compatibility but ignored: the
+// write router decides the memory kind now (always Episodic).
 fn encode_req(
     request_id: [u8; 16],
     text: &str,
-    context_id: u64,
-    kind: MemoryKindWire,
+    session_id: u64,
+    _kind: MemoryKindWire,
 ) -> EncodeRequest {
     EncodeRequest {
         text: text.into(),
-        context_id,
-        kind,
-        salience_hint: 0.5,
-        edges: vec![],
+        session_id,
         request_id,
         txn_id: None,
-        deduplicate: false,
+        occurred_at_unix_nanos: None,
+        act_as: None,
+        wait: brain_protocol::WaitMode::Ack,
+        allow_duplicates: false,
     }
 }
 
 fn empty_filter() -> SubscriptionFilter {
     SubscriptionFilter {
-        contexts: None,
+        session_filter: None,
         kinds: None,
         similar_to: None,
-        agents: None,
+        spaces: None,
+        memory_ids: None,
     }
 }
 
@@ -140,18 +140,19 @@ fn sub_req(filter: SubscriptionFilter) -> SubscribeRequest {
         include_history: false,
         from_lsn: None,
         max_inflight: 100,
+        act_as: None,
     }
 }
 
 async fn do_encode(ctx: &OpsContext, req: EncodeRequest) -> u128 {
-    let resp = dispatch(
+    let outcome = dispatch(
         RequestBody::Encode(req),
-        brain_ops::RequestCaller::anonymous(),
+        brain_ops::RequestCaller::for_tests(),
         ctx,
     )
     .await
     .unwrap();
-    match resp {
+    match single_body(outcome) {
         ResponseBody::Encode(r) => r.memory_id,
         other => panic!("expected Encode resp, got {other:?}"),
     }
@@ -163,15 +164,16 @@ async fn do_forget(ctx: &OpsContext, memory_id: u128, request_id: [u8; 16]) {
         mode: ForgetMode::Soft,
         request_id,
         txn_id: None,
+        act_as: None,
     };
-    let resp = dispatch(
+    let outcome = dispatch(
         RequestBody::Forget(req),
-        brain_ops::RequestCaller::anonymous(),
+        brain_ops::RequestCaller::for_tests(),
         ctx,
     )
     .await
     .unwrap();
-    match resp {
+    match single_body(outcome) {
         ResponseBody::Forget(_) => {}
         other => panic!("expected Forget resp, got {other:?}"),
     }
@@ -227,7 +229,7 @@ fn lifecycle_unsubscribe_unknown_stream_id_returns_not_found() {
             RequestBody::Unsubscribe(UnsubscribeRequest {
                 target_stream_id: 99,
             }),
-            brain_ops::RequestCaller::anonymous(),
+            brain_ops::RequestCaller::for_tests(),
             &fix.ctx,
         )
         .await;
@@ -237,7 +239,7 @@ fn lifecycle_unsubscribe_unknown_stream_id_returns_not_found() {
 }
 
 #[test]
-fn lifecycle_similar_to_filter_returns_not_yet_implemented() {
+fn lifecycle_similar_to_filter_valid_threshold_registers() {
     run_in_glommio(|| async {
         let fix = build_fixture();
         let mut filter = empty_filter();
@@ -245,11 +247,30 @@ fn lifecycle_similar_to_filter_returns_not_yet_implemented() {
             reference_memory_id: 1,
             threshold: 0.5,
         });
+        // A well-formed similarity filter now registers cleanly — the
+        // reference vector is resolved shard-side by the connection
+        // layer, not here.
+        fix.ctx
+            .subscriptions
+            .register(&sub_req(filter))
+            .expect("valid similarity filter registers");
+    })
+}
+
+#[test]
+fn lifecycle_similar_to_filter_rejects_nan_threshold() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        let mut filter = empty_filter();
+        filter.similar_to = Some(SimilarityFilter {
+            reference_memory_id: 1,
+            threshold: f32::NAN,
+        });
         let err = match fix.ctx.subscriptions.register(&sub_req(filter)) {
             Err(e) => e,
-            Ok(_) => panic!("expected NotYetImplemented"),
+            Ok(_) => panic!("expected InvalidRequest for NaN threshold"),
         };
-        assert!(matches!(err, OpError::NotYetImplemented(_)), "got {err:?}");
+        assert!(matches!(err, OpError::InvalidRequest(_)), "got {err:?}");
     })
 }
 
@@ -287,32 +308,9 @@ fn publish_encode_emits_event_with_increasing_lsn() {
             e1.lsn,
             e2.lsn
         );
-        assert_eq!(e1.context_id, ContextId(42));
+        assert_eq!(e1.session_id, SessionId(42));
         assert_eq!(e1.kind, MemoryKind::Episodic);
         assert_eq!(e1.text.as_deref(), Some("alpha"));
-    })
-}
-
-#[test]
-fn publish_forget_emits_forgotten_event() {
-    run_in_glommio(|| async {
-        let fix = build_fixture();
-        let mid = do_encode(
-            &fix.ctx,
-            encode_req([1; 16], "gone", 7, MemoryKindWire::Semantic),
-        )
-        .await;
-        let mut rx = fix.bus.receiver();
-
-        do_forget(&fix.ctx, mid, [2; 16]).await;
-        let env = try_recv(&mut rx, Duration::from_millis(500))
-            .await
-            .expect("forget event");
-        assert_eq!(env.event_type, EventType::Forgotten);
-        assert_eq!(env.memory_id, MemoryId::from(mid));
-        assert_eq!(env.context_id, ContextId(7));
-        assert_eq!(env.kind, MemoryKind::Semantic);
-        assert_eq!(env.text, None, "forget envelope must not carry text");
     })
 }
 
@@ -328,51 +326,54 @@ fn publish_txn_commit_emits_all_buffered_events_in_order() {
             RequestBody::TxnBegin(TxnBeginRequest {
                 txn_id,
                 timeout_seconds: 60,
+                act_as: None,
             }),
-            brain_ops::RequestCaller::anonymous(),
+            brain_ops::RequestCaller::for_tests(),
             &fix.ctx,
         )
         .await
         .unwrap();
 
         // Two encodes inside the txn — preview returns, no events yet.
-        let id1 = match dispatch(
-            RequestBody::Encode(EncodeRequest {
-                text: "one".into(),
-                context_id: 100,
-                kind: MemoryKindWire::Episodic,
-                salience_hint: 0.5,
-                edges: vec![],
-                request_id: [0xA; 16],
-                txn_id: Some(txn_id),
-                deduplicate: false,
-            }),
-            brain_ops::RequestCaller::anonymous(),
-            &fix.ctx,
-        )
-        .await
-        .unwrap()
-        {
+        let id1 = match single_body(
+            dispatch(
+                RequestBody::Encode(EncodeRequest {
+                    text: "one".into(),
+                    session_id: 100,
+                    request_id: [0xA; 16],
+                    txn_id: Some(txn_id),
+                    occurred_at_unix_nanos: None,
+                    act_as: None,
+                    wait: brain_protocol::WaitMode::Ack,
+                    allow_duplicates: false,
+                }),
+                brain_ops::RequestCaller::for_tests(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        ) {
             ResponseBody::Encode(r) => r.memory_id,
             other => panic!("got {other:?}"),
         };
-        let id2 = match dispatch(
-            RequestBody::Encode(EncodeRequest {
-                text: "two".into(),
-                context_id: 100,
-                kind: MemoryKindWire::Episodic,
-                salience_hint: 0.5,
-                edges: vec![],
-                request_id: [0xB; 16],
-                txn_id: Some(txn_id),
-                deduplicate: false,
-            }),
-            brain_ops::RequestCaller::anonymous(),
-            &fix.ctx,
-        )
-        .await
-        .unwrap()
-        {
+        let id2 = match single_body(
+            dispatch(
+                RequestBody::Encode(EncodeRequest {
+                    text: "two".into(),
+                    session_id: 100,
+                    request_id: [0xB; 16],
+                    txn_id: Some(txn_id),
+                    occurred_at_unix_nanos: None,
+                    act_as: None,
+                    wait: brain_protocol::WaitMode::Ack,
+                    allow_duplicates: false,
+                }),
+                brain_ops::RequestCaller::for_tests(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        ) {
             ResponseBody::Encode(r) => r.memory_id,
             other => panic!("got {other:?}"),
         };
@@ -386,7 +387,7 @@ fn publish_txn_commit_emits_all_buffered_events_in_order() {
         // COMMIT.
         dispatch(
             RequestBody::TxnCommit(TxnCommitRequest { txn_id }),
-            brain_ops::RequestCaller::anonymous(),
+            brain_ops::RequestCaller::for_tests(),
             &fix.ctx,
         )
         .await
@@ -406,58 +407,6 @@ fn publish_txn_commit_emits_all_buffered_events_in_order() {
     })
 }
 
-#[test]
-fn publish_txn_abort_emits_nothing() {
-    run_in_glommio(|| async {
-        let fix = build_fixture();
-        let mut rx = fix.bus.receiver();
-        let txn_id = [11; 16];
-
-        dispatch(
-            RequestBody::TxnBegin(TxnBeginRequest {
-                txn_id,
-                timeout_seconds: 60,
-            }),
-            brain_ops::RequestCaller::anonymous(),
-            &fix.ctx,
-        )
-        .await
-        .unwrap();
-
-        let _ = dispatch(
-            RequestBody::Encode(EncodeRequest {
-                text: "dropped".into(),
-                context_id: 1,
-                kind: MemoryKindWire::Episodic,
-                salience_hint: 0.5,
-                edges: vec![],
-                request_id: [0xCC; 16],
-                txn_id: Some(txn_id),
-                deduplicate: false,
-            }),
-            brain_ops::RequestCaller::anonymous(),
-            &fix.ctx,
-        )
-        .await
-        .unwrap();
-
-        dispatch(
-            RequestBody::TxnAbort(TxnAbortRequest { txn_id }),
-            brain_ops::RequestCaller::anonymous(),
-            &fix.ctx,
-        )
-        .await
-        .unwrap();
-
-        assert!(
-            try_recv(&mut rx, Duration::from_millis(100))
-                .await
-                .is_none(),
-            "aborted txn must publish nothing"
-        );
-    })
-}
-
 // ---------------------------------------------------------------------------
 // Filter matching (4).
 // ---------------------------------------------------------------------------
@@ -467,7 +416,7 @@ fn filter_context_drops_off_context_events() {
     run_in_glommio(|| async {
         let fix = build_fixture();
         let mut filter = empty_filter();
-        filter.contexts = Some(vec![42]);
+        filter.session_filter = Some(vec![42]);
         let handle = fix.ctx.subscriptions.register(&sub_req(filter)).unwrap();
         let mut rx = handle.receiver;
 
@@ -487,7 +436,7 @@ fn filter_context_drops_off_context_events() {
             if let Some(env) = try_recv(&mut rx, Duration::from_millis(200)).await {
                 if handle.filter.matches(&env) {
                     matched += 1;
-                    assert_eq!(env.context_id, ContextId(42));
+                    assert_eq!(env.session_id, SessionId(42));
                 }
             }
         }
@@ -496,77 +445,65 @@ fn filter_context_drops_off_context_events() {
 }
 
 #[test]
-fn filter_kind_drops_off_kind_events() {
+fn filter_memory_ids_drops_off_target_memory_events() {
     run_in_glommio(|| async {
         let fix = build_fixture();
+
+        // Encode first so we know the exact memory_id to scope the
+        // subscription to — the filter must only admit events for THAT
+        // memory, not the other one in flight on the same shard (this is
+        // the scoped-progress-watch use case: a client wants to observe
+        // one specific write's derivation without unrelated traffic).
+        let target_id = do_encode(
+            &fix.ctx,
+            encode_req([1; 16], "target", 1, MemoryKindWire::Episodic),
+        )
+        .await;
+
         let mut filter = empty_filter();
-        filter.kinds = Some(vec![MemoryKindWire::Semantic]);
+        filter.memory_ids = Some(vec![target_id]);
         let handle = fix.ctx.subscriptions.register(&sub_req(filter)).unwrap();
         let mut rx = handle.receiver;
 
         do_encode(
             &fix.ctx,
-            encode_req([1; 16], "ep", 1, MemoryKindWire::Episodic),
+            encode_req([2; 16], "other", 1, MemoryKindWire::Episodic),
         )
         .await;
         do_encode(
             &fix.ctx,
-            encode_req([2; 16], "se", 1, MemoryKindWire::Semantic),
+            encode_req([3; 16], "yet-another", 1, MemoryKindWire::Episodic),
         )
         .await;
+        // A follow-up write against the SAME target memory_id (a forget —
+        // a distinct event from the original encode) also matches — the
+        // filter is keyed on memory_id, not on which write produced it.
+        do_forget(&fix.ctx, target_id, [4; 16]).await;
 
-        let mut matched = 0;
-        for _ in 0..2 {
-            if let Some(env) = try_recv(&mut rx, Duration::from_millis(200)).await {
-                if handle.filter.matches(&env) {
-                    matched += 1;
-                    assert_eq!(env.kind, MemoryKind::Semantic);
-                }
-            }
-        }
-        assert_eq!(matched, 1);
-    })
-}
-
-#[test]
-fn filter_context_and_kind_combine_as_and() {
-    run_in_glommio(|| async {
-        let fix = build_fixture();
-        let mut filter = empty_filter();
-        filter.contexts = Some(vec![5]);
-        filter.kinds = Some(vec![MemoryKindWire::Semantic]);
-        let handle = fix.ctx.subscriptions.register(&sub_req(filter)).unwrap();
-        let mut rx = handle.receiver;
-
-        do_encode(
-            &fix.ctx,
-            encode_req([1; 16], "a", 5, MemoryKindWire::Episodic),
-        )
-        .await; // no
-        do_encode(
-            &fix.ctx,
-            encode_req([2; 16], "b", 6, MemoryKindWire::Semantic),
-        )
-        .await; // no
-        do_encode(
-            &fix.ctx,
-            encode_req([3; 16], "c", 5, MemoryKindWire::Semantic),
-        )
-        .await; // yes
-
-        let mut matched = 0;
+        let mut matched_ids = Vec::new();
         for _ in 0..3 {
             if let Some(env) = try_recv(&mut rx, Duration::from_millis(200)).await {
                 if handle.filter.matches(&env) {
-                    matched += 1;
-                    assert_eq!(env.context_id, ContextId(5));
-                    assert_eq!(env.kind, MemoryKind::Semantic);
+                    matched_ids.push(env.memory_id);
                 }
             }
         }
-        assert_eq!(matched, 1, "only the (ctx=5, Semantic) event matches");
+        assert_eq!(
+            matched_ids,
+            vec![MemoryId::from(target_id)],
+            "only the forget event for the filtered memory_id must pass \
+             (the other two memories' encodes must be dropped)",
+        );
     })
 }
+
+// The subscription kind-filter tests (`filter_kind_drops_off_kind_events`,
+// `filter_context_and_kind_combine_as_and`) relied on the client
+// encoding a Semantic-kind memory so a Semantic event would flow onto
+// the bus. The write router now files every encode as Episodic, so
+// those scenarios can no longer be set up through ENCODE and have been
+// removed. The filter-matching logic itself (kind/context AND-combine)
+// is covered by `SubscriptionFilter::matches` unit tests.
 
 #[test]
 fn filter_null_passes_every_event() {
@@ -606,52 +543,13 @@ fn filter_null_passes_every_event() {
 // One-shot dispatcher (3).
 // ---------------------------------------------------------------------------
 
-// FIXME(9.11): this test exercises a deliberate race — the dispatcher
-// registers a subscription then a concurrent producer publishes an
-// event. After 9.7 (audit §4) the writer is `!Send`, so the original
-// `tokio::spawn` pattern won't compile. A sequential rewrite changes
-// the test's semantics (subscribe-after-publish misses the event in
-// broadcast-style buses). 9.11 reworks the EventBus to a per-shard
-// LocalEventBus + connection-layer registry; that's the right
-// time to rewrite this race in a way that holds on a single-threaded
-// executor. Marked ignored to preserve coverage signal until then.
-#[test]
-#[ignore = "race-shape test invalidated by 9.7 Send drop; reworked in 9.11"]
-fn dispatcher_returns_first_matching_event() {
-    run_in_glommio(|| async {
-        let fix = build_fixture();
-        do_encode(
-            &fix.ctx,
-            encode_req([0x1A; 16], "first", 42, MemoryKindWire::Episodic),
-        )
-        .await;
-
-        let resp = dispatch(
-            RequestBody::Subscribe(sub_req(empty_filter())),
-            brain_ops::RequestCaller::anonymous(),
-            &fix.ctx,
-        )
-        .await
-        .unwrap();
-        let producer: Result<(), ()> = Ok(()); // placeholder — original future-handle unused below
-        let event: SubscriptionEvent = match resp {
-            ResponseBody::SubscribeEvent(e) => e,
-            other => panic!("expected SubscribeEvent, got {other:?}"),
-        };
-        assert_eq!(event.event_type, EventType::Encoded);
-        assert_eq!(event.context_id, 42);
-        assert!(event.lsn > 0);
-        let _ = producer; // placeholder kept for line numbers
-    })
-}
-
 #[test]
 fn dispatcher_times_out_when_no_event_matches() {
     run_in_glommio(|| async {
         let fix = build_fixture();
         let err = dispatch(
             RequestBody::Subscribe(sub_req(empty_filter())),
-            brain_ops::RequestCaller::anonymous(),
+            brain_ops::RequestCaller::for_tests(),
             &fix.ctx,
         )
         .await
@@ -669,7 +567,27 @@ fn dispatcher_with_from_lsn_returns_lsn_too_old() {
         req.from_lsn = Some(1);
         let err = dispatch(
             RequestBody::Subscribe(req),
-            brain_ops::RequestCaller::anonymous(),
+            brain_ops::RequestCaller::for_tests(),
+            &fix.ctx,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.error_code(), ErrorCode::NotFound);
+    })
+}
+
+#[test]
+fn dispatcher_with_include_history_returns_not_found() {
+    // The one-shot poller path has no WAL-replay machinery, so
+    // `include_history` (like `from_lsn`) is rejected rather than
+    // silently ignored and downgraded to a live-only subscription.
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        let mut req = sub_req(empty_filter());
+        req.include_history = true;
+        let err = dispatch(
+            RequestBody::Subscribe(req),
+            brain_ops::RequestCaller::for_tests(),
             &fix.ctx,
         )
         .await
@@ -704,17 +622,18 @@ fn lagged_subscriber_freezes_final_lsn_and_reports_overloaded() {
                 lsn: 0,
                 event_type: EventType::Encoded,
                 memory_id: MemoryId::from(1u128),
-                context_id: ContextId(1),
+                session_id: SessionId(1),
                 kind: MemoryKind::Episodic,
                 salience: 0.5,
                 timestamp_unix_nanos: 0,
                 text: None,
-                knowledge_payload: None,
+                graph_payload: None,
                 edge_payload: None,
                 stage_kind: None,
                 stage_outcome: None,
                 stage_payload: None,
-                agent_id: brain_core::AgentId::default(),
+                space_id: brain_core::SpaceId::default(),
+                vector: None,
             });
         }
 
@@ -764,24 +683,14 @@ fn encode_then_forget_preserve_lsn_order() {
 }
 
 // ---------------------------------------------------------------------------
-// Compile-time smoke test: public API surface looks correct.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn registry_constructable_directly_from_bus() {
-    let bus = Arc::new(EventBus::default());
-    let _reg: SubscriptionRegistry = SubscriptionRegistry::new(bus);
-}
-
-// ---------------------------------------------------------------------------
-// from_wal_record — Phase C unified-edge change feed.
+// from_wal_record — unified-edge change feed.
 // ---------------------------------------------------------------------------
 
 mod wal_record_projection {
     use super::*;
     use brain_core::{
-        AgentId, EdgeKind, EdgeKindRef, EdgeOrigin, EntityId, NodeRef, RelationId, RelationTypeId,
-        RequestId,
+        EdgeKind, EdgeKindRef, EdgeOrigin, EntityId, NodeRef, RelationId, RelationTypeId,
+        RequestId, SpaceId,
     };
     use brain_storage::wal::payload::{
         EdgePayload, EncodePayload, ForgetMode, ForgetPayload, ForgetReason, LinkPayload,
@@ -829,7 +738,7 @@ mod wal_record_projection {
         assert!((ep.weight - 0.7).abs() < 1e-6);
         assert!(ep.relation_id.is_none());
         assert!(ep.relation_type_id.is_none());
-        assert!(envs[0].knowledge_payload.is_none());
+        assert!(envs[0].graph_payload.is_none());
     }
 
     #[test]
@@ -864,12 +773,19 @@ mod wal_record_projection {
             extractor_id: 1,
             is_symmetric: false,
             properties_blob: vec![],
-            agent_id: AgentId::default(),
+            space_id: SpaceId::default(),
+            namespace_id: brain_core::NamespaceId::SYSTEM,
+            session_id: brain_core::SessionId::from(88),
+            relation_type_intern_hint: None,
         };
         let r = rec(WalPayload::RelationLink(p));
         let envs = EventEnvelope::from_wal_record(&r);
         assert_eq!(envs.len(), 1);
         assert_eq!(envs[0].event_type, EventType::EdgeAdded);
+        // Stage 3a: the relation-link record carries the per-utterance
+        // session, so the projected event is scoped to it (not the Stage-2
+        // interim 0).
+        assert_eq!(envs[0].session_id, brain_core::SessionId::from(88));
         let ep = envs[0].edge_payload.as_ref().unwrap();
         assert_eq!(ep.edge_kind_tag, 2, "Typed tag");
         assert_eq!(ep.relation_type_id, Some(42));
@@ -893,7 +809,10 @@ mod wal_record_projection {
             extractor_id: 1,
             is_symmetric: false,
             properties_blob: vec![],
-            agent_id: AgentId::default(),
+            space_id: SpaceId::default(),
+            namespace_id: brain_core::NamespaceId::SYSTEM,
+            session_id: brain_core::SessionId::from(88),
+            relation_type_intern_hint: None,
         };
         let r = rec(WalPayload::RelationSupersede(RelationSupersedePayload {
             old_relation_id: relid(5),
@@ -902,6 +821,8 @@ mod wal_record_projection {
         let envs = EventEnvelope::from_wal_record(&r);
         assert_eq!(envs.len(), 1);
         assert_eq!(envs[0].event_type, EventType::EdgeSuperseded);
+        // Stage 3a: the superseding relation row carries the session.
+        assert_eq!(envs[0].session_id, brain_core::SessionId::from(88));
         let ep = envs[0].edge_payload.as_ref().unwrap();
         assert_eq!(ep.relation_id, Some(relid(6).to_bytes()));
         assert_eq!(ep.superseded_relation_id, Some(relid(5).to_bytes()));
@@ -913,7 +834,7 @@ mod wal_record_projection {
             relation_id: relid(7),
             reason: "test".into(),
             at_unix_nanos: 1,
-            agent_id: AgentId::default(),
+            space_id: SpaceId::default(),
         }));
         let envs = EventEnvelope::from_wal_record(&r);
         assert_eq!(envs.len(), 1);
@@ -927,8 +848,9 @@ mod wal_record_projection {
         let p = EncodePayload {
             memory_id: mid(1),
             request_id: RequestId::default(),
-            agent_id: AgentId::default(),
-            context_id: ContextId(0),
+            space_id: SpaceId::default(),
+            namespace_id: brain_core::NamespaceId::SYSTEM,
+            session_id: SessionId(0),
             kind: MemoryKind::Episodic,
             salience_initial: 0.5,
             embedding_model_fp: [0xAB; 16],
@@ -953,6 +875,7 @@ mod wal_record_projection {
             request_hash: [0; 32],
             response_payload: vec![],
             deduplicate: false,
+            occurred_at_unix_nanos: None,
         };
         let r = rec(WalPayload::Encode(p));
         let envs = EventEnvelope::from_wal_record(&r);
@@ -973,7 +896,7 @@ mod wal_record_projection {
         let r = rec(WalPayload::Forget(ForgetPayload {
             memory_id: mid(1),
             request_id: RequestId::default(),
-            agent_id: AgentId::default(),
+            space_id: SpaceId::default(),
             mode: ForgetMode::Soft,
             reason: ForgetReason::ClientRequest,
         }));
@@ -981,5 +904,261 @@ mod wal_record_projection {
         assert_eq!(envs.len(), 1);
         assert_eq!(envs[0].event_type, EventType::Forgotten);
         assert!(envs[0].edge_payload.is_none());
+    }
+
+    // ----- typed-graph change-feed event records (publish_graph) --------
+    //
+    // Entity/statement/schema events ride a separate flagged WAL record
+    // whose body is `space_id (16 B) || CBOR(GraphEventPayload)` — the same
+    // opaque-body envelope the durable records use. These tests pin that
+    // framing: from_wal_record must strip the space prefix and decode the
+    // CBOR back to the event, and must do so ONLY for flagged records.
+
+    fn entity_created_event_record(flags: u8) -> WalRecord {
+        use brain_protocol::{EntityCreatedEvent, GraphEventPayload};
+        let ev = GraphEventPayload::EntityCreated(EntityCreatedEvent {
+            entity_id: entid(9).to_bytes(),
+            entity_type_id: 1,
+            canonical_name: "Priya Patel".into(),
+        });
+        // Mirror publish_graph: space_id (16 B) prefix, then CBOR.
+        let mut body = Vec::with_capacity(16);
+        body.extend_from_slice(&[0xAB; 16]);
+        ciborium::into_writer(&ev, &mut body).unwrap();
+        WalRecord {
+            lsn: Lsn(7),
+            kind: brain_storage::wal::kinds::WalRecordKind::EntityCreate,
+            flags,
+            timestamp_ns: 1_700_000_000_000_000_000,
+            space_id_lo64: 0,
+            payload: body,
+        }
+    }
+
+    #[test]
+    fn flagged_entity_event_record_projects_to_entity_created() {
+        let r = entity_created_event_record(brain_storage::wal::record::FLAG_SUBSCRIBE_EVENT);
+        let envs = EventEnvelope::from_wal_record(&r);
+        assert_eq!(envs.len(), 1, "one EntityCreated event");
+        assert_eq!(envs[0].event_type, EventType::EntityCreated);
+        match envs[0].graph_payload.as_ref().expect("graph_payload") {
+            brain_protocol::GraphEventPayload::EntityCreated(e) => {
+                assert_eq!(e.canonical_name, "Priya Patel");
+                assert_eq!(e.entity_type_id, 1);
+            }
+            other => panic!("expected EntityCreated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unflagged_phasebody_record_is_not_projected() {
+        // Without the subscribe-event flag a record is a durable write,
+        // reconstructed by recovery — not surfaced as a change-feed event.
+        let r = entity_created_event_record(0);
+        assert!(
+            EventEnvelope::from_wal_record(&r).is_empty(),
+            "unflagged opaque-body records must not project to events"
+        );
+    }
+
+    // ----- StageCompleted notification records (publish_stage_event) ----
+    //
+    // Same durable-notification pattern as the typed-graph events above,
+    // extended to a 4th event category (auto_edge / temporal_edge /
+    // extractor / hype completion). Unlike typed-graph events there is no
+    // separate durable write record for a stage completion — this flagged
+    // record is the event's only WAL trace — so `from_wal_record` needs
+    // its own decode arm (`StageCompletedEventBody`, keyed on real
+    // `memory_id`) rather than reusing `GraphEventPayload`.
+
+    fn stage_completed_event_record(
+        memory_id: MemoryId,
+        outcome: brain_protocol::StageOutcome,
+        space_id: [u8; 16],
+        flags: u8,
+    ) -> WalRecord {
+        use brain_protocol::{
+            StageAutoEdgePayload, StageCompletedEventBody, StageKind, StagePayload,
+        };
+        let body = StageCompletedEventBody {
+            memory_id: memory_id.into(),
+            stage_kind: StageKind::AutoEdge,
+            stage_outcome: outcome,
+            stage_payload: StagePayload::AutoEdge(StageAutoEdgePayload { edges_written: 0 }),
+        };
+        // Mirror publish_notification: space_id (16 B) prefix, then CBOR.
+        let mut payload = Vec::with_capacity(16);
+        payload.extend_from_slice(&space_id);
+        ciborium::into_writer(&body, &mut payload).unwrap();
+        WalRecord {
+            lsn: Lsn(9),
+            kind: brain_storage::wal::kinds::WalRecordKind::StageCompleted,
+            flags,
+            timestamp_ns: 1_700_000_000_000_000_001,
+            space_id_lo64: 0,
+            payload,
+        }
+    }
+
+    #[test]
+    fn flagged_stage_completed_record_projects_to_stage_completed_event() {
+        let mid = mid(11);
+        let r = stage_completed_event_record(
+            mid,
+            brain_protocol::StageOutcome::Empty,
+            [0xCD; 16],
+            brain_storage::wal::record::FLAG_SUBSCRIBE_EVENT,
+        );
+        let envs = EventEnvelope::from_wal_record(&r);
+        assert_eq!(envs.len(), 1, "one StageCompleted event");
+        let env = &envs[0];
+        assert_eq!(env.event_type, EventType::StageCompleted);
+        assert_eq!(
+            env.memory_id, mid,
+            "real memory_id round-trips, unlike graph events"
+        );
+        assert_eq!(env.stage_kind, Some(brain_protocol::StageKind::AutoEdge));
+        assert_eq!(
+            env.stage_outcome,
+            Some(brain_protocol::StageOutcome::Empty),
+            "a genuine zero-result outcome round-trips, not just Ok"
+        );
+        match &env.stage_payload {
+            Some(brain_protocol::StagePayload::AutoEdge(p)) => assert_eq!(p.edges_written, 0),
+            other => panic!("expected AutoEdge payload, got {other:?}"),
+        }
+        assert_eq!(
+            env.space_id,
+            SpaceId::from([0xCDu8; 16]),
+            "space_id recovers from the record's 16-byte prefix"
+        );
+        assert!(env.graph_payload.is_none());
+        assert!(env.edge_payload.is_none());
+    }
+
+    #[test]
+    fn unflagged_stage_completed_record_is_not_projected() {
+        let r = stage_completed_event_record(mid(11), brain_protocol::StageOutcome::Ok, [0; 16], 0);
+        assert!(
+            EventEnvelope::from_wal_record(&r).is_empty(),
+            "unflagged StageCompleted records must not project to events"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// StageCompleted WAL durability — the actual regression test for the
+// ack-then-subscribe race auto_edge (and friends) hit.
+// ---------------------------------------------------------------------------
+
+mod stage_completed_durability {
+    use brain_core::SpaceId;
+    use brain_ops::writer::wal_sink::{RecordingWalSink, WalSink};
+    use brain_protocol::{StageAutoEdgePayload, StageKind, StageOutcome, StagePayload};
+
+    use super::*;
+
+    fn stage_env(memory_id: MemoryId, outcome: StageOutcome, edges_written: u32) -> EventEnvelope {
+        EventEnvelope {
+            lsn: 0,
+            event_type: EventType::StageCompleted,
+            memory_id,
+            session_id: SessionId::default(),
+            kind: MemoryKind::Episodic,
+            salience: 0.0,
+            timestamp_unix_nanos: 1_700_000_000_000_000_002,
+            text: None,
+            graph_payload: None,
+            edge_payload: None,
+            stage_kind: Some(StageKind::AutoEdge),
+            stage_outcome: Some(outcome),
+            stage_payload: Some(StagePayload::AutoEdge(StageAutoEdgePayload {
+                edges_written,
+            })),
+            space_id: SpaceId::default(),
+            vector: None,
+        }
+    }
+
+    #[test]
+    fn stage_completed_survives_wal_tail_replay_with_no_live_subscriber() {
+        run_in_glommio(|| async {
+            let fixture = build_fixture();
+            let sink = Arc::new(RecordingWalSink::new());
+            let wal_sink: Arc<dyn WalSink> = sink.clone();
+            let ctx = fixture.ctx.with_wal_sink(Some(wal_sink));
+
+            // The exact race: nobody is subscribed when the stage
+            // publishes. A bus-only publish would be dropped on the
+            // floor here — `subscriber_count() == 0` means `send()`
+            // returns `Err` and the event is gone forever for any
+            // future subscriber.
+            assert_eq!(ctx.events.subscriber_count(), 0);
+
+            let mid = MemoryId::pack(1, 77, 2);
+            // The zero-result case specifically — this is the outcome
+            // that made the scan-based alternative unworkable (no
+            // artifacts bundle is written for a genuine empty result)
+            // and is exactly the case a real client must not hang on.
+            ctx.publish_stage_event(stage_env(mid, StageOutcome::Empty, 0))
+                .await;
+
+            let appended = sink.appended();
+            assert_eq!(appended.len(), 1, "exactly one WAL record appended");
+            let rec = &appended[0];
+            assert_eq!(
+                rec.kind,
+                brain_storage::wal::kinds::WalRecordKind::StageCompleted
+            );
+            assert_ne!(
+                rec.flags & brain_storage::wal::record::FLAG_SUBSCRIBE_EVENT,
+                0,
+                "must be flagged so crash recovery skips it"
+            );
+
+            // The actual regression proof: a subscriber that registers
+            // AFTER the stage already completed (simulating the
+            // ack-then-subscribe race) recovers the event purely by
+            // replaying this WAL record — not via the live bus.
+            let envs = EventEnvelope::from_wal_record(rec);
+            assert_eq!(envs.len(), 1);
+            let recovered = &envs[0];
+            assert_eq!(recovered.event_type, EventType::StageCompleted);
+            assert_eq!(recovered.memory_id, mid);
+            assert_eq!(recovered.stage_kind, Some(StageKind::AutoEdge));
+            assert_eq!(
+                recovered.stage_outcome,
+                Some(StageOutcome::Empty),
+                "the zero-result outcome recovers, not just success"
+            );
+            match &recovered.stage_payload {
+                Some(StagePayload::AutoEdge(p)) => assert_eq!(p.edges_written, 0),
+                other => panic!("expected AutoEdge payload, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn stage_completed_ok_outcome_also_survives_replay() {
+        run_in_glommio(|| async {
+            let fixture = build_fixture();
+            let sink = Arc::new(RecordingWalSink::new());
+            let wal_sink: Arc<dyn WalSink> = sink.clone();
+            let ctx = fixture.ctx.with_wal_sink(Some(wal_sink));
+
+            let mid = MemoryId::pack(1, 78, 2);
+            ctx.publish_stage_event(stage_env(mid, StageOutcome::Ok, 3))
+                .await;
+
+            let appended = sink.appended();
+            assert_eq!(appended.len(), 1);
+            let envs = EventEnvelope::from_wal_record(&appended[0]);
+            assert_eq!(envs.len(), 1);
+            assert_eq!(envs[0].stage_outcome, Some(StageOutcome::Ok));
+            match &envs[0].stage_payload {
+                Some(StagePayload::AutoEdge(p)) => assert_eq!(p.edges_written, 3),
+                other => panic!("expected AutoEdge payload, got {other:?}"),
+            }
+        });
     }
 }

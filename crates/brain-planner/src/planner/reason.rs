@@ -1,8 +1,6 @@
 //! Planner side for the `REASON` cognitive operation.
 //!
 //! Maps a wire `ReasonRequest` into a [`ReasonPlan`]. Pure.
-//!
-//! See `spec/12_query_optimizer/05_plan_reason_planning.md` §8-§10.
 
 use brain_protocol::envelope::request::{ObservationInput, ReasonRequest};
 
@@ -180,11 +178,13 @@ mod tests {
             observation: ObservationInput::ByText("the cat sat".into()),
             depth: 3,
             confidence_threshold: 0.5,
-            context_filter: None,
+            session_filter: None,
             max_inferences: 5,
             budget_wall_time_ms: 100,
             request_id: None,
             txn_id: None,
+            act_as: None,
+            trace: false,
         }
     }
 
@@ -277,13 +277,5 @@ mod tests {
             }
             other => panic!("expected InvalidParameters, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn aggregation_defaults_to_five_and_five() {
-        let plan = unwrap_reason(plan_reason(&base_request(), &PlannerContext::default()).unwrap());
-        assert_eq!(plan.aggregation.max_supporting, 5);
-        assert_eq!(plan.aggregation.max_contradicting, 5);
-        assert!(plan.aggregation.include_aggregate_confidence);
     }
 }

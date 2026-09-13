@@ -1,9 +1,8 @@
 //! Throughput benchmark for the embedding layer.
 //!
-//! Spec / phase-doc / orientation plan converge on **≥ 1 000 texts/sec
-//! sustained on the reference CPU with the cache cold** (phase-05.md
-//! §0; orientation plan §0) says 5–10 ms/text single-
-//! threaded, so the 1 000/s target implies parallelism. We measure:
+//! The target is **≥ 1 000 texts/sec
+//! sustained on the reference CPU with the cache cold**. At 5–10 ms/text
+//! single-threaded, the 1 000/s target implies parallelism. We measure:
 //!
 //! 1. `single_thread_short` — single embed, short input. Reports the
 //!    per-iter latency that quotes.

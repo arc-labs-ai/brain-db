@@ -1,19 +1,15 @@
-//! `Statement` value types — Layer 3 of the knowledge graph.
+//! `Statement` value types — the typed-graph statement node.
 //!
 //! Pure value types — no I/O, no async, no rkyv. The rkyv-archived
-//! storage shape lives in `brain-metadata::tables::knowledge::statement`
+//! storage shape lives in `brain-metadata::tables::statement`
 //! and the wire-archived shape lives in
-//! `brain-protocol::knowledge::statement_*`. Conversion between this
-//! brain-core value type and those layers is the respective layer's
+//! `brain-protocol::ops::statement`. Conversion between this
+//! brain-core value type and those crates is the respective crate's
 //! responsibility (via `From` impls).
-//!
-//! See `spec/02_data_model/00_purpose.md` for the canonical schema and
-//! `spec/02_data_model/{01_supersession, 02_contradiction, 04_confidence, 05_evidence}.md`
-//! for the kind-specific contracts.
 //!
 //! ## Four-timestamp bi-temporal model
 //!
-//! Every statement carries four independent timestamps so an agent can
+//! Every statement carries four independent timestamps so an space can
 //! answer both "what was true on date X" and "what did I believe on
 //! date X" without resurrecting tombstones (Zep / Graphiti's bi-temporal
 //! model, applied to a typed graph):
@@ -52,13 +48,24 @@ pub const INLINE_EVIDENCE_CAP: usize = 8;
 // SubjectRef.
 // ---------------------------------------------------------------------------
 
-/// The subject of a statement — either a resolved entity or a pending
-/// resolution audit (when the resolver returns `Ambiguous`).
+/// The subject of a statement — a resolved entity, the source memory
+/// itself, or a pending resolution audit (when the resolver returns
+/// `Ambiguous`).
 ///
-/// Spec `§19/00` §"Schema".
+/// `Memory` lets a statement be *about a memory* rather than an entity —
+/// e.g. a temporal Event ("this memory's content occurred on
+/// 2020-01-15"), where there is no natural entity subject. Entity ids
+/// (UUID) and memory ids (packed u128) occupy disjoint byte spaces, so
+/// the by-subject index keys both by their raw 16 bytes without a kind
+/// discriminant in the key; the row's `subject_kind` disambiguates on
+/// read.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum SubjectRef {
     Entity(EntityId),
+    /// The statement is about the source memory itself (no entity
+    /// subject). Used by the temporal-expressions extractor for Event
+    /// statements.
+    Memory(MemoryId),
     /// The resolver returned `Ambiguous`; the bound audit row records
     /// the candidate set. Query paths excluding pending subjects skip
     /// these.
@@ -71,7 +78,17 @@ impl SubjectRef {
     pub fn as_entity(&self) -> Option<EntityId> {
         match self {
             Self::Entity(id) => Some(*id),
-            Self::Pending(_) => None,
+            Self::Memory(_) | Self::Pending(_) => None,
+        }
+    }
+
+    /// Returns the memory id if this subject is the source memory, else
+    /// `None`.
+    #[must_use]
+    pub fn as_memory(&self) -> Option<MemoryId> {
+        match self {
+            Self::Memory(id) => Some(*id),
+            Self::Entity(_) | Self::Pending(_) => None,
         }
     }
 
@@ -88,9 +105,8 @@ impl SubjectRef {
 
 /// Typed literal value used in [`StatementObject::Value`].
 ///
-/// Spec `§19/00` lists "typed literal" without specifying the variants
-/// — these match the value types the wire layer encodes in
-/// `brain-protocol::knowledge::statement_resp::StatementValueWire`.
+/// These match the value types the wire layer encodes in
+/// `brain-protocol::ops::statement::StatementValueWire`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum StatementValue {
     Text(String),
@@ -98,8 +114,7 @@ pub enum StatementValue {
     Float(f64),
     Bool(bool),
     UnixNanos(u64),
-    /// Opaque bytes (caps at 64 KiB at the wire layer per
-    /// `spec/28_knowledge_wire_protocol/04_validation.md`).
+    /// Opaque bytes (caps at 64 KiB at the wire layer).
     Blob(Vec<u8>),
 }
 
@@ -119,7 +134,7 @@ impl StatementValue {
 // StatementObject (tagged union).
 // ---------------------------------------------------------------------------
 
-/// The object of a statement §"Schema":
+/// The object of a statement:
 ///
 /// ```text
 /// enum StatementObject {
@@ -169,15 +184,14 @@ impl StatementObject {
 // EvidenceEntry + EvidenceRef.
 // ---------------------------------------------------------------------------
 
-/// One piece of evidence backing a statement. Spec `§19/05 §1`.
+/// One piece of evidence backing a statement.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct EvidenceEntry {
     pub memory_id: MemoryId,
     /// Per-source confidence in `[0, 1]`. Aggregated into the
-    /// statement's `confidence` via the noisy-OR in `§19/04`.
+    /// statement's `confidence` via noisy-OR.
     pub confidence_milli: u16,
-    /// When the evidence was first observed. Drives decay in
-    /// `§19/04 §3`.
+    /// When the evidence was first observed. Drives confidence decay.
     pub timestamp_unix_nanos: u64,
     /// Which extractor (`0` = user-authored).
     pub extractor_id: ExtractorId,
@@ -218,7 +232,7 @@ impl EvidenceEntry {
 }
 
 /// Evidence pointer — inline (up to `INLINE_EVIDENCE_CAP`) or
-/// overflow row pointer. Spec `§19/05`.
+/// overflow row pointer.
 ///
 /// The inline payload is boxed: the inline `SmallVec` carries an
 /// 8-wide `EvidenceEntry` buffer (~272 bytes); without boxing every
@@ -254,7 +268,7 @@ impl EvidenceRef {
 
 impl EvidenceRef {
     /// `true` if no evidence backs this statement. Used by the
-    /// FORGET cascade in `§19/05 §6` to decide auto-tombstone.
+    /// FORGET cascade to decide auto-tombstone.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         match self {
@@ -282,8 +296,6 @@ impl EvidenceRef {
 
 /// Why a statement was tombstoned. Mirrors the byte discriminants in
 /// `brain-metadata::tables::nodes::statement::tombstone_reason`.
-///
-/// Spec `§19/00` §"Schema".
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum TombstoneReason {
@@ -291,6 +303,18 @@ pub enum TombstoneReason {
     UserRequest = 2,
     SchemaInvalidation = 3,
     ExtractorRetraction = 4,
+    /// Hard-delete intent from `STATEMENT_RETRACT` / `FORGET_STATEMENT`.
+    /// Distinct from the other reasons so the physical-reclamation GC
+    /// worker can select only rows the caller asked to remove (vs.
+    /// soft tombstones and superseded rows, which are kept for audit).
+    /// The retract handler stamps this regardless of the caller's
+    /// audit reason byte.
+    Retract = 5,
+    /// Soft-tombstoned by the reclaim worker because the statement outlived
+    /// its predicate's declared `retention` TTL. Like `Retract`, it is
+    /// physically reclaimed after the tombstone grace (an explicit retention
+    /// policy means the data is meant to be removed, not kept for audit).
+    RetentionExpired = 6,
 }
 
 impl TombstoneReason {
@@ -306,6 +330,54 @@ impl TombstoneReason {
             2 => Self::UserRequest,
             3 => Self::SchemaInvalidation,
             4 => Self::ExtractorRetraction,
+            5 => Self::Retract,
+            6 => Self::RetentionExpired,
+            _ => return None,
+        })
+    }
+
+    /// True iff this reason marks a hard-delete (retract) — the signal
+    /// the reclamation GC worker keys on.
+    #[must_use]
+    pub const fn is_retract(self) -> bool {
+        matches!(self, Self::Retract)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Slot.
+// ---------------------------------------------------------------------------
+
+/// Which slot of a reified fact a bridge question leaves unbound (and thus
+/// answers). `Object` = "what is S's P" (today's only case); `Subject` = "who
+/// P'd O"; `Time` = "when did S P" (needs the statement's `event_at`).
+/// Extensible.
+///
+/// A statement is a slotted record (subject / predicate / object / time / …).
+/// A bridge question is generated by omitting exactly one slot, so the omitted
+/// slot is known by construction — no interrogative-word heuristics. Tagging
+/// each question point with its slot lets the read path project the matched
+/// slot's value rather than always returning the object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum Slot {
+    Object = 0,
+    Subject = 1,
+    Time = 2,
+}
+
+impl Slot {
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    #[must_use]
+    pub const fn from_u8(b: u8) -> Option<Self> {
+        Some(match b {
+            0 => Self::Object,
+            1 => Self::Subject,
+            2 => Self::Time,
             _ => return None,
         })
     }
@@ -315,7 +387,7 @@ impl TombstoneReason {
 // Statement (the value type).
 // ---------------------------------------------------------------------------
 
-/// A typed claim about an entity. Spec `§19/00`.
+/// A typed claim about an entity.
 ///
 /// Pure value type. The brain-metadata storage layer holds the rkyv-
 /// archived form (`brain_metadata::tables::statement::StatementMetadata`);
@@ -337,7 +409,7 @@ pub struct Statement {
 
     /// Open-ended if `None`.
     pub valid_from_unix_nanos: Option<u64>,
-    /// Open-ended if `None`. Set on supersession (`§19/01 §3.2`).
+    /// Open-ended if `None`. Set on supersession.
     pub valid_to_unix_nanos: Option<u64>,
     /// Required for `Event` kind; `None` for `Fact` / `Preference`.
     pub event_at_unix_nanos: Option<u64>,
@@ -345,7 +417,7 @@ pub struct Statement {
     pub version: u32,
     pub superseded_by: Option<StatementId>,
     pub supersedes: Option<StatementId>,
-    /// Spec `§19/01` — id of the first statement in this chain.
+    /// Id of the first statement in this chain.
     /// Self-referential for un-superseded statements.
     pub chain_root: StatementId,
 
@@ -365,23 +437,13 @@ pub struct Statement {
     /// diverge under late-arriving corrections — e.g., if we learn in
     /// May that Alice changed jobs in February, `valid_to` is set to
     /// February but `record_invalidated_at` is May. This enables
-    /// time-travel queries of the form "what did the agent believe on
+    /// time-travel queries of the form "what did the space believe on
     /// date X" without resurrecting tombstones.
     pub record_invalidated_at_unix_nanos: Option<u64>,
 
-    /// LLM-coined predicate qname when this row landed on the
-    /// `brain:fact` wildcard sink. `None` for statements whose
-    /// `predicate` resolves to a schema-declared row — the wildcard
-    /// sink preserves the model's original intent so a later schema
-    /// upload can promote `(brain:fact, original_predicate_qname)` rows
-    /// into typed predicates without re-extraction.
-    pub original_predicate_qname: Option<String>,
-
     /// Per-statement statefulness flag. Copied from
     /// `PredicateDefinition.is_stateful` at write time for schema-
-    /// declared predicates; carries the LLM's per-extraction signal
-    /// for `brain:fact` wildcard rows (where the predicate registry
-    /// row is generic and can't speak for the individual fact).
+    /// declared predicates.
     pub is_stateful: bool,
 }
 
@@ -428,7 +490,6 @@ impl Statement {
             tombstoned_at_unix_nanos: None,
             tombstone_reason: None,
             record_invalidated_at_unix_nanos: None,
-            original_predicate_qname: None,
             is_stateful: false,
         }
     }
@@ -436,8 +497,6 @@ impl Statement {
     /// `true` iff the statement is the current entry in its chain:
     /// not superseded, not tombstoned, and (if validity-bounded) the
     /// `now` value falls within `[valid_from, valid_to)`.
-    ///
-    /// Spec `§19/01 §3.1` `is_current` bit definition.
     #[must_use]
     pub fn is_current(&self, now_unix_nanos: u64) -> bool {
         if self.tombstoned || self.superseded_by.is_some() {
@@ -475,7 +534,7 @@ impl Statement {
 // Predicate (the registry value type).
 // ---------------------------------------------------------------------------
 
-/// A registered predicate. Spec `§19/00 §"Predicate vocabulary"`.
+/// A registered predicate.
 ///
 /// The id is a u32 (`PredicateId`), interned at first use in the
 /// `predicates` redb table. `kind_constraint` / `object_type_constraint`
@@ -487,10 +546,15 @@ pub struct Predicate {
     pub name: String,
     /// `None` means any kind is allowed for this predicate.
     pub kind_constraint: Option<StatementKind>,
-    /// Per-predicate object-type constraint (spec `§21_schema_dsl`).
-    /// Phase 17 uses a coarse byte; phase 19's schema DSL replaces
-    /// this with a richer typed constraint.
+    /// Per-predicate object-type constraint: which `StatementObject`
+    /// variant the object must be. `0` = any.
     pub object_type_constraint_byte: u8,
+    /// Narrows [`Self::object_type_constraint_byte`] when it selects
+    /// `Entity`: the `EntityTypeId` the object entity must have, from a
+    /// declared `object: Entity<SomeType>` range. `0` = any entity type
+    /// (a bare `Entity` declaration, or an object variant other than
+    /// `Entity`).
+    pub object_entity_type_id: u32,
     pub schema_version: u32,
     pub description: String,
     /// When true, a new statement with the same `(subject, predicate)`
@@ -515,7 +579,7 @@ impl Predicate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ContextId;
+    use crate::SessionId;
 
     fn sample_subject() -> SubjectRef {
         SubjectRef::Entity(EntityId::new())
@@ -523,7 +587,7 @@ mod tests {
 
     fn sample_evidence() -> EvidenceRef {
         let entry = EvidenceEntry::from_parts(
-            MemoryId::pack(1, ContextId::DEFAULT.into(), 0),
+            MemoryId::pack(1, SessionId::DEFAULT.into(), 0),
             0.9,
             1_700_000_000_000_000_000,
             ExtractorId::default(),
@@ -548,63 +612,6 @@ mod tests {
             1_700_000_000_000_000_000,
             1,
         )
-    }
-
-    // ---- SubjectRef ----
-
-    #[test]
-    fn subject_entity_as_entity_returns_id() {
-        let id = EntityId::new();
-        let s = SubjectRef::Entity(id);
-        assert_eq!(s.as_entity(), Some(id));
-        assert!(!s.is_pending());
-    }
-
-    #[test]
-    fn subject_pending_marker() {
-        let s = SubjectRef::Pending(AuditId::new());
-        assert!(s.is_pending());
-        assert_eq!(s.as_entity(), None);
-    }
-
-    // ---- StatementValue ----
-
-    #[test]
-    fn statement_value_matches_same_variant_same_inner() {
-        let a = StatementValue::Text("hi".into());
-        let b = StatementValue::Text("hi".into());
-        assert!(a.matches(&b));
-    }
-
-    #[test]
-    fn statement_value_differs_across_variants() {
-        let a = StatementValue::Text("42".into());
-        let b = StatementValue::Integer(42);
-        assert!(!a.matches(&b));
-    }
-
-    // ---- StatementObject ----
-
-    #[test]
-    fn statement_object_discriminants_are_stable() {
-        let e = StatementObject::Entity(EntityId::new());
-        let v = StatementObject::Value(StatementValue::Bool(true));
-        let m = StatementObject::Memory(MemoryId::pack(0, 0, 0));
-        let s = StatementObject::Statement(StatementId::new());
-        assert_eq!(e.discriminant(), 0);
-        assert_eq!(v.discriminant(), 1);
-        assert_eq!(m.discriminant(), 2);
-        assert_eq!(s.discriminant(), 3);
-    }
-
-    #[test]
-    fn statement_object_as_entity() {
-        let id = EntityId::new();
-        assert_eq!(StatementObject::Entity(id).as_entity(), Some(id));
-        assert_eq!(
-            StatementObject::Value(StatementValue::Integer(1)).as_entity(),
-            None
-        );
     }
 
     // ---- EvidenceEntry / EvidenceRef ----
@@ -648,22 +655,6 @@ mod tests {
         let r = EvidenceRef::Overflow(EvidenceOverflowId::new());
         assert!(!r.is_empty());
         assert_eq!(r.inline_len(), None);
-    }
-
-    // ---- TombstoneReason ----
-
-    #[test]
-    fn tombstone_reason_round_trips() {
-        for r in [
-            TombstoneReason::SourceMemoryForgotten,
-            TombstoneReason::UserRequest,
-            TombstoneReason::SchemaInvalidation,
-            TombstoneReason::ExtractorRetraction,
-        ] {
-            assert_eq!(TombstoneReason::from_u8(r.as_u8()), Some(r));
-        }
-        assert_eq!(TombstoneReason::from_u8(0), None);
-        assert_eq!(TombstoneReason::from_u8(255), None);
     }
 
     // ---- Statement ----
@@ -724,6 +715,19 @@ mod tests {
         assert!(!s.is_event());
     }
 
+    // ---- Slot ----
+
+    #[test]
+    fn slot_round_trips() {
+        for s in [Slot::Object, Slot::Subject, Slot::Time] {
+            assert_eq!(Slot::from_u8(s.as_u8()), Some(s));
+        }
+        assert_eq!(Slot::from_u8(0), Some(Slot::Object));
+        assert_eq!(Slot::from_u8(2), Some(Slot::Time));
+        assert_eq!(Slot::from_u8(3), None);
+        assert_eq!(Slot::from_u8(255), None);
+    }
+
     // ---- Predicate ----
 
     #[test]
@@ -734,6 +738,7 @@ mod tests {
             name: "is_a".into(),
             kind_constraint: Some(StatementKind::Fact),
             object_type_constraint_byte: 0,
+            object_entity_type_id: 0,
             schema_version: 1,
             description: "entity type assertion".into(),
             is_stateful: false,

@@ -10,7 +10,7 @@
 | Audience | Operators; cluster-mode implementers |
 | Voice | Hybrid (rationale + normative) |
 | Depends on | [01. System Architecture](../01_architecture/00_purpose.md), [08. Storage](../08_storage/00_purpose.md), [14. Concurrency](../14_concurrency/00_purpose.md) |
-| Referenced by | [06. SDK Design](../06_sdk/00_purpose.md), [17. Observability](../17_observability/00_purpose.md) |
+| Referenced by | [06. Client Interface](../06_sdk/00_purpose.md), [17. Observability](../17_observability/00_purpose.md) |
 
 ## What this spec defines
 

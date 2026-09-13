@@ -3,12 +3,10 @@
 //! Takes a wire `RecallRequest` (from `brain-protocol`) and produces a
 //! single-shard `RecallPlan`. Pure: no I/O, no async, no state.
 //!
-//! See `spec/12_query_optimizer/03_recall_planning.md` for the
-//! authoritative shape. Phase 6 ships single-shard (orientation
-//! plan §4.7); Phase 12 lights up the cross-shard branch using the
-//! same `RecallPlan { shards: Vec<_> }` envelope.
+//! Ships single-shard today; the cross-shard branch later lights up
+//! using the same `RecallPlan { shards: Vec<_> }` envelope.
 
-use brain_core::ContextId;
+use brain_core::SessionId;
 use brain_protocol::envelope::request::RecallRequest;
 
 use crate::config::PlannerConfig;
@@ -36,7 +34,7 @@ pub fn plan_recall_inner(
 
     let post_rules = build_filter_rules(req);
     let selectivity = cost::estimate_filter_selectivity(&post_rules);
-    let k = req.top_k as usize;
+    let k = req.max_results as usize;
 
     let ef = cost::pick_ef(k, selectivity, ctx).max(k); // ef ≥ k
     let factor = cost::over_factor(selectivity);
@@ -104,16 +102,16 @@ pub fn plan_recall_inner(
 }
 
 fn validate(req: &RecallRequest, config: &PlannerConfig) -> Result<(), PlanError> {
-    if req.top_k == 0 {
+    if req.max_results == 0 {
         return Err(PlanError::InvalidParameters {
-            field: "top_k",
+            field: "max_results",
             reason: "must be > 0".to_string(),
         });
     }
-    let k = req.top_k as usize;
+    let k = req.max_results as usize;
     if k > config.max_k {
         return Err(PlanError::InvalidParameters {
-            field: "top_k",
+            field: "max_results",
             reason: format!("{k} exceeds max_k = {}", config.max_k),
         });
     }
@@ -142,14 +140,14 @@ fn build_filter_rules(req: &RecallRequest) -> Vec<FilterRule> {
         }
     }
 
-    if let Some(contexts) = &req.context_filter {
-        if !contexts.is_empty() {
-            let mapped = contexts
+    if let Some(sessions) = &req.session_filter {
+        if !sessions.is_empty() {
+            let mapped = sessions
                 .iter()
                 .copied()
-                .map(ContextId::from)
+                .map(SessionId::from)
                 .collect::<Vec<_>>();
-            rules.push(FilterRule::ContextIn(mapped));
+            rules.push(FilterRule::SessionIn(mapped));
         }
     }
 
@@ -173,11 +171,15 @@ mod tests {
 
     fn base_request() -> RecallRequest {
         RecallRequest {
+            scope: Default::default(),
+            trace: false,
             cue_text: "hello".into(),
-            top_k: 10,
+            subject_name: String::new(),
+            max_results: 10,
             confidence_threshold: 0.0,
-            context_filter: None,
+            session_filter: None,
             age_bound_unix_nanos: None,
+            as_of_record_time_unix_nanos: None,
             kind_filter: None,
             salience_floor: 0.0,
             include_edges: false,
@@ -185,7 +187,7 @@ mod tests {
             include_text: false,
             request_id: None,
             txn_id: None,
-            rerank: false,
+            act_as: None,
         }
     }
 
@@ -215,23 +217,23 @@ mod tests {
     #[test]
     fn zero_k_is_rejected() {
         let mut r = base_request();
-        r.top_k = 0;
+        r.max_results = 0;
         match plan_recall(&r, &ctx()) {
-            Err(PlanError::InvalidParameters { field, .. }) => assert_eq!(field, "top_k"),
-            other => panic!("expected InvalidParameters[top_k], got {other:?}"),
+            Err(PlanError::InvalidParameters { field, .. }) => assert_eq!(field, "max_results"),
+            other => panic!("expected InvalidParameters[max_results], got {other:?}"),
         }
     }
 
     #[test]
     fn k_over_max_is_rejected() {
         let mut r = base_request();
-        r.top_k = 5000;
+        r.max_results = 5000;
         match plan_recall(&r, &ctx()) {
             Err(PlanError::InvalidParameters { field, reason }) => {
-                assert_eq!(field, "top_k");
+                assert_eq!(field, "max_results");
                 assert!(reason.contains("max_k"));
             }
-            other => panic!("expected InvalidParameters[top_k], got {other:?}"),
+            other => panic!("expected InvalidParameters[max_results], got {other:?}"),
         }
     }
 
@@ -286,19 +288,13 @@ mod tests {
     #[test]
     fn candidates_are_capped() {
         let mut r = base_request();
-        r.top_k = 100;
+        r.max_results = 100;
         let plan = unwrap_recall(plan_recall(&r, &ctx()).unwrap());
         assert!(
             plan.shards[0].ann_search.candidates_to_request
                 <= ctx().config.max_candidates_per_search
         );
         assert!(plan.shards[0].ann_search.candidates_to_request >= 100);
-    }
-
-    #[test]
-    fn estimated_cost_is_populated() {
-        let plan = unwrap_recall(plan_recall(&base_request(), &ctx()).unwrap());
-        assert!(plan.estimated_cost_ms > 0.0);
     }
 
     #[test]

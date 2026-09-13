@@ -14,6 +14,11 @@ use brain_metadata::entity::ops::{entity_get, normalize_name};
 use brain_metadata::MetadataDb;
 use tempfile::TempDir;
 
+/// Fixed (namespace, space) scope for resolver tests.
+fn test_scope() -> brain_metadata::RowScope {
+    brain_metadata::RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xA1; 16])
+}
+
 const NOW: u64 = 1_700_000_000_000_000_000;
 
 fn open_db() -> (TempDir, MetadataDb) {
@@ -23,9 +28,9 @@ fn open_db() -> (TempDir, MetadataDb) {
 }
 
 fn create_and_fetch(sf: &str, qname: &str) -> (EntityId, String) {
-    let (_dir, mut db) = open_db();
+    let (_dir, db) = open_db();
     let wtxn = db.write_txn().unwrap();
-    let res = resolve_or_create(&wtxn, sf, qname, 0.9, NOW).unwrap();
+    let res = resolve_or_create(&wtxn, test_scope(), sf, qname, 0.9, NOW).unwrap();
     wtxn.commit().unwrap();
     let rtxn = db.read_txn().unwrap();
     let row = entity_get(&rtxn, res.entity_id).unwrap().expect("row");
@@ -56,10 +61,11 @@ fn mixed_script_round_trips() {
 
 #[test]
 fn unicode_case_folding_still_dedupes() {
-    let (_dir, mut db) = open_db();
+    let (_dir, db) = open_db();
     let wtxn = db.write_txn().unwrap();
-    let r1 = resolve_or_create(&wtxn, "Straße", "brain:Person", 0.9, NOW).unwrap();
-    let r2 = resolve_or_create(&wtxn, "STRASSE", "brain:Person", 0.9, NOW + 1).unwrap();
+    let r1 = resolve_or_create(&wtxn, test_scope(), "Straße", "brain:Person", 0.9, NOW).unwrap();
+    let r2 =
+        resolve_or_create(&wtxn, test_scope(), "STRASSE", "brain:Person", 0.9, NOW + 1).unwrap();
     wtxn.commit().unwrap();
     // The Rust stdlib's to_lowercase maps ß → "ss"; STRASSE lowercases
     // to "strasse", which differs from "straße". They should NOT collide
@@ -77,9 +83,9 @@ fn unicode_case_folding_still_dedupes() {
 #[test]
 fn very_long_surface_form_does_not_panic_or_truncate() {
     let long: String = "a".repeat(10_000);
-    let (_dir, mut db) = open_db();
+    let (_dir, db) = open_db();
     let wtxn = db.write_txn().unwrap();
-    let res = resolve_or_create(&wtxn, &long, "brain:Person", 0.9, NOW).unwrap();
+    let res = resolve_or_create(&wtxn, test_scope(), &long, "brain:Person", 0.9, NOW).unwrap();
     wtxn.commit().unwrap();
     let rtxn = db.read_txn().unwrap();
     let row = entity_get(&rtxn, res.entity_id).unwrap().unwrap();
@@ -95,11 +101,12 @@ fn very_long_surface_form_does_not_panic_or_truncate() {
 fn one_character_surface_forms_create_independently() {
     // A 1-char string has zero trigrams; the fuzzy tier returns no
     // candidate, so each distinct char gets its own entity.
-    let (_dir, mut db) = open_db();
+    let (_dir, db) = open_db();
     let wtxn = db.write_txn().unwrap();
-    let a = resolve_or_create(&wtxn, "a", "brain:Person", 0.9, NOW).unwrap();
-    let b = resolve_or_create(&wtxn, "b", "brain:Person", 0.9, NOW + 1).unwrap();
-    let a_again = resolve_or_create(&wtxn, "A", "brain:Person", 0.9, NOW + 2).unwrap();
+    let a = resolve_or_create(&wtxn, test_scope(), "a", "brain:Person", 0.9, NOW).unwrap();
+    let b = resolve_or_create(&wtxn, test_scope(), "b", "brain:Person", 0.9, NOW + 1).unwrap();
+    let a_again =
+        resolve_or_create(&wtxn, test_scope(), "A", "brain:Person", 0.9, NOW + 2).unwrap();
     wtxn.commit().unwrap();
     assert_ne!(a.entity_id, b.entity_id);
     // 'A' normalises to 'a' → tier-1 hit.
@@ -109,10 +116,10 @@ fn one_character_surface_forms_create_independently() {
 
 #[test]
 fn unrelated_names_do_not_dedup_via_fuzzy() {
-    let (_dir, mut db) = open_db();
+    let (_dir, db) = open_db();
     let wtxn = db.write_txn().unwrap();
-    let a = resolve_or_create(&wtxn, "Alice", "brain:Person", 0.9, NOW).unwrap();
-    let b = resolve_or_create(&wtxn, "Zelda", "brain:Person", 0.9, NOW + 1).unwrap();
+    let a = resolve_or_create(&wtxn, test_scope(), "Alice", "brain:Person", 0.9, NOW).unwrap();
+    let b = resolve_or_create(&wtxn, test_scope(), "Zelda", "brain:Person", 0.9, NOW + 1).unwrap();
     wtxn.commit().unwrap();
     assert_ne!(a.entity_id, b.entity_id);
     assert_eq!(a.tier, ResolutionTier::Created);
@@ -120,16 +127,28 @@ fn unrelated_names_do_not_dedup_via_fuzzy() {
 }
 
 #[test]
-fn type_qname_isolates_namespaces() {
-    // Same surface form under two different entity types → two distinct
-    // entities (the canonical-name index is keyed on type).
-    let (_dir, mut db) = open_db();
+fn cross_type_exact_name_reuses_entity_on_first_collision() {
+    // Same surface form first seen as a Person, then as an Organization.
+    // With exactly one prior cross-type match the resolver reuses that
+    // node instead of fragmenting the referent across types (Tier 1b
+    // cross-type exact reuse — extractor tiers routinely assign different
+    // type ids to the same referent). The homograph guard only forks once
+    // two same-name entities already exist, so the first collision reuses.
+    let (_dir, db) = open_db();
     let wtxn = db.write_txn().unwrap();
-    let p = resolve_or_create(&wtxn, "Acme", "brain:Person", 0.9, NOW).unwrap();
-    let o = resolve_or_create(&wtxn, "Acme", "brain:Organization", 0.9, NOW + 1).unwrap();
+    let p = resolve_or_create(&wtxn, test_scope(), "Acme", "brain:Person", 0.9, NOW).unwrap();
+    let o = resolve_or_create(
+        &wtxn,
+        test_scope(),
+        "Acme",
+        "brain:Organization",
+        0.9,
+        NOW + 1,
+    )
+    .unwrap();
     wtxn.commit().unwrap();
-    assert_ne!(
+    assert_eq!(
         p.entity_id, o.entity_id,
-        "type qname must partition the canonical-name index"
+        "exactly one prior cross-type match → reuse, not fragment"
     );
 }

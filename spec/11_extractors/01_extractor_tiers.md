@@ -4,7 +4,7 @@ The three extractor tiers — pattern (regex), classifier (pinned model), and LL
 
 ## Pattern Extractor
 
-Pattern extractors apply regex matches to memory text and emit typed outputs (entity mentions / statements / relations). They are the **first tier** — fast (~10–100 µs per memory), deterministic, zero-cost, foreground-synchronous.
+Pattern extractors apply regex matches to memory text and emit typed outputs (entity mentions / statements / relations). They are the **first tier** — fast (~10–100 µs per memory), deterministic, zero-cost. Like the other tiers they run asynchronously in the per-shard extractor worker (pattern is the first tier the worker runs per memory), not inline in ENCODE.
 
 Cross-references:
 - [`./00_purpose.md`](./00_purpose.md) — three-tier overview.
@@ -263,10 +263,11 @@ Per [`../19_benchmarks/02_performance_targets.md`](../19_benchmarks/02_performan
 |---|---|---|
 | `ClassifierExtractor::run` over a 4 KiB memory | 5 ms | 15 ms |
 
-Budget includes feature extraction + inference. ENCODE's overall
-P99 budget absorbs at most one classifier extractor per memory;
-multiple classifiers go to a near-foreground queue (see
-[`../15_background_workers/00_purpose.md`](../15_background_workers/00_purpose.md)).
+Budget includes feature extraction + inference. This is a
+**worker-throughput** target, not part of ENCODE's latency:
+extraction runs in the per-shard extractor worker (see
+[`../15_background_workers/06_typed_graph_workers.md`](../15_background_workers/06_typed_graph_workers.md)),
+so classifier cost never widens ENCODE's p99.
 
 ### 14.1 GLiNER backbone sharing
 

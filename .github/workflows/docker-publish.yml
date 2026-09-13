@@ -1,0 +1,191 @@
+name: Docker publish
+
+# Publishes the production brain-server image to GHCR (ghcr.io), the primary
+# release artifact — self-hosters `docker run` it, and our own playground /
+# gateway deploy pins the same tag, so cutting a release and shipping the
+# deploy are one act. Runs only on version tags (v*): Brain is pre-release
+# with no external users yet, so we don't want a public image cut from every
+# commit to main. Tag a release only from a commit that already passed the
+# main-branch CI workflow (ci.yml); this workflow builds the image but does
+# not re-run the test suite.
+#
+# GHCR over Docker Hub: free for public images, GitHub-native auth via the
+# job's GITHUB_TOKEN (no long-lived registry secret to rotate), and no
+# anonymous pull-rate-limit pain for self-hosters.
+#
+# Each platform builds on its own native runner (amd64 on ubuntu-latest,
+# arm64 on the free-for-public-repos ubuntu-24.04-arm) rather than
+# cross-building arm64 under QEMU on a single runner. The Dockerfile's
+# builder stage compiles a large Rust workspace with native deps (cmake /
+# build-essential, for candle + hnsw_rs), and QEMU-emulated compiles of
+# workloads like that are known to blow up from minutes to hours (or time
+# out outright) — native hardware avoids that entirely. Each build job
+# pushes its image by digest only; the `merge` job assembles the two
+# digests into one multi-arch manifest, applies the real tags, and cuts the
+# GitHub Release that pins the published digest.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# `packages: write` lets the job's GITHUB_TOKEN push to GHCR; `contents:
+# write` lets the merge job create the GitHub Release for the tag.
+permissions:
+  contents: write
+  packages: write
+
+# A release publish shouldn't be interrupted mid-push by a newer tag (there
+# usually isn't one), but group by ref so two accidental pushes of the same
+# tag can't race each other.
+concurrency:
+  group: docker-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+# Lowercased owner keeps GHCR happy (ghcr.io rejects uppercase path
+# segments); arc-labs-ai is already lowercase, so a bare interpolation is
+# fine here.
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/brain
+  # Run JavaScript actions (docker/login-action et al.) on Node 24 rather
+  # than the deprecated Node 20, silencing the per-step deprecation warning.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  build:
+    name: Build (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Derive platform tag pair
+        run: |
+          platform="${{ matrix.platform }}"
+          echo "PLATFORM_PAIR=${platform//\//-}" >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ env.PLATFORM_PAIR }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Publish multi-arch manifest
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Derive image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # `${{ env.IMAGE }}` is substituted into the format string at the
+      # workflow-expression level (before the shell runs), leaving exactly
+      # one `%s` for printf to cycle across each digest filename glob-
+      # expanded by `*`. Interpolating $IMAGE as a second printf argument
+      # instead would add a second %s and misalign every pair after the
+      # first digest.
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.IMAGE }}@sha256:%s ' *)
+        env:
+          DOCKER_METADATA_OUTPUT_JSON: ${{ steps.meta.outputs.json }}
+
+      - name: Inspect image
+        id: inspect
+        run: |
+          docker buildx imagetools inspect "${IMAGE}:${VERSION}"
+          # The manifest-list digest is the one thing a deploy should pin —
+          # `${IMAGE}@${DIGEST}` is immutable where a tag can be re-pushed.
+          digest="$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+        env:
+          IMAGE: ${{ env.IMAGE }}
+          VERSION: ${{ steps.meta.outputs.version }}
+
+      # Human-facing landing for the version: release-please owns the
+      # changelog body (generate_release_notes fills the rest); here we pin
+      # the exact image coordinates so a reader can copy a digest-pinned
+      # `docker run` straight out of the release.
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          body: |
+            ## Container image
+
+            ```
+            docker pull ${{ env.IMAGE }}:${{ steps.meta.outputs.version }}
+            ```
+
+            Digest-pinned (immutable) for deploy manifests:
+
+            ```
+            ${{ env.IMAGE }}@${{ steps.inspect.outputs.digest }}
+            ```
+
+            Multi-arch: `linux/amd64`, `linux/arm64`.
+            See [`DEPLOY.md`](DEPLOY.md) for self-host / compose instructions.

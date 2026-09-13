@@ -2,7 +2,7 @@
 //!
 //! redb serialises write transactions internally (single-writer-per-db
 //! discipline at the file level). These tests verify that the
-//! Phase C unified edge tables behave correctly under:
+//! unified edge tables behave correctly under:
 //!
 //! - Two concurrent writers issuing 100 edges each from overlapping
 //!   NodeRef sets — final state must contain all 200 edges, no

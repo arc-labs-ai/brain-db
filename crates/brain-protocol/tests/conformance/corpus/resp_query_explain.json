@@ -1,0 +1,4 @@
+{
+  "plan_text": "semantic ∪ graph -> rrf(k=60) -> limit 20",
+  "estimated_cost_ms": 1.25
+}

@@ -1,5 +1,5 @@
-//! Twelve concrete workers (sub-tasks 8.2 – 8.13). Each is a peer
-//! module here; the crate root re-exports the public surface.
+//! Twelve concrete workers. Each is a peer module here; the crate root
+//! re-exports the public surface.
 
 pub mod access_boost;
 pub mod ambiguity_resolver;
@@ -17,6 +17,7 @@ pub mod entity_gc;
 pub mod extractor;
 pub mod forget_cascade;
 pub mod hnsw_maint;
+pub mod hype;
 pub mod idempotency_cleanup;
 pub mod llm_cache_sweeper;
 pub mod schema_migration;
@@ -24,6 +25,7 @@ pub mod slot_reclaim;
 pub mod snapshot;
 pub mod stale_extraction_detector;
 pub mod statement_embed;
+pub mod statement_reclaim;
 pub mod statistics;
 pub mod supersession_sweeper;
 pub mod temporal_edge;

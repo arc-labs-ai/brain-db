@@ -1,0 +1,46 @@
+{
+  "steps": [
+    {
+      "step_index": 0,
+      "memory_id": 33059591799037110662230,
+      "text": "first step",
+      "transition_kind": "Causal",
+      "confidence": 0.8,
+      "estimated_distance_to_goal": 0.5
+    }
+  ],
+  "is_final": true,
+  "plan_status": 0,
+  "trace": {
+    "explored": [
+      {
+        "memory_id": 33059591799037110662230,
+        "text": "origin: the trip begins in paris",
+        "direction": 0,
+        "depth": 0,
+        "parent_edge": null,
+        "alignment_score": null
+      },
+      {
+        "memory_id": 33059591799037110662230,
+        "text": "destination: the trip ends in rome",
+        "direction": 1,
+        "depth": 1,
+        "parent_edge": 33059591799037110662230,
+        "alignment_score": 0.62
+      }
+    ],
+    "meeting_points": [
+      {
+        "memory_id": 33059591799037110662230,
+        "text": "layover in milan connects both legs",
+        "included_in_result": true
+      },
+      {
+        "memory_id": 33059591799037110662230,
+        "text": "layover in zurich, discarded by the max_paths cap",
+        "included_in_result": false
+      }
+    ]
+  }
+}

@@ -1,17 +1,22 @@
-//! Unit tests for the tantivy rebuild worker (phase 22.6).
+//! Unit tests for the tantivy rebuild worker.
 
 use std::fs;
 use std::path::Path;
 
 use brain_core::{
+    Entity, EntityId, EntityTypeId, ExtractorId, MemoryId, MemoryKind, PredicateId, SessionId,
+    SpaceId, StatementId,
+};
+use brain_core::{
     EvidenceRef, Statement, StatementKind, StatementObject, StatementValue, SubjectRef,
 };
-use brain_core::{Entity, EntityId, EntityTypeId, ExtractorId, PredicateId, StatementId};
-use brain_index::{IndexStatus, LexicalScope, TantivyShard};
+use brain_index::{build_analyzer, IndexStatus, LexicalScope, TantivyShard, BRAIN_TOKENIZER_NAME};
 use brain_metadata::entity::ops::entity_put;
 use brain_metadata::entity::types::entity_type_intern;
 use brain_metadata::schema::predicate::predicate_intern_or_get;
 use brain_metadata::statement::{statement_create, statement_tombstone};
+use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
+use brain_metadata::tables::text::TEXTS_TABLE;
 use brain_metadata::MetadataDb;
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
@@ -39,7 +44,36 @@ fn put_entity(metadata: &mut MetadataDb, name: &str, type_id: EntityTypeId) -> E
     let id = EntityId::new();
     let entity = Entity::new_active(id, type_id, name.into(), name.to_lowercase(), 0);
     let wtxn = metadata.write_txn().expect("wtxn");
-    entity_put(&wtxn, &entity).expect("entity_put");
+    entity_put(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &entity).expect("entity_put");
+    wtxn.commit().expect("commit");
+    id
+}
+
+/// Seed an active memory row in `MEMORIES_TABLE` + its text in
+/// `TEXTS_TABLE`, mirroring what the apply layer writes at ENCODE.
+fn put_memory(metadata: &mut MetadataDb, slot: u64, text: &str, kind: MemoryKind) -> MemoryId {
+    let id = MemoryId::pack(0, slot, 1);
+    let meta = MemoryMetadata::new_active(
+        id,
+        brain_core::NamespaceId::SYSTEM,
+        SpaceId::from([7u8; 16]),
+        SessionId::from(42),
+        slot,
+        1,
+        kind,
+        [0u8; 16],
+        0.5,
+        text.len() as u32,
+        1_700_000_000_000_000_000,
+    );
+    let wtxn = metadata.write_txn().expect("wtxn");
+    {
+        let mut m = wtxn.open_table(MEMORIES_TABLE).expect("open MEMORIES");
+        m.insert(&id.to_be_bytes(), &meta).expect("insert mem");
+        let mut t = wtxn.open_table(TEXTS_TABLE).expect("open TEXTS");
+        t.insert(&id.to_be_bytes(), text.as_bytes())
+            .expect("insert text");
+    }
     wtxn.commit().expect("commit");
     id
 }
@@ -76,7 +110,8 @@ fn create_statement(
         1,
     );
     let wtxn = metadata.write_txn().expect("wtxn");
-    let created = statement_create(&wtxn, &stmt, 0).expect("create");
+    let created =
+        statement_create(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &stmt, 0).expect("create");
     wtxn.commit().expect("commit");
     created
 }
@@ -96,24 +131,54 @@ fn count_text_hits(index: &Index, field_name: &str, query_text: &str) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// Memory text rebuild — v1 emits an empty valid index.
+// Memory text rebuild — content-complete from MEMORIES_TABLE + TEXTS_TABLE.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn rebuild_memory_text_produces_empty_valid_index() {
+fn rebuild_memory_text_empty_db_yields_empty_index() {
     let dir = TempDir::new().expect("tempdir");
-    let mut metadata = fresh_metadata(dir.path());
+    let metadata = fresh_metadata(dir.path());
 
+    // No memories seeded → zero rows, but a valid index + Ready status.
     let report = rebuild_memory_text(dir.path(), &metadata).expect("rebuild");
     assert_eq!(report.scope, LexicalScope::MemoryText);
     assert_eq!(report.rows_processed, 0);
 
-    // Re-open via TantivyShard to confirm Ready status.
     let startup = TantivyShard::open(dir.path()).expect("open after rebuild");
     assert!(matches!(startup.memory_status, IndexStatus::Ready));
     assert!(matches!(startup.statements_status, IndexStatus::Ready));
+}
 
-    let _ = &mut metadata;
+#[test]
+fn rebuild_memory_text_round_trip() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut metadata = fresh_metadata(dir.path());
+
+    put_memory(
+        &mut metadata,
+        1,
+        "Sarah leads the payments platform team at Aurora",
+        MemoryKind::Semantic,
+    );
+    put_memory(
+        &mut metadata,
+        2,
+        "Cello practice happens every morning before work",
+        MemoryKind::Episodic,
+    );
+
+    let report = rebuild_memory_text(dir.path(), &metadata).expect("rebuild");
+    assert_eq!(report.scope, LexicalScope::MemoryText);
+    assert_eq!(report.rows_processed, 2, "both active memories indexed");
+
+    // Re-open the rebuilt index and confirm each is lexically findable.
+    let index = Index::open_in_dir(dir.path().join("memory_text.tantivy")).expect("open index");
+    index
+        .tokenizers()
+        .register(BRAIN_TOKENIZER_NAME, build_analyzer());
+    assert_eq!(count_text_hits(&index, "text", "payments"), 1);
+    assert_eq!(count_text_hits(&index, "text", "cello"), 1);
+    assert_eq!(count_text_hits(&index, "text", "Aurora"), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -184,13 +249,8 @@ fn rebuild_statements_skips_tombstoned() {
     // Tombstone the dead one.
     {
         let wtxn = metadata.write_txn().expect("wtxn");
-        statement_tombstone(
-            &wtxn,
-            dead,
-            brain_core::TombstoneReason::UserRequest,
-            0,
-        )
-        .expect("tombstone");
+        statement_tombstone(&wtxn, dead, brain_core::TombstoneReason::UserRequest, 0)
+            .expect("tombstone");
         wtxn.commit().expect("commit");
     }
     let _ = live;
@@ -209,7 +269,7 @@ fn rebuild_statements_skips_tombstoned() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn rebuild_idempotent() {
+fn repeated_text_rebuild_succeeds_without_error() {
     let dir = TempDir::new().expect("tempdir");
     let metadata = fresh_metadata(dir.path());
 
@@ -243,10 +303,10 @@ fn rebuild_after_corrupt_live_replaces_it() {
 
     // Pre-check: TantivyShard::open would now report
     // NeedsRebuild — but we can rebuild directly without going
-    // through 22.1.
+    // through `TantivyShard::open`.
     rebuild_memory_text(dir.path(), &metadata).expect("second");
 
-    // Re-open via 22.1; status must be Ready.
+    // Re-open via `TantivyShard::open`; status must be Ready.
     let startup = TantivyShard::open(dir.path()).expect("open");
     assert!(matches!(startup.memory_status, IndexStatus::Ready));
 }
@@ -258,8 +318,84 @@ fn rebuild_creates_payload_for_reopen() {
     rebuild_memory_text(dir.path(), &metadata).expect("rebuild");
     rebuild_statements(dir.path(), &metadata).expect("rebuild stmts");
 
-    // The whole point: 22.1 sees Ready after a rebuild.
+    // The whole point: `TantivyShard::open` sees Ready after a rebuild.
     let startup = TantivyShard::open(dir.path()).expect("open");
     assert!(matches!(startup.memory_status, IndexStatus::Ready));
     assert!(matches!(startup.statements_status, IndexStatus::Ready));
+}
+
+fn __ts() -> brain_metadata::RowScope {
+    brain_metadata::RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xA1; 16])
+}
+
+// ---------------------------------------------------------------------------
+// Confidence bucketing parity: the rebuild must bucket identically to the
+// live indexer (both delegate to the canonical
+// `brain_metadata::tables::statement::confidence_bucket`, 0..=10). A
+// confidence-1.0 statement must land in bucket 10 in the rebuilt index, so
+// a `confidence_bucket: 10` lexical filter matches it — not bucket 9 as the
+// old divergent `.min(9)` produced.
+fn count_bucket_hits(index: &Index, bucket: u64) -> usize {
+    use tantivy::query::TermQuery;
+    use tantivy::schema::IndexRecordOption;
+    use tantivy::Term;
+
+    let field = index
+        .schema()
+        .get_field("confidence_bucket")
+        .expect("confidence_bucket field");
+    let reader = index.reader().expect("reader");
+    reader.reload().expect("reload");
+    let searcher = reader.searcher();
+    let term = Term::from_field_u64(field, bucket);
+    let query = TermQuery::new(term, IndexRecordOption::Basic);
+    searcher
+        .search(&query, &tantivy::collector::Count)
+        .expect("search")
+}
+
+#[test]
+fn rebuild_confidence_one_lands_in_bucket_ten_matching_live() {
+    // Canonical + live indexer bucketing agree at the 1.0 boundary.
+    assert_eq!(
+        brain_metadata::tables::statement::confidence_bucket(1.0),
+        10,
+        "canonical bucketing puts confidence 1.0 in bucket 10",
+    );
+    assert_eq!(
+        crate::index::text_indexer::statement::confidence_bucket(1.0),
+        10,
+        "live indexer must bucket confidence 1.0 as 10",
+    );
+
+    let dir = TempDir::new().expect("tempdir");
+    let mut metadata = fresh_metadata(dir.path());
+
+    let type_id = ensure_person_type(&mut metadata);
+    let carol = put_entity(&mut metadata, "Carol", type_id);
+    let predicate = intern_predicate(&mut metadata, "brain", "speaks");
+    let _ = create_statement(
+        &mut metadata,
+        carol,
+        predicate,
+        StatementObject::Value(StatementValue::Text("Certain".into())),
+        StatementKind::Fact,
+        1.0,
+    );
+
+    let report = rebuild_statements(dir.path(), &metadata).expect("rebuild");
+    assert_eq!(report.rows_processed, 1);
+
+    let startup = TantivyShard::open(dir.path()).expect("open");
+    let index = &startup.shard.statements.index;
+    assert_eq!(
+        count_bucket_hits(index, 10),
+        1,
+        "rebuild must place confidence 1.0 in bucket 10, matching the live indexer",
+    );
+    assert_eq!(
+        count_bucket_hits(index, 9),
+        0,
+        "confidence 1.0 must NOT land in bucket 9 (the old divergent behaviour)",
+    );
 }

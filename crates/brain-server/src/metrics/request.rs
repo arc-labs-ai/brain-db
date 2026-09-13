@@ -13,7 +13,7 @@
 //! it deliberately: the dispatch path doesn't know the target shard
 //! until *after* validation, and emitting a partial `shard="?"` label
 //! would corrupt PromQL `sum by (shard)` queries. Per-shard request
-//! counts can be derived from worker / connection metrics in 12.1c.
+//! counts can be derived from worker / connection metrics.
 //!
 //! ## RAII timing
 //!
@@ -51,8 +51,8 @@ pub const OP_LABELS: &[&str] = &[
 /// Status labels — the three terminal outcomes of a request.
 ///
 /// `error` is the catch-all for any wire-level error response;
-/// 12.1c may refine this to `error_<code>` if cardinality budget
-/// permits.
+/// a later refinement may split this to `error_<code>` if the
+/// cardinality budget permits.
 pub const STATUS_LABELS: &[&str] = &["success", "error", "timeout"];
 
 /// Number of `(op, status)` combinations indexed in [`RequestMetrics`].
@@ -122,7 +122,7 @@ impl Default for RequestMetrics {
 /// Map a [`RequestBody`] variant to its `OP_LABELS` index. Returns
 /// `None` for variants that aren't on the OpDispatch path (Subscribe
 /// family, Ping, Hello, Auth, Bye). Those are handled by the connection-
-/// layer frame metrics in 12.1c.
+/// layer frame metrics.
 #[must_use]
 pub fn op_index(req: &RequestBody) -> Option<usize> {
     use RequestBody::*;

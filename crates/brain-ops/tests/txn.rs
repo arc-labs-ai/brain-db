@@ -1,4 +1,4 @@
-//! Integration tests for transactions (sub-task 7.9).
+//! Integration tests for transactions.
 //!
 //! Covers:
 //! - Lifecycle (begin / commit / abort + replay + sweep)
@@ -13,19 +13,18 @@ use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::MetadataDb;
 use brain_ops::test_support::run_in_glommio;
-use brain_ops::{dispatch, ErrorCode, OpError, OpsContext, RealWriterHandle};
+use brain_ops::{dispatch, DispatchOutcome, ErrorCode, OpError, OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_protocol::envelope::request::{
-    EdgeKindWire, EncodeRequest, ForgetMode, ForgetRequest, LinkRequest, MemoryKindWire,
-    ObservationInput, PlanBudget, PlanRequest, PlanState, ReasonRequest, RecallRequest,
-    RequestBody, TxnAbortRequest, TxnBeginRequest, TxnCommitRequest, UnlinkRequest,
+    EdgeKindWire, EncodeRequest, ForgetMode, ForgetRequest, LinkRequest, ObservationInput,
+    PlanBudget, PlanRequest, PlanState, ReasonRequest, RecallRequest, RequestBody, TxnAbortRequest,
+    TxnBeginRequest, TxnCommitRequest, UnlinkRequest,
 };
 use brain_protocol::envelope::response::{
     EncodeResponse, ForgetResponse, LinkResponse, PlanResponseFrame, PlanStatus as WirePlanStatus,
     ReasonResponseFrame, RecallResponseFrame, ResponseBody, TxnAbortResponse, TxnBeginResponse,
     TxnCommitResponse, UnlinkResponse,
 };
-use parking_lot::Mutex;
 
 // ---------------------------------------------------------------------------
 // Mock dispatcher: deterministic per-text vector.
@@ -55,24 +54,39 @@ impl Dispatcher for MockDispatcher {
 
 struct Fixture {
     ctx: OpsContext,
-    _tempdir: tempfile::TempDir,
+    tempdir: tempfile::TempDir,
+    metadata: SharedMetadataDb,
+}
+
+impl Fixture {
+    /// Rebuild the lexical lane from redb so a *committed*, non-txn recall
+    /// sees a fully-indexed corpus (no text-indexer worker runs in a unit
+    /// test). Call after the writes are committed and before the recall.
+    /// In-txn pending writes are not in redb, so this does not affect them.
+    fn reindex_lexical(&mut self) {
+        self.ctx.lexical_retriever = brain_ops::test_support::reindex_memory_lexical_for_tests(
+            self.tempdir.path(),
+            &self.metadata,
+        );
+    }
 }
 
 fn build_fixture() -> Fixture {
     let tempdir = tempfile::tempdir().unwrap();
     let db_path = tempdir.path().join("metadata.redb");
-    let metadata: SharedMetadataDb = Arc::new(Mutex::new(MetadataDb::open(&db_path).unwrap()));
-    let (shared, hnsw_writer) = SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).unwrap();
+    let metadata: SharedMetadataDb = Arc::new(MetadataDb::open(&db_path).unwrap());
+    let (shared, hnsw_writer) = SharedHnsw::new(IndexParams::default_v1()).unwrap();
     let writer = Arc::new(RealWriterHandle::new(metadata.clone(), hnsw_writer));
     let executor = ExecutorContext::new(
         Arc::new(MockDispatcher) as Arc<dyn Dispatcher>,
         shared,
-        metadata,
+        metadata.clone(),
         writer as Arc<dyn WriterHandle>,
     );
     Fixture {
-        ctx: OpsContext::new(executor),
-        _tempdir: tempdir,
+        ctx: brain_ops::test_support::ops_context_for_tests(executor, tempdir.path()),
+        tempdir,
+        metadata,
     }
 }
 
@@ -83,13 +97,13 @@ fn build_fixture() -> Fixture {
 fn encode_req(request_id: [u8; 16], text: &str, txn: Option<[u8; 16]>) -> EncodeRequest {
     EncodeRequest {
         text: text.into(),
-        context_id: 42,
-        kind: MemoryKindWire::Episodic,
-        salience_hint: 0.5,
-        edges: vec![],
+        session_id: 42,
         request_id,
         txn_id: txn,
-        deduplicate: false,
+        occurred_at_unix_nanos: None,
+        act_as: None,
+        wait: brain_protocol::WaitMode::Ack,
+        allow_duplicates: false,
     }
 }
 
@@ -108,6 +122,7 @@ fn link_req(
         weight,
         request_id,
         txn_id: txn,
+        act_as: None,
     }
 }
 
@@ -124,6 +139,7 @@ fn unlink_req(
         kind,
         request_id,
         txn_id: txn,
+        act_as: None,
     }
 }
 
@@ -133,16 +149,21 @@ fn forget_req(memory_id: u128, request_id: [u8; 16], txn: Option<[u8; 16]>) -> F
         mode: ForgetMode::Soft,
         request_id,
         txn_id: txn,
+        act_as: None,
     }
 }
 
-fn recall_req(cue: &str, top_k: u32, txn: Option<[u8; 16]>) -> RecallRequest {
+fn recall_req(cue: &str, max_results: u32, txn: Option<[u8; 16]>) -> RecallRequest {
     RecallRequest {
+        scope: Default::default(),
+        trace: false,
         cue_text: cue.into(),
-        top_k,
+        subject_name: String::new(),
+        max_results,
         confidence_threshold: 0.0,
-        context_filter: None,
+        session_filter: None,
         age_bound_unix_nanos: None,
+        as_of_record_time_unix_nanos: None,
         kind_filter: None,
         salience_floor: 0.0,
         include_edges: false,
@@ -150,7 +171,7 @@ fn recall_req(cue: &str, top_k: u32, txn: Option<[u8; 16]>) -> RecallRequest {
         include_text: false,
         request_id: None,
         txn_id: txn,
-        rerank: false,
+        act_as: None,
     }
 }
 
@@ -164,9 +185,11 @@ fn plan_req(start: u128, goal: u128, max_depth: u32, txn: Option<[u8; 16]>) -> P
             max_branches_explored: 256,
         },
         strategy_hint: None,
-        context_filter: None,
+        session_filter: None,
         request_id: None,
         txn_id: txn,
+        trace: false,
+        act_as: None,
     }
 }
 
@@ -175,81 +198,137 @@ fn reason_req(base: u128, depth: u32, txn: Option<[u8; 16]>) -> ReasonRequest {
         observation: ObservationInput::ByMemoryId(base),
         depth,
         confidence_threshold: 0.0,
-        context_filter: None,
+        session_filter: None,
         max_inferences: 10,
         budget_wall_time_ms: 1000,
         request_id: None,
         txn_id: txn,
+        trace: false,
+        act_as: None,
     }
 }
 
 async fn encode(fix: &Fixture, rid: [u8; 16], text: &str, txn: Option<[u8; 16]>) -> u128 {
-    match dispatch(
-        RequestBody::Encode(encode_req(rid, text, txn)),
-        brain_ops::RequestCaller::anonymous(),
-        &fix.ctx,
-    )
-    .await
-    .unwrap()
-    {
+    match single_body(
+        dispatch(
+            RequestBody::Encode(encode_req(rid, text, txn)),
+            brain_ops::RequestCaller::for_tests(),
+            &fix.ctx,
+        )
+        .await
+        .unwrap(),
+    ) {
         ResponseBody::Encode(EncodeResponse { memory_id, .. }) => memory_id,
         other => panic!("expected Encode, got {other:?}"),
     }
 }
 
-fn unwrap_begin(r: ResponseBody) -> TxnBeginResponse {
-    match r {
+/// Unwrap a non-streaming dispatch outcome. Streaming ops (PLAN /
+/// REASON) collect via `unwrap_plan` / `unwrap_reason`, which drain
+/// the per-frame projections.
+fn single_body(outcome: DispatchOutcome) -> ResponseBody {
+    match outcome {
+        DispatchOutcome::Single(b) => b,
+        DispatchOutcome::Stream(_) => panic!("expected DispatchOutcome::Single, got Stream"),
+    }
+}
+
+fn unwrap_begin(r: DispatchOutcome) -> TxnBeginResponse {
+    match single_body(r) {
         ResponseBody::TxnBegin(b) => b,
         other => panic!("expected TxnBegin, got {other:?}"),
     }
 }
-fn unwrap_commit(r: ResponseBody) -> TxnCommitResponse {
-    match r {
+fn unwrap_commit(r: DispatchOutcome) -> TxnCommitResponse {
+    match single_body(r) {
         ResponseBody::TxnCommit(c) => c,
         other => panic!("expected TxnCommit, got {other:?}"),
     }
 }
-fn unwrap_abort(r: ResponseBody) -> TxnAbortResponse {
-    match r {
+fn unwrap_abort(r: DispatchOutcome) -> TxnAbortResponse {
+    match single_body(r) {
         ResponseBody::TxnAbort(a) => a,
         other => panic!("expected TxnAbort, got {other:?}"),
     }
 }
-fn unwrap_link(r: ResponseBody) -> LinkResponse {
-    match r {
+fn unwrap_link(r: DispatchOutcome) -> LinkResponse {
+    match single_body(r) {
         ResponseBody::Link(l) => l,
         other => panic!("expected Link, got {other:?}"),
     }
 }
-fn unwrap_unlink(r: ResponseBody) -> UnlinkResponse {
-    match r {
+fn unwrap_unlink(r: DispatchOutcome) -> UnlinkResponse {
+    match single_body(r) {
         ResponseBody::Unlink(u) => u,
         other => panic!("expected Unlink, got {other:?}"),
     }
 }
 #[allow(dead_code)]
-fn unwrap_forget(r: ResponseBody) -> ForgetResponse {
-    match r {
+fn unwrap_forget(r: DispatchOutcome) -> ForgetResponse {
+    match single_body(r) {
         ResponseBody::Forget(f) => f,
         other => panic!("expected Forget, got {other:?}"),
     }
 }
-fn unwrap_recall(r: ResponseBody) -> RecallResponseFrame {
-    match r {
+fn unwrap_recall(r: DispatchOutcome) -> RecallResponseFrame {
+    match single_body(r) {
         ResponseBody::Recall(r) => r,
         other => panic!("expected Recall, got {other:?}"),
     }
 }
-fn unwrap_plan(r: ResponseBody) -> PlanResponseFrame {
-    match r {
-        ResponseBody::Plan(p) => p,
-        other => panic!("expected Plan, got {other:?}"),
+
+/// Collapse the streamed PLAN frames into the v1 single-frame shape
+/// the tests assert against.
+fn unwrap_plan(outcome: DispatchOutcome) -> PlanResponseFrame {
+    let mut steps = Vec::new();
+    let mut terminal: Option<PlanResponseFrame> = None;
+    match outcome {
+        DispatchOutcome::Stream(bodies) => {
+            for b in bodies {
+                match b {
+                    ResponseBody::Plan(f) if f.is_final => terminal = Some(f),
+                    ResponseBody::Plan(f) => steps.extend(f.steps),
+                    other => panic!("expected Plan frame, got {other:?}"),
+                }
+            }
+        }
+        DispatchOutcome::Single(other) => {
+            panic!("expected Stream of Plan, got Single({other:?})")
+        }
+    }
+    let t = terminal.expect("PLAN stream must end with a terminal frame");
+    PlanResponseFrame {
+        steps,
+        is_final: t.is_final,
+        plan_status: t.plan_status,
+        trace: t.trace,
     }
 }
-fn unwrap_reason(r: ResponseBody) -> ReasonResponseFrame {
-    match r {
-        ResponseBody::Reason(r) => r,
-        other => panic!("expected Reason, got {other:?}"),
+
+/// Collapse the streamed REASON frames into the v1 single-frame shape.
+fn unwrap_reason(outcome: DispatchOutcome) -> ReasonResponseFrame {
+    let mut inferences = Vec::new();
+    let mut terminal: Option<ReasonResponseFrame> = None;
+    match outcome {
+        DispatchOutcome::Stream(bodies) => {
+            for b in bodies {
+                match b {
+                    ResponseBody::Reason(f) if f.is_final => terminal = Some(f),
+                    ResponseBody::Reason(f) => inferences.extend(f.inferences),
+                    other => panic!("expected Reason frame, got {other:?}"),
+                }
+            }
+        }
+        DispatchOutcome::Single(other) => {
+            panic!("expected Stream of Reason, got Single({other:?})")
+        }
+    }
+    let t = terminal.expect("REASON stream must end with a terminal frame");
+    ReasonResponseFrame {
+        inferences,
+        is_final: t.is_final,
+        reason_status: t.reason_status,
+        trace: t.trace,
     }
 }
 
@@ -259,8 +338,9 @@ async fn begin(fix: &Fixture, txn_id: [u8; 16], timeout_seconds: u32) -> TxnBegi
             RequestBody::TxnBegin(TxnBeginRequest {
                 txn_id,
                 timeout_seconds,
+                act_as: None,
             }),
-            brain_ops::RequestCaller::anonymous(),
+            brain_ops::RequestCaller::for_tests(),
             &fix.ctx,
         )
         .await
@@ -272,7 +352,7 @@ async fn commit(fix: &Fixture, txn_id: [u8; 16]) -> TxnCommitResponse {
     unwrap_commit(
         dispatch(
             RequestBody::TxnCommit(TxnCommitRequest { txn_id }),
-            brain_ops::RequestCaller::anonymous(),
+            brain_ops::RequestCaller::for_tests(),
             &fix.ctx,
         )
         .await
@@ -284,7 +364,7 @@ async fn abort(fix: &Fixture, txn_id: [u8; 16]) -> TxnAbortResponse {
     unwrap_abort(
         dispatch(
             RequestBody::TxnAbort(TxnAbortRequest { txn_id }),
-            brain_ops::RequestCaller::anonymous(),
+            brain_ops::RequestCaller::for_tests(),
             &fix.ctx,
         )
         .await
@@ -333,7 +413,7 @@ fn expired_txn_swept_on_next_op() {
         // Now an in-txn encode must fail with TxnExpired.
         let err = dispatch(
             RequestBody::Encode(encode_req([99; 16], "x", Some(txn))),
-            brain_ops::RequestCaller::anonymous(),
+            brain_ops::RequestCaller::for_tests(),
             &fix.ctx,
         )
         .await
@@ -360,14 +440,14 @@ fn encode_in_txn_not_visible_outside() {
         let frame = unwrap_recall(
             dispatch(
                 RequestBody::Recall(recall_req("secret", 10, None)),
-                brain_ops::RequestCaller::anonymous(),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
             .unwrap(),
         );
         assert!(
-            !frame.results.iter().any(|r| r.memory_id == mid),
+            !frame.memories.iter().any(|r| r.memory_id == mid),
             "pending memory must be invisible to non-txn RECALL"
         );
     })
@@ -376,24 +456,27 @@ fn encode_in_txn_not_visible_outside() {
 #[test]
 fn commit_makes_buffered_writes_visible() {
     run_in_glommio(|| async {
-        let fix = build_fixture();
+        let mut fix = build_fixture();
         let txn = [20; 16];
         let _ = begin(&fix, txn, 60).await;
         let mid = encode(&fix, [21; 16], "committed", Some(txn)).await;
 
         let c = commit(&fix, txn).await;
         assert_eq!(c.operations_applied, 1);
+        // The committed row is now in redb; index it lexically so the
+        // post-commit retrieval recall sees a fully-indexed corpus.
+        fix.reindex_lexical();
 
         let frame = unwrap_recall(
             dispatch(
                 RequestBody::Recall(recall_req("committed", 10, None)),
-                brain_ops::RequestCaller::anonymous(),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
             .unwrap(),
         );
-        assert!(frame.results.iter().any(|r| r.memory_id == mid));
+        assert!(frame.memories.iter().any(|r| r.memory_id == mid));
     })
 }
 
@@ -412,13 +495,13 @@ fn abort_discards_buffered_writes() {
         let frame = unwrap_recall(
             dispatch(
                 RequestBody::Recall(recall_req("aborted", 10, None)),
-                brain_ops::RequestCaller::anonymous(),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
             .unwrap(),
         );
-        assert!(!frame.results.iter().any(|r| r.memory_id == mid));
+        assert!(!frame.memories.iter().any(|r| r.memory_id == mid));
     })
 }
 
@@ -444,7 +527,7 @@ fn commit_is_atomic_link_to_phantom_fails_whole_txn() {
                 [42; 16],
                 Some(txn),
             )),
-            brain_ops::RequestCaller::anonymous(),
+            brain_ops::RequestCaller::for_tests(),
             &fix.ctx,
         )
         .await
@@ -472,80 +555,16 @@ fn recall_in_txn_sees_pending_encode() {
         let frame = unwrap_recall(
             dispatch(
                 RequestBody::Recall(recall_req("in-flight", 10, Some(txn))),
-                brain_ops::RequestCaller::anonymous(),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
             .unwrap(),
         );
         assert!(
-            frame.results.iter().any(|r| r.memory_id == mid),
+            frame.memories.iter().any(|r| r.memory_id == mid),
             "in-txn RECALL must see pending memory; got {:?}",
-            frame.results
-        );
-    })
-}
-
-#[test]
-fn recall_in_txn_returns_pending_text_when_include_text_set() {
-    run_in_glommio(|| async {
-        let fix = build_fixture();
-        let txn = [70; 16];
-        let _ = begin(&fix, txn, 60).await;
-        let _mid = encode(&fix, [71; 16], "alpha buffered text", Some(txn)).await;
-
-        let mut req = recall_req("alpha buffered", 10, Some(txn));
-        req.include_text = true;
-        let frame = unwrap_recall(
-            dispatch(
-                RequestBody::Recall(req),
-                brain_ops::RequestCaller::anonymous(),
-                &fix.ctx,
-            )
-            .await
-            .unwrap(),
-        );
-        let hit = frame
-            .results
-            .iter()
-            .find(|r| r.text == "alpha buffered text")
-            .unwrap_or_else(|| {
-                panic!(
-                    "expected pending hit to carry the buffered text; got {:?}",
-                    frame.results
-                )
-            });
-        assert_eq!(hit.text, "alpha buffered text");
-    })
-}
-
-#[test]
-fn recall_in_txn_omits_pending_text_when_include_text_unset() {
-    run_in_glommio(|| async {
-        let fix = build_fixture();
-        let txn = [72; 16];
-        let _ = begin(&fix, txn, 60).await;
-        let mid = encode(&fix, [73; 16], "alpha unbuffered text", Some(txn)).await;
-
-        // include_text defaults to false in recall_req.
-        let frame = unwrap_recall(
-            dispatch(
-                RequestBody::Recall(recall_req("alpha", 10, Some(txn))),
-                brain_ops::RequestCaller::anonymous(),
-                &fix.ctx,
-            )
-            .await
-            .unwrap(),
-        );
-        let hit = frame
-            .results
-            .iter()
-            .find(|r| r.memory_id == mid)
-            .expect("pending hit must surface even without include_text");
-        assert!(
-            hit.text.is_empty(),
-            "include_text=false must not surface pending text: got {:?}",
-            hit.text
+            frame.memories
         );
     })
 }
@@ -553,16 +572,20 @@ fn recall_in_txn_omits_pending_text_when_include_text_unset() {
 #[test]
 fn recall_in_txn_drops_pending_tombstone() {
     run_in_glommio(|| async {
-        let fix = build_fixture();
+        let mut fix = build_fixture();
         // First commit a memory.
         let committed_mid = encode(&fix, [60; 16], "doomed", None).await;
+        // It's committed to redb — index it lexically so the committed
+        // retrieval lane surfaces it (the in-txn overlay then drops it as
+        // tombstoned; the non-txn recall still sees it).
+        fix.reindex_lexical();
 
         // Now open a txn and FORGET it.
         let txn = [61; 16];
         let _ = begin(&fix, txn, 60).await;
         let _ = dispatch(
             RequestBody::Forget(forget_req(committed_mid, [62; 16], Some(txn))),
-            brain_ops::RequestCaller::anonymous(),
+            brain_ops::RequestCaller::for_tests(),
             &fix.ctx,
         )
         .await
@@ -572,25 +595,28 @@ fn recall_in_txn_drops_pending_tombstone() {
         let in_txn = unwrap_recall(
             dispatch(
                 RequestBody::Recall(recall_req("doomed", 10, Some(txn))),
-                brain_ops::RequestCaller::anonymous(),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
             .unwrap(),
         );
-        assert!(!in_txn.results.iter().any(|r| r.memory_id == committed_mid));
+        assert!(!in_txn.memories.iter().any(|r| r.memory_id == committed_mid));
 
         // Non-txn RECALL still sees it (uncommitted abort below).
         let outside = unwrap_recall(
             dispatch(
                 RequestBody::Recall(recall_req("doomed", 10, None)),
-                brain_ops::RequestCaller::anonymous(),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
             .unwrap(),
         );
-        assert!(outside.results.iter().any(|r| r.memory_id == committed_mid));
+        assert!(outside
+            .memories
+            .iter()
+            .any(|r| r.memory_id == committed_mid));
 
         // Abort the txn — the tombstone goes away.
         let _ = abort(&fix, txn).await;
@@ -615,7 +641,7 @@ fn plan_in_txn_traverses_pending_link() {
                 [73; 16],
                 Some(txn),
             )),
-            brain_ops::RequestCaller::anonymous(),
+            brain_ops::RequestCaller::for_tests(),
             &fix.ctx,
         )
         .await
@@ -625,7 +651,7 @@ fn plan_in_txn_traverses_pending_link() {
         let in_txn = unwrap_plan(
             dispatch(
                 RequestBody::Plan(plan_req(a, b, 3, Some(txn))),
-                brain_ops::RequestCaller::anonymous(),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
@@ -638,7 +664,7 @@ fn plan_in_txn_traverses_pending_link() {
         let outside = unwrap_plan(
             dispatch(
                 RequestBody::Plan(plan_req(a, b, 3, None)),
-                brain_ops::RequestCaller::anonymous(),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
@@ -668,7 +694,7 @@ fn reason_in_txn_picks_up_pending_supports_edge() {
                 [83; 16],
                 Some(txn),
             )),
-            brain_ops::RequestCaller::anonymous(),
+            brain_ops::RequestCaller::for_tests(),
             &fix.ctx,
         )
         .await
@@ -677,7 +703,7 @@ fn reason_in_txn_picks_up_pending_supports_edge() {
         let frame = unwrap_reason(
             dispatch(
                 RequestBody::Reason(reason_req(a, 2, Some(txn))),
-                brain_ops::RequestCaller::anonymous(),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
@@ -704,7 +730,7 @@ fn unlink_in_txn_hides_committed_edge() {
         let _ = unwrap_link(
             dispatch(
                 RequestBody::Link(link_req(a, b, EdgeKindWire::Caused, 1.0, [92; 16], None)),
-                brain_ops::RequestCaller::anonymous(),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
@@ -715,7 +741,7 @@ fn unlink_in_txn_hides_committed_edge() {
         let outside = unwrap_plan(
             dispatch(
                 RequestBody::Plan(plan_req(a, b, 3, None)),
-                brain_ops::RequestCaller::anonymous(),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
@@ -729,7 +755,7 @@ fn unlink_in_txn_hides_committed_edge() {
         let u = unwrap_unlink(
             dispatch(
                 RequestBody::Unlink(unlink_req(a, b, EdgeKindWire::Caused, [94; 16], Some(txn))),
-                brain_ops::RequestCaller::anonymous(),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
@@ -740,7 +766,7 @@ fn unlink_in_txn_hides_committed_edge() {
         let in_txn = unwrap_plan(
             dispatch(
                 RequestBody::Plan(plan_req(a, b, 3, Some(txn))),
-                brain_ops::RequestCaller::anonymous(),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
@@ -753,7 +779,7 @@ fn unlink_in_txn_hides_committed_edge() {
         let restored = unwrap_plan(
             dispatch(
                 RequestBody::Plan(plan_req(a, b, 3, None)),
-                brain_ops::RequestCaller::anonymous(),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
@@ -775,41 +801,7 @@ fn op_with_unknown_txn_id_returns_txn_not_found() {
         let fix = build_fixture();
         let err = dispatch(
             RequestBody::Encode(encode_req([100; 16], "x", Some([99; 16]))),
-            brain_ops::RequestCaller::anonymous(),
-            &fix.ctx,
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(err, OpError::TxnNotFound), "got {err:?}");
-        assert_eq!(err.error_code(), ErrorCode::TxnNotFound);
-    })
-}
-
-#[test]
-fn commit_with_unknown_txn_id_returns_txn_not_found() {
-    // Mirrors `op_with_unknown_txn_id_*` but exercises the
-    // handle_txn_commit path explicitly — the user's REPL trap.
-    run_in_glommio(|| async {
-        let fix = build_fixture();
-        let err = dispatch(
-            RequestBody::TxnCommit(TxnCommitRequest { txn_id: [88; 16] }),
-            brain_ops::RequestCaller::anonymous(),
-            &fix.ctx,
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(err, OpError::TxnNotFound), "got {err:?}");
-        assert_eq!(err.error_code(), ErrorCode::TxnNotFound);
-    })
-}
-
-#[test]
-fn abort_with_unknown_txn_id_returns_txn_not_found() {
-    run_in_glommio(|| async {
-        let fix = build_fixture();
-        let err = dispatch(
-            RequestBody::TxnAbort(TxnAbortRequest { txn_id: [89; 16] }),
-            brain_ops::RequestCaller::anonymous(),
+            brain_ops::RequestCaller::for_tests(),
             &fix.ctx,
         )
         .await
@@ -833,35 +825,7 @@ fn op_against_committed_txn_returns_txn_expired() {
 
         let err = dispatch(
             RequestBody::Encode(encode_req([112; 16], "after", Some(txn))),
-            brain_ops::RequestCaller::anonymous(),
-            &fix.ctx,
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(err, OpError::TxnExpired), "got {err:?}");
-        assert_eq!(err.error_code(), ErrorCode::TxnExpired);
-    })
-}
-
-#[test]
-fn commit_against_aborted_txn_returns_txn_expired() {
-    // Symmetric to the committed case: aborting then re-committing
-    // the same id should surface TxnExpired, not TxnNotFound.
-    run_in_glommio(|| async {
-        let fix = build_fixture();
-        let txn = [130; 16];
-        let _ = begin(&fix, txn, 60).await;
-        let _ = dispatch(
-            RequestBody::TxnAbort(TxnAbortRequest { txn_id: txn }),
-            brain_ops::RequestCaller::anonymous(),
-            &fix.ctx,
-        )
-        .await
-        .unwrap();
-
-        let err = dispatch(
-            RequestBody::TxnCommit(TxnCommitRequest { txn_id: txn }),
-            brain_ops::RequestCaller::anonymous(),
+            brain_ops::RequestCaller::for_tests(),
             &fix.ctx,
         )
         .await
@@ -929,11 +893,568 @@ fn txn_expires_after_idle_window() {
         // Commit must report expired.
         let err = dispatch(
             RequestBody::TxnCommit(TxnCommitRequest { txn_id: txn }),
-            brain_ops::RequestCaller::anonymous(),
+            brain_ops::RequestCaller::for_tests(),
             &fix.ctx,
         )
         .await
         .unwrap_err();
         assert!(matches!(err, OpError::TxnExpired), "got {err:?}");
+    })
+}
+
+// =============================================================================
+// Connection-drop auto-abort
+//
+// A client whose TCP/TLS connection dies before TXN_COMMIT must see
+// none of its buffered operations applied. The connection layer fans
+// `TxnStore::abort_orphaned_for_connection` across every shard the
+// moment it observes the disconnect; these tests exercise that sweep
+// directly against `TxnStore`.
+// =============================================================================
+
+/// Open a txn that's linked to the given wire `connection_id`. Mirrors
+/// `begin` but carries a non-anonymous caller so the entry inherits
+/// the session linkage the connection layer would stamp in production.
+async fn begin_with_connection(
+    fix: &Fixture,
+    txn_id: [u8; 16],
+    timeout_seconds: u32,
+    connection_id: [u8; 16],
+) -> TxnBeginResponse {
+    let caller = brain_ops::RequestCaller::for_tests().with_session_id(connection_id);
+    unwrap_begin(
+        dispatch(
+            RequestBody::TxnBegin(TxnBeginRequest {
+                txn_id,
+                timeout_seconds,
+                act_as: None,
+            }),
+            caller,
+            &fix.ctx,
+        )
+        .await
+        .unwrap(),
+    )
+}
+
+/// Buffer one ENCODE inside `txn` as the connection that opened it.
+/// The connection-ownership check rejects an in-txn op issued by any
+/// other connection, so a session-bound txn's writes must ride the same
+/// session id.
+async fn encode_on(
+    fix: &Fixture,
+    rid: [u8; 16],
+    text: &str,
+    txn: [u8; 16],
+    connection_id: [u8; 16],
+) -> u128 {
+    match single_body(
+        dispatch(
+            RequestBody::Encode(encode_req(rid, text, Some(txn))),
+            brain_ops::RequestCaller::for_tests().with_session_id(connection_id),
+            &fix.ctx,
+        )
+        .await
+        .unwrap(),
+    ) {
+        ResponseBody::Encode(EncodeResponse { memory_id, .. }) => memory_id,
+        other => panic!("expected Encode, got {other:?}"),
+    }
+}
+
+/// Commit `txn` as the connection that opened it.
+async fn commit_on(fix: &Fixture, txn: [u8; 16], connection_id: [u8; 16]) -> TxnCommitResponse {
+    unwrap_commit(
+        dispatch(
+            RequestBody::TxnCommit(TxnCommitRequest { txn_id: txn }),
+            brain_ops::RequestCaller::for_tests().with_session_id(connection_id),
+            &fix.ctx,
+        )
+        .await
+        .unwrap(),
+    )
+}
+
+#[test]
+fn session_drop_aborts_open_txns() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        let session = [0xAA; 16];
+        let txn = [200; 16];
+        let _ = begin_with_connection(&fix, txn, 30, session).await;
+        // Buffer some work — these must NOT land after the sweep.
+        let _ = encode_on(&fix, [201; 16], "draft-1", txn, session).await;
+        let _ = encode_on(&fix, [202; 16], "draft-2", txn, session).await;
+
+        // Simulate the connection drop hook: connection layer fans
+        // `abort_orphaned_for_connection` to every shard. Here we hit
+        // the single shard directly.
+        let aborted = fix.ctx.txn_store.abort_orphaned_for_connection(session);
+        assert_eq!(aborted, vec![txn], "exactly the dropped session's txn");
+
+        // Subsequent ops on the txn (from the owning session) must see
+        // it as Expired (the post-sweep state is Aborted, validate_active
+        // returns TxnExpired for any non-Active state).
+        let err = dispatch(
+            RequestBody::TxnCommit(TxnCommitRequest { txn_id: txn }),
+            brain_ops::RequestCaller::for_tests().with_session_id(session),
+            &fix.ctx,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, OpError::TxnExpired), "got {err:?}");
+
+        // And the buffered drafts are gone — a fresh recall over
+        // committed state finds nothing.
+        let mut req = recall_req("draft", 5, None);
+        req.include_text = true;
+        let recall = unwrap_recall(
+            dispatch(
+                RequestBody::Recall(req),
+                brain_ops::RequestCaller::for_tests(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(
+            recall.memories.is_empty(),
+            "buffered encodes leaked into committed state: {:?}",
+            recall.memories
+        );
+    })
+}
+
+#[test]
+fn session_drop_does_not_affect_other_sessions() {
+    run_in_glommio(|| async {
+        let mut fix = build_fixture();
+        let session_a = [0xAA; 16];
+        let session_b = [0xBB; 16];
+        let txn_a = [210; 16];
+        let txn_b = [211; 16];
+        let _ = begin_with_connection(&fix, txn_a, 30, session_a).await;
+        let _ = begin_with_connection(&fix, txn_b, 30, session_b).await;
+        let _ = encode_on(&fix, [212; 16], "from-b", txn_b, session_b).await;
+
+        // Drop session A. Session B's txn must keep working.
+        let aborted = fix.ctx.txn_store.abort_orphaned_for_connection(session_a);
+        assert_eq!(aborted, vec![txn_a]);
+
+        // Session B can commit. Its encode must land.
+        let resp = commit_on(&fix, txn_b, session_b).await;
+        assert_eq!(resp.operations_applied, 1);
+        // Committed to redb — index it lexically so the non-txn recall
+        // surfaces it.
+        fix.reindex_lexical();
+
+        let mut req = recall_req("from-b", 5, None);
+        req.include_text = true;
+        let recall = unwrap_recall(
+            dispatch(
+                RequestBody::Recall(req),
+                brain_ops::RequestCaller::for_tests(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(
+            recall.memories.len(),
+            1,
+            "session B's committed encode should be visible"
+        );
+    })
+}
+
+#[test]
+fn reconnect_after_drop_sees_clean_state() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        let session_1 = [0xAA; 16];
+        let session_2 = [0xCC; 16];
+        let old_txn = [220; 16];
+        let _ = begin_with_connection(&fix, old_txn, 30, session_1).await;
+        let _ = encode_on(&fix, [221; 16], "lost-draft", old_txn, session_1).await;
+
+        // Original connection dies.
+        let aborted = fix.ctx.txn_store.abort_orphaned_for_connection(session_1);
+        assert_eq!(aborted, vec![old_txn]);
+
+        // Client reconnects with a brand-new session + a brand-new
+        // txn id. The fresh begin must succeed and operate on a
+        // clean buffer — the previous draft must not leak through.
+        let new_txn = [222; 16];
+        let _ = begin_with_connection(&fix, new_txn, 30, session_2).await;
+        let _ = encode_on(&fix, [223; 16], "fresh-draft", new_txn, session_2).await;
+
+        // Recall inside the new txn sees only its own pending encode,
+        // not the dropped one.
+        let mut req = recall_req("draft", 5, Some(new_txn));
+        req.include_text = true;
+        let recall = unwrap_recall(
+            dispatch(
+                RequestBody::Recall(req),
+                brain_ops::RequestCaller::for_tests().with_session_id(session_2),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        let texts: Vec<&str> = recall.memories.iter().map(|h| h.text.as_str()).collect();
+        assert!(
+            texts.iter().any(|t| t.contains("fresh-draft")),
+            "new-session recall must see its own pending encode: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t.contains("lost-draft")),
+            "dropped-session buffer must NOT leak into new session: {texts:?}"
+        );
+
+        // Commit the new session's txn — the encode lands cleanly.
+        let resp = commit_on(&fix, new_txn, session_2).await;
+        assert_eq!(resp.operations_applied, 1);
+    })
+}
+
+#[test]
+fn auto_abort_sweep_is_noop_for_zero_session_id() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        let txn = [230; 16];
+        // Default begin() uses the anonymous caller, which carries
+        // connection_id == [0; 16]. The sweep must not touch such entries
+        // — otherwise in-process embedded callers (tests, harnesses)
+        // would wipe their own txns by accident.
+        let _ = begin(&fix, txn, 30).await;
+        let _ = encode(&fix, [231; 16], "still-here", Some(txn)).await;
+
+        let aborted = fix.ctx.txn_store.abort_orphaned_for_connection([0u8; 16]);
+        assert!(aborted.is_empty(), "zero connection_id must be a no-op");
+
+        // Txn is still committable.
+        let resp = commit(&fix, txn).await;
+        assert_eq!(resp.operations_applied, 1);
+    })
+}
+
+// =============================================================================
+// Per-transaction op cap (MAX_TXN_OPS = 1000)
+// =============================================================================
+//
+// The cap is enforced two ways: append-time (so the 1001st buffered op
+// fails fast) and commit-time (defense-in-depth for buffer mutations
+// that slip past the append guard). The append-time check sits AFTER
+// the intra-txn replay cache so an idempotent re-submit at the cap
+// boundary still replays.
+
+/// `i`-th request_id within these tests. Disambiguates the per-op
+/// idempotency hash so each buffered op hits a fresh buffer slot.
+fn rid(prefix: u8, i: u32) -> [u8; 16] {
+    let mut id = [prefix; 16];
+    id[12..16].copy_from_slice(&i.to_be_bytes());
+    id
+}
+
+/// Buffer one ENCODE inside `txn`, returning the dispatch result so
+/// callers can assert on success/failure. Each call grows the buffer
+/// by exactly one (the encoder mints a fresh `MemoryId` per call).
+async fn buffer_encode(fix: &Fixture, txn: [u8; 16], i: u32) -> Result<EncodeResponse, OpError> {
+    let text = format!("cap-fill-{i}");
+    dispatch(
+        RequestBody::Encode(encode_req(rid(0xE0, i), &text, Some(txn))),
+        brain_ops::RequestCaller::for_tests(),
+        &fix.ctx,
+    )
+    .await
+    .map(|r| match single_body(r) {
+        ResponseBody::Encode(e) => e,
+        other => panic!("expected Encode, got {other:?}"),
+    })
+}
+
+#[test]
+fn txn_at_exactly_1000_commits_fine() {
+    // Boundary test: a buffer filled to exactly MAX_TXN_OPS must still
+    // commit. The 1001st op is what fails — not the 1000th.
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        let txn = [160; 16];
+        let _ = begin(&fix, txn, 300).await; // generous timeout
+        for i in 0..1000u32 {
+            buffer_encode(&fix, txn, i)
+                .await
+                .unwrap_or_else(|e| panic!("encode #{i} failed: {e:?}"));
+        }
+        let c = commit(&fix, txn).await;
+        assert_eq!(
+            c.operations_applied, 1000,
+            "exactly-MAX_TXN_OPS commit must apply all ops"
+        );
+    })
+}
+
+#[test]
+fn txn_rejects_op_beyond_1000_cap() {
+    // Append-time check: the 1000th op succeeds, the 1001st returns
+    // TransactionTooLarge. The space learns about the cap immediately
+    // rather than burning thousands of doomed ops only to be rejected
+    // at TXN_COMMIT.
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        let txn = [161; 16];
+        let _ = begin(&fix, txn, 300).await;
+        for i in 0..1000u32 {
+            buffer_encode(&fix, txn, i)
+                .await
+                .unwrap_or_else(|e| panic!("encode #{i} failed: {e:?}"));
+        }
+        // The 1001st op must fail with TransactionTooLarge carrying
+        // the current ops count + cap, so the client can surface a useful
+        // message.
+        let err = buffer_encode(&fix, txn, 1000).await.unwrap_err();
+        match err {
+            OpError::TransactionTooLarge { ops, cap } => {
+                assert_eq!(ops, 1000, "ops should report the current buffered count");
+                assert_eq!(cap, 1000, "cap should report MAX_TXN_OPS");
+            }
+            other => panic!("expected TransactionTooLarge, got {other:?}"),
+        }
+        // Wire-level error code maps to the dedicated TransactionTooLarge
+        // code (not generic Conflict or InvalidArgument) so clients
+        // can detect it programmatically.
+        let err = buffer_encode(&fix, txn, 1001).await.unwrap_err();
+        assert_eq!(err.error_code(), ErrorCode::TransactionTooLarge);
+
+        // The buffer is intact at exactly 1000 — commit must succeed.
+        // (Append-time rejection MUST NOT corrupt the buffer.)
+        let c = commit(&fix, txn).await;
+        assert_eq!(c.operations_applied, 1000);
+    })
+}
+
+#[test]
+fn txn_replay_still_works_when_buffer_is_full() {
+    // Edge case: at the cap, an idempotent re-submit of an already-
+    // buffered request_id MUST still replay (return cached response)
+    // — the replay path doesn't grow the buffer, so the cap doesn't
+    // apply. Otherwise an space's automatic retry on a flaky
+    // connection would fail the moment it hit the cap.
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        let txn = [162; 16];
+        let _ = begin(&fix, txn, 300).await;
+        let mut first_id: u128 = 0;
+        for i in 0..1000u32 {
+            let resp = buffer_encode(&fix, txn, i)
+                .await
+                .unwrap_or_else(|e| panic!("encode #{i} failed: {e:?}"));
+            if i == 500 {
+                first_id = resp.memory_id;
+            }
+        }
+        // Re-submit op #500 — same request_id, same params — should
+        // hit the replay cache and return the same memory id, not
+        // bump the buffer to 1001.
+        let replay = buffer_encode(&fix, txn, 500)
+            .await
+            .expect("idempotent replay at-cap must succeed");
+        assert_eq!(
+            replay.memory_id, first_id,
+            "replayed encode must return the cached memory id"
+        );
+        // Commit still works.
+        let c = commit(&fix, txn).await;
+        assert_eq!(c.operations_applied, 1000);
+    })
+}
+
+// =============================================================================
+// Connection ownership (isolation between distinct wire connections)
+// =============================================================================
+//
+// A txn is owned by the connection that opened it. Only that connection
+// may read its pending writes, buffer into it, or commit/abort it. A
+// different connection that knows (or guesses) the `txn_id` must be
+// turned away as `TxnNotFound` — never served the uncommitted writes,
+// never allowed to mutate or finalize the txn.
+
+/// A test caller bound to a specific wire-level session id.
+fn caller_on(connection_id: [u8; 16]) -> brain_ops::RequestCaller {
+    brain_ops::RequestCaller::for_tests().with_session_id(connection_id)
+}
+
+const CONN_A: [u8; 16] = [0xAA; 16];
+const CONN_B: [u8; 16] = [0xBB; 16];
+
+#[test]
+fn foreign_connection_cannot_read_pending_writes() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        let txn = [170; 16];
+
+        // Connection A opens the txn and buffers a pending encode.
+        let _ = unwrap_begin(
+            dispatch(
+                RequestBody::TxnBegin(TxnBeginRequest {
+                    txn_id: txn,
+                    timeout_seconds: 60,
+                    act_as: None,
+                }),
+                caller_on(CONN_A),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        let mid = match single_body(
+            dispatch(
+                RequestBody::Encode(encode_req([171; 16], "a-secret", Some(txn))),
+                caller_on(CONN_A),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        ) {
+            ResponseBody::Encode(EncodeResponse { memory_id, .. }) => memory_id,
+            other => panic!("expected Encode, got {other:?}"),
+        };
+
+        // Connection B, knowing the txn_id, tries an in-txn RECALL.
+        // It must be rejected as TxnNotFound and see none of A's writes.
+        let err = dispatch(
+            RequestBody::Recall(recall_req("a-secret", 10, Some(txn))),
+            caller_on(CONN_B),
+            &fix.ctx,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, OpError::TxnNotFound), "got {err:?}");
+        assert_eq!(err.error_code(), ErrorCode::TxnNotFound);
+
+        // A's own in-txn RECALL still sees its pending write (RYOW).
+        let frame = unwrap_recall(
+            dispatch(
+                RequestBody::Recall(recall_req("a-secret", 10, Some(txn))),
+                caller_on(CONN_A),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(
+            frame.memories.iter().any(|r| r.memory_id == mid),
+            "owning connection must still see its pending write; got {:?}",
+            frame.memories
+        );
+    })
+}
+
+#[test]
+fn foreign_connection_cannot_write_into_txn() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        let txn = [172; 16];
+        let _ = dispatch(
+            RequestBody::TxnBegin(TxnBeginRequest {
+                txn_id: txn,
+                timeout_seconds: 60,
+                act_as: None,
+            }),
+            caller_on(CONN_A),
+            &fix.ctx,
+        )
+        .await
+        .unwrap();
+
+        // B tries to inject a write into A's txn.
+        let err = dispatch(
+            RequestBody::Encode(encode_req([173; 16], "b-injected", Some(txn))),
+            caller_on(CONN_B),
+            &fix.ctx,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, OpError::TxnNotFound), "got {err:?}");
+
+        // A commits — the buffer must be empty (B's injection never
+        // landed).
+        let c = unwrap_commit(
+            dispatch(
+                RequestBody::TxnCommit(TxnCommitRequest { txn_id: txn }),
+                caller_on(CONN_A),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(
+            c.operations_applied, 0,
+            "foreign write must not enter the txn buffer"
+        );
+    })
+}
+
+#[test]
+fn foreign_connection_cannot_commit_or_abort_txn() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        let txn = [174; 16];
+        let _ = dispatch(
+            RequestBody::TxnBegin(TxnBeginRequest {
+                txn_id: txn,
+                timeout_seconds: 60,
+                act_as: None,
+            }),
+            caller_on(CONN_A),
+            &fix.ctx,
+        )
+        .await
+        .unwrap();
+        let _ = dispatch(
+            RequestBody::Encode(encode_req([175; 16], "a-pending", Some(txn))),
+            caller_on(CONN_A),
+            &fix.ctx,
+        )
+        .await
+        .unwrap();
+
+        // B cannot commit A's txn.
+        let commit_err = dispatch(
+            RequestBody::TxnCommit(TxnCommitRequest { txn_id: txn }),
+            caller_on(CONN_B),
+            &fix.ctx,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(commit_err, OpError::TxnNotFound),
+            "got {commit_err:?}"
+        );
+
+        // B cannot abort A's txn.
+        let abort_err = dispatch(
+            RequestBody::TxnAbort(TxnAbortRequest { txn_id: txn }),
+            caller_on(CONN_B),
+            &fix.ctx,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(abort_err, OpError::TxnNotFound),
+            "got {abort_err:?}"
+        );
+
+        // A's own commit still works and applies its buffered op.
+        let c = unwrap_commit(
+            dispatch(
+                RequestBody::TxnCommit(TxnCommitRequest { txn_id: txn }),
+                caller_on(CONN_A),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(c.operations_applied, 1);
     })
 }

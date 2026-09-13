@@ -6,7 +6,7 @@
 //! Before this worker landed, every substrate edge was client-supplied
 //! (via `ENCODE_REQ.edges` or a separate `LINK`). The memory graph was
 //! empty by default, which made the planner's memory-anchor graph
-//! retriever (Phase A's hybrid recall) a no-op on any deployment that
+//! retriever (the retrieval recall) a no-op on any deployment that
 //! didn't manually LINK things. AutoEdgeWorker fills that gap: the
 //! substrate now produces a real graph clients can traverse without
 //! lifting a finger.
@@ -48,8 +48,14 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use brain_core::{AgentId, ContextId, EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NodeRef};
-use brain_metadata::tables::edge::{derived_by, origin, zero_disambiguator};
+use brain_core::{
+    EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NamespaceId, NodeRef, RequestId, SessionId,
+    SpaceId,
+};
+use brain_metadata::tables::edge::{
+    derived_by, list_memory_edges_from, origin, zero_disambiguator,
+};
+use brain_metadata::tables::memory::MEMORIES_TABLE;
 use brain_ops::{
     AutoEdgeEnqueue, AutoEdgeMetrics, EventEnvelope, Phase, RealWriterHandle, Write, WriteId,
 };
@@ -58,12 +64,19 @@ use brain_protocol::shared::enums::{
 };
 use futures_lite::FutureExt;
 use glommio::timer::sleep;
-use tracing::trace;
+use tracing::{trace, warn};
+use uuid::Uuid;
 
 use crate::config::{WorkerConfig, WorkerKind};
 use crate::context::WorkerContext;
 use crate::error::WorkerError;
 use crate::worker::Worker;
+
+/// A memory's owning tenant scope: `(namespace_id, space_id_bytes)`. The
+/// worker links two memories only when their scopes are byte-equal, and
+/// submits each scope's edge batch as that scope's real space so the apply
+/// layer's Link tenant wall accepts it.
+type Scope = (u32, [u8; 16]);
 
 /// Knobs that don't fit `WorkerConfig`'s generic shape. Defaults match
 /// the master plan's latency budget: ~0.5 ms HNSW query × 5
@@ -91,67 +104,35 @@ pub struct AutoEdgeKnobs {
 pub const DEFAULT_TOP_K: usize = 5;
 /// Cosine similarity floor for auto-derived `SimilarTo` edges.
 ///
-/// 0.85 is the classical "near-duplicate" floor (paraphrases of the
-/// same sentence; same agent restating itself). For an agent
-/// journaling its day, that threshold is too tight — "Priya works at
-/// Stripe" and "Priya now works at OpenAI" describe the same entity
-/// but their BGE-small embeddings sit around 0.75–0.80. 0.75 catches
-/// the "same topic / same entity" cluster the planner's graph
-/// retriever actually wants; operators who want strict deduping push
-/// it back to 0.85 via `BRAIN_AUTO_EDGE_THRESHOLD`.
-pub const DEFAULT_AUTO_EDGE_SIMILARITY_THRESHOLD: f32 = 0.75;
+/// 0.85 is the classical "near-duplicate" floor — paraphrases of the
+/// same sentence, or an space restating itself. Below it, BGE-small
+/// embeddings still score 0.75–0.80 for pairs that are merely
+/// topically near but semantically distinct ("Priya works at Stripe"
+/// vs. "Priya now works at OpenAI" — same entity, contradictory
+/// fact); admitting those manufactures false `SimilarTo` edges and
+/// turns popular memories into hub nodes that drown the graph
+/// retriever. We keep the floor at the near-duplicate boundary so an
+/// edge means "these say the same thing." Operators who want a looser
+/// topical clustering lower it via `[workers.auto_edge]
+/// similarity_threshold` in the server config.
+pub const DEFAULT_AUTO_EDGE_SIMILARITY_THRESHOLD: f32 = 0.85;
 pub const DEFAULT_EF_SEARCH: usize = 64;
 
-/// Environment variable for overriding [`DEFAULT_AUTO_EDGE_SIMILARITY_THRESHOLD`].
-/// Accepts an `f32` in `[0.0, 1.0]`. Values outside the range or
-/// unparseable strings fall back to the default with a tracing warn —
-/// silently ignoring a misconfigured threshold would let auto-edge
-/// fire on everything (or nothing) for a whole deployment.
-pub const AUTO_EDGE_THRESHOLD_ENV: &str = "BRAIN_AUTO_EDGE_THRESHOLD";
-
-/// Resolve the threshold from the env var (if set + valid) or fall
-/// back to `default`. Lives outside [`AutoEdgeKnobs::default`] so
-/// callers wiring `AutoEdgeKnobs` programmatically (tests, server
-/// config) can pick the same precedence.
-#[must_use]
-pub fn resolved_threshold(default: f32) -> f32 {
-    resolved_threshold_from(std::env::var(AUTO_EDGE_THRESHOLD_ENV).ok(), default)
-}
-
-/// Pure parse step extracted from [`resolved_threshold`] so tests can
-/// exercise the value-validation logic without mutating process-wide
-/// env state (forbidden under the project's no-`unsafe` rule).
-#[must_use]
-pub fn resolved_threshold_from(raw: Option<String>, default: f32) -> f32 {
-    let Some(raw) = raw else {
-        return default;
-    };
-    match raw.parse::<f32>() {
-        Ok(v) if (0.0..=1.0).contains(&v) => v,
-        Ok(v) => {
-            tracing::warn!(
-                env = AUTO_EDGE_THRESHOLD_ENV,
-                value = v,
-                "auto-edge threshold out of [0.0, 1.0]; using default"
-            );
-            default
-        }
-        Err(e) => {
-            tracing::warn!(
-                env = AUTO_EDGE_THRESHOLD_ENV,
-                error = %e,
-                "auto-edge threshold not a valid f32; using default"
-            );
-            default
-        }
-    }
-}
+/// Maximum cumulative `SimilarTo` out-edges any one memory may
+/// accumulate across cycles. Each cycle adds at most `top_k`, but
+/// nothing else bounds the total: a memory that keeps surfacing as a
+/// near-neighbour would otherwise grow an unbounded fan-out and become
+/// a hub node that the graph retriever has to expand on every walk,
+/// inflating latency and burying the genuinely-relevant edges. 16
+/// near-duplicate links is far more than any single memory needs to be
+/// reachable; past that, more edges add cost without adding recall.
+pub const MAX_SIMILAR_TO_OUT_DEGREE: usize = 16;
 
 impl Default for AutoEdgeKnobs {
     fn default() -> Self {
         Self {
             top_k: DEFAULT_TOP_K,
-            similarity_threshold: resolved_threshold(DEFAULT_AUTO_EDGE_SIMILARITY_THRESHOLD),
+            similarity_threshold: DEFAULT_AUTO_EDGE_SIMILARITY_THRESHOLD,
             ef_search: Some(DEFAULT_EF_SEARCH),
         }
     }
@@ -254,6 +235,14 @@ async fn do_auto_edge_cycle(
     let knobs = worker.knobs;
     let started = Instant::now();
     let index = ctx.ops.executor.index.clone();
+    let metadata = ctx.ops.executor.metadata.clone();
+
+    // Remaining `SimilarTo` out-edge budget per source for this cycle.
+    // Seeded lazily from the persisted out-degree on first sight of a
+    // source, then decremented as we queue edges — so a source drained
+    // twice in one cycle doesn't blow past the cap by reading the same
+    // stale persisted count both times.
+    let mut similar_to_budget: HashMap<MemoryId, usize> = HashMap::new();
 
     // Read phase: drain up to `batch_size` (or the per-cycle wall-clock
     // budget) from the channel, run knn for each, collect link tuples.
@@ -265,9 +254,19 @@ async fn do_auto_edge_cycle(
     // a `StageCompleted{AutoEdge}` event for each. Wait helpers depend
     // on per-source completion signals; skipping the "no edges" case
     // would hang the client.
-    let mut to_link: Vec<(MemoryId, MemoryId, f32)> = Vec::new();
+    // Each derived link carries the `(namespace_id, space_id_bytes)` scope
+    // both endpoints share — the writer's Link-apply tenant wall requires the
+    // submitted `Write` to run as the memories' real space, and cross-scope
+    // pairs are dropped entirely (linking two tenants' memories would itself
+    // be a tenancy violation). The HNSW neighbour search is shard-wide and
+    // scope-blind, so we resolve + compare each endpoint's owning scope here.
+    let mut to_link: Vec<(Scope, MemoryId, MemoryId, f32)> = Vec::new();
     let mut drained_sources: Vec<MemoryId> = Vec::new();
     let mut per_source_edges: HashMap<MemoryId, u32> = HashMap::new();
+    // Per-cycle memcache of each memory's owning scope, keyed by id. `None`
+    // means the MEMORIES row was absent (forgotten / never committed) — those
+    // ids can't be tenant-placed, so they never receive an edge.
+    let mut scope_cache: HashMap<MemoryId, Option<Scope>> = HashMap::new();
     let mut processed = 0usize;
     let mut neighbours_found = 0u64;
     while processed < cfg.batch_size {
@@ -312,8 +311,8 @@ async fn do_auto_edge_cycle(
             continue;
         }
 
-        // Zero-vector guard. Until the real embedder lands (Phase 9.10
-        // wires the BGE-small CpuDispatcher), the stub dispatcher hands
+        // Zero-vector guard. Until the real embedder lands (the
+        // BGE-small CpuDispatcher), the stub dispatcher hands
         // every encode a [0; VECTOR_DIM] vector. Two such memories in
         // HNSW make cosine similarity compute 0/0 = NaN, which
         // contaminates the edge weight and crashes downstream consumers
@@ -324,6 +323,40 @@ async fn do_auto_edge_cycle(
         if vector.iter().all(|component| *component == 0.0) {
             continue;
         }
+
+        // Seed this source's remaining out-edge budget from the count
+        // already persisted in redb (first time we see it this cycle),
+        // so the cap holds across cycles and not just within one. A read
+        // failure is non-fatal: rather than drop the source's edges
+        // entirely we fall back to a fresh budget — over-linking on a
+        // transient metadata error is the lesser evil, and the
+        // counter_reconcile worker keeps the persisted count honest.
+        let budget = match similar_to_budget.entry(source_id) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let existing = metadata
+                    .read_txn()
+                    .ok()
+                    .and_then(|rtxn| {
+                        list_memory_edges_from(&rtxn, source_id, Some(EdgeKind::SimilarTo)).ok()
+                    })
+                    .map_or(0, |edges| edges.len());
+                e.insert(MAX_SIMILAR_TO_OUT_DEGREE.saturating_sub(existing))
+            }
+        };
+        if *budget == 0 {
+            continue;
+        }
+
+        // Resolve the source's owning scope. A source with no MEMORIES row
+        // can't be tenant-placed — skip it rather than risk an untenanted
+        // edge. (Shouldn't happen for a memory the writer just committed.)
+        let source_scope = *scope_cache
+            .entry(source_id)
+            .or_insert_with(|| load_memory_scope(ctx, source_id));
+        let Some(source_scope) = source_scope else {
+            continue;
+        };
 
         // Over-fetch by one so the self-hit doesn't eat into the
         // requested k. HNSW's search_active already filters tombstones,
@@ -347,8 +380,28 @@ async fn do_auto_edge_cycle(
             if similarity < knobs.similarity_threshold {
                 continue;
             }
-            to_link.push((source_id, neighbour, similarity));
+            // Tenant wall (worker side). Only link two memories in the SAME
+            // (namespace, space) scope — a cross-scope SimilarTo edge would be
+            // a tenancy violation the apply layer rejects anyway. Cross-scope
+            // neighbours are dropped WITHOUT spending the source's budget:
+            // they aren't edges, so they mustn't shed a genuine same-scope
+            // link the source could still form from a weaker neighbour.
+            let neighbour_scope = *scope_cache
+                .entry(neighbour)
+                .or_insert_with(|| load_memory_scope(ctx, neighbour));
+            if neighbour_scope != Some(source_scope) {
+                continue;
+            }
+            // Stop once the source has spent its out-edge budget. HNSW
+            // returns neighbours strongest-first, so the edges we keep
+            // are the highest-similarity ones — the cap sheds the
+            // weakest links, not arbitrary ones.
+            if *budget == 0 {
+                break;
+            }
+            to_link.push((source_scope, source_id, neighbour, similarity));
             *per_source_edges.entry(source_id).or_insert(0) += 1;
+            *budget -= 1;
             neighbours_found += 1;
         }
 
@@ -369,22 +422,15 @@ async fn do_auto_edge_cycle(
     let written = if to_link.is_empty() {
         0
     } else {
-        let phases: Vec<Phase> = to_link
-            .iter()
-            .map(|(from, to, sim)| Phase::Link {
-                from: NodeRef::Memory(*from),
-                to: NodeRef::Memory(*to),
-                kind: EdgeKindRef::Builtin(EdgeKind::SimilarTo),
-                weight: *sim,
-                origin: origin::AUTO_DERIVED,
-                derived_by: derived_by::SIMILARITY_WORKER,
-                disambiguator: zero_disambiguator(),
-                created_at_unix_nanos: created_at,
-            })
-            .collect();
-        let request_hash = hash_link_batch(&to_link);
-        let write = Write::from_phases(WriteId::new(), AgentId::default(), phases)
-            .with_request_hash(request_hash);
+        // Bucket the derived links by the scope both endpoints share, then
+        // submit one Write per scope stamped with that scope's real space +
+        // namespace so the apply layer's tenant wall passes. A NIL-space
+        // submit (the previous bug) failed `memory_in_space` for every real
+        // memory and silently dropped every edge.
+        let mut by_scope: HashMap<Scope, Vec<(MemoryId, MemoryId, f32)>> = HashMap::new();
+        for (scope, from, to, sim) in &to_link {
+            by_scope.entry(*scope).or_default().push((*from, *to, *sim));
+        }
         let real_writer = ctx
             .ops
             .executor
@@ -394,12 +440,72 @@ async fn do_auto_edge_cycle(
             .ok_or_else(|| {
                 WorkerError::Ops("auto_edge: unified path requires RealWriterHandle".into())
             })?;
-        real_writer
-            .submit(write)
-            .await
-            .map_err(|e| WorkerError::Ops(format!("submit: {e:?}")))?;
-        to_link.len()
+        let mut written = 0usize;
+        for (scope, pairs) in &by_scope {
+            let (namespace_id, space_id_bytes) = *scope;
+            let space = SpaceId::from(space_id_bytes);
+            let namespace = NamespaceId::from(namespace_id);
+            let phases: Vec<Phase> = pairs
+                .iter()
+                .map(|(from, to, sim)| Phase::Link {
+                    from: NodeRef::Memory(*from),
+                    to: NodeRef::Memory(*to),
+                    kind: EdgeKindRef::Builtin(EdgeKind::SimilarTo),
+                    weight: *sim,
+                    origin: origin::AUTO_DERIVED,
+                    derived_by: derived_by::SIMILARITY_WORKER,
+                    disambiguator: zero_disambiguator(),
+                    created_at_unix_nanos: created_at,
+                })
+                .collect();
+            // Deterministic WriteId folds the batch hash (as a RequestId)
+            // with the scope's space, so a same-scope retry of the identical
+            // pair set collapses onto the cached ack, while different scopes
+            // never share an idempotency key.
+            let request_hash = hash_link_batch(pairs);
+            let write_id = WriteId::from_request(request_id_from_hash(&request_hash), space);
+            let write = Write::from_phases(write_id, space, phases)
+                .with_namespace(namespace)
+                .with_request_hash(request_hash);
+            real_writer
+                .submit(write)
+                .await
+                .map_err(|e| WorkerError::Ops(format!("submit: {e:?}")))?;
+            written += pairs.len();
+        }
+        written
     };
+
+    // Merge the real per-source edge detail (target memory id + cosine
+    // similarity, not just the count) into each source's durable
+    // write-artifact bundle, so `MEMORY_INSPECT` can show it later —
+    // mirroring `extractor`'s `merge_graph_from_committed` and `hype`'s
+    // `merge_hype_questions`. Grouped by source so one bundle merge covers
+    // every edge that source produced this cycle. Best-effort: a merge
+    // failure is logged and never blocks the cycle — the edges themselves
+    // already committed via `submit(Write)` above.
+    if written > 0 {
+        let metadata = ctx.ops.executor.metadata.as_ref();
+        let mut by_source: HashMap<MemoryId, Vec<(MemoryId, MemoryId, f32)>> = HashMap::new();
+        for (_scope, source, neighbour, similarity) in &to_link {
+            by_source
+                .entry(*source)
+                .or_default()
+                .push((*source, *neighbour, *similarity));
+        }
+        for (source, links) in by_source {
+            if let Err(e) =
+                brain_ops::memory_artifact::merge_edge_links(metadata, source, "similar_to", &links)
+            {
+                warn!(
+                    target: "brain_workers::auto_edge",
+                    memory_id = ?source,
+                    error = %e,
+                    "artifact edge merge failed (durable edges are committed; bundle detail deferred)",
+                );
+            }
+        }
+    }
 
     let elapsed = started.elapsed();
     worker.metrics.add_edges_written(written as u64);
@@ -422,21 +528,22 @@ async fn do_auto_edge_cycle(
             lsn: 0,
             event_type: EventType::StageCompleted,
             memory_id: source_id,
-            context_id: ContextId::default(),
+            session_id: SessionId::default(),
             kind: MemoryKind::Episodic,
             salience: 0.0,
             timestamp_unix_nanos: ts,
             text: None,
-            knowledge_payload: None,
+            graph_payload: None,
             edge_payload: None,
             stage_kind: Some(StageKind::AutoEdge),
             stage_outcome: Some(outcome),
             stage_payload: Some(StagePayload::AutoEdge(StageAutoEdgePayload {
                 edges_written,
             })),
-            agent_id: AgentId::default(),
+            space_id: memory_space_id(ctx, source_id),
+            vector: None,
         };
-        let _ = ctx.ops.events.publish(envelope);
+        ctx.ops.publish_stage_event(envelope).await;
     }
 
     trace!(
@@ -453,6 +560,60 @@ fn now_unix_nanos() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
+}
+
+/// Read a memory's real owning space from `MEMORIES_TABLE`, for stamping
+/// onto the `StageCompleted{AutoEdge}` publish — `AutoEdgeEnqueue` carries
+/// only `(memory_id, vector)`, so unlike the temporal-edge worker (whose
+/// enqueue payload already threads `space_id` through) this needs its own
+/// lookup. Falls back to [`SpaceId::default`] (the nil space) when the row
+/// is absent — shouldn't happen for a memory the writer just committed,
+/// but a missing row here isn't reason to fail the whole publish loop.
+fn memory_space_id(ctx: &WorkerContext, memory_id: MemoryId) -> SpaceId {
+    ctx.ops
+        .executor
+        .metadata
+        .as_ref()
+        .read_txn()
+        .ok()
+        .and_then(|rtxn| {
+            rtxn.open_table(MEMORIES_TABLE)
+                .ok()
+                .and_then(|t| t.get(&memory_id.to_be_bytes()).ok().flatten())
+                .map(|g| g.value().space_id())
+        })
+        .unwrap_or_default()
+}
+
+/// Read a memory's owning `(namespace_id, space_id_bytes)` scope from
+/// `MEMORIES_TABLE`. Returns `None` when the row is absent — a memory that
+/// can't be tenant-placed never receives an auto-derived edge (the apply
+/// layer's Link tenant wall would drop it anyway).
+fn load_memory_scope(ctx: &WorkerContext, memory_id: MemoryId) -> Option<Scope> {
+    ctx.ops
+        .executor
+        .metadata
+        .as_ref()
+        .read_txn()
+        .ok()
+        .and_then(|rtxn| {
+            rtxn.open_table(MEMORIES_TABLE)
+                .ok()
+                .and_then(|t| t.get(&memory_id.to_be_bytes()).ok().flatten())
+                .map(|g| {
+                    let meta = g.value();
+                    (meta.namespace_id, meta.space_id_bytes)
+                })
+        })
+}
+
+/// Fold a 32-byte batch hash into a 16-byte [`RequestId`]. Feeds
+/// [`WriteId::from_request`] so a same-scope retry of the identical pair set
+/// lands on the same idempotency key.
+fn request_id_from_hash(hash: &[u8; 32]) -> RequestId {
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&hash[..16]);
+    RequestId(Uuid::from_bytes(bytes))
 }
 
 /// Deterministic hash of a batch of `(source, target, weight)` tuples.
@@ -478,36 +639,13 @@ fn hash_link_batch(pairs: &[(MemoryId, MemoryId, f32)]) -> [u8; 32] {
 mod tests {
     use super::*;
 
-    // We test the *parse step* (`resolved_threshold_from`) instead of
-    // the env-reading wrapper. Mutating process-wide env state would
-    // require `unsafe` (forbidden in this crate); the wrapper itself
-    // is two lines and exercised in integration tests via the
-    // configured worker.
-
     #[test]
-    fn auto_edge_threshold_default_when_none() {
-        assert!((resolved_threshold_from(None, 0.75) - 0.75).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn auto_edge_threshold_env_overrides_default() {
-        let v = resolved_threshold_from(Some("0.6".to_string()), 0.75);
-        assert!((v - 0.6).abs() < 1e-6);
-    }
-
-    #[test]
-    fn auto_edge_threshold_invalid_falls_back() {
-        let v = resolved_threshold_from(Some("not-a-number".to_string()), 0.75);
-        assert!((v - 0.75).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn auto_edge_threshold_out_of_range_falls_back() {
+    fn default_knobs_match_constants() {
+        let k = AutoEdgeKnobs::default();
         assert!(
-            (resolved_threshold_from(Some("1.5".to_string()), 0.75) - 0.75).abs() < f32::EPSILON
+            (k.similarity_threshold - DEFAULT_AUTO_EDGE_SIMILARITY_THRESHOLD).abs() < f32::EPSILON
         );
-        assert!(
-            (resolved_threshold_from(Some("-0.1".to_string()), 0.75) - 0.75).abs() < f32::EPSILON
-        );
+        assert_eq!(k.top_k, DEFAULT_TOP_K);
+        assert_eq!(k.ef_search, Some(DEFAULT_EF_SEARCH));
     }
 }

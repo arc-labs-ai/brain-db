@@ -11,10 +11,12 @@ pub mod relation;
 pub mod statement;
 
 pub use entity::{Entity, EntityAttributes, EntityType};
-pub use kinds::{Cardinality, ExtractorKind, StatementKind};
+pub use kinds::{
+    Cardinality, ExtractorKind, KindBehavior, KindCardinality, StatementKind, TemporalModel,
+};
 pub use memory::{Memory, MemoryKind, Salience};
 pub use relation::{canonical_pair, Relation, RelationType};
 pub use statement::{
-    EvidenceEntry, EvidenceRef, Predicate, Statement, StatementObject, StatementValue, SubjectRef,
-    TombstoneReason, INLINE_EVIDENCE_CAP,
+    EvidenceEntry, EvidenceRef, Predicate, Slot, Statement, StatementObject, StatementValue,
+    SubjectRef, TombstoneReason, INLINE_EVIDENCE_CAP,
 };

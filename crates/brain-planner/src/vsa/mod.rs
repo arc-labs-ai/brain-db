@@ -14,7 +14,7 @@
 //!   when `c` was bundled, so the caller snaps it to a known
 //!   vocabulary via [`Codebook::cleanup`].
 //!
-//! Together these let us represent structured knowledge ("Alice
+//! Together these let us represent structured data ("Alice
 //! works_at Acme") as a single fixed-dim vector that supports
 //! retrieval of any one component given the others. The smoke test
 //! in [`analogy`] encodes two such triples and recovers "Stripe"
@@ -30,6 +30,7 @@ pub mod codebook;
 pub mod errors;
 pub mod fft;
 pub mod ops;
+pub mod semantic_centroid;
 
 pub use analogy::{
     analogy_query, encode_triple, query_role, ROLE_OBJECT, ROLE_PREDICATE, ROLE_SUBJECT,
@@ -37,3 +38,4 @@ pub use analogy::{
 pub use codebook::Codebook;
 pub use errors::VsaError;
 pub use ops::{bind, bundle, cosine, normalize, random_vec, unbind, VsaVec, VSA_DIM};
+pub use semantic_centroid::{cosine_to_centroid, semantic_centroid};

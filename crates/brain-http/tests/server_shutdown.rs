@@ -1,4 +1,4 @@
-//! M2 graceful-shutdown tests.
+//! Graceful-shutdown tests.
 //!
 //! Verifies the accept loop stops, in-flight connections drain, and
 //! the 30 s drain timeout fires for stragglers.

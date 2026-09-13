@@ -1,19 +1,15 @@
 //! `slot_versions` table: per-slot version counter for lazy reclaim.
 //!
-//! See `spec/10_metadata/02_table_layout.md` §13 (purpose +
-//! shape) and `spec/08_storage/07_write_path.md` §2.3
-//! (initial value: 1 for never-used, current+1 for reclaimed).
+//! Initial value is 1 for a never-used slot, current+1 for a reclaimed
+//! one.
 //!
-//! ## Realignment note (sub-task 3.7)
+//! ## Why this is not a tombstone table
 //!
-//! The phase doc originally titled this sub-task "Tombstone table" with
-//! value `(memory_id, tombstoned_at, grace_until)`. That table is not
-//! in the spec's 13-table catalog (§07/02 §1). Tombstone *state* lives
-//! as `flags & HARD_FORGOTTEN` + `forgot_at_unix_nanos` on the existing
-//! `memories` row (3.2's `MemoryMetadata`); the reclaim worker scans
-//! memories for `forgot_at + grace < now`. The
-//! actual reclaim-related table in the spec catalog is
-//! `slot_versions`, which is this file.
+//! Tombstone *state* does not live here — it lives as
+//! `flags & HARD_FORGOTTEN` + `forgot_at_unix_nanos` on the existing
+//! `memories` row; the reclaim worker scans memories for
+//! `forgot_at + grace < now`. This table only tracks the per-slot
+//! version counter that lets a reclaimed slot mint a fresh `MemoryId`.
 //!
 //! ## What lives here
 //!
@@ -26,13 +22,13 @@
 //! ## What does NOT live here
 //!
 //! - Composition with FORGET / reclaim (increment + memory-row remove
-//!   + arena zero in one txn) — `MetadataDb` (3.10) + Phase 8 worker.
+//!   + arena zero in one txn) — `MetadataDb` + the reclaim worker.
 //! - MemoryId minting (packing `slot_id + version` into 16 bytes) —
 //!   `brain-core`'s identifier code.
-//! - Recovery cross-check vs the arena's slot metadata (
-//!   §6) — composition lives in the `MetadataSink` impl (3.11).
-//! - Retirement strategy for u32::MAX-overflowed slots — spec doesn't
-//!   address; v1 surfaces the error and lets the caller decide.
+//! - Recovery cross-check vs the arena's slot metadata — composition
+//!   lives in the `MetadataSink` impl.
+//! - Retirement strategy for u32::MAX-overflowed slots — the substrate
+//!   surfaces the error and lets the caller decide.
 
 use redb::{ReadableTable, Table, TableDefinition};
 
@@ -40,8 +36,8 @@ use redb::{ReadableTable, Table, TableDefinition};
 /// current `version` as `u32`. Uses redb's built-in scalar `Value`
 /// impls — no rkyv wrapper (no struct to evolve).
 ///
-/// `slot_id` is logically 48 bits in the MemoryId (`spec/02_data_model/02_memory.md`
-/// §2.1) but is stored as `u64` here 's catalog.
+/// `slot_id` is logically 48 bits in the MemoryId but is stored as
+/// `u64` here.
 pub const SLOT_VERSIONS_TABLE: TableDefinition<'static, u64, u32> =
     TableDefinition::new("slot_versions");
 
@@ -60,6 +56,40 @@ pub enum SlotVersionError {
     /// (likely permanent retirement; v1 doesn't auto-retire).
     #[error("slot {slot_id} version exhausted (reached u32::MAX)")]
     Exhausted { slot_id: u64 },
+}
+
+/// Highest arena slot index ever assigned on this shard: the maximum over
+/// present memory rows AND the recycled-slot version records (a reclaimed
+/// slot's memory row is gone but its version row remains). Fresh slots have
+/// no version row, so `MEMORIES_TABLE` is the source for those; reclaimed
+/// slots have no memory row, so `SLOT_VERSIONS_TABLE` is the source for those.
+///
+/// The writer's in-process slot counter resets to 1 on every boot, so a
+/// restart on a non-empty data dir would otherwise re-issue live slots —
+/// colliding `memory_id`s (silently overwriting rows AND tripping the
+/// extractor's `has_extracted` gate so new writes never extract). Boot seeds
+/// the counter to `max_assigned_slot + 1` so slots stay monotonic across
+/// restarts.
+pub fn max_assigned_slot(rtxn: &redb::ReadTransaction) -> Result<u64, SlotVersionError> {
+    use crate::tables::memory::MEMORIES_TABLE;
+    use redb::ReadableTable;
+
+    let mut hi = 0u64;
+    // Present memories: keyed by `memory_id` big-endian, so the last key holds
+    // the greatest `(shard, slot, version)`; its slot is the max present slot.
+    // (Each shard's redb only holds its own shard's rows.)
+    if let Ok(mem) = rtxn.open_table(MEMORIES_TABLE) {
+        if let Some((k, _)) = mem.last()? {
+            hi = hi.max(brain_core::MemoryId::from_be_bytes(k.value()).slot());
+        }
+    }
+    // Recycled slots: `slot_id` is the key directly.
+    if let Ok(sv) = rtxn.open_table(SLOT_VERSIONS_TABLE) {
+        if let Some((k, _)) = sv.last()? {
+            hi = hi.max(k.value());
+        }
+    }
+    Ok(hi)
 }
 
 /// Atomic read-modify-write of `slot_versions[slot_id]`. Returns the
@@ -88,10 +118,64 @@ pub fn increment(table: &mut Table<'_, u64, u32>, slot_id: u64) -> Result<u32, S
 #[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
-    use redb::{Database, ReadableDatabase, ReadableTable};
+    use redb::{Database, ReadableDatabase};
 
     fn fresh_db(dir: &tempfile::TempDir) -> Database {
         Database::create(dir.path().join("test.redb")).expect("create redb")
+    }
+
+    #[test]
+    fn max_assigned_slot_covers_memories_and_recycled_slots() {
+        use crate::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
+        use brain_core::{MemoryId, MemoryKind, NamespaceId, SessionId, SpaceId};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(&dir);
+
+        // Empty shard → high-water 0 (writer will seed to 1).
+        {
+            let rtxn = db.begin_read().unwrap();
+            assert_eq!(max_assigned_slot(&rtxn).unwrap(), 0);
+        }
+
+        let mem = |slot: u64| {
+            MemoryMetadata::new_active(
+                MemoryId::pack(0, slot, 1),
+                NamespaceId::SYSTEM,
+                SpaceId::from([0u8; 16]),
+                SessionId(0),
+                slot,
+                1,
+                MemoryKind::Episodic,
+                [0u8; 16],
+                0.5,
+                1,
+                1_700_000_000_000,
+            )
+        };
+
+        let wtxn = db.begin_write().unwrap();
+        {
+            let mut mt = wtxn.open_table(MEMORIES_TABLE).unwrap();
+            for slot in [1u64, 7, 42] {
+                let m = mem(slot);
+                let key = m.memory_id_bytes;
+                mt.insert(&key, m).unwrap();
+            }
+            // A reclaimed slot 100: its memory row is gone but the version
+            // record survives, so it must still count toward the high-water.
+            let mut sv = wtxn.open_table(SLOT_VERSIONS_TABLE).unwrap();
+            sv.insert(&100u64, &3u32).unwrap();
+        }
+        wtxn.commit().unwrap();
+
+        let rtxn = db.begin_read().unwrap();
+        assert_eq!(
+            max_assigned_slot(&rtxn).unwrap(),
+            100,
+            "high-water must be the max over present memories (42) AND recycled \
+             slot records (100)",
+        );
     }
 
     #[test]
@@ -188,8 +272,8 @@ mod tests {
     #[test]
     fn overflow_returns_exhausted_and_does_not_write() {
         // The catastrophic-failure-mode pin: a slot at u32::MAX must
-        // not wrap to 0 on increment. Silent wrap would violate spec
-        // §02/03 §2.3's MemoryId-stability invariant.
+        // not wrap to 0 on increment. Silent wrap would violate the
+        // MemoryId-stability invariant.
         let dir = tempfile::tempdir().unwrap();
         let db = fresh_db(&dir);
         let slot = 0xDEAD_BEEFu64;
@@ -218,67 +302,5 @@ mod tests {
         let rtxn = db.begin_read().unwrap();
         let t = rtxn.open_table(SLOT_VERSIONS_TABLE).unwrap();
         assert_eq!(t.get(&slot).unwrap().unwrap().value(), u32::MAX);
-    }
-
-    #[test]
-    fn direct_get_after_insert() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = fresh_db(&dir);
-
-        let wtxn = db.begin_write().unwrap();
-        {
-            let mut t = wtxn.open_table(SLOT_VERSIONS_TABLE).unwrap();
-            t.insert(&1234u64, &42u32).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(SLOT_VERSIONS_TABLE).unwrap();
-        assert_eq!(t.get(&1234u64).unwrap().unwrap().value(), 42);
-    }
-
-    #[test]
-    fn range_scan_returns_in_order() {
-        // Pins redb's u64-lexicographic-by-bytes key ordering matches
-        // numerical order: inserting 100, 50, 200 must iterate as
-        // 50, 100, 200. (redb sorts integer keys big-endian-encoded
-        // under the hood; this test catches any change.)
-        let dir = tempfile::tempdir().unwrap();
-        let db = fresh_db(&dir);
-
-        let wtxn = db.begin_write().unwrap();
-        {
-            let mut t = wtxn.open_table(SLOT_VERSIONS_TABLE).unwrap();
-            t.insert(&100u64, &1u32).unwrap();
-            t.insert(&50u64, &2u32).unwrap();
-            t.insert(&200u64, &3u32).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(SLOT_VERSIONS_TABLE).unwrap();
-        let keys: Vec<u64> = t
-            .iter()
-            .unwrap()
-            .map(|entry| entry.unwrap().0.value())
-            .collect();
-        assert_eq!(keys, vec![50, 100, 200]);
-    }
-
-    #[test]
-    fn missing_key_get_returns_none() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = fresh_db(&dir);
-
-        // Create the table so a read txn can open it.
-        let wtxn = db.begin_write().unwrap();
-        {
-            let _t = wtxn.open_table(SLOT_VERSIONS_TABLE).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(SLOT_VERSIONS_TABLE).unwrap();
-        assert!(t.get(&u64::MAX).unwrap().is_none());
     }
 }

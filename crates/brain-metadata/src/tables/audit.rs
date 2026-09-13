@@ -1,15 +1,9 @@
 //! Audit tables: `extractor_audit` + `entity_resolution_audit` +
 //! the three secondary indexes over the extractor audit table.
 //!
-//! See `spec/11_extractors/05_audit.md` and
-//! `spec/25_provenance_versioning/01_audit_tables.md`. Audit entries
-//! are append-only and time-ordered via the `AuditId` UUIDv7 key.
-//!
-//! Phase 20.4 widens the row to the spec's full shape (versions,
-//! timestamps, outputs, cost, input hash) and lays down three
-//! secondary indexes (by-memory / by-extractor / by-time). The
-//! phase-15.1 placeholder row was narrower; v1 hasn't shipped so
-//! there's no migration concern.
+//! Audit entries are append-only and time-ordered via the `AuditId`
+//! UUIDv7 key. The row carries versions, timestamps, outputs, cost and
+//! input hash, indexed three ways (by-memory / by-extractor / by-time).
 
 use crate::impl_redb_rkyv_value;
 use brain_core::{AuditId, EntityId, MemoryId};
@@ -82,14 +76,13 @@ pub struct ExtractionAudit {
     pub status_reason: String,
     /// Produced outputs. Capped at `OUTPUTS_CAP`.
     pub outputs: Vec<OutputRef>,
-    /// Estimated cost in dollar micro-units (1e-6 USD). 0 for
-    /// pattern + classifier in phase 20; phase 21 LLM fills this.
+    /// Estimated cost in dollar micro-units (1e-6 USD). 0 for the
+    /// pattern + classifier tiers; the LLM tier fills this.
     pub cost_micro_usd: u64,
-    /// rkyv-archived `ModelMetadata` blob — empty for non-LLM in
-    /// phase 20. Phase 21 defines the inner shape (§25/07 Q7).
+    /// rkyv-archived `ModelMetadata` blob — empty for non-LLM tiers.
     pub model_metadata: Vec<u8>,
-    /// BLAKE3 of `memory.text` (32 bytes). The idempotency probe
-    /// in §22/06 uses this to detect text edits.
+    /// BLAKE3 of `memory.text` (32 bytes). The idempotency probe uses
+    /// this to detect text edits.
     pub input_hash: [u8; 32],
 }
 
@@ -197,19 +190,19 @@ impl ExtractionAudit {
     }
 }
 
-impl_redb_rkyv_value!(ExtractionAudit, "brain_metadata::ExtractionAudit::v2");
-impl_redb_rkyv_value!(OutputRef, "brain_metadata::OutputRef::v1");
+impl_redb_rkyv_value!(ExtractionAudit, "brain_metadata::ExtractionAudit");
+impl_redb_rkyv_value!(OutputRef, "brain_metadata::OutputRef");
 
 // ---------------------------------------------------------------------------
-// entity_resolution_audit (unchanged from phase 15.1).
+// entity_resolution_audit
 // ---------------------------------------------------------------------------
 
 pub const ENTITY_RESOLUTION_AUDIT_TABLE: TableDefinition<'static, [u8; 16], ResolutionAudit> =
     TableDefinition::new("entity_resolution_audit");
 
-/// `ResolutionAudit::outcome` byte values. Mirrors the resolver tier
-/// Tier 5 (Created) is a side-effect, not a tier; included
-/// here for completeness.
+/// `ResolutionAudit::outcome` byte values. Mirrors the resolver tiers.
+/// Tier 5 (Created) is a side-effect, not a tier; included here for
+/// completeness.
 pub mod resolution_outcome {
     pub const TIER_1_EXACT: u8 = 0;
     pub const TIER_2_FUZZY: u8 = 1;
@@ -218,6 +211,12 @@ pub mod resolution_outcome {
     pub const CREATED: u8 = 4;
     pub const AMBIGUOUS: u8 = 5;
     pub const NOT_RESOLVED: u8 = 6;
+    /// The entity was tombstoned by the entity-GC sweeper because it had
+    /// no inbound references past the grace period (`EntityGcEligible`).
+    /// Additive byte value: the `outcome` field is a `u8`, so appending a
+    /// new discriminant does not renumber any existing value and old rows
+    /// still decode unchanged.
+    pub const TOMBSTONED_ENTITY_GC: u8 = 7;
 }
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
@@ -268,7 +267,7 @@ impl ResolutionAudit {
     }
 }
 
-impl_redb_rkyv_value!(ResolutionAudit, "brain_metadata::ResolutionAudit::v1");
+impl_redb_rkyv_value!(ResolutionAudit, "brain_metadata::ResolutionAudit");
 
 #[cfg(all(test, not(miri)))]
 mod tests {
@@ -354,7 +353,7 @@ mod tests {
     }
 
     #[test]
-    fn extraction_status_bytes_are_stable() {
+    fn discriminant_bytes_are_stable() {
         // These bytes are part of the on-disk format. Never renumber.
         assert_eq!(extraction_status::SUCCESS, 1);
         assert_eq!(extraction_status::FAILURE, 2);
@@ -362,10 +361,7 @@ mod tests {
         assert_eq!(extraction_status::SKIPPED_FILTER, 4);
         assert_eq!(extraction_status::SKIPPED_DUPLICATE, 5);
         assert_eq!(extraction_status::SKIPPED_DISABLED, 6);
-    }
 
-    #[test]
-    fn output_kind_bytes_are_stable() {
         assert_eq!(output_kind::ENTITY, 1);
         assert_eq!(output_kind::STATEMENT, 2);
         assert_eq!(output_kind::RELATION, 3);

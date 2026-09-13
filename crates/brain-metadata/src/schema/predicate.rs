@@ -1,24 +1,19 @@
-//! Typed CRUD + interning over the predicate registry. Sub-task 17.3.
+//! Typed CRUD + interning over the predicate registry.
 //!
 //! Free functions over `redb::{ReadTransaction, WriteTransaction}`
 //! mirroring the [`crate::entity::ops`] precedent: callers compose them
-//! inside their own redb txns so a phase-17.4 `statement_create` can
+//! inside their own redb txns so a `statement_create` can
 //! validate-and-write atomically.
-//!
-//! Spec refs:
-//! - `spec/02_data_model/00_purpose.md` §"Predicate vocabulary" —
-//!   field shape + built-in catalog.
-//! - `spec/26_knowledge_storage/00_purpose.md` — predicate row lives
-//!   in the knowledge storage catalog.
 
 use std::collections::HashSet;
 
-use brain_core::{Predicate, StatementKind};
 use brain_core::PredicateId;
+use brain_core::{Predicate, StatementKind};
 use redb::{ReadTransaction, ReadableTable, WriteTransaction};
 
 use crate::tables::predicate::{
     PredicateDefinition, SchemaOrigin, PREDICATES_BY_QNAME_TABLE, PREDICATES_TABLE,
+    PREDICATE_EMBEDDINGS_TABLE,
 };
 
 // ---------------------------------------------------------------------------
@@ -41,6 +36,63 @@ pub enum PredicateOpError {
         qname: String,
         existing_id: PredicateId,
     },
+
+    #[error("predicate {0:?} not found")]
+    NotFound(PredicateId),
+}
+
+// ---------------------------------------------------------------------------
+// Object-type constraint.
+// ---------------------------------------------------------------------------
+
+/// The object-type constraint a predicate declaration carries.
+///
+/// `object_type_byte` selects the `StatementObject` variant (`0` any /
+/// `1` Entity / `2` Value / `3` Memory / `4` Statement).
+/// `entity_type_id` narrows the `Entity` case to a single declared
+/// entity type — `object: Entity<Person>` stores Person's
+/// `EntityTypeId`, a bare `Entity` stores `0` (any).
+///
+/// ```
+/// # use brain_metadata::schema::predicate::ObjectConstraint;
+/// // `object: Value<text>` — variant only, nothing to narrow.
+/// assert_eq!(ObjectConstraint::from(2), ObjectConstraint { object_type_byte: 2, entity_type_id: 0 });
+/// // `object: Entity<Person>` where Person is EntityTypeId(1).
+/// assert_eq!(ObjectConstraint::entity(1).entity_type_id, 1);
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ObjectConstraint {
+    pub object_type_byte: u8,
+    pub entity_type_id: u32,
+}
+
+impl ObjectConstraint {
+    /// No constraint at all — any object variant, any entity type.
+    pub const ANY: Self = Self {
+        object_type_byte: 0,
+        entity_type_id: 0,
+    };
+
+    /// An `Entity` object narrowed to `entity_type_id` (`0` = any
+    /// entity type).
+    #[must_use]
+    pub fn entity(entity_type_id: u32) -> Self {
+        Self {
+            object_type_byte: 1,
+            entity_type_id,
+        }
+    }
+}
+
+/// A bare variant byte with no entity-type narrowing. Lets call sites
+/// that only pin the object variant keep passing the byte directly.
+impl From<u8> for ObjectConstraint {
+    fn from(object_type_byte: u8) -> Self {
+        Self {
+            object_type_byte,
+            entity_type_id: 0,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -59,10 +111,64 @@ fn validate_namespace(s: &str) -> Result<(), PredicateOpError> {
     validate_identifier(s, NAMESPACE_MAX_LEN, "namespace")
 }
 
-/// Validate a name segment of a predicate qname. Same grammar as
-/// namespace; different length bound.
+/// Validate a name segment of a predicate qname.
+///
+/// Predicate names are an OPEN vocabulary coined from arbitrary-domain,
+/// arbitrary-language source text (`作用于`, `wirkt_gegen`, `5ht2a_agonist`,
+/// `inhibits`). The grammar is therefore **structural-safety only**, not an
+/// ASCII/English grammar: any-script letters and digits plus `_`/`-` are
+/// accepted; only characters that would break the qname or the store are
+/// rejected (the `:` qname separator, whitespace, control chars). This keeps
+/// the write path from rejecting — and thereby dropping — a genuine non-English
+/// or symbol-bearing relation. Length is bounded by code points, not bytes, so
+/// a multibyte name isn't unfairly clipped.
 fn validate_name(s: &str) -> Result<(), PredicateOpError> {
-    validate_identifier(s, NAME_MAX_LEN, "name")
+    if s.is_empty() {
+        return Err(PredicateOpError::InvalidIdentifier {
+            reason: "name must not be empty",
+        });
+    }
+    if s.chars().count() > NAME_MAX_LEN {
+        return Err(PredicateOpError::InvalidIdentifier {
+            reason: "name exceeds 64 characters",
+        });
+    }
+    let mut saw_alnum = false;
+    let mut first = true;
+    for c in s.chars() {
+        // Structural hazards: `:` splits the qname; whitespace/control break
+        // storage, logging, and embedding-phrase derivation.
+        if c == ':' || c.is_whitespace() || c.is_control() {
+            return Err(PredicateOpError::InvalidIdentifier {
+                reason: "name must not contain ':', whitespace, or control characters",
+            });
+        }
+        let is_alnum = c.is_alphanumeric();
+        if is_alnum {
+            saw_alnum = true;
+        }
+        // A leading connector (`_`/`-`) reads as a malformed fragment, not a
+        // relation; require the name to start with an actual letter/digit.
+        if first && !is_alnum {
+            return Err(PredicateOpError::InvalidIdentifier {
+                reason: "name must start with a letter or digit",
+            });
+        }
+        // Body: letters/digits of any script, plus the two connectors a
+        // coined relation legitimately uses.
+        if !is_alnum && c != '_' && c != '-' {
+            return Err(PredicateOpError::InvalidIdentifier {
+                reason: "name may contain only letters, digits, '_', or '-'",
+            });
+        }
+        first = false;
+    }
+    if !saw_alnum {
+        return Err(PredicateOpError::InvalidIdentifier {
+            reason: "name must contain at least one letter or digit",
+        });
+    }
+    Ok(())
 }
 
 fn validate_identifier(s: &str, max: usize, label: &'static str) -> Result<(), PredicateOpError> {
@@ -124,6 +230,41 @@ pub fn predicate_get(
     let t = rtxn.open_table(PREDICATES_TABLE)?;
     let row: Option<PredicateDefinition> = t.get(&id.raw())?.map(|g| g.value());
     Ok(row.as_ref().map(PredicateDefinition::to_predicate))
+}
+
+/// Set (or clear, with `0`) the explicit retention TTL for a predicate, in
+/// seconds. Called from schema-apply after the predicate is interned — retention
+/// is a storage-only policy the projected `Predicate` value type doesn't carry,
+/// so it's stamped directly on the row here. Idempotent; a no-op when the value
+/// is already current. Errors if the predicate row doesn't exist.
+pub fn predicate_set_retention(
+    wtxn: &WriteTransaction,
+    id: PredicateId,
+    retention_seconds: u64,
+) -> Result<(), PredicateOpError> {
+    let mut t = wtxn.open_table(PREDICATES_TABLE)?;
+    let Some(mut row) = t.get(&id.raw())?.map(|g| g.value()) else {
+        return Err(PredicateOpError::NotFound(id));
+    };
+    if row.retention_seconds == retention_seconds {
+        return Ok(());
+    }
+    row.retention_seconds = retention_seconds;
+    t.insert(&id.raw(), &row)?;
+    Ok(())
+}
+
+/// The explicit retention TTL for a predicate, in seconds (`0` = none). Reads
+/// the persisted row directly, since [`predicate_get`]'s projected `Predicate`
+/// drops this storage-only field. Missing predicate ⇒ `0`.
+pub fn predicate_retention_seconds(
+    rtxn: &ReadTransaction,
+    id: PredicateId,
+) -> Result<u64, PredicateOpError> {
+    let t = rtxn.open_table(PREDICATES_TABLE)?;
+    Ok(t.get(&id.raw())?
+        .map(|g| g.value().retention_seconds)
+        .unwrap_or(0))
 }
 
 /// Look up a predicate by its namespaced qname. Identifier validation
@@ -206,6 +347,129 @@ pub fn predicate_list(
     Ok(out)
 }
 
+/// Render the active predicates as a prompt block for the LLM extractor's
+/// `{DECLARED_PREDICATES}` placeholder. Each predicate becomes one bullet
+/// line of the form `qname (Kind, single|set): description`. This makes the
+/// extractor's closed vocabulary track the **active schema** at runtime —
+/// the seeded system core together with any predicates a user declared via
+/// `SCHEMA_UPLOAD` — so a user's declared predicate appears here
+/// automatically with no system-schema edits.
+///
+/// Predicates whose name starts with `behavior_` are excluded; they are
+/// procedural-memory sinks materialized by `MATERIALIZE_PROCEDURAL`, not
+/// extraction targets, and listing them only invites mis-mapping.
+pub fn render_declared_predicates_block(
+    rtxn: &ReadTransaction,
+) -> Result<String, PredicateOpError> {
+    let mut preds = predicate_list(rtxn, None)?;
+    // Stable order: namespace then name, so the prompt block (and its
+    // prompt-cache key) is deterministic across cycles.
+    preds.sort_by(|a, b| (a.namespace.as_str(), a.name.as_str()).cmp(&(&b.namespace, &b.name)));
+    let mut out = String::new();
+    for p in &preds {
+        if p.name.starts_with("behavior_") {
+            continue;
+        }
+        let kind = match p.kind_constraint {
+            Some(StatementKind::Fact) => "Fact",
+            Some(StatementKind::Preference) => "Preference",
+            Some(StatementKind::Event) => "Event",
+            Some(StatementKind::Attribute) => "Attribute",
+            Some(StatementKind::Relation) => "Relation",
+            Some(StatementKind::Directive) => "Directive",
+            Some(StatementKind::Custom(_)) | None => "any-kind",
+        };
+        let card = if p.is_stateful { "single" } else { "set" };
+        out.push_str("- ");
+        out.push_str(&p.namespace);
+        out.push(':');
+        out.push_str(&p.name);
+        out.push_str(" (");
+        out.push_str(kind);
+        out.push_str(", ");
+        out.push_str(card);
+        out.push(')');
+        if !p.description.is_empty() {
+            out.push_str(": ");
+            out.push_str(&p.description);
+        }
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+/// Store the semantic embedding for a predicate. Called when a predicate
+/// is first interned at extraction time. `vec` is the BGE-small output
+/// (384 dims); stored as little-endian `f32` bytes. Idempotent overwrite.
+pub fn predicate_embedding_put(
+    wtxn: &WriteTransaction,
+    predicate_id: PredicateId,
+    vec: &[f32],
+) -> Result<(), PredicateOpError> {
+    let mut bytes = Vec::with_capacity(vec.len() * 4);
+    for f in vec {
+        bytes.extend_from_slice(&f.to_le_bytes());
+    }
+    let mut t = wtxn.open_table(PREDICATE_EMBEDDINGS_TABLE)?;
+    t.insert(predicate_id.raw(), bytes.as_slice())?;
+    Ok(())
+}
+
+/// Load a predicate's embedding, decoding the little-endian `f32` bytes.
+/// Returns `None` when no vector was stored (e.g. predicates interned
+/// before the embedding pass, or user-authored facts with no extractor
+/// embedding).
+pub fn predicate_embedding_get(
+    rtxn: &ReadTransaction,
+    predicate_id: PredicateId,
+) -> Result<Option<Vec<f32>>, PredicateOpError> {
+    let t = rtxn.open_table(PREDICATE_EMBEDDINGS_TABLE)?;
+    let Some(g) = t.get(predicate_id.raw())? else {
+        return Ok(None);
+    };
+    let bytes = g.value();
+    let mut out = Vec::with_capacity(bytes.len() / 4);
+    for chunk in bytes.as_chunks::<4>().0.iter() {
+        out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    Ok(Some(out))
+}
+
+/// Record one sighting of an undeclared predicate qname in the review
+/// queue, incrementing its count. Called by the extractor's closed-vocab
+/// gate when a proposed predicate isn't in the active schema, so the
+/// candidate is captured durably for later promotion instead of silently
+/// lost. Composed inside the caller's write txn.
+pub fn predicate_review_record(
+    wtxn: &WriteTransaction,
+    qname: &str,
+) -> Result<(), PredicateOpError> {
+    let mut t = wtxn.open_table(crate::tables::predicate::PREDICATE_REVIEW_QUEUE_TABLE)?;
+    let prev = t.get(qname)?.map(|g| g.value()).unwrap_or(0);
+    t.insert(qname, &prev.saturating_add(1))?;
+    Ok(())
+}
+
+/// List the review queue as `(qname, count)` pairs, descending by count.
+/// For operator review — which coined predicates recur enough to promote.
+pub fn predicate_review_list(
+    rtxn: &ReadTransaction,
+) -> Result<Vec<(String, u64)>, PredicateOpError> {
+    let t = match rtxn.open_table(crate::tables::predicate::PREDICATE_REVIEW_QUEUE_TABLE) {
+        Ok(t) => t,
+        // Never-written table on a fresh DB → empty queue.
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut out: Vec<(String, u64)> = Vec::new();
+    for entry in t.iter()? {
+        let (k, v) = entry?;
+        out.push((k.value().to_string(), v.value()));
+    }
+    out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // Write path.
 // ---------------------------------------------------------------------------
@@ -229,7 +493,7 @@ pub fn predicate_intern(
     namespace: &str,
     name: &str,
     kind_constraint: Option<StatementKind>,
-    object_type_constraint_byte: u8,
+    object_constraint: impl Into<ObjectConstraint>,
     schema_version: u32,
     description: &str,
     is_stateful: bool,
@@ -237,6 +501,11 @@ pub fn predicate_intern(
 ) -> Result<PredicateId, PredicateOpError> {
     validate_namespace(namespace)?;
     validate_name(name)?;
+
+    let ObjectConstraint {
+        object_type_byte: object_type_constraint_byte,
+        entity_type_id: object_entity_type_id,
+    } = object_constraint.into();
 
     let q = qname(namespace, name);
 
@@ -274,6 +543,7 @@ pub fn predicate_intern(
         let constraints_match = row.kind_constraint
             == crate::tables::predicate::encode_kind_constraint(kind_constraint)
             && row.object_type_constraint_byte == object_type_constraint_byte
+            && row.object_entity_type_id == object_entity_type_id
             && row.description == description
             && row.is_stateful == is_stateful;
 
@@ -293,6 +563,7 @@ pub fn predicate_intern(
                 name: name.to_string(),
                 kind_constraint,
                 object_type_constraint_byte,
+                object_entity_type_id,
                 schema_version,
                 description: description.to_string(),
                 is_stateful,
@@ -319,6 +590,7 @@ pub fn predicate_intern(
                 name: name.to_string(),
                 kind_constraint,
                 object_type_constraint_byte,
+                object_entity_type_id,
                 schema_version,
                 description: description.to_string(),
                 is_stateful,
@@ -360,6 +632,7 @@ pub fn predicate_intern(
         name: name.to_string(),
         kind_constraint,
         object_type_constraint_byte,
+        object_entity_type_id,
         schema_version,
         description: description.to_string(),
         is_stateful,
@@ -437,6 +710,7 @@ pub fn predicate_intern_or_get(
         // tighten this on a subsequent SCHEMA_UPLOAD.
         kind_constraint: None,
         object_type_constraint_byte: 0,
+        object_entity_type_id: 0,
         // `schema_version = 0` reserves the slot for "not declared
         // by any schema yet". The origin tag carries the real
         // provenance via `ImplicitFromWrite`.
@@ -463,6 +737,251 @@ pub fn predicate_intern_or_get(
     Ok(PredicateId::from(next_id_raw))
 }
 
+/// Look up a predicate id by its `(namespace, name)` qname inside a live
+/// write transaction, WITHOUT minting. Returns `None` for an unknown
+/// qname.
+///
+/// The extractor's consolidation path needs to tell an exact repeat
+/// mention (fast path — return the id untouched) apart from a would-be-
+/// fresh predicate (a consolidation candidate) before deciding to mint,
+/// and `predicate_intern_or_get` would mint on the miss.
+pub fn predicate_id_by_qname(
+    wtxn: &WriteTransaction,
+    namespace: &str,
+    name: &str,
+) -> Result<Option<PredicateId>, PredicateOpError> {
+    validate_namespace(namespace)?;
+    validate_name(name)?;
+    let q = qname(namespace, name);
+    let idx = wtxn.open_table(PREDICATES_BY_QNAME_TABLE)?;
+    // Bind before returning so the borrow of `idx` (the access guard) drops
+    // at the semicolon, ahead of `idx` itself.
+    let found = idx.get(q.as_str())?.map(|g| PredicateId::from(g.value()));
+    Ok(found)
+}
+
+/// Point a fresh open-vocab qname at an already-interned predicate id,
+/// creating NO new `PREDICATES_TABLE` row and NO new embedding.
+///
+/// This is the write half of embedding-based predicate consolidation: a
+/// near-synonym surface form (`keen_about`) is aliased onto the canonical
+/// predicate (`keen_on`) so future exact lookups of the variant hit the
+/// fast path and the typed graph converges on one predicate id instead of
+/// fragmenting across morphological variants.
+///
+/// Refuses to alias onto a schema-declared target: declared vocabulary is
+/// authoritative and must never silently absorb open-vocab drift — merging
+/// a free predicate into, say, the seeded `brain:occurred_at` would corrupt
+/// the meaning of every statement that predicate keys.
+pub fn predicate_alias_qname(
+    wtxn: &WriteTransaction,
+    namespace: &str,
+    name: &str,
+    target: PredicateId,
+) -> Result<(), PredicateOpError> {
+    validate_namespace(namespace)?;
+    validate_name(name)?;
+
+    // The target must exist and be open-vocab. A vanished or declared
+    // target means the caller's candidate scan raced or was buggy; refuse
+    // rather than mint a dangling / meaning-corrupting alias.
+    {
+        let t = wtxn.open_table(PREDICATES_TABLE)?;
+        // Materialize the row before matching so the access guard drops here,
+        // not held across the `t` binding's lifetime.
+        let row = t.get(&target.raw())?.map(|g| g.value());
+        match row {
+            None => {
+                return Err(PredicateOpError::InvalidIdentifier {
+                    reason: "alias target predicate does not exist",
+                })
+            }
+            Some(row) if row.origin().is_schema_declared() => {
+                return Err(PredicateOpError::InvalidIdentifier {
+                    reason: "cannot alias onto a schema-declared predicate",
+                })
+            }
+            Some(_) => {}
+        }
+    }
+
+    let q = qname(namespace, name);
+    let mut idx = wtxn.open_table(PREDICATES_BY_QNAME_TABLE)?;
+    idx.insert(q.as_str(), &target.raw())?;
+    Ok(())
+}
+
+/// One embedding-consolidation candidate: `(id, name, embedding,
+/// is_schema_declared)`. See [`predicate_consolidation_candidates`].
+pub type PredicateConsolidationCandidate = (PredicateId, String, Vec<f32>, bool);
+
+/// Gather the consolidation candidate set for `namespace`: every predicate
+/// that carries a stored embedding, as `(id, name, embedding,
+/// is_schema_declared)`. The extractor compares a would-be-fresh
+/// predicate's embedding against these to reuse a near-synonym's id.
+///
+/// Rows without an embedding are omitted — they can't be compared. The
+/// `is_schema_declared` flag is returned rather than filtered here so the
+/// caller's selection logic can enforce the "never merge into declared
+/// vocabulary" rule (and unit-test it in isolation).
+pub fn predicate_consolidation_candidates(
+    wtxn: &WriteTransaction,
+    namespace: &str,
+) -> Result<Vec<PredicateConsolidationCandidate>, PredicateOpError> {
+    validate_namespace(namespace)?;
+    let preds = wtxn.open_table(PREDICATES_TABLE)?;
+    let embs = wtxn.open_table(PREDICATE_EMBEDDINGS_TABLE)?;
+    let mut out = Vec::new();
+    for entry in preds.iter()? {
+        let (k, v) = entry?;
+        let row = v.value();
+        if row.namespace != namespace {
+            continue;
+        }
+        let Some(g) = embs.get(k.value())? else {
+            continue;
+        };
+        out.push(decode_candidate(&row, g.value()));
+    }
+    Ok(out)
+}
+
+/// Read-transaction counterpart to [`predicate_consolidation_candidates`].
+///
+/// The extractor's per-memory prompt build runs under a read txn (it only
+/// reads the active vocabulary to render the candidate-predicate block); a
+/// write txn would be both wrong for that context and needlessly contended.
+/// Same rows, same `(id, name, embedding, is_declared)` shape.
+pub fn predicate_consolidation_candidates_rtxn(
+    rtxn: &ReadTransaction,
+    namespace: &str,
+) -> Result<Vec<PredicateConsolidationCandidate>, PredicateOpError> {
+    validate_namespace(namespace)?;
+    let preds = rtxn.open_table(PREDICATES_TABLE)?;
+    let embs = rtxn.open_table(PREDICATE_EMBEDDINGS_TABLE)?;
+    let mut out = Vec::new();
+    for entry in preds.iter()? {
+        let (k, v) = entry?;
+        let row = v.value();
+        if row.namespace != namespace {
+            continue;
+        }
+        let Some(g) = embs.get(k.value())? else {
+            continue;
+        };
+        out.push(decode_candidate(&row, g.value()));
+    }
+    Ok(out)
+}
+
+/// Decode one `(row, embedding-bytes)` pair into a consolidation candidate.
+/// The embedding is stored as little-endian `f32`s.
+fn decode_candidate(row: &PredicateDefinition, bytes: &[u8]) -> PredicateConsolidationCandidate {
+    let mut vec = Vec::with_capacity(bytes.len() / 4);
+    for chunk in bytes.as_chunks::<4>().0.iter() {
+        vec.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    (
+        PredicateId::from(row.predicate_id),
+        row.name.clone(),
+        vec,
+        row.origin().is_schema_declared(),
+    )
+}
+
+/// Drop every schema-declared predicate row in `namespace`. Implicit-
+/// from-write rows are preserved — they belong to the open-vocabulary
+/// world, not the declared schema. Used by `SCHEMA_REPLACE`: callers
+/// invoke this before re-running `apply_schema_definitions` with the
+/// new schema so the destructive replace doesn't trip the constraint
+/// conflict check on same-name diverging declarations.
+///
+/// Returns the number of rows removed.
+pub fn predicate_drop_schema_declared(
+    wtxn: &WriteTransaction,
+    namespace: &str,
+) -> Result<usize, PredicateOpError> {
+    validate_namespace(namespace)?;
+
+    // Collect victims first so we don't mutate while iterating.
+    let victims: Vec<(u32, String)> = {
+        let t = wtxn.open_table(PREDICATES_TABLE)?;
+        let mut out = Vec::new();
+        for entry in t.iter()? {
+            let (k, v) = entry?;
+            let row: PredicateDefinition = v.value();
+            if row.namespace == namespace && row.origin().is_schema_declared() {
+                out.push((k.value(), qname(&row.namespace, &row.name)));
+            }
+        }
+        out
+    };
+    let count = victims.len();
+    {
+        let mut t = wtxn.open_table(PREDICATES_TABLE)?;
+        for (id, _) in &victims {
+            t.remove(id)?;
+        }
+    }
+    {
+        let mut idx = wtxn.open_table(PREDICATES_BY_QNAME_TABLE)?;
+        for (_, q) in &victims {
+            idx.remove(q.as_str())?;
+        }
+    }
+    Ok(count)
+}
+
+/// Drop a single schema-declared predicate row identified by
+/// `(namespace, name)`. The scoped counterpart to
+/// [`predicate_drop_schema_declared`]: `SCHEMA_DROP` narrows one
+/// declaration instead of wiping the whole namespace.
+///
+/// Returns `Some(id)` when a schema-declared predicate with that qname
+/// existed and was removed, `None` when no schema-declared predicate
+/// with that qname exists. An implicit-from-write row sharing the qname
+/// is deliberately left untouched — the declared vocabulary is the only
+/// thing `SCHEMA_DROP` narrows, and an open-vocab row is not part of it.
+/// The embedding row is left in place (a harmless orphan), matching
+/// [`predicate_drop_schema_declared`].
+pub fn predicate_drop_one(
+    wtxn: &WriteTransaction,
+    namespace: &str,
+    name: &str,
+) -> Result<Option<PredicateId>, PredicateOpError> {
+    validate_namespace(namespace)?;
+    validate_name(name)?;
+
+    let q = qname(namespace, name);
+    let victim: Option<u32> = {
+        let idx = wtxn.open_table(PREDICATES_BY_QNAME_TABLE)?;
+        let id = idx.get(q.as_str())?.map(|g| g.value());
+        drop(idx);
+        match id {
+            Some(id) => {
+                let t = wtxn.open_table(PREDICATES_TABLE)?;
+                let row: Option<PredicateDefinition> = t.get(&id)?.map(|g| g.value());
+                match row {
+                    Some(r) if r.origin().is_schema_declared() => Some(id),
+                    _ => None,
+                }
+            }
+            None => None,
+        }
+    };
+    if let Some(id) = victim {
+        {
+            let mut t = wtxn.open_table(PREDICATES_TABLE)?;
+            t.remove(&id)?;
+        }
+        {
+            let mut idx = wtxn.open_table(PREDICATES_BY_QNAME_TABLE)?;
+            idx.remove(q.as_str())?;
+        }
+    }
+    Ok(victim.map(PredicateId::from))
+}
+
 // ---------------------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------------------
@@ -477,6 +996,28 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = fresh_db(&dir);
         (dir, db)
+    }
+
+    #[test]
+    fn embedding_round_trips() {
+        let (_dir, db) = open_db();
+        let pid = PredicateId::from(42);
+        let vec: Vec<f32> = (0..384).map(|i| (i as f32) * 0.001 - 0.19).collect();
+        {
+            let wtxn = db.begin_write().unwrap();
+            predicate_embedding_put(&wtxn, pid, &vec).unwrap();
+            wtxn.commit().unwrap();
+        }
+        let rtxn = db.begin_read().unwrap();
+        let got = predicate_embedding_get(&rtxn, pid).unwrap().unwrap();
+        assert_eq!(got.len(), 384);
+        for (a, b) in got.iter().zip(vec.iter()) {
+            assert!((a - b).abs() < 1e-9, "{a} != {b}");
+        }
+        // Absent predicate → None.
+        assert!(predicate_embedding_get(&rtxn, PredicateId::from(99))
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -641,74 +1182,38 @@ mod tests {
     }
 
     #[test]
-    fn invalid_namespace_empty() {
+    fn name_accepts_open_vocabulary_forms() {
+        // Predicate names are an open vocabulary. Hyphens, digits, non-ASCII
+        // letters, and CJK are all legitimate relation surfaces and must NOT
+        // be rejected — rejecting would silently drop a real fact.
         let (_dir, db) = open_db();
         let wtxn = db.begin_write().unwrap();
-        let err = predicate_intern(&wtxn, "", "name", None, 0, 1, "", false, 0).unwrap_err();
-        matches!(err, PredicateOpError::InvalidIdentifier { .. })
-            .then_some(())
-            .expect("expected InvalidIdentifier");
+        for name in [
+            "is-a",
+            "5ht2a_agonist",
+            "co2_binds",
+            "wirkt_gegen",
+            "作用于",
+        ] {
+            predicate_intern(&wtxn, "brain", name, None, 0, 1, "", false, 0)
+                .unwrap_or_else(|e| panic!("open-vocab name {name:?} must intern, got {e:?}"));
+        }
+        wtxn.commit().unwrap();
     }
 
     #[test]
-    fn invalid_namespace_uppercase() {
+    fn name_rejects_structural_hazards() {
+        // Only structurally-unsafe names are rejected: the qname separator,
+        // whitespace, and a leading connector.
         let (_dir, db) = open_db();
         let wtxn = db.begin_write().unwrap();
-        let err = predicate_intern(&wtxn, "Brain", "name", None, 0, 1, "", false, 0).unwrap_err();
-        matches!(err, PredicateOpError::InvalidIdentifier { .. })
-            .then_some(())
-            .expect("expected InvalidIdentifier");
-    }
-
-    #[test]
-    fn invalid_namespace_leading_digit() {
-        let (_dir, db) = open_db();
-        let wtxn = db.begin_write().unwrap();
-        let err = predicate_intern(&wtxn, "1brain", "name", None, 0, 1, "", false, 0).unwrap_err();
-        matches!(err, PredicateOpError::InvalidIdentifier { .. })
-            .then_some(())
-            .expect("expected InvalidIdentifier");
-    }
-
-    #[test]
-    fn invalid_namespace_with_colon() {
-        let (_dir, db) = open_db();
-        let wtxn = db.begin_write().unwrap();
-        let err = predicate_intern(&wtxn, "br:ain", "name", None, 0, 1, "", false, 0).unwrap_err();
-        matches!(err, PredicateOpError::InvalidIdentifier { .. })
-            .then_some(())
-            .expect("expected InvalidIdentifier");
-    }
-
-    #[test]
-    fn invalid_name_empty() {
-        let (_dir, db) = open_db();
-        let wtxn = db.begin_write().unwrap();
-        let err = predicate_intern(&wtxn, "brain", "", None, 0, 1, "", false, 0).unwrap_err();
-        matches!(err, PredicateOpError::InvalidIdentifier { .. })
-            .then_some(())
-            .expect("expected InvalidIdentifier");
-    }
-
-    #[test]
-    fn invalid_name_too_long() {
-        let (_dir, db) = open_db();
-        let wtxn = db.begin_write().unwrap();
-        let long = "a".repeat(NAME_MAX_LEN + 1);
-        let err = predicate_intern(&wtxn, "brain", &long, None, 0, 1, "", false, 0).unwrap_err();
-        matches!(err, PredicateOpError::InvalidIdentifier { .. })
-            .then_some(())
-            .expect("expected InvalidIdentifier");
-    }
-
-    #[test]
-    fn invalid_name_with_hyphen() {
-        let (_dir, db) = open_db();
-        let wtxn = db.begin_write().unwrap();
-        let err = predicate_intern(&wtxn, "brain", "is-a", None, 0, 1, "", false, 0).unwrap_err();
-        matches!(err, PredicateOpError::InvalidIdentifier { .. })
-            .then_some(())
-            .expect("expected InvalidIdentifier");
+        for bad in ["is:a", "works at", "_leading", "-leading", "\tctrl"] {
+            let err = predicate_intern(&wtxn, "brain", bad, None, 0, 1, "", false, 0)
+                .expect_err("structurally-unsafe name must be rejected");
+            matches!(err, PredicateOpError::InvalidIdentifier { .. })
+                .then_some(())
+                .unwrap_or_else(|| panic!("expected InvalidIdentifier for {bad:?}"));
+        }
     }
 
     // ----- Open-vocabulary intern path. -----
@@ -911,6 +1416,85 @@ mod tests {
             }
             other => panic!("expected AlreadyExists, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn id_by_qname_probes_without_minting() {
+        let (_dir, db) = open_db();
+        let wtxn = db.begin_write().unwrap();
+        // Unknown qname → None, and no row minted.
+        assert!(predicate_id_by_qname(&wtxn, "acme", "keen_on")
+            .unwrap()
+            .is_none());
+        let id = predicate_intern_or_get(&wtxn, "acme", "keen_on", 0, 0).unwrap();
+        assert_eq!(
+            predicate_id_by_qname(&wtxn, "acme", "keen_on").unwrap(),
+            Some(id)
+        );
+        wtxn.commit().unwrap();
+
+        let rtxn = db.begin_read().unwrap();
+        // The probe must not have created rows: only the one real intern.
+        assert_eq!(predicate_list(&rtxn, Some("acme")).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn alias_qname_points_variant_at_canonical_without_new_row() {
+        let (_dir, db) = open_db();
+        let wtxn = db.begin_write().unwrap();
+        let canonical = predicate_intern_or_get(&wtxn, "acme", "keen_on", 0, 0).unwrap();
+        predicate_alias_qname(&wtxn, "acme", "keen_about", canonical).unwrap();
+        wtxn.commit().unwrap();
+
+        let rtxn = db.begin_read().unwrap();
+        // The variant qname resolves to the canonical id...
+        let by_qname = predicate_lookup_by_qname(&rtxn, "acme", "keen_about")
+            .unwrap()
+            .unwrap();
+        assert_eq!(by_qname.id, canonical);
+        // ...but its NAME is still the canonical's — no second PREDICATES_TABLE
+        // row was minted, so the qname index simply aliases.
+        assert_eq!(by_qname.name, "keen_on");
+        assert_eq!(predicate_list(&rtxn, Some("acme")).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn alias_qname_refuses_schema_declared_target() {
+        let (_dir, db) = open_db();
+        let wtxn = db.begin_write().unwrap();
+        let declared =
+            predicate_intern(&wtxn, "brain", "occurred_at", None, 2, 1, "", false, 0).unwrap();
+        let err = predicate_alias_qname(&wtxn, "brain", "happened_at", declared).unwrap_err();
+        matches!(err, PredicateOpError::InvalidIdentifier { .. })
+            .then_some(())
+            .expect("declared target must be refused");
+    }
+
+    #[test]
+    fn consolidation_candidates_yields_only_embedded_rows_with_flags() {
+        let (_dir, db) = open_db();
+        let wtxn = db.begin_write().unwrap();
+        let implicit = predicate_intern_or_get(&wtxn, "acme", "keen_on", 0, 0).unwrap();
+        predicate_embedding_put(&wtxn, implicit, &[1.0, 0.0, 0.0]).unwrap();
+        let declared =
+            predicate_intern(&wtxn, "acme", "manages", None, 1, 1, "", false, 0).unwrap();
+        predicate_embedding_put(&wtxn, declared, &[0.0, 1.0, 0.0]).unwrap();
+        // No embedding → excluded from candidates.
+        let _bare = predicate_intern_or_get(&wtxn, "acme", "unembedded", 0, 0).unwrap();
+        wtxn.commit().unwrap();
+
+        let wtxn = db.begin_write().unwrap();
+        let cands = predicate_consolidation_candidates(&wtxn, "acme").unwrap();
+        assert_eq!(cands.len(), 2, "only the two embedded rows are candidates");
+        let implicit_c = cands.iter().find(|c| c.0 == implicit).unwrap();
+        assert_eq!(implicit_c.1, "keen_on");
+        assert_eq!(implicit_c.2, vec![1.0, 0.0, 0.0]);
+        assert!(!implicit_c.3, "implicit-from-write row is not declared");
+        let declared_c = cands.iter().find(|c| c.0 == declared).unwrap();
+        assert!(
+            declared_c.3,
+            "schema-declared row carries the declared flag"
+        );
     }
 
     #[test]

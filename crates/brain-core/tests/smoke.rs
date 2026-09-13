@@ -4,15 +4,15 @@
 //! test that the public surface is reachable and behaves sanely.
 
 use brain_core::{
-    AgentId, ContextId, Edge, EdgeKind, EdgeOrigin, Error, Memory, MemoryId, MemoryKind, RequestId,
-    Salience, TxnId,
+    Edge, EdgeKind, EdgeOrigin, Error, Memory, MemoryId, MemoryKind, RequestId, Salience,
+    SessionId, SpaceId, TxnId,
 };
 
 #[test]
 fn public_types_construct() {
-    let _ = AgentId::new();
-    let _ = ContextId::DEFAULT;
-    let _ = ContextId(42);
+    let _ = SpaceId::new();
+    let _ = SessionId::DEFAULT;
+    let _ = SessionId(42);
     let _ = RequestId::new();
     let _ = TxnId::new();
     let _ = Salience::new(0.7);
@@ -33,13 +33,14 @@ fn memory_id_is_routable_after_packing() {
 fn memory_can_be_constructed() {
     let m = Memory {
         id: MemoryId::pack(0, 1, 0),
-        agent: AgentId::new(),
-        context: ContextId(0),
+        space: SpaceId::new(),
+        session_id: SessionId(0),
         kind: MemoryKind::Episodic,
         salience: Salience::default(),
         text: Some("hello".into()),
         created_at_unix_ms: 0,
         last_accessed_at_unix_ms: 0,
+        occurred_at_unix_nanos: None,
     };
     assert_eq!(m.salience.raw(), 0.5);
     assert_eq!(m.text.as_deref(), Some("hello"));

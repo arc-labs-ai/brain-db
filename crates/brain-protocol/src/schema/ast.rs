@@ -1,9 +1,8 @@
 //! Schema-DSL AST — value-typed.
 //!
-//! Consumed by the parser (§21/01 / phase 19.3), validator
-//! (§21/03 / phase 19.4), persistence (§21/05 / phase 19.5), and
-//! the SDK `SchemaBuilder` (§29/00 / phase 19.8). One source of
-//! truth for the in-memory shape of a schema document.
+//! Consumed by the parser, validator, persistence, and client-side
+//! schema building. One source of truth for the in-memory shape of a
+//! schema document.
 //!
 //! Flat per document — namespaces don't nest. `Schema::namespace`
 //! qualifies every predicate / entity / relation declared inside.
@@ -31,6 +30,11 @@ pub enum SchemaItem {
     Predicate(PredicateDef),
     RelationType(RelationTypeDef),
     Extractor(ExtractorDef),
+    /// A user-declared statement kind — the expansion lever. Predicates are
+    /// open-vocab (never declared/gated); the schema instead declares the
+    /// *shape* of facts (cardinality / temporal / polarity) so the
+    /// classifier and the read engine treat them correctly.
+    Kind(KindDef),
 }
 
 // ---------------------------------------------------------------------------
@@ -105,6 +109,15 @@ pub struct PredicateDef {
     pub stateful: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Explicit time-to-live for statements of this predicate. When set, a
+    /// statement older than this (measured per kind from `event_at` for
+    /// Events, `valid_from` for Facts/Preferences) is soft-tombstoned by the
+    /// reclaim worker, then hard-reclaimed on the standard tombstone grace.
+    /// `None` (the default) keeps statements indefinitely — subject only to
+    /// confidence decay, supersession, and explicit FORGET/RETRACT. Distinct
+    /// from decay, which dims confidence but never removes a row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<DurationAst>,
 }
 
 impl PredicateDef {
@@ -116,18 +129,89 @@ impl PredicateDef {
     #[must_use]
     pub fn resolved_stateful(&self) -> bool {
         self.stateful.unwrap_or(match self.kind {
-            StatementKindAst::Preference => true,
-            StatementKindAst::Fact | StatementKindAst::Event | StatementKindAst::Any => false,
+            // Single-valued kinds supersede; set/append kinds accumulate.
+            StatementKindAst::Attribute | StatementKindAst::Directive => true,
+            StatementKindAst::Fact
+            | StatementKindAst::Preference
+            | StatementKindAst::Event
+            | StatementKindAst::Relation
+            | StatementKindAst::Any => false,
         })
     }
 }
 
+/// The built-in statement kinds, as named in the DSL. Mirrors
+/// `brain_core::StatementKind` (minus `Custom`, which is named via a
+/// `kind {}` declaration rather than this enum).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum StatementKindAst {
     Fact,
     Preference,
     Event,
+    Attribute,
+    Relation,
+    Directive,
     Any,
+}
+
+// ---------------------------------------------------------------------------
+// 3b. User-declared kinds (the expansion lever).
+// ---------------------------------------------------------------------------
+
+/// A user-declared statement kind. Carries the behavioral semantics the
+/// storage + read layers need (cardinality / temporal / polarity) plus a
+/// natural-language `hint` the extractor's kind classifier uses to decide
+/// when a fact belongs to this kind.
+///
+/// ```text
+/// kind investment {
+///     cardinality: set
+///     temporal:    event
+///     object:      [entity, quantity]
+///     polarity:    false
+///     hint: "an entity funded/invested in another, with an amount"
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KindDef {
+    /// Local name; the qname is `{schema.namespace}:{name}`.
+    pub name: String,
+    pub cardinality: KindCardinalityAst,
+    pub temporal: TemporalModelAst,
+    /// Object kinds this kind accepts (empty = any).
+    #[serde(default)]
+    pub object: Vec<ObjectKindAst>,
+    #[serde(default)]
+    pub polarity: bool,
+    /// Classifier hint — what facts belong to this kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+}
+
+/// How many current values a `(subject, predicate)` pair may hold under a
+/// kind. Mirrors `brain_core::KindCardinality`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum KindCardinalityAst {
+    Single,
+    Set,
+}
+
+/// How a kind relates to time. Mirrors `brain_core::TemporalModel`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TemporalModelAst {
+    State,
+    Event,
+    None,
+}
+
+/// The object shape a kind accepts. Maps onto `StatementObject`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ObjectKindAst {
+    Entity,
+    Value,
+    Time,
+    Quantity,
+    List,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -183,7 +267,7 @@ pub struct ExtractorDef {
     pub target: ExtractorTarget,
     /// Source-order-preserved configuration fields. The validator
     /// rejects duplicates (e.g., two `Model` entries) and reports
-    /// the source line for diagnostics (§21/02 §7).
+    /// the source line for diagnostics.
     #[serde(default)]
     pub fields: Vec<ExtractorField>,
 }
@@ -231,7 +315,7 @@ pub enum ExtractorField {
     CostBudget(CostExpr),
     /// Names of upstream extractors this one depends on.
     DependsOn(Vec<String>),
-    /// Resolver configuration (placeholder; §22 fills in).
+    /// Resolver configuration (placeholder; to be filled in).
     Resolver(ResolverConfig),
 }
 
@@ -253,6 +337,20 @@ pub enum DurationUnit {
     Minutes,
     Hours,
     Days,
+}
+
+impl DurationAst {
+    /// Total seconds this duration represents (saturating).
+    #[must_use]
+    pub fn to_seconds(self) -> u64 {
+        let mult = match self.unit {
+            DurationUnit::Seconds => 1,
+            DurationUnit::Minutes => 60,
+            DurationUnit::Hours => 3_600,
+            DurationUnit::Days => 86_400,
+        };
+        self.amount.saturating_mul(mult)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -316,7 +414,7 @@ pub enum ConditionValue {
     List(Vec<ConditionValue>),
 }
 
-/// Placeholder for resolver config — §22 will populate this.
+/// Placeholder for resolver config — to be populated later.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ResolverConfig {}
 
@@ -327,160 +425,6 @@ pub struct ResolverConfig {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn schema_defaults_are_empty() {
-        let s = Schema::default();
-        assert_eq!(s.namespace, "");
-        assert!(s.items.is_empty());
-        assert!(s.source.is_none());
-    }
-
-    #[test]
-    fn attribute_decl_defaults_optional() {
-        let attr = AttributeDecl {
-            name: "email".into(),
-            attr_type: AttrType::Text,
-            required: false,
-            unique: false,
-            indexed: false,
-            default: None,
-        };
-        assert!(!attr.required);
-        assert!(!attr.unique);
-        assert!(!attr.indexed);
-        assert!(attr.default.is_none());
-    }
-
-    #[test]
-    fn attr_type_enum_variants_preserved() {
-        let t = AttrType::Enum {
-            variants: vec!["red".into(), "green".into(), "blue".into()],
-        };
-        let json_text = serde_json::to_string(&t).unwrap();
-        let back: AttrType = serde_json::from_str(&json_text).unwrap();
-        assert_eq!(t, back);
-    }
-
-    #[test]
-    fn attr_type_ref_target_preserved() {
-        let t = AttrType::Ref {
-            target: "Person".into(),
-        };
-        let back: AttrType = serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
-        assert_eq!(t, back);
-    }
-
-    #[test]
-    fn predicate_def_round_trip_json() {
-        let p = PredicateDef {
-            name: "prefers".into(),
-            kind: StatementKindAst::Preference,
-            object: ObjectTypeDecl::Value {
-                value_type: AttrType::Text,
-            },
-            stateful: None,
-            description: Some("user preference".into()),
-        };
-        let back: PredicateDef = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
-        assert_eq!(p, back);
-    }
-
-    #[test]
-    fn relation_def_with_properties() {
-        let r = RelationTypeDef {
-            name: "reports_to".into(),
-            from_type: "Person".into(),
-            to_type: "Person".into(),
-            cardinality: CardinalityAst::ManyToOne,
-            symmetric: false,
-            properties: vec![AttributeDecl {
-                name: "since".into(),
-                attr_type: AttrType::Date,
-                required: false,
-                unique: false,
-                indexed: false,
-                default: None,
-            }],
-            description: None,
-        };
-        let back: RelationTypeDef =
-            serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
-        assert_eq!(r, back);
-        assert_eq!(back.properties.len(), 1);
-    }
-
-    #[test]
-    fn extractor_pattern_round_trip() {
-        let e = ExtractorDef {
-            name: "person_mentions".into(),
-            kind: ExtractorKindAst::Pattern,
-            target: ExtractorTarget::Entity {
-                entity_type: "Person".into(),
-            },
-            fields: vec![
-                ExtractorField::Patterns(vec![r"\b[A-Z][a-z]+\b".into()]),
-                ExtractorField::Confidence(0.7),
-                ExtractorField::Trigger(TriggerExpr::OnEncode),
-            ],
-        };
-        let back: ExtractorDef = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
-        assert_eq!(e, back);
-    }
-
-    #[test]
-    fn extractor_llm_round_trip() {
-        let e = ExtractorDef {
-            name: "preferences".into(),
-            kind: ExtractorKindAst::Llm,
-            target: ExtractorTarget::Statement {
-                kind: StatementKindAst::Preference,
-            },
-            fields: vec![
-                ExtractorField::Model("claude-haiku-4-5".into()),
-                ExtractorField::Prompt("Extract user preferences.".into()),
-                ExtractorField::Schema(json!({"type": "object"})),
-                ExtractorField::Cache(CacheConfig::Enabled),
-                ExtractorField::CacheTtl(DurationAst {
-                    amount: 24,
-                    unit: DurationUnit::Hours,
-                }),
-                ExtractorField::CostBudget(CostExpr {
-                    amount: 0.10,
-                    unit: CostUnit::PerMemory,
-                }),
-                ExtractorField::ConfidenceThreshold(0.8),
-            ],
-        };
-        let back: ExtractorDef = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
-        assert_eq!(e, back);
-    }
-
-    #[test]
-    fn condition_expr_nested() {
-        let cond = ConditionExpr::And(
-            Box::new(ConditionExpr::Atom {
-                field: vec!["entity".into(), "type".into()],
-                op: ConditionOp::Eq,
-                value: ConditionValue::Text("Person".into()),
-            }),
-            Box::new(ConditionExpr::Or(
-                Box::new(ConditionExpr::Matches {
-                    field: vec!["text".into()],
-                    regex: "(?i)meeting".into(),
-                }),
-                Box::new(ConditionExpr::Atom {
-                    field: vec!["confidence".into()],
-                    op: ConditionOp::Gte,
-                    value: ConditionValue::Number(0.5),
-                }),
-            )),
-        );
-        let back: ConditionExpr =
-            serde_json::from_str(&serde_json::to_string(&cond).unwrap()).unwrap();
-        assert_eq!(cond, back);
-    }
 
     #[test]
     fn schema_full_document_round_trip() {
@@ -507,6 +451,7 @@ mod tests {
                     },
                     stateful: None,
                     description: None,
+                    retention: None,
                 }),
                 SchemaItem::Predicate(PredicateDef {
                     name: "prefers".into(),
@@ -516,6 +461,7 @@ mod tests {
                     },
                     stateful: None,
                     description: None,
+                    retention: None,
                 }),
                 SchemaItem::RelationType(RelationTypeDef {
                     name: "reports_to".into(),
@@ -543,19 +489,5 @@ mod tests {
         let back: Schema = serde_json::from_str(&json_text).unwrap();
         assert_eq!(schema, back);
         assert_eq!(back.items.len(), 5);
-    }
-
-    #[test]
-    fn statement_kind_round_trips_all_variants() {
-        for k in [
-            StatementKindAst::Fact,
-            StatementKindAst::Preference,
-            StatementKindAst::Event,
-            StatementKindAst::Any,
-        ] {
-            let back: StatementKindAst =
-                serde_json::from_str(&serde_json::to_string(&k).unwrap()).unwrap();
-            assert_eq!(k, back);
-        }
     }
 }

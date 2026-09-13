@@ -3,10 +3,9 @@
 # Brain — production container image.
 #
 # Multi-stage build:
-#   1. `builder` compiles brain-server + brain-cli against the
-#      Debian-bookworm Rust toolchain (Brain is Linux-only — see
-#      spec §01/05 §1.1). Uses BuildKit cache mounts so repeated
-#      builds reuse the cargo registry + target dir.
+#   1. `builder` compiles brain-server against the Debian-bookworm
+#      Rust toolchain (Brain is Linux-only). Uses BuildKit cache
+#      mounts so repeated builds reuse the cargo registry + target dir.
 #   2. `runtime` is debian:bookworm-slim (glibc — candle's tensor
 #      kernels and io_uring's helper libs both expect it). Adds
 #      ca-certificates (for the embedding-model download on first
@@ -21,8 +20,6 @@
 #     -p 8080:8080 -p 9091:9091 \
 #     -v brain-data:/var/lib/brain/data \
 #     brain:latest
-#
-# Full guide: docs/guides/deployment/docker.md
 
 # ----------------------------------------------------------------------------
 # Builder
@@ -50,11 +47,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
     cargo build --release \
         -p brain-server \
-        -p brain-cli \
         ${CARGO_FEATURES:+--features ${CARGO_FEATURES}} \
  && mkdir -p /out \
- && cp target/release/brain-server /out/ \
- && cp target/release/brain-cli    /out/
+ && cp target/release/brain-server /out/
 
 # ----------------------------------------------------------------------------
 # Runtime
@@ -73,13 +68,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && chown -R brain:brain /var/lib/brain
 
 COPY --from=builder /out/brain-server /usr/local/bin/brain-server
-COPY --from=builder /out/brain-cli    /usr/local/bin/brain-cli
 COPY config/docker.toml               /etc/brain/config.toml
 
 USER brain
 WORKDIR /var/lib/brain
 
-# Data plane (clients + SDK) + public HTTP (/healthz + /metrics).
+# Data plane (binary wire protocol) + public HTTP (/healthz + /metrics).
 # `admin_addr` (default 9092 — /v1/* routes) is loopback-only by
 # config and is not EXPOSEd: reach it via `docker exec brain ...`.
 EXPOSE 8080 9091

@@ -1,6 +1,6 @@
 # 01. System Architecture
 
-> **TL;DR.** Brain stores four record types (Memory, Entity, Statement, Relation) for AI agents, with explicit provenance, confidence, and bi-temporal validity. Hybrid retrieval (semantic + lexical + entity-graph + temporal) fused with weighted rank fusion. One Rust core, one wire protocol, one schema, Apache 2.0. This section frames the system: the three problems it solves, the layered architecture, hardware envelope, non-goals, and the five competitive design wedges every decision protects.
+> **TL;DR.** Brain stores four record types (Memory, Entity, Statement, Relation) for AI agents, with explicit provenance, confidence, and bi-temporal validity. Retrieval fuses semantic, lexical, entity-graph, and temporal signals with weighted rank fusion. One Rust core, one wire protocol, one schema, Apache 2.0. This section frames the system: the three problems it solves, the layered architecture, hardware envelope, non-goals, and the five competitive design wedges every decision protects.
 
 ## Status
 
@@ -39,7 +39,7 @@ Brain stores typed memories — facts, preferences, events, entities, and relati
 - **Statement** — typed claims about entities (Fact / Preference / Event) with confidence, evidence, and bi-temporal validity (`valid_from`, `valid_to`, `extracted_at`, `record_invalidated_at`)
 - **Relation** — typed binary edges between entities with cardinality and provenance
 
-Retrieval is hybrid (semantic + lexical + entity-graph + temporal) fused with weighted rank fusion. One Rust core, one wire protocol, one schema model. Apache 2.0. Embedded / self-hosted / cluster from the same crates.
+Retrieval fuses semantic, lexical, entity-graph, and temporal signals with weighted rank fusion. One Rust core, one wire protocol, one schema model. Apache 2.0. Embedded / self-hosted / cluster from the same crates.
 
 ## Three problems Brain solves
 

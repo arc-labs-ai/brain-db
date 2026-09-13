@@ -28,7 +28,7 @@ The `ErrorCategory` enum classifies errors into broad groups:
 | `Internal` | Server bug | Maybe (retry; report if persistent) |
 | `Unavailable` | Shard unavailable, server overloaded | Yes (after retry-after) |
 
-The category drives client retry behavior. The SDK uses category to decide whether to retry, propagate, or fail fast.
+The category drives client retry behavior. The client uses category to decide whether to retry, propagate, or fail fast.
 
 ### 3. Error codes
 
@@ -47,7 +47,7 @@ A more specific error code accompanies each category. The complete table:
 | `OversizePayload` | Payload exceeds server's max |
 | `ReservedFieldNonZero` | A reserved field had a non-zero value |
 | `BadFlagCombination` | Frame flags are mutually inconsistent |
-| `MalformedRkyv` | Rkyv-encoded payload didn't validate |
+| `MalformedPayload` | CBOR payload didn't decode or failed schema validation |
 | `MalformedVector` | Raw vector bytes don't match declared dim or fail norm check |
 
 #### 3.2 Connection / handshake (Category: `Protocol` or `Authentication`)
@@ -61,13 +61,29 @@ A more specific error code accompanies each category. The complete table:
 | `AuthBackendUnavailable` | Auth backend (e.g., token service) unreachable |
 | `SessionExpired` | Session timed out (rare; sessions are connection-lifetime) |
 
+Authentication is mandatory on every data-plane connection — there is no anonymous mode. The auth-required failure modes all map onto the codes above; no new numbers are needed:
+
+- **Missing credential** (`AUTH` presented nothing) → `Unauthenticated`. There is no anonymous fallback to accept the connection.
+- **Unknown key** (credential resolves to no minted key) → `Unauthenticated`.
+- **Revoked key** (credential names a key that was revoked via the admin surface) → `Unauthenticated`.
+- **Anonymous not allowed** (a client attempts to skip AUTH or asserts identity without a credential) → `Unauthenticated`; an operation sent before `AUTH_OK` is the separate `NotAuthenticated`.
+- A credential that authenticates but resolves to no provisioned namespace → `NamespaceUnknown` (§3.3), not `Unauthenticated`.
+
+The error `message` MAY distinguish these for the operator but the code is the same — clients treat any `Unauthenticated` as "refresh the credential and reconnect".
+
 #### 3.3 Authorization (Category: `Authorization`)
 
 | Code | Meaning |
 |---|---|
-| `PermissionDenied` | Agent lacks permission for this operation |
+| `PermissionDenied` | Agent lacks permission for this operation (incl. any attempt to read/write across the connection's namespace boundary — cross-namespace access is never permitted) |
 | `AdminPermissionRequired` | Operation requires `can_admin` |
 | `WrongShard` | Operation tried to address a different shard than the connection's |
+| `NamespaceRequired` | A write resolved to no owning namespace — fail-closed; namespace is required and there is no implicit/default namespace |
+| `NamespaceUnknown` | The connection's key (or a referenced namespace) names a namespace that has not been provisioned |
+| `WriteToSystemNamespace` | Attempt to own/modify data in the reserved read-only `brain` system namespace |
+| `ActAsDenied` | A request carried an `act_as` field the connection principal is not entitled to honor — either the principal lacks the `can_act_as` grant (invariant R1) or `act_as.namespace` is outside its `may_act` allowlist (invariant R2) |
+
+`ActAsDenied` is the dedicated code for a per-request-identity denial (see [`04_handshake.md`](04_handshake.md) §10a). It is distinct from `PermissionDenied` so that "this principal may not impersonate / may not act for that namespace" is never confused with "the effective agent lacks permission for this op" — the latter is resolved against the effective identity and surfaces as ordinary `PermissionDenied` (invariant R4). Per R1, an `act_as` the principal cannot honor is **hard-rejected** with `ActAsDenied`; the server never silently downgrades the op to the connection's own identity. Like every `Authorization`-category error it is **not** retryable. The transport precondition (R6 — `act_as` honored only over mTLS / a trusted network) is a deployment guarantee, not a per-request error code.
 
 #### 3.4 Validation (Category: `Validation`)
 
@@ -174,7 +190,7 @@ Cardinality violations on RELATION_CREATE surface as the substrate-wide `Cardina
 
 ##### 3.10.2 Schema-not-declared mode
 
-When no schema has been declared for a namespace, typed-graph writes (`STATEMENT_CREATE`, `RELATION_CREATE`) and reads (`QUERY`, etc.) accept any predicate / relation-type qname — the registry interns it on first use with `SchemaOrigin::ImplicitFromWrite` / `RelationTypeOrigin::ImplicitFromWrite`. No `SchemaNotDeclared` error is returned for these opcodes.
+When no schema has been declared for a namespace, typed-graph writes (`STATEMENT_CREATE`, `RELATION_CREATE`) and reads (`RECALL`, `STATEMENT_LIST`, the `QUERY_TRACE` introspection op, etc.) accept any predicate / relation-type qname — the registry interns it on first use with `SchemaOrigin::ImplicitFromWrite` / `RelationTypeOrigin::ImplicitFromWrite`. No `SchemaNotDeclared` error is returned for these opcodes.
 
 `SchemaNotDeclared` remains reserved for explicit schema-introspection opcodes (e.g. `SCHEMA_GET` against a namespace that has never had one), where there is nothing to return. Its category is `Conflict`.
 
@@ -231,7 +247,7 @@ For `Overloaded`, it's the server's estimate of when load might subside.
 
 ### 6. Client retry guidance
 
-The SDK's recommended retry policy:
+The recommended client retry policy:
 
 | Error category | Action |
 |---|---|
@@ -282,7 +298,7 @@ S → C: ERROR(stream_id=<encode's stream>, EOS)
          retry_after_ms: None
 ```
 
-The client's SDK maps this to a typed exception (`InvalidArgumentError`) and surfaces it.
+A client maps this to a typed error (`InvalidArgumentError`) and surfaces it.
 
 ### 9. Wire format example: stream cancellation acknowledged
 
@@ -329,14 +345,14 @@ Each log entry includes the connection's session_id and the stream_id of the aff
 
 What the server validates when it receives a frame, and what it rejects. The protocol assumes adversarial input and validates aggressively.
 
-The validation rules MUST be implemented by every conforming server. SDKs SHOULD perform the same validation client-side to fail fast on bugs without round-tripping to the server.
+The validation rules MUST be implemented by every conforming server. Clients SHOULD perform the same validation locally to fail fast on bugs without round-tripping to the server.
 
 ### 13. Layered validation
 
 Validation happens in three layers, in order:
 
 1. **Frame-level** — the 32-byte header is parsed and structurally validated. Bad framing closes the connection.
-2. **Payload-level** — the payload is decoded (rkyv or bytemuck) and structurally validated. Bad payloads return an error frame.
+2. **Payload-level** — the payload is decoded (CBOR for structured fields, little-endian f32 for vectors) and structurally validated. Bad payloads return an error frame.
 3. **Operation-level** — the parameters of a specific opcode are validated against the data model. Bad parameters return an opcode-specific error frame.
 
 Earlier failures take precedence over later ones. If the frame's header is malformed, the payload is never decoded.
@@ -394,11 +410,11 @@ The payload's CRC32C in the header is recomputed against the actual payload byte
 
 For zero-length payloads, the payload CRC field is 0; no CRC check.
 
-#### 15.2 rkyv structural validation
+#### 15.2 CBOR structural validation
 
-For structured payloads encoded with rkyv:
+For structured payloads encoded with CBOR:
 
-- The payload MUST decode without error using rkyv's `check_archived_root` (or equivalent validation API). This catches:
+- The payload MUST decode without error using a standards-conformant CBOR decoder. This catches:
   - Truncated payloads.
   - Out-of-bounds offsets within the payload.
   - Type tag mismatches.
@@ -479,7 +495,7 @@ All ENCODE rules plus:
 
 #### 16.9 Typed-graph opcodes (`0x01xx`)
 
-Typed-graph opcodes use the same two-layer discipline: rkyv structural validation at the wire layer, then handler-layer semantic validation. The rules below run before any storage call.
+Typed-graph opcodes use the same two-layer discipline: CBOR structural validation at the wire layer, then handler-layer semantic validation. The rules below run before any storage call.
 
 ##### 16.9.1 Universal field caps
 
@@ -502,7 +518,7 @@ Violations return `InvalidArgument` (category `Validation`) with `details.field`
 | Field | Rule | Error code |
 |---|---|---|
 | `entity_type_id` | must be > 0 and registered in `entity_types` table | `EntityTypeMismatch` |
-| `canonical_name` | non-empty after `.trim()`; ≤ 256 bytes; valid UTF-8 (rkyv guarantees) | `InvalidArgument` |
+| `canonical_name` | non-empty after `.trim()`; ≤ 256 bytes; valid UTF-8 (validated on decode) | `InvalidArgument` |
 | `canonical_name` (after server-side `normalize_name`) | must not collide with an existing entity of the same `entity_type_id` | `EntityAmbiguous` (duplicate) |
 | `aliases.len()` | ≤ 32 | `InvalidArgument` |
 | each `alias` | non-empty after `.trim()`; ≤ 256 bytes | `InvalidArgument` |
@@ -592,12 +608,14 @@ Aliases are deduplicated server-side on the normalized form before insertion. A 
 - `from`, `to`: must be existing entities; for schema-declared types, endpoint entity types must match the relation's declared signature → `EntityTypeMismatch`. Implicit types skip this check.
 - cardinality (`one_to_one` / `one_to_many` / etc.): enforced server-side on schema-declared types only → `CardinalityViolation` (0x0065).
 
-##### 16.9.6 Query opcodes (`0x0160–0x0163`)
+##### 16.9.6 Query introspection opcodes (`0x0161–0x0162`)
 
-- `top_k`: 1 ≤ top_k ≤ 1000.
+Validation of the `QueryRequest` accepted by `QUERY_EXPLAIN` / `QUERY_TRACE`:
+
+- `top_k`: 1 ≤ top_k ≤ 1000 (the trace-output head size; ignored by EXPLAIN).
 - `depth` (for `RELATION_TRAVERSE`-shaped queries): 1 ≤ depth ≤ 8.
 - `budget_wall_time_ms`: 1 ≤ budget ≤ 60000 (60 s ceiling).
-- empty filter clauses are allowed (no-op); empty `text` for `RECALL_HYBRID` rejected.
+- empty filter clauses are allowed (no-op).
 
 ##### 16.9.7 Admin opcodes (`0x0170–0x0177`)
 
@@ -607,7 +625,7 @@ Aliases are deduplicated server-side on the normalized form before insertion. A 
 
 ##### 16.9.8 Constants
 
-Centralized so SDK clients and the server agree on the same numbers. Defined at `brain-core::knowledge::validation`:
+Centralized so clients and the server agree on the same numbers. Defined at `brain-core::knowledge::validation`:
 
 ```rust
 pub const MAX_IDENT_BYTES: usize        = 256;
@@ -627,7 +645,7 @@ pub const MIN_MERGE_CONFIDENCE: f32     = 0.7;
 
 Per typed-graph request, the server runs validations in this order. The first failure short-circuits with the corresponding error:
 
-1. **rkyv structural check** (`check_archived_root`). `MalformedRkyv` → close frame, keep connection.
+1. **CBOR structural check** (decode + schema). `MalformedPayload` → close frame, keep connection.
 2. **Universal field caps** (§16.9.1). `InvalidArgument`.
 3. **Op-specific field-level rules** (§16.9.2 – §16.9.7). Various codes per table.
 4. **Cross-field rules** (e.g. `survivor != merged`). Op-specific codes.
@@ -691,7 +709,7 @@ This matters for testing and debugging: a frame that fails validation in product
 
 When a validation rule is unclear or under-specified, the server MUST reject. New, unspecified fields, novel opcode parameters, ambiguous flag combinations: all reject by default.
 
-This is the opposite of "best effort". The protocol's premise is that the SDK provides correct frames; anything unrecognized is treated as a bug or attack, not as a feature to be inferred.
+This is the opposite of "best effort". The protocol's premise is that the client provides correct frames; anything unrecognized is treated as a bug or attack, not as a feature to be inferred.
 
 ### 21. Validation error reporting
 
@@ -709,7 +727,7 @@ The server SHOULD include enough detail to diagnose the issue without leaking in
 Validation is on the hot path. Each validation step adds latency. The budget for validation cost is:
 
 - Frame-level: < 100 ns per frame (CRC plus a few comparisons).
-- Payload-level rkyv decode: < 1 µs typical, larger for bigger payloads.
+- Payload-level CBOR decode: single-digit µs typical, larger for bigger payloads.
 - Payload-level bytemuck cast: < 100 ns (no copying, just a length check and a pointer reinterpret).
 - Operation-level: < 5 µs typical.
 

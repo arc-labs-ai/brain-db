@@ -7,10 +7,10 @@
 | Field | Value |
 |---|---|
 | Status | Draft |
-| Audience | SDK authors; agent integrators |
+| Audience | client implementers; agent integrators |
 | Voice | Hybrid (rationale + normative) |
 | Depends on | [02. Data Model](../02_data_model/00_purpose.md), [12. Query Optimizer](../12_query_optimizer/00_purpose.md) |
-| Referenced by | [06. SDK Design](../06_sdk/00_purpose.md) |
+| Referenced by | [06. Client Interface](../06_sdk/00_purpose.md) |
 
 ## What this spec defines
 
@@ -42,7 +42,7 @@ This document specifies what each cognitive operation **means** — not how Brai
 
 - **Wire-level details.** Defined in [04. Wire Protocol](../04_wire_protocol/00_purpose.md).
 - **Implementation.** Defined in [12. Query Optimizer](../12_query_optimizer/00_purpose.md) and the storage docs.
-- **SDK ergonomics.** Defined in [06. SDK Design](../06_sdk/00_purpose.md).
+- **Client ergonomics.** The client author's concern; see [06. Client Interface](../06_sdk/00_purpose.md).
 
 ## 1. The "five primitives" framing
 

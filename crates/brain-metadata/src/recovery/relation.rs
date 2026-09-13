@@ -23,12 +23,13 @@ use crate::tables::edge::{self, derived_by, origin, EdgeData, EDGES_REVERSE_TABL
 use crate::tables::relation::{
     RelationMetadata, RELATION_BY_EVIDENCE_TABLE, RELATION_METADATA_TABLE,
 };
+use crate::tables::scope::RowScope;
 
 use super::transient;
 
 impl MetadataDb {
     pub(super) fn apply_relation_link(
-        &mut self,
+        &self,
         lsn: u64,
         timestamp_ns: u64,
         p: &RelationLinkPayload,
@@ -43,7 +44,7 @@ impl MetadataDb {
     }
 
     pub(super) fn apply_relation_supersede(
-        &mut self,
+        &self,
         lsn: u64,
         timestamp_ns: u64,
         p: &RelationSupersedePayload,
@@ -89,7 +90,7 @@ impl MetadataDb {
     }
 
     pub(super) fn apply_relation_tombstone(
-        &mut self,
+        &self,
         lsn: u64,
         p: &RelationTombstonePayload,
     ) -> Result<(), MetadataSinkError> {
@@ -137,6 +138,20 @@ fn write_relation_link(
     p: &RelationLinkPayload,
     now_unix_nanos: u64,
 ) -> Result<(), MetadataSinkError> {
+    // Schemaless path: the relation type wasn't interned at WAL-append
+    // time, so re-resolve it here. Deterministic in LSN order; idempotent.
+    let relation_type_id = match &p.relation_type_intern_hint {
+        None => p.relation_type_id,
+        Some((namespace, name)) => crate::relation::types::relation_type_intern_or_get(
+            wtxn,
+            namespace,
+            name,
+            /* first_seen_lsn */ 0,
+            now_unix_nanos,
+        )
+        .map_err(|e| MetadataSinkError::Corruption(format!("relation_type_intern_or_get: {e}")))?,
+    };
+
     // Edge row(s). The auto-mirror split mirrors `relation_ops`:
     // symmetric typed relations write the mirror explicitly here so
     // the `is_symmetric` bit stays sidecar-local. Substrate auto-
@@ -151,7 +166,7 @@ fn write_relation_link(
             derived_by::CLIENT,
             now_unix_nanos,
         );
-        let kind = EdgeKindRef::Typed(p.relation_type_id);
+        let kind = EdgeKindRef::Typed(relation_type_id);
         edge::link(
             &mut edges,
             &mut reverse,
@@ -198,12 +213,22 @@ fn write_relation_link(
         Some(_) => 2,
         None => 1,
     };
+    // The WAL payload carries the owning `(namespace, space)`, so recovery
+    // rebuilds the relation sidecar (and its scope-prefixed evidence index)
+    // under the real tenant — cross-tenant isolation on the typed-graph
+    // holds across a restart.
+    let scope = RowScope::from_bytes(p.namespace_id.raw(), <[u8; 16]>::from(p.space_id));
     let meta = RelationMetadata {
+        namespace_id: scope.namespace_id,
+        space_id_bytes: scope.space_id_bytes,
+        // The WAL payload carries the per-utterance session; recovery
+        // rebuilds the sidecar with it so the relation keeps its grouping.
+        session_id: p.session_id.raw(),
         from_tag: p.from.tag(),
         from_bytes: p.from.id_bytes(),
         to_tag: p.to.tag(),
         to_bytes: p.to.id_bytes(),
-        relation_type_id: p.relation_type_id.raw(),
+        relation_type_id: relation_type_id.raw(),
         chain_root_bytes,
         properties_blob: p.properties_blob.clone(),
         version,
@@ -235,8 +260,16 @@ fn write_relation_link(
             .open_table(RELATION_BY_EVIDENCE_TABLE)
             .map_err(transient)?;
         for mem in &p.evidence {
-            t.insert(&(mem.to_be_bytes(), p.relation_id.to_bytes()), &())
-                .map_err(transient)?;
+            t.insert(
+                &(
+                    scope.namespace_id,
+                    scope.space_id_bytes,
+                    mem.to_be_bytes(),
+                    p.relation_id.to_bytes(),
+                ),
+                &(),
+            )
+            .map_err(transient)?;
         }
     }
 

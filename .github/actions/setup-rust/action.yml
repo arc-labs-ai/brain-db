@@ -1,0 +1,37 @@
+name: Set up Rust
+description: >
+  Rust toolchain + Swatinem/rust-cache — the setup every Rust job in this
+  repo's workflows shares. Centralized here so the toolchain/cache
+  configuration only needs to change in one place. Callers MUST run
+  actions/checkout first: a local action can't be located until the repo is
+  checked out, so this composite deliberately does not check itself out.
+
+inputs:
+  toolchain:
+    description: Toolchain channel to install (stable, nightly, ...)
+    required: false
+    default: stable
+  components:
+    description: Comma-separated rustup components (e.g. "rustfmt, clippy")
+    required: false
+    default: ""
+  cache:
+    description: Whether to enable Swatinem/rust-cache
+    required: false
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    # dtolnay/rust-toolchain normally selects the channel via the ref
+    # (@stable / @nightly), but that can't be parameterized through an
+    # input — `uses:` doesn't accept expressions. `@master` is the one ref
+    # that instead takes the channel as a `toolchain` input, which is what
+    # lets this composite action pick stable vs. nightly per caller.
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ inputs.toolchain }}
+        components: ${{ inputs.components }}
+
+    - if: inputs.cache == 'true'
+      uses: Swatinem/rust-cache@v2

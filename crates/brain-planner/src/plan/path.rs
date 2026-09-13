@@ -2,13 +2,12 @@
 //! operation, not the planner's output).
 //!
 //! Named `PathPlan` to avoid `ExecutionPlan::Plan(PlanPlan)` confusion.
-//! describes the shape: embed both endpoints, RECALL
-//! near each, traverse the graph between them via bidirectional BFS,
-//! score paths, return.
+//! The shape: embed both endpoints, RECALL near each, traverse the
+//! graph between them via bidirectional BFS, score paths, return.
 //!
-//! Phase 6.5 ships the **planner-side** shape. The executor is
-//! deferred — bidirectional-BFS edge traversal lands with Phase 7
-//! cognitive-ops alongside `LINK` / `UNLINK`.
+//! Ships the **planner-side** shape. The executor is deferred —
+//! bidirectional-BFS edge traversal lands later alongside `LINK` /
+//! `UNLINK`.
 
 use brain_core::EdgeKind;
 use brain_protocol::envelope::request::{PlanBudget, PlanState, PlanStrategy};
@@ -33,7 +32,7 @@ pub struct PathPlan {
     pub estimated_cost_ms: f32,
 }
 
-/// Bidirectional BFS along the named edge kinds-§5.
+/// Bidirectional BFS along the named edge kinds.
 #[derive(Debug, Clone)]
 pub struct TraversalStep {
     pub edge_kinds: Vec<EdgeKind>,

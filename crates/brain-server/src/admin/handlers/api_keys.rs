@@ -2,11 +2,12 @@
 //!
 //! Three actions:
 //!
-//! - `POST /v1/api-keys` — mint a key. Body is JSON with `org_id`,
-//!   `agent_id`, `namespace`, `permissions` (string array or `u32`
-//!   bitfield), optional `user_id`. The reply carries the raw secret
-//!   once — never again.
-//! - `GET /v1/api-keys?agent=…` — list keys for the given agent.
+//! - `POST /v1/api-keys` — mint a key. Body is JSON with `space_id`,
+//!   `namespace`, `permissions` (string array or `u32` bitfield), and
+//!   optional `user_id` / `org_id` (both reserved audit tags, default
+//!   all-zero). Minting interns the namespace and binds the space +
+//!   permissions. The reply carries the raw secret once — never again.
+//! - `GET /v1/api-keys?space=…` — list keys for the given space.
 //! - `DELETE /v1/api-keys/<hex>` — revoke a key by hex key-hash.
 //!
 //! All three are admin-only and intended to be reached over the
@@ -15,12 +16,11 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use brain_http::body::ResponseBody;
+use brain_http::body::{read_to_bytes, ResponseBody, MAX_BODY_BYTES};
 use brain_metadata::api_keys::bits;
 use bytes::Bytes;
 use http::{Method, Request, Response, StatusCode};
-use http_body_util::BodyExt as _;
-use hyper::body::Incoming;
+use hyper::body::{Body, Incoming};
 use serde::{Deserialize, Serialize};
 
 use crate::admin::util::{json_response, text_response};
@@ -30,17 +30,35 @@ use crate::auth::hex32;
 /// JSON body of `POST /v1/api-keys`.
 #[derive(Debug, Deserialize)]
 struct MintBody {
-    /// 32 hex chars = 16 bytes.
-    org_id_hex: String,
+    /// 32 hex chars; optional. Reserved audit tag, all-zero when omitted
+    /// (the locked design dropped org_id as an identity dimension).
+    #[serde(default)]
+    org_id_hex: Option<String>,
     /// 32 hex chars; optional. All-zero when omitted.
     #[serde(default)]
     user_id_hex: Option<String>,
     /// 32 hex chars = 16 bytes.
-    agent_id_hex: String,
+    space_id_hex: String,
     /// Schema namespace ("acme", "brain", …).
     namespace: String,
     /// Either a list of named permissions or a raw `u32` bitfield.
     permissions: PermissionsSpec,
+    /// Allowlist of namespaces this key may act *for* under the `ACT_AS`
+    /// grant. Only meaningful when the resolved permission set carries the
+    /// `ACT_AS` bit; empty (the default) for every ordinary key. A single
+    /// `"*"` entry is the wildcard grant — the key may act as *any*
+    /// namespace, the trusted-front-door case for a gateway/edge that fronts
+    /// every tenant and can't enumerate an allowlist that grows per tenant.
+    #[serde(default)]
+    may_act: Vec<String>,
+    /// Opt-in marker for minting the internal gateway service principal.
+    /// The wildcard `may_act = ["*"]` grant is reserved for that principal;
+    /// an ordinary (customer-tier) mint MUST NOT carry it, since a wildcard
+    /// customer key is a cross-tenant hole. Defaults to `false`, so the
+    /// customer-facing path rejects wildcard unless the operator explicitly
+    /// asks for the service principal.
+    #[serde(default)]
+    service_principal: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -64,7 +82,8 @@ impl PermissionsSpec {
                         "LINK" => bits::LINK,
                         "SCHEMA_UPLOAD" => bits::SCHEMA_UPLOAD,
                         "ADMIN" => bits::ADMIN,
-                        "STANDARD_AGENT" => bits::STANDARD_AGENT,
+                        "ACT_AS" => bits::ACT_AS,
+                        "STANDARD_SPACE" => bits::STANDARD_SPACE,
                         "READ_ONLY" => bits::READ_ONLY,
                         "READ_WRITE" => bits::READ_WRITE,
                         "FULL" => bits::FULL,
@@ -88,13 +107,13 @@ struct MintReply {
     key_hash_hex: String,
 }
 
-/// Single row in `GET /v1/api-keys?agent=…`.
+/// Single row in `GET /v1/api-keys?space=…`.
 #[derive(Debug, Serialize)]
 struct ApiKeyView {
     key_hash_hex: String,
     org_id_hex: String,
     user_id_hex: String,
-    agent_id_hex: String,
+    space_id_hex: String,
     namespace: String,
     permissions: u32,
     created_at_unix_nanos: u64,
@@ -128,9 +147,11 @@ async fn mint(
     req: Request<Incoming>,
     state: Arc<AdminState>,
 ) -> brain_http::Result<Response<ResponseBody>> {
-    let body = match collect_body(req).await {
+    // Bounded read: an unbounded `collect()` here would let a malicious
+    // multi-GB body OOM-kill the whole process (shards + admin share it).
+    let body = match read_bounded_body(req.into_body()).await {
         Ok(b) => b,
-        Err(msg) => return Ok(text_response(StatusCode::BAD_REQUEST, &msg)),
+        Err(e) => return Ok(map_body_error(e)),
     };
     let parsed: MintBody = match serde_json::from_slice(&body) {
         Ok(b) => b,
@@ -141,9 +162,12 @@ async fn mint(
             ))
         }
     };
-    let org_id = match parse_16(&parsed.org_id_hex) {
-        Ok(b) => b,
-        Err(msg) => return Ok(text_response(StatusCode::BAD_REQUEST, &msg)),
+    let org_id = match parsed.org_id_hex.as_deref() {
+        Some(s) => match parse_16(s) {
+            Ok(b) => b,
+            Err(msg) => return Ok(text_response(StatusCode::BAD_REQUEST, &msg)),
+        },
+        None => [0u8; 16],
     };
     let user_id = match parsed.user_id_hex.as_deref() {
         Some(s) => match parse_16(s) {
@@ -152,7 +176,7 @@ async fn mint(
         },
         None => [0u8; 16],
     };
-    let agent_id = match parse_16(&parsed.agent_id_hex) {
+    let space_id = match parse_16(&parsed.space_id_hex) {
         Ok(b) => b,
         Err(msg) => return Ok(text_response(StatusCode::BAD_REQUEST, &msg)),
     };
@@ -160,6 +184,36 @@ async fn mint(
         Ok(b) => b,
         Err(msg) => return Ok(text_response(StatusCode::BAD_REQUEST, &format!("{msg}\n"))),
     };
+    // `may_act` is only meaningful under the ACT_AS grant. Reject the two
+    // incoherent shapes: a `may_act` list without ACT_AS (the allowlist
+    // would never be consulted), and an ACT_AS grant with an empty
+    // allowlist (the key could never act for anyone — a useless, and
+    // likely mistaken, grant).
+    let has_act_as = permissions & bits::ACT_AS != 0;
+    if !parsed.may_act.is_empty() && !has_act_as {
+        return Ok(text_response(
+            StatusCode::BAD_REQUEST,
+            "may_act is only valid together with the ACT_AS permission\n",
+        ));
+    }
+    if has_act_as && parsed.may_act.is_empty() {
+        return Ok(text_response(
+            StatusCode::BAD_REQUEST,
+            "ACT_AS grant requires a non-empty may_act allowlist\n",
+        ));
+    }
+    // Wildcard `may_act = ["*"]` is reserved for the internal gateway service
+    // principal. A customer-tier mint carrying it would be a cross-tenant
+    // hole (the key could act for every namespace), so reject it unless the
+    // operator explicitly asked for the service principal.
+    if parsed.may_act.iter().any(|ns| ns == "*") && !parsed.service_principal {
+        return Ok(text_response(
+            StatusCode::BAD_REQUEST,
+            "wildcard may_act = [\"*\"] is reserved for the internal gateway service \
+             principal; a customer-tier key must enumerate its namespaces \
+             (set service_principal=true only for the gateway bootstrap)\n",
+        ));
+    }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
@@ -169,8 +223,9 @@ async fn mint(
         org_id,
         user_id,
         parsed.namespace,
-        agent_id,
+        space_id,
         permissions,
+        parsed.may_act,
         now,
     ) {
         Ok(m) => m,
@@ -194,21 +249,21 @@ async fn list(
     state: Arc<AdminState>,
 ) -> brain_http::Result<Response<ResponseBody>> {
     let query = req.uri().query().unwrap_or("");
-    let agent_hex = query
+    let space_hex = query
         .split('&')
-        .find_map(|kv| kv.strip_prefix("agent="))
+        .find_map(|kv| kv.strip_prefix("space="))
         .unwrap_or("");
-    if agent_hex.is_empty() {
+    if space_hex.is_empty() {
         return Ok(text_response(
             StatusCode::BAD_REQUEST,
-            "missing ?agent=<32-hex-agent-id>\n",
+            "missing ?space=<32-hex-space-id>\n",
         ));
     }
-    let agent_id = match parse_16(agent_hex) {
+    let space_id = match parse_16(space_hex) {
         Ok(b) => b,
         Err(msg) => return Ok(text_response(StatusCode::BAD_REQUEST, &msg)),
     };
-    let rows = match state.auth_store.list_for_agent(&agent_id) {
+    let rows = match state.auth_store.list_for_space(&space_id) {
         Ok(r) => r,
         Err(e) => {
             return Ok(text_response(
@@ -223,7 +278,7 @@ async fn list(
             key_hash_hex: hex32(&r.key_hash),
             org_id_hex: hex16(&r.org_id),
             user_id_hex: hex16(&r.user_id),
-            agent_id_hex: hex16(&r.agent_id),
+            space_id_hex: hex16(&r.space_id),
             namespace: r.namespace,
             permissions: r.permissions,
             created_at_unix_nanos: r.created_at_unix_nanos,
@@ -265,12 +320,26 @@ async fn revoke(
 // Helpers
 // ---------------------------------------------------------------------------
 
-async fn collect_body(req: Request<Incoming>) -> Result<Bytes, String> {
-    req.into_body()
-        .collect()
-        .await
-        .map(|c| c.to_bytes())
-        .map_err(|e| format!("body read failed: {e}\n"))
+/// Read a request body into memory, bounded by [`MAX_BODY_BYTES`]. Routing
+/// every body-reading admin handler through this guard keeps an unbounded
+/// `collect()` from OOM-killing the shared process. Map the error to a
+/// client response with [`map_body_error`].
+async fn read_bounded_body<B>(body: B) -> brain_http::Result<Bytes>
+where
+    B: Body<Data = Bytes>,
+    B::Error: Into<brain_http::Error>,
+{
+    read_to_bytes(body, MAX_BODY_BYTES).await
+}
+
+fn map_body_error(e: brain_http::Error) -> Response<ResponseBody> {
+    match e {
+        brain_http::Error::BodyTooLarge { limit, .. } => text_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            &format!("request body exceeds {limit} bytes\n"),
+        ),
+        _ => text_response(StatusCode::BAD_REQUEST, "failed to read request body\n"),
+    }
 }
 
 fn parse_16(s: &str) -> Result<[u8; 16], String> {
@@ -310,4 +379,57 @@ fn hex16(bytes: &[u8; 16]) -> String {
         let _ = write!(&mut s, "{b:02x}");
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    use hyper::body::{Frame, SizeHint};
+
+    /// A body that lies about being enormous but yields no data. Proves the
+    /// bounded reader rejects on the size-hint cheap path — before buffering
+    /// a single byte — so a hostile `Content-Length` can't OOM the process.
+    struct HugeBody;
+
+    impl Body for HugeBody {
+        type Data = Bytes;
+        type Error = brain_http::Error;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            // Must never be polled: rejection happens before any read.
+            panic!("invariant: oversize body must be rejected before buffering");
+        }
+
+        fn size_hint(&self) -> SizeHint {
+            let mut sh = SizeHint::new();
+            sh.set_upper(u64::MAX);
+            sh
+        }
+    }
+
+    #[tokio::test]
+    async fn oversize_body_rejected_without_buffering() {
+        let err = read_bounded_body(HugeBody)
+            .await
+            .expect_err("oversize body must be rejected");
+        // Rejected via the size-hint cheap path — HugeBody::poll_frame would
+        // have panicked had the reader tried to buffer.
+        assert!(matches!(err, brain_http::Error::BodyTooLarge { .. }));
+        // And the client-facing mapping is a 413.
+        assert_eq!(map_body_error(err).status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn body_at_limit_is_accepted() {
+        use http_body_util::Full;
+        let body = Full::new(Bytes::from(vec![0u8; 64]));
+        let bytes = read_bounded_body(body).await.expect("small body accepted");
+        assert_eq!(bytes.len(), 64);
+    }
 }

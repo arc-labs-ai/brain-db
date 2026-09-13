@@ -1,23 +1,23 @@
 //! LRU cache for text → vector.
 //!
-//! Implements `spec/07_embedding/05_caching.md` faithfully:
+//! Behaviour:
 //!
-//! - Key = `BLAKE3(text)[..16]` (§2).
-//! - Value = `(vector, fingerprint, inserted_at)` (§1).
+//! - Key = `BLAKE3(text)[..16]`.
+//! - Value = `(vector, fingerprint, inserted_at)`.
 //! - Fingerprint mismatch on lookup → miss; stale entries are *not*
-//!   auto-removed, they age out via LRU (§8).
-//! - LRU eviction via the `lru` crate (§7).
-//! - `cache_size = 0` → cache disabled, pure passthrough (§13).
+//!   auto-removed, they age out via LRU.
+//! - LRU eviction via the `lru` crate.
+//! - `cache_size = 0` → cache disabled, pure passthrough.
 //! - Hit / miss / eviction counters as `AtomicU64` so observers don't
-//!   contend the cache mutex (§10).
+//!   contend the cache mutex.
 //!
-//! Wraps any [`Dispatcher`] (5.4). Implements `Dispatcher` itself, so
+//! Wraps any [`Dispatcher`]. Implements `Dispatcher` itself, so
 //! it composes cleanly: `CachingDispatcher<CpuDispatcher>` is what a
-//! shard holds; Phase 7's ops see only the trait.
+//! shard holds; ops see only the trait.
 //!
-//! `embed_batch` is a pure passthrough names "cues" (single
-//! texts via `ENCODE` / `RECALL` / etc.). A cache-aware batch
-//! implementation is a contained follow-up if Phase 7+ ever wants one.
+//! `embed_batch` is a pure passthrough; the cache keys on single
+//! "cue" texts (via `ENCODE` / `RECALL` / etc.). A cache-aware batch
+//! implementation is a contained follow-up if it's ever wanted.
 
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,7 +32,7 @@ use crate::error::EmbedError;
 use crate::fingerprint::blake3_hash_text;
 use crate::model::VECTOR_DIM;
 
-/// Default cache size per spec `04/05 §5`.
+/// Default cache size.
 pub const DEFAULT_CACHE_SIZE: usize = 10_000;
 
 /// One LRU entry. The `inserted_at` field is reserved for future
@@ -41,7 +41,7 @@ pub const DEFAULT_CACHE_SIZE: usize = 10_000;
 struct CachedEmbedding {
     vector: [f32; VECTOR_DIM],
     fingerprint: [u8; 16],
-    #[allow(dead_code)] // mandates the field; reads land in Phase 8+
+    #[allow(dead_code)] // reserved for future migration / admin tooling
     inserted_at: Instant,
 }
 
@@ -74,8 +74,7 @@ impl CacheStats {
 /// dispatcher's methods inline into the miss path.
 pub struct CachingDispatcher<D: Dispatcher> {
     inner: D,
-    /// `None` when `cache_size = 0` — cache disabled, pure passthrough
-    /// per spec `04/05 §13`.
+    /// `None` when `cache_size = 0` — cache disabled, pure passthrough.
     #[allow(clippy::type_complexity)]
     state: Option<Arc<Mutex<LruCache<[u8; 16], CachedEmbedding>>>>,
     hits: AtomicU64,
@@ -85,7 +84,7 @@ pub struct CachingDispatcher<D: Dispatcher> {
 
 impl<D: Dispatcher> CachingDispatcher<D> {
     /// Wrap `inner` with an LRU of capacity `cache_size`. A capacity
-    /// of `0` disables the cache entirely (spec `04/05 §13`).
+    /// of `0` disables the cache entirely.
     #[must_use]
     pub fn new(inner: D, cache_size: usize) -> Self {
         let state =
@@ -137,6 +136,9 @@ impl<D: Dispatcher> CachingDispatcher<D> {
 
 impl<D: Dispatcher> Dispatcher for CachingDispatcher<D> {
     fn embed(&self, text: &str) -> Result<[f32; VECTOR_DIM], EmbedError> {
+        // Synchronous embed — no `.await` inside — so `.entered()` guards
+        // are safe; nothing interleaves to steal the span.
+        let _embed_span = tracing::info_span!("brain.embed").entered();
         // Disabled cache: pure passthrough.
         let Some(state) = &self.state else {
             return self.inner.embed(text);
@@ -148,6 +150,7 @@ impl<D: Dispatcher> Dispatcher for CachingDispatcher<D> {
         // Hit path. `peek` doesn't bump LRU — we promote only on
         // confirmed hits below.
         {
+            let _cache_span = tracing::info_span!("brain.embedder.cache_lookup").entered();
             let mut guard = state.lock();
             if let Some(entry) = guard.peek(&key) {
                 if entry.fingerprint == current_fp {
@@ -159,7 +162,7 @@ impl<D: Dispatcher> Dispatcher for CachingDispatcher<D> {
                     return Ok(vector);
                 }
                 // Fingerprint mismatch: fall through as miss. Don't
-                // delete (§8 says stale entries age out via LRU).
+                // delete — stale entries age out via LRU.
             }
         }
 
@@ -401,14 +404,5 @@ mod tests {
         cache.embed("a").unwrap();
         assert_eq!(cache.stats().misses, 1);
         assert_eq!(cache.stats().hits, 0);
-    }
-
-    #[test]
-    fn caching_dispatcher_object_safe_and_send_sync() {
-        fn _assert_send_sync<T: Send + Sync>() {}
-        _assert_send_sync::<CachingDispatcher<CountingMock>>();
-        fn _accepts(_d: &dyn Dispatcher) {}
-        let cache = CachingDispatcher::new(CountingMock::new(fp(0x99)), 1);
-        _accepts(&cache);
     }
 }

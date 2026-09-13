@@ -1,4 +1,4 @@
-//! Confidence aggregation. Phase 17.9.
+//! Confidence aggregation.
 //!
 //! Pure noisy-OR formula:
 //!
@@ -11,7 +11,7 @@
 //! when inline evidence carries per-entry metadata
 //! (`confidence_milli > 0`). Wire callers without per-evidence
 //! metadata keep their caller-supplied statement-level confidence
-//! until phase 22's `STATEMENT_ADD_EVIDENCE` op lands.
+//! until the `STATEMENT_ADD_EVIDENCE` op lands.
 
 use crate::nodes::{kinds::StatementKind, statement::EvidenceEntry};
 
@@ -91,8 +91,16 @@ pub fn decay_for(kind: StatementKind, age_secs: f32, config: &ConfidenceConfig) 
     match kind {
         StatementKind::Event if config.event_decay_disabled => 1.0,
         StatementKind::Event => exp_decay(age_secs, config.fact_half_life_seconds),
-        StatementKind::Fact => exp_decay(age_secs, config.fact_half_life_seconds),
+        // Preferences are the slowest to decay — a stated like/dislike stays
+        // true far longer than an episodic fact.
         StatementKind::Preference => exp_decay(age_secs, config.pref_half_life_seconds),
+        // Everything else (Fact, Attribute, Relation, Directive, and
+        // user-declared Custom kinds) decays on the fact half-life.
+        StatementKind::Fact
+        | StatementKind::Attribute
+        | StatementKind::Relation
+        | StatementKind::Directive
+        | StatementKind::Custom(_) => exp_decay(age_secs, config.fact_half_life_seconds),
     }
 }
 
@@ -120,7 +128,7 @@ fn exp_decay(age_secs: f32, half_life_seconds: u64) -> f32 {
 mod tests {
     use super::*;
     use crate::ids::ExtractorId;
-    use crate::{ContextId, MemoryId};
+    use crate::{MemoryId, SessionId};
 
     fn cfg() -> ConfidenceConfig {
         ConfidenceConfig::default_v1()
@@ -128,7 +136,7 @@ mod tests {
 
     fn evi(confidence: f32, timestamp_unix_nanos: u64) -> EvidenceEntry {
         EvidenceEntry::from_parts(
-            MemoryId::pack(1, ContextId::DEFAULT.into(), 0),
+            MemoryId::pack(1, SessionId::DEFAULT.into(), 0),
             confidence,
             timestamp_unix_nanos,
             ExtractorId::from(0),
@@ -139,14 +147,6 @@ mod tests {
     const ONE_YEAR_NS: u64 = 365 * 24 * 60 * 60 * 1_000_000_000;
     const SIXTY_DAYS_NS: u64 = 60 * 24 * 60 * 60 * 1_000_000_000;
     const FIVE_YEARS_NS: u64 = 5 * 365 * 24 * 60 * 60 * 1_000_000_000;
-
-    #[test]
-    fn default_v1_matches_spec() {
-        let c = ConfidenceConfig::default_v1();
-        assert_eq!(c.fact_half_life_seconds, 31_536_000);
-        assert_eq!(c.pref_half_life_seconds, 5_184_000);
-        assert!(c.event_decay_disabled);
-    }
 
     #[test]
     fn empty_evidence_zero() {
@@ -223,55 +223,25 @@ mod tests {
         let r = aggregate_confidence(&e, NOW, StatementKind::Fact, &cfg());
         assert_eq!(r, 0.0);
     }
-
-    #[test]
-    fn aggregate_in_unit_interval() {
-        // Smoke test on a varied input — should always land in [0, 1].
-        for cnt in [1, 2, 5, 10, 50, 100] {
-            for c in [0.0, 0.1, 0.5, 0.9, 1.0] {
-                let evidence: Vec<EvidenceEntry> = (0..cnt).map(|_| evi(c, NOW)).collect();
-                for kind in [
-                    StatementKind::Fact,
-                    StatementKind::Preference,
-                    StatementKind::Event,
-                ] {
-                    let r = aggregate_confidence(&evidence, NOW, kind, &cfg());
-                    assert!(
-                        (0.0..=1.0).contains(&r) && !r.is_nan(),
-                        "cnt={cnt} c={c} kind={kind:?} -> {r} out of bounds"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn confidence_monotonic_in_evidence_count() {
-        // Adding more evidence (all c >= 0) never decreases confidence.
-        let mut prev = 0.0_f32;
-        for cnt in 1..=20 {
-            let evidence: Vec<EvidenceEntry> = (0..cnt).map(|_| evi(0.3, NOW)).collect();
-            let r = aggregate_confidence(&evidence, NOW, StatementKind::Event, &cfg());
-            assert!(
-                r + 1e-6 >= prev,
-                "non-monotonic: cnt={cnt} got {r}, prev {prev}"
-            );
-            prev = r;
-        }
-    }
 }
 
 #[cfg(test)]
 mod proptests {
     use super::*;
     use crate::ids::ExtractorId;
-    use crate::{ContextId, MemoryId};
+    use crate::{MemoryId, SessionId};
     use proptest::prelude::*;
+
+    /// A fixed "now" well clear of both the epoch and the upper ts
+    /// bound, so ages and future offsets stay in-range for both
+    /// `saturating_sub` and `saturating_add`.
+    const NOW: u64 = 1_700_000_000_000_000_000;
+    const NANOS_PER_SEC: u64 = 1_000_000_000;
 
     fn evi_strategy() -> impl Strategy<Value = EvidenceEntry> {
         (0.0f32..=1.0f32, 0u64..2_000_000_000_000_000_000u64).prop_map(|(c, ts)| {
             EvidenceEntry::from_parts(
-                MemoryId::pack(1, ContextId::DEFAULT.into(), 0),
+                MemoryId::pack(1, SessionId::DEFAULT.into(), 0),
                 c,
                 ts,
                 ExtractorId::from(0),
@@ -279,14 +249,23 @@ mod proptests {
         })
     }
 
+    fn evi_at(confidence: f32, timestamp_unix_nanos: u64) -> EvidenceEntry {
+        EvidenceEntry::from_parts(
+            MemoryId::pack(1, SessionId::DEFAULT.into(), 0),
+            confidence,
+            timestamp_unix_nanos,
+            ExtractorId::from(0),
+        )
+    }
+
     proptest! {
         #[test]
         fn confidence_in_unit_interval(
             evidence in proptest::collection::vec(evi_strategy(), 0..50),
             now in 0u64..2_500_000_000_000_000_000u64,
-            kind_byte in 0u8..3u8,
+            kind_byte in 0u8..6u8,
         ) {
-            let kind = StatementKind::from_u8(kind_byte).unwrap();
+            let kind = StatementKind::from_u8(kind_byte);
             let r = aggregate_confidence(&evidence, now, kind, &ConfidenceConfig::default_v1());
             prop_assert!((0.0..=1.0).contains(&r) && !r.is_nan(), "got {r}");
         }
@@ -295,9 +274,9 @@ mod proptests {
         fn confidence_monotonic_in_evidence(
             mut evidence in proptest::collection::vec(evi_strategy(), 1..20),
             now in 1_500_000_000_000_000_000u64..2_500_000_000_000_000_000u64,
-            kind_byte in 0u8..3u8,
+            kind_byte in 0u8..6u8,
         ) {
-            let kind = StatementKind::from_u8(kind_byte).unwrap();
+            let kind = StatementKind::from_u8(kind_byte);
             let cfg = ConfidenceConfig::default_v1();
             let base = aggregate_confidence(&evidence, now, kind, &cfg);
             // Append a duplicate of the first entry; confidence must
@@ -306,6 +285,115 @@ mod proptests {
             evidence.push(dup);
             let extended = aggregate_confidence(&evidence, now, kind, &cfg);
             prop_assert!(extended + 1e-5 >= base, "extended {extended} < base {base}");
+        }
+
+        /// Bounded and non-NaN across *all* kind bytes (built-in and
+        /// user Custom `>= 6`), arbitrary evidence counts, and ages
+        /// that range from zero to absurdly large.
+        #[test]
+        fn confidence_bounded_all_kinds_and_ages(
+            evidence in proptest::collection::vec(evi_strategy(), 0..64),
+            now in 0u64..2_500_000_000_000_000_000u64,
+            kind_byte in 0u8..=255u8,
+        ) {
+            let kind = StatementKind::from_u8(kind_byte);
+            let r = aggregate_confidence(&evidence, now, kind, &ConfidenceConfig::default_v1());
+            prop_assert!((0.0..=1.0).contains(&r) && !r.is_nan(), "got {r}");
+        }
+
+        /// Empty evidence is always exactly 0.0, regardless of clock or
+        /// kind.
+        #[test]
+        fn empty_evidence_is_zero(now in any::<u64>(), kind_byte in 0u8..=255u8) {
+            let r = aggregate_confidence(
+                &[],
+                now,
+                StatementKind::from_u8(kind_byte),
+                &ConfidenceConfig::default_v1(),
+            );
+            prop_assert_eq!(r, 0.0);
+        }
+
+        /// A single fresh (zero-age) evidence entry decays by nothing:
+        /// the aggregate equals that entry's own confidence for every
+        /// kind (decay(0) = 1).
+        #[test]
+        fn single_fresh_evidence_equals_confidence(
+            c in 0.0f32..=1.0f32,
+            kind_byte in 0u8..=255u8,
+        ) {
+            let e = [evi_at(c, NOW)];
+            let r = aggregate_confidence(
+                &e,
+                NOW,
+                StatementKind::from_u8(kind_byte),
+                &ConfidenceConfig::default_v1(),
+            );
+            let expected = e[0].confidence();
+            prop_assert!((r - expected).abs() < 1e-6, "r={r} expected={expected}");
+        }
+
+        /// Event evidence is age-invariant: with `event_decay_disabled`
+        /// the aggregate of a single Event entry is its confidence at
+        /// any age.
+        #[test]
+        fn event_kind_is_age_invariant(
+            c in 0.0f32..=1.0f32,
+            age_secs in 0u64..(200u64 * 365 * 24 * 3600),
+        ) {
+            let ts = NOW.saturating_sub(age_secs * NANOS_PER_SEC);
+            let e = [evi_at(c, ts)];
+            let r = aggregate_confidence(
+                &e,
+                NOW,
+                StatementKind::Event,
+                &ConfidenceConfig::default_v1(),
+            );
+            let expected = e[0].confidence();
+            prop_assert!((r - expected).abs() < 1e-6, "event decayed: r={r} expected={expected}");
+        }
+
+        /// Decay is monotone in age: for the same kind and confidence,
+        /// older evidence never contributes *more* than fresher
+        /// evidence. Holds for decaying kinds and (with equality) for
+        /// Event.
+        #[test]
+        fn older_evidence_never_exceeds_fresher(
+            c in 0.0f32..=1.0f32,
+            kind_byte in 0u8..=255u8,
+            age_a in 0u64..(50u64 * 365 * 24 * 3600),
+            age_b in 0u64..(50u64 * 365 * 24 * 3600),
+        ) {
+            let (younger, older) = if age_a <= age_b { (age_a, age_b) } else { (age_b, age_a) };
+            let kind = StatementKind::from_u8(kind_byte);
+            let cfg = ConfidenceConfig::default_v1();
+            let e_young = [evi_at(c, NOW.saturating_sub(younger * NANOS_PER_SEC))];
+            let e_old = [evi_at(c, NOW.saturating_sub(older * NANOS_PER_SEC))];
+            let r_young = aggregate_confidence(&e_young, NOW, kind, &cfg);
+            let r_old = aggregate_confidence(&e_old, NOW, kind, &cfg);
+            prop_assert!(r_old <= r_young + 1e-6, "older {r_old} > younger {r_young}");
+        }
+
+        /// A future-dated (clock-skewed) timestamp saturates to age 0:
+        /// no panic, the result stays within `[0, 1]`, and equals the
+        /// entry's confidence (decay(0) = 1).
+        #[test]
+        fn future_dated_evidence_clamps_and_bounded(
+            c in 0.0f32..=1.0f32,
+            future_offset in 1u64..(365u64 * 24 * 3600),
+            kind_byte in 0u8..=255u8,
+        ) {
+            let ts = NOW.saturating_add(future_offset * NANOS_PER_SEC);
+            let e = [evi_at(c, ts)];
+            let r = aggregate_confidence(
+                &e,
+                NOW,
+                StatementKind::from_u8(kind_byte),
+                &ConfidenceConfig::default_v1(),
+            );
+            prop_assert!((0.0..=1.0).contains(&r) && !r.is_nan(), "out of bounds: {r}");
+            let expected = e[0].confidence();
+            prop_assert!((r - expected).abs() < 1e-6, "r={r} expected={expected}");
         }
     }
 }

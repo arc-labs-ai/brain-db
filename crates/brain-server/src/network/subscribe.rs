@@ -1,6 +1,6 @@
-//! Connection-layer SUBSCRIBE infrastructure (sub-task 9.11).
+//! Connection-layer SUBSCRIBE infrastructure.
 //!
-//! Implements the audit §8.1 topology:
+//! Implements this topology:
 //!
 //! ```text
 //!   Shard 0 Glommio                  Connection layer Tokio
@@ -9,7 +9,7 @@
 //!   │       │             │ flume    │   per_shard_bus: Vec<broadcast>│
 //!   │       ▼             │ bounded  │       ▲                        │
 //!   │ EventBus (broadcast)├─►        │       │  bridge_task (×shards) │
-//!   │ → fanout_task (9.11)│          │       │  drains flume → bcast  │
+//!   │ → fanout_task       │          │       │  drains flume → bcast  │
 //!   └─────────────────────┘          │                                │
 //!                                     │ SubscriptionRegistry (per-conn)│
 //!                                     │   HashMap<StreamId, State>     │
@@ -31,15 +31,12 @@
 //!   watch + a final-LSN counter.
 //! - **per-subscription task**: spawned on SUBSCRIBE_REQ. Drains
 //!   broadcast receivers (one per relevant shard — typically the
-//!   agent's bound shard) and pushes filtered events to the per-conn
+//!   space's bound shard) and pushes filtered events to the per-conn
 //!   outgoing-frame queue.
-//!
-//! (SUBSCRIBE / UNSUBSCRIBE), §03/09 §3.3 (open-
-//! ended streams), §09/09 (SUBSCRIBE semantics).
 
 #![cfg(target_os = "linux")]
 // `num_shards` + `active_count` are diagnostic / test-only surfaces;
-// production code paths don't call them yet (9.13 admin endpoints
+// production code paths don't call them yet (admin endpoints
 // will). Avoid churning the surface for now.
 #![allow(dead_code)]
 
@@ -104,13 +101,15 @@ impl SubscriptionMetrics {
 
 use brain_core::{MemoryId, ShardId};
 use brain_ops::{parse_filter, EventEnvelope, ParsedFilter};
-use brain_protocol::error::ErrorCode;
 use brain_protocol::codec::opcode::Opcode;
-use brain_protocol::envelope::request::{CancelStreamRequest, SubscribeRequest, UnsubscribeRequest};
+use brain_protocol::envelope::request::{
+    CancelStreamRequest, SubscribeRequest, UnsubscribeRequest,
+};
 use brain_protocol::envelope::response::{
     CancelStreamAck, ErrorCategoryWire, ErrorCodeWire, ErrorResponse, ResponseBody,
     SubscriptionEvent, UnsubscribeResponse,
 };
+use brain_protocol::error::ErrorCode;
 use brain_protocol::Frame;
 use parking_lot::Mutex;
 use tokio::sync::{broadcast, watch};
@@ -274,9 +273,14 @@ async fn bridge_task(
 
 pub struct SubscriptionRegistry {
     hub: ShardEventHub,
-    inner: Mutex<RegistryInner>,
+    inner: Arc<Mutex<RegistryInner>>,
     next_stream_id: AtomicU32,
     metrics: SubscriptionMetrics,
+    /// Per-connection cap on concurrently-active subscriptions — the
+    /// advertised `max_concurrent_streams`. Over the cap, `start` returns
+    /// `StreamLimitExceeded` rather than registering an unbounded number of
+    /// per-subscription tasks + broadcast receivers on one connection.
+    max_streams: usize,
 }
 
 struct RegistryInner {
@@ -288,21 +292,54 @@ struct SubscriptionState {
     cancel: watch::Sender<bool>,
 }
 
+/// RAII slot reclaimer for a per-connection subscription entry.
+///
+/// Held by the per-subscription task; its `Drop` removes the
+/// `stream_id` entry from `RegistryInner::streams` when the task
+/// returns by *any* path — natural end, broadcast `Closed`, lag
+/// `Overloaded`, WAL-replay error, or client disconnect. Without it,
+/// only the explicit `cancel()` path frees the slot, so a churning
+/// connection would leak entries until it hit `StreamLimitExceeded`
+/// with zero live subscriptions.
+///
+/// The reference is a [`Weak`] so a task that outlives its
+/// (per-connection) registry does not resurrect the freed map: if the
+/// registry is gone, the whole `streams` map is gone and the drop is a
+/// no-op. Removing an already-absent key (the `cancel()` raced ahead)
+/// is likewise a harmless no-op.
+struct StreamSlotGuard {
+    inner: std::sync::Weak<Mutex<RegistryInner>>,
+    stream_id: u32,
+}
+
+impl Drop for StreamSlotGuard {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.upgrade() {
+            inner.lock().streams.remove(&self.stream_id);
+        }
+    }
+}
+
 impl SubscriptionRegistry {
-    pub fn new(hub: ShardEventHub) -> Self {
-        Self::with_metrics(hub, SubscriptionMetrics::default())
+    pub fn new(hub: ShardEventHub, max_streams: usize) -> Self {
+        Self::with_metrics(hub, SubscriptionMetrics::default(), max_streams)
     }
 
     /// Construct with an externally-owned `SubscriptionMetrics` so
     /// the admin exposition path can read the same counters the
     /// registry bumps from `start` / `run_subscription_task`.
-    pub fn with_metrics(hub: ShardEventHub, metrics: SubscriptionMetrics) -> Self {
+    pub fn with_metrics(
+        hub: ShardEventHub,
+        metrics: SubscriptionMetrics,
+        max_streams: usize,
+    ) -> Self {
         Self {
             hub,
-            inner: Mutex::new(RegistryInner {
+            inner: Arc::new(Mutex::new(RegistryInner {
                 streams: HashMap::new(),
-            }),
+            })),
             next_stream_id: AtomicU32::new(0),
+            max_streams: max_streams.max(1),
             metrics,
         }
     }
@@ -317,8 +354,8 @@ impl SubscriptionRegistry {
     /// shard's broadcast Receiver, filters events, and pushes
     /// SUBSCRIPTION_EVENT frames to `frame_tx`.
     ///
-    /// Returns the stream id the client should observe events on. For
-    /// 9.11 we use the client's request `stream_id` directly (so the
+    /// Returns the stream id the client should observe events on. We
+    /// use the client's request `stream_id` directly (so the
     /// returned id == `client_stream_id`); future per-listener stream
     /// allocation may reuse the internal `next_stream_id`.
     pub fn start(
@@ -327,10 +364,27 @@ impl SubscriptionRegistry {
         target_shard: ShardId,
         req: &SubscribeRequest,
         frame_tx: flume::Sender<crate::connection::OutgoingFrame>,
+        similarity_reference: Option<[f32; brain_embed::VECTOR_DIM]>,
     ) -> Result<u32, OpError> {
-        let filter = parse_filter(req).map_err(OpError::Ops)?;
+        let mut filter = parse_filter(req).map_err(OpError::Ops)?;
+        // Inject the reference vector resolved by the caller
+        // (`handle_subscribe_start`) via the one-time shard round-trip.
+        // The threshold was already validated by `parse_filter`. A
+        // similarity filter with no resolved reference cannot match
+        // meaningfully, so treat it as a hard rejection rather than a
+        // silent all-pass.
+        if let Some(sim) = req.filter.similar_to {
+            match similarity_reference {
+                Some(reference) => filter.set_similarity_reference(reference, sim.threshold),
+                None => {
+                    return Err(OpError::Ops(brain_ops::OpError::InvalidRequest(
+                        "subscribe: similar_to reference vector was not resolved".into(),
+                    )))
+                }
+            }
+        }
         // Subscribe live FIRST, then replay the WAL — this is the
-        // cutover discipline from plan §"Subscribe replay path":
+        // cutover discipline:
         // taking the broadcast Receiver before we read the WAL
         // guarantees no event in `[from_lsn, current_tail)` slips
         // through the gap between "WAL tail snapshot" and "live
@@ -341,9 +395,24 @@ impl SubscriptionRegistry {
             .subscribe_shard(target_shard)
             .ok_or(OpError::ShardOutOfRange(target_shard))?;
 
+        // `from_lsn` is the precise resume mechanism ("continue from
+        // where I left off"); `include_history` is the coarse "replay
+        // the history still retained, then go live" flag. An explicit
+        // `from_lsn` always wins; when the client only asked for
+        // `include_history` (no `from_lsn`), replay everything still in
+        // the WAL by anchoring at LSN 0 — the retained-history-then-live
+        // cutover the WAL-tail semantic already implements. Without this
+        // mapping `include_history` would be silently ignored.
+        let effective_from_lsn = req.from_lsn.or({
+            if req.include_history {
+                Some(0)
+            } else {
+                None
+            }
+        });
         // Optional replay info — `None` when the client subscribed
         // to the live tail only.
-        let replay = if let Some(from_lsn) = req.from_lsn {
+        let replay = if let Some(from_lsn) = effective_from_lsn {
             let locator = self
                 .hub
                 .wal_locator(target_shard)
@@ -354,7 +423,7 @@ impl SubscriptionRegistry {
             // task has started streaming.
             //
             // `from_lsn == 0` means "everything still in the WAL" —
-            // not an error per plan §"Locked decisions".
+            // not an error.
             let reader =
                 brain_storage::wal::reader::WalReader::open(&locator.dir, locator.shard_uuid)
                     .map_err(|e| OpError::WalOpen(format!("{e}")))?;
@@ -375,6 +444,9 @@ impl SubscriptionRegistry {
             if inner.streams.contains_key(&client_stream_id) {
                 return Err(OpError::StreamIdInUse);
             }
+            if inner.streams.len() >= self.max_streams {
+                return Err(OpError::StreamLimitExceeded);
+            }
             inner.streams.insert(
                 client_stream_id,
                 SubscriptionState {
@@ -393,7 +465,15 @@ impl SubscriptionRegistry {
         let frame_tx_for_task = frame_tx;
         let metrics_for_task = self.metrics.clone();
         let replay_semaphore = self.hub.replay_semaphore();
+        // Free the registry slot on EVERY task exit, not just explicit
+        // cancel(). The guard is moved into the task and drops when
+        // `run_subscription_task` returns by any path.
+        let slot_guard = StreamSlotGuard {
+            inner: Arc::downgrade(&self.inner),
+            stream_id,
+        };
         tokio::spawn(async move {
+            let _slot_guard = slot_guard;
             run_subscription_task(
                 stream_id,
                 target_shard,
@@ -436,6 +516,8 @@ pub enum OpError {
     LsnTooOld { oldest: u64 },
     #[error("subscribe: stream_id already in use")]
     StreamIdInUse,
+    #[error("subscribe: per-connection concurrent stream limit reached")]
+    StreamLimitExceeded,
     #[error("subscribe: target shard {0} out of range")]
     ShardOutOfRange(u16),
     #[error("subscribe: WAL open: {0}")]
@@ -454,6 +536,7 @@ impl OpError {
                 ),
             ),
             Self::StreamIdInUse => (ErrorCode::StreamIdInUse, self.to_string()),
+            Self::StreamLimitExceeded => (ErrorCode::StreamLimitExceeded, self.to_string()),
             Self::ShardOutOfRange(_) => (ErrorCode::ShardUnavailable, self.to_string()),
             Self::WalOpen(_) => (ErrorCode::Internal, self.to_string()),
             Self::Ops(e) => (ErrorCode::InvalidArgument, format!("subscribe filter: {e}")),
@@ -580,7 +663,7 @@ async fn run_subscription_task(
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         // Slow subscriber — drop the subscription with
-                        // an ERROR(Overloaded).4 / audit §8.1.
+                        // an ERROR(Overloaded).
                         metrics.record_lag(skipped);
                         warn!(stream_id, target_shard, skipped, "subscription lagged");
                         let f = error_frame(
@@ -681,13 +764,13 @@ fn empty_subscription_event_frame(stream_id: u32, last_lsn: u64) -> Frame {
     let payload = ResponseBody::SubscribeEvent(SubscriptionEvent {
         event_type: brain_protocol::envelope::response::EventType::Forgotten,
         memory_id: MemoryId::NULL.raw(),
-        context_id: 0,
+        session_id: 0,
         text: String::new(),
         kind: brain_protocol::envelope::request::MemoryKindWire::Episodic,
         salience: 0.0,
         timestamp_unix_nanos: 0,
         lsn: last_lsn,
-        knowledge_payload: None,
+        graph_payload: None,
         edge_payload: None,
         stage_kind: None,
         stage_outcome: None,
@@ -749,4 +832,167 @@ pub fn build_cancel_stream_ack_frame(
         request_stream_id,
         body.encode(),
     )
+}
+
+#[cfg(test)]
+mod slot_reclaim_tests {
+    use super::*;
+    use brain_core::{MemoryKind, SessionId, SpaceId};
+    use brain_protocol::envelope::response::EventType;
+    use std::time::Duration;
+
+    /// A hub with one broadcast bus and no real shard behind it. The
+    /// caller keeps the returned `Sender` to publish synthetic events
+    /// onto the single shard's channel.
+    fn test_hub() -> (ShardEventHub, broadcast::Sender<EventEnvelope>) {
+        let (tx, _keep) = broadcast::channel::<EventEnvelope>(16);
+        let hub = ShardEventHub {
+            per_shard_bus: Arc::new(vec![tx.clone()]),
+            wal_locators: Arc::new(vec![WalLocator {
+                dir: std::path::PathBuf::from("/nonexistent"),
+                shard_uuid: [0u8; 16],
+            }]),
+            broadcast_capacity: 16,
+            replay_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        };
+        (hub, tx)
+    }
+
+    /// An all-pass live-tail subscribe request (no filter, no replay).
+    fn all_pass_request() -> SubscribeRequest {
+        SubscribeRequest {
+            filter: brain_protocol::envelope::request::SubscriptionFilter {
+                session_filter: None,
+                kinds: None,
+                similar_to: None,
+                spaces: None,
+                memory_ids: None,
+            },
+            include_history: false,
+            from_lsn: None,
+            max_inflight: 0,
+            act_as: None,
+        }
+    }
+
+    fn synthetic_event(lsn: u64) -> EventEnvelope {
+        EventEnvelope {
+            lsn,
+            event_type: EventType::Encoded,
+            memory_id: MemoryId::from(1u128),
+            session_id: SessionId::default(),
+            kind: MemoryKind::Episodic,
+            salience: 0.5,
+            timestamp_unix_nanos: 0,
+            text: None,
+            graph_payload: None,
+            edge_payload: None,
+            stage_kind: None,
+            stage_outcome: None,
+            stage_payload: None,
+            space_id: SpaceId::default(),
+            vector: None,
+        }
+    }
+
+    async fn wait_for_count(registry: &SubscriptionRegistry, want: usize) {
+        for _ in 0..200 {
+            if registry.active_count() == want {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!(
+            "active_count never reached {want}; stuck at {}",
+            registry.active_count()
+        );
+    }
+
+    /// A subscription that exits *naturally* (client gone — the
+    /// outgoing frame channel's receiver is dropped, so the task's
+    /// frame send fails and it returns) must free its registry slot.
+    /// Before the RAII guard, only `cancel()` freed the slot, so this
+    /// path leaked one of `max_concurrent_streams` forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn natural_exit_frees_slot() {
+        let (hub, event_tx) = test_hub();
+        let registry = SubscriptionRegistry::new(hub, 4);
+
+        let (frame_tx, frame_rx) = flume::bounded(16);
+        // Model a disconnected client: nothing will ever read frames,
+        // and the sender sees the channel as closed.
+        drop(frame_rx);
+
+        let req = all_pass_request();
+        registry
+            .start(1, 0, &req, frame_tx, None)
+            .expect("start ok");
+        // Entry is registered synchronously on `start`.
+        assert_eq!(registry.active_count(), 1);
+
+        // Publish an event; the task wakes, tries to forward it, the
+        // send fails (receiver gone), the task returns, and the guard
+        // reclaims the slot.
+        event_tx.send(synthetic_event(1)).expect("broadcast send");
+
+        wait_for_count(&registry, 0).await;
+        assert_eq!(registry.active_count(), 0);
+    }
+
+    /// After a natural exit reclaims the slot, the same `stream_id`
+    /// can be reused for a fresh subscription — proof the entry is
+    /// truly gone and not merely dead-but-present (which would trip
+    /// `StreamIdInUse`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stream_id_reusable_after_natural_exit() {
+        let (hub, event_tx) = test_hub();
+        let registry = SubscriptionRegistry::new(hub, 4);
+
+        let (frame_tx, frame_rx) = flume::bounded(16);
+        drop(frame_rx);
+        registry
+            .start(7, 0, &all_pass_request(), frame_tx, None)
+            .expect("first start ok");
+        event_tx.send(synthetic_event(1)).expect("broadcast send");
+        wait_for_count(&registry, 0).await;
+
+        // Same stream_id, fresh live receiver — must not be
+        // StreamIdInUse.
+        let (frame_tx2, _frame_rx2) = flume::bounded(16);
+        registry
+            .start(7, 0, &all_pass_request(), frame_tx2, None)
+            .expect("reuse of freed stream_id must succeed");
+        assert_eq!(registry.active_count(), 1);
+        // Clean shutdown of the live subscription.
+        assert!(registry.cancel(7).is_some());
+    }
+
+    /// Churn `max_streams` subscriptions to natural exit, one at a
+    /// time, then confirm a fresh subscribe still succeeds. Before the
+    /// fix, leaked entries would exhaust the per-connection cap and
+    /// this final subscribe would fail with `StreamLimitExceeded`
+    /// despite zero live subscriptions.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn churn_does_not_exhaust_cap() {
+        let (hub, event_tx) = test_hub();
+        let max = 3;
+        let registry = SubscriptionRegistry::new(hub, max);
+
+        for id in 0..(max as u32 * 3) {
+            let (frame_tx, frame_rx) = flume::bounded(16);
+            drop(frame_rx);
+            registry
+                .start(id, 0, &all_pass_request(), frame_tx, None)
+                .expect("start within reclaimed cap");
+            event_tx.send(synthetic_event(1)).expect("broadcast send");
+            wait_for_count(&registry, 0).await;
+        }
+
+        // Cap is fully reclaimed: a live subscription still fits.
+        let (frame_tx, _frame_rx) = flume::bounded(16);
+        registry
+            .start(999, 0, &all_pass_request(), frame_tx, None)
+            .expect("fresh subscribe after churn must succeed");
+        assert_eq!(registry.active_count(), 1);
+    }
 }

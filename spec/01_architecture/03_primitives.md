@@ -77,7 +77,7 @@ The agent asks for memories relevant to a cue.
 
 1. Embeds the cue text.
 2. Asks the planner which strategy to use:
-   - **Hybrid** (default) — ANN + lexical + memory-edge graph fused via RRF.
+   - **Retrieval** (default) — ANN + lexical + memory-edge graph fused via RRF.
    - **Schemaless** — fast vector-only similarity.
 3. Executes the strategy.
 4. Filters by context, age, kind, and other criteria.
@@ -89,7 +89,7 @@ The agent asks for memories relevant to a cue.
 
 The planner's strategy choice is invisible to the client. The agent says "recall things similar to this cue"; Brain decides which path to run. This is the SQL-like abstraction: declarative query, the planner picks the algorithm.
 
-For RECALL specifically there are exactly two paths and one selection rule: a request carrying a `txn_id` runs Brain path so read-your-writes works against the per-txn buffer overlay; every other request runs the hybrid path (semantic + lexical + memory-edge graph, fused via RRF). The selection is server-side; no wire field controls it.
+For RECALL specifically there are exactly two paths and one selection rule: a request carrying a `txn_id` runs Brain path so read-your-writes works against the per-txn buffer overlay; every other request runs the retrieval path (semantic + lexical + memory-edge graph, fused via RRF). The selection is server-side; no wire field controls it.
 
 ### 2.3 Confidence calibration
 
@@ -101,7 +101,7 @@ The `min_confidence` parameter filters results below the threshold. Default: 0.0
 
 `RECALL` is streamed: results arrive one frame at a time, sharing a stream_id, with the last frame marked end-of-stream. This lets clients start processing top results before the full top-k is computed.
 
-For small `top_k` (≤ 10), Brain may emit all results in a single frame. The client SDK presents both cases with the same async-iterator interface.
+For small `top_k` (≤ 10), Brain may emit all results in a single frame. Clients present both cases with the same async-iterator interface.
 
 ### 2.5 Latency
 
@@ -192,7 +192,27 @@ Each inference step includes a claim, supporting memories, contradicting memorie
 
 - Causal explanation ("why did X happen?").
 - Evidence accumulation ("what supports / contradicts this claim?").
-- Analogical inference (limited; via vector algebra on bound concepts).
+- Analogical inference — live: an automatic internal re-rank nudge on the
+  evidence-accumulation walk's results, not a separate client-facing
+  pattern or request flag. For each evidence item that survives the
+  confidence-floor cut, Brain bridges the item's memory to the statement it
+  was extracted into (subject/predicate/object, via the same
+  memory→statement lookup RECALL's graph enrichment already uses) and runs
+  the VSA `analogy_query` against the observation's own triple to score
+  structural fit — an "Alice works_at Acme" / "Bob works_at ?" shaped pair
+  gets a boost; a different predicate stays neutral. The result multiplies
+  the item's score by a factor bounded to `[0.8, 1.2]` (±20%). Because this
+  runs strictly after the confidence-floor cut, analogical fit can only
+  re-rank evidence that's already included — it can never by itself move an
+  item across the confidence-floor inclusion boundary. Items with no
+  resolvable triple get the neutral factor `1.0`. The wire value
+  `InferenceKind::AnalogicalInference` is emitted only when the nudge
+  materially reshapes a step's aggregate confidence versus its
+  evidence-only baseline; otherwise the step is tagged
+  `EvidenceAccumulation` as before. See
+  [12. Query Optimizer](../12_query_optimizer/06_vsa_algebra.md) §5–6 for
+  the algebra and [05. Operations](../05_operations/00_purpose.md) §REASON
+  for the full scoring pipeline.
 
 Future iterations expand the operator set. Brain's architecture supports arbitrary inference DAGs; v1 limits the patterns to what we can confidently calibrate.
 
@@ -279,6 +299,7 @@ The agent registers interest in events matching a filter; Brain pushes notificat
 - **Reactive agents** — wake up when relevant new information arrives.
 - **Cross-session continuity** — when one session of an agent encodes new memories, another session is notified.
 - **Audit / observability** — external systems can tail the memory stream for compliance or analysis.
+- **Write-pipeline progress** — pairing `ENCODE`'s `wait: ack` mode (§1.4) with a memory-id-scoped subscription to watch one write's asynchronous derivation complete live. See [05. Operations](../05_operations/02_write_pipeline.md) §17e.
 
 ### 7.2 Filters
 
@@ -287,6 +308,7 @@ A subscription's filter can specify:
 - Contexts to include.
 - Memory kinds (Episodic / Semantic / Consolidated).
 - Similarity threshold to a reference memory.
+- Specific memory ids to include — the narrowest dimension, useful for watching a single write's derivation (see §7.1).
 
 Multiple subscriptions per connection are allowed; each has its own stream_id.
 

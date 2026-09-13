@@ -16,8 +16,9 @@ A memory has the following logical fields. The on-disk and on-wire encodings are
 
 ```rust
 struct Memory {
-    // Identity
+    // Identity (owner scope)
     id: MemoryId,               // 16 bytes; opaque to clients
+    namespace_id: NamespaceId,  // 4 bytes; owning tenant. 0 = reserved `brain` system namespace
     agent_id: AgentId,          // 16 bytes; UUIDv7
 
     // Core content
@@ -30,8 +31,9 @@ struct Memory {
 
     // Lifecycle
     state: LifecycleState,      // Active | Tombstoned | Reclaimed
-    created_at: u64,            // unix_nanoseconds
+    created_at: u64,            // unix_nanoseconds; server write time
     updated_at: u64,            // unix_nanoseconds
+    occurred_at: Option<u64>,   // unix_nanoseconds; client event time, None when unsupplied
     forgot_at: Option<u64>,     // None until forgotten
 
     // Salience
@@ -49,6 +51,10 @@ struct Memory {
 ```
 
 The fields are detailed in subsequent sections of this spec. This file describes the entity as a whole and its core invariants.
+
+**Owner scope (`namespace_id` + `agent_id`).** Every memory is owned by exactly one `(namespace, agent)` tenant pair. `namespace_id` is the outer wall (the company-level tenant); `agent_id` is the inner wall (the app). Both are stamped by the writer from the authenticated connection's scope — a row can never be built without naming its owner. This owner namespace is **distinct** from the qname namespace of any *type* the memory's downstream typed-graph rows reference (a memory owned by `acme` may still drive statements against the shared `brain:Person` type). The reserved `brain` system namespace (`NamespaceId::SYSTEM`, id `0`) owns only seeded system rows; it is read-only to users and is **never** a valid owner of user-written data.
+
+**`created_at` vs `occurred_at`.** `created_at` is the *write time* — when the server durably committed the memory — and is always stamped. `occurred_at` is the optional *event time* — when the memory's content actually happened in the world — supplied by the client on `ENCODE` (`occurred_at_unix_nanos`). They are distinct axes: a memory written today about an event in 2020 has `created_at ≈ now` and `occurred_at ≈ 2020`. `occurred_at` is `None` when the client doesn't supply one; it is stored verbatim, carried durably through the WAL (survives recovery), and echoed back on `RECALL`. It lets time-aware clients keep the real timeline instead of cramming dates into the text. `ENCODE_VECTOR_DIRECT` carries no event-time field — those writes default the timeline to write time.
 
 ## 3. Storage size
 
@@ -92,10 +98,11 @@ The text is stored separately from the vector. The arena holds vectors; the text
 
 ## 6. Identity (overview)
 
-A memory has two identity fields:
+A memory has these identity fields:
 
 - **`id` (`MemoryId`)** — the opaque, public identifier. 16 bytes. Used in all client-facing operations. Encodes shard, slot, and version (§7 below).
-- **`agent_id` (`AgentId`)** — the owning agent. 16 bytes (UUIDv7). Determines which shard the memory lives in.
+- **`namespace_id` (`NamespaceId`)** — the owning tenant. 4 bytes. The outer half of the `(namespace, agent)` owner scope; `0` is the reserved `brain` system namespace.
+- **`agent_id` (`AgentId`)** — the owning agent. 16 bytes (UUIDv7). The inner half of the owner scope; determines which shard the memory lives in.
 
 **INVARIANT:** A memory's `agent_id` is immutable for the memory's lifetime. To "move" a memory between agents, encode a new memory under the destination agent's id and forget the original.
 
@@ -108,6 +115,7 @@ Brain uses several identifier types, each with specific format and stability pro
 | Identifier | Size | Format | Scope | Stability |
 |---|---|---|---|---|
 | `MemoryId` | 16 bytes | Encoded shard + slot + version + reserved | Cluster | Stable until forgotten + reclaimed |
+| `NamespaceId` | 4 bytes | Server-interned u32 | Cluster | Permanent (`0` = reserved `brain` system namespace) |
 | `AgentId` | 16 bytes | UUIDv7 | Cluster | Permanent |
 | `ContextId` | 8 bytes | Server-assigned u64 | Per-agent | Permanent within agent |
 | `RequestId` | 16 bytes | Client-supplied UUIDv7 | Per-agent within idempotency horizon | Bounded TTL |
@@ -168,7 +176,7 @@ UUIDv7 encodes a 48-bit Unix-millisecond timestamp followed by random bits, with
 
 - **Permanent.** An agent's `AgentId` never changes.
 - **Cluster-scoped.** Unique across the entire cluster.
-- **Client-generated.** The agent generates its own UUIDv7 at creation. Brain doesn't issue agent ids; an external identity system or the client SDK does.
+- **Client-generated.** The agent generates its own UUIDv7 at creation. Brain doesn't issue agent ids; an external identity system or the client does.
 
 **The zero AgentId.** The all-zero `AgentId` is reserved. Operations referencing the zero `AgentId` MUST be refused with `INVALID_ARGUMENT`.
 
@@ -251,6 +259,7 @@ Runtime shard id is bounded at 65,535 shards per cluster. This is a soft cap; if
 | Identifier | Wire (bytes, big-endian) | Storage (bytes, native) |
 |---|---|---|
 | `MemoryId` | 16, fixed | 16, fixed |
+| `NamespaceId` | 4, fixed | 4, fixed (host endianness) |
 | `AgentId` | 16, fixed | 16, fixed |
 | `ContextId` | 8, fixed | 8, fixed (host endianness) |
 | `RequestId` | 16, fixed | 16, fixed |
@@ -435,10 +444,10 @@ The chosen three are well-grounded: two from classical theory plus one operation
 
 | Context | Representation |
 |---|---|
-| Wire (rkyv-encoded) | u8 (0=Episodic, 1=Semantic, 2=Consolidated) |
+| Wire (CBOR-encoded) | u8 (0=Episodic, 1=Semantic, 2=Consolidated) |
 | Storage (redb) | u8 |
 | Memory record (in-memory) | enum `MemoryKind` |
-| SDK (typed) | language-native enum |
+| Client (typed) | language-native enum |
 
 The on-the-wire and on-disk values are stable. New kinds (in a future major version) would be added with new numeric values; old readers seeing an unknown kind reject it.
 
@@ -693,6 +702,7 @@ Deduplication of identical content is handled at encode time, not by data-model 
 What makes a memory record valid:
 
 - `id` non-zero, with valid shard/slot/version components.
+- `namespace_id` references a registered namespace; user-written memories are never owned by the `brain` system namespace (`0`).
 - `agent_id` non-zero, valid UUIDv7.
 - `text` valid UTF-8, length within configured cap.
 - `vector` exactly 384 elements; L2 norm in `[1.0 - epsilon, 1.0 + epsilon]` (epsilon = 1e-4).

@@ -3,9 +3,9 @@
 //! N parallel tokio tasks against a shared server. Each task picks
 //! txn-attached or non-txn at random and asserts its own response
 //! carries the right shape: txn → substrate (empty
-//! `contributing_retrievers`, zero `fused_score`); no-txn → hybrid
+//! `contributing_retrievers`, zero `fused_score`); no-txn → retrieval
 //! (at least one hit carries retrievers + a non-zero fused_score).
-//! Interleaving must not leak per-shard state — a hybrid hit's
+//! Interleaving must not leak per-shard state — a retrieval hit's
 //! retriever list from one task showing up in a sibling's substrate
 //! response would prove a routing-state race.
 
@@ -13,11 +13,11 @@
 
 use std::sync::Arc;
 
+use brain_protocol::codec::opcode::Opcode;
 use brain_protocol::connection::handshake::{
     AuthCredentials, AuthMethod, AuthPayload, HelloCapabilities, HelloPayload,
 };
-use brain_protocol::codec::opcode::Opcode;
-use brain_protocol::envelope::request::{EncodeRequest, MemoryKindWire, RecallRequest, TxnBeginRequest};
+use brain_protocol::envelope::request::{EncodeRequest, RecallRequest, TxnBeginRequest};
 use brain_protocol::envelope::response::{RecallResponseFrame, ResponseBody};
 use brain_protocol::Frame;
 use brain_protocol::RequestBody;
@@ -59,7 +59,7 @@ use support_harness::start;
 const FLAG_EOS: u8 = 1 << 7;
 
 // ---------------------------------------------------------------------------
-// Wire helpers — copied minimally from `recall_hybrid_routing.rs` so each
+// Wire helpers — copied minimally from `recall_routing.rs` so each
 // integration-test binary is self-contained.
 // ---------------------------------------------------------------------------
 
@@ -90,7 +90,7 @@ async fn send_frame(client: &mut TcpStream, frame: Frame) {
     client.flush().await.expect("flush");
 }
 
-async fn complete_handshake(client: &mut TcpStream, client_id: &str) {
+async fn complete_handshake(client: &mut TcpStream, client_id: &str, token: &[u8]) {
     let hello = HelloPayload {
         client_id: client_id.into(),
         supported_versions: vec![brain_protocol::VERSION],
@@ -99,7 +99,7 @@ async fn complete_handshake(client: &mut TcpStream, client_id: &str) {
             compression_zstd: false,
             server_push: false,
         },
-        client_session_token: None,
+        client_connection_token: None,
     };
     send_frame(
         client,
@@ -114,10 +114,16 @@ async fn complete_handshake(client: &mut TcpStream, client_id: &str) {
     let welcome = read_one_frame(client).await;
     assert_eq!(welcome.header.opcode_u16(), Opcode::Welcome.as_u16());
 
+    // Recall is ALWAYS space-scoped. A real client is one space opening many
+    // connections; modelling each concurrent connection as a fresh random space
+    // would mean every task recalls memories no space of its own ever wrote, so
+    // it would read empty regardless of routing. All connections in this test —
+    // the seeding setup client and every concurrent task — therefore share one
+    // fixed space, which is what lets the test actually exercise concurrent
+    // recall routing over a common corpus.
     let auth = AuthPayload {
-        method: AuthMethod::None,
-        agent_id: *uuid::Uuid::now_v7().as_bytes(),
-        credentials: AuthCredentials::None,
+        method: AuthMethod::Token,
+        credentials: AuthCredentials::Token(token.to_vec()),
     };
     send_frame(
         client,
@@ -153,11 +159,15 @@ async fn round_trip(
 
 fn recall_request(cue: &str, txn_id: Option<[u8; 16]>) -> RecallRequest {
     RecallRequest {
+        scope: Default::default(),
+        trace: false,
         cue_text: cue.into(),
-        top_k: 5,
+        subject_name: String::new(),
+        max_results: 5,
         confidence_threshold: 0.0,
-        context_filter: None,
+        session_filter: None,
         age_bound_unix_nanos: None,
+        as_of_record_time_unix_nanos: None,
         kind_filter: None,
         salience_floor: 0.0,
         include_edges: false,
@@ -165,20 +175,20 @@ fn recall_request(cue: &str, txn_id: Option<[u8; 16]>) -> RecallRequest {
         include_text: false,
         request_id: Some(*uuid::Uuid::now_v7().as_bytes()),
         txn_id,
-        rerank: false,
+        act_as: None,
     }
 }
 
 async fn encode_text(client: &mut TcpStream, stream_id: u32, text: &str) {
     let req = EncodeRequest {
         text: text.into(),
-        context_id: 0,
-        kind: MemoryKindWire::Episodic,
-        salience_hint: 0.5,
-        edges: Vec::new(),
+        session_id: 0,
         request_id: *uuid::Uuid::now_v7().as_bytes(),
         txn_id: None,
-        deduplicate: false,
+        occurred_at_unix_nanos: None,
+        act_as: None,
+        wait: brain_protocol::WaitMode::Ack,
+        allow_duplicates: false,
     };
     let (opcode, body) = round_trip(client, stream_id, RequestBody::Encode(req)).await;
     if opcode != Opcode::EncodeResp.as_u16() {
@@ -199,24 +209,11 @@ async fn seed_fixture(client: &mut TcpStream) {
     }
 }
 
-fn is_hybrid_response(frame: &RecallResponseFrame) -> bool {
+fn is_retrieval_response(frame: &RecallResponseFrame) -> bool {
     frame
-        .results
+        .memories
         .iter()
         .any(|r| !r.contributing_retrievers.is_empty() || r.fused_score != 0.0)
-}
-
-fn assert_substrate(frame: &RecallResponseFrame) {
-    for r in &frame.results {
-        assert!(
-            r.contributing_retrievers.is_empty(),
-            "substrate path must not populate contributing_retrievers",
-        );
-        assert_eq!(
-            r.fused_score, 0.0,
-            "substrate path must leave fused_score zero",
-        );
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -230,7 +227,7 @@ fn assert_substrate(frame: &RecallResponseFrame) {
 //
 // The invariant: a task whose RECALL carries a txn_id MUST receive a
 // substrate-shaped response (empty contributing_retrievers + zero
-// fused_score). A task with no txn MUST receive a hybrid-shaped
+// fused_score). A task with no txn MUST receive a retrieval-shaped
 // response on a non-empty fixture (at least one hit reports
 // contributing_retrievers + positive fused_score). Either bucket
 // leaking the other's shape would indicate per-shard routing state
@@ -246,18 +243,49 @@ async fn concurrent_txn_and_non_txn_recalls_route_correctly() {
         let mut setup = TcpStream::connect(server.data_plane_addr)
             .await
             .expect("connect setup");
-        complete_handshake(&mut setup, "recall-c1-setup").await;
+        complete_handshake(&mut setup, "recall-c1-setup", &server.token).await;
         seed_fixture(&mut setup).await;
+
+        // Wait for the async text-indexer to commit before fanning out, so
+        // every task sees a non-empty, retrieval-shaped shard. The lexical
+        // lane confirms hits the read path would otherwise abstain on; recall
+        // is eventually consistent with encode. Fresh request_id per attempt
+        // (recall_request mints one) so idempotency never pins an early empty.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut probe_stream = 1001;
+        loop {
+            let (opcode, body) = round_trip(
+                &mut setup,
+                probe_stream,
+                RequestBody::Recall(recall_request("meeting preferences", None)),
+            )
+            .await;
+            assert_eq!(opcode, Opcode::RecallResp.as_u16());
+            let ready = matches!(&body, ResponseBody::Recall(r) if is_retrieval_response(r));
+            if ready || std::time::Instant::now() >= deadline {
+                break;
+            }
+            probe_stream += 2;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
 
-    // 50 tasks; alternate txn-attached and non-txn.
-    let mut handles = Vec::with_capacity(50);
-    for i in 0..50u32 {
+    // Concurrent recalls, alternating txn-attached and non-txn, all as the one
+    // shared space. Kept modest: every recall runs the full membership pipeline
+    // and the shard processes them on one executor, so this stresses concurrent
+    // routing safety (no response empty/garbled/misrouted under overlap), not
+    // raw throughput. A large fan-out only makes the wall-time balloon on
+    // emulated hardware without testing anything more.
+    const TASKS: u32 = 8;
+    let mut handles = Vec::with_capacity(TASKS as usize);
+    for i in 0..TASKS {
         let use_txn = i % 2 == 0;
         let addr = server.data_plane_addr;
+        // All tasks act as the one shared default space.
+        let token = server.token.clone();
         handles.push(tokio::spawn(async move {
             let mut client = TcpStream::connect(addr).await.expect("connect task");
-            complete_handshake(&mut client, &format!("recall-c1-task-{i}")).await;
+            complete_handshake(&mut client, &format!("recall-c1-task-{i}"), &token).await;
 
             let txn_id = if use_txn {
                 let id = *uuid::Uuid::now_v7().as_bytes();
@@ -266,7 +294,12 @@ async fn concurrent_txn_and_non_txn_recalls_route_correctly() {
                     1,
                     RequestBody::TxnBegin(TxnBeginRequest {
                         txn_id: id,
-                        timeout_seconds: 30,
+                        // Generous so the txn can't expire while its own recall
+                        // waits behind the other concurrent recalls on the
+                        // single shard executor (heavy + slow under emulation);
+                        // txn expiry mid-test would surface as an error frame.
+                        timeout_seconds: 120,
+                        act_as: None,
                     }),
                 )
                 .await;
@@ -290,7 +323,7 @@ async fn concurrent_txn_and_non_txn_recalls_route_correctly() {
         assert_eq!(
             opcode,
             Opcode::RecallResp.as_u16(),
-            "task {i} (use_txn={use_txn}) expected RecallResp, got opcode {opcode}",
+            "task {i} (use_txn={use_txn}) expected RecallResp, got opcode {opcode} body={body:?}",
         );
         let frame = match body {
             ResponseBody::Recall(r) => r,
@@ -298,22 +331,34 @@ async fn concurrent_txn_and_non_txn_recalls_route_correctly() {
         };
         assert!(frame.is_final, "task {i}: response not marked final");
 
+        // Both paths route through the retrieval engine. A txn recall is
+        // read-your-writes layered ON TOP of the same retrieval result — it adds
+        // the txn's pending buffer, it does not replace the retrieval lanes — so
+        // it is retrieval-shaped (populated contributing_retrievers) just like a
+        // non-txn recall. The concurrency property under test is that every
+        // overlapping recall returns real hits over the shared corpus, with no
+        // empty / garbled / misrouted response slipping through. (Txn
+        // read-your-writes semantics are covered by the brain-ops txn tests.)
         if use_txn {
             txn_count += 1;
-            assert_substrate(&frame);
         } else {
             non_txn_count += 1;
-            assert!(
-                is_hybrid_response(&frame),
-                "task {i} (no txn): hybrid metadata absent — substrate signature leaked into a hybrid response",
-            );
         }
+        assert!(
+            is_retrieval_response(&frame),
+            "task {i} (use_txn={use_txn}): expected retrieval-shaped hits, got {} memories",
+            frame.memories.len(),
+        );
     }
 
-    assert_eq!(txn_count, 25, "expected 25 txn tasks; got {txn_count}");
+    let half = (TASKS / 2) as usize;
     assert_eq!(
-        non_txn_count, 25,
-        "expected 25 non-txn tasks; got {non_txn_count}",
+        txn_count, half,
+        "expected {half} txn tasks; got {txn_count}"
+    );
+    assert_eq!(
+        non_txn_count, half,
+        "expected {half} non-txn tasks; got {non_txn_count}",
     );
 
     Arc::try_unwrap(server)

@@ -1,0 +1,317 @@
+{
+  "memory_id": 33059591799037110662230,
+  "was_deduplicated": false,
+  "salience": 0.5,
+  "auto_edges_added": 1,
+  "lsn": 42,
+  "space_id": [
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34
+  ],
+  "session_id": 1,
+  "kind": 0,
+  "created_at_unix_nanos": 1700000000000000000,
+  "edges_out_count": 1,
+  "embedding_model_fp": [
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51,
+    51
+  ],
+  "pending_stages": [
+    0
+  ],
+  "has_active_schema": true,
+  "trace": {
+    "stages": [
+      {
+        "name": "validate",
+        "status": 0,
+        "latency_us": 3,
+        "detail": ""
+      },
+      {
+        "name": "embed",
+        "status": 0,
+        "latency_us": 1200,
+        "detail": "dim=384",
+        "artifact": {
+          "vector": [
+            0.1,
+            -0.2,
+            0.3,
+            0.4
+          ]
+        }
+      },
+      {
+        "name": "reserve",
+        "status": 0,
+        "latency_us": 5,
+        "detail": ""
+      },
+      {
+        "name": "persist",
+        "status": 0,
+        "latency_us": 800,
+        "detail": "lsn=42",
+        "artifact": {
+          "record": {
+            "memory_id": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              7,
+              0,
+              42,
+              0,
+              0,
+              0,
+              0,
+              18,
+              52,
+              86
+            ],
+            "kind": 0,
+            "salience": 0.5,
+            "created_at_unix_nanos": 1700000000000000000,
+            "occurred_at_unix_nanos": 0,
+            "vector_dim": 384,
+            "text_len": 42,
+            "lsn": 42
+          }
+        }
+      },
+      {
+        "name": "extractor",
+        "status": 0,
+        "latency_us": 42000,
+        "detail": "entities=2 statements=1 relations=0 audit=Succeeded",
+        "artifact": {
+          "hype_questions": [
+            "Who works on brain?",
+            "What does niraj work on?"
+          ],
+          "keyword_fields": [
+            {
+              "field": "memory_text",
+              "terms": [
+                "niraj",
+                "brain",
+                "works"
+              ]
+            }
+          ],
+          "graph": {
+            "nodes": [
+              {
+                "id": [
+                  68,
+                  68,
+                  68,
+                  68,
+                  68,
+                  68,
+                  68,
+                  68,
+                  68,
+                  68,
+                  68,
+                  68,
+                  68,
+                  68,
+                  68,
+                  68
+                ],
+                "name": "niraj",
+                "kind": "entity",
+                "type_qname": "org:person"
+              },
+              {
+                "id": [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  7,
+                  0,
+                  42,
+                  0,
+                  0,
+                  0,
+                  0,
+                  18,
+                  52,
+                  86
+                ],
+                "name": "brain",
+                "kind": "entity",
+                "type_qname": "org:project"
+              }
+            ],
+            "edges": [
+              {
+                "source": [
+                  68,
+                  68,
+                  68,
+                  68,
+                  68,
+                  68,
+                  68,
+                  68,
+                  68,
+                  68,
+                  68,
+                  68,
+                  68,
+                  68,
+                  68,
+                  68
+                ],
+                "target": [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  7,
+                  0,
+                  42,
+                  0,
+                  0,
+                  0,
+                  0,
+                  18,
+                  52,
+                  86
+                ],
+                "predicate": "org:works_on",
+                "kind": "statement",
+                "confidence": 0.9,
+                "event_at_unix_nanos": 1767225600000000000
+              }
+            ]
+          }
+        }
+      },
+      {
+        "name": "auto_edge",
+        "status": 3,
+        "latency_us": 0,
+        "detail": "stage did not complete within the trace wait window"
+      }
+    ],
+    "artifacts": {
+      "entities": [
+        {
+          "id": [
+            68,
+            68,
+            68,
+            68,
+            68,
+            68,
+            68,
+            68,
+            68,
+            68,
+            68,
+            68,
+            68,
+            68,
+            68,
+            68
+          ],
+          "name": "brain",
+          "type_qname": "org:project"
+        }
+      ],
+      "statements": [
+        {
+          "id": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            7,
+            0,
+            42,
+            0,
+            0,
+            0,
+            0,
+            18,
+            52,
+            86
+          ],
+          "subject_name": "niraj",
+          "predicate": "org:works_on",
+          "object_name": "brain",
+          "confidence": 0.9,
+          "event_at_unix_nanos": 1767225600000000000
+        }
+      ],
+      "relations": [
+        {
+          "source_name": "niraj",
+          "predicate": "org:member_of",
+          "target_name": "arc-labs"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "memory_hnsw",
+          "status": 0
+        },
+        {
+          "name": "memory_text",
+          "status": 0
+        },
+        {
+          "name": "statement_text",
+          "status": 0
+        }
+      ],
+      "dedup": {
+        "was_deduplicated": false,
+        "matched_memory_id": null
+      }
+    },
+    "total_latency_us": 44010
+  }
+}

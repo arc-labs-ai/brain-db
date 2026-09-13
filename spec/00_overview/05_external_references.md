@@ -37,7 +37,7 @@ This file collects external sources (academic papers, RFC documents, library doc
 
 ## Wire format
 
-- **rkyv** — Zero-copy archived serialization. https://github.com/rkyv/rkyv
+- **rkyv** — Zero-copy archived serialization (internal on-disk storage). https://github.com/rkyv/rkyv
 - **bytemuck** — Plain-old-data type casts for raw vector payloads. https://github.com/Lokathor/bytemuck
 - **RFC 2119** — Key words for use in requirements (MUST / SHOULD / MAY).
 
@@ -50,7 +50,7 @@ This file collects external sources (academic papers, RFC documents, library doc
 - **CockroachDB** — Range-based sharding with Raft replication. https://github.com/cockroachdb/cockroach/blob/master/docs/design.md
 - **FoundationDB** — Decoupled-role transactional KV store. https://apple.github.io/foundationdb/architecture.html
 - **TigerBeetle** — Static allocation, deterministic execution, VOPR-style simulation testing. https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/ARCHITECTURE.md
-- **arc-labs Recall** — The sibling memory-layer project; Postgres + pgvector backed. https://github.com/arc-labs/recall
+- **arc-labs Recall** — The sibling memory-layer project; Postgres + pgvector backed. https://github.com/arc-labs-ai/recall
 
 ## Memory-system field background
 

@@ -18,7 +18,7 @@ use super::transient;
 
 impl MetadataDb {
     pub(super) fn apply_link(
-        &mut self,
+        &self,
         lsn: u64,
         timestamp_ns: u64,
         p: &LinkPayload,
@@ -54,7 +54,7 @@ impl MetadataDb {
     }
 
     pub(super) fn apply_unlink(
-        &mut self,
+        &self,
         lsn: u64,
         _timestamp_ns: u64,
         p: &UnlinkPayload,

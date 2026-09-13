@@ -1,8 +1,8 @@
-//! Integration tests for sub-task 9.14 — graceful shutdown.
+//! Integration tests for graceful shutdown.
 //!
 //! Process-state-mutating SIGINT/SIGTERM tests are intentionally
 //! out of scope (signal delivery is hostile to parallel test
-//! execution; see plan §4). Cover the meaningful drain logic
+//! execution). Cover the meaningful drain logic
 //! instead.
 
 #![cfg(target_os = "linux")]

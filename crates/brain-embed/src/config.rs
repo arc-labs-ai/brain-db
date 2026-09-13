@@ -1,14 +1,13 @@
 //! Configuration for the embedding layer.
 //!
-//! See `spec/07_embedding/01_model_choice.md` §7 (`model_path`
-//! as the operator-control surface) and `spec/07_embedding/03_inference.md`
-//! §5 (FP32 default; FP16/INT8 deferred).
+//! `model_path` is the operator-control surface; FP32 is the default
+//! (FP16/INT8 deferred).
 
 use std::path::PathBuf;
 
 use candle_core::{DType, Device};
 
-/// Knobs for [`crate::ModelHandle`]. Future sub-tasks (cache, batcher)
+/// Knobs for [`crate::ModelHandle`]. Future additions (cache, batcher)
 /// will extend with their own fields without forcing a re-spelling of
 /// the model-load surface.
 ///
@@ -24,8 +23,7 @@ pub struct EmbedderConfig {
     pub model_path: PathBuf,
 
     /// Inference device. v1: `Device::Cpu`. `Device::Cuda(_)` is
-    /// reserved for future Phase 5.x / Phase 11+ work and rejected
-    /// at load.
+    /// reserved for future work and rejected at load.
     pub device: Device,
 
     /// Inference dtype. v1: `DType::F32`. FP16 / INT8 deferred per

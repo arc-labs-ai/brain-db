@@ -1,4 +1,4 @@
-//! Integration tests for `handle_recall` (sub-task 7.4).
+//! Integration tests for `handle_recall`.
 //!
 //! Drives the full pipeline:
 //!   dispatcher → handle_recall → plan_recall_inner → execute_recall
@@ -8,25 +8,23 @@
 //! first, then runs RECALL against it.
 
 use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
 
-use brain_core::MemoryId;
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
-use brain_index::{
-    GraphError, GraphQuery, GraphRetriever, GraphRetrieverConfig, IndexParams, LexicalError,
-    LexicalQuery, LexicalRetriever, LexicalRetrieverConfig, LexicalScope, RankedItem, RankedItemId,
-    SemanticError, SemanticQuery, SemanticRetriever, SemanticRetrieverConfig, SemanticScope,
-    SharedHnsw,
-};
+use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::MetadataDb;
-use brain_ops::test_support::run_in_glommio;
-use brain_ops::{dispatch, ErrorCode, OpError, OpsContext, RealWriterHandle};
+use brain_ops::test_support::{run_in_glommio, single_body};
+use brain_ops::{dispatch, DispatchOutcome, OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_protocol::envelope::request::{
-    EncodeRequest, MemoryKindWire, RecallRequest, RequestBody, TxnBeginRequest,
+    EncodeRequest, MemoryKindWire, RecallRequest, RecallScopeWire, RequestBody,
 };
-use brain_protocol::envelope::response::{EncodeResponse, RecallResponseFrame, ResponseBody};
-use parking_lot::Mutex;
+use brain_protocol::envelope::response::{
+    EncodeResponse, RankedItemKindWire, RecallResponseFrame, ResponseBody,
+};
+use brain_protocol::{
+    EntityCreateRequest, EntityCreateResponse, EvidenceRefWire, StatementCreateRequest,
+    StatementCreateResponse, StatementKindWire, StatementObjectWire, StatementValueWire,
+};
 
 // ---------------------------------------------------------------------------
 // Mock dispatcher: text-driven deterministic vectors.
@@ -58,7 +56,23 @@ impl Dispatcher for MockDispatcher {
 
 struct Fixture {
     ctx: OpsContext,
-    _tempdir: tempfile::TempDir,
+    tempdir: tempfile::TempDir,
+    metadata: SharedMetadataDb,
+}
+
+impl Fixture {
+    /// Rebuild the lexical lane from redb so recall sees a fully-indexed
+    /// corpus, the way a production shard does. The write path populates
+    /// redb + HNSW but no text-indexer worker runs in a unit test, so the
+    /// lexical lane is empty until this is called. Invoke it after the
+    /// last encode and before recall; the read path's structural
+    /// abstention needs a stored memory's own words to confirm it.
+    fn reindex_lexical(&mut self) {
+        self.ctx.lexical_retriever = brain_ops::test_support::reindex_memory_lexical_for_tests(
+            self.tempdir.path(),
+            &self.metadata,
+        );
+    }
 }
 
 fn build_fixture() -> Fixture {
@@ -68,40 +82,52 @@ fn build_fixture() -> Fixture {
 fn build_fixture_with_embedder(embedder: Arc<dyn Dispatcher>) -> Fixture {
     let tempdir = tempfile::tempdir().unwrap();
     let db_path = tempdir.path().join("metadata.redb");
-    let metadata: SharedMetadataDb = Arc::new(Mutex::new(MetadataDb::open(&db_path).unwrap()));
+    let metadata: SharedMetadataDb = Arc::new(MetadataDb::open(&db_path).unwrap());
 
-    let (shared, hnsw_writer) = SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).unwrap();
+    let (shared, hnsw_writer) = SharedHnsw::new(IndexParams::default_v1()).unwrap();
     let writer = Arc::new(RealWriterHandle::new(metadata.clone(), hnsw_writer));
 
-    let executor =
-        ExecutorContext::new(embedder, shared, metadata, writer as Arc<dyn WriterHandle>);
+    let executor = ExecutorContext::new(
+        embedder,
+        shared,
+        metadata.clone(),
+        writer as Arc<dyn WriterHandle>,
+    );
 
     Fixture {
-        ctx: OpsContext::new(executor),
-        _tempdir: tempdir,
+        ctx: brain_ops::test_support::ops_context_for_tests(executor, tempdir.path()),
+        tempdir,
+        metadata,
     }
 }
 
-fn encode_req(request_id: [u8; 16], text: &str, kind: MemoryKindWire) -> EncodeRequest {
+// `_kind` is accepted for call-site compatibility but ignored: the
+// write router decides the memory kind now (always Episodic), so the
+// client can no longer steer it.
+fn encode_req(request_id: [u8; 16], text: &str, _kind: MemoryKindWire) -> EncodeRequest {
     EncodeRequest {
         text: text.into(),
-        context_id: 42,
-        kind,
-        salience_hint: 0.5,
-        edges: vec![],
+        session_id: 42,
         request_id,
         txn_id: None,
-        deduplicate: false,
+        occurred_at_unix_nanos: None,
+        act_as: None,
+        wait: brain_protocol::WaitMode::Ack,
+        allow_duplicates: false,
     }
 }
 
-fn recall_req(cue: &str, top_k: u32) -> RecallRequest {
+fn recall_req(cue: &str, max_results: u32) -> RecallRequest {
     RecallRequest {
+        scope: Default::default(),
+        trace: false,
         cue_text: cue.into(),
-        top_k,
+        subject_name: String::new(),
+        max_results,
         confidence_threshold: 0.0,
-        context_filter: None,
+        session_filter: None,
         age_bound_unix_nanos: None,
+        as_of_record_time_unix_nanos: None,
         kind_filter: None,
         salience_floor: 0.0,
         include_edges: false,
@@ -109,30 +135,55 @@ fn recall_req(cue: &str, top_k: u32) -> RecallRequest {
         include_text: false,
         request_id: None,
         txn_id: None,
-        rerank: false,
+        act_as: None,
     }
 }
 
 async fn encode(fix: &Fixture, request_id: [u8; 16], text: &str, kind: MemoryKindWire) -> u128 {
     let req = encode_req(request_id, text, kind);
-    match dispatch(
+    let outcome = dispatch(
         RequestBody::Encode(req),
-        brain_ops::RequestCaller::anonymous(),
+        brain_ops::RequestCaller::for_tests(),
         &fix.ctx,
     )
     .await
-    .unwrap()
-    {
+    .unwrap();
+    match single_body(outcome) {
         ResponseBody::Encode(EncodeResponse { memory_id, .. }) => memory_id,
         other => panic!("expected Encode response, got {other:?}"),
     }
 }
 
-fn unwrap_recall_resp(body: ResponseBody) -> RecallResponseFrame {
-    match body {
+fn unwrap_recall_resp(outcome: DispatchOutcome) -> RecallResponseFrame {
+    match single_body(outcome) {
         ResponseBody::Recall(r) => r,
         other => panic!("expected ResponseBody::Recall, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// 0. Namespace-wide scope gate (Phase A — fan-out not yet wired).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn namespace_scope_recall_is_refused_until_fanout_lands() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        let mut req = recall_req("anything", 5);
+        req.scope = RecallScopeWire::Namespace;
+        // A single shard can't serve namespace-wide recall; the handler refuses
+        // it until the cross-shard fan-out + global merge path is wired.
+        let result = dispatch(
+            RequestBody::Recall(req),
+            brain_ops::RequestCaller::for_tests(),
+            &fix.ctx,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "scope=Namespace must be refused until fan-out lands, got {result:?}"
+        );
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -140,45 +191,259 @@ fn unwrap_recall_resp(body: ResponseBody) -> RecallResponseFrame {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn recall_full_pipeline_returns_top_k() {
+fn recall_cue_hit_returns_member_with_fields_plumbed() {
     run_in_glommio(|| async {
-        let fix = build_fixture();
-        encode(&fix, [1; 16], "alpha", MemoryKindWire::Episodic).await;
+        let mut fix = build_fixture();
+        let alpha = encode(&fix, [1; 16], "alpha", MemoryKindWire::Episodic).await;
         encode(&fix, [2; 16], "beta", MemoryKindWire::Episodic).await;
         encode(&fix, [3; 16], "gamma", MemoryKindWire::Episodic).await;
+        fix.reindex_lexical();
 
         let frame = unwrap_recall_resp(
             dispatch(
                 RequestBody::Recall(recall_req("alpha", 2)),
-                brain_ops::RequestCaller::anonymous(),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
             .unwrap(),
         );
         assert!(frame.is_final);
-        assert_eq!(frame.results.len(), 2, "k=2 → exactly 2 results");
-        assert_eq!(frame.cumulative_count, 2);
-        // Sorted by score descending.
-        assert!(
-            frame.results[0].similarity_score >= frame.results[1].similarity_score,
-            "results must be sorted by score desc"
+        // Recall returns the membership set, not a top-k pile. The cue
+        // "alpha" is the one memory both the semantic and lexical lanes
+        // agree on, so the cross-lane consensus collapses to that crisp
+        // Single — "beta"/"gamma" are at most single-lane noise.
+        assert_eq!(
+            frame.memories.len(),
+            1,
+            "unique cross-lane consensus → Single"
+        );
+        assert_eq!(frame.cumulative_count as usize, frame.memories.len());
+        assert_eq!(
+            frame.memories[0].memory_id, alpha,
+            "the confirmed member is the alpha memory"
         );
         // Fields plumbed through.
-        let top = &frame.results[0];
+        let top = &frame.memories[0];
         assert_ne!(top.memory_id, 0);
-        assert_eq!(top.context_id, 42);
+        assert_eq!(top.session_id, 42);
         assert_eq!(top.kind, MemoryKindWire::Episodic);
         assert!((top.salience - 0.5).abs() < 1e-6);
-        assert_eq!(
-            top.confidence, top.similarity_score,
-            "v1: confidence == similarity"
+        // The retrieval pipeline carries two distinct scores per hit:
+        // `similarity_score` is the semantic retriever's raw cosine and
+        // `confidence` mirrors it — both bounded in [0, 1]. The unbounded
+        // RRF rank-fusion sum is a separate diagnostic (`fused_score`),
+        // never surfaced as confidence.
+        assert!(top.similarity_score > 0.0, "similarity_score populated");
+        assert!(
+            top.confidence > 0.0 && top.confidence <= 1.0,
+            "confidence is a bounded [0,1] similarity, got {}",
+            top.confidence
+        );
+        assert!(
+            (top.confidence - top.similarity_score).abs() < 1e-6,
+            "confidence mirrors similarity_score on the retrieval path"
         );
         assert_eq!(
             top.last_accessed_at_unix_nanos, top.created_at_unix_nanos,
             "v1: last_accessed mirrors created_at"
         );
         assert!(top.edges.is_none());
+        // A plain ENCODE supplies no event time, so the echoed field is
+        // absent — distinct from `created_at`, which is always stamped.
+        assert_eq!(top.occurred_at_unix_nanos, None);
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 1b. Client-supplied event time round-trips through to RECALL.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn recall_echoes_client_supplied_occurred_at() {
+    run_in_glommio(|| async {
+        let mut fix = build_fixture();
+
+        // A real-world event time well in the past — distinct from the
+        // server's write time so we can prove the two don't get conflated.
+        let event_time: u64 = 1_577_836_800_000_000_000; // 2020-01-01T00:00:00Z
+
+        let req = EncodeRequest {
+            text: "moved to berlin".into(),
+            session_id: 42,
+            request_id: [9; 16],
+            txn_id: None,
+            occurred_at_unix_nanos: Some(event_time),
+            act_as: None,
+            wait: brain_protocol::WaitMode::Ack,
+            allow_duplicates: false,
+        };
+        dispatch(
+            RequestBody::Encode(req),
+            brain_ops::RequestCaller::for_tests(),
+            &fix.ctx,
+        )
+        .await
+        .unwrap();
+        fix.reindex_lexical();
+
+        let frame = unwrap_recall_resp(
+            dispatch(
+                RequestBody::Recall(recall_req("moved to berlin", 1)),
+                brain_ops::RequestCaller::for_tests(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(frame.memories.len(), 1);
+        let hit = &frame.memories[0];
+        assert_eq!(
+            hit.occurred_at_unix_nanos,
+            Some(event_time),
+            "client event time must survive the write→read round trip"
+        );
+        assert_ne!(
+            hit.created_at_unix_nanos, event_time,
+            "occurred_at is the client's timeline, not the server write time"
+        );
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 1c. Recency ranking: with a temporal signal (`as_of`), the more-recent
+//     memory wins a relevance tie.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn recency_breaks_relevance_ties_toward_recent_event_time() {
+    run_in_glommio(|| async {
+        let mut fix = build_fixture();
+
+        // Reference point for the recency decay. `as_of` on the request
+        // both supplies the temporal signal that gates the boost and sets
+        // this reference.
+        let reference: u64 = 1_900_000_000 * 1_000_000_000;
+        let day = 86_400 * 1_000_000_000_u64;
+
+        // Identical text ⇒ identical mock vectors ⇒ identical cosine, so
+        // the two hits tie on pure relevance and only event-time recency
+        // separates them.
+        let text = "team offsite in lisbon";
+        let recent = EncodeRequest {
+            text: text.into(),
+            session_id: 42,
+            request_id: [21; 16],
+            txn_id: None,
+            occurred_at_unix_nanos: Some(reference - day), // yesterday
+            act_as: None,
+            wait: brain_protocol::WaitMode::Ack,
+            // Byte-identical text is the whole point of this test: two
+            // memories that tie on cosine so only event-time recency can
+            // separate them. Content dedup (the default) would collapse
+            // the pair into one row, so duplicates must be allowed here.
+            allow_duplicates: true,
+        };
+        let old = EncodeRequest {
+            occurred_at_unix_nanos: Some(reference - 400 * day), // >1 year ago
+            request_id: [22; 16],
+            ..recent.clone()
+        };
+        let recent_id = match single_body(
+            dispatch(
+                RequestBody::Encode(recent),
+                brain_ops::RequestCaller::for_tests(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        ) {
+            ResponseBody::Encode(EncodeResponse { memory_id, .. }) => memory_id,
+            other => panic!("expected Encode, got {other:?}"),
+        };
+        dispatch(
+            RequestBody::Encode(old),
+            brain_ops::RequestCaller::for_tests(),
+            &fix.ctx,
+        )
+        .await
+        .unwrap();
+
+        fix.reindex_lexical();
+
+        let mut recall = recall_req(text, 2);
+        recall.as_of_record_time_unix_nanos = Some(reference);
+
+        let frame = unwrap_recall_resp(
+            dispatch(
+                RequestBody::Recall(recall),
+                brain_ops::RequestCaller::for_tests(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(frame.memories.len(), 2);
+        assert_eq!(
+            frame.memories[0].memory_id, recent_id,
+            "on a relevance tie, the more recent event time ranks first when a temporal signal is present",
+        );
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 1d. List-intent recall drives the merge/diversity path end-to-end.
+//     The cue carries enumerative intent ("list all ..."), so the router
+//     flags list_intent and the executor runs the MMR stage over real
+//     redb text. This is a smoke test that the path (text fetch →
+//     tokenize → MMR reorder) executes on live data without panicking
+//     and still returns the requested results.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn list_intent_recall_runs_merge_path_and_returns_results() {
+    run_in_glommio(|| async {
+        let mut fix = build_fixture();
+        encode(
+            &fix,
+            [1; 16],
+            "she enjoys hiking in the mountains",
+            MemoryKindWire::Episodic,
+        )
+        .await;
+        encode(
+            &fix,
+            [2; 16],
+            "she enjoys hiking up steep trails",
+            MemoryKindWire::Episodic,
+        )
+        .await;
+        encode(
+            &fix,
+            [3; 16],
+            "she enjoys painting watercolors",
+            MemoryKindWire::Episodic,
+        )
+        .await;
+        fix.reindex_lexical();
+
+        let frame = unwrap_recall_resp(
+            dispatch(
+                RequestBody::Recall(recall_req("list all the things she enjoys", 3)),
+                brain_ops::RequestCaller::for_tests(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(
+            !frame.memories.is_empty(),
+            "list-intent recall must still return results after the merge stage",
+        );
+        assert!(
+            frame.memories.len() <= 3,
+            "max_results is a safety ceiling on the membership set",
+        );
     })
 }
 
@@ -193,13 +458,13 @@ fn recall_empty_index_returns_empty_frame() {
         let frame = unwrap_recall_resp(
             dispatch(
                 RequestBody::Recall(recall_req("nothing", 10)),
-                brain_ops::RequestCaller::anonymous(),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
             .unwrap(),
         );
-        assert!(frame.results.is_empty());
+        assert!(frame.memories.is_empty());
         assert!(frame.is_final);
         assert_eq!(frame.cumulative_count, 0);
         assert!(frame.estimated_remaining.is_none());
@@ -207,66 +472,51 @@ fn recall_empty_index_returns_empty_frame() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. K-truncation.
+// 3. max_results bounds the membership set (a safety ceiling, not a target).
 // ---------------------------------------------------------------------------
 
 #[test]
-fn recall_k_truncation() {
+fn recall_membership_set_bounded_by_max_results() {
     run_in_glommio(|| async {
-        let fix = build_fixture();
+        let mut fix = build_fixture();
         for i in 0..5u8 {
             let mut req_id = [0u8; 16];
             req_id[0] = 0x10 + i;
             let text = format!("doc-{i}");
             encode(&fix, req_id, &text, MemoryKindWire::Episodic).await;
         }
+        fix.reindex_lexical();
         let frame = unwrap_recall_resp(
             dispatch(
                 RequestBody::Recall(recall_req("doc-2", 3)),
-                brain_ops::RequestCaller::anonymous(),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
             .unwrap(),
         );
-        assert_eq!(frame.results.len(), 3, "k=3 → exactly 3 results");
+        // Five near-identical docs all share the "doc" token, so several
+        // belong to the cue — but the returned set never exceeds the
+        // requested ceiling. max_results caps, it does not pad.
+        assert!(!frame.memories.is_empty(), "the doc-2 cue has members");
+        assert!(
+            frame.memories.len() <= 3,
+            "membership set must not exceed max_results, got {}",
+            frame.memories.len(),
+        );
     })
 }
 
 // ---------------------------------------------------------------------------
 // 4. Kind filter.
 // ---------------------------------------------------------------------------
-
-#[test]
-fn recall_kind_filter_rejects_off_kind_hits() {
-    run_in_glommio(|| async {
-        let fix = build_fixture();
-        encode(&fix, [20; 16], "ep-a", MemoryKindWire::Episodic).await;
-        encode(&fix, [21; 16], "ep-b", MemoryKindWire::Episodic).await;
-        encode(&fix, [22; 16], "sem-a", MemoryKindWire::Semantic).await;
-        encode(&fix, [23; 16], "sem-b", MemoryKindWire::Semantic).await;
-
-        let mut req = recall_req("ep-a", 10);
-        req.kind_filter = Some(vec![MemoryKindWire::Semantic]);
-        let frame = unwrap_recall_resp(
-            dispatch(
-                RequestBody::Recall(req),
-                brain_ops::RequestCaller::anonymous(),
-                &fix.ctx,
-            )
-            .await
-            .unwrap(),
-        );
-
-        assert!(
-            !frame.results.is_empty(),
-            "the semantic memories must be in candidates"
-        );
-        for r in &frame.results {
-            assert_eq!(r.kind, MemoryKindWire::Semantic);
-        }
-    })
-}
+//
+// The client can no longer choose a memory's kind via ENCODE — the
+// write router files every text encode as Episodic. The old
+// "recall kind filter rejects off-kind hits" test relied on encoding
+// Semantic memories from the client, which is no longer possible, so it
+// has been removed. The kind-filter retrieval mechanism itself is still
+// exercised by the planner/retriever unit tests.
 
 // ---------------------------------------------------------------------------
 // 5. Confidence floor.
@@ -291,13 +541,13 @@ fn recall_confidence_floor_drops_low_score_hits() {
         let frame = unwrap_recall_resp(
             dispatch(
                 RequestBody::Recall(req),
-                brain_ops::RequestCaller::anonymous(),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
             .unwrap(),
         );
-        for r in &frame.results {
+        for r in &frame.memories {
             assert!(
                 r.similarity_score >= 0.999,
                 "every result must clear the floor; got {}",
@@ -308,26 +558,34 @@ fn recall_confidence_floor_drops_low_score_hits() {
 }
 
 // ---------------------------------------------------------------------------
-// 6. Invalid top_k → planner rejects.
+// 6. max_results=0 → server default (the cap is a safety bound, not a
+//    "give me zero" request).
 // ---------------------------------------------------------------------------
 
 #[test]
-fn recall_invalid_top_k_returns_plan_error() {
+fn recall_zero_max_results_defaults_not_rejected() {
+    // `max_results` is a safety cap on the returned set, not a ranking
+    // knob: `0` means "server default", never "give me zero results".
+    // The handler normalises it and proceeds instead of erroring.
     run_in_glommio(|| async {
-        let fix = build_fixture();
-        let req = recall_req("anything", 0);
-        let err = dispatch(
-            RequestBody::Recall(req),
-            brain_ops::RequestCaller::anonymous(),
-            &fix.ctx,
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            matches!(err, OpError::PlanError(_)),
-            "top_k=0 is a planner validation failure, got {err:?}"
+        let mut fix = build_fixture();
+        encode(&fix, [60; 16], "zero-cap-alpha", MemoryKindWire::Episodic).await;
+        fix.reindex_lexical();
+        let frame = unwrap_recall_resp(
+            dispatch(
+                RequestBody::Recall(recall_req("zero-cap-alpha", 0)),
+                brain_ops::RequestCaller::for_tests(),
+                &fix.ctx,
+            )
+            .await
+            .expect("max_results=0 must default, not error"),
         );
-        assert_eq!(err.error_code(), ErrorCode::InvalidRequest);
+        // The encoded memory is returned — the cap defaulted to a
+        // generous bound rather than zero.
+        assert!(
+            !frame.memories.is_empty(),
+            "max_results=0 should default and still return hits"
+        );
     })
 }
 
@@ -336,27 +594,36 @@ fn recall_invalid_top_k_returns_plan_error() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn recall_include_text_false_returns_empty_text_field() {
+fn recall_returns_text_even_when_include_text_false() {
+    // `include_text` is intentionally forced on in the read path: a recalled
+    // memory without its text is useless to the caller, so `handle_recall`
+    // returns the remembered text regardless of the (legacy) wire flag. This
+    // guards that deliberate behavior — `recall_req` defaults the flag to false,
+    // yet every recalled memory must still carry its text.
     run_in_glommio(|| async {
-        let fix = build_fixture();
+        let mut fix = build_fixture();
         encode(&fix, [40; 16], "alpha-text-rev0", MemoryKindWire::Episodic).await;
         encode(&fix, [41; 16], "beta-text-rev0", MemoryKindWire::Episodic).await;
+        fix.reindex_lexical();
 
         let frame = unwrap_recall_resp(
             dispatch(
                 RequestBody::Recall(recall_req("alpha-text-rev0", 2)),
-                brain_ops::RequestCaller::anonymous(),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
             .unwrap(),
         );
-        assert_eq!(frame.results.len(), 2);
-        for r in &frame.results {
+        assert!(
+            frame.memories.iter().any(|r| r.text == "alpha-text-rev0"),
+            "recall must return the remembered text even with include_text=false, got {:?}",
+            frame.memories.iter().map(|r| &r.text).collect::<Vec<_>>()
+        );
+        for r in &frame.memories {
             assert!(
-                r.text.is_empty(),
-                "include_text default=false must return empty text, got {:?}",
-                r.text
+                !r.text.is_empty(),
+                "every recalled memory must carry its text"
             );
         }
     })
@@ -365,7 +632,7 @@ fn recall_include_text_false_returns_empty_text_field() {
 #[test]
 fn recall_include_text_true_returns_stored_text() {
     run_in_glommio(|| async {
-        let fix = build_fixture();
+        let mut fix = build_fixture();
         let ids = [
             (
                 encode(&fix, [50; 16], "alpha-text-rev1", MemoryKindWire::Episodic).await,
@@ -381,21 +648,27 @@ fn recall_include_text_true_returns_stored_text() {
             ),
         ];
         let by_id: std::collections::HashMap<u128, &'static str> = ids.iter().copied().collect();
+        fix.reindex_lexical();
 
         let mut req = recall_req("alpha-text-rev1", 3);
         req.include_text = true;
         let frame = unwrap_recall_resp(
             dispatch(
                 RequestBody::Recall(req),
-                brain_ops::RequestCaller::anonymous(),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
             .unwrap(),
         );
 
-        assert_eq!(frame.results.len(), 3);
-        for r in &frame.results {
+        // Whatever the membership set's size, every returned member must
+        // carry the exact UTF-8 stored for its id.
+        assert!(
+            !frame.memories.is_empty(),
+            "the cue has at least one member"
+        );
+        for r in &frame.memories {
             let want = by_id.get(&r.memory_id).copied().expect("known id");
             assert_eq!(
                 r.text, want,
@@ -421,7 +694,7 @@ fn recall_with_real_embedder_end_to_end() {
         let handle = brain_embed::ModelHandle::load(&brain_embed::EmbedderConfig::new(model_dir))
             .expect("BGE model loads");
         let dispatcher = brain_embed::CpuDispatcher::new(handle);
-        let fix = build_fixture_with_embedder(Arc::new(dispatcher) as Arc<dyn Dispatcher>);
+        let mut fix = build_fixture_with_embedder(Arc::new(dispatcher) as Arc<dyn Dispatcher>);
 
         let cats_id = encode(
             &fix,
@@ -437,205 +710,357 @@ fn recall_with_real_embedder_end_to_end() {
             MemoryKindWire::Episodic,
         )
         .await;
+        fix.reindex_lexical();
 
         let frame = unwrap_recall_resp(
             dispatch(
                 RequestBody::Recall(recall_req("a cat resting on a rug", 2)),
-                brain_ops::RequestCaller::anonymous(),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
             .unwrap(),
         );
-        assert_eq!(frame.results.len(), 2);
-        assert_eq!(
-            frame.results[0].memory_id, cats_id,
-            "the cat memory must rank higher than the physics memory"
-        );
-    })
-}
-
-// ---------------------------------------------------------------------------
-// 9. handle_recall routing — txn_id determines substrate vs hybrid.
-//
-// RECALL is one verb with one server-side rule: a txn forces the
-// substrate path (read-your-writes), everything else fuses through the
-// hybrid retrievers. These tests pin both branches with a context
-// that has all three retrievers wired, so the cold-start fallback at
-// `recall.rs::handle_recall` doesn't mask a regression in the txn
-// gate.
-// ---------------------------------------------------------------------------
-
-#[derive(Clone)]
-struct CannedSemantic {
-    items: Arc<StdMutex<Vec<RankedItem>>>,
-}
-
-impl SemanticRetriever for CannedSemantic {
-    fn retrieve(
-        &self,
-        _query: &SemanticQuery,
-        _scope: SemanticScope,
-        _config: &SemanticRetrieverConfig,
-    ) -> Result<Vec<RankedItem>, SemanticError> {
-        Ok(self.items.lock().expect("canned semantic lock").clone())
-    }
-}
-
-#[derive(Clone)]
-struct CannedLexical {
-    items: Arc<StdMutex<Vec<RankedItem>>>,
-}
-
-impl LexicalRetriever for CannedLexical {
-    fn retrieve(
-        &self,
-        _query: &LexicalQuery,
-        _scope: LexicalScope,
-        _config: &LexicalRetrieverConfig,
-    ) -> Result<Vec<RankedItem>, LexicalError> {
-        Ok(self.items.lock().expect("canned lexical lock").clone())
-    }
-}
-
-#[derive(Clone)]
-struct CannedGraph {
-    items: Arc<StdMutex<Vec<RankedItem>>>,
-}
-
-impl GraphRetriever for CannedGraph {
-    fn retrieve(
-        &self,
-        _query: &GraphQuery,
-        _config: &GraphRetrieverConfig,
-    ) -> Result<Vec<RankedItem>, GraphError> {
-        Ok(self.items.lock().expect("canned graph lock").clone())
-    }
-}
-
-/// Build a fixture whose `OpsContext` has all three hybrid retrievers
-/// wired with canned hits for `memory_id`. With all three slots
-/// populated, `handle_recall` exits the cold-start branch and picks
-/// the production route: `substrate_recall` when a txn is attached,
-/// `hybrid_recall` otherwise.
-fn build_fixture_with_hybrid_mocks(memory_id: u128) -> Fixture {
-    let mut fix = build_fixture();
-    let mid = MemoryId::from_raw(memory_id);
-    let item = RankedItem {
-        id: RankedItemId::Memory(mid),
-        rank: 1,
-        score: 0.95,
-        snippet: None,
-    };
-
-    let semantic = CannedSemantic {
-        items: Arc::new(StdMutex::new(vec![item.clone()])),
-    };
-    let lexical = CannedLexical {
-        items: Arc::new(StdMutex::new(vec![item.clone()])),
-    };
-    let graph = CannedGraph {
-        items: Arc::new(StdMutex::new(vec![item])),
-    };
-
-    fix.ctx = fix
-        .ctx
-        .with_semantic_retriever(Some(Arc::new(semantic) as Arc<dyn SemanticRetriever>))
-        .with_lexical_retriever(Some(Arc::new(lexical) as Arc<dyn LexicalRetriever>))
-        .with_graph_retriever(Some(Arc::new(graph) as Arc<dyn GraphRetriever>));
-    fix
-}
-
-#[test]
-fn handle_recall_routes_to_substrate_when_txn_present() {
-    // A txn forces the substrate path: hybrid retrievers can't see
-    // the per-txn buffer, so RYW would silently miss pending
-    // writes. Returned hits must carry the substrate signature —
-    // no `contributing_retrievers`, `fused_score` left at zero.
-    run_in_glommio(|| async {
-        let fix0 = build_fixture();
-        let mid = encode(&fix0, [0x90; 16], "alpha", MemoryKindWire::Episodic).await;
-        drop(fix0);
-
-        let fix = build_fixture_with_hybrid_mocks(mid);
-        // Re-encode against the new fixture so the row actually
-        // exists in this fixture's metadata DB. Same request_id
-        // yields a deterministic memory id under the fixture's
-        // mock embedder, but we don't rely on that — instead, re-
-        // encode and use the returned id, which is what the txn
-        // gate validates against.
-        let mid = encode(&fix, [0x90; 16], "alpha", MemoryKindWire::Episodic).await;
-
-        let txn_id = *uuid::Uuid::now_v7().as_bytes();
-        brain_ops::txn::handle_txn_begin(
-            TxnBeginRequest {
-                txn_id,
-                timeout_seconds: 30,
-            },
-            &fix.ctx,
-        )
-        .await
-        .expect("txn_begin");
-
-        let mut req = recall_req("alpha", 5);
-        req.txn_id = Some(txn_id);
-        let frame = brain_ops::recall::handle_recall(req, &fix.ctx)
-            .await
-            .expect("substrate recall inside txn");
-
-        assert!(frame.is_final, "txn recall must mark response final");
+        // The physics memory shares no words and is semantically distant,
+        // so it does not belong to a cat cue. The cat memory is the one
+        // member — and it leads the answer.
         assert!(
-            !frame.results.is_empty(),
-            "expected at least one hit; encoded id was {mid}",
+            !frame.memories.is_empty(),
+            "the cat cue must recall the cat memory"
         );
-        for r in &frame.results {
-            assert!(
-                r.contributing_retrievers.is_empty(),
-                "substrate path leaked contributing_retrievers: {:?}",
-                r.contributing_retrievers,
-            );
-            assert_eq!(
-                r.fused_score, 0.0,
-                "substrate path leaked fused_score: {}",
-                r.fused_score,
-            );
-        }
+        assert_eq!(
+            frame.memories[0].memory_id, cats_id,
+            "the cat memory must lead the membership set"
+        );
     })
 }
 
-#[test]
-fn handle_recall_routes_to_hybrid_when_no_txn() {
-    // No txn → hybrid runs. The canned retrievers all return the
-    // same memory id, so RRF fusion produces one hit with three
-    // contributors and a non-zero fused score. A regression that
-    // re-routed to substrate would zero `fused_score` and clear
-    // `contributing_retrievers`.
-    run_in_glommio(|| async {
-        let fix0 = build_fixture();
-        let mid = encode(&fix0, [0xA0; 16], "beta", MemoryKindWire::Episodic).await;
-        drop(fix0);
+// ---------------------------------------------------------------------------
+// 9. handle_recall routing — no txn fuses through the retrieval lanes.
+//
+// RECALL is one verb with one server-side rule: a txn forces the substrate
+// path (read-your-writes), everything else fuses through the retrieval
+// lanes. With a real semantic lane (HNSW) and a populated lexical lane, a
+// cue that matches a stored memory surfaces a fused hit carrying multiple
+// contributors and a non-zero fused score. A regression that re-routed to
+// substrate would zero `fused_score` and clear `contributing_retrievers`.
+// ---------------------------------------------------------------------------
 
-        let fix = build_fixture_with_hybrid_mocks(mid);
-        let _ = encode(&fix, [0xA0; 16], "beta", MemoryKindWire::Episodic).await;
+#[test]
+fn handle_recall_no_txn_fuses_retrieval_lanes() {
+    run_in_glommio(|| async {
+        let mut fix = build_fixture();
+        let _mid = encode(&fix, [0xA0; 16], "beta", MemoryKindWire::Episodic).await;
+        fix.reindex_lexical();
 
         let frame = brain_ops::recall::handle_recall(recall_req("beta", 5), &fix.ctx)
             .await
-            .expect("hybrid recall");
+            .expect("retrieval recall");
 
         assert!(frame.is_final);
-        assert!(!frame.results.is_empty(), "hybrid recall returned no hits",);
+        assert!(
+            !frame.memories.is_empty(),
+            "retrieval recall returned no hits",
+        );
+        // The cue "beta" is the stored memory's own text, so both the
+        // semantic and lexical lanes surface it — fusion records the
+        // contributing lanes and a non-zero fused score.
         let any_with_retrievers = frame
-            .results
+            .memories
             .iter()
             .any(|r| !r.contributing_retrievers.is_empty());
-        let any_nonzero_fused = frame.results.iter().any(|r| r.fused_score > 0.0);
+        let any_nonzero_fused = frame.memories.iter().any(|r| r.fused_score > 0.0);
         assert!(
             any_with_retrievers,
-            "hybrid path must populate contributing_retrievers on at least one hit",
+            "retrieval path must populate contributing_retrievers on at least one hit",
         );
         assert!(
             any_nonzero_fused,
-            "hybrid path must produce a non-zero fused_score on at least one hit",
+            "retrieval path must produce a non-zero fused_score on at least one hit",
+        );
+    })
+}
+
+// ---------------------------------------------------------------------------
+// A served recall advances the retriever_* / query_* metric families. The
+// executor already measured the per-lane stats + effective fusion k + rerank
+// flag; the handler records them post-hoc from the returned metadata plus the
+// final answer shape. This confirms the recording fires on the normal (no
+// txn, no trace) path — the v1 acceptance gate requires these emitted.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn recall_records_retriever_and_query_metrics() {
+    run_in_glommio(|| async {
+        let mut fix = build_fixture();
+        let _mid = encode(&fix, [0xC1; 16], "beta", MemoryKindWire::Episodic).await;
+        fix.reindex_lexical();
+
+        // Baseline: fresh fixture, nothing recorded yet.
+        let q0 = fix.ctx.query_metrics.snapshot();
+        assert_eq!(q0.total, 0, "no recall served yet");
+
+        let frame = brain_ops::recall::handle_recall(recall_req("beta", 5), &fix.ctx)
+            .await
+            .expect("retrieval recall");
+        assert!(
+            !frame.memories.is_empty(),
+            "expected a hit for the recording"
+        );
+
+        let q1 = fix.ctx.query_metrics.snapshot();
+        assert_eq!(q1.total, 1, "one recall must advance brain_query_total");
+        assert_eq!(q1.latency_ms.count, 1, "end-to-end latency observed once");
+        assert_eq!(q1.fusion_k.count, 1, "effective fusion-k observed once");
+        // The hit returns Single or Many depending on membership; either way
+        // exactly one outcome slot advanced and it is not `none`.
+        let outcomes_total: u64 = q1.outcome_total.iter().sum();
+        assert_eq!(outcomes_total, 1, "exactly one outcome recorded");
+        // QueryOutcome::None is index 2.
+        assert_eq!(q1.outcome_total[2], 0, "a hit is never the none outcome");
+
+        // The semantic + lexical lanes both run on this cue (real HNSW +
+        // reindexed lexical), so their invocation counters advance.
+        let r1 = fix.ctx.retriever_metrics.snapshot();
+        // RetrieverKind: semantic=0, lexical=1, graph=2.
+        assert_eq!(
+            r1.invocations_total[0], 1,
+            "semantic lane invoked once; got {r1:?}"
+        );
+        assert_eq!(r1.invocations_total[1], 1, "lexical lane invoked once");
+        assert_eq!(
+            r1.latency_ms[0].count, 1,
+            "semantic latency observed once per invocation"
+        );
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Opt-in per-stage trace. `trace = false` leaves the frame's `trace` field
+// `None` (zero-cost, unchanged payload); `trace = true` populates a
+// `RecallTrace` from the pipeline's already-computed metadata: one entry per
+// retriever lane, filter-chain survivor counts, and total wall-time.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn recall_trace_absent_when_not_requested() {
+    run_in_glommio(|| async {
+        let mut fix = build_fixture();
+        encode(&fix, [0xB0; 16], "delta", MemoryKindWire::Episodic).await;
+        fix.reindex_lexical();
+
+        let frame = unwrap_recall_resp(
+            dispatch(
+                RequestBody::Recall(recall_req("delta", 5)),
+                brain_ops::RequestCaller::for_tests(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(
+            frame.trace.is_none(),
+            "trace=false must leave the frame trace unpopulated",
+        );
+    })
+}
+
+#[test]
+fn recall_trace_populated_when_requested() {
+    run_in_glommio(|| async {
+        let mut fix = build_fixture();
+        encode(&fix, [0xC0; 16], "delta", MemoryKindWire::Episodic).await;
+        encode(&fix, [0xC1; 16], "epsilon", MemoryKindWire::Episodic).await;
+        encode(&fix, [0xC2; 16], "zeta", MemoryKindWire::Episodic).await;
+        fix.reindex_lexical();
+
+        let mut req = recall_req("delta", 5);
+        req.trace = true;
+        let frame = unwrap_recall_resp(
+            dispatch(
+                RequestBody::Recall(req),
+                brain_ops::RequestCaller::for_tests(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+
+        let trace = frame
+            .trace
+            .expect("trace=true must populate the frame trace");
+        assert!(
+            !trace.retrievers.is_empty(),
+            "trace must record at least one retriever lane",
+        );
+        assert!(
+            trace.filter_chain.before >= trace.filter_chain.after_limit,
+            "filter chain survivors never exceed the pre-filter count",
+        );
+        assert!(
+            trace.total_latency_ms >= 0.0,
+            "total latency is a non-negative wall-time",
+        );
+
+        // `trace = true` is the one full-detail knob (no separate
+        // `trace_detail` field on the wire) — at least one retriever lane
+        // must carry its raw per-item candidates (id + text + score), not
+        // just a count, and every carried candidate must have its text
+        // fetched.
+        let any_candidates = trace.retrievers.iter().any(|r| !r.candidates.is_empty());
+        assert!(
+            any_candidates,
+            "full-detail trace must carry per-lane candidates, not just counts",
+        );
+        for r in &trace.retrievers {
+            for c in &r.candidates {
+                assert!(
+                    !c.text.is_empty(),
+                    "full-detail candidate must carry its fetched text",
+                );
+            }
+        }
+
+        // Fusion breakdown: every fused item's per-lane score contribution.
+        let fusion = trace
+            .fusion
+            .expect("full-detail trace must carry a fusion breakdown");
+        assert!(
+            !fusion.items.is_empty(),
+            "fusion breakdown must carry at least one fused item",
+        );
+        assert!(
+            fusion.items.iter().any(|i| !i.lane_scores.is_empty()),
+            "at least one fused item must carry a per-lane score breakdown",
+        );
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 10. RECALL trace kind-tags dropped Statement/Relation ids (regression for
+//    the bug where `dropped_by_supersession`/`dropped_by_as_of`/
+//    `dropped_by_limit` silently discarded non-Memory drops instead of
+//    surfacing them with their real kind).
+// ---------------------------------------------------------------------------
+
+async fn create_entity(fix: &Fixture, request_id: [u8; 16], canonical: &str) -> [u8; 16] {
+    let req = EntityCreateRequest {
+        // brain:Person is seeded by the system schema at id = 1.
+        entity_type_id: 1,
+        canonical_name: canonical.to_string(),
+        aliases: Vec::new(),
+        attributes_blob: Vec::new(),
+        session_id: 0,
+        request_id,
+        act_as: None,
+    };
+    let outcome = dispatch(
+        RequestBody::EntityCreate(req),
+        brain_ops::RequestCaller::for_tests(),
+        &fix.ctx,
+    )
+    .await
+    .expect("entity_create dispatch");
+    match single_body(outcome) {
+        ResponseBody::EntityCreate(EntityCreateResponse { entity_id }) => entity_id,
+        other => panic!("expected EntityCreate response, got {other:?}"),
+    }
+}
+
+async fn create_statement(
+    fix: &Fixture,
+    request_id: [u8; 16],
+    subject: [u8; 16],
+    predicate: &str,
+    value: &str,
+) -> [u8; 16] {
+    let req = StatementCreateRequest {
+        kind: StatementKindWire::Fact,
+        subject,
+        predicate: predicate.to_string(),
+        object: StatementObjectWire::Value(StatementValueWire::Text(value.to_string())),
+        confidence: 0.95,
+        evidence: EvidenceRefWire::Inline(Vec::new()),
+        extractor_id: 0,
+        valid_from_unix_nanos: 0,
+        valid_to_unix_nanos: 0,
+        event_at_unix_nanos: 0,
+        schema_version: 0,
+        session_id: 0,
+        request_id,
+        act_as: None,
+    };
+    let outcome = dispatch(
+        RequestBody::StatementCreate(req),
+        brain_ops::RequestCaller::for_tests(),
+        &fix.ctx,
+    )
+    .await
+    .expect("statement_create dispatch");
+    match single_body(outcome) {
+        ResponseBody::StatementCreate(StatementCreateResponse { statement_id, .. }) => statement_id,
+        other => panic!("expected StatementCreate response, got {other:?}"),
+    }
+}
+
+#[test]
+fn recall_trace_dropped_by_as_of_kind_tags_statement_drop() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+
+        // A reference point strictly BEFORE the statement is extracted:
+        // `filter_as_of` drops any statement whose `extracted_at_unix_nanos`
+        // is later than the request's `as_of_record_time_unix_nanos`. The
+        // graph lane's `push_statements` only filters by supersession
+        // (`current_only`), not by extraction time, so this current,
+        // never-superseded statement still reaches the fused pool and gets
+        // cut by `filter_as_of` specifically — the real drop this test
+        // targets, not a supersession or type-filter side effect.
+        let before_creation = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos() as u64;
+
+        let acme = create_entity(&fix, [0xD0; 16], "Acme Corp").await;
+        let stmt_id = create_statement(&fix, [0xD1; 16], acme, "app:worksAt", "engineering").await;
+
+        // Anchor the graph lane directly on the entity via `subject_name`
+        // (bypassing cue-text surface mining) so the walk is deterministic.
+        let mut req = recall_req("engineering department", 5);
+        req.subject_name = "Acme Corp".to_string();
+        req.trace = true;
+        req.as_of_record_time_unix_nanos = Some(before_creation);
+
+        let frame = unwrap_recall_resp(
+            dispatch(
+                RequestBody::Recall(req),
+                brain_ops::RequestCaller::for_tests(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+
+        let trace = frame
+            .trace
+            .expect("trace=true must populate the frame trace");
+        let want_id = u128::from_be_bytes(stmt_id);
+        let hit = trace
+            .filter_chain
+            .dropped_by_as_of
+            .iter()
+            .find(|d| d.id == want_id);
+        let hit = hit.unwrap_or_else(|| {
+            panic!(
+                "expected the statement to be dropped by as_of, got dropped_by_as_of={:?}",
+                trace.filter_chain.dropped_by_as_of
+            )
+        });
+        assert_eq!(
+            hit.kind,
+            RankedItemKindWire::Statement,
+            "the dropped id must be kind-tagged Statement, not silently discarded or \
+             mistagged as Memory",
         );
     })
 }

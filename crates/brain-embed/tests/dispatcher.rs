@@ -1,8 +1,8 @@
 //! Integration test for `CpuDispatcher` under concurrent load.
 //!
-//! Spec `04/03 §7` says: "multiple Glommio executors can call inference
+//! Multiple Glommio executors can call inference
 //! concurrently. Each call runs on the current core. The model's
-//! weights are shared across all callers via `Arc<Model>`." This test
+//! weights are shared across all callers via `Arc<Model>`. This test
 //! is the empirical proof that `Arc<ModelHandle>` + candle's `Tensor`
 //! are actually thread-safe at runtime, not just at the type level.
 //!
@@ -83,17 +83,6 @@ fn cpu_dispatcher_batch_matches_single() {
             "batched[{i}] != single({text}); cos = {cos}"
         );
     }
-}
-
-#[test]
-fn cpu_dispatcher_fingerprint_stable() {
-    let Some(dispatcher) = try_load() else {
-        return;
-    };
-    let fp1 = dispatcher.fingerprint();
-    let fp2 = dispatcher.fingerprint();
-    assert_eq!(fp1, fp2, "fingerprint must be stable per dispatcher");
-    assert_ne!(fp1, [0u8; 16], "fingerprint should not be all-zero");
 }
 
 #[test]

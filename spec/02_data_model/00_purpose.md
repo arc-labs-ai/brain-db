@@ -7,7 +7,7 @@
 | Field | Value |
 |---|---|
 | Status | Draft |
-| Audience | Anyone who interacts with Brain at the data level — implementers, SDK authors, operators, application developers |
+| Audience | Anyone who interacts with Brain at the data level — implementers, client implementers, operators, application developers |
 | Voice | Hybrid (rationale + normative MUST/SHOULD) |
 | Depends on | [01. System Architecture](../01_architecture/00_purpose.md) |
 | Referenced by | All other specs |

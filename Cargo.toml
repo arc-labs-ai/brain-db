@@ -1,7 +1,7 @@
 # Workspace root for the Brain cognitive substrate.
 #
 # Individual crates live under crates/. Add new members both here and in
-# the relevant CLAUDE.md / ROADMAP.md sections.
+# the relevant CLAUDE.md section.
 
 [workspace]
 resolver = "2"
@@ -20,37 +20,58 @@ members = [
     "crates/brain-ops",
     "crates/brain-workers",
     "crates/brain-server",
-    "crates/brain-sdk-rust",
-    "crates/brain-cli",
-    "crates/brain-shell",
-    "crates/brain-explore",
     "crates/brain-http",
 ]
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.1.0"
 edition = "2021"
+version = "0.1.0" # x-release-please-version
 rust-version = "1.95"
 license = "Apache-2.0"
-repository = "https://github.com/brain-db-io/brain-db"
+repository = "https://github.com/arc-labs-ai/brain-db"
+# This repo ships the server (as a git tag + Docker image), not crates.io
+# packages — the SDKs live in sibling repos. Gate every member crate against an
+# accidental `cargo publish`; flip a specific crate's inherited value if one is
+# ever intended for crates.io.
+publish = false
 
 # Centralize dependency versions here. Crates inherit with `dep.workspace = true`.
 [workspace.dependencies]
 # Async / runtime
 glommio = "0.9"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "time", "sync"] }
+tokio = { version = "1", features = [
+    "net",
+    "sync",
+    "time",
+    "signal",
+    "macros",
+    "io-util",
+    "rt-multi-thread",
+] }
 # rustls 0.23 bundles `aws-lc-rs` as its default crypto provider; we
 # install it at startup. tls12 stays off — spec §03/02 §2.2 mandates
 # TLS 1.3 only; we also restrict via `ServerConfig::with_protocol_versions`.
-rustls = { version = "0.23", default-features = false, features = ["std", "logging", "aws-lc-rs"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
+rustls = { version = "0.23", default-features = false, features = [
+    "std",
+    "logging",
+    "aws-lc-rs",
+] }
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "aws-lc-rs",
+] }
 rustls-pemfile = "2"
 rcgen = "0.13"
 socket2 = { version = "0.5", features = ["all"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
 # Runtime-agnostic mpsc (used at the Tokio↔Glommio shard boundary, spec §01/04).
-flume = { version = "0.11", default-features = false, features = ["async", "select"] }
+flume = { version = "0.11", default-features = false, features = [
+    "async",
+    "select",
+] }
 futures-lite = "2"
 
 # HTTP stack (Phase 11 — brain-http). hyper handles HTTP/1.1 wire codec,
@@ -64,7 +85,11 @@ http-body-util = "0.1"
 hyper = { version = "1.5", default-features = false }
 hyper-util = { version = "0.1", default-features = false }
 # WebSocket framing + masking + close-handshake (used in M6).
-tokio-tungstenite = { version = "0.21", default-features = false, features = ["handshake", "connect", "stream"] }
+tokio-tungstenite = { version = "0.21", default-features = false, features = [
+    "stream",
+    "connect",
+    "handshake",
+] }
 # M4: Stream trait (used by sse::SseStream and body::stream). transitively
 # pulled by tokio already; declared here for hygiene.
 futures-core = "0.3"
@@ -85,6 +110,16 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 rkyv = { version = "0.7", features = ["validation"] }
 bytemuck = { version = "1", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
+serde_repr = "0.1"
+# Encodes fixed `[u8; N]` and `Vec<u8>` wire fields as CBOR byte strings
+# (major type 2) rather than serde's default integer arrays, so a
+# third-party client reading "16-byte id" from the spec produces
+# byte-identical bytes.
+serde_bytes = "0.11"
+# Portable, self-describing wire payload encoding (RFC 8949 CBOR). Pure-Rust,
+# serde-native. Replaces rkyv on the wire so any language can speak the
+# protocol from the spec alone; rkyv stays for internal on-disk storage.
+ciborium = "0.2"
 serde_json = "1"
 toml = "0.8"
 # Schema DSL parser (phase 19.3) — PEG grammar for `schema.brain`.
@@ -108,7 +143,11 @@ hnsw_rs = "0.3"
 # `stopwords` feature because §23/02 §3 binds "no stop-word
 # removal in v1" (preserves exact-ID queries like ACME-1247);
 # `mmap` + `lz4-compression` + `stemmer` are kept.
-tantivy = { version = "0.26", default-features = false, features = ["mmap", "lz4-compression", "stemmer"] }
+tantivy = { version = "0.26", default-features = false, features = [
+    "mmap",
+    "stemmer",
+    "lz4-compression",
+] }
 
 # Embeddings (pure-Rust)
 candle-core = "0.8"
@@ -140,20 +179,11 @@ smallvec = { version = "1", features = ["const_generics", "union", "serde"] }
 # Hashing / IDs
 blake3 = "1"
 crc32c = "0.6"
-uuid = { version = "1.7", features = ["v7", "serde"] }
+uuid = { version = "1.7", features = ["v5", "v7", "serde"] }
 
 # Errors
 thiserror = "1"
 anyhow = "1"
-
-# `brain-shell` CLI: clap for the argv + REPL command tree, rustyline
-# for line editing + persistent history, dirs for XDG history-file
-# discovery. Self-contained to the shell crate; no other workspace
-# member depends on these.
-clap = { version = "4", features = ["derive", "env", "wrap_help"] }
-clap_complete = "4"
-rustyline = "14"
-dirs = "5"
 
 # Syscalls (mmap/mremap/munmap/fallocate/msync/madvise — used by brain-storage).
 libc = "0.2"
@@ -190,11 +220,19 @@ tempfile = "3"
 
 [profile.dev]
 opt-level = 0
-debug = true
+# Line-tables only, not full debuginfo. `cargo test`/`nextest` link the heavy
+# integration-test binaries (e.g. brain-server's, ~250 dep rlibs) under this
+# profile; full debuginfo makes a single `ld` invocation exceed the dev
+# container's ~8 GiB ceiling and the linker is OOM-killed (signal 9), so the
+# test suite can't even build. Line tables keep panic backtraces with
+# file:line while shrinking the link enough to fit. For an interactive
+# debugging session that needs full locals, override transiently with
+# `RUSTFLAGS="-C debuginfo=2"` or bump the container's RAM.
+debug = "line-tables-only"
 
 [profile.release]
 opt-level = 3
-debug = 1          # keep symbols for profiling
+debug = 1         # keep symbols for profiling
 lto = "thin"
 codegen-units = 1
 panic = "abort"

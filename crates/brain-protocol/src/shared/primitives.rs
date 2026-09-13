@@ -4,14 +4,19 @@
 // the spec's discriminator phrasing — see request.rs for the historical note.
 #![allow(clippy::enum_variant_names)]
 
-use rkyv::{Archive, Deserialize, Serialize};
-
 use crate::envelope::request::WireMemoryId;
 
 /// — three durable kinds.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, Eq, Hash, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Eq,
+    Hash,
+    PartialEq,
+    serde_repr::Serialize_repr,
+    serde_repr::Deserialize_repr,
+)]
 #[repr(u8)]
 pub enum MemoryKindWire {
     Episodic = 0,
@@ -20,9 +25,9 @@ pub enum MemoryKindWire {
 }
 
 /// — eight built-in edge kinds.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, serde_repr::Serialize_repr, serde_repr::Deserialize_repr,
+)]
 #[repr(u8)]
 pub enum EdgeKindWire {
     Caused = 0,
@@ -36,9 +41,9 @@ pub enum EdgeKindWire {
 }
 
 /// — plan-strategy hint.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, serde_repr::Serialize_repr, serde_repr::Deserialize_repr,
+)]
 #[repr(u8)]
 pub enum PlanStrategy {
     Auto = 0,
@@ -51,9 +56,7 @@ pub enum PlanStrategy {
 /// spec's `ByMemoryId` / `ByText` / `ByVector` discriminator naming.
 /// (See the crate-level `#![allow(clippy::enum_variant_names)]` for why
 /// the per-item allow isn't enough.)
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum PlanState {
     ByMemoryId(WireMemoryId),
     ByText(String),
@@ -61,18 +64,16 @@ pub enum PlanState {
 }
 
 /// — what to reason about.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ObservationInput {
     ByMemoryId(WireMemoryId),
     ByText(String),
 }
 
 /// — soft tombstone vs. hard erase.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, serde_repr::Serialize_repr, serde_repr::Deserialize_repr,
+)]
 #[repr(u8)]
 pub enum ForgetMode {
     Soft = 0,
@@ -80,9 +81,7 @@ pub enum ForgetMode {
 }
 
 /// — cancellation reason.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum CancellationReason {
     ClientUnneeded,
     Timeout,
@@ -90,9 +89,9 @@ pub enum CancellationReason {
 }
 
 /// — admin stats verbosity.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, serde_repr::Serialize_repr, serde_repr::Deserialize_repr,
+)]
 #[repr(u8)]
 pub enum StatsDetail {
     Summary = 0,
@@ -102,9 +101,7 @@ pub enum StatsDetail {
 }
 
 /// — integrity-check scope.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum CheckScope {
     QuickSample,
     PerShard(Vec<u8>),

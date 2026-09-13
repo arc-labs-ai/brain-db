@@ -30,7 +30,7 @@ What can go wrong with sharding and (in a future major version) clustering, and 
 
 **Response.** Returns `WrongShard` error with the correct runtime `shard_id`.
 
-**Operator action.** None (transient). The client (or SDK) refreshes routing and retries.
+**Operator action.** None (transient). The client refreshes routing and retries.
 
 ## 4. Stale routing table
 
@@ -42,7 +42,7 @@ What can go wrong with sharding and (in a future major version) clustering, and 
 - Client retries with corrected routing.
 - Some clients refresh their routing table proactively (e.g., periodically).
 
-**Operator action.** None. SDK handles.
+**Operator action.** None. Clients handle this.
 
 ## 5. Shard count mismatch
 
@@ -210,12 +210,12 @@ What can go wrong with sharding and (in a future major version) clustering, and 
 
 **Operator action.** Investigate; restart the rebalance after fixing the issue.
 
-## 20. The "client SDK" failure modes
+## 20. The client failure modes
 
 **Failure modes.**
-- SDK has stale routing.
-- SDK can't reach any node.
-- SDK has bugs in retry logic.
+- Client has stale routing.
+- Client can't reach any node.
+- Client has bugs in retry logic.
 
 **Detection.** Application-level errors.
 
@@ -224,7 +224,7 @@ What can go wrong with sharding and (in a future major version) clustering, and 
 - Refresh routing on persistent failures.
 - Fall back to bootstrap nodes if all fails.
 
-**Operator action.** Update SDK if buggy. Configure correct bootstrap nodes.
+**Operator action.** Update the client if buggy. Configure correct bootstrap nodes.
 
 ---
 

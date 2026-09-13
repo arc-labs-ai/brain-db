@@ -1,12 +1,12 @@
 //! `ReasonPlan` — the plan for a `REASON` request.
 //!
-//! embed the observation, RECALL similar memories,
-//! traverse SUPPORTS / DERIVED_FROM edges (supporting evidence) and
+//! Embed the observation, RECALL similar memories, traverse
+//! SUPPORTS / DERIVED_FROM edges (supporting evidence) and
 //! CONTRADICTS edges (contradicting evidence), aggregate scores into
 //! a confidence value.
 //!
-//! Phase 6.5 ships the **planner-side** shape; the executor lands with
-//! Phase 7 cognitive-ops alongside `LINK` / `UNLINK`.
+//! Ships the **planner-side** shape; the executor lands later
+//! alongside `LINK` / `UNLINK`.
 
 use brain_core::EdgeKind;
 use brain_protocol::envelope::request::ObservationInput;
@@ -34,7 +34,7 @@ pub struct ReasonPlan {
     pub estimated_cost_ms: f32,
 }
 
-/// 's confidence aggregation.
+/// Confidence aggregation for REASON.
 #[derive(Debug, Clone, Copy)]
 pub struct AggregationStep {
     pub max_supporting: usize,

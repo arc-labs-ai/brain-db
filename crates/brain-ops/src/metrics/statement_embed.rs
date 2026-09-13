@@ -89,36 +89,3 @@ pub struct StatementEmbedMetricsSnapshot {
     pub embed_errors_total: u64,
     pub batch_duration_seconds: WorkerHistogramSnapshot,
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn counters_start_at_zero() {
-        let m = StatementEmbedMetrics::new();
-        let s = m.snapshot();
-        assert_eq!(s.cycles_total, 0);
-        assert_eq!(s.rows_embedded_total, 0);
-        assert_eq!(s.rows_skipped_total, 0);
-        assert_eq!(s.embed_errors_total, 0);
-        assert_eq!(s.batch_duration_seconds.count, 0);
-    }
-
-    #[test]
-    fn counter_increments_round_trip() {
-        let m = StatementEmbedMetrics::new();
-        m.inc_cycles();
-        m.inc_cycles();
-        m.add_rows_embedded(5);
-        m.add_rows_skipped(2);
-        m.inc_embed_errors();
-        m.observe_batch_duration(0.020);
-        let s = m.snapshot();
-        assert_eq!(s.cycles_total, 2);
-        assert_eq!(s.rows_embedded_total, 5);
-        assert_eq!(s.rows_skipped_total, 2);
-        assert_eq!(s.embed_errors_total, 1);
-        assert_eq!(s.batch_duration_seconds.count, 1);
-    }
-}

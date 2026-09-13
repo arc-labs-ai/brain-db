@@ -1,4 +1,4 @@
-//! Ollama `/api/generate` Summarizer adapter (sub-task 9.15).
+//! Ollama `/api/generate` Summarizer adapter.
 //!
 //! Ollama runs locally (typical `http://localhost:11434`) and
 //! doesn't require auth. We use the non-streaming `/api/generate`

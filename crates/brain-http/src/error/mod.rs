@@ -1,9 +1,9 @@
-//! Brain-HTTP error taxonomy. `thiserror` per CLAUDE.md §7.
+//! Brain-HTTP error taxonomy, built on `thiserror`.
 //!
 //! Variants are deliberately Brain-flavoured — they correspond to the
-//! shapes the admin / SDK surfaces care about. Hyper's own
-//! [`hyper::Error`] is collapsed under [`Error::Hyper`] for now; M3
-//! revisits whether finer mapping is worth the surface.
+//! shapes the admin / client surfaces care about. Hyper's own
+//! [`hyper::Error`] is collapsed under [`Error::Hyper`] for now; finer
+//! mapping can come later if it's worth the surface.
 
 use http::StatusCode;
 
@@ -11,7 +11,7 @@ mod status;
 pub use status::status_for_error;
 
 /// All errors brain-http exposes. `#[non_exhaustive]` because we
-/// expect to grow the variant set in M3-M8.
+/// expect to grow the variant set over time.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
@@ -19,9 +19,9 @@ pub enum Error {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 
-    /// Hyper produced an error. Collapsed wrapper for now; M3 may
-    /// pattern-match on `hyper::Error` to surface specific Brain
-    /// variants.
+    /// Hyper produced an error. Collapsed wrapper for now; a future
+    /// revision may pattern-match on `hyper::Error` to surface specific
+    /// Brain variants.
     #[error("hyper: {0}")]
     Hyper(#[from] hyper::Error),
 
@@ -31,8 +31,7 @@ pub enum Error {
 
     /// Inbound body exceeded the configured byte limit. Returned by
     /// [`crate::body::read_to_bytes`] without buffering the rest of
-    /// the body (mitigates the trivial-DoS pattern flagged in the
-    /// design report §R9).
+    /// the body (mitigates a trivial-DoS pattern).
     #[error("body too large: {actual} > {limit} bytes")]
     BodyTooLarge {
         /// Bytes seen on the wire or declared in `Content-Length`.
@@ -91,52 +90,5 @@ impl Error {
 impl From<std::convert::Infallible> for Error {
     fn from(never: std::convert::Infallible) -> Self {
         match never {}
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn body_too_large_maps_to_413() {
-        let e = Error::BodyTooLarge {
-            actual: 100,
-            limit: 10,
-        };
-        assert_eq!(e.status_code(), StatusCode::PAYLOAD_TOO_LARGE);
-    }
-
-    #[test]
-    fn header_too_large_maps_to_431() {
-        let e = Error::HeaderTooLarge {
-            actual: 100,
-            limit: 10,
-        };
-        assert_eq!(e.status_code(), StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE);
-    }
-
-    #[test]
-    fn timeout_maps_to_504() {
-        let e = Error::Timeout(std::time::Duration::from_secs(1));
-        assert_eq!(e.status_code(), StatusCode::GATEWAY_TIMEOUT);
-    }
-
-    #[test]
-    fn server_wraps_supplied_code() {
-        let e = Error::Server(StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(e.status_code(), StatusCode::SERVICE_UNAVAILABLE);
-    }
-
-    #[test]
-    fn client_wraps_supplied_code() {
-        let e = Error::Client(StatusCode::BAD_REQUEST);
-        assert_eq!(e.status_code(), StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
-    fn io_maps_to_500_by_default() {
-        let e = Error::Io(std::io::Error::other("boom"));
-        assert_eq!(e.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

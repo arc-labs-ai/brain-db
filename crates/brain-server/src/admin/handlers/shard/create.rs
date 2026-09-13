@@ -1,4 +1,4 @@
-//! `POST /v1/shards` — deferred (cluster expansion is Phase-12).
+//! `POST /v1/shards` — deferred (cluster expansion not yet supported).
 
 use std::sync::Arc;
 

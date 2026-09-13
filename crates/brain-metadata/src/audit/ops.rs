@@ -1,20 +1,16 @@
 //! Extractor audit-log query API.
 //!
-//! Single-writer-per-shard discipline (CLAUDE.md §5 invariant 2)
-//! applies — `audit_write` takes the caller's `wtxn`. Reads via
+//! Single-writer-per-shard discipline applies — `audit_write` takes
+//! the caller's `wtxn`. Reads via
 //! `audit_by_*` / `audit_recent_*` are MVCC-safe (`&ReadTransaction`).
-//!
-//! All read paths treat `TableDoesNotExist` as `Ok(empty)` so
-//! fresh DBs respond to queries before any audit row has been
-//! written.
 
 use brain_core::{AuditId, MemoryId};
 use redb::{ReadTransaction, WriteTransaction};
 
 use crate::tables::audit::{
-    extraction_status, ExtractionAudit, EXTRACTOR_AUDIT_BY_EXTRACTOR_TABLE,
-    EXTRACTOR_AUDIT_BY_MEMORY_TABLE, EXTRACTOR_AUDIT_BY_TIME_TABLE, EXTRACTOR_AUDIT_TABLE,
-    OUTPUTS_CAP,
+    extraction_status, ExtractionAudit, ResolutionAudit, ENTITY_RESOLUTION_AUDIT_TABLE,
+    EXTRACTOR_AUDIT_BY_EXTRACTOR_TABLE, EXTRACTOR_AUDIT_BY_MEMORY_TABLE,
+    EXTRACTOR_AUDIT_BY_TIME_TABLE, EXTRACTOR_AUDIT_TABLE, OUTPUTS_CAP,
 };
 
 #[derive(thiserror::Error, Debug)]
@@ -67,6 +63,23 @@ pub fn audit_write(wtxn: &WriteTransaction, audit: &ExtractionAudit) -> Result<(
     Ok(())
 }
 
+/// Write one entity-resolution audit row into
+/// [`ENTITY_RESOLUTION_AUDIT_TABLE`]. The key is the row's UUIDv7
+/// `audit_id`, which keeps the table time-ordered.
+///
+/// Caller commits the same `wtxn` that performed the audited mutation
+/// (e.g. the entity tombstone) so the audit and the state change land
+/// atomically. This is the entity-lifecycle counterpart to
+/// [`audit_write`] (which targets the extraction log).
+pub fn resolution_audit_write(
+    wtxn: &WriteTransaction,
+    audit: &ResolutionAudit,
+) -> Result<(), AuditOpError> {
+    let mut t = wtxn.open_table(ENTITY_RESOLUTION_AUDIT_TABLE)?;
+    t.insert(&audit.audit_id_bytes, audit)?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Reads.
 // ---------------------------------------------------------------------------
@@ -76,11 +89,7 @@ pub fn audit_get(
     rtxn: &ReadTransaction,
     audit_id: AuditId,
 ) -> Result<Option<ExtractionAudit>, AuditOpError> {
-    let t = match rtxn.open_table(EXTRACTOR_AUDIT_TABLE) {
-        Ok(t) => t,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
+    let t = rtxn.open_table(EXTRACTOR_AUDIT_TABLE)?;
     let guard = t.get(&audit_id.to_bytes())?;
     Ok(guard.map(|g| g.value()))
 }
@@ -91,11 +100,7 @@ pub fn audit_by_memory(
     memory_id: MemoryId,
     limit: usize,
 ) -> Result<Vec<ExtractionAudit>, AuditOpError> {
-    let idx = match rtxn.open_table(EXTRACTOR_AUDIT_BY_MEMORY_TABLE) {
-        Ok(t) => t,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-        Err(e) => return Err(e.into()),
-    };
+    let idx = rtxn.open_table(EXTRACTOR_AUDIT_BY_MEMORY_TABLE)?;
     let mid = memory_id.to_be_bytes();
     let lo = (mid, [0u8; 16]);
     let hi = (mid, [0xffu8; 16]);
@@ -116,11 +121,7 @@ pub fn audit_by_extractor(
     extractor_id: u32,
     limit: usize,
 ) -> Result<Vec<ExtractionAudit>, AuditOpError> {
-    let idx = match rtxn.open_table(EXTRACTOR_AUDIT_BY_EXTRACTOR_TABLE) {
-        Ok(t) => t,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-        Err(e) => return Err(e.into()),
-    };
+    let idx = rtxn.open_table(EXTRACTOR_AUDIT_BY_EXTRACTOR_TABLE)?;
     let lo = (extractor_id, [0u8; 16]);
     let hi = (extractor_id, [0xffu8; 16]);
     let mut ids: Vec<[u8; 16]> = Vec::new();
@@ -140,11 +141,7 @@ pub fn audit_recent(
     since_unix_nanos: u64,
     limit: usize,
 ) -> Result<Vec<ExtractionAudit>, AuditOpError> {
-    let idx = match rtxn.open_table(EXTRACTOR_AUDIT_BY_TIME_TABLE) {
-        Ok(t) => t,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-        Err(e) => return Err(e.into()),
-    };
+    let idx = rtxn.open_table(EXTRACTOR_AUDIT_BY_TIME_TABLE)?;
     let lo = (since_unix_nanos, [0u8; 16]);
     let hi = (u64::MAX, [0xffu8; 16]);
     let mut ids: Vec<[u8; 16]> = Vec::new();
@@ -166,9 +163,9 @@ pub fn audit_recent_failures(
 ) -> Result<Vec<ExtractionAudit>, AuditOpError> {
     let mut out = Vec::new();
     // Fan out wide; filter; stop at limit. Worst case scans more rows
-    // than necessary, but phase 20 doesn't ship a status-indexed
-    // secondary table — operators with very-failure-heavy
-    // workloads should raise the issue (§22/07 follow-up).
+    // than necessary; there's no status-indexed secondary table yet —
+    // operators with very-failure-heavy workloads should raise the
+    // issue.
     let fanout = limit.saturating_mul(8).max(limit + 16);
     for row in audit_recent(rtxn, since_unix_nanos, fanout)? {
         if row.status == extraction_status::FAILURE {
@@ -186,11 +183,7 @@ fn fetch_rows(
     ids: &[[u8; 16]],
     limit: usize,
 ) -> Result<Vec<ExtractionAudit>, AuditOpError> {
-    let primary = match rtxn.open_table(EXTRACTOR_AUDIT_TABLE) {
-        Ok(t) => t,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-        Err(e) => return Err(e.into()),
-    };
+    let primary = rtxn.open_table(EXTRACTOR_AUDIT_TABLE)?;
     let mut out = Vec::with_capacity(limit.min(ids.len()));
     for id in ids.iter().take(limit) {
         if let Some(g) = primary.get(id)? {
@@ -212,7 +205,11 @@ mod tests {
     use redb::{Database, ReadableDatabase};
 
     fn open_db(dir: &tempfile::TempDir) -> Database {
-        Database::create(dir.path().join("test.redb")).unwrap()
+        let db = Database::create(dir.path().join("test.redb")).unwrap();
+        let wtxn = db.begin_write().unwrap();
+        crate::tables::materialize_all_tables(&wtxn).unwrap();
+        wtxn.commit().unwrap();
+        db
     }
 
     fn success_row(memory: MemoryId, extractor_id: u32, started_at: u64) -> ExtractionAudit {

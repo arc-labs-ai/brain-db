@@ -1,5 +1,5 @@
-//! `POST /v1/diagnostics/profile` — deferred (Glommio profiler is
-//! phase-11 territory; operators today can run `perf record` against
+//! `POST /v1/diagnostics/profile` — deferred (the Glommio profiler is
+//! not yet wired; operators today can run `perf record` against
 //! the server PID).
 
 use std::sync::Arc;

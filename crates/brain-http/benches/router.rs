@@ -1,7 +1,7 @@
 //! Criterion bench for `Router::dispatch` — pure routing throughput.
 //!
 //! No TCP, no hyper. Measures the dispatch overhead in isolation so
-//! Phase 12's instrumentation changes can be compared against this
+//! later instrumentation changes can be compared against this
 //! baseline.
 
 use std::sync::Arc;
@@ -31,7 +31,7 @@ fn build_router() -> Router<Full<Bytes>> {
         .get("/v1/route/5", ok_handler)
         .route_prefix(Method::POST, "/v1/snapshots/", ok_handler)
         .route_prefix(Method::POST, "/v1/workers/", ok_handler)
-        .route_prefix(Method::GET, "/v1/agents/", ok_handler)
+        .route_prefix(Method::GET, "/v1/spaces/", ok_handler)
         .route_prefix(Method::DELETE, "/v1/shards/", ok_handler)
         .fallback(ok_handler)
 }

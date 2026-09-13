@@ -1,4 +1,4 @@
-//! Schema migration types (sub-task 24.8).
+//! Schema migration types.
 //!
 //! Pure value types shared across the SCHEMA_UPLOAD response,
 //! brain-workers' migration worker, and operator-facing CLIs.

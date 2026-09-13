@@ -1,7 +1,7 @@
 //! OpenAI Chat Completions client.
 //!
-//! POST `https://api.openai.com/v1/chat/completions`. Reads
-//! `OPENAI_API_KEY` at construction.
+//! POST `https://api.openai.com/v1/chat/completions`. Constructed with
+//! the single resolved credential (`[llm] api_key` / `BRAIN__LLM__API_KEY`).
 //!
 //! ## Wire shape (request)
 //!
@@ -55,8 +55,7 @@ use crate::types::{LlmRequest, LlmResponse, LlmRole};
 const DEFAULT_BASE_URL: &str = "https://api.openai.com";
 
 /// Pricing (dollar micro-units per token) for unknown OpenAI
-/// models. Conservative; phase 22+ ships a pricing table per
-/// model (§22/09 §5 + §22/07 Q-llm-3).
+/// models. Conservative; a per-model pricing table ships later.
 const PRICE_INPUT_PER_TOKEN_DEFAULT: u64 = 1;
 const PRICE_OUTPUT_PER_TOKEN_DEFAULT: u64 = 4;
 
@@ -84,10 +83,12 @@ impl std::fmt::Debug for OpenAIClient {
 }
 
 impl OpenAIClient {
-    /// Construct from the `OPENAI_API_KEY` env var. Returns
-    /// `None` if unset.
-    pub fn from_env(model: impl Into<String>) -> Option<Self> {
-        let key = std::env::var("OPENAI_API_KEY").ok()?;
+    /// Construct with an explicit API key against the default endpoint.
+    /// The key comes from the single resolved credential (`[llm] api_key`
+    /// / `BRAIN__LLM__API_KEY`). Returns `None` for an empty key so
+    /// callers can fall back uniformly.
+    pub fn with_key(model: impl Into<String>, api_key: impl Into<String>) -> Option<Self> {
+        let key = api_key.into();
         if key.is_empty() {
             return None;
         }
@@ -113,7 +114,7 @@ impl OpenAIClient {
         Self {
             http: reqwest::Client::builder()
                 .build()
-                .expect("reqwest::Client::build is infallible with defaults"),
+                .expect("invariant: reqwest::Client::build is infallible with defaults"),
             base_url: base_url.into(),
             api_key: api_key.into(),
             model_id_hash: hash,
@@ -224,7 +225,7 @@ impl From<&LlmRequest> for OpenAIRequestBody {
     fn from(req: &LlmRequest) -> Self {
         // OpenAI puts the system prompt as the first message with
         // role="system". For o-series models the role becomes
-        // "developer"; phase 21 sticks with "system" — OpenAI accepts
+        // "developer"; we stick with "system" — OpenAI accepts
         // both transparently. Anthropic-style prompt caching has no
         // direct equivalent on the Chat Completions API, so cached
         // and live blocks both fold into a single concatenated system
@@ -332,8 +333,8 @@ fn decode_openai_response(payload: OpenAIResponseBody) -> Result<LlmResponse, Ll
 
 fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> u64 {
     // OpenAI returns `retry-after` in seconds (sometimes as a
-    // float, sometimes integer). Phase 21 reads seconds-as-integer
-    // and converts; non-integer / absent → 0.
+    // float, sometimes integer). We read seconds-as-integer
+    // and convert; non-integer / absent → 0.
     headers
         .get("retry-after")
         .and_then(|v| v.to_str().ok())
@@ -350,24 +351,6 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> u64 {
 mod tests {
     use super::*;
     use crate::types::{LlmMessage, LlmRole};
-
-    #[test]
-    fn from_env_returns_none_when_key_unset() {
-        let prior = std::env::var("OPENAI_API_KEY").ok();
-        std::env::remove_var("OPENAI_API_KEY");
-        let client = OpenAIClient::from_env("gpt-4o-mini");
-        assert!(client.is_none());
-        if let Some(p) = prior {
-            std::env::set_var("OPENAI_API_KEY", p);
-        }
-    }
-
-    #[test]
-    fn with_endpoint_sets_fields() {
-        let c = OpenAIClient::with_endpoint("gpt-4o-mini", "test-key", "http://localhost:1234");
-        assert_eq!(c.model(), "gpt-4o-mini");
-        assert_ne!(c.model_id_hash(), 0);
-    }
 
     #[test]
     fn request_body_minimal_shape() {

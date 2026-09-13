@@ -1,4 +1,4 @@
-//! `DELETE /v1/shards/{idx}` — deferred (cluster decommission is Phase-12).
+//! `DELETE /v1/shards/{idx}` — deferred (cluster decommission not yet supported).
 
 use std::sync::Arc;
 

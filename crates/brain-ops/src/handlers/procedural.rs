@@ -1,6 +1,6 @@
 //! `MATERIALIZE_PROCEDURAL` handler (W3.1, wire v2).
 //!
-//! Reads the calling agent's stored `brain:behavior_*` Preferences,
+//! Reads the calling space's stored `brain:behavior_*` Preferences,
 //! sorts by confidence, applies the `top_k` cap, and renders a single
 //! Markdown system block ready for LLM prompt injection.
 //!
@@ -11,12 +11,10 @@
 
 use std::collections::HashMap;
 
+use brain_core::{EntityId, PredicateId, SessionId, StatementKind};
 use brain_core::{Statement, StatementObject, StatementValue};
-use brain_core::{ContextId, EntityId, PredicateId, StatementKind};
-use brain_metadata::schema::predicate::{
-    predicate_get, predicate_lookup_by_qname, PredicateOpError,
-};
-use brain_metadata::statement::{statement_list, StatementListFilter, StatementOpError};
+use brain_metadata::schema::predicate::{predicate_get, predicate_lookup_by_qname};
+use brain_metadata::statement::{statement_list, StatementListFilter};
 use brain_protocol::{MaterializeProceduralRequest, MaterializeProceduralResponse};
 
 use crate::context::OpsContext;
@@ -107,27 +105,26 @@ pub async fn handle_materialize_procedural(
         req.top_k
     };
 
-    // The wire field is opt-in; an all-zeros agent_id means "use the
+    // The wire field is opt-in; an all-zeros space_id means "use the
     // authenticated caller". Anonymous deployments fall back to
-    // AgentId::NIL which won't have any procedural statements stored
+    // SpaceId::NIL which won't have any procedural statements stored
     // against it — the renderer returns an empty block in that case.
-    let agent_bytes = if req.agent_id == [0u8; 16] {
-        ctx.executor.caller_agent.0.into_bytes()
+    let space_bytes = if req.space_id == [0u8; 16] {
+        ctx.executor.caller_space.0.into_bytes()
     } else {
-        req.agent_id
+        req.space_id
     };
-    let subject_entity = EntityId::from(agent_bytes);
+    let subject_entity = EntityId::from(space_bytes);
 
-    let context_filter = if req.context_filter == 0 {
-        None
-    } else {
-        Some(ContextId(req.context_filter))
+    let session_filter: Option<std::collections::HashSet<SessionId>> = match &req.session_filter {
+        Some(ids) if !ids.is_empty() => Some(ids.iter().map(|id| SessionId(*id)).collect()),
+        _ => None,
     };
 
     // ── Resolve the procedural predicate set ─────────────────────
     // Walks the registry once per call (5 lookups). When a schema
     // hasn't been seeded the predicate rows won't exist and we
-    // return an empty block — no agent could have written a
+    // return an empty block — no space could have written a
     // procedural statement without those predicates declared.
     let categories_set: Option<&[String]> = if req.categories.is_empty() {
         None
@@ -136,8 +133,9 @@ pub async fn handle_materialize_procedural(
     };
 
     let (matched_rows, total_candidates) = {
-        let db_guard = ctx.executor.metadata.lock();
-        let rtxn = db_guard
+        let rtxn = ctx
+            .executor
+            .metadata
             .read_txn()
             .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
 
@@ -151,7 +149,7 @@ pub async fn handle_materialize_procedural(
                 continue;
             }
             match predicate_lookup_by_qname(&rtxn, BEHAVIOR_NAMESPACE, name)
-                .map_err(map_predicate_op_error)?
+                .map_err(OpError::from)?
             {
                 Some(p) => {
                     procedural_ids.insert(p.id, (*name).into());
@@ -193,7 +191,15 @@ pub async fn handle_materialize_procedural(
                 // sort + cap across the union below.
                 limit: TOP_K_MAX as usize,
             };
-            let rows = statement_list(&rtxn, &filter).map_err(map_statement_op_error)?;
+            let rows = statement_list(
+                &rtxn,
+                brain_metadata::RowScope::new(
+                    ctx.executor.caller_namespace,
+                    ctx.executor.caller_space,
+                ),
+                &filter,
+            )
+            .map_err(OpError::from)?;
             for row in rows {
                 if row.tombstoned {
                     continue;
@@ -201,8 +207,8 @@ pub async fn handle_materialize_procedural(
                 if row.superseded_by.is_some() {
                     continue;
                 }
-                if let Some(ctx_id) = context_filter {
-                    if !statement_touches_context(&row, ctx_id) {
+                if let Some(ref sessions) = session_filter {
+                    if !statement_touches_session(&row, sessions) {
                         continue;
                     }
                 }
@@ -233,7 +239,7 @@ pub async fn handle_materialize_procedural(
         for s in hits {
             let predicate_name = match procedural_ids.get(&s.predicate) {
                 Some(name) => name.clone(),
-                None => match predicate_get(&rtxn, s.predicate).map_err(map_predicate_op_error)? {
+                None => match predicate_get(&rtxn, s.predicate).map_err(OpError::from)? {
                     Some(p) => p.name,
                     None => continue,
                 },
@@ -299,16 +305,19 @@ fn render_object(obj: &StatementObject) -> Option<String> {
     }
 }
 
-fn statement_touches_context(s: &Statement, context: ContextId) -> bool {
-    // Procedural memory is inherently agent-scoped; the per-memory
-    // ContextId lives in the `memories` redb row, not on the
+fn statement_touches_session(
+    s: &Statement,
+    sessions: &std::collections::HashSet<SessionId>,
+) -> bool {
+    // Procedural memory is inherently space-scoped; the per-memory
+    // SessionId lives in the `memories` redb row, not on the
     // statement itself, so a precise filter would require an
     // O(n_evidence) row-by-row lookup against the rtxn. For v1 we
-    // treat the context filter as advisory and accept every row —
-    // an agent's `behavior_*` claim doesn't shift meaning across
-    // contexts the way a Fact would. A later pass can fold per-
-    // evidence context lookups in if a use case emerges.
-    let _ = (s, context);
+    // treat the session filter as advisory and accept every row —
+    // a space's `behavior_*` claim doesn't shift meaning across
+    // sessions the way a Fact would. A later pass can fold per-
+    // evidence session lookups in if a use case emerges.
+    let _ = (s, sessions);
     true
 }
 
@@ -330,7 +339,7 @@ fn render_system_block(rows: &[RenderedStatement], total_candidates: u32) -> Str
 
     let mut out = String::new();
     out.push_str("# Learned behaviors (procedural memory)\n\n");
-    out.push_str("The following are behaviors the agent has learned over prior sessions.\n");
+    out.push_str("The following are behaviors the space has learned over prior sessions.\n");
     out.push_str(
         "They are sorted by confidence; ignore any that seem inconsistent with the current request.\n\n",
     );
@@ -387,7 +396,7 @@ fn push_section(out: &mut String, title: &str, rows: &[&RenderedStatement]) {
 
 fn render_empty_block() -> String {
     "# Learned behaviors (procedural memory)\n\n\
-     (no procedural statements stored for this agent yet)\n"
+     (no procedural statements stored for this space yet)\n"
         .to_string()
 }
 
@@ -404,13 +413,9 @@ fn uuid_short(b: &[u8; 16]) -> String {
     s
 }
 
-fn map_predicate_op_error(e: PredicateOpError) -> OpError {
-    OpError::Internal(format!("predicate lookup: {e}"))
-}
-
-fn map_statement_op_error(e: StatementOpError) -> OpError {
-    OpError::Internal(format!("statement_list: {e}"))
-}
+// Errors are classified by `OpError`'s `From` impls (crate::error) —
+// this path previously downgraded everything to Internal (500), losing
+// NotFound/Conflict classification; routing through `From` fixes that.
 
 // ---------------------------------------------------------------------------
 // Tests (rendering / validation only — handler integration tests live in

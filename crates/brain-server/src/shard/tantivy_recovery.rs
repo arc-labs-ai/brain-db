@@ -1,12 +1,9 @@
-//! Tantivy recovery on shard startup (phase 22.7).
+//! Tantivy recovery on shard startup.
 //!
-//! Replaces the 22.1 warn-and-continue block in `spawn_shard`.
 //! Walks the [`TantivyShardStartup`] reported by `TantivyShard::open`
-//! and runs the 22.6 rebuild functions for any scope whose status
+//! and runs the rebuild functions for any scope whose status
 //! is `NeedsRebuild`, then re-opens to pick up the fresh on-disk
 //! state.
-//!
-//! See `spec/26_knowledge_storage/01_tantivy_layout.md` §6.
 
 use std::path::Path;
 use std::sync::Arc;

@@ -1,0 +1,73 @@
+{
+  "query": {
+    "text": "who mentored whom",
+    "entity_anchor": [
+      68,
+      68,
+      68,
+      68,
+      68,
+      68,
+      68,
+      68,
+      68,
+      68,
+      68,
+      68,
+      68,
+      68,
+      68,
+      68
+    ],
+    "kind_filter": [
+      0,
+      1
+    ],
+    "predicate_filter": [
+      "org:works_on"
+    ],
+    "session_filter": [
+      7,
+      9
+    ],
+    "time_filter": {
+      "from_unix_ms": 1700000000000,
+      "to_unix_ms": null
+    },
+    "as_of_record_time_unix_nanos": 1710000000000000000,
+    "confidence_min": 0.25,
+    "include_tombstoned": false,
+    "include_superseded": true,
+    "limit": 20,
+    "retrievers": {
+      "Explicit": [
+        "Semantic",
+        "Graph"
+      ]
+    },
+    "fusion_config": {
+      "k": 60,
+      "semantic_weight": 0.5,
+      "lexical_weight": 0.25,
+      "graph_weight": 0.25
+    },
+    "request_id": [
+      17,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17,
+      17
+    ]
+  }
+}

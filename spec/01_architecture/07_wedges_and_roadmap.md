@@ -59,7 +59,7 @@ Brain ships the same Rust crates whether the deployment is embedded (in-process,
 
 ## Wedge 5 — Apache 2.0, no SaaS lock-in
 
-Brain — the typed graph, the extractor pipeline, the reranker, the schema DSL, the SDKs — is Apache 2.0. Operators can self-host any feature documented in the spec.
+Brain — the typed graph, the extractor pipeline, the reranker, the schema DSL — is Apache 2.0. Operators can self-host any feature documented in the spec.
 
 **What it costs.** No premium commercial features to up-sell. Revenue model relies on hosting + support, not feature gating.
 
@@ -74,7 +74,7 @@ Brain — the typed graph, the extractor pipeline, the reranker, the schema DSL,
 For clarity — these are features Brain has but doesn't differentiate on:
 
 - **HNSW for vector indexing** — table stakes. Pinecone, Weaviate, Qdrant all use HNSW (or close kin). Brain's `M=16, ef_construction=200, ef_search=64` defaults are standard.
-- **Rank fusion** — RRF with `k=60` is standard for hybrid retrieval. Brain's weighted variant + adaptive top-K is incremental, not category-defining.
+- **Rank fusion** — RRF with `k=60` is standard for retrieval. Brain's weighted variant + adaptive top-K is incremental, not category-defining.
 - **Per-shard tantivy for lexical** — common pattern. Brain's choice but not novel.
 - **Glommio for async I/O** — implementation detail. Could be Tokio + io_uring + careful structuring; same result.
 
@@ -97,6 +97,16 @@ A wedge weakens when:
 - **Wedge 5 weakens** if a feature lands behind a commercial license, or if the Apache 2.0 commitment quietly softens to AGPL or BSL.
 
 Flag any change that weakens a wedge for explicit review.
+
+### Resolved — mode bifurcation (substrate vs retrieval)
+
+**Status:** Resolved in phase 26 (`f2d2f61` / `778fe54` / `2bc5181`).
+
+Historically Brain branched between a "substrate" path (no schema declared → memory-only ANN search) and a "retrieval" path (schema declared → typed-graph fan-out). The branch lived in the read pipeline (`substrate_recall` vs `retrieval_recall`), the planner inputs (`has_active_schema`, `has_llm_extractor`), and the shard wiring (`Option<Arc<dyn LexicalRetriever>>`). The bifurcation violated Wedge 4 (one codebase, one shape) and made client behavior depend on what the deployment happened to have uploaded.
+
+Phase 26 collapsed it: every shard wires the three retrievers and the tantivy indexes at spawn, `SCHEMA_UPLOAD` became associative-merge against the seeded `brain:` namespace, and extractors run on every ENCODE with per-entity persistence gating. A new `GET_CAPABILITIES` opcode (`0x0032` / `0x00B2`) lets clients introspect the shard's enabled tiers. The "schemaless mode" framing is retired throughout the spec.
+
+Kept in the wedges log for the historical record; the bifurcation no longer exists in code or spec.
 
 ---
 
@@ -133,13 +143,15 @@ The patterns below are the ones with the clearest fit. The design wedges above c
 
 ## IVF + Product Quantization on top of HNSW
 
-**Pattern.** Pure HNSW is RAM-heavy at billion-vector scale because the index references every full-precision vector. IVF (inverted-file index) partitions the vector space; PQ (product quantization) compresses each vector to ~16 bytes. Memory drops roughly 10× with modest recall loss. Pinecone uses this hybrid at scale.
+**Status:** Partial — **HNSW + PQ in active development for v1.x** per [`spec/09_indexing/07_hnsw_pq.md`](../09_indexing/07_hnsw_pq.md) (phase 25). Pure IVF (no graph) remains deferred.
+
+**Pattern.** Pure HNSW is RAM-heavy at billion-vector scale because the index references every full-precision vector. IVF (inverted-file index) partitions the vector space; PQ (product quantization) compresses each vector to ~8-16 bytes. Memory drops roughly 10× with modest recall loss. Pinecone uses this combination at scale.
 
 **What it enables.** Brain at billion-vector scale without provisioning 1.5 TB of vector RAM. Today's HNSW loads every 384-d vector at full precision (~1.5 KB per vector); at 1M memories that's 1.5 GB, at 1B it's 1.5 TB.
 
-**Deferred because.** Brain's recall targets are calibrated for HNSW with `ef_search=64`; adopting PQ shifts the recall/memory trade-off and forces a re-measurement against the acceptance suite. Default-on at small scale doesn't make sense.
+**Resolved-in-part because.** HNSW+PQ (graph payload compressed; arena still full-precision for re-rank) is the lower-risk increment — keeps the §09 search interface unchanged and the existing two-tier `MainEpoch` model intact. The §19 acceptance suite re-runs under a PQ profile to gate the recall trade-off.
 
-**Path.** New executor mode in indexing, IVF+PQ active above a configurable memory threshold (default keeps HNSW). Recall measurement gates the cutoff. Either an alternative crate to `hnsw_rs` or an extension; bench-gated.
+**Still deferred.** Pure IVF (no HNSW graph) would replace traversal with coarse-cell scan + `nprobe`. The architectural change is larger; HNSW+PQ resolves the immediate memory pressure at Brain's target scale and below.
 
 ---
 

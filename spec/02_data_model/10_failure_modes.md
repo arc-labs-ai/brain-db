@@ -157,5 +157,5 @@ A clean abort path exists: if the operator wants to revert the model change, swi
 
 **Response.** Return a specific error: `InvalidArgument` with details indicating which parameter was wrong.
 
-**Implication.** Clients should validate before submitting. The SDK does this on the client's behalf; raw protocol users need their own checks.
+**Implication.** Clients should validate before submitting. Clients should validate before submitting; the server also validates server-side.
 

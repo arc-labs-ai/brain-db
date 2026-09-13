@@ -18,7 +18,7 @@ pub enum TriggerExpr {
 
 | Variant | Semantics | Worker tier |
 |---|---|---|
-| `OnEncode` | Fires after every successful ENCODE on the same shard. | Foreground (pattern) / near-foreground (classifier) / background (llm). |
+| `OnEncode` | Fires after every successful ENCODE on the same shard. | Enqueued to the per-shard extractor worker; all tiers run async (pattern → classifier → LLM). |
 | `OnEncodeWhere(c)` | Same as above, filtered by `c`. | Same as above. |
 | `OnDemand` | Never fires automatically; admin / API invokes explicitly. | Background. |
 | `OnSchemaChange` | Fires once when `schema_active(ns)` advances. post-v1 — out of scope here. | Background. |

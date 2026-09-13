@@ -1,0 +1,14 @@
+{
+  "namespace": "org",
+  "would_be_version": 0,
+  "validation_errors": [
+    {
+      "code": "UnknownAttributeType",
+      "message": "unknown attribute type 'timestampz' on Person.joined_at",
+      "line": 4,
+      "column": 17,
+      "length": 11,
+      "severity": 2
+    }
+  ]
+}

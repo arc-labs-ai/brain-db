@@ -1,6 +1,6 @@
 //! `SseEvent` — one Server-Sent Event.
 //!
-//! Spec: WHATWG HTML §9.2.6. Fields map 1:1 to the wire shape:
+//! Wire format per WHATWG HTML §9.2.6. Fields map 1:1 to the wire shape:
 //!
 //! ```text
 //! id: <id>\n

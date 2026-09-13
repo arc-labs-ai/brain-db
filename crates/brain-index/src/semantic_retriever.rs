@@ -1,7 +1,6 @@
-//! Semantic retriever trait + value types (phase 23.1).
+//! Semantic retriever trait + value types.
 //!
-//! The trait surface defined here matches
-//! `spec/13_retrievers/03_semantic_retriever.md`. The
+//! The
 //! production impl (`BrainSemanticRetriever`) lives in
 //! `brain-ops::ops::retrievers::semantic` because it needs
 //! both the HNSW handles defined here and the `MetadataDb`
@@ -13,34 +12,104 @@
 use std::ops::RangeInclusive;
 
 use brain_core::StatementKind;
-use brain_core::{AgentId, MemoryKind, PredicateId};
+use brain_core::{MemoryKind, PredicateId, SpaceId};
 
 use crate::tantivy_shard::{RankedItem, RankedItemId};
 
 /// 384-dim vectors per BGE-small.
 pub const VECTOR_DIM: usize = 384;
 
-/// Substrate HNSW default `ef_search` (§06/02).
+/// Substrate HNSW default `ef_search`.
 pub const DEFAULT_EF_SEARCH: usize = 64;
 
-/// Hard cap on `ef_search` (§06/02 §5).
+/// Hard cap on `ef_search`.
 pub const EF_SEARCH_MAX: usize = 500;
 
-/// Default top-k (§23/03 §3).
+/// Default top-k.
 pub const DEFAULT_TOP_K: usize = 64;
 
-/// Default timeout (§23/03 §3).
+/// Default timeout.
 pub const DEFAULT_TIMEOUT_MS: u32 = 50;
 
 /// The semantic-retrieval trait. Object-safe; consumers hold
 /// an `Arc<dyn SemanticRetriever>`.
 pub trait SemanticRetriever: Send + Sync {
+    /// Run the semantic lane.
+    ///
+    /// `arena` is the borrowed per-space vector source for the
+    /// single-space brute-force lane (see
+    /// [`crate::SpaceVectorSource`]). It is `Some` only on the shard read
+    /// path, where the memory lane may exact-scan a small tenant's own
+    /// vectors instead of walking the shared HNSW graph; it is borrowed
+    /// (never stored), which is why the trait stays `Send + Sync` while
+    /// the arena itself is `!Send`. Pass `None` from tests, mocks, and
+    /// non-arena callers — the retriever then always uses the shared HNSW
+    /// path.
     fn retrieve(
         &self,
         query: &SemanticQuery,
         scope: SemanticScope,
         config: &SemanticRetrieverConfig,
+        arena: Option<&dyn crate::SpaceVectorSource>,
     ) -> Result<Vec<RankedItem>, SemanticError>;
+
+    /// Return a memory's stored embedding by id, if obtainable. Used to
+    /// cue-condition graph-walk candidates — a structurally-walked node's
+    /// score is multiplied by its cosine to the query — so the always-on
+    /// entity-graph lane surfaces relationship-connected memories that are
+    /// ALSO on-topic, never flooding the top-K with the anchor's whole
+    /// neighbourhood. Default `None`: retrievers without a by-id vector
+    /// source (mocks, test doubles) contribute no relevance signal and the
+    /// caller leaves such a candidate's graph score unchanged.
+    fn vector_for(&self, _id: brain_core::MemoryId) -> Option<[f32; VECTOR_DIM]> {
+        None
+    }
+
+    /// Best HyPE (hypothetical-question) cosine per memory for `query`.
+    ///
+    /// Each returned `(MemoryId, cosine)` is the strongest match between the
+    /// query vector and any hypothetical question generated *from* that memory
+    /// at write time — i.e. how well the memory ANSWERS the query, independent
+    /// of the passage↔query topical cosine that governs the direct semantic
+    /// lane. The read path uses this as a deterministic, no-LLM answer-lead
+    /// signal: a memory whose stored question closely matches the cue is, by
+    /// construction, an answering memory and should lead the result even when a
+    /// topically-adjacent memory has a higher raw passage cosine.
+    ///
+    /// This is scope-agnostic (no namespace / space push-down): callers use it
+    /// only to look up scores for candidates *already* admitted by the filtered
+    /// membership set, so a hit for an out-of-scope memory is simply never read.
+    /// Default empty: retrievers without a HyPE pool contribute no answer-lead
+    /// signal and the caller leaves the existing order unchanged.
+    fn hype_scores_for_query(
+        &self,
+        _query: &[f32; VECTOR_DIM],
+        _k: usize,
+    ) -> Vec<(brain_core::MemoryId, f32)> {
+        Vec::new()
+    }
+
+    /// Best per-statement question-bridge hits for `query`, each carrying the
+    /// reified-fact [`Slot`](brain_core::Slot) it leaves unbound.
+    ///
+    /// Each returned `(StatementId, Slot, cosine)` is the strongest match
+    /// between the query vector and any bridge question generated *from* that
+    /// statement's slot at write time. Because the omitted slot is known by
+    /// construction, the tag names EXACTLY which slot the question asked for —
+    /// the read path projects that slot's value (object / event time / subject)
+    /// rather than always returning the object. Returned descending by cosine.
+    ///
+    /// Scope-agnostic (no namespace / space push-down): callers project only
+    /// statements they can already see, so an out-of-scope hit is never read.
+    /// Default empty: retrievers without a statement-question pool contribute no
+    /// slot-projection signal and the caller leaves the grounded path unchanged.
+    fn statement_slot_hits_for_query(
+        &self,
+        _query: &[f32; VECTOR_DIM],
+        _k: usize,
+    ) -> Vec<(brain_core::StatementId, brain_core::Slot, f32)> {
+        Vec::new()
+    }
 }
 
 /// Query input — either a pre-embedded 384-d vector or raw
@@ -57,25 +126,46 @@ pub enum SemanticQuery {
 /// Which corpus to search.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SemanticScope {
-    /// Substrate memory HNSW (§06). Returns `RankedItemId::Memory`.
+    /// Substrate memory HNSW. Returns `RankedItemId::Memory`.
     Memory,
-    /// Statement HNSW (§26/00). Returns `RankedItemId::Statement`.
+    /// Statement HNSW. Returns `RankedItemId::Statement`.
     Statement,
     /// Both corpora; results merged by descending cosine.
     Both,
 }
 
-/// Filters applied either as HNSW push-down (memory scope,
-/// per §23/03 §5) or post-search.
+/// Filters applied either as HNSW push-down (memory scope)
+/// or post-search.
 #[derive(Debug, Clone, Default)]
 pub struct SemanticFilters {
-    pub agent_id: Option<AgentId>,
+    /// Tenant data boundary. The caller's namespace; the vector lane admits
+    /// only rows whose `namespace_id` equals this value. Unlike space scoping
+    /// (a soft, optionally-empty filter), the namespace wall is unconditional:
+    /// there is no escape that widens recall across tenants.
+    pub namespace_id: u32,
+    pub space_ids: Vec<SpaceId>,
     pub memory_kind: Option<MemoryKind>,
     pub statement_kind: Option<StatementKind>,
     pub predicate_id: Option<PredicateId>,
     pub confidence_bucket: Option<RangeInclusive<u8>>,
     pub created_at_ms: Option<RangeInclusive<u64>>,
     pub extracted_at_ms: Option<RangeInclusive<u64>>,
+    /// Front-gate scope tag: when non-empty, the closure restricts
+    /// HNSW visits to memories whose `session_id` is in this set. The
+    /// closure already reads `MemoryMetadata` per visit (for space /
+    /// kind / created_at), so checking context costs nothing extra and
+    /// stays bounded by HNSW visits — sublinear in the corpus size.
+    pub session_ids: Vec<u64>,
+    /// Whether tombstoned (soft-forgotten) rows may surface in the vector
+    /// lane. A soft-FORGET flips a row's `ACTIVE` flag but leaves its HNSW
+    /// node in place until the next index rebuild, so without this gate the
+    /// HNSW would fill its top-k with tombstoned candidates and the live
+    /// matches sitting just below them in the `ef` window would never enter
+    /// the fused set — a silent recall-completeness loss. `false` (the
+    /// RECALL default) excludes tombstoned at the source, matching the
+    /// graph and lexical lanes; `true` is the admin/debug path that wants
+    /// tombstoned rows returned.
+    pub include_tombstoned: bool,
 }
 
 /// HNSW search config + post-search cuts.
@@ -107,7 +197,7 @@ impl Default for SemanticRetrieverConfig {
     }
 }
 
-/// Error taxonomy (§23/03 §7).
+/// Error taxonomy.
 #[derive(Debug, thiserror::Error)]
 pub enum SemanticError {
     #[error("index unavailable (rebuild in progress)")]
@@ -124,7 +214,7 @@ pub enum SemanticError {
     Internal(String),
 }
 
-/// Validate scope + filter compatibility per §23/03 §5.
+/// Validate scope + filter compatibility.
 /// Wrong-scope filter (e.g. `predicate_id` with `Memory` scope)
 /// returns `QueryParseFailed`.
 pub fn validate_filters_for_scope(
@@ -155,9 +245,9 @@ pub fn validate_filters_for_scope(
             }
         }
         SemanticScope::Statement => {
-            if filters.agent_id.is_some() {
+            if !filters.space_ids.is_empty() {
                 return Err(SemanticError::QueryParseFailed(
-                    "agent_id filter applies only to Memory / Both".into(),
+                    "space_id filter applies only to Memory / Both".into(),
                 ));
             }
             if filters.memory_kind.is_some() {

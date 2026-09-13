@@ -1,9 +1,8 @@
-//! `RecallPlan` and its step structs spells out
-//! the full example; this module mirrors it.
+//! `RecallPlan` and its step structs.
 //!
-//! Single-shard for Phase 6 (orientation plan §4.7): `shards: Vec<_>`
-//! is always length 1. The structure is preserved so cross-shard
-//! fan-out lands in Phase 12 without re-spelling the plan.
+//! Single-shard for now: `shards: Vec<_>` is always length 1. The
+//! structure is preserved so cross-shard fan-out lands later without
+//! re-spelling the plan.
 
 use brain_core::MemoryId;
 
@@ -16,12 +15,12 @@ pub struct RecallPlan {
     pub merge: MergeStep,
     pub text_fetch: Option<TextFetchStep>,
     pub response: ResponseStep,
-    /// Filled by 6.2's cost model when 6.3 builds the plan.
+    /// Filled by the cost model when the plan is built.
     pub estimated_cost_ms: f32,
 }
 
-/// — the embedding step is shared across shards (we
-/// embed the cue once, then reuse the vector).
+/// The embedding step is shared across shards (we embed the cue once,
+/// then reuse the vector).
 #[derive(Debug, Clone)]
 pub struct EmbeddingStep {
     pub text: String,
@@ -41,7 +40,7 @@ pub struct ShardSearchStep {
 
 #[derive(Debug, Clone)]
 pub struct AnnSearchStep {
-    /// Picked by 6.2's `pick_ef`.
+    /// Picked by the cost model's `pick_ef`.
     pub ef: usize,
     /// `k * over_factor`, capped at `PlannerConfig::max_candidates_per_search`.
     pub candidates_to_request: usize,

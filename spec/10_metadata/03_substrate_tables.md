@@ -10,9 +10,10 @@ The `memories` table is the central index of Brain. Every memory has exactly one
 
 ```rust
 struct MemoryMetadata {
-    // Identity
+    // Identity (owner scope)
     memory_id: MemoryId,                  // 16 bytes (also the key)
-    agent_id: AgentId,                    // 16 bytes
+    namespace_id: NamespaceId,            // 4 bytes; owning tenant. 0 = reserved `brain` system namespace
+    agent_id: AgentId,                    // 16 bytes; owning agent
     context_id: ContextId,                // 8 bytes
     slot_id: u64,                         // 8 bytes (effective 48-bit)
     slot_version: u32,                    // 4 bytes
@@ -54,8 +55,11 @@ For 1M memories: ~150 MB.
 #### 2.1 Identity
 
 - `memory_id` — primary key. Repeated as a row field for convenience (rkyv decoders can return the row including the key).
-- `agent_id` — owner. Searches typically filter by agent.
+- `namespace_id` — owning tenant (the outer half of the `(namespace, agent)` owner scope). `0` is the reserved `brain` system namespace, which owns only seeded rows. Stamped by the writer from the authenticated connection's scope (fail-closed by construction). Distinct from the qname namespace of any *type* the memory's downstream typed-graph rows reference.
+- `agent_id` — owning agent (the inner half of the owner scope). Searches typically filter by agent.
 - `context_id` — bucket the memory belongs to (one of an agent's contexts).
+
+The `memories` primary table is `MemoryId`-keyed; the `(namespace_id, agent_id)` owner scope lives on the row value and is the leading prefix of the per-tenant `memories_by_agent_timeline` index ([`02_table_layout.md`](02_table_layout.md) §4), so a timeline scan for one `(namespace, agent)` can never traverse another tenant's rows.
 - `slot_id` and `slot_version` — locate the vector in the arena. Version disambiguates reused slots.
 
 #### 2.2 Kind
@@ -669,6 +673,12 @@ fn handle_encode(request: EncodeRequest) -> EncodeResponse {
 ```
 
 The lookup is in a read transaction (cheap, MVCC). The act is in a write transaction (atomic with the rest of the encode).
+
+### 3a. Key scoping under `act_as`
+
+The lookup above shows a bare-`RequestId` key, which is correct **only** because a connection's identity is fixed for its whole life. When a request carries the `act_as` field — a trusted service principal running the op on behalf of a tenant agent, defined in [`../04_wire_protocol/04_handshake.md`](../04_wire_protocol/04_handshake.md) §"Per-request identity (`act_as`)" — that assumption no longer holds: one service principal issues ops for many effective identities over one shared connection.
+
+Therefore, under `act_as`, the idempotency key MUST be scoped by the **effective** `(namespace_id, agent_id)` named in `act_as`, not by the connection principal — the key is the composite `(namespace_id, agent_id, RequestId)`, and shard routing likewise keys on the effective agent (see §12). Consistent with [`../05_operations/02_write_pipeline.md`](../05_operations/02_write_pipeline.md) §4. This is a load-bearing safety rule: with a bare-RequestId key, a service principal that reuses a RequestId across two tenants would **collide**, replaying tenant A's cached response to tenant B — a cross-tenant data leak, invisible because the pool and the idempotency table are shared. Scoping the key by the effective identity makes the collision impossible; the two tenants land on disjoint keys.
 
 ### 4. The replay safety
 

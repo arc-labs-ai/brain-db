@@ -5,7 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Cross-encoder reranker (bge-reranker-base) for the hybrid query pipeline."
+publish.workspace = true
+description = "Cross-encoder reranker (bge-reranker-base) for the retrieval query pipeline."
 
 [dependencies]
 thiserror.workspace = true
@@ -16,6 +17,7 @@ tokenizers.workspace = true
 tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+flume.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

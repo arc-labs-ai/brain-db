@@ -1,4 +1,4 @@
-//! M4 SSE basic tests.
+//! SSE basic tests.
 
 mod common;
 

@@ -23,7 +23,7 @@ use thiserror::Error;
 // ErrorCategory.
 // ---------------------------------------------------------------------------
 
-/// Broad error class. Drives the SDK's default retry policy: only
+/// Broad error class. Drives the client's default retry policy: only
 /// `ResourceExhausted`, `Internal`, and `Unavailable` retry by default
 /// (see [`ErrorCategory::is_retryable`]).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -49,7 +49,7 @@ pub enum ErrorCategory {
 }
 
 impl ErrorCategory {
-    /// Whether the SDK should retry by default. Three retryable
+    /// Whether the client should retry by default. Three retryable
     /// categories: `ResourceExhausted`, `Internal`, `Unavailable`.
     #[must_use]
     pub fn is_retryable(self) -> bool {
@@ -73,7 +73,7 @@ impl ErrorCategory {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 #[non_exhaustive]
 pub enum ErrorCode {
-    // §3.1 Protocol
+    // Protocol
     BadMagic,
     BadHeaderCrc,
     BadPayloadCrc,
@@ -83,10 +83,10 @@ pub enum ErrorCode {
     OversizePayload,
     ReservedFieldNonZero,
     BadFlagCombination,
-    MalformedRkyv,
+    MalformedPayload,
     MalformedVector,
 
-    // §3.2 Connection / handshake
+    // Connection / handshake
     VersionNotSupported,
     NoSuchAuthMethod,
     Unauthenticated,
@@ -94,17 +94,25 @@ pub enum ErrorCode {
     AuthBackendUnavailable,
     SessionExpired,
 
-    // §3.3 Authorization
+    // Authorization
     PermissionDenied,
     AdminPermissionRequired,
     WrongShard,
+    /// A request carried an `act_as` field the connection principal is
+    /// not entitled to honor — either the principal lacks the
+    /// `can_act_as` grant (invariant R1) or `act_as.namespace` is
+    /// outside its `may_act` allowlist (invariant R2). Distinct from
+    /// `PermissionDenied` (which is resolved against the *effective*
+    /// identity per R4). Hard-rejected; never silently downgraded to the
+    /// connection's own identity.
+    ActAsDenied,
 
-    // §3.4 Validation
+    // Validation
     InvalidArgument,
     MissingRequiredField,
     TextTooLarge,
     TextEmpty,
-    BadContextId,
+    BadSessionId,
     BadMemoryKind,
     BadEdgeKind,
     BadStrategyHint,
@@ -121,14 +129,14 @@ pub enum ErrorCode {
     /// `PredicateNotInSchema` for the relation registry.
     RelationTypeNotInSchema,
 
-    // §3.5 Not found
+    // Not found
     MemoryNotFound,
     ContextNotFound,
     SubscriptionNotFound,
     SnapshotNotFound,
     TxnNotFound,
 
-    // §3.6 Conflict
+    // Conflict
     IdempotencyConflict,
     TransactionConflict,
     TransactionTimeout,
@@ -140,7 +148,7 @@ pub enum ErrorCode {
     /// behave as ManyToMany.
     CardinalityViolation,
 
-    // §3.7 Resource exhausted
+    // Resource exhausted
     OutOfSlots,
     OutOfDisk,
     OutOfMemory,
@@ -148,8 +156,15 @@ pub enum ErrorCode {
     StreamLimitExceeded,
     ConnectionLimitExceeded,
     TransactionLimitExceeded,
+    /// Transaction buffer exceeded the per-transaction op cap (1000 ops).
+    /// Surfaced both at append-time (so the space
+    /// learns immediately when the 1001st op is buffered) and at commit
+    /// time (defense-in-depth for any buffer mutation that slipped past
+    /// the append guard). The client should split the work into multiple
+    /// transactions.
+    TransactionTooLarge,
 
-    // §3.8 Internal
+    // Internal
     Internal,
     StorageError,
     IndexError,
@@ -160,7 +175,7 @@ pub enum ErrorCode {
     /// stream's terminal ERROR frame.
     Cancelled,
 
-    // §3.9 Unavailable
+    // Unavailable
     ShardUnavailable,
     Overloaded,
     Restarting,
@@ -172,7 +187,7 @@ pub enum ErrorCode {
     /// spawn if a required retriever is unwired.
     RetrieverDegraded,
 
-    // §3.10 Typed-graph error codes (`0x01xx` namespace). Low-byte family
+    // Typed-graph error codes (`0x01xx` namespace). Low-byte family
     // mirrors the typed-graph opcode ranges.
     /// Schema upload failed validation (syntax, type-ref, attribute rule, etc.).
     SchemaInvalid,
@@ -199,13 +214,14 @@ pub enum ErrorCode {
     /// (subject, predicate). Resolution: client picks `STATEMENT_SUPERSEDE`
     /// or leaves both active.
     StatementContradictsExisting,
-    /// `QUERY` / `RECALL_HYBRID` exceeded its wall-time budget.
+    /// A retrieval read (`RECALL`, or a `QUERY_EXPLAIN` / `QUERY_TRACE`
+    /// plan probe) exceeded its wall-time budget.
     QueryTimeout,
-    /// `QUERY` exceeded its declared cost budget (top_k × retrievers ×
-    /// per-hit cost).
+    /// A retrieval read exceeded its declared cost budget (top_k ×
+    /// retrievers × per-hit cost).
     QueryOverBudget,
-    /// Extractor governance op (`EXTRACTOR_DISABLE` / `_ENABLE`) refused —
-    /// extractor is disabled by the operator or unreachable.
+    /// The extractor tier is disabled or unreachable — surfaced when a
+    /// governance or introspection op cannot be served.
     ExtractorDisabled,
     /// LLM extractor's per-call cost budget exceeded.
     ExtractorBudgetExceeded,
@@ -229,7 +245,7 @@ impl ErrorCode {
             | Self::OversizePayload
             | Self::ReservedFieldNonZero
             | Self::BadFlagCombination
-            | Self::MalformedRkyv
+            | Self::MalformedPayload
             | Self::MalformedVector => ErrorCategory::Protocol,
 
             // Connection / handshake — version + auth-method failures are
@@ -241,16 +257,17 @@ impl ErrorCode {
             | Self::SessionExpired => ErrorCategory::Authentication,
 
             // Authorization codes.
-            Self::PermissionDenied | Self::AdminPermissionRequired | Self::WrongShard => {
-                ErrorCategory::Authorization
-            }
+            Self::PermissionDenied
+            | Self::AdminPermissionRequired
+            | Self::WrongShard
+            | Self::ActAsDenied => ErrorCategory::Authorization,
 
             // Validation codes.
             Self::InvalidArgument
             | Self::MissingRequiredField
             | Self::TextTooLarge
             | Self::TextEmpty
-            | Self::BadContextId
+            | Self::BadSessionId
             | Self::BadMemoryKind
             | Self::BadEdgeKind
             | Self::BadStrategyHint
@@ -282,7 +299,8 @@ impl ErrorCode {
             | Self::RateLimited
             | Self::StreamLimitExceeded
             | Self::ConnectionLimitExceeded
-            | Self::TransactionLimitExceeded => ErrorCategory::ResourceExhausted,
+            | Self::TransactionLimitExceeded
+            | Self::TransactionTooLarge => ErrorCategory::ResourceExhausted,
 
             // Internal codes.
             Self::Internal
@@ -302,9 +320,9 @@ impl ErrorCode {
             | Self::QueryTimeout => ErrorCategory::Unavailable,
 
             // Typed-graph validation codes.
-            Self::SchemaInvalid
-            | Self::EntityTypeMismatch
-            | Self::StatementObjectTypeMismatch => ErrorCategory::Validation,
+            Self::SchemaInvalid | Self::EntityTypeMismatch | Self::StatementObjectTypeMismatch => {
+                ErrorCategory::Validation
+            }
 
             // Typed-graph not-found codes.
             Self::EntityNotFound | Self::StatementNotFound => ErrorCategory::NotFound,
@@ -366,7 +384,7 @@ pub enum ProtocolError {
     /// Frame flags are mutually inconsistent.
     #[error("bad flag combination: {0}")]
     BadFlagCombination(String),
-    /// Payload failed structural validation (rkyv / vector layout).
+    /// Payload failed structural validation (CBOR / vector layout).
     #[error("malformed payload: {0}")]
     MalformedPayload(String),
 }
@@ -386,7 +404,7 @@ impl ProtocolError {
             Self::Truncated { .. } => ErrorCode::BadFrame,
             Self::BadFrame(_) => ErrorCode::BadFrame,
             Self::BadFlagCombination(_) => ErrorCode::BadFlagCombination,
-            Self::MalformedPayload(_) => ErrorCode::MalformedRkyv,
+            Self::MalformedPayload(_) => ErrorCode::MalformedPayload,
         }
     }
 
@@ -493,7 +511,7 @@ mod tests {
             ProtocolError::Truncated { have: 0, need: 32 },
             ProtocolError::BadFrame("x".into()),
             ProtocolError::BadFlagCombination("EOS+MPL".into()),
-            ProtocolError::MalformedPayload("rkyv check failed".into()),
+            ProtocolError::MalformedPayload("CBOR decode failed".into()),
         ];
         for e in samples {
             assert_eq!(
@@ -546,32 +564,38 @@ mod tests {
         );
         assert_eq!(
             ProtocolError::MalformedPayload("z".into()).code(),
-            ErrorCode::MalformedRkyv
+            ErrorCode::MalformedPayload
         );
     }
 
-    /// Pins every typed-graph code (§3.10) + the newly-assigned Cancelled
-    /// (§3.8) and RetrieverDegraded (§3.9) to the categories the spec lists.
-    /// Drift guard: if the spec changes a category, this fails and forces
+    /// Pins every typed-graph code plus the Cancelled and
+    /// RetrieverDegraded codes to their assigned categories.
+    /// Drift guard: if a category changes, this fails and forces
     /// an explicit decision rather than silent drift.
     #[test]
     fn typed_graph_and_new_codes_match_spec_categories() {
-        // §3.8 Internal additions.
+        // Internal additions.
         assert_eq!(ErrorCode::Cancelled.category(), ErrorCategory::Internal);
 
-        // §3.9 Unavailable additions.
+        // Unavailable additions.
         assert_eq!(
             ErrorCode::RetrieverDegraded.category(),
             ErrorCategory::Unavailable
         );
 
-        // §3.10 Typed-graph codes.
-        assert_eq!(ErrorCode::SchemaInvalid.category(), ErrorCategory::Validation);
+        // Typed-graph codes.
+        assert_eq!(
+            ErrorCode::SchemaInvalid.category(),
+            ErrorCategory::Validation
+        );
         assert_eq!(
             ErrorCode::SchemaMigrationRequired.category(),
             ErrorCategory::Conflict
         );
-        assert_eq!(ErrorCode::EntityNotFound.category(), ErrorCategory::NotFound);
+        assert_eq!(
+            ErrorCode::EntityNotFound.category(),
+            ErrorCategory::NotFound
+        );
         assert_eq!(
             ErrorCode::EntityTypeMismatch.category(),
             ErrorCategory::Validation

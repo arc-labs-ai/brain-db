@@ -1,110 +1,312 @@
-//! Concurrent wrapper around `HnswIndex`.
+//! Two-tier lock-free wrapper for the memory HNSW.
 //!
-//! See `spec/09_indexing/08_concurrency.md` and SD-4.8-1 in
-//! `docs/development/spec-deviations.md`.
+//! - An immutable `MainEpoch` swapped via `ArcSwap` holds the
+//!   published full-precision graph.
+//! - A mutable `PendingBuffer` protected by `RwLock` holds recent
+//!   inserts and tombstones that haven't been folded into main yet.
 //!
-//! ## Reader / writer split
-//!
-//! - [`SharedHnsw<D>`] is the **reader handle**: `Clone`, all methods
-//!   take `&self`. Multiple clones can search the same index from
-//!   different threads concurrently.
-//! - [`Writer<D>`] is the **writer handle**: not `Clone`, mutation
-//!   methods take `&mut self`. Constructed exactly once alongside
-//!   the reader via [`SharedHnsw::new`] — the type system enforces
-//!   single-writer-per-shard at compile time.
-//!
-//! ## RwLock not ArcSwap (SD-4.8-1)
-//!
-//! mandates lock-free reads via `ArcSwap<HnswState>`
-//! and a pending-insert buffer that periodically rebuilds and
-//! publishes a new state. That model requires cloning the HNSW
-//! graph cheaply; `hnsw_rs::Hnsw` doesn't implement `Clone`, and at
-//! 1M nodes a deep clone would cost ~150 MB and seconds — way past
-//! the spec's 100 ms flush cadence.
-//!
-//! v1 ships with `Arc<parking_lot::RwLock<HnswIndex<D>>>` instead:
-//! concurrent readers, exclusive writes. Not lock-free, but readers
-//! aren't serialised against each other. Write latency dips reader
-//! latency briefly during inserts (~1-3 ms at 1M),
-//! which we accept for v1. Reconciliation: future Phase 11+ work
-//! either patches hnsw_rs to expose a clone-aware mutation model or
-//! replaces it with a custom HNSW.
+//! Both tiers score with exact cosine similarity: main via the
+//! full-precision HNSW graph, pending via brute-force over the
+//! buffered vectors. Search merges the two, deduping by `MemoryId`
+//! with pending winning on collision (its vector is the latest write).
 
-use std::path::Path;
+use std::collections::HashSet;
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use brain_core::MemoryId;
 use parking_lot::RwLock;
 
 use crate::hnsw::{HnswError, HnswIndex};
-use crate::params::IndexParams;
-use crate::rebuild::RebuildReport;
+use crate::params::{IndexParams, VECTOR_DIM};
 
-/// Cloneable reader handle. All methods are concurrent (RwLock read).
-#[derive(Clone)]
-pub struct SharedHnsw<const D: usize> {
-    inner: Arc<RwLock<HnswIndex<D>>>,
-}
-
-/// Single-writer handle. Not `Clone`; mutation methods take `&mut
-/// self`. Only obtained via [`SharedHnsw::new`] or
-/// [`SharedHnsw::load_snapshot`].
-pub struct Writer<const D: usize> {
-    inner: Arc<RwLock<HnswIndex<D>>>,
-}
-
-impl<const D: usize> SharedHnsw<D> {
-    /// Create a fresh shared index and its single writer. Returns the
-    /// reader handle (cloneable) and the writer handle (one-shot).
-    pub fn new(params: IndexParams) -> Result<(Self, Writer<D>), HnswError> {
-        let idx = HnswIndex::<D>::new(params)?;
+impl SharedHnsw {
+    /// Build an empty [`SharedHnsw`] / [`Writer`] pair.
+    ///
+    /// Errors:
+    /// - [`HnswError::InvalidParams`] if `params` doesn't validate.
+    pub fn new(params: IndexParams) -> Result<(Self, Writer), HnswError> {
+        let idx = HnswIndex::new(params)?;
         Ok(Self::from_index(idx))
     }
 
-    /// Wrap an existing `HnswIndex`, returning the reader/writer pair.
-    #[must_use]
-    pub fn from_index(idx: HnswIndex<D>) -> (Self, Writer<D>) {
-        let inner = Arc::new(RwLock::new(idx));
-        let reader = Self {
-            inner: inner.clone(),
+    /// Persist the published main to a directory at the given basename.
+    /// Writes three files:
+    /// `<basename>.hnsw.graph`, `<basename>.hnsw.data`, and
+    /// `<basename>.brain` (the wrapper, written **last** so its presence
+    /// marks "snapshot complete"). The wrapper carries BLAKE3 hashes of
+    /// the two sibling files so cross-file integrity is verifiable from
+    /// the wrapper alone.
+    ///
+    /// `taken_at_lsn` is recorded in the wrapper header so recovery
+    /// knows the WAL position to replay past. Pending-buffer state is
+    /// **not** included; the convention is that the snapshot worker
+    /// runs after a checkpoint, so any pending entry at that point
+    /// either landed in the arena (will be replayed on load) or hadn't
+    /// reached durable state yet (no WAL record → not visible at all).
+    ///
+    /// `dir` must already exist (matches `hnsw_rs::Hnsw::file_dump`).
+    pub fn save_snapshot(
+        &self,
+        dir: &std::path::Path,
+        basename: &str,
+        taken_at_lsn: u64,
+        shard_uuid: [u8; 16],
+    ) -> Result<(), HnswError> {
+        use crate::persistence::{compute_footer, Body, Header};
+
+        // 1. Snapshot the published main. ArcSwap → no writer locking.
+        let epoch = self.main.load();
+        let idx = &epoch.index;
+        let params = idx.params();
+
+        // 2. Empty-main guard: `hnsw_rs::Hnsw::file_dump` errors on an
+        //    empty graph. An empty snapshot has no value over the arena-
+        //    rebuild fallback (no nodes to load), so skip the write
+        //    silently. Recovery's `find_latest_snapshot_dir` won't find a
+        //    `<basename>.brain` here and will run the rebuild path.
+        if idx.is_empty() {
+            return Ok(());
+        }
+
+        // 3. Dump the inner graph: hnsw_rs writes
+        //    <basename>.hnsw.graph + <basename>.hnsw.data into `dir`.
+        let _basename_used = idx.file_dump(dir, basename)?;
+
+        // 4. BLAKE3 each sibling file. Read-once, no streaming — the
+        //    largest will be the graph file; load time will repeat the
+        //    same hash before trusting the load (see load_snapshot).
+        let graph_hash = blake3_file(&dir.join(format!("{basename}.hnsw.graph")))?;
+        let data_hash = blake3_file(&dir.join(format!("{basename}.hnsw.data")))?;
+
+        // 5. Build the wrapper. Header.encode → 64 bytes; Body.encode →
+        //    variable; Footer = BLAKE3(header || body) truncated.
+        let header = Header::new::<{ crate::params::VECTOR_DIM }>(
+            shard_uuid,
+            taken_at_lsn,
+            idx.id_map().len() as u64,
+            params,
+        );
+        let body = Body::encode(
+            idx.id_map(),
+            idx.id_map().next_id(),
+            idx.tombstones(),
+            graph_hash,
+            data_hash,
+        );
+
+        let mut wrapper = Vec::with_capacity(
+            crate::persistence::HEADER_LEN + body.bytes.len() + crate::persistence::FOOTER_LEN,
+        );
+        wrapper.extend_from_slice(&header.encode());
+        wrapper.extend_from_slice(&body.bytes);
+        let footer = compute_footer(&wrapper);
+        wrapper.extend_from_slice(&footer);
+
+        // 6. `.brain` is the snapshot-complete marker. Write last so a
+        //    partial directory (only graph + data written before crash)
+        //    fails the "load .brain first" probe and the caller cleanly
+        //    falls back to arena rebuild.
+        std::fs::write(dir.join(format!("{basename}.brain")), &wrapper)?;
+        Ok(())
+    }
+
+    /// Reload a snapshot triple+wrapper into `(HnswIndex, taken_at_lsn)`.
+    /// Verifies the wrapper's magic + version + header CRC + footer
+    /// BLAKE3, refuses on a `shard_uuid` mismatch, then verifies each
+    /// sibling file's BLAKE3 matches the wrapper body. Any failure
+    /// returns a clear error so the caller can fall back to a fresh
+    /// rebuild.
+    ///
+    /// Returns the bare index rather than a wrapped `(Self, Writer)`
+    /// so the caller (`spawn_shard`) can `swap()` the loaded index into
+    /// an already-constructed `SharedHnsw` without disturbing the
+    /// writer it has already wired into the rest of the stack.
+    pub fn load_snapshot(
+        dir: &std::path::Path,
+        basename: &str,
+        expected_shard_uuid: [u8; 16],
+    ) -> Result<(HnswIndex, u64), HnswError> {
+        use crate::persistence::{
+            read_brain_file, verify_footer, BodyError, Header, HeaderError, ParsedBody, FOOTER_LEN,
+            HEADER_LEN,
         };
-        let writer = Writer { inner };
+
+        // 1. Wrapper.
+        let wrapper_path = dir.join(format!("{basename}.brain"));
+        let wrapper = read_brain_file(&wrapper_path)?;
+        if !verify_footer(&wrapper) {
+            return Err(HnswError::SnapshotCorrupt(
+                "wrapper footer BLAKE3 mismatch".into(),
+            ));
+        }
+        if wrapper.len() < HEADER_LEN + FOOTER_LEN {
+            return Err(HnswError::SnapshotCorrupt(
+                "wrapper smaller than header+footer".into(),
+            ));
+        }
+        let header = Header::parse(&wrapper[..HEADER_LEN]).map_err(|e: HeaderError| {
+            HnswError::SnapshotCorrupt(format!("wrapper header: {e:?}"))
+        })?;
+        if header.shard_uuid != expected_shard_uuid {
+            return Err(HnswError::SnapshotCorrupt(format!(
+                "shard_uuid mismatch: expected {:?}, got {:?}",
+                expected_shard_uuid, header.shard_uuid
+            )));
+        }
+        let body_bytes = &wrapper[HEADER_LEN..wrapper.len() - FOOTER_LEN];
+        let body = ParsedBody::parse(body_bytes)
+            .map_err(|e: BodyError| HnswError::SnapshotCorrupt(format!("wrapper body: {e:?}")))?;
+
+        // 2. Graph + data sibling-hash verification.
+        let graph_path = dir.join(format!("{basename}.hnsw.graph"));
+        let data_path = dir.join(format!("{basename}.hnsw.data"));
+        let graph_hash = blake3_file(&graph_path)?;
+        if graph_hash != body.graph_hash {
+            return Err(HnswError::SnapshotCorrupt("graph BLAKE3 mismatch".into()));
+        }
+        let data_hash = blake3_file(&data_path)?;
+        if data_hash != body.data_hash {
+            return Err(HnswError::SnapshotCorrupt("data BLAKE3 mismatch".into()));
+        }
+
+        // 3. hnsw_rs reload as the full-precision cosine graph.
+        //    `load_hnsw` returns `Hnsw<'b, ...>` where `'b` is bounded by
+        //    the `HnswIo`'s lifetime. Brain stores the inner Hnsw as
+        //    `'static` (the `HnswIndex` contract), so we leak the io. The
+        //    leaked struct is small and the leak is bounded by
+        //    `O(shard restarts)`, freed at process exit. The graph itself
+        //    is owned by `Hnsw` after `load_hnsw` returns, so we're not
+        //    leaking the graph bytes — only the small handle.
+        let io_ref: &'static mut hnsw_rs::hnswio::HnswIo =
+            Box::leak(Box::new(hnsw_rs::hnswio::HnswIo::new(dir, basename)));
+        let inner = io_ref
+            .load_hnsw::<f32, hnsw_rs::prelude::DistCosine>()
+            .map_err(|e| HnswError::SnapshotCorrupt(format!("hnsw_rs load: {e}")))?;
+
+        // 4. Rebuild IdMap + TombstoneBitmap + params.
+        let id_map = crate::idmap::IdMap::from_snapshot(body.id_map_entries, body.next_internal_id);
+        let tombstones = crate::tombstones::TombstoneBitmap::from_snapshot(
+            body.tombstone_words,
+            body.tombstone_set_count as usize,
+        );
+        let params = crate::params::IndexParams::default_v1();
+
+        // 5. Assemble. Caller decides whether to wrap with `from_index`
+        //    (standalone usage / tests) or `swap` into an existing
+        //    SharedHnsw (recovery in spawn_shard).
+        let idx = HnswIndex::from_persisted_parts(params, inner, id_map, tombstones);
+        Ok((idx, header.taken_at_lsn))
+    }
+}
+
+/// Stream BLAKE3 over a file. Used at save+load time to verify
+/// cross-file integrity in the snapshot triple.
+fn blake3_file(path: &std::path::Path) -> Result<[u8; 32], HnswError> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(*hasher.finalize().as_bytes())
+}
+
+/// An immutable HNSW snapshot for a single published epoch.
+struct MainEpoch {
+    index: HnswIndex,
+    epoch_id: u64,
+}
+
+/// Recent inserts and tombstones that haven't yet been folded into
+/// the main HNSW. Full-precision vectors live here so pending inserts
+/// are visible at exact cosine immediately.
+struct PendingBuffer {
+    entries: Vec<PendingEntry>,
+    tombstoned: HashSet<MemoryId>,
+}
+
+impl PendingBuffer {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            tombstoned: HashSet::new(),
+        }
+    }
+}
+
+/// A full-precision vector buffered until the next flush rebuild folds
+/// it into the main HNSW. The `vector` field is kept verbatim so
+/// pending search uses exact cosine.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingEntry {
+    pub memory_id: MemoryId,
+    pub vector: [f32; VECTOR_DIM],
+    pub tombstoned: bool,
+}
+
+/// Report returned by [`SharedHnsw::flush_with_rebuild`].
+#[derive(Debug, Clone)]
+pub struct FlushReport {
+    pub entries_flushed: usize,
+    pub new_epoch: u64,
+    pub main_len_after: usize,
+}
+
+/// Cloneable reader handle for the shared memory index.
+#[derive(Clone)]
+pub struct SharedHnsw {
+    main: Arc<ArcSwap<MainEpoch>>,
+    pending: Arc<RwLock<PendingBuffer>>,
+}
+
+/// Single-writer handle. Not `Clone` — enforces single-writer-per-shard
+/// at the type level.
+pub struct Writer {
+    /// Kept so the published main outlives the writer regardless of
+    /// reader cloning patterns; never read directly.
+    _main: Arc<ArcSwap<MainEpoch>>,
+    pending: Arc<RwLock<PendingBuffer>>,
+}
+
+impl SharedHnsw {
+    /// Wrap an existing [`HnswIndex`], returning the reader/writer pair.
+    #[must_use]
+    pub fn from_index(idx: HnswIndex) -> (Self, Writer) {
+        let epoch = Arc::new(MainEpoch {
+            index: idx,
+            epoch_id: 0,
+        });
+        let main = Arc::new(ArcSwap::new(epoch));
+        let pending = Arc::new(RwLock::new(PendingBuffer::new()));
+        let reader = Self {
+            main: main.clone(),
+            pending: pending.clone(),
+        };
+        let writer = Writer {
+            _main: main,
+            pending,
+        };
         (reader, writer)
     }
 
-    /// Rebuild a shared index from an iterator.
-    /// Convenience around [`HnswIndex::rebuild`] + `from_index`.
-    pub fn rebuild<I>(
-        params: IndexParams,
-        source: I,
-    ) -> Result<(Self, Writer<D>, RebuildReport), HnswError>
-    where
-        I: IntoIterator<Item = (MemoryId, [f32; D])>,
-    {
-        let (idx, report) = HnswIndex::<D>::rebuild(params, source)?;
-        let (reader, writer) = Self::from_index(idx);
-        Ok((reader, writer, report))
-    }
+    // ----- Reader methods --------------------------------------------------
 
-    /// Load a shared index from a snapshot. Wraps
-    /// [`HnswIndex::load_snapshot`]. Returns the reader/writer pair
-    /// plus the `taken_at_lsn` recorded in the snapshot header.
-    pub fn load_snapshot(
-        dir: &Path,
-        basename: &str,
-        expected_shard_uuid: [u8; 16],
-    ) -> Result<(Self, Writer<D>, u64), HnswError> {
-        let (idx, lsn) = HnswIndex::<D>::load_snapshot(dir, basename, expected_shard_uuid)?;
-        let (reader, writer) = Self::from_index(idx);
-        Ok((reader, writer, lsn))
-    }
-
-    // ----- Reader-only methods ----------------------------------------
-
+    /// Top-`k` nearest neighbours of `query`. Returns
+    /// `(MemoryId, cosine_similarity)` pairs sorted descending by
+    /// similarity. The main graph scores exact cosine directly; the
+    /// pending buffer is brute-forced at exact cosine. Tombstoned
+    /// candidates (in either tier) are dropped; `filter` runs as an
+    /// extra predicate alongside the always-on tombstone filter.
     #[must_use]
     pub fn search<F>(
         &self,
-        query: &[f32; D],
+        query: &[f32; VECTOR_DIM],
         k: usize,
         ef: Option<usize>,
         filter: F,
@@ -112,245 +314,794 @@ impl<const D: usize> SharedHnsw<D> {
     where
         F: Fn(MemoryId) -> bool,
     {
-        let guard = self.inner.read();
-        guard.search(query, k, ef, filter)
+        if k == 0 {
+            return Vec::new();
+        }
+
+        // Pending tombstone overlay wins everywhere.
+        let pending_tombstones: HashSet<MemoryId> = self.pending.read().tombstoned.clone();
+
+        // 1. Main: exact-cosine top-k from the full-precision graph.
+        let epoch = self.main.load();
+        let main_hits = epoch.index.search(query, k, ef, |id| {
+            !pending_tombstones.contains(&id) && filter(id)
+        });
+
+        // 2. Pending: brute-force exact cosine. Tombstoned overlay
+        //    already excluded above.
+        let pending_hits = self.pending_search(query, k, &filter);
+
+        // 3. Merge + dedupe by MemoryId, prefer pending's score on
+        //    collision (latest vector wins). Both tiers are cosine
+        //    similarity, so the merge is a plain descending sort.
+        merge_dedupe_descending(main_hits, pending_hits, k)
     }
 
+    /// Top-`k` nearest neighbours, excluding tombstoned memories.
+    /// Convenience for the common case.
     #[must_use]
     pub fn search_active(
         &self,
-        query: &[f32; D],
+        query: &[f32; VECTOR_DIM],
         k: usize,
         ef: Option<usize>,
     ) -> Vec<(MemoryId, f32)> {
-        let guard = self.inner.read();
-        guard.search_active(query, k, ef)
+        self.search(query, k, ef, |_| true)
     }
 
+    /// Is `memory_id` present (and not tombstoned) in either tier?
     #[must_use]
     pub fn contains(&self, memory_id: MemoryId) -> bool {
-        self.inner.read().contains(memory_id)
+        let pending = self.pending.read();
+        if pending.tombstoned.contains(&memory_id) {
+            return false;
+        }
+        if pending
+            .entries
+            .iter()
+            .any(|e| e.memory_id == memory_id && !e.tombstoned)
+        {
+            return true;
+        }
+        drop(pending);
+        let epoch = self.main.load();
+        epoch.index.contains(memory_id) && !epoch.index.is_tombstoned(memory_id)
     }
 
+    /// Is `memory_id` tombstoned in either tier?
     #[must_use]
     pub fn is_tombstoned(&self, memory_id: MemoryId) -> bool {
-        self.inner.read().is_tombstoned(memory_id)
+        if self.pending.read().tombstoned.contains(&memory_id) {
+            return true;
+        }
+        self.main.load().index.is_tombstoned(memory_id)
     }
 
+    /// Approximate combined size: published main plus pending entries.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.inner.read().len()
+        let pending = self.pending.read();
+        let pending_extra = pending.entries.iter().filter(|e| !e.tombstoned).count();
+        self.main.load().index.len() + pending_extra
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.inner.read().is_empty()
+        let pending = self.pending.read();
+        if pending.entries.iter().any(|e| !e.tombstoned) {
+            return false;
+        }
+        drop(pending);
+        self.main.load().index.is_empty()
     }
 
+    /// Combined tombstone count: main's bitmap plus pending overlay
+    /// entries not already counted in main.
     #[must_use]
     pub fn tombstone_count(&self) -> usize {
-        self.inner.read().tombstone_count()
+        let epoch = self.main.load();
+        let pending = self.pending.read();
+        let mut count = epoch.index.tombstone_count();
+        for id in &pending.tombstoned {
+            if !epoch.index.is_tombstoned(*id) {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Index params of the published main.
+    #[must_use]
+    pub fn params(&self) -> IndexParams {
+        self.main.load().index.params()
     }
 
     #[must_use]
-    pub fn params(&self) -> IndexParams {
-        self.inner.read().params()
+    pub fn epoch(&self) -> u64 {
+        self.main.load().epoch_id
     }
 
-    /// Save a snapshot. Acquires the read lock for the duration of
-    /// the write (writes block, readers don't).
-    pub fn save_snapshot(
-        &self,
-        dir: &Path,
-        basename: &str,
-        taken_at_lsn: u64,
-        shard_uuid: [u8; 16],
-    ) -> Result<(), HnswError> {
-        let guard = self.inner.read();
-        guard.save_snapshot(dir, basename, taken_at_lsn, shard_uuid)
-    }
-
-    /// Atomically replace the inner index with `new`. Used by the
-    /// HNSW maintenance worker (sub-task 8.5) when a full rebuild
-    /// completes describes the operation as an
-    /// "ArcSwap" — our `Arc<RwLock<HnswIndex>>` realises the same
-    /// semantics: readers complete on the old index, the brief
-    /// write-lock acquisition is microsecond-scale, new reads see
-    /// the replacement.
+    /// Recovery-only: insert a `(memory_id, vector)` pair directly
+    /// into the pending buffer, bypassing the [`Writer`].
     ///
-    /// **Discipline**: only one task should call `swap` at a time.
-    /// The scheduler's single-worker-per-name guarantee (sub-task
-    /// 8.1) is what enforces this at runtime.
-    pub fn swap(&self, new: HnswIndex<D>) {
-        let mut guard = self.inner.write();
-        *guard = new;
+    /// Used by `spawn_shard`'s snapshot-load → tail-replay path. The
+    /// snapshot captures the memory HNSW at `taken_at_lsn`; arena
+    /// records whose `encoded_at_lsn > taken_at_lsn` aren't in the
+    /// loaded main and must be brought forward so the rebuilt index
+    /// reflects every durable write. The writer has already been
+    /// moved into `RealWriterHandle` by the time recovery runs in the
+    /// current shard layout — exposing a direct pending insert avoids
+    /// the alternative of reordering writer construction or holding
+    /// two writers. Boot is single-threaded, so this is safe.
+    ///
+    /// Production write paths must continue to go through
+    /// [`Writer::insert`].
+    pub fn insert_recovery(&self, memory_id: MemoryId, vector: &[f32; crate::params::VECTOR_DIM]) {
+        let mut pending = self.pending.write();
+        pending.tombstoned.remove(&memory_id);
+        if let Some(slot) = pending
+            .entries
+            .iter_mut()
+            .find(|e| e.memory_id == memory_id)
+        {
+            slot.vector = *vector;
+            slot.tombstoned = false;
+        } else {
+            pending.entries.push(PendingEntry {
+                memory_id,
+                vector: *vector,
+                tombstoned: false,
+            });
+        }
+    }
+
+    /// Recovery-only: mark `memory_id` tombstoned directly in the
+    /// pending overlay, bypassing the [`Writer`].
+    ///
+    /// The mirror of [`Self::insert_recovery`] for the snapshot-load →
+    /// tail-reconciliation path. A snapshot captures the memory HNSW at
+    /// `taken_at_lsn`; a `FORGET` that landed *after* the snapshot marks
+    /// the memory inactive in redb but leaves the loaded main graph
+    /// holding the node active. Without re-applying that delete the node
+    /// becomes a ghost — an active top-k slot that diverges from redb
+    /// indefinitely (the tombstone-ratio rebuild trigger may never fire
+    /// on a freshly-loaded snapshot). Calling this for every memory whose
+    /// redb row is inactive/tombstoned as of the recovered tail makes the
+    /// HNSW active set converge to the redb active set.
+    ///
+    /// Boot is single-threaded, so bypassing the writer is safe.
+    /// Production tombstone paths must go through
+    /// [`Writer::mark_tombstoned`].
+    pub fn tombstone_recovery(&self, memory_id: MemoryId) {
+        let mut pending = self.pending.write();
+        pending.tombstoned.insert(memory_id);
+        if let Some(slot) = pending
+            .entries
+            .iter_mut()
+            .find(|e| e.memory_id == memory_id)
+        {
+            slot.tombstoned = true;
+        }
+    }
+
+    /// Atomically replace the published main with `new_index` and
+    /// clear pending. Used for bootstrap and snapshot-load paths
+    /// where main was rebuilt from a source of truth that already
+    /// reflects all writes.
+    pub fn swap(&self, new_index: HnswIndex) {
+        let prev = self.main.load();
+        let next = Arc::new(MainEpoch {
+            index: new_index,
+            epoch_id: prev.epoch_id.wrapping_add(1),
+        });
+        self.main.store(next);
+        let mut pending = self.pending.write();
+        pending.entries.clear();
+        pending.tombstoned.clear();
+    }
+
+    /// Snapshot pending entries, pass them to `build` to produce a new
+    /// main, then atomically publish + drain the flushed ids.
+    pub fn flush_with_rebuild<F>(&self, build: F) -> Result<FlushReport, HnswError>
+    where
+        F: FnOnce(&[PendingEntry]) -> Result<HnswIndex, HnswError>,
+    {
+        let snapshot: Vec<PendingEntry> = self.pending.read().entries.clone();
+        let snapshot_count = snapshot.len();
+
+        let new_index = build(&snapshot)?;
+
+        let mut pending = self.pending.write();
+        let prev_epoch = self.main.load();
+        let new_epoch_id = prev_epoch.epoch_id.wrapping_add(1);
+        let main_len_after = new_index.len();
+        let new_epoch = Arc::new(MainEpoch {
+            index: new_index,
+            epoch_id: new_epoch_id,
+        });
+        self.main.store(new_epoch);
+
+        // Reconcile pending against exactly what was folded into the new
+        // main — by *identity*, not by id. The build closure ran with no
+        // lock held (snapshot cloned above, write-lock re-acquired here),
+        // so a re-insert (updated vector) or a fresh tombstone for an id in
+        // the snapshot may have landed during the build. Retaining by id
+        // would drop that newer pending entry while the freshly-published
+        // main still carries the *old* snapshot vector — losing the update
+        // from both tiers. Retaining by identity keeps any entry that no
+        // longer byte-matches its folded snapshot version.
+        //
+        // (Not reachable under today's single-threaded Glommio model — the
+        // build is synchronous with no `.await`, so no foreground insert
+        // interleaves — but hardened so it stays correct if that changes.)
+        use std::collections::HashMap;
+        let folded: HashMap<MemoryId, &PendingEntry> =
+            snapshot.iter().map(|e| (e.memory_id, e)).collect();
+        pending.entries.retain(|e| {
+            folded
+                .get(&e.memory_id)
+                .is_none_or(|folded_e| *folded_e != e)
+        });
+        // Drop only tombstone-overlay ids whose folded snapshot entry was
+        // itself tombstoned (build already excluded them from main). A
+        // tombstone that arrived after the snapshot for an id folded as
+        // active is preserved by the entries retain above.
+        let folded_tombstones: HashSet<MemoryId> = snapshot
+            .iter()
+            .filter(|e| e.tombstoned)
+            .map(|e| e.memory_id)
+            .collect();
+        pending
+            .tombstoned
+            .retain(|id| !folded_tombstones.contains(id));
+
+        Ok(FlushReport {
+            entries_flushed: snapshot_count,
+            new_epoch: new_epoch_id,
+            main_len_after,
+        })
+    }
+
+    /// Clone the current pending entries — used by the maintenance
+    /// worker's flush prep.
+    #[must_use]
+    pub fn pending_snapshot(&self) -> Vec<PendingEntry> {
+        self.pending.read().entries.clone()
+    }
+
+    /// Count of live (non-tombstoned) pending entries.
+    #[must_use]
+    pub fn pending_len(&self) -> usize {
+        self.pending
+            .read()
+            .entries
+            .iter()
+            .filter(|e| !e.tombstoned)
+            .count()
+    }
+
+    // ----- Private helpers -------------------------------------------------
+
+    /// Brute-force exact-cosine over the pending buffer. Pending holds
+    /// full-precision vectors, so the score matches main's scale.
+    fn pending_search<F>(
+        &self,
+        query: &[f32; VECTOR_DIM],
+        k: usize,
+        filter: &F,
+    ) -> Vec<(MemoryId, f32)>
+    where
+        F: Fn(MemoryId) -> bool,
+    {
+        let pending = self.pending.read();
+        if pending.entries.is_empty() || k == 0 {
+            return Vec::new();
+        }
+        let mut scored: Vec<(MemoryId, f32)> = pending
+            .entries
+            .iter()
+            .filter(|e| !e.tombstoned && filter(e.memory_id))
+            .map(|e| (e.memory_id, dot(query, &e.vector)))
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(k);
+        scored
     }
 }
 
-impl<const D: usize> Writer<D> {
-    /// Insert a vector. Takes `&mut self` — the type system rejects
-    /// concurrent writes through the same `Writer`. The `Writer`
-    /// itself isn't `Clone`, so only one exists per shard
-    /// ('s single-writer-per-shard discipline).
-    ///
-    /// Acquires the RwLock's write lock briefly (~1-3 ms at 1M per
-    /// ); concurrent readers wait this out.
-    pub fn insert(&mut self, memory_id: MemoryId, vector: &[f32; D]) -> Result<(), HnswError> {
-        let mut guard = self.inner.write();
-        guard.insert(memory_id, vector)
+impl Writer {
+    /// Insert a full-precision vector. It lives in pending and reads
+    /// at exact cosine until the next flush folds it into main.
+    pub fn insert(
+        &mut self,
+        memory_id: MemoryId,
+        vector: &[f32; VECTOR_DIM],
+    ) -> Result<(), HnswError> {
+        let mut pending = self.pending.write();
+        // Re-insert after tombstone resurrects the entry.
+        pending.tombstoned.remove(&memory_id);
+        if let Some(slot) = pending
+            .entries
+            .iter_mut()
+            .find(|e| e.memory_id == memory_id)
+        {
+            slot.vector = *vector;
+            slot.tombstoned = false;
+        } else {
+            pending.entries.push(PendingEntry {
+                memory_id,
+                vector: *vector,
+                tombstoned: false,
+            });
+        }
+        Ok(())
     }
 
-    /// Mark a memory tombstoned. Same locking discipline as `insert`.
+    /// Mark a memory tombstoned. Visible immediately via
+    /// [`SharedHnsw::is_tombstoned`].
     pub fn mark_tombstoned(&mut self, memory_id: MemoryId) -> Result<(), HnswError> {
-        let mut guard = self.inner.write();
-        guard.mark_tombstoned(memory_id)
+        let mut pending = self.pending.write();
+        pending.tombstoned.insert(memory_id);
+        if let Some(slot) = pending
+            .entries
+            .iter_mut()
+            .find(|e| e.memory_id == memory_id)
+        {
+            slot.tombstoned = true;
+        }
+        Ok(())
     }
+}
+
+// ===== Helpers =============================================================
+
+/// Dot product of two equal-length `f32` vectors. With L2-normalised
+/// inputs (BGE-small output) this equals cosine similarity.
+fn dot(a: &[f32; VECTOR_DIM], b: &[f32; VECTOR_DIM]) -> f32 {
+    let mut sum = 0.0_f32;
+    for i in 0..VECTOR_DIM {
+        sum += a[i] * b[i];
+    }
+    sum
+}
+
+/// Merge main and pending hit lists, dedupe by `MemoryId` (pending
+/// wins on collision), sort descending by similarity, truncate to `k`.
+fn merge_dedupe_descending(
+    main: Vec<(MemoryId, f32)>,
+    pending: Vec<(MemoryId, f32)>,
+    k: usize,
+) -> Vec<(MemoryId, f32)> {
+    use std::collections::HashMap;
+    let mut by_id: HashMap<MemoryId, f32> = HashMap::with_capacity(main.len() + pending.len());
+    for (id, score) in main {
+        by_id.insert(id, score);
+    }
+    for (id, score) in pending {
+        // Pending overrides main if both present.
+        by_id.insert(id, score);
+    }
+    let mut merged: Vec<(MemoryId, f32)> = by_id.into_iter().collect();
+    merged.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    merged.truncate(k);
+    merged
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::thread;
 
-    fn vec4(a: f32, b: f32, c: f32, d: f32) -> [f32; 4] {
-        let n = (a * a + b * b + c * c + d * d).sqrt();
-        [a / n, b / n, c / n, d / n]
+    fn mid(slot: u8) -> MemoryId {
+        MemoryId::pack(1, slot as u64, 1)
     }
 
-    fn mid(slot: u64) -> MemoryId {
-        MemoryId::pack(1, slot, 1)
+    fn unit_at_angle(angle_radians: f32) -> [f32; VECTOR_DIM] {
+        let mut v = [0.0_f32; VECTOR_DIM];
+        v[0] = angle_radians.cos();
+        v[1] = angle_radians.sin();
+        v
+    }
+
+    fn build_shared() -> (SharedHnsw, Writer) {
+        let idx = HnswIndex::new(IndexParams::default_v1()).unwrap();
+        SharedHnsw::from_index(idx)
     }
 
     #[test]
-    fn single_threaded_insert_and_search() {
-        let (reader, mut writer) = SharedHnsw::<4>::new(IndexParams::default_v1()).unwrap();
-        writer.insert(mid(1), &vec4(1.0, 0.0, 0.0, 0.0)).unwrap();
-        let results = reader.search_active(&vec4(1.0, 0.0, 0.0, 0.0), 1, None);
+    fn empty_search_returns_empty() {
+        let (reader, _writer) = build_shared();
+        let results = reader.search_active(&unit_at_angle(0.0), 5, None);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn pending_insert_visible_to_reader_before_flush() {
+        let (reader, mut writer) = build_shared();
+        let v = unit_at_angle(0.0);
+        writer.insert(mid(1), &v).unwrap();
+        assert!(reader.contains(mid(1)));
+        assert_eq!(reader.pending_len(), 1);
+
+        // Pending hit ranks via exact cosine (1.0 against itself).
+        let results = reader.search_active(&v, 1, None);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, mid(1));
+        assert!((results[0].1 - 1.0).abs() < 1e-5);
     }
 
     #[test]
-    fn reader_clones_share_state() {
-        let (reader, mut writer) = SharedHnsw::<4>::new(IndexParams::default_v1()).unwrap();
-        let r1 = reader.clone();
-        let r2 = reader.clone();
-        writer.insert(mid(7), &vec4(1.0, 0.0, 0.0, 0.0)).unwrap();
-        // Both reader clones see the post-insert state.
-        assert!(r1.contains(mid(7)));
-        assert!(r2.contains(mid(7)));
-        assert_eq!(r1.len(), 1);
-        assert_eq!(r2.len(), 1);
+    fn pending_tombstone_hides_from_reader() {
+        let (reader, mut writer) = build_shared();
+        let v = unit_at_angle(0.0);
+        writer.insert(mid(2), &v).unwrap();
+        writer.mark_tombstoned(mid(2)).unwrap();
+        assert!(!reader.contains(mid(2)));
+        assert!(reader.is_tombstoned(mid(2)));
+
+        let results = reader.search_active(&v, 5, None);
+        assert!(results.iter().all(|(id, _)| *id != mid(2)));
     }
 
     #[test]
-    fn tombstone_visible_after_write() {
-        let (reader, mut writer) = SharedHnsw::<4>::new(IndexParams::default_v1()).unwrap();
-        writer.insert(mid(1), &vec4(1.0, 0.0, 0.0, 0.0)).unwrap();
-        writer.mark_tombstoned(mid(1)).unwrap();
-        // RwLock writes commit before unlock — read-after-write is
-        // immediate, no flush hint needed.
-        assert!(reader.is_tombstoned(mid(1)));
-        assert_eq!(reader.tombstone_count(), 1);
+    fn swap_clears_pending_and_bumps_epoch() {
+        let (reader, mut writer) = build_shared();
+        writer.insert(mid(1), &unit_at_angle(0.0)).unwrap();
+        assert_eq!(reader.pending_len(), 1);
+        let before = reader.epoch();
+
+        let replacement = HnswIndex::new(IndexParams::default_v1()).unwrap();
+        reader.swap(replacement);
+
+        assert_eq!(reader.epoch(), before.wrapping_add(1));
+        assert_eq!(reader.pending_len(), 0);
+        // The swapped main is empty; the inserted memory is gone.
+        assert!(!reader.contains(mid(1)));
     }
 
     #[test]
-    fn writer_serialises_sequential_calls() {
-        let (reader, mut writer) = SharedHnsw::<4>::new(IndexParams::default_v1()).unwrap();
-        writer.insert(mid(1), &vec4(1.0, 0.0, 0.0, 0.0)).unwrap();
-        writer.insert(mid(2), &vec4(0.0, 1.0, 0.0, 0.0)).unwrap();
-        writer.insert(mid(3), &vec4(0.0, 0.0, 1.0, 0.0)).unwrap();
-        assert_eq!(reader.len(), 3);
-    }
+    fn flush_folds_pending_into_main() {
+        let (reader, mut writer) = build_shared();
+        let v = unit_at_angle(0.0);
+        writer.insert(mid(1), &v).unwrap();
+        writer.insert(mid(2), &v).unwrap();
+        assert_eq!(reader.pending_len(), 2);
 
-    #[test]
-    fn concurrent_readers_during_writer_no_panic() {
-        // The big one: 8 reader threads + 1 writer in std::thread::scope
-        // ('s lock-free-reads is the goal; RwLock gives us
-        // concurrent reads but not lock-free). The test asserts:
-        // - no panic
-        // - no data race (RwLock prevents)
-        // - final len() reflects all writes
-        let (reader, mut writer) = SharedHnsw::<4>::new(IndexParams::default_v1()).unwrap();
-
-        const N_INSERTS: u64 = 100;
-        const N_READERS: usize = 8;
-        const READS_PER_THREAD: usize = 500;
-
-        // Pre-seed one vector so readers have something to query.
-        writer.insert(mid(0), &vec4(1.0, 0.0, 0.0, 0.0)).unwrap();
-
-        thread::scope(|s| {
-            // Spawn N readers.
-            let mut reader_handles = Vec::new();
-            for tid in 0..N_READERS {
-                let r = reader.clone();
-                let h = s.spawn(move || {
-                    let q = vec4(1.0, 0.0, 0.0, 0.0);
-                    for i in 0..READS_PER_THREAD {
-                        let results = r.search_active(&q, 5, None);
-                        // Sanity: len > 0 always (we pre-seeded).
-                        assert!(!results.is_empty(), "thread {tid} iter {i}: empty results");
+        let report = reader
+            .flush_with_rebuild(|snapshot| {
+                let mut new_idx = HnswIndex::new(IndexParams::default_v1()).unwrap();
+                for entry in snapshot {
+                    if !entry.tombstoned {
+                        new_idx.insert(entry.memory_id, &entry.vector).unwrap();
                     }
-                });
-                reader_handles.push(h);
-            }
-
-            // Spawn the writer.
-            s.spawn(|| {
-                for i in 1..=N_INSERTS {
-                    writer
-                        .insert(mid(i), &vec4(i as f32, 0.5, 0.0, 0.0))
-                        .expect("insert");
                 }
-            });
-
-            // Join readers (writer is joined by scope drop).
-            for h in reader_handles {
-                h.join().unwrap();
-            }
-        });
-
-        // After the scope, all threads have completed.
-        assert_eq!(reader.len(), (N_INSERTS as usize) + 1);
+                Ok(new_idx)
+            })
+            .unwrap();
+        assert_eq!(report.entries_flushed, 2);
+        assert_eq!(report.main_len_after, 2);
+        assert_eq!(reader.pending_len(), 0);
+        assert!(reader.contains(mid(1)));
+        assert!(reader.contains(mid(2)));
     }
 
     #[test]
-    fn shared_save_snapshot_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
-        let shard_uuid = [0xAB; 16];
+    fn tombstone_recovery_hides_snapshot_memory() {
+        // Simulate IDX1: a memory folded into the loaded main (an active
+        // snapshot node) that a post-snapshot FORGET marked inactive in
+        // redb. The recovery reconciliation must re-apply the delete so the
+        // node stops surfacing.
+        let (reader, mut writer) = build_shared();
+        let v = unit_at_angle(0.0);
+        writer.insert(mid(5), &v).unwrap();
+        reader
+            .flush_with_rebuild(|snapshot| {
+                let mut idx = HnswIndex::new(IndexParams::default_v1()).unwrap();
+                for e in snapshot {
+                    idx.insert(e.memory_id, &e.vector).unwrap();
+                }
+                Ok(idx)
+            })
+            .unwrap();
+        assert!(reader.contains(mid(5)), "memory should be active in main");
 
-        let (reader, mut writer) = SharedHnsw::<4>::new(IndexParams::default_v1()).unwrap();
-        writer.insert(mid(1), &vec4(1.0, 0.0, 0.0, 0.0)).unwrap();
-        writer.insert(mid(2), &vec4(0.0, 1.0, 0.0, 0.0)).unwrap();
-        let pre = reader.search_active(&vec4(1.0, 0.0, 0.0, 0.0), 2, None);
+        reader.tombstone_recovery(mid(5));
+        assert!(reader.is_tombstoned(mid(5)));
+        assert!(!reader.contains(mid(5)));
+        let results = reader.search_active(&v, 5, None);
+        assert!(
+            results.iter().all(|(id, _)| *id != mid(5)),
+            "ghost node still surfaced after recovery tombstone"
+        );
+    }
+
+    #[test]
+    fn flush_preserves_reinsert_during_build_window() {
+        // IDX4: a re-insert (updated vector) for a snapshot id lands during
+        // the lock-free build window. Identity-based retain must keep the
+        // newer pending entry rather than dropping it (which would leave the
+        // old snapshot vector in main and lose the update from both tiers).
+        let (reader, mut writer) = build_shared();
+        let v_old = unit_at_angle(0.0);
+        writer.insert(mid(1), &v_old).unwrap();
+        let v_new = unit_at_angle(1.0);
+        let reader2 = reader.clone();
 
         reader
-            .save_snapshot(dir.path(), "shr", 42, shard_uuid)
+            .flush_with_rebuild(|snapshot| {
+                let mut idx = HnswIndex::new(IndexParams::default_v1()).unwrap();
+                for e in snapshot {
+                    if !e.tombstoned {
+                        idx.insert(e.memory_id, &e.vector).unwrap();
+                    }
+                }
+                // Interleaved re-insert during the build window (no lock held).
+                reader2.insert_recovery(mid(1), &v_new);
+                Ok(idx)
+            })
             .unwrap();
 
-        let (loaded_reader, _loaded_writer, lsn) =
-            SharedHnsw::<4>::load_snapshot(dir.path(), "shr", shard_uuid).unwrap();
-        assert_eq!(lsn, 42);
-        let post = loaded_reader.search_active(&vec4(1.0, 0.0, 0.0, 0.0), 2, None);
-        assert_eq!(pre.len(), post.len());
-        for (a, b) in pre.iter().zip(post.iter()) {
-            assert_eq!(a.0, b.0);
+        assert_eq!(
+            reader.pending_len(),
+            1,
+            "updated re-insert must survive the flush reconciliation"
+        );
+        // Querying the NEW vector must score ~1.0: the pending entry (v_new)
+        // wins on collision. If the entry had been dropped, main's v_old
+        // would score cos(0,1) ≈ 0.54 instead.
+        let results = reader.search_active(&v_new, 1, None);
+        assert_eq!(results[0].0, mid(1));
+        assert!(
+            (results[0].1 - 1.0).abs() < 1e-5,
+            "new vector must win, got {}",
+            results[0].1
+        );
+    }
+
+    #[test]
+    fn merge_dedupe_prefers_pending_on_collision() {
+        let main = vec![(mid(1), 0.5), (mid(2), 0.7)];
+        let pending = vec![(mid(1), 0.95), (mid(3), 0.6)];
+        let merged = merge_dedupe_descending(main, pending, 5);
+
+        // mid(1) appears once with pending's 0.95, not main's 0.5.
+        let m1 = merged.iter().find(|(id, _)| *id == mid(1)).unwrap();
+        assert!((m1.1 - 0.95).abs() < 1e-6);
+        // Sorted descending.
+        for w in merged.windows(2) {
+            assert!(w[0].1 >= w[1].1);
+        }
+    }
+
+    // ----- Snapshot persistence ------------------------------------------
+
+    fn unit_vec(seed: u64) -> [f32; crate::params::VECTOR_DIM] {
+        // Build a deterministic non-zero vector so the HNSW has actual
+        // structure to dump. L2-normalise so cosine distances behave.
+        use crate::params::VECTOR_DIM;
+        let mut v = [0.0_f32; VECTOR_DIM];
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let mut norm_sq = 0.0_f32;
+        for slot in &mut v {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let f = (((x >> 33) as u32) as f32 / u32::MAX as f32) - 0.5;
+            *slot = f;
+            norm_sq += f * f;
+        }
+        let inv = 1.0 / norm_sq.sqrt();
+        for slot in &mut v {
+            *slot *= inv;
+        }
+        v
+    }
+
+    fn fixture_with_writes(n: usize) -> (SharedHnsw, Writer, Vec<MemoryId>) {
+        let (shared, mut writer) = SharedHnsw::new(IndexParams::default_v1()).unwrap();
+        let mut ids = Vec::with_capacity(n);
+        for i in 0..n {
+            let id = MemoryId::pack(0, (i + 1) as u64, 1);
+            writer.insert(id, &unit_vec(i as u64 + 1)).unwrap();
+            ids.push(id);
+        }
+        // Move pending into main: rebuild yields a freshly-published
+        // epoch the snapshot can capture from.
+        shared
+            .flush_with_rebuild(|pending| {
+                let params = shared.params();
+                let pairs: Vec<(MemoryId, [f32; crate::params::VECTOR_DIM])> =
+                    pending.iter().map(|e| (e.memory_id, e.vector)).collect();
+                let (idx, _) = crate::rebuild::rebuild_impl(params, pairs)?;
+                Ok(idx)
+            })
+            .unwrap();
+        (shared, writer, ids)
+    }
+
+    #[test]
+    fn save_load_round_trips_epoch_and_lsn() {
+        let dir = tempfile::tempdir().unwrap();
+        let basename = "hnsw";
+        let shard_uuid: [u8; 16] = [0xAA; 16];
+        let taken_at_lsn = 12345_u64;
+
+        let (shared, _writer, ids) = fixture_with_writes(5);
+        let len_before = shared.len();
+
+        // Pre-snapshot search baseline. Query against one of the inserted
+        // vectors so the expected top-1 is deterministic: the inserted
+        // memory itself. We compare against this baseline post-load to
+        // prove the graph round-tripped semantically, not just that
+        // node_count matches.
+        let query = unit_vec(1);
+        let pre_results = shared.search_active(&query, 5, None);
+        let pre_top1 = *pre_results
+            .first()
+            .expect("pre-snapshot search returned no results");
+
+        shared
+            .save_snapshot(dir.path(), basename, taken_at_lsn, shard_uuid)
+            .expect("save_snapshot");
+
+        let (loaded_idx, lsn) =
+            SharedHnsw::load_snapshot(dir.path(), basename, shard_uuid).expect("load_snapshot");
+        assert_eq!(lsn, taken_at_lsn);
+        assert_eq!(loaded_idx.len(), len_before);
+        // Every inserted id is in the rehydrated index.
+        for id in &ids {
+            assert!(
+                loaded_idx.contains(*id),
+                "memory {:?} missing after reload",
+                id
+            );
+        }
+
+        let (loaded_shared, _loaded_writer) = SharedHnsw::from_index(loaded_idx);
+        let post_results = loaded_shared.search_active(&query, 5, None);
+        let post_top1 = *post_results
+            .first()
+            .expect("post-load search returned no results");
+
+        // The top-1 memory id and its exact-cosine score must match
+        // across the round-trip: full-precision vectors round-trip
+        // losslessly through the graph dump.
+        assert_eq!(
+            pre_top1.0, post_top1.0,
+            "top-1 id changed across snapshot round-trip: pre={:?} post={:?}",
+            pre_top1.0, post_top1.0
+        );
+        assert!(
+            (pre_top1.1 - post_top1.1).abs() < 1e-4,
+            "top-1 score drifted: pre={} post={}",
+            pre_top1.1,
+            post_top1.1
+        );
+    }
+
+    #[test]
+    fn load_rejects_shard_uuid_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let (shared, _w, _) = fixture_with_writes(2);
+        shared
+            .save_snapshot(dir.path(), "hnsw", 1, [0xAA; 16])
+            .unwrap();
+        match SharedHnsw::load_snapshot(dir.path(), "hnsw", [0xBB; 16]) {
+            Err(HnswError::SnapshotCorrupt(msg)) => assert!(msg.contains("shard_uuid")),
+            Err(other) => panic!("expected SnapshotCorrupt(shard_uuid), got {other:?}"),
+            Ok(_) => panic!("expected error on uuid mismatch"),
         }
     }
 
     #[test]
-    fn rebuild_returns_shared_pair() {
-        let source = vec![
-            (mid(1), vec4(1.0, 0.0, 0.0, 0.0)),
-            (mid(2), vec4(0.0, 1.0, 0.0, 0.0)),
-        ];
-        let (reader, mut writer, report) =
-            SharedHnsw::<4>::rebuild(IndexParams::default_v1(), source).unwrap();
-        assert_eq!(report.memories_inserted, 2);
-        assert_eq!(reader.len(), 2);
-        // Writer still works on the rebuilt index.
-        writer.insert(mid(3), &vec4(0.0, 0.0, 1.0, 0.0)).unwrap();
-        assert_eq!(reader.len(), 3);
+    fn load_rejects_corrupted_graph_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (shared, _w, _) = fixture_with_writes(2);
+        shared
+            .save_snapshot(dir.path(), "hnsw", 1, [0xAA; 16])
+            .unwrap();
+
+        // Flip a byte in the graph file. The wrapper's BLAKE3 over the
+        // graph won't match → SnapshotCorrupt.
+        let graph_path = dir.path().join("hnsw.hnsw.graph");
+        let mut bytes = std::fs::read(&graph_path).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xFF;
+        std::fs::write(&graph_path, bytes).unwrap();
+
+        match SharedHnsw::load_snapshot(dir.path(), "hnsw", [0xAA; 16]) {
+            Err(HnswError::SnapshotCorrupt(msg)) => {
+                assert!(
+                    msg.contains("graph") || msg.contains("BLAKE3"),
+                    "msg: {msg}"
+                );
+            }
+            Err(other) => panic!("expected SnapshotCorrupt(graph), got {other:?}"),
+            Ok(_) => panic!("expected error on graph corruption"),
+        }
+    }
+
+    #[test]
+    fn load_rejects_missing_wrapper() {
+        let dir = tempfile::tempdir().unwrap();
+        match SharedHnsw::load_snapshot(dir.path(), "hnsw", [0xAA; 16]) {
+            Err(HnswError::SnapshotIo(_)) => {}
+            Err(other) => panic!("expected SnapshotIo(missing), got {other:?}"),
+            Ok(_) => panic!("expected error on missing wrapper"),
+        }
+    }
+
+    // ----- Chaos: partial-write / corruption scenarios -------------------
+    //
+    // Simulates each plausible kill-during-snapshot state by manually
+    // mutating the on-disk snapshot. The invariant we're protecting
+    // ("no silent corruption") is: any load failure
+    // surfaces as `Err(_)` — never a panic, never a silently-wrong load.
+    // Recovery's contract is that a bad snapshot triggers the arena-
+    // rebuild fallback; these tests check the "bad snapshot" detection
+    // side of that contract.
+
+    #[test]
+    fn load_rejects_truncated_brain_wrapper() {
+        // Crash mid-write of the .brain wrapper: bytes are present but
+        // the footer or trailing body fields are missing.
+        let dir = tempfile::tempdir().unwrap();
+        let (shared, _w, _) = fixture_with_writes(2);
+        shared
+            .save_snapshot(dir.path(), "hnsw", 1, [0xAA; 16])
+            .unwrap();
+        let wrapper_path = dir.path().join("hnsw.brain");
+        let mut bytes = std::fs::read(&wrapper_path).unwrap();
+        // Chop the last 16 bytes — strips the footer and bites into the
+        // trailing data_hash field.
+        bytes.truncate(bytes.len() - 16);
+        std::fs::write(&wrapper_path, bytes).unwrap();
+        match SharedHnsw::load_snapshot(dir.path(), "hnsw", [0xAA; 16]) {
+            Err(HnswError::SnapshotCorrupt(_)) => {}
+            Err(other) => panic!("expected SnapshotCorrupt(truncated), got {other:?}"),
+            Ok(_) => panic!("truncated wrapper must not load"),
+        }
+    }
+
+    #[test]
+    fn load_rejects_missing_data_file() {
+        // Crash between graph-dump and wrapper write leaves a sibling
+        // file missing; .brain present (we simulate by writing then
+        // removing the data file). The I/O error fires when the missing
+        // sibling is hashed.
+        let dir = tempfile::tempdir().unwrap();
+        let (shared, _w, _) = fixture_with_writes(2);
+        shared
+            .save_snapshot(dir.path(), "hnsw", 1, [0xAA; 16])
+            .unwrap();
+        std::fs::remove_file(dir.path().join("hnsw.hnsw.data")).unwrap();
+        match SharedHnsw::load_snapshot(dir.path(), "hnsw", [0xAA; 16]) {
+            Err(HnswError::SnapshotIo(_)) => {}
+            Err(HnswError::SnapshotCorrupt(_)) => {} // also acceptable
+            Err(other) => panic!("expected SnapshotIo|SnapshotCorrupt, got {other:?}"),
+            Ok(_) => panic!("missing data file must not load"),
+        }
+    }
+
+    #[test]
+    fn load_rejects_corrupted_data_file() {
+        // The .hnsw.data file's BLAKE3 must match the wrapper body. Flip
+        // a byte well past hnsw_rs's own magic prefix.
+        let dir = tempfile::tempdir().unwrap();
+        let (shared, _w, _) = fixture_with_writes(2);
+        shared
+            .save_snapshot(dir.path(), "hnsw", 1, [0xAA; 16])
+            .unwrap();
+        let data_path = dir.path().join("hnsw.hnsw.data");
+        let mut bytes = std::fs::read(&data_path).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xFF;
+        std::fs::write(&data_path, bytes).unwrap();
+        match SharedHnsw::load_snapshot(dir.path(), "hnsw", [0xAA; 16]) {
+            Err(HnswError::SnapshotCorrupt(msg)) => {
+                assert!(msg.contains("data") || msg.contains("BLAKE3"), "msg: {msg}");
+            }
+            Err(other) => panic!("expected SnapshotCorrupt(data), got {other:?}"),
+            Ok(_) => panic!("corrupted data file must not load"),
+        }
     }
 }

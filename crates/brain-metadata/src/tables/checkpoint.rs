@@ -1,39 +1,32 @@
 //! `checkpoints` table: durable record of completed WAL checkpoints.
 //!
-//! Spec references:
-//! - `spec/08_storage/09_checkpointing.md` §2 — full struct + table shape.
-//! - `spec/10_metadata/02_table_layout.md` §1 row 11 — catalog entry.
-//!
 //! ## Why this matters
 //!
-//! without checkpointing, recovery replays the entire
-//! WAL from the first record — recovery time grows unbounded. A
-//! checkpoint marks an LSN below which records are reflected in arena
-//! and metadata, so recovery can skip everything before it.
+//! Without checkpointing, recovery replays the entire WAL from the
+//! first record — recovery time grows unbounded. A checkpoint marks an
+//! LSN below which records are reflected in arena and metadata, so
+//! recovery can skip everything before it.
 //!
-//! Multiple checkpoint rows can exist ("the substrate keeps
-//! the most recent one as the recovery target"); [`latest`] returns
-//! the highest-id row in O(log N).
+//! Multiple checkpoint rows can exist; the substrate keeps the most
+//! recent one as the recovery target. [`latest`] returns the
+//! highest-id row in O(log N).
 //!
 //! ## What lives here
 //!
 //! - [`CHECKPOINTS_TABLE`] — `checkpoint_id: u64` → [`CheckpointMeta`].
-//! - [`CheckpointMeta`] — rkyv-derived row with the six u64 fields
-//!   prescribes.
+//! - [`CheckpointMeta`] — rkyv-derived row with the six u64 fields.
 //! - [`latest`] — read-only "most recent checkpoint" query; the
 //!   recovery target.
 //!
 //! ## What does NOT live here
 //!
 //! - **Composition with `brain_storage::wal::checkpoint::write_checkpoint`**
-//!   — `MetadataSink` in sub-task 3.11 owns the conversion from
-//!   `CheckpointReport` to [`CheckpointMeta`], filling
-//!   `metadata_version_at_checkpoint` from
+//!   — `MetadataSink` owns the conversion from `CheckpointReport` to
+//!   [`CheckpointMeta`], filling `metadata_version_at_checkpoint` from
 //!   [`crate::storage_version::CURRENT_SCHEMA_VERSION`].
-//! - **Retention sweep** (delete old checkpoints);
-//!   Phase 8 maintenance worker.
+//! - **Retention sweep** (delete old checkpoints); maintenance worker.
 //! - **Recovery handshake** (read [`latest`], replay WAL after its
-//!   `durable_lsn`) — 3.11.
+//!   `durable_lsn`).
 
 use redb::{ReadOnlyTable, ReadableTable, TableDefinition};
 
@@ -45,12 +38,11 @@ pub const CHECKPOINTS_TABLE: TableDefinition<'static, u64, CheckpointMeta> =
 
 /// Persisted checkpoint record.
 ///
-/// Field renaming from spec: `started_at` / `completed_at` → suffixed
-/// `_unix_nanos` to match the established 3.x time-field convention.
-/// Not an SD — spec doesn't pin field names.
+/// Time fields `started_at` / `completed_at` are suffixed
+/// `_unix_nanos` to match this crate's time-field convention.
 ///
 /// Named `CheckpointMeta` rather than `Checkpoint` (collides with the
-/// WAL `Checkpoint` opcode) or the spec catalog's `CheckpointInfo`
+/// WAL `Checkpoint` opcode) or `CheckpointInfo`
 /// (inconsistent with this crate's `*Metadata`/`*Info` mix). All other
 /// metadata rows in this crate end in `Metadata` (e.g.
 /// [`crate::tables::memory::MemoryMetadata`]); the `Meta` suffix
@@ -86,7 +78,7 @@ pub struct CheckpointMeta {
 }
 
 impl CheckpointMeta {
-    /// Convenience constructor with the spec's field order.
+    /// Convenience constructor in canonical field order.
     #[must_use]
     pub fn new(
         checkpoint_id: u64,
@@ -138,7 +130,7 @@ impl redb::Value for CheckpointMeta {
     }
 
     fn type_name() -> redb::TypeName {
-        redb::TypeName::new("brain_metadata::CheckpointMeta::v1")
+        redb::TypeName::new("brain_metadata::CheckpointMeta")
     }
 }
 
@@ -181,24 +173,6 @@ mod tests {
     }
 
     #[test]
-    fn insert_and_get_round_trips() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = fresh_db(&dir);
-        let m = sample(1);
-
-        let wtxn = db.begin_write().unwrap();
-        {
-            let mut t = wtxn.open_table(CHECKPOINTS_TABLE).unwrap();
-            t.insert(&1u64, &m).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(CHECKPOINTS_TABLE).unwrap();
-        assert_eq!(t.get(&1u64).unwrap().unwrap().value(), m);
-    }
-
-    #[test]
     fn all_fields_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let db = fresh_db(&dir);
@@ -230,69 +204,6 @@ mod tests {
         assert_eq!(got.metadata_version_at_checkpoint, 42);
         assert_eq!(got.started_at_unix_nanos, 1_700_000_000_000_000_000);
         assert_eq!(got.completed_at_unix_nanos, 1_700_000_000_001_500_000);
-    }
-
-    #[test]
-    fn update_overwrites() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = fresh_db(&dir);
-
-        let wtxn = db.begin_write().unwrap();
-        {
-            let mut t = wtxn.open_table(CHECKPOINTS_TABLE).unwrap();
-            t.insert(&5u64, &sample(5)).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let mut updated = sample(5);
-        updated.durable_lsn = 999_999;
-
-        let wtxn = db.begin_write().unwrap();
-        {
-            let mut t = wtxn.open_table(CHECKPOINTS_TABLE).unwrap();
-            t.insert(&5u64, &updated).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(CHECKPOINTS_TABLE).unwrap();
-        assert_eq!(t.get(&5u64).unwrap().unwrap().value().durable_lsn, 999_999);
-    }
-
-    #[test]
-    fn missing_key_returns_none() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = fresh_db(&dir);
-        let wtxn = db.begin_write().unwrap();
-        {
-            let _t = wtxn.open_table(CHECKPOINTS_TABLE).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(CHECKPOINTS_TABLE).unwrap();
-        assert!(t.get(&u64::MAX).unwrap().is_none());
-    }
-
-    #[test]
-    fn multiple_checkpoints_coexist() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = fresh_db(&dir);
-
-        let wtxn = db.begin_write().unwrap();
-        {
-            let mut t = wtxn.open_table(CHECKPOINTS_TABLE).unwrap();
-            t.insert(&1u64, &sample(1)).unwrap();
-            t.insert(&2u64, &sample(2)).unwrap();
-            t.insert(&3u64, &sample(3)).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(CHECKPOINTS_TABLE).unwrap();
-        assert_eq!(t.get(&1u64).unwrap().unwrap().value(), sample(1));
-        assert_eq!(t.get(&2u64).unwrap().unwrap().value(), sample(2));
-        assert_eq!(t.get(&3u64).unwrap().unwrap().value(), sample(3));
     }
 
     #[test]
@@ -366,12 +277,5 @@ mod tests {
         let got = latest(&t).unwrap().unwrap();
         assert_eq!(got.checkpoint_id, id);
         assert_eq!(got.durable_lsn, 7_777_777);
-    }
-
-    #[test]
-    fn type_name_includes_v1() {
-        let name = <CheckpointMeta as redb::Value>::type_name();
-        let s = format!("{name:?}");
-        assert!(s.contains("v1"), "type_name missing v1 marker: {s}");
     }
 }

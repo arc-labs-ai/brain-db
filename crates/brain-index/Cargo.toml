@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+publish.workspace = true
 description = "ANN (HNSW) index integration for Brain."
 
 [dependencies]
@@ -15,6 +16,10 @@ tracing.workspace = true
 blake3.workspace = true
 crc32c.workspace = true
 parking_lot.workspace = true
+# Lock-free epoch publication for SharedHnsw's two-tier main/pending
+# model: reads against the published main HNSW never block on writes.
+arc-swap = { workspace = true }
+crossbeam-epoch = { workspace = true }
 # Phase 22.1 — lexical retrieval. tantivy provides the BM25
 # index used by the LexicalRetriever (§23/02) and laid out per
 # §26/01. Schema-version stamping uses serde_json on the
@@ -33,14 +38,6 @@ unicode-normalization = { workspace = true }
 [dev-dependencies]
 tempfile.workspace = true
 criterion.workspace = true
-
-[[bench]]
-name = "recall"
-harness = false
-
-[[bench]]
-name = "insert"
-harness = false
 
 [[bench]]
 name = "lexical_retrieve"

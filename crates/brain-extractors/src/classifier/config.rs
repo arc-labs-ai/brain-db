@@ -6,7 +6,7 @@ use candle_core::{DType, Device};
 
 use super::{
     DEFAULT_GLINER_THRESHOLD, DEFAULT_MAX_SEQ_LEN, DEFAULT_WARMUP_ITERS, NER_MODEL_DIR_NAME,
-    NER_MODEL_PATH_ENV, NER_MODEL_REQUIRED_FILES, NER_THRESHOLD_ENV,
+    NER_MODEL_REQUIRED_FILES,
 };
 
 /// Operator-supplied classifier model configuration.
@@ -77,54 +77,33 @@ impl ClassifierConfig {
             .unwrap_or_else(|| std::path::Path::new(""))
     }
 
-    /// Resolve the classifier model directory using the same cascade
-    /// the bootstrap script writes to:
+    /// Resolve the classifier model directory from the XDG cascade the
+    /// bootstrap script writes to:
     ///
-    ///   1. `BRAIN_NER_MODEL_PATH` if set to a non-empty value — used
-    ///      verbatim. Treated as the operator's explicit choice, so we
-    ///      don't probe its contents; load-time validation handles
-    ///      missing files and surfaces a clear error.
-    ///   2. `$XDG_DATA_HOME/brain/models/gliner-small-v2.1/` — used
+    ///   1. `$XDG_DATA_HOME/brain/models/gliner-small-v2.1/` — used
     ///      iff the directory contains all four GLiNER files
     ///      (`pytorch_model.bin`, `tokenizer.json`, `config.json`,
     ///      `gliner_config.json`).
-    ///   3. `$HOME/.local/share/brain/models/gliner-small-v2.1/` —
-    ///      same content check as (2).
+    ///   2. `$HOME/.local/share/brain/models/gliner-small-v2.1/` —
+    ///      same content check as (1).
     ///
-    /// Returns an [`unloaded`](Self::unloaded) config when none of the
-    /// candidates resolve to a populated directory. Callers can read
-    /// [`default_xdg_model_dir`] for the path Brain *would* have
-    /// looked at — useful for diagnostic logs that tell the operator
-    /// where to put the model.
+    /// Returns an [`unloaded`](Self::unloaded) config when neither
+    /// candidate resolves to a populated directory. An operator who
+    /// wants a path outside this cascade sets `[extractors.classifier]
+    /// model_path` in the server config, which the shard applies via
+    /// [`Self::with_model_path`] instead of calling this. Callers can
+    /// read [`default_xdg_model_dir`] for the path Brain *would* have
+    /// looked at — useful for diagnostic logs.
     #[must_use]
     pub fn auto_discover() -> Self {
         Self::auto_discover_with(&|k| std::env::var(k).ok(), &|p| p.is_file())
     }
 
     /// Closure-injection variant of [`Self::auto_discover`] for tests.
-    /// `env` looks up environment variables; `is_file` answers whether
-    /// a candidate file exists on disk.
+    /// `env` resolves the XDG / HOME directory base; `is_file` answers
+    /// whether a candidate file exists on disk.
     #[must_use]
     pub fn auto_discover_with<E, F>(env: &E, is_file: &F) -> Self
-    where
-        E: Fn(&str) -> Option<String>,
-        F: Fn(&Path) -> bool,
-    {
-        let threshold = parse_threshold_env(env);
-        let mut config = if let Some(raw) = env(NER_MODEL_PATH_ENV) {
-            if !raw.is_empty() {
-                Self::with_model_path(PathBuf::from(raw))
-            } else {
-                Self::auto_discover_default(env, is_file)
-            }
-        } else {
-            Self::auto_discover_default(env, is_file)
-        };
-        config.threshold = threshold;
-        config
-    }
-
-    fn auto_discover_default<E, F>(env: &E, is_file: &F) -> Self
     where
         E: Fn(&str) -> Option<String>,
         F: Fn(&Path) -> bool,
@@ -151,44 +130,6 @@ impl ClassifierConfig {
 #[must_use]
 pub fn default_xdg_model_dir() -> Option<PathBuf> {
     default_xdg_model_dir_with(&|k| std::env::var(k).ok())
-}
-
-/// Parse `BRAIN_NER_THRESHOLD` env var. Returns the parsed value if it
-/// is a valid f32 in `[0.0, 1.0]`; otherwise returns the default and
-/// warns on invalid (non-numeric) input. Empty / unset returns default
-/// silently.
-fn parse_threshold_env<E>(env: &E) -> f32
-where
-    E: Fn(&str) -> Option<String>,
-{
-    let Some(raw) = env(NER_THRESHOLD_ENV) else {
-        return DEFAULT_GLINER_THRESHOLD;
-    };
-    if raw.is_empty() {
-        return DEFAULT_GLINER_THRESHOLD;
-    }
-    match raw.parse::<f32>() {
-        Ok(v) if (0.0..=1.0).contains(&v) => v,
-        Ok(v) => {
-            tracing::warn!(
-                target: "brain_extractors::classifier",
-                env_var = NER_THRESHOLD_ENV,
-                value = v,
-                "threshold outside [0.0, 1.0]; using default"
-            );
-            DEFAULT_GLINER_THRESHOLD
-        }
-        Err(e) => {
-            tracing::warn!(
-                target: "brain_extractors::classifier",
-                env_var = NER_THRESHOLD_ENV,
-                value = %raw,
-                error = %e,
-                "threshold env var is not a valid f32; using default"
-            );
-            DEFAULT_GLINER_THRESHOLD
-        }
-    }
 }
 
 /// Closure-injection variant of [`default_xdg_model_dir`].

@@ -2,14 +2,10 @@
 //! ErrorCategoryWire / ErrorCodeWire mirrors of `crate::error`'s
 //! `#[non_exhaustive]` types.
 
-use rkyv::{Archive, Deserialize, Serialize};
-
 use crate::error::{ErrorCategory, ErrorCode};
 
 /// — `PlanResponseFrame::TransitionKind`.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum TransitionKind {
     Initial,
     Causal,
@@ -18,7 +14,7 @@ pub enum TransitionKind {
     Other(String),
 }
 
-// Bridge from the typed-graph namespace's hybrid-query retriever
+// Bridge from the typed-graph namespace's retrieval-query retriever
 // enum to the cognitive RECALL response field. Lives here so the
 // cognitive response module stays free of typed-graph imports beyond
 // this single conversion.
@@ -34,15 +30,22 @@ impl From<crate::ops::query::RetrieverWire> for RetrieverNameWire {
 
 /// Names the retriever family that surfaced a memory in a
 /// `MemoryResult`. Populated when `RECALL_REQ` routes through the
-/// hybrid query engine (schema-declared deployments).
+/// retrieval query engine (schema-declared deployments).
 ///
 /// This is the cognitive-side wire enum. The typed-graph namespace
-/// has its own `RetrieverWire` for hybrid-query opcodes;
+/// has its own `RetrieverWire` for retrieval-query opcodes;
 /// `From<RetrieverWire>` bridges the two so the cognitive response
 /// type doesn't depend on the typed-graph namespace.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq, Hash)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Eq,
+    PartialEq,
+    Hash,
+    serde_repr::Serialize_repr,
+    serde_repr::Deserialize_repr,
+)]
 #[repr(u8)]
 pub enum RetrieverNameWire {
     Semantic = 0,
@@ -52,9 +55,9 @@ pub enum RetrieverNameWire {
 
 /// — `PlanResponseFrame::PlanStatus` (set on the final frame
 /// only).
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, serde_repr::Serialize_repr, serde_repr::Deserialize_repr,
+)]
 #[repr(u8)]
 pub enum PlanStatus {
     GoalReached = 0,
@@ -64,9 +67,7 @@ pub enum PlanStatus {
 }
 
 /// — `ReasonResponseFrame::InferenceKind`.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum InferenceKind {
     CausalExplanation,
     EvidenceAccumulation,
@@ -75,9 +76,9 @@ pub enum InferenceKind {
 }
 
 /// — `ReasonResponseFrame::ReasonStatus`.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, serde_repr::Serialize_repr, serde_repr::Deserialize_repr,
+)]
 #[repr(u8)]
 pub enum ReasonStatus {
     Complete = 0,
@@ -90,12 +91,12 @@ pub enum ReasonStatus {
 ///
 /// Carries 14 typed-graph event variants ([`Self::EntityCreated`]
 /// through [`Self::SchemaUpdated`]). For typed-graph events the
-/// cognitive fields on `SubscriptionEvent` (`memory_id`, `context_id`,
-/// `kind`, `salience`, `text`) are zero-filled and `knowledge_payload`
+/// cognitive fields on `SubscriptionEvent` (`memory_id`, `session_id`,
+/// `kind`, `salience`, `text`) are zero-filled and `graph_payload`
 /// carries the typed body.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, serde_repr::Serialize_repr, serde_repr::Deserialize_repr,
+)]
 #[repr(u8)]
 pub enum EventType {
     // Cognitive events.
@@ -104,7 +105,7 @@ pub enum EventType {
     Reclaimed = 2,
     KindChanged = 3,
 
-    // Typed-graph events. knowledge_payload is populated.
+    // Typed-graph events. graph_payload is populated.
     EntityCreated = 16,
     EntityUpdated = 17,
     EntityRenamed = 18,
@@ -118,8 +119,8 @@ pub enum EventType {
     RelationSuperseded = 26,
     /// One *stage* of a write's pipeline completed. The same envelope
     /// is published by every background worker (auto-edge, temporal-
-    /// edge, extractor) once it has committed its derived phases for
-    /// a memory. Subscribers waiting on a write's completion count
+    /// edge, extractor, HyPE) once it has committed its derived phases
+    /// for a memory. Subscribers waiting on a write's completion count
     /// down their `pending_stages` checklist as `StageCompleted`
     /// events arrive. `stage_payload` carries the per-stage detail
     /// (extractor counts + audit status, edge stages: the count of
@@ -145,9 +146,16 @@ pub enum EventType {
 /// may opt in via `--wait`). The ack lists the stages this write
 /// queued so a client knows which `StageCompleted` events to wait
 /// for.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq, Hash)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Eq,
+    PartialEq,
+    Hash,
+    serde_repr::Serialize_repr,
+    serde_repr::Deserialize_repr,
+)]
 #[repr(u8)]
 pub enum StageKind {
     /// `SimilarTo` edges derived from HNSW k-NN of the new memory.
@@ -157,14 +165,17 @@ pub enum StageKind {
     /// Entities, statements, relations extracted from memory text via
     /// the three-tier pipeline (pattern → classifier → LLM).
     Extractor = 2,
+    /// Hypothetical questions generated for the new memory (write-time
+    /// HyPE), embedded and inserted into the memory HNSW index.
+    Hype = 3,
 }
 
 /// Verdict of a completed stage. Carried on every `StageCompleted`
 /// event so a client can distinguish "ran and produced output" from
 /// "ran but had nothing to produce" from "failed."
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, serde_repr::Serialize_repr, serde_repr::Deserialize_repr,
+)]
 #[repr(u8)]
 pub enum StageOutcome {
     /// Stage produced at least one derived item.
@@ -181,34 +192,37 @@ pub enum StageOutcome {
 /// Per-stage detail sidecar on `StageCompleted` events. Discriminated
 /// by [`StageKind`] but kept as a flat enum so subscribers can
 /// destructure without first reading the parent stage_kind byte.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum StagePayload {
     AutoEdge(StageAutoEdgePayload),
     TemporalEdge(StageTemporalEdgePayload),
     Extractor(StageExtractorPayload),
+    Hype(StageHypePayload),
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StageAutoEdgePayload {
     /// How many `SimilarTo` rows the worker wrote.
     pub edges_written: u32,
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StageTemporalEdgePayload {
     /// How many `FollowedBy` rows the worker wrote.
     pub edges_written: u32,
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StageHypePayload {
+    /// How many hypothetical questions were embedded, persisted, and
+    /// inserted into the memory HNSW index.
+    pub questions_written: u32,
+    /// LLM micro-USD spent generating the questions (`0` on a cache
+    /// hit).
+    pub cost_micro_usd: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StageExtractorPayload {
     pub entity_count: u32,
     pub statement_count: u32,
@@ -223,9 +237,9 @@ pub struct StageExtractorPayload {
 /// because the extractor pipeline has more granularity than the
 /// generic three-state outcome — `PartiallyApplied` is a per-tier
 /// concern that doesn't make sense for the edge stages.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, serde_repr::Serialize_repr, serde_repr::Deserialize_repr,
+)]
 #[repr(u8)]
 pub enum StageAuditStatus {
     /// Every enabled tier ran cleanly and writes committed.
@@ -241,9 +255,7 @@ pub enum StageAuditStatus {
 }
 
 /// — `IntegrityIssue::IntegrityIssueType`.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum IntegrityIssueType {
     VectorCorruption,
     TextCorruption,
@@ -254,9 +266,7 @@ pub enum IntegrityIssueType {
 }
 
 /// — `AdminMigrateEmbeddingsResponseFrame::MigrationStatus`.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum MigrationStatus {
     InProgress,
     Completed,
@@ -264,12 +274,12 @@ pub enum MigrationStatus {
     Cancelled,
 }
 
-/// rkyv-archivable mirror of [`crate::error::ErrorCategory`]. The
+/// Wire-encoded mirror of [`crate::error::ErrorCategory`]. The
 /// canonical type is intentionally `#[non_exhaustive]` for forward-
-/// compatibility, which is incompatible with rkyv's closed-world derive.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+/// compatibility, so the wire needs a closed mirror with a stable repr.
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, serde_repr::Serialize_repr, serde_repr::Deserialize_repr,
+)]
 #[repr(u8)]
 pub enum ErrorCategoryWire {
     Protocol = 0,
@@ -315,11 +325,11 @@ impl From<ErrorCategoryWire> for ErrorCategory {
     }
 }
 
-/// rkyv-archivable mirror of [`crate::error::ErrorCode`]. Numeric repr
+/// Wire-encoded mirror of [`crate::error::ErrorCode`]. Numeric repr
 /// is stable; this is the *wire* representation.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, serde_repr::Serialize_repr, serde_repr::Deserialize_repr,
+)]
 #[repr(u16)]
 pub enum ErrorCodeWire {
     // Protocol
@@ -332,7 +342,7 @@ pub enum ErrorCodeWire {
     OversizePayload = 0x0007,
     ReservedFieldNonZero = 0x0008,
     BadFlagCombination = 0x0009,
-    MalformedRkyv = 0x000A,
+    MalformedPayload = 0x000A,
     MalformedVector = 0x000B,
     // Connection / handshake
     VersionNotSupported = 0x0020,
@@ -345,12 +355,13 @@ pub enum ErrorCodeWire {
     PermissionDenied = 0x0030,
     AdminPermissionRequired = 0x0031,
     WrongShard = 0x0032,
+    ActAsDenied = 0x0033,
     // Validation
     InvalidArgument = 0x0040,
     MissingRequiredField = 0x0041,
     TextTooLarge = 0x0042,
     TextEmpty = 0x0043,
-    BadContextId = 0x0044,
+    BadSessionId = 0x0044,
     BadMemoryKind = 0x0045,
     BadEdgeKind = 0x0046,
     BadStrategyHint = 0x0047,
@@ -380,6 +391,7 @@ pub enum ErrorCodeWire {
     StreamLimitExceeded = 0x0074,
     ConnectionLimitExceeded = 0x0075,
     TransactionLimitExceeded = 0x0076,
+    TransactionTooLarge = 0x0077,
     // Internal
     Internal = 0x0080,
     StorageError = 0x0081,
@@ -395,7 +407,7 @@ pub enum ErrorCodeWire {
     RetrieverDegraded = 0x0094,
 
     // Typed-graph error codes (0x01xx namespace; low-byte family mirrors
-    // the typed-graph opcode ranges). See spec §04/07 §3.10.
+    // the typed-graph opcode ranges).
     SchemaInvalid = 0x0120,
     SchemaMigrationRequired = 0x0121,
     EntityNotFound = 0x0130,
@@ -425,7 +437,7 @@ impl From<ErrorCode> for ErrorCodeWire {
             ErrorCode::OversizePayload => Self::OversizePayload,
             ErrorCode::ReservedFieldNonZero => Self::ReservedFieldNonZero,
             ErrorCode::BadFlagCombination => Self::BadFlagCombination,
-            ErrorCode::MalformedRkyv => Self::MalformedRkyv,
+            ErrorCode::MalformedPayload => Self::MalformedPayload,
             ErrorCode::MalformedVector => Self::MalformedVector,
             ErrorCode::VersionNotSupported => Self::VersionNotSupported,
             ErrorCode::NoSuchAuthMethod => Self::NoSuchAuthMethod,
@@ -436,11 +448,12 @@ impl From<ErrorCode> for ErrorCodeWire {
             ErrorCode::PermissionDenied => Self::PermissionDenied,
             ErrorCode::AdminPermissionRequired => Self::AdminPermissionRequired,
             ErrorCode::WrongShard => Self::WrongShard,
+            ErrorCode::ActAsDenied => Self::ActAsDenied,
             ErrorCode::InvalidArgument => Self::InvalidArgument,
             ErrorCode::MissingRequiredField => Self::MissingRequiredField,
             ErrorCode::TextTooLarge => Self::TextTooLarge,
             ErrorCode::TextEmpty => Self::TextEmpty,
-            ErrorCode::BadContextId => Self::BadContextId,
+            ErrorCode::BadSessionId => Self::BadSessionId,
             ErrorCode::BadMemoryKind => Self::BadMemoryKind,
             ErrorCode::BadEdgeKind => Self::BadEdgeKind,
             ErrorCode::BadStrategyHint => Self::BadStrategyHint,
@@ -467,6 +480,7 @@ impl From<ErrorCode> for ErrorCodeWire {
             ErrorCode::StreamLimitExceeded => Self::StreamLimitExceeded,
             ErrorCode::ConnectionLimitExceeded => Self::ConnectionLimitExceeded,
             ErrorCode::TransactionLimitExceeded => Self::TransactionLimitExceeded,
+            ErrorCode::TransactionTooLarge => Self::TransactionTooLarge,
             ErrorCode::Internal => Self::Internal,
             ErrorCode::StorageError => Self::StorageError,
             ErrorCode::IndexError => Self::IndexError,
@@ -510,7 +524,7 @@ impl From<ErrorCodeWire> for ErrorCode {
             ErrorCodeWire::OversizePayload => Self::OversizePayload,
             ErrorCodeWire::ReservedFieldNonZero => Self::ReservedFieldNonZero,
             ErrorCodeWire::BadFlagCombination => Self::BadFlagCombination,
-            ErrorCodeWire::MalformedRkyv => Self::MalformedRkyv,
+            ErrorCodeWire::MalformedPayload => Self::MalformedPayload,
             ErrorCodeWire::MalformedVector => Self::MalformedVector,
             ErrorCodeWire::VersionNotSupported => Self::VersionNotSupported,
             ErrorCodeWire::NoSuchAuthMethod => Self::NoSuchAuthMethod,
@@ -521,11 +535,12 @@ impl From<ErrorCodeWire> for ErrorCode {
             ErrorCodeWire::PermissionDenied => Self::PermissionDenied,
             ErrorCodeWire::AdminPermissionRequired => Self::AdminPermissionRequired,
             ErrorCodeWire::WrongShard => Self::WrongShard,
+            ErrorCodeWire::ActAsDenied => Self::ActAsDenied,
             ErrorCodeWire::InvalidArgument => Self::InvalidArgument,
             ErrorCodeWire::MissingRequiredField => Self::MissingRequiredField,
             ErrorCodeWire::TextTooLarge => Self::TextTooLarge,
             ErrorCodeWire::TextEmpty => Self::TextEmpty,
-            ErrorCodeWire::BadContextId => Self::BadContextId,
+            ErrorCodeWire::BadSessionId => Self::BadSessionId,
             ErrorCodeWire::BadMemoryKind => Self::BadMemoryKind,
             ErrorCodeWire::BadEdgeKind => Self::BadEdgeKind,
             ErrorCodeWire::BadStrategyHint => Self::BadStrategyHint,
@@ -552,6 +567,7 @@ impl From<ErrorCodeWire> for ErrorCode {
             ErrorCodeWire::StreamLimitExceeded => Self::StreamLimitExceeded,
             ErrorCodeWire::ConnectionLimitExceeded => Self::ConnectionLimitExceeded,
             ErrorCodeWire::TransactionLimitExceeded => Self::TransactionLimitExceeded,
+            ErrorCodeWire::TransactionTooLarge => Self::TransactionTooLarge,
             ErrorCodeWire::Internal => Self::Internal,
             ErrorCodeWire::StorageError => Self::StorageError,
             ErrorCodeWire::IndexError => Self::IndexError,

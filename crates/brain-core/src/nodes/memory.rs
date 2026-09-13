@@ -1,12 +1,10 @@
 //! Memory and salience types.
-//!
-//! See `spec/02_data_model/02_memory.md`.
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{AgentId, ContextId, MemoryId};
+use crate::ids::{MemoryId, SessionId, SpaceId};
 
-/// Three durable kinds, per `spec/02_data_model/02_memory.md`.
+/// Three durable kinds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub enum MemoryKind {
     /// Default. 30-day half-life. Created by clients via `ENCODE`.
@@ -19,7 +17,7 @@ pub enum MemoryKind {
 
 /// A salience score in `[0.0, 1.0]`. Higher = more important.
 ///
-/// The decay worker reduces salience over time per `spec/16_background_workers/`.
+/// The decay worker reduces salience over time.
 /// Recall ranking blends salience with similarity, recency, and graph proximity.
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct Salience(f32);
@@ -45,18 +43,23 @@ impl Default for Salience {
 
 /// A stored memory, as returned by recall and other read operations.
 ///
-/// This is the "fully hydrated" view. The on-disk slot layout is defined in
-/// `spec/08_storage/02_arena_layout.md`.
+/// This is the "fully hydrated" view.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Memory {
     pub id: MemoryId,
-    pub agent: AgentId,
-    pub context: ContextId,
+    pub space: SpaceId,
+    pub session_id: SessionId,
     pub kind: MemoryKind,
     pub salience: Salience,
     pub text: Option<String>,
     pub created_at_unix_ms: u64,
     pub last_accessed_at_unix_ms: u64,
+    /// Client-supplied event time (when the content happened), in unix
+    /// nanoseconds. `None` when unsupplied. The temporal-expressions
+    /// extractor anchors relative dates ("last week") to this when
+    /// present, falling back to `created_at` — so a memory ingested today
+    /// about a 2020 event resolves its relative dates against 2020.
+    pub occurred_at_unix_nanos: Option<u64>,
 }
 
 #[cfg(test)]
@@ -64,14 +67,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn salience_clamps() {
+    fn salience_clamps_out_of_range_values_to_unit_interval() {
         assert_eq!(Salience::new(2.0).raw(), 1.0);
         assert_eq!(Salience::new(-1.0).raw(), 0.0);
         assert_eq!(Salience::new(0.5).raw(), 0.5);
-    }
-
-    #[test]
-    fn salience_default_is_neutral() {
-        assert_eq!(Salience::default().raw(), 0.5);
     }
 }

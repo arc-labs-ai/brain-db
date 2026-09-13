@@ -1,0 +1,24 @@
+{
+  "entity_id": [
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68
+  ],
+  "act_as": {
+    "namespace": "tenant-acme",
+    "space_id": "support-bot:user123"
+  }
+}

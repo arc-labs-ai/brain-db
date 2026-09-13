@@ -1,10 +1,9 @@
 //! Trigram extraction, Jaccard similarity, and the `entity_trigrams`
-//! index ops. Sub-task 16.4.
+//! index ops.
 //!
-//! Implements the tier-2 fuzzy-resolution primitives per
-//! `spec/02_data_model/01_resolution.md` § Tier 2. Free functions over
-//! redb transactions; matches the `entity_ops` precedent so callers
-//! can compose multi-table writes within one transaction.
+//! Implements the tier-2 fuzzy-resolution primitives. Free functions
+//! over redb transactions; matches the `entity_ops` precedent so
+//! callers can compose multi-table writes within one transaction.
 //!
 //! ## Trigram extraction style
 //!
@@ -23,6 +22,7 @@ use redb::{ReadTransaction, WriteTransaction};
 
 use super::ops::normalize_name;
 use crate::tables::entity::ENTITY_TRIGRAMS_TABLE;
+use crate::tables::scope::RowScope;
 
 // ---------------------------------------------------------------------------
 // Errors.
@@ -39,10 +39,10 @@ pub enum TrigramOpError {
 // ---------------------------------------------------------------------------
 // Extraction + similarity — re-exported from brain-core.
 //
-// Sub-task 16.5 moved the pure trigram functions to brain-core so the
-// resolver (in brain-core) can use them without taking a dep on
-// brain-metadata. The redb integration stays here; the pure functions
-// are re-exported for compatibility with existing callers.
+// The pure trigram functions live in brain-core so the resolver (in
+// brain-core) can use them without taking a dep on brain-metadata. The
+// redb integration stays here; the pure functions are re-exported for
+// compatibility with existing callers.
 // ---------------------------------------------------------------------------
 
 pub use brain_core::resolution::trigrams::{extract_trigrams, jaccard};
@@ -76,9 +76,11 @@ pub fn trigrams_of_components(canonical_name: &str, aliases: &[String]) -> HashS
 // redb writes.
 // ---------------------------------------------------------------------------
 
-/// Insert one `entity_trigrams` row per trigram in `trigrams`.
+/// Insert one `entity_trigrams` row per trigram in `trigrams`, under the
+/// owning `(namespace, space)` scope.
 pub fn index_entity_trigrams(
     wtxn: &WriteTransaction,
+    scope: RowScope,
     type_id: EntityTypeId,
     entity_id: EntityId,
     trigrams: &HashSet<[u8; 3]>,
@@ -89,7 +91,16 @@ pub fn index_entity_trigrams(
     let mut t = wtxn.open_table(ENTITY_TRIGRAMS_TABLE)?;
     let id_bytes = entity_id.to_bytes();
     for tg in trigrams {
-        t.insert(&(type_id.raw(), *tg, id_bytes), &())?;
+        t.insert(
+            &(
+                scope.namespace_id,
+                scope.space_id_bytes,
+                type_id.raw(),
+                *tg,
+                id_bytes,
+            ),
+            &(),
+        )?;
     }
     Ok(())
 }
@@ -99,6 +110,7 @@ pub fn index_entity_trigrams(
 /// that case).
 pub fn remove_entity_trigrams(
     wtxn: &WriteTransaction,
+    scope: RowScope,
     type_id: EntityTypeId,
     entity_id: EntityId,
     trigrams: &HashSet<[u8; 3]>,
@@ -109,7 +121,13 @@ pub fn remove_entity_trigrams(
     let mut t = wtxn.open_table(ENTITY_TRIGRAMS_TABLE)?;
     let id_bytes = entity_id.to_bytes();
     for tg in trigrams {
-        t.remove(&(type_id.raw(), *tg, id_bytes))?;
+        t.remove(&(
+            scope.namespace_id,
+            scope.space_id_bytes,
+            type_id.raw(),
+            *tg,
+            id_bytes,
+        ))?;
     }
     Ok(())
 }
@@ -118,21 +136,39 @@ pub fn remove_entity_trigrams(
 // redb reads.
 // ---------------------------------------------------------------------------
 
-/// All EntityIds whose trigram set contains `trigram` under `type_id`.
-/// Range-scans the multi-value index at prefix `(type_id, trigram, *)`.
+/// All EntityIds whose trigram set contains `trigram` under
+/// `(scope, type_id)`. Range-scans the multi-value index at prefix
+/// `(namespace, space, type_id, trigram, *)`.
 pub fn lookup_candidates_by_trigram(
     rtxn: &ReadTransaction,
+    scope: RowScope,
     type_id: EntityTypeId,
     trigram: [u8; 3],
 ) -> Result<Vec<EntityId>, TrigramOpError> {
     let t = rtxn.open_table(ENTITY_TRIGRAMS_TABLE)?;
-    let lo = (type_id.raw(), trigram, [0u8; 16]);
-    let hi = (type_id.raw(), trigram, [0xFFu8; 16]);
+    let lo = (
+        scope.namespace_id,
+        scope.space_id_bytes,
+        type_id.raw(),
+        trigram,
+        [0u8; 16],
+    );
+    let hi = (
+        scope.namespace_id,
+        scope.space_id_bytes,
+        type_id.raw(),
+        trigram,
+        [0xFFu8; 16],
+    );
     let mut out = Vec::new();
     for entry in t.range(lo..=hi)? {
         let (k, _) = entry?;
-        let (k_type, k_tg, k_id) = k.value();
-        if k_type == type_id.raw() && k_tg == trigram {
+        let (k_ns, k_space, k_type, k_tg, k_id) = k.value();
+        if k_ns == scope.namespace_id
+            && k_space == scope.space_id_bytes
+            && k_type == type_id.raw()
+            && k_tg == trigram
+        {
             out.push(EntityId::from(k_id));
         }
     }
@@ -140,13 +176,15 @@ pub fn lookup_candidates_by_trigram(
 }
 
 /// Tier-2 candidate union: for every trigram of `query_normalized`,
-/// collect EntityIds from the index and return the deduplicated set.
+/// collect EntityIds from the index (within `scope`) and return the
+/// deduplicated set.
 ///
-/// The resolver (16.5) feeds the result through Jaccard scoring +
-/// the configured threshold. This function returns *candidates*, not
+/// The resolver feeds the result through Jaccard scoring + the
+/// configured threshold. This function returns *candidates*, not
 /// resolved matches.
 pub fn candidates_for_query(
     rtxn: &ReadTransaction,
+    scope: RowScope,
     type_id: EntityTypeId,
     query_normalized: &str,
 ) -> Result<HashSet<EntityId>, TrigramOpError> {
@@ -157,12 +195,28 @@ pub fn candidates_for_query(
     }
     let t = rtxn.open_table(ENTITY_TRIGRAMS_TABLE)?;
     for tg in qg {
-        let lo = (type_id.raw(), tg, [0u8; 16]);
-        let hi = (type_id.raw(), tg, [0xFFu8; 16]);
+        let lo = (
+            scope.namespace_id,
+            scope.space_id_bytes,
+            type_id.raw(),
+            tg,
+            [0u8; 16],
+        );
+        let hi = (
+            scope.namespace_id,
+            scope.space_id_bytes,
+            type_id.raw(),
+            tg,
+            [0xFFu8; 16],
+        );
         for entry in t.range(lo..=hi)? {
             let (k, _) = entry?;
-            let (k_type, k_tg, k_id) = k.value();
-            if k_type == type_id.raw() && k_tg == tg {
+            let (k_ns, k_space, k_type, k_tg, k_id) = k.value();
+            if k_ns == scope.namespace_id
+                && k_space == scope.space_id_bytes
+                && k_type == type_id.raw()
+                && k_tg == tg
+            {
                 out.insert(EntityId::from(k_id));
             }
         }
@@ -190,17 +244,23 @@ mod tests {
         MetadataDb::open(db_path(dir)).expect("open")
     }
 
+    fn test_scope() -> RowScope {
+        RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xAB; 16])
+    }
+
     // ----- Extraction + Jaccard ----------------------------------------
     //
-    // The pure functions live in brain-core::knowledge::trigrams and are
-    // tested there (sub-task 16.5 moved them). One re-export sanity test
-    // here ensures the public path through brain-metadata still works.
+    // The pure functions live in brain-core::typed-graph::trigrams and are
+    // tested there. One re-export sanity test here ensures the public
+    // path through brain-metadata still works.
 
     #[test]
     fn re_export_extract_trigrams_works() {
+        // Trigrams are opaque code-point buckets; assert the count + that the
+        // leading "  p" window bucket is shared with another "p"-initial word.
         let t = extract_trigrams("priya");
-        assert!(t.contains(b"  p"));
-        assert!(t.contains(b"ya "));
+        assert_eq!(t.len(), 6);
+        assert!(!t.is_disjoint(&extract_trigrams("patel")));
     }
 
     #[test]
@@ -222,9 +282,15 @@ mod tests {
                 "alias union must include canonical"
             );
         }
-        // "pat" is only in the alias.
-        assert!(with_alias.contains(b"pat"));
-        assert!(!canonical_only.contains(b"pat"));
+        // The alias contributes trigrams the canonical name lacks: every
+        // "patel"-only bucket is present with the alias and absent without.
+        let patel_only: HashSet<[u8; 3]> = extract_trigrams("patel")
+            .difference(&extract_trigrams("priya"))
+            .copied()
+            .collect();
+        assert!(!patel_only.is_empty());
+        assert!(patel_only.is_subset(&with_alias));
+        assert!(patel_only.is_disjoint(&canonical_only));
     }
 
     #[test]
@@ -239,17 +305,18 @@ mod tests {
     #[test]
     fn index_then_lookup_round_trips() {
         let dir = TempDir::new().unwrap();
-        let mut db = fresh_db(&dir);
+        let db = fresh_db(&dir);
         let id = EntityId::new();
         let trigrams: HashSet<[u8; 3]> = [*b"pri", *b"riy", *b"iya"].into_iter().collect();
 
+        let s = test_scope();
         let wtxn = db.write_txn().unwrap();
-        index_entity_trigrams(&wtxn, EntityType::PERSON_ID, id, &trigrams).unwrap();
+        index_entity_trigrams(&wtxn, s, EntityType::PERSON_ID, id, &trigrams).unwrap();
         wtxn.commit().unwrap();
 
         let rtxn = db.read_txn().unwrap();
         for tg in &trigrams {
-            let ids = lookup_candidates_by_trigram(&rtxn, EntityType::PERSON_ID, *tg).unwrap();
+            let ids = lookup_candidates_by_trigram(&rtxn, s, EntityType::PERSON_ID, *tg).unwrap();
             assert_eq!(ids, vec![id]);
         }
     }
@@ -257,22 +324,23 @@ mod tests {
     #[test]
     fn remove_clears_index_rows() {
         let dir = TempDir::new().unwrap();
-        let mut db = fresh_db(&dir);
+        let db = fresh_db(&dir);
         let id = EntityId::new();
         let trigrams: HashSet<[u8; 3]> = [*b"pri", *b"riy"].into_iter().collect();
 
+        let s = test_scope();
         let wtxn = db.write_txn().unwrap();
-        index_entity_trigrams(&wtxn, EntityType::PERSON_ID, id, &trigrams).unwrap();
+        index_entity_trigrams(&wtxn, s, EntityType::PERSON_ID, id, &trigrams).unwrap();
         wtxn.commit().unwrap();
 
         let wtxn = db.write_txn().unwrap();
-        remove_entity_trigrams(&wtxn, EntityType::PERSON_ID, id, &trigrams).unwrap();
+        remove_entity_trigrams(&wtxn, s, EntityType::PERSON_ID, id, &trigrams).unwrap();
         wtxn.commit().unwrap();
 
         let rtxn = db.read_txn().unwrap();
         for tg in &trigrams {
             assert!(
-                lookup_candidates_by_trigram(&rtxn, EntityType::PERSON_ID, *tg)
+                lookup_candidates_by_trigram(&rtxn, s, EntityType::PERSON_ID, *tg)
                     .unwrap()
                     .is_empty()
             );
@@ -282,13 +350,15 @@ mod tests {
     #[test]
     fn candidates_for_query_unions_across_trigrams() {
         let dir = TempDir::new().unwrap();
-        let mut db = fresh_db(&dir);
+        let db = fresh_db(&dir);
         let alpha = EntityId::new();
         let beta = EntityId::new();
 
+        let s = test_scope();
         let wtxn = db.write_txn().unwrap();
         index_entity_trigrams(
             &wtxn,
+            s,
             EntityType::PERSON_ID,
             alpha,
             &extract_trigrams("priya"),
@@ -296,6 +366,7 @@ mod tests {
         .unwrap();
         index_entity_trigrams(
             &wtxn,
+            s,
             EntityType::PERSON_ID,
             beta,
             &extract_trigrams("paris"),
@@ -307,7 +378,7 @@ mod tests {
         // Query "priya" should match alpha strongly + beta weakly (they
         // share "  p", " p?", etc.). candidates_for_query returns the
         // UNION — both are in the candidate set.
-        let cands = candidates_for_query(&rtxn, EntityType::PERSON_ID, "priya").unwrap();
+        let cands = candidates_for_query(&rtxn, s, EntityType::PERSON_ID, "priya").unwrap();
         assert!(cands.contains(&alpha));
         assert!(cands.contains(&beta));
     }
@@ -315,7 +386,7 @@ mod tests {
     #[test]
     fn lookup_filters_by_type_id() {
         let dir = TempDir::new().unwrap();
-        let mut db = fresh_db(&dir);
+        let db = fresh_db(&dir);
 
         // Seed a second entity type so the filter is meaningful.
         {
@@ -335,15 +406,17 @@ mod tests {
         let tg = *b"pri";
         let trigrams: HashSet<[u8; 3]> = [tg].into_iter().collect();
 
+        let s = test_scope();
         let wtxn = db.write_txn().unwrap();
-        index_entity_trigrams(&wtxn, EntityType::PERSON_ID, person, &trigrams).unwrap();
-        index_entity_trigrams(&wtxn, EntityTypeId(7), project, &trigrams).unwrap();
+        index_entity_trigrams(&wtxn, s, EntityType::PERSON_ID, person, &trigrams).unwrap();
+        index_entity_trigrams(&wtxn, s, EntityTypeId(7), project, &trigrams).unwrap();
         wtxn.commit().unwrap();
 
         let rtxn = db.read_txn().unwrap();
-        let person_cands = lookup_candidates_by_trigram(&rtxn, EntityType::PERSON_ID, tg).unwrap();
+        let person_cands =
+            lookup_candidates_by_trigram(&rtxn, s, EntityType::PERSON_ID, tg).unwrap();
         assert_eq!(person_cands, vec![person]);
-        let project_cands = lookup_candidates_by_trigram(&rtxn, EntityTypeId(7), tg).unwrap();
+        let project_cands = lookup_candidates_by_trigram(&rtxn, s, EntityTypeId(7), tg).unwrap();
         assert_eq!(project_cands, vec![project]);
     }
 }

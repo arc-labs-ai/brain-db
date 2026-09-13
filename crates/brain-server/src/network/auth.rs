@@ -1,131 +1,155 @@
-//! Scope-bound authentication for incoming connections.
+//! Mandatory key authentication for incoming connections.
 //!
-//! The AUTH frame carries either:
-//!
-//! - `AuthMethod::Token` — the bytes of a previously-minted API key.
-//!   The server hashes them, looks up the scope row, and stamps the
-//!   resolved scope on the connection. Every subsequent request reads
-//!   identity / namespace / permissions from this scope, never from
-//!   the wire request.
-//! - `AuthMethod::None` — dev / trusted-network mode. Whether this is
-//!   acceptable depends on `BRAIN_REQUIRE_SCOPED_API_KEYS`:
-//!   - unset / "false" / "0" (v1.0 default): scope is permissive over
-//!     the agent_id the client claimed.
-//!   - "true" / "1" (v1.1 default): the AUTH is rejected.
+//! Every data-plane connection MUST present a valid, resolvable,
+//! non-revoked API key. The AUTH frame carries `AuthMethod::Token` — the
+//! bytes of a previously-minted key. The server hashes them, looks up the
+//! scope row, and stamps the resolved `(namespace, space, permissions)` on
+//! the connection. Every subsequent request reads identity from this scope,
+//! never from the wire request. There is no anonymous / permissive mode and
+//! no default namespace: a missing / unknown / revoked key — or an mTLS
+//! method (not yet supported) — is rejected at AUTH.
 //!
 //! The store lives in its own redb file (`api_keys.redb`) so the
-//! connection layer can resolve credentials before pinning a shard.
-//! Mint and revoke are implemented as plain functions; the HTTP admin
-//! surface wires them up.
+//! connection layer can resolve credentials before pinning a shard. Keys
+//! are minted via the HTTP admin listener (gated by the operator admin
+//! secret); mint and revoke are implemented as plain functions here.
 
 #![cfg(target_os = "linux")]
 
 use std::path::Path;
 use std::sync::Arc;
 
-use brain_core::AgentId;
+use brain_core::SpaceId;
 use brain_metadata::api_keys::{bits, hash_secret, ResolvedScope};
 use brain_metadata::{
-    api_key_create, api_key_list_for_agent, api_key_lookup_by_secret, api_key_revoke, ApiKeyDb,
-    ApiKeyError,
+    api_key_create, api_key_list_for_space, api_key_lookup_by_hash, api_key_lookup_by_secret,
+    api_key_revoke, ApiKeyDb, ApiKeyError,
 };
-use brain_protocol::connection::handshake::{AgentPermissions, AuthCredentials, AuthMethod, AuthPayload};
+use brain_protocol::connection::handshake::{
+    AuthCredentials, AuthMethod, AuthPayload, SpacePermissions,
+};
 use parking_lot::RwLock;
 use tracing::{debug, warn};
 
-/// Environment variable that flips strict scope enforcement on.
-pub const STRICT_ENV_VAR: &str = "BRAIN_REQUIRE_SCOPED_API_KEYS";
-
-/// True when strict mode is requested via the environment.
-#[must_use]
-pub fn require_scoped_keys_from_env() -> bool {
-    matches!(
-        std::env::var(STRICT_ENV_VAR).as_deref(),
-        Ok("true") | Ok("1") | Ok("TRUE") | Ok("True")
-    )
-}
-
 /// Resolved scope a connection inherits from its AUTH credential.
-/// Wraps [`ResolvedScope`] alongside a typed [`AgentId`] for fast
+/// Wraps [`ResolvedScope`] alongside a typed [`SpaceId`] for fast
 /// shard-routing.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RequestScope {
-    pub agent_id: AgentId,
+    pub space_id: SpaceId,
     pub org_id: [u8; 16],
     pub user_id: [u8; 16],
     pub namespace: String,
     pub permissions: u32,
-    pub scope_enforced: bool,
-    /// BLAKE3 of the secret used to authenticate; all-zero in
-    /// permissive mode. Useful for `last_used_at` background touches.
+    /// Allowlist of namespaces this connection principal may act *for*
+    /// under the `ACT_AS` grant. A request's `act_as.namespace` is
+    /// validated against this set before the effective caller is built.
+    /// Empty for every non-`ACT_AS` key.
+    pub may_act: Vec<String>,
+    /// BLAKE3 of the secret used to authenticate. Useful for
+    /// `last_used_at` background touches.
     pub key_hash: [u8; 32],
 }
 
 impl RequestScope {
-    /// Build a permissive scope carrying the agent the client claimed.
-    #[must_use]
-    pub fn permissive(agent_id: AgentId) -> Self {
-        Self {
-            agent_id,
-            org_id: [0u8; 16],
-            user_id: [0u8; 16],
-            namespace: String::new(),
-            permissions: bits::FULL,
-            scope_enforced: false,
-            key_hash: [0u8; 32],
-        }
-    }
-
     /// Project a resolved row onto the connection scope.
     #[must_use]
     pub fn from_resolved(resolved: ResolvedScope) -> Self {
         Self {
-            agent_id: AgentId(uuid::Uuid::from_bytes(resolved.agent_id)),
+            space_id: SpaceId(uuid::Uuid::from_bytes(resolved.space_id)),
             org_id: resolved.org_id,
             user_id: resolved.user_id,
             namespace: resolved.namespace,
             permissions: resolved.permissions,
-            scope_enforced: true,
+            may_act: resolved.may_act,
             key_hash: resolved.key_hash,
         }
     }
 
-    /// Project these scope claims onto the `AgentPermissions` wire
+    /// Project these scope claims onto the `SpacePermissions` wire
     /// shape carried by `AUTH_OK`.
     #[must_use]
-    pub fn to_agent_permissions(&self) -> AgentPermissions {
-        AgentPermissions {
+    pub fn to_space_permissions(&self) -> SpacePermissions {
+        SpacePermissions {
             can_encode: self.permissions & bits::ENCODE != 0,
             can_recall: self.permissions & bits::RECALL != 0,
             can_plan: self.permissions & bits::RECALL != 0,
             can_reason: self.permissions & bits::RECALL != 0,
             can_forget: self.permissions & bits::FORGET != 0,
             can_admin: self.permissions & bits::ADMIN != 0,
+            can_act_as: self.permissions & bits::ACT_AS != 0,
         }
     }
 
     /// Materialize a `brain_ops::RequestCaller` for dispatch.
+    ///
+    /// The caller is stamped with the wire-level `connection_id` minted
+    /// at HELLO/WELCOME so the txn store can link buffered work back
+    /// to the originating connection — disconnect-time cleanup
+    /// fans out on connection_id, not on space_id, because a
+    /// single space may hold many concurrent sessions.
     #[must_use]
-    pub fn to_caller(&self) -> brain_ops::RequestCaller {
-        if self.scope_enforced {
-            brain_ops::RequestCaller::from_scope(
-                self.agent_id,
-                self.org_id,
-                self.user_id,
-                self.namespace.clone(),
-                self.permissions,
-            )
+    pub fn to_caller(&self, connection_id: [u8; 16]) -> brain_ops::RequestCaller {
+        brain_ops::RequestCaller::from_scope(
+            self.space_id,
+            self.org_id,
+            self.user_id,
+            self.namespace.clone(),
+            self.permissions,
+        )
+        .with_session_id(connection_id)
+    }
+
+    /// Materialize the EFFECTIVE `brain_ops::RequestCaller` for an
+    /// `act_as` request.
+    ///
+    /// The op runs as the target `(namespace, space_id)`, not the
+    /// connection principal's own identity. Effective permissions are the
+    /// fixed `STANDARD_SPACE` mask — never the principal's bits, and never
+    /// `ADMIN` / `ACT_AS` — because Brain has no per-space permission
+    /// store to consult for the impersonated identity. The principal's
+    /// `org_id` / `user_id` are retained for the audit trail (the acting
+    /// party is never erased; see RFC 8693 delegation), and the wire
+    /// `connection_id` rides along so the connection-drop sweep still finds
+    /// buffered work.
+    ///
+    /// Callers MUST validate the request's `act_as` against
+    /// `permissions & ACT_AS` and `may_act` before calling this — this
+    /// constructor performs no authorization.
+    #[must_use]
+    pub fn to_effective_caller(
+        &self,
+        act_as: &brain_protocol::ActAs,
+        connection_id: [u8; 16],
+    ) -> brain_ops::RequestCaller {
+        // Ingress hashing: the wire carries a structured opaque space
+        // string; the 16-byte storage id is a deterministic UUIDv5 of it,
+        // with the namespace folded into the seed so equal strings under
+        // different namespaces diverge at the id level. An empty selector
+        // means "use the connection's key-bound space" (single-space keys,
+        // zero ceremony) — there is no human string for that space.
+        let space_id = if act_as.space_id.is_empty() {
+            self.space_id
         } else {
-            brain_ops::RequestCaller::new(self.agent_id)
-        }
+            SpaceId::derive_from_string(&act_as.namespace, &act_as.space_id)
+        };
+        brain_ops::RequestCaller::from_scope(
+            space_id,
+            self.org_id,
+            self.user_id,
+            act_as.namespace.clone(),
+            bits::STANDARD_SPACE,
+        )
+        .with_session_id(connection_id)
+        .with_space_string(act_as.space_id.clone())
     }
 }
 
 /// Auth-time failure modes. Each maps to a specific wire error.
 #[derive(thiserror::Error, Debug)]
 pub enum AuthError {
-    /// Strict mode is on but the AUTH frame carries no token.
-    #[error("API key required (BRAIN_REQUIRE_SCOPED_API_KEYS=true)")]
+    /// The AUTH frame carries no token (empty or wrong credential shape).
+    #[error("API key required")]
     Missing,
     /// The presented secret hashed to an unknown key.
     #[error("unknown API key")]
@@ -133,9 +157,10 @@ pub enum AuthError {
     /// The key exists but has been revoked.
     #[error("API key has been revoked")]
     Revoked,
-    /// Strict mode is on and the client picked `AuthMethod::None`.
-    #[error("anonymous authentication is disabled")]
-    PolicyForbidsAnonymous,
+    /// The client picked an auth method the server does not support
+    /// (currently mTLS).
+    #[error("unsupported auth method")]
+    UnsupportedMethod,
     /// Backend redb error during lookup.
     #[error("api-key store: {0}")]
     Storage(#[from] ApiKeyError),
@@ -149,25 +174,16 @@ pub enum AuthError {
 /// enforces single-writer via `&mut self` on `write_txn`.
 pub struct AuthStore {
     db: RwLock<ApiKeyDb>,
-    strict: bool,
 }
 
 impl AuthStore {
-    /// Open the store at `path`. `strict` is captured at construction
-    /// (typically from [`require_scoped_keys_from_env`]) so all
-    /// concurrent readers see a single coherent flag.
-    pub fn open(path: impl AsRef<Path>, strict: bool) -> Result<Self, ApiKeyError> {
+    /// Open the store at `path`. Auth is always mandatory; there is no
+    /// permissive mode to configure.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, ApiKeyError> {
         let db = ApiKeyDb::open(path)?;
         Ok(Self {
             db: RwLock::new(db),
-            strict,
         })
-    }
-
-    /// True iff scope binding is enforced for new connections.
-    #[must_use]
-    pub fn strict(&self) -> bool {
-        self.strict
     }
 
     /// Convenience for tests that need to pre-seed keys.
@@ -192,13 +208,15 @@ impl AuthStore {
 
     /// Mint a fresh scope-bound API key. Returns the raw secret bytes
     /// to surface once to the operator (never stored).
+    #[allow(clippy::too_many_arguments)]
     pub fn mint(
         &self,
         org_id: [u8; 16],
         user_id: [u8; 16],
         namespace: String,
-        agent_id: [u8; 16],
+        space_id: [u8; 16],
         permissions: u32,
+        may_act: Vec<String>,
         now_unix_nanos: u64,
     ) -> Result<MintedKey, ApiKeyError> {
         // 32 bytes of CSPRNG output. Concatenate two v7 UUIDs and run
@@ -216,8 +234,9 @@ impl AuthStore {
             org_id,
             user_id,
             namespace,
-            agent_id,
+            space_id,
             permissions,
+            may_act,
             now_unix_nanos,
         )?;
         wtxn.commit()?;
@@ -236,15 +255,33 @@ impl AuthStore {
         Ok(found)
     }
 
-    /// List every key issued to `agent_id`. Returns the rows verbatim
+    /// List every key issued to `space_id`. Returns the rows verbatim
     /// — admin views should redact `key_hash` if surfacing publicly.
-    pub fn list_for_agent(
+    pub fn list_for_space(
         &self,
-        agent_id: &[u8; 16],
+        space_id: &[u8; 16],
     ) -> Result<Vec<brain_metadata::tables::api_keys::ApiKeyRow>, ApiKeyError> {
         let guard = self.db.read();
         let rtxn = guard.read_txn()?;
-        api_key_list_for_agent(&rtxn, agent_id)
+        api_key_list_for_space(&rtxn, space_id)
+    }
+
+    /// Report whether the key identified by `key_hash` is still active
+    /// (present in the store and not revoked).
+    ///
+    /// This is the cheap read the connection layer uses for its live,
+    /// bounded-staleness revocation re-check: keys are validated in full at
+    /// AUTH, but a long-lived connection could outlive a mid-session revoke,
+    /// so we re-look-up the row by its hash periodically. Callers are
+    /// fail-closed — a missing row (`Ok(false)`), a revoked row
+    /// (`Ok(false)`), or a storage error (`Err`) must all deny access.
+    pub fn is_key_active(&self, key_hash: &[u8; 32]) -> Result<bool, ApiKeyError> {
+        let guard = self.db.read();
+        let rtxn = guard.read_txn()?;
+        match api_key_lookup_by_hash(&rtxn, key_hash)? {
+            Some(row) => Ok(!row.revoked),
+            None => Ok(false),
+        }
     }
 
     /// Look up a secret. Returns `None` when the secret hashes to a row
@@ -281,7 +318,6 @@ impl MintedKey {
 
 /// Parse the canonical `brain_<base64url(secret)>` display form back to
 /// the raw 32-byte secret. Returns `None` on a malformed string.
-#[allow(dead_code)]
 #[must_use]
 pub fn parse_formatted_key(s: &str) -> Option<Vec<u8>> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -292,31 +328,32 @@ pub fn parse_formatted_key(s: &str) -> Option<Vec<u8>> {
 
 /// Resolve the AUTH frame into a [`RequestScope`].
 ///
-/// In permissive mode the scope is whatever the client claimed; in
-/// strict mode the AUTH must carry a valid `Token` whose hash maps to a
-/// non-revoked row in the store.
+/// The AUTH MUST carry a valid `Token` whose hash maps to a non-revoked
+/// row in the store. Any other method (mTLS), a missing/empty token, an
+/// unknown key, or a revoked key is rejected — identity is the credential.
 pub fn derive_scope_from_handshake(
     auth: &AuthPayload,
     store: &Arc<AuthStore>,
 ) -> Result<RequestScope, AuthError> {
-    if !store.strict() {
-        // Permissive: token (if any) is opaque, we just trust the
-        // client-supplied agent. No store hit on the hot path.
-        return Ok(RequestScope::permissive(AgentId(uuid::Uuid::from_bytes(
-            auth.agent_id,
-        ))));
-    }
-
-    let secret = match (&auth.method, &auth.credentials) {
+    let token = match (&auth.method, &auth.credentials) {
         (AuthMethod::Token, AuthCredentials::Token(bytes)) => bytes.as_slice(),
-        (AuthMethod::None, _) | (_, AuthCredentials::None) => {
-            return Err(AuthError::PolicyForbidsAnonymous);
+        (AuthMethod::Mtls, _) | (_, AuthCredentials::Mtls(_)) => {
+            return Err(AuthError::UnsupportedMethod);
         }
-        _ => return Err(AuthError::Missing),
     };
-    if secret.is_empty() {
+    if token.is_empty() {
         return Err(AuthError::Missing);
     }
+
+    // The credential clients present is the canonical `brain_<base64url>` form
+    // the admin mint hands out, sent verbatim. Decode it to the raw secret
+    // before hashing — the store keys on BLAKE3(secret_bytes), not the display
+    // string. Fall back to the raw bytes for a caller that presents the
+    // pre-decoded secret directly.
+    let decoded = std::str::from_utf8(token)
+        .ok()
+        .and_then(parse_formatted_key);
+    let secret: &[u8] = decoded.as_deref().unwrap_or(token);
 
     let row = store.lookup(secret)?.ok_or(AuthError::Unknown)?;
     if row.revoked {
@@ -325,7 +362,7 @@ pub fn derive_scope_from_handshake(
     }
     debug!(
         key_hash = %hex32(&row.key_hash),
-        agent_id = ?row.agent_id,
+        space_id = ?row.space_id,
         namespace = %row.namespace,
         "AUTH resolved scope from API key",
     );
@@ -352,133 +389,168 @@ pub fn hex32(bytes: &[u8; 32]) -> String {
 mod tests {
     use super::*;
 
-    fn store(strict: bool) -> (tempfile::TempDir, Arc<AuthStore>) {
+    fn store() -> (tempfile::TempDir, Arc<AuthStore>) {
         let dir = tempfile::tempdir().unwrap();
-        let s = AuthStore::open(dir.path().join("api_keys.redb"), strict).unwrap();
+        let s = AuthStore::open(dir.path().join("api_keys.redb")).unwrap();
         (dir, Arc::new(s))
     }
 
-    fn agent(byte: u8) -> [u8; 16] {
+    fn space(byte: u8) -> [u8; 16] {
         let mut a = [0u8; 16];
         a[15] = byte;
         a
     }
 
-    fn auth_token(agent_id: [u8; 16], secret: Vec<u8>) -> AuthPayload {
+    fn auth_token(secret: Vec<u8>) -> AuthPayload {
         AuthPayload {
             method: AuthMethod::Token,
-            agent_id,
             credentials: AuthCredentials::Token(secret),
         }
     }
 
-    fn auth_none(agent_id: [u8; 16]) -> AuthPayload {
+    fn auth_mtls() -> AuthPayload {
         AuthPayload {
-            method: AuthMethod::None,
-            agent_id,
-            credentials: AuthCredentials::None,
+            method: AuthMethod::Mtls,
+            credentials: AuthCredentials::Mtls(brain_protocol::connection::handshake::MtlsClaim {
+                cert_fingerprint: [0u8; 32],
+                asserted_subject: "CN=x".into(),
+            }),
         }
     }
 
     #[test]
-    fn permissive_mode_allows_unscoped_handshake() {
-        let (_dir, store) = store(false);
-        let scope =
-            derive_scope_from_handshake(&auth_none(agent(7)), &store).expect("permissive accepts");
-        assert!(!scope.scope_enforced);
-        assert_eq!(scope.permissions, bits::FULL);
-        assert_eq!(scope.agent_id, AgentId(uuid::Uuid::from_bytes(agent(7))));
-    }
-
-    #[test]
-    fn permissive_mode_ignores_missing_token() {
-        let (_dir, store) = store(false);
-        // Even an empty-token AUTH succeeds in permissive mode.
-        let payload = auth_token(agent(7), Vec::new());
-        let scope = derive_scope_from_handshake(&payload, &store).unwrap();
-        assert!(!scope.scope_enforced);
-    }
-
-    #[test]
-    fn strict_mode_rejects_missing_api_key() {
-        let (_dir, store) = store(true);
-        let err = derive_scope_from_handshake(&auth_none(agent(1)), &store).unwrap_err();
-        assert!(matches!(err, AuthError::PolicyForbidsAnonymous));
-
-        let err =
-            derive_scope_from_handshake(&auth_token(agent(1), Vec::new()), &store).unwrap_err();
+    fn rejects_missing_token() {
+        let (_dir, store) = store();
+        let err = derive_scope_from_handshake(&auth_token(Vec::new()), &store).unwrap_err();
         assert!(matches!(err, AuthError::Missing));
     }
 
     #[test]
-    fn strict_mode_accepts_valid_api_key() {
-        let (_dir, store) = store(true);
-        let minted = store
-            .mint(
-                agent(2),
-                [0u8; 16],
-                "acme".into(),
-                agent(7),
-                bits::STANDARD_AGENT,
-                1_700_000_000_000_000_000,
-            )
-            .unwrap();
-        let payload = auth_token(agent(7), minted.secret_bytes.clone());
-        let scope = derive_scope_from_handshake(&payload, &store).expect("accepts");
-        assert!(scope.scope_enforced);
-        assert_eq!(scope.namespace, "acme");
-        assert_eq!(scope.agent_id, AgentId(uuid::Uuid::from_bytes(agent(7))));
-        assert!(scope.permissions & bits::ENCODE != 0);
-        assert!(scope.permissions & bits::ADMIN == 0);
+    fn rejects_mtls_method() {
+        let (_dir, store) = store();
+        let err = derive_scope_from_handshake(&auth_mtls(), &store).unwrap_err();
+        assert!(matches!(err, AuthError::UnsupportedMethod));
     }
 
     #[test]
-    fn strict_mode_rejects_unknown_key() {
-        let (_dir, store) = store(true);
-        let payload = auth_token(agent(1), b"never-minted".to_vec());
+    fn accepts_valid_api_key() {
+        let (_dir, store) = store();
+        let minted = store
+            .mint(
+                space(2),
+                [0u8; 16],
+                "acme".into(),
+                space(7),
+                bits::STANDARD_SPACE,
+                Vec::new(),
+                1_700_000_000_000_000_000,
+            )
+            .unwrap();
+        let payload = auth_token(minted.secret_bytes.clone());
+        let scope = derive_scope_from_handshake(&payload, &store).expect("accepts");
+        assert_eq!(scope.namespace, "acme");
+        assert_eq!(scope.space_id, SpaceId(uuid::Uuid::from_bytes(space(7))));
+        assert!(scope.permissions & bits::ENCODE != 0);
+        assert!(scope.permissions & bits::ADMIN == 0);
+        // The caller inherits the key's namespace; identity is the credential.
+        assert_eq!(scope.to_caller([0u8; 16]).namespace, "acme");
+    }
+
+    #[test]
+    fn accepts_formatted_api_key() {
+        // The canonical credential clients present is the `brain_<base64url>`
+        // display string the admin mint returns — verbatim, not pre-decoded.
+        // The wire path must decode it before hashing, or every minted key is
+        // rejected as unknown (the bug the docker e2e caught).
+        let (_dir, store) = store();
+        let minted = store
+            .mint(
+                space(2),
+                [0u8; 16],
+                "acme".into(),
+                space(7),
+                bits::STANDARD_SPACE,
+                Vec::new(),
+                1_700_000_000_000_000_000,
+            )
+            .unwrap();
+        let payload = auth_token(minted.formatted().into_bytes());
+        let scope = derive_scope_from_handshake(&payload, &store)
+            .expect("the formatted brain_ token must resolve");
+        assert_eq!(scope.namespace, "acme");
+        assert_eq!(scope.space_id, SpaceId(uuid::Uuid::from_bytes(space(7))));
+    }
+
+    #[test]
+    fn rejects_unknown_key() {
+        let (_dir, store) = store();
+        let payload = auth_token(b"never-minted".to_vec());
         let err = derive_scope_from_handshake(&payload, &store).unwrap_err();
         assert!(matches!(err, AuthError::Unknown));
     }
 
     #[test]
-    fn strict_mode_rejects_revoked_key() {
-        let (_dir, store) = store(true);
+    fn rejects_revoked_key() {
+        let (_dir, store) = store();
         let minted = store
             .mint(
-                agent(2),
+                space(2),
                 [0u8; 16],
                 "acme".into(),
-                agent(7),
-                bits::STANDARD_AGENT,
+                space(7),
+                bits::STANDARD_SPACE,
+                Vec::new(),
                 1,
             )
             .unwrap();
         assert!(store.revoke(&minted.key_hash).unwrap());
-        let payload = auth_token(agent(7), minted.secret_bytes);
+        let payload = auth_token(minted.secret_bytes);
         let err = derive_scope_from_handshake(&payload, &store).unwrap_err();
         assert!(matches!(err, AuthError::Revoked));
     }
 
     #[test]
-    fn strict_mode_resolves_agent_from_key_not_client() {
-        // Even if the client claims agent X in the AUTH frame, the
-        // resolved scope's agent comes from the API key row.
-        let (_dir, store) = store(true);
-        let key_agent = agent(7);
-        let claimed_agent = agent(9);
+    fn is_key_active_tracks_revocation() {
+        // The live re-check reads the store by key hash: active before
+        // revoke, inactive after, and inactive for a hash that was never
+        // minted (fail-closed on an unknown key).
+        let (_dir, store) = store();
         let minted = store
             .mint(
-                agent(2),
+                space(2),
                 [0u8; 16],
                 "acme".into(),
-                key_agent,
-                bits::STANDARD_AGENT,
+                space(7),
+                bits::STANDARD_SPACE,
+                Vec::new(),
                 1,
             )
             .unwrap();
-        let payload = auth_token(claimed_agent, minted.secret_bytes);
+        assert!(store.is_key_active(&minted.key_hash).unwrap());
+        assert!(store.revoke(&minted.key_hash).unwrap());
+        assert!(!store.is_key_active(&minted.key_hash).unwrap());
+        assert!(!store.is_key_active(&[0xABu8; 32]).unwrap());
+    }
+
+    #[test]
+    fn resolves_space_from_key() {
+        // The resolved scope's space comes entirely from the API key row.
+        let (_dir, store) = store();
+        let key_space = space(7);
+        let minted = store
+            .mint(
+                space(2),
+                [0u8; 16],
+                "acme".into(),
+                key_space,
+                bits::STANDARD_SPACE,
+                Vec::new(),
+                1,
+            )
+            .unwrap();
+        let payload = auth_token(minted.secret_bytes);
         let scope = derive_scope_from_handshake(&payload, &store).unwrap();
-        assert_eq!(scope.agent_id, AgentId(uuid::Uuid::from_bytes(key_agent)));
+        assert_eq!(scope.space_id, SpaceId(uuid::Uuid::from_bytes(key_space)));
     }
 
     #[test]
@@ -488,10 +560,11 @@ mod tests {
             org_id: [0u8; 16],
             user_id: [0u8; 16],
             namespace: "n".into(),
-            agent_id: agent(1),
+            space_id: space(1),
             permissions: bits::ENCODE | bits::RECALL,
+            may_act: Vec::new(),
         });
-        let p = scope.to_agent_permissions();
+        let p = scope.to_space_permissions();
         assert!(p.can_encode);
         assert!(p.can_recall);
         assert!(p.can_plan);
@@ -502,14 +575,15 @@ mod tests {
 
     #[test]
     fn minted_key_round_trips_through_formatted() {
-        let (_dir, store) = store(true);
+        let (_dir, store) = store();
         let minted = store
             .mint(
-                agent(1),
+                space(1),
                 [0u8; 16],
                 "n".into(),
-                agent(1),
-                bits::STANDARD_AGENT,
+                space(1),
+                bits::STANDARD_SPACE,
+                Vec::new(),
                 1,
             )
             .unwrap();

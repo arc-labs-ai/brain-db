@@ -1,14 +1,11 @@
 {
   "name": "brain-dev",
-
   "build": {
     "dockerfile": "Dockerfile",
     "context": ".."
   },
-
-  "workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/brain,type=bind,consistency=cached",
   "workspaceFolder": "/workspaces/brain",
-
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/brain,type=bind,consistency=cached",
   // Persistent named volumes for cargo registry and target dir so a fresh
   // container start doesn't re-download dependencies. See README.md
   // "Development environment" for the rationale.
@@ -34,31 +31,38 @@
     // on every `devcontainer up` after a rebuild.
     "source=brain-models,target=/root/.local/share/brain/models,type=volume"
   ],
-
   "remoteEnv": {
     "RUST_BACKTRACE": "1",
     "CARGO_TERM_COLOR": "always",
-    // Cap parallel compile jobs to avoid the OOM-killer (signal 9) on the
-    // linker when many crates link concurrently in an 8–12 GB Docker
-    // Desktop VM. 2 is conservative; bump if your container has 16+ GB.
-    "CARGO_BUILD_JOBS": "2"
-
+    // Parallel compile jobs. Raised to 4: the VM has ~15 GB and links with
+    // mold (much lower link memory than bfd), so the linker-OOM that forced a
+    // conservative 2 on smaller VMs no longer applies. Lower again only if a
+    // shrunk VM starts OOM-killing (signal 9) during concurrent links.
+    "CARGO_BUILD_JOBS": "4"
     // target-cpu / fullfp16 handling lives in .cargo/config.toml as
     // per-target rustflags so it scopes to aarch64-unknown-linux-gnu only.
     // Don't add a RUSTFLAGS entry here — env vars OVERRIDE the per-target
     // config and we lose the macOS-host vs Linux-container distinction.
   },
-
   // Phase 9 unlock: io_uring (Glommio executor) needs both the memlock
   // rlimit raised and seccomp permissions for io_uring_setup/enter/register.
-  // Spec §01/05 §1.3.
   "runArgs": [
-    "--ulimit", "memlock=-1",
-    "--security-opt", "seccomp=unconfined"
+    // Stable, human-readable container name instead of Docker's random
+    // "romantic_nightingale". `docker ps` / Docker Desktop show `brain-dev`.
+    "--name",
+    "brain-dev",
+    "--ulimit",
+    "memlock=-1",
+    "--security-opt",
+    "seccomp=unconfined",
+    "-p",
+    "127.0.0.1:9090:9090",
+    "-p",
+    "127.0.0.1:9091:9091",
+    "-p",
+    "127.0.0.1:9092:9092"
   ],
-
   "postCreateCommand": "bash .devcontainer/post-create.sh",
-
   // Editor integration. devcontainer.json is the lingua franca across
   // VS Code, Cursor, JetBrains, and GitHub Codespaces; these settings
   // are read by VS Code / Cursor and silently ignored elsewhere.
@@ -80,13 +84,11 @@
       }
     }
   },
-
   // Phase 9 unlocks (memlock + seccomp) are baked in above; aarch64 target
   // tuning is in .cargo/config.toml. VS Code / Cursor "Reopen in Container"
   // picks both up automatically. Bare `devcontainer` CLI:
   //   devcontainer up --workspace-folder .
   //   devcontainer exec --workspace-folder . cargo test --workspace --tests --lib
   // (Install via `npm install -g @devcontainers/cli` if missing.)
-
   "remoteUser": "root"
 }

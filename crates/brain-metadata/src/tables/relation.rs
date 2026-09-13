@@ -1,6 +1,6 @@
 //! Relation sidecar metadata + evidence reverse index.
 //!
-//! After Phase C the `(from, to, type)` pair lives in the unified
+//! The `(from, to, type)` pair lives in the unified
 //! [`crate::tables::edge::EDGES_TABLE`]; this module owns the
 //! per-relation fields that have no substrate analog — confidence,
 //! validity window, supersession chain, evidence pointers,
@@ -22,21 +22,44 @@
 //! is the directional index.
 
 use crate::impl_redb_rkyv_value;
+use crate::tables::scope::RowScope;
 use brain_core::Relation;
-use brain_core::{EntityId, ExtractorId, MemoryId, NodeRef, RelationId, RelationTypeId};
+use brain_core::{
+    EntityId, ExtractorId, MemoryId, NamespaceId, NodeRef, RelationId, RelationTypeId, SpaceId,
+};
 use redb::TableDefinition;
 
 // ---------------------------------------------------------------------------
 // Tables.
 // ---------------------------------------------------------------------------
 
-pub const RELATION_METADATA_TABLE: TableDefinition<'static, [u8; 16], RelationMetadata> =
-    TableDefinition::new("relation_metadata_v2");
+/// Scope-prefixed evidence key: `(namespace_id, space_id_bytes, MemoryId,
+/// RelationId)`. Named so the `(namespace, space)` prefix stays under
+/// clippy's type-complexity threshold.
+type EvidenceKey = (u32, [u8; 16], [u8; 16], [u8; 16]);
 
-/// `(MemoryId.to_be_bytes(), RelationId.to_bytes())` → `()`. FORGET
-/// cascade lookup index.
-pub const RELATION_BY_EVIDENCE_TABLE: TableDefinition<'static, ([u8; 16], [u8; 16]), ()> =
-    TableDefinition::new("relation_by_evidence_v2");
+pub const RELATION_METADATA_TABLE: TableDefinition<'static, [u8; 16], RelationMetadata> =
+    TableDefinition::new("relation_metadata");
+
+/// `(namespace_id, space_id_bytes, MemoryId.to_be_bytes(),
+/// RelationId.to_bytes())` → `()`. FORGET cascade lookup index. The
+/// leading scope prefix keeps each tenant's evidence rows in a private
+/// keyspace; the relation read path itself filters by the sidecar's
+/// scope (the shared `EDGES_TABLE` is not re-keyed).
+pub const RELATION_BY_EVIDENCE_TABLE: TableDefinition<'static, EvidenceKey, ()> =
+    TableDefinition::new("relation_by_evidence");
+
+/// `relation_type_embeddings` — per-relation-type semantic vector, keyed
+/// by `RelationTypeId.raw()` (u32). Value is the embedding as
+/// little-endian `f32` bytes (BGE-small → 384 dims → 1536 bytes). Written
+/// when a relation type is first interned at extraction time; read by the
+/// grounded answer engine to match a query's relation against a subject's
+/// relation types by cosine (the "two-way match", alongside the exact
+/// qname index). Open-vocab relation types are never gated, so this is how
+/// a free relation type stays *findable* by a paraphrased question.
+/// Mirrors [`crate::tables::predicate::PREDICATE_EMBEDDINGS_TABLE`].
+pub const RELATION_TYPE_EMBEDDINGS_TABLE: TableDefinition<'static, u32, &[u8]> =
+    TableDefinition::new("relation_type_embeddings");
 
 // ---------------------------------------------------------------------------
 // Sidecar value type.
@@ -55,6 +78,19 @@ pub const RELATION_BY_EVIDENCE_TABLE: TableDefinition<'static, ([u8; 16], [u8; 1
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
 #[archive(check_bytes)]
 pub struct RelationMetadata {
+    /// Owning namespace (tenant) — the outer half of the
+    /// `(namespace, space)` scope key. Required; stamped from the
+    /// caller's scope at create time (fail-closed by construction).
+    pub namespace_id: u32,
+    /// Owning space (app) — the inner half of the scope key.
+    pub space_id_bytes: [u8; 16],
+    /// Conversation/run this relation was extracted from — the REAL
+    /// per-utterance `session_id`, copied from the source memory (or the
+    /// explicit `RELATION_CREATE` request). A GROUPING/FILTER column,
+    /// NOT part of the `(namespace, space)` isolation prefix. `0` is the
+    /// default session. Appended after the scope so old rkyv rows still
+    /// decode (positional).
+    pub session_id: u64,
     pub from_tag: u8,
     pub from_bytes: [u8; 16],
     pub to_tag: u8,
@@ -115,8 +151,32 @@ impl RelationMetadata {
         RelationId::from(self.chain_root_bytes)
     }
 
+    /// The owning namespace (tenant) of this relation.
+    #[must_use]
+    pub fn namespace(&self) -> NamespaceId {
+        NamespaceId::from(self.namespace_id)
+    }
+
+    /// The owning space of this relation.
+    #[must_use]
+    pub fn space_id(&self) -> SpaceId {
+        SpaceId::from(self.space_id_bytes)
+    }
+
+    /// The `(namespace, space)` scope this relation belongs to.
+    #[must_use]
+    pub fn scope(&self) -> RowScope {
+        RowScope::from_bytes(self.namespace_id, self.space_id_bytes)
+    }
+
+    /// The conversation/run this relation was extracted from.
+    #[must_use]
+    pub fn session(&self) -> brain_core::SessionId {
+        brain_core::SessionId::from(self.session_id)
+    }
+
     /// Project the `(from, to)` pair as [`EntityId`]s. Returns `None`
-    /// if either endpoint is not an `Entity` — typed knowledge
+    /// if either endpoint is not an `Entity` — typed-graph
     /// relations canonically have entity endpoints; a Memory endpoint
     /// indicates a future mention-style typed relation.
     #[must_use]
@@ -143,7 +203,7 @@ impl RelationMetadata {
     }
 }
 
-impl_redb_rkyv_value!(RelationMetadata, "brain_metadata::RelationMetadata::v2");
+impl_redb_rkyv_value!(RelationMetadata, "brain_metadata::RelationMetadata");
 
 // ---------------------------------------------------------------------------
 // Projections — Relation (brain-core) ↔ RelationMetadata (rkyv row).
@@ -153,11 +213,17 @@ impl_redb_rkyv_value!(RelationMetadata, "brain_metadata::RelationMetadata::v2");
 /// `superseded_by / tombstoned` only — validity-window timing is left
 /// to query-time.
 #[must_use]
-pub fn metadata_from_relation(r: &Relation) -> RelationMetadata {
+pub fn metadata_from_relation(r: &Relation, scope: RowScope) -> RelationMetadata {
     let is_current = u8::from(!r.tombstoned && r.superseded_by.is_none());
     let evidence_inline: Vec<[u8; 16]> = r.evidence.iter().map(|m| m.to_be_bytes()).collect();
 
     RelationMetadata {
+        namespace_id: scope.namespace_id,
+        space_id_bytes: scope.space_id_bytes,
+        // Default session; `relation_create`/`relation_supersede` stamp the
+        // real per-utterance session onto the row after building it (the
+        // brain-core `Relation` carries no session slot).
+        session_id: brain_core::SessionId::DEFAULT.raw(),
         from_tag: NodeRef::Entity(r.from_entity).tag(),
         from_bytes: r.from_entity.to_bytes(),
         to_tag: NodeRef::Entity(r.to_entity).tag(),
@@ -228,6 +294,11 @@ mod tests {
     use brain_core::Relation;
     use redb::ReadableDatabase;
 
+    /// Fixed test scope: system namespace + a stable test space.
+    fn test_scope() -> RowScope {
+        RowScope::from_bytes(NamespaceId::SYSTEM.raw(), [0xAB; 16])
+    }
+
     fn sample_relation() -> Relation {
         let id = RelationId::new();
         Relation::new_root(
@@ -248,7 +319,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = fresh_db(&dir);
         let r = sample_relation();
-        let row = metadata_from_relation(&r);
+        let row = metadata_from_relation(&r, test_scope());
         let key = r.id.to_bytes();
 
         let wtxn = db.begin_write().unwrap();
@@ -272,7 +343,7 @@ mod tests {
     #[test]
     fn endpoint_projection_recovers_entity_pair() {
         let r = sample_relation();
-        let row = metadata_from_relation(&r);
+        let row = metadata_from_relation(&r, test_scope());
         let (a, b) = row.entity_endpoints().unwrap();
         assert_eq!(a, r.from_entity);
         assert_eq!(b, r.to_entity);
@@ -284,7 +355,8 @@ mod tests {
         let db = fresh_db(&dir);
         let rel_id = RelationId::new();
         let mem = [7u8; 16];
-        let key = (mem, rel_id.to_bytes());
+        let s = test_scope();
+        let key = (s.namespace_id, s.space_id_bytes, mem, rel_id.to_bytes());
 
         let wtxn = db.begin_write().unwrap();
         {

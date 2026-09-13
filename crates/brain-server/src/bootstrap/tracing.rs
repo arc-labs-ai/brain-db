@@ -1,7 +1,5 @@
 //! OpenTelemetry tracing — OTLP exporter pipeline.
 //!
-//! Sub-task 12.3.
-//!
 //! Returns a `Layer` that `bootstrap::logging` composes into the
 //! global subscriber. The layer is wired to an OTLP/HTTP exporter
 //! sending to the collector at `tracing.endpoint`. If `enabled =
@@ -14,16 +12,24 @@
 //! The wire protocol does not currently carry a `traceparent`
 //! header (amendment required). v1 emits
 //! server-side spans only; client-supplied trace context is not
-//! consumed. Tracker: `phase-13/wire-traceparent`.
+//! consumed.
 //!
 //! ## Glommio note
 //!
 //! `tracing_opentelemetry::OpenTelemetryLayer` records spans into
-//! thread-local context. Glommio's per-core executors keep their
-//! own thread-locals; spans don't leak across the Tokio↔Glommio
-//! boundary. The shard-side handlers in `brain-ops` instrument with
-//! their own `tracing::info_span!` calls; those become independent
-//! OTel spans rooted at the request span at the connection layer.
+//! thread-local context, and `tracing`'s current-span stack is
+//! thread-local too. Glommio's per-core executors keep their own
+//! thread-locals, so span context does *not* follow the Tokio→Glommio
+//! hop on its own. The connection layer (`network::dispatch`) opens the
+//! `client.request` span and carries the `tracing::Span` handle (which
+//! is `Send + Sync`) across the shard channel in
+//! `ShardRequest::DispatchOp`; the shard re-enters it via
+//! `.instrument()`, so the `brain.encode` span and its storage
+//! sub-spans (`brain.embed`, `brain.wal.append`, `brain.metadata.write`,
+//! `brain.hnsw.insert`) nest under the request span as one trace tree.
+//! Span *creation* and *close* are thread-agnostic — only the batched
+//! OTLP export needs the Tokio runtime, and that runs on its own task,
+//! so emitting spans from a Glommio thread is sound.
 
 #![cfg(target_os = "linux")]
 
@@ -47,7 +53,7 @@ pub struct BuiltTracing {
     pub provider: TracerProvider,
 }
 
-/// Build an OpenTelemetry pipeline from `[tracing]` config. Returns
+/// Build an OpenTelemetry pipeline from `[monitoring.tracing]` config. Returns
 /// `None` when tracing is disabled or the resolved sampler is
 /// `always_off`.
 ///
@@ -94,7 +100,35 @@ pub fn build(cfg: &TracingConfig) -> Result<Option<BuiltTracing>, String> {
     let tracer = opentelemetry::trace::TracerProvider::tracer(&provider, "brain");
     let layer = tracing_opentelemetry::layer().with_tracer(tracer);
 
+    install_error_handler();
+
     Ok(Some(BuiltTracing { layer, provider }))
+}
+
+/// Feed the trace-pipeline self-metrics from OpenTelemetry's process-global
+/// error handler. The batch processor reports a full export buffer as
+/// `TraceError::Other` (a "send failed" on the internal channel) and an
+/// export failure/timeout as `ExportFailed` / `ExportTimedOut`; we map the
+/// former to dropped spans and the latter to export errors. The handler is a
+/// process singleton, so this is only meaningfully installed once — a second
+/// `build()` (config reload) just re-points it at the same global counters.
+fn install_error_handler() {
+    use opentelemetry::global::Error as OtelError;
+    use opentelemetry::trace::TraceError;
+
+    let metrics = crate::metrics::otel::global().clone();
+    let _ = opentelemetry::global::set_error_handler(move |err| {
+        match &err {
+            OtelError::Trace(TraceError::ExportFailed(_) | TraceError::ExportTimedOut(_)) => {
+                metrics.export_errors.inc();
+            }
+            OtelError::Trace(TraceError::Other(_)) => {
+                metrics.spans_dropped.inc();
+            }
+            _ => {}
+        }
+        tracing::warn!(otel_error = %err, "opentelemetry trace pipeline error");
+    });
 }
 
 /// Resolve the sampler.

@@ -38,6 +38,10 @@ The opcode is a big-endian `u16` in the frame header (bytes 5–6). The high byt
 | 0x00A5 | `LINK_RESP` | S → C | Link acknowledgment |
 | 0x0026 | `UNLINK_REQ` | C → S | Remove an edge between two memories |
 | 0x00A6 | `UNLINK_RESP` | S → C | Unlink acknowledgment |
+| 0x0027 | `MEMORY_LIST_REQ` | C → S | Paginated enumeration of the caller's memories (non-ranked) |
+| 0x00A7 | `MEMORY_LIST_RESP` | S → C | Enumeration page + keyset cursor |
+| 0x0028 | `MEMORY_INSPECT_REQ` | C → S | Fetch one memory's durable write-artifact bundle |
+| 0x00A8 | `MEMORY_INSPECT_RESP` | S → C | Text + per-stage artifact bundle (vector, record, keywords, HyPE, graph) |
 | 0x002A | `ENCODE_VECTOR_DIRECT_REQ` | C → S | Power-user encode with pre-supplied vector |
 | 0x00AA | `ENCODE_VECTOR_DIRECT_RESP` | S → C | (Same response shape as ENCODE_RESP) |
 
@@ -49,6 +53,15 @@ The opcode is a big-endian `u16` in the frame header (bytes 5–6). The high byt
 | 0x00B0 | `SUBSCRIBE_EVENT` | S → C | Push event matching subscription |
 | 0x0031 | `UNSUBSCRIBE_REQ` | C → S | Stop a subscription |
 | 0x00B1 | `UNSUBSCRIBE_RESP` | S → C | Acknowledgment |
+
+### 1.3a Capability introspection
+
+| Opcode | Name | Direction | Purpose |
+|---|---|---|---|
+| 0x0032 | `GET_CAPABILITIES_REQ` | C → S | Query the shard's enabled features (rerank, extractor tiers, schema namespaces, vector dim) |
+| 0x00B2 | `GET_CAPABILITIES_RESP` | S → C | Capability descriptor |
+
+`GET_CAPABILITIES` is available to every authenticated client — not admin-only. Clients call it after `WELCOME` to avoid issuing requests the shard can't serve (e.g. `request.rerank = true` against a shard with `rerank.enabled = false`). The response carries explicit booleans per capability plus the set of currently-active schema namespaces; there is no "feature flag" fallback — capabilities that are disabled by config or unavailable on this shard are surfaced concretely.
 
 ### 1.4 Transactions
 
@@ -100,6 +113,10 @@ The opcode is a big-endian `u16` in the frame header (bytes 5–6). The high byt
 | 0x00EC | `ADMIN_ABORT_MIGRATION_RESP` | S → C | Abort ack |
 | 0x006D | `ADMIN_RETIRE_FINGERPRINT_REQ` | C → S | Retire a model fingerprint after a completed migration |
 | 0x00ED | `ADMIN_RETIRE_FINGERPRINT_RESP` | S → C | Retire ack |
+| 0x006E | `ADMIN_BACKFILL_REQ` | C → S | Submit a backfill run (re-run extractors over a memory range); returns a `BackfillId` |
+| 0x00EE | `ADMIN_BACKFILL_RESP` | S → C | Backfill submission ack (id + initial progress) |
+| 0x006F | `ADMIN_BACKFILL_CANCEL_REQ` | C → S | Cancel an in-flight backfill run by id |
+| 0x00EF | `ADMIN_BACKFILL_CANCEL_RESP` | S → C | Cancel ack (final progress snapshot) |
 
 ### 1.7 Errors
 
@@ -120,7 +137,7 @@ All typed-graph opcodes live in the `0x01xx` namespace. Within `0x01xx`, low-byt
 0x0130–0x013F   entity operations
 0x0140–0x014F   statement operations
 0x0150–0x015F   relation operations
-0x0160–0x016F   query operations (hybrid retrieval)
+0x0160–0x016F   query introspection + procedural materialization
 0x0170–0x017F   admin operations (extraction + index maintenance)
 0x0180–0x018F   reserved future
 ```
@@ -131,13 +148,17 @@ The low byte's high bit selects direction within this namespace, mirroring the s
 
 | Opcode | Name | Body | Response |
 |---|---|---|---|
-| 0x0120 | `SCHEMA_UPLOAD` | schema document (text) | schema_version, validation_errors |
+| 0x0120 | `SCHEMA_UPLOAD` | schema document (text) | schema_version, validation_errors. Additive-merge: classifies each declared item as Insert / Idempotent / Conflict against the current namespace; one conflict aborts the whole upload. See [`../03_schema/05_versioning.md`](../03_schema/05_versioning.md) §1a. |
 | 0x0121 | `SCHEMA_GET` | version_id (latest if 0) | schema document |
 | 0x0122 | `SCHEMA_LIST` | (none) | list of versions with timestamps |
 | 0x0123 | `SCHEMA_VALIDATE` | schema document | validation_errors (without commit) |
-| 0x0124 | `EXTRACTOR_LIST` | (none) | active extractors |
-| 0x0125 | `EXTRACTOR_DISABLE` | extractor_id | confirmation |
-| 0x0126 | `EXTRACTOR_ENABLE` | extractor_id | confirmation |
+| 0x0124 | `EXTRACTOR_LIST` | (none) | active extractors (read-only introspection) |
+| 0x0125 | `SCHEMA_DROP` | target_kind (0 = predicate, 1 = relation_type) + target_name + `force` | namespace, schema_version, target_kind, target_name, dropped, live_rows, validation_errors |
+| 0x0127 | `SCHEMA_REPLACE` | schema document + `force_drop_existing: true` | namespace, schema_version, dropped_count, validation_errors |
+
+`SCHEMA_REPLACE` (request `0x0127`, response `0x01A7`) is the destructive counterpart to the additive-merge `SCHEMA_UPLOAD`. It tombstones every schema-declared predicate, relation_type, and extractor row in the target namespace and re-runs the apply path against a clean slate inside a single redb wtxn. Entity types are **not** dropped (they are global in v1; see [`../03_schema/05_versioning.md`](../03_schema/05_versioning.md) §1c). Admin-only; the handler rejects the call unless `force_drop_existing` is exactly `true`. See [`../03_schema/05_versioning.md`](../03_schema/05_versioning.md) §9.
+
+`SCHEMA_DROP` (request `0x0125`, response `0x01A5`) is the *targeted* narrowing: it removes one declared predicate or relation_type from a namespace and re-versions the narrowed document, versus `SCHEMA_REPLACE`, which wipes the whole namespace. Entity types are global and never dropped. An in-use safety gate rejects the drop (`Conflict`) when live (non-tombstoned) rows are still keyed on the target unless `force` is set. Re-dropping an already-absent target is a lenient no-op success (`dropped = false`, version unchanged), matching FORGET's idempotency. Admin-only. Like `SCHEMA_UPLOAD` / `SCHEMA_REPLACE`, it flows through the unified `submit(Write)` path so the mutation is WAL-durable and replayed on recovery (see [`../08_storage/02_wal.md`](../08_storage/02_wal.md) §21). See [`../03_schema/05_versioning.md`](../03_schema/05_versioning.md) §9a.
 
 ### 2.2 Entity operations (0x0130–0x013F)
 
@@ -162,7 +183,7 @@ The low byte's high bit selects direction within this namespace, mirroring the s
 | 0x0142 | `STATEMENT_SUPERSEDE` | old_id, new_statement | new StatementId |
 | 0x0143 | `STATEMENT_TOMBSTONE` | StatementId, reason | confirmation |
 | 0x0144 | `STATEMENT_RETRACT` | StatementId | confirmation |
-| 0x0145 | `STATEMENT_HISTORY` | StatementId or chain_root | full chain |
+| 0x0145 | `STATEMENT_HISTORY` | StatementId or chain_root, limit, cursor | page of versions + next_cursor (keyset) |
 | 0x0146 | `STATEMENT_LIST` | filter (subject, predicate, kind, time, confidence) | StatementIds |
 
 ### 2.4 Relation operations (0x0150–0x015F)
@@ -177,21 +198,46 @@ The low byte's high bit selects direction within this namespace, mirroring the s
 | 0x0155 | `RELATION_LIST_TO` | EntityId, type_filter, time_filter | RelationIds |
 | 0x0156 | `RELATION_TRAVERSE` | start, types, depth, direction | path/subgraph |
 
-### 2.5 Query operations (0x0160–0x016F)
+### 2.5 Query introspection operations (0x0160–0x016F)
 
 | Opcode | Name | Body | Response |
 |---|---|---|---|
-| 0x0160 | `QUERY` | QueryRequest | QueryResult (streamed if large) |
 | 0x0161 | `QUERY_EXPLAIN` | QueryRequest | QueryPlan (no execution) |
 | 0x0162 | `QUERY_TRACE` | QueryRequest | QueryResult + per-retriever debug |
-| 0x0163 | `RECALL_HYBRID` | text, filters, retriever_selection | RecallResult |
+| 0x0163 | `GRAPH_FETCH` | cursor, layer toggles, page size | Typed-graph nodes + edges page + keyset cursor |
+| 0x00E3 → 0x01E3 | `GRAPH_FETCH_RESP` | S → C | nodes[], edges[], next_cursor |
 | 0x0164 | `MATERIALIZE_PROCEDURAL` | agent_id, target_predicates | ProceduralBlock (rendered system prompt) |
 
-`QUERY` is the primary structured query opcode. `RECALL_HYBRID` is the simple-text fast path used by clients that just want hybrid text-only retrieval with no entity anchoring.
+`GRAPH_FETCH` (`0x0163` / resp `0x01E3`) is a paginated export of the caller's
+whole `(namespace, agent)` typed graph as a node/edge set — the read that
+backs a graph-explorer UI. It is not `RECALL`: no cue, no ranking. It paginates
+over the subject-anchored statement index (the one typed-graph index that is
+`(namespace, agent)`-prefixed) and derives the entity set from traversal, so a
+fully-isolated entity (never a statement subject/object and with no relation to
+a statemented entity) does not surface. Nodes are entities (always), plus
+value-object statement nodes when `include_statements` and source-memory nodes
+when `include_memories`; edges are `Relation` (entity↔entity, relations table),
+`Fact` (entity↔entity, from an entity-object statement), `HasStatement`
+(entity→value statement), and `Mentions` (memory→entity). The cursor is opaque
+and signed over the layer toggles; the response contract is **completeness, not
+disjointness** — every node/edge appears in ≥1 page and may repeat across
+pages, each carrying a stable 16-byte id for client-side dedup.
+
+There is **no client-facing bulk-query verb.** `RECALL` (`0x0021`) is the sole
+primary read; it returns the answer as a membership shape (Single / Many /
+None), not a ranked candidate list. `QUERY_EXPLAIN` and `QUERY_TRACE` are the
+**operator debug/introspection surface** over the same shared retrieval engine:
+EXPLAIN renders the plan without executing, TRACE executes and returns the
+per-retriever candidate breakdown for diagnosing "why did the engine rank it
+this way." They accept the internal `QueryRequest` (retriever selection, fusion
+overrides, filters) precisely because they are a debugging tool, not the agent
+read path. Structured typed-graph lookup ("list every statement with predicate
+X on entity Y") is served by the LIST ops (`STATEMENT_LIST`, `RELATION_LIST_*`,
+`ENTITY_RESOLVE` / `ENTITY_LIST`), not a fused ranked list.
 
 `MATERIALIZE_PROCEDURAL` (`0x0164` request, `0x01E4` response) renders the agent's procedural-memory predicates (`brain:behavior_*` — see [`../03_schema/06_system_schema.md`](../03_schema/06_system_schema.md)) into a single system-prompt block the agent can re-inject at conversation start. Semantically a read-only structured query under the hood; conceptually a memory primitive because the agent treats the materialised block as a separate handle.
 
-The substrate `RECALL` opcode (`0x0021`) is the primary vector recall. Hybrid retrieval (semantic + lexical + memory-edge graph) is the default `RECALL` path; the server runs it regardless of whether a schema has been declared. The response always carries `contributing_retrievers` and `fused_score`. What declaring a schema adds here is typed entity-anchored graph traversal and predicate-vocabulary checking; it does not toggle the retrieval mode.
+The substrate `RECALL` opcode (`0x0021`) is the primary vector recall. The pipeline (semantic + lexical + memory-edge graph fused by RRF) is the **only** `RECALL` path; every shard runs it on every request. The response always carries `contributing_retrievers` and `fused_score`. Declaring a user schema does not toggle a different retrieval path — it makes typed entity-anchored graph traversal and predicate-vocabulary checking available to callers, and lets extracted typed rows persist; the fan-out, fusion, and filter chain are the same shape regardless.
 
 ### 2.6 Admin operations (0x0170–0x017F)
 
@@ -205,6 +251,9 @@ The substrate `RECALL` opcode (`0x0021`) is the primary vector recall. Hybrid re
 | 0x0175 | `ADMIN_LIST_STALE_STATEMENTS` | filter | StatementIds |
 | 0x0176 | `ADMIN_BACKFILL` | extractor_ids, memory_range | job_id |
 | 0x0177 | `ADMIN_JOB_STATUS` | job_id | status, progress, ETA |
+| 0x0178 | `ADMIN_LIST_PENDING_CONTRADICTIONS` | limit | list of open Fact-vs-Fact contradictions |
+
+Responses live at `0x01F0–0x01FF` (e.g. `ADMIN_LIST_PENDING_CONTRADICTIONS_RESP` = `0x01F8`).
 
 ### 2.7 SUBSCRIBE event types (typed graph)
 
@@ -219,14 +268,19 @@ The SUBSCRIBE primitive (§1.3) carries event types for the typed graph:
 
 Subscribers filter by event type, entity_id, predicate, etc. Event-payload schemas and emission semantics are part of the streaming surface defined in [`06_streaming.md`](06_streaming.md).
 
-### 2.8 Schema-optional behavior
+### 2.8 Schema as a per-type gate
 
-The server operates with or without a declared schema:
+The server operates the same pipeline whether or not a user namespace has been uploaded. Every shard ships with the seeded `brain:` system namespace, so there is always at least one schema active.
 
-- **No schema declared**: typed-graph opcodes `0x0120–0x0177` return `SCHEMA_NOT_DECLARED` errors except for `SCHEMA_UPLOAD` (`0x0120`) itself. Substrate primitives (the `0x00xx` namespace) work normally.
-- **Schema declared**: all opcodes function. RECALL routes through hybrid retrieval.
+What user declarations control is **per-type acceptance** on explicit typed-graph writes:
 
-This is a deployment choice. A deployment that wants only the vector substrate simply doesn't declare a schema; typed-graph opcodes then return `SCHEMA_NOT_DECLARED`.
+- `ENTITY_CREATE` with an entity type that isn't in any active namespace → `EntityTypeNotInSchema`.
+- `STATEMENT_CREATE` with an undeclared predicate qname → `PredicateNotInSchema` (or open-vocabulary intern with `SchemaOrigin::ImplicitFromWrite` if the deployment runs in open-vocabulary mode; see §07/error-handling).
+- `RELATION_CREATE` with an undeclared relation_type qname → `RelationTypeNotInSchema` (same open-vocabulary rule).
+
+Extracted candidates whose types are not in any active schema are dropped silently (extractor best-effort; see [`../11_extractors/00_purpose.md`](../11_extractors/00_purpose.md)). `RECALL`, the `QUERY_EXPLAIN` / `QUERY_TRACE` introspection ops, and the fan-out pipeline always run regardless of which user namespaces are present.
+
+There is no `SCHEMA_NOT_DECLARED` error any more — the gate is per-type, not per-namespace.
 
 ## 3. Reserved ranges
 
@@ -374,6 +428,8 @@ Adding new opcodes is a wire-protocol-version bump (see §"Versioning" below). T
 
 A future major-version bump might add opcodes for replication-related operations, multi-modal operations, etc.
 
+**Per-request identity (`act_as`) adds no opcode.** The `act_as` mechanism (see [`04_handshake.md`](04_handshake.md) §10a) is an **optional field on existing data-plane op requests** (`ENCODE_REQ` / `RECALL_REQ` / `FORGET_REQ`), not a new operation. The `can_act_as` grant is minted over the admin HTTP surface, not a wire op. Because Brain is pre-release (v0.1.0) with no published wire, this field was added **in place** — no new opcode, and no wire-version bump (the version stays `1`; see [`02_wire_format.md`](02_wire_format.md) §11.3).
+
 ## Versioning
 
 The wire protocol carries a single version field. Clients at any other version are rejected at handshake.
@@ -391,8 +447,8 @@ The HELLO frame's payload includes:
 ```
 struct HelloPayload {
     wire_version: u8,                   // must be 1
-    sdk_name: String,
-    sdk_version: String,
+    client_name: String,
+    client_version: String,
     feature_flags_requested: Vec<String>,
 }
 ```
@@ -430,9 +486,9 @@ If, after handshake, the server receives a frame whose `wire_version` differs fr
 - The `ADMIN_STATS` opcode reports the server's wire version.
 - Logs record connections that fail handshake with `WireVersionMismatch`.
 
-### SDK responsibilities
+### Client responsibilities
 
-A conforming SDK MUST:
+A conforming client MUST:
 
 - Send a HELLO at the server's wire version.
 - Refuse to operate if the server reports a different version.

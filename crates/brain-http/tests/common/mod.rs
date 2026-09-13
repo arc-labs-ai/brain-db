@@ -1,4 +1,4 @@
-//! Shared scaffold for M2 integration tests.
+//! Shared scaffold for server integration tests.
 //!
 //! Provides [`TestServer`] which binds a port-0 listener, spawns the
 //! accept loop, exposes the bound address, and offers a `shutdown()`

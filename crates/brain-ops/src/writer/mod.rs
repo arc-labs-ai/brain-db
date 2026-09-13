@@ -1,14 +1,14 @@
 //! Real per-shard write surface.
 //!
 //! Implements `brain_planner::WriterHandle` against real
-//! `MetadataDb` + `HnswWriter`. Idempotency lives here because spec
-//! §08/04 §4 + §07/06 §3 mandate the lookup-then-act protocol with
-//! the response payload written in the **same redb txn** as the
-//! memory row.
+//! `MetadataDb` + `HnswWriter`. Idempotency lives here: the
+//! lookup-then-act protocol writes the response payload in the
+//! **same redb txn** as the memory row, so a replay can never observe
+//! a committed row without its cached response.
 //!
-//! **No WAL**'s group-commit channel-fed writer
-//! lands in Phase 8 / 9. The trait surface doesn't change; production
-//! swaps the implementation.
+//! **No WAL yet** — the group-commit channel-fed writer lands later.
+//! The trait surface doesn't change; production swaps the
+//! implementation.
 //!
 //! Concurrency: every interior mutable piece is `Mutex`-wrapped.
 //! Concurrent submits serialise on the metadata mutex; throughput is
@@ -22,10 +22,10 @@
 //!   via [`brain_metadata::tables::edge::link`], and the source /
 //!   target memory rows' `edges_out_count` / `edges_in_count` denorms
 //!   are bumped — all inside the same write txn as the memory row.
-//! - **LINK** (-§3): same pattern. `do_link` returns
+//! - **LINK**: same pattern. `do_link` returns
 //!   `already_existed=true` when the canonical `(source, kind, target)`
 //!   was present (overwrite-weight semantics, no count bump).
-//! - **UNLINK** (-§5): non-existent edge is a no-op
+//! - **UNLINK**: non-existent edge is a no-op
 //!   (`removed=false`), not an error. Successful unlink decrements
 //!   both counts.
 
@@ -34,13 +34,8 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use brain_core::{AgentId, MemoryId, ShardId};
+use brain_core::{MemoryId, ShardId, SpaceId};
 use brain_index::Writer as HnswWriter;
-use brain_metadata::tables::edge::{EDGES_REVERSE_TABLE, EDGES_TABLE};
-use brain_metadata::tables::fingerprint::FINGERPRINTS_TABLE;
-use brain_metadata::tables::idempotency::IDEMPOTENCY_TABLE;
-use brain_metadata::tables::memory::{MEMORIES_BY_AGENT_TIMELINE_TABLE, MEMORIES_TABLE};
-use brain_metadata::tables::text::TEXTS_TABLE;
 use brain_planner::{SharedMetadataDb, WriterError, WriterHandle};
 use parking_lot::Mutex;
 use uuid::Uuid;
@@ -48,19 +43,19 @@ use uuid::Uuid;
 use crate::subscribe::EventBus;
 
 /// Real per-shard writer backed by `MetadataDb` + `HnswWriter`. No
-/// WAL — Phase 8 / 9 swap this for a WAL-backed implementation
+/// WAL yet — a WAL-backed implementation swaps in later
 /// without changing `WriterHandle`'s public surface.
 pub struct RealWriterHandle {
     metadata: SharedMetadataDb,
-    hnsw_writer: Mutex<HnswWriter<384>>,
-    /// In-process slot counter. Phase 8 / 9 will replace with the
+    hnsw_writer: Mutex<HnswWriter>,
+    /// In-process slot counter. Replaced later with the
     /// arena allocator. Starts at 1.
     next_slot: AtomicU64,
-    /// Agent id stamped on every memory metadata row. Phase 9 will
-    /// derive this from the authenticated connection; for now it's
+    /// Space id stamped on every memory metadata row. Eventually
+    /// derived from the authenticated connection; for now it's
     /// nil. Carried as a field so tests + the future server can pin
     /// it without re-creating the writer.
-    agent_id: AgentId,
+    space_id: SpaceId,
     /// Shard id stamped into every `MemoryId` this writer issues.
     /// Routing back to the owning shard (LINK / UNLINK / FORGET in
     /// `brain-server::network::dispatch::shard_for_memory`) reads
@@ -69,12 +64,12 @@ pub struct RealWriterHandle {
     /// and surfaces as `NotFound`. Defaults to `0`; production
     /// callers must override via [`Self::with_shard_id`].
     shard_id: ShardId,
-    /// Change-feed publisher (sub-task 7.10). Single-op encode/forget
+    /// Change-feed publisher. Single-op encode/forget
     /// commits and TXN_COMMIT batches publish here *after* the redb
     /// commit() succeeds. Optional so existing callers don't break
     /// (defaults to no publication — events are dropped on the floor).
     events: Option<Arc<EventBus>>,
-    /// WAL append sink (Phase 9 wiring). When `Some`, every write
+    /// WAL append sink. When `Some`, every write
     /// op appends a typed [`brain_storage::wal::payload::WalPayload`]
     /// record to the WAL **before** mutating redb — establishing the
     /// durability barrier. The returned LSN is stamped
@@ -89,25 +84,27 @@ pub struct RealWriterHandle {
     /// worker drains the channel and writes SimilarTo edges back into
     /// the unified edge tables. `None` means the worker isn't wired
     /// for this build (gated by config); enqueue becomes a no-op.
-    // TODO(part-3): make non-optional when auto-edge is unconditionally
-    // wired at shard spawn.
+    // A real shard wires this at spawn; the field stays `Option` only
+    // for unit-test writers that run without a shard or with the
+    // AutoEdgeWorker not provisioned.
     auto_edge_tx: Option<flume::Sender<AutoEdgeEnqueue>>,
     /// Optional non-blocking sender feeding the per-shard
     /// ExtractorWorker. Each successful ENCODE enqueues
     /// `(memory_id, text)` post-WAL-fsync + post-commit + post-HNSW;
     /// the worker drains the channel and runs the three-tier
-    /// extractor pipeline against the text. `None` means the worker
-    /// isn't wired (gated by config); enqueue becomes a no-op. The
+    /// extractor pipeline against the text. `None` means the writer
+    /// runs without a shard (unit tests); enqueue becomes a no-op. The
     /// `Arc<str>` keeps the payload cheap to push and avoids the
     /// worker re-reading text from the metadata DB on a hot path.
-    // TODO(part-3): make non-optional when extractor pool is unconditionally
-    // wired at shard spawn (entity HNSW + statement HNSW dependencies land then).
+    // Extraction is always-on, so a real shard always wires this at
+    // spawn; the field stays `Option` only for unit-test writers that
+    // run without a shard.
     extractor_tx: Option<flume::Sender<ExtractorEnqueue>>,
     /// Optional non-blocking sender feeding the per-shard
     /// TemporalEdgeWorker. Each successful ENCODE enqueues
-    /// `(memory_id, agent_id, context_id, created_at_unix_nanos)`
+    /// `(memory_id, space_id, session_id, created_at_unix_nanos)`
     /// post-commit; the worker looks up the previous memory for the
-    /// same agent + context in `MEMORIES_BY_AGENT_TIMELINE_TABLE`
+    /// same space + context in `MEMORIES_BY_SPACE_TIMELINE_TABLE`
     /// and writes a `FollowedBy` auto-edge with decay-weighted
     /// strength. `None` → worker disabled.
     temporal_edge_tx: Option<flume::Sender<TemporalEdgeEnqueue>>,
@@ -152,7 +149,7 @@ pub struct RealWriterHandle {
     /// run inside the upload's redb wtxn and pay full-table scan cost
     /// before ack — moving it post-commit keeps SCHEMA_UPLOAD latency
     /// bounded. `None` when the worker isn't wired (test fixtures /
-    /// no-knowledge deployments). Best-effort: a full channel logs a
+    /// no-typed-graph deployments). Best-effort: a full channel logs a
     /// warn and drops; the upload itself never fails on backpressure.
     schema_flag_sweep_tx: Option<flume::Sender<SchemaFlagSweepJob>>,
     /// Companion to [`Self::auto_edge_metrics`] for the
@@ -170,7 +167,7 @@ pub struct RealWriterHandle {
     /// Per-writer idempotency cache for the universal `submit(Write)`
     /// path. Distinct from the redb-backed substrate cache (which keys
     /// by `RequestId` and lives in `IDEMPOTENCY_TABLE`). The two will
-    /// merge in P3c when this cache becomes redb-backed and keys by
+    /// merge once this cache becomes redb-backed and keys by
     /// `WriteId`.
     write_idempotency: Arc<submit::WriteIdempotencyCache>,
     /// Writer-level metric family. Bumped per submitted phase, per
@@ -178,6 +175,68 @@ pub struct RealWriterHandle {
     /// present — defaults to a fresh `Arc<WriterMetrics>` on construction;
     /// the server's exposition layer reads the shared snapshot.
     writer_metrics: Arc<crate::metrics::WriterMetrics>,
+    /// Per-shard "last redb-committed LSN" watermark. Advanced by
+    /// [`Self::submit`] to a write's highest WAL LSN **after** that
+    /// write's `wtxn.commit()` succeeds — never at WAL-append time. The
+    /// checkpoint path reads it (via the shared handle) as the
+    /// `CHECKPOINT_END.durable_lsn`, so a snapshot can never promise a
+    /// durable LSN that redb has not committed. Defaults to a fresh
+    /// (zero) handle; the shard shares its own handle in via
+    /// [`Self::with_redb_committed_watermark`].
+    redb_committed_watermark: RedbCommittedWatermark,
+}
+
+/// Per-shard "last redb-committed LSN" watermark.
+///
+/// The writer advances this to a write's highest WAL LSN **after** the
+/// redb `wtxn.commit()` for that write succeeds. It therefore tracks the
+/// LSN up to which every WAL-durable record's redb effect is *also*
+/// durable — strictly at or behind the WAL-appended tail
+/// (`Wal::next_lsn() - 1`), which advances at enqueue time, before the
+/// group-commit fsync and before the later redb commit.
+///
+/// The snapshot / checkpoint path reads this as the checkpoint's
+/// `durable_lsn`: the checkpoint contract promises the LSN is durable in
+/// the arena *and* metadata (= redb), so stamping the WAL tail there
+/// would let recovery skip a record that is WAL-durable but whose redb
+/// commit had not yet run at power loss — silently dropping it.
+///
+/// Lock-free (`Arc<AtomicU64>`): the writer (advance) and the snapshot
+/// source (read) both live on the same shard executor, so there is no
+/// cross-thread contention; the atomic keeps `RealWriterHandle`
+/// `Send + Sync` for the existing trait-object plumbing. Monotonic —
+/// [`Self::advance_to`] uses `fetch_max`, so an out-of-order commit can
+/// never regress it.
+#[derive(Clone, Debug)]
+pub struct RedbCommittedWatermark(Arc<AtomicU64>);
+
+impl Default for RedbCommittedWatermark {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RedbCommittedWatermark {
+    /// Fresh watermark at LSN 0 (nothing committed yet).
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Arc::new(AtomicU64::new(0)))
+    }
+
+    /// Advance the watermark to `lsn` if it is higher (monotonic).
+    /// Called after a successful `wtxn.commit()`. `Release` so the
+    /// snapshot source's `Acquire` load observes a fully-committed
+    /// value.
+    pub fn advance_to(&self, lsn: u64) {
+        self.0.fetch_max(lsn, Ordering::Release);
+    }
+
+    /// Current committed watermark. `Acquire` pairs with
+    /// [`Self::advance_to`]'s `Release`.
+    #[must_use]
+    pub fn load(&self) -> u64 {
+        self.0.load(Ordering::Acquire)
+    }
 }
 
 /// What the writer pushes into the AutoEdgeWorker's channel after a
@@ -196,16 +255,16 @@ pub type ExtractorEnqueue = (brain_core::MemoryId, std::sync::Arc<str>);
 
 /// What the writer pushes into the TemporalEdgeWorker's channel after
 /// a successful ENCODE. The worker uses
-/// `(memory_id, agent_id, context_id, created_at_unix_nanos)` to look
-/// up the predecessor via `MEMORIES_BY_AGENT_TIMELINE_TABLE`, and the
+/// `(memory_id, space_id, session_id, created_at_unix_nanos)` to look
+/// up the predecessor via `MEMORIES_BY_SPACE_TIMELINE_TABLE`, and the
 /// inline `vector` to topical-gate the candidate edge (cosine
 /// similarity against the predecessor; below the configured floor →
 /// drop). The vector is carried inline (matching `AutoEdgeEnqueue`)
 /// because the HNSW reader exposes no public per-id vector accessor.
 pub type TemporalEdgeEnqueue = (
     brain_core::MemoryId,
-    brain_core::AgentId,
-    brain_core::ContextId,
+    brain_core::SpaceId,
+    brain_core::SessionId,
     u64,
     [f32; brain_embed::VECTOR_DIM],
 );
@@ -219,10 +278,9 @@ pub type TemporalEdgeEnqueue = (
 /// evidence) without saving any redb work on the worker side.
 pub type CausalEdgeEnqueue = brain_core::StatementId;
 
-/// Soft vs hard FORGET. Both modes enqueue the cascade per spec
-/// §17/03 Rule 3 — readers must not see a statement at full
-/// confidence backed by a memory the user already forgot, even
-/// during the soft-grace window.
+/// Soft vs hard FORGET. Both modes enqueue the cascade — readers must
+/// not see a statement at full confidence backed by a memory the user
+/// already forgot, even during the soft-grace window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForgetCascadeMode {
     Soft,
@@ -273,34 +331,12 @@ pub struct SchemaFlagSweepJob {
 
 impl RealWriterHandle {
     #[must_use]
-    pub fn new(metadata: SharedMetadataDb, hnsw_writer: HnswWriter<384>) -> Self {
-        // Materialise the tables we read from. redb creates tables
-        // on first write_txn().open_table(), but read_txn() on a
-        // never-opened table returns `TableDoesNotExist`. We do a
-        // one-time empty write txn at construction so subsequent
-        // idempotency + metadata reads succeed even before the
-        // first submit. Every substrate table that any reader path
-        // touches (dedup lookup, timeline walks, edge planner reads)
-        // must be listed here, otherwise the first read on a fresh
-        // shard explodes.
-        {
-            let mut db = metadata.lock();
-            if let Ok(wtxn) = db.write_txn() {
-                let _ = wtxn.open_table(MEMORIES_TABLE);
-                let _ = wtxn.open_table(MEMORIES_BY_AGENT_TIMELINE_TABLE);
-                let _ = wtxn.open_table(IDEMPOTENCY_TABLE);
-                let _ = wtxn.open_table(EDGES_TABLE);
-                let _ = wtxn.open_table(EDGES_REVERSE_TABLE);
-                let _ = wtxn.open_table(FINGERPRINTS_TABLE);
-                let _ = wtxn.open_table(TEXTS_TABLE);
-                let _ = wtxn.commit();
-            }
-        }
+    pub fn new(metadata: SharedMetadataDb, hnsw_writer: HnswWriter) -> Self {
         Self {
             metadata,
             hnsw_writer: Mutex::new(hnsw_writer),
             next_slot: AtomicU64::new(1),
-            agent_id: AgentId(Uuid::nil()),
+            space_id: SpaceId(Uuid::nil()),
             shard_id: 0,
             events: None,
             wal_sink: None,
@@ -317,7 +353,38 @@ impl RealWriterHandle {
             memory_text_dispatcher: None,
             write_idempotency: Arc::new(submit::WriteIdempotencyCache::new()),
             writer_metrics: Arc::new(crate::metrics::WriterMetrics::new()),
+            redb_committed_watermark: RedbCommittedWatermark::new(),
         }
+    }
+
+    /// Share the per-shard redb-committed-LSN watermark. The shard
+    /// constructs one handle and threads the SAME clone into both this
+    /// writer (which advances it post-commit) and the snapshot source
+    /// (which reads it for `CHECKPOINT_END.durable_lsn`). Without this
+    /// call the writer keeps its private default handle — correct in
+    /// isolation but invisible to the checkpoint path.
+    #[must_use]
+    pub fn with_redb_committed_watermark(mut self, watermark: RedbCommittedWatermark) -> Self {
+        self.redb_committed_watermark = watermark;
+        self
+    }
+
+    /// Accessor for the shared redb-committed watermark. Used by
+    /// [`Self::submit`] to advance it after commit; exposed for tests.
+    #[must_use]
+    pub fn redb_committed_watermark(&self) -> &RedbCommittedWatermark {
+        &self.redb_committed_watermark
+    }
+
+    /// Seed the in-process slot counter from the persisted high-water mark at
+    /// boot. The counter resets to `1` in [`Self::new`], so without this a
+    /// restart on a non-empty shard re-issues live arena slots — colliding
+    /// `memory_id`s (silently overwriting rows AND tripping the extractor's
+    /// `has_extracted` gate so new writes never extract). `fetch_max` keeps
+    /// the counter monotonic: it only ever moves forward, never below `1`.
+    pub fn seed_next_slot(&self, next_slot: u64) {
+        self.next_slot
+            .fetch_max(next_slot.max(1), Ordering::Relaxed);
     }
 
     /// Accessor for the writer-level metric family. Production wires
@@ -339,7 +406,7 @@ impl RealWriterHandle {
     }
 
     /// Accessor for the unified write-path idempotency cache.
-    /// Used by [`submit::submit`] and exposed for tests + future
+    /// Used by [`RealWriterHandle::submit`] and exposed for tests + future
     /// admin observability.
     #[must_use]
     pub fn write_idempotency_cache(&self) -> &submit::WriteIdempotencyCache {
@@ -401,13 +468,13 @@ impl RealWriterHandle {
     /// Lock the HNSW writer for the unified path's side-effect step.
     /// Returns a `MutexGuard` so the caller holds the lock for the
     /// minimum window (single insert / mark_tombstoned).
-    pub(crate) fn hnsw_writer_lock(&self) -> parking_lot::MutexGuard<'_, brain_index::Writer<384>> {
+    pub(crate) fn hnsw_writer_lock(&self) -> parking_lot::MutexGuard<'_, brain_index::Writer> {
         self.hnsw_writer.lock()
     }
 
     #[must_use]
-    pub fn with_agent_id(mut self, agent_id: AgentId) -> Self {
-        self.agent_id = agent_id;
+    pub fn with_space_id(mut self, space_id: SpaceId) -> Self {
+        self.space_id = space_id;
         self
     }
 
@@ -423,7 +490,7 @@ impl RealWriterHandle {
     }
 
     /// Wire the change-feed bus. After this call every successful
-    /// commit publishes an [`EventEnvelope`] onto the bus.
+    /// commit publishes an [`crate::EventEnvelope`] onto the bus.
     #[must_use]
     pub fn with_event_bus(mut self, bus: Arc<EventBus>) -> Self {
         self.events = Some(bus);
@@ -506,7 +573,7 @@ impl RealWriterHandle {
 
     /// Wire the TemporalEdgeWorker's feed channel. After this call
     /// every successful ENCODE enqueues
-    /// `(memory_id, agent_id, context_id, created_at_unix_nanos)`
+    /// `(memory_id, space_id, session_id, created_at_unix_nanos)`
     /// post-commit. Without this call the enqueue path is a no-op
     /// (matches `set_auto_edge_sender`).
     pub fn set_temporal_edge_sender(&mut self, sender: flume::Sender<TemporalEdgeEnqueue>) {
@@ -618,29 +685,24 @@ impl WriterHandle for RealWriterHandle {
             // the post-reclaim bumped version. Stale references to the
             // prior occupant then mismatch on every read path.
             let version: u32 = {
-                let db = self.metadata.lock();
-                let rtxn = db
+                let rtxn = self
+                    .metadata
                     .read_txn()
                     .map_err(|e| WriterError::Internal(format!("reserve slot ver read: {e:?}")))?;
-                match rtxn.open_table(brain_metadata::tables::slot_version::SLOT_VERSIONS_TABLE) {
-                    Ok(table) => table
-                        .get(&slot)
-                        .map_err(|e| WriterError::Internal(format!("reserve slot ver get: {e:?}")))?
-                        .map_or(1, |a| a.value()),
-                    Err(redb::TableError::TableDoesNotExist(_)) => 1,
-                    Err(e) => {
-                        return Err(WriterError::Internal(format!(
-                            "reserve slot ver open: {e:?}"
-                        )))
-                    }
-                }
+                let table = rtxn
+                    .open_table(brain_metadata::tables::slot_version::SLOT_VERSIONS_TABLE)
+                    .map_err(|e| WriterError::Internal(format!("reserve slot ver open: {e:?}")))?;
+                table
+                    .get(&slot)
+                    .map_err(|e| WriterError::Internal(format!("reserve slot ver get: {e:?}")))?
+                    .map_or(1, |a| a.value())
             };
             Ok(MemoryId::pack(self.shard_id, slot, version))
         })
     }
 
-    fn agent_id(&self) -> AgentId {
-        self.agent_id
+    fn space_id(&self) -> SpaceId {
+        self.space_id
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -653,10 +715,10 @@ impl WriterHandle for RealWriterHandle {
     /// enabling a previously-disabled extractor).
     ///
     /// The encode-time post-commit enqueue goes through
-    /// [`try_enqueue_extractor`] instead — it lives outside the trait
+    /// `try_enqueue_extractor` instead — it lives outside the trait
     /// because the submit pipeline doesn't go through the
     /// `WriterHandle` indirection. Both ultimately push onto the same
-    /// `flume::Sender<ExtractorEnqueue>` channel ([`extractor_sender`]).
+    /// `flume::Sender<ExtractorEnqueue>` channel (`extractor_sender`).
     fn enqueue_for_extraction(&self, memory_id: MemoryId, text: &str) -> bool {
         let Some(sender) = self.extractor_sender() else {
             return false;
@@ -741,15 +803,15 @@ pub(crate) fn try_enqueue_auto_edge(
     }
 }
 
-/// Enqueue `(memory_id, agent_id, context_id, created_at_unix_nanos)`
+/// Enqueue `(memory_id, space_id, session_id, created_at_unix_nanos)`
 /// onto the TemporalEdgeWorker channel if one is wired. Mirrors
 /// [`try_enqueue_auto_edge`] semantics — full channel drops with a
 /// counter bump; disconnected logs at debug.
 pub(crate) fn try_enqueue_temporal_edge(
     writer: &RealWriterHandle,
     memory_id: MemoryId,
-    agent_id: brain_core::AgentId,
-    context_id: brain_core::ContextId,
+    space_id: brain_core::SpaceId,
+    session_id: brain_core::SessionId,
     created_at_unix_nanos: u64,
     vector: &[f32; brain_embed::VECTOR_DIM],
 ) -> bool {
@@ -758,8 +820,8 @@ pub(crate) fn try_enqueue_temporal_edge(
     };
     let payload: TemporalEdgeEnqueue = (
         memory_id,
-        agent_id,
-        context_id,
+        space_id,
+        session_id,
         created_at_unix_nanos,
         *vector,
     );
@@ -788,12 +850,17 @@ pub(crate) fn try_enqueue_temporal_edge(
     }
 }
 
-/// Submit-path post-commit helper. Enqueues `(memory_id, text)` onto
-/// the ExtractorWorker channel if one is wired. Non-blocking; full
-/// channel logs a warn and drops (encode succeeds without
-/// extraction). Disconnected channel logs at debug. This is the
-/// single enqueue point both the single-encode and TXN batch paths
-/// route through.
+/// Submit-path post-commit helper. Sends a low-latency *wakeup hint*
+/// onto the ExtractorWorker channel if one is wired.
+///
+/// This is NOT the durable source of truth for extraction work — the
+/// memory is durably enqueued in `EXTRACTION_QUEUE_TABLE` inside the
+/// same redb txn that wrote the memory row (`apply_upsert_memory`), so
+/// a crash, restart, or full/dropped channel never loses the work. The
+/// flume send here only wakes the worker sooner than its interval tick;
+/// the worker reads its actual work list from the durable table. A
+/// full channel therefore drops harmlessly (logged + counted), and a
+/// disconnected channel logs at debug.
 ///
 /// The admin path (`EXTRACT_BACKFILL` op) uses
 /// [`WriterHandle::enqueue_for_extraction`] instead — same

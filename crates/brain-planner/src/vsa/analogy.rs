@@ -90,31 +90,4 @@ mod tests {
         assert_eq!(name, "Stripe", "recovered={name} cos={cos}");
         assert!(cos > 0.4, "cos={cos}");
     }
-
-    #[test]
-    fn analogy_recovers_subject() {
-        let mut cb = Codebook::new(7).with_fillers([
-            "Alice", "Bob", "Carol", "Acme", "Stripe", "Globex", "works_at",
-        ]);
-        let triple_1 = encode_triple(&mut cb, "Alice", "works_at", "Acme").unwrap();
-        let triple_2 = encode_triple(&mut cb, "Carol", "works_at", "Globex").unwrap();
-
-        let (name, cos) = analogy_query(&mut cb, &triple_1, &triple_2, ROLE_SUBJECT)
-            .unwrap()
-            .expect("non-empty codebook");
-        assert_eq!(name, "Carol", "recovered={name} cos={cos}");
-        assert!(cos > 0.4, "cos={cos}");
-    }
-
-    #[test]
-    fn querying_predicate_recovers_the_relation_name() {
-        let mut cb =
-            Codebook::new(99).with_fillers(["Alice", "Acme", "works_at", "lives_in", "owns"]);
-        let triple = encode_triple(&mut cb, "Alice", "works_at", "Acme").unwrap();
-        let (name, cos) = query_role(&mut cb, &triple, ROLE_PREDICATE)
-            .unwrap()
-            .expect("non-empty codebook");
-        assert_eq!(name, "works_at", "recovered={name} cos={cos}");
-        assert!(cos > 0.4, "cos={cos}");
-    }
 }

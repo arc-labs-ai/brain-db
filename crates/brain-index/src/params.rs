@@ -1,48 +1,48 @@
-//! HNSW parameters with Brain's spec defaults.
+//! HNSW parameters with Brain's defaults.
 //!
-//! See `spec/09_indexing/02_parameters.md` (M=16, ef_construction=200,
-//! ef_search=64, ef_search_max=500).
+//! `M=16, ef_construction=200, ef_search=64, ef_search_max=500`. PQ
+//! compression is part of the core implementation and is not
+//! exposed as a knob — every corpus uses HNSW+PQ.
 
 use thiserror::Error;
 
 /// The vector dimension used throughout v1: BGE-small-en-v1.5 produces
-/// 384-dim L2-normalised vectors. Spec `§04/03 §1`.
+/// 384-dim L2-normalised vectors.
 pub const VECTOR_DIM: usize = 384;
 
-/// Maximum graph layer count passed to `hnsw_rs::Hnsw::new`. Spec doesn't
-/// pin this directly; HNSW theory says `max_layer ≥ log_M(N)`. At M=16
-/// and N=10M (the spec's per-shard ceiling), log_16(10M) ≈ 5.6 — `16` is
-/// a comfortable upper bound recommended by the original HNSW paper and
-/// matched by hnsw_rs's own defaults.
+/// Maximum graph layer count passed to `hnsw_rs::Hnsw::new`. HNSW theory
+/// says `max_layer ≥ log_M(N)`. At M=16 and N=10M (the per-shard
+/// ceiling), log_16(10M) ≈ 5.6 — `16` is a comfortable upper bound
+/// recommended by the original HNSW paper and matched by hnsw_rs's own
+/// defaults.
 pub const MAX_LAYER: usize = 16;
 
 /// Initial `max_elements` hint to pass to `hnsw_rs::Hnsw::new`. The crate
 /// uses this only to pre-size internal tables; it does not cap insert
 /// count, so undersizing is a perf hint rather than a correctness limit.
 /// `1024` keeps the small-test footprint tiny; production callers
-/// override via a `with_capacity_hint` builder (added in 4.6 when
-/// rebuild needs it).
+/// override via a `with_capacity_hint` builder.
 pub const DEFAULT_CAPACITY_HINT: usize = 1024;
 
 /// HNSW knobs.
 ///
-/// Defaults from [`Self::default_v1`] match `spec/09_indexing/02_parameters.md`:
+/// Defaults from [`Self::default_v1`]:
 /// `M=16, ef_construction=200, ef_search=64, ef_search_max=500`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexParams {
-    /// Max edges per non-bottom-layer node. Spec `§02 §1` range: 4..=64.
+    /// Max edges per non-bottom-layer node. Range: 4..=64.
     pub m: usize,
-    /// Search width during insertion. Spec `§02 §1` range: 50..=500.
+    /// Search width during insertion. Range: 50..=500.
     pub ef_construction: usize,
-    /// Default search width per query. Spec `§02 §1` range: 10..=500.
+    /// Default search width per query. Range: 10..=500.
     /// Per-query overrides are clamped to `[k, ef_search_max]`.
     pub ef_search: usize,
-    /// Cap on per-query `ef_search` overrides. Spec `§02 §8` config key.
+    /// Cap on per-query `ef_search` overrides.
     pub ef_search_max: usize,
 }
 
 impl IndexParams {
-    /// Brain's v1 defaults per `spec/09_indexing/02_parameters.md`.
+    /// Brain's v1 defaults.
     #[must_use]
     pub const fn default_v1() -> Self {
         Self {
@@ -53,7 +53,7 @@ impl IndexParams {
         }
     }
 
-    /// Validate fields lie in the spec's ranges. The validation runs once
+    /// Validate fields lie in the accepted ranges. The validation runs once
     /// at [`HnswIndex::new`][crate::hnsw::HnswIndex::new]; downstream code
     /// can rely on the invariants.
     pub fn validate(&self) -> Result<(), IndexParamsError> {

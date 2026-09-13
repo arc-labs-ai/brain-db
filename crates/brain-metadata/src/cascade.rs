@@ -1,53 +1,79 @@
-//! FORGET cascade operations (sub-task 24.2)
-//! §"Cascading effects of FORGET".
+//! FORGET cascade operations — cascading effects of FORGET.
 //!
 //! When a memory is forgotten, statements / relations whose
 //! evidence list referenced it must be updated:
 //!
-//! 1. Drop `memory_id` from `evidence_inline` (and overflow, when
-//!    we get there post-v1).
-//! 2. Recompute `confidence` from the remaining evidence per
-//!    §25/00 §"Confidence aggregation across evidence".
+//! 1. Drop `memory_id` from the statement's evidence — inline buffer
+//!    on the row when small, the overflow row when the list spilled.
+//! 2. Recompute `confidence` from the remaining evidence via
+//!    confidence aggregation across evidence.
 //! 3. If evidence becomes empty AND confidence < threshold,
-//!    tombstone with reason `SourceMemoryForgotten`.
+//!    tombstone with reason `SourceMemoryForgotten` and reclaim
+//!    the orphaned overflow row.
 //!
-//! ## v1 scope cuts
+//! ## Scope notes
 //!
-//! - Overflow evidence lists (post-`INLINE_EVIDENCE_CAP = 8`) are
-//!   **not** searched in v1. Statements with overflow evidence
-//!   containing the forgotten memory keep the evidence entry; the
-//!   v1 confidence is still recomputed on the inline-only set.
-//!   Full overflow-aware cascade is a post-v1 enhancement.
-//! - Relations are scanned but only have a single-evidence link
-//!   per the v1 schema; if that evidence equals `memory_id`, the
-//!   relation is tombstoned.
+//! - Overflow evidence lists are walked alongside inline. A statement
+//!   whose forgotten memory lives only in the overflow row gets the
+//!   entry dropped + the row rewritten (or reclaimed if the rewrite
+//!   leaves it empty). When the entry rewrite would bring the list
+//!   back inside [`INLINE_EVIDENCE_CAP`] the row also collapses back
+//!   onto the inline buffer.
+//! - Relations are scanned through `RELATION_BY_EVIDENCE_TABLE`; if
+//!   the forgotten memory was the sole evidence, the relation is
+//!   tombstoned.
 //!
 //! ## Audit
 //!
-//! Audit-event semantics for the cascade live in §25/00 §"The
-//! audit log" but the v1 `audit_ops::audit_write` API targets
-//! extraction events. Cascade audit rows land as a post-v1
-//! enhancement; the cascade still updates the row, so an
-//! external observer can see the change via the change feed.
+//! The `audit_ops::audit_write` API currently targets extraction
+//! events. Cascade audit rows are a future enhancement; the cascade
+//! still updates the row, so an external observer can see the change
+//! via the change feed.
 
 use brain_core::{
-    aggregate_confidence, ConfidenceConfig, EvidenceEntry, ExtractorId, StatementKind,
-    TombstoneReason,
+    aggregate_confidence, ConfidenceConfig, EvidenceEntry, EvidenceOverflowId, StatementKind,
+    TombstoneReason, INLINE_EVIDENCE_CAP,
 };
 use brain_core::{EdgeKindRef, MemoryId, NodeRef, RelationId};
 use redb::{ReadableTable, WriteTransaction};
 
 use crate::relation::ops::{relation_tombstone, RelationOpError};
 use crate::statement::tombstone::statement_tombstone;
-use crate::statement::StatementOpError;
+use crate::statement::{
+    add_to_predicate_index, flip_by_subject_to_current, rekey_predicate_index, StatementOpError,
+};
 use crate::tables::edge::{self, EdgeKey, EDGES_REVERSE_TABLE, EDGES_TABLE};
+use crate::tables::forget_undo::{
+    outcome as undo_outcome, record_kind as undo_record_kind, ForgetUndoRecord,
+    FORGET_UNDO_LOG_TABLE,
+};
 use crate::tables::relation::{RELATION_BY_EVIDENCE_TABLE, RELATION_METADATA_TABLE};
-use crate::tables::statement::{EvidenceEntryRow, StatementMetadata, STATEMENTS_TABLE};
+use crate::tables::scope::RowScope;
+use crate::tables::statement::{
+    tombstone_reason as stmt_tombstone_reason, EvidenceEntryRow, EvidenceOverflow,
+    StatementMetadata, EVIDENCE_OVERFLOW_TABLE, STATEMENTS_BY_EVIDENCE_TABLE, STATEMENTS_TABLE,
+    STATEMENT_EMBED_QUEUE_TABLE,
+};
 
 /// Default confidence threshold below which a statement that
 /// loses its only piece of evidence is tombstoned. Configurable
 /// at the caller doesn't pin a number.
 pub const DEFAULT_CASCADE_CONFIDENCE_THRESHOLD: f32 = 0.2;
+
+/// Instructs the forward cascade to journal an undo record per mutated
+/// dependent row so the FORGET can be reversed within the grace window.
+///
+/// Passed as `Some` only for a **soft** FORGET (reversible during grace);
+/// a hard FORGET passes `None` and writes no undo log, because a hard
+/// FORGET is the irreversible privacy escape hatch.
+#[derive(Debug, Clone, Copy)]
+pub struct UndoWriteCtx {
+    /// Wall-clock (unix nanos) after which the undo rows this cascade
+    /// writes are no longer valid — the source memory's tombstone-grace
+    /// expiry. Stamped onto every [`ForgetUndoRecord`] so slot
+    /// reclamation can reap expired undo rows.
+    pub grace_expiry_unix_nanos: u64,
+}
 
 /// Outcome of cascading one FORGET against one statement.
 #[derive(Debug, Clone, PartialEq)]
@@ -78,10 +104,9 @@ pub struct CascadeSummary {
 /// statement. Returns counts.
 ///
 /// `batch_cap` bounds the scan in a single txn so heavily-
-/// referenced memories don't produce an unbounded wtxn. Spec
-/// §27/04 §4.5 ("continuation jobs") tracks the post-v1
-/// follow-up that resumes from a cursor when the batch cap is
-/// hit.
+/// referenced memories don't produce an unbounded wtxn. A future
+/// continuation-job mechanism will resume from a cursor when the batch
+/// cap is hit.
 ///
 /// `confidence_threshold` follows the [`DEFAULT_CASCADE_CONFIDENCE_THRESHOLD`]
 /// when the caller doesn't override.
@@ -91,14 +116,17 @@ pub fn cascade_forget_to_statements(
     confidence_threshold: f32,
     batch_cap: usize,
     now_unix_nanos: u64,
+    undo: Option<UndoWriteCtx>,
 ) -> Result<CascadeSummary, StatementOpError> {
     let mut summary = CascadeSummary::default();
     let memory_bytes = memory_id.to_be_bytes();
 
-    // Collect affected statement_ids first; then mutate per-row.
-    // Snapshot-then-update avoids interleaving redb reads and
-    // writes against the same table.
-    let mut affected: Vec<(StatementMetadata, Vec<EvidenceEntryRowLike>)> = Vec::new();
+    // Snapshot phase. We collect every row that references the
+    // forgotten memory along with the surviving evidence list (with
+    // the forgotten entry removed) so the mutate phase has a single
+    // source of truth per statement. Reading inline + overflow in
+    // the same pass avoids re-scanning the statements table.
+    let mut affected: Vec<AffectedStatement> = Vec::new();
     {
         let table = wtxn.open_table(STATEMENTS_TABLE)?;
         for entry in table.iter()? {
@@ -108,33 +136,65 @@ pub fn cascade_forget_to_statements(
             if row.is_tombstoned() {
                 continue;
             }
-            let referenced = row
+            let inline_hit = row
                 .evidence_inline
                 .iter()
                 .any(|e| e.memory_id_bytes == memory_bytes);
-            if !referenced {
+
+            let overflow_id = row.evidence_overflow_id_bytes.map(EvidenceOverflowId::from);
+
+            // The overflow row needs probing too — the inline list is
+            // empty when the row owns evidence-overflow form, so a
+            // pure inline check would silently miss those statements.
+            let (overflow_hit, overflow_entries) = if let Some(oid) = overflow_id {
+                load_overflow_entries(wtxn, oid)?
+                    .map(|entries| {
+                        let hit = entries.iter().any(|e| e.memory_id_bytes == memory_bytes);
+                        (hit, Some(entries))
+                    })
+                    .unwrap_or((false, None))
+            } else {
+                (false, None)
+            };
+
+            if !inline_hit && !overflow_hit {
                 continue;
             }
-            let remaining: Vec<EvidenceEntryRowLike> = row
-                .evidence_inline
+
+            // Build the surviving entries from whichever side holds
+            // the row's evidence. By construction these are mutually
+            // exclusive (see `metadata_from_statement`), so it's safe
+            // to source from inline OR overflow exclusively.
+            let source_entries: Vec<EvidenceEntryRow> = if let Some(over) = overflow_entries {
+                over
+            } else {
+                row.evidence_inline.clone()
+            };
+            // The entry the cascade is about to strip — captured so a soft
+            // FORGET can journal it for revert.
+            let dropped = source_entries
                 .iter()
+                .find(|e| e.memory_id_bytes == memory_bytes)
+                .cloned();
+            let remaining: Vec<EvidenceEntryRow> = source_entries
+                .into_iter()
                 .filter(|e| e.memory_id_bytes != memory_bytes)
-                .map(|e| EvidenceEntryRowLike {
-                    memory_id_bytes: e.memory_id_bytes,
-                    confidence_milli: e.confidence_milli,
-                    timestamp_unix_nanos: e.timestamp_unix_nanos,
-                    extractor_id: e.extractor_id,
-                })
                 .collect();
-            affected.push((row, remaining));
+
+            affected.push(AffectedStatement {
+                row,
+                remaining,
+                prior_overflow_id: overflow_id,
+                dropped,
+            });
             if affected.len() >= batch_cap {
                 break;
             }
         }
     }
 
-    // Apply mutations. Each affected statement either becomes
-    // evidence-shrunk + confidence-recomputed, or tombstoned.
+    // Mutate phase. Each affected statement either becomes evidence-
+    // shrunk + confidence-recomputed, or tombstoned.
     //
     // Re-derivation uses the noisy-OR formula across the surviving
     // evidence with per-kind decay — same math the resolver and the
@@ -143,74 +203,176 @@ pub fn cascade_forget_to_statements(
     // inputs. Falling back to a flat mean would silently diverge from
     // the rest of the system on every cascade.
     //
-    // The mutation-side table handle is hoisted out of the loop so
+    // The mutation-side table handles are hoisted out of the loop so
     // we don't pay the open-table cost N times per cascade. We drop
-    // it before any `statement_tombstone` call because that helper
+    // them before any `statement_tombstone` call because that helper
     // opens the same table itself and redb prefers one handle in
     // flight.
     let confidence_cfg = ConfidenceConfig::default_v1();
+    // Tombstone deferral + overflow reclamation deferral — both side-
+    // effects open `STATEMENTS_TABLE` / `EVIDENCE_OVERFLOW_TABLE`, so
+    // we collect them and apply after the mutation handles drop.
     let mut to_tombstone: Vec<brain_core::StatementId> = Vec::new();
+    let mut overflow_reclaim: Vec<EvidenceOverflowId> = Vec::new();
+    // Predicate-bucket re-keys for rows whose confidence changed. Applied
+    // after the STATEMENTS handle drops (and before the tombstone pass,
+    // so a subsequently-tombstoned row's index entry sits under its new
+    // bucket where `statement_tombstone` will find and remove it).
+    // Tuple: (scope, predicate_id, kind, old_confidence, new_confidence, id).
+    let mut rekey_moves: Vec<(RowScope, u32, u8, f32, f32, [u8; 16])> = Vec::new();
     {
         let mut table = wtxn.open_table(STATEMENTS_TABLE)?;
-        for (mut row, remaining) in affected {
-            let kind = StatementKind::from_u8(row.kind).unwrap_or(StatementKind::Fact);
+        let mut overflow_table = wtxn.open_table(EVIDENCE_OVERFLOW_TABLE)?;
+        // Reverse evidence index. Every affected statement had the
+        // forgotten memory in its evidence list, so it owns a
+        // `(scope, forgotten_memory, statement_id)` row here. Strip it
+        // in the same pass — mirroring the relation twin's cleanup of
+        // RELATION_BY_EVIDENCE — so graph enrichment (memory_list
+        // graph_counts, recall include_graph) stops counting the
+        // statement as sourced-by the forgotten memory the instant the
+        // FORGET commits, not only after slot reclamation.
+        let mut by_evidence = wtxn.open_table(STATEMENTS_BY_EVIDENCE_TABLE)?;
+        for AffectedStatement {
+            mut row,
+            remaining,
+            prior_overflow_id,
+            dropped,
+        } in affected
+        {
+            let scope = row.scope();
+            // Snapshot the pre-mutation state for the undo record. These
+            // fields describe the row as it was *before* this cascade
+            // touched it, so the revert executor can restore them.
+            let prior_confidence = row.confidence;
+            let prior_is_current = row.is_current;
+            let prior_tombstone_reason = row.tombstone_reason;
+            // `remove` on an absent key is a benign no-op, so this never
+            // double-errors if the row was already stripped.
+            by_evidence.remove(&(
+                scope.namespace_id,
+                scope.space_id_bytes,
+                memory_bytes,
+                row.statement_id_bytes,
+            ))?;
+            let kind = StatementKind::from_u8(row.kind);
+            // A previously-overflowed statement that drops back to ≤
+            // INLINE_EVIDENCE_CAP entries collapses onto the inline
+            // buffer; the now-orphaned overflow row gets reclaimed.
+            // Statements that stay overflowed get the row rewritten
+            // in place — same id, smaller payload. Statements that
+            // grow past the cap (not possible here, but the code is
+            // symmetric) would allocate a new overflow.
             if remaining.is_empty() {
-                // Empty inline evidence after dropping the forgotten
-                // memory. If the row also lacks an overflow pointer the
-                // statement is now evidence-orphaned; either tombstone
-                // with SourceMemoryForgotten (below the floor, by far
-                // the common case since confidence collapses to 0) or
-                // keep as a stale-evidence sentinel for audit.
-                let new_conf = if row.evidence_overflow_id_bytes.is_some() {
-                    // Overflow still holds evidence the v1 cascade
-                    // doesn't crack open; preserve the stored
-                    // confidence so the row remains queryable.
-                    row.confidence
-                } else {
-                    0.0
-                };
-                // Whether we tombstone or keep stale, the inline list
-                // must no longer reference the forgotten memory. Clear
-                // it here and persist so the row's on-disk shape is
-                // consistent before `statement_tombstone` flips its
-                // tombstone bits in a separate open of the table.
+                let old_conf = row.confidence;
                 row.evidence_inline.clear();
-                row.confidence = new_conf;
+                row.evidence_overflow_id_bytes = None;
+                row.confidence = 0.0;
+                rekey_moves.push((
+                    row.scope(),
+                    row.predicate_id,
+                    row.kind,
+                    old_conf,
+                    0.0,
+                    row.statement_id_bytes,
+                ));
                 table.insert(&row.statement_id_bytes, &row)?;
-                if new_conf < confidence_threshold && row.evidence_overflow_id_bytes.is_none() {
-                    // Defer to a second loop so we can drop the table handle
-                    // before statement_tombstone re-opens it.
+                if let Some(oid) = prior_overflow_id {
+                    overflow_reclaim.push(oid);
+                }
+                let will_tombstone = 0.0 < confidence_threshold;
+                if will_tombstone {
                     to_tombstone.push(row.statement_id());
                 } else {
                     summary.kept_stale += 1;
                 }
-            } else {
-                let entries: Vec<EvidenceEntry> = remaining
-                    .iter()
-                    .map(|e| EvidenceEntry {
-                        memory_id: MemoryId::from_be_bytes(e.memory_id_bytes),
-                        confidence_milli: e.confidence_milli,
-                        timestamp_unix_nanos: e.timestamp_unix_nanos,
-                        extractor_id: ExtractorId::from(e.extractor_id),
-                    })
-                    .collect();
-                let new_conf =
-                    aggregate_confidence(&entries, now_unix_nanos, kind, &confidence_cfg);
-                row.evidence_inline = remaining
-                    .into_iter()
-                    .map(|e| EvidenceEntryRow {
-                        memory_id_bytes: e.memory_id_bytes,
-                        confidence_milli: e.confidence_milli,
-                        timestamp_unix_nanos: e.timestamp_unix_nanos,
-                        extractor_id: e.extractor_id,
-                    })
-                    .collect();
-                row.confidence = new_conf;
-                table.insert(&row.statement_id_bytes, &row)?;
-                summary.evidence_dropped += 1;
+                write_statement_undo(
+                    wtxn,
+                    undo,
+                    memory_bytes,
+                    &row,
+                    dropped.as_ref(),
+                    prior_confidence,
+                    prior_is_current,
+                    prior_tombstone_reason,
+                    prior_overflow_id,
+                    if will_tombstone {
+                        undo_outcome::TOMBSTONED
+                    } else {
+                        undo_outcome::KEPT_STALE
+                    },
+                )?;
+                continue;
             }
+
+            let entries: Vec<EvidenceEntry> =
+                remaining.iter().map(EvidenceEntryRow::to_entry).collect();
+            let new_conf = aggregate_confidence(&entries, now_unix_nanos, kind, &confidence_cfg);
+            let old_conf = row.confidence;
+            row.confidence = new_conf;
+            rekey_moves.push((
+                row.scope(),
+                row.predicate_id,
+                row.kind,
+                old_conf,
+                new_conf,
+                row.statement_id_bytes,
+            ));
+
+            if remaining.len() <= INLINE_EVIDENCE_CAP {
+                row.evidence_inline = remaining;
+                row.evidence_overflow_id_bytes = None;
+                if let Some(oid) = prior_overflow_id {
+                    overflow_reclaim.push(oid);
+                }
+            } else {
+                // Rewrite the overflow row in place when one already
+                // exists, or allocate a fresh id when the row used to
+                // be inline (can't happen during a single-entry FORGET
+                // since the list only shrinks, but the branch keeps
+                // the helper symmetric for future callers).
+                let oid = prior_overflow_id.unwrap_or_else(EvidenceOverflowId::new);
+                let entries_clone: Vec<EvidenceEntry> = entries.clone();
+                let overflow_row =
+                    EvidenceOverflow::from_entries(oid, &entries_clone, now_unix_nanos);
+                overflow_table.insert(&oid.to_bytes(), &overflow_row)?;
+                row.evidence_inline.clear();
+                row.evidence_overflow_id_bytes = Some(oid.to_bytes());
+            }
+
+            table.insert(&row.statement_id_bytes, &row)?;
+            write_statement_undo(
+                wtxn,
+                undo,
+                memory_bytes,
+                &row,
+                dropped.as_ref(),
+                prior_confidence,
+                prior_is_current,
+                prior_tombstone_reason,
+                prior_overflow_id,
+                undo_outcome::EVIDENCE_DROPPED,
+            )?;
+            summary.evidence_dropped += 1;
         }
-    } // table handle dropped here, before statement_tombstone re-opens.
+    } // table handles dropped before tombstone / overflow-reclaim re-open.
+
+    // Move predicate-bucket entries for rows whose confidence changed.
+    // Runs before the tombstone pass so a row about to be tombstoned has
+    // its index entry under the new (zeroed) bucket, where
+    // `statement_tombstone` will then remove it.
+    for (scope, pred, kind, old_conf, new_conf, id) in rekey_moves {
+        rekey_predicate_index(wtxn, scope, pred, kind, old_conf, new_conf, &id)?;
+    }
+
+    // Reclaim orphaned overflow rows. Safe to do regardless of
+    // tombstone outcome — once the statement no longer references the
+    // id, the row is dead weight.
+    {
+        let mut overflow_table = wtxn.open_table(EVIDENCE_OVERFLOW_TABLE)?;
+        for oid in overflow_reclaim {
+            overflow_table.remove(&oid.to_bytes())?;
+        }
+    }
 
     for id in to_tombstone {
         statement_tombstone(
@@ -225,8 +387,94 @@ pub fn cascade_forget_to_statements(
     Ok(summary)
 }
 
+/// Helper used by the snapshot phase. Pulls the overflow row's
+/// entries into a `Vec<EvidenceEntryRow>` so callers can apply the
+/// same `retain`-style filter they use for inline entries.
+fn load_overflow_entries(
+    wtxn: &WriteTransaction,
+    overflow_id: EvidenceOverflowId,
+) -> Result<Option<Vec<EvidenceEntryRow>>, StatementOpError> {
+    let t = wtxn.open_table(EVIDENCE_OVERFLOW_TABLE)?;
+    let row: Option<EvidenceOverflow> = t.get(&overflow_id.to_bytes())?.map(|g| g.value());
+    let Some(over) = row else {
+        return Ok(None);
+    };
+    let n = over
+        .memory_ids
+        .len()
+        .min(over.extractor_ids.len())
+        .min(over.confidences_milli.len())
+        .min(over.timestamps_unix_nanos.len());
+    let entries = (0..n)
+        .map(|i| EvidenceEntryRow {
+            memory_id_bytes: over.memory_ids[i],
+            confidence_milli: over.confidences_milli[i],
+            timestamp_unix_nanos: over.timestamps_unix_nanos[i],
+            extractor_id: over.extractor_ids[i],
+        })
+        .collect();
+    Ok(Some(entries))
+}
+
+/// One snapshot-phase entry: the existing row, the surviving evidence
+/// list (forgotten memory already filtered out), and the prior
+/// overflow id (if any) so the mutate phase can rewrite or reclaim
+/// it. The overflow id stays separate from the row because the row's
+/// `evidence_overflow_id_bytes` may be cleared mid-flow when the
+/// remaining list collapses back inline.
+struct AffectedStatement {
+    row: StatementMetadata,
+    remaining: Vec<EvidenceEntryRow>,
+    prior_overflow_id: Option<EvidenceOverflowId>,
+    /// The evidence entry the cascade strips — `Some` whenever the row
+    /// actually cited the forgotten memory (always, by construction of the
+    /// snapshot filter). Journaled into the undo log for a soft FORGET.
+    dropped: Option<EvidenceEntryRow>,
+}
+
+/// Journal one statement-cascade undo record — a no-op unless this is a
+/// soft FORGET (`undo` is `Some`) and the dropped entry was captured.
+///
+/// Opens `FORGET_UNDO_LOG_TABLE` fresh per call so the caller's already-
+/// open `STATEMENTS_TABLE` / overflow / by-evidence handles don't have to
+/// carry it; the handle drops at return so redb never sees two concurrent
+/// opens of the undo table.
+#[allow(clippy::too_many_arguments)]
+fn write_statement_undo(
+    wtxn: &WriteTransaction,
+    undo: Option<UndoWriteCtx>,
+    memory_bytes: [u8; 16],
+    row: &StatementMetadata,
+    dropped: Option<&EvidenceEntryRow>,
+    prior_confidence: f32,
+    prior_is_current: u8,
+    prior_tombstone_reason: u8,
+    prior_overflow_id: Option<EvidenceOverflowId>,
+    outcome: u8,
+) -> Result<(), StatementOpError> {
+    let (Some(ctx), Some(entry)) = (undo, dropped) else {
+        return Ok(());
+    };
+    let rec = ForgetUndoRecord {
+        record_kind: undo_record_kind::STATEMENT,
+        dropped_memory_id_bytes: entry.memory_id_bytes,
+        dropped_confidence_milli: entry.confidence_milli,
+        dropped_timestamp_unix_nanos: entry.timestamp_unix_nanos,
+        dropped_extractor_id: entry.extractor_id,
+        prior_confidence,
+        prior_is_current,
+        prior_tombstone_reason,
+        prior_overflow_id_bytes: prior_overflow_id.map(|o| o.to_bytes()),
+        outcome,
+        grace_expiry_unix_nanos: ctx.grace_expiry_unix_nanos,
+    };
+    let mut t = wtxn.open_table(FORGET_UNDO_LOG_TABLE)?;
+    t.insert(&(memory_bytes, row.statement_id_bytes), &rec)?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
-// Edge + relation cascade (Phase C wiring).
+// Edge + relation cascade.
 // ---------------------------------------------------------------------------
 
 /// Per-cascade summary for the unified-edge sweep.
@@ -265,8 +513,10 @@ pub struct EdgeCascadeSummary {
 ///    - Otherwise persist the shrunken sidecar.
 pub fn cascade_forget_to_edges(
     wtxn: &WriteTransaction,
+    scope: RowScope,
     memory_id: MemoryId,
     now_unix_nanos: u64,
+    undo: Option<UndoWriteCtx>,
 ) -> Result<EdgeCascadeSummary, EdgeCascadeError> {
     let mut summary = EdgeCascadeSummary::default();
     let anchor = NodeRef::Memory(memory_id);
@@ -350,12 +600,22 @@ pub fn cascade_forget_to_edges(
     {
         let by_ev = wtxn.open_table(RELATION_BY_EVIDENCE_TABLE)?;
         let mem_bytes = memory_id.to_be_bytes();
-        let lo = (mem_bytes, [0u8; 16]);
-        let hi = (mem_bytes, [0xFFu8; 16]);
+        let lo = (
+            scope.namespace_id,
+            scope.space_id_bytes,
+            mem_bytes,
+            [0u8; 16],
+        );
+        let hi = (
+            scope.namespace_id,
+            scope.space_id_bytes,
+            mem_bytes,
+            [0xFFu8; 16],
+        );
         for entry in by_ev.range(lo..=hi)? {
             let (k, _) = entry?;
-            let (k_mem, k_rel) = k.value();
-            if k_mem != mem_bytes {
+            let (k_ns, k_space, k_mem, k_rel) = k.value();
+            if k_ns != scope.namespace_id || k_space != scope.space_id_bytes || k_mem != mem_bytes {
                 continue;
             }
             relation_ids.push(RelationId::from(k_rel));
@@ -363,18 +623,29 @@ pub fn cascade_forget_to_edges(
     }
 
     let mut to_tombstone: Vec<RelationId> = Vec::new();
+    // Deferred relation undo records — collected during the mutate pass and
+    // written after the sidecar handle drops (soft FORGET only).
+    let mut relation_undo: Vec<RelationUndo> = Vec::new();
     {
         let mut by_ev = wtxn.open_table(RELATION_BY_EVIDENCE_TABLE)?;
         let mut sidecar = wtxn.open_table(RELATION_METADATA_TABLE)?;
         let mem_bytes = memory_id.to_be_bytes();
         for rel_id in &relation_ids {
             let rel_bytes = rel_id.to_bytes();
-            by_ev.remove(&(mem_bytes, rel_bytes))?;
+            by_ev.remove(&(
+                scope.namespace_id,
+                scope.space_id_bytes,
+                mem_bytes,
+                rel_bytes,
+            ))?;
             let Some(mut meta) = sidecar.get(&rel_bytes)?.map(|g| g.value()) else {
                 // Sidecar already gone; skip — the BY_EVIDENCE row
                 // was stale.
                 continue;
             };
+            // Snapshot the pre-mutation state for the undo record.
+            let prior_confidence = meta.confidence;
+            let prior_is_current = meta.is_current;
             let before = meta.evidence_inline.len();
             meta.evidence_inline.retain(|e| *e != mem_bytes);
             let shrank = meta.evidence_inline.len() < before;
@@ -383,10 +654,52 @@ pub fn cascade_forget_to_edges(
                 // sidecar handle is dropped, since
                 // `relation_tombstone` reopens the same table.
                 to_tombstone.push(*rel_id);
+                relation_undo.push(RelationUndo {
+                    rel_bytes,
+                    prior_confidence,
+                    prior_is_current,
+                    outcome: undo_outcome::TOMBSTONED,
+                });
             } else if shrank {
                 sidecar.insert(&rel_bytes, &meta)?;
                 summary.relations_evidence_dropped += 1;
+                relation_undo.push(RelationUndo {
+                    rel_bytes,
+                    prior_confidence,
+                    prior_is_current,
+                    outcome: undo_outcome::EVIDENCE_DROPPED,
+                });
             }
+        }
+    }
+
+    // Journal relation-cascade undo records — soft FORGET only. Written
+    // after the sidecar handle drops so the undo-table open never races a
+    // held handle; the forward mutation and its undo commit in one wtxn.
+    if let Some(ctx) = undo {
+        let mem_bytes = memory_id.to_be_bytes();
+        let mut undo_t = wtxn.open_table(FORGET_UNDO_LOG_TABLE)?;
+        for RelationUndo {
+            rel_bytes,
+            prior_confidence,
+            prior_is_current,
+            outcome,
+        } in &relation_undo
+        {
+            let rec = ForgetUndoRecord {
+                record_kind: undo_record_kind::RELATION,
+                dropped_memory_id_bytes: mem_bytes,
+                dropped_confidence_milli: 0,
+                dropped_timestamp_unix_nanos: 0,
+                dropped_extractor_id: 0,
+                prior_confidence: *prior_confidence,
+                prior_is_current: *prior_is_current,
+                prior_tombstone_reason: 0,
+                prior_overflow_id_bytes: None,
+                outcome: *outcome,
+                grace_expiry_unix_nanos: ctx.grace_expiry_unix_nanos,
+            };
+            undo_t.insert(&(mem_bytes, *rel_bytes), &rec)?;
         }
     }
 
@@ -403,6 +716,340 @@ pub fn cascade_forget_to_edges(
     }
 
     Ok(summary)
+}
+
+/// One deferred relation-cascade undo entry, collected while the sidecar
+/// handle is held and drained into the undo log after it drops.
+struct RelationUndo {
+    rel_bytes: [u8; 16],
+    prior_confidence: f32,
+    prior_is_current: u8,
+    outcome: u8,
+}
+
+// ---------------------------------------------------------------------------
+// Revert — replay the undo log to reverse a soft FORGET cascade.
+// ---------------------------------------------------------------------------
+
+/// Per-revert aggregate summary.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RevertSummary {
+    /// Undo rows scanned for this memory.
+    pub scanned: u64,
+    /// Statement rows whose evidence + confidence were restored.
+    pub statements_reverted: u64,
+    /// Of those, statements whose `SourceMemoryForgotten` tombstone was
+    /// cleared.
+    pub statements_untombstoned: u64,
+    /// Relation rows whose evidence was restored.
+    pub relations_reverted: u64,
+    /// Of those, relations whose FORGET-driven tombstone was cleared.
+    pub relations_untombstoned: u64,
+    /// Undo rows whose dependent row had vanished (nothing to restore) or
+    /// whose `record_kind` was unrecognized.
+    pub skipped: u64,
+}
+
+/// Errors from [`cascade_revert_forget`].
+#[derive(thiserror::Error, Debug)]
+pub enum CascadeRevertError {
+    #[error("redb storage error: {0}")]
+    Storage(#[from] redb::StorageError),
+
+    #[error("redb table error: {0}")]
+    Table(#[from] redb::TableError),
+
+    #[error("statement op error: {0}")]
+    Statement(#[from] StatementOpError),
+}
+
+/// Reverse a soft FORGET cascade for `memory_id` by replaying its undo
+/// log ([`FORGET_UNDO_LOG_TABLE`]).
+///
+/// For each journaled dependent row, in this one wtxn:
+/// 1. Re-attach the dropped evidence entry (idempotent: skipped if the
+///    row already cites the memory).
+/// 2. Re-add the `STATEMENTS_BY_EVIDENCE` / `RELATION_BY_EVIDENCE`
+///    reverse-index row.
+/// 3. Recompute statement confidence via noisy-OR over the restored
+///    evidence and re-key its predicate bucket.
+/// 4. If the forward cascade tombstoned the row (`outcome == Tombstoned`)
+///    **and** it is still tombstoned for `SourceMemoryForgotten`
+///    (statements) / not superseded elsewhere (relations), clear the
+///    tombstone and re-activate its indexes. A row tombstoned for any
+///    other reason is left tombstoned — the guard that keeps a revert
+///    from resurrecting a row the user deleted for a different reason.
+/// 5. Delete the consumed undo row, so a second revert run over the same
+///    memory is a structural no-op (idempotent crash-safe replay).
+///
+/// `batch_cap` bounds the undo rows consumed per call; a heavily-
+/// referenced memory drains across successive worker cycles, and because
+/// each consumed row is deleted in-txn, a re-run resumes cleanly.
+pub fn cascade_revert_forget(
+    wtxn: &WriteTransaction,
+    memory_id: MemoryId,
+    now_unix_nanos: u64,
+    batch_cap: usize,
+) -> Result<RevertSummary, CascadeRevertError> {
+    let mut summary = RevertSummary::default();
+    let memory_bytes = memory_id.to_be_bytes();
+
+    // Snapshot phase: collect this memory's undo rows, bounded by cap.
+    let mut records: Vec<([u8; 16], ForgetUndoRecord)> = Vec::new();
+    {
+        let t = wtxn.open_table(FORGET_UNDO_LOG_TABLE)?;
+        let lo = (memory_bytes, [0u8; 16]);
+        let hi = (memory_bytes, [0xFFu8; 16]);
+        for entry in t.range(lo..=hi)? {
+            let (k, v) = entry?;
+            let (k_mem, k_dep) = k.value();
+            if k_mem != memory_bytes {
+                continue;
+            }
+            records.push((k_dep, v.value()));
+            if records.len() >= batch_cap {
+                break;
+            }
+        }
+    }
+    summary.scanned = records.len() as u64;
+
+    for (dep_bytes, rec) in records {
+        match rec.record_kind {
+            undo_record_kind::STATEMENT => {
+                revert_statement(wtxn, dep_bytes, &rec, now_unix_nanos, &mut summary)?;
+            }
+            undo_record_kind::RELATION => {
+                revert_relation(wtxn, memory_bytes, dep_bytes, &rec, &mut summary)?;
+            }
+            _ => {
+                summary.skipped += 1;
+            }
+        }
+        // Delete the consumed undo row in the same wtxn — makes a re-run
+        // over the same memory a structural no-op.
+        let mut t = wtxn.open_table(FORGET_UNDO_LOG_TABLE)?;
+        t.remove(&(memory_bytes, dep_bytes))?;
+    }
+
+    Ok(summary)
+}
+
+/// Restore one statement from an undo record. See
+/// [`cascade_revert_forget`] for the step-by-step contract.
+fn revert_statement(
+    wtxn: &WriteTransaction,
+    dep_bytes: [u8; 16],
+    rec: &ForgetUndoRecord,
+    now_unix_nanos: u64,
+    summary: &mut RevertSummary,
+) -> Result<(), CascadeRevertError> {
+    let row_opt = {
+        let t = wtxn.open_table(STATEMENTS_TABLE)?;
+        let guard = t.get(&dep_bytes)?;
+        guard.map(|g| g.value())
+    };
+    let Some(mut row) = row_opt else {
+        // Dependent row gone (hard-reclaimed, or a later retract).
+        // Nothing to restore.
+        summary.skipped += 1;
+        return Ok(());
+    };
+    let scope = row.scope();
+    let kind = StatementKind::from_u8(row.kind);
+
+    // 1. Reconstruct the evidence list = current surviving evidence + the
+    //    dropped entry (idempotent: skip the add if already present).
+    let current_overflow = row.evidence_overflow_id_bytes.map(EvidenceOverflowId::from);
+    let mut entries: Vec<EvidenceEntryRow> = if let Some(oid) = current_overflow {
+        load_overflow_entries(wtxn, oid)?.unwrap_or_default()
+    } else {
+        row.evidence_inline.clone()
+    };
+    if !entries
+        .iter()
+        .any(|e| e.memory_id_bytes == rec.dropped_memory_id_bytes)
+    {
+        entries.push(EvidenceEntryRow {
+            memory_id_bytes: rec.dropped_memory_id_bytes,
+            confidence_milli: rec.dropped_confidence_milli,
+            timestamp_unix_nanos: rec.dropped_timestamp_unix_nanos,
+            extractor_id: rec.dropped_extractor_id,
+        });
+    }
+
+    // 2. Re-add the reverse-index row (idempotent insert).
+    {
+        let mut t = wtxn.open_table(STATEMENTS_BY_EVIDENCE_TABLE)?;
+        t.insert(
+            &(
+                scope.namespace_id,
+                scope.space_id_bytes,
+                rec.dropped_memory_id_bytes,
+                dep_bytes,
+            ),
+            &(),
+        )?;
+    }
+
+    // 3. Recompute confidence over the restored evidence.
+    let core_entries: Vec<EvidenceEntry> = entries.iter().map(EvidenceEntryRow::to_entry).collect();
+    let old_conf = row.confidence;
+    let new_conf = aggregate_confidence(
+        &core_entries,
+        now_unix_nanos,
+        kind,
+        &ConfidenceConfig::default_v1(),
+    );
+    row.confidence = new_conf;
+
+    // Store the evidence back onto the row — inline when it fits, else an
+    // overflow row (reusing the current / prior overflow id, or a fresh
+    // one).
+    if entries.len() <= INLINE_EVIDENCE_CAP {
+        row.evidence_inline = entries;
+        row.evidence_overflow_id_bytes = None;
+        if let Some(oid) = current_overflow {
+            let mut ot = wtxn.open_table(EVIDENCE_OVERFLOW_TABLE)?;
+            ot.remove(&oid.to_bytes())?;
+        }
+    } else {
+        let oid = current_overflow
+            .or_else(|| rec.prior_overflow_id_bytes.map(EvidenceOverflowId::from))
+            .unwrap_or_else(EvidenceOverflowId::new);
+        let overflow_row = EvidenceOverflow::from_entries(oid, &core_entries, now_unix_nanos);
+        let mut ot = wtxn.open_table(EVIDENCE_OVERFLOW_TABLE)?;
+        ot.insert(&oid.to_bytes(), &overflow_row)?;
+        row.evidence_inline.clear();
+        row.evidence_overflow_id_bytes = Some(oid.to_bytes());
+    }
+
+    // 4. Un-tombstone iff the forward cascade tombstoned it AND it is
+    //    still tombstoned for exactly `SourceMemoryForgotten`. Never
+    //    resurrect a row the user deleted for another reason.
+    let was_tombstoned = row.is_tombstoned();
+    let untomb =
+        was_tombstoned && row.tombstone_reason == stmt_tombstone_reason::SOURCE_MEMORY_FORGOTTEN;
+    if untomb {
+        row.tombstoned = 0;
+        row.tombstoned_at_unix_nanos = None;
+        row.tombstone_reason = stmt_tombstone_reason::NOT_TOMBSTONED;
+        row.record_invalidated_at_unix_nanos = None;
+        row.is_current = rec.prior_is_current;
+    }
+
+    {
+        let mut t = wtxn.open_table(STATEMENTS_TABLE)?;
+        t.insert(&dep_bytes, &row)?;
+    }
+
+    if untomb {
+        // Re-activate the indexes `statement_tombstone` tore down.
+        if rec.prior_is_current != 0 {
+            flip_by_subject_to_current(
+                wtxn,
+                scope,
+                row.subject_entity_bytes,
+                row.kind,
+                row.predicate_id,
+                &dep_bytes,
+            )?;
+        }
+        add_to_predicate_index(
+            wtxn,
+            scope,
+            row.predicate_id,
+            row.kind,
+            new_conf,
+            &dep_bytes,
+        )?;
+        // Re-enqueue for Statement-HNSW embedding — tombstone dropped the
+        // queue row, so a restored row must re-embed to be findable.
+        {
+            let mut q = wtxn.open_table(STATEMENT_EMBED_QUEUE_TABLE)?;
+            q.insert(&dep_bytes, &now_unix_nanos)?;
+        }
+        summary.statements_untombstoned += 1;
+    } else if !was_tombstoned {
+        // Row stayed live through the FORGET (evidence-dropped / kept-
+        // stale): its predicate-bucket entry sits at the post-FORGET
+        // confidence; move it to the restored confidence.
+        rekey_predicate_index(
+            wtxn,
+            scope,
+            row.predicate_id,
+            row.kind,
+            old_conf,
+            new_conf,
+            &dep_bytes,
+        )?;
+    }
+    // else: tombstoned for a different reason — evidence restored, row left
+    // tombstoned and out of the live indexes.
+
+    summary.statements_reverted += 1;
+    Ok(())
+}
+
+/// Restore one relation from an undo record. Relations carry no
+/// tombstone-reason byte, so the undo record's `outcome == Tombstoned`
+/// (this cascade caused the tombstone) plus "not superseded elsewhere"
+/// is the guard.
+fn revert_relation(
+    wtxn: &WriteTransaction,
+    memory_bytes: [u8; 16],
+    dep_bytes: [u8; 16],
+    rec: &ForgetUndoRecord,
+    summary: &mut RevertSummary,
+) -> Result<(), CascadeRevertError> {
+    let meta_opt = {
+        let t = wtxn.open_table(RELATION_METADATA_TABLE)?;
+        let guard = t.get(&dep_bytes)?;
+        guard.map(|g| g.value())
+    };
+    let Some(mut meta) = meta_opt else {
+        summary.skipped += 1;
+        return Ok(());
+    };
+
+    // 1. Re-attach the memory to the evidence list (idempotent).
+    if !meta.evidence_inline.contains(&memory_bytes) {
+        meta.evidence_inline.push(memory_bytes);
+    }
+
+    // 2. Re-add the reverse-index row (idempotent).
+    {
+        let mut t = wtxn.open_table(RELATION_BY_EVIDENCE_TABLE)?;
+        t.insert(
+            &(
+                meta.namespace_id,
+                meta.space_id_bytes,
+                memory_bytes,
+                dep_bytes,
+            ),
+            &(),
+        )?;
+    }
+
+    // 3. Un-tombstone iff this cascade tombstoned it, it is still
+    //    tombstoned, and nothing else superseded it in the meantime.
+    let untomb = rec.outcome == undo_outcome::TOMBSTONED
+        && meta.is_tombstoned()
+        && meta.superseded_by_bytes.is_none();
+    if untomb {
+        meta.tombstoned = 0;
+        meta.tombstoned_at_unix_nanos = None;
+        meta.is_current = u8::from(rec.prior_is_current != 0);
+        summary.relations_untombstoned += 1;
+    }
+
+    {
+        let mut t = wtxn.open_table(RELATION_METADATA_TABLE)?;
+        t.insert(&dep_bytes, &meta)?;
+    }
+
+    summary.relations_reverted += 1;
+    Ok(())
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -423,16 +1070,6 @@ pub enum EdgeCascadeError {
     Relation(#[from] RelationOpError),
 }
 
-// Local mirror so cascade_ops doesn't depend on the row layout
-// from brain-metadata's table module directly. The two are kept
-// in sync; cascade-side processing is the only consumer.
-struct EvidenceEntryRowLike {
-    memory_id_bytes: [u8; 16],
-    confidence_milli: u16,
-    timestamp_unix_nanos: u64,
-    extractor_id: u32,
-}
-
 #[cfg(all(test, not(miri)))]
 mod edge_cascade_tests {
     use super::*;
@@ -443,10 +1080,13 @@ mod edge_cascade_tests {
         self, derived_by, origin, EdgeData, EDGES_REVERSE_TABLE, EDGES_TABLE,
     };
     use crate::MetadataDb;
-    use brain_core::{Entity, EntityType, Relation};
     use brain_core::{Cardinality, EntityId, ExtractorId, RelationId, RelationTypeId};
+    use brain_core::{Entity, EntityType, Relation};
 
     const NOW: u64 = 1_700_000_000_000_000_000;
+    fn test_scope() -> RowScope {
+        RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xAB; 16])
+    }
 
     fn open_db() -> (tempfile::TempDir, MetadataDb) {
         let dir = tempfile::tempdir().unwrap();
@@ -464,7 +1104,7 @@ mod edge_cascade_tests {
             NOW,
         );
         let wtxn = db.write_txn().unwrap();
-        entity_put(&wtxn, &e).unwrap();
+        entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
         wtxn.commit().unwrap();
         id
     }
@@ -519,7 +1159,7 @@ mod edge_cascade_tests {
         seed_substrate_edge(&mut db, m_other, m);
 
         let wtxn = db.write_txn().unwrap();
-        let summary = cascade_forget_to_edges(&wtxn, m, NOW).unwrap();
+        let summary = cascade_forget_to_edges(&wtxn, test_scope(), m, NOW, None).unwrap();
         wtxn.commit().unwrap();
 
         assert_eq!(summary.substrate_unlinked, 2);
@@ -559,11 +1199,11 @@ mod edge_cascade_tests {
         let rid = r.id;
 
         let wtxn = db.write_txn().unwrap();
-        relation_create(&wtxn, &r, NOW).unwrap();
+        relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &r, NOW).unwrap();
         wtxn.commit().unwrap();
 
         let wtxn = db.write_txn().unwrap();
-        let summary = cascade_forget_to_edges(&wtxn, mem, NOW + 1).unwrap();
+        let summary = cascade_forget_to_edges(&wtxn, test_scope(), mem, NOW + 1, None).unwrap();
         wtxn.commit().unwrap();
 
         assert_eq!(summary.relations_tombstoned, 1);
@@ -600,12 +1240,12 @@ mod edge_cascade_tests {
         let rid = r.id;
 
         let wtxn = db.write_txn().unwrap();
-        relation_create(&wtxn, &r, NOW).unwrap();
+        relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &r, NOW).unwrap();
         wtxn.commit().unwrap();
 
         // Forget m1 only.
         let wtxn = db.write_txn().unwrap();
-        let summary = cascade_forget_to_edges(&wtxn, m1, NOW + 1).unwrap();
+        let summary = cascade_forget_to_edges(&wtxn, test_scope(), m1, NOW + 1, None).unwrap();
         wtxn.commit().unwrap();
 
         assert_eq!(summary.relations_tombstoned, 0);
@@ -621,13 +1261,24 @@ mod edge_cascade_tests {
         assert_eq!(meta.evidence_inline[0], m2.to_be_bytes());
 
         let by_ev = rtxn.open_table(RELATION_BY_EVIDENCE_TABLE).unwrap();
+        let sc = test_scope();
         // m1 row dropped; m2 row stays.
         assert!(by_ev
-            .get(&(m1.to_be_bytes(), rid.to_bytes()))
+            .get(&(
+                sc.namespace_id,
+                sc.space_id_bytes,
+                m1.to_be_bytes(),
+                rid.to_bytes()
+            ))
             .unwrap()
             .is_none());
         assert!(by_ev
-            .get(&(m2.to_be_bytes(), rid.to_bytes()))
+            .get(&(
+                sc.namespace_id,
+                sc.space_id_bytes,
+                m2.to_be_bytes(),
+                rid.to_bytes()
+            ))
             .unwrap()
             .is_some());
     }
@@ -654,7 +1305,7 @@ mod edge_cascade_tests {
         r.is_symmetric = false;
 
         let wtxn = db.write_txn().unwrap();
-        relation_create(&wtxn, &r, NOW).unwrap();
+        relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &r, NOW).unwrap();
         wtxn.commit().unwrap();
 
         let edges_before = {
@@ -667,7 +1318,7 @@ mod edge_cascade_tests {
         };
 
         let wtxn = db.write_txn().unwrap();
-        cascade_forget_to_edges(&wtxn, mem, NOW + 1).unwrap();
+        cascade_forget_to_edges(&wtxn, test_scope(), mem, NOW + 1, None).unwrap();
         wtxn.commit().unwrap();
 
         let edges_after = {
@@ -682,5 +1333,533 @@ mod edge_cascade_tests {
         // Typed-relation edge rows survive — tombstoning is a sidecar
         // operation, not an edge deletion.
         assert_eq!(edges_before, edges_after);
+    }
+
+    #[test]
+    fn revert_restores_relation_evidence_and_untombstones() {
+        // Soft-FORGET a relation's sole evidence → tombstoned + undo
+        // journaled; revert re-attaches the evidence, re-adds the
+        // reverse-index row, and clears the tombstone.
+        let (_dir, mut db) = open_db();
+        let a = make_entity(&mut db, "a-rev");
+        let b = make_entity(&mut db, "b-rev");
+        let t = intern_type(&mut db, "knows_rev");
+        let mem = MemoryId::pack(1, 60, 1);
+
+        let mut r = Relation::new_root(
+            RelationId::new(),
+            t,
+            a,
+            b,
+            0.8,
+            vec![mem],
+            ExtractorId::from(0),
+            NOW,
+            false,
+        );
+        r.is_symmetric = false;
+        let rid = r.id;
+
+        let wtxn = db.write_txn().unwrap();
+        relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &r, NOW).unwrap();
+        wtxn.commit().unwrap();
+
+        // Soft FORGET (undo journaled).
+        let wtxn = db.write_txn().unwrap();
+        let summary = cascade_forget_to_edges(
+            &wtxn,
+            test_scope(),
+            mem,
+            NOW + 1,
+            Some(UndoWriteCtx {
+                grace_expiry_unix_nanos: NOW + 3_600_000_000_000,
+            }),
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(summary.relations_tombstoned, 1);
+
+        // Revert.
+        let wtxn = db.write_txn().unwrap();
+        let rsummary = cascade_revert_forget(&wtxn, mem, NOW + 2, 256).unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(rsummary.relations_reverted, 1);
+        assert_eq!(rsummary.relations_untombstoned, 1);
+
+        let rtxn = db.read_txn().unwrap();
+        let sidecar = rtxn.open_table(RELATION_METADATA_TABLE).unwrap();
+        let meta = sidecar.get(&rid.to_bytes()).unwrap().unwrap().value();
+        assert_eq!(meta.tombstoned, 0);
+        assert_eq!(meta.is_current, 1);
+        assert_eq!(meta.evidence_inline, vec![mem.to_be_bytes()]);
+        // Reverse-index row restored.
+        let by_ev = rtxn.open_table(RELATION_BY_EVIDENCE_TABLE).unwrap();
+        let sc = test_scope();
+        assert!(by_ev
+            .get(&(
+                sc.namespace_id,
+                sc.space_id_bytes,
+                mem.to_be_bytes(),
+                rid.to_bytes()
+            ))
+            .unwrap()
+            .is_some());
+    }
+}
+
+#[cfg(all(test, not(miri)))]
+mod statement_cascade_overflow_tests {
+    use super::*;
+    use crate::entity::ops::{entity_put, normalize_name};
+    use crate::schema::predicate::predicate_intern;
+    use crate::statement::evidence::{pack_evidence_ids, read_evidence_ids};
+    use crate::statement::statement_create;
+    use crate::tables::statement::{
+        StatementMetadata, EVIDENCE_OVERFLOW_TABLE, STATEMENTS_BY_EVIDENCE_TABLE, STATEMENTS_TABLE,
+    };
+    use crate::MetadataDb;
+    use brain_core::{
+        Entity, EntityType, EvidenceRef, ExtractorId, PredicateId, SessionId, Statement,
+        StatementId, StatementKind, StatementObject, StatementValue, SubjectRef,
+    };
+
+    const NOW: u64 = 1_700_000_000_000_000_000;
+
+    fn test_scope() -> RowScope {
+        RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xAB; 16])
+    }
+
+    fn open_db() -> (tempfile::TempDir, MetadataDb) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = MetadataDb::open(dir.path().join("md.redb")).unwrap();
+        (dir, db)
+    }
+
+    fn make_subject(db: &mut MetadataDb, name: &str) -> brain_core::EntityId {
+        let id = brain_core::EntityId::new();
+        let e = Entity::new_active(
+            id,
+            EntityType::PERSON_ID,
+            name.into(),
+            normalize_name(name),
+            NOW,
+        );
+        let wtxn = db.write_txn().unwrap();
+        entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
+        wtxn.commit().unwrap();
+        id
+    }
+
+    fn intern_pred(db: &mut MetadataDb, name: &str) -> PredicateId {
+        let wtxn = db.write_txn().unwrap();
+        let id = predicate_intern(
+            &wtxn,
+            "test",
+            name,
+            Some(StatementKind::Fact),
+            2,
+            1,
+            "",
+            false,
+            NOW,
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+        id
+    }
+
+    fn pack_ids_for_test(db: &mut MetadataDb, ids: Vec<MemoryId>) -> EvidenceRef {
+        let wtxn = db.write_txn().unwrap();
+        let r = pack_evidence_ids(&wtxn, ids, 0.9, NOW, ExtractorId::from(0)).unwrap();
+        wtxn.commit().unwrap();
+        r
+    }
+
+    fn make_statement(
+        db: &mut MetadataDb,
+        subject: brain_core::EntityId,
+        predicate: PredicateId,
+        evidence: EvidenceRef,
+    ) -> StatementId {
+        let id = StatementId::new();
+        let s = Statement::new_root(
+            id,
+            StatementKind::Fact,
+            SubjectRef::Entity(subject),
+            predicate,
+            StatementObject::Value(StatementValue::Text("placeholder".into())),
+            0.9,
+            evidence,
+            ExtractorId::from(0),
+            NOW,
+            1,
+        );
+        let wtxn = db.write_txn().unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &s, NOW).unwrap();
+        wtxn.commit().unwrap();
+        id
+    }
+
+    fn ids(n: usize) -> Vec<MemoryId> {
+        (0..n)
+            .map(|i| MemoryId::pack(i as u16 + 1, SessionId::DEFAULT.into(), 0))
+            .collect()
+    }
+
+    fn statement_row(db: &MetadataDb, id: StatementId) -> StatementMetadata {
+        let rtxn = db.read_txn().unwrap();
+        let t = rtxn.open_table(STATEMENTS_TABLE).unwrap();
+        t.get(&id.to_bytes()).unwrap().unwrap().value()
+    }
+
+    #[test]
+    fn cascade_drops_forgotten_memory_from_overflow_and_collapses_back_inline() {
+        let (_dir, mut db) = open_db();
+        let subj = make_subject(&mut db, "ada");
+        let pred = intern_pred(&mut db, "knows_collapse");
+
+        // 9 evidence ids — guaranteed overflow.
+        let memory_ids = ids(9);
+        let ev = pack_ids_for_test(&mut db, memory_ids.clone());
+        assert!(matches!(ev, EvidenceRef::Overflow(_)));
+        let stmt = make_statement(&mut db, subj, pred, ev);
+
+        // Forget the first memory — leaves 8 surviving, fits inline.
+        let wtxn = db.write_txn().unwrap();
+        let summary =
+            cascade_forget_to_statements(&wtxn, memory_ids[0], 0.2, 100, NOW + 1, None).unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(summary.evidence_dropped, 1);
+        assert_eq!(summary.tombstoned, 0);
+
+        let row = statement_row(&db, stmt);
+        assert_eq!(row.evidence_inline.len(), 8);
+        assert!(row.evidence_overflow_id_bytes.is_none());
+    }
+
+    #[test]
+    fn cascade_drops_forgotten_memory_keeping_overflow_form() {
+        let (_dir, mut db) = open_db();
+        let subj = make_subject(&mut db, "ada-keep");
+        let pred = intern_pred(&mut db, "knows_keep");
+
+        // 12 ids — stays overflow after forgetting one (11 > 8).
+        let memory_ids = ids(12);
+        let ev = pack_ids_for_test(&mut db, memory_ids.clone());
+        let stmt = make_statement(&mut db, subj, pred, ev);
+
+        let wtxn = db.write_txn().unwrap();
+        cascade_forget_to_statements(&wtxn, memory_ids[3], 0.2, 100, NOW + 1, None).unwrap();
+        wtxn.commit().unwrap();
+
+        let row = statement_row(&db, stmt);
+        assert!(row.evidence_overflow_id_bytes.is_some());
+        assert!(row.evidence_inline.is_empty());
+
+        // The overflow row now holds 11 ids.
+        let oid = EvidenceOverflowId::from(row.evidence_overflow_id_bytes.unwrap());
+        let reference = EvidenceRef::Overflow(oid);
+        let rtxn = db.read_txn().unwrap();
+        let back = read_evidence_ids(&rtxn, &reference).unwrap();
+        assert_eq!(back.len(), 11);
+        assert!(!back.contains(&memory_ids[3]));
+    }
+
+    #[test]
+    fn cascade_tombstones_statement_and_reclaims_overflow_when_evidence_empty() {
+        let (_dir, mut db) = open_db();
+        let subj = make_subject(&mut db, "ada-tomb");
+        let pred = intern_pred(&mut db, "knows_tomb");
+
+        // 9 ids — overflow. After forgetting all but one, then forgetting
+        // the last, the row should tombstone + reclaim.
+        let memory_ids = ids(9);
+        let ev = pack_ids_for_test(&mut db, memory_ids.clone());
+        let stmt = make_statement(&mut db, subj, pred, ev);
+
+        // Forget all 9 in sequence; the last call should tombstone.
+        for mid in &memory_ids {
+            let wtxn = db.write_txn().unwrap();
+            cascade_forget_to_statements(&wtxn, *mid, 0.2, 100, NOW + 1, None).unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        let row = statement_row(&db, stmt);
+        assert!(row.is_tombstoned());
+        assert!(row.evidence_inline.is_empty());
+        assert!(row.evidence_overflow_id_bytes.is_none());
+
+        // The overflow row is reclaimed.
+        let rtxn = db.read_txn().unwrap();
+        let t = rtxn.open_table(EVIDENCE_OVERFLOW_TABLE).unwrap();
+        assert_eq!(t.iter().unwrap().count(), 0);
+    }
+
+    fn evidence_row_present(db: &MetadataDb, mem: MemoryId, stmt: StatementId) -> bool {
+        let sc = test_scope();
+        let rtxn = db.read_txn().unwrap();
+        let t = rtxn.open_table(STATEMENTS_BY_EVIDENCE_TABLE).unwrap();
+        t.get(&(
+            sc.namespace_id,
+            sc.space_id_bytes,
+            mem.to_be_bytes(),
+            stmt.to_bytes(),
+        ))
+        .unwrap()
+        .is_some()
+    }
+
+    #[test]
+    fn cascade_strips_evidence_row_when_statement_kept() {
+        // Regression: the STATEMENTS_BY_EVIDENCE reverse index must lose
+        // the (forgotten_memory, statement) row the instant FORGET
+        // commits — mirroring RELATION_BY_EVIDENCE — so graph enrichment
+        // stops counting the statement as sourced-by the forgotten
+        // memory during the tombstone-grace window.
+        let (_dir, mut db) = open_db();
+        let subj = make_subject(&mut db, "ada-strip-kept");
+        let pred = intern_pred(&mut db, "knows_strip_kept");
+
+        // Two inline evidence ids; forget one → statement survives.
+        let memory_ids = ids(2);
+        let ev = pack_ids_for_test(&mut db, memory_ids.clone());
+        assert!(matches!(ev, EvidenceRef::Inline(_)));
+        let stmt = make_statement(&mut db, subj, pred, ev);
+
+        // Both reverse-index rows present before the cascade.
+        assert!(evidence_row_present(&db, memory_ids[0], stmt));
+        assert!(evidence_row_present(&db, memory_ids[1], stmt));
+
+        let wtxn = db.write_txn().unwrap();
+        let summary =
+            cascade_forget_to_statements(&wtxn, memory_ids[0], 0.2, 100, NOW + 1, None).unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(summary.evidence_dropped, 1);
+        assert_eq!(summary.tombstoned, 0);
+
+        // Forgotten memory's row is gone; the survivor's row stays.
+        assert!(!evidence_row_present(&db, memory_ids[0], stmt));
+        assert!(evidence_row_present(&db, memory_ids[1], stmt));
+    }
+
+    #[test]
+    fn cascade_strips_evidence_row_when_statement_tombstoned() {
+        // Sole-evidence case: the statement tombstones, and its lone
+        // reverse-index row must also be removed.
+        let (_dir, mut db) = open_db();
+        let subj = make_subject(&mut db, "ada-strip-tomb");
+        let pred = intern_pred(&mut db, "knows_strip_tomb");
+
+        let memory_ids = ids(1);
+        let ev = pack_ids_for_test(&mut db, memory_ids.clone());
+        let stmt = make_statement(&mut db, subj, pred, ev);
+        assert!(evidence_row_present(&db, memory_ids[0], stmt));
+
+        let wtxn = db.write_txn().unwrap();
+        let summary =
+            cascade_forget_to_statements(&wtxn, memory_ids[0], 0.2, 100, NOW + 1, None).unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(summary.tombstoned, 1);
+
+        assert!(!evidence_row_present(&db, memory_ids[0], stmt));
+    }
+
+    #[test]
+    fn cascade_strips_evidence_row_from_overflow_form() {
+        // Overflow-backed evidence: forgetting one id must still strip
+        // that id's reverse-index row while the survivors remain.
+        let (_dir, mut db) = open_db();
+        let subj = make_subject(&mut db, "ada-strip-over");
+        let pred = intern_pred(&mut db, "knows_strip_over");
+
+        let memory_ids = ids(9);
+        let ev = pack_ids_for_test(&mut db, memory_ids.clone());
+        assert!(matches!(ev, EvidenceRef::Overflow(_)));
+        let stmt = make_statement(&mut db, subj, pred, ev);
+        for mid in &memory_ids {
+            assert!(evidence_row_present(&db, *mid, stmt));
+        }
+
+        let wtxn = db.write_txn().unwrap();
+        cascade_forget_to_statements(&wtxn, memory_ids[4], 0.2, 100, NOW + 1, None).unwrap();
+        wtxn.commit().unwrap();
+
+        assert!(!evidence_row_present(&db, memory_ids[4], stmt));
+        for (i, mid) in memory_ids.iter().enumerate() {
+            if i != 4 {
+                assert!(evidence_row_present(&db, *mid, stmt));
+            }
+        }
+    }
+
+    #[test]
+    fn cascade_recomputes_confidence_over_overflow_evidence() {
+        let (_dir, mut db) = open_db();
+        let subj = make_subject(&mut db, "ada-conf");
+        let pred = intern_pred(&mut db, "knows_conf");
+
+        // 50 ids — overflow. Recompute is observable: the per-entry
+        // confidence_milli (0 from pack_evidence_ids — actually 900 since
+        // we pass 0.9 → milli) yields a noisy-OR aggregate the cascade
+        // can re-derive after dropping one.
+        let memory_ids = ids(50);
+        let ev = pack_ids_for_test(&mut db, memory_ids.clone());
+        let stmt = make_statement(&mut db, subj, pred, ev);
+        let before = statement_row(&db, stmt).confidence;
+
+        let wtxn = db.write_txn().unwrap();
+        let summary =
+            cascade_forget_to_statements(&wtxn, memory_ids[7], 0.05, 100, NOW + 1, None).unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(summary.evidence_dropped, 1);
+
+        let after_row = statement_row(&db, stmt);
+        let after = after_row.confidence;
+        // 49 surviving entries still aggregate well above the floor.
+        assert!(after > 0.0);
+        // Confidence either stays equal or shrinks — never grows when an
+        // entry is removed.
+        assert!(after <= before + 1e-6);
+        assert!(after_row.evidence_overflow_id_bytes.is_some());
+
+        // Cross-check the overflow row holds 49 ids.
+        let oid = EvidenceOverflowId::from(after_row.evidence_overflow_id_bytes.unwrap());
+        let rtxn = db.read_txn().unwrap();
+        let back = read_evidence_ids(&rtxn, &EvidenceRef::Overflow(oid)).unwrap();
+        assert_eq!(back.len(), 49);
+    }
+
+    fn soft_undo() -> Option<UndoWriteCtx> {
+        Some(UndoWriteCtx {
+            grace_expiry_unix_nanos: NOW + 3_600_000_000_000,
+        })
+    }
+
+    #[test]
+    fn revert_re_adds_evidence_row_and_recomputes_confidence() {
+        // Two-evidence statement, soft-FORGET one → evidence dropped (row
+        // kept). Revert re-attaches it and recomputes confidence back up.
+        let (_dir, mut db) = open_db();
+        let subj = make_subject(&mut db, "ada-rev-drop");
+        let pred = intern_pred(&mut db, "knows_rev_drop");
+        let memory_ids = ids(2);
+        let ev = pack_ids_for_test(&mut db, memory_ids.clone());
+        let stmt = make_statement(&mut db, subj, pred, ev);
+
+        let wtxn = db.write_txn().unwrap();
+        let summary =
+            cascade_forget_to_statements(&wtxn, memory_ids[0], 0.2, 100, NOW + 1, soft_undo())
+                .unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(summary.evidence_dropped, 1);
+        assert!(!evidence_row_present(&db, memory_ids[0], stmt));
+        assert_eq!(statement_row(&db, stmt).evidence_inline.len(), 1);
+
+        let wtxn = db.write_txn().unwrap();
+        let rsummary = cascade_revert_forget(&wtxn, memory_ids[0], NOW + 2, 256).unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(rsummary.statements_reverted, 1);
+        assert_eq!(rsummary.statements_untombstoned, 0);
+
+        let row = statement_row(&db, stmt);
+        assert_eq!(row.evidence_inline.len(), 2);
+        assert!(!row.is_tombstoned());
+        assert!(evidence_row_present(&db, memory_ids[0], stmt));
+    }
+
+    #[test]
+    fn revert_guard_leaves_row_tombstoned_for_other_reason() {
+        // A row whose current tombstone reason is NOT SourceMemoryForgotten
+        // must never be un-tombstoned, even when an undo record with
+        // outcome=Tombstoned exists for it.
+        let (_dir, mut db) = open_db();
+        let subj = make_subject(&mut db, "ada-guard");
+        let pred = intern_pred(&mut db, "knows_guard");
+        let m = ids(1)[0];
+        let ev = pack_ids_for_test(&mut db, vec![m]);
+        let stmt = make_statement(&mut db, subj, pred, ev);
+
+        // Soft FORGET tombstones it with SourceMemoryForgotten + undo.
+        let wtxn = db.write_txn().unwrap();
+        cascade_forget_to_statements(&wtxn, m, 0.2, 100, NOW + 1, soft_undo()).unwrap();
+        wtxn.commit().unwrap();
+
+        // Rewrite the reason to UserRequest — simulating a row the operator
+        // deleted for a different reason after the FORGET.
+        {
+            let wtxn = db.write_txn().unwrap();
+            {
+                let mut t = wtxn.open_table(STATEMENTS_TABLE).unwrap();
+                let mut row = t.get(&stmt.to_bytes()).unwrap().unwrap().value();
+                row.tombstone_reason = stmt_tombstone_reason::USER_REQUEST;
+                t.insert(&stmt.to_bytes(), &row).unwrap();
+            }
+            wtxn.commit().unwrap();
+        }
+
+        let wtxn = db.write_txn().unwrap();
+        let rsummary = cascade_revert_forget(&wtxn, m, NOW + 2, 256).unwrap();
+        wtxn.commit().unwrap();
+        // Evidence restored, but the tombstone is respected.
+        assert_eq!(rsummary.statements_reverted, 1);
+        assert_eq!(rsummary.statements_untombstoned, 0);
+        let row = statement_row(&db, stmt);
+        assert!(row.is_tombstoned());
+        assert_eq!(row.tombstone_reason, stmt_tombstone_reason::USER_REQUEST);
+    }
+
+    #[test]
+    fn revert_partial_batch_then_replay_completes() {
+        // Crash-safety: a bounded batch reverts some rows and deletes their
+        // undo entries; a re-run resumes from the survivors and finishes.
+        let (_dir, mut db) = open_db();
+        let pred = intern_pred(&mut db, "knows_partial");
+        let m = ids(1)[0];
+        // Three statements, distinct subjects, all citing the same memory.
+        let s1 = {
+            let subj = make_subject(&mut db, "p-a");
+            let ev = pack_ids_for_test(&mut db, vec![m]);
+            make_statement(&mut db, subj, pred, ev)
+        };
+        let s2 = {
+            let subj = make_subject(&mut db, "p-b");
+            let ev = pack_ids_for_test(&mut db, vec![m]);
+            make_statement(&mut db, subj, pred, ev)
+        };
+        let s3 = {
+            let subj = make_subject(&mut db, "p-c");
+            let ev = pack_ids_for_test(&mut db, vec![m]);
+            make_statement(&mut db, subj, pred, ev)
+        };
+
+        let wtxn = db.write_txn().unwrap();
+        let fsummary =
+            cascade_forget_to_statements(&wtxn, m, 0.2, 100, NOW + 1, soft_undo()).unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(fsummary.tombstoned, 3);
+
+        // Revert only two per batch.
+        let wtxn = db.write_txn().unwrap();
+        let first = cascade_revert_forget(&wtxn, m, NOW + 2, 2).unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(first.scanned, 2);
+        assert_eq!(first.statements_untombstoned, 2);
+
+        // Replay drains the remaining one.
+        let wtxn = db.write_txn().unwrap();
+        let second = cascade_revert_forget(&wtxn, m, NOW + 3, 2).unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(second.scanned, 1);
+        assert_eq!(second.statements_untombstoned, 1);
+
+        // A third run is a structural no-op.
+        let wtxn = db.write_txn().unwrap();
+        let third = cascade_revert_forget(&wtxn, m, NOW + 4, 2).unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(third.scanned, 0);
+
+        for s in [s1, s2, s3] {
+            assert!(!statement_row(&db, s).is_tombstoned());
+        }
     }
 }

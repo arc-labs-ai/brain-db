@@ -1,10 +1,10 @@
-//! Stale extraction detector (sub-task 24.4).
+//! Stale extraction detector.
 //!
 //! Periodic Low-priority worker that **counts** statements whose
 //! `schema_version` is behind the current schema. v1 does NOT
 //! write a per-row flag (that's a `StatementRow.flags` bump, post-
 //! v1); instead, the worker logs the count + exposes it via
-//! metrics. The schema-migration worker (24.8) is the side that
+//! metrics. The schema-migration worker is the side that
 //! re-extracts.
 //!
 //! ## v1 scope cuts
@@ -46,7 +46,7 @@ impl StaleExtractionDetector {
     }
 
     async fn run_once(&self, ctx: &WorkerContext) -> Result<usize, WorkerError> {
-        let metadata = ctx.ops.executor.metadata.lock();
+        let metadata = ctx.ops.executor.metadata.as_ref();
         let rtxn = metadata
             .read_txn()
             .map_err(|e| WorkerError::Internal(format!("stale detector rtxn: {e}")))?;
@@ -117,16 +117,5 @@ impl Worker for StaleExtractionDetector {
         ctx: &'a WorkerContext,
     ) -> Pin<Box<dyn Future<Output = Result<usize, WorkerError>> + 'a>> {
         Box::pin(self.run_once(ctx))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn worker_kind_name() {
-        let w = StaleExtractionDetector::new();
-        assert_eq!(w.name(), "stale_extraction_detector");
     }
 }

@@ -6,7 +6,6 @@
 //!
 //! - [`access_buffer`] — RECALL → boost-worker hand-off buffer.
 //! - [`idempotency`] — request-hash helpers for the unified write path.
-//! - [`schema_gate`] — per-shard "schema declared" ArcSwap gate.
 //! - [`txn_lens`] — `ExecutorContext` lens that layers an active txn's
 //!   buffered writes on committed state.
 //!
@@ -17,5 +16,4 @@
 pub mod access_buffer;
 pub mod ack_codec;
 pub mod idempotency;
-pub mod schema_gate;
 pub mod txn_lens;

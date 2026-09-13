@@ -1,7 +1,6 @@
-//! Audit-ops perf bench (sub-task 20.10).
+//! Audit-ops perf bench.
 //!
-//! Spec targets per `spec/20_benchmarks/02_latency_targets.md`
-//! §2.7 at a single dispatch over a 4 KiB memory:
+//! Latency targets at a single dispatch over a 4 KiB memory:
 //!
 //! - Audit-row write (primary + 3 indexes, single wtxn): p50 200 µs, p99 1 ms.
 //! - `audit_by_memory` (limit 100): p50 500 µs, p99 2 ms.
@@ -41,7 +40,7 @@ fn success_row(memory: MemoryId, extractor_id: u32, started_at: u64) -> Extracti
 
 fn build_seeded_fixture() -> (TempDir, MetadataDb, MemoryId, u32) {
     let dir = TempDir::new().expect("tmp");
-    let mut db = open_db(&dir);
+    let db = open_db(&dir);
     let target_memory = MemoryId::pack(1, 0, 42);
     let target_extractor: u32 = 1;
     let wtxn = db.write_txn().expect("wtxn");
@@ -71,7 +70,7 @@ fn bench_audit_write(c: &mut Criterion) {
                 let db = open_db(&dir);
                 (dir, db)
             },
-            |(dir, mut db)| {
+            |(dir, db)| {
                 let row = success_row(MemoryId::pack(1, 0, 0), 1, 1_000);
                 let wtxn = db.write_txn().expect("wtxn");
                 audit_write(&wtxn, &row).expect("write");

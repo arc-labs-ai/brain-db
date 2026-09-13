@@ -23,19 +23,85 @@ pub struct Config {
     pub shard: ShardConfig,
     pub hnsw: HnswConfig,
     pub embedder: EmbedderConfig,
+    /// Cross-encoder rerank capability. Defaults to enabled; when the
+    /// operator turns it off, opt-in rerank requests hard-fail with
+    /// `CapabilityNotEnabled` instead of silently falling back to RRF.
+    #[serde(default)]
+    pub rerank: RerankConfig,
+    /// Extractor-pipeline tuning. Extraction itself is always-on and
+    /// non-configurable — the three tiers (pattern, classifier, LLM)
+    /// populate the typed graph that reads fuse, so there is no per-tier
+    /// on/off gate. This section only carries per-tier tuning (classifier
+    /// model path / threshold, resolver threshold, HyPE question count).
+    #[serde(default)]
+    pub extractors: ExtractorsConfig,
     #[serde(default)]
     pub workers: WorkersConfig,
+    /// Index-pipeline tuning (tantivy commit cadence). Section may be
+    /// omitted; every field defaults.
     #[serde(default)]
-    pub logging: LoggingConfig,
+    pub index: IndexConfig,
     #[serde(default)]
-    pub tracing: TracingConfig,
+    pub retrieval: RetrievalConfig,
+    /// Deploy-time precision-decision tuning (calibrated selective shaping of
+    /// the RECALL answer). Every field defaults to a no-op, so the section may
+    /// be omitted and an uncalibrated deploy behaves as before.
     #[serde(default)]
-    pub auth: AuthConfig,
-    /// Sub-task 9.15. Defaulted so existing `dev.toml` files keep
+    pub precision: PrecisionConfig,
+    #[serde(default)]
+    pub monitoring: MonitoringConfig,
+    /// Operator admin-plane config. The admin HTTP listener (key mint /
+    /// revoke / stats) is gated on `token`; without it the listener refuses
+    /// to start (fail-closed).
+    #[serde(default)]
+    pub admin: AdminConfig,
+    /// Defaulted so existing `dev.toml` files keep
     /// working (consolidation remains disabled until an LLM backend
     /// is wired).
     #[serde(default)]
     pub summarizer: SummarizerConfig,
+    /// Single provider credential + model id for every LLM consumer
+    /// (write-time HyPE, the extractor's LLM tier, the entity
+    /// disambiguator, the summarizer). Section may be omitted; the
+    /// generic env override `BRAIN__LLM__API_KEY` / `BRAIN__LLM__MODEL`
+    /// folds into these fields before validation, so a deployment's
+    /// env-provided secret wins over a committed config.
+    #[serde(default)]
+    pub llm: LlmConfig,
+}
+
+/// `[llm]` TOML section. The single credential + model for every LLM
+/// consumer in the server. Provider-agnostic by design: one key and one
+/// model id. The provider (OpenAI / Anthropic) is derived from the model
+/// id prefix, so adding a provider is a routing-table entry, not a new
+/// config key. Both fields are optional; the generic env override
+/// (`BRAIN__LLM__API_KEY` / `BRAIN__LLM__MODEL`) wins when present.
+/// Prefer the environment for production secrets — values committed to
+/// TOML leak into version control.
+#[derive(Clone, Default, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LlmConfig {
+    /// API key for the configured model's provider. Override with
+    /// `BRAIN__LLM__API_KEY`.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Model id (e.g. `gpt-4o-mini`, `claude-haiku-4-5`). The provider
+    /// is derived from this id. Override with `BRAIN__LLM__MODEL`;
+    /// falls back to the built-in default when unset.
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+// Redact the provider key from `Debug` output. A future `debug!(?cfg)` must
+// never leak the LLM credential; the model id is safe to show. `Serialize`
+// (GET /v1/config) redacts separately and is left untouched.
+impl std::fmt::Debug for LlmConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LlmConfig")
+            .field("api_key", &self.api_key.as_ref().map(|_| "[redacted]"))
+            .field("model", &self.model)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -112,7 +178,7 @@ impl EmbedderConfig {
         self.resolve_model_dir_with(&|k| std::env::var(k).ok())
     }
 
-    /// Same as [`resolve_model_dir`] but reads env via the supplied
+    /// Same as [`Self::resolve_model_dir`] but reads env via the supplied
     /// closure so tests can drive the cascade without touching the
     /// global process environment.
     pub fn resolve_model_dir_with<F>(&self, env: &F) -> Result<PathBuf, ConfigError>
@@ -150,6 +216,129 @@ impl EmbedderConfig {
     }
 }
 
+/// `[rerank]` TOML section. Controls the per-shard cross-encoder
+/// reranker. Section may be omitted; every field has a default.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RerankConfig {
+    /// Master switch. `false` (default) skips loading the cross-encoder
+    /// entirely. Rerank only reorders already-retrieved candidates; it
+    /// cannot surface a memory the retrieval+grounding stages missed, so
+    /// the real correctness work happens before it and the deploy pays
+    /// neither its load cost nor its per-read latency by default. Set
+    /// `true` to load it; enabled-but-failed-to-load is a spawn failure
+    /// (no silently-degraded reranker).
+    #[serde(default = "default_rerank_enabled")]
+    pub enabled: bool,
+}
+
+impl Default for RerankConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_rerank_enabled(),
+        }
+    }
+}
+
+fn default_rerank_enabled() -> bool {
+    false
+}
+
+/// `[extractors]` TOML section. Per-tier tuning for the extractor
+/// pipeline. Extraction is always-on and non-configurable — there is no
+/// per-tier on/off gate; the pattern / classifier / LLM tiers always run.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ExtractorsConfig {
+    #[serde(default)]
+    pub classifier: ClassifierExtractorConfig,
+    /// Entity-resolution embedding tier tuning.
+    #[serde(default)]
+    pub resolver: ResolverExtractorConfig,
+    /// Write-time HyPE (hypothetical-question) generation tuning.
+    #[serde(default)]
+    pub hype: HypeExtractorConfig,
+}
+
+/// `[extractors.classifier]` TOML sub-section. The classifier tier's
+/// tuning: an explicit NER model override and confidence threshold. The
+/// tier is always-on (no gate); the model path defaults to XDG
+/// auto-discovery at shard spawn — the field is an explicit override only.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ClassifierExtractorConfig {
+    /// Explicit NER model directory. `None` (default) falls back to the
+    /// XDG-cascade auto-discovery the bootstrap script writes to.
+    #[serde(default)]
+    pub model_path: Option<String>,
+    /// Post-sigmoid acceptance threshold. Defaults to 0.5; tune up for
+    /// noisy domains, down for short / unusual surface forms.
+    #[serde(default = "default_classifier_threshold")]
+    pub threshold: f32,
+}
+
+impl Default for ClassifierExtractorConfig {
+    fn default() -> Self {
+        Self {
+            model_path: None,
+            threshold: default_classifier_threshold(),
+        }
+    }
+}
+
+fn default_classifier_threshold() -> f32 {
+    brain_extractors::classifier::DEFAULT_GLINER_THRESHOLD
+}
+
+/// `[extractors.resolver]` TOML sub-section. Entity-resolution
+/// embedding-tier tuning.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ResolverExtractorConfig {
+    /// Cosine floor for tier-3 embedding lookups. A surface form whose
+    /// top embedding-HNSW neighbour scores at or above this is accepted
+    /// as an alias. Defaults to 0.78.
+    #[serde(default = "default_resolver_embed_threshold")]
+    pub embed_threshold: f32,
+}
+
+impl Default for ResolverExtractorConfig {
+    fn default() -> Self {
+        Self {
+            embed_threshold: default_resolver_embed_threshold(),
+        }
+    }
+}
+
+fn default_resolver_embed_threshold() -> f32 {
+    brain_extractors::resolver::EMBED_RESOLVE_THRESHOLD
+}
+
+/// `[extractors.hype]` TOML sub-section. Write-time hypothetical-
+/// question generation tuning. HyPE is **mandatory and always-on** —
+/// there is no flag to disable it, and the LLM it depends on is a hard
+/// startup requirement (see `Config::validate_llm_provider`). The only
+/// tunable is the question count.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HypeExtractorConfig {
+    /// Hypothetical questions generated per memory. Defaults to 6.
+    #[serde(default = "default_hype_num_questions")]
+    pub num_questions: usize,
+}
+
+impl Default for HypeExtractorConfig {
+    fn default() -> Self {
+        Self {
+            num_questions: default_hype_num_questions(),
+        }
+    }
+}
+
+fn default_hype_num_questions() -> usize {
+    6
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkersConfig {
@@ -164,33 +353,325 @@ pub struct WorkersConfig {
     pub statistics_update_interval_sec: Option<u64>,
     pub embedder_cache_eviction_interval_sec: Option<u64>,
     pub snapshot_interval_sec: Option<u64>,
-    /// Phase B: substrate auto-derived `SimilarTo` edges. Defaults
+    /// Substrate auto-derived `SimilarTo` edges. Defaults
     /// kick in when the section is omitted from TOML.
     #[serde(default)]
     pub auto_edge: AutoEdgeWorkerConfig,
-    /// Phase E: per-shard extractor pipeline worker. Drains the
+    /// Per-shard extractor pipeline worker. Drains the
     /// writer's post-encode channel and runs the three-tier
     /// extractor framework (pattern + classifier + LLM) before
     /// writing entities / statements / relations / mention edges.
     /// Section may be omitted; every field has a default.
     #[serde(default)]
     pub extractor: ExtractorWorkerConfig,
-    /// Phase T: substrate auto-derived `FollowedBy` edges keyed on
-    /// per-agent temporal adjacency. Defaults kick in when the
+    /// Substrate auto-derived `FollowedBy` edges keyed on
+    /// per-space temporal adjacency. Defaults kick in when the
     /// section is omitted from TOML.
     #[serde(default)]
     pub temporal_edge: TemporalEdgeWorkerConfig,
-    /// Phase C: substrate auto-derived `Caused` edges, sourced from
+    /// Substrate auto-derived `Caused` edges, sourced from
     /// extractor-asserted causal statements (`brain:caused_by` etc).
     /// No-schema deployments resolve an empty whitelist and the
     /// worker no-ops; setting `enabled = false` skips registration
     /// entirely.
     #[serde(default)]
     pub causal_edge: CausalEdgeWorkerConfig,
+    /// Physical reclamation of retracted statement rows after the
+    /// retract grace window. Off by default. Section may be omitted.
+    #[serde(default)]
+    pub statement_reclaim: StatementReclaimWorkerConfig,
+    /// Entity merge-review-queue sweeper cadence. Section may be
+    /// omitted; the field defaults.
+    #[serde(default)]
+    pub ambiguity_resolver: AmbiguityResolverWorkerConfig,
+    /// Statement confidence-refresh sweep cadence. Section may be
+    /// omitted; the field defaults.
+    #[serde(default)]
+    pub confidence_sweep: ConfidenceSweepWorkerConfig,
+    /// LLM extractor response-cache TTL sweep cadence. Section may be
+    /// omitted; the field defaults.
+    #[serde(default)]
+    pub llm_cache_sweep: LlmCacheSweepWorkerConfig,
+    /// Physical reclamation of superseded statement rows after a
+    /// retention window. Off by default (retention 0); superseded rows
+    /// stay in redb (invisible to retrieval) until an operator opts in.
+    /// Section may be omitted.
+    #[serde(default)]
+    pub supersession_sweeper: SupersessionSweeperWorkerConfig,
+}
+
+/// `[workers.supersession_sweeper]` TOML section. Controls physical
+/// reclamation of superseded statement rows. Off by default — a
+/// superseded row is filtered from every read regardless, so retention
+/// is purely a disk-reclamation knob the operator opts into.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SupersessionSweeperWorkerConfig {
+    /// Master switch. `false` (default) registers the worker as a no-op;
+    /// `true` physically deletes superseded rows past the retention
+    /// window each cycle. A superseded row is filtered from every read
+    /// regardless, so this is purely a disk-reclamation opt-in.
+    #[serde(default = "default_supersession_enabled")]
+    pub enabled: bool,
+    /// Retention window in seconds. A superseded row is eligible for
+    /// physical delete once this long has elapsed since it was
+    /// superseded. (Tuning only — gating is `enabled`.)
+    #[serde(default = "default_supersession_retention_seconds")]
+    pub retention_seconds: u64,
+    /// Sweep cadence in seconds. Defaults to 1 day.
+    #[serde(default = "default_supersession_period_seconds")]
+    pub period_seconds: u64,
+    /// When `true`, the sweeper logs what it would delete without
+    /// deleting. Useful for validating a retention window before
+    /// arming it.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+impl Default for SupersessionSweeperWorkerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_supersession_enabled(),
+            retention_seconds: default_supersession_retention_seconds(),
+            period_seconds: default_supersession_period_seconds(),
+            dry_run: false,
+        }
+    }
+}
+
+fn default_supersession_enabled() -> bool {
+    false
+}
+fn default_supersession_retention_seconds() -> u64 {
+    0
+}
+fn default_supersession_period_seconds() -> u64 {
+    brain_workers::workers::supersession_sweeper::DEFAULT_PERIOD_SECONDS
+}
+
+/// `[workers.statement_reclaim]` TOML section. Controls the retracted-
+/// statement GC worker. Off by default — retracted rows stay in redb
+/// (invisible to retrieval) until an operator opts in.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct StatementReclaimWorkerConfig {
+    /// Master switch. `false` (default) registers the worker as a
+    /// no-op; `true` physically deletes retracted rows past the grace
+    /// window each cycle.
+    #[serde(default = "default_statement_reclaim_enabled")]
+    pub enabled: bool,
+    /// Retract grace window in seconds. A retracted row is eligible for
+    /// physical delete only once this long has elapsed since the
+    /// retract. Defaults to 30 days, matching the retract handler's
+    /// `will_zero_at` promise.
+    #[serde(default = "default_statement_reclaim_grace_seconds")]
+    pub grace_seconds: u64,
+    /// Sweep cadence in seconds. Defaults to 1 day.
+    #[serde(default = "default_statement_reclaim_period_seconds")]
+    pub period_seconds: u64,
+}
+
+impl Default for StatementReclaimWorkerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_statement_reclaim_enabled(),
+            grace_seconds: default_statement_reclaim_grace_seconds(),
+            period_seconds: default_statement_reclaim_period_seconds(),
+        }
+    }
+}
+
+fn default_statement_reclaim_enabled() -> bool {
+    false
+}
+fn default_statement_reclaim_grace_seconds() -> u64 {
+    brain_workers::workers::statement_reclaim::DEFAULT_GRACE_SECONDS
+}
+fn default_statement_reclaim_period_seconds() -> u64 {
+    brain_workers::workers::statement_reclaim::DEFAULT_PERIOD_SECONDS
+}
+
+/// `[workers.ambiguity_resolver]` TOML section. Controls the entity
+/// merge-review-queue sweeper cadence.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AmbiguityResolverWorkerConfig {
+    /// Master switch. `true` (default) registers the worker; `false`
+    /// skips registration. Low-cost metadata maintenance — on by default.
+    #[serde(default = "default_worker_enabled_true")]
+    pub enabled: bool,
+    /// Sweep interval in seconds. Slow on purpose: a proposal's
+    /// confidence shifts as the HNSW absorbs new aliases, on the order
+    /// of hours. Defaults to 1 hour.
+    #[serde(default = "default_ambiguity_resolver_interval_secs")]
+    pub interval_secs: u64,
+}
+
+impl Default for AmbiguityResolverWorkerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_worker_enabled_true(),
+            interval_secs: default_ambiguity_resolver_interval_secs(),
+        }
+    }
+}
+
+fn default_ambiguity_resolver_interval_secs() -> u64 {
+    brain_workers::workers::ambiguity_resolver::DEFAULT_INTERVAL_SECS
+}
+
+/// `[workers.confidence_sweep]` TOML section. Controls the Statement
+/// confidence-refresh sweep cadence.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ConfidenceSweepWorkerConfig {
+    /// Master switch. `true` (default) registers the worker; `false`
+    /// skips registration. Low-cost metadata maintenance — on by default.
+    #[serde(default = "default_worker_enabled_true")]
+    pub enabled: bool,
+    /// Sweep interval in seconds. Defaults to 1 hour.
+    #[serde(default = "default_confidence_sweep_interval_secs")]
+    pub interval_secs: u64,
+}
+
+impl Default for ConfidenceSweepWorkerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_worker_enabled_true(),
+            interval_secs: default_confidence_sweep_interval_secs(),
+        }
+    }
+}
+
+fn default_confidence_sweep_interval_secs() -> u64 {
+    brain_workers::workers::confidence_sweep::DEFAULT_INTERVAL_SECS
+}
+
+/// Shared default for low-cost maintenance workers that are on unless an
+/// operator explicitly opts out.
+fn default_worker_enabled_true() -> bool {
+    true
+}
+
+/// `[workers.llm_cache_sweep]` TOML section. Controls the LLM
+/// extractor response-cache TTL sweep cadence.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LlmCacheSweepWorkerConfig {
+    /// Master switch. `true` (default) registers the worker; `false`
+    /// skips registration. Low-cost metadata maintenance — on by default.
+    #[serde(default = "default_worker_enabled_true")]
+    pub enabled: bool,
+    /// Sweep interval in seconds. Defaults to 1 hour.
+    #[serde(default = "default_llm_cache_sweep_interval_secs")]
+    pub interval_secs: u64,
+}
+
+impl Default for LlmCacheSweepWorkerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_worker_enabled_true(),
+            interval_secs: default_llm_cache_sweep_interval_secs(),
+        }
+    }
+}
+
+fn default_llm_cache_sweep_interval_secs() -> u64 {
+    brain_workers::workers::llm_cache_sweeper::DEFAULT_INTERVAL_SECS
+}
+
+/// `[index]` TOML section. Index-pipeline tuning. Currently the tantivy
+/// text-indexer group-commit cadence. Section may be omitted; every
+/// field defaults.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct IndexConfig {
+    /// Group-commit the tantivy writer after this many queued writes,
+    /// whichever comes first with `tantivy_commit_ms`. Defaults to 256.
+    #[serde(default = "default_tantivy_commit_n")]
+    pub tantivy_commit_n: usize,
+    /// Group-commit the tantivy writer after this many milliseconds,
+    /// whichever comes first with `tantivy_commit_n`. Defaults to 1000.
+    #[serde(default = "default_tantivy_commit_ms")]
+    pub tantivy_commit_ms: u64,
+}
+
+impl Default for IndexConfig {
+    fn default() -> Self {
+        Self {
+            tantivy_commit_n: default_tantivy_commit_n(),
+            tantivy_commit_ms: default_tantivy_commit_ms(),
+        }
+    }
+}
+
+fn default_tantivy_commit_n() -> usize {
+    brain_ops::index::text_indexer::DEFAULT_COMMIT_N
+}
+fn default_tantivy_commit_ms() -> u64 {
+    brain_ops::index::text_indexer::DEFAULT_COMMIT_MS
+}
+
+/// `[retrieval]` TOML section. Deploy-time read-path tuning that was
+/// previously read via bespoke `BRAIN_*` env vars deep in the planner /
+/// retriever / RECALL handler. Every field defaults to the historical
+/// env-unset behaviour, so the section may be omitted entirely. The generic
+/// `BRAIN__RETRIEVAL__FIELD` override applies like any other section.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RetrievalConfig {
+    /// Rank-fusion strategy: `"rrf"` (default), `"relative"`, or `"zscore"`.
+    #[serde(default = "default_fusion_method")]
+    pub fusion_method: String,
+    /// HyPE joins the semantic lane as its own RRF rank list rather than a
+    /// non-displacing append. Default false.
+    #[serde(default)]
+    pub hype_rrf: bool,
+    /// Scale the memory probe's `ef_search` by index occupancy. Default false.
+    #[serde(default)]
+    pub ef_occupancy_scaling: bool,
+    /// Relative-drop autocut of the ranked result tail. Default false.
+    #[serde(default)]
+    pub autocut: bool,
+}
+
+impl Default for RetrievalConfig {
+    fn default() -> Self {
+        Self {
+            fusion_method: default_fusion_method(),
+            hype_rrf: false,
+            ef_occupancy_scaling: false,
+            autocut: false,
+        }
+    }
+}
+
+fn default_fusion_method() -> String {
+    "rrf".to_string()
+}
+
+/// `[precision]` TOML section. Deploy-time tuning for the read path's calibrated
+/// precision decision (RECALL membership → answer shape / abstention). Both
+/// fields default to `0`, a no-op that reproduces the pre-precision behaviour, so
+/// the section may be omitted. The generic `BRAIN__PRECISION__FIELD` override
+/// applies like any other section. See `spec/13_retrievers/07_precision_engine.md`.
+/// The derived `Default` is all-zero — the no-op that reproduces the
+/// pre-precision behaviour, so the whole section may be omitted.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct PrecisionConfig {
+    /// Minimum cross-lane `support` (0..=5) the uncommitted lead must carry to
+    /// commit rather than abstain with `None`. `0` never abstains on this signal.
+    #[serde(default)]
+    pub commit_min_support: u8,
+    /// Minimum `support` a member needs to join a `Many` answer's committed set
+    /// (vs. retained context). `0` keeps every band member (no trim).
+    #[serde(default)]
+    pub many_min_support: u8,
 }
 
 /// `[workers.auto_edge]` TOML section. Controls the substrate
-/// SimilarTo derivation worker (Phase B). Every field defaults so an
+/// SimilarTo derivation worker. Every field defaults so an
 /// existing `dev.toml` keeps working without edits.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -249,13 +730,11 @@ fn default_auto_edge_batch_size() -> usize {
     256
 }
 fn default_auto_edge_similarity_threshold() -> f32 {
-    // Reads `BRAIN_AUTO_EDGE_THRESHOLD` at startup so operators can
-    // tune the cosine-similarity floor without re-rolling the config.
-    // The crate default is 0.75 (topical-cluster floor), tunable up
-    // to 0.85+ for strict deduping.
-    brain_workers::resolved_auto_edge_threshold(
-        brain_workers::DEFAULT_AUTO_EDGE_SIMILARITY_THRESHOLD,
-    )
+    // 0.85 is the near-duplicate floor; a looser value manufactures
+    // false SimilarTo edges and hub clutter. Operators override via
+    // `BRAIN__WORKERS__AUTO_EDGE__SIMILARITY_THRESHOLD` (the generic
+    // env-override path) or directly in TOML.
+    brain_workers::DEFAULT_AUTO_EDGE_SIMILARITY_THRESHOLD
 }
 fn default_auto_edge_top_k() -> usize {
     5
@@ -268,7 +747,7 @@ fn default_auto_edge_channel_capacity() -> usize {
 }
 
 /// `[workers.temporal_edge]` TOML section. Controls the substrate
-/// `FollowedBy` derivation worker (sub-task T). Every field defaults
+/// `FollowedBy` derivation worker. Every field defaults
 /// so an existing `dev.toml` keeps working without edits.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -294,15 +773,14 @@ pub struct TemporalEdgeWorkerConfig {
     /// Writer → worker queue depth.
     #[serde(default = "default_temporal_edge_channel_capacity")]
     pub channel_capacity: usize,
-    /// Allow `FollowedBy` edges across context boundaries.
-    #[serde(default = "default_temporal_edge_cross_context")]
-    pub cross_context: bool,
+    /// Allow `FollowedBy` edges across session boundaries.
+    #[serde(default = "default_temporal_edge_cross_session")]
+    pub cross_session: bool,
     /// Cosine similarity floor for the topical gate. Below this, the
     /// candidate predecessor is dropped — preserves narrative threads
     /// without writing spurious "followed by" edges between
     /// topically-unrelated memories ("I had lunch" → "deployed to
-    /// prod"). The default reads `BRAIN_TEMPORAL_EDGE_TOPICAL_THRESHOLD`
-    /// at startup so operators can tune without re-rolling configs.
+    /// prod").
     #[serde(default = "default_temporal_edge_topical_threshold")]
     pub topical_threshold: f32,
 }
@@ -316,7 +794,7 @@ impl Default for TemporalEdgeWorkerConfig {
             window_seconds: default_temporal_edge_window_seconds(),
             weight_min: default_temporal_edge_weight_min(),
             channel_capacity: default_temporal_edge_channel_capacity(),
-            cross_context: default_temporal_edge_cross_context(),
+            cross_session: default_temporal_edge_cross_session(),
             topical_threshold: default_temporal_edge_topical_threshold(),
         }
     }
@@ -332,7 +810,10 @@ fn default_temporal_edge_batch_size() -> usize {
     256
 }
 fn default_temporal_edge_window_seconds() -> u64 {
-    300
+    // 30 minutes. A short 5-minute window split a single conversational
+    // session into disconnected fragments, so consecutive turns never
+    // linked; 30 minutes keeps one session's turns chained.
+    1800
 }
 fn default_temporal_edge_weight_min() -> f32 {
     0.1
@@ -340,13 +821,11 @@ fn default_temporal_edge_weight_min() -> f32 {
 fn default_temporal_edge_channel_capacity() -> usize {
     1024
 }
-fn default_temporal_edge_cross_context() -> bool {
+fn default_temporal_edge_cross_session() -> bool {
     false
 }
 fn default_temporal_edge_topical_threshold() -> f32 {
-    brain_workers::resolved_topical_threshold(
-        brain_workers::DEFAULT_TEMPORAL_EDGE_TOPICAL_THRESHOLD,
-    )
+    brain_workers::DEFAULT_TEMPORAL_EDGE_TOPICAL_THRESHOLD
 }
 
 /// `[workers.causal_edge]` TOML section. Controls extractor-driven
@@ -440,15 +919,14 @@ fn default_causal_edge_channel_capacity() -> usize {
     1024
 }
 
-/// `[workers.extractor]` TOML section. Defaults registered every
-/// shard. Omit the section to accept defaults; set `enabled = false`
-/// to skip worker registration entirely for no-schema deployments.
+/// `[workers.extractor]` TOML section — TUNING for the extraction-pipeline
+/// worker. The worker is NOT enabled/disabled here: extraction is always-on
+/// and non-configurable, so the worker is always provisioned. This section
+/// only carries per-worker tuning (interval, drain-per-cycle, budget, queue
+/// depth).
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ExtractorWorkerConfig {
-    /// Master switch. `false` skips registration entirely.
-    #[serde(default = "default_extractor_enabled")]
-    pub enabled: bool,
     /// Scheduler tick in milliseconds.
     #[serde(default = "default_extractor_interval_ms")]
     pub interval_ms: u64,
@@ -470,9 +948,7 @@ pub struct ExtractorWorkerConfig {
     /// Memories the extractor worker bundles into one classifier
     /// forward pass per cycle iteration. The GLiNER backbone GEMM
     /// dominates per-encode latency; batching 8 memories pulls
-    /// per-memory cost down by ~4-5x on a CPU host. Operators can
-    /// override via `BRAIN_EXTRACTOR_BATCH_SIZE` for tail-latency
-    /// tuning.
+    /// per-memory cost down by ~4-5x on a CPU host.
     #[serde(default = "default_extractor_batch_size")]
     pub batch_size: usize,
 }
@@ -480,7 +956,6 @@ pub struct ExtractorWorkerConfig {
 impl Default for ExtractorWorkerConfig {
     fn default() -> Self {
         Self {
-            enabled: default_extractor_enabled(),
             interval_ms: default_extractor_interval_ms(),
             drain_per_cycle: default_extractor_drain_per_cycle(),
             llm_budget_per_cycle_micro_usd: default_extractor_llm_budget_micro_usd(),
@@ -491,9 +966,6 @@ impl Default for ExtractorWorkerConfig {
     }
 }
 
-fn default_extractor_enabled() -> bool {
-    true
-}
 fn default_extractor_interval_ms() -> u64 {
     1000
 }
@@ -511,6 +983,18 @@ fn default_extractor_skip_audited() -> bool {
 }
 fn default_extractor_batch_size() -> usize {
     brain_workers::DEFAULT_EXTRACTOR_BATCH_SIZE
+}
+
+/// `[monitoring]` TOML section. Groups logging and distributed-tracing
+/// configuration. All sub-sections default so existing configs that
+/// omit the block entirely still load.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct MonitoringConfig {
+    #[serde(default)]
+    pub logging: LoggingConfig,
+    #[serde(default)]
+    pub tracing: TracingConfig,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -561,29 +1045,44 @@ fn default_service_name() -> String {
     "brain-server".to_string()
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+/// `[admin]` TOML section. Gates the operator admin HTTP plane (key
+/// mint / revoke / stats). Data-plane auth is always mandatory and is not
+/// configurable here — identity is the API key. Override the token with
+/// `BRAIN__ADMIN__TOKEN`; prefer the environment for production secrets.
+#[derive(Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct AuthConfig {
-    pub mode: AuthMode,
+pub struct AdminConfig {
+    /// Operator admin secret. Every admin HTTP request must present it as
+    /// `Authorization: Bearer <token>`. When unset the admin listener
+    /// refuses to start (fail-closed) — there is no unauthenticated mint
+    /// channel.
+    #[serde(default)]
+    pub token: Option<String>,
 }
 
-impl Default for AuthConfig {
-    fn default() -> Self {
-        Self {
-            mode: AuthMode::None,
-        }
+impl AdminConfig {
+    /// Whether a usable admin secret is configured. A token that is unset
+    /// or whitespace-only is treated as absent: the admin listener mints
+    /// data-plane API keys, so a blank secret is no secret at all. The
+    /// boot gate in `main.rs` fails closed on `!has_token()`.
+    pub fn has_token(&self) -> bool {
+        self.token.as_deref().is_some_and(|t| !t.trim().is_empty())
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum AuthMode {
-    None,
-    ApiKey,
+// Redact the admin secret from `Debug` output. A future `debug!(?cfg)` must
+// never leak the operator token; `Serialize` (GET /v1/config) redacts
+// separately and is left untouched.
+impl std::fmt::Debug for AdminConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdminConfig")
+            .field("token", &self.token.as_ref().map(|_| "[redacted]"))
+            .finish()
+    }
 }
 
 // ----------------------------------------------------------------------------
-// Summarizer (sub-task 9.15)
+// Summarizer
 // ----------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -613,13 +1112,12 @@ pub struct SummarizerConfig {
     #[serde(default = "default_max_summary_chars")]
     pub max_summary_chars: u32,
 
-    // OpenAI-specific knobs. Read only when `backend == Openai`.
+    // OpenAI-specific knobs. Read only when `backend == Openai`. The
+    // credential is NOT here — the summarizer shares the single
+    // `[llm] api_key` (override `BRAIN__LLM__API_KEY`) like every other
+    // LLM consumer.
     #[serde(default = "default_openai_api_base")]
     pub openai_api_base: String,
-    /// Name of the env var holding the API key. We never store the
-    /// key itself in TOML — operators set the env var.
-    #[serde(default)]
-    pub openai_api_key_env: Option<String>,
     #[serde(default = "default_openai_model")]
     pub openai_model: String,
     #[serde(default = "default_temperature")]
@@ -639,7 +1137,6 @@ impl Default for SummarizerConfig {
             request_timeout_sec: default_request_timeout_sec(),
             max_summary_chars: default_max_summary_chars(),
             openai_api_base: default_openai_api_base(),
-            openai_api_key_env: None,
             openai_model: default_openai_model(),
             openai_temperature: default_temperature(),
             ollama_base: default_ollama_base(),
@@ -717,6 +1214,16 @@ pub enum ConfigError {
 // human_bytes
 // ----------------------------------------------------------------------------
 
+/// Reject a zero value for a cadence / capacity / timeout field with a clear,
+/// field-named boot error. A zero interval busy-spins a shard core, a zero
+/// channel capacity drops all work, and a zero timeout hangs on retries.
+fn require_nonzero(name: &str, v: u64) -> Result<(), ConfigError> {
+    if v == 0 {
+        return Err(ConfigError::Invariant(format!("{name} must be >= 1")));
+    }
+    Ok(())
+}
+
 fn deserialize_human_bytes<'de, D>(d: D) -> Result<u64, D::Error>
 where
     D: Deserializer<'de>,
@@ -765,6 +1272,12 @@ pub fn parse_human_bytes(s: &str) -> Result<u64, ConfigError> {
 /// re-typed (bool / integer / float / string) so the subsequent `serde`
 /// deserialize sees a value of the expected primitive type.
 fn apply_env_overrides(value: &mut toml::Value, env: &HashMap<String, String>) {
+    // Type oracle: a fully-typed reference tree of the target `Config`, used
+    // to decide whether an env leaf is a genuine numeric/bool field (coerce)
+    // or a string field — secrets, model ids, paths — that must stay a string
+    // even when its value looks numeric or boolean (e.g. a pure-digit API
+    // key, or an admin token of "48291057").
+    let reference = coercion_reference();
     for (key, val) in env {
         let Some(suffix) = key.strip_prefix("BRAIN__") else {
             continue;
@@ -773,14 +1286,57 @@ fn apply_env_overrides(value: &mut toml::Value, env: &HashMap<String, String>) {
         if path.is_empty() || path.iter().any(String::is_empty) {
             continue;
         }
-        set_path(value, &path, val);
+        set_path(value, &path, val, &reference);
     }
 }
 
+/// A fully-typed reference `toml::Value` for the target [`Config`]. Every
+/// string-typed leaf (including `Option<String>` / `Option<PathBuf>` fields
+/// that default to `None`, and `SocketAddr` / byte-size fields serialized as
+/// strings) is populated so [`reference_leaf_is_string`] can distinguish a
+/// string target from a numeric/bool one. Absent leaves (genuinely numeric
+/// `Option<u64>` worker cadences, or fields added in the future) fall through
+/// to the numeric heuristic, which is the correct default for them.
+fn coercion_reference() -> toml::Value {
+    let mut cfg = Config::for_tests();
+    // Populate the `None`-by-default string-typed options so their `String`
+    // type is visible in the serialized oracle.
+    cfg.llm.api_key = Some(String::new());
+    cfg.llm.model = Some(String::new());
+    cfg.extractors.classifier.model_path = Some(String::new());
+    cfg.server.tls.cert = Some(PathBuf::from("x"));
+    cfg.server.tls.key = Some(PathBuf::from("x"));
+    // admin.token is already `Some(..)` in `for_tests`.
+    toml::Value::try_from(cfg).expect("invariant: Config serializes to TOML")
+}
+
+/// Whether the reference tree marks the leaf at `path` as a `String`.
+/// A missing leaf returns `false` so the caller applies the numeric
+/// heuristic (correct for numeric `Option` cadences and unknown fields).
+fn reference_leaf_is_string(reference: &toml::Value, path: &[String]) -> bool {
+    let mut cursor = reference;
+    for segment in path {
+        let toml::Value::Table(table) = cursor else {
+            return false;
+        };
+        match table.get(segment) {
+            Some(next) => cursor = next,
+            None => return false,
+        }
+    }
+    matches!(cursor, toml::Value::String(_))
+}
+
 /// Coerce a raw env-var string to the most specific TOML scalar that fits.
-/// Fields that look like byte-size strings (e.g. "2GiB") fall through to
-/// `String`, which is exactly what `deserialize_human_bytes` expects.
-fn coerce_leaf(raw: &str) -> toml::Value {
+/// When `force_string` is set the value is kept verbatim as a `String` — this
+/// is how string-typed targets (secrets, model ids, addresses, paths) accept
+/// values that happen to look numeric or boolean. Byte-size strings (e.g.
+/// "2GiB") also fall through to `String`, which is what
+/// `deserialize_human_bytes` expects.
+fn coerce_leaf(raw: &str, force_string: bool) -> toml::Value {
+    if force_string {
+        return toml::Value::String(raw.to_owned());
+    }
     match raw {
         "true" => return toml::Value::Boolean(true),
         "false" => return toml::Value::Boolean(false),
@@ -796,10 +1352,11 @@ fn coerce_leaf(raw: &str) -> toml::Value {
     toml::Value::String(raw.to_owned())
 }
 
-fn set_path(value: &mut toml::Value, path: &[String], leaf: &str) {
+fn set_path(value: &mut toml::Value, path: &[String], leaf: &str, reference: &toml::Value) {
     if path.is_empty() {
         return;
     }
+    let force_string = reference_leaf_is_string(reference, path);
     let mut cursor = value;
     for segment in &path[..path.len() - 1] {
         if !matches!(cursor, toml::Value::Table(_)) {
@@ -819,7 +1376,7 @@ fn set_path(value: &mut toml::Value, path: &[String], leaf: &str) {
         unreachable!("ensured above");
     };
     let leaf_key = path.last().expect("path non-empty").clone();
-    table.insert(leaf_key, coerce_leaf(leaf));
+    table.insert(leaf_key, coerce_leaf(leaf, force_string));
 }
 
 // ----------------------------------------------------------------------------
@@ -855,6 +1412,7 @@ impl Config {
             source,
         })?;
         cfg.validate_post()?;
+        cfg.validate_llm_provider()?;
         Ok(cfg)
     }
 
@@ -891,14 +1449,24 @@ impl Config {
                 batch_size: 1,
                 batch_window_ms: 1,
             },
+            rerank: RerankConfig::default(),
+            extractors: ExtractorsConfig::default(),
             workers: WorkersConfig::default(),
-            logging: LoggingConfig::default(),
-            tracing: TracingConfig::default(),
-            auth: AuthConfig::default(),
+            index: IndexConfig::default(),
+            retrieval: RetrievalConfig::default(),
+            precision: PrecisionConfig::default(),
+            monitoring: MonitoringConfig::default(),
+            admin: AdminConfig {
+                // Non-empty so the admin listener boots in tests; admin
+                // HTTP tests present this as `Authorization: Bearer …`.
+                token: Some("test-admin-token".to_string()),
+            },
             summarizer: SummarizerConfig::default(),
+            llm: LlmConfig::default(),
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn validate_post(&self) -> Result<(), ConfigError> {
         if self.storage.shard_count == 0 {
             return Err(ConfigError::Invariant(
@@ -948,6 +1516,175 @@ impl Config {
                 "server.tls.enabled = true requires both server.tls.cert and server.tls.key".into(),
             ));
         }
+
+        // A zero embedder batch window would flush every embed immediately —
+        // defeating batching without disabling it — so reject it explicitly.
+        require_nonzero(
+            "embedder.batch_window_ms",
+            u64::from(self.embedder.batch_window_ms),
+        )?;
+
+        // Worker cadences and queue depths. A zero interval busy-spins a shard
+        // core (the scheduler sleeps for the interval each tick); a zero
+        // channel capacity silently drops every enqueued item; a zero
+        // drain/batch stalls the worker. All are config errors, not runtime
+        // surprises — validate them at boot.
+        let w = &self.workers;
+
+        // Optional maintenance cadences: only constrained when set.
+        for (name, v) in [
+            ("workers.decay_interval_sec", w.decay_interval_sec),
+            (
+                "workers.consolidation_interval_sec",
+                w.consolidation_interval_sec,
+            ),
+            (
+                "workers.hnsw_maintenance_interval_sec",
+                w.hnsw_maintenance_interval_sec,
+            ),
+            (
+                "workers.idempotency_cleanup_interval_sec",
+                w.idempotency_cleanup_interval_sec,
+            ),
+            (
+                "workers.slot_reclamation_interval_sec",
+                w.slot_reclamation_interval_sec,
+            ),
+            (
+                "workers.wal_retention_interval_sec",
+                w.wal_retention_interval_sec,
+            ),
+            ("workers.edge_scrub_interval_sec", w.edge_scrub_interval_sec),
+            (
+                "workers.counter_reconciliation_interval_sec",
+                w.counter_reconciliation_interval_sec,
+            ),
+            (
+                "workers.statistics_update_interval_sec",
+                w.statistics_update_interval_sec,
+            ),
+            (
+                "workers.embedder_cache_eviction_interval_sec",
+                w.embedder_cache_eviction_interval_sec,
+            ),
+            ("workers.snapshot_interval_sec", w.snapshot_interval_sec),
+        ] {
+            if let Some(v) = v {
+                require_nonzero(name, v)?;
+            }
+        }
+
+        require_nonzero("workers.auto_edge.interval_ms", w.auto_edge.interval_ms)?;
+        require_nonzero(
+            "workers.auto_edge.channel_capacity",
+            w.auto_edge.channel_capacity as u64,
+        )?;
+        require_nonzero(
+            "workers.auto_edge.batch_size",
+            w.auto_edge.batch_size as u64,
+        )?;
+
+        require_nonzero(
+            "workers.temporal_edge.interval_ms",
+            w.temporal_edge.interval_ms,
+        )?;
+        require_nonzero(
+            "workers.temporal_edge.channel_capacity",
+            w.temporal_edge.channel_capacity as u64,
+        )?;
+        require_nonzero(
+            "workers.temporal_edge.batch_size",
+            w.temporal_edge.batch_size as u64,
+        )?;
+
+        require_nonzero("workers.causal_edge.interval_ms", w.causal_edge.interval_ms)?;
+        require_nonzero(
+            "workers.causal_edge.channel_capacity",
+            w.causal_edge.channel_capacity as u64,
+        )?;
+        require_nonzero(
+            "workers.causal_edge.batch_size",
+            w.causal_edge.batch_size as u64,
+        )?;
+
+        require_nonzero("workers.extractor.interval_ms", w.extractor.interval_ms)?;
+        require_nonzero(
+            "workers.extractor.channel_capacity",
+            w.extractor.channel_capacity as u64,
+        )?;
+        require_nonzero(
+            "workers.extractor.drain_per_cycle",
+            w.extractor.drain_per_cycle as u64,
+        )?;
+        require_nonzero(
+            "workers.extractor.batch_size",
+            w.extractor.batch_size as u64,
+        )?;
+
+        require_nonzero(
+            "workers.ambiguity_resolver.interval_secs",
+            w.ambiguity_resolver.interval_secs,
+        )?;
+        require_nonzero(
+            "workers.confidence_sweep.interval_secs",
+            w.confidence_sweep.interval_secs,
+        )?;
+        require_nonzero(
+            "workers.llm_cache_sweep.interval_secs",
+            w.llm_cache_sweep.interval_secs,
+        )?;
+        require_nonzero(
+            "workers.supersession_sweeper.period_seconds",
+            w.supersession_sweeper.period_seconds,
+        )?;
+        require_nonzero(
+            "workers.statement_reclaim.period_seconds",
+            w.statement_reclaim.period_seconds,
+        )?;
+
+        // Every LLM round-trip is bounded by this; a zero timeout would fail
+        // instantly, hanging the consolidation worker on retries.
+        require_nonzero(
+            "summarizer.request_timeout_sec",
+            u64::from(self.summarizer.request_timeout_sec),
+        )?;
+
+        Ok(())
+    }
+
+    /// Hard, unconditional startup gate on the LLM provider key. An LLM
+    /// is a mandatory dependency of every Brain shard — it is not a tier
+    /// the operator can opt out of. Write-time HyPE hypothetical-question
+    /// generation is always-on (there is no flag to disable it), and HyPE
+    /// has no fallback path: without an LLM there are no question vectors,
+    /// no entity/statement/relation extraction, and the read-side
+    /// question-vector bridge is empty. So the server refuses to boot
+    /// without a provider key, period — there is no substrate-only mode.
+    ///
+    /// The key is read from the single `[llm] api_key` field — which the
+    /// generic `BRAIN__LLM__API_KEY` env override has already folded into
+    /// `self.llm` by this point, so there is exactly one source to check.
+    ///
+    /// There is no `[extractors.llm]` on/off gate — extraction is always-on
+    /// — so nothing can lift this requirement: the LLM is mandatory and a
+    /// missing key is always a hard startup error.
+    fn validate_llm_provider(&self) -> Result<(), ConfigError> {
+        let have_provider = self
+            .llm
+            .api_key
+            .as_deref()
+            .is_some_and(|v| !v.trim().is_empty());
+        if !have_provider {
+            return Err(ConfigError::Invariant(
+                "no LLM provider key configured. Brain requires an LLM: write-time HyPE \
+                 hypothetical-question generation is mandatory and always-on, and the \
+                 write path (entity / statement / relation extraction) depends on it. \
+                 There is no way to disable HyPE or run without an LLM. \
+                 Set BRAIN__LLM__API_KEY in the environment, or `[llm] api_key` in the \
+                 config, and ensure `[llm] model` names a provider you hold a key for."
+                    .into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -967,6 +1704,28 @@ mod tests {
         assert_eq!(parse_human_bytes("256MiB").unwrap(), 256 * (1u64 << 20));
         assert_eq!(parse_human_bytes("4KiB").unwrap(), 4096);
         assert_eq!(parse_human_bytes("1TiB").unwrap(), 1u64 << 40);
+    }
+
+    #[test]
+    fn llm_provider_gate_requires_key_unconditionally() {
+        let mut cfg = Config::for_tests();
+
+        // No key → refuse to start.
+        cfg.llm.api_key = None;
+        assert!(
+            cfg.validate_llm_provider().is_err(),
+            "no provider key must fail startup — the LLM is mandatory"
+        );
+
+        // A key in `[llm] api_key` satisfies it. The generic
+        // `BRAIN__LLM__API_KEY` override folds into this same field before
+        // validation, so there is exactly one source to check.
+        cfg.llm.api_key = Some("sk-cfg".to_string());
+        assert!(cfg.validate_llm_provider().is_ok());
+
+        // Whitespace-only key does not count.
+        cfg.llm.api_key = Some("   ".to_string());
+        assert!(cfg.validate_llm_provider().is_err());
     }
 
     #[test]
@@ -1009,27 +1768,135 @@ mod tests {
 
     #[test]
     fn coerce_leaf_handles_primitive_types() {
-        assert_eq!(coerce_leaf("true"), toml::Value::Boolean(true));
-        assert_eq!(coerce_leaf("false"), toml::Value::Boolean(false));
-        assert_eq!(coerce_leaf("42"), toml::Value::Integer(42));
-        assert_eq!(coerce_leaf("-7"), toml::Value::Integer(-7));
-        assert_eq!(coerce_leaf("0.5"), toml::Value::Float(0.5));
-        assert_eq!(coerce_leaf("1e3"), toml::Value::Float(1000.0));
+        assert_eq!(coerce_leaf("true", false), toml::Value::Boolean(true));
+        assert_eq!(coerce_leaf("false", false), toml::Value::Boolean(false));
+        assert_eq!(coerce_leaf("42", false), toml::Value::Integer(42));
+        assert_eq!(coerce_leaf("-7", false), toml::Value::Integer(-7));
+        assert_eq!(coerce_leaf("0.5", false), toml::Value::Float(0.5));
+        assert_eq!(coerce_leaf("1e3", false), toml::Value::Float(1000.0));
         // Strings that aren't numeric or bool keep type String — including
         // byte-size syntax that human_bytes will parse downstream.
-        assert_eq!(coerce_leaf("2GiB"), toml::Value::String("2GiB".into()));
         assert_eq!(
-            coerce_leaf("127.0.0.1:9090"),
+            coerce_leaf("2GiB", false),
+            toml::Value::String("2GiB".into())
+        );
+        assert_eq!(
+            coerce_leaf("127.0.0.1:9090", false),
             toml::Value::String("127.0.0.1:9090".into())
         );
     }
 
     #[test]
+    fn coerce_leaf_force_string_keeps_numeric_looking_values() {
+        // A string-typed target (secret / model id / path) must keep a
+        // numeric- or bool-looking value verbatim rather than re-typing it.
+        assert_eq!(
+            coerce_leaf("12345678", true),
+            toml::Value::String("12345678".into())
+        );
+        assert_eq!(
+            coerce_leaf("true", true),
+            toml::Value::String("true".into())
+        );
+        assert_eq!(
+            coerce_leaf("99999", true),
+            toml::Value::String("99999".into())
+        );
+    }
+
+    #[test]
+    fn reference_marks_string_secrets_and_numeric_fields() {
+        let reference = coercion_reference();
+        // Secrets / ids / addresses are string-typed.
+        assert!(reference_leaf_is_string(
+            &reference,
+            &["admin".into(), "token".into()]
+        ));
+        assert!(reference_leaf_is_string(
+            &reference,
+            &["llm".into(), "api_key".into()]
+        ));
+        assert!(reference_leaf_is_string(
+            &reference,
+            &["llm".into(), "model".into()]
+        ));
+        assert!(reference_leaf_is_string(
+            &reference,
+            &["server".into(), "listen_addr".into()]
+        ));
+        // Genuine numeric fields are not string-typed.
+        assert!(!reference_leaf_is_string(
+            &reference,
+            &["storage".into(), "shard_count".into()]
+        ));
+        assert!(!reference_leaf_is_string(
+            &reference,
+            &["workers".into(), "auto_edge".into(), "interval_ms".into()]
+        ));
+        // Unknown paths default to non-string (numeric heuristic).
+        assert!(!reference_leaf_is_string(
+            &reference,
+            &["nope".into(), "missing".into()]
+        ));
+    }
+
+    #[test]
     fn set_path_replaces_existing_scalar() {
+        let reference = coercion_reference();
         let mut value: toml::Value = toml::from_str("[a]\nb = 1\n").unwrap();
-        set_path(&mut value, &["a".into(), "b".into()], "0.0.0.0:8080");
+        set_path(
+            &mut value,
+            &["a".into(), "b".into()],
+            "0.0.0.0:8080",
+            &reference,
+        );
         let s = value["a"]["b"].as_str().unwrap();
         assert_eq!(s, "0.0.0.0:8080");
+    }
+
+    #[test]
+    fn set_path_forces_string_for_secret_leaf() {
+        let reference = coercion_reference();
+        let mut value: toml::Value = toml::from_str("[admin]\ntoken = \"x\"\n").unwrap();
+        set_path(
+            &mut value,
+            &["admin".into(), "token".into()],
+            "48291057",
+            &reference,
+        );
+        assert_eq!(value["admin"]["token"].as_str().unwrap(), "48291057");
+    }
+
+    #[test]
+    fn admin_config_has_token_trims_whitespace() {
+        let mut admin = AdminConfig::default();
+        assert!(!admin.has_token(), "unset token is not usable");
+        admin.token = Some("   ".to_string());
+        assert!(!admin.has_token(), "whitespace-only token is not usable");
+        admin.token = Some(String::new());
+        assert!(!admin.has_token(), "empty token is not usable");
+        admin.token = Some("real-secret".to_string());
+        assert!(admin.has_token(), "a real token is usable");
+    }
+
+    #[test]
+    fn debug_redacts_secrets() {
+        let mut cfg = Config::for_tests();
+        cfg.llm.api_key = Some("sk-supersecret-value".to_string());
+        cfg.admin.token = Some("operator-token-value".to_string());
+        let rendered = format!("{cfg:?}");
+        assert!(
+            !rendered.contains("sk-supersecret-value"),
+            "api_key must not appear in Debug output"
+        );
+        assert!(
+            !rendered.contains("operator-token-value"),
+            "admin token must not appear in Debug output"
+        );
+        assert!(
+            rendered.contains("[redacted]"),
+            "Debug output must mark secrets as [redacted]"
+        );
     }
 
     fn embedder(model: &str) -> EmbedderConfig {
@@ -1112,8 +1979,14 @@ mod tests {
     #[test]
     fn set_path_inserts_into_missing_section() {
         let mut value: toml::Value = toml::from_str("[a]\nb = 1\n").unwrap();
-        set_path(&mut value, &["c".into(), "d".into(), "e".into()], "true");
-        // "true" coerces to a Boolean.
+        let reference = coercion_reference();
+        set_path(
+            &mut value,
+            &["c".into(), "d".into(), "e".into()],
+            "true",
+            &reference,
+        );
+        // "true" coerces to a Boolean (unknown path → numeric heuristic).
         assert!(value["c"]["d"]["e"].as_bool().unwrap());
     }
 }

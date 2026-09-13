@@ -1,4 +1,4 @@
-//! Performance gate for the unified edge layer (Phase C).
+//! Performance gate for the unified edge layer.
 //!
 //! Validates that collapsing the substrate `edges_out`/`edges_in`
 //! tables and the typed-relation `relations`/`by_from`/`by_to` tables
@@ -10,9 +10,8 @@
 //! - depth=3 : p50 ≤ 30 ms
 //!
 //! Also validates that the no-schema memory-anchored walk
-//! (`walk_memory_edges` from Phase A, exercised when no typed
-//! relations are declared) has not regressed under the same
-//! unification.
+//! (`walk_memory_edges`, exercised when no typed relations are
+//! declared) has not regressed under the same unification.
 //!
 //! Fixture:
 //! - 1000 entities + 5000 typed relations across 3 distinct relation
@@ -24,10 +23,10 @@
 
 use std::time::{Duration, Instant};
 
-use brain_core::{Entity, EntityType, Relation};
 use brain_core::{
     EdgeKind, EdgeKindRef, EntityId, ExtractorId, MemoryId, NodeRef, RelationId, RelationTypeId,
 };
+use brain_core::{Entity, EntityType, Relation};
 use brain_metadata::entity::ops::{entity_put, normalize_name};
 use brain_metadata::relation::ops::relation_create;
 use brain_metadata::relation::traversal::{traverse, TraversalConfig, TraversalDirection};
@@ -38,6 +37,10 @@ use brain_metadata::tables::edge::{
 use brain_metadata::MetadataDb;
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use tempfile::TempDir;
+
+fn __ts() -> brain_metadata::RowScope {
+    brain_metadata::RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xA1; 16])
+}
 
 const N_ENTITIES: usize = 1000;
 const N_TYPED_RELATIONS: usize = 5000;
@@ -65,7 +68,7 @@ struct EntityFixture {
 
 fn build_entity_fixture() -> EntityFixture {
     let dir = TempDir::new().expect("tempdir");
-    let mut db = MetadataDb::open(dir.path().join("md.redb")).expect("open db");
+    let db = MetadataDb::open(dir.path().join("md.redb")).expect("open db");
 
     // Use the seeded `brain:related_to` plus two ad-hoc types.
     let related_to: RelationTypeId = {
@@ -102,7 +105,7 @@ fn build_entity_fixture() -> EntityFixture {
                 normalize_name(&name),
                 T0,
             );
-            entity_put(&wtxn, &e).expect("entity_put");
+            entity_put(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &e).expect("entity_put");
             entities.push(id);
         }
         wtxn.commit().expect("commit");
@@ -141,7 +144,7 @@ fn build_entity_fixture() -> EntityFixture {
             // Cardinality conflicts silently auto-supersede or error;
             // both are fine for the bench fixture (we just want
             // realistic row counts).
-            let _ = relation_create(&wtxn, &r, T0);
+            let _ = relation_create(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &r, T0);
         }
         wtxn.commit().expect("commit");
     }
@@ -162,7 +165,7 @@ struct MemoryFixture {
 
 fn build_memory_fixture() -> MemoryFixture {
     let dir = TempDir::new().expect("tempdir");
-    let mut db = MetadataDb::open(dir.path().join("md.redb")).expect("open db");
+    let db = MetadataDb::open(dir.path().join("md.redb")).expect("open db");
 
     let memories: Vec<MemoryId> = (0..N_MEMORIES as u64)
         .map(|slot| MemoryId::pack(1, slot, 1))
@@ -218,7 +221,7 @@ fn build_memory_fixture() -> MemoryFixture {
 }
 
 // ---------------------------------------------------------------------------
-// p50 helpers — direct timing so we can assert against the spec target
+// p50 helpers — direct timing so we can assert against the latency target
 // even when criterion is invoked without the statistical-summary mode.
 // ---------------------------------------------------------------------------
 
@@ -273,6 +276,7 @@ fn bench_relation_traverse_depths(c: &mut Criterion) {
             let s = next_start(&mut idx, &fx.entities);
             let _ = traverse(
                 &rtxn,
+                __ts(),
                 s,
                 &fx.relation_types,
                 TraversalDirection::Outgoing,
@@ -289,6 +293,7 @@ fn bench_relation_traverse_depths(c: &mut Criterion) {
             let s = next_start(&mut idx, &fx.entities);
             let _ = traverse(
                 &rtxn,
+                __ts(),
                 s,
                 &fx.relation_types,
                 TraversalDirection::Outgoing,
@@ -305,6 +310,7 @@ fn bench_relation_traverse_depths(c: &mut Criterion) {
             let s = next_start(&mut idx, &fx.entities);
             let _ = traverse(
                 &rtxn,
+                __ts(),
                 s,
                 &fx.relation_types,
                 TraversalDirection::Outgoing,
@@ -360,6 +366,7 @@ fn bench_relation_traverse_depths(c: &mut Criterion) {
             let s = next_start(&mut idx_c, &fx.entities);
             let _ = traverse(
                 &rtxn,
+                __ts(),
                 s,
                 &fx.relation_types,
                 TraversalDirection::Outgoing,
@@ -375,6 +382,7 @@ fn bench_relation_traverse_depths(c: &mut Criterion) {
             let s = next_start(&mut idx_c, &fx.entities);
             let _ = traverse(
                 &rtxn,
+                __ts(),
                 s,
                 &fx.relation_types,
                 TraversalDirection::Outgoing,
@@ -390,6 +398,7 @@ fn bench_relation_traverse_depths(c: &mut Criterion) {
             let s = next_start(&mut idx_c, &fx.entities);
             let _ = traverse(
                 &rtxn,
+                __ts(),
                 s,
                 &fx.relation_types,
                 TraversalDirection::Outgoing,
@@ -401,7 +410,7 @@ fn bench_relation_traverse_depths(c: &mut Criterion) {
 }
 
 /// Memory-anchor walk on a memory-only fixture (no typed relations
-/// declared). Verifies that Phase A's `walk_memory_edges` (now backed
+/// declared). Verifies that `walk_memory_edges` (now backed
 /// by the unified `EDGES_TABLE`) hasn't regressed against the depth=1
 /// target.
 fn bench_substrate_walk(c: &mut Criterion) {

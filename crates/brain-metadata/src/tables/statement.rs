@@ -1,8 +1,5 @@
 //! Statement family — 8 tables.
 //!
-//! See `spec/02_data_model/` (record + supersession rules) and
-//! `spec/26_knowledge_storage/00_purpose.md` (table catalog).
-//!
 //! - [`STATEMENTS_TABLE`]                  — primary `StatementId → StatementMetadata`.
 //! - [`STATEMENTS_BY_SUBJECT_TABLE`]       — subject-anchored secondary.
 //! - [`STATEMENTS_BY_PREDICATE_TABLE`]     — predicate-anchored secondary.
@@ -12,20 +9,19 @@
 //! - [`STATEMENT_CHAIN_TABLE`]             — supersession-chain traversal.
 //! - [`EVIDENCE_OVERFLOW_TABLE`]           — long evidence lists that don't fit inline.
 //!
-//! Phase 15.1 declared the tables with minimal value shapes. Phase 17.4
-//! widens `StatementMetadata.evidence_inline` from `Vec<[u8; 16]>` to
-//! a parallel structure carrying confidence + timestamp + extractor
-//! and adds the typed `StatementObject` encoding
-//! via a private rkyv shim. Archive ids bumped to `v2` — pre-v1.0,
-//! no migration needed.
+//! `StatementMetadata.evidence_inline` is a parallel structure
+//! carrying confidence + timestamp + extractor, and the typed
+//! `StatementObject` encoding is done via a private rkyv shim.
 
 use crate::impl_redb_rkyv_value;
+use crate::tables::scope::RowScope;
+use brain_core::{
+    EntityId, EvidenceOverflowId, ExtractorId, MemoryId, NamespaceId, PredicateId, SpaceId,
+    StatementId, StatementKind,
+};
 use brain_core::{
     EvidenceEntry, EvidenceRef, Statement, StatementObject, StatementValue, SubjectRef,
     INLINE_EVIDENCE_CAP,
-};
-use brain_core::{
-    EntityId, EvidenceOverflowId, ExtractorId, MemoryId, PredicateId, StatementId, StatementKind,
 };
 use redb::TableDefinition;
 use smallvec::SmallVec;
@@ -33,38 +29,117 @@ use smallvec::SmallVec;
 // ---------------------------------------------------------------------------
 // Tables.
 // ---------------------------------------------------------------------------
+//
+// Every secondary index carries a LEADING `(namespace_id,
+// space_id_bytes)` scope prefix so a range scan for one `(namespace,
+// space)` can physically never traverse another tenant's rows. The
+// primary `STATEMENTS_TABLE` stays keyed by `StatementId`; the scope
+// lives on the row.
 
 pub const STATEMENTS_TABLE: TableDefinition<'static, [u8; 16], StatementMetadata> =
     TableDefinition::new("statements");
 
-/// `(EntityId, kind, predicate_id, is_current)` → `StatementId.to_bytes()`.
-pub const STATEMENTS_BY_SUBJECT_TABLE: TableDefinition<'static, ([u8; 16], u8, u32, u8), [u8; 16]> =
-    TableDefinition::new("statements_by_subject");
+/// `(namespace_id, space_id_bytes, EntityId, kind, predicate_id,
+/// is_current, statement_id)` → `StatementId.to_bytes()`.
+///
+/// Multi-value index: the statement id is appended to the key so every
+/// statement is its own row. Two Set-valued statements sharing
+/// `(subject, kind, predicate_id, is_current)` — e.g. two `likes` for
+/// one person — therefore each get a distinct index entry instead of
+/// colliding on a single key (last-writer-wins) and losing all but one.
+/// The value still holds the statement id so range scans read it as
+/// before without parsing the key tuple.
+#[allow(clippy::type_complexity)] // a redb composite-key tuple, not worth a type alias
+pub const STATEMENTS_BY_SUBJECT_TABLE: TableDefinition<
+    'static,
+    (u32, [u8; 16], [u8; 16], u8, u32, u8, [u8; 16]),
+    [u8; 16],
+> = TableDefinition::new("statements_by_subject");
 
-/// `(predicate_id, kind, confidence_bucket)` → `StatementId.to_bytes()`.
+/// `(namespace_id, space_id_bytes, predicate_id, kind, confidence_bucket,
+/// statement_id)` → `StatementId.to_bytes()`.
 /// `confidence_bucket` is `floor(confidence * 10)` clamped to `0..=10`.
-pub const STATEMENTS_BY_PREDICATE_TABLE: TableDefinition<'static, (u32, u8, u8), [u8; 16]> =
-    TableDefinition::new("statements_by_predicate");
+/// The trailing statement_id keeps the index multi-value (two statements
+/// in the same `(scope, predicate, kind, bucket)` cell don't collide).
+#[allow(clippy::type_complexity)]
+pub const STATEMENTS_BY_PREDICATE_TABLE: TableDefinition<
+    'static,
+    (u32, [u8; 16], u32, u8, u8, [u8; 16]),
+    [u8; 16],
+> = TableDefinition::new("statements_by_predicate");
 
-/// `(EntityId, kind)` → `StatementId.to_bytes()`. Walk this when
-/// answering "what statements have X as object?".
-pub const STATEMENTS_BY_OBJECT_ENTITY_TABLE: TableDefinition<'static, ([u8; 16], u8), [u8; 16]> =
-    TableDefinition::new("statements_by_object_entity");
+/// `(namespace_id, space_id_bytes, EntityId, statement_id)` → `()`.
+///
+/// Subject-anchored listing index whose *only* varying column is the
+/// immutable statement id (a UUIDv7). Unlike [`STATEMENTS_BY_SUBJECT_TABLE`]
+/// — whose key embeds the mutable `is_current` bit — a row here never
+/// changes position when it is superseded, tombstoned, or has its
+/// confidence recomputed. That makes it the resume structure for keyset
+/// pagination: paging strictly past the last emitted id can neither gap a
+/// row that moved nor re-emit one, because ids do not move. `is_current` /
+/// `kind` / `predicate` / tombstone / confidence / time are applied as
+/// in-walk filters against the primary row instead of as key columns.
+/// Derived data, rebuilt on open like the in-RAM indexes.
+#[allow(clippy::type_complexity)]
+pub const STATEMENTS_BY_SUBJECT_ID_TABLE: TableDefinition<
+    'static,
+    (u32, [u8; 16], [u8; 16], [u8; 16]),
+    (),
+> = TableDefinition::new("statements_by_subject_id");
 
-/// `(event_at_unix_nanos, subject_entity_bytes)` → `StatementId.to_bytes()`.
-/// Time-range queries scan a prefix; the EntityId disambiguates same-time
-/// events for the same subject.
-pub const STATEMENTS_BY_EVENT_TIME_TABLE: TableDefinition<'static, (u64, [u8; 16]), [u8; 16]> =
-    TableDefinition::new("statements_by_event_time");
+/// `(namespace_id, space_id_bytes, predicate_id, statement_id)` → `()`.
+///
+/// Predicate-anchored twin of [`STATEMENTS_BY_SUBJECT_ID_TABLE`]: id-ordered
+/// within a `(scope, predicate)` cell, so its key is immutable across a
+/// confidence recompute (the mutable `confidence_bucket` that
+/// [`STATEMENTS_BY_PREDICATE_TABLE`] keys on is not present here). Resume
+/// point for predicate-anchored keyset pagination.
+#[allow(clippy::type_complexity)]
+pub const STATEMENTS_BY_PREDICATE_ID_TABLE: TableDefinition<
+    'static,
+    (u32, [u8; 16], u32, [u8; 16]),
+    (),
+> = TableDefinition::new("statements_by_predicate_id");
 
-/// `(MemoryId, StatementId)` → `()`. Reverse index for FORGET cascade.
-pub const STATEMENTS_BY_EVIDENCE_TABLE: TableDefinition<'static, ([u8; 16], [u8; 16]), ()> =
-    TableDefinition::new("statements_by_evidence");
+/// `(namespace_id, space_id_bytes, EntityId, kind, statement_id)` →
+/// `StatementId.to_bytes()`. Walk this when answering "what statements have
+/// X as object?". The trailing statement_id keeps the index multi-value.
+#[allow(clippy::type_complexity)]
+pub const STATEMENTS_BY_OBJECT_ENTITY_TABLE: TableDefinition<
+    'static,
+    (u32, [u8; 16], [u8; 16], u8, [u8; 16]),
+    [u8; 16],
+> = TableDefinition::new("statements_by_object_entity");
 
-/// `(chain_root, version)` → `StatementId.to_bytes()`. Walk this to
-/// reconstruct the supersession chain of a statement.
-pub const STATEMENT_CHAIN_TABLE: TableDefinition<'static, ([u8; 16], u32), [u8; 16]> =
-    TableDefinition::new("statement_chain");
+/// `(namespace_id, space_id_bytes, event_at_unix_nanos,
+/// subject_entity_bytes, statement_id)` → `StatementId.to_bytes()`.
+/// Time-range queries scan a prefix; the EntityId + statement_id
+/// disambiguate same-time events for the same subject.
+#[allow(clippy::type_complexity)]
+pub const STATEMENTS_BY_EVENT_TIME_TABLE: TableDefinition<
+    'static,
+    (u32, [u8; 16], u64, [u8; 16], [u8; 16]),
+    [u8; 16],
+> = TableDefinition::new("statements_by_event_time");
+
+/// `(namespace_id, space_id_bytes, MemoryId, StatementId)` → `()`. Reverse
+/// index for FORGET cascade.
+#[allow(clippy::type_complexity)]
+pub const STATEMENTS_BY_EVIDENCE_TABLE: TableDefinition<
+    'static,
+    (u32, [u8; 16], [u8; 16], [u8; 16]),
+    (),
+> = TableDefinition::new("statements_by_evidence");
+
+/// `(namespace_id, space_id_bytes, chain_root, version)` →
+/// `StatementId.to_bytes()`. Walk this to reconstruct the supersession
+/// chain of a statement.
+#[allow(clippy::type_complexity)]
+pub const STATEMENT_CHAIN_TABLE: TableDefinition<
+    'static,
+    (u32, [u8; 16], [u8; 16], u32),
+    [u8; 16],
+> = TableDefinition::new("statement_chain");
 
 pub const EVIDENCE_OVERFLOW_TABLE: TableDefinition<'static, [u8; 16], EvidenceOverflow> =
     TableDefinition::new("evidence_overflow");
@@ -96,6 +171,14 @@ pub mod tombstone_reason {
     pub const USER_REQUEST: u8 = 2;
     pub const SCHEMA_INVALIDATION: u8 = 3;
     pub const EXTRACTOR_RETRACTION: u8 = 4;
+    /// Hard-delete intent (`STATEMENT_RETRACT` / `FORGET_STATEMENT`).
+    /// The reclamation GC worker selects only rows carrying this byte
+    /// so plain tombstones and superseded rows stay put for audit.
+    pub const RETRACT: u8 = 5;
+    /// Expired past the predicate's declared `retention` TTL. Physically
+    /// reclaimed after grace like `RETRACT` — an explicit retention policy
+    /// means the data is meant to be removed, not retained for audit.
+    pub const RETENTION_EXPIRED: u8 = 6;
 }
 
 // ---------------------------------------------------------------------------
@@ -143,9 +226,8 @@ impl EvidenceEntryRow {
 /// Private rkyv shim for `brain_core::StatementValue`.
 ///
 /// One variant byte + one populated payload field; the rest are zero/
-/// empty. Stable byte layout so phase-21 readers can skim past the
-/// payload without a full deserialize when only the discriminant
-/// matters.
+/// empty. Stable byte layout so readers can skim past the payload
+/// without a full deserialize when only the discriminant matters.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
 #[archive(check_bytes)]
 struct StatementValueBlob {
@@ -313,21 +395,38 @@ pub fn confidence_bucket(c: f32) -> u8 {
 // Value structs.
 // ---------------------------------------------------------------------------
 
-/// Primary statement record. Carries every field §"Schema"
-/// in rkyv-archived form.
+/// Primary statement record. Carries every schema field in
+/// rkyv-archived form.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
 #[archive(check_bytes)]
 pub struct StatementMetadata {
     pub statement_id_bytes: [u8; 16],
+    /// Owning namespace (tenant) — the outer half of the
+    /// `(namespace, space)` scope key. Required; stamped from the
+    /// caller's scope at create time (fail-closed by construction).
+    pub namespace_id: u32,
+    /// Owning space (app) — the inner half of the scope key.
+    pub space_id_bytes: [u8; 16],
+    /// Conversation/run this statement was extracted from — the REAL
+    /// per-utterance `session_id`, copied from the source memory (or the
+    /// explicit `STATEMENT_CREATE` request). A GROUPING/FILTER column,
+    /// NOT part of the `(namespace, space)` isolation prefix: no
+    /// secondary-index key includes it. `0` is the default session.
+    /// Appended after the scope so old rkyv rows still decode (positional).
+    pub session_id: u64,
     pub chain_root_bytes: [u8; 16],
     pub version: u32,
     /// Fact=0 / Preference=1 / Event=2 per `brain_core::StatementKind`.
     pub kind: u8,
     pub subject_entity_bytes: [u8; 16],
-    /// `0` if subject is `SubjectRef::Entity`, `1` if
-    /// `SubjectRef::Pending` (in which case `subject_entity_bytes`
-    /// holds the pending audit id).
-    pub subject_is_pending: u8,
+    /// Subject kind: `0` = `SubjectRef::Entity`, `1` = `SubjectRef::Pending`
+    /// (in which case `subject_entity_bytes` holds the pending audit id),
+    /// `2` = `SubjectRef::Memory` (the bytes hold the source memory id).
+    /// rkyv is positional, so this repurposes the former
+    /// `subject_is_pending` slot in place. Readers that asked
+    /// `subject_is_pending == 0` ("is an entity subject") stay correct as
+    /// `subject_kind == 0`.
+    pub subject_kind: u8,
     pub predicate_id: u32,
     /// rkyv-encoded `StatementObject` (via [`encode_object`]).
     pub object_blob: Vec<u8>,
@@ -364,17 +463,8 @@ pub struct StatementMetadata {
     ///   version. Allows readers to surface "pre-schema" data while
     ///   schema-strict queries can opt to filter it out.
     pub flags: u32,
-    /// LLM-coined predicate qname when this row landed on the
-    /// `brain:fact` wildcard sink. Empty string means the predicate
-    /// row at `predicate_id` is the LLM's actual intent. Empty rather
-    /// than `Option<String>` because rkyv-archived `Option<String>`
-    /// adds a discriminant byte the layout doesn't need — the empty
-    /// string is a natural sentinel.
-    pub original_predicate_qname: String,
     /// `1` if the row is stateful (per-statement signal), `0` otherwise.
-    /// For declared predicates this is copied from
-    /// `PredicateDefinition.is_stateful`; for `brain:fact` rows it's
-    /// the LLM's per-extraction signal.
+    /// Copied from `PredicateDefinition.is_stateful` at write time.
     pub is_stateful: u8,
 }
 
@@ -403,13 +493,40 @@ impl StatementMetadata {
         StatementId::from(self.statement_id_bytes)
     }
 
+    /// The owning namespace (tenant) of this statement.
+    #[must_use]
+    pub fn namespace(&self) -> NamespaceId {
+        NamespaceId::from(self.namespace_id)
+    }
+
+    /// The owning space of this statement.
+    #[must_use]
+    pub fn space_id(&self) -> SpaceId {
+        SpaceId::from(self.space_id_bytes)
+    }
+
+    /// The `(namespace, space)` scope this statement belongs to.
+    #[must_use]
+    pub fn scope(&self) -> RowScope {
+        RowScope::from_bytes(self.namespace_id, self.space_id_bytes)
+    }
+
+    /// The conversation/run this statement was extracted from.
+    #[must_use]
+    pub fn session(&self) -> brain_core::SessionId {
+        brain_core::SessionId::from(self.session_id)
+    }
+
     #[must_use]
     pub fn chain_root(&self) -> StatementId {
         StatementId::from(self.chain_root_bytes)
     }
 
     pub fn kind(&self) -> Option<StatementKind> {
-        StatementKind::from_u8(self.kind)
+        // Every byte decodes to a valid kind now (builtin 0..=5, else
+        // Custom). The `Option` is retained so existing callers keep their
+        // `?` / `ok_or` ergonomics; it is always `Some`.
+        Some(StatementKind::from_u8(self.kind))
     }
 
     #[must_use]
@@ -445,7 +562,7 @@ impl StatementMetadata {
     }
 }
 
-impl_redb_rkyv_value!(StatementMetadata, "brain_metadata::StatementMetadata::v5");
+impl_redb_rkyv_value!(StatementMetadata, "brain_metadata::StatementMetadata");
 
 /// Overflow row for statements whose inline evidence list outgrew the
 /// `INLINE_EVIDENCE_CAP = 8` inline budget. Four parallel vectors per
@@ -520,7 +637,7 @@ impl EvidenceOverflow {
     }
 }
 
-impl_redb_rkyv_value!(EvidenceOverflow, "brain_metadata::EvidenceOverflow::v2");
+impl_redb_rkyv_value!(EvidenceOverflow, "brain_metadata::EvidenceOverflow");
 
 // ---------------------------------------------------------------------------
 // Projections — Statement (brain-core) ↔ StatementMetadata (rkyv row).
@@ -530,10 +647,11 @@ impl_redb_rkyv_value!(EvidenceOverflow, "brain_metadata::EvidenceOverflow::v2");
 /// `superseded_by / tombstoned` only — validity-window timing is left
 /// to query-time.
 #[must_use]
-pub fn metadata_from_statement(s: &Statement) -> StatementMetadata {
-    let (subject_entity_bytes, subject_is_pending) = match s.subject {
+pub fn metadata_from_statement(s: &Statement, scope: RowScope) -> StatementMetadata {
+    let (subject_entity_bytes, subject_kind) = match s.subject {
         SubjectRef::Entity(id) => (id.to_bytes(), 0u8),
         SubjectRef::Pending(audit) => (audit.to_bytes(), 1u8),
+        SubjectRef::Memory(id) => (id.to_be_bytes(), 2u8),
     };
     let object_discriminant = s.object.discriminant() + 1;
     let object_blob = encode_object(&s.object);
@@ -557,11 +675,17 @@ pub fn metadata_from_statement(s: &Statement) -> StatementMetadata {
 
     StatementMetadata {
         statement_id_bytes: s.id.to_bytes(),
+        namespace_id: scope.namespace_id,
+        space_id_bytes: scope.space_id_bytes,
+        // Default session; the create/supersede helpers stamp the real
+        // per-utterance session onto the row after building it (the
+        // brain-core `Statement` carries no session slot).
+        session_id: brain_core::SessionId::DEFAULT.raw(),
         chain_root_bytes: s.chain_root.to_bytes(),
         version: s.version,
         kind: s.kind.as_u8(),
         subject_entity_bytes,
-        subject_is_pending,
+        subject_kind,
         predicate_id: s.predicate.raw(),
         object_blob,
         object_discriminant,
@@ -588,7 +712,6 @@ pub fn metadata_from_statement(s: &Statement) -> StatementMetadata {
         // STATEMENT_CREATE handler / SCHEMA_UPLOAD will OR in the
         // right bits after `metadata_from_statement` returns.
         flags: 0,
-        original_predicate_qname: s.original_predicate_qname.clone().unwrap_or_default(),
         is_stateful: u8::from(s.is_stateful),
     }
 }
@@ -602,12 +725,13 @@ pub fn statement_from_metadata(m: &StatementMetadata) -> Option<Statement> {
     let kind = m.kind()?;
     let object = decode_object(&m.object_blob)?;
 
-    let subject = if m.subject_is_pending == 0 {
-        SubjectRef::Entity(EntityId::from_bytes(m.subject_entity_bytes))
-    } else {
-        SubjectRef::Pending(brain_core::AuditId::from_bytes(
+    let subject = match m.subject_kind {
+        0 => SubjectRef::Entity(EntityId::from_bytes(m.subject_entity_bytes)),
+        2 => SubjectRef::Memory(brain_core::MemoryId::from_raw(u128::from_be_bytes(
             m.subject_entity_bytes,
-        ))
+        ))),
+        // 1 (and any unknown byte, defensively) → Pending.
+        _ => SubjectRef::Pending(brain_core::AuditId::from_bytes(m.subject_entity_bytes)),
     };
 
     let evidence = if let Some(bytes) = m.evidence_overflow_id_bytes {
@@ -645,11 +769,6 @@ pub fn statement_from_metadata(m: &StatementMetadata) -> Option<Statement> {
         tombstoned_at_unix_nanos: m.tombstoned_at_unix_nanos,
         tombstone_reason,
         record_invalidated_at_unix_nanos: m.record_invalidated_at_unix_nanos,
-        original_predicate_qname: if m.original_predicate_qname.is_empty() {
-            None
-        } else {
-            Some(m.original_predicate_qname.clone())
-        },
         is_stateful: m.is_stateful != 0,
     })
 }
@@ -662,101 +781,16 @@ pub fn statement_from_metadata(m: &StatementMetadata) -> Option<Statement> {
 mod tests {
     use super::*;
     use crate::tables::fresh_db;
-    use brain_core::INLINE_EVIDENCE_CAP;
-    use brain_core::{ContextId, EntityId, MemoryId};
+    use brain_core::{EntityId, MemoryId, SessionId};
     use redb::ReadableDatabase;
 
     fn sample_evidence_entry(byte: u8, confidence_milli: u16) -> EvidenceEntry {
         EvidenceEntry {
-            memory_id: MemoryId::pack(byte as u16, ContextId::DEFAULT.into(), 0),
+            memory_id: MemoryId::pack(byte as u16, SessionId::DEFAULT.into(), 0),
             confidence_milli,
             timestamp_unix_nanos: 1_700_000_000_000_000_000,
             extractor_id: ExtractorId::from(0),
         }
-    }
-
-    fn sample_statement() -> Statement {
-        let id = StatementId::new();
-        let subject = EntityId::new();
-        Statement::new_root(
-            id,
-            StatementKind::Fact,
-            SubjectRef::Entity(subject),
-            PredicateId::from(7),
-            StatementObject::Entity(EntityId::new()),
-            0.91,
-            EvidenceRef::Inline(Box::new(SmallVec::from_buf_and_len(
-                [sample_evidence_entry(1, 900); INLINE_EVIDENCE_CAP],
-                1,
-            ))),
-            ExtractorId::from(0),
-            1_700_000_000_000_000_000,
-            1,
-        )
-    }
-
-    #[test]
-    fn statements_round_trip() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = fresh_db(&dir);
-        let s = sample_statement();
-        let row = metadata_from_statement(&s);
-        let key = row.statement_id_bytes;
-
-        let wtxn = db.begin_write().unwrap();
-        {
-            let mut t = wtxn.open_table(STATEMENTS_TABLE).unwrap();
-            t.insert(&key, &row).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(STATEMENTS_TABLE).unwrap();
-        let got = t.get(&key).unwrap().unwrap().value();
-        assert_eq!(got, row);
-        let s2 = statement_from_metadata(&got).unwrap();
-        assert_eq!(s2, s);
-    }
-
-    #[test]
-    fn statements_round_trip_with_original_qname_and_is_stateful() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = fresh_db(&dir);
-        let mut s = sample_statement();
-        s.original_predicate_qname = Some("works_at".into());
-        s.is_stateful = true;
-        let row = metadata_from_statement(&s);
-        assert_eq!(row.original_predicate_qname, "works_at");
-        assert_eq!(row.is_stateful, 1);
-        let key = row.statement_id_bytes;
-
-        let wtxn = db.begin_write().unwrap();
-        {
-            let mut t = wtxn.open_table(STATEMENTS_TABLE).unwrap();
-            t.insert(&key, &row).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(STATEMENTS_TABLE).unwrap();
-        let got = t.get(&key).unwrap().unwrap().value();
-        let s2 = statement_from_metadata(&got).unwrap();
-        assert_eq!(s2.original_predicate_qname.as_deref(), Some("works_at"));
-        assert!(s2.is_stateful);
-        assert_eq!(s2, s);
-    }
-
-    #[test]
-    fn empty_original_predicate_qname_decodes_to_none() {
-        let s = sample_statement();
-        let row = metadata_from_statement(&s);
-        // Default-constructed statement has neither field set; empty
-        // string is the on-disk sentinel that decodes back to None.
-        assert!(row.original_predicate_qname.is_empty());
-        assert_eq!(row.is_stateful, 0);
-        let s2 = statement_from_metadata(&row).unwrap();
-        assert_eq!(s2.original_predicate_qname, None);
-        assert!(!s2.is_stateful);
     }
 
     #[test]
@@ -769,7 +803,7 @@ mod tests {
             StatementObject::Value(StatementValue::Bool(true)),
             StatementObject::Value(StatementValue::UnixNanos(1_700_000_000)),
             StatementObject::Value(StatementValue::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF])),
-            StatementObject::Memory(MemoryId::pack(7, ContextId::DEFAULT.into(), 0)),
+            StatementObject::Memory(MemoryId::pack(7, SessionId::DEFAULT.into(), 0)),
             StatementObject::Statement(StatementId::new()),
         ];
         for o in cases {
@@ -789,121 +823,6 @@ mod tests {
         assert_eq!(confidence_bucket(-0.5), 0);
         assert_eq!(confidence_bucket(2.0), 10);
         assert_eq!(confidence_bucket(f32::NAN), 0);
-    }
-
-    #[test]
-    fn by_subject_index_round_trip() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = fresh_db(&dir);
-        let subject = EntityId::new();
-        let stmt = StatementId::new();
-        let key = (
-            subject.to_bytes(),
-            StatementKind::Preference.as_u8(),
-            3u32,
-            1u8,
-        );
-
-        let wtxn = db.begin_write().unwrap();
-        {
-            let mut t = wtxn.open_table(STATEMENTS_BY_SUBJECT_TABLE).unwrap();
-            t.insert(&key, &stmt.to_bytes()).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(STATEMENTS_BY_SUBJECT_TABLE).unwrap();
-        let got = t.get(&key).unwrap().unwrap().value();
-        assert_eq!(StatementId::from(got), stmt);
-    }
-
-    #[test]
-    fn by_predicate_index_round_trip() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = fresh_db(&dir);
-        let stmt = StatementId::new();
-        let key = (3u32, StatementKind::Fact.as_u8(), 9u8);
-
-        let wtxn = db.begin_write().unwrap();
-        {
-            let mut t = wtxn.open_table(STATEMENTS_BY_PREDICATE_TABLE).unwrap();
-            t.insert(&key, &stmt.to_bytes()).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(STATEMENTS_BY_PREDICATE_TABLE).unwrap();
-        assert!(t.get(&key).unwrap().is_some());
-    }
-
-    #[test]
-    fn by_object_entity_index_round_trip() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = fresh_db(&dir);
-        let entity = EntityId::new();
-        let stmt = StatementId::new();
-        let key = (entity.to_bytes(), StatementKind::Fact.as_u8());
-
-        let wtxn = db.begin_write().unwrap();
-        {
-            let mut t = wtxn.open_table(STATEMENTS_BY_OBJECT_ENTITY_TABLE).unwrap();
-            t.insert(&key, &stmt.to_bytes()).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(STATEMENTS_BY_OBJECT_ENTITY_TABLE).unwrap();
-        assert!(t.get(&key).unwrap().is_some());
-    }
-
-    #[test]
-    fn by_event_time_index_round_trip() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = fresh_db(&dir);
-        let entity = EntityId::new();
-        let stmt = StatementId::new();
-        let key = (1_700_000_000_000_000_000u64, entity.to_bytes());
-
-        let wtxn = db.begin_write().unwrap();
-        {
-            let mut t = wtxn.open_table(STATEMENTS_BY_EVENT_TIME_TABLE).unwrap();
-            t.insert(&key, &stmt.to_bytes()).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let rtxn = db.begin_read().unwrap();
-        let t = rtxn.open_table(STATEMENTS_BY_EVENT_TIME_TABLE).unwrap();
-        assert!(t.get(&key).unwrap().is_some());
-    }
-
-    #[test]
-    fn by_evidence_and_chain_indexes_round_trip() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = fresh_db(&dir);
-        let mem = [9u8; 16];
-        let stmt = StatementId::new();
-        let chain_root = StatementId::new();
-
-        let wtxn = db.begin_write().unwrap();
-        {
-            let mut e = wtxn.open_table(STATEMENTS_BY_EVIDENCE_TABLE).unwrap();
-            e.insert(&(mem, stmt.to_bytes()), &()).unwrap();
-            let mut c = wtxn.open_table(STATEMENT_CHAIN_TABLE).unwrap();
-            c.insert(&(chain_root.to_bytes(), 1u32), &stmt.to_bytes())
-                .unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let rtxn = db.begin_read().unwrap();
-        let e = rtxn.open_table(STATEMENTS_BY_EVIDENCE_TABLE).unwrap();
-        assert!(e.get(&(mem, stmt.to_bytes())).unwrap().is_some());
-        let c = rtxn.open_table(STATEMENT_CHAIN_TABLE).unwrap();
-        let got = c
-            .get(&(chain_root.to_bytes(), 1u32))
-            .unwrap()
-            .unwrap()
-            .value();
-        assert_eq!(StatementId::from(got), stmt);
     }
 
     #[test]

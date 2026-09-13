@@ -1,7 +1,6 @@
-//! Brain-side tantivy analyzer (phase 22.2).
+//! Brain-side tantivy analyzer.
 //!
-//! Implements the pipeline defined in
-//! `spec/13_retrievers/02_lexical_retriever.md` §3:
+//! The pipeline:
 //!
 //! 1. Unicode NFC normalisation.
 //! 2. Lowercase (Unicode-aware).
@@ -14,8 +13,7 @@
 //!
 //! Registered on each per-shard [`tantivy::Index`] under the name
 //! [`BRAIN_TOKENIZER_NAME`] (`"default"`), so the `TEXT` fields
-//! defined in 22.1 pick it up automatically — no schema-version
-//! bump required.
+//! pick it up automatically — no schema-version bump required.
 
 use std::sync::Arc;
 
@@ -25,11 +23,11 @@ use tantivy::tokenizer::{TextAnalyzer, Token, TokenStream, Tokenizer};
 use unicode_normalization::UnicodeNormalization;
 
 /// Name the brain analyzer is registered under. Override of
-/// tantivy's built-in `"default"` so the schemas from 22.1 pick
-/// it up without a schema-version bump (§23/02 §3 binding).
+/// tantivy's built-in `"default"` so the schemas pick
+/// it up without a schema-version bump.
 pub const BRAIN_TOKENIZER_NAME: &str = "default";
 
-/// `\bhttps?://\S+`. Bound by §23/02 §3.
+/// `\bhttps?://\S+`.
 const URL_RE: &str = r"\bhttps?://\S+";
 
 /// Ticket-style code IDs (uppercase prefix + dash + digits) —

@@ -1,6 +1,6 @@
 //! `EntityHnswIndex` — per-shard HNSW over entity embeddings.
 //!
-//! Sub-task 16.3. Distinct from the substrate's [`crate::HnswIndex`]
+//! Distinct from the substrate's [`crate::HnswIndex`]
 //! over memory embeddings:
 //!
 //! | Index | M | ef_construction | ef_search | capacity_hint |
@@ -8,19 +8,14 @@
 //! | Memory (existing) | 16 | 200 | 64 | 1024 |
 //! | Entity (this module) | 16 | **100** | 64 | **256** |
 //!
-//! "Entity embedding HNSW" — entity counts are typically
+//! Entity counts are typically
 //! 10–100× smaller than memory counts per shard, so the index is
 //! initialized smaller and its `ef_construction` is lower.
 //!
-//! ## Surface (16.3 only)
-//!
-//! - In-memory only; no `entity.hnsw` persistence (deferred — phase
-//!   plan 16.3 F-2).
-//! - Single-owner; no concurrency wrapper (deferred to 16.5+ when
-//!   the resolver needs concurrent reads).
+//! - In-memory only; no `entity.hnsw` persistence.
+//! - Single-owner; no concurrency wrapper.
 //! - Inlined `EntityId ↔ u32` mapping (Vec + HashMap) — does NOT
 //!   reuse the substrate's `MemoryId`-typed [`crate::IdMap`].
-//!   Generalizing the id-map is a phase-16 follow-up.
 
 use std::collections::HashMap;
 
@@ -41,8 +36,8 @@ const OVER_FACTOR: usize = 2;
 // ---------------------------------------------------------------------------
 
 /// HNSW knobs for the entity index. Defaults from
-/// [`Self::default_v1`] match `spec/02_data_model/02_storage.md`:
-/// `M=16, ef_construction=100, ef_search=64`, capacity hint 256.
+/// [`Self::default_v1`]: `M=16, ef_construction=100, ef_search=64`,
+/// capacity hint 256.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EntityHnswParams {
     /// Max edges per non-bottom-layer node range:
@@ -155,7 +150,7 @@ pub struct RebuildReport {
 
 /// Per-shard HNSW over entity embeddings (384-dim, BGE-small).
 ///
-/// **Single-writer** by `&mut self` discipline (CLAUDE.md §5 inv. 2).
+/// **Single-writer** by `&mut self` discipline.
 pub struct EntityHnswIndex {
     inner: Hnsw<'static, f32, DistCosine>,
     params: EntityHnswParams,
@@ -201,7 +196,7 @@ impl EntityHnswIndex {
             return Err(EntityHnswError::DuplicateEntity(entity_id));
         }
         let internal_id = u32::try_from(self.forward.len())
-            .expect("entity HNSW id-space exhausted (> u32::MAX entities per shard)");
+            .expect("invariant: entity count per shard never reaches u32::MAX");
         self.forward.push(Some(entity_id));
         self.reverse.insert(entity_id, internal_id);
         self.inner
@@ -249,27 +244,60 @@ impl EntityHnswIndex {
             }
         };
 
-        let fetch_k = k.saturating_mul(OVER_FACTOR).min(self.forward.len());
-        let neighbours: Vec<Neighbour> = self.inner.search(query.as_slice(), fetch_k, ef);
+        // Escalate the fetch width (and `ef`) when tombstone attrition
+        // starves the post-filter result set. A single fixed fetch can
+        // return fewer than `k` live neighbours if more than half of the
+        // top candidates were tombstoned by FORGET/consolidation before
+        // the next rebuild; widen until we have `k` live results or the
+        // graph is exhausted. Termination is guaranteed: `fetch_k` is
+        // capped at the node count and `ef` at `ef_search_max`.
+        let total_nodes = self.forward.len();
+        let mut ef = ef;
+        let mut fetch_multiplier = OVER_FACTOR;
         let mut out: Vec<(EntityId, f32)> = Vec::with_capacity(k);
-        for n in neighbours {
+        loop {
+            out.clear();
+            let fetch_k = k.saturating_mul(fetch_multiplier).min(total_nodes);
+            let neighbours: Vec<Neighbour> = self.inner.search(query.as_slice(), fetch_k, ef);
+            for n in neighbours {
+                if out.len() >= k {
+                    break;
+                }
+                let Ok(internal_id) = u32::try_from(n.d_id) else {
+                    continue;
+                };
+                if self.tombstones.is_set(internal_id) {
+                    continue;
+                }
+                let Some(Some(entity_id)) = self.forward.get(internal_id as usize) else {
+                    tracing::warn!(
+                        internal_id,
+                        "entity HNSW returned an internal id with no EntityId mapping; dropping"
+                    );
+                    continue;
+                };
+                out.push((*entity_id, 1.0 - n.distance));
+            }
+
             if out.len() >= k {
                 break;
             }
-            let Ok(internal_id) = u32::try_from(n.d_id) else {
-                continue;
-            };
-            if self.tombstones.is_set(internal_id) {
-                continue;
-            }
-            let Some(Some(entity_id)) = self.forward.get(internal_id as usize) else {
-                tracing::warn!(
-                    internal_id,
-                    "entity HNSW returned an internal id with no EntityId mapping; dropping"
+            let fetch_saturated = fetch_k >= total_nodes;
+            let ef_saturated = ef >= self.params.ef_search_max;
+            if fetch_saturated && ef_saturated {
+                tracing::debug!(
+                    requested_k = k,
+                    returned = out.len(),
+                    "entity HNSW search bailout exhausted; returning partial results"
                 );
-                continue;
-            };
-            out.push((*entity_id, 1.0 - n.distance));
+                break;
+            }
+            if !fetch_saturated {
+                fetch_multiplier = fetch_multiplier.saturating_mul(2);
+            }
+            if !ef_saturated {
+                ef = ef.saturating_mul(2).min(self.params.ef_search_max);
+            }
         }
         // hnsw_rs returns ascending by distance → descending by
         // similarity once we convert. Already in the right order;
@@ -357,7 +385,7 @@ impl EntityHnswIndex {
                 continue;
             }
             let internal_id = u32::try_from(self.forward.len())
-                .expect("entity HNSW id-space exhausted during rebuild");
+                .expect("invariant: rebuilt entity count never reaches u32::MAX");
             self.forward.push(Some(id));
             self.reverse.insert(id, internal_id);
             self.inner
@@ -366,6 +394,28 @@ impl EntityHnswIndex {
         }
         Ok(report)
     }
+}
+
+/// Read-only entity vector search as the resolve handler (tier 3) needs it.
+///
+/// Abstracts the concrete per-shard [`EntityHnswIndex`] behind an object-safe
+/// trait so `brain-ops` can query the index without owning its lock or the
+/// `hnsw_rs` types. The query is a plain `&[f32]` (the caller's embedding, of
+/// [`VECTOR_DIM`]); implementations return `(entity, cosine)` pairs descending
+/// by score and yield an empty vec when the index is empty or the query is the
+/// wrong width — the resolver treats "no in-band hit" and "no index" the same
+/// (fall through to the create fallback).
+pub trait EntityVectorIndex: Send + Sync {
+    /// Top-`k` nearest live entities to `query` (cosine, descending).
+    fn search(&self, query: &[f32], k: usize) -> Vec<(EntityId, f32)>;
+
+    /// Insert `(entity_id, vector)` into the index unless the entity is already
+    /// present. Best-effort: a wrong-width vector or an insert error leaves the
+    /// entity durable but tier-3-unreachable until a rebuild (implementations
+    /// log and move on rather than failing the caller's write). Lets the write
+    /// path keep explicitly-created entities embedding-resolvable, matching the
+    /// extraction path which already stages entity vectors into the index.
+    fn insert(&self, entity_id: EntityId, vector: &[f32]);
 }
 
 // ---------------------------------------------------------------------------
@@ -390,152 +440,30 @@ mod tests {
         v
     }
 
-    // ----- Params -------------------------------------------------------
-
-    #[test]
-    fn params_default_matches_spec() {
-        let p = EntityHnswParams::default_v1();
-        assert_eq!(p.m, 16);
-        assert_eq!(p.ef_construction, 100, "— lower than memory");
-        assert_eq!(p.ef_search, 64);
-        assert_eq!(p.ef_search_max, 500);
-        assert_eq!(p.capacity_hint, 256, "— smaller than memory");
+    /// The query / anchor vector the widening tests probe with.
+    fn query() -> [f32; VECTOR_DIM] {
+        one_hot(0)
     }
 
-    #[test]
-    fn params_validate_rejects_out_of_range() {
-        let mut p = EntityHnswParams::default_v1();
-        p.m = 3;
-        assert!(matches!(
-            p.validate(),
-            Err(IndexParamsError::MOutOfRange(3))
-        ));
-
-        p = EntityHnswParams::default_v1();
-        p.ef_construction = 49;
-        assert!(matches!(
-            p.validate(),
-            Err(IndexParamsError::EfConstructionOutOfRange(49))
-        ));
-
-        p = EntityHnswParams::default_v1();
-        p.ef_search = 501;
-        assert!(matches!(
-            p.validate(),
-            Err(IndexParamsError::EfSearchOutOfRange(501))
-        ));
-
-        p = EntityHnswParams {
-            m: 16,
-            ef_construction: 100,
-            ef_search: 64,
-            ef_search_max: 32, // < ef_search
-            capacity_hint: 256,
-        };
-        assert!(matches!(
-            p.validate(),
-            Err(IndexParamsError::EfSearchMaxBelowDefault { .. })
-        ));
+    /// A vector in a tight cluster around [`query`]: a dominant query
+    /// component plus a unique perturbation of magnitude `mag` on dimension
+    /// `1 + seed`. Cosine to the query is ~1.0 and every such point occupies
+    /// a distinct location (no duplicate cluster to trap the traversal), so
+    /// the small graphs stay well-connected and HNSW returns them with
+    /// essentially full recall. `mag` sets the (small) distance from the
+    /// query: smaller = nearer. The tests never depend on HNSW surfacing
+    /// genuinely far nodes, which it does not guarantee on tiny graphs.
+    fn near_at(seed: usize, mag: f32) -> [f32; VECTOR_DIM] {
+        let mut v = zeros();
+        v[0] = 1.0;
+        v[1 + (seed % (VECTOR_DIM - 1))] = mag;
+        v
     }
 
-    // ----- Insert + contains --------------------------------------------
-
-    #[test]
-    fn insert_then_contains() {
-        let mut idx = EntityHnswIndex::new(EntityHnswParams::default_v1()).unwrap();
-        let id = EntityId::new();
-        let other = EntityId::new();
-        assert!(!idx.contains(id));
-        idx.insert(id, &one_hot(0)).unwrap();
-        assert!(idx.contains(id));
-        assert!(!idx.contains(other));
-        assert_eq!(idx.len(), 1);
-        assert!(!idx.is_empty());
-    }
-
-    #[test]
-    fn insert_rejects_duplicate() {
-        let mut idx = EntityHnswIndex::new(EntityHnswParams::default_v1()).unwrap();
-        let id = EntityId::new();
-        idx.insert(id, &one_hot(0)).unwrap();
-        let err = idx.insert(id, &one_hot(1)).expect_err("dup");
-        assert!(matches!(err, EntityHnswError::DuplicateEntity(x) if x == id));
-        // Index unchanged on the duplicate path.
-        assert_eq!(idx.len(), 1);
-    }
-
-    // ----- Search -------------------------------------------------------
-
-    #[test]
-    fn search_empty_returns_empty() {
-        let idx = EntityHnswIndex::new(EntityHnswParams::default_v1()).unwrap();
-        let r = idx.search(&one_hot(0), 5).unwrap();
-        assert!(r.is_empty());
-    }
-
-    #[test]
-    fn search_returns_inserted_with_high_similarity() {
-        let mut idx = EntityHnswIndex::new(EntityHnswParams::default_v1()).unwrap();
-        let id = EntityId::new();
-        let v = one_hot(7);
-        idx.insert(id, &v).unwrap();
-
-        let r = idx.search(&v, 1).unwrap();
-        assert_eq!(r.len(), 1);
-        let (got_id, similarity) = r[0];
-        assert_eq!(got_id, id);
-        assert!(
-            similarity > 0.99,
-            "self-search similarity should be ~1.0; got {similarity}"
-        );
-    }
-
-    #[test]
-    fn search_topk_bounded_by_k() {
-        let mut idx = EntityHnswIndex::new(EntityHnswParams::default_v1()).unwrap();
-        for i in 0..10 {
-            idx.insert(EntityId::new(), &one_hot(i)).unwrap();
-        }
-        let r = idx.search(&one_hot(0), 5).unwrap();
-        assert!(r.len() <= 5, "got {} results", r.len());
-    }
-
-    #[test]
-    fn search_with_ef_above_max_errors() {
-        let mut idx = EntityHnswIndex::new(EntityHnswParams::default_v1()).unwrap();
-        // Need at least one entity inserted; otherwise the early-return on
-        // empty-index path runs before the ef validation.
-        idx.insert(EntityId::new(), &one_hot(0)).unwrap();
-        let err = idx
-            .search_with_ef(&one_hot(0), 5, Some(1000))
-            .expect_err("over max");
-        assert!(matches!(
-            err,
-            EntityHnswError::EfSearchTooLarge { ef: 1000, max: 500 }
-        ));
-    }
-
-    // ----- Tombstones ---------------------------------------------------
-
-    #[test]
-    fn mark_tombstoned_excludes_from_search() {
-        let mut idx = EntityHnswIndex::new(EntityHnswParams::default_v1()).unwrap();
-        let a = EntityId::new();
-        let b = EntityId::new();
-        let c = EntityId::new();
-        idx.insert(a, &one_hot(0)).unwrap();
-        idx.insert(b, &one_hot(1)).unwrap();
-        idx.insert(c, &one_hot(2)).unwrap();
-
-        idx.mark_tombstoned(b).unwrap();
-        assert!(idx.is_tombstoned(b));
-        assert_eq!(idx.tombstone_count(), 1);
-
-        let r = idx.search(&one_hot(0), 3).unwrap();
-        let ids: Vec<EntityId> = r.iter().map(|(id, _)| *id).collect();
-        assert!(!ids.contains(&b), "tombstoned id surfaced in search");
-        assert!(ids.contains(&a), "expected a in results");
-    }
+    // The params / insert / search / tombstone / rebuild matrix is covered
+    // by the strictly-richer suite in `statement_hnsw.rs`. Only the
+    // entity-specific `is_tombstoned` round-trip and the search-widening
+    // escalation live here.
 
     #[test]
     fn is_tombstoned_round_trip() {
@@ -548,56 +476,89 @@ mod tests {
     }
 
     #[test]
-    fn mark_tombstoned_unknown_errors() {
+    fn search_widens_past_tombstone_attrition() {
+        // A dense hub of 24 tombstoned entities occupies the query's nearest
+        // ring — far more than the initial fetch window (k*OVER_FACTOR =
+        // 5*2 = 10) — so a single fixed fetch lands entirely on tombstoned
+        // neighbours and collapses to zero live results. A comfortable
+        // surplus of 12 live entities sits in a slightly farther ring of the
+        // same tight cluster (each ~cosine 1.0 to the query, all on distinct
+        // dimensions so the graph is densely connected and HNSW recalls them
+        // reliably). Escalation must widen the fetch past the tombstoned
+        // front until the k live results survive.
+        //
+        // Density is load-bearing: a large, well-connected cluster (as in the
+        // reliable statement-question widening test) lets the widened search
+        // reach the live ring; a sparse handful of points can leave the far
+        // ring unreachable on the approximate graph.
         let mut idx = EntityHnswIndex::new(EntityHnswParams::default_v1()).unwrap();
-        let id = EntityId::new();
-        let err = idx.mark_tombstoned(id).expect_err("unknown");
-        assert!(matches!(err, EntityHnswError::UnknownEntity(x) if x == id));
-    }
-
-    // ----- Rebuild ------------------------------------------------------
-
-    #[test]
-    fn rebuild_drops_tombstones_and_resets_state() {
-        let mut idx = EntityHnswIndex::new(EntityHnswParams::default_v1()).unwrap();
-        let ids: Vec<EntityId> = (0..5).map(|_| EntityId::new()).collect();
-        for (i, id) in ids.iter().enumerate() {
-            idx.insert(*id, &one_hot(i)).unwrap();
+        let tombstoned: Vec<EntityId> = (0..24).map(|_| EntityId::new()).collect();
+        for (i, id) in tombstoned.iter().enumerate() {
+            idx.insert(*id, &near_at(i, 0.01)).unwrap();
         }
-        idx.mark_tombstoned(ids[0]).unwrap();
-        idx.mark_tombstoned(ids[1]).unwrap();
-        assert_eq!(idx.tombstone_count(), 2);
-
-        // Rebuild with 3 fresh entities (the surviving ones — caller
-        // pre-filters tombstoned).
-        let fresh: Vec<EntityId> = (0..3).map(|_| EntityId::new()).collect();
-        let input: Vec<_> = fresh
-            .iter()
-            .enumerate()
-            .map(|(i, id)| (*id, one_hot(i + 100)))
-            .collect();
-        let report = idx.rebuild(input).unwrap();
-        assert_eq!(report.inserted, 3);
-        assert_eq!(report.duplicates_skipped, 0);
-        assert_eq!(idx.len(), 3);
-        assert_eq!(idx.tombstone_count(), 0);
-        for old in &ids {
-            assert!(!idx.contains(*old));
+        let live: Vec<EntityId> = (0..12).map(|_| EntityId::new()).collect();
+        for (i, id) in live.iter().enumerate() {
+            idx.insert(*id, &near_at(30 + i, 0.02)).unwrap();
         }
-        for f in &fresh {
-            assert!(idx.contains(*f));
+        for id in &tombstoned {
+            idx.mark_tombstoned(*id).unwrap();
+        }
+
+        let r = idx.search(&query(), 5).unwrap();
+        assert_eq!(r.len(), 5, "escalation should still return k live results");
+        let got: Vec<EntityId> = r.iter().map(|(id, _)| *id).collect();
+        for id in &tombstoned {
+            assert!(!got.contains(id), "tombstoned id surfaced after widening");
+        }
+        for id in &got {
+            assert!(live.contains(id), "unexpected non-live entity in results");
         }
     }
 
     #[test]
-    fn rebuild_skips_duplicate_input_ids() {
+    fn search_exhausts_cleanly_when_fewer_than_k_live() {
+        // Only 3 live of 6 total; search(k=5) can never reach k, so it must
+        // terminate cleanly (no infinite escalation loop) and return only live
+        // survivors — never fabricate up to k, never leak a tombstoned entry.
+        // The 3 live entities sit in a tight cluster around the query (cosine
+        // ~1.0) while the 3 tombstoned entities are orthogonal to it (cosine
+        // ~0, distinct far dimensions), so the live trio is unambiguously the
+        // query's nearest neighbourhood.
+        //
+        // The assertions bound the exhaustion behaviour — a non-empty subset
+        // of the live set, strictly fewer than k, with no tombstoned leak —
+        // rather than demanding exact full recall. Exactly how many of the
+        // few live points HNSW surfaces from a tiny graph is an approximate-
+        // recall property of the index itself (even ef widened to its maximum
+        // occasionally drops one node on a near-degenerate graph), not of the
+        // exhaustion/termination logic this test exists to pin down.
         let mut idx = EntityHnswIndex::new(EntityHnswParams::default_v1()).unwrap();
-        let id = EntityId::new();
-        let report = idx
-            .rebuild(vec![(id, one_hot(0)), (id, one_hot(1))])
-            .unwrap();
-        assert_eq!(report.inserted, 1);
-        assert_eq!(report.duplicates_skipped, 1);
-        assert!(idx.contains(id));
+        let live: Vec<EntityId> = (0..3).map(|_| EntityId::new()).collect();
+        for (i, id) in live.iter().enumerate() {
+            idx.insert(*id, &near_at(i, 0.01)).unwrap();
+        }
+        let tombstoned: Vec<EntityId> = (0..3).map(|_| EntityId::new()).collect();
+        for (i, id) in tombstoned.iter().enumerate() {
+            idx.insert(*id, &one_hot(100 + i)).unwrap();
+            idx.mark_tombstoned(*id).unwrap();
+        }
+
+        let r = idx.search(&query(), 5).unwrap();
+        assert!(!r.is_empty(), "live survivors must remain reachable");
+        assert!(
+            r.len() <= live.len(),
+            "must not return more than the live count on exhaustion"
+        );
+        assert!(
+            r.len() < 5,
+            "cannot reach k when fewer than k live entries exist"
+        );
+        let got: Vec<EntityId> = r.iter().map(|(id, _)| *id).collect();
+        for id in &got {
+            assert!(live.contains(id), "returned id must be a live survivor");
+        }
+        for id in &tombstoned {
+            assert!(!got.contains(id), "tombstoned id must not surface");
+        }
     }
 }

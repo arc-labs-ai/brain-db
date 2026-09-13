@@ -1,0 +1,14 @@
+{
+  "steps": [
+    {
+      "step_index": 0,
+      "memory_id": 33059591799037110662230,
+      "text": "first step",
+      "transition_kind": "Causal",
+      "confidence": 0.8,
+      "estimated_distance_to_goal": 0.5
+    }
+  ],
+  "is_final": true,
+  "plan_status": 0
+}

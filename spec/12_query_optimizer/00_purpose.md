@@ -175,7 +175,7 @@ They're also where most of Brain's runtime cost is — embedding and search, bot
 
 The planner crate also hosts the **VSA algebra module** — Vector-Symbolic Architecture primitives used to bind / bundle / unbind typed predicates over Holographic Reduced Representation (HRR) vectors. VSA ships as a callable algebra module (see [`./06_vsa_algebra.md`](./06_vsa_algebra.md)).
 
-The module is wired but **not yet plumbed into PLAN / REASON executors** — that integration lands in a future version. The initial release ships the deterministic codebook, bind/bundle/unbind operators, and an `analogy_query` API exposed for tools and experimentation.
+The module is **wired into REASON's executor** as an automatic internal re-rank nudge (analogical inference, see [`01_architecture/03_primitives.md`](../01_architecture/03_primitives.md) §4.2 and [`06_vsa_algebra.md`](./06_vsa_algebra.md) §6). PLAN integration was never proposed and remains out of scope. The module also ships the deterministic codebook, bind/bundle/unbind operators, and the `analogy_query` API exposed directly for tools and experimentation.
 
 ---
 

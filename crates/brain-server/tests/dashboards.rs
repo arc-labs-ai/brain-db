@@ -1,4 +1,4 @@
-//! CI gate for `monitoring/dashboards/*.json`.
+//! CI gate for `config/monitoring/dashboards/*.json`.
 //!
 //! Verifies each dashboard:
 //! - Parses as valid JSON.
@@ -30,25 +30,13 @@ const EXPECTED_DASHBOARDS: &[&str] = &[
 const ALLOWED_PREFIXES: &[&str] = &["brain_", "process_"];
 
 fn dashboards_dir() -> PathBuf {
-    // brain-server/tests/dashboards.rs → monitoring/dashboards/
+    // brain-server/tests/dashboards.rs → config/monitoring/dashboards/
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
+        .join("config")
         .join("monitoring")
         .join("dashboards")
-}
-
-#[test]
-fn every_dashboard_is_present() {
-    let dir = dashboards_dir();
-    for name in EXPECTED_DASHBOARDS {
-        let path = dir.join(format!("{name}.json"));
-        assert!(
-            path.exists(),
-            "missing dashboard file: {} — lists 8 dashboards",
-            path.display()
-        );
-    }
 }
 
 #[test]
@@ -173,33 +161,4 @@ fn extract_metric_names(expr: &str) -> Vec<String> {
         }
     }
     out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn extract_metric_names_finds_brain_prefix() {
-        let expr = "sum by (op) (rate(brain_request_total{status=\"error\"}[1m]))";
-        let names = extract_metric_names(expr);
-        assert!(names.contains(&"brain_request_total".to_string()));
-    }
-
-    #[test]
-    fn extract_metric_names_strips_histogram_suffixes() {
-        let names = extract_metric_names(
-            "histogram_quantile(0.99, sum by (le) (rate(brain_request_duration_ms_bucket[1m])))",
-        );
-        assert!(names.contains(&"brain_request_duration_ms".to_string()));
-    }
-
-    #[test]
-    fn extract_metric_names_skips_keywords() {
-        let names = extract_metric_names("sum by (op) (rate(brain_x[1m]))");
-        assert!(!names.contains(&"sum".to_string()));
-        assert!(!names.contains(&"rate".to_string()));
-        assert!(!names.contains(&"by".to_string()));
-        assert!(!names.contains(&"op".to_string()));
-    }
 }

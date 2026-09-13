@@ -19,7 +19,7 @@
 //! - `top` / `ps` shows stable RSS over the 5-minute window (no
 //!   leak).
 //!
-//! Last run results live in the M8 commit message; update when
+//! Last run results live in the commit message; update when
 //! re-run.
 
 #![cfg(target_os = "linux")]

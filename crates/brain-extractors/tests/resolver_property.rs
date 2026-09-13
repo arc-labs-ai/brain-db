@@ -26,6 +26,11 @@ use proptest::collection::vec as pvec;
 use proptest::prelude::*;
 use tempfile::TempDir;
 
+/// Fixed (namespace, space) scope for resolver tests.
+fn test_scope() -> brain_metadata::RowScope {
+    brain_metadata::RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xA1; 16])
+}
+
 const NOW: u64 = 1_700_000_000_000_000_000;
 
 fn open_db() -> (TempDir, MetadataDb) {
@@ -39,7 +44,7 @@ fn open_db() -> (TempDir, MetadataDb) {
 /// mapping (after dedup) is the read model under test for replay
 /// determinism.
 fn replay(seq: &[(String, &str)]) -> Vec<(String, EntityId)> {
-    let (_dir, mut db) = open_db();
+    let (_dir, db) = open_db();
     let mut out = Vec::with_capacity(seq.len());
     let wtxn = db.write_txn().unwrap();
     for (i, (sf, qname)) in seq.iter().enumerate() {
@@ -48,7 +53,7 @@ fn replay(seq: &[(String, &str)]) -> Vec<(String, EntityId)> {
         if normalize_name(sf).is_empty() {
             continue;
         }
-        let res = resolve_or_create(&wtxn, sf, qname, 0.9, NOW + i as u64).unwrap();
+        let res = resolve_or_create(&wtxn, test_scope(), sf, qname, 0.9, NOW + i as u64).unwrap();
         out.push((sf.clone(), res.entity_id));
     }
     wtxn.commit().unwrap();
@@ -103,11 +108,11 @@ proptest! {
         sf in "[a-zA-Z]{3,10}( [a-zA-Z]{3,10})?",
         qname in prop::sample::select(vec!["brain:Person", "brain:Organization"])
     ) {
-        let (_dir, mut db) = open_db();
+        let (_dir, db) = open_db();
         let wtxn = db.write_txn().unwrap();
-        let r1 = resolve_or_create(&wtxn, &sf, qname, 0.9, NOW).unwrap();
-        let r2 = resolve_or_create(&wtxn, &sf, qname, 0.9, NOW + 1).unwrap();
-        let r3 = resolve_or_create(&wtxn, &sf, qname, 0.9, NOW + 2).unwrap();
+        let r1 = resolve_or_create(&wtxn, test_scope(), &sf, qname, 0.9, NOW).unwrap();
+        let r2 = resolve_or_create(&wtxn, test_scope(), &sf, qname, 0.9, NOW + 1).unwrap();
+        let r3 = resolve_or_create(&wtxn, test_scope(), &sf, qname, 0.9, NOW + 2).unwrap();
         prop_assert_eq!(r1.entity_id, r2.entity_id);
         prop_assert_eq!(r2.entity_id, r3.entity_id);
         prop_assert_eq!(r1.tier, ResolutionTier::Created);
@@ -127,7 +132,7 @@ proptest! {
         leading_pad in 0usize..4,
         trailing_pad in 0usize..4,
     ) {
-        let (_dir, mut db) = open_db();
+        let (_dir, db) = open_db();
         let base = format!("{first} {second}");
         let mut variants = vec![
             base.clone(),
@@ -147,7 +152,7 @@ proptest! {
         let mut ids = Vec::new();
         for (i, v) in variants.iter().enumerate() {
             if normalize_name(v).is_empty() { continue; }
-            let r = resolve_or_create(&wtxn, v, "brain:Person", 0.9, NOW + i as u64).unwrap();
+            let r = resolve_or_create(&wtxn, test_scope(), v, "brain:Person", 0.9, NOW + i as u64).unwrap();
             ids.push(r.entity_id);
         }
         wtxn.commit().unwrap();
@@ -223,7 +228,7 @@ fn higher_threshold_never_increases_dedup_count() {
 
 #[test]
 fn alias_lookup_normalises_case() {
-    let (_dir, mut db) = open_db();
+    let (_dir, db) = open_db();
     let mut e = Entity::new_active(
         EntityId::new(),
         EntityType::PERSON_ID,
@@ -235,13 +240,14 @@ fn alias_lookup_normalises_case() {
     let target = e.id;
     {
         let wtxn = db.write_txn().unwrap();
-        entity_put(&wtxn, &e).unwrap();
+        entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
         wtxn.commit().unwrap();
     }
     for variant in ["priya", "PRIYA", "Priya", "  PrIyA  "] {
         let wtxn = db.write_txn().unwrap();
-        let Resolution { entity_id, tier } =
-            resolve_or_create(&wtxn, variant, "brain:Person", 0.7, NOW + 1).unwrap();
+        let Resolution {
+            entity_id, tier, ..
+        } = resolve_or_create(&wtxn, test_scope(), variant, "brain:Person", 0.7, NOW + 1).unwrap();
         wtxn.commit().unwrap();
         assert_eq!(entity_id, target, "{variant} should resolve to target");
         assert_eq!(tier, ResolutionTier::Alias, "{variant} should be tier-2");
@@ -257,9 +263,9 @@ proptest! {
 
     #[test]
     fn whitespace_only_surface_forms_are_rejected(ws in "[ \\t\\n]{1,16}") {
-        let (_dir, mut db) = open_db();
+        let (_dir, db) = open_db();
         let wtxn = db.write_txn().unwrap();
-        let res = resolve_or_create(&wtxn, &ws, "brain:Person", 0.5, NOW);
+        let res = resolve_or_create(&wtxn, test_scope(), &ws, "brain:Person", 0.5, NOW);
         prop_assert!(res.is_err(), "whitespace-only surface form must error, not panic");
     }
 }

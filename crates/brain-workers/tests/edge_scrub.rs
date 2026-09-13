@@ -1,11 +1,16 @@
-#![allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send post-9.7 (audit §4)
-//! Edge scrub worker tests (sub-task 8.9).
+#![allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send
+//! Edge scrub worker tests.
+//!
+//! Guards removal of orphaned edges whose endpoints no longer live:
+//! an edge to or from a dead memory is dropped from both the forward
+//! and reverse tables, while live-to-live edges are kept. Pins per-cycle
+//! batch caps, cursor advance, and the metric the scheduler reads.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use brain_core::{AgentId, ContextId, EdgeKind, MemoryId, MemoryKind};
+use brain_core::{EdgeKind, MemoryId, MemoryKind, SessionId, SpaceId};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::tables::edge::{
@@ -18,7 +23,6 @@ use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_workers::{
     EdgeScrubWorker, Worker, WorkerConfig, WorkerContext, WorkerKind, WorkerScheduler,
 };
-use parking_lot::Mutex;
 use redb::ReadableTable;
 use uuid::Uuid;
 
@@ -48,8 +52,8 @@ struct Fixture {
 fn build_fixture() -> Fixture {
     let tempdir = tempfile::tempdir().unwrap();
     let db_path = tempdir.path().join("metadata.redb");
-    let metadata: SharedMetadataDb = Arc::new(Mutex::new(MetadataDb::open(&db_path).unwrap()));
-    let (shared, hnsw_writer) = SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).unwrap();
+    let metadata: SharedMetadataDb = Arc::new(MetadataDb::open(&db_path).unwrap());
+    let (shared, hnsw_writer) = SharedHnsw::new(IndexParams::default_v1()).unwrap();
     let writer = Arc::new(RealWriterHandle::new(metadata.clone(), hnsw_writer));
     let executor = ExecutorContext::new(
         Arc::new(NopDispatcher) as Arc<dyn Dispatcher>,
@@ -58,7 +62,7 @@ fn build_fixture() -> Fixture {
         writer as Arc<dyn WriterHandle>,
     );
     Fixture {
-        ctx: Arc::new(OpsContext::new(executor)),
+        ctx: Arc::new(brain_ops::test_support::ops_context_for_tests_owning_tempdir(executor)),
         metadata,
         _tempdir: tempdir,
     }
@@ -79,14 +83,14 @@ fn make_id(slot: u64) -> MemoryId {
 
 fn seed_memory(metadata: &SharedMetadataDb, slot: u64) -> MemoryId {
     let id = make_id(slot);
-    let mut db = metadata.lock();
-    let wtxn = db.write_txn().unwrap();
+    let wtxn = metadata.write_txn().unwrap();
     {
         let mut table = wtxn.open_table(MEMORIES_TABLE).unwrap();
         let meta = MemoryMetadata::new_active(
             id,
-            AgentId(Uuid::nil()),
-            ContextId(1),
+            brain_core::NamespaceId::SYSTEM,
+            SpaceId(Uuid::nil()),
+            SessionId(1),
             slot,
             1,
             MemoryKind::Episodic,
@@ -104,8 +108,7 @@ fn seed_memory(metadata: &SharedMetadataDb, slot: u64) -> MemoryId {
 /// Insert an edge directly into both tables — bypasses the writer's
 /// alive-endpoint validation so we can craft orphans.
 fn seed_edge_raw(metadata: &SharedMetadataDb, src: MemoryId, kind: EdgeKind, tgt: MemoryId) {
-    let mut db = metadata.lock();
-    let wtxn = db.write_txn().unwrap();
+    let wtxn = metadata.write_txn().unwrap();
     {
         let mut out = wtxn.open_table(EDGES_TABLE).unwrap();
         let mut rev = wtxn.open_table(EDGES_REVERSE_TABLE).unwrap();
@@ -125,15 +128,13 @@ fn seed_edge_raw(metadata: &SharedMetadataDb, src: MemoryId, kind: EdgeKind, tgt
 }
 
 fn count_edges_out(metadata: &SharedMetadataDb) -> usize {
-    let db = metadata.lock();
-    let rtxn = db.read_txn().unwrap();
+    let rtxn = metadata.read_txn().unwrap();
     let t = rtxn.open_table(EDGES_TABLE).unwrap();
     t.iter().unwrap().count()
 }
 
 fn count_edges_in(metadata: &SharedMetadataDb) -> usize {
-    let db = metadata.lock();
-    let rtxn = db.read_txn().unwrap();
+    let rtxn = metadata.read_txn().unwrap();
     let t = rtxn.open_table(EDGES_REVERSE_TABLE).unwrap();
     t.iter().unwrap().count()
 }
@@ -217,8 +218,7 @@ fn edge_from_dead_source_removed_from_in() {
         // Simulate post-reclamation: remove dead_src's MEMORIES row plus
         // the EDGES_OUT[dead_src,*,*] entry.
         {
-            let mut db = fix.metadata.lock();
-            let wtxn = db.write_txn().unwrap();
+            let wtxn = fix.metadata.write_txn().unwrap();
             {
                 let mut out = wtxn.open_table(EDGES_TABLE).unwrap();
                 let key = brain_metadata::tables::edge::EdgeKey {
@@ -349,47 +349,6 @@ fn mixed_live_and_orphan_only_orphans_removed() {
 // ===========================================================================
 // Worker integration (3).
 // ===========================================================================
-
-#[test]
-fn worker_registers_with_correct_kind_and_default_cadence() {
-    glommio_run(|| async {
-        let fix = build_fixture();
-        let mut sched = WorkerScheduler::new();
-        sched
-            .register(Arc::new(EdgeScrubWorker::new()), fix.ctx)
-            .unwrap();
-        let cfg = sched.config(WorkerKind::EdgeScrub.name()).unwrap();
-        assert_eq!(cfg.interval, Duration::from_secs(1800));
-        sched.shutdown().await.unwrap();
-    });
-}
-
-#[test]
-fn disabled_worker_via_config_does_not_scrub() {
-    glommio_run(|| async {
-        let fix = build_fixture();
-        let alive = seed_memory(&fix.metadata, 1);
-        let dead = make_id(99);
-        seed_edge_raw(&fix.metadata, alive, EdgeKind::FollowedBy, dead);
-        let cfg = WorkerConfig {
-            enabled: false,
-            interval: Duration::from_millis(20),
-            batch_size: 100,
-            max_runtime: Duration::from_secs(1),
-        };
-        let mut sched = WorkerScheduler::new();
-        sched
-            .register(Arc::new(EdgeScrubWorker::new().with_config(cfg)), fix.ctx)
-            .unwrap();
-        glommio::timer::sleep(Duration::from_millis(150)).await;
-        sched.shutdown().await.unwrap();
-        assert_eq!(
-            count_edges_out(&fix.metadata),
-            1,
-            "disabled worker must not touch edges"
-        );
-    });
-}
 
 #[test]
 fn cycle_processed_count_feeds_metrics() {

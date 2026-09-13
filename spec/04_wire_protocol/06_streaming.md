@@ -89,7 +89,7 @@ This is intentional. Forcing a strict serial order across streams would defeat m
 
 ### 4.3 Implication for clients
 
-Clients must demultiplex by stream_id. The SDK's typical pattern: each stream is a future / async iterator that consumes frames matching its stream_id.
+Clients must demultiplex by stream_id. A typical client pattern: each stream is a future / async iterator that consumes frames matching its stream_id.
 
 ## 5. Stream cancellation
 

@@ -1,4 +1,4 @@
-//! M2 smoke: real TCP, real hyper, real router.
+//! Server smoke: real TCP, real hyper, real router.
 //!
 //! Three scenarios:
 //! 1. Round-trip GET with a small response body.

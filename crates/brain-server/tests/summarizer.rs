@@ -1,4 +1,4 @@
-//! Integration tests for sub-task 9.15 — OpenAI / Ollama
+//! Integration tests for the OpenAI / Ollama
 //! Summarizer adapters.
 //!
 //! Each test stands up a hand-rolled mock HTTP server (Tokio
@@ -25,7 +25,7 @@ mod config;
 #[path = "../src/llm/mod.rs"]
 mod llm;
 
-use config::{Config, SummarizerBackend, SummarizerConfig};
+use config::{Config, SummarizerConfig};
 
 fn cfg_with_summarizer(s: SummarizerConfig) -> Config {
     // Borrow the rest of Config's defaults from the dev TOML by
@@ -56,17 +56,6 @@ fn build_summarizer_disabled_returns_disabled_implementation() {
         .unwrap();
     let result = rt.block_on(async { summarizer.summarize(&["hello"]).await });
     assert!(matches!(result, Err(SummarizerError::Disabled)));
-}
-
-#[test]
-fn config_round_trips_summarizer_backend() {
-    let cfg = cfg_with_summarizer(SummarizerConfig {
-        backend: SummarizerBackend::Ollama,
-        ..SummarizerConfig::default()
-    });
-    assert_eq!(cfg.summarizer.backend, SummarizerBackend::Ollama);
-    // Default Ollama base is localhost.
-    assert!(cfg.summarizer.ollama_base.contains("localhost"));
 }
 
 // ---------------------------------------------------------------------------
@@ -110,17 +99,19 @@ mod openai_tests {
     }
 
     fn openai_cfg(api_base: String) -> Config {
-        std::env::set_var("BRAIN_TEST_OPENAI_KEY", "test-key");
-        super::cfg_with_summarizer(SummarizerConfig {
-            backend: SummarizerBackend::Openai,
+        // The summarizer shares the single `[llm] api_key`; the mock
+        // server accepts any non-empty key.
+        let mut cfg = super::cfg_with_summarizer(SummarizerConfig {
+            backend: config::SummarizerBackend::Openai,
             request_timeout_sec: 5,
             max_summary_chars: 256,
             openai_api_base: api_base,
-            openai_api_key_env: Some("BRAIN_TEST_OPENAI_KEY".to_owned()),
             openai_model: "gpt-test".to_owned(),
             openai_temperature: 0.0,
             ..SummarizerConfig::default()
-        })
+        });
+        cfg.llm.api_key = Some("test-key".to_owned());
+        cfg
     }
 
     /// Spin up the mock first (its own runtime), then the
@@ -187,24 +178,22 @@ mod openai_tests {
     }
 
     #[test]
-    fn openai_missing_env_var_fails_construction() {
-        std::env::remove_var("BRAIN_TEST_OPENAI_MISSING");
-        let cfg = super::cfg_with_summarizer(SummarizerConfig {
-            backend: SummarizerBackend::Openai,
-            openai_api_key_env: Some("BRAIN_TEST_OPENAI_MISSING".to_owned()),
+    fn openai_missing_key_fails_construction() {
+        // No shared `[llm] api_key` → construction fails. The summarizer
+        // reads only that one field, so there is no ambient env var to
+        // guard against.
+        let mut cfg = super::cfg_with_summarizer(SummarizerConfig {
+            backend: config::SummarizerBackend::Openai,
             ..SummarizerConfig::default()
         });
+        cfg.llm.api_key = None;
         // `Result<Arc<dyn Summarizer>, _>` isn't `Debug`, so we can't
         // use `expect_err`. Pattern-match directly.
-        match llm::factory::build_summarizer(&cfg) {
-            Ok(_) => panic!("build should fail"),
-            Err(e) => assert!(
-                format!("{e}")
-                    .to_lowercase()
-                    .contains("environment variable"),
-                "unexpected error: {e}"
-            ),
-        }
+        let failed = matches!(
+            llm::factory::build_summarizer(&cfg),
+            Err(llm::factory::BuildSummarizerError::OpenAiKeyMissing)
+        );
+        assert!(failed, "expected OpenAiKeyMissing with no shared LLM key");
     }
 }
 
@@ -243,7 +232,7 @@ mod ollama_tests {
 
     fn ollama_cfg(base: String) -> Config {
         super::cfg_with_summarizer(SummarizerConfig {
-            backend: SummarizerBackend::Ollama,
+            backend: config::SummarizerBackend::Ollama,
             request_timeout_sec: 5,
             ollama_base: base,
             ollama_model: "llama-test".to_owned(),

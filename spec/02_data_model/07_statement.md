@@ -132,6 +132,10 @@ struct Statement {
     id: StatementId,                 // UUIDv7
     kind: StatementKind,             // Fact | Preference | Event
 
+    // Owner scope — stamped from the caller's authenticated (namespace, agent)
+    namespace_id: NamespaceId,       // owning tenant; 0 = reserved `brain` system namespace
+    agent_id: AgentId,               // owning agent
+
     // Subject + predicate are required for all kinds
     subject: SubjectRef,             // EntityId or Pending(AuditId)
     predicate: PredicateId,          // interned namespaced string
@@ -188,6 +192,8 @@ enum TombstoneReason {
 ```
 
 The unified row averages ~256 bytes (fixed fields ~160, object tagged union typically 16–64, inline evidence 0–128). For deployments with very large evidence lists, the `evidence_overflow` table absorbs the size.
+
+**Owner scope (`namespace_id` + `agent_id`).** Every statement is owned by exactly one `(namespace, agent)` tenant pair, stamped from the caller's authenticated scope at create time (fail-closed by construction). This owner namespace is **distinct** from the qname namespace of the statement's `predicate` — a statement owned by `acme` may use the shared `brain:role` predicate. The reserved `brain` system namespace (id `0`) owns only seeded rows and is never a valid owner of user-written statements. The scope is the leading prefix of every statement secondary index, so a range scan for one tenant can never traverse another's rows.
 
 ## Kind-specific contracts
 
@@ -410,7 +416,7 @@ For chain_root = anchor_id_or_followed_chain_root:
         emit
 ```
 
-Returns the full chain ordered by `version` ascending. The wire-side shape is in [`../04_wire_protocol/08_typed_graph_frames.md`](../04_wire_protocol/08_typed_graph_frames.md) §8.
+Returns the chain ordered by `version` ascending, **keyset-paginated**: each call takes a `limit` and an opaque `cursor` (empty on the first page) and returns a page plus a `next_cursor`; the full chain is read by following the cursor to exhaustion. Pagination keys on the immutable `version`, so a page can neither gap nor duplicate a row across fetches. The wire-side shape is in [`../04_wire_protocol/08_typed_graph_frames.md`](../04_wire_protocol/08_typed_graph_frames.md) §8.
 
 #### Anchor flexibility
 
@@ -541,7 +547,7 @@ Returns:
 - Empty if all active Facts agree (`object` equal across all).
 - The set of disagreeing Facts otherwise — caller decides how to surface.
 
-#### Wire / SDK surface
+#### Wire surface
 
 In v1.0 contradiction inspection is internal to Brain (used by query routing here) and by the admin op `ADMIN_LIST_PENDING_RESOLUTIONS` ([`../04_wire_protocol/09_typed_graph_admin.md`](../04_wire_protocol/09_typed_graph_admin.md) §4). There is **no** `STATEMENT_LIST_CONTRADICTIONS` wire opcode in v1.
 
@@ -550,7 +556,10 @@ Clients that want contradictions:
 - Call `STATEMENT_LIST` with `subject + predicate + only_current=true`.
 - Inspect the returned set; if more than one distinct `object`, the set is contradictory.
 
-The query router exposes contradictions in `QUERY_TRACE` debug output. Production callers route there.
+Production callers detect contradictions through `STATEMENT_LIST` (above) or a
+`RECALL` that returns a `Many` answer with conflicting members. The query router
+additionally surfaces them in `QUERY_TRACE` debug output for operators diagnosing
+the engine.
 
 ### Resolving contradictions
 
@@ -589,7 +598,7 @@ At step "validate" in statement_create (after subject/predicate check):
                 // No error — insert proceeds.
 ```
 
-`contradiction_audit_record` writes a row to `entity_resolution_audit` (re-used) so operators can find unresolved contradictions via `ADMIN_LIST_PENDING_RESOLUTIONS`.
+`contradiction_audit_record` writes a row to the dedicated `statement_contradiction_audit` table (keyed by `(subject, predicate_id)`, one open row per pair, storing the conflicting statement ids) so operators can find unresolved contradictions via `ADMIN_LIST_PENDING_CONTRADICTIONS` (`0x0178`). The row is self-contained — its `contradicting_statement_ids` are re-checked against `statements` at list time, and a row that no longer holds (one side superseded/retracted/tombstoned, ≤1 distinct object) is lazily marked `RESOLVED`. The `entity_resolution_audit` table is **not** reused: it is the entity-resolution log and carries no statement-lifecycle discriminator.
 
 #### Event emission
 
@@ -806,7 +815,7 @@ When confidence is recomputed and the bucket changes, the index entry must be re
 
 The default `STATEMENT_LIST` order is by confidence descending — high-confidence facts surface first. The query router uses confidence as one input to RRF fusion alongside semantic similarity, lexical relevance, and graph proximity.
 
-`min_confidence` filter on `STATEMENT_LIST` and `QUERY` opcodes lets callers gate on a threshold. Default threshold per-deployment, configurable via `brain.query.min_confidence`.
+`min_confidence` filter on `STATEMENT_LIST` (and, for operators, the `QUERY_TRACE` introspection op) lets callers gate on a threshold. Default threshold per-deployment, configurable via `brain.query.min_confidence`.
 
 ### Confidence tests
 
@@ -875,7 +884,7 @@ When `statement_create` is called with ≥ 9 evidence entries:
 2. Write `EvidenceOverflow { memory_ids: Vec<...>, extractor_ids: Vec<u32>, confidences: Vec<f32>, timestamps: Vec<u64> }` to `EVIDENCE_OVERFLOW_TABLE`.
 3. Set `Statement.evidence = EvidenceRef::Overflow(overflow_id)`.
 
-Subsequent reads dereference the pointer transparently — SDK / handler decodes overflow rows into the same `EvidenceEntry` shape callers see for inline.
+Subsequent reads dereference the pointer transparently — the client / handler decodes overflow rows into the same `EvidenceEntry` shape callers see for inline.
 
 #### Add-evidence promotion
 
@@ -950,13 +959,13 @@ Evidence to memories in OTHER shards is allowed. The cross-shard reverse-index e
 
 `extractor_id` lives on each `EvidenceEntry` and identifies **which extractor produced this evidence**. Values:
 
-- `0` — user-authored (no extractor; the statement came from an SDK call by an agent or human).
+- `0` — user-authored (no extractor; the statement came from an explicit client write by an agent or human).
 - `≥ 1` — registered extractor id (per [`../11_extractors/`](../11_extractors/00_purpose.md)).
 
 Brain uses `extractor_id` for:
 
 - **Audit** — "which extractor's output drove this claim?"
-- **Per-extractor governance** — when an extractor is retracted (`EXTRACTOR_DISABLE`), all its evidence remains but downstream consumers see the `extractor_id` and can filter or down-weight.
+- **Provenance filtering** — evidence records the `extractor_id`, so downstream consumers (and future re-extraction / backfill passes) can filter or down-weight a specific extractor's output without losing the underlying evidence.
 - **Confidence calibration** — different extractors have different reliability profiles; future versions weight by extractor.
 
 ### Evidence tests

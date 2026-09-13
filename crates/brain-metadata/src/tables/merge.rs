@@ -1,21 +1,13 @@
 //! `merge_log` table — entity merge history.
 //!
-//! See `spec/02_data_model/02_storage.md` (`MergeRecord` shape) +
-//! `spec/02_data_model/03_merge.md` (merge mechanics) +
-//! `spec/02_data_model/04_unmerge.md` (unmerge replays this record in reverse).
-//!
-//! Key is `(timestamp_unix_nanos, MergeId.to_bytes())` for time-ordered
+//! Unmerge replays this record in reverse. Key is
+//! `(timestamp_unix_nanos, MergeId.to_bytes())` for time-ordered
 //! traversal. Grace-period unmerge consults this table to reconstruct
 //! the pre-merge state.
 //!
-//! ## v1 → v2 (phase 16.7)
-//!
-//! Phase 16.5 stubbed a thin `v1` shape with only
-//! `(survivor, merged, timestamps, confidence, finalized)`. Phase 16.7
-//! widens to the full spec'd shape so unmerge can replay the diff:
-//! aliases contributed, attribute conflicts, mention_count delta, audit
-//! lifecycle. No production data exists on `v1`, so the migration is a
-//! straight replacement — dev databases must be wiped.
+//! The row carries everything unmerge needs to replay the diff:
+//! aliases contributed, attribute conflicts, mention_count delta, and
+//! audit lifecycle.
 
 use crate::impl_redb_rkyv_value;
 use brain_core::{EntityId, MergeId};
@@ -25,10 +17,7 @@ pub const MERGE_LOG_TABLE: TableDefinition<'static, (u64, [u8; 16]), MergeRecord
     TableDefinition::new("merge_log");
 
 /// Overflow rows for merges that re-routed many statements / relations
-/// (phase 17/18+ — the lists live here; phase 16.7 never writes the
-/// table since statement/relation tables don't yet exist).
-///
-/// Spec: `spec/02_data_model/02_storage.md` §"entity_merge_log".
+/// — the re-routed-id lists live here when they don't fit inline.
 pub const ENTITY_MERGE_AUDIT_OVERFLOW: TableDefinition<
     'static,
     ([u8; 16], u32),
@@ -41,14 +30,13 @@ pub const ENTITY_MERGE_AUDIT_OVERFLOW: TableDefinition<
 
 /// Actor-kind byte values for [`MergeRecord::actor_kind`] and
 /// [`MergeRecord::unmerged_by_actor_kind`]. `System` is the resolver /
-/// background worker; `Agent` is an operator agent_id over the wire.
+/// background worker; `Space` is an operator space_id over the wire.
 pub mod actor_kind {
     pub const SYSTEM: u8 = 0;
-    pub const AGENT: u8 = 1;
+    pub const SPACE: u8 = 1;
 }
 
 /// Conflict-resolution policy byte values for [`AttributeConflictRecord::policy`].
-/// Mirrors `spec/02_data_model/03_merge.md` §6.
 pub mod conflict_policy {
     pub const SURVIVOR_WINS: u8 = 1;
     pub const MERGED_WINS: u8 = 2;
@@ -73,8 +61,8 @@ pub mod conflict_outcome {
 ///
 /// `survivor_value_blob` and `merged_value_blob` carry rkyv-encoded
 /// `StatementValueWire` bytes (the wire-level union of typed
-/// attribute values). Phase 16.7 treats these as opaque bytes; phase
-/// 19's schema validator gets typed access.
+/// attribute values). The merge path treats these as opaque bytes; the
+/// schema validator gets typed access.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
 #[archive(check_bytes)]
 pub struct AttributeConflictRecord {
@@ -88,16 +76,61 @@ pub struct AttributeConflictRecord {
 }
 
 // ---------------------------------------------------------------------------
+// Re-route records — the exact per-row diff unmerge replays in reverse.
+// ---------------------------------------------------------------------------
+
+/// One statement re-routed off the merged entity during a merge.
+///
+/// A statement is re-routed on its subject side (subject was the merged
+/// entity), its object side (object was `Entity(merged)`), or both
+/// (a self-referential statement). The subject-side reroute bumps the
+/// row `version`; `old_version` / `new_version` capture that so unmerge
+/// restores the exact prior value and rewrites the chain-table key back.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
+#[archive(check_bytes)]
+pub struct StatementReroute {
+    pub statement_id_bytes: [u8; 16],
+    /// `1` iff the subject was re-pointed merged → survivor.
+    pub subject_changed: u8,
+    /// `1` iff the object `Entity(merged)` was re-pointed to survivor.
+    pub object_changed: u8,
+    /// Version before the subject-side bump. Equals `new_version` when
+    /// only the object changed (no bump).
+    pub old_version: u32,
+    /// Version after the subject-side bump.
+    pub new_version: u32,
+    /// Chain root (unchanged by reroute) — needed to rewrite the
+    /// version-keyed chain-table row on unmerge.
+    pub chain_root_bytes: [u8; 16],
+}
+
+/// One relation re-routed off the merged entity during a merge. Stores
+/// both the pre- and post-merge endpoints so unmerge can unlink the
+/// survivor-side edge rows and relink the original merged-side ones
+/// exactly, without recomputing symmetric canonicalisation.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
+#[archive(check_bytes)]
+pub struct RelationReroute {
+    pub relation_id_bytes: [u8; 16],
+    pub old_from_bytes: [u8; 16],
+    pub old_to_bytes: [u8; 16],
+    pub new_from_bytes: [u8; 16],
+    pub new_to_bytes: [u8; 16],
+    /// `1` iff the `from` endpoint was re-pointed merged → survivor.
+    pub from_changed: u8,
+    /// `1` iff the `to` endpoint was re-pointed merged → survivor.
+    pub to_changed: u8,
+}
+
+// ---------------------------------------------------------------------------
 // MergeRecord (v2).
 // ---------------------------------------------------------------------------
 
 /// Full merge audit row. Carries the complete diff between pre-merge
 /// and post-merge state — unmerge replays this in reverse.
 ///
-/// Phase scope: `statements_rerouted` / `relations_rerouted` are always
-/// `0` in phase 16.7 (statement / relation tables don't exist yet).
-/// Phases 17 / 18 sweep this table and populate the counts + overflow
-/// rows. See `spec/02_data_model/03_merge.md` §0.
+/// `statements_rerouted` / `relations_rerouted` count re-routed graph
+/// rows; the id lists themselves live in the overflow table.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
 #[archive(check_bytes)]
 pub struct MergeRecord {
@@ -109,12 +142,12 @@ pub struct MergeRecord {
     pub merged_at_unix_nanos: u64,
     pub grace_period_until_unix_nanos: u64,
     pub confidence: f32,
-    /// Operator-supplied reason. ≤ 4 KiB per `spec/28/04_validation.md` §1.
+    /// Operator-supplied reason. Capped at 4 KiB.
     pub reason: String,
     /// See [`actor_kind`].
     pub actor_kind: u8,
     /// `[0; 16]` when `actor_kind == SYSTEM`.
-    pub actor_agent_bytes: [u8; 16],
+    pub actor_space_bytes: [u8; 16],
 
     // Diffs against the survivor (replayed in reverse by unmerge).
     /// Aliases that were `merged`'s but weren't already on `survivor`
@@ -125,12 +158,24 @@ pub struct MergeRecord {
     pub trigrams_added: Vec<[u8; 3]>,
     pub attribute_conflicts: Vec<AttributeConflictRecord>,
 
-    // Re-routing counts (lists live in the overflow table). Always
-    // `0` in phase 16.7.
+    // Re-routing counts.
     pub statements_rerouted: u32,
     pub relations_rerouted: u32,
     /// `survivor.mention_count += this` on merge; reversed on unmerge.
     pub mention_count_added: u32,
+
+    /// Per-row statement re-route diff. Inlined (typical mention_count is
+    /// well under 1000, so the row stays far below redb's per-value cap);
+    /// the `entity_merge_audit_overflow` table stays reserved for the
+    /// very-high-degree case.
+    pub rerouted_statements: Vec<StatementReroute>,
+    /// Per-row relation re-route diff.
+    pub rerouted_relations: Vec<RelationReroute>,
+    /// Survivor's `attributes_blob` before the merge folded merged's in.
+    /// Unmerge restores this verbatim (the attribute fold is
+    /// survivor-wins, so this is the survivor's own bytes unless the
+    /// survivor had no attributes and adopted merged's whole blob).
+    pub survivor_attributes_before: Vec<u8>,
 
     // Status.
     /// `0` = reversible (within grace); `1` = finalized (post-grace
@@ -141,7 +186,7 @@ pub struct MergeRecord {
     /// See [`actor_kind`]; `0` if not unmerged.
     pub unmerged_by_actor_kind: u8,
     /// `[0; 16]` if not unmerged or unmerge actor is `SYSTEM`.
-    pub unmerged_by_agent_bytes: [u8; 16],
+    pub unmerged_by_space_bytes: [u8; 16],
 }
 
 impl MergeRecord {
@@ -159,7 +204,7 @@ impl MergeRecord {
         confidence: f32,
         reason: String,
         actor_kind: u8,
-        actor_agent_bytes: [u8; 16],
+        actor_space_bytes: [u8; 16],
     ) -> Self {
         Self {
             merge_id_bytes: merge_id.to_bytes(),
@@ -170,17 +215,20 @@ impl MergeRecord {
             confidence,
             reason,
             actor_kind,
-            actor_agent_bytes,
+            actor_space_bytes,
             aliases_added: Vec::new(),
             trigrams_added: Vec::new(),
             attribute_conflicts: Vec::new(),
             statements_rerouted: 0,
             relations_rerouted: 0,
             mention_count_added: 0,
+            rerouted_statements: Vec::new(),
+            rerouted_relations: Vec::new(),
+            survivor_attributes_before: Vec::new(),
             finalized: 0,
             unmerged_at_unix_nanos: 0,
             unmerged_by_actor_kind: 0,
-            unmerged_by_agent_bytes: [0; 16],
+            unmerged_by_space_bytes: [0; 16],
         }
     }
 
@@ -220,8 +268,7 @@ impl MergeRecord {
 
 /// Overflow chunk for very-large re-route lists. Each chunk holds up
 /// to a few thousand re-routed ids; redb's per-value 1 MiB cap drives
-/// the chunking. Phase 16.7 declares the table but never writes it
-/// (`statements_rerouted` / `relations_rerouted` always `0` in 16.7).
+/// the chunking.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
 #[archive(check_bytes)]
 pub struct MergeAuditOverflow {
@@ -229,12 +276,12 @@ pub struct MergeAuditOverflow {
     pub rerouted_relation_ids: Vec<[u8; 16]>,
 }
 
-impl_redb_rkyv_value!(MergeRecord, "brain_metadata::MergeRecord::v2");
+impl_redb_rkyv_value!(MergeRecord, "brain_metadata::MergeRecord");
 impl_redb_rkyv_value!(
     AttributeConflictRecord,
-    "brain_metadata::AttributeConflictRecord::v1"
+    "brain_metadata::AttributeConflictRecord"
 );
-impl_redb_rkyv_value!(MergeAuditOverflow, "brain_metadata::MergeAuditOverflow::v1");
+impl_redb_rkyv_value!(MergeAuditOverflow, "brain_metadata::MergeAuditOverflow");
 
 // ---------------------------------------------------------------------------
 // Tests.
@@ -258,7 +305,7 @@ mod tests {
             1_700_604_800_000_000_000,
             0.92,
             "duplicate detected".to_owned(),
-            actor_kind::AGENT,
+            actor_kind::SPACE,
             [7u8; 16],
         );
         rec.aliases_added = vec!["P. Patel".into(), "Priya P".into()];
@@ -320,8 +367,8 @@ mod tests {
 
         // Simulate an unmerge.
         rec.unmerged_at_unix_nanos = rec.merged_at_unix_nanos + 60_000_000_000;
-        rec.unmerged_by_actor_kind = actor_kind::AGENT;
-        rec.unmerged_by_agent_bytes = [9u8; 16];
+        rec.unmerged_by_actor_kind = actor_kind::SPACE;
+        rec.unmerged_by_space_bytes = [9u8; 16];
         rec.finalized = 1;
         {
             let wtxn = db.begin_write().unwrap();
@@ -337,8 +384,8 @@ mod tests {
         let got = t.get(&key).unwrap().unwrap().value();
         assert!(got.is_unmerged());
         assert!(got.is_finalized());
-        assert_eq!(got.unmerged_by_actor_kind, actor_kind::AGENT);
-        assert_eq!(got.unmerged_by_agent_bytes, [9u8; 16]);
+        assert_eq!(got.unmerged_by_actor_kind, actor_kind::SPACE);
+        assert_eq!(got.unmerged_by_space_bytes, [9u8; 16]);
     }
 
     #[test]

@@ -1,14 +1,10 @@
 //! `relation_types` table — user-declared relation types.
 //!
-//! See `spec/02_data_model/00_purpose.md` (cardinality, symmetry) and
-//! `spec/03_schema/00_purpose.md` (declaration). `Cardinality` is
-//! encoded as `u8` per the discriminant in `brain_core::Cardinality`.
-//!
-//! Phase 15.1 declared a minimal row (name + cardinality + symmetric
-//! plus from/to plus created_at). Phase 18.3 widens to match
-//! `brain_core::RelationType`, adding namespace,
-//! schema_version, description, and a `relation_types_by_qname`
-//! lookup index. Archive id bumped to v2 (pre-v1.0; no migration).
+//! `Cardinality` is encoded as `u8` per the discriminant in
+//! `brain_core::Cardinality`. The row matches `brain_core::RelationType`:
+//! namespace, name, cardinality, symmetric, from/to, schema_version,
+//! description, created_at, plus a `relation_types_by_qname` lookup
+//! index.
 
 use crate::impl_redb_rkyv_value;
 use brain_core::RelationType;
@@ -21,8 +17,8 @@ pub const RELATION_TYPES_TABLE: TableDefinition<'static, u32, RelationTypeDefini
     TableDefinition::new("relation_types");
 
 /// `relation_types_by_qname` — secondary index for
-/// `(namespace, name) → RelationTypeId`. Phase 18.3. Key is the
-/// canonical `"namespace:name"` string; value is the type id.
+/// `(namespace, name) → RelationTypeId`. Key is the canonical
+/// `"namespace:name"` string; value is the type id.
 pub const RELATION_TYPES_BY_QNAME_TABLE: TableDefinition<'static, &str, u32> =
     TableDefinition::new("relation_types_by_qname");
 
@@ -33,8 +29,8 @@ pub const RELATION_TYPES_BY_QNAME_TABLE: TableDefinition<'static, &str, u32> =
 ///
 /// `from_entity_type_id` / `to_entity_type_id`: `0` means "any
 /// entity type allowed", else the `EntityTypeId.raw()` of the
-/// constrained type. Person seeds at `EntityTypeId(1)` per phase
-/// 16.1, so `0` is safe as a "no constraint" sentinel.
+/// constrained type. Person seeds at `EntityTypeId(1)`, so `0` is safe
+/// as a "no constraint" sentinel.
 /// Origin of a registered relation type. Mirrors
 /// [`crate::tables::predicate::SchemaOrigin`]: tracks
 /// whether the row was authored by `SCHEMA_UPLOAD` (strict mode) or
@@ -184,7 +180,7 @@ pub fn decode_entity_type_id(raw: u32) -> Option<EntityTypeId> {
 }
 
 /// Inverse of [`decode_entity_type_id`]. `EntityTypeId(0)` is a
-/// reserved sentinel — Person is `EntityTypeId(1)` per phase 16.1.
+/// reserved sentinel — Person is `EntityTypeId(1)`.
 #[must_use]
 pub fn encode_entity_type_id(t: Option<EntityTypeId>) -> u32 {
     t.map(|e| e.raw()).unwrap_or(0)
@@ -192,7 +188,7 @@ pub fn encode_entity_type_id(t: Option<EntityTypeId>) -> u32 {
 
 impl_redb_rkyv_value!(
     RelationTypeDefinition,
-    "brain_metadata::RelationTypeDefinition::v3"
+    "brain_metadata::RelationTypeDefinition"
 );
 
 #[cfg(all(test, not(miri)))]

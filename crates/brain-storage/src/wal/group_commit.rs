@@ -1,9 +1,7 @@
 //! Group commit: batches concurrent `WalRecord` appends into a single
 //! `write_at` + `fdatasync` (both io_uring) for amortized fsync cost.
 //!
-//! See `spec/08_storage/06_wal_durability.md`.
-//!
-//! ## Architecture (sub-task 9.6a port)
+//! ## Architecture
 //!
 //! [`GroupCommitter::start`] spawns a Glommio **task** (`Task::local`) on
 //! the current executor that owns the [`WalSegment`]. Appenders call
@@ -19,10 +17,8 @@
 //! 4. Signals every pending ack with `Ok(lsn)` (or `Err(WalBroken)` on
 //!    failure).
 //!
-//! Pre-port (SD-2.8-2) used a dedicated OS `std::thread` calling synchronous
-//! `pwritev2(RWF_DSYNC)` from a `crossbeam_channel::select!` loop. The new
-//! design lives on the shard's single Glommio executor; no cross-thread
-//! synchronization on the hot path.
+//! This design lives on the shard's single Glommio executor; no
+//! cross-thread synchronization on the hot path.
 //!
 //! Errors are sticky: after a failed flush the WAL is "broken"; all
 //! in-flight handles and subsequent appends receive `Err(WalBroken)` until
@@ -217,7 +213,7 @@ async fn committer_loop(
 
     loop {
         // -----------------------------------------------------------------
-        // Phase 1: receive the first submission (or shutdown).
+        // Step 1: receive the first submission (or shutdown).
         // -----------------------------------------------------------------
         let first = if shutdown_requested {
             submission_rx.try_recv().ok()
@@ -247,12 +243,12 @@ async fn committer_loop(
         }
 
         // -----------------------------------------------------------------
-        // Phase 2: gather more records up to commit_window or size threshold.
+        // Step 2: gather more records up to commit_window or size threshold.
         // -----------------------------------------------------------------
         if got_any && broken.is_none() && !shutdown_requested {
             // Race the timer against the submission stream. We re-arm the
-            // timer once per iteration relative to when we entered Phase 2,
-            // not per-record — matches the pre-port crossbeam behavior.
+            // timer once per iteration relative to when we entered step 2,
+            // not per-record.
             let timer_fut = sleep(config.commit_window);
             futures_lite::pin!(timer_fut);
 
@@ -278,7 +274,7 @@ async fn committer_loop(
         }
 
         // -----------------------------------------------------------------
-        // Phase 3: drain any remaining queued submissions on shutdown.
+        // Step 3: drain any remaining queued submissions on shutdown.
         // -----------------------------------------------------------------
         if shutdown_requested {
             while let Ok(sub) = submission_rx.try_recv() {
@@ -287,7 +283,7 @@ async fn committer_loop(
         }
 
         // -----------------------------------------------------------------
-        // Phase 4: flush + signal.
+        // Step 4: flush + signal.
         // -----------------------------------------------------------------
         if !pending.is_empty() {
             if let Some(reason) = broken.clone() {
@@ -313,7 +309,7 @@ async fn committer_loop(
         }
 
         // -----------------------------------------------------------------
-        // Phase 5: exit on shutdown when the queue is fully drained.
+        // Step 5: exit on shutdown when the queue is fully drained.
         // -----------------------------------------------------------------
         if shutdown_requested && submission_rx.is_empty() {
             return Ok(segment);
@@ -371,7 +367,7 @@ mod tests {
             kind: WalRecordKind::Encode,
             flags: 0,
             timestamp_ns: 1_700_000_000_000_000_000,
-            agent_id_lo64: 0x1234_5678_9ABC_DEF0,
+            space_id_lo64: 0x1234_5678_9ABC_DEF0,
             payload: vec![(lsn & 0xFF) as u8; 32],
         }
     }

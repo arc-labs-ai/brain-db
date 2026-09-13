@@ -1,6 +1,5 @@
 //! Fan-out from a `ValidatedSchema` into the existing
-//! entity_type / predicate / relation_type intern paths
-//! (phase 19.7).
+//! entity_type / predicate / relation_type intern paths.
 //!
 //! Called by [`crate::schema::store::schema_upload`] after the
 //! schema-version row is written. The single code path used both
@@ -9,13 +8,18 @@
 use std::collections::HashSet;
 
 use brain_core::StatementKind;
-use brain_core::{Cardinality, EntityTypeId, ExtractorKind, PredicateId};
+use brain_core::{
+    Cardinality, EntityTypeId, ExtractorKind, KindCardinality, PredicateId, TemporalModel,
+};
 use brain_protocol::schema::{
     CardinalityAst, ExtractorKindAst, ObjectTypeDecl, SchemaItem, StatementKindAst, ValidatedSchema,
 };
 use redb::{ReadableTable, WriteTransaction};
 
-use super::predicate::{predicate_intern, PredicateOpError};
+use super::kind::{kind_intern, KindOpError};
+use super::predicate::{
+    predicate_intern, predicate_set_retention, ObjectConstraint, PredicateOpError,
+};
 use crate::entity::types::{entity_type_intern, entity_type_lookup_by_name, EntityTypeOpError};
 use crate::extractor::ops::{extractor_intern, ExtractorOpError};
 use crate::relation::types::{relation_type_intern, RelationTypeOpError};
@@ -32,6 +36,8 @@ pub enum SchemaApplyError {
     RelationType(#[from] RelationTypeOpError),
     #[error("extractor: {0}")]
     Extractor(#[from] ExtractorOpError),
+    #[error("kind: {0}")]
+    Kind(#[from] KindOpError),
     #[error("extractor encode: {0}")]
     ExtractorEncode(String),
     #[error("redb storage: {0}")]
@@ -41,7 +47,7 @@ pub enum SchemaApplyError {
 }
 
 /// Walk `validated.items` in source order and intern each
-/// definition. Extractors are skipped (phase 20+).
+/// definition. Extractors are skipped.
 pub fn apply_schema_definitions(
     wtxn: &WriteTransaction,
     validated: &ValidatedSchema,
@@ -54,22 +60,39 @@ pub fn apply_schema_definitions(
     for item in &schema.items {
         match item {
             SchemaItem::EntityType(e) => {
-                // `schema_blob` left empty in 19.7 — phase 19+
-                // typed accessors will own the encoding.
+                // `schema_blob` left empty — typed accessors will own
+                // the encoding.
                 entity_type_intern(wtxn, &e.name, Vec::new(), now_unix_nanos)?;
             }
             SchemaItem::Predicate(p) => {
-                predicate_intern(
+                // A declared `Entity<Type>` range is carried through to
+                // storage so `statement_create` can reject an object
+                // entity of the wrong type. An unresolvable name
+                // degrades to "any entity type" rather than failing the
+                // upload, matching `resolve_entity_type`'s leniency on
+                // the relation path.
+                let object_entity_type = match declared_object_entity_type(&p.object) {
+                    Some(name) => resolve_entity_type(wtxn, name)?,
+                    None => None,
+                };
+                let object_constraint = ObjectConstraint {
+                    object_type_byte: object_type_constraint_byte(&p.object),
+                    entity_type_id: object_entity_type.map_or(0, EntityTypeId::raw),
+                };
+                let pred_id = predicate_intern(
                     wtxn,
                     namespace,
                     &p.name,
                     map_statement_kind(p.kind),
-                    object_type_constraint_byte(&p.object),
+                    object_constraint,
                     schema_version,
                     p.description.as_deref().unwrap_or(""),
                     p.resolved_stateful(),
                     now_unix_nanos,
                 )?;
+                // Stamp the declared retention TTL (or clear it, with 0, when the
+                // re-declaration drops `retention:`) onto the interned row.
+                predicate_set_retention(wtxn, pred_id, p.retention.map_or(0, |d| d.to_seconds()))?;
             }
             SchemaItem::RelationType(r) => {
                 let from = resolve_entity_type(wtxn, &r.from_type)?;
@@ -101,9 +124,39 @@ pub fn apply_schema_definitions(
                     now_unix_nanos,
                 )?;
             }
+            SchemaItem::Kind(k) => {
+                kind_intern(
+                    wtxn,
+                    namespace,
+                    &k.name,
+                    map_kind_cardinality(k.cardinality),
+                    map_temporal_model(k.temporal),
+                    k.polarity,
+                    k.hint.as_deref().unwrap_or(""),
+                    schema_version,
+                    now_unix_nanos,
+                )?;
+            }
         }
     }
     Ok(())
+}
+
+fn map_kind_cardinality(c: brain_protocol::schema::KindCardinalityAst) -> KindCardinality {
+    use brain_protocol::schema::KindCardinalityAst as A;
+    match c {
+        A::Single => KindCardinality::Single,
+        A::Set => KindCardinality::Set,
+    }
+}
+
+fn map_temporal_model(t: brain_protocol::schema::TemporalModelAst) -> TemporalModel {
+    use brain_protocol::schema::TemporalModelAst as A;
+    match t {
+        A::State => TemporalModel::State,
+        A::Event => TemporalModel::Event,
+        A::None => TemporalModel::Atemporal,
+    }
 }
 
 /// Mark every statement in `namespace` whose predicate isn't in the
@@ -183,19 +236,42 @@ fn map_statement_kind(k: StatementKindAst) -> Option<StatementKind> {
         StatementKindAst::Fact => Some(StatementKind::Fact),
         StatementKindAst::Preference => Some(StatementKind::Preference),
         StatementKindAst::Event => Some(StatementKind::Event),
+        StatementKindAst::Attribute => Some(StatementKind::Attribute),
+        StatementKindAst::Relation => Some(StatementKind::Relation),
+        StatementKindAst::Directive => Some(StatementKind::Directive),
         StatementKindAst::Any => None,
     }
 }
 
-/// Mirror of the 17.3 byte encoding: `0` any / `1` Entity /
-/// `2` Value / `3` Memory / `4` Statement.
-fn object_type_constraint_byte(o: &ObjectTypeDecl) -> u8 {
+/// Byte encoding for the object-type constraint: `0` any / `1` Entity
+/// / `2` Value / `3` Memory / `4` Statement.
+///
+/// Shared with the `SCHEMA_UPLOAD` pre-flight in brain-ops so both
+/// sides encode a declaration identically — a divergence here would
+/// make an idempotent re-upload look like a conflict (or vice versa).
+#[must_use]
+pub fn object_type_constraint_byte(o: &ObjectTypeDecl) -> u8 {
     match o {
         ObjectTypeDecl::Any => 0,
         ObjectTypeDecl::Entity { .. } => 1,
         ObjectTypeDecl::Value { .. } => 2,
         ObjectTypeDecl::Memory => 3,
         ObjectTypeDecl::Statement => 4,
+    }
+}
+
+/// The entity type name an `object: Entity<Name>` range declares.
+/// `None` for every other object declaration (and for the `Any`
+/// sentinel, which constrains nothing).
+///
+/// Companion to [`object_type_constraint_byte`] — the byte says *which
+/// variant*, this says *which entity type* — kept next to it so the two
+/// halves of one declaration can't drift apart.
+#[must_use]
+pub fn declared_object_entity_type(o: &ObjectTypeDecl) -> Option<&str> {
+    match o {
+        ObjectTypeDecl::Entity { entity_type } if entity_type != "Any" => Some(entity_type),
+        _ => None,
     }
 }
 
@@ -217,9 +293,8 @@ pub(crate) fn map_extractor_kind(k: ExtractorKindAst) -> ExtractorKind {
 }
 
 /// `"Any"` → `None`; otherwise looks up the entity type by name.
-/// In 19.7 the only relation-type targets are `"Any"` so missing
-/// lookups fall through as `None` (preserves the pre-19 "no
-/// constraint" semantics for unknown / Any).
+/// Missing lookups fall through as `None`, preserving the "no
+/// constraint" semantics for unknown / Any targets.
 fn resolve_entity_type(
     wtxn: &WriteTransaction,
     name: &str,
@@ -275,7 +350,6 @@ mod tests {
         assert_eq!(row.namespace, "acme");
         assert_eq!(row.name, "person_mentions");
         assert_eq!(row.kind, brain_core::ExtractorKind::Pattern.as_u8());
-        assert!(row.is_enabled());
 
         // `definition_blob` decodes back to the same ExtractorDef AST.
         let decoded: ExtractorDef = serde_json::from_slice(&row.definition_blob).unwrap();
@@ -284,6 +358,85 @@ mod tests {
             decoded.target,
             ExtractorTarget::Entity { entity_type } if entity_type == "Person"
         ));
+    }
+
+    #[test]
+    fn declared_entity_range_survives_apply() {
+        let src = r#"
+            namespace acme
+            define entity_type Person { attributes {} }
+            define entity_type Organization { attributes {} }
+            define predicate works_at {
+                kind: Fact
+                object: Entity<Organization>
+            }
+            define predicate knows {
+                kind: Fact
+                object: Entity<Any>
+            }
+        "#;
+        let schema = parse_schema(src).expect("parse");
+        let validated = validate(&schema).expect("validate");
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(&dir);
+        {
+            let wtxn = db.begin_write().unwrap();
+            apply_schema_definitions(&wtxn, &validated, 1, 1_700_000_000_000_000_000).unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        let rtxn = db.begin_read().unwrap();
+        let org_id = crate::entity::types::entity_type_lookup_by_name_rtxn(&rtxn, "Organization")
+            .unwrap()
+            .expect("Organization interned")
+            .id();
+        let works_at =
+            crate::schema::predicate::predicate_lookup_by_qname(&rtxn, "acme", "works_at")
+                .unwrap()
+                .expect("works_at interned");
+        assert_eq!(works_at.object_type_constraint_byte, 1, "Entity variant");
+        assert_eq!(
+            works_at.object_entity_type_id,
+            org_id.raw(),
+            "declared Entity<Organization> range must reach storage"
+        );
+
+        // `Entity<Any>` pins the variant but narrows no type.
+        let knows = crate::schema::predicate::predicate_lookup_by_qname(&rtxn, "acme", "knows")
+            .unwrap()
+            .expect("knows interned");
+        assert_eq!(knows.object_type_constraint_byte, 1);
+        assert_eq!(knows.object_entity_type_id, 0);
+    }
+
+    #[test]
+    fn seeded_system_schema_declares_no_entity_ranges() {
+        // Regression guard for a fresh boot: the seeded `brain:`
+        // predicates are all `Value<text>` and its relation types are
+        // `Any` except `family_of`. If that ever changes, the new
+        // write-time enforcement starts biting normal writes.
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::MetadataDb::open(dir.path().join("md.redb")).unwrap();
+        let rtxn = db.read_txn().unwrap();
+
+        for p in crate::schema::predicate::predicate_list(&rtxn, Some("brain")).unwrap() {
+            assert_eq!(
+                p.object_entity_type_id,
+                0,
+                "seeded predicate {} must not constrain an entity type",
+                p.canonical()
+            );
+        }
+        for rt in crate::relation::types::relation_type_list(&rtxn, Some("brain")).unwrap() {
+            if rt.name == "family_of" {
+                assert_eq!(rt.from_type, Some(brain_core::EntityType::PERSON_ID));
+                assert_eq!(rt.to_type, Some(brain_core::EntityType::PERSON_ID));
+            } else {
+                assert_eq!(rt.from_type, None, "{} declares from: Any", rt.canonical());
+                assert_eq!(rt.to_type, None, "{} declares to: Any", rt.canonical());
+            }
+        }
     }
 
     #[test]

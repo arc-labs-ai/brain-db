@@ -1,9 +1,9 @@
 //! TemporalEdgeWorker — derives `FollowedBy` substrate edges by
-//! walking the per-agent timeline index after every ENCODE.
+//! walking the per-space timeline index after every ENCODE.
 //!
 //! ## Why this exists
 //!
-//! Real agents stream observations in order. Each new memory almost
+//! Real spaces stream observations in order. Each new memory almost
 //! always *follows* a previous one in a narrative sense — but until
 //! this worker landed every `FollowedBy` edge had to be hand-attached
 //! by the caller via `--edge followed_by:<prev_id>`. The
@@ -12,13 +12,13 @@
 //! ## Flow
 //!
 //! 1. The writer's ENCODE handler pushes
-//!    `(memory_id, agent_id, context_id, created_at_unix_nanos)`
+//!    `(memory_id, space_id, session_id, created_at_unix_nanos)`
 //!    into a per-shard `flume::Sender` after redb commit. Non-blocking;
 //!    full channel drops with a counter bump.
 //! 2. The worker drains the receiver in bounded batches every
 //!    `interval_ms`. For each enqueue it walks
-//!    `MEMORIES_BY_AGENT_TIMELINE_TABLE` backwards from the new
-//!    memory's timestamp to find the predecessor in the same agent +
+//!    `MEMORIES_BY_SPACE_TIMELINE_TABLE` backwards from the new
+//!    memory's timestamp to find the predecessor in the same space +
 //!    context, computes a linear-decay weight from the gap, and writes
 //!    a `FollowedBy` edge from predecessor → new memory.
 //! 3. The worker builds a single `Write { phases: Vec<Phase::Link> }`
@@ -30,8 +30,8 @@
 //!
 //! ## What's *not* in scope
 //!
-//! - Cross-agent edges (different agent_id → no edge).
-//! - Cross-context by default (`cross_context = true` knob to opt in).
+//! - Cross-space edges (different space_id → no edge).
+//! - Cross-session by default (`cross_session = true` knob to opt in).
 //! - Multi-strand temporal threading. If three memories arrive in
 //!   rapid succession this worker builds a chain, not a fan.
 //! - Backfilling existing memories. Migration is for the timeline
@@ -43,11 +43,11 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use brain_core::{AgentId, ContextId, EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NodeRef};
+use brain_core::{EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NodeRef, SessionId, SpaceId};
 use brain_metadata::tables::edge::{derived_by, origin, zero_disambiguator, EdgeKey};
 use brain_metadata::tables::memory::{
-    agent_timeline_prefix_agent_time, AGENT_TIMELINE_KEY_LEN, MEMORIES_BY_AGENT_TIMELINE_TABLE,
-    MEMORIES_TABLE,
+    space_timeline_prefix_space, space_timeline_prefix_space_time,
+    MEMORIES_BY_SPACE_TIMELINE_TABLE, MEMORIES_TABLE, SPACE_TIMELINE_KEY_LEN,
 };
 use brain_ops::{
     EventEnvelope, Phase, RealWriterHandle, TemporalEdgeEnqueue, TemporalEdgeMetrics,
@@ -58,7 +58,7 @@ use brain_protocol::shared::enums::{
 };
 use futures_lite::FutureExt;
 use glommio::timer::sleep;
-use tracing::trace;
+use tracing::{trace, warn};
 
 use crate::config::{WorkerConfig, WorkerKind};
 use crate::context::WorkerContext;
@@ -76,9 +76,9 @@ pub struct TemporalEdgeKnobs {
     /// get written; keeps the table from filling with near-zero
     /// weight rows.
     pub weight_min: f32,
-    /// Allow `FollowedBy` across context boundaries. Defaults to
-    /// `false` — most narratives are scoped to a single context.
-    pub cross_context: bool,
+    /// Allow `FollowedBy` across session boundaries. Defaults to
+    /// `false` — most narratives are scoped to a single session.
+    pub cross_session: bool,
     /// Minimum cosine similarity between the new memory and its
     /// candidate predecessor for the edge to be written.
     ///
@@ -86,72 +86,31 @@ pub struct TemporalEdgeKnobs {
     /// `FollowedBy` edge regardless of content — "I had lunch" then
     /// "deployed to prod" would link despite zero shared topic.
     ///
-    /// Strict (≥0.5): tight thematic chains; the agent's narrative
+    /// Strict (≥0.5): tight thematic chains; the space's narrative
     /// stays on-topic. Loose (~0.3): broader narrative; cross-topic
     /// adjacency captured. 0.4 is the operator-tunable middle.
     pub topical_threshold: f32,
 }
 
-pub const DEFAULT_WINDOW_SECONDS: u64 = 300;
+/// Maximum gap between two memories for the later one to be linked as
+/// `FollowedBy` the earlier. 30 minutes, not 5: a single conversational
+/// session has natural pauses — the space reads a doc, the human steps
+/// away — and a 5-minute window slices that one session into
+/// disconnected fragments, breaking the narrative chain the retriever
+/// walks. 30 minutes keeps a session's turns linked while still cutting
+/// the thread between genuinely separate sittings.
+pub const DEFAULT_WINDOW_SECONDS: u64 = 1800;
 pub const DEFAULT_WEIGHT_MIN: f32 = 0.1;
-pub const DEFAULT_CROSS_CONTEXT: bool = false;
+pub const DEFAULT_CROSS_SESSION: bool = false;
 pub const DEFAULT_TEMPORAL_EDGE_TOPICAL_THRESHOLD: f32 = 0.4;
-
-/// Environment variable for overriding
-/// [`DEFAULT_TEMPORAL_EDGE_TOPICAL_THRESHOLD`]. Accepts an `f32` in
-/// `[0.0, 1.0]`. Out-of-range or unparseable values fall back to the
-/// default with a tracing warn.
-pub const TEMPORAL_EDGE_TOPICAL_THRESHOLD_ENV: &str = "BRAIN_TEMPORAL_EDGE_TOPICAL_THRESHOLD";
-
-/// Resolve the topical threshold from the env var (if set + valid)
-/// or fall back to `default`. Same shape as
-/// `auto_edge::resolved_threshold` so operators get consistent
-/// override semantics across both derivation workers.
-#[must_use]
-pub fn resolved_topical_threshold(default: f32) -> f32 {
-    resolved_topical_threshold_from(
-        std::env::var(TEMPORAL_EDGE_TOPICAL_THRESHOLD_ENV).ok(),
-        default,
-    )
-}
-
-/// Pure parse step extracted from [`resolved_topical_threshold`] so
-/// tests can validate the value-validation logic without mutating
-/// process-wide env state (forbidden under the project's no-`unsafe`
-/// rule).
-#[must_use]
-pub fn resolved_topical_threshold_from(raw: Option<String>, default: f32) -> f32 {
-    let Some(raw) = raw else {
-        return default;
-    };
-    match raw.parse::<f32>() {
-        Ok(v) if (0.0..=1.0).contains(&v) => v,
-        Ok(v) => {
-            tracing::warn!(
-                env = TEMPORAL_EDGE_TOPICAL_THRESHOLD_ENV,
-                value = v,
-                "temporal-edge topical threshold out of [0.0, 1.0]; using default"
-            );
-            default
-        }
-        Err(e) => {
-            tracing::warn!(
-                env = TEMPORAL_EDGE_TOPICAL_THRESHOLD_ENV,
-                error = %e,
-                "temporal-edge topical threshold not a valid f32; using default"
-            );
-            default
-        }
-    }
-}
 
 impl Default for TemporalEdgeKnobs {
     fn default() -> Self {
         Self {
             window_seconds: DEFAULT_WINDOW_SECONDS,
             weight_min: DEFAULT_WEIGHT_MIN,
-            cross_context: DEFAULT_CROSS_CONTEXT,
-            topical_threshold: resolved_topical_threshold(DEFAULT_TEMPORAL_EDGE_TOPICAL_THRESHOLD),
+            cross_session: DEFAULT_CROSS_SESSION,
+            topical_threshold: DEFAULT_TEMPORAL_EDGE_TOPICAL_THRESHOLD,
         }
     }
 }
@@ -274,6 +233,11 @@ async fn do_temporal_edge_cycle(
     // commit for each source.
     let mut drained_sources: Vec<MemoryId> = Vec::new();
     let mut per_source_edges: HashMap<MemoryId, u32> = HashMap::new();
+    // Real owning space for each drained source, carried through from the
+    // writer's enqueue payload — the `StageCompleted{TemporalEdge}`
+    // publish below stamps this instead of `SpaceId::default()` so an
+    // space-scoped SUBSCRIBE filter actually matches the event.
+    let mut source_spaces: HashMap<MemoryId, SpaceId> = HashMap::new();
 
     while processed < cfg.batch_size {
         if started.elapsed() >= cfg.max_runtime {
@@ -303,20 +267,21 @@ async fn do_temporal_edge_cycle(
                 Err(_) => break,
             }
         };
-        let (new_memory_id, agent_id, context_id, new_ts, new_vector) = item;
+        let (new_memory_id, space_id, session_id, new_ts, new_vector) = item;
         processed += 1;
         drained_sources.push(new_memory_id);
+        source_spaces.insert(new_memory_id, space_id);
 
-        // Look up the predecessor via the agent-timeline index in
+        // Look up the predecessor via the space-timeline index in
         // its own read txn. One tiny rtxn per enqueue keeps the
         // lock contention surface minimal.
         let prev_lookup = lookup_predecessor(
             ctx,
-            agent_id,
-            context_id,
+            space_id,
+            session_id,
             new_ts,
             new_memory_id,
-            knobs.cross_context,
+            knobs.cross_session,
         );
         let (prev_id, prev_ts) = match prev_lookup {
             PredecessorOutcome::Found(id, ts) => (id, ts),
@@ -360,7 +325,7 @@ async fn do_temporal_edge_cycle(
         if !new_vector.iter().all(|c| *c == 0.0) {
             // K = 64 matches default ef_search. The widest practical
             // case is "the predecessor is a top-64 neighbour" — true
-            // for any topical link in agent-journaling workloads;
+            // for any topical link in space-journaling workloads;
             // very-distant predecessors are precisely the ones we
             // want to drop.
             const TOPICAL_KNN_K: usize = 64;
@@ -442,7 +407,7 @@ async fn do_temporal_edge_cycle(
             })
             .collect();
         let request_hash = hash_temporal_batch(&to_link);
-        let write = Write::from_phases(WriteId::new(), AgentId::default(), phases)
+        let write = Write::from_phases(WriteId::new(), SpaceId::default(), phases)
             .with_request_hash(request_hash);
         let real_writer = ctx
             .ops
@@ -459,6 +424,42 @@ async fn do_temporal_edge_cycle(
             .map_err(|e| WorkerError::Ops(format!("submit: {e:?}")))?;
         to_link.len()
     };
+
+    // Merge the real per-edge detail (predecessor memory id + real decay
+    // weight, not just the count) into the successor's durable
+    // write-artifact bundle, so `MEMORY_INSPECT` can show it later —
+    // mirroring `extractor`'s `merge_graph_from_committed` and `hype`'s
+    // `merge_hype_questions`. Keyed by successor (`new_memory_id`, the
+    // second tuple element) to match `per_source_edges`'s / the
+    // `StageCompleted` publish's grouping below. Best-effort: a merge
+    // failure is logged and never blocks the cycle — the edges themselves
+    // already committed via `submit(Write)` above.
+    if written > 0 {
+        let metadata = ctx.ops.executor.metadata.as_ref();
+        let mut by_successor: HashMap<MemoryId, Vec<(MemoryId, MemoryId, f32)>> = HashMap::new();
+        for (prev_id, new_memory_id, weight) in &to_link {
+            by_successor.entry(*new_memory_id).or_default().push((
+                *prev_id,
+                *new_memory_id,
+                *weight,
+            ));
+        }
+        for (successor, links) in by_successor {
+            if let Err(e) = brain_ops::memory_artifact::merge_edge_links(
+                metadata,
+                successor,
+                "followed_by",
+                &links,
+            ) {
+                warn!(
+                    target: "brain_workers::temporal_edge",
+                    memory_id = ?successor,
+                    error = %e,
+                    "artifact edge merge failed (durable edges are committed; bundle detail deferred)",
+                );
+            }
+        }
+    }
 
     let elapsed = started.elapsed();
     worker.metrics.add_edges_written(written as u64);
@@ -478,21 +479,22 @@ async fn do_temporal_edge_cycle(
             lsn: 0,
             event_type: EventType::StageCompleted,
             memory_id,
-            context_id: ContextId::default(),
+            session_id: SessionId::default(),
             kind: MemoryKind::Episodic,
             salience: 0.0,
             timestamp_unix_nanos: ts,
             text: None,
-            knowledge_payload: None,
+            graph_payload: None,
             edge_payload: None,
             stage_kind: Some(StageKind::TemporalEdge),
             stage_outcome: Some(outcome),
             stage_payload: Some(StagePayload::TemporalEdge(StageTemporalEdgePayload {
                 edges_written,
             })),
-            agent_id: AgentId::default(),
+            space_id: source_spaces.get(&memory_id).copied().unwrap_or_default(),
+            vector: None,
         };
-        let _ = ctx.ops.events.publish(envelope);
+        ctx.ops.publish_stage_event(envelope).await;
     }
 
     trace!(
@@ -538,32 +540,48 @@ enum PredecessorOutcome {
 
 fn lookup_predecessor(
     ctx: &WorkerContext,
-    agent_id: AgentId,
-    context_id: ContextId,
+    space_id: SpaceId,
+    session_id: SessionId,
     new_ts: u64,
     new_memory_id: MemoryId,
-    cross_context: bool,
+    cross_session: bool,
 ) -> PredecessorOutcome {
     use brain_metadata::tables::memory::flags as memory_flags;
 
-    let db = ctx.ops.executor.metadata.lock();
+    let db = ctx.ops.executor.metadata.as_ref();
     let rtxn = match db.read_txn() {
         Ok(t) => t,
         Err(_) => return PredecessorOutcome::Skip(TemporalSkipReason::NoPrev),
     };
-    let timeline_t = match rtxn.open_table(MEMORIES_BY_AGENT_TIMELINE_TABLE) {
+    let timeline_t = match rtxn.open_table(MEMORIES_BY_SPACE_TIMELINE_TABLE) {
         Ok(t) => t,
         Err(_) => return PredecessorOutcome::Skip(TemporalSkipReason::NoPrev),
     };
 
-    // Range scan: from the start of this agent's rows up to (but not
-    // including) the new memory's key. The last entry in that range is
-    // the most recent predecessor. The timeline key is:
-    //   [agent(16)] [created_at_be(8)] [context(8)] [memory_id(16)]
-    // so a prefix `[agent(16)] [new_ts_be(8)]` and a `..` exclusive
-    // upper bound is exactly what we want.
-    let lower: [u8; 16] = agent_id.0.into_bytes();
-    let upper_24 = agent_timeline_prefix_agent_time(agent_id.0.into_bytes(), new_ts);
+    // The new memory's owning namespace is the outer half of the
+    // timeline scope key; read it from the memory's own row so the scan
+    // stays inside this tenant's keyspace. A missing row (shouldn't
+    // happen — we're processing its enqueue) falls back to the system
+    // namespace.
+    let namespace_id = {
+        let memories_t = match rtxn.open_table(MEMORIES_TABLE) {
+            Ok(t) => t,
+            Err(_) => return PredecessorOutcome::Skip(TemporalSkipReason::NoPrev),
+        };
+        match memories_t.get(&new_memory_id.to_be_bytes()) {
+            Ok(Some(g)) => g.value().namespace_id,
+            _ => brain_core::NamespaceId::SYSTEM.raw(),
+        }
+    };
+
+    // Range scan: from the start of this (namespace, space)'s rows up to
+    // (but not including) the new memory's key. The last entry in that
+    // range is the most recent predecessor. The timeline key is:
+    //   [namespace(4)] [space(16)] [created_at_be(8)] [session(8)] [memory_id(16)]
+    // so a prefix `[namespace(4)] [space(16)] [new_ts_be(8)]` and a `..`
+    // exclusive upper bound is exactly what we want.
+    let lower = space_timeline_prefix_space(namespace_id, space_id.0.into_bytes());
+    let upper_24 = space_timeline_prefix_space_time(namespace_id, space_id.0.into_bytes(), new_ts);
 
     let lower_slice = lower.as_slice();
     let upper_slice = upper_24.as_slice();
@@ -572,9 +590,9 @@ fn lookup_predecessor(
         Err(_) => return PredecessorOutcome::Skip(TemporalSkipReason::NoPrev),
     };
 
-    // Walk to the last row by consuming the iterator. Most agents
+    // Walk to the last row by consuming the iterator. Most spaces
     // produce ≤1 memory per cycle; the iterator length is bounded by
-    // how many rows the agent has within the window-equivalent slice.
+    // how many rows the space has within the window-equivalent slice.
     // For tighter performance once it's a hot path we can add a
     // reverse-iter API to redb; for now, forward + last() is fine.
     let mut last_key: Option<Vec<u8>> = None;
@@ -586,20 +604,21 @@ fn lookup_predecessor(
     let Some(last_key_bytes) = last_key else {
         return PredecessorOutcome::Skip(TemporalSkipReason::NoPrev);
     };
-    if last_key_bytes.len() != AGENT_TIMELINE_KEY_LEN {
+    if last_key_bytes.len() != SPACE_TIMELINE_KEY_LEN {
         // Corrupt key length — treat as no predecessor.
         return PredecessorOutcome::Skip(TemporalSkipReason::NoPrev);
     }
 
-    // Decode the key.
-    let prev_ts = u64::from_be_bytes(last_key_bytes[16..24].try_into().unwrap_or([0; 8]));
-    let prev_context = u64::from_be_bytes(last_key_bytes[24..32].try_into().unwrap_or([0; 8]));
+    // Decode the key (namespace-prefixed layout: ns(4) space(16)
+    // ts(8) session(8) memory_id(16)).
+    let prev_ts = u64::from_be_bytes(last_key_bytes[20..28].try_into().unwrap_or([0; 8]));
+    let prev_session = u64::from_be_bytes(last_key_bytes[28..36].try_into().unwrap_or([0; 8]));
     let mut prev_mem_bytes = [0u8; 16];
-    prev_mem_bytes.copy_from_slice(&last_key_bytes[32..48]);
+    prev_mem_bytes.copy_from_slice(&last_key_bytes[36..52]);
     let prev_id = MemoryId::from_be_bytes(prev_mem_bytes);
 
     // Order check — the range scan is upper-exclusive on the
-    // (agent, ts)-prefix, so prev_ts < new_ts MUST hold. Defensive.
+    // (space, ts)-prefix, so prev_ts < new_ts MUST hold. Defensive.
     if prev_ts >= new_ts {
         return PredecessorOutcome::Skip(TemporalSkipReason::OutOfOrder);
     }
@@ -609,7 +628,7 @@ fn lookup_predecessor(
         // belt-and-suspenders.
         return PredecessorOutcome::Skip(TemporalSkipReason::OutOfOrder);
     }
-    if !cross_context && prev_context != context_id.0 {
+    if !cross_session && prev_session != session_id.0 {
         return PredecessorOutcome::Skip(TemporalSkipReason::CrossContext);
     }
 
@@ -640,22 +659,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn topical_threshold_default_when_none() {
-        assert!((resolved_topical_threshold_from(None, 0.4) - 0.4).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn topical_threshold_env_override() {
-        let v = resolved_topical_threshold_from(Some("0.6".to_string()), 0.4);
-        assert!((v - 0.6).abs() < 1e-6);
-    }
-
-    #[test]
-    fn topical_threshold_invalid_falls_back() {
-        let v = resolved_topical_threshold_from(Some("nope".to_string()), 0.4);
-        assert!((v - 0.4).abs() < f32::EPSILON);
-        let v = resolved_topical_threshold_from(Some("2.0".to_string()), 0.4);
-        assert!((v - 0.4).abs() < f32::EPSILON);
+    fn default_knobs_match_constants() {
+        let k = TemporalEdgeKnobs::default();
+        assert!(
+            (k.topical_threshold - DEFAULT_TEMPORAL_EDGE_TOPICAL_THRESHOLD).abs() < f32::EPSILON
+        );
+        assert_eq!(k.window_seconds, DEFAULT_WINDOW_SECONDS);
+        assert!((k.weight_min - DEFAULT_WEIGHT_MIN).abs() < f32::EPSILON);
+        assert_eq!(k.cross_session, DEFAULT_CROSS_SESSION);
     }
 
     #[test]

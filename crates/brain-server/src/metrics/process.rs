@@ -112,14 +112,13 @@ fn capture_open_fds() -> Option<u64> {
 ///
 /// Hardcoded to 100 — the de-facto modern Linux default
 /// (`CONFIG_HZ_100`). Calling `sysconf(_SC_CLK_TCK)` would be
-/// authoritative but requires `unsafe`, which CLAUDE.md §7 reserves
+/// authoritative but requires `unsafe`, which is reserved
 /// to `crates/brain-storage`. On a 250 Hz or 1000 Hz kernel the
 /// absolute `process_cpu_seconds_total` value is wrong by a fixed
 /// factor; PromQL `rate()` is unaffected (it's scaled the same way).
 ///
-/// Tracker: `phase-12/sysconf-clock-tick` — wrap sysconf behind a
-/// dep that exposes it safely (e.g. `rustix`) or add a build-script
-/// probe.
+/// A safe sysconf wrapper (e.g. `rustix`) or a build-script probe
+/// would let us read the real value.
 const CLOCK_TICKS_PER_SEC: i64 = 100;
 
 fn clock_ticks_per_sec() -> i64 {

@@ -1,9 +1,8 @@
 //! Schema-DSL parser integration tests.
 //!
-//! Exercises the parser end-to-end against fixtures drawn from
-//! `spec/03_schema/00_purpose.md`. Unit tests in
-//! `crates/brain-protocol/src/schema/parser.rs` cover small grammar
-//! pieces; this file covers full schema documents.
+//! Exercises the parser end-to-end against schema-document fixtures.
+//! Unit tests in `crates/brain-protocol/src/schema/parser.rs` cover
+//! small grammar pieces; this file covers full schema documents.
 
 use brain_protocol::schema::{
     parse_schema, AttrType, CardinalityAst, ExtractorField, ExtractorKindAst, ExtractorTarget,

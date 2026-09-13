@@ -4,20 +4,148 @@ The read-side cognitive primitives: RECALL (similarity search), PLAN (graph path
 
 ## RECALL
 
-The RECALL primitive: find memories by similarity.
+The RECALL primitive is Brain's **sole primary read verb**: ask the memory a
+question, get the answer. **One verb, one code path** — every request walks the
+same pipeline regardless of whether a user schema has been declared. There is no
+second client read verb; RECALL returns the answer as a membership shape
+(Single / Many / None), not a ranked candidate list the caller has to sift.
 
 ### 1. Semantic contract
 
 ```
-RECALL(cue_text, agent_id, k, filter, ...) → Vec<RecallResult>
+RECALL(cue_text, agent_id, filter, max_results, ...) → RecallAnswer
 ```
 
-Brain:
+Brain runs a single pipeline on every request:
 
-1. Embeds the cue text into a vector.
-2. Searches the HNSW index for nearest neighbors.
-3. Filters candidates by the supplied filter.
-4. Returns up to K results, sorted by similarity.
+```
+RECALL → validate → embed cue → fan out to three retrievers
+       (semantic / lexical / graph, all always-wired)
+       → RRF fusion (k=60)
+       → filter chain (tombstone, kind, context, temporal,
+         confidence, salience, supersession)
+       → metadata enrichment from redb
+       → cross-encoder rerank (always-on when the model is loaded)
+       → membership: keep the answer set inside a relevance band,
+         shape by cardinality → Single / Many / None
+       → wire response
+```
+
+The three retrievers are mandatory shard wiring — they are never `None`. The
+cross-encoder rerank runs on every read whenever the model is loaded; there is
+no request flag. The only control is the deploy-time `config.rerank.enabled`
+load gate — when the operator opts out, no model loads and the pipeline returns
+RRF-only ordering (no error). Schema declarations do not gate any stage of this
+pipeline. They only narrow what `STATEMENT_CREATE` / `RELATION_CREATE` and
+predicate-aware filters accept.
+
+Crucially, membership is computed over the **full filtered candidate pool**, not
+a fixed top-K window. The relevance band (not a count) decides which memories
+belong to the answer; `max_results` is only a safety ceiling on how many members
+are returned, never the criterion that shapes the answer.
+
+### Recall scope — space (default) vs namespace-wide
+
+RECALL carries a `scope` selector:
+
+```rust
+enum RecallScope { Space, Namespace }   // wire default: Space
+```
+
+- **`Space`** (default, unchanged): the request is served by the single shard the
+  caller's `(namespace, space)` hashes to (`shard_for_space`), and the pipeline
+  above runs once on that shard.
+- **`Namespace`**: the request spans **every space in the caller's own namespace**.
+  Because a namespace's spaces hash across shards (shared-nothing shards, each with
+  its own indexes), the connection layer **fans the RECALL out to all shards in
+  parallel**; each shard runs the retrieval pipeline with its scope filter widened
+  from `(namespace, space)` to `namespace_id` only (all spaces it holds), and
+  returns **raw scored candidates** (per-lane scores, not yet shaped). The router
+  then **globally merges** the per-shard pools (RRF), and the membership / precision
+  shaping runs **once over the merged pool** — so `Single`/`Many`/`None` and the
+  precision decision are computed globally, not per shard.
+
+Authorization reuses the existing `RECALL` permission: a key that may RECALL may
+request `scope = Namespace`. **Tenant-isolation invariant (non-negotiable):** a
+namespace-wide RECALL returns only rows of the caller's own `namespace_id`. Each
+shard's filter pins `namespace_id`, and the router never merges across namespaces —
+`scope = Namespace` can never surface another tenant's data. `act_as` still selects
+the effective identity; the namespace-wide span is over the *effective* namespace.
+
+`max_results` remains a global safety ceiling on the merged answer; each shard is
+additionally bounded to a per-shard top-K during fan-out so the merge cost stays
+proportional to one shard's work, not the whole corpus.
+
+### MEMORY_LIST — enumeration, not search
+
+`MEMORY_LIST` (`0x0027`) is a distinct read *kind*: a non-ranked, paginated
+enumeration of the caller's `(namespace, agent)` memories in a stable order. It
+does **not** run the retrieval pipeline — no cue, no embedding, no RRF, no
+rerank, no relevance suppression. Where RECALL answers *"what is relevant to this
+query"*, MEMORY_LIST answers *"what is stored here"*: it walks the tenant-scoped
+`created_at` timeline index and returns a page plus an opaque, signed keyset
+cursor (seek pagination, never offset — page N costs the same as page 1 and pages
+are stable under concurrent writes). Filters (kind, tombstone state, created-time
+range, salience range) are applied during the scan; changing any filter or the
+sort invalidates an in-flight cursor (`stale_cursor`). It never crosses the
+`(namespace, agent)` boundary and never aggregates or counts the whole pool.
+
+### GRAPH_FETCH — typed-graph export, not search
+
+`GRAPH_FETCH` (`0x0163`) is the enumeration analogue for the *typed graph*: a
+non-ranked, paginated export of the caller's `(namespace, agent)` entities and
+the edges between them, shaped as a node/edge set a graph-explorer UI renders
+directly. Like MEMORY_LIST it does **not** run the retrieval pipeline. It
+paginates over the subject-anchored statement index — the one typed-graph index
+that is `(namespace, agent)`-prefixed — and *derives* the entity set from
+traversal (statement subjects/objects, plus the relation and mention neighbours
+of those entities) rather than a dedicated per-agent entity index; a
+fully-isolated entity therefore does not surface. The default layer is the
+concept map (entity nodes + `Relation`/`Fact` edges); `include_statements` adds
+value-object statement nodes and `include_memories` adds source-memory nodes
+with `Mentions` edges. The cursor is opaque and signed over the layer toggles.
+Because an entity can be reached on more than one page, the response guarantees
+**completeness, not disjointness**: every node/edge appears in at least one page,
+may repeat across pages, and carries a stable 16-byte id so the client dedups by
+id. It never crosses the `(namespace, agent)` boundary.
+
+### MEMORY_INSPECT — one memory's write story, not search
+
+`MEMORY_INSPECT` (`0x0028`) is a single-memory point read: given one
+`memory_id`, it returns that memory's text plus the durable **write-artifact
+bundle** — the per-stage record of what the write built. It does **not** run
+the retrieval pipeline; it is a keyed lookup, not a query. Where RECALL answers
+*"what is relevant"* and MEMORY_LIST answers *"what is stored"*, MEMORY_INSPECT
+answers *"how was this one memory built"*.
+
+The response carries `found`, the `memory_id`, the `text`, and an
+`EncodeStageArtifact` bundle with the same shape the live ENCODE trace uses for
+its per-stage `artifact`: the embedding `vector`, the stored `record` (kind,
+salience, times, dims, text length), the analyzed `keyword_fields` (the exact
+terms the `memory_text` index matches on), the generated `hype_questions`, and
+the typed `graph` (nodes + edges). The bundle is persisted in the
+`memory_artifacts` table (§10.9a) and populated incrementally: the sync fields
+(vector, record, keywords) are present the instant the write acks; the graph and
+HyPE fields fill in as the async workers settle. A memory whose async stages
+have not yet run therefore returns `found = true` with those fields still empty
+— the same "how far along is this write" signal the ENCODE trace's drain window
+exposes, but readable for any memory at any later time.
+
+Scope is enforced by the memory's own `(namespace, agent)` owner: a
+`memory_id` owned by another tenant reads as `found = false`, indistinguishable
+from a missing one — an id never leaks cross-tenant. Requires the `RECALL`
+capability bit. A hard-forgotten or reclaimed memory returns `found = false`;
+its bundle is purged with the memory (§10.9a).
+
+#### In-transaction read-your-writes overlay
+
+When `req.txn_id` is set, the txn's pending ENCODE buffer is overlaid on the committed retrieval result before the response is built:
+
+- Tombstoned ids in the buffer drop committed hits.
+- Pending encodes are scored against the cue vector and merged with the committed list.
+- The combined list is re-sorted by similarity (descending); membership shaping then runs over it, bounded only by the `max_results` safety ceiling.
+
+This is the single read-your-writes path; the same overlay runs whether or not a schema is active.
 
 ### 2. The arguments
 
@@ -31,9 +159,15 @@ The cue can be a single word, a sentence, a longer document — whatever the age
 
 The owning agent. Returns are scoped to this agent's memories.
 
-#### k
+**Under `act_as` the scope is the effective agent.** When the request carries the `act_as` field (a trusted service principal reading on behalf of a tenant agent; defined in [`../04_wire_protocol/04_handshake.md`](../04_wire_protocol/04_handshake.md) §"Per-request identity (`act_as`)"), the `agent_filter` isolation scopes to the **effective** `(namespace, agent_id)` named in `act_as`, never to the connection principal. A `RECALL` under `act_as` therefore returns the **effective identity's** memories only — never the service principal's own, and never any other tenant's. The isolation boundary follows the effective identity for every read, exactly as the write path stamps rows with it.
 
-How many results. Default 10. Max 1000.
+#### max_results
+
+A **safety ceiling** on how many members a `Many` answer may carry — not a
+ranking knob and not the criterion that shapes the answer. `0` ⇒ server default;
+an explicit value caps the returned member count. Max 1000. The answer's shape
+(Single / Many / None) comes from the relevance band over the full candidate
+pool (§3), never from this number.
 
 #### filter
 
@@ -75,16 +209,30 @@ Optional. Filter results with similarity score below this threshold. Useful when
 
 ### 3. The response
 
+RECALL answers with memories — one, several, or none. The `answer_kind`
+carries which; the memory list holds the members. There is no
+retrieval-mechanism vocabulary in the response (no "episodic", no "grounded") —
+how the router found the memories is an internal concern the caller never sees.
+
 ```rust
-struct RecallResponse {
-    results: Vec<RecallResult>,
+struct RecallAnswer {
+    answer_kind: AnswerKind,          // Single | Many | None
+    memories: Vec<RecallResult>,      // 0 for None; see §"Lead vs. retained
+                                       // membership" below for Single/Many —
+                                       // the count is NOT always 1 / 2+
     partial: bool,                    // True if some shards failed
     total_candidates: usize,          // Pre-filter count (for diagnostics)
 }
 
+enum AnswerKind {
+    Single,                           // exactly one memory is the answer
+    Many,                             // several memories together are the answer
+    None,                             // no memory answers the cue (explicit absence)
+}
+
 struct RecallResult {
     memory_id: MemoryId,
-    score: f32,                       // [-1, 1]; higher = more similar
+    score: f32,                       // [-1, 1]; higher = more similar (provenance)
     text: Option<String>,             // If include_text
     metadata: Option<MemoryMetadata>, // If include_metadata
     context_id: ContextId,
@@ -92,7 +240,63 @@ struct RecallResult {
 }
 ```
 
-Results are sorted by score, descending.
+#### The membership band (how the shape is decided)
+
+The answer set is the memories that fall inside a **relevance band** over the
+full filtered candidate pool, not the top-K by rank:
+
+- Let `top` = the best relevance score in the pool. A candidate belongs to the
+  answer iff it clears both an absolute floor and a relative band around `top`
+  (`score ≥ ABS_FLOOR` **and** `score ≥ top × REL_BAND`). Lexical- or
+  graph-confirmed hits, and grounded source memories for a resolved
+  subject/predicate, are admitted the same way.
+- `answer_kind` is then pure cardinality of that set: `0 → None`, `1 → Single`,
+  `2+ → Many`. When several members all assert the same value, the router may
+  collapse them to a single `Single`.
+- `max_results` (§2) only caps the size of a `Many`; it never turns a `Many`
+  into a `Single` by truncation, and never suppresses the band.
+
+#### Lead vs. retained membership (grounded commit)
+
+When the typed-graph (grounded) answer is anchor-scoped, clears the strong-match
+floor, and its source memory is cross-lane corroborated, its value is
+**committed** as the lead: `answer_kind` is set from the committed shape
+(`Single` for one committed value, `Many` for a committed enumerated set)
+independently of the raw membership count, and the committed memory (or
+memories, for a `Many` commit) is moved to the **front** of `memories` in
+committed order.
+
+Critically, the rest of the relevance-band membership is **retained below the
+lead, never discarded** — a `Single` answer's `memories` can therefore contain
+more than one entry. This is deliberate, not a defect: an incorrect commit
+(wrong subject, stale value) can only **mis-order** the response, because the
+real answer — if it's anywhere in the band — is still present in the retained
+tail. Silently dropping the tail was tried and reverted after it caused a
+grounded-first regression (a loose predicate-name match on the wrong subject
+hijacked the answer with no episodic fallback to catch it).
+
+The caller-facing contract is therefore:
+
+- **`Single`**: `memories[0]` is the committed answer. Any further entries
+  (`memories[1..]`) are retained relevance-band context, not part of the
+  answer — present for provenance/fallback, not for display as additional
+  results. A client that wants "the answer, nothing else" reads only index 0.
+- **`Many` via an uncommitted band** (no grounded commit fired): every entry in
+  `memories` is part of the answer, per the pure-cardinality rule above — this
+  is the common case and matches the original contract.
+- **`Many` via a committed enumerated set**: the committed set leads (in
+  committed/recency order); anything appended after it is retained context,
+  not part of the enumerated answer. The wire does not currently carry an
+  explicit boundary count between the committed set and the retained tail — a
+  client that needs to draw that line precisely should treat this case the
+  same as the uncommitted `Many` (all of `memories` as answer-relevant) until a
+  `lead_count`-style field is added; this is an open follow-up, not yet
+  implemented.
+
+Absence is explicit (`None`, empty list), never a fabricated guess.
+`RecallResult.score` and the other retrieval fields are **provenance** — they
+say why a member surfaced; they are not a ranking the caller is expected to
+re-sort or threshold.
 
 ### 4. Score semantics
 
@@ -108,18 +312,21 @@ Heuristic interpretation:
 
 These aren't strict thresholds; they depend on the model and the corpus. Agents tune `confidence_min` to their use case.
 
-### 5. The "fewer than K" case
+### 5. The small-answer case
 
-If Brain finds fewer than K matching memories, the response has fewer than K results. This is normal for:
+A `Single` answer, or a `Many` with only a handful of members, is normal — the
+band admits exactly the memories that answer the cue, however few. This is
+common for:
 - Small or new agents.
 - Selective filters.
 - Very specific cues.
 
-It's not an error.
+It's not an error, and it is not "fewer than requested" — there is no requested
+count. `max_results` only caps the upper end.
 
-### 6. The "empty result" case
+### 6. The `None` case
 
-Zero results. Possible if:
+`answer_kind = None`, empty member list. Possible if:
 - The agent has no memories.
 - All memories are tombstoned.
 - All memories have a different model fingerprint (after a model upgrade).
@@ -165,33 +372,32 @@ If the agent wants recent-favoring, it can:
 
 ### 11. The "context boost" effect
 
-The agent might want memories in the current context to rank higher. Brain doesn't do this automatically. The agent can:
-
-1. RECALL with no context filter; get K results.
-2. RECALL with the context filter; get K results.
-3. Merge in the agent layer with weights.
-
-Or use a single RECALL with explicit `contexts: Some([current])`.
+The agent might want to restrict the answer to the current context. Use a single
+RECALL with explicit `contexts: Some([current])` — the filter chain scopes the
+candidate pool before membership runs. The agent does not merge or re-rank result
+lists in its own layer; the DB returns the answer.
 
 ### 12. The "across-shard" recall
 
 For agents whose data spans multiple shards (rare), RECALL fans out:
 
-- Each shard runs its sub-recall in parallel.
-- Results are merged by score.
+- Each shard runs its sub-recall in parallel, returning raw scored candidates (not shaped).
+- The router merges the per-shard pools with **global RRF** over each hit's within-shard rank (see the "Recall scope — space vs namespace-wide" section above and [`../13_retrievers/01_rrf_fusion.md`](../13_retrievers/01_rrf_fusion.md)).
 
-The response is the global top K.
+The membership answer is computed over the merged global candidate pool.
 
-This is transparent to the agent — it sees a single result list.
+This is transparent to the agent — it sees a single answer.
 
 ### 13. Latency
 
-For typical workloads (single-shard, K=10, no complex filter):
+For typical workloads (single-shard, no complex filter):
 
 - p50: ~10 ms.
 - p99: ~25 ms.
 
-For larger K or complex filters: latency rises proportionally. K=100 takes ~15 ms typical; K=1000 takes ~30 ms.
+Latency scales with the candidate-pool size the retrievers fan out over and the
+filter complexity, not with a caller-chosen result count — there isn't one. A
+larger answer set (a broad `Many`) costs marginally more to project.
 
 For cross-shard recalls (2-3 shards): p99 rises to ~30-50 ms.
 
@@ -208,9 +414,8 @@ For higher throughput, scale shards.
 
 Including text fetches each result's text from the metadata store:
 
-- Per-result cost: ~5-20 µs (cache-dependent).
-- For K=10: ~100 µs additional.
-- For K=100: ~1 ms additional.
+- Per-member cost: ~5-20 µs (cache-dependent).
+- A handful of members: ~100 µs additional; a broad `Many`: proportionally more.
 
 For very large texts (~MB each), the response size grows correspondingly.
 
@@ -228,32 +433,224 @@ filter.tags = Some(vec!["urgent".to_string(), "personal".to_string()])
 
 Returns memories that have ALL the specified tags (intersection). For "any of these tags" (union), make multiple recalls.
 
-Tags are filtered post-search; selective tag filters need higher ef_search (substrate handles automatically).
+Tags are filtered post-search; selective tag filters need higher ef_search (the planner adjusts automatically).
 
 ### 18. The "score-only" mode
 
 For agents that want just IDs and scores (no text, no metadata), the default is fine — text and metadata are off by default. The response is small and fast.
 
-### 19. The "no result" semantics
+### 19. The `None` semantics
 
-If the agent gets zero results, possible interpretations:
+`answer_kind = None` is Brain's explicit "no memory answers this" — absence is a
+first-class answer, never a fabricated guess. Possible causes:
 
 - The agent has no relevant memories.
-- The cue is unusual (no similar memories).
+- The cue is unusual (nothing clears the relevance band).
 - The filter is too tight.
 
-Brain doesn't distinguish these. The agent decides what to do — broaden the cue, relax the filter, or accept no results.
+Brain doesn't distinguish these causes on the wire. The agent decides what to do
+— broaden the cue, relax the filter, or accept the `None`.
 
-### 20. The "two-stage" pattern
+### 20. No client-side re-ranking
 
-Some agents do:
+Brain does not expose a "fetch a broad top-K and re-rank on the agent side"
+pattern — that is the SaaS-search shape this DB rejects. The heavy lifting
+(fusion, rerank, membership) happens server-side at read time; the answer comes
+back already shaped (Single / Many / None). The agent consumes the answer, it
+does not re-sort or threshold a candidate list. `RecallResult.score` is
+provenance, not a ranking the caller is expected to act on.
 
-1. RECALL with K=100 to get a broad set.
-2. Re-rank with custom logic on the agent side.
+### 21. The RECALL trace (`trace: true`)
 
-Brain's K=100 isn't much more expensive than K=10. The agent gets flexibility.
+RECALL carries the same `trace: bool` observability toggle used across the read
+primitives (see [`02_write_pipeline.md`](02_write_pipeline.md) §17, "API
+convention — `wait` for writes, `trace` for reads" — a read has nothing to wait
+for, so it carries a single boolean rather than a `wait`-shaped enum). The
+default, `trace: false` (the common case, omitted from the wire map), is the
+fast path described in §1-§20 above, unchanged: the response's trace field is
+`None`, and the pipeline pays nothing for it — no per-item collection, no extra
+allocation, no shape change to the hot path.
 
-For very large K (>100), make sure to consider cost (K=1000 is ~3× the cost of K=10).
+`trace: true` returns a populated `RecallTrace` describing every stage of the
+pipeline in full per-item detail: not just the aggregate counts a caller could
+already infer from the final answer, but which specific candidate each
+retriever lane surfaced, which specific memory each filter step dropped, and
+exactly what the cross-encoder reordered. There is one knob, not two — a caller
+opting into tracing always gets the full per-item picture; there is no
+separate size-minimized or id-only detail level to request instead.
+
+```rust
+struct RecallTrace {
+    retrievers: Vec<RecallTraceRetriever>,
+    filter_chain: RecallTraceFilterChain,
+    rerank: Option<RecallTraceRerank>,  // None when no cross-encoder is loaded
+    total_latency_ms: f64,
+    fusion: Option<RecallTraceFusion>,  // full-detail only; None if fusion produced nothing
+}
+```
+
+#### 21a. Per-retriever candidates
+
+Each of the three always-wired lanes (semantic / lexical / graph) already
+reported its terminal status, latency, and an aggregate `candidate_count`. It
+now also reports the candidates themselves:
+
+```rust
+struct RecallTraceRetriever {
+    name: RetrieverNameWire,
+    status: RecallTraceRetrieverStatus,     // Success | Skipped | Timeout | Failure
+    status_detail: String,                  // skip reason / error message
+    latency_ms: f64,                        // 0.0 when skipped
+    candidate_count: u32,                   // aggregate count, always present
+    candidates: Vec<RecallTraceCandidate>,  // full-detail only
+}
+
+struct RecallTraceCandidate {
+    memory_id: WireMemoryId,
+    text: String,      // full-detail only; truncated server-side
+    score: f32,        // this lane's own raw score for this item
+}
+```
+
+`candidates` is empty on `trace: false` and holds the lane's raw hits **before**
+RRF fusion, in the lane's own rank order, on `trace: true` — the same
+population `candidate_count` already summarized, now with id, text, and score
+attached instead of collapsed to a length. This is what makes it possible to
+see, e.g., that the lexical lane surfaced memory X at rank 3 with its own
+BM25-derived score of 0.42, independent of whatever rank X ended up at after
+fusion.
+
+#### 21b. Per-filter-step drops
+
+The filter chain's survivor counts (`before`, `after_type`, `after_temporal`,
+`after_confidence`, `after_tombstone`, `after_supersession`, `after_as_of`,
+`after_limit`) are unchanged — always present, regardless of `trace`. Each step
+now also carries exactly which ids it removed. Four of the seven drop lists are
+plain memory-id lists; the last three are kind-tagged, because they can drop
+`Statement` and `Relation` items too — not just `Memory` ones:
+
+```rust
+struct RecallTraceFilterChain {
+    before: u32,
+    after_type: u32,
+    after_temporal: u32,
+    after_confidence: u32,
+    after_tombstone: u32,
+    after_supersession: u32,
+    after_as_of: u32,
+    after_limit: u32,
+    // full-detail only; empty on trace: false and on any step that dropped nothing
+    dropped_by_type: Vec<WireMemoryId>,
+    dropped_by_temporal: Vec<WireMemoryId>,
+    dropped_by_confidence: Vec<WireMemoryId>,
+    dropped_by_tombstone: Vec<WireMemoryId>,
+    // kind-tagged — see below
+    dropped_by_supersession: Vec<RecallTraceDroppedId>,
+    dropped_by_as_of: Vec<RecallTraceDroppedId>,
+    dropped_by_limit: Vec<RecallTraceDroppedId>,
+}
+
+/// One id a filter-chain step dropped, tagged with which item-kind
+/// id-space it belongs to.
+struct RecallTraceDroppedId {
+    kind: RankedItemKindWire,
+    id: u128,
+}
+
+enum RankedItemKindWire {
+    Memory = 0,
+    Statement = 1,
+    Entity = 2,
+    Relation = 3,
+}
+```
+
+An empty `dropped_by_*` Vec means that step removed nothing at all (the
+survivor count didn't shrink between the prior step and this one); a non-empty
+one names precisely which ids that step removed. This is the difference
+between knowing "confidence filtering went from 26 to 25" and knowing
+"confidence filtering dropped memory `<id>`" — the latter is what turns "why
+didn't memory X make the answer" from a guess into a lookup.
+
+**Why the split.** The filter chain (`crates/brain-planner/src/retrieval/filters/logic.rs`)
+runs over the fused set produced by RECALL's three retriever lanes, and that
+set is not Memory-only — the graph lane can surface `Statement`- and
+`Relation`-backed candidates alongside the semantic/lexical lanes' `Memory`
+hits, so every filter step is written generically over the full
+`RankedItemId` union (`Memory` / `Statement` / `Entity` / `Relation`).
+`dropped_by_type` / `dropped_by_temporal` / `dropped_by_confidence` /
+`dropped_by_tombstone` stay plain `Vec<WireMemoryId>` because, for RECALL,
+these four steps only ever drop `Memory` items in practice. The remaining
+three are different in kind, not just in practice:
+
+- **Supersession** is a concept the filter code defines as not applying to
+  `Memory` / `Entity` at all — `filter_supersession` passes those two kinds
+  through unconditionally ("Memory / Entity have no supersession concept"),
+  so any live supersession drop is definitionally a `Statement` or
+  `Relation`.
+- **As-of** (bi-temporal record-time filtering) is scoped narrower still:
+  only `Statement` carries a record-time invalidation timestamp today —
+  `filter_as_of` passes `Memory` / `Entity` / `Relation` through because
+  bi-temporal validity is "a statement-layer property today" — so an as-of
+  drop is definitionally a `Statement`.
+- **Limit** truncation runs last, after all six filters, over the fully
+  fused-and-filtered survivor list, which by then can hold any item kind
+  that made it through the chain — so its drops need the same kind tag as
+  supersession and as-of, for the same reason (a plain `WireMemoryId` can't
+  represent a dropped `Statement` or `Relation`).
+
+#### 21c. Pre-/post-rerank order
+
+```rust
+struct RecallTraceRerank {
+    applied: bool,
+    candidates: u32,
+    latency_ms: f64,
+    before_order: Vec<WireMemoryId>,  // full-detail only: fused order immediately before rerank
+    after_order: Vec<WireMemoryId>,   // full-detail only: final order after the cross-encoder
+}
+```
+
+`before_order` and `after_order` show exactly what the cross-encoder moved —
+not just that it ran (`applied`) and how many candidates it scored
+(`candidates`), but the concrete before/after permutation. Both are empty on
+`trace: false`, when `rerank` is `None` (no cross-encoder loaded on this
+shard), and when `applied = false` (loaded, but nothing in the fused list had
+fetchable text to score).
+
+#### 21d. Per-fused-item lane contribution
+
+```rust
+struct RecallTraceFusion {
+    items: Vec<RecallTraceFusionItem>,
+}
+
+struct RecallTraceFusionItem {
+    memory_id: WireMemoryId,
+    rrf_score: f32,
+    lane_scores: Vec<(RetrieverNameWire, f32)>,
+}
+```
+
+`RecallTrace.fusion` has no aggregate-count precedent — nothing in the
+`trace: false`-equivalent counts summarized fusion below the per-retriever
+level at all. On `trace: true`, for each item RRF admitted to the candidate
+pool, `lane_scores` lists which of the three lanes contributed to it and that
+lane's own raw score, so a caller can see that a given fused item was surfaced
+by both semantic (0.81) and graph (0.65) but not lexical, and how that
+combination produced its `rrf_score`. `fusion` is `None` when tracing wasn't
+requested or when fusion produced no items.
+
+#### 21e. Why full detail, not counts-only or id-only
+
+Tracing exists to debug recall accuracy — to answer "why did memory X end up
+in, or stay out of, the answer," which an aggregate count can never answer.
+Because `trace: true` is opt-in and only exercised by a caller who has already
+decided the extra cost is worth it (an eval harness, a debugging console — never
+the default production path), the trace returns full per-item detail, including
+text, rather than a size-minimized id-only variant. This mirrors
+`include_text`'s existing per-final-result fetch (§2, "include_text"), just
+applied to every stage's candidates instead of only the final answer set.
 
 ## PLAN
 
@@ -448,15 +845,17 @@ The latency is dominated by:
 
 For deeper PLAN (max_depth=8): can reach 200+ ms. Brain's cost-budget check (in [12.03 Cost Estimation](../12_query_optimizer/03_cost_estimation.md)) may reject overly-expensive plans.
 
-### 13. The "explain" option
+### 13. The "explain" option (superseded)
 
-With `explain=true`, the response includes:
-
-- The intermediate frontier expansions.
-- Paths that were considered but didn't make the top results.
-- The scoring breakdown for each returned path.
-
-Useful for debugging or showing reasoning to a human.
+This section originally described an `explain=true` option returning the
+intermediate frontier expansions, paths considered but not returned, and a
+per-path scoring breakdown. No such field was ever implemented on
+`PlanRequest`. The real, shipped mechanism for this is the `trace: bool`
+flag — see §19, "The PLAN trace (`trace: true`)" — which returns the full
+BFS-explored node set (both directions) and every meeting point found,
+including ones the `max_paths` cap excluded from the result. Kept here only
+so old references to "the explain option" land somewhere; new integrations
+should read §19 directly.
 
 ### 14. The "actionable edges" default
 
@@ -508,6 +907,67 @@ PLAN is most useful when:
 For sparse graphs (few edges), PLAN often returns no paths. The agent should use RECALL or REASON instead.
 
 For text-only memories without edges, PLAN is mostly useless. The graph is the planning substrate.
+
+### 19. The PLAN trace (`trace: true`)
+
+PLAN carries the same `trace: bool` opt-in observability toggle as RECALL
+(§21 above) and REASON (§20 below): `pub trace: bool` on `PlanRequest`,
+defaulting to `false` and omitted from the wire map in that case. The default
+path is byte-for-byte unchanged — the bidirectional BFS already tracks full
+per-node visited-map state and per-neighbor alignment scores internally, but
+today collapses them to a scalar `nodes_explored` count and a capped
+`meeting_points` list before they reach the wire; `trace: false` continues to
+discard that detail with zero extra allocation.
+
+`trace: true` populates `PlanResponseFrame.trace: Option<PlanTrace>` on the
+**final** frame only (`is_final: true`); intermediate streamed `PlanStep`
+frames are unaffected.
+
+```rust
+struct PlanTrace {
+    explored: Vec<PlanTraceNode>,
+    meeting_points: Vec<PlanTraceMeetingPoint>,
+}
+```
+
+#### 19a. Explored nodes (both BFS directions)
+
+```rust
+struct PlanTraceNode {
+    memory_id: WireMemoryId,
+    text: String,
+    direction: PlanTraceDirection,   // Forward (rooted at start) | Backward (rooted at goal)
+    depth: u32,
+    parent_edge: Option<WireMemoryId>,  // None for the root of each direction
+    alignment_score: Option<f32>,       // set when order_by_goal_proximity scored this node
+}
+```
+
+`explored` is the full visited-map contents of `run_bidirectional_bfs`
+(`brain-planner/src/executor/path.rs`), from **both** the forward search
+(rooted at `start`) and the backward search (rooted at `goal`) — not just the
+scalar `nodes_explored` count the non-traced response already reports. Each
+entry carries which direction found it, its BFS depth, the id of the parent
+node it was reached from (`None` only for the two roots), and — when
+`order_by_goal_proximity` scored it — the per-neighbor alignment score that
+today is used only to reorder candidates and otherwise discarded.
+
+#### 19b. Meeting points (found vs. included)
+
+```rust
+struct PlanTraceMeetingPoint {
+    memory_id: WireMemoryId,
+    text: String,
+    included_in_result: bool,
+}
+```
+
+Every node where the forward and backward frontiers connected is listed,
+whether or not it survived the `max_paths` cap. `included_in_result: true`
+marks the meeting points that made it into a returned `Path`; `false` marks
+ones the cap dropped. This turns "why didn't the shorter path show up" into a
+lookup instead of a guess — the meeting point is visible in the trace even
+when the response's `paths` list doesn't contain it.
 
 ## REASON
 
@@ -663,15 +1123,17 @@ Brain does not currently do this. CONTRADICTS edges (explicitly created by the a
 
 A future enhancement: integrate with an LLM-based contradiction detector. Brain would generate candidate pairs (query + memory) and let an external LLM judge contradiction. Out of scope at present.
 
-### 13. The "explain" option
+### 13. The "explain" option (superseded)
 
-With `explain=true`, the response includes:
-
-- Why each evidence item was selected.
-- Which edges were traversed.
-- Per-edge confidence.
-
-Useful for showing reasoning chains to humans or other systems.
+This section originally described an `explain=true` option returning why
+each evidence item was selected, which edges were traversed, and per-edge
+confidence. No such field was ever implemented on `ReasonRequest`. The real,
+shipped mechanism for this is the `trace: bool` flag — see §20, "The REASON
+trace (`trace: true`)" — which returns the full considered/dropped edge
+walk, the per-item score breakdown (base similarity, decay, weight product,
+alignment), and whether the topic-alignment centroid was computed at all.
+Kept here only so old references to "the explain option" land somewhere;
+new integrations should read §20 directly.
 
 ### 14. The "different from PLAN" semantic
 
@@ -732,6 +1194,130 @@ For agents with few memories on a topic, REASON returns weak evidence:
 - Confidence near zero either way.
 
 The agent can use this as a signal to seek more information (encode more memories from external sources, do web searches, etc.).
+
+### 20. The REASON trace (`trace: true`)
+
+REASON carries the same `trace: bool` toggle as RECALL (§21 above) and PLAN
+(§19 above): `pub trace: bool` on `ReasonRequest`, defaulting to `false` and
+omitted from the wire map in that case. The fast default path (§1-§19 above)
+is unchanged — `resolve_base`, `walk_outward`, `filter_and_trim`, and
+`topic_alignment_factor` already compute this detail internally and discard
+it today; `trace: false` keeps discarding it with zero extra allocation.
+
+> **Note on §13's `explain` option:** §13 above describes an `explain=true`
+> option with similar intent ("why each evidence item was selected, which
+> edges were traversed, per-edge confidence") but no such field exists on the
+> implemented `ReasonRequest` — it was never built under that name. `trace`
+> is the real, shipped mechanism for this; §13 should likely be reconciled
+> or marked superseded by the owner rather than left as a second,
+> unimplemented description of the same capability.
+
+`trace: true` populates `ReasonResponseFrame.trace: Option<ReasonTrace>` on
+the **final** frame only; intermediate streamed `InferenceStep` frames are
+unaffected.
+
+```rust
+struct ReasonTrace {
+    base: ReasonTraceBase,
+    walk: ReasonTraceWalk,
+    scoring: Vec<ReasonTraceScoreBreakdown>,
+    centroid: ReasonTraceCentroid,
+}
+```
+
+#### 20a. Base candidates
+
+```rust
+struct ReasonTraceBase {
+    candidates: Vec<ReasonTraceCandidate>,
+}
+struct ReasonTraceCandidate {
+    memory_id: WireMemoryId,
+    text: String,
+    score: f32,
+}
+```
+
+`base.candidates` is the full HNSW hit set `resolve_base` returns, not just
+the subset that seeded `walk_outward` — the same "everything a lane
+surfaced, not the collapsed count" precedent as RECALL's per-retriever
+`candidates` (§21a).
+
+#### 20b. The edge walk: considered and dropped-by-kind
+
+```rust
+struct ReasonTraceWalk {
+    considered: Vec<ReasonTraceEdgeCandidate>,
+    dropped_by_edge_kind: Vec<ReasonTraceEdgeCandidate>,
+    dropped_by_tombstone: Vec<ReasonTraceIdWithText>,
+    dropped_by_visited: Vec<ReasonTraceIdWithText>,
+    dropped_by_confidence: Vec<ReasonTraceScoredId>,
+    dropped_by_max_supporting: Vec<ReasonTraceIdWithText>,
+    dropped_by_max_contradicting: Vec<ReasonTraceIdWithText>,
+}
+struct ReasonTraceEdgeCandidate {
+    memory_id: WireMemoryId,
+    text: String,
+    edge_kind: EdgeKindWire,
+    depth: u32,
+    from_memory_id: WireMemoryId,
+    raw_score: f32,
+}
+struct ReasonTraceIdWithText { memory_id: WireMemoryId, text: String }
+struct ReasonTraceScoredId { memory_id: WireMemoryId, text: String, score: f32 }
+```
+
+`considered` is every edge `walk_outward` visited at every node, from both
+the supporting-side and contradicting-side traversals, before any pruning —
+the walk's own analogue of a retriever lane's raw candidate list; a caller
+can tell supporting from contradicting entries by `edge_kind`. The remaining
+fields are that same walk's prune reasons, one bucket per prune point in the
+executor: edge-kind filter, tombstoned target, an already-visited target,
+sub-`confidence_threshold` score (in `filter_and_trim`), and the two post-hoc
+trim caps on the surviving supporting/contradicting sets per inference step.
+Every bucket carries the dropped memory's real text, not a bare id — same
+"understand why, not just which id" rationale as RECALL's trace (§21e).
+
+#### 20c. Score breakdown
+
+```rust
+struct ReasonTraceScoreBreakdown {
+    memory_id: WireMemoryId,
+    text: String,
+    base_similarity: f32,
+    decay: f32,
+    weight_product: f32,
+    alignment: f32,
+    final_score: f32,
+}
+```
+
+One entry per surviving evidence item, un-collapsing the multiplicative
+score `topic_alignment_factor` folds into the single `EvidenceItem.score` /
+`InferenceStep.confidence` value the non-traced response reports. This
+exposes, e.g., that a low final score came from a weak `alignment` term
+rather than a stale `decay` term, without the caller having to guess at the
+factorization.
+
+#### 20d. Centroid computed/skipped
+
+```rust
+struct ReasonTraceCentroid {
+    computed: bool,
+    skipped_reason: Option<String>,
+}
+```
+
+`build_base_centroid` silently returns `None` on several paths (a singleton
+base set, a `ByText` observation, missing text, or an embed error), logged
+only at `tracing::debug!` today. The trace surfaces that outcome on the wire:
+`computed: false` plus a `skipped_reason` string names which of those paths
+fired, instead of leaving the caller to infer from an absent alignment term
+whether topic-alignment scoring ran at all.
+
+Both PLAN's and REASON's trace payload follow the same "full detail,
+including text, not a size-minimized id-only variant" rationale as RECALL's
+trace — see §21e above.
 
 ---
 

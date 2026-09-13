@@ -20,7 +20,7 @@ pub fn hash_encode_request(op: &EncodeOp) -> [u8; 32] {
     h.update(b"encode:");
     h.update(op.text.as_bytes());
     h.update(b"\0");
-    h.update(&op.context_id.raw().to_le_bytes());
+    h.update(&op.session_id.raw().to_le_bytes());
     h.update(b"\0");
     h.update(&[memory_kind_byte(op.kind)]);
     h.update(b"\0");
@@ -109,7 +109,7 @@ mod tests {
     fn encode_op() -> EncodeOp {
         EncodeOp {
             request_id: brain_core::RequestId::from([1u8; 16]),
-            context_id: brain_core::ContextId(42),
+            session_id: brain_core::SessionId(42),
             kind: brain_core::MemoryKind::Episodic,
             text: "hello".into(),
             vector: [0.0; brain_embed::VECTOR_DIM],
@@ -122,7 +122,7 @@ mod tests {
             }],
             deduplicate: false,
             content_hash: [0u8; 32],
-            agent_id: brain_core::AgentId::default(),
+            space_id: brain_core::SpaceId::default(),
         }
     }
 
@@ -158,7 +158,7 @@ mod tests {
             request_id: brain_core::RequestId::from([1u8; 16]),
             memory_id: brain_core::MemoryId::from(7u128),
             mode: ForgetMode::Soft,
-            agent_id: brain_core::AgentId::default(),
+            space_id: brain_core::SpaceId::default(),
         };
         let a = hash_forget_request(&op);
         let b = hash_forget_request(&op);
@@ -171,7 +171,7 @@ mod tests {
             request_id: brain_core::RequestId::from([1u8; 16]),
             memory_id: brain_core::MemoryId::from(7u128),
             mode: ForgetMode::Soft,
-            agent_id: brain_core::AgentId::default(),
+            space_id: brain_core::SpaceId::default(),
         };
         let soft = hash_forget_request(&op);
         op.mode = ForgetMode::Hard;

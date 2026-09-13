@@ -1,18 +1,17 @@
 //! Snapshot persistence for `HnswIndex`.
 //!
-//! See `spec/09_indexing/06_persistence.md` §5 and SD-4.5-1 in
-//! `docs/development/spec-deviations.md`.
-//!
 //! ## File layout
 //!
 //! A snapshot is a **directory** containing three files at the same
-//! `basename` (SD-4.5-1: hnsw_rs's `Hnsw::file_dump` writes two files,
-//! so we live with three rather than concatenating into one):
+//! `basename` (hnsw_rs's `Hnsw::file_dump` writes two; the wrapper is
+//! the third):
 //!
 //! - `<basename>.hnsw.graph` — hnsw_rs's graph dump.
 //! - `<basename>.hnsw.data`  — hnsw_rs's data dump.
 //! - `<basename>.brain`      — our wrapper (this module). Written
 //!   **last** so its presence is the marker for "snapshot complete".
+//!   The wrapper body carries BLAKE3 hashes of each sibling so cross-
+//!   file integrity is verifiable from the wrapper alone.
 //!
 //! ### `.brain` layout
 //!
@@ -20,7 +19,7 @@
 //! offset  size  field
 //! ------  ----  -----
 //!    0    4     magic = b"BHN0"
-//!    4    4     format_version: u32 LE  (= 1)
+//!    4    4     format_version: u32 LE  (= 3)
 //!    8    16    shard_uuid: [u8; 16]
 //!   24    8     taken_at_lsn: u64 LE
 //!   32    8     graph_node_count: u64 LE  (= IdMap.len at save time)
@@ -37,6 +36,8 @@
 //!    .    8     tombstone_word_count: u64 LE
 //!    .   M×8   tombstone bitmap: u64 LE words
 //!    .    4     tombstone_set_count: u32 LE (TombstoneBitmap.count)
+//!    .   32    graph_hash: BLAKE3 of <basename>.hnsw.graph
+//!    .   32    data_hash:  BLAKE3 of <basename>.hnsw.data
 //!    .    8     footer: BLAKE3(file[..footer]) truncated to u64 LE
 //! ```
 
@@ -50,7 +51,14 @@ use crate::tombstones::TombstoneBitmap;
 pub const BRAIN_MAGIC: [u8; 4] = *b"BHN0";
 
 /// On-disk format version. Bump on any incompatible layout change.
-pub const FORMAT_VERSION: u32 = 1;
+///
+/// v1 — non-PQ HnswIndex snapshot (`.brain` wrapper only).
+/// v2 — PQ snapshot with a `.codebook` sibling and a third cross-file
+///      hash in the body.
+/// v3 — full-precision HNSW. The codebook sibling and its hash are
+///      gone; the body carries BLAKE3 hashes of the two `.hnsw.*`
+///      siblings only.
+pub const FORMAT_VERSION: u32 = 3;
 
 /// Size of the fixed-width header (bytes 0..=63).
 pub const HEADER_LEN: usize = 64;
@@ -86,12 +94,15 @@ impl Header {
             shard_uuid,
             taken_at_lsn,
             graph_node_count,
-            m: u32::try_from(params.m).expect("M fits in u32"),
+            m: u32::try_from(params.m).expect("invariant: HNSW M is small and fits in u32"),
             ef_construction: u32::try_from(params.ef_construction)
-                .expect("ef_construction fits in u32"),
-            ef_search: u32::try_from(params.ef_search).expect("ef_search fits in u32"),
-            ef_search_max: u32::try_from(params.ef_search_max).expect("ef_search_max fits in u32"),
-            vector_dim: u32::try_from(D).expect("vector dim fits in u32"),
+                .expect("invariant: ef_construction is small and fits in u32"),
+            ef_search: u32::try_from(params.ef_search)
+                .expect("invariant: ef_search is small and fits in u32"),
+            ef_search_max: u32::try_from(params.ef_search_max)
+                .expect("invariant: ef_search_max is small and fits in u32"),
+            vector_dim: u32::try_from(D)
+                .expect("invariant: embedding dim is small and fits in u32"),
         }
     }
 
@@ -122,15 +133,25 @@ impl Header {
                 got: bytes.len(),
             });
         }
-        let magic: [u8; 4] = bytes[0..4].try_into().expect("4 bytes");
+        let magic: [u8; 4] = bytes[0..4]
+            .try_into()
+            .expect("invariant: HEADER_LEN length checked above guarantees 4 magic bytes");
         if magic != BRAIN_MAGIC {
             return Err(HeaderError::BadMagic(magic));
         }
-        let format_version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        let format_version = u32::from_le_bytes(
+            bytes[4..8]
+                .try_into()
+                .expect("invariant: HEADER_LEN length checked above guarantees these 4 bytes"),
+        );
         if format_version != FORMAT_VERSION {
             return Err(HeaderError::UnsupportedVersion(format_version));
         }
-        let stored_crc = u32::from_le_bytes(bytes[60..64].try_into().unwrap());
+        let stored_crc = u32::from_le_bytes(
+            bytes[60..64]
+                .try_into()
+                .expect("invariant: HEADER_LEN length checked above guarantees these 4 bytes"),
+        );
         let computed_crc = crc32c::crc32c(&bytes[..60]);
         if stored_crc != computed_crc {
             return Err(HeaderError::BadCrc {
@@ -140,14 +161,44 @@ impl Header {
         }
         Ok(Self {
             format_version,
-            shard_uuid: bytes[8..24].try_into().unwrap(),
-            taken_at_lsn: u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
-            graph_node_count: u64::from_le_bytes(bytes[32..40].try_into().unwrap()),
-            m: u32::from_le_bytes(bytes[40..44].try_into().unwrap()),
-            ef_construction: u32::from_le_bytes(bytes[44..48].try_into().unwrap()),
-            ef_search: u32::from_le_bytes(bytes[48..52].try_into().unwrap()),
-            ef_search_max: u32::from_le_bytes(bytes[52..56].try_into().unwrap()),
-            vector_dim: u32::from_le_bytes(bytes[56..60].try_into().unwrap()),
+            shard_uuid: bytes[8..24]
+                .try_into()
+                .expect("invariant: HEADER_LEN length checked above guarantees these 16 bytes"),
+            taken_at_lsn: u64::from_le_bytes(
+                bytes[24..32]
+                    .try_into()
+                    .expect("invariant: HEADER_LEN length checked above guarantees these 8 bytes"),
+            ),
+            graph_node_count: u64::from_le_bytes(
+                bytes[32..40]
+                    .try_into()
+                    .expect("invariant: HEADER_LEN length checked above guarantees these 8 bytes"),
+            ),
+            m: u32::from_le_bytes(
+                bytes[40..44]
+                    .try_into()
+                    .expect("invariant: HEADER_LEN length checked above guarantees these 4 bytes"),
+            ),
+            ef_construction: u32::from_le_bytes(
+                bytes[44..48]
+                    .try_into()
+                    .expect("invariant: HEADER_LEN length checked above guarantees these 4 bytes"),
+            ),
+            ef_search: u32::from_le_bytes(
+                bytes[48..52]
+                    .try_into()
+                    .expect("invariant: HEADER_LEN length checked above guarantees these 4 bytes"),
+            ),
+            ef_search_max: u32::from_le_bytes(
+                bytes[52..56]
+                    .try_into()
+                    .expect("invariant: HEADER_LEN length checked above guarantees these 4 bytes"),
+            ),
+            vector_dim: u32::from_le_bytes(
+                bytes[56..60]
+                    .try_into()
+                    .expect("invariant: HEADER_LEN length checked above guarantees these 4 bytes"),
+            ),
         })
     }
 }
@@ -167,13 +218,23 @@ pub struct Body {
 }
 
 impl Body {
-    /// Encode the id_map + tombstone bitmap state.
+    /// Encode the id_map + tombstone bitmap state + sibling-file hashes.
+    /// The two hashes bind the wrapper to its `.hnsw.graph` and
+    /// `.hnsw.data` siblings — load-time verification hashes each
+    /// sibling and matches against these fields.
     #[must_use]
-    pub fn encode(id_map: &IdMap, next_internal_id: u32, tombstones: &TombstoneBitmap) -> Self {
+    pub fn encode(
+        id_map: &IdMap,
+        next_internal_id: u32,
+        tombstones: &TombstoneBitmap,
+        graph_hash: [u8; 32],
+        data_hash: [u8; 32],
+    ) -> Self {
         let mut bytes = Vec::new();
 
         // id_map entries.
-        let count = u32::try_from(id_map.len()).expect("id_map.len fits in u32");
+        let count = u32::try_from(id_map.len())
+            .expect("invariant: id_map len bounded by u32 internal-id space");
         bytes.extend_from_slice(&count.to_le_bytes());
         for entry in id_map.iter_forward() {
             bytes.extend_from_slice(&entry.0);
@@ -185,13 +246,22 @@ impl Body {
 
         // Tombstone bitmap.
         let words = tombstones.raw_words();
-        let word_count = u64::try_from(words.len()).expect("bitmap word count fits in u64");
+        let word_count = u64::try_from(words.len())
+            .expect("invariant: bitmap word count is a usize and fits in u64");
         bytes.extend_from_slice(&word_count.to_le_bytes());
         for w in words {
             bytes.extend_from_slice(&w.to_le_bytes());
         }
-        let set_count = u32::try_from(tombstones.count()).expect("tombstone count fits in u32");
+        let set_count = u32::try_from(tombstones.count())
+            .expect("invariant: tombstone count bounded by u32 internal-id space");
         bytes.extend_from_slice(&set_count.to_le_bytes());
+
+        // Sibling-file hashes. 64 bytes appended after the tombstone
+        // footer; order matches load-time verification. A version
+        // mismatch is caught by the FORMAT_VERSION check before a parse
+        // ever reaches these bytes.
+        bytes.extend_from_slice(&graph_hash);
+        bytes.extend_from_slice(&data_hash);
 
         Self { bytes }
     }
@@ -203,6 +273,8 @@ pub struct ParsedBody {
     pub next_internal_id: u32,
     pub tombstone_words: Vec<u64>,
     pub tombstone_set_count: u32,
+    pub graph_hash: [u8; 32],
+    pub data_hash: [u8; 32],
 }
 
 impl ParsedBody {
@@ -223,6 +295,8 @@ impl ParsedBody {
             tombstone_words.push(read_u64(&mut bytes)?);
         }
         let tombstone_set_count = read_u32(&mut bytes)?;
+        let graph_hash = read_array_32(&mut bytes)?;
+        let data_hash = read_array_32(&mut bytes)?;
         if !bytes.is_empty() {
             return Err(BodyError::TrailingBytes(bytes.len()));
         }
@@ -231,6 +305,8 @@ impl ParsedBody {
             next_internal_id,
             tombstone_words,
             tombstone_set_count,
+            graph_hash,
+            data_hash,
         })
     }
 }
@@ -245,7 +321,11 @@ fn read_u32(bytes: &mut &[u8]) -> Result<u32, BodyError> {
     if bytes.len() < 4 {
         return Err(BodyError::Truncated);
     }
-    let v = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+    let v = u32::from_le_bytes(
+        bytes[..4]
+            .try_into()
+            .expect("invariant: length checked above guarantees 4 bytes"),
+    );
     *bytes = &bytes[4..];
     Ok(v)
 }
@@ -254,7 +334,11 @@ fn read_u64(bytes: &mut &[u8]) -> Result<u64, BodyError> {
     if bytes.len() < 8 {
         return Err(BodyError::Truncated);
     }
-    let v = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+    let v = u64::from_le_bytes(
+        bytes[..8]
+            .try_into()
+            .expect("invariant: length checked above guarantees 8 bytes"),
+    );
     *bytes = &bytes[8..];
     Ok(v)
 }
@@ -263,8 +347,21 @@ fn read_array_16(bytes: &mut &[u8]) -> Result<[u8; 16], BodyError> {
     if bytes.len() < 16 {
         return Err(BodyError::Truncated);
     }
-    let v: [u8; 16] = bytes[..16].try_into().unwrap();
+    let v: [u8; 16] = bytes[..16]
+        .try_into()
+        .expect("invariant: length checked above guarantees 16 bytes");
     *bytes = &bytes[16..];
+    Ok(v)
+}
+
+fn read_array_32(bytes: &mut &[u8]) -> Result<[u8; 32], BodyError> {
+    if bytes.len() < 32 {
+        return Err(BodyError::Truncated);
+    }
+    let v: [u8; 32] = bytes[..32]
+        .try_into()
+        .expect("invariant: length checked above guarantees 32 bytes");
+    *bytes = &bytes[32..];
     Ok(v)
 }
 

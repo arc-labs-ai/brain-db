@@ -13,8 +13,9 @@ use pest::Parser as _;
 use crate::schema::ast::{
     AttrType, AttributeDecl, CacheConfig, CardinalityAst, ConditionExpr, ConditionOp,
     ConditionValue, CostExpr, CostUnit, DurationAst, DurationUnit, EntityTypeDef, ExtractorDef,
-    ExtractorField, ExtractorKindAst, ExtractorTarget, LiteralValue, ObjectTypeDecl, PredicateDef,
-    RelationTypeDef, ResolverConfig, Schema, SchemaItem, StatementKindAst, TriggerExpr,
+    ExtractorField, ExtractorKindAst, ExtractorTarget, KindCardinalityAst, KindDef, LiteralValue,
+    ObjectKindAst, ObjectTypeDecl, PredicateDef, RelationTypeDef, ResolverConfig, Schema,
+    SchemaItem, StatementKindAst, TemporalModelAst, TriggerExpr,
 };
 use crate::schema::parse_error::ParseError;
 
@@ -22,14 +23,199 @@ use crate::schema::parse_error::ParseError;
 #[grammar = "schema/grammar.pest"]
 struct SchemaParser;
 
+/// Maximum bracket-nesting depth accepted in a schema document.
+///
+/// The grammar has mutually-recursive rules with no built-in bound —
+/// `condition_paren` (`( ... )`) and the JSON capture rules
+/// (`json_nested_object` / `json_nested_array`) each descend once per
+/// bracket. pest parses by recursive descent, so a document with deeply
+/// nested brackets recurses once per level and overflows the native
+/// stack, aborting the whole process (all shards/tenants) — an
+/// availability failure reachable from any low-privilege caller via
+/// `SCHEMA_VALIDATE` / `SCHEMA_UPLOAD`.
+///
+/// A stack overflow cannot be caught, so it must be prevented before the
+/// document reaches pest. 64 is far above anything a legitimate schema
+/// needs — real `where` conditions nest a handful of parens deep and JSON
+/// `schema:` bodies a dozen or so, while the enclosing `define … { }`
+/// blocks never accumulate across items — yet far below the tens of
+/// thousands of frames that would overflow the 8 MiB stack.
+const MAX_NESTING_DEPTH: usize = 64;
+
 // ---------------------------------------------------------------------------
 // Entry point.
 // ---------------------------------------------------------------------------
+
+/// Reject documents whose bracket nesting exceeds [`MAX_NESTING_DEPTH`]
+/// before they reach the recursive-descent pest parser.
+///
+/// A cheap single-pass byte scan that tracks the current `(`/`[`/`{`
+/// nesting depth. Brackets inside string literals, triple-quoted
+/// heredocs, and line comments do not count — they are opaque to the
+/// recursive grammar rules, so counting them would falsely reject
+/// legitimate documents (e.g. a prompt heredoc containing many unbalanced
+/// parens). Brackets inside a *closed* regex literal (`/.../` on a single
+/// line) are likewise skipped, because pest parses the literal as one
+/// atomic token. A lone `/` that does not close before the line ends is
+/// treated as an ordinary byte so that JSON-body brackets following it
+/// are still counted — see the `b'/'` arm. Byte scanning is sound because
+/// every relevant delimiter is ASCII and UTF-8 continuation bytes never
+/// collide with ASCII.
+fn check_nesting_depth(input: &str) -> Result<(), ParseError> {
+    let bytes = input.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    let mut line = 1usize;
+    let mut col = 1usize;
+    let mut depth = 0usize;
+
+    while i < len {
+        match bytes[i] {
+            b'\n' => {
+                line += 1;
+                col = 1;
+                i += 1;
+            }
+            b'#' => {
+                // Line comment: skip to (but not past) the newline.
+                while i < len && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'"' => {
+                if i + 2 < len && bytes[i + 1] == b'"' && bytes[i + 2] == b'"' {
+                    // Triple-quoted heredoc: opaque until the next `"""`.
+                    i += 3;
+                    col += 3;
+                    while i < len {
+                        if bytes[i] == b'"'
+                            && i + 2 < len
+                            && bytes[i + 1] == b'"'
+                            && bytes[i + 2] == b'"'
+                        {
+                            i += 3;
+                            col += 3;
+                            break;
+                        }
+                        if bytes[i] == b'\n' {
+                            line += 1;
+                            col = 1;
+                        } else {
+                            col += 1;
+                        }
+                        i += 1;
+                    }
+                } else {
+                    // Double-quoted string with backslash escapes.
+                    i += 1;
+                    col += 1;
+                    while i < len {
+                        match bytes[i] {
+                            b'\\' => {
+                                i += 2;
+                                col += 2;
+                            }
+                            b'"' => {
+                                i += 1;
+                                col += 1;
+                                break;
+                            }
+                            b'\n' => {
+                                line += 1;
+                                col = 1;
+                                i += 1;
+                            }
+                            _ => {
+                                col += 1;
+                                i += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            b'/' => {
+                // A `/` may open a regex literal (`/.../`) in a trigger/where
+                // clause, where pest parses the whole literal as one atomic
+                // token and never recurses into its brackets — so its
+                // contents are legitimately opaque to the depth cap. But `/`
+                // is also an ordinary byte inside a JSON `schema:`/`examples:`
+                // body, where the grammar *does* recurse once per `{`/`[`. We
+                // may only leave a span uncounted when pest treats it
+                // atomically — i.e. a genuine regex that closes with a
+                // matching `/` before the line ends. If no closing `/` appears
+                // before the next newline or EOF, this `/` is not a regex; the
+                // brackets that follow are real nesting and must be counted, or
+                // a payload like `schema: {/{{{...` would hide unbounded `{`
+                // from the cap and overflow pest's recursive descent.
+                //
+                // The look-ahead never re-scans a span it consumes (a closed
+                // regex is skipped whole; a non-regex `/` advances a single
+                // byte and the main loop counts the rest), so the scan stays
+                // linear overall.
+                let mut j = i + 1;
+                let mut closed = false;
+                while j < len {
+                    match bytes[j] {
+                        b'\\' => j += 2,
+                        b'/' => {
+                            closed = true;
+                            break;
+                        }
+                        b'\n' => break,
+                        _ => j += 1,
+                    }
+                }
+                if closed {
+                    // Genuine regex literal — atomic to pest. Skip it whole;
+                    // `j` indexes the closing `/`, and a closed regex cannot
+                    // contain a newline, so column advance is the byte count.
+                    col += j - i + 1;
+                    i = j + 1;
+                } else {
+                    // Not a regex — treat `/` as an ordinary byte and let the
+                    // main loop count any brackets that follow.
+                    col += 1;
+                    i += 1;
+                }
+            }
+            b'(' | b'[' | b'{' => {
+                depth += 1;
+                if depth > MAX_NESTING_DEPTH {
+                    return Err(ParseError::Syntax {
+                        line,
+                        col,
+                        message: format!(
+                            "bracket nesting depth exceeds maximum of {MAX_NESTING_DEPTH}"
+                        ),
+                    });
+                }
+                col += 1;
+                i += 1;
+            }
+            b')' | b']' | b'}' => {
+                depth = depth.saturating_sub(1);
+                col += 1;
+                i += 1;
+            }
+            _ => {
+                col += 1;
+                i += 1;
+            }
+        }
+    }
+
+    Ok(())
+}
 
 /// Parse a schema document into an AST. Source text is preserved in
 /// `Schema.source`. Returns a structured [`ParseError`] with 1-based
 /// line/col on failure.
 pub fn parse_schema(input: &str) -> Result<Schema, ParseError> {
+    // Bound recursion before handing untrusted input to pest, which parses
+    // by recursive descent and would otherwise overflow the stack on deeply
+    // nested brackets.
+    check_nesting_depth(input)?;
+
     let mut pairs = SchemaParser::parse(Rule::schema, input).map_err(map_pest_error)?;
     let schema_pair = pairs
         .next()
@@ -46,14 +232,17 @@ pub fn parse_schema(input: &str) -> Result<Schema, ParseError> {
                 schema.namespace = parse_namespace_decl(inner);
             }
             Rule::use_decl => {
-                // §21/01 admits the token; v1 has no multi-document support
-                // (§21/04 + §21/07 Q6) — accept-and-discard.
+                // The grammar admits the token; v1 has no multi-document
+                // support — accept-and-discard.
                 let _ = inner;
             }
             Rule::entity_type_def => {
                 schema
                     .items
                     .push(SchemaItem::EntityType(parse_entity_type_def(inner)?));
+            }
+            Rule::kind_def => {
+                schema.items.push(SchemaItem::Kind(parse_kind_def(inner)?));
             }
             Rule::predicate_def => {
                 schema
@@ -233,6 +422,7 @@ fn parse_predicate_def(pair: Pair<'_, Rule>) -> Result<PredicateDef, ParseError>
     let mut object: Option<ObjectTypeDecl> = None;
     let mut stateful: Option<bool> = None;
     let mut description: Option<String> = None;
+    let mut retention: Option<DurationAst> = None;
 
     for child in pair.into_inner() {
         match child.as_rule() {
@@ -265,6 +455,13 @@ fn parse_predicate_def(pair: Pair<'_, Rule>) -> Result<PredicateDef, ParseError>
                     .expect("description field always has string_literal child");
                 description = Some(unquote_string(s));
             }
+            Rule::predicate_retention_field => {
+                let d = child
+                    .into_inner()
+                    .find(|p| p.as_rule() == Rule::duration_literal)
+                    .expect("retention field always has duration_literal child");
+                retention = Some(parse_duration_literal(d)?);
+            }
             _ => {}
         }
     }
@@ -286,6 +483,7 @@ fn parse_predicate_def(pair: Pair<'_, Rule>) -> Result<PredicateDef, ParseError>
         object,
         stateful,
         description,
+        retention,
     })
 }
 
@@ -294,9 +492,108 @@ fn parse_statement_kind(s: &str) -> StatementKindAst {
         "Fact" => StatementKindAst::Fact,
         "Preference" => StatementKindAst::Preference,
         "Event" => StatementKindAst::Event,
+        "Attribute" => StatementKindAst::Attribute,
+        "Relation" => StatementKindAst::Relation,
+        "Directive" => StatementKindAst::Directive,
         "Any" => StatementKindAst::Any,
         other => unreachable!("statement_kind produced {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// User-declared kind.
+// ---------------------------------------------------------------------------
+
+fn parse_kind_def(pair: Pair<'_, Rule>) -> Result<KindDef, ParseError> {
+    let line_col = pair.line_col();
+    let mut name = String::new();
+    let mut cardinality: Option<KindCardinalityAst> = None;
+    let mut temporal: Option<TemporalModelAst> = None;
+    let mut object: Vec<ObjectKindAst> = Vec::new();
+    let mut polarity = false;
+    let mut hint: Option<String> = None;
+
+    for child in pair.into_inner() {
+        match child.as_rule() {
+            Rule::identifier => name = child.as_str().to_string(),
+            Rule::kind_cardinality_field => {
+                let p = child
+                    .into_inner()
+                    .find(|p| p.as_rule() == Rule::kind_cardinality)
+                    .expect("cardinality field always has a kind_cardinality child");
+                cardinality = Some(match p.as_str() {
+                    "single" => KindCardinalityAst::Single,
+                    "set" => KindCardinalityAst::Set,
+                    other => unreachable!("kind_cardinality produced {other:?}"),
+                });
+            }
+            Rule::kind_temporal_field => {
+                let p = child
+                    .into_inner()
+                    .find(|p| p.as_rule() == Rule::temporal_model)
+                    .expect("temporal field always has a temporal_model child");
+                temporal = Some(match p.as_str() {
+                    "state" => TemporalModelAst::State,
+                    "event" => TemporalModelAst::Event,
+                    "none" => TemporalModelAst::None,
+                    other => unreachable!("temporal_model produced {other:?}"),
+                });
+            }
+            Rule::kind_object_field => {
+                for ok in child.into_inner() {
+                    if ok.as_rule() == Rule::object_kind_list {
+                        for k in ok.into_inner() {
+                            if k.as_rule() == Rule::object_kind {
+                                object.push(match k.as_str() {
+                                    "entity" => ObjectKindAst::Entity,
+                                    "value" => ObjectKindAst::Value,
+                                    "time" => ObjectKindAst::Time,
+                                    "quantity" => ObjectKindAst::Quantity,
+                                    "list" => ObjectKindAst::List,
+                                    other => unreachable!("object_kind produced {other:?}"),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            Rule::kind_polarity_field => {
+                let b = child
+                    .into_inner()
+                    .find(|p| p.as_rule() == Rule::bool_literal)
+                    .expect("polarity field always has a bool_literal child");
+                polarity = b.as_str() == "true";
+            }
+            Rule::kind_hint_field => {
+                let s = child
+                    .into_inner()
+                    .find(|p| p.as_rule() == Rule::string_literal)
+                    .expect("hint field always has a string_literal child");
+                hint = Some(unquote_string(s));
+            }
+            _ => {}
+        }
+    }
+
+    let cardinality = cardinality.ok_or_else(|| ParseError::MissingField {
+        line: line_col.0,
+        col: line_col.1,
+        field: "cardinality".into(),
+    })?;
+    let temporal = temporal.ok_or_else(|| ParseError::MissingField {
+        line: line_col.0,
+        col: line_col.1,
+        field: "temporal".into(),
+    })?;
+
+    Ok(KindDef {
+        name,
+        cardinality,
+        temporal,
+        object,
+        polarity,
+        hint,
+    })
 }
 
 fn parse_object_type(pair: Pair<'_, Rule>) -> ObjectTypeDecl {
@@ -413,7 +710,7 @@ fn parse_relation_type_def(pair: Pair<'_, Rule>) -> Result<RelationTypeDef, Pars
             field: "to".into(),
         });
     }
-    // Default cardinality `many-to-many` per §21/02 if unspecified.
+    // Default cardinality `many-to-many` if unspecified.
     let _ = saw_cardinality;
 
     Ok(def)
@@ -1027,9 +1324,40 @@ mod tests {
         );
         assert_eq!(p.description.as_deref(), Some("user preference"));
         // No explicit stateful keyword → AST carries None; resolution
-        // happens at intern time (Preference defaults to true).
+        // happens at intern time. Preferences accumulate as a set (a person
+        // can like many things), so the kind-derived default is NOT stateful.
         assert_eq!(p.stateful, None);
-        assert!(p.resolved_stateful());
+        assert!(!p.resolved_stateful());
+    }
+
+    #[test]
+    fn kind_def_round_trip() {
+        let src = r#"
+            namespace t
+            define kind investment {
+                cardinality: set
+                temporal: event
+                object: [entity, quantity]
+                polarity: false
+                hint: "an entity funded another, with an amount"
+            }
+        "#;
+        let s = parse_ok(src);
+        let SchemaItem::Kind(k) = &s.items[0] else {
+            panic!("kind expected")
+        };
+        assert_eq!(k.name, "investment");
+        assert_eq!(k.cardinality, KindCardinalityAst::Set);
+        assert_eq!(k.temporal, TemporalModelAst::Event);
+        assert_eq!(
+            k.object,
+            vec![ObjectKindAst::Entity, ObjectKindAst::Quantity]
+        );
+        assert!(!k.polarity);
+        assert_eq!(
+            k.hint.as_deref(),
+            Some("an entity funded another, with an amount")
+        );
     }
 
     #[test]
@@ -1052,6 +1380,42 @@ mod tests {
             p.resolved_stateful(),
             "explicit stateful: true overrides Fact default"
         );
+    }
+
+    #[test]
+    fn predicate_def_with_retention_ttl() {
+        let src = r#"
+            namespace t
+            define predicate visited {
+                kind: Event
+                object: Entity<Place>
+                retention: 90d
+            }
+        "#;
+        let s = parse_ok(src);
+        let SchemaItem::Predicate(p) = &s.items[0] else {
+            panic!("predicate expected")
+        };
+        let d = p.retention.expect("retention parsed");
+        assert_eq!(d.amount, 90);
+        assert_eq!(d.unit, DurationUnit::Days);
+        assert_eq!(d.to_seconds(), 90 * 86_400);
+    }
+
+    #[test]
+    fn predicate_def_without_retention_is_none() {
+        let src = r#"
+            namespace t
+            define predicate works_at {
+                kind: Fact
+                object: Entity<Organization>
+            }
+        "#;
+        let s = parse_ok(src);
+        let SchemaItem::Predicate(p) = &s.items[0] else {
+            panic!("predicate expected")
+        };
+        assert_eq!(p.retention, None, "omitted retention defaults to None");
     }
 
     #[test]
@@ -1240,6 +1604,136 @@ mod tests {
             }
             other => panic!("expected Syntax error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn pathological_nesting_is_rejected_not_crashed() {
+        // A low-privilege client could send this via SCHEMA_VALIDATE. The
+        // guard must return Err rather than letting pest recurse and abort
+        // the process — if this test overflowed, the test runner would crash.
+        let src = "(".repeat(100_000);
+        let err = parse_schema(&src).unwrap_err();
+        match err {
+            ParseError::Syntax { message, .. } => {
+                assert!(
+                    message.contains("nesting depth"),
+                    "expected depth error, got {message:?}"
+                );
+            }
+            other => panic!("expected Syntax depth error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nesting_guard_boundary() {
+        // At the limit the guard passes; one deeper is rejected.
+        assert!(check_nesting_depth(&"(".repeat(MAX_NESTING_DEPTH)).is_ok());
+        let err = check_nesting_depth(&"(".repeat(MAX_NESTING_DEPTH + 1)).unwrap_err();
+        assert!(matches!(err, ParseError::Syntax { .. }));
+    }
+
+    #[test]
+    fn nesting_guard_ignores_brackets_in_opaque_spans() {
+        // Unbalanced brackets inside strings, heredocs, regex literals, and
+        // comments are opaque to the recursive rules and must not accumulate
+        // depth (else legitimate documents would be falsely rejected).
+        let big = "(".repeat(1000);
+        assert!(check_nesting_depth(&format!("\"{big}\"")).is_ok());
+        assert!(check_nesting_depth(&format!("\"\"\"{big}\"\"\"")).is_ok());
+        assert!(check_nesting_depth(&format!("/{big}/")).is_ok());
+        assert!(check_nesting_depth(&format!("# {big}\n")).is_ok());
+    }
+
+    #[test]
+    fn legit_nested_condition_still_parses() {
+        // A few levels of real parens in a where-clause must parse fine.
+        let src = r#"
+            namespace t
+            define extractor x {
+                kind: classifier
+                target: relation reports_to
+                trigger: on encode where ((memory.text matches /a/) and (confidence >= 0.5))
+                model: "m"
+            }
+        "#;
+        let s = parse_ok(src);
+        assert_eq!(s.items.len(), 1);
+    }
+
+    #[test]
+    fn json_body_slash_prefixed_nesting_is_rejected() {
+        // The `/{{{...` bypass: a lone `/` in JSON-value position must not
+        // hide unbounded `{` from the depth cap. Before the fix the scanner
+        // entered regex-skip on the `/` and consumed every brace to EOF,
+        // returning Ok and letting pest recurse one frame per `{` until the
+        // stack overflowed. A few hundred braces is enough to prove the guard
+        // now rejects rather than accepts.
+        let mut src = String::from("namespace t\ndefine extractor x { schema: {/");
+        src.push_str(&"{".repeat(300));
+        let err = parse_schema(&src).unwrap_err();
+        match err {
+            ParseError::Syntax { message, .. } => {
+                assert!(
+                    message.contains("nesting depth"),
+                    "expected depth error, got {message:?}"
+                );
+            }
+            other => panic!("expected Syntax depth error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slash_terminated_by_newline_still_counts_following_braces() {
+        // A `/` that never closes before the newline is not a regex; braces
+        // after it are real nesting and must count toward the cap.
+        let mut src = String::from("/\n");
+        src.push_str(&"(".repeat(MAX_NESTING_DEPTH + 1));
+        let err = check_nesting_depth(&src).unwrap_err();
+        assert!(matches!(err, ParseError::Syntax { .. }));
+    }
+
+    #[test]
+    fn closed_regex_with_many_brackets_is_skipped() {
+        // A genuine single-line regex literal is atomic to pest; its brackets
+        // (even 1000 of them, closed by `/`) must not accumulate depth.
+        let big = "{".repeat(1000);
+        assert!(check_nesting_depth(&format!("/{big}/")).is_ok());
+        let parens = "(".repeat(1000);
+        assert!(check_nesting_depth(&format!("/{parens}/")).is_ok());
+    }
+
+    #[test]
+    fn regex_with_braces_in_where_still_parses() {
+        // A regex quantifier `{2,4}` in a trigger where-clause is a legit
+        // literal and must not be false-rejected by the depth guard.
+        let src = r#"
+            namespace t
+            define extractor x {
+                kind: classifier
+                target: relation reports_to
+                trigger: on encode where memory.text matches /[A-Z]{2,4}/
+                model: "m"
+            }
+        "#;
+        let s = parse_ok(src);
+        assert_eq!(s.items.len(), 1);
+    }
+
+    #[test]
+    fn regex_pattern_with_literal_braces_parses() {
+        // A pattern matching literal braces `/\{[a-z]+\}/` must parse — the
+        // regex is atomic and its brackets do not count against the cap.
+        let src = r#"
+            namespace t
+            define extractor x {
+                kind: pattern
+                target: entity Person
+                patterns [ /\{[a-z]+\}/ ]
+                confidence: 0.7
+            }
+        "#;
+        let s = parse_ok(src);
+        assert_eq!(s.items.len(), 1);
     }
 
     #[test]

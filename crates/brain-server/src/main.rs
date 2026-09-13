@@ -2,10 +2,8 @@
 //!
 //! Entry point for the Brain cognitive substrate.
 //!
-//! See `spec/01_architecture/` for the layering and request lifecycle.
-//! Phase 9 status: as of 9.9 the Tokio connection layer accepts TCP/TLS and
-//! routes each accepted stream through a per-connection task; the frame
-//! dispatcher lands in 9.10.
+//! The Tokio connection layer accepts TCP/TLS and routes each accepted
+//! stream through a per-connection task, then the frame dispatcher.
 
 #![allow(clippy::missing_errors_doc)]
 
@@ -20,7 +18,7 @@ mod metrics;
 #[cfg(target_os = "linux")]
 mod network;
 #[cfg(target_os = "linux")]
-#[allow(dead_code)] // consumed by the connection layer in sub-task 9.10.
+#[allow(dead_code)] // consumed by the connection layer.
 mod shard;
 
 // Crate-root aliases. The folder reorg moved each module into a
@@ -68,7 +66,7 @@ fn main() -> ExitCode {
     }
 
     #[cfg(target_os = "linux")]
-    logging::init_pre_config();
+    let log_handle = logging::init_pre_config();
     #[cfg(not(target_os = "linux"))]
     init_tracing_pre_config_portable();
 
@@ -80,8 +78,33 @@ fn main() -> ExitCode {
         }
     };
 
+    // Install the process-wide retrieval tuning from the parsed `[retrieval]`
+    // section before any shard or read path runs. This replaces the former
+    // bespoke `BRAIN_*` env reads at the fusion / retriever / RECALL call
+    // sites; the generic `BRAIN__RETRIEVAL__*` override already applied during
+    // `Config::load`, so TOML is the single source of truth.
+    let _ = brain_core::RetrievalTuning {
+        fusion_method: cfg.retrieval.fusion_method.clone(),
+        hype_rrf: cfg.retrieval.hype_rrf,
+        ef_occupancy_scaling: cfg.retrieval.ef_occupancy_scaling,
+        autocut: cfg.retrieval.autocut,
+    }
+    .install();
+
+    // Same one-shot install for the precision-decision tuning from `[precision]`.
+    // Defaults are no-ops, so an uncalibrated deploy shapes answers exactly as
+    // before; a fitted calibration makes None reachable and Many minimal.
+    let _ = brain_core::PrecisionTuning {
+        commit_min_support: cfg.precision.commit_min_support,
+        many_min_support: cfg.precision.many_min_support,
+    }
+    .install();
+
+    // Apply the configured formatter + level immediately, so the startup
+    // logs below already honor `[monitoring.logging]`. OTel is attached
+    // later, from inside the Tokio runtime (its exporter needs one).
     #[cfg(target_os = "linux")]
-    let _tracer_provider = logging::reinit_from_config(&cfg.logging, &cfg.tracing);
+    log_handle.reconfigure(&cfg.monitoring.logging);
 
     tracing::info!(
         version = %VERSION,
@@ -108,13 +131,12 @@ fn main() -> ExitCode {
                 eprintln!();
                 eprintln!("brain-server requires a BERT-shaped embedding model on disk.");
                 eprintln!("To install BGE-small-en-v1.5:");
-                eprintln!("  ./scripts/bootstrap-model.sh");
+                eprintln!("  ./.devcontainer/bootstrap-model.sh");
                 eprintln!("Or set BRAIN_EMBED_MODEL_DIR=/path/to/model");
-                eprintln!("See docs/notes/embedding-model-install.md for details.");
                 return ExitCode::FAILURE;
             }
         };
-        linux_main::run(cfg, dispatcher)
+        linux_main::run(cfg, dispatcher, log_handle, args.config)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -130,7 +152,7 @@ fn main() -> ExitCode {
 
 // ----------------------------------------------------------------------------
 // Linux runtime: Tokio multi-thread + ConnectionListener.
-// Shards land in 9.10's frame dispatcher; 9.9 just opens the listener.
+// The listener accepts connections; the frame dispatcher routes to shards.
 // ----------------------------------------------------------------------------
 
 #[cfg(target_os = "linux")]
@@ -147,8 +169,11 @@ mod linux_main {
     };
     use crate::routing::RoutingTable;
     use crate::shard::{
-        spawn_shard, AutoEdgeSpawnConfig, CausalEdgeSpawnConfig, ExtractorSpawnConfig, ShardHandle,
-        ShardJoiner, ShardSpawnConfig, TemporalEdgeSpawnConfig,
+        spawn_shard, AmbiguityResolverSpawnConfig, AutoEdgeSpawnConfig, CausalEdgeSpawnConfig,
+        ConfidenceSweepSpawnConfig, ExtractorSpawnConfig, ExtractorTuningSpawnConfig,
+        IndexSpawnConfig, LlmCacheSweepSpawnConfig, RerankSpawnConfig, ShardHandle, ShardJoiner,
+        ShardSpawnConfig, StatementReclaimSpawnConfig, SupersessionSweeperSpawnConfig,
+        TemporalEdgeSpawnConfig,
     };
 
     /// Errors surfaced by [`build_dispatcher`]. Hand-rolled `Display`
@@ -205,8 +230,13 @@ mod linux_main {
         Ok(Arc::new(cached))
     }
 
-    pub fn run(cfg: Config, dispatcher: Arc<dyn brain_embed::Dispatcher>) -> ExitCode {
-        // Sub-task 9.15: build the configured Summarizer (default
+    pub fn run(
+        cfg: Config,
+        dispatcher: Arc<dyn brain_embed::Dispatcher>,
+        log_handle: crate::logging::LoggingHandle,
+        config_path: std::path::PathBuf,
+    ) -> ExitCode {
+        // Build the configured Summarizer (default
         // `DisabledSummarizer`). Construction happens once and the
         // resulting `Arc<dyn Summarizer>` is cloned into each shard's
         // `ShardSpawnConfig` so all shards share one bridge runtime.
@@ -218,7 +248,35 @@ mod linux_main {
             }
         };
 
-        // Sub-task 9.10: spawn one Glommio shard per `cfg.storage.shard_count`,
+        // Cheap boot-time LLM credential probe. An LLM is mandatory (HyPE +
+        // extraction are always-on), and an EMPTY key is already rejected at
+        // config validation — but a present-but-invalid key used to boot fine
+        // and then silently extract nothing. One 1-token completion catches a
+        // rejected key here and refuses to start; a transient/network failure
+        // only warns so a correctly-configured deploy isn't bricked by a
+        // provider hiccup.
+        {
+            use crate::shard::llm_setup::{preflight_llm_auth, LlmPreflight};
+            let llm_cfg = crate::shard::LlmSpawnConfig {
+                api_key: cfg.llm.api_key.clone(),
+                model: cfg.llm.model.clone(),
+            };
+            match preflight_llm_auth(&llm_cfg) {
+                LlmPreflight::Ok => {
+                    tracing::info!("LLM provider credential verified (boot preflight)");
+                }
+                LlmPreflight::Skipped => {}
+                LlmPreflight::Inconclusive(msg) => {
+                    tracing::warn!(detail = %msg, "LLM credential preflight inconclusive; proceeding");
+                }
+                LlmPreflight::InvalidKey(msg) => {
+                    tracing::error!(detail = %msg, "LLM credential rejected — refusing to start");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+
+        // Spawn one Glommio shard per `cfg.storage.shard_count`,
         // then build a `Topology` (shards + `RoutingTable` + `ServerCapabilities`)
         // and feed it into the `ConnectionListener`.
         let (shards, joiners) = match spawn_shards(&cfg, &summarizer, &dispatcher) {
@@ -227,7 +285,7 @@ mod linux_main {
         };
         let shards = Arc::new(shards);
 
-        // Sub-task 9.12: publish the routing table via `ArcSwap` so a
+        // Publish the routing table via `ArcSwap` so a
         // future admin RPC can hot-reload it without restarting
         // connections.
         let routing = match RoutingTable::new(cfg.storage.shard_count as u16, HashMap::new()) {
@@ -238,15 +296,13 @@ mod linux_main {
             }
         };
 
-        // W2.5: scope-bound API keys. The store lives in its own redb
-        // file under the configured data dir; strict enforcement is
-        // opt-in via `BRAIN_REQUIRE_SCOPED_API_KEYS`. In permissive
-        // mode the server still advertises `AuthMethod::Token` so
-        // scoped clients can opt in client-side; the AUTH path treats
-        // both methods uniformly when strict mode is off.
-        let strict_scope = crate::auth::require_scoped_keys_from_env();
+        // Mandatory key auth. The store lives in its own redb file under
+        // the configured data dir. Every data-plane connection must present
+        // a valid, resolvable, non-revoked key; identity (namespace, space,
+        // permissions) is derived entirely from it. Keys are minted via the
+        // admin HTTP listener — there is no permissive / anonymous mode.
         let auth_store_path = cfg.storage.data_dir.join("api_keys.redb");
-        let auth_store = match crate::auth::AuthStore::open(&auth_store_path, strict_scope) {
+        let auth_store = match crate::auth::AuthStore::open(&auth_store_path) {
             Ok(s) => Arc::new(s),
             Err(e) => {
                 tracing::error!(
@@ -258,18 +314,25 @@ mod linux_main {
             }
         };
         tracing::info!(
-            strict = strict_scope,
             path = %auth_store_path.display(),
-            "API-key scope store opened",
+            "API-key scope store opened (auth is mandatory)",
         );
 
-        let server_caps = Arc::new(ServerCapabilities::v1_default(
+        // One source of truth for the per-connection stream budget: the
+        // connection layer enforces `limits.max_concurrent_streams`, and we
+        // advertise that same value in WELCOME so a client's stream budget
+        // matches what the server will actually accept (no drift between the
+        // advertised and enforced caps).
+        let limits = ConnectionLimits::default();
+        let mut caps = ServerCapabilities::v1_default(
             format!("brain-server/{}", env!("CARGO_PKG_VERSION")),
-            vec![AuthMethod::Token, AuthMethod::None],
-        ));
+            vec![AuthMethod::Token],
+        );
+        caps.server_features.max_concurrent_streams = limits.max_concurrent_streams;
+        let server_caps = Arc::new(caps);
 
         // Keep an extra `Arc<Vec<ShardHandle>>` clone outside the
-        // runtime so sub-task 9.14's `graceful_shutdown_shards` can
+        // runtime so `graceful_shutdown_shards` can
         // drop it (and thereby close every shard's request channel)
         // after the connection + admin servers have exited.
         let shards_for_drain = shards.clone();
@@ -297,6 +360,13 @@ mod linux_main {
         };
 
         let rc = runtime.block_on(async move {
+            // Attach the OpenTelemetry exporter now that we're inside the
+            // Tokio runtime — its OTLP batch processor spawns a background
+            // task here. Held for the whole serving block so buffered spans
+            // flush when it drops at shutdown.
+            let _otel_provider =
+                log_handle.attach_otel(&cfg.monitoring.logging, &cfg.monitoring.tracing);
+
             let (trigger, signal) = ShutdownSignal::channel();
             spawn_signal_listener(trigger);
 
@@ -313,13 +383,19 @@ mod linux_main {
             //   - admin   → `/v1/*`                  on `admin_addr` (loopback default)
             // Both share the same ShutdownSignal so a single ctrl-c brings
             // them down together.
-            let admin_state = Arc::new(crate::admin::AdminState::new(
-                topology.shards.clone(),
-                connection_metrics.clone(),
-                Arc::new(cfg.clone()),
-                request_metrics.clone(),
-                topology.auth_store.clone(),
-            ));
+            let admin_state = Arc::new(
+                crate::admin::AdminState::new(
+                    topology.shards.clone(),
+                    connection_metrics.clone(),
+                    Arc::new(cfg.clone()),
+                    request_metrics.clone(),
+                    topology.auth_store.clone(),
+                )
+                .with_reload(config_path, {
+                    let h = log_handle.clone();
+                    Arc::new(move |level: &str| h.set_level(level))
+                }),
+            );
 
             let public = crate::admin::AdminServer::public(
                 cfg.server.metrics_addr,
@@ -336,6 +412,20 @@ mod linux_main {
                     return ExitCode::FAILURE;
                 }
             };
+
+            // Fail-closed: the admin listener is the bootstrap channel for
+            // minting data-plane keys, so it must be gated by an operator
+            // secret. Without one configured, refuse to start it rather than
+            // expose an unauthenticated mint endpoint.
+            if !cfg.admin.has_token() {
+                tracing::error!(
+                    hint = "set [admin] token or BRAIN__ADMIN__TOKEN",
+                    "admin secret not configured: the admin HTTP listener mints \
+                     data-plane API keys and must not run unauthenticated. Set \
+                     [admin] token (or BRAIN__ADMIN__TOKEN) and restart.",
+                );
+                return ExitCode::FAILURE;
+            }
 
             let admin = crate::admin::AdminServer::admin(
                 cfg.server.admin_addr,
@@ -358,7 +448,7 @@ mod linux_main {
                 tls,
                 topology,
                 connection_metrics.clone(),
-                ConnectionLimits::default(),
+                limits,
                 signal,
             );
             let bound = match listener.bind() {
@@ -370,7 +460,7 @@ mod linux_main {
             };
             tracing::info!(addr = %bound.local_addr(), "brain-server listening");
 
-            // Sub-task 9.14: spawn the listener as a JoinHandle so we
+            // Spawn the listener as a JoinHandle so we
             // can `await` it deterministically, then drain the admin
             // server with a bounded budget. Both servers observe the
             // same `ShutdownSignal` clone, so a single SIGINT/SIGTERM
@@ -414,9 +504,9 @@ mod linux_main {
                 .unwrap_or(ExitCode::SUCCESS)
         });
 
-        // Phase B (outside the Tokio runtime): close every shard's
+        // Outside the Tokio runtime: close every shard's
         // request channel, then join each `ShardJoiner` with a per-
-        // shard timeout. Sub-task 9.14.
+        // shard timeout.
         let shard_rc = crate::shutdown::graceful_shutdown_shards(
             shards_for_drain,
             joiners,
@@ -444,7 +534,14 @@ mod linux_main {
             let mut spawn_cfg =
                 ShardSpawnConfig::new(cfg.storage.data_dir.clone(), dispatcher.clone());
             spawn_cfg.summarizer = summarizer.clone();
-            // Phase B: ferry the operator's `[workers.auto_edge]`
+            // Ferry the operator's `[llm]` provider key / model id so the
+            // LLM extractor tier can resolve a client from config when no
+            // env var is set.
+            spawn_cfg.llm = crate::shard::LlmSpawnConfig {
+                api_key: cfg.llm.api_key.clone(),
+                model: cfg.llm.model.clone(),
+            };
+            // Ferry the operator's `[workers.auto_edge]`
             // overrides into the per-shard spawn config so the
             // AutoEdgeWorker registers with the configured knobs
             // (or stays unwired when disabled).
@@ -457,12 +554,11 @@ mod linux_main {
                 ef_search: cfg.workers.auto_edge.ef_search,
                 channel_capacity: cfg.workers.auto_edge.channel_capacity,
             };
-            // Phase E: ferry the operator's `[workers.extractor]`
-            // overrides into the per-shard spawn config so the
-            // ExtractorWorker registers with the configured knobs (or
-            // stays unwired when disabled).
+            // Ferry the operator's `[workers.extractor]` TUNING overrides into
+            // the per-shard spawn config. The worker's existence is derived
+            // from the extractor tier gates (`[extractors.<tier>].enabled`),
+            // not a separate flag here — so only tuning knobs are ferried.
             spawn_cfg.extractor = ExtractorSpawnConfig {
-                enabled: cfg.workers.extractor.enabled,
                 interval_ms: cfg.workers.extractor.interval_ms,
                 drain_per_cycle: cfg.workers.extractor.drain_per_cycle,
                 llm_budget_per_cycle_micro_usd: cfg
@@ -473,7 +569,7 @@ mod linux_main {
                 skip_already_extracted: cfg.workers.extractor.skip_already_extracted,
                 batch_size: cfg.workers.extractor.batch_size,
             };
-            // Phase T: ferry the operator's `[workers.temporal_edge]`
+            // Ferry the operator's `[workers.temporal_edge]`
             // overrides into the per-shard spawn config.
             spawn_cfg.temporal_edge = TemporalEdgeSpawnConfig {
                 enabled: cfg.workers.temporal_edge.enabled,
@@ -482,10 +578,10 @@ mod linux_main {
                 window_seconds: cfg.workers.temporal_edge.window_seconds,
                 weight_min: cfg.workers.temporal_edge.weight_min,
                 channel_capacity: cfg.workers.temporal_edge.channel_capacity,
-                cross_context: cfg.workers.temporal_edge.cross_context,
+                cross_session: cfg.workers.temporal_edge.cross_session,
                 topical_threshold: cfg.workers.temporal_edge.topical_threshold,
             };
-            // Phase C: ferry the operator's `[workers.causal_edge]`
+            // Ferry the operator's `[workers.causal_edge]`
             // overrides. The whitelist strings are split into
             // (namespace, name) pairs here so the spawn config never
             // carries unparsed qnames. Malformed entries (missing or
@@ -528,6 +624,52 @@ mod linux_main {
                     .max_related_statements_per_entity,
                 channel_capacity: cfg.workers.causal_edge.channel_capacity,
             };
+            // Cross-encoder rerank capability gate. The operator opt-out
+            // rides the same config plumbing the worker knobs above use;
+            // spawn_shard hard-fails when an enabled capability can't be
+            // brought up. Extraction has no such gate — all three tiers are
+            // always-on (see `spawn_shard`'s tier gate).
+            spawn_cfg.rerank = RerankSpawnConfig {
+                enabled: cfg.rerank.enabled,
+            };
+            // Ferry the per-worker cadence / gate knobs that previously
+            // only had bespoke `BRAIN_*` env vars.
+            spawn_cfg.statement_reclaim = StatementReclaimSpawnConfig {
+                enabled: cfg.workers.statement_reclaim.enabled,
+                grace_seconds: cfg.workers.statement_reclaim.grace_seconds,
+                period_seconds: cfg.workers.statement_reclaim.period_seconds,
+            };
+            spawn_cfg.supersession_sweeper = SupersessionSweeperSpawnConfig {
+                enabled: cfg.workers.supersession_sweeper.enabled,
+                retention_seconds: cfg.workers.supersession_sweeper.retention_seconds,
+                period_seconds: cfg.workers.supersession_sweeper.period_seconds,
+                dry_run: cfg.workers.supersession_sweeper.dry_run,
+            };
+            spawn_cfg.ambiguity_resolver = AmbiguityResolverSpawnConfig {
+                enabled: cfg.workers.ambiguity_resolver.enabled,
+                interval_secs: cfg.workers.ambiguity_resolver.interval_secs,
+            };
+            spawn_cfg.confidence_sweep = ConfidenceSweepSpawnConfig {
+                enabled: cfg.workers.confidence_sweep.enabled,
+                interval_secs: cfg.workers.confidence_sweep.interval_secs,
+            };
+            spawn_cfg.llm_cache_sweep = LlmCacheSweepSpawnConfig {
+                enabled: cfg.workers.llm_cache_sweep.enabled,
+                interval_secs: cfg.workers.llm_cache_sweep.interval_secs,
+            };
+            // Ferry the extractor-pipeline tuning (resolver / classifier
+            // / HyPE) that previously read bespoke `BRAIN_*` env vars.
+            spawn_cfg.extractor_tuning = ExtractorTuningSpawnConfig {
+                resolver_embed_threshold: cfg.extractors.resolver.embed_threshold,
+                classifier_model_path: cfg.extractors.classifier.model_path.clone(),
+                classifier_threshold: cfg.extractors.classifier.threshold,
+                hype_num_questions: cfg.extractors.hype.num_questions,
+            };
+            // Ferry the tantivy commit cadence.
+            spawn_cfg.index = IndexSpawnConfig {
+                tantivy_commit_n: cfg.index.tantivy_commit_n,
+                tantivy_commit_ms: cfg.index.tantivy_commit_ms,
+            };
             match spawn_shard(shard_id as u16, spawn_cfg) {
                 Ok((h, j)) => {
                     handles.push(h);
@@ -536,7 +678,7 @@ mod linux_main {
                 Err(e) => {
                     tracing::error!(shard_id, error = %e, "failed to spawn shard");
                     // Best-effort: drop the handles we have; ShardJoiners
-                    // will warn on drop without `join()` (9.14 cleans up).
+                    // will warn on drop without `join()` (graceful shutdown cleans up).
                     return Err(ExitCode::FAILURE);
                 }
             }
@@ -571,7 +713,7 @@ mod linux_main {
 
     fn spawn_signal_listener(trigger: ShutdownTrigger) {
         tokio::spawn(async move {
-            // Sub-task 9.14: handle both SIGINT (ctrl-c) and SIGTERM.
+            // Handle both SIGINT (ctrl-c) and SIGTERM.
             // SIGTERM is what process supervisors (systemd, k8s, docker
             // stop) send first; SIGKILL follows if we don't exit fast.
             // We install SIGTERM via tokio::signal::unix; if that
@@ -685,7 +827,7 @@ fn parse_args<I: IntoIterator<Item = String>>(iter: I) -> Result<Args, String> {
 // tracing init (non-Linux fallback)
 //
 // Linux uses crate::bootstrap::logging — it owns the JSON / EnvFilter
-// wiring spec'd in §14/02. The shim below keeps the non-Linux build
+// wiring. The shim below keeps the non-Linux build
 // path (which never reaches linux_main) compilable.
 // ----------------------------------------------------------------------------
 

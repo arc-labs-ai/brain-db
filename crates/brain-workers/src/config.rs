@@ -1,8 +1,8 @@
 //! Worker configuration.
 //!
-//! `WorkerKind` enumerates the 12 workers shipped by sub-tasks
-//! 8.2 – 8.13. `WorkerConfig` is the shared bag of knobs every worker
-//! shares; per-worker configs add their own fields on top.
+//! `WorkerKind` enumerates the 12 workers. `WorkerConfig` is the shared
+//! bag of knobs every worker shares; per-worker configs add their own
+//! fields on top.
 
 use std::time::Duration;
 
@@ -21,11 +21,18 @@ pub enum WorkerKind {
     Statistics,
     EmbedderCacheEvict,
     Snapshot,
-    // Phase 24 — knowledge-layer workers.
+    // Typed-graph workers.
     Backfill,
     ForgetCascade,
     SchemaMigration,
     SupersessionSweeper,
+    /// Physically reclaims retracted statement rows (and their
+    /// secondary-index + evidence-overflow entries) once the retract
+    /// grace period elapses. **Off by default** — enabled via the
+    /// worker's `[workers.<w>].enabled` TOML knob (C2). Closes the
+    /// tombstone-grace-then-reclaim loop on the statement side, the way
+    /// slot reclamation does for memories.
+    StatementReclaim,
     AuditLogSweeper,
     LlmCacheSweeper,
     StaleExtractionDetector,
@@ -38,16 +45,16 @@ pub enum WorkerKind {
     /// LLM) after each ENCODE, then writes the resolved entities /
     /// statements / relations / mention edges back through brain-metadata.
     Extractor,
-    /// Derives `FollowedBy` edges by walking the per-agent timeline
+    /// Derives `FollowedBy` edges by walking the per-space timeline
     /// index after each ENCODE. Connects each new memory to the
-    /// agent's previous memory in the same context, weighted by
+    /// space's previous memory in the same context, weighted by
     /// elapsed time. The substrate's narrative spine.
     TemporalEdge,
     /// Derives `Caused` edges from extractor-produced causal
     /// statements (predicates `caused_by`, `triggered`, `led_to`, …).
     /// Walks the statement-by-subject index to find the cause-side
     /// memories anchoring the statement's object entity, and writes
-    /// memory→memory edges from cause to effect. Knowledge-layer only:
+    /// memory→memory edges from cause to effect. Typed-graph only:
     /// no-schema deployments resolve an empty whitelist and the
     /// worker no-ops.
     CausalEdge,
@@ -56,8 +63,8 @@ pub enum WorkerKind {
     /// text via the shared BGE dispatcher, and inserts the resulting
     /// 384-d vector into the per-shard `StatementHnswIndex`. Without
     /// this worker the statement HNSW stays empty forever and the
-    /// hybrid query path's statement-corpus semantic retriever returns
-    /// zero hits — hybrid recall over statements degenerates to
+    /// retrieval query path's statement-corpus semantic retriever returns
+    /// zero hits — retrieval recall over statements degenerates to
     /// BM25 + graph only.
     StatementEmbed,
     /// Walks active Statement rows and re-aggregates their stored
@@ -100,6 +107,7 @@ impl WorkerKind {
             Self::ForgetCascade => "forget_cascade",
             Self::SchemaMigration => "schema_migration",
             Self::SupersessionSweeper => "supersession_sweeper",
+            Self::StatementReclaim => "statement_reclaim",
             Self::AuditLogSweeper => "audit_log_sweeper",
             Self::LlmCacheSweeper => "llm_cache_sweeper",
             Self::StaleExtractionDetector => "stale_extraction_detector",
@@ -131,10 +139,8 @@ pub struct WorkerConfig {
 }
 
 impl WorkerConfig {
-    /// default cadence table. Per-worker sub-tasks
-    /// may tune (e.g., HNSW maintenance bumps `max_runtime` for the
-    /// rebuild). Snapshot defaults disabled — operators opt in via
-    /// `ADMIN_*_SNAPSHOT` (Phase 9).
+    /// Default cadence table. Per-worker configs may tune (e.g., HNSW
+    /// maintenance bumps `max_runtime` for the rebuild).
     #[must_use]
     pub fn defaults_for(kind: WorkerKind) -> Self {
         let (enabled, interval, batch_size, max_runtime_ms) = match kind {
@@ -149,13 +155,19 @@ impl WorkerConfig {
             WorkerKind::CounterReconcile => (true, Duration::from_secs(3600), 1, 30_000),
             WorkerKind::Statistics => (true, Duration::from_secs(300), 1, 5_000),
             WorkerKind::EmbedderCacheEvict => (true, Duration::from_secs(60), 5_000, 2_000),
-            WorkerKind::Snapshot => (false, Duration::from_secs(3600), 1, 300_000),
-            // Phase 24 — knowledge workers.
+            // On by default: an hourly snapshot bounds the next restart's
+            // WAL replay. `do_snapshot_cycle` skips empty-HNSW shards to
+            // avoid writing redundant CHECKPOINT records.
+            WorkerKind::Snapshot => (true, Duration::from_secs(3600), 1, 300_000),
+            // Typed-graph workers.
             // Backfill is admin-triggered; the loop ticks fast when work is pending.
             WorkerKind::Backfill => (true, Duration::from_secs(1), 256, 20_000),
             WorkerKind::ForgetCascade => (true, Duration::from_secs(1), 256, 10_000),
             WorkerKind::SchemaMigration => (true, Duration::from_secs(1), 128, 30_000),
             WorkerKind::SupersessionSweeper => (true, Duration::from_secs(86400), 256, 30_000),
+            // Off by default — like EntityGc, the operator opts in. Daily
+            // cadence, bounded batch keeps each reclamation wtxn small.
+            WorkerKind::StatementReclaim => (false, Duration::from_secs(86400), 256, 30_000),
             WorkerKind::AuditLogSweeper => (true, Duration::from_secs(86400), 1024, 30_000),
             WorkerKind::LlmCacheSweeper => (true, Duration::from_secs(3600), 1024, 10_000),
             WorkerKind::StaleExtractionDetector => (true, Duration::from_secs(3600), 512, 10_000),
@@ -194,7 +206,7 @@ impl WorkerConfig {
             // pathological "huge predicate bucket" case.
             WorkerKind::ConfidenceSweep => (true, Duration::from_secs(3600), 256, 10_000),
             // Ambiguity resolver re-checks merge-review-queue rows.
-            // 1 h tick matches the spec band: a proposal's confidence
+            // 1 h tick: a proposal's confidence
             // shifts only as the HNSW absorbs new aliases (hours, not
             // seconds). batch_size=64 caps per-cycle wall-clock at
             // 64 * (1 embed + 1 HNSW knn + 1 possible merge_entity) ≈

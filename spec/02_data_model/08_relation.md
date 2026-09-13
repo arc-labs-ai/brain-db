@@ -19,6 +19,11 @@ Both coexist. They are independent.
 struct Relation {
     id: RelationId,                  // UUIDv7
     relation_type: RelationTypeId,   // user-declared type
+
+    // Owner scope — stamped from the caller's authenticated (namespace, agent)
+    namespace_id: NamespaceId,       // owning tenant; 0 = reserved `brain` system namespace
+    agent_id: AgentId,               // owning agent
+
     from_entity: EntityId,
     to_entity: EntityId,
 
@@ -78,6 +83,8 @@ define relation_type owns {
     symmetric: false
 }
 ```
+
+**Owner scope (`namespace_id` + `agent_id`).** Every relation is owned by exactly one `(namespace, agent)` tenant pair, carried on the relation sidecar and stamped from the caller's authenticated scope at create time (fail-closed by construction). This owner namespace is **distinct** from the qname namespace of `relation_type` — a relation owned by `acme` may use a `brain:`-namespaced type. The reserved `brain` system namespace (id `0`) owns only seeded rows and is never a valid owner of user-written relations.
 
 Properties:
 - **`from`, `to`**: entity type constraints. Enforced on write.
@@ -417,7 +424,7 @@ Violations indicate a write-path bug. Brain ships the write path; the sweeper is
 
 ### Wire-layer semantics
 
-`RelationView` reports the **canonical** direction in `from / to` plus a `flags & 1 == 1` bit indicating symmetry. SDK projections handle this transparently — `RelationHandle::other_side(known_endpoint)` returns the opposite end without the caller caring about canonicalisation.
+`RelationView` reports the **canonical** direction in `from / to` plus a `flags & 1 == 1` bit indicating symmetry. Clients handle this transparently — `RelationHandle::other_side(known_endpoint)` returns the opposite end without the caller caring about canonicalisation.
 
 ### Cross-shard considerations (symmetric)
 

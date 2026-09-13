@@ -72,7 +72,7 @@ The same glossary is also hosted in [`../01_architecture/08_glossary.md`](../01_
 
 **`io_uring`.** The modern Linux async I/O interface, kernel 5.1+. Brain uses io_uring for both wire-protocol I/O and storage I/O. See [liburing](https://github.com/axboe/liburing).
 
-**Idempotency horizon.** The time window during which a `request_id` is retained for deduplication. Default 5 minutes for substrate operations (`ENCODE`, `FORGET`); 24 hours for typed-graph operations (entity / statement / relation creates and queries). Retries within the horizon are deduplicated; retries beyond it may be treated as new operations.
+**Idempotency horizon.** The time window during which a `request_id` is retained for deduplication. Default 24 hours across all operations (`ENCODE`, `FORGET`, and the typed-graph entity / statement / relation creates and queries). Retries within the horizon are deduplicated; retries beyond it may be treated as new operations.
 
 **LSN (Log Sequence Number).** A per-shard monotonic identifier for WAL records. Used for replay ordering, idempotency, subscription resumption, and checkpoint advancement.
 
@@ -104,7 +104,7 @@ The same glossary is also hosted in [`../01_architecture/08_glossary.md`](../01_
 
 **Reservation.** A pre-allocated stack/scratch buffer used on the hot path to avoid runtime allocation. Brain reserves these per core at startup.
 
-**rkyv.** A zero-copy deserialization framework for Rust. Brain's structured wire-protocol payloads are rkyv-encoded. See [rkyv](https://github.com/rkyv/rkyv).
+**rkyv.** A zero-copy deserialization framework for Rust. Brain uses rkyv for internal on-disk storage (redb values, WAL records, arena slots). Wire payloads use CBOR (see [04](../04_wire_protocol/00_purpose.md)). See [rkyv](https://github.com/rkyv/rkyv).
 
 **Salience.** A numeric score in [0, 1] representing how important a memory is. Drives decay and consolidation; influences ranking in `RECALL`. Updated on access; decayed by background workers.
 

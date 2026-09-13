@@ -1,9 +1,7 @@
 //! `entity_types` table — user-declared entity types.
 //!
-//! See `spec/02_data_model/00_purpose.md` (type system) and
-//! `spec/03_schema/00_purpose.md` (declaration syntax). The
-//! attribute schema is stored as an opaque `Vec<u8>` blob in 15.1; the
-//! typed AST lands in phase 19 (schema DSL).
+//! The attribute schema is stored as an opaque `Vec<u8>` blob; the
+//! typed AST is defined by the schema DSL.
 
 use crate::impl_redb_rkyv_value;
 use brain_core::EntityTypeId;
@@ -17,8 +15,8 @@ pub const ENTITY_TYPES_TABLE: TableDefinition<'static, u32, EntityTypeDefinition
 pub struct EntityTypeDefinition {
     pub entity_type_id: u32,
     pub name: String,
-    /// rkyv-encoded attribute schema. Phase 19 (schema DSL) defines
-    /// the typed shape; for now it's an opaque payload.
+    /// rkyv-encoded attribute schema. The schema DSL defines the typed
+    /// shape; for now it's an opaque payload.
     pub schema_blob: Vec<u8>,
     pub created_at_unix_nanos: u64,
 }
@@ -45,10 +43,7 @@ impl EntityTypeDefinition {
     }
 }
 
-impl_redb_rkyv_value!(
-    EntityTypeDefinition,
-    "brain_metadata::EntityTypeDefinition::v1"
-);
+impl_redb_rkyv_value!(EntityTypeDefinition, "brain_metadata::EntityTypeDefinition");
 
 #[cfg(all(test, not(miri)))]
 mod tests {

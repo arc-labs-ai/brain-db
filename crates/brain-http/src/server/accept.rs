@@ -11,8 +11,8 @@
 //! implement `GracefulConnection`. `hyper-util` 0.1 implements that
 //! trait for `http1::Connection<I, S>` but **not** for
 //! `http1::UpgradeableConnection<I, S>` (the variant returned by
-//! `.with_upgrades()`). Brain-http needs upgrades for WebSocket
-//! (M6), so every connection is upgradeable. We track tasks
+//! `.with_upgrades()`). Brain-http needs upgrades for WebSocket,
+//! so every connection is upgradeable. We track tasks
 //! ourselves and best-effort drain on shutdown.
 
 use std::future::Future;

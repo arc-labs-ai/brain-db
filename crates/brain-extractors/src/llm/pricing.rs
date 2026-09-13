@@ -2,8 +2,8 @@
 
 use brain_llm::LlmRequest;
 
-/// Per-call cost ceiling. Phase 21 ships per-call only; the
-/// per-deployment global budget is post-v1 (§22/09 §5 + §22/07).
+/// Per-call cost ceiling. v1 ships per-call only; the
+/// per-deployment global budget is post-v1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CostBudget {
     pub per_call_micro_usd: u64,
@@ -11,7 +11,7 @@ pub struct CostBudget {
 
 /// Pricing for a single model in dollar micro-units per token.
 /// Operator-overridable; v1 ships a small embedded default table
-/// for the common models (§22/09 §5). Unknown models fall back
+/// for the common models. Unknown models fall back
 /// to the conservative default `100 µ$/1K input + 300 µ$/1K
 /// output` ⇒ `0.1 µ$ / 0.3 µ$` per token.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -21,7 +21,7 @@ pub struct Pricing {
 }
 
 impl Pricing {
-    /// default — used when no model-specific entry
+    /// Conservative default — used when no model-specific entry
     /// is registered.
     #[must_use]
     pub const fn conservative_default() -> Self {
@@ -32,8 +32,7 @@ impl Pricing {
     }
 
     /// Lookup pricing by model prefix. Embedded table covers the
-    /// models referenced in; operators override
-    /// via the pricing config in phase 21.5+.
+    /// common models; operators override via the pricing config.
     #[must_use]
     pub fn for_model(model: &str) -> Self {
         if model.starts_with("claude-haiku") {
@@ -45,6 +44,21 @@ impl Pricing {
             Self {
                 input_micro_usd_per_token: 3.0,
                 output_micro_usd_per_token: 15.0,
+            }
+        } else if model.starts_with("gpt-4.1-nano") {
+            Self {
+                input_micro_usd_per_token: 0.1,
+                output_micro_usd_per_token: 0.4,
+            }
+        } else if model.starts_with("gpt-4.1-mini") {
+            Self {
+                input_micro_usd_per_token: 0.4,
+                output_micro_usd_per_token: 1.6,
+            }
+        } else if model.starts_with("gpt-4.1") {
+            Self {
+                input_micro_usd_per_token: 2.0,
+                output_micro_usd_per_token: 8.0,
             }
         } else if model.starts_with("gpt-4o-mini") {
             Self {

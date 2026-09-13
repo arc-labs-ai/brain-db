@@ -49,7 +49,7 @@ pub enum ExecError {
     Internal(String),
 
     /// Writer rejected or failed (overloaded queue, internal error).
-    /// 's backpressure surfaces here.
+    /// The writer's backpressure surfaces here.
     #[error("writer rejected: {0}")]
     WriterFailed(#[from] WriterError),
 }

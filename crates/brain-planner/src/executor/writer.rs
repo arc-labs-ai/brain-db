@@ -1,7 +1,7 @@
-//! Per-shard write surface describes a channel-fed
-//! writer task that batches encodes, group-commits to the WAL, and
-//! acks via a return channel. Phase 6 ships only the **trait** — the
-//! real writer lands in Phase 8 (workers) / Phase 9 (server).
+//! Per-shard write surface: a channel-fed writer task that batches
+//! encodes, group-commits to the WAL, and acks via a return channel.
+//! This module ships only the **trait** — the real writer lands with
+//! the workers and server.
 //!
 //! Tests use a `FakeWriterHandle` that drives the test `MetadataDb` and
 //! `SharedHnsw` synchronously without WAL — enough to exercise the
@@ -10,7 +10,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use brain_core::{ContextId, EdgeKind, MemoryId, MemoryKind, RequestId};
+use brain_core::{EdgeKind, MemoryId, MemoryKind, RequestId, SessionId};
 use brain_protocol::envelope::request::ForgetMode;
 use thiserror::Error;
 
@@ -21,8 +21,7 @@ use thiserror::Error;
 /// Rust 1.95 can't yet be used through `dyn`, so we hand-roll the return
 /// type.
 ///
-/// **`!Send + !Sync`** per the audit (`docs/development/phases/phase-09-glommio-port.md`
-/// §4). Phase 9 enforces single-writer-per-shard by living
+/// **`!Send + !Sync`.** Single-writer-per-shard is enforced by living
 /// on one Glommio executor — no cross-thread sharing — so `Send + Sync` on
 /// the trait would be misleading + over-constraining for concrete impls.
 pub trait WriterHandle {
@@ -34,12 +33,12 @@ pub trait WriterHandle {
         &'a self,
     ) -> Pin<Box<dyn Future<Output = Result<MemoryId, WriterError>> + 'a>>;
 
-    /// Agent the writer stamps on every memory it creates. Surfaced
-    /// to handlers so the wire response can echo the bound agent
+    /// Space the writer stamps on every memory it creates. Surfaced
+    /// to handlers so the wire response can echo the bound space
     /// without threading it through the request. Default is `nil`
-    /// (`AgentId::default`) for impls that don't bind an agent.
-    fn agent_id(&self) -> brain_core::AgentId {
-        brain_core::AgentId::default()
+    /// (`SpaceId::default`) for impls that don't bind an space.
+    fn space_id(&self) -> brain_core::SpaceId {
+        brain_core::SpaceId::default()
     }
 
     /// Push `(memory_id, text)` onto the per-shard ExtractorWorker
@@ -58,7 +57,7 @@ pub trait WriterHandle {
     }
 
     /// Downcast hook for the unified write path. Handlers that want
-    /// to call the concrete [`RealWriterHandle::submit`] (which takes
+    /// to call the concrete `RealWriterHandle::submit` (which takes
     /// the brain-ops `Write` value type that brain-planner cannot
     /// import without a dep cycle) do so via
     /// `ctx.executor.writer.as_any().downcast_ref::<RealWriterHandle>()`.
@@ -75,40 +74,40 @@ pub trait WriterHandle {
 /// everything the writer needs to:
 ///
 /// 1. Look up idempotency by `request_id`.
-/// 2. Allocate a slot, append a WAL record, fsync (-§8).
+/// 2. Allocate a slot, append a WAL record, fsync.
 /// 3. Write vector to arena, metadata row to redb, vector to HNSW
 /// 4. Insert edge rows.
 /// 5. Cache the response in the idempotency table (same write txn).
 #[derive(Debug, Clone)]
 pub struct EncodeOp {
     pub request_id: RequestId,
-    pub context_id: ContextId,
+    pub session_id: SessionId,
     pub kind: MemoryKind,
     pub text: String,
     pub vector: [f32; brain_embed::VECTOR_DIM],
     pub salience_initial: f32,
-    /// Embedding-model fingerprint stamped on the stored row. Phase 7
-    /// wires this from the live dispatcher; for now the executor passes
+    /// Embedding-model fingerprint stamped on the stored row. Wired
+    /// from the live dispatcher later; for now the executor passes
     /// `Dispatcher::fingerprint()` through.
     pub fingerprint: [u8; 16],
     pub edges: Vec<EncodeOpEdge>,
-    /// — when `true`, the writer consults the per-
-    /// shard `fingerprints` table keyed by
-    /// `(agent_id, context_id, content_hash)` and, on a hit, returns
-    /// the existing `MemoryId` without allocating a new slot.
+    /// When `true`, the writer consults the per-shard `fingerprints`
+    /// table keyed by `(space_id, session_id, content_hash)` and, on a
+    /// hit, returns the existing `MemoryId` without allocating a new
+    /// slot.
     pub deduplicate: bool,
     /// BLAKE3 over the canonical UTF-8 text. Always computed by
     /// the executor (cheap); the writer only reads it when
     /// `deduplicate` is set.
     pub content_hash: [u8; 32],
-    /// **The caller's authenticated agent.** Stamped by the
-    /// dispatcher from `ConnPhase::Established.agent` — not from
+    /// **The caller's authenticated space.** Stamped by the
+    /// dispatcher from `ConnPhase::Established.space` — not from
     /// the wire request. Used by the writer to populate the
     /// memory row, the WAL payload, and the published event so the
-    /// subscribe `agents` filter can isolate per-tenant on a
-    /// shared shard. Defaults to `AgentId::default()` in tests
+    /// subscribe `spaces` filter can isolate per-tenant on a
+    /// shared shard. Defaults to `SpaceId::default()` in tests
     /// that bypass the dispatcher.
-    pub agent_id: brain_core::AgentId,
+    pub space_id: brain_core::SpaceId,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -131,9 +130,9 @@ pub enum WriterError {
     /// queue over its max length → reject + retry.
     #[error("writer queue overloaded")]
     Overloaded,
-    /// — duplicate `request_id` with a different
-    /// `request_hash`. Client retries should carry the same params;
-    /// a hash mismatch indicates a client bug or RequestId reuse.
+    /// Duplicate `request_id` with a different `request_hash`. Client
+    /// retries should carry the same params; a hash mismatch indicates
+    /// a client bug or RequestId reuse.
     #[error("idempotency conflict: {0}")]
     Conflict(String),
     #[error("writer internal error: {0}")]
@@ -146,8 +145,8 @@ pub struct ForgetOp {
     pub request_id: RequestId,
     pub memory_id: MemoryId,
     pub mode: ForgetMode,
-    /// Caller's authenticated agent (see [`EncodeOp::agent_id`]).
-    pub agent_id: brain_core::AgentId,
+    /// Caller's authenticated space (see [`EncodeOp::space_id`]).
+    pub space_id: brain_core::SpaceId,
 }
 
 /// Per-memory outcome's per-memory error tolerance:
@@ -173,17 +172,17 @@ pub struct LinkOp {
     pub kind: EdgeKind,
     /// `[0, 1]` for most kinds; `[-1, 1]` for `Contradicts`.
     pub weight: f32,
-    /// Caller's authenticated agent (see [`EncodeOp::agent_id`]).
-    pub agent_id: brain_core::AgentId,
+    /// Caller's authenticated space (see [`EncodeOp::space_id`]).
+    pub space_id: brain_core::SpaceId,
 }
 
-/// UNLINK operation payload-§5.
+/// UNLINK operation payload.
 #[derive(Debug, Clone, Copy)]
 pub struct UnlinkOp {
     pub request_id: RequestId,
     pub source: MemoryId,
     pub target: MemoryId,
     pub kind: EdgeKind,
-    /// Caller's authenticated agent (see [`EncodeOp::agent_id`]).
-    pub agent_id: brain_core::AgentId,
+    /// Caller's authenticated space (see [`EncodeOp::space_id`]).
+    pub space_id: brain_core::SpaceId,
 }

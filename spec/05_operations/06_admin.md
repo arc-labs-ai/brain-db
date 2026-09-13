@@ -191,11 +191,11 @@ QUOTA_SET: configures per-agent limits (max memories, max contexts, max RPS).
 ADMIN_RESTORE_FORGOTTEN(memory_id) → RestoreResponse
 ```
 
-Undoes a Soft FORGET within the grace period. The memory's tombstone flag is cleared; it becomes searchable again.
+Undoes a Soft FORGET within the grace period. Served on the admin HTTP plane as `POST /v1/memories/{id}/restore`. It un-tombstones the memory (making it searchable again) and replays the forget undo log to reverse the soft cascade: for each dependent statement / relation the cascade touched it re-attaches the stripped evidence, re-adds the reverse-index row, recomputes confidence, and un-tombstones rows still carrying reason `SourceMemoryForgotten`. Replay is idempotent — each consumed undo row is deleted in-txn, so a re-run is a structural no-op. See [`../10_metadata/00_purpose.md`](../10_metadata/00_purpose.md) (the additive undo log) for the mechanism.
 
 Fails if:
-- The memory was hard-forgotten (data is gone).
-- The grace period has expired (reclamation already happened).
+- The memory was hard-forgotten (no undo log was written — the data is gone).
+- The grace period has expired (slot reclamation already reaped the undo rows; a post-grace forget is irreversible).
 
 This is admin-only because it can resurrect data the agent expected to be gone. Compliance-sensitive.
 
@@ -270,12 +270,28 @@ Used to mark a memory as a "summary of others" for organizational purposes. Does
 
 ## 16. Auth model
 
-Admin operations require admin credentials, distinct from agent credentials:
+Every credential (API key) binds a `(namespace, agent, permissions)` scope plus a non-authoritative `user` audit tag (see [`../04_wire_protocol/04_handshake.md`](../04_wire_protocol/04_handshake.md) §10). Namespace is the tenant boundary; agent is the application within it.
 
-- Agent credentials: scoped to an agent_id; can only act within that agent.
-- Admin credentials: cross-agent; can do operational work.
+- Agent credentials: scoped to one `(namespace, agent)`; can only act within that namespace and agent.
+- Admin credentials: may act cross-**agent** *within their own namespace* (operational work). **No credential — admin or otherwise — can act across namespaces**; cross-namespace access is rejected at the boundary. Cross-tenant operations require separate provisioning, not a wider key.
 
-The wire protocol carries the credential type in the connection's session state. Admin requests on a non-admin session return `Unauthorized`.
+**Namespace-scoped operations.** Key-mint provisions a tenant: minting a key for a namespace interns that namespace (creating the tenant). `SCHEMA_UPLOAD` / `SCHEMA_REPLACE` may target only the caller's own namespace; the reserved `brain` namespace is immutable (read-only system vocabulary). `GET_CAPABILITIES.schema_namespaces` returns only the caller's namespace (plus `brain`).
+
+The wire protocol carries the scope + credential type in the connection's session state, derived from the key at AUTH (never client-supplied). Admin requests on a non-admin session return `Unauthorized`; a write that resolves to no provisioned namespace is rejected fail-closed (`NamespaceRequired` / `NamespaceUnknown`).
+
+### 16.1 Key provisioning is the bootstrap
+
+Identity enters Brain in exactly one place: the admin HTTP surface mints API keys, and minting a key is what creates identity. There is no anonymous access and no self-service identity on the data plane — a data-plane connection can only *prove* a key, never *create* one.
+
+Minting a key:
+
+- **Creates / interns its namespace.** The first key minted for a namespace name brings that tenant into existence; later keys for the same name join it. There is no implicit or default namespace.
+- **Binds its agent** within that namespace, and **binds its permissions** (including whether the key is admin).
+- Returns the opaque key material once, out-of-band, for the operator to hand to the application.
+
+The admin HTTP surface is itself gated by an **operator admin secret**, presented as a request header (the bearer admin token). Without that secret, the provisioning routes reject the request — so the ability to create identity is held by the operator, not by any agent. Keys are revoked the same way; a revoked key fails AUTH (`Unauthenticated`).
+
+The data plane never creates identity: no opcode mints, names, or elevates a key, a namespace, or an agent. The full provisioning flow and the header-based admin-secret gate are specified in [`../17_observability/04_admin_ops.md`](../17_observability/04_admin_ops.md).
 
 ## 17. Audit logging
 

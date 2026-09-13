@@ -155,11 +155,11 @@ Brain's wire protocol (defined in [04. Wire Protocol](../04_wire_protocol/00_pur
 
 The protocol's framing, opcodes, and error handling apply uniformly. Cross-node calls are just network calls of the same protocol.
 
-## 14. The SDK in clustered mode
+## 14. Clients in clustered mode
 
-Client SDKs handle the cluster:
+Clients handle the cluster:
 
-- The SDK has a list of bootstrap nodes.
+- The client has a list of bootstrap nodes.
 - Connects to one; learns the membership.
 - For each request, sends to the appropriate node (based on routing).
 - Handles node failures by reconnecting and rerouting.

@@ -1,21 +1,21 @@
-//! Statistics update worker (sub-task 8.11).
+//! Statistics update worker.
 //!
 //! Every 5 min, scans `MEMORIES_TABLE` + `SharedHnsw` and refreshes
-//! a per-shard `Stats` cache. Phase 9's `ADMIN_STATS` handler will
-//! hold a clone of [`StatisticsUpdateWorker::cache_handle`] and read
-//! the cache without doing the scan itself.
+//! a per-shard `Stats` cache. The `ADMIN_STATS` handler holds a clone
+//! of [`StatisticsUpdateWorker::cache_handle`] and reads the cache
+//! without doing the scan itself.
 //!
 //! ## v1 deviations (documented)
 //!
-//! 1 lists nine fields; v1 fills five and leaves the others
-//! as `Option::None`:
+//! The `Stats` struct has nine fields; v1 fills five and leaves the
+//! others as `Option::None`:
 //! - `arena_used_bytes` / `arena_capacity_bytes` — no arena yet.
 //! - `wal_size_bytes` — no WAL hookup.
 //! - `metadata_size_bytes` — `OpsContext` doesn't hold the metadata
 //!   filesystem path.
 //!
-//! 1's "histograms of salience / edge degree / age" is Phase
-//! 9 admin tooling. v1 ships the counts + age range layer.
+//! The "histograms of salience / edge degree / age" belong to admin
+//! tooling. v1 ships the counts + age range layer.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -42,12 +42,12 @@ pub struct Stats {
     pub oldest_memory_age_nanos: Option<u64>,
     /// nanos since the newest memory's `created_at`. `None` if empty.
     pub newest_memory_age_nanos: Option<u64>,
-    /// Phase 9 wires the arena.
+    /// Wired from the arena.
     pub arena_used_bytes: Option<u64>,
     pub arena_capacity_bytes: Option<u64>,
-    /// Phase 9 wires the WAL.
+    /// Wired from the WAL.
     pub wal_size_bytes: Option<u64>,
-    /// Phase 9 wires the metadata file path.
+    /// Wired from the metadata file path.
     pub metadata_size_bytes: Option<u64>,
     /// Worker wall-clock when this snapshot was computed.
     pub computed_at_unix_nanos: u64,
@@ -79,8 +79,8 @@ impl StatisticsUpdateWorker {
         self.cache.read().clone()
     }
 
-    /// Hand the cache handle to consumers (e.g., Phase 9's
-    /// `ADMIN_STATS` handler). Cloning bumps the `Arc` refcount.
+    /// Hand the cache handle to consumers (e.g., the `ADMIN_STATS`
+    /// handler). Cloning bumps the `Arc` refcount.
     #[must_use]
     pub fn cache_handle(&self) -> Arc<RwLock<Stats>> {
         self.cache.clone()
@@ -155,8 +155,7 @@ async fn do_stats_cycle(
 fn scan_memories(
     metadata: &brain_planner::SharedMetadataDb,
 ) -> Result<(u64, Option<u64>, Option<u64>), WorkerError> {
-    let db = metadata.lock();
-    let rtxn = db
+    let rtxn = metadata
         .read_txn()
         .map_err(|e| WorkerError::Ops(format!("stats rtxn: {e:?}")))?;
     let table = rtxn

@@ -1,4 +1,4 @@
-//! Access-boost worker (sub-task 8.3), §8, §16.
+//! Access-boost worker.
 //!
 //! Drains the per-shard `AccessBuffer` (filled by RECALL responses)
 //! and applies a `salience × (1 + boost_factor)` bump, capped at 1.0.
@@ -98,6 +98,21 @@ async fn do_boost_cycle(
     worker: &AccessBoostWorker,
     ctx: &WorkerContext,
 ) -> Result<usize, WorkerError> {
+    // Production runs with no artificial visit budget — the only stop
+    // conditions are `max_runtime` and shutdown.
+    run_boost_cycle(worker, ctx, usize::MAX).await
+}
+
+/// Core boost cycle. `visit_budget` caps how many drained ids the loop
+/// may *visit* before it stops early (as if `max_runtime` or shutdown
+/// fired). Production passes `usize::MAX`; tests pass a small value to
+/// deterministically exercise the early-exit / re-queue boundary
+/// without depending on wall-clock timing.
+async fn run_boost_cycle(
+    worker: &AccessBoostWorker,
+    ctx: &WorkerContext,
+    visit_budget: usize,
+) -> Result<usize, WorkerError> {
     let cfg = worker.config.clone();
     if cfg.batch_size == 0 || worker.boost_factor == 0.0 {
         return Ok(0);
@@ -114,11 +129,18 @@ async fn do_boost_cycle(
     let metadata = ctx.ops.executor.metadata.clone();
     let started = Instant::now();
     let mut applied = 0usize;
-    let mut stopped_early = false;
+    // Index into `ids` marking where the unprocessed remainder begins.
+    // On a normal run this ends at `take_n`; on an early exit it stops
+    // at the id we broke on (which we did NOT process). Everything at
+    // an index < `processed_upto` has already been visited this cycle —
+    // either boosted, or intentionally skipped (missing / at-cap) —
+    // and must never be re-queued as if it were pending. Re-queuing a
+    // boosted id would double-boost it next cycle (salience *= 1.10
+    // again), which is exactly the non-idempotency this guards against.
+    let mut processed_upto = 0usize;
 
     {
-        let mut db = metadata.lock();
-        let wtxn = db
+        let wtxn = metadata
             .write_txn()
             .map_err(|e| WorkerError::Ops(format!("boost write_txn: {e:?}")))?;
         {
@@ -127,18 +149,15 @@ async fn do_boost_cycle(
                 .map_err(|e| WorkerError::Ops(format!("boost open MEMORIES: {e:?}")))?;
 
             for (i, id) in ids.iter().take(take_n).enumerate() {
-                if started.elapsed() >= cfg.max_runtime {
-                    stopped_early = true;
-                    // Carry the rest of `ids` back into the buffer
-                    // (including the current id, which we haven't
-                    // applied).
-                    let _ = i;
+                if i >= visit_budget || started.elapsed() >= cfg.max_runtime || ctx.is_shutdown() {
+                    // Break BEFORE touching this id: it belongs to the
+                    // unprocessed remainder and is re-queued below.
                     break;
                 }
-                if ctx.is_shutdown() {
-                    stopped_early = true;
-                    break;
-                }
+                // We are now committing to visiting `ids[i]`; advance the
+                // watermark so the remainder re-queue starts strictly
+                // after it, regardless of whether it boosts or skips.
+                processed_upto = i + 1;
                 let key = id.to_be_bytes();
                 let prior = table
                     .get(key)
@@ -163,18 +182,16 @@ async fn do_boost_cycle(
             .map_err(|e| WorkerError::Ops(format!("boost commit: {e:?}")))?;
     }
 
-    // Re-queue overflow (everything past `take_n` or after early
-    // exit). Drain semantics + re-record keeps the contract simple:
-    // ids that didn't make it this cycle are picked up next.
-    let requeue_from = if stopped_early {
-        // Conservatively re-queue everything past `applied`. Some of
-        // those may have been skip-no-changes; recording them again is
-        // a no-op (dedup at record).
-        applied
-    } else {
-        take_n
-    };
-    for id in &ids[requeue_from.min(ids.len())..] {
+    // Re-queue only the unprocessed remainder: ids we never visited this
+    // cycle (the current-and-later ids on early exit, plus everything
+    // past `take_n` that we always defer). This range is disjoint from
+    // every boosted id, so a row boosted once per drain can never be
+    // boosted twice via re-queue — the cycle is idempotent.
+    // `processed_upto <= take_n <= ids.len()`, so `ids[processed_upto..]`
+    // is exactly the unvisited window rows on early exit plus the
+    // always-deferred overflow past `take_n`.
+    let requeue_from = processed_upto.min(ids.len());
+    for id in &ids[requeue_from..] {
         ctx.ops.access_buffer.record(*id);
     }
 
@@ -186,4 +203,241 @@ async fn do_boost_cycle(
     );
 
     Ok(applied)
+}
+
+// ---------------------------------------------------------------------------
+// Tests.
+// ---------------------------------------------------------------------------
+
+#[cfg(all(test, not(miri)))]
+#[allow(clippy::arc_with_non_send_sync)]
+mod tests {
+    use super::*;
+    use brain_core::{MemoryId, MemoryKind, NamespaceId, SessionId, SpaceId};
+    use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
+    use brain_metadata::tables::memory::MemoryMetadata;
+    use brain_metadata::MetadataDb;
+    use brain_ops::RealWriterHandle;
+    use brain_planner::{ExecutorContext, WriterHandle};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    const NOW: u64 = 1_700_000_000_000_000_000;
+
+    struct NoopDispatcher;
+    impl Dispatcher for NoopDispatcher {
+        fn embed(&self, _text: &str) -> Result<[f32; VECTOR_DIM], EmbedError> {
+            Ok([0.0_f32; VECTOR_DIM])
+        }
+        fn embed_batch(&self, texts: &[&str]) -> Result<Vec<[f32; VECTOR_DIM]>, EmbedError> {
+            Ok(vec![[0.0_f32; VECTOR_DIM]; texts.len()])
+        }
+        fn fingerprint(&self) -> [u8; 16] {
+            [0u8; 16]
+        }
+    }
+
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        metadata: Arc<MetadataDb>,
+        ctx: WorkerContext,
+    }
+
+    fn fixture() -> Fixture {
+        use brain_index::{IndexParams, SharedHnsw};
+        let dir = tempfile::tempdir().unwrap();
+        let metadata = Arc::new(MetadataDb::open(dir.path().join("test.redb")).unwrap());
+        let dispatcher: Arc<dyn Dispatcher> = Arc::new(NoopDispatcher);
+        let (shared, hnsw_writer) = SharedHnsw::new(IndexParams::default_v1()).unwrap();
+        let writer: Arc<dyn WriterHandle> =
+            Arc::new(RealWriterHandle::new(metadata.clone(), hnsw_writer));
+        let executor = ExecutorContext::new(dispatcher, shared, metadata.clone(), writer);
+        let ops = Arc::new(brain_ops::test_support::ops_context_for_tests_owning_tempdir(executor));
+        let ctx = WorkerContext {
+            ops,
+            shutdown: Arc::new(AtomicBool::new(false)),
+        };
+        Fixture {
+            _dir: dir,
+            metadata,
+            ctx,
+        }
+    }
+
+    /// Seed a memory row at the given salience and return its id.
+    fn seed_memory(metadata: &Arc<MetadataDb>, n: u16, salience: f32) -> MemoryId {
+        let mid = MemoryId::pack(n, SessionId::DEFAULT.into(), 0);
+        let row = MemoryMetadata::new_active(
+            mid,
+            NamespaceId::SYSTEM,
+            SpaceId::default(),
+            SessionId::DEFAULT,
+            mid.slot(),
+            mid.version(),
+            MemoryKind::Episodic,
+            [0u8; 16],
+            salience,
+            16,
+            NOW,
+        );
+        let wtxn = metadata.write_txn().unwrap();
+        {
+            let mut t = wtxn.open_table(MEMORIES_TABLE).unwrap();
+            t.insert(mid.to_be_bytes(), row).unwrap();
+        }
+        wtxn.commit().unwrap();
+        mid
+    }
+
+    fn read_salience(metadata: &Arc<MetadataDb>, id: MemoryId) -> f32 {
+        let rtxn = metadata.read_txn().unwrap();
+        let t = rtxn.open_table(MEMORIES_TABLE).unwrap();
+        t.get(id.to_be_bytes()).unwrap().unwrap().value().salience
+    }
+
+    fn read_access_count(metadata: &Arc<MetadataDb>, id: MemoryId) -> u32 {
+        let rtxn = metadata.read_txn().unwrap();
+        let t = rtxn.open_table(MEMORIES_TABLE).unwrap();
+        t.get(id.to_be_bytes())
+            .unwrap()
+            .unwrap()
+            .value()
+            .access_count
+    }
+
+    fn worker() -> AccessBoostWorker {
+        // Large batch_size + max_runtime so the only early-exit lever in
+        // tests is the explicit visit budget.
+        let mut cfg = WorkerConfig::defaults_for(WorkerKind::AccessBoost);
+        cfg.batch_size = 4096;
+        cfg.max_runtime = std::time::Duration::from_secs(3600);
+        AccessBoostWorker::new().with_config(cfg)
+    }
+
+    #[test]
+    fn boosted_salience_caps_at_one() {
+        assert!((boosted_salience(0.5, 0.10) - 0.55).abs() < 1e-6);
+        assert_eq!(boosted_salience(0.95, 0.10), MAX_SALIENCE);
+        assert_eq!(boosted_salience(1.0, 0.10), MAX_SALIENCE);
+    }
+
+    /// An early-exit cycle must re-queue only the ids it never visited,
+    /// and must never re-queue a boosted id. The proof: across the
+    /// exit→resume boundary every boostable row ends up boosted exactly
+    /// once (salience == 0.55, access_count == 1), never twice.
+    #[test]
+    fn early_exit_boosts_each_row_exactly_once() {
+        let fx = fixture();
+        let n_rows: u16 = 12;
+        let ids: Vec<MemoryId> = (0..n_rows)
+            .map(|i| seed_memory(&fx.metadata, i, 0.5))
+            .collect();
+        for id in &ids {
+            fx.ctx.ops.access_buffer.record(*id);
+        }
+
+        // Cycle 1: visit only 5 of the 12 drained ids, then early-exit.
+        // The 7 unvisited ids are re-queued; the (≤5) boosted ids are not.
+        let w = worker();
+        let applied1 = futures_lite::future::block_on(run_boost_cycle(&w, &fx.ctx, 5)).unwrap();
+        assert_eq!(applied1, 5, "budget-limited cycle boosts exactly 5 rows");
+        assert_eq!(
+            fx.ctx.ops.access_buffer.len(),
+            7,
+            "only the 7 unvisited ids are re-queued",
+        );
+
+        // Cycle 2: drain the re-queued remainder and finish. If the fix
+        // regressed and a boosted id were re-queued, that row would be
+        // boosted twice here (0.55 → 0.605) and its access_count would
+        // reach 2 — the assertions below catch exactly that.
+        let applied2 =
+            futures_lite::future::block_on(run_boost_cycle(&w, &fx.ctx, usize::MAX)).unwrap();
+        assert_eq!(applied2, 7, "resume cycle boosts the 7 remaining rows");
+        assert_eq!(fx.ctx.ops.access_buffer.len(), 0, "buffer drained");
+
+        for id in &ids {
+            let sal = read_salience(&fx.metadata, *id);
+            assert!(
+                (sal - 0.55).abs() < 1e-6,
+                "row boosted exactly once expected 0.55, got {sal}",
+            );
+            assert_eq!(
+                read_access_count(&fx.metadata, *id),
+                1,
+                "row boosted exactly once across the exit/resume boundary",
+            );
+        }
+    }
+
+    /// Skipped rows (at-cap) interleaved with boostable rows must not
+    /// corrupt the re-queue watermark. This is the precise shape of the
+    /// original bug: `applied` (a count of boosted rows) was used as an
+    /// index, so an at-cap row before a boosted row shifted the split and
+    /// re-queued an already-boosted id.
+    #[test]
+    fn early_exit_with_skipped_rows_never_double_boosts() {
+        let fx = fixture();
+        // Half at cap (salience 1.0 → skip), half boostable (0.5).
+        let n_rows: u16 = 16;
+        let mut boostable: Vec<MemoryId> = Vec::new();
+        for i in 0..n_rows {
+            let salience = if i % 2 == 0 { 1.0 } else { 0.5 };
+            let id = seed_memory(&fx.metadata, i, salience);
+            if salience < 1.0 {
+                boostable.push(id);
+            }
+            fx.ctx.ops.access_buffer.record(id);
+        }
+
+        // Run in small budgeted slices until the buffer empties, so the
+        // early-exit / re-queue path is exercised repeatedly regardless
+        // of the arbitrary drain order.
+        let w = worker();
+        let mut guard = 0;
+        while !fx.ctx.ops.access_buffer.is_empty() {
+            let _ = futures_lite::future::block_on(run_boost_cycle(&w, &fx.ctx, 3)).unwrap();
+            guard += 1;
+            assert!(guard < 100, "cycles should terminate");
+        }
+
+        // Every boostable row boosted exactly once; at-cap rows untouched.
+        for id in &boostable {
+            let sal = read_salience(&fx.metadata, *id);
+            assert!(
+                (sal - 0.55).abs() < 1e-6,
+                "boostable row must be boosted exactly once, got {sal}",
+            );
+            assert_eq!(read_access_count(&fx.metadata, *id), 1);
+        }
+    }
+
+    /// A full cycle followed by a re-run over a freshly-recorded set must
+    /// not double-boost: `drain` clears the buffer, so a row present in
+    /// only the first drain is boosted once.
+    #[test]
+    fn overflow_requeue_boosts_each_row_once() {
+        let fx = fixture();
+        let ids: Vec<MemoryId> = (0..5).map(|i| seed_memory(&fx.metadata, i, 0.5)).collect();
+        for id in &ids {
+            fx.ctx.ops.access_buffer.record(*id);
+        }
+
+        // batch_size = 2 → overflow re-queue across cycles.
+        let mut cfg = WorkerConfig::defaults_for(WorkerKind::AccessBoost);
+        cfg.batch_size = 2;
+        cfg.max_runtime = std::time::Duration::from_secs(3600);
+        let w = AccessBoostWorker::new().with_config(cfg);
+
+        let mut guard = 0;
+        while !fx.ctx.ops.access_buffer.is_empty() {
+            let _ =
+                futures_lite::future::block_on(run_boost_cycle(&w, &fx.ctx, usize::MAX)).unwrap();
+            guard += 1;
+            assert!(guard < 100, "cycles should terminate");
+        }
+        for id in &ids {
+            assert_eq!(read_access_count(&fx.metadata, *id), 1);
+        }
+    }
 }

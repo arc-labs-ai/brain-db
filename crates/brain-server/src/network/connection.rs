@@ -1,31 +1,21 @@
-//! Connection layer — Tokio TCP accept loop with optional rustls TLS
-//! (sub-task 9.9) (L1), §03/02 (transport).
+//! Connection layer — Tokio TCP accept loop with optional rustls TLS.
 //!
-//! ## What 9.9 ships
+//! ## What it ships
 //!
 //! - `TcpListener::bind` on `config.server.listen_addr` with
 //!   `SO_REUSEADDR`.
 //! - Optional `tokio_rustls::TlsAcceptor` wrap on accepted streams.
 //! - Per-connection task: applies `TCP_NODELAY` + `SO_KEEPALIVE`,
 //!   reads one frame at a time with a per-frame read timeout, validates
-//!   with [`brain_protocol::Frame::decode_with_max`], and (for now)
-//!   replies `ERROR(BadFrame)` then closes.
+//!   with [`brain_protocol::Frame::decode_with_max`], runs the
+//!   HELLO/WELCOME/AUTH handshake, then the dispatch loop.
 //! - Graceful shutdown via a `watch::channel`-based [`ShutdownSignal`]
 //!   shared with `main`. (Switched off `tokio::sync::Notify` to avoid
 //!   the "wake lost between loop iterations" race.)
 //!
-//! ## What 9.10 will plug in
+//! ## Not yet wired
 //!
-//! The body of [`serve_connection`] becomes the real handshake →
-//! AUTH → dispatch loop. The frame I/O helpers and the shutdown wiring
-//! stay as they are; only the inner match changes.
-//!
-//! ## What stays out of 9.9
-//!
-//! - HELLO/WELCOME/AUTH/AUTH_OK handshake — 9.10.
-//! - Real opcode → shard routing — 9.10.
-//! - Idle PING/PONG, BYE handling — 9.10.
-//! - Per-IP / per-agent connection limits — 9.13.
+//! - Per-IP / per-space connection limits.
 //! - mTLS — follow-up marks opt-in.
 
 #![cfg(target_os = "linux")]
@@ -36,14 +26,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use brain_protocol::error::{ErrorCategory, ErrorCode};
 use brain_protocol::codec::opcode::Opcode;
-use brain_protocol::envelope::response::{ErrorCategoryWire, ErrorCodeWire, ErrorResponse, ResponseBody};
+use brain_protocol::envelope::response::{
+    ErrorCategoryWire, ErrorCodeWire, ErrorResponse, ResponseBody,
+};
+use brain_protocol::error::{ErrorCategory, ErrorCode};
 use brain_protocol::{Frame, HEADER_SIZE, MAX_PAYLOAD_BYTES};
 use socket2::{SockRef, TcpKeepalive};
 use tokio::io::{split, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::{watch, Semaphore};
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn, Instrument as _};
@@ -51,13 +43,22 @@ use tracing::{debug, info, warn, Instrument as _};
 pub use crate::dispatch::Topology;
 
 use crate::dispatch::{
-    build_server_ping_frame, dispatch_frame, run_op_dispatch, Action, CancelSubscribe, ConnState,
-    IdleTimer, SubscribeStart, Tick,
+    build_server_ping_frame, dispatch_frame, error_frame, run_op_dispatch, Action, CancelSubscribe,
+    ConnState, IdleTimer, SubscribeStart, Tick, TxnRouteOutcome,
 };
+use crate::shard::ShardHandle;
 use crate::subscribe::{
     build_cancel_stream_ack_frame, build_unsubscribe_response_frame, ShardEventHub,
     SubscriptionRegistry,
 };
+
+// Declared as a child module here (rather than a sibling under `network`) so the
+// relative `#[path]` resolves identically whether this file is compiled as
+// `network::connection` in the binary or root-mounted as `connection` by each
+// integration-test binary's `#[path]` mount.
+#[path = "gate.rs"]
+mod gate;
+use gate::ConnectionGate;
 
 // ---------------------------------------------------------------------------
 // Shutdown signal
@@ -124,7 +125,7 @@ pub struct ConnectionLimits {
     /// Inter-frame idle (the wait BETWEEN frames, while no bytes
     /// are on the wire) is governed by `idle_timeout` + the
     /// SERVER_PING path instead; bounding it here too closes idle
-    /// REPLs / SDKs before the application-level keepalive can fire.
+    /// connections before the application-level keepalive can fire.
     pub read_timeout: Duration,
     /// — interval before AUTH must arrive after WELCOME.
     pub auth_timeout: Duration,
@@ -136,6 +137,21 @@ pub struct ConnectionLimits {
     /// load; if the writer can't keep up, sub-tasks back-pressure on
     /// `send_async` and the read loop naturally slows down.
     pub outgoing_capacity: usize,
+    /// Maximum concurrent connections accepted process-wide; `0` disables
+    /// the cap. Excess connections are dropped at accept time, before any
+    /// TLS or handshake work.
+    pub max_connections: usize,
+    /// Maximum concurrent connections accepted from a single peer IP; `0`
+    /// disables the cap. Bounds the blast radius of a single noisy source.
+    pub max_connections_per_ip: usize,
+    /// Maximum concurrent streams per connection — the value advertised in
+    /// WELCOME (`ServerFeatures.max_concurrent_streams`). Enforced as two
+    /// independent budgets, each capped here: in-flight op-dispatch requests
+    /// and active subscriptions. Over the cap, the server returns
+    /// `StreamLimitExceeded` rather than spawning unbounded per-request tasks
+    /// (each of which would pin its request body — up to `max_payload_bytes` —
+    /// in memory). Spec default 1024.
+    pub max_concurrent_streams: u32,
 }
 
 impl Default for ConnectionLimits {
@@ -147,22 +163,27 @@ impl Default for ConnectionLimits {
             idle_timeout: Duration::from_secs(300),
             ping_timeout: Duration::from_secs(30),
             outgoing_capacity: 256,
+            max_connections: 4096,
+            max_connections_per_ip: 64,
+            max_concurrent_streams: 1024,
         }
     }
 }
 
 /// Live connection counters surfaced via the admin `/metrics`
-/// endpoint. Extended in 12.7 (closed-by-reason + frame send/recv
-/// counters) and in F-7 (frame_size_bytes histograms after the
-/// unit-agnostic `Histogram` refactor).
+/// endpoint. Covers closed-by-reason + frame send/recv
+/// counters and frame_size_bytes histograms.
 pub struct ConnectionMetrics {
     pub active: AtomicU64,
     pub total: AtomicU64,
+    /// Connections shed at accept time by the admission gate (global or
+    /// per-IP cap), before any TLS/handshake work.
+    pub rejected: AtomicU64,
     /// Per-reason close counters; indexed by [`CloseReason::idx`].
     pub closed_by_reason: [AtomicU64; CloseReason::COUNT],
     pub frame_send_total: AtomicU64,
     pub frame_recv_total: AtomicU64,
-    /// F-7: raw-mode histograms of
+    /// Raw-mode histograms of
     /// outbound / inbound frame size in bytes. `Histogram::new` with
     /// [`FRAME_BYTES_BUCKETS`] gives an exact `_sum`.
     pub frame_send_bytes: crate::metrics::histogram::Histogram,
@@ -191,6 +212,7 @@ impl Default for ConnectionMetrics {
         Self {
             active: AtomicU64::new(0),
             total: AtomicU64::new(0),
+            rejected: AtomicU64::new(0),
             closed_by_reason: Default::default(),
             frame_send_total: AtomicU64::new(0),
             frame_recv_total: AtomicU64::new(0),
@@ -288,13 +310,13 @@ pub struct ConnectionListener {
     listen_addr: SocketAddr,
     tls: Option<Arc<ServerConfig>>,
     topology: Topology,
-    /// Cross-shard event hub (sub-task 9.11). Built once per listener
+    /// Cross-shard event hub. Built once per listener
     /// at construction time; spawns one bridge task per shard that
     /// drains the shard's per-process flume Receiver into a
     /// `broadcast::Sender`. Per-connection `SubscriptionRegistry`s
     /// subscribe to the right shard's broadcast.
     event_hub: ShardEventHub,
-    /// Live counters surfaced by the admin server (sub-task 9.13).
+    /// Live counters surfaced by the admin server.
     metrics: Arc<ConnectionMetrics>,
     limits: ConnectionLimits,
     shutdown: ShutdownSignal,
@@ -374,13 +396,17 @@ impl BoundConnectionListener {
     ///
     /// Returns once the accept loop has exited. Per-connection tasks
     /// that were already running are NOT awaited here — they observe
-    /// the same `shutdown` notify and unwind on their own. 9.14 layers
-    /// a JoinSet-based drain over this.
+    /// the same `shutdown` notify and unwind on their own. Graceful
+    /// shutdown layers a JoinSet-based drain over this.
     pub async fn serve(mut self) -> io::Result<SocketAddr> {
         let local_addr = self.local_addr;
         info!(addr = %local_addr, "connection listener accepting");
 
         let acceptor = self.tls.clone().map(TlsAcceptor::from);
+        let gate = ConnectionGate::new(
+            self.limits.max_connections,
+            self.limits.max_connections_per_ip,
+        );
 
         loop {
             tokio::select! {
@@ -400,13 +426,25 @@ impl BoundConnectionListener {
                     if let Err(e) = configure_tcp(&stream) {
                         warn!(peer = %peer, error = %e, "TCP option setup failed");
                     }
+                    // Admission caps, enforced before any TLS or handshake work
+                    // so a connection flood is shed as cheaply as possible. The
+                    // guard rides with the per-connection task and frees its
+                    // global + per-IP slot when that task ends, however it ends.
+                    let admission = match gate.try_admit(peer.ip()) {
+                        Some(guard) => guard,
+                        None => {
+                            self.metrics.rejected.fetch_add(1, Ordering::Relaxed);
+                            debug!(peer = %peer, "connection rejected: admission cap reached");
+                            continue;
+                        }
+                    };
                     let acceptor = acceptor.clone();
                     let shutdown = self.shutdown.clone();
                     let limits = self.limits.clone();
                     let topology = self.topology.clone();
                     let event_hub = self.event_hub.clone();
                     let metrics = self.metrics.clone();
-                    // Counter bookkeeping (sub-task 9.13). `_guard`
+                    // Counter bookkeeping. `_guard`
                     // decrements `active` on drop — handles every
                     // exit path including TLS handshake failure.
                     metrics.total.fetch_add(1, Ordering::Relaxed);
@@ -415,6 +453,8 @@ impl BoundConnectionListener {
                         let _guard = ConnectionGuard {
                             metrics: metrics.clone(),
                         };
+                        // Released when this task ends, freeing the gate slots.
+                        let _admission = admission;
                         let result = match acceptor {
                             Some(acceptor) => match acceptor.accept(stream).await {
                                 Ok(tls_stream) => {
@@ -451,7 +491,7 @@ impl BoundConnectionListener {
 // Per-connection task
 // ---------------------------------------------------------------------------
 
-/// One connection's lifetime (sub-task 9.10). Splits the stream into
+/// One connection's lifetime. Splits the stream into
 /// reader + writer halves and runs three loops:
 ///
 /// 1. **Reader** — pulls frames from the socket, decides via
@@ -484,12 +524,19 @@ where
     let writer_metrics = metrics.clone();
     let writer = tokio::spawn(writer_loop(write_half, frame_rx, writer_metrics));
 
-    // Sub-task 9.11: each connection gets its own SubscriptionRegistry.
+    // Each connection gets its own SubscriptionRegistry.
     // It reuses the listener-wide `ShardEventHub` to subscribe to per-
     // shard broadcasts.
-    let subscriptions = Arc::new(SubscriptionRegistry::new(event_hub));
+    let subscriptions = Arc::new(SubscriptionRegistry::new(
+        event_hub,
+        limits.max_concurrent_streams as usize,
+    ));
 
-    let result = receiver_loop(
+    // The receiver loop returns the session id it minted at
+    // HELLO/WELCOME (or all-zero when the connection died pre-handshake)
+    // plus whether the connection ever opened a transaction. We need both
+    // post-loop to drive the auto-abort sweep below.
+    let (result, connection_id, opened_txn) = receiver_loop(
         &mut read_half,
         &topology,
         &limits,
@@ -507,7 +554,66 @@ where
     // own channel close cooperatively.)
     drop(frame_tx);
     let _ = writer.await;
+
+    // On TXN_ABORT or connection drop before commit, none of the
+    // operations take effect. Any txn
+    // this session opened (TXN_BEGIN without a matching COMMIT/ABORT)
+    // is still buffering work on its target shard; sweep every shard
+    // and discard the buffer. A connection that never opened a txn has
+    // nothing to abort, so skip the per-shard sweep entirely (the common
+    // case). Pre-handshake disconnects carry an all-zero connection_id and
+    // can't have opened a txn, so they never reach the sweep either.
+    if needs_orphan_sweep(opened_txn, connection_id) {
+        abort_orphaned_transactions(&topology.shards, connection_id).await;
+    }
+
     result
+}
+
+/// Whether the disconnect-time orphan-txn sweep needs to run for this
+/// connection. Only a connection that actually opened a transaction can
+/// have orphans to abort; everything else (the common case) skips the
+/// per-shard fan-out entirely. An all-zero `connection_id` (pre-handshake
+/// disconnect / in-process test) can never have opened a txn, so it is
+/// excluded too — defense-in-depth alongside the `opened_txn` latch.
+fn needs_orphan_sweep(opened_txn: bool, connection_id: [u8; 16]) -> bool {
+    opened_txn && connection_id != [0u8; 16]
+}
+
+/// Fan an auto-abort sweep across every shard so any txn the
+/// just-dropped session opened is discarded immediately, not lazily
+/// at the per-txn timeout. Logs a single info line summarising the
+/// abort count when at least one txn was swept; stays silent on the
+/// common "session never opened a txn" path.
+///
+/// Callers gate this on [`needs_orphan_sweep`], so it is only reached for
+/// connections that actually opened a transaction. The all-zero
+/// `connection_id` short-circuit remains as a belt-and-suspenders guard —
+/// `TxnStore::abort_orphaned_for_connection` enforces the same, but skipping
+/// the cross-runtime hop avoids a wasted per-shard message.
+async fn abort_orphaned_transactions(shards: &[ShardHandle], connection_id: [u8; 16]) {
+    if connection_id == [0u8; 16] {
+        return;
+    }
+    let mut total_aborted = 0usize;
+    for shard in shards.iter() {
+        match shard.abort_orphaned_for_connection(connection_id).await {
+            Ok(n) => total_aborted += n,
+            Err(e) => {
+                debug!(
+                    error = %e,
+                    "auto-abort sweep: shard unreachable (already shutting down?)"
+                );
+            }
+        }
+    }
+    if total_aborted > 0 {
+        info!(
+            connection_id = %uuid::Uuid::from_bytes(connection_id),
+            aborted = total_aborted,
+            "auto-aborted orphaned transactions on disconnect"
+        );
+    }
 }
 
 // One outgoing frame: bytes pre-encoded, with an optional "close after
@@ -549,13 +655,37 @@ async fn receiver_loop<R>(
     frame_tx: flume::Sender<OutgoingFrame>,
     subscriptions: Arc<SubscriptionRegistry>,
     metrics: Arc<ConnectionMetrics>,
-) -> io::Result<()>
+) -> (io::Result<()>, [u8; 16], bool)
 where
     R: AsyncRead + Unpin,
 {
     let mut state = ConnState::new();
     let mut idle = IdleTimer::new(limits.idle_timeout, limits.ping_timeout);
     let mut handshake_deadline = Some(tokio::time::Instant::now() + limits.auth_timeout);
+
+    // Per-connection in-flight op budget — one owned permit per dispatched
+    // request, held for the request's lifetime. Bounds the number of
+    // concurrently-spawned op tasks (each pins its request body in memory
+    // and a slot in the shard queue) to the advertised stream cap; without
+    // it a client that pipelines requests without reading responses grows
+    // tasks + memory without limit. `acquire`/release is the only state.
+    let op_limiter = Arc::new(Semaphore::new(limits.max_concurrent_streams.max(1) as usize));
+
+    // Confirmed transaction outcomes flow back here from the per-op tasks. A
+    // txn route is demoted / dropped only when the shard's real answer arrives
+    // on this channel — never optimistically at dispatch time — so a lost or
+    // mid-flight commit keeps its route long enough for a retry to resolve it.
+    // The receiver-loop retains the sender for the connection's lifetime, so
+    // `recv_async` never observes a closed channel.
+    let (txn_outcome_tx, txn_outcome_rx) = flume::unbounded::<TxnRouteOutcome>();
+
+    // Return helper so every exit path surfaces the session id the
+    // caller needs for the disconnect-time txn sweep.
+    macro_rules! exit {
+        ($result:expr) => {{
+            return ($result, state.connection_id, state.opened_txn);
+        }};
+    }
 
     loop {
         // Compute the next deadline: handshake timeout while pre-AUTH,
@@ -567,7 +697,7 @@ where
 
         tokio::select! {
             biased;
-            () = shutdown.recv() => return Ok(()),
+            () = shutdown.recv() => exit!(Ok(())),
             _ = tokio::time::sleep_until(next_deadline) => {
                 if handshake_deadline.is_some() {
                     // — auth timeout before AUTH_OK.
@@ -579,7 +709,7 @@ where
                         bytes: frame.encode(),
                         close_after: true,
                     }).await;
-                    return Ok(());
+                    exit!(Ok(()));
                 }
                 match idle.fire() {
                     Tick::SendPing => {
@@ -588,13 +718,13 @@ where
                             bytes: frame.encode(),
                             close_after: false,
                         }).await.is_err() {
-                            return Ok(());
+                            exit!(Ok(()));
                         }
                     }
                     Tick::Close => {
                         // SERVER_PING went unanswered past ping_timeout.
                         metrics.record_close(CloseReason::Timeout);
-                        return Ok(());
+                        exit!(Ok(()));
                     }
                 }
             }
@@ -618,13 +748,63 @@ where
                                     bytes: frame.encode(),
                                     close_after: false,
                                 }).await.is_err() {
-                                    return Ok(());
+                                    exit!(Ok(()));
                                 }
                             }
                             Action::OpDispatch(op) => {
+                                // Latch that this connection opened (or tried to
+                                // open) a transaction, so the disconnect-time
+                                // orphan sweep runs for it. Connections that
+                                // never send TXN_BEGIN skip the sweep entirely.
+                                if matches!(
+                                    op.req,
+                                    brain_protocol::envelope::request::RequestBody::TxnBegin(_)
+                                ) {
+                                    state.opened_txn = true;
+                                }
+                                // Enforce the advertised per-connection stream
+                                // cap: take a permit for this op's lifetime, or
+                                // reject with StreamLimitExceeded. try_acquire
+                                // (non-blocking) so a saturated connection gets a
+                                // clear error instead of head-of-line-blocking
+                                // unrelated control frames on the receiver loop.
+                                let permit = match op_limiter.clone().try_acquire_owned() {
+                                    Ok(p) => p,
+                                    Err(_) => {
+                                        let frame = error_frame(
+                                            op.stream_id,
+                                            ErrorCode::StreamLimitExceeded,
+                                            "per-connection concurrent stream limit reached",
+                                        );
+                                        if frame_tx
+                                            .send_async(OutgoingFrame {
+                                                bytes: frame.encode(),
+                                                close_after: false,
+                                            })
+                                            .await
+                                            .is_err()
+                                        {
+                                            exit!(Ok(()));
+                                        }
+                                        continue;
+                                    }
+                                };
                                 let shards = topology.shards.clone();
                                 let request_metrics = topology.request_metrics.clone();
                                 let tx = frame_tx.clone();
+                                // Only txn lifecycle ops report a route outcome;
+                                // hand the sender to the task only for those so
+                                // the common path pays no clone.
+                                let txn_outcome_tx = if matches!(
+                                    op.req,
+                                    brain_protocol::envelope::request::RequestBody::TxnBegin(_)
+                                        | brain_protocol::envelope::request::RequestBody::TxnCommit(_)
+                                        | brain_protocol::envelope::request::RequestBody::TxnAbort(_)
+                                ) {
+                                    Some(txn_outcome_tx.clone())
+                                } else {
+                                    None
+                                };
                                 let op_idx = crate::metrics::request::op_index(&op.req);
                                 let op_label = op_idx
                                     .and_then(|i| crate::metrics::request::OP_LABELS.get(i))
@@ -632,7 +812,7 @@ where
                                     .unwrap_or("unknown");
                                 let stream_id = op.stream_id;
                                 let target_shard = op.target_shard;
-                                // 12.3 — request-level span instruments each
+                                // Request-level span instruments each
                                 // request; child spans inside the shard (brain.encode →
                                 // brain.embed → brain.hnsw.insert) attach to this parent.
                                 let span = tracing::info_span!(
@@ -643,21 +823,33 @@ where
                                 );
                                 tokio::spawn(
                                     async move {
+                                        // Held until the task completes, then
+                                        // dropped — releasing the stream slot.
+                                        let _permit = permit;
                                         let timer = op_idx.map(|idx| {
                                             crate::metrics::request::RequestTimer::start(
                                                 request_metrics.clone(),
                                                 idx,
                                             )
                                         });
-                                        let frame = run_op_dispatch(op, shards).await;
-                                        if let Some(timer) = timer {
-                                            let status = response_status(&frame);
+                                        let frames =
+                                            run_op_dispatch(op, shards, txn_outcome_tx).await;
+                                        if let (Some(timer), Some(last)) = (timer, frames.last()) {
+                                            let status = response_status(last);
                                             timer.record(status);
                                         }
-                                        let _ = tx.send_async(OutgoingFrame {
-                                            bytes: frame.encode(),
-                                            close_after: false,
-                                        }).await;
+                                        for frame in frames {
+                                            if tx
+                                                .send_async(OutgoingFrame {
+                                                    bytes: frame.encode(),
+                                                    close_after: false,
+                                                })
+                                                .await
+                                                .is_err()
+                                            {
+                                                break;
+                                            }
+                                        }
                                     }
                                     .instrument(span),
                                 );
@@ -667,6 +859,7 @@ where
                                     start,
                                     &subscriptions,
                                     &frame_tx,
+                                    topology,
                                 )
                                 .await;
                             }
@@ -691,18 +884,18 @@ where
                                     CloseReason::ProtocolError
                                 };
                                 metrics.record_close(reason);
-                                return Ok(());
+                                exit!(Ok(()));
                             }
                             Action::Close => {
                                 metrics.record_close(CloseReason::Bye);
-                                return Ok(());
+                                exit!(Ok(()));
                             }
                             Action::Nothing => {}
                         }
                     }
                     Err(FrameReadError::Eof) => {
                         metrics.record_close(CloseReason::Eof);
-                        return Ok(());
+                        exit!(Ok(()));
                     }
                     Err(FrameReadError::Protocol(code, category, detail)) => {
                         let frame = build_close_error_frame_with_category(code, category, &detail);
@@ -711,19 +904,29 @@ where
                             close_after: true,
                         }).await;
                         metrics.record_close(CloseReason::ProtocolError);
-                        return Ok(());
+                        exit!(Ok(()));
                     }
                     Err(FrameReadError::Timeout) => {
                         // Per-frame read budget expired. Close quietly;
                         // the idle/SERVER_PING path is for application-
                         // level keepalive.
                         metrics.record_close(CloseReason::Timeout);
-                        return Ok(());
+                        exit!(Ok(()));
                     }
                     Err(FrameReadError::Io(e)) => {
                         metrics.record_close(CloseReason::Fatal);
-                        return Err(e);
+                        exit!(Err(e));
                     }
+                }
+            }
+            // A per-op task confirmed a transaction outcome: update the router
+            // so a committed txn's route is demoted into the bounded retry
+            // window (and a rejected begin's route is dropped). Placed last in
+            // the biased select so frame reading is never starved; outcomes
+            // arrive only as in-flight ops finish, so this can't busy-loop.
+            outcome = txn_outcome_rx.recv_async() => {
+                if let Ok(outcome) = outcome {
+                    state.txn_shards.apply_outcome(outcome);
                 }
             }
         }
@@ -762,24 +965,98 @@ fn build_close_error_frame_with_category(
 }
 
 // ---------------------------------------------------------------------------
-// SUBSCRIBE / UNSUBSCRIBE / CANCEL_STREAM helpers (sub-task 9.11)
+// SUBSCRIBE / UNSUBSCRIBE / CANCEL_STREAM helpers
 // ---------------------------------------------------------------------------
 
 async fn handle_subscribe_start(
     start: SubscribeStart,
     subscriptions: &Arc<SubscriptionRegistry>,
     frame_tx: &flume::Sender<OutgoingFrame>,
+    topology: &Topology,
 ) {
     let SubscribeStart {
         stream_id,
         req,
         target_shard,
+        space,
     } = start;
-    match subscriptions.start(stream_id, target_shard, &req, frame_tx.clone()) {
+
+    // Resolve the `similar_to` reference vector ONCE, here at
+    // registration — a single boundary-safe round-trip to the owning
+    // shard. The per-event filter then runs entirely network-side; it
+    // never reaches back into shard state. A missing / tombstoned /
+    // out-of-space reference is rejected with `InvalidRequest` rather
+    // than silently degrading to an all-pass filter.
+    let similarity_reference = match req.filter.similar_to {
+        Some(sim) => {
+            let Some(shard) = topology.shards.get(target_shard as usize) else {
+                let frame = error_frame(
+                    stream_id,
+                    ErrorCode::ShardUnavailable,
+                    "subscribe: target shard unavailable",
+                );
+                let _ = frame_tx
+                    .send_async(OutgoingFrame {
+                        bytes: frame.encode(),
+                        close_after: false,
+                    })
+                    .await;
+                return;
+            };
+            let reference_id = brain_core::MemoryId::from(sim.reference_memory_id);
+            match shard.get_memory_vector(space, reference_id).await {
+                Ok(Some(v)) => Some(v),
+                // A shard-unreachable error is a transient infrastructure
+                // fault, not a client input error — surface it as
+                // ShardUnavailable (retriable) so a client doesn't treat
+                // its valid reference id as permanently bad. Only a
+                // resolved-to-None (Ok(None)) is a genuine bad reference.
+                Err(_) => {
+                    let frame = error_frame(
+                        stream_id,
+                        ErrorCode::ShardUnavailable,
+                        "subscribe: target shard unavailable while resolving \
+                         the similarity reference vector",
+                    );
+                    let _ = frame_tx
+                        .send_async(OutgoingFrame {
+                            bytes: frame.encode(),
+                            close_after: false,
+                        })
+                        .await;
+                    return;
+                }
+                Ok(None) => {
+                    let frame = error_frame(
+                        stream_id,
+                        ErrorCode::InvalidArgument,
+                        "subscribe: filter.similar_to.reference_memory_id does not \
+                         resolve to a live memory in this space",
+                    );
+                    let _ = frame_tx
+                        .send_async(OutgoingFrame {
+                            bytes: frame.encode(),
+                            close_after: false,
+                        })
+                        .await;
+                    return;
+                }
+            }
+        }
+        None => None,
+    };
+
+    match subscriptions.start(
+        stream_id,
+        target_shard,
+        &req,
+        frame_tx.clone(),
+        similarity_reference,
+    ) {
         Ok(_) => {
             // Subscription established. Per-sub task is running; it
             // will start emitting SUBSCRIBE_EVENT frames as events
-            // arrive. 9.11 doesn't send a synchronous opener frame
+            // arrive. We don't send a synchronous opener frame
             // (the wire protocol doesn't require one); the client
             // observes the first event when it lands.
         }
@@ -859,8 +1136,8 @@ where
 {
     // Wait for the first byte of the next frame WITHOUT a timeout.
     // Inter-frame idle is governed by the connection layer's
-    // [`ConnectionLimits::idle_timeout`] + SERVER_PING path (spec
-    // §03/02 §6.1). Bounding it here too caused a real regression:
+    // [`ConnectionLimits::idle_timeout`] + SERVER_PING path.
+    // Bounding it here too caused a real regression:
     // any client (e.g. the `brain` REPL) that paused > `read_timeout`
     // between two valid requests was silently closed before the
     // application-level keepalive could fire. `read_timeout`
@@ -981,11 +1258,75 @@ fn configure_tcp(stream: &TcpStream) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering as AtomicOrdering;
+
+    use crate::shard::ShardRequest;
 
     #[test]
     fn defaults_match_spec_caps() {
         let limits = ConnectionLimits::default();
         assert_eq!(limits.max_payload_bytes as usize, MAX_PAYLOAD_BYTES);
         assert_eq!(limits.read_timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn no_sweep_when_no_txn_opened() {
+        // The common case: a handshook connection that never opened a txn
+        // must skip the sweep entirely.
+        let conn = [7u8; 16];
+        assert!(!needs_orphan_sweep(false, conn));
+    }
+
+    #[test]
+    fn sweep_when_txn_opened() {
+        // A connection that opened a txn must be swept on close.
+        let conn = [7u8; 16];
+        assert!(needs_orphan_sweep(true, conn));
+    }
+
+    #[test]
+    fn no_sweep_for_pre_handshake_connection() {
+        // All-zero id can never have opened a txn; belt-and-suspenders.
+        assert!(!needs_orphan_sweep(true, [0u8; 16]));
+        assert!(!needs_orphan_sweep(false, [0u8; 16]));
+    }
+
+    // Build N mock shards whose request channels are drained by background
+    // tasks that count `AbortOrphanedTxns` messages and reply. Returns the
+    // shard handles and the shared counter.
+    fn mock_shards(n: u16) -> (Vec<ShardHandle>, Arc<AtomicUsize>) {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut shards = Vec::with_capacity(n as usize);
+        for shard_id in 0..n {
+            let (tx, rx) = flume::unbounded::<ShardRequest>();
+            let counter_for_task = counter.clone();
+            tokio::spawn(async move {
+                while let Ok(req) = rx.recv_async().await {
+                    if let ShardRequest::AbortOrphanedTxns { reply_tx, .. } = req {
+                        counter_for_task.fetch_add(1, AtomicOrdering::SeqCst);
+                        let _ = reply_tx.send_async(0).await;
+                    }
+                }
+            });
+            shards.push(ShardHandle::new_for_test(shard_id, tx));
+        }
+        (shards, counter)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sweep_fans_out_to_every_shard() {
+        // A connection that opened a txn aborts orphans on every shard.
+        let (shards, counter) = mock_shards(4);
+        abort_orphaned_transactions(&shards, [9u8; 16]).await;
+        assert_eq!(counter.load(AtomicOrdering::SeqCst), 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sweep_is_noop_for_zero_connection_id() {
+        // The all-zero short-circuit inside the sweep issues no per-shard hop.
+        let (shards, counter) = mock_shards(4);
+        abort_orphaned_transactions(&shards, [0u8; 16]).await;
+        assert_eq!(counter.load(AtomicOrdering::SeqCst), 0);
     }
 }

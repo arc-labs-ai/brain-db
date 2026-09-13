@@ -166,15 +166,15 @@ If a request lands on the wrong shard (a stale routing table, or a misconfigured
 
 Proxying isn't implemented in v1. Clients are expected to use the correct routing.
 
-## 15. The SDK's role
+## 15. The client's role
 
-Client SDKs handle routing transparently:
+Clients handle routing transparently:
 
-- The SDK has the routing table.
+- The client has the routing table.
 - Each request is sent directly to the correct shard.
-- If the routing table is stale, the SDK handles `WrongShard` errors and refreshes.
+- If the routing table is stale, the client handles `WrongShard` errors and refreshes.
 
-For most users, routing is invisible. The SDK abstracts it away.
+For most users, routing is invisible. The client abstracts it away.
 
 ## 16. The "all shards" fan-out
 
@@ -201,7 +201,7 @@ Once a deployment is configured, routing is stable:
 - Same agent → same shard (assuming overrides don't change).
 - Same memory → same shard (encoded in the ID).
 
-This stability matters for client SDKs (caching) and for application correctness (no surprise migrations).
+This stability matters for clients (caching) and for application correctness (no surprise migrations).
 
 ---
 
@@ -341,7 +341,7 @@ If a request arrives at the wrong shard for an agent:
 
 - The shard checks the agents table; finds no record (the agent isn't here).
 - Returns a `WrongShard` error with the correct shard's ID.
-- The client (or SDK) retries on the correct shard.
+- The client retries on the correct shard.
 
 This handles routing-table staleness gracefully. The client refreshes its routing and retries.
 
@@ -398,15 +398,15 @@ If two clients use the same agent_id, they'll write to the same shard (same hash
 
 For operators wanting strict uniqueness, the application layer must enforce it. Brain trusts the agent_id.
 
-## 33. The "tenancy" pattern
+## 33. The tenancy model
 
-A common pattern: each tenant is an "agent" in Brain's terminology.
+A tenant is a **namespace** (company); an application within it is an **agent**. The data-isolation scope of every record is the pair `(namespace, agent)` — namespace the outer wall (companies never see each other), agent the inner wall (apps within a company are separate). See [`../03_schema/04_namespaces.md`](../03_schema/04_namespaces.md) for the operational contract and [`../04_wire_protocol/04_handshake.md`](../04_wire_protocol/04_handshake.md) §10 for how the `(namespace, agent, permissions)` scope is derived from the authenticated API key.
 
-- Tenant A's data is one agent's data.
-- Tenant B's data is another's.
-- Agents' data are isolated (separate shards or separate ranges of memory).
+- Company A is namespace `acme`; its chatbot and research apps are agents within `acme`.
+- Company B is namespace `globex`; it cannot see `acme`'s data under any request or flag.
+- The boundary is enforced logically on every read/write (owner `namespace_id` + `agent_id` on every row, folded into index key prefixes), not by physical shard separation — a single deployment safely hosts many tenants.
 
-Brain's agent isolation enforces tenant separation. With proper authentication (each client can only access its own agent's data), tenants don't see each other.
+The earlier "tenant = agent by convention" framing is superseded: namespace is now the committed tenant boundary (open-question `OQ-V2-4`, resolved). Identity is server-derived from the key, so a client cannot name another tenant's namespace or agent; cross-namespace access is rejected at the boundary.
 
 ## 34. The auto-spread (future)
 

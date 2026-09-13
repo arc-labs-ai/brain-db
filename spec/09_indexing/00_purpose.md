@@ -1,6 +1,6 @@
 # 09. ANN Index (HNSW)
 
-> **TL;DR.** HNSW per shard, via the `hnsw_rs` crate. Memory HNSW defaults `M=16, ef_construction=200, ef_search=64`; entity and statement HNSWs use per-corpus parameters documented in [`01_hnsw_basics.md`](01_hnsw_basics.md) § 25. Three corpora when a schema is declared: memory HNSW, entity HNSW, statement HNSW. The index references slots in the arena rather than copying vectors. Single-writer-per-shard inserts, lock-free reads through ArcSwap + crossbeam-epoch, inline filtering by model fingerprint, kind, and context. p99 search 5-10 ms; recall@10 95-98% at default ef_search.
+> **TL;DR.** HNSW per shard, via the `hnsw_rs` crate. Memory HNSW defaults `M=16, ef_construction=200, ef_search=64`; entity and statement HNSWs use per-corpus parameters documented in [`01_hnsw_basics.md`](01_hnsw_basics.md) § 25. Every shard owns three HNSW corpora (memory, entity, statement) and two tantivy indexes (memory text, statement text) from byte zero — none of them activate on schema upload. The HNSW indexes reference slots in the arena rather than copying vectors. Single-writer-per-shard inserts, lock-free reads through ArcSwap + crossbeam-epoch, inline filtering by model fingerprint, kind, and context. p99 search 5-10 ms; recall@10 95-98% at default ef_search.
 
 ## Status
 
@@ -64,7 +64,7 @@ Brain selected HNSW over alternatives:
 - **Annoy (random forest of trees).** Simpler. Worse recall at high K.
 - **DiskANN.** Designed for SSDs holding indexes too large for RAM. Adds I/O complexity Brain does not need at this scale.
 - **ScaNN.** Google's competitive ANN. Excellent quality. Less mature in Rust ecosystem.
-- **PQ + IVF hybrids.** Fancy compression + clustering. Useful at extreme scale; overkill for Brain.
+- **PQ + IVF combinations.** Compression + clustering. Useful at extreme scale; pure IVF (no graph) remains overkill for Brain's mid-scale target. HNSW with PQ-compressed graph payload **is** in scope as an opt-in extension — see [`07_hnsw_pq.md`](07_hnsw_pq.md).
 
 HNSW wins because:
 
@@ -96,9 +96,19 @@ Brain does not fork hnsw_rs. Brain uses it as a library and layers concurrency a
 
 ## 4. Per-shard HNSW
 
-Each shard has one HNSW index. The index covers all of the shard's active (non-tombstoned) memories.
+Each shard has one memory HNSW index. The index covers all of the shard's active (non-tombstoned) memories. Each shard also owns an entity HNSW and a statement HNSW (parameters in [`01_hnsw_basics.md`](01_hnsw_basics.md) §25) for the typed-graph retrievers — these are core per-shard state alongside the arena and redb, not optional extensions that activate on schema upload.
 
 Cross-shard queries don't combine HNSW indexes; the query is fanned out to each shard, each shard runs its own HNSW search, and results are merged. See [16. Sharding & Clustering](../16_sharding/00_purpose.md) §Cross-Shard Queries.
+
+### 4a. Tantivy is mandatory per shard
+
+Every shard owns the two tantivy indexes — `memory_text.tantivy/` and `statements.tantivy/` — at spawn. The lexical retriever (`§13/02`) operates over these two indexes. They are core capabilities, not optional extensions:
+
+- If either tantivy index fails to open at shard spawn (corrupt segment, missing meta.json, snapshot-restore failure), the shard refuses to start: `ShardError::TantivyInitFailed { source }`. A degraded shard with a missing lexical lane would silently drop results the operator expects to see, which is worse than a missing shard the operator can diagnose.
+- The post-recovery `IndexStatus::NeedsRebuild` signal is **not** a spawn failure — the tantivy maintenance worker handles rebuilds in the background while normal queries continue.
+- There is no "lexical retrieval unavailable" runtime degradation. The lexical retriever is `Arc<dyn LexicalRetriever>` (non-optional) in `OpsContext`.
+
+Operators who don't want to pay the disk + RAM cost of tantivy on a particular deployment have to opt out at build time, not at runtime — see the wedge note in [`../01_architecture/07_wedges_and_roadmap.md`](../01_architecture/07_wedges_and_roadmap.md).
 
 ## 5. Index size
 

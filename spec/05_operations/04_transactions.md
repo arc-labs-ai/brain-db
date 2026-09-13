@@ -238,7 +238,7 @@ def do_thing():
         raise
 ```
 
-The SDK provides a `with` block (Python) / closure (Rust) abstraction:
+Clients can wrap this in a scope/closure abstraction:
 
 ```python
 with brain.transaction() as txn:

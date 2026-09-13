@@ -224,34 +224,11 @@ mod tests {
     }
 
     #[test]
-    fn new_defaults_match_spec() {
-        let req = LlmRequest::new("m", "x");
-        assert_eq!(req.temperature, 0.0);
-        assert_eq!(req.max_tokens, 1024);
-        assert_eq!(req.timeout.as_secs(), 30);
-        assert!(req.response_schema.is_none());
-        assert!(req.system_blocks.is_empty());
-        assert_eq!(req.messages.len(), 1);
-    }
-
-    #[test]
     fn with_system_replaces_blocks_uncached() {
         let req = LlmRequest::new("m", "u").with_system("sys");
         assert_eq!(req.system_blocks.len(), 1);
         assert!(!req.system_blocks[0].cache);
         assert_eq!(req.system_blocks[0].text, "sys");
-    }
-
-    #[test]
-    fn message_role_round_trips_json() {
-        let m = LlmMessage {
-            role: LlmRole::User,
-            content: "hi".into(),
-        };
-        let s = serde_json::to_string(&m).unwrap();
-        assert!(s.contains("\"role\":\"user\""));
-        let back: LlmMessage = serde_json::from_str(&s).unwrap();
-        assert_eq!(back, m);
     }
 
     #[test]

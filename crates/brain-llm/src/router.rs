@@ -1,8 +1,7 @@
 //! Provider routing: maps a model identifier to its serving
 //! provider.
 //!
-//! Phase 21.1 ships the skeleton + Anthropic prefixes. Phase 21.2
-//! extends with OpenAI prefixes. Unknown prefixes return
+//! Covers Anthropic and OpenAI prefixes. Unknown prefixes return
 //! [`Provider::Unknown`]; the LLM-extractor materializer treats
 //! that as "no client configured" and registers the extractor in
 //! degraded mode.
@@ -48,11 +47,11 @@ impl Provider {
 
 /// Routes a `model` field to one of the configured clients.
 ///
-/// Built at shard startup: the server reads env vars
-/// (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY`) and constructs the
-/// matching clients; missing keys produce `None` slots. The
-/// extractor materializer asks the router for a client at
-/// `materialize_llm_extractor` time.
+/// Built at shard startup from the single resolved credential
+/// (`[llm] api_key` / `BRAIN__LLM__API_KEY`); the provider is derived
+/// from the model id, so exactly one client slot is populated and a
+/// missing key produces all-`None` slots. The extractor materializer
+/// asks the router for a client at `materialize_llm_extractor` time.
 #[derive(Default)]
 pub struct ModelRouter {
     anthropic: Option<Arc<dyn LlmClient>>,

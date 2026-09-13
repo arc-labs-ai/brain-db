@@ -1,7 +1,7 @@
 //! Tier-3 embedding resolver — integration coverage against a
 //! deterministic mocked embedder. The unit tests inside
 //! `resolver.rs::tests` cover the same surface; this file pins the
-//! external API shape that downstream callers (worker, future SDK
+//! external API shape that downstream callers (worker, future client
 //! consumers) bind to.
 
 use std::collections::HashMap;
@@ -11,7 +11,8 @@ use brain_core::Entity;
 use brain_core::{EntityId, EntityType, EntityTypeId};
 use brain_embed::{Dispatcher, EmbedError};
 use brain_extractors::resolver::{
-    resolve_or_create_with_hnsw, EmbeddingDeps, ResolutionTier, EMBED_RESOLVE_THRESHOLD,
+    resolve_or_create_with_deps, Disambiguation, EmbeddingDeps, Resolution, ResolutionTier,
+    ResolverError, StagedEntityVectors, EMBED_RESOLVE_THRESHOLD,
 };
 use brain_index::entity_hnsw::{EntityHnswIndex, EntityHnswParams};
 use brain_index::VECTOR_DIM;
@@ -19,6 +20,11 @@ use brain_metadata::entity::ops::{entity_get, entity_put, normalize_name};
 use brain_metadata::MetadataDb;
 use parking_lot::RwLock;
 use tempfile::TempDir;
+
+/// Fixed (namespace, space) scope for resolver tests.
+fn test_scope() -> brain_metadata::RowScope {
+    brain_metadata::RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xA1; 16])
+}
 
 const NOW: u64 = 1_700_000_000_000_000_000;
 
@@ -100,7 +106,39 @@ fn deps_for(embedder: Arc<ScriptedEmbedder>, hnsw: Arc<RwLock<EntityHnswIndex>>)
     EmbeddingDeps {
         hnsw,
         embedder: embedder as Arc<dyn Dispatcher>,
+        embed_threshold: brain_extractors::resolver::EMBED_RESOLVE_THRESHOLD,
     }
+}
+
+/// Resolve with the embedding tier wired and publish whatever tier-4
+/// staged, mirroring the production `commit()`-then-flush sequence (these
+/// tests commit on the next line and never roll back, so the flush is
+/// ordered with the commit either way).
+fn resolve_and_publish(
+    wtxn: &redb::WriteTransaction,
+    scope: brain_metadata::RowScope,
+    surface_form: &str,
+    entity_type_qname: &str,
+    confidence: f32,
+    now_unix_nanos: u64,
+    embed_deps: Option<&EmbeddingDeps>,
+) -> Result<Resolution, ResolverError> {
+    let mut staged = StagedEntityVectors::new();
+    let res = resolve_or_create_with_deps(
+        wtxn,
+        scope,
+        surface_form,
+        entity_type_qname,
+        confidence,
+        now_unix_nanos,
+        embed_deps,
+        &mut staged,
+        &mut Disambiguation::Off,
+    );
+    if let Some(deps) = embed_deps {
+        staged.flush_into_hnsw(deps);
+    }
+    res
 }
 
 fn seed_entity(
@@ -119,7 +157,7 @@ fn seed_entity(
         NOW,
     );
     let wtxn = db.write_txn().unwrap();
-    entity_put(&wtxn, &ent).unwrap();
+    entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &ent).unwrap();
     wtxn.commit().unwrap();
     hnsw.write().insert(id, &vector).unwrap();
     id
@@ -151,8 +189,9 @@ fn tier_embedding_resolves_near_paraphrase_and_writes_alias() {
 
     let deps = deps_for(embedder, hnsw.clone());
     let wtxn = db.write_txn().unwrap();
-    let res = resolve_or_create_with_hnsw(
+    let res = resolve_and_publish(
         &wtxn,
+        test_scope(),
         "Stripe Payments",
         "brain:Person",
         0.9,
@@ -194,9 +233,16 @@ fn tier_embedding_below_threshold_creates_new_entity() {
 
     let deps = deps_for(embedder, hnsw.clone());
     let wtxn = db.write_txn().unwrap();
-    let res =
-        resolve_or_create_with_hnsw(&wtxn, "Bitcoin", "brain:Person", 0.9, NOW + 1, Some(&deps))
-            .unwrap();
+    let res = resolve_and_publish(
+        &wtxn,
+        test_scope(),
+        "Bitcoin",
+        "brain:Person",
+        0.9,
+        NOW + 1,
+        Some(&deps),
+    )
+    .unwrap();
     wtxn.commit().unwrap();
 
     assert_eq!(res.tier, ResolutionTier::Created);
@@ -207,12 +253,18 @@ fn tier_embedding_below_threshold_creates_new_entity() {
 
 #[test]
 fn tier_embedding_respects_entity_type() {
-    // Person + Organization share an embedding peak — the type
-    // filter must reject the Organization candidate.
+    // A Person and an Organization share an embedding peak — the
+    // embedding tier's type filter must reject the Organization
+    // candidate. The query is a paraphrase that surface-matches neither
+    // seeded name (shares only the leading token, like the Stripe case
+    // in `tier_embedding_resolves_near_paraphrase`), so the exact /
+    // alias / partial-name tiers all miss and tier-3 (embedding) is the
+    // one under test. ("Wong" alone would be a partial-name subset of
+    // both seeded names and resolve at an earlier tier.)
     let shared_peak = axis_pair(42, 43, 1.0, 0.0);
 
     let embedder = Arc::new(ScriptedEmbedder::new());
-    embedder.set("Alice", shared_peak);
+    embedder.set("Wong Group", shared_peak);
 
     let (_dir, mut db) = fresh_db();
     let hnsw = fresh_hnsw();
@@ -231,29 +283,36 @@ fn tier_embedding_respects_entity_type() {
         id
     };
 
-    let alice_person_id = seed_entity(
+    let wong_person_id = seed_entity(
         &mut db,
         &hnsw,
         EntityType::PERSON_ID,
-        "Alice Wong",
+        "Wong Industries",
         shared_peak,
     );
-    let _cafe_id = seed_entity(
+    let _org_id = seed_entity(
         &mut db,
         &hnsw,
         org_type_id,
-        "Alice's Cafe",
+        "Wong Holdings",
         axis_pair(42, 43, 0.998, 0.063),
     );
 
     let deps = deps_for(embedder, hnsw);
     let wtxn = db.write_txn().unwrap();
-    let res =
-        resolve_or_create_with_hnsw(&wtxn, "Alice", "brain:Person", 0.9, NOW + 1, Some(&deps))
-            .unwrap();
+    let res = resolve_and_publish(
+        &wtxn,
+        test_scope(),
+        "Wong Group",
+        "brain:Person",
+        0.9,
+        NOW + 1,
+        Some(&deps),
+    )
+    .unwrap();
     wtxn.commit().unwrap();
 
-    assert_eq!(res.entity_id, alice_person_id);
+    assert_eq!(res.entity_id, wong_person_id);
     assert_eq!(res.tier, ResolutionTier::Embedding);
 }
 
@@ -269,22 +328,30 @@ fn tier_create_populates_hnsw_for_next_paraphrase() {
     embedder.set("Brand New Co", canonical_v);
     embedder.set("Brand New Company", paraphrase_v);
 
-    let (_dir, mut db) = fresh_db();
+    let (_dir, db) = fresh_db();
     let hnsw = fresh_hnsw();
 
     let deps = deps_for(embedder, hnsw.clone());
 
     let wtxn = db.write_txn().unwrap();
-    let r1 =
-        resolve_or_create_with_hnsw(&wtxn, "Brand New Co", "brain:Person", 0.9, NOW, Some(&deps))
-            .unwrap();
+    let r1 = resolve_and_publish(
+        &wtxn,
+        test_scope(),
+        "Brand New Co",
+        "brain:Person",
+        0.9,
+        NOW,
+        Some(&deps),
+    )
+    .unwrap();
     wtxn.commit().unwrap();
     assert_eq!(r1.tier, ResolutionTier::Created);
     assert!(hnsw.read().contains(r1.entity_id));
 
     let wtxn = db.write_txn().unwrap();
-    let r2 = resolve_or_create_with_hnsw(
+    let r2 = resolve_and_publish(
         &wtxn,
+        test_scope(),
         "Brand New Company",
         "brain:Person",
         0.9,

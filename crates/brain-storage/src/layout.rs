@@ -2,8 +2,7 @@
 //!
 //! Centralizes the names of files and directories that live inside a
 //! shard's data root. Substrate names (`arena.bin`, `metadata.redb`,
-//! `wal/`, `shard.uuid`) are pre-existing; knowledge-layer names are
-//! added by sub-task 15.3 per `spec/26_knowledge_storage/00_purpose.md`.
+//! `wal/`, `shard.uuid`) coexist with opaque-body names.
 //!
 //! ## Layout (per shard)
 //!
@@ -11,13 +10,13 @@
 //! <data_dir>/<shard_id>/
 //!   shard.uuid                 (substrate)
 //!   arena.bin                  (substrate)
-//!   metadata.redb              (substrate + knowledge tables)
+//!   metadata.redb              (substrate + typed-graph tables)
 //!   wal/                       (substrate — directory)
-//!   statements.tantivy/        (knowledge — directory; phase 22)
-//!   memory_text.tantivy/       (knowledge — directory; phase 22)
-//!   entity.hnsw                (knowledge — file; phase 16)
-//!   statement.hnsw             (knowledge — file; phase 17)
-//!   llm_cache.redb             (knowledge — file; sub-task 15.4)
+//!   statements.tantivy/        (typed-graph — directory)
+//!   memory_text.tantivy/       (typed-graph — directory)
+//!   entity.hnsw                (typed-graph — file)
+//!   statement.hnsw             (typed-graph — file)
+//!   llm_cache.redb             (typed-graph — file)
 //! ```
 //!
 //! Files are created by their owning module on first use (HNSW on
@@ -26,7 +25,7 @@
 //!
 //! ## Migration note
 //!
-//! As of sub-task 15.3, callers outside `brain-storage` and the
+//! Some callers outside `brain-storage` and the
 //! `spawn_shard` site still use literal path strings (test code,
 //! integration tests). Migrating them to the constants below is a
 //! separate cleanup and not blocking — the constants here remain the
@@ -45,31 +44,30 @@ pub const SHARD_UUID_FILE: &str = "shard.uuid";
 /// `arena.bin` — memory-mapped vector arena.
 pub const ARENA_FILE: &str = "arena.bin";
 
-/// `metadata.redb` — substrate + knowledge-layer redb tables
+/// `metadata.redb` — substrate + opaque-body redb tables
 pub const METADATA_DB_FILE: &str = "metadata.redb";
 
 /// `wal/` — write-ahead log directory; segments live inside as
-/// `seg-XXXXXXXXXX.wal` (.08).
+/// `seg-XXXXXXXXXX.wal`.
 pub const WAL_DIR: &str = "wal";
 
 // ---------------------------------------------------------------------------
-// Knowledge-layer names.
+// typed-graph names.
 // ---------------------------------------------------------------------------
 
-/// `entity.hnsw` — HNSW index over entity embeddings (phase 16).
+/// `entity.hnsw` — HNSW index over entity embeddings.
 pub const ENTITY_HNSW_FILE: &str = "entity.hnsw";
 
-/// `statement.hnsw` — HNSW index over statement embeddings (phase 17).
+/// `statement.hnsw` — HNSW index over statement embeddings.
 pub const STATEMENT_HNSW_FILE: &str = "statement.hnsw";
 
-/// `statements.tantivy/` — BM25 index over statement text (phase 22).
+/// `statements.tantivy/` — BM25 index over statement text.
 pub const STATEMENTS_TANTIVY_DIR: &str = "statements.tantivy";
 
-/// `memory_text.tantivy/` — BM25 index over memory text (phase 22).
+/// `memory_text.tantivy/` — BM25 index over memory text.
 pub const MEMORY_TEXT_TANTIVY_DIR: &str = "memory_text.tantivy";
 
-/// `llm_cache.redb` — separate redb file for LLM extractor cache
-/// (sub-task 15.4 opens; phase 21 populates).
+/// `llm_cache.redb` — separate redb file for LLM extractor cache.
 pub const LLM_CACHE_DB_FILE: &str = "llm_cache.redb";
 
 // ---------------------------------------------------------------------------
@@ -121,7 +119,7 @@ impl ShardPaths {
         self.root.join(WAL_DIR)
     }
 
-    // ---- Knowledge layer ----
+    // ---- typed-graph phases ----
 
     #[must_use]
     pub fn entity_hnsw(&self) -> PathBuf {
@@ -150,11 +148,56 @@ impl ShardPaths {
 }
 
 // ---------------------------------------------------------------------------
+// WAL segment accounting.
+// ---------------------------------------------------------------------------
+
+/// Sum the on-disk size of every WAL segment in `wal_dir` and count
+/// them. Returns `(total_bytes, segment_count)`.
+///
+/// A segment is any regular file whose extension is `wal` — the same
+/// key the recovery scan and rollover writer use. Files that vanish
+/// mid-scan (a retention sweep rotating a segment away under us) are
+/// skipped rather than failing the whole count, so a `/metrics` scrape
+/// never errors on a benign race; a single missing segment only
+/// understates the total for one scrape. A `read_dir` failure on the
+/// directory itself yields `(0, 0)`.
+///
+/// ```no_run
+/// use brain_storage::ShardPaths;
+/// let paths = ShardPaths::at("/data/shard-0");
+/// let (bytes, segments) = brain_storage::wal_segment_stats(&paths.wal_dir());
+/// println!("wal: {bytes} bytes across {segments} segments");
+/// ```
+#[must_use]
+pub fn wal_segment_stats(wal_dir: &Path) -> (u64, u64) {
+    let Ok(entries) = std::fs::read_dir(wal_dir) else {
+        return (0, 0);
+    };
+    let mut total_bytes = 0u64;
+    let mut segment_count = 0u64;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("wal") {
+            continue;
+        }
+        // A segment rotated away between read_dir and metadata is a
+        // benign race on the scrape path: skip it.
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if meta.is_file() {
+                total_bytes += meta.len();
+                segment_count += 1;
+            }
+        }
+    }
+    (total_bytes, segment_count)
+}
+
+// ---------------------------------------------------------------------------
 // Directory bootstrap.
 // ---------------------------------------------------------------------------
 
 /// Idempotent mkdir for every directory the shard layout requires:
-/// the root, `wal/`, and the two knowledge-layer tantivy directories.
+/// the root, `wal/`, and the two opaque-body tantivy directories.
 ///
 /// Files (`arena.bin`, `metadata.redb`, `*.hnsw`, `llm_cache.redb`)
 /// are NOT created here — their owning modules open or create them on
@@ -174,7 +217,9 @@ pub fn ensure_dirs(root: &Path) -> std::io::Result<()> {
 // Tests.
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+// Tests create real directories (`mkdir`). Gated out under miri, which cannot
+// perform those syscalls; the syscall-free tests in other modules still run.
+#[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
 
@@ -256,10 +301,34 @@ mod tests {
     }
 
     #[test]
+    fn wal_segment_stats_sums_only_dot_wal_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = dir.path().join("wal");
+        std::fs::create_dir_all(&wal).unwrap();
+
+        std::fs::write(wal.join("0000000000.wal"), vec![0u8; 100]).unwrap();
+        std::fs::write(wal.join("0000000001.wal"), vec![0u8; 250]).unwrap();
+        // Non-segment files must not be counted.
+        std::fs::write(wal.join("scratch.tmp"), vec![0u8; 9999]).unwrap();
+        std::fs::write(wal.join("notes.txt"), vec![0u8; 9999]).unwrap();
+
+        let (bytes, segments) = wal_segment_stats(&wal);
+        assert_eq!(bytes, 350);
+        assert_eq!(segments, 2);
+    }
+
+    #[test]
+    fn wal_segment_stats_missing_dir_is_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let absent = dir.path().join("does-not-exist");
+        assert_eq!(wal_segment_stats(&absent), (0, 0));
+    }
+
+    #[test]
     fn ensure_dirs_preserves_existing_substrate_files() {
         // Simulate an upgrade: a pre-existing shard with no schema
         // declared yet — arena.bin, metadata.redb, shard.uuid, and a
-        // WAL segment, but no knowledge-layer files on disk.
+        // WAL segment, but no opaque-body files on disk.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("shard-0");
         std::fs::create_dir_all(&root).unwrap();

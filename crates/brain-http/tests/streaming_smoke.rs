@@ -1,4 +1,4 @@
-//! M4 streaming smoke: server emits 5 chunks at 10 ms intervals;
+//! Streaming smoke: server emits 5 chunks at 10 ms intervals;
 //! verify each chunk arrives within 50 ms of its emit time.
 //!
 //! The bug-pattern this guards against is buffering — a framework

@@ -1,0 +1,44 @@
+name: Release please
+
+# Version + changelog automation. On every push to main, release-please reads
+# the Conventional Commits since the last release and maintains a standing
+# "Release PR" that bumps the workspace version (Cargo.toml
+# [workspace.package].version) and writes CHANGELOG.md. Merging that PR is the
+# single human gesture that cuts a release: release-please then pushes the
+# `vX.Y.Z` tag, which fans out to docker-publish.yml (multi-arch image + GitHub
+# Release) and, in the brain-sdk repo, the lockstep SDK publish.
+#
+# Nothing here builds or publishes — it only manages the version/changelog and
+# the tag. The tag is the contract every downstream workflow keys off.
+
+on:
+  push:
+    branches:
+      - main
+
+# Run the release-please JavaScript action on Node 24 rather than the
+# deprecated Node 20, silencing the per-run deprecation warning.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+# release-please opens/updates a PR and, on merge, creates a release + tag.
+permissions:
+  contents: write
+  pull-requests: write
+
+# Never run two release-please passes concurrently on main — the second would
+# race the first's PR update. Don't cancel in progress: a half-applied release
+# PR is worse than a slightly stale one.
+concurrency:
+  group: release-please
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: googleapis/release-please-action@v5
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json

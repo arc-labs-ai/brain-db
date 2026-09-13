@@ -2,7 +2,7 @@
 //! `StatementHnswIndex`.
 //!
 //! The metadata-layer
-//! [`brain_metadata::statement::TieredSupersedeDecider`] (W2.1) calls
+//! [`brain_metadata::statement::TieredSupersedeDecider`] calls
 //! `StatementSimilaritySource::nearest` on the candidate vector for
 //! Tier 1/2 of the supersession ladder. The metadata crate itself
 //! does not depend on `brain-index` — inverting the dep would break
@@ -58,7 +58,9 @@ impl StatementSimilaritySource for StatementHnswSource {
         if query_vector.len() != DIM {
             return Ok(Vec::new());
         }
-        let arr: &[f32; DIM] = query_vector.try_into().expect("dim equality just checked");
+        let arr: &[f32; DIM] = query_vector
+            .try_into()
+            .expect("invariant: query_vector.len() == DIM, length-checked above");
 
         // Hold the read lock only for the duration of the HNSW search
         // — re-locking per-candidate would let writers slip in

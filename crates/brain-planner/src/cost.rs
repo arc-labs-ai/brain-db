@@ -1,19 +1,16 @@
-//! Cost model. Pure functions; no I/O, no state. Consumed by
-//! 6.3–6.6's planners.
+//! Cost model. Pure functions; no I/O, no state. Consumed by the
+//! per-operation planners.
 //!
-//! See `spec/12_query_optimizer/07_cost_estimation.md` for the
-//! authoritative coefficients and formulas. Highlights:
+//! Highlights:
 //!
-//! - Time is the only cost unit we track (§1). Memory / disk-I/O are
-//!   mentioned in the spec but never used by the planner; we ignore.
-//! - Coefficients live as crate-private `const f32` values pinned to
-//!   the spec's §2 table.
-//! - `pick_ef` and `over_factor` are -§5 + §07 §4.
+//! - Time is the only cost unit we track. Memory / disk-I/O are not
+//!   used by the planner; we ignore them.
+//! - Coefficients live as crate-private `const f32` values.
 //! - `check_budget` raises [`PlanError::QueryTooExpensive`] above
 //!   `ctx.config.cost_budget_ms`; logs `tracing::warn!` above the
 //!   hardcoded `BUDGET_WARN_MS = 100`.
 //!
-//! this is **intentionally** a hand-tuned heuristic —
+//! This is **intentionally** a hand-tuned heuristic —
 //! no calibration, no probing, no ML. If a coefficient is wrong, fix
 //! the constant; the formulas don't change.
 
@@ -26,7 +23,7 @@ use crate::plan::FilterRule;
 // ---------------------------------------------------------------------------
 
 pub(crate) const EMBED_CACHE_HIT_MS: f32 = 0.005;
-/// Mid of the spec's 5–10 ms range.
+/// Mid of the 5–10 ms range.
 pub(crate) const EMBED_CACHE_MISS_MS: f32 = 7.5;
 pub(crate) const ANN_SEARCH_BASELINE_MS: f32 = 0.05;
 pub(crate) const ANN_SEARCH_PER_EF_LOGN_MS: f32 = 0.001;
@@ -35,13 +32,13 @@ pub(crate) const METADATA_POINT_LOOKUP_MS: f32 = 0.005;
 pub(crate) const METADATA_RANGE_SCAN_PER_ROW_MS: f32 = 0.0004;
 pub(crate) const WAL_FSYNC_GROUP_MS: f32 = 0.3;
 pub(crate) const ARENA_IO_MS: f32 = 0.001;
-/// Mid of the spec's 0.5–2 ms range.
+/// Mid of the 0.5–2 ms range.
 pub(crate) const HNSW_INSERT_MS: f32 = 1.25;
-/// Reserved for Phase 12 cross-shard cost; unused at v1.
+/// Reserved for cross-shard cost; unused at v1.
 #[allow(dead_code)]
 pub(crate) const NETWORK_INTRA_SHARD_MS: f32 = 0.1;
 
-// Encode phase coefficients from 's latency table.
+// Encode phase coefficients from the latency table.
 pub(crate) const ENCODE_IDEMPOTENCY_MS: f32 = 0.0075; // 5–10 µs mid
 pub(crate) const ENCODE_CONTEXT_RESOLVE_MS: f32 = 0.005;
 pub(crate) const ENCODE_SLOT_ALLOC_MS: f32 = 0.001;
@@ -52,6 +49,14 @@ pub(crate) const ENCODE_RESPONSE_MS: f32 = 0.05;
 // Cross-shard overhead.
 pub(crate) const CROSS_SHARD_MERGE_MS: f32 = 0.05;
 pub(crate) const CROSS_SHARD_PER_SHARD_SERIALISATION_MS: f32 = 0.1;
+
+// REASON's VSA analogical-fit nudge (`executor::analogical`). Per
+// Order-of-magnitude estimate: ~10 µs for the bind/unbind
+// pair that builds a triple's HRR vector, plus ~5 ms for the
+// `Codebook::cleanup` argmax cosine-rank over the call's filler
+// vocabulary. One lookup per surviving evidence item.
+pub(crate) const ANALOGICAL_BIND_UNBIND_MS: f32 = 0.01;
+pub(crate) const ANALOGICAL_COSINE_RANK_MS: f32 = 5.0;
 
 // Budget thresholds.
 /// Above this, the planner logs a `tracing::warn!`.
@@ -154,9 +159,9 @@ fn per_rule_selectivity(rule: &FilterRule) -> f32 {
             let r = (kinds.len() as f32 / 3.0).clamp(SELECTIVITY_FLOOR, 1.0);
             r
         }
-        FilterRule::ContextIn(contexts) => {
+        FilterRule::SessionIn(sessions) => {
             #[allow(clippy::cast_precision_loss)]
-            let r = (contexts.len() as f32 / 10.0).clamp(SELECTIVITY_FLOOR, 1.0);
+            let r = (sessions.len() as f32 / 10.0).clamp(SELECTIVITY_FLOOR, 1.0);
             r
         }
         FilterRule::SalienceFloor(threshold) => (1.0 - threshold).clamp(0.05, 1.0),
@@ -183,7 +188,7 @@ pub fn over_factor(selectivity: f32) -> f32 {
 /// Order of application:
 /// 1. Start at `ctx.config.default_ef_search` (64).
 /// 2. Bias up to ≥ 100 if `memory_count > 1M`.
-/// 3. Bias up by `K * 4` when `K > 50` (§03 §4).
+/// 3. Bias up by `K * 4` when `K > 50`.
 /// 4. Multiply by `(1 + tombstone_ratio * 5)`.
 /// 5. Divide by `selectivity` if it's below 0.5.
 /// 6. Cap at `ctx.config.max_ef_search`.
@@ -306,14 +311,21 @@ pub fn cost_path(max_depth: usize, max_branches: usize, ctx: &PlannerContext) ->
 }
 
 /// REASON cost: one embedding + base RECALL + two parallel traversals
-/// (supports + contradicts) cites 30-50 ms.
+/// (supports + contradicts) cites 30-50 ms, plus the VSA analogical-fit
+/// nudge (one bind/unbind + cosine-rank lookup per surviving evidence
+/// item, bounded by `max_inferences`; see `ANALOGICAL_*_MS`). REASON has
+/// no RRF dependency, so this is a plain additive term — no cost-model
+/// redesign, just one more phase in the same heuristic sum.
 #[must_use]
 pub fn cost_reason(depth: usize, max_inferences: usize, ctx: &PlannerContext) -> f32 {
     let embed = embedding_cost(false);
     let recall = cost_recall(20, 1.0, /* cache_hit */ false, ctx);
     #[allow(clippy::cast_precision_loss)]
     let traversal = 2.0 * (depth as f32) * (max_inferences as f32) * METADATA_POINT_LOOKUP_MS * 4.0;
-    embed + recall + traversal
+    #[allow(clippy::cast_precision_loss)]
+    let analogical =
+        (max_inferences as f32) * (ANALOGICAL_BIND_UNBIND_MS + ANALOGICAL_COSINE_RANK_MS);
+    embed + recall + traversal + analogical
 }
 
 // ---------------------------------------------------------------------------
@@ -341,8 +353,8 @@ pub fn check_budget(estimated_cost_ms: f32, ctx: &PlannerContext) -> Result<(), 
     Ok(())
 }
 
-/// — fast-path predicate. Inputs are unpacked from the
-/// wire `RecallRequest` by 6.3; this function stays free of wire
+/// Fast-path predicate. Inputs are unpacked from the wire
+/// `RecallRequest` by the planner; this function stays free of wire
 /// types.
 #[must_use]
 pub fn is_simple_recall(k: usize, no_filter: bool, eventual_consistency: bool) -> bool {
@@ -394,9 +406,9 @@ mod tests {
     #[test]
     fn ann_search_cost_at_10m_ef64_in_spec_range() {
         // "HNSW search (10M, ef=64): 3-5 ms" — formula gives ~1.5 ms.
-        // The formula doesn't perfectly match the spec table at 10M
+        // The formula doesn't perfectly match the reference table at 10M
         // because the table includes constant overhead at scale. Our
-        // §07 §11 accuracy budget is ±20% for simple queries, but ±50%
+        // accuracy budget is ±20% for simple queries, but ±50%
         // for complex; cross-scale extrapolation falls in the
         // "complex" bucket. Test the formula is monotone instead.
         let small = ann_search_cost(1_000_000, 64);
@@ -543,7 +555,7 @@ mod tests {
             (7.0..=13.0).contains(&ms),
             "cost_encode(miss, 0) = {ms} ms, expected 7-13 ms"
         );
-        // 10 edges adds ~0.5 ms per spec.
+        // 10 edges adds ~0.5 ms.
         let with_edges = cost_encode(false, 10);
         assert!(with_edges - ms >= 0.4);
         assert!(with_edges - ms <= 0.6);

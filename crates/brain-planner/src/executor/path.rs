@@ -10,7 +10,7 @@
 //!    by one hop, scanning `edges_out` (forward) or `edges_in`
 //!    (backward) filtered to the plan's `edge_kinds`. Stop on
 //!    intersection or budget exhaustion.
-//! 3. **Path scoring.** Per:
+//! 3. **Path scoring.**
 //!    `score = length × edge_weight × salience` (geometric mean for
 //!    edge-weight and salience).
 //! 4. **Truncate** to `scoring.top_n` and return.
@@ -19,21 +19,76 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
 use brain_core::{EdgeKind, MemoryId};
+use brain_embed::VECTOR_DIM;
 use brain_metadata::tables::edge::{list_memory_edges_from, list_memory_edges_to};
 use brain_metadata::tables::memory::MEMORIES_TABLE;
 use brain_metadata::tables::text::TEXTS_TABLE;
 use brain_protocol::envelope::request::PlanState;
 
 use crate::plan::path::PathPlan;
+use crate::vsa::{cosine_to_centroid, semantic_centroid};
 
 use super::context::ExecutorContext;
 use super::error::ExecError;
-use super::result::{Path, PathResult, PlanStatus};
+use super::result::{
+    Path, PathFrame, PathResult, PathStream, PathStreamTerminal, PlanExecutionMetadata, PlanStatus,
+    PlanTraceDirection, PlanTraceMeetingPoint, PlanTraceNode,
+};
 
 const ENDPOINT_RECALL_K: usize = 5;
 const ENDPOINT_RECALL_EF: usize = 32;
 
-pub async fn execute_path(plan: PathPlan, ctx: &ExecutorContext) -> Result<PathResult, ExecError> {
+/// Score every candidate path produced by the bi-BFS, then emit them
+/// one frame at a time in score-descending order followed by a
+/// terminal summary. This is the streaming entrypoint the wire
+/// handler drives; `execute_path` is the aggregate convenience.
+///
+/// Truncation to `scoring.top_n` still applies — the stream caps at
+/// that count regardless of how many meeting points the BFS found.
+///
+/// `trace` mirrors RECALL's `trace_detail` / REASON's `trace`: `false`
+/// (the default) is the fast path, byte-for-byte unchanged from
+/// before full-detail tracing existed. `true` additionally populates
+/// `PathStreamTerminal.trace` with the full per-stage BFS detail (see
+/// [`PlanExecutionMetadata`]).
+pub async fn execute_path_stream(
+    plan: PathPlan,
+    ctx: &ExecutorContext,
+    trace: bool,
+) -> Result<PathStream, ExecError> {
+    let top_n = plan.scoring.top_n.max(1);
+    let result = execute_path(plan, ctx, trace).await?;
+    let paths_emitted = u32::try_from(result.paths.len().min(top_n)).unwrap_or(u32::MAX);
+    let frames: Vec<PathFrame> = result
+        .paths
+        .into_iter()
+        .take(top_n)
+        .enumerate()
+        .map(|(i, p)| PathFrame {
+            path_index: u32::try_from(i).unwrap_or(u32::MAX),
+            path: p,
+        })
+        .collect();
+    Ok(PathStream {
+        paths: frames,
+        terminal: PathStreamTerminal {
+            status: result.status,
+            paths_emitted,
+            trace: result.trace,
+        },
+    })
+}
+
+/// `trace` gates the opt-in full-detail trace (see
+/// [`PlanExecutionMetadata`]): `false` is today's behavior with zero
+/// extra capture or allocation; `true` additionally populates
+/// `PathResult.trace` with the full BFS visited-map contents and
+/// meeting-point cap detail.
+pub async fn execute_path(
+    plan: PathPlan,
+    ctx: &ExecutorContext,
+    trace: bool,
+) -> Result<PathResult, ExecError> {
     // 1. Resolve endpoints. ByMemoryId is direct; ByText runs a
     //    small ANN search; ByVector isn't wired yet.
     let starts = resolve_endpoint(&plan.start, ctx)?;
@@ -43,8 +98,17 @@ pub async fn execute_path(plan: PathPlan, ctx: &ExecutorContext) -> Result<PathR
         return Ok(PathResult {
             paths: Vec::new(),
             status: PlanStatus::NoPathFound,
+            trace: None,
         });
     }
+
+    // Consensus direction across the goal-side endpoint memories. The
+    // forward BFS sorts each frontier's neighbours by cosine alignment
+    // to this centroid so the budget is spent on goal-proximate paths
+    // first. `None` whenever we can't reliably read the relevant text
+    // (missing rows, empty endpoint sets, embed failures); BFS then
+    // falls back to its native insertion order.
+    let goal_centroid = build_endpoint_centroid(&plan.goal, &goals, ctx);
 
     // 2. Bi-BFS along the configured edge kinds.
     let edge_kinds: HashSet<EdgeKind> = plan.traversal.edge_kinds.iter().copied().collect();
@@ -56,13 +120,16 @@ pub async fn execute_path(plan: PathPlan, ctx: &ExecutorContext) -> Result<PathR
         plan.budget.max_branches_explored as usize,
         plan.budget.max_wall_time_ms as u64,
         plan.traversal.max_paths,
+        goal_centroid.as_ref(),
         ctx,
+        trace,
     )?;
 
     if bfs.paths.is_empty() {
         return Ok(PathResult {
             paths: Vec::new(),
             status: bfs.status,
+            trace: bfs.trace,
         });
     }
 
@@ -83,6 +150,7 @@ pub async fn execute_path(plan: PathPlan, ctx: &ExecutorContext) -> Result<PathR
     Ok(PathResult {
         paths,
         status: bfs.status,
+        trace: bfs.trace,
     })
 }
 
@@ -97,13 +165,21 @@ fn resolve_endpoint(
     match state {
         PlanState::ByMemoryId(raw) => {
             let id = MemoryId::from(*raw);
-            // Sub-task 9.16: — tombstoned memories
-            // aren't visible unless explicitly requested. A
-            // tombstoned start / goal returns an empty endpoint
-            // set; `execute_path` short-circuits to `NoPathFound`.
-            // Matches `search_active`'s silent-filter behavior for
-            // ByText endpoints.
+            // Tombstoned memories aren't visible unless explicitly
+            // requested. A tombstoned start / goal returns an empty
+            // endpoint set; `execute_path` short-circuits to
+            // `NoPathFound`. Matches `search_active`'s silent-filter
+            // behavior for ByText endpoints.
             if ctx.index.is_tombstoned(id) {
+                return Ok(HashSet::new());
+            }
+            // Tenant wall: the caller must not seed a traversal with another
+            // tenant's memory id. The per-shard edge graph is tenant-blind at
+            // the id level, so a foreign seed would let the BFS read a foreign
+            // tenant's subgraph text. An out-of-scope (or missing) id yields an
+            // empty endpoint — indistinguishable from tombstoned, so it leaks
+            // nothing (not even existence).
+            if !ctx.memory_in_caller_scope(id) {
                 return Ok(HashSet::new());
             }
             let mut s = HashSet::with_capacity(1);
@@ -111,11 +187,22 @@ fn resolve_endpoint(
             Ok(s)
         }
         PlanState::ByText(text) => {
-            let vector = ctx.embedder.embed(text)?;
+            // Caller-supplied query text (PLAN endpoint resolution) —
+            // BGE asymmetric retrieval prefix applies.
+            let vector = ctx.embedder.embed_query(text)?;
             let hits =
                 ctx.index
                     .search_active(&vector, ENDPOINT_RECALL_K, Some(ENDPOINT_RECALL_EF));
-            Ok(hits.into_iter().map(|(id, _)| id).collect())
+            // The shard HNSW is tenant-blind; keep only the caller's own
+            // memories as endpoints so a text seed can't anchor on a
+            // foreign-tenant memory.
+            let mut out = HashSet::new();
+            for (id, _) in hits {
+                if ctx.memory_in_caller_scope(id) {
+                    out.insert(id);
+                }
+            }
+            Ok(out)
         }
         PlanState::ByVector { .. } => Err(ExecError::Unsupported(
             "PLAN endpoint ByVector — wire vector window not yet exposed to the executor",
@@ -142,6 +229,10 @@ struct BfsRaw {
     /// start to a goal.
     paths: Vec<(Vec<MemoryId>, Vec<EdgeKind>, Vec<f32>)>,
     status: PlanStatus,
+    /// Full-detail BFS trace. `Some` only when `trace = true` **and**
+    /// the BFS actually ran (the trivial start == goal short-circuit
+    /// below has nothing to trace); `None` otherwise.
+    trace: Option<PlanExecutionMetadata>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -153,7 +244,9 @@ fn run_bidirectional_bfs(
     max_branches: usize,
     max_wall_time_ms: u64,
     max_paths: usize,
+    goal_centroid: Option<&[f32; VECTOR_DIM]>,
     ctx: &ExecutorContext,
+    trace: bool,
 ) -> Result<BfsRaw, ExecError> {
     // Quick win: any start == any goal.
     let trivial: Vec<MemoryId> = starts.intersection(goals).copied().collect();
@@ -164,6 +257,7 @@ fn run_bidirectional_bfs(
                 .map(|id| (vec![id], Vec::new(), Vec::new()))
                 .collect(),
             status: PlanStatus::GoalReached,
+            trace: None,
         });
     }
 
@@ -207,10 +301,22 @@ fn run_bidirectional_bfs(
     let mut meeting_points: Vec<MemoryId> = Vec::new();
     let mut status = PlanStatus::NoPathFound;
 
+    // Full-detail trace accumulators. Unused (never inserted into) on
+    // the `trace = false` fast path, so the empty `HashMap`/`Vec`
+    // allocate nothing.
+    //
+    // `alignment_scores` is filled by `order_by_goal_proximity` for
+    // whichever forward-frontier neighbours it actually scores.
+    // `trace_meeting_points` records every meeting point found,
+    // including ones beyond `max_paths` that `meeting_points` (the
+    // capped list driving the real `paths` result) never receives.
+    let mut alignment_scores: HashMap<MemoryId, f32> = HashMap::new();
+    let mut trace_meeting_points: Vec<(MemoryId, bool)> = Vec::new();
+
     // Open one read txn for the whole BFS — repeated `read_txn()` calls
     // are cheap but not free, and the BFS may do hundreds of lookups.
-    let metadata_guard = ctx.metadata.lock();
-    let rtxn = metadata_guard
+    let rtxn = ctx
+        .metadata
         .read_txn()
         .map_err(|e| ExecError::MetadataReadFailed(e.to_string()))?;
     // No edge tables to open: the convenience helpers take the read
@@ -264,10 +370,9 @@ fn run_bidirectional_bfs(
                     .collect()
             };
 
-            // Sub-task 9.16: drop committed tombstoned memories from
-            // PLAN traversals. Outside an active
-            // txn this is the only filter; inside one, the
-            // `snap.tombstoned` retain below layers in-flight
+            // Drop committed tombstoned memories from PLAN traversals.
+            // Outside an active txn this is the only filter; inside
+            // one, the `snap.tombstoned` retain below layers in-flight
             // tombstones on top.
             neighbours.retain(|(_, other, _)| !ctx.index.is_tombstoned(*other));
 
@@ -294,6 +399,24 @@ fn run_bidirectional_bfs(
                 neighbours.retain(|(_, other, _)| !snap.tombstoned.contains(other));
             }
 
+            // Forward-frontier only: spend the budget on neighbours
+            // whose memory text aligns with the goal direction first.
+            // The backward frontier is already at the goal; sorting it
+            // by goal proximity is a no-op.
+            if is_forward {
+                neighbours = order_by_goal_proximity(
+                    neighbours,
+                    goal_centroid,
+                    &rtxn,
+                    ctx,
+                    if trace {
+                        Some(&mut alignment_scores)
+                    } else {
+                        None
+                    },
+                );
+            }
+
             for (kind, next, weight) in neighbours {
                 if visited.contains_key(&next) {
                     continue; // already seen on this side → skip
@@ -311,8 +434,22 @@ fn run_bidirectional_bfs(
                 nodes_explored += 1;
 
                 if other_visited.contains_key(&next) {
-                    meeting_points.push(next);
-                    if meeting_points.len() >= max_paths {
+                    // Every meeting point beyond `max_paths` is
+                    // silently dropped from `meeting_points` (and thus
+                    // from `paths`) exactly as before — `included`
+                    // captures that same cap decision. In full-detail
+                    // mode we additionally keep looking past the cap
+                    // (skip the early `break` below) so
+                    // `trace_meeting_points` sees every meeting point
+                    // this level actually finds.
+                    let included = meeting_points.len() < max_paths;
+                    if included {
+                        meeting_points.push(next);
+                    }
+                    if trace {
+                        trace_meeting_points.push((next, included));
+                    }
+                    if !trace && meeting_points.len() >= max_paths {
                         break;
                     }
                 }
@@ -322,7 +459,7 @@ fn run_bidirectional_bfs(
                     break;
                 }
             }
-            if meeting_points.len() >= max_paths || status != PlanStatus::NoPathFound {
+            if (!trace && meeting_points.len() >= max_paths) || status != PlanStatus::NoPathFound {
                 break;
             }
         }
@@ -333,13 +470,63 @@ fn run_bidirectional_bfs(
         }
     }
 
+    // Full-detail trace: snapshot every node in both visited maps, plus
+    // the meeting points found (capped and dropped alike). Built after
+    // the BFS loop so it reflects everything actually explored,
+    // including the extra level-tail exploration `trace = true` didn't
+    // cut short above.
+    let trace_metadata = if trace {
+        let mut explored = Vec::with_capacity(fwd.len() + bwd.len());
+        for (&id, crumb) in &fwd {
+            explored.push(PlanTraceNode {
+                memory_id: id,
+                direction: PlanTraceDirection::Forward,
+                depth: crumb.depth,
+                parent_edge: crumb.edge,
+                parent_id: crumb.parent,
+                alignment_score: alignment_scores.get(&id).copied(),
+            });
+        }
+        for (&id, crumb) in &bwd {
+            explored.push(PlanTraceNode {
+                memory_id: id,
+                direction: PlanTraceDirection::Backward,
+                depth: crumb.depth,
+                parent_edge: crumb.edge,
+                parent_id: crumb.parent,
+                // The goal-direction heuristic only ever sorts the
+                // forward frontier (see `order_by_goal_proximity`'s
+                // is_forward gate above) — backward nodes are never
+                // scored against the goal centroid.
+                alignment_score: None,
+            });
+        }
+        let meeting_points = trace_meeting_points
+            .into_iter()
+            .map(|(memory_id, included_in_result)| PlanTraceMeetingPoint {
+                memory_id,
+                included_in_result,
+            })
+            .collect();
+        Some(PlanExecutionMetadata {
+            explored,
+            meeting_points,
+        })
+    } else {
+        None
+    };
+
     // Reconstruct paths from each meeting point.
     let paths = meeting_points
         .into_iter()
         .filter_map(|m| reconstruct(m, &fwd, &bwd))
         .collect();
 
-    Ok(BfsRaw { paths, status })
+    Ok(BfsRaw {
+        paths,
+        status,
+        trace: trace_metadata,
+    })
 }
 
 /// Walk parent pointers from a meeting node out to the seeds on
@@ -399,7 +586,7 @@ fn reconstruct(
     let mut weights = fwd_weights;
     weights.extend(bwd_weights);
 
-    // Self-loop guard (§16). Visited maps make this redundant on each
+    // Self-loop guard. Visited maps make this redundant on each
     // side, but the meet-point can theoretically appear twice if the
     // BFS finds the same node via both sides' seeds; assert.
     let mut seen = HashSet::with_capacity(nodes.len());
@@ -420,21 +607,16 @@ fn hydrate_paths(
     raw: Vec<(Vec<MemoryId>, Vec<EdgeKind>, Vec<f32>)>,
     ctx: &ExecutorContext,
 ) -> Result<Vec<Path>, ExecError> {
-    let metadata_guard = ctx.metadata.lock();
-    let rtxn = metadata_guard
+    let rtxn = ctx
+        .metadata
         .read_txn()
         .map_err(|e| ExecError::MetadataReadFailed(e.to_string()))?;
     let table = rtxn
         .open_table(MEMORIES_TABLE)
         .map_err(|e| ExecError::MetadataReadFailed(e.to_string()))?;
-    // A shard that hasn't received an encode yet won't have a texts
-    // table — treat that as "no texts available" rather than failing
-    // the whole PLAN.
-    let texts_table = match rtxn.open_table(TEXTS_TABLE) {
-        Ok(t) => Some(t),
-        Err(redb::TableError::TableDoesNotExist(_)) => None,
-        Err(e) => return Err(ExecError::MetadataReadFailed(e.to_string())),
-    };
+    let texts_table = rtxn
+        .open_table(TEXTS_TABLE)
+        .map_err(|e| ExecError::MetadataReadFailed(e.to_string()))?;
 
     let mut out = Vec::with_capacity(raw.len());
     for (nodes, edges, edge_weights) in raw {
@@ -464,8 +646,8 @@ fn hydrate_paths(
             // text today, and surfacing empty is honest.
             let node_text = if is_pending {
                 String::new()
-            } else if let Some(tbl) = texts_table.as_ref() {
-                match tbl.get(id.to_be_bytes()) {
+            } else {
+                match texts_table.get(id.to_be_bytes()) {
                     Ok(Some(g)) => std::str::from_utf8(g.value())
                         .map_err(|e| {
                             ExecError::Internal(format!("texts row for {id:?} is not UTF-8: {e}"))
@@ -474,8 +656,6 @@ fn hydrate_paths(
                     Ok(None) => String::new(),
                     Err(e) => return Err(ExecError::MetadataReadFailed(e.to_string())),
                 }
-            } else {
-                String::new()
             };
             text.push(node_text);
         }
@@ -535,6 +715,201 @@ fn score_path(p: &Path, scoring: &crate::plan::path::ScoringStep) -> f32 {
         1.0
     };
     length_score * edge_score * salience_score
+}
+
+// ---------------------------------------------------------------------------
+// Goal-direction heuristic: pull a semantic centroid out of the goal-
+// side endpoint memories and bias the forward-expansion order toward
+// neighbours that already point that way. Algebra mirrors HRR bundling
+// (sum + L2 normalize) operating directly in the 384-dim embedding
+// space so we don't need a separate projection.
+// ---------------------------------------------------------------------------
+
+/// Build the consensus direction for an endpoint set by re-embedding
+/// each memory's stored text. `None` whenever:
+///
+/// - the endpoint set is empty,
+/// - any required text row is missing or non-UTF-8,
+/// - the embedder errors on a candidate,
+/// - or the resulting sum has no well-defined direction (zero-norm).
+///
+/// Returns the L2-normalized sum across whichever endpoints we can
+/// read — partial reads still produce a centroid, since the BFS only
+/// needs a direction, not a faithful average.
+fn build_endpoint_centroid(
+    state: &PlanState,
+    endpoints: &HashSet<MemoryId>,
+    ctx: &ExecutorContext,
+) -> Option<[f32; VECTOR_DIM]> {
+    if endpoints.is_empty() {
+        return None;
+    }
+
+    // ByText: re-embed the cue directly. The dispatcher cache keeps
+    // this sub-µs on repeats. Query side of BGE asymmetric retrieval
+    // — the prefix is applied automatically.
+    if let PlanState::ByText(text) = state {
+        return match ctx.embedder.embed_query(text) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::debug!(error = %e, "PLAN goal-centroid: embed of cue failed; skipping");
+                None
+            }
+        };
+    }
+
+    // ByMemoryId / ByVector fallthrough: look up each endpoint's text
+    // row and embed it. Skip silently on any failure — the BFS still
+    // runs, just without the goal-direction sort.
+    let vectors = match collect_endpoint_text_vectors(endpoints, ctx) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!(error = %e, "PLAN goal-centroid: text/embed lookup failed; skipping");
+            return None;
+        }
+    };
+    if vectors.is_empty() {
+        return None;
+    }
+    let refs: Vec<&[f32; VECTOR_DIM]> = vectors.iter().collect();
+    match semantic_centroid::<VECTOR_DIM>(&refs) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            tracing::debug!(error = ?e, "PLAN goal-centroid: bundle failed; skipping");
+            None
+        }
+    }
+}
+
+/// Read each endpoint memory's text from TEXTS_TABLE and embed it.
+/// Returns whatever we could resolve; missing/empty/non-UTF-8 texts
+/// are skipped quietly. An error here means the metadata read itself
+/// failed — the caller treats that as "no centroid" rather than
+/// failing the whole PLAN.
+fn collect_endpoint_text_vectors(
+    endpoints: &HashSet<MemoryId>,
+    ctx: &ExecutorContext,
+) -> Result<Vec<[f32; VECTOR_DIM]>, ExecError> {
+    let rtxn = ctx
+        .metadata
+        .read_txn()
+        .map_err(|e| ExecError::MetadataReadFailed(e.to_string()))?;
+    let table = rtxn
+        .open_table(TEXTS_TABLE)
+        .map_err(|e| ExecError::MetadataReadFailed(e.to_string()))?;
+
+    let mut out = Vec::with_capacity(endpoints.len());
+    for &id in endpoints {
+        let row = table
+            .get(id.to_be_bytes())
+            .map_err(|e| ExecError::MetadataReadFailed(e.to_string()))?;
+        let Some(guard) = row else { continue };
+        let text = match std::str::from_utf8(guard.value()) {
+            Ok(s) if !s.is_empty() => s,
+            _ => continue,
+        };
+        match ctx.embedder.embed(text) {
+            Ok(v) => out.push(v),
+            Err(e) => {
+                tracing::debug!(?id, error = %e, "PLAN goal-centroid: embed of endpoint text failed; skipping endpoint");
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Order the forward-expansion neighbours by how well their memory
+/// vectors align with the goal centroid. Returns the input unchanged
+/// when no centroid is provided, when any vector read fails, or when
+/// fewer than two neighbours are present (a single candidate is
+/// already optimal).
+///
+/// Reuses the BFS-scoped `rtxn` rather than acquiring a fresh one —
+/// the executor holds the metadata mutex for the lifetime of the BFS
+/// (single read txn shared across all neighbour lookups), and
+/// `parking_lot::Mutex` is non-reentrant.
+///
+/// `trace_scores` is the opt-in full-detail sink: when `Some`, every
+/// neighbour's raw alignment score is recorded into it (keyed by
+/// memory id) before the score is consumed for sort order — the
+/// direct analogue of REASON's `topic_alignment_factor` un-collapse.
+/// `None` on the default fast path costs nothing extra; the scores
+/// are already computed unconditionally below for the sort itself.
+fn order_by_goal_proximity(
+    mut neighbours: Vec<(EdgeKind, MemoryId, f32)>,
+    goal_centroid: Option<&[f32; VECTOR_DIM]>,
+    rtxn: &redb::ReadTransaction,
+    ctx: &ExecutorContext,
+    trace_scores: Option<&mut HashMap<MemoryId, f32>>,
+) -> Vec<(EdgeKind, MemoryId, f32)> {
+    let Some(centroid) = goal_centroid else {
+        return neighbours;
+    };
+    if neighbours.len() < 2 {
+        return neighbours;
+    }
+
+    let scores = match neighbour_alignment_scores(&neighbours, centroid, rtxn, ctx) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!(error = %e, "PLAN goal-direction: neighbour alignment lookup failed; proceeding unsorted");
+            return neighbours;
+        }
+    };
+
+    if let Some(acc) = trace_scores {
+        for ((_, id, _), &score) in neighbours.iter().zip(scores.iter()) {
+            acc.insert(*id, score);
+        }
+    }
+
+    // Stable sort by alignment descending. Equal scores preserve the
+    // original insertion order so the centroid only re-ranks where it
+    // has signal.
+    let mut indexed: Vec<(usize, f32)> = scores.into_iter().enumerate().collect();
+    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut out = Vec::with_capacity(neighbours.len());
+    for (i, _) in indexed {
+        out.push(neighbours[i]);
+    }
+    // Drop the original by swap to free its allocation.
+    neighbours.clear();
+    out
+}
+
+/// Per-neighbour cosine to the goal centroid, derived from each
+/// neighbour's stored text. Returns one score per neighbour preserving
+/// the input order. Missing text → 0.0 (neutral, sorts last after any
+/// positively-aligned candidate). A metadata-read failure short-
+/// circuits the whole call so the caller can fall back to unsorted.
+fn neighbour_alignment_scores(
+    neighbours: &[(EdgeKind, MemoryId, f32)],
+    centroid: &[f32; VECTOR_DIM],
+    rtxn: &redb::ReadTransaction,
+    ctx: &ExecutorContext,
+) -> Result<Vec<f32>, ExecError> {
+    let table = rtxn
+        .open_table(TEXTS_TABLE)
+        .map_err(|e| ExecError::MetadataReadFailed(e.to_string()))?;
+
+    let mut scores = Vec::with_capacity(neighbours.len());
+    for (_, id, _) in neighbours {
+        let row = table
+            .get(id.to_be_bytes())
+            .map_err(|e| ExecError::MetadataReadFailed(e.to_string()))?;
+        let score = match row {
+            Some(guard) => match std::str::from_utf8(guard.value()) {
+                Ok(s) if !s.is_empty() => match ctx.embedder.embed(s) {
+                    Ok(v) => cosine_to_centroid(&v, centroid),
+                    Err(_) => 0.0,
+                },
+                _ => 0.0,
+            },
+            None => 0.0,
+        };
+        scores.push(score);
+    }
+    Ok(scores)
 }
 
 // ---------------------------------------------------------------------------

@@ -7,8 +7,10 @@ admin_addr = "127.0.0.1:9092"
 listen_addr = "127.0.0.1:9090"
 metrics_addr = "127.0.0.1:9091"
 
+# Single shard so the eval's ingested corpus lives in one shard dir and
+# survives restarts under a persistent volume without shard-routing skew.
 [storage]
-shard_count = 2
+shard_count = 1
 data_dir = "./data"
 
 [shard]
@@ -26,6 +28,21 @@ batch_size = 32
 cache_size = 10000
 batch_window_ms = 5
 model = "bge-small-en-v1.5"
+
+# Deploy-time read-path tuning. All fields default to the baseline shown here;
+# the section may be omitted entirely. Override per the usual env convention,
+# e.g. BRAIN__RETRIEVAL__FUSION_METHOD=relative.
+[retrieval]
+# Rank-fusion strategy: "rrf" (default, score-scale-invariant), "relative",
+# or "zscore".
+fusion_method = "rrf"
+# HyPE joins the semantic lane as its own RRF rank list rather than a
+# non-displacing append.
+hype_rrf = false
+# Scale the memory probe's ef_search by index occupancy.
+ef_occupancy_scaling = false
+# Relative-drop autocut of the ranked result tail.
+autocut = false
 
 [workers]
 decay_interval_sec = 3600
@@ -68,10 +85,11 @@ channel_capacity = 1024
 # + LLM) against each memory's text. Outputs are resolved through the
 # entity resolver gauntlet and written as entities / statements /
 # relations / mention edges.
+#
+# There is no master switch here: extraction is always-on and
+# non-configurable, so the worker is always provisioned. This section only
+# tunes the worker.
 [workers.extractor]
-# Master switch. `false` skips registration entirely — no channel, no
-# worker, encodes see a None sender.
-enabled = true
 # Scheduler tick. Extraction is heavier than auto-edge (LLM round-trip
 # dominates), so the default is 1s vs 100ms.
 interval_ms = 1000
@@ -89,8 +107,8 @@ channel_capacity = 1024
 skip_already_extracted = true
 
 # Phase T: per-shard TemporalEdgeWorker. Drains the writer's post-encode
-# channel and writes `FollowedBy` edges from the agent's previous memory
-# in the same context within `window_seconds`. Linear decay weight on
+# channel and writes `FollowedBy` edges from the space's previous memory
+# in the same session within `window_seconds`. Linear decay weight on
 # the gap; asymmetric edges (no mirror).
 [workers.temporal_edge]
 # Master switch.
@@ -105,8 +123,8 @@ window_seconds = 300
 weight_min = 0.1
 # Writer→worker queue depth.
 channel_capacity = 1024
-# Allow FollowedBy edges across context boundaries.
-cross_context = false
+# Allow FollowedBy edges across session boundaries.
+cross_session = false
 
 # Phase C: per-shard CausalEdgeWorker. Drains the ExtractorWorker's post-
 # commit channel and writes `Caused` edges from cause-side memories to
@@ -138,19 +156,67 @@ max_cause_memories_per_statement = 3
 max_effect_memories_per_statement = 3
 max_related_statements_per_entity = 5
 
-[logging]
+# Per-shard retracted-statement GC. Physically deletes retracted
+# statement rows (and their secondary-index / evidence-overflow entries)
+# once the retract grace window has elapsed. Off by default — retracted
+# rows stay in redb (invisible to retrieval) until an operator opts in.
+# [workers.statement_reclaim]
+# enabled = false
+# grace_seconds = 2592000   # 30 days
+# period_seconds = 86400    # 1 day sweep cadence
+
+# Entity merge-review-queue sweeper. Re-checks ambiguous-band entity
+# resolutions as the entity HNSW grows. Slow cadence on purpose.
+# [workers.ambiguity_resolver]
+# interval_secs = 3600      # 1 hour
+
+# Statement confidence-refresh sweep. Recomputes stored Statement
+# confidence (noisy-OR + kind decay) so aged evidence stops over-ranking.
+# [workers.confidence_sweep]
+# interval_secs = 3600      # 1 hour
+
+# LLM extractor response-cache TTL sweep. Deletes expired cache rows so
+# the cache file doesn't grow unbounded.
+# [workers.llm_cache_sweep]
+# interval_secs = 3600      # 1 hour
+
+# Extractor pipeline tuning. Extraction is always-on and non-configurable —
+# there are no per-tier on/off gates; the knobs below tune resolution /
+# classification / HyPE only.
+# [extractors.resolver]
+# embed_threshold = 0.78    # tier-3 entity-alias cosine floor
+
+# [extractors.classifier]
+# model_path = "/abs/path/to/gliner-model"   # override; default = XDG discovery
+# threshold = 0.5           # GLiNER post-sigmoid acceptance floor
+
+# [extractors.hype]
+# HyPE is mandatory and always-on — there is no enable/disable flag.
+# It requires the LLM configured under [llm] (a keyless server won't boot).
+# num_questions = 6         # hypothetical questions generated per memory
+
+# Index pipeline tuning. Tantivy group-commit cadence (whichever of the
+# two thresholds trips first).
+# [index]
+# tantivy_commit_n = 256    # commit after N queued writes
+# tantivy_commit_ms = 1000  # commit after T milliseconds
+
+[monitoring.logging]
 level = "info"
 format = "json"
 output = "stdout"
 
-[tracing]
+[monitoring.tracing]
 enabled = false
 sampler = "ratio"
 sample_ratio = 0.01
 
-[auth]
-# Dev mode: no auth. Set this for production.
-mode = "none"
+[admin]
+# Operator admin secret. Gates every /v1/* admin HTTP request (key mint /
+# revoke / stats) as `Authorization: Bearer <token>`. The admin listener
+# refuses to start without it. Prefer the environment (BRAIN__ADMIN__TOKEN)
+# for production secrets; this dev value is for local use only.
+token = "dev-admin-token"
 
 [summarizer]
 # Sub-task 9.15. Consolidation worker stays a no-op until an LLM
@@ -159,8 +225,29 @@ mode = "none"
 backend = "disabled"
 request_timeout_sec = 30
 max_summary_chars = 4096
-# OpenAI knobs — only used when backend = "openai".
+# OpenAI knobs — only used when backend = "openai". The credential is
+# NOT here: the summarizer shares the single [llm] api_key below.
 openai_model = "gpt-4o-mini"
 # Ollama knobs — only used when backend = "ollama".
 # ollama_base = "http://localhost:11434"
 # ollama_model = "llama3.1:8b"
+
+[llm]
+# REQUIRED. An LLM is mandatory: write-time HyPE hypothetical-question
+# generation is always-on and cannot be disabled, and the write path
+# depends on it. The server refuses to boot without a provider key —
+# there is no substrate-only / HyPE-less mode.
+#
+# Single provider-agnostic credential + model, shared by every LLM
+# consumer (HyPE, extraction, disambiguator, summarizer). The provider is
+# derived from the model id (claude* → Anthropic, else OpenAI). Override
+# at deploy time with the generic env parser:
+#   BRAIN__LLM__API_KEY=sk-...   BRAIN__LLM__MODEL=gpt-4o-mini
+api_key = ""   # operator sets at deploy time — never commit a real key
+# model = "gpt-4o-mini"  # default when unset
+
+[rerank]
+# Off by default: rerank only reorders already-retrieved candidates and
+# can't surface what retrieval+grounding missed. Solve recall correctness
+# upstream; flip to true only to A/B the cross-encoder's ordering.
+enabled = false

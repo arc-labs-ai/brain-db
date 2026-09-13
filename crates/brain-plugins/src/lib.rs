@@ -1,6 +1,6 @@
 //! # brain-plugins
 //!
-//! Plugin surface for the Brain knowledge pipeline.
+//! Plugin surface for the Brain write pipeline.
 //!
 //! Three plugin kinds, each anchored on the shared lifecycle trait
 //! [`RecallPlugin`]:

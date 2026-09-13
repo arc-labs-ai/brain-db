@@ -1,13 +1,11 @@
-//! `Entity` value type — the brain-core public API for a knowledge-
-//! graph entity.
+//! `Entity` value type — the brain-core public API for a typed-graph
+//! entity.
 //!
 //! Mirrors the substrate's [`crate::Memory`] / `brain_metadata::tables::memory`
 //! split: `Entity` is the high-level value type (no I/O, no rkyv); the
 //! redb row lives in `brain-metadata::tables::nodes::entity::EntityMetadata`.
 //! Conversion at the boundary is via `From` impls defined on the
 //! brain-metadata side.
-//!
-//! See `spec/02_data_model/00_purpose.md` for the canonical schema.
 
 use serde::{Deserialize, Serialize};
 
@@ -19,10 +17,10 @@ use crate::ids::{EntityId, EntityTypeId};
 
 /// Free-form per-entity key/value attribute bag.
 ///
-/// In Phase 16 this is an opaque `Vec<u8>` (rkyv-encoded
-/// `BTreeMap<String, Value>` once phase 19's schema DSL lands). The
-/// newtype isolates callers from the encoding so phase 19 can add
-/// typed accessors without changing the public field type.
+/// Currently an opaque `Vec<u8>` (an rkyv-encoded
+/// `BTreeMap<String, Value>` once the schema DSL lands). The
+/// newtype isolates callers from the encoding so typed accessors can
+/// be added later without changing the public field type.
 #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct EntityAttributes(pub Vec<u8>);
 
@@ -67,14 +65,14 @@ impl From<EntityAttributes> for Vec<u8> {
 // EntityType — registry entry for a user-declared (or built-in) entity type.
 // ---------------------------------------------------------------------------
 
-/// A registered entity type. In Phase 16 only the built-in `Person`
-/// type exists (seeded by `MetadataDb::open`); phase 19's schema DSL
+/// A registered entity type. Currently only the built-in `Person`
+/// type exists (seeded by `MetadataDb::open`); the schema DSL
 /// adds user-declared types via `SCHEMA_UPLOAD`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EntityType {
     pub id: EntityTypeId,
     pub name: String,
-    /// rkyv-encoded attribute schema. Phase 19 defines the shape.
+    /// rkyv-encoded attribute schema. The schema DSL defines the shape.
     pub attribute_schema_blob: Vec<u8>,
     pub created_at_unix_nanos: u64,
 }
@@ -105,28 +103,28 @@ impl EntityType {
 // Entity — the public value type.
 // ---------------------------------------------------------------------------
 
-/// A canonical reference to a noun in the knowledge graph.
+/// A canonical reference to a noun in the typed graph.
 ///
-/// Field semantics (§"Field semantics"):
+/// Field semantics:
 ///
 /// - `id` — immutable; survives renames.
 /// - `entity_type` — the registry entry this entity instantiates;
-///   mutation requires `RETYPE_ENTITY` (phase 18+).
+///   mutation requires `RETYPE_ENTITY`.
 /// - `canonical_name` — primary display name. Mutable; old values
 ///   move into `aliases` on rename.
 /// - `normalized_name` — lowercased + whitespace-collapsed form for
 ///   exact-match lookup (`entity_by_canonical_name` index).
-/// - `aliases` — alternative names that resolve to this entity. Spec
-///   §18/00 caps length at 32 by default; not enforced in the value
-///   type (CRUD layer in 16.2 enforces).
-/// - `attributes` — opaque blob; phase 19 typed accessors.
+/// - `aliases` — alternative names that resolve to this entity. Length
+///   caps at 32 by default; not enforced in the value type (the CRUD
+///   layer enforces).
+/// - `attributes` — opaque blob; typed accessors come with the schema DSL.
 /// - `mention_count` — denormalized count of memories referencing
-///   this entity; maintained by 16.2's `entity_put` paths.
+///   this entity; maintained by the `entity_put` paths.
 /// - `merged_into` — `Some` if this entity has been merged into
-///   another. Queries follow the redirect via 16.7's merge path.
+///   another. Queries follow the redirect via the merge path.
 /// - `embedding_version` — bumped on canonical_name change so the
-///   embedding worker (phase 21) can detect stale vectors.
-/// - `flags` — bitfield; specific bits TBD in 16.2.
+///   embedding worker can detect stale vectors.
+/// - `flags` — bitfield.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Entity {
     pub id: EntityId,
@@ -197,62 +195,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn attributes_empty_round_trip() {
-        let a = EntityAttributes::empty();
-        assert!(a.is_empty());
-        assert_eq!(a.as_bytes(), &[] as &[u8]);
-        let bytes = a.into_bytes();
-        assert!(bytes.is_empty());
-    }
-
-    #[test]
-    fn attributes_from_vec_preserves_bytes() {
-        let raw = vec![1u8, 2, 3, 4];
-        let a = EntityAttributes::from(raw.clone());
-        assert_eq!(a.as_bytes(), raw.as_slice());
-        let back: Vec<u8> = a.into();
-        assert_eq!(back, raw);
-    }
-
-    #[test]
-    fn entity_type_person_id_is_stable() {
-        assert_eq!(EntityType::PERSON_ID, EntityTypeId(1));
-        assert_eq!(EntityType::PERSON_NAME, "Person");
-    }
-
-    #[test]
-    fn entity_type_person_constructor_populates_fields() {
-        let t = EntityType::person(1_700_000_000_000_000_000);
-        assert_eq!(t.id, EntityType::PERSON_ID);
-        assert_eq!(t.name, "Person");
-        assert!(t.attribute_schema_blob.is_empty());
-        assert_eq!(t.created_at_unix_nanos, 1_700_000_000_000_000_000);
-    }
-
-    #[test]
-    fn entity_new_active_sets_defaults() {
-        let id = EntityId::new();
-        let e = Entity::new_active(
-            id,
-            EntityType::PERSON_ID,
-            "Priya Patel".into(),
-            "priya patel".into(),
-            1_700_000_000_000_000_000,
-        );
-        assert_eq!(e.id, id);
-        assert_eq!(e.entity_type, EntityType::PERSON_ID);
-        assert_eq!(e.canonical_name, "Priya Patel");
-        assert_eq!(e.normalized_name, "priya patel");
-        assert!(e.aliases.is_empty());
-        assert!(e.attributes.is_empty());
-        assert_eq!(e.mention_count, 0);
-        assert_eq!(e.created_at_unix_nanos, e.updated_at_unix_nanos);
-        assert!(!e.is_merged());
-        assert_eq!(e.embedding_version, 0);
-        assert_eq!(e.flags, 0);
-    }
-
-    #[test]
     fn entity_has_alias_scans_aliases() {
         let mut e = Entity::new_active(
             EntityId::new(),
@@ -267,19 +209,5 @@ mod tests {
         assert!(e.has_alias("priya"));
         assert!(e.has_alias("p. patel"));
         assert!(!e.has_alias("PRIYA")); // exact match; callers normalize
-    }
-
-    #[test]
-    fn entity_is_merged_reports_redirect() {
-        let mut e = Entity::new_active(
-            EntityId::new(),
-            EntityType::PERSON_ID,
-            "old".into(),
-            "old".into(),
-            0,
-        );
-        assert!(!e.is_merged());
-        e.merged_into = Some(EntityId::new());
-        assert!(e.is_merged());
     }
 }

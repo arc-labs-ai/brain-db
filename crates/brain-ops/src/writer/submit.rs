@@ -9,24 +9,24 @@
 //!
 //! For every submitted [`Write`] the writer does:
 //!
-//! 1. Idempotency check (in-memory cache for now; durable redb-backed
-//!    cache lands in P3c).
+//! 1. Idempotency check (in-memory cache for now; a durable redb-backed
+//!    cache lands later).
 //! 2. Open ONE `WriteTransaction`.
-//! 3. For each phase: call [`apply::dispatch`] against the wtxn.
+//! 3. For each phase: call [`crate::apply::dispatch`] against the wtxn.
 //! 4. Commit.
 //! 5. Stamp the idempotency cache.
 //! 6. Return the [`WriteAck`].
 //!
-//! WAL framing (P3b) and post-commit event publishing (P3c) layer on
+//! WAL framing and post-commit event publishing layer on
 //! top — both are additive to this skeleton. The phase apply functions
 //! never read clocks / mint ids / publish events, so the writer is the
 //! only place those side-effects live; adding them later doesn't
 //! require apply changes.
 
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
-use brain_core::{ContextId, MemoryId, MemoryKind, NodeRef};
+use brain_core::{MemoryId, MemoryKind, NodeRef, SessionId};
 use brain_planner::WriterError;
 use brain_protocol::EventType;
 use brain_storage::wal::payload::WalPayload;
@@ -139,8 +139,7 @@ impl WriteIdempotencyCache {
 
         // Cold path: open a read txn against the durable table.
         let (decoded, stored_hash, created_at) = {
-            let db = metadata.lock();
-            let Ok(rtxn) = db.read_txn() else {
+            let Ok(rtxn) = metadata.read_txn() else {
                 return CacheLookup::Miss;
             };
             let table = match rtxn.open_table(IDEMPOTENCY_TABLE) {
@@ -224,10 +223,7 @@ fn classify(
 }
 
 fn default_now_unix_nanos() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
+    crate::clock::now_unix_nanos()
 }
 
 /// Build the durable idempotency row for a successful submit. Encodes
@@ -257,9 +253,9 @@ impl RealWriterHandle {
     /// - [`WriterError::Internal`] for storage / apply failures (the
     ///   wtxn auto-rolls-back on drop).
     /// - [`WriterError::Conflict`] for idempotency mismatch — same
-    ///   `WriteId`, different phases. (Not yet wired in P3; the cache
+    ///   `WriteId`, different phases. (Not yet wired; the cache
     ///   just returns the cached ack on hit.)
-    pub async fn submit(&self, write: Write) -> Result<WriteAck, WriterError> {
+    pub async fn submit(&self, write: Write) -> Result<Arc<WriteAck>, WriterError> {
         let start = Instant::now();
         let metrics = self.writer_metrics().clone();
 
@@ -270,7 +266,9 @@ impl RealWriterHandle {
         match cache.lookup_with_hash(self.metadata(), write.write_id, write.request_hash) {
             CacheLookup::Hit(cached) => {
                 metrics.record_idempotency(IdempotencyOutcome::Hit);
-                return Ok((*cached).clone());
+                // Hand the cached Arc straight back to the caller — no
+                // inner clone. Hot replays cost one Arc bump.
+                return Ok(cached);
             }
             CacheLookup::Conflict => {
                 metrics.record_idempotency(IdempotencyOutcome::Conflict);
@@ -286,18 +284,33 @@ impl RealWriterHandle {
         // 2. WAL append. Single-phase writes get one typed payload;
         // multi-phase writes get TxnBegin + N × payloads + TxnCommit.
         let started_at = self.now_unix_nanos_or_zero(write.started_at_unix_nanos);
-        let lsn_first = match wal_append_for_write(self, &write, started_at).await {
+        let wal_span = tracing::info_span!("brain.wal.append", phases = write.phases.len());
+        // `(first, last)` LSN of this write's WAL records, or `None`
+        // when the write mapped no WAL payloads. `last` drives the
+        // post-commit redb-committed watermark advance below.
+        let wal_lsns = match tracing::Instrument::instrument(
+            wal_append_for_write(self, &write, started_at),
+            wal_span,
+        )
+        .await
+        {
             Ok(v) => v,
             Err(e) => {
                 record_phase_outcomes(&metrics, &write, SubmitOutcome::Err, start.elapsed());
                 return Err(e);
             }
         };
+        let lsn_first = wal_lsns.map(|(f, _)| f);
+        let lsn_last = wal_lsns.map(|(_, l)| l);
 
-        // 3. HNSW side effects (P3d). Run before the redb wtxn opens
+        // 3. HNSW side effects. Run before the redb wtxn opens
         // so the wtxn lifetime stays minimal and a HNSW failure
         // abandons the encode before any metadata commits.
-        if let Err(e) = execute_hnsw_side_effects(self, &write) {
+        let hnsw_res = {
+            let _hnsw_span = tracing::info_span!("brain.hnsw.insert").entered();
+            execute_hnsw_side_effects(self, &write)
+        };
+        if let Err(e) = hnsw_res {
             record_phase_outcomes(&metrics, &write, SubmitOutcome::Err, start.elapsed());
             return Err(e);
         }
@@ -307,10 +320,19 @@ impl RealWriterHandle {
         // idempotency stamp shares the wtxn so a crash between "phases
         // applied" and "idempotency stamped" is impossible — either
         // both commit or neither.
+        //
+        // We construct the durable `WriteAck` once — moving `acks` into
+        // it instead of cloning. The `pending_stages` list lands later
+        // (after the post-commit worker fan-out) and is patched onto the
+        // same struct just before we Arc-wrap and return.
         let committed_at = (cache.now_unix_nanos)();
-        let phase_acks: Vec<PhaseAck> = {
-            let mut db = self.metadata().lock();
-            let wtxn = match db.write_txn() {
+        let mut durable_ack: WriteAck = {
+            // All-sync redb work (open → apply phases → stamp idempotency →
+            // commit) with no `.await` inside, so an `.entered()` guard is
+            // safe — nothing interleaves to steal the span.
+            let _md_span =
+                tracing::info_span!("brain.metadata.write", phases = write.phases.len()).entered();
+            let wtxn = match self.metadata().write_txn() {
                 Ok(w) => w,
                 Err(e) => {
                     record_phase_outcomes(&metrics, &write, SubmitOutcome::Err, start.elapsed());
@@ -342,8 +364,8 @@ impl RealWriterHandle {
                 write_id: write.write_id,
                 committed_at_unix_nanos: committed_at,
                 lsn_first: lsn_first.unwrap_or(Lsn(0)),
-                lsn_last: lsn_first.unwrap_or(Lsn(0)),
-                phase_acks: acks.clone(),
+                lsn_last: lsn_last.unwrap_or_else(|| lsn_first.unwrap_or(Lsn(0))),
+                phase_acks: acks,
                 pending_stages: Vec::new(),
             };
             let idem_entry = idempotency_entry_for(&durable_ack, write.request_hash, committed_at);
@@ -365,7 +387,17 @@ impl RealWriterHandle {
                 record_phase_outcomes(&metrics, &write, SubmitOutcome::Err, start.elapsed());
                 return Err(WriterError::Internal(format!("commit: {e:?}")));
             }
-            acks
+            // Redb is now durable for this write. Advance the shared
+            // redb-committed watermark to this write's highest WAL LSN
+            // so the checkpoint path can promise a `durable_lsn` that
+            // metadata has actually committed — never the WAL-appended
+            // tail, which advances before this commit. Writes with no
+            // WAL records (`None`) leave the watermark untouched: there
+            // is nothing for recovery to skip on their behalf.
+            if let Some(last) = lsn_last {
+                self.redb_committed_watermark().advance_to(last.raw());
+            }
+            durable_ack
         };
 
         // 5. Publish events (one per phase that has a wire surface).
@@ -386,7 +418,8 @@ impl RealWriterHandle {
                 id,
                 text,
                 vector,
-                context,
+                kind,
+                session_id,
                 created_at_unix_nanos,
                 ..
             } = phase
@@ -400,8 +433,8 @@ impl RealWriterHandle {
                 if super::try_enqueue_temporal_edge(
                     self,
                     *id,
-                    write.agent_id,
-                    *context,
+                    write.space_id,
+                    *session_id,
                     *created_at_unix_nanos,
                     vector.as_ref(),
                 ) {
@@ -422,6 +455,35 @@ impl RealWriterHandle {
                         memory_id: *id,
                         stage_kind: brain_protocol::StageKind::Extractor,
                     });
+                    // HyPE runs over every item the extractor batch
+                    // processes (idempotent on the memory's own question
+                    // vectors, independent of the extraction-audit gate —
+                    // see `run_hype_pass` in brain-workers), so it's
+                    // enqueued 1:1 with `Extractor`: whenever this memory
+                    // reaches the extractor pipeline, HyPE will eventually
+                    // publish its own `StageCompleted{Hype}` for it too.
+                    pending_stages.push(crate::write::PendingStage {
+                        memory_id: *id,
+                        stage_kind: brain_protocol::StageKind::Hype,
+                    });
+                }
+                // Index the memory text into tantivy so the lexical
+                // retriever can find it. Backpressures (awaits) rather
+                // than dropping on a full queue: lexical indexing is a
+                // primary recall lane, not best-effort enrichment, so a
+                // silently-dropped doc would make the memory permanently
+                // unsearchable by keyword.
+                if let Some(dispatcher) = &self.memory_text_dispatcher {
+                    dispatcher
+                        .dispatch(crate::index::text_indexer::MemoryTextOp::Upsert {
+                            id: *id,
+                            text: text.clone(),
+                            space: write.space_id,
+                            kind: *kind,
+                            created_at_unix_ms: *created_at_unix_nanos / 1_000_000,
+                            session: session_id.raw(),
+                        })
+                        .await;
                 }
             }
             // Tombstone(Memory) fans out to the FORGET cascade. Both
@@ -457,6 +519,26 @@ impl RealWriterHandle {
                     "submit: post-commit forget cascade enqueue attempt",
                 );
             }
+            // RestoreMemory fans out to the FORGET-cascade *revert*. The
+            // memory row is un-tombstoned by the phase apply above; this
+            // enqueue drives `cascade_revert_forget`, which replays the soft
+            // FORGET's undo journal to re-attach dependent statements and
+            // relations. Soft mode by construction — only a soft FORGET
+            // journals undo records, so only a soft FORGET is reversible.
+            if let Phase::RestoreMemory { id, at_unix_nanos } = phase {
+                let job = crate::writer::ForgetCascadeJob {
+                    memory_id: *id,
+                    mode: crate::writer::ForgetCascadeMode::Soft,
+                    kind: crate::writer::ForgetCascadeKind::Revert,
+                    forgot_at_unix_nanos: *at_unix_nanos,
+                };
+                let enqueued = super::try_enqueue_forget_cascade(self, job);
+                tracing::debug!(
+                    memory_id = ?id,
+                    enqueued,
+                    "submit: post-commit forget cascade revert enqueue attempt",
+                );
+            }
             // UpsertSchema fans out to the SchemaMigrationWorker. The
             // OUTSIDE_ACTIVE_SCHEMA flag-sweep was previously inline
             // inside the upload wtxn; moving it post-commit keeps the
@@ -476,10 +558,11 @@ impl RealWriterHandle {
                 // just committed, so the matching ack from `apply` is
                 // the source of truth for what version the sweep
                 // should align against.
-                let ack_version = phase_acks.iter().find_map(|a| match a {
+                let ack_version = durable_ack.phase_acks.iter().find_map(|a| match a {
                     PhaseAck::UpsertedSchema {
                         namespace: ns,
                         version,
+                        ..
                     } if ns == namespace => Some(*version),
                     _ => None,
                 });
@@ -502,18 +585,14 @@ impl RealWriterHandle {
 
         // 6. Stamp the in-memory hot cache. The durable row already
         // landed inside the wtxn above; this just keeps the in-process
-        // replay path off redb for hot keys.
-        let ack = WriteAck {
-            write_id: write.write_id,
-            committed_at_unix_nanos: committed_at,
-            lsn_first: lsn_first.unwrap_or(Lsn(0)),
-            lsn_last: lsn_first.unwrap_or(Lsn(0)),
-            phase_acks,
-            pending_stages,
-        };
+        // replay path off redb for hot keys. We Arc-wrap once and hand
+        // the same Arc to both the cache and the caller — no inner
+        // clone.
+        durable_ack.pending_stages = pending_stages;
+        let ack = Arc::new(durable_ack);
         cache.stamp_hot(
             write.write_id,
-            Arc::new(ack.clone()),
+            ack.clone(),
             write.request_hash,
             committed_at,
         );
@@ -535,10 +614,7 @@ impl RealWriterHandle {
 }
 
 fn now_unix_nanos() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
+    crate::clock::now_unix_nanos()
 }
 
 /// Record one submit outcome per phase in the parent [`Write`]. The
@@ -557,11 +633,12 @@ fn record_phase_outcomes(
     }
 }
 
-/// Append a Write to the WAL. Returns the LSN of the first appended
-/// record (event publishing stamps this onto envelopes).
+/// Append a Write to the WAL. Returns the `(first, last)` LSN of the
+/// appended records — the first stamps published-event envelopes, the
+/// last drives the post-commit redb-committed watermark.
 ///
 /// Only phases that map to a `WalPayload` are appended. Unmapped phases
-/// (knowledge-layer phases persisted via redb; auto-derived phases
+/// (opaque-body phases persisted via redb; auto-derived phases
 /// re-derivable from state) are skipped — their durability rides on the
 /// redb commit's fsync. A `tracing::debug!` log surfaces each skip.
 ///
@@ -578,13 +655,13 @@ async fn wal_append_for_write(
     writer: &RealWriterHandle,
     write: &Write,
     started_at_unix_nanos: u64,
-) -> Result<Option<Lsn>, WriterError> {
+) -> Result<Option<(Lsn, Lsn)>, WriterError> {
     let Some(sink) = writer.wal_sink_ref() else {
         return Ok(None);
     };
 
-    let agent_bytes: [u8; 16] = write.agent_id.into();
-    let agent_id_lo64 = u64::from_be_bytes(agent_bytes[8..16].try_into().unwrap_or([0; 8]));
+    let space_bytes: [u8; 16] = write.space_id.into();
+    let space_id_lo64 = u64::from_be_bytes(space_bytes[8..16].try_into().unwrap_or([0; 8]));
 
     // Partition phases into (mapped payload) and (skipped). Unmapped
     // phases get a debug trace so degraded-durability writes are visible
@@ -610,71 +687,68 @@ async fn wal_append_for_write(
         return Ok(None);
     }
 
-    if mapped.len() == 1 {
-        let record = WalRecord::from_typed(
+    // Build the full record batch up front (TxnBegin + payloads +
+    // TxnCommit for multi-phase, single payload for single-phase) and
+    // issue ONE `append_many`. Multi-phase writes previously cost
+    // 2 + N channel hops + 2 + N fsyncs; the batched path collapses
+    // to 1 channel hop + 1 fsync (group-commit folds the whole batch).
+    let records: Vec<WalRecord> = if mapped.len() == 1 {
+        vec![WalRecord::from_typed(
             Lsn(0),
             /* flags */ 0,
             started_at_unix_nanos,
-            agent_id_lo64,
+            space_id_lo64,
             &mapped[0],
-        );
-        let lsn = sink
-            .append(record)
-            .await
-            .map_err(|e| WriterError::Internal(format!("wal append: {e}")))?;
-        return Ok(Some(lsn));
-    }
+        )]
+    } else {
+        use brain_core::TxnId;
+        use brain_storage::wal::payload::{TxnBeginPayload, TxnCommitPayload};
 
-    use brain_core::TxnId;
-    use brain_storage::wal::payload::{TxnBeginPayload, TxnCommitPayload};
+        let txn_id = TxnId(write.write_id.as_uuid());
+        let begin = WalPayload::TxnBegin(TxnBeginPayload {
+            txn_id,
+            expected_record_count: mapped.len() as u32,
+        });
+        let commit = WalPayload::TxnCommit(TxnCommitPayload { txn_id });
 
-    let txn_id = TxnId(write.write_id.as_uuid());
-    let begin = WalPayload::TxnBegin(TxnBeginPayload {
-        txn_id,
-        expected_record_count: mapped.len() as u32,
-    });
-    let commit = WalPayload::TxnCommit(TxnCommitPayload { txn_id });
-
-    let begin_record = WalRecord::from_typed(
-        Lsn(0),
-        /* flags */ 0,
-        started_at_unix_nanos,
-        agent_id_lo64,
-        &begin,
-    );
-    let lsn_first = sink
-        .append(begin_record)
-        .await
-        .map_err(|e| WriterError::Internal(format!("wal append (txn begin): {e}")))?;
-
-    for payload in &mapped {
-        let record = WalRecord::from_typed(
+        let mut batch: Vec<WalRecord> = Vec::with_capacity(mapped.len() + 2);
+        batch.push(WalRecord::from_typed(
             Lsn(0),
-            /* flags */ 0,
+            0,
             started_at_unix_nanos,
-            agent_id_lo64,
-            payload,
-        );
-        sink.append(record)
-            .await
-            .map_err(|e| WriterError::Internal(format!("wal append (phase): {e}")))?;
-    }
+            space_id_lo64,
+            &begin,
+        ));
+        for payload in &mapped {
+            batch.push(WalRecord::from_typed(
+                Lsn(0),
+                0,
+                started_at_unix_nanos,
+                space_id_lo64,
+                payload,
+            ));
+        }
+        batch.push(WalRecord::from_typed(
+            Lsn(0),
+            0,
+            started_at_unix_nanos,
+            space_id_lo64,
+            &commit,
+        ));
+        batch
+    };
 
-    let commit_record = WalRecord::from_typed(
-        Lsn(0),
-        /* flags */ 0,
-        started_at_unix_nanos,
-        agent_id_lo64,
-        &commit,
-    );
-    sink.append(commit_record)
+    let lsns = sink
+        .append_many(records)
         .await
-        .map_err(|e| WriterError::Internal(format!("wal append (txn commit): {e}")))?;
-
-    Ok(Some(lsn_first))
+        .map_err(|e| WriterError::Internal(format!("wal append_many: {e}")))?;
+    Ok(match (lsns.first().copied(), lsns.last().copied()) {
+        (Some(first), Some(last)) => Some((first, last)),
+        _ => None,
+    })
 }
 
-/// P3d: HNSW writes per phase. Runs after WAL append and before the
+/// HNSW writes per phase. Runs after WAL append and before the
 /// redb wtxn opens. A HNSW failure here aborts the write before any
 /// metadata commits; the WAL record stays and recovery's replay will
 /// retry on next start.
@@ -721,7 +795,7 @@ fn execute_hnsw_side_effects(writer: &RealWriterHandle, write: &Write) -> Result
 /// Publish one event per phase that has a wire-side counterpart.
 ///
 /// Memory phases (UpsertMemory, Tombstone(Memory), Link, Unlink) and
-/// knowledge phases (UpsertEntity, ...) publish their corresponding
+/// typed-graph phases (UpsertEntity, ...) publish their corresponding
 /// event types. Phases without a wire surface (UpdateSalience,
 /// ReclaimSlots, …) don't publish — they affect observability through
 /// metrics, not subscribers.
@@ -736,7 +810,7 @@ fn publish_events_for(writer: &RealWriterHandle, write: &Write, committed_at_uni
         let Some(mut env) = phase_to_envelope(phase, write, committed_at_unix_nanos) else {
             continue;
         };
-        // Tombstone(Memory) needs the original row's context_id +
+        // Tombstone(Memory) needs the original row's session_id +
         // kind in the envelope so subscribers can filter properly.
         // Read it back post-commit — the row is still present (soft
         // tombstone keeps it during the grace window).
@@ -745,8 +819,8 @@ fn publish_events_for(writer: &RealWriterHandle, write: &Write, committed_at_uni
             ..
         } = phase
         {
-            if let Some((ctx, kind)) = read_memory_context_and_kind(writer, *id) {
-                env.context_id = ctx;
+            if let Some((ctx, kind)) = read_memory_session_and_kind(writer, *id) {
+                env.session_id = ctx;
                 env.kind = kind;
             }
         }
@@ -754,17 +828,16 @@ fn publish_events_for(writer: &RealWriterHandle, write: &Write, committed_at_uni
     }
 }
 
-/// Read MEMORIES_TABLE for the row's context_id + kind. Used by the
+/// Read MEMORIES_TABLE for the row's session_id + kind. Used by the
 /// post-commit event publisher to stamp Tombstone events with the
 /// values the subscriber filter actually compares against. Returns
 /// `None` if the row went away between commit and publish (shouldn't
 /// happen — single-writer-per-shard — but defensive).
-fn read_memory_context_and_kind(
+fn read_memory_session_and_kind(
     writer: &RealWriterHandle,
     id: brain_core::MemoryId,
-) -> Option<(ContextId, MemoryKind)> {
-    let db = writer.metadata().lock();
-    let rtxn = db.read_txn().ok()?;
+) -> Option<(SessionId, MemoryKind)> {
+    let rtxn = writer.metadata().read_txn().ok()?;
     let t = rtxn
         .open_table(brain_metadata::tables::memory::MEMORIES_TABLE)
         .ok()?;
@@ -775,7 +848,7 @@ fn read_memory_context_and_kind(
         2 => MemoryKind::Consolidated,
         _ => MemoryKind::Episodic,
     };
-    Some((ContextId(row.context_id), kind))
+    Some((SessionId(row.session_id), kind))
 }
 
 /// Map a single phase into an [`EventEnvelope`] for the bus. Returns
@@ -791,25 +864,30 @@ fn phase_to_envelope(
         Phase::UpsertMemory {
             id,
             text,
+            vector,
             kind,
             salience,
-            context,
+            session_id,
             ..
         } => Some(EventEnvelope {
             lsn: 0,
             event_type: EventType::Encoded,
             memory_id: *id,
-            context_id: *context,
+            session_id: *session_id,
             kind: *kind,
             salience: salience.raw(),
             timestamp_unix_nanos: committed_at_unix_nanos,
             text: Some(text.clone()),
-            knowledge_payload: None,
+            graph_payload: None,
             edge_payload: None,
             stage_kind: None,
             stage_outcome: None,
             stage_payload: None,
-            agent_id: write.agent_id,
+            space_id: write.space_id,
+            // Carry the freshly-embedded vector so a `similar_to`
+            // subscription can be evaluated network-side without a
+            // per-event shard lookup.
+            vector: Some(Arc::from(vector.clone())),
         }),
 
         Phase::Tombstone { target, .. } => match target {
@@ -817,20 +895,21 @@ fn phase_to_envelope(
                 lsn: 0,
                 event_type: EventType::Forgotten,
                 memory_id: *id,
-                context_id: ContextId::default(),
+                session_id: SessionId::default(),
                 kind: MemoryKind::Episodic,
                 salience: 0.0,
                 timestamp_unix_nanos: committed_at_unix_nanos,
                 text: None,
-                knowledge_payload: None,
+                graph_payload: None,
                 edge_payload: None,
                 stage_kind: None,
                 stage_outcome: None,
                 stage_payload: None,
-                agent_id: write.agent_id,
+                space_id: write.space_id,
+                vector: None,
             }),
-            // Knowledge tombstones publish through the knowledge-event
-            // path (emit_knowledge_event), not the memory subscribe bus.
+            // Typed-graph tombstones publish through the typed-graph-event
+            // path (emit_graph_event), not the memory subscribe bus.
             TombstoneTarget::Entity(_)
             | TombstoneTarget::Statement(_)
             | TombstoneTarget::Relation(_) => None,
@@ -847,12 +926,12 @@ fn phase_to_envelope(
             lsn: 0,
             event_type: EventType::EdgeAdded,
             memory_id: memory_id_from_node_ref(*from),
-            context_id: ContextId::default(),
+            session_id: SessionId::default(),
             kind: MemoryKind::Episodic,
             salience: 0.0,
             timestamp_unix_nanos: committed_at_unix_nanos,
             text: None,
-            knowledge_payload: None,
+            graph_payload: None,
             edge_payload: Some(edge_payload_to_event(
                 *from,
                 *to,
@@ -865,19 +944,20 @@ fn phase_to_envelope(
             stage_kind: None,
             stage_outcome: None,
             stage_payload: None,
-            agent_id: write.agent_id,
+            space_id: write.space_id,
+            vector: None,
         }),
 
         Phase::Unlink { from, to, kind, .. } => Some(EventEnvelope {
             lsn: 0,
             event_type: EventType::EdgeRemoved,
             memory_id: memory_id_from_node_ref(*from),
-            context_id: ContextId::default(),
+            session_id: SessionId::default(),
             kind: MemoryKind::Episodic,
             salience: 0.0,
             timestamp_unix_nanos: committed_at_unix_nanos,
             text: None,
-            knowledge_payload: None,
+            graph_payload: None,
             edge_payload: Some(edge_payload_to_event(
                 *from,
                 *to,
@@ -890,11 +970,12 @@ fn phase_to_envelope(
             stage_kind: None,
             stage_outcome: None,
             stage_payload: None,
-            agent_id: write.agent_id,
+            space_id: write.space_id,
+            vector: None,
         }),
 
-        // Knowledge phases publish through the knowledge-event channel
-        // (emit_knowledge_event), not the memory subscribe bus — they
+        // typed-graph phases publish through the typed-graph-event channel
+        // (emit_graph_event), not the memory subscribe bus — they
         // surface to subscribers via that path, not this envelope.
         Phase::UpsertEntity { .. }
         | Phase::UpsertStatement { .. }
@@ -906,19 +987,27 @@ fn phase_to_envelope(
         | Phase::UnmergeEntities { .. }
         | Phase::MergeEntities { .. }
         | Phase::ApproveMerge { .. }
-        | Phase::RejectMerge { .. }
-        | Phase::SetExtractorEnabled { .. } => None,
+        | Phase::RejectMerge { .. } => None,
 
         // Substrate phases without a subscribe-feed surface — their
         // observability is metrics-only. SalienceUpdated / KindUpdated /
         // ContextUpdated / EmbeddingUpdated don't trigger a wire event
         // because subscribers don't filter on them; ReclaimSlots is an
         // internal-ish maintenance op.
-        Phase::UpdateSalience { .. }
+        // RestoreMemory publishes no memory-subscribe event — it is an
+        // admin-plane lifecycle op, not a client write with a wire surface.
+        Phase::RestoreMemory { .. }
+        | Phase::UpdateSalience { .. }
         | Phase::UpdateKind { .. }
-        | Phase::UpdateContext { .. }
+        | Phase::UpdateSession { .. }
         | Phase::UpdateEmbedding { .. }
-        | Phase::ReclaimSlots { .. } => None,
+        | Phase::ReclaimSlots { .. }
+        // Registry phases publish no memory-subscribe event; their wire
+        // response comes straight from the handler's WriteAck.
+        | Phase::SpaceCreate { .. }
+        | Phase::SpaceDelete { .. }
+        | Phase::SessionCreate { .. }
+        | Phase::SessionDelete { .. } => None,
     }
 }
 
@@ -937,8 +1026,8 @@ fn memory_id_from_node_ref(n: NodeRef) -> MemoryId {
 ///
 /// Storage / metadata / phase mis-shape all surface as `Internal` — the
 /// writer is the boundary at which apply errors become wire errors. The
-/// schema-admission and not-found variants get richer wire mappings in
-/// P4 when the handler-side projection lands.
+/// schema-admission and not-found variants get richer wire mappings
+/// once the handler-side projection lands.
 fn map_apply_err(e: ApplyError) -> WriterError {
     match e {
         ApplyError::Storage(s) => WriterError::Internal(format!("storage: {s}")),
@@ -957,13 +1046,13 @@ mod tests {
     use super::*;
     use crate::write::{Phase, Write, WriteId};
     use crate::writer::RealWriterHandle;
-    use brain_core::{AgentId, ContextId, EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NodeRef};
+    use brain_core::{EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NodeRef, SessionId, SpaceId};
     use brain_embed::VECTOR_DIM;
     use brain_index::{IndexParams, SharedHnsw};
     use brain_metadata::tables::edge::zero_disambiguator;
     use brain_metadata::MetadataDb;
     use brain_planner::SharedMetadataDb;
-    use parking_lot::Mutex;
+
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -975,12 +1064,11 @@ mod tests {
     /// Test helper that also returns the SharedHnsw reader so tests
     /// can assert on HNSW post-submit (the RealWriterHandle holds
     /// only the Writer half of the pair).
-    fn build_writer_with_shared() -> (TempDir, RealWriterHandle, SharedHnsw<VECTOR_DIM>) {
+    fn build_writer_with_shared() -> (TempDir, RealWriterHandle, SharedHnsw) {
         let dir = TempDir::new().unwrap();
         let db = MetadataDb::open(dir.path().join("meta.redb")).unwrap();
-        let metadata: SharedMetadataDb = Arc::new(Mutex::new(db));
-        let (shared, hnsw_writer) =
-            SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).unwrap();
+        let metadata: SharedMetadataDb = Arc::new(db);
+        let (shared, hnsw_writer) = SharedHnsw::new(IndexParams::default_v1()).unwrap();
         let writer = RealWriterHandle::new(metadata, hnsw_writer);
         (dir, writer, shared)
     }
@@ -998,7 +1086,7 @@ mod tests {
             disambiguator: zero_disambiguator(),
             created_at_unix_nanos: 1_700_000_000_000,
         };
-        let write = Write::single(WriteId::new(), AgentId::default(), phase);
+        let write = Write::single(WriteId::new(), SpaceId::default(), phase);
         let ack = writer.submit(write).await.expect("submit");
         assert_eq!(ack.phase_acks.len(), 1);
         assert!(matches!(ack.single_phase(), PhaseAck::Linked));
@@ -1018,7 +1106,7 @@ mod tests {
             disambiguator: zero_disambiguator(),
             created_at_unix_nanos: 1_700_000_000_000,
         };
-        let write = Write::single(id, AgentId::default(), phase);
+        let write = Write::single(id, SpaceId::default(), phase);
         let first = writer.submit(write.clone()).await.expect("first submit");
         let second = writer.submit(write).await.expect("second submit");
         assert_eq!(first.write_id, second.write_id);
@@ -1046,7 +1134,7 @@ mod tests {
             disambiguator: zero_disambiguator(),
             created_at_unix_nanos: 1_700_000_000_000,
         };
-        let write = Write::single(id, AgentId::default(), phase);
+        let write = Write::single(id, SpaceId::default(), phase);
         let _ = writer.submit(write.clone()).await.expect("first submit");
         let _ = writer.submit(write).await.expect("replay");
 
@@ -1069,7 +1157,7 @@ mod tests {
     #[tokio::test]
     async fn submit_multi_phase_applies_all_atomically() {
         let (_dir, writer) = build_writer();
-        let agent = AgentId::new();
+        let space = SpaceId::new();
 
         let upsert = Phase::UpsertMemory {
             id: MemoryId::pack(0, 1, 0),
@@ -1077,11 +1165,12 @@ mod tests {
             vector: Box::new([0.0_f32; VECTOR_DIM]),
             kind: MemoryKind::Episodic,
             salience: brain_core::Salience::default(),
-            context: ContextId(0),
+            session_id: SessionId(0),
             created_at_unix_nanos: 1_700_000_000_000,
             arena_slot: 1,
             embedding_model_fp: [0xAA; 16],
             content_hash: None,
+            occurred_at_unix_nanos: None,
             deduplicate: false,
         };
         let link = Phase::Link {
@@ -1095,7 +1184,7 @@ mod tests {
             created_at_unix_nanos: 1_700_000_000_000,
         };
 
-        let write = Write::from_phases(WriteId::new(), agent, vec![upsert, link]);
+        let write = Write::from_phases(WriteId::new(), space, vec![upsert, link]);
         let ack = writer.submit(write).await.expect("submit");
         assert_eq!(ack.phase_acks.len(), 2);
         assert!(matches!(ack.phase_acks[0], PhaseAck::UpsertedMemory(_)));
@@ -1123,7 +1212,7 @@ mod tests {
             disambiguator: zero_disambiguator(),
             created_at_unix_nanos: 1_700_000_000_000,
         };
-        let write = Write::single(WriteId::new(), AgentId::default(), phase);
+        let write = Write::single(WriteId::new(), SpaceId::default(), phase);
         writer.submit(write).await.expect("submit");
 
         // The bus minted at least one LSN — an event was published.
@@ -1148,14 +1237,15 @@ mod tests {
             vector: Box::new([0.0_f32; VECTOR_DIM]),
             kind: MemoryKind::Episodic,
             salience: brain_core::Salience::default(),
-            context: ContextId(0),
+            session_id: SessionId(0),
             created_at_unix_nanos: 1_700_000_000_000,
             arena_slot: 1,
             embedding_model_fp: [0xAA; 16],
             content_hash: None,
+            occurred_at_unix_nanos: None,
             deduplicate: false,
         };
-        let write = Write::single(WriteId::new(), AgentId::new(), phase);
+        let write = Write::single(WriteId::new(), SpaceId::new(), phase);
         writer.submit(write).await.expect("submit");
 
         let lsn_after = bus.current_lsn();
@@ -1167,7 +1257,7 @@ mod tests {
 
     #[tokio::test]
     async fn submit_upsert_memory_inserts_into_hnsw() {
-        // P3d: UpsertMemory's HNSW side-effect lands the vector in
+        // UpsertMemory's HNSW side-effect lands the vector in
         // the search index. We query via the SharedHnsw reader half
         // — the writer holds only the Writer half.
         let (_dir, writer, shared) = build_writer_with_shared();
@@ -1178,14 +1268,15 @@ mod tests {
             vector: Box::new([0.5_f32; VECTOR_DIM]),
             kind: MemoryKind::Episodic,
             salience: brain_core::Salience::default(),
-            context: ContextId(0),
+            session_id: SessionId(0),
             created_at_unix_nanos: 1_700_000_000_000,
             arena_slot: 1,
             embedding_model_fp: [0xAA; 16],
             content_hash: None,
+            occurred_at_unix_nanos: None,
             deduplicate: false,
         };
-        let write = Write::single(WriteId::new(), AgentId::new(), phase);
+        let write = Write::single(WriteId::new(), SpaceId::new(), phase);
         writer.submit(write).await.expect("submit");
         assert!(
             shared.contains(id),
@@ -1197,6 +1288,9 @@ mod tests {
     async fn submit_tombstone_memory_marks_hnsw() {
         let (_dir, writer, shared) = build_writer_with_shared();
         let id = MemoryId::pack(0, 1, 0);
+        // The upsert and the tombstone must run in the same space — the
+        // tombstone apply guard treats a foreign space as NotFound.
+        let space = SpaceId::new();
         // Set up: insert.
         let upsert = Phase::UpsertMemory {
             id,
@@ -1204,15 +1298,16 @@ mod tests {
             vector: Box::new([0.5_f32; VECTOR_DIM]),
             kind: MemoryKind::Episodic,
             salience: brain_core::Salience::default(),
-            context: ContextId(0),
+            session_id: SessionId(0),
             created_at_unix_nanos: 0,
             arena_slot: 1,
             embedding_model_fp: [0; 16],
             content_hash: None,
+            occurred_at_unix_nanos: None,
             deduplicate: false,
         };
         writer
-            .submit(Write::single(WriteId::new(), AgentId::new(), upsert))
+            .submit(Write::single(WriteId::new(), space, upsert))
             .await
             .unwrap();
         assert!(!shared.is_tombstoned(id));
@@ -1227,13 +1322,83 @@ mod tests {
             at_unix_nanos: 1_700_000_001_000,
         };
         writer
-            .submit(Write::single(WriteId::new(), AgentId::new(), tomb))
+            .submit(Write::single(WriteId::new(), space, tomb))
             .await
             .expect("tombstone submit");
         assert!(
             shared.is_tombstoned(id),
             "HNSW must mark the memory_id tombstoned after Phase::Tombstone(Memory)"
         );
+    }
+
+    #[tokio::test]
+    async fn submit_restore_reactivates_and_enqueues_revert_cascade() {
+        // The acked trigger: a RestoreMemory write un-tombstones the memory
+        // (WAL-durable) AND enqueues a ForgetCascadeJob{kind: Revert} so the
+        // dependent graph is re-attached. This asserts both halves.
+        let (_dir, mut writer, shared) = build_writer_with_shared();
+        let (tx, rx) = flume::unbounded::<crate::writer::ForgetCascadeJob>();
+        writer.set_forget_cascade_sender(tx);
+
+        let id = MemoryId::pack(0, 1, 0);
+        let space = SpaceId::new();
+        let upsert = Phase::UpsertMemory {
+            id,
+            text: "hi".into(),
+            vector: Box::new([0.5_f32; VECTOR_DIM]),
+            kind: MemoryKind::Episodic,
+            salience: brain_core::Salience::default(),
+            session_id: SessionId(0),
+            created_at_unix_nanos: 0,
+            arena_slot: 1,
+            embedding_model_fp: [0; 16],
+            content_hash: None,
+            occurred_at_unix_nanos: None,
+            deduplicate: false,
+        };
+        writer
+            .submit(Write::single(WriteId::new(), space, upsert))
+            .await
+            .unwrap();
+
+        // Soft forget → Apply cascade job.
+        let tomb = Phase::Tombstone {
+            target: TombstoneTarget::Memory {
+                id,
+                mode: crate::write::phase::TombstoneMode::Soft,
+            },
+            reason: 0,
+            at_unix_nanos: 1_700_000_001_000,
+        };
+        writer
+            .submit(Write::single(WriteId::new(), space, tomb))
+            .await
+            .unwrap();
+        assert!(shared.is_tombstoned(id));
+        let apply_job = rx.try_recv().expect("forget cascade apply job");
+        assert_eq!(apply_job.kind, crate::writer::ForgetCascadeKind::Apply);
+
+        // Restore → the memory is active again AND a Revert job is enqueued.
+        let restore = Phase::RestoreMemory {
+            id,
+            at_unix_nanos: 1_700_000_002_000,
+        };
+        let ack = writer
+            .submit(Write::single(WriteId::new(), space, restore))
+            .await
+            .expect("restore submit");
+        assert!(matches!(
+            ack.single_phase(),
+            PhaseAck::MemoryRestored {
+                already_active: false,
+                ..
+            }
+        ));
+        let revert_job = rx.try_recv().expect("forget cascade revert job");
+        assert_eq!(revert_job.kind, crate::writer::ForgetCascadeKind::Revert);
+        assert_eq!(revert_job.memory_id, id);
+        assert_eq!(revert_job.mode, crate::writer::ForgetCascadeMode::Soft);
+        assert_eq!(revert_job.forgot_at_unix_nanos, 1_700_000_002_000);
     }
 
     /// Regression: fresh-DB encode with `deduplicate=true` used to
@@ -1247,19 +1412,17 @@ mod tests {
     fn writer_construction_bootstraps_fingerprint_table_for_reads() {
         let dir = TempDir::new().unwrap();
         let db = MetadataDb::open(dir.path().join("meta.redb")).unwrap();
-        let metadata: SharedMetadataDb = Arc::new(Mutex::new(db));
-        let (_shared, hnsw_writer) =
-            SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).unwrap();
+        let metadata: SharedMetadataDb = Arc::new(db);
+        let (_shared, hnsw_writer) = SharedHnsw::new(IndexParams::default_v1()).unwrap();
         let _writer = RealWriterHandle::new(metadata.clone(), hnsw_writer);
 
         // After construction, every table that op handlers read from
         // pre-submit must be openable in a fresh read txn — proving
         // the bootstrap covers them.
-        let db_guard = metadata.lock();
-        let rtxn = db_guard.read_txn().expect("read_txn");
+        let rtxn = metadata.read_txn().expect("read_txn");
         for table_label in [
             "MEMORIES",
-            "MEMORIES_BY_AGENT_TIMELINE",
+            "MEMORIES_BY_SPACE_TIMELINE",
             "IDEMPOTENCY",
             "EDGES",
             "EDGES_REVERSE",
@@ -1270,8 +1433,8 @@ mod tests {
                 "MEMORIES" => rtxn
                     .open_table(brain_metadata::tables::memory::MEMORIES_TABLE)
                     .map(|_| ()),
-                "MEMORIES_BY_AGENT_TIMELINE" => rtxn
-                    .open_table(brain_metadata::tables::memory::MEMORIES_BY_AGENT_TIMELINE_TABLE)
+                "MEMORIES_BY_SPACE_TIMELINE" => rtxn
+                    .open_table(brain_metadata::tables::memory::MEMORIES_BY_SPACE_TIMELINE_TABLE)
                     .map(|_| ()),
                 "IDEMPOTENCY" => rtxn
                     .open_table(brain_metadata::tables::idempotency::IDEMPOTENCY_TABLE)
@@ -1311,7 +1474,7 @@ mod tests {
             disambiguator: zero_disambiguator(),
             created_at_unix_nanos: 1_700_000_000_000,
         };
-        let write = Write::single(WriteId::new(), AgentId::default(), phase);
+        let write = Write::single(WriteId::new(), SpaceId::default(), phase);
         writer.submit(write).await.expect("submit");
         // No bus → no observable side-effect besides the redb row.
     }
@@ -1352,6 +1515,35 @@ mod tests {
                     Ok(lsn)
                 })
             }
+
+            fn append_many<'a>(
+                &'a self,
+                records: Vec<WalRecord>,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                Vec<brain_storage::wal::record::Lsn>,
+                                crate::writer::wal_sink::WalSinkError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async move {
+                    let mut out = Vec::with_capacity(records.len());
+                    let mut lsn_guard = self.next_lsn.lock().unwrap();
+                    let mut sink = self.records.lock().unwrap();
+                    for mut record in records {
+                        let lsn = brain_storage::wal::record::Lsn(*lsn_guard);
+                        *lsn_guard += 1;
+                        record.lsn = lsn;
+                        sink.push(record);
+                        out.push(lsn);
+                    }
+                    Ok(out)
+                })
+            }
         }
 
         // The WAL sink type is referenced through brain_ops to keep
@@ -1376,7 +1568,7 @@ mod tests {
             created_at_unix_nanos: 0,
         };
         let phases = vec![mk_link(1, 2), mk_link(2, 3), mk_link(3, 4)];
-        let write = Write::from_phases(WriteId::new(), AgentId::default(), phases);
+        let write = Write::from_phases(WriteId::new(), SpaceId::default(), phases);
         let ack = writer.submit(write).await.expect("submit");
         assert!(ack.lsn_first.raw() >= 1, "ack should carry a real LSN");
 
@@ -1390,13 +1582,12 @@ mod tests {
     }
 
     /// A Write that mixes mapped substrate phases with an unmapped
-    /// knowledge phase must produce a WAL record for every mapped
+    /// typed-graph phase must produce a WAL record for every mapped
     /// phase. The earlier "all-or-nothing" gate dropped the entire
     /// append, silently demoting WAL-durable writes to redb-only.
     #[tokio::test]
     async fn mixed_mapped_and_unmapped_phases_wal_only_the_mapped() {
         use crate::writer::wal_sink::RecordingWalSink;
-        use brain_core::EntityId;
         use brain_storage::wal::kinds::WalRecordKind;
 
         let (_dir, mut writer) = build_writer();
@@ -1409,22 +1600,18 @@ mod tests {
             vector: Box::new([0.0_f32; VECTOR_DIM]),
             kind: MemoryKind::Episodic,
             salience: brain_core::Salience::default(),
-            context: ContextId(0),
+            session_id: SessionId(0),
             created_at_unix_nanos: 1_700_000_000_000,
             arena_slot: 1,
             embedding_model_fp: [0xAA; 16],
             content_hash: None,
+            occurred_at_unix_nanos: None,
             deduplicate: false,
         };
-        // UpdateEntity has no WAL mapping today — must be skipped, not
+        // ReclaimSlots has no WAL mapping (it's derivable from
+        // MEMORIES_TABLE state on recovery) — it must be skipped, not
         // poison the whole append.
-        let update_entity = Phase::UpdateEntity {
-            id: EntityId::new(),
-            canonical_name: "Alice".into(),
-            aliases: Vec::new(),
-            attributes_blob: Vec::new(),
-            at_unix_nanos: 1_700_000_000_000,
-        };
+        let reclaim = Phase::ReclaimSlots { slots: vec![1, 2] };
         let link = Phase::Link {
             from: NodeRef::Memory(MemoryId::pack(0, 1, 0)),
             to: NodeRef::Memory(MemoryId::pack(0, 1, 0)),
@@ -1438,13 +1625,13 @@ mod tests {
 
         let write = Write::from_phases(
             WriteId::new(),
-            AgentId::default(),
-            vec![upsert, update_entity, link],
+            SpaceId::default(),
+            vec![upsert, reclaim, link],
         );
-        // Apply may reject UpdateEntity (the entity row doesn't exist
-        // in metadata yet), but WAL append runs before apply opens its
-        // wtxn, so the recording sink sees the durable framing we're
-        // asserting on regardless of apply's outcome.
+        // The unmapped ReclaimSlots phase is skipped at the WAL layer;
+        // WAL append runs before apply opens its wtxn, so the recording
+        // sink sees the durable framing we're asserting on regardless of
+        // apply's outcome.
         let _ = writer.submit(write).await;
 
         let kinds: Vec<WalRecordKind> = sink.appended().iter().map(|r| r.kind).collect();
@@ -1457,7 +1644,7 @@ mod tests {
                 WalRecordKind::TxnCommit,
             ],
             "mapped substrate phases must reach WAL even when an unmapped \
-             knowledge phase is interleaved",
+             phase is interleaved",
         );
     }
 
@@ -1467,29 +1654,24 @@ mod tests {
     #[tokio::test]
     async fn all_unmapped_phases_no_wal_records() {
         use crate::writer::wal_sink::RecordingWalSink;
-        use brain_core::EntityId;
 
         let (_dir, mut writer) = build_writer();
         let sink = Arc::new(RecordingWalSink::new());
         writer = writer.with_wal_sink(sink.clone());
 
-        let update_entity = Phase::UpdateEntity {
-            id: EntityId::new(),
-            canonical_name: "Alice".into(),
-            aliases: Vec::new(),
-            attributes_blob: Vec::new(),
-            at_unix_nanos: 1_700_000_000_000,
-        };
-        let rename_entity = Phase::RenameEntity {
-            id: EntityId::new(),
-            new_canonical_name: "Bob".into(),
-            at_unix_nanos: 1_700_000_000_000,
+        // Two phases with no WAL mapping: ReclaimSlots is derivable from
+        // MEMORIES_TABLE on recovery, and UpdateEmbedding rewrites a
+        // vector the HNSW already absorbed pre-commit.
+        let reclaim = Phase::ReclaimSlots { slots: vec![3, 4] };
+        let update_embedding = Phase::UpdateEmbedding {
+            id: MemoryId::pack(0, 1, 0),
+            new_vector: Box::new([0.0_f32; VECTOR_DIM]),
         };
 
         let write = Write::from_phases(
             WriteId::new(),
-            AgentId::default(),
-            vec![update_entity, rename_entity],
+            SpaceId::default(),
+            vec![reclaim, update_embedding],
         );
         // The phases will fail in apply (no rows to update), but the WAL
         // append happens before apply — we only care that nothing reached
@@ -1502,6 +1684,107 @@ mod tests {
              got {} record(s)",
             sink.len(),
         );
+    }
+
+    /// An N-phase Write must cross the writer→WAL boundary in exactly
+    /// one `append_many` invocation. The pre-batched code path issued
+    /// `2 + N` separate `append` calls (TxnBegin, N records, TxnCommit)
+    /// — each one a channel hop, a oneshot allocation, and a wakeup. The
+    /// batched path collapses that to a single hop while still emitting
+    /// the same on-WAL framing.
+    #[tokio::test]
+    async fn multi_phase_write_issues_one_append_many_call() {
+        use crate::writer::wal_sink::RecordingWalSink;
+        use brain_storage::wal::kinds::WalRecordKind;
+
+        let (_dir, mut writer) = build_writer();
+        let sink = Arc::new(RecordingWalSink::new());
+        writer = writer.with_wal_sink(sink.clone());
+
+        let upsert = Phase::UpsertMemory {
+            id: MemoryId::pack(0, 1, 0),
+            text: "hello".into(),
+            vector: Box::new([0.0_f32; VECTOR_DIM]),
+            kind: MemoryKind::Episodic,
+            salience: brain_core::Salience::default(),
+            session_id: SessionId(0),
+            created_at_unix_nanos: 1_700_000_000_000,
+            arena_slot: 1,
+            embedding_model_fp: [0xAA; 16],
+            content_hash: None,
+            occurred_at_unix_nanos: None,
+            deduplicate: false,
+        };
+        let mk_link = |from_slot: u64, to_slot: u64| Phase::Link {
+            from: NodeRef::Memory(MemoryId::pack(0, from_slot, 0)),
+            to: NodeRef::Memory(MemoryId::pack(0, to_slot, 0)),
+            kind: EdgeKindRef::Builtin(EdgeKind::SimilarTo),
+            weight: 0.5,
+            origin: 0,
+            derived_by: 0,
+            disambiguator: zero_disambiguator(),
+            created_at_unix_nanos: 1_700_000_000_000,
+        };
+        let phases = vec![upsert, mk_link(1, 1), mk_link(1, 1), mk_link(1, 1)];
+        let write = Write::from_phases(WriteId::new(), SpaceId::default(), phases);
+        let _ = writer.submit(write).await;
+
+        // One batched submission, zero single-record submissions.
+        assert_eq!(
+            sink.append_many_calls(),
+            1,
+            "expected one batched append_many call",
+        );
+        assert_eq!(
+            sink.append_calls(),
+            0,
+            "writer must not issue per-phase append calls",
+        );
+
+        // The on-WAL framing still matches what recovery expects:
+        // TxnBegin + 4 typed payloads + TxnCommit.
+        let kinds: Vec<WalRecordKind> = sink.appended().iter().map(|r| r.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                WalRecordKind::TxnBegin,
+                WalRecordKind::Encode,
+                WalRecordKind::Link,
+                WalRecordKind::Link,
+                WalRecordKind::Link,
+                WalRecordKind::TxnCommit,
+            ],
+        );
+    }
+
+    /// A single-phase Write also takes the batched path (records.len()==1)
+    /// — verified by call counts.
+    #[tokio::test]
+    async fn single_phase_write_also_takes_append_many_path() {
+        use crate::writer::wal_sink::RecordingWalSink;
+
+        let (_dir, mut writer) = build_writer();
+        let sink = Arc::new(RecordingWalSink::new());
+        writer = writer.with_wal_sink(sink.clone());
+
+        let phase = Phase::Link {
+            from: NodeRef::Memory(MemoryId::pack(0, 1, 0)),
+            to: NodeRef::Memory(MemoryId::pack(0, 2, 0)),
+            kind: EdgeKindRef::Builtin(EdgeKind::SimilarTo),
+            weight: 0.5,
+            origin: 0,
+            derived_by: 0,
+            disambiguator: zero_disambiguator(),
+            created_at_unix_nanos: 0,
+        };
+        let write = Write::single(WriteId::new(), SpaceId::default(), phase);
+        let _ = writer.submit(write).await;
+
+        assert_eq!(sink.append_many_calls(), 1);
+        assert_eq!(sink.append_calls(), 0);
+        // Single-phase: no TxnBegin/TxnCommit envelope, just the
+        // typed payload itself.
+        assert_eq!(sink.len(), 1);
     }
 
     // ---------------------------------------------------------------
@@ -1524,9 +1807,8 @@ mod tests {
 
     fn build_writer_for_path(path: std::path::PathBuf) -> RealWriterHandle {
         let db = MetadataDb::open(path).unwrap();
-        let metadata: SharedMetadataDb = Arc::new(Mutex::new(db));
-        let (_shared, hnsw_writer) =
-            SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).unwrap();
+        let metadata: SharedMetadataDb = Arc::new(db);
+        let (_shared, hnsw_writer) = SharedHnsw::new(IndexParams::default_v1()).unwrap();
         RealWriterHandle::new(metadata, hnsw_writer)
     }
 
@@ -1535,9 +1817,8 @@ mod tests {
         clock: std::sync::Arc<std::sync::atomic::AtomicU64>,
     ) -> RealWriterHandle {
         let db = MetadataDb::open(path).unwrap();
-        let metadata: SharedMetadataDb = Arc::new(Mutex::new(db));
-        let (_shared, hnsw_writer) =
-            SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).unwrap();
+        let metadata: SharedMetadataDb = Arc::new(db);
+        let (_shared, hnsw_writer) = SharedHnsw::new(IndexParams::default_v1()).unwrap();
         let writer = RealWriterHandle::new(metadata, hnsw_writer);
         // Swap the default clock for the test-driven one.
         let c = clock.clone();
@@ -1572,7 +1853,7 @@ mod tests {
                 created_at_unix_nanos: 1_700_000_000_000,
             };
             let write =
-                Write::single(write_id, AgentId::default(), phase).with_request_hash(request_hash);
+                Write::single(write_id, SpaceId::default(), phase).with_request_hash(request_hash);
             writer.submit(write).await.expect("first submit")
             // writer drops here; redb file closes.
         };
@@ -1598,7 +1879,7 @@ mod tests {
             created_at_unix_nanos: 1_700_000_000_000,
         };
         let write =
-            Write::single(write_id, AgentId::default(), phase).with_request_hash(request_hash);
+            Write::single(write_id, SpaceId::default(), phase).with_request_hash(request_hash);
         let second_ack = writer2.submit(write).await.expect("replay submit");
 
         assert_eq!(first_ack.write_id, second_ack.write_id);
@@ -1641,7 +1922,7 @@ mod tests {
                 created_at_unix_nanos: 1_700_000_000_000,
             };
             let write =
-                Write::single(write_id, AgentId::default(), phase).with_request_hash(hash_a);
+                Write::single(write_id, SpaceId::default(), phase).with_request_hash(hash_a);
             writer.submit(write).await.expect("first submit");
         }
 
@@ -1656,7 +1937,7 @@ mod tests {
             disambiguator: zero_disambiguator(),
             created_at_unix_nanos: 1_700_000_000_000,
         };
-        let write = Write::single(write_id, AgentId::default(), phase).with_request_hash(hash_b);
+        let write = Write::single(write_id, SpaceId::default(), phase).with_request_hash(hash_b);
         let err = writer2.submit(write).await.expect_err("must conflict");
         assert!(
             matches!(err, WriterError::Conflict(_)),
@@ -1693,7 +1974,7 @@ mod tests {
                 created_at_unix_nanos: 1_700_000_000_000,
             };
             let write =
-                Write::single(write_id, AgentId::default(), phase).with_request_hash(request_hash);
+                Write::single(write_id, SpaceId::default(), phase).with_request_hash(request_hash);
             let ack = writer.submit(write).await.expect("first submit");
             assert_eq!(
                 ack.committed_at_unix_nanos, t0,
@@ -1719,7 +2000,7 @@ mod tests {
             created_at_unix_nanos: 1_700_000_000_000,
         };
         let write =
-            Write::single(write_id, AgentId::default(), phase).with_request_hash(request_hash);
+            Write::single(write_id, SpaceId::default(), phase).with_request_hash(request_hash);
         let second_ack = writer2.submit(write).await.expect("re-executed submit");
         assert_ne!(
             second_ack.committed_at_unix_nanos, first_committed_at,

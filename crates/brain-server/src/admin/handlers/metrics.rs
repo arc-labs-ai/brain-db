@@ -1,9 +1,9 @@
 //! `GET /metrics` — Prometheus text-format exposition.
 //!
-//! As of Phase 12 sub-task 12.1a the writeln-chain that lived here is
-//! moved into [`crate::metrics::format`] and the typed primitives in
-//! `crate::metrics::{counter,gauge,histogram}`. This handler is now a
-//! thin shim: build the body, set the content-type, return.
+//! The exposition body is built by [`crate::metrics::format`] and the
+//! typed primitives in `crate::metrics::{counter,gauge,histogram}`.
+//! This handler is a thin shim: build the body, set the content-type,
+//! return.
 
 use std::sync::Arc;
 

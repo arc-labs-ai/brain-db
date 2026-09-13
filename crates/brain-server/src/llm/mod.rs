@@ -1,4 +1,4 @@
-//! LLM-backed Summarizer adapters (sub-task 9.15).
+//! LLM-backed Summarizer adapters.
 //!
 //! — the consolidation worker needs an LLM to turn
 //! a cluster of episodic memories into a single consolidated summary.

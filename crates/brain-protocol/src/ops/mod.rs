@@ -6,12 +6,16 @@
 //! connection-lifecycle ops live under `crate::connection`.
 
 pub mod admin;
+pub mod capabilities;
 pub mod entity;
 pub mod extractor;
+pub mod graph;
 pub mod memory;
 pub mod procedural;
 pub mod query;
 pub mod relation;
+pub mod session;
+pub mod space;
 pub mod statement;
 pub mod subscribe;
 pub mod txn;

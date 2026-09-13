@@ -1,8 +1,6 @@
-//! Entity-resolver perf bench (sub-task 16.9.4).
+//! Entity-resolver perf bench.
 //!
-//! Spec targets per [`spec/20_benchmarks/02_latency_targets.md`](
-//! ../../spec/20_benchmarks/02_latency_targets.md) §2.2 at
-//! 100K entities:
+//! Latency targets at 100K entities:
 //!
 //! - tier-1 exact lookup: p50 ≤ 1 ms, p99 ≤ 2 ms.
 //! - tier-1 alias lookup: p50 ≤ 1 ms, p99 ≤ 2 ms.
@@ -12,9 +10,8 @@
 //!
 //! Run with: `cargo bench -p brain-metadata --bench entity_resolve`.
 //!
-//! Phase scope (16.9): benches are operator-run; CI regression
-//! thresholds land in phase 14. Tier-3 (embedding) bench lands in
-//! phase 21 alongside the entity HNSW wiring.
+//! Benches are operator-run; the tier-3 (embedding) bench lands
+//! alongside the entity HNSW wiring.
 
 use brain_core::{Entity, EntityId, EntityType, EntityTypeId};
 use brain_metadata::entity::ops::{
@@ -24,6 +21,11 @@ use brain_metadata::entity::trigram::{
     candidates_for_query, extract_trigrams, jaccard, trigrams_of_components,
 };
 use brain_metadata::MetadataDb;
+use brain_metadata::RowScope;
+
+fn bench_scope() -> RowScope {
+    RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xAB; 16])
+}
 use criterion::{black_box, criterion_group, Criterion};
 use tempfile::TempDir;
 
@@ -51,7 +53,7 @@ struct Fixture {
 
 fn build_fixture(n: usize) -> Fixture {
     let dir = TempDir::new().expect("tempdir");
-    let mut db = MetadataDb::open(dir.path().join("metadata.redb")).expect("open db");
+    let db = MetadataDb::open(dir.path().join("metadata.redb")).expect("open db");
 
     let mut ids = Vec::with_capacity(n);
     let now = 1_700_000_000_000_000_000u64;
@@ -62,7 +64,13 @@ fn build_fixture(n: usize) -> Fixture {
         let normalized = normalize_name(&name);
         let mut entity = Entity::new_active(id, PERSON, name, normalized, now);
         entity.aliases = vec![format!("alias_{i}")];
-        entity_put(&wtxn, &entity).expect("entity_put");
+        entity_put(
+            &wtxn,
+            bench_scope(),
+            brain_core::SessionId::DEFAULT,
+            &entity,
+        )
+        .expect("entity_put");
         ids.push(id);
     }
     wtxn.commit().expect("commit");
@@ -87,7 +95,8 @@ fn bench_tier1_exact_lookup(c: &mut Criterion) {
             let q = &queries[idx % queries.len()];
             idx = idx.wrapping_add(1);
             let result =
-                entity_lookup_by_canonical_name(&rtxn, PERSON, black_box(q)).expect("lookup");
+                entity_lookup_by_canonical_name(&rtxn, bench_scope(), PERSON, black_box(q))
+                    .expect("lookup");
             black_box(result);
         });
     });
@@ -109,7 +118,8 @@ fn bench_tier1_alias_lookup(c: &mut Criterion) {
             let rtxn = fixture.db.read_txn().expect("read_txn");
             let q = &queries[idx % queries.len()];
             idx = idx.wrapping_add(1);
-            let result = entity_lookup_by_alias(&rtxn, PERSON, black_box(q)).expect("lookup");
+            let result =
+                entity_lookup_by_alias(&rtxn, bench_scope(), PERSON, black_box(q)).expect("lookup");
             black_box(result);
         });
     });
@@ -133,8 +143,9 @@ fn bench_tier2_trigram_candidates_only(c: &mut Criterion) {
             let rtxn = fixture.db.read_txn().expect("read_txn");
             let q = &queries[idx % queries.len()];
             idx = idx.wrapping_add(1);
-            let candidates = candidates_for_query(&rtxn, PERSON, &normalize_name(black_box(q)))
-                .expect("trigram");
+            let candidates =
+                candidates_for_query(&rtxn, bench_scope(), PERSON, &normalize_name(black_box(q)))
+                    .expect("trigram");
             black_box(candidates);
         });
     });
@@ -160,7 +171,8 @@ fn bench_tier2_full_resolve(c: &mut Criterion) {
             idx = idx.wrapping_add(1);
             let q_norm = normalize_name(q);
             let q_trigrams = extract_trigrams(&q_norm);
-            let candidates = candidates_for_query(&rtxn, PERSON, &q_norm).expect("trigram");
+            let candidates =
+                candidates_for_query(&rtxn, bench_scope(), PERSON, &q_norm).expect("trigram");
 
             let mut scored = Vec::with_capacity(candidates.len());
             for cand in candidates {
@@ -189,14 +201,15 @@ fn print_corpus_summary() {
     let fixture = build_fixture(1024); // tiny sample for the sanity print
     let rtxn = fixture.db.read_txn().expect("read_txn");
     let probe = "person_42";
-    let exact = entity_lookup_by_canonical_name(&rtxn, PERSON, probe)
+    let exact = entity_lookup_by_canonical_name(&rtxn, bench_scope(), PERSON, probe)
         .expect("exact")
         .is_some();
     let probe_alias = "alias_42";
-    let alias = entity_lookup_by_alias(&rtxn, PERSON, probe_alias).expect("alias");
+    let alias = entity_lookup_by_alias(&rtxn, bench_scope(), PERSON, probe_alias).expect("alias");
     let probe_fuzzy = "persoon_42";
     let candidates =
-        candidates_for_query(&rtxn, PERSON, &normalize_name(probe_fuzzy)).expect("trigram");
+        candidates_for_query(&rtxn, bench_scope(), PERSON, &normalize_name(probe_fuzzy))
+            .expect("trigram");
     eprintln!(
         "entity_resolve bench setup: 1024-entity sample probe shows exact={exact} alias_hits={} fuzzy_candidates={}",
         alias.len(),

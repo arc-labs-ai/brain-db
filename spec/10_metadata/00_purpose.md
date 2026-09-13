@@ -283,7 +283,15 @@ FORGET memory_x
 
 This cascade is performed by a worker (the FORGET cascade worker), not synchronously. The triggering FORGET returns immediately; the cascade processes in background.
 
-If the original FORGET was soft (tombstone with grace period), the cascade is also soft: derived records are marked pending-tombstone with the same grace period. If the FORGET is reverted before grace expires, the cascade is rolled back.
+### Reversibility: the additive undo log
+
+A soft FORGET (tombstone with a grace window) is reversible within grace via an **additive undo log**, not a pending-tombstone flag. The forward cascade applies its mutations immediately — it strips the forgotten memory from each dependent's evidence, drops the reverse-index row, recomputes confidence, and (when the memory was the sole evidence) tombstones the row with reason `SourceMemoryForgotten`. All of that is lossy, so before mutating each dependent the cascade writes one `ForgetUndoRecord` to the `forget_undo_log` table, capturing exactly what is needed to reverse the change: the stripped evidence entry, the row's prior confidence, its prior `is_current` / `tombstone_reason` / evidence-overflow id, and which outcome the cascade applied.
+
+The undo log is keyed `(forgotten_memory_id, dependent_record_id)`, so every dependent of one forgotten memory forms a contiguous key range that the revert executor prefix-scans cheaply. The table is additive — materialized lazily on open, adding no column to any existing row and requiring no `CURRENT_SCHEMA_VERSION` bump.
+
+An admin restore within the grace window replays these undo records: it re-attaches the evidence entry, re-adds the reverse-index row, recomputes confidence, re-keys the predicate bucket, and un-tombstones each row still carrying `SourceMemoryForgotten`. Each consumed undo row is deleted in the same write txn, so a re-run is a structural no-op (idempotent, crash-safe replay).
+
+A **hard** FORGET writes no undo records and is irreversible by design (the privacy escape hatch). Once the grace window passes and slot reclamation runs, that memory's undo rows are reaped as well — so a soft FORGET also becomes irreversible after grace, and the journal cannot leak.
 
 ## Confidence aggregation across evidence
 

@@ -3,8 +3,8 @@
 //!
 //! ## Why one table instead of two
 //!
-//! Before Phase C, substrate edges (`Memory → Memory`) and typed
-//! knowledge relations (`Entity → Entity`) lived in separate redb
+//! Previously, substrate edges (`Memory → Memory`) and typed
+//! typed-graph relations (`Entity → Entity`) lived in separate redb
 //! tables. Mention edges (`Memory → Entity`) had no home at all. The
 //! unified table keys both endpoints as [`NodeRef`] and the label as
 //! [`EdgeKindRef`], so every edge in Brain — substrate, mention, or
@@ -62,10 +62,10 @@ use redb::{ReadOnlyTable, ReadTransaction, Table, TableDefinition};
 // Tables.
 // ---------------------------------------------------------------------------
 
-pub const EDGES_TABLE: TableDefinition<'static, &[u8], EdgeData> = TableDefinition::new("edges_v2");
+pub const EDGES_TABLE: TableDefinition<'static, &[u8], EdgeData> = TableDefinition::new("edges");
 
 pub const EDGES_REVERSE_TABLE: TableDefinition<'static, &[u8], EdgeData> =
-    TableDefinition::new("edges_reverse_v2");
+    TableDefinition::new("edges_reverse");
 
 // ---------------------------------------------------------------------------
 // origin / derived_by byte mappings.
@@ -83,7 +83,7 @@ pub mod derived_by {
     pub const CONSOLIDATION_WORKER: u8 = 1;
     pub const SIMILARITY_WORKER: u8 = 2;
     /// TemporalEdgeWorker — writes `FollowedBy` edges keyed on
-    /// `(agent_id, context_id, created_at)` adjacency.
+    /// `(space_id, session_id, created_at)` adjacency.
     pub const TEMPORAL_WORKER: u8 = 3;
     /// CausalEdgeWorker — writes `Caused` edges from extractor-
     /// derived causal statements. Reserved for the v1 implementation.
@@ -148,7 +148,7 @@ impl redb::Value for EdgeData {
     }
 
     fn type_name() -> redb::TypeName {
-        redb::TypeName::new("brain_metadata::EdgeData::v2")
+        redb::TypeName::new("brain_metadata::EdgeData")
     }
 }
 
@@ -448,12 +448,18 @@ pub fn walk_incoming(
     range_scan(&t, to, kind_filter)
 }
 
-fn range_scan(
-    table: &ReadOnlyTable<&'static [u8], EdgeData>,
-    anchor: NodeRef,
-    kind_filter: Option<EdgeKindRef>,
-) -> Result<Vec<EdgeRow>, EdgeOpError> {
-    let (lo, hi) = match kind_filter {
+/// Inclusive `(lower_prefix, upper)` byte bounds for a scan of every
+/// edge anchored at `anchor`, optionally narrowed to a single `kind`.
+///
+/// The lower bound is the raw anchor (or anchor+kind) prefix; the upper
+/// bound saturates the remaining `(to, disambiguator)` suffix with
+/// `0xFF` so an inclusive range covers every row under the prefix.
+/// Exposed so a keyset-paginated walk can seek strictly past a resume
+/// key (`Bound::Excluded(after_key)`) while keeping the same upper
+/// bound — see `relation::ops::list_directional_page`.
+#[must_use]
+pub fn range_bounds(anchor: NodeRef, kind_filter: Option<EdgeKindRef>) -> (Vec<u8>, Vec<u8>) {
+    match kind_filter {
         Some(k) => {
             let prefix = EdgeKey::from_kind_prefix(anchor, k);
             let mut hi = prefix.clone();
@@ -470,7 +476,15 @@ fn range_scan(
             );
             (prefix, hi)
         }
-    };
+    }
+}
+
+fn range_scan(
+    table: &ReadOnlyTable<&'static [u8], EdgeData>,
+    anchor: NodeRef,
+    kind_filter: Option<EdgeKindRef>,
+) -> Result<Vec<EdgeRow>, EdgeOpError> {
+    let (lo, hi) = range_bounds(anchor, kind_filter);
 
     let mut out = Vec::new();
     for entry in table.range::<&[u8]>(lo.as_slice()..=hi.as_slice())? {

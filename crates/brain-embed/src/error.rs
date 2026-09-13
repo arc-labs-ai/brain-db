@@ -1,7 +1,7 @@
 //! Workspace-wide error type for `brain-embed`.
 //!
-//! Grown across sub-tasks. 5.1 adds the model-load variants; later
-//! sub-tasks (tokenisation, forward pass, cache, batcher) extend.
+//! Covers the model-load, tokenisation, forward-pass, cache, and
+//! batcher failure modes.
 
 use std::path::PathBuf;
 
@@ -32,8 +32,7 @@ pub enum EmbedError {
     #[error("tokenizer.json failed to load: {0}")]
     TokenizerParse(String),
 
-    /// Per spec `§04/03 §11` plus our SD-5.1-1: we refuse `pytorch_model.bin`
-    /// outright (spec allows warn-and-load; we don't). `model.safetensors`
+    /// We refuse `pytorch_model.bin` outright. `model.safetensors`
     /// is the only accepted weight format.
     #[error("model.safetensors missing in {0}; pickle (.bin) weights are refused")]
     WeightsMissing(PathBuf),

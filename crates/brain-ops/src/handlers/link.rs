@@ -1,8 +1,6 @@
 //! LINK / UNLINK handlers — submit Link / Unlink phases through the
 //! unified writer; in-TXN ops buffer for later commit.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use brain_core::{EdgeKind, EdgeKindRef, MemoryId, NodeRef, RequestId};
 use brain_planner::{LinkOp, UnlinkOp, WriterError};
 use brain_protocol::envelope::request::{EdgeKindWire, LinkRequest, UnlinkRequest};
@@ -27,14 +25,15 @@ pub async fn handle_link(req: LinkRequest, ctx: &OpsContext) -> Result<LinkRespo
     let kind = EdgeKind::from(req.kind);
 
     let real_writer = downcast_writer(ctx)?;
-    let write_id = WriteId::from_request(RequestId::from(req.request_id));
+    let write_id =
+        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_link_request(&LinkOp {
         request_id: RequestId::from(req.request_id),
         source,
         target,
         kind,
         weight: req.weight,
-        agent_id: ctx.executor.caller_agent,
+        space_id: ctx.executor.caller_space,
     });
 
     // Idempotency replay short-circuit + conflict detection.
@@ -91,7 +90,7 @@ pub async fn handle_link(req: LinkRequest, ctx: &OpsContext) -> Result<LinkRespo
         created_at_unix_nanos: created_at,
     };
     let write =
-        Write::single(write_id, ctx.executor.caller_agent, phase).with_request_hash(request_hash);
+        Write::single(write_id, ctx.executor.caller_space, phase).with_request_hash(request_hash);
     let ack = real_writer
         .submit(write)
         .await
@@ -119,8 +118,7 @@ fn peek_link_state(
     target: MemoryId,
     kind: EdgeKind,
 ) -> Result<(bool, bool, bool), OpError> {
-    let db_guard = ctx.executor.metadata.lock();
-    let rtxn = db_guard.read_txn().map_err(|e| {
+    let rtxn = ctx.executor.metadata.read_txn().map_err(|e| {
         OpError::ExecError(brain_planner::ExecError::MetadataReadFailed(e.to_string()))
     })?;
     let mem_t = rtxn
@@ -128,8 +126,26 @@ fn peek_link_state(
         .map_err(|e| {
             OpError::ExecError(brain_planner::ExecError::MetadataReadFailed(e.to_string()))
         })?;
-    let src_exists = mem_t.get(source.to_be_bytes()).ok().flatten().is_some();
-    let tgt_exists = mem_t.get(target.to_be_bytes()).ok().flatten().is_some();
+    // Tenant wall — an endpoint owned by another `(namespace, space)` reads
+    // as absent to this caller, so a cross-tenant LINK produces the same
+    // NotFound-shaped leniency as a genuinely missing id (no create, no
+    // existence oracle over foreign ids). Mirrors the read paths; the apply
+    // layer re-checks inside the write txn as the authoritative guard.
+    let caller_ns = ctx.executor.caller_namespace.raw();
+    let caller_space: [u8; 16] = ctx.executor.caller_space.into();
+    let owned = |id: MemoryId| -> bool {
+        mem_t
+            .get(id.to_be_bytes())
+            .ok()
+            .flatten()
+            .map(|g| {
+                let m = g.value();
+                m.namespace_id == caller_ns && m.space_id_bytes == caller_space
+            })
+            .unwrap_or(false)
+    };
+    let src_exists = owned(source);
+    let tgt_exists = owned(target);
     drop(mem_t);
 
     let edges_t = rtxn
@@ -167,10 +183,7 @@ pub(crate) fn downcast_writer_pub(ctx: &OpsContext) -> Result<&RealWriterHandle,
 }
 
 fn now_unix_nanos() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
+    crate::clock::now_unix_nanos()
 }
 
 pub async fn handle_unlink(
@@ -185,13 +198,14 @@ pub async fn handle_unlink(
     let kind = EdgeKind::from(req.kind);
 
     let real_writer = downcast_writer(ctx)?;
-    let write_id = WriteId::from_request(RequestId::from(req.request_id));
+    let write_id =
+        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_unlink_request(&UnlinkOp {
         request_id: RequestId::from(req.request_id),
         source,
         target,
         kind,
-        agent_id: ctx.executor.caller_agent,
+        space_id: ctx.executor.caller_space,
     });
 
     match real_writer.idempotency_lookup(write_id, Some(request_hash)) {
@@ -228,7 +242,7 @@ pub async fn handle_unlink(
         disambiguator: brain_metadata::tables::edge::zero_disambiguator(),
     };
     let write =
-        Write::single(write_id, ctx.executor.caller_agent, phase).with_request_hash(request_hash);
+        Write::single(write_id, ctx.executor.caller_space, phase).with_request_hash(request_hash);
     let ack = real_writer
         .submit(write)
         .await
@@ -251,8 +265,7 @@ fn peek_edge_exists(
     target: MemoryId,
     kind: EdgeKind,
 ) -> Result<bool, OpError> {
-    let db_guard = ctx.executor.metadata.lock();
-    let rtxn = db_guard.read_txn().map_err(|e| {
+    let rtxn = ctx.executor.metadata.read_txn().map_err(|e| {
         OpError::ExecError(brain_planner::ExecError::MetadataReadFailed(e.to_string()))
     })?;
     let edges_t = rtxn
@@ -275,7 +288,9 @@ async fn handle_link_in_txn(
     txn_id: [u8; 16],
     ctx: &OpsContext,
 ) -> Result<LinkResponse, OpError> {
-    let _ = ctx.txn_store.validate_active(txn_id)?;
+    let _ = ctx
+        .txn_store
+        .validate_active(txn_id, ctx.caller_connection_id)?;
 
     let source = MemoryId::from(req.source);
     let target = MemoryId::from(req.target);
@@ -286,47 +301,55 @@ async fn handle_link_in_txn(
         target,
         kind,
         weight: req.weight,
-        agent_id: ctx.executor.caller_agent,
+        space_id: ctx.executor.caller_space,
     };
     let request_hash = hash_link_request(&op);
 
     // Replay check.
-    let cached = ctx.txn_store.with_buffer(txn_id, |buf| {
-        if let Some(prior) = buf.request_hashes.get(&req.request_id) {
-            if prior != &request_hash {
-                return Err(OpError::Conflict(
-                    "link in-txn request_id replay with different params".into(),
-                ));
+    let cached = ctx
+        .txn_store
+        .with_buffer(txn_id, ctx.caller_connection_id, |buf| {
+            if let Some(prior) = buf.request_hashes.get(&req.request_id) {
+                if prior != &request_hash {
+                    return Err(OpError::Conflict(
+                        "link in-txn request_id replay with different params".into(),
+                    ));
+                }
+                if let Some(BufferedReplay::Link {
+                    source,
+                    target,
+                    kind,
+                    weight,
+                    created_at_unix_nanos,
+                    already_existed,
+                }) = buf.request_id_cache.get(&req.request_id)
+                {
+                    return Ok(Some(LinkResponse {
+                        source: (*source).into(),
+                        target: (*target).into(),
+                        kind: EdgeKindWire::from(*kind),
+                        weight: *weight,
+                        created_at_unix_nanos: *created_at_unix_nanos,
+                        already_existed: *already_existed,
+                    }));
+                }
             }
-            if let Some(BufferedReplay::Link {
-                source,
-                target,
-                kind,
-                weight,
-                created_at_unix_nanos,
-                already_existed,
-            }) = buf.request_id_cache.get(&req.request_id)
-            {
-                return Ok(Some(LinkResponse {
-                    source: (*source).into(),
-                    target: (*target).into(),
-                    kind: EdgeKindWire::from(*kind),
-                    weight: *weight,
-                    created_at_unix_nanos: *created_at_unix_nanos,
-                    already_existed: *already_existed,
-                }));
-            }
-        }
-        Ok(None)
-    })?;
+            Ok(None)
+        })?;
     if let Some(resp) = cached {
         return Ok(resp);
     }
 
+    // Reject the 1001st op now — replay-cache hits still replay, but
+    // a fresh LINK against a full buffer fails fast.
+    ctx.txn_store
+        .with_buffer(txn_id, ctx.caller_connection_id, |buf| {
+            buf.check_capacity_for_push()
+        })?;
+
     // Validate both endpoints (committed or pending in-buffer).
     let (src_committed, tgt_committed) = {
-        let db_guard = ctx.executor.metadata.lock();
-        let rtxn = db_guard.read_txn().map_err(|e| {
+        let rtxn = ctx.executor.metadata.read_txn().map_err(|e| {
             OpError::ExecError(brain_planner::ExecError::MetadataReadFailed(e.to_string()))
         })?;
         let table = rtxn
@@ -334,15 +357,30 @@ async fn handle_link_in_txn(
             .map_err(|e| {
                 OpError::ExecError(brain_planner::ExecError::MetadataReadFailed(e.to_string()))
             })?;
-        let s = table.get(source.to_be_bytes()).ok().flatten().is_some();
-        let t = table.get(target.to_be_bytes()).ok().flatten().is_some();
-        (s, t)
+        // Scope the existence probe: a foreign-tenant id must read as absent,
+        // not present, so this in-txn preview can't be used as a cross-tenant
+        // existence oracle. (The link mutation is already walled at apply time
+        // — apply/edge.rs checks both endpoints' space — this closes the probe.)
+        let in_scope = |id: MemoryId| {
+            table
+                .get(id.to_be_bytes())
+                .ok()
+                .flatten()
+                .map(|g| g.value())
+                .is_some_and(|row| {
+                    row.namespace_id == ctx.executor.caller_namespace.raw()
+                        && row.space_id_bytes == <[u8; 16]>::from(ctx.executor.caller_space)
+                })
+        };
+        (in_scope(source), in_scope(target))
     };
-    let (src_pending, tgt_pending) = ctx.txn_store.with_buffer(txn_id, |buf| {
-        let ids: std::collections::HashSet<MemoryId> =
-            buf.encodes.iter().map(|e| e.memory_id).collect();
-        Ok((ids.contains(&source), ids.contains(&target)))
-    })?;
+    let (src_pending, tgt_pending) =
+        ctx.txn_store
+            .with_buffer(txn_id, ctx.caller_connection_id, |buf| {
+                let ids: std::collections::HashSet<MemoryId> =
+                    buf.encodes.iter().map(|e| e.memory_id).collect();
+                Ok((ids.contains(&source), ids.contains(&target)))
+            })?;
     if !(src_committed || src_pending) {
         return Err(OpError::NotFound {
             what: "memory",
@@ -358,8 +396,7 @@ async fn handle_link_in_txn(
 
     // Detect already_existed against committed edges + earlier-in-txn links.
     let already_existed = {
-        let db_guard = ctx.executor.metadata.lock();
-        let rtxn = db_guard.read_txn().map_err(|e| {
+        let rtxn = ctx.executor.metadata.read_txn().map_err(|e| {
             OpError::ExecError(brain_planner::ExecError::MetadataReadFailed(e.to_string()))
         })?;
         let table = rtxn
@@ -378,7 +415,7 @@ async fn handle_link_in_txn(
         let key_triple = (source, kind, target);
         let pending_has = ctx
             .txn_store
-            .with_buffer(txn_id, |buf| {
+            .with_buffer(txn_id, ctx.caller_connection_id, |buf| {
                 Ok(buf
                     .links
                     .iter()
@@ -396,7 +433,9 @@ async fn handle_link_in_txn(
         // create (not an overwrite) unless the unlink is removed.
         let pending_unlinked = ctx
             .txn_store
-            .with_buffer(txn_id, |buf| Ok(buf.unlinked_edges.contains(&key_triple)))
+            .with_buffer(txn_id, ctx.caller_connection_id, |buf| {
+                Ok(buf.unlinked_edges.contains(&key_triple))
+            })
             .unwrap_or(false);
         (committed_has || pending_has) && !pending_unlinked
     };
@@ -410,26 +449,27 @@ async fn handle_link_in_txn(
         request_id: req.request_id,
         request_hash,
         created_at_unix_nanos: created_at,
-        agent_id: ctx.executor.caller_agent,
+        space_id: ctx.executor.caller_space,
     };
-    ctx.txn_store.with_buffer(txn_id, |buf| {
-        buf.links.push(buffered);
-        // If this LINK undoes a pending UNLINK, drop the unlink mark.
-        buf.unlinked_edges.remove(&(source, kind, target));
-        buf.request_hashes.insert(req.request_id, request_hash);
-        buf.request_id_cache.insert(
-            req.request_id,
-            BufferedReplay::Link {
-                source,
-                target,
-                kind,
-                weight: req.weight,
-                created_at_unix_nanos: created_at,
-                already_existed,
-            },
-        );
-        Ok(())
-    })?;
+    ctx.txn_store
+        .with_buffer(txn_id, ctx.caller_connection_id, |buf| {
+            buf.links.push(buffered);
+            // If this LINK undoes a pending UNLINK, drop the unlink mark.
+            buf.unlinked_edges.remove(&(source, kind, target));
+            buf.request_hashes.insert(req.request_id, request_hash);
+            buf.request_id_cache.insert(
+                req.request_id,
+                BufferedReplay::Link {
+                    source,
+                    target,
+                    kind,
+                    weight: req.weight,
+                    created_at_unix_nanos: created_at,
+                    already_existed,
+                },
+            );
+            Ok(())
+        })?;
 
     Ok(LinkResponse {
         source: source.into(),
@@ -446,7 +486,9 @@ async fn handle_unlink_in_txn(
     txn_id: [u8; 16],
     ctx: &OpsContext,
 ) -> Result<UnlinkResponse, OpError> {
-    let _ = ctx.txn_store.validate_active(txn_id)?;
+    let _ = ctx
+        .txn_store
+        .validate_active(txn_id, ctx.caller_connection_id)?;
 
     let source = MemoryId::from(req.source);
     let target = MemoryId::from(req.target);
@@ -456,37 +498,46 @@ async fn handle_unlink_in_txn(
         source,
         target,
         kind,
-        agent_id: ctx.executor.caller_agent,
+        space_id: ctx.executor.caller_space,
     };
     let request_hash = hash_unlink_request(&op);
 
-    let cached = ctx.txn_store.with_buffer(txn_id, |buf| {
-        if let Some(prior) = buf.request_hashes.get(&req.request_id) {
-            if prior != &request_hash {
-                return Err(OpError::Conflict(
-                    "unlink in-txn request_id replay with different params".into(),
-                ));
+    let cached = ctx
+        .txn_store
+        .with_buffer(txn_id, ctx.caller_connection_id, |buf| {
+            if let Some(prior) = buf.request_hashes.get(&req.request_id) {
+                if prior != &request_hash {
+                    return Err(OpError::Conflict(
+                        "unlink in-txn request_id replay with different params".into(),
+                    ));
+                }
+                if let Some(BufferedReplay::Unlink {
+                    source,
+                    target,
+                    kind,
+                    removed,
+                }) = buf.request_id_cache.get(&req.request_id)
+                {
+                    return Ok(Some(UnlinkResponse {
+                        source: (*source).into(),
+                        target: (*target).into(),
+                        kind: EdgeKindWire::from(*kind),
+                        removed: *removed,
+                    }));
+                }
             }
-            if let Some(BufferedReplay::Unlink {
-                source,
-                target,
-                kind,
-                removed,
-            }) = buf.request_id_cache.get(&req.request_id)
-            {
-                return Ok(Some(UnlinkResponse {
-                    source: (*source).into(),
-                    target: (*target).into(),
-                    kind: EdgeKindWire::from(*kind),
-                    removed: *removed,
-                }));
-            }
-        }
-        Ok(None)
-    })?;
+            Ok(None)
+        })?;
     if let Some(resp) = cached {
         return Ok(resp);
     }
+
+    // Reject the 1001st op now — replay-cache hits still replay, but
+    // a fresh UNLINK against a full buffer fails fast.
+    ctx.txn_store
+        .with_buffer(txn_id, ctx.caller_connection_id, |buf| {
+            buf.check_capacity_for_push()
+        })?;
 
     // Decide `removed` at preview time. An edge "exists" if it's in
     // the committed `edges_out` table OR appears in any pending
@@ -494,8 +545,7 @@ async fn handle_unlink_in_txn(
     // already queued for unlink.
     let key_triple = (source, kind, target);
     let committed_has = {
-        let db_guard = ctx.executor.metadata.lock();
-        let rtxn = db_guard.read_txn().map_err(|e| {
+        let rtxn = ctx.executor.metadata.read_txn().map_err(|e| {
             OpError::ExecError(brain_planner::ExecError::MetadataReadFailed(e.to_string()))
         })?;
         let table = rtxn
@@ -512,21 +562,25 @@ async fn handle_unlink_in_txn(
         .encode();
         table.get(key.as_slice()).ok().flatten().is_some()
     };
-    let pending_has = ctx.txn_store.with_buffer(txn_id, |buf| {
-        Ok(buf
-            .links
-            .iter()
-            .any(|l| (l.source, l.kind, l.target) == key_triple)
-            || buf.encodes.iter().any(|e| {
-                e.memory_id == source
-                    && e.edges
-                        .iter()
-                        .any(|edge| edge.target == target && edge.kind == kind)
-            }))
-    })?;
+    let pending_has = ctx
+        .txn_store
+        .with_buffer(txn_id, ctx.caller_connection_id, |buf| {
+            Ok(buf
+                .links
+                .iter()
+                .any(|l| (l.source, l.kind, l.target) == key_triple)
+                || buf.encodes.iter().any(|e| {
+                    e.memory_id == source
+                        && e.edges
+                            .iter()
+                            .any(|edge| edge.target == target && edge.kind == kind)
+                }))
+        })?;
     let already_unlinked = ctx
         .txn_store
-        .with_buffer(txn_id, |buf| Ok(buf.unlinked_edges.contains(&key_triple)))?;
+        .with_buffer(txn_id, ctx.caller_connection_id, |buf| {
+            Ok(buf.unlinked_edges.contains(&key_triple))
+        })?;
 
     let removed = (committed_has || pending_has) && !already_unlinked;
 
@@ -538,25 +592,26 @@ async fn handle_unlink_in_txn(
         request_id: req.request_id,
         request_hash,
         created_at_unix_nanos: created_at,
-        agent_id: ctx.executor.caller_agent,
+        space_id: ctx.executor.caller_space,
     };
-    ctx.txn_store.with_buffer(txn_id, |buf| {
-        buf.unlinks.push(buffered);
-        if removed {
-            buf.unlinked_edges.insert(key_triple);
-        }
-        buf.request_hashes.insert(req.request_id, request_hash);
-        buf.request_id_cache.insert(
-            req.request_id,
-            BufferedReplay::Unlink {
-                source,
-                target,
-                kind,
-                removed,
-            },
-        );
-        Ok(())
-    })?;
+    ctx.txn_store
+        .with_buffer(txn_id, ctx.caller_connection_id, |buf| {
+            buf.unlinks.push(buffered);
+            if removed {
+                buf.unlinked_edges.insert(key_triple);
+            }
+            buf.request_hashes.insert(req.request_id, request_hash);
+            buf.request_id_cache.insert(
+                req.request_id,
+                BufferedReplay::Unlink {
+                    source,
+                    target,
+                    kind,
+                    removed,
+                },
+            );
+            Ok(())
+        })?;
 
     Ok(UnlinkResponse {
         source: source.into(),

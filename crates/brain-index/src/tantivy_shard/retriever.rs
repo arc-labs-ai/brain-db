@@ -1,17 +1,16 @@
-//! LexicalRetriever — phase 22.5 (read side of the tantivy
-//! pipeline). Implements the surface defined in
-//! `spec/13_retrievers/02_lexical_retriever.md`.
+//! LexicalRetriever — the read side of the tantivy pipeline.
 //!
-//! Consumers (phase 23 hybrid query, future RECALL paths) hold an
+//! Consumers (retrieval query, RECALL paths) hold an
 //! `Arc<dyn LexicalRetriever>` and call [`LexicalRetriever::retrieve`].
 //! Per-shard wiring is the server's responsibility (see
 //! `brain-server::shard::spawn`).
 
 use std::ops::{Bound, RangeInclusive};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use brain_core::StatementKind;
-use brain_core::{AgentId, EntityId, MemoryId, MemoryKind, RelationId, StatementId};
+use brain_core::{EntityId, MemoryId, MemoryKind, RelationId, SpaceId, StatementId};
 use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, RangeQuery, TermQuery};
 use tantivy::schema::{IndexRecordOption, Value};
@@ -48,13 +47,17 @@ pub struct LexicalQuery {
 
 #[derive(Debug, Clone, Default)]
 pub struct LexicalFilters {
-    pub agent_id: Option<AgentId>,
+    pub space_ids: Vec<SpaceId>,
     pub memory_kind: Option<MemoryKind>,
     pub statement_kind: Option<StatementKind>,
     pub predicate_id: Option<u32>,
     pub confidence_bucket: Option<RangeInclusive<u8>>,
     pub created_at_ms: Option<RangeInclusive<u64>>,
     pub extracted_at_ms: Option<RangeInclusive<u64>>,
+    /// Front-gate scope tag for memory text. When non-empty, the
+    /// boolean query adds a MUST clause matching any `context` in the
+    /// list — BM25 ranks within that universe only.
+    pub session_ids: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -90,9 +93,9 @@ pub struct RankedItem {
 pub enum RankedItemId {
     Memory(MemoryId),
     Statement(StatementId),
-    /// Graph retrieval emits entities (§23/04 §1).
+    /// Graph retrieval emits entities.
     Entity(EntityId),
-    /// Graph retrieval emits relations (§23/04 §1).
+    /// Graph retrieval emits relations.
     Relation(RelationId),
 }
 
@@ -112,17 +115,26 @@ pub enum LexicalError {
 // TantivyLexicalRetriever — production impl.
 // ---------------------------------------------------------------------------
 
-/// Production `LexicalRetriever` impl. Holds an `Arc<TantivyShard>`
-/// plus cached `IndexReader` per scope; readers auto-refresh on
-/// commit per tantivy's default `ReloadPolicy::OnCommit`.
-pub struct TantivyLexicalRetriever {
+/// The swappable inner state of [`TantivyLexicalRetriever`]: the open
+/// `TantivyShard` plus a cached `IndexReader` per scope. Bundled behind
+/// one `ArcSwap` so a hot rebuild can replace the shard *and* both
+/// readers in a single atomic publish — a reader is bound to the `Index`
+/// it was opened from, so a new post-rebuild index needs fresh readers,
+/// never a `reload()` of the old ones.
+struct RetrieverInner {
     shard: Arc<TantivyShard>,
     memory_reader: IndexReader,
     statements_reader: IndexReader,
+    /// The `IndexHandle::commit_generation` each cached reader was last
+    /// `reload()`ed at. `u64::MAX` is the "never reloaded" sentinel — no real
+    /// generation reaches it, so the first query on this bundle always
+    /// reloads. Bumped only forward, matching the writer's monotonic counter.
+    memory_reloaded_gen: AtomicU64,
+    statements_reloaded_gen: AtomicU64,
 }
 
-impl TantivyLexicalRetriever {
-    pub fn new(shard: Arc<TantivyShard>) -> Result<Self, LexicalError> {
+impl RetrieverInner {
+    fn build(shard: Arc<TantivyShard>) -> Result<Self, LexicalError> {
         let memory_reader = shard
             .memory_text
             .index
@@ -137,7 +149,44 @@ impl TantivyLexicalRetriever {
             shard,
             memory_reader,
             statements_reader,
+            memory_reloaded_gen: AtomicU64::new(u64::MAX),
+            statements_reloaded_gen: AtomicU64::new(u64::MAX),
         })
+    }
+}
+
+/// Production `LexicalRetriever` impl. Holds its `TantivyShard` + cached
+/// `IndexReader`s behind an [`arc_swap::ArcSwap`] so the whole open-index
+/// bundle can be replaced atomically by a hot rebuild
+/// ([`swap_shard`](Self::swap_shard)) without disturbing the stable
+/// `Arc<dyn LexicalRetriever>` handle every consumer already holds. Each
+/// `retrieve` loads the current bundle once; a concurrent swap publishes
+/// the next bundle without ever exposing a torn or empty state, so reads
+/// see either the complete pre-rebuild index or the complete post-rebuild
+/// index — never stale-mixed data (invariant #7).
+pub struct TantivyLexicalRetriever {
+    inner: arc_swap::ArcSwap<RetrieverInner>,
+}
+
+impl TantivyLexicalRetriever {
+    pub fn new(shard: Arc<TantivyShard>) -> Result<Self, LexicalError> {
+        Ok(Self {
+            inner: arc_swap::ArcSwap::from_pointee(RetrieverInner::build(shard)?),
+        })
+    }
+
+    /// Atomically replace the open index bundle with readers opened from
+    /// `shard`. Called by the shard's hot-rebuild dance after the on-disk
+    /// index directory has been rebuilt from authoritative redb and
+    /// swapped into place, and the shard reopened. The new readers are
+    /// fully built *before* the publish, so a build failure leaves the
+    /// prior bundle serving untouched and the swap is all-or-nothing:
+    /// `retrieve` calls straddling this point see either the old complete
+    /// index or the new complete index, never a partial view.
+    pub fn swap_shard(&self, shard: Arc<TantivyShard>) -> Result<(), LexicalError> {
+        let next = RetrieverInner::build(shard)?;
+        self.inner.store(Arc::new(next));
+        Ok(())
     }
 }
 
@@ -150,19 +199,37 @@ impl LexicalRetriever for TantivyLexicalRetriever {
     ) -> Result<Vec<RankedItem>, LexicalError> {
         validate_filters_for_scope(&query.filters, scope)?;
 
-        let (handle, reader) = match scope {
-            LexicalScope::MemoryText => (&self.shard.memory_text, &self.memory_reader),
-            LexicalScope::StatementText => (&self.shard.statements, &self.statements_reader),
+        // Load the current bundle once for the whole call. A concurrent
+        // `swap_shard` publishes a new bundle without invalidating this
+        // guard, so the query runs entirely against one consistent index.
+        let inner = self.inner.load();
+        let (handle, reader, reloaded_gen) = match scope {
+            LexicalScope::MemoryText => (
+                &inner.shard.memory_text,
+                &inner.memory_reader,
+                &inner.memory_reloaded_gen,
+            ),
+            LexicalScope::StatementText => (
+                &inner.shard.statements,
+                &inner.statements_reader,
+                &inner.statements_reloaded_gen,
+            ),
         };
-        // Tantivy's default `ReloadPolicy::OnCommitWithDelay` may
-        // lag behind the writer's commits by up to ~50 ms. We
-        // call `reload()` synchronously so callers see a
-        // consistent view of all committed writes (matches the
-        // §23/02 §6 idempotency contract: identical results
-        // between commits).
-        reader
-            .reload()
-            .map_err(|e| LexicalError::Internal(format!("reader reload: {e}")))?;
+        // Tantivy's default `ReloadPolicy::OnCommitWithDelay` may lag behind
+        // the writer's commits by up to ~50 ms, so this path used to
+        // `reload()` on every query to guarantee read-your-commits. That is
+        // pure overhead when nothing has committed since the last reload. The
+        // indexer bumps `commit_generation` after each commit; reload only
+        // when it has advanced past the generation this reader last saw, then
+        // record the new value. The cached searcher still reflects every
+        // committed write (invariant #7), without a reload per query.
+        let current_gen = handle.commit_generation();
+        if reloaded_gen.load(Ordering::Acquire) != current_gen {
+            reader
+                .reload()
+                .map_err(|e| LexicalError::Internal(format!("reader reload: {e}")))?;
+            reloaded_gen.store(current_gen, Ordering::Release);
+        }
         let searcher = reader.searcher();
         let q = build_query(query, handle, scope)?;
         let collector = TopDocs::with_limit(config.top_k.max(1)).order_by_score();
@@ -207,9 +274,9 @@ fn validate_filters_for_scope(
             }
         }
         LexicalScope::StatementText => {
-            if filters.agent_id.is_some() {
+            if !filters.space_ids.is_empty() {
                 return Err(LexicalError::QueryParseFailed(
-                    "agent_id filter applies only to MemoryText".into(),
+                    "space_id filter applies only to MemoryText scope".into(),
                 ));
             }
             if filters.memory_kind.is_some() {
@@ -263,16 +330,26 @@ fn build_query(
     let f = &query.filters;
     match scope {
         LexicalScope::MemoryText => {
-            if let Some(agent) = f.agent_id {
+            if !f.space_ids.is_empty() {
                 let field = schema
-                    .get_field("agent_id")
-                    .map_err(|e| LexicalError::Internal(format!("agent_id field: {e}")))?;
-                let bytes: [u8; 16] = agent.into();
-                let term = Term::from_field_bytes(field, &bytes);
-                clauses.push((
-                    Occur::Must,
-                    Box::new(TermQuery::new(term, IndexRecordOption::Basic)),
-                ));
+                    .get_field("space_id")
+                    .map_err(|e| LexicalError::Internal(format!("space_id field: {e}")))?;
+                // `space_id IN [..]` = OR-group of TermQuery, wrapped as
+                // a single MUST so the BM25 scoring stays inside the
+                // requested space universe.
+                let inner: Vec<(Occur, Box<dyn tantivy::query::Query>)> = f
+                    .space_ids
+                    .iter()
+                    .map(|space| -> (Occur, Box<dyn tantivy::query::Query>) {
+                        let bytes: [u8; 16] = (*space).into();
+                        let term = Term::from_field_bytes(field, &bytes);
+                        (
+                            Occur::Should,
+                            Box::new(TermQuery::new(term, IndexRecordOption::Basic)),
+                        )
+                    })
+                    .collect();
+                clauses.push((Occur::Must, Box::new(BooleanQuery::new(inner))));
             }
             if let Some(kind) = f.memory_kind {
                 let field = schema
@@ -289,6 +366,26 @@ fn build_query(
                     .get_field("created_at")
                     .map_err(|e| LexicalError::Internal(format!("created_at field: {e}")))?;
                 clauses.push((Occur::Must, range_query_u64(field, range)));
+            }
+            if !f.session_ids.is_empty() {
+                let field = schema
+                    .get_field("session")
+                    .map_err(|e| LexicalError::Internal(format!("context field: {e}")))?;
+                // `context IN [..]` = OR-group of TermQuery, wrapped as
+                // a single MUST so the BM25 scoring stays inside the
+                // requested context universe.
+                let inner: Vec<(Occur, Box<dyn tantivy::query::Query>)> = f
+                    .session_ids
+                    .iter()
+                    .map(|cid| -> (Occur, Box<dyn tantivy::query::Query>) {
+                        let term = Term::from_field_u64(field, *cid);
+                        (
+                            Occur::Should,
+                            Box::new(TermQuery::new(term, IndexRecordOption::Basic)),
+                        )
+                    })
+                    .collect();
+                clauses.push((Occur::Must, Box::new(BooleanQuery::new(inner))));
             }
         }
         LexicalScope::StatementText => {
@@ -380,10 +477,19 @@ fn compose_text_input(terms: &[String], phrases: &[Vec<String>]) -> String {
 /// Escape tantivy `QueryParser` syntax characters so the token is
 /// matched literally. Phrase tokens are already wrapped in quotes
 /// so we only need to escape backslashes + quotes inside.
+///
+/// Apostrophes (and the curly/back variants) are mapped to a space rather
+/// than escaped: the indexing tokenizer splits on them, so "Niraj's" is stored
+/// as the token "niraj", and a raw apostrophe in the query string makes the
+/// `QueryParser` grammar fail outright ("Syntax Error: niraj's …"). Mapping to
+/// a space yields "niraj s", which tokenizes to the same indexed terms and
+/// parses cleanly — so possessive cues ("Niraj's manager") match instead of
+/// dropping the whole lexical lane.
 fn escape_query_token(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         match ch {
+            '\'' | '\u{2019}' | '\u{2018}' | '`' => out.push(' '),
             '\\' | '"' | '+' | '-' | '!' | '(' | ')' | '^' | '{' | '}' | '[' | ']' | ':' | '~'
             | '*' | '?' => {
                 out.push('\\');

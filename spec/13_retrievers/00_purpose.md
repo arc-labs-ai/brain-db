@@ -10,15 +10,17 @@
 | Audience | Implementers of the retrieval engine; schema authors tuning query behavior |
 | Voice | Hybrid (rationale + normative) |
 | Depends on | [07. Embedding](../07_embedding/00_purpose.md), [09. Indexing](../09_indexing/00_purpose.md), [10. Metadata](../10_metadata/00_purpose.md), [11. Extractors](../11_extractors/00_purpose.md), [12. Query Optimizer](../12_query_optimizer/00_purpose.md) |
-| Referenced by | [05. Operations](../05_operations/00_purpose.md), [06. SDK](../06_sdk/00_purpose.md), [19. Benchmarks](../19_benchmarks/00_purpose.md) |
+| Referenced by | [05. Operations](../05_operations/00_purpose.md), [06. Client Interface](../06_sdk/00_purpose.md), [19. Benchmarks](../19_benchmarks/00_purpose.md) |
 
 ## What this spec defines
 
-The retrieval surface activated when a schema is declared. Three retrievers (semantic, lexical, graph) run in parallel; their ranked outputs are fused with weighted Reciprocal Rank Fusion (RRF, k=60). An optional cross-encoder reranker (bge-reranker-base) reorders the top-K. A rule-based query router decides per-query which retrievers to invoke and with what weights.
+The retrieval surface activated when a schema is declared. Three retrievers (semantic, lexical, graph) run in parallel; their ranked outputs are fused with weighted Reciprocal Rank Fusion (RRF, k=60). A cross-encoder reranker (bge-reranker-base) then reorders the top-K — always-on whenever the model is loaded, gated only by the deploy-time `config.rerank.enabled` switch, with no per-request flag. A rule-based query router decides per-query which retrievers to invoke and with what weights.
 
-`RECALL` transparently uses this path when a schema is active; the response shape is identical to the schemaless path with extra `contributing_retrievers` and `fused_score` metadata.
+`RECALL` — Brain's sole client read verb — runs this engine on every request. It
+does not return the raw fused ranking; it shapes the fused-and-filtered pool into
+a membership answer (Single / Many / None, see [`../05_operations/03_read_pipeline.md`](../05_operations/03_read_pipeline.md)) via a relevance band, not a top-K cut. The per-member `contributing_retrievers` and `fused_score` fields ride along as provenance. The raw ranked list is reachable only through the operator debug ops `QUERY_EXPLAIN` / `QUERY_TRACE`.
 
-## The hybrid retrieval architecture
+## The retrieval architecture
 
 The typed-graph retrieval surface is a multi-retriever architecture. Three retrievers run in parallel (or selectively, per the query router), each producing a ranked list. Results are fused with Reciprocal Rank Fusion (RRF) into a single ranked output.
 

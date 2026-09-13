@@ -1,7 +1,6 @@
-//! LLM extractor perf bench (sub-task 21.7).
+//! LLM extractor perf bench.
 //!
-//! Spec targets per
-//! `spec/20_benchmarks/02_latency_targets.md` §2.8:
+//! Latency targets:
 //!
 //! - `LlmExtractor::predict` cache hit: p50 1 ms / p99 5 ms.
 //! - Cost-budget skip path (no LLM call): p50 200 µs / p99 1 ms.
@@ -24,7 +23,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use brain_core::{AgentId, ContextId, ExtractorId, Memory, MemoryId, MemoryKind, Salience};
+use brain_core::{ExtractorId, Memory, MemoryId, MemoryKind, Salience, SessionId, SpaceId};
 use brain_extractors::{
     framework::extractor::ExtractionContext, CostBudget, Extractor, ExtractorRegistry, LlmExtractor,
 };
@@ -105,13 +104,14 @@ fn memory_text() -> &'static str {
 fn build_memory() -> Memory {
     Memory {
         id: MemoryId::pack(0, 1, 0),
-        agent: AgentId::new(),
-        context: ContextId(0),
+        space: SpaceId::new(),
+        session_id: SessionId(0),
         kind: MemoryKind::Episodic,
         salience: Salience::default(),
         text: Some(memory_text().into()),
         created_at_unix_ms: 0,
         last_accessed_at_unix_ms: 0,
+        occurred_at_unix_nanos: None,
     }
 }
 
@@ -145,6 +145,10 @@ fn build_extractor(
 
 fn ctx<'a>(reg: &'a ExtractorRegistry) -> ExtractionContext<'a> {
     ExtractionContext {
+        declared_entity_types: None,
+        candidate_predicates: None,
+        declared_kinds: None,
+        entity_type_labels: None,
         schema_version: 1,
         now_unix_nanos: 0,
         registry: reg,
@@ -251,13 +255,14 @@ fn bench_llm_mock_miss(c: &mut Criterion) {
             counter = counter.wrapping_add(1);
             let mem = Memory {
                 id: MemoryId::pack(0, counter.wrapping_add(1), 0),
-                agent: AgentId::new(),
-                context: ContextId(0),
+                space: SpaceId::new(),
+                session_id: SessionId(0),
                 kind: MemoryKind::Episodic,
                 salience: Salience::default(),
                 text: Some(format!("{} iteration={counter}", memory_text())),
                 created_at_unix_ms: 0,
                 last_accessed_at_unix_ms: 0,
+                occurred_at_unix_nanos: None,
             };
             let r = block_on(ext.run(&ctx(&reg), black_box(&mem)));
             black_box(r);

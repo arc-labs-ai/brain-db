@@ -12,14 +12,11 @@ use std::sync::Arc;
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::MetadataDb;
-use brain_ops::test_support::run_in_glommio;
-use brain_ops::{dispatch, ErrorCode, OpError, OpsContext, RealWriterHandle};
+use brain_ops::test_support::{run_in_glommio, single_body};
+use brain_ops::{dispatch, DispatchOutcome, ErrorCode, OpError, OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
-use brain_protocol::envelope::request::{
-    EncodeRequest, ForgetMode, ForgetRequest, MemoryKindWire, RequestBody,
-};
+use brain_protocol::envelope::request::{EncodeRequest, ForgetMode, ForgetRequest, RequestBody};
 use brain_protocol::envelope::response::{EncodeResponse, ForgetResponse, ResponseBody};
-use parking_lot::Mutex;
 
 // ---------------------------------------------------------------------------
 // Mock dispatcher.
@@ -55,9 +52,9 @@ struct Fixture {
 fn build_fixture() -> Fixture {
     let tempdir = tempfile::tempdir().unwrap();
     let db_path = tempdir.path().join("metadata.redb");
-    let metadata: SharedMetadataDb = Arc::new(Mutex::new(MetadataDb::open(&db_path).unwrap()));
+    let metadata: SharedMetadataDb = Arc::new(MetadataDb::open(&db_path).unwrap());
 
-    let (shared, hnsw_writer) = SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).unwrap();
+    let (shared, hnsw_writer) = SharedHnsw::new(IndexParams::default_v1()).unwrap();
     let writer = Arc::new(RealWriterHandle::new(metadata.clone(), hnsw_writer));
     let executor = ExecutorContext::new(
         Arc::new(MockDispatcher) as Arc<dyn Dispatcher>,
@@ -67,7 +64,7 @@ fn build_fixture() -> Fixture {
     );
 
     Fixture {
-        ctx: OpsContext::new(executor),
+        ctx: brain_ops::test_support::ops_context_for_tests_owning_tempdir(executor),
         _tempdir: tempdir,
     }
 }
@@ -75,13 +72,13 @@ fn build_fixture() -> Fixture {
 fn encode_req(request_id: [u8; 16], text: &str) -> EncodeRequest {
     EncodeRequest {
         text: text.into(),
-        context_id: 42,
-        kind: MemoryKindWire::Episodic,
-        salience_hint: 0.5,
-        edges: vec![],
+        session_id: 42,
         request_id,
         txn_id: None,
-        deduplicate: false,
+        occurred_at_unix_nanos: None,
+        act_as: None,
+        wait: brain_protocol::WaitMode::Ack,
+        allow_duplicates: false,
     }
 }
 
@@ -91,29 +88,47 @@ fn forget_req(memory_id: u128, request_id: [u8; 16]) -> ForgetRequest {
         mode: ForgetMode::Soft,
         request_id,
         txn_id: None,
+        act_as: None,
     }
 }
 
 async fn encode(fix: &Fixture, request_id: [u8; 16], text: &str) -> u128 {
     let req = encode_req(request_id, text);
-    match dispatch(
+    let outcome = dispatch(
         RequestBody::Encode(req),
-        brain_ops::RequestCaller::anonymous(),
+        brain_ops::RequestCaller::for_tests(),
         &fix.ctx,
     )
     .await
-    .unwrap()
-    {
+    .unwrap();
+    match single_body(outcome) {
         ResponseBody::Encode(EncodeResponse { memory_id, .. }) => memory_id,
         other => panic!("expected Encode response, got {other:?}"),
     }
 }
 
-fn unwrap_forget_resp(body: ResponseBody) -> ForgetResponse {
-    match body {
+fn unwrap_forget_resp(outcome: DispatchOutcome) -> ForgetResponse {
+    match single_body(outcome) {
         ResponseBody::Forget(r) => r,
         other => panic!("expected ResponseBody::Forget, got {other:?}"),
     }
+}
+
+fn seed_hype_vectors(fix: &Fixture, memory_id: u128, n: u8) {
+    let id = brain_core::MemoryId::from(memory_id);
+    let wtxn = fix.ctx.executor.metadata.write_txn().unwrap();
+    for i in 0..n {
+        let mut v = [0.0f32; VECTOR_DIM];
+        v[usize::from(i) % VECTOR_DIM] = 1.0;
+        brain_metadata::hype_vector_put(&wtxn, id, i, &v).unwrap();
+    }
+    wtxn.commit().unwrap();
+}
+
+fn has_hype_vectors(fix: &Fixture, memory_id: u128) -> bool {
+    let id = brain_core::MemoryId::from(memory_id);
+    let rtxn = fix.ctx.executor.metadata.read_txn().unwrap();
+    brain_metadata::hype_has_vectors(&rtxn, id).unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -129,7 +144,7 @@ fn forget_full_pipeline_tombstones_memory() {
         let resp = unwrap_forget_resp(
             dispatch(
                 RequestBody::Forget(forget_req(memory_id, [2; 16])),
-                brain_ops::RequestCaller::anonymous(),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
@@ -154,7 +169,7 @@ fn forget_already_tombstoned_returns_flag() {
         let first = unwrap_forget_resp(
             dispatch(
                 RequestBody::Forget(forget_req(memory_id, [11; 16])),
-                brain_ops::RequestCaller::anonymous(),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
@@ -166,7 +181,7 @@ fn forget_already_tombstoned_returns_flag() {
         let second = unwrap_forget_resp(
             dispatch(
                 RequestBody::Forget(forget_req(memory_id, [12; 16])),
-                brain_ops::RequestCaller::anonymous(),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
@@ -190,7 +205,7 @@ fn forget_memory_not_found_returns_flag_not_error() {
         let resp = unwrap_forget_resp(
             dispatch(
                 RequestBody::Forget(forget_req(phantom, [20; 16])),
-                brain_ops::RequestCaller::anonymous(),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
@@ -215,8 +230,8 @@ fn forget_idempotent_replay_returns_cached_response() {
         let req = forget_req(memory_id, [31; 16]);
         let first = unwrap_forget_resp(
             dispatch(
-                RequestBody::Forget(req),
-                brain_ops::RequestCaller::anonymous(),
+                RequestBody::Forget(req.clone()),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
@@ -225,7 +240,7 @@ fn forget_idempotent_replay_returns_cached_response() {
         let second = unwrap_forget_resp(
             dispatch(
                 RequestBody::Forget(req),
-                brain_ops::RequestCaller::anonymous(),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
@@ -237,6 +252,78 @@ fn forget_idempotent_replay_returns_cached_response() {
         // wire shape can't distinguish a replay from a fresh result.)
         assert_eq!(first.was_already_forgotten, second.was_already_forgotten);
         assert_eq!(first.memory_id, second.memory_id);
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 6. FORGET removes the memory's HyPE question-vectors promptly, on the
+//    same policy as the lexical index (at tombstone time, Soft or Hard).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn forget_removes_hype_vectors() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        let memory_id = encode(&fix, [50; 16], "hype-owner").await;
+        // Simulate the HyPE worker having generated question-vectors.
+        seed_hype_vectors(&fix, memory_id, 3);
+        assert!(has_hype_vectors(&fix, memory_id));
+
+        let resp = unwrap_forget_resp(
+            dispatch(
+                RequestBody::Forget(forget_req(memory_id, [51; 16])),
+                brain_ops::RequestCaller::for_tests(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(!resp.was_already_forgotten);
+        assert!(
+            !has_hype_vectors(&fix, memory_id),
+            "FORGET must drop the memory's HyPE question-vectors"
+        );
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 7. A double-forget is a harmless no-op for the HyPE cleanup too — the
+//    second call finds no vectors and succeeds.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn double_forget_hype_cleanup_is_noop() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        let memory_id = encode(&fix, [60; 16], "hype-twice").await;
+        seed_hype_vectors(&fix, memory_id, 2);
+
+        // First FORGET drops the vectors.
+        let first = unwrap_forget_resp(
+            dispatch(
+                RequestBody::Forget(forget_req(memory_id, [61; 16])),
+                brain_ops::RequestCaller::for_tests(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(!first.was_already_forgotten);
+        assert!(!has_hype_vectors(&fix, memory_id));
+
+        // Second FORGET (fresh request_id) is AlreadyTombstoned; the HyPE
+        // delete never runs again, and there's nothing to remove anyway.
+        let second = unwrap_forget_resp(
+            dispatch(
+                RequestBody::Forget(forget_req(memory_id, [62; 16])),
+                brain_ops::RequestCaller::for_tests(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(second.was_already_forgotten);
+        assert!(!has_hype_vectors(&fix, memory_id));
     })
 }
 
@@ -253,14 +340,14 @@ fn forget_idempotency_conflict_returns_error() {
 
         let _ok = dispatch(
             RequestBody::Forget(forget_req(a, [42; 16])),
-            brain_ops::RequestCaller::anonymous(),
+            brain_ops::RequestCaller::for_tests(),
             &fix.ctx,
         )
         .await
         .unwrap();
         let err = dispatch(
             RequestBody::Forget(forget_req(b, [42; 16])),
-            brain_ops::RequestCaller::anonymous(),
+            brain_ops::RequestCaller::for_tests(),
             &fix.ctx,
         )
         .await

@@ -1,44 +1,39 @@
 //! Request-frame payload codecs.
 //!
 //! One variant of [`RequestBody`] per server-bound opcode. Structured
-//! fields are encoded with [rkyv] 0.7; raw vector blobs (per
-//! `ENCODE_VECTOR_DIRECT_REQ` and `RECALL_REQ` with a pre-supplied cue
-//! vector) live in the trailing raw section of the payload and are
-//! composed at the [`crate::Frame`] layer — they are *not* part of the
-//! rkyv-encoded bytes this module produces.
+//! fields are CBOR-encoded; the raw embedding blob for
+//! `ENCODE_VECTOR_DIRECT_REQ` lives in the trailing raw section of the
+//! payload and is composed at the [`crate::Frame`] layer — it is *not*
+//! part of the CBOR-encoded bytes this module produces.
 //!
 //! ## Wire-domain types
 //!
 //! Each request struct uses raw representations (`u128` for `MemoryId`,
-//! `[u8; 16]` for UUID-shaped IDs, `u8`-mapped enums) so the
-//! `rkyv::Archive` derive can fire without coupling `brain-core` value
-//! types to rkyv. Conversion between these wire types and `brain_core`
-//! domain types is the operation handler's responsibility.
-//!
-//! [rkyv]: https://docs.rs/rkyv/0.7
+//! `[u8; 16]` for UUID-shaped IDs, `u8`-mapped enums) so the wire types
+//! stay decoupled from `brain-core` value types. Conversion between
+//! these wire types and `brain_core` domain types is the operation
+//! handler's responsibility.
 
-// `PlanState` and `ObservationInput` use `By*` variant naming that mirrors
-// the spec's discriminator phrasing. rkyv's `Archive` derive generates a
-// parallel `ArchivedPlanState` whose variant names are inherited; clippy
-// 1.95+ flags both the source and the macro-generated copy and the
-// per-item `#[allow]` doesn't always reach the macro expansion path. The
-// module-level allow covers both without spreading attribute noise.
+// `PlanState` and `ObservationInput` use `By*` variant naming that
+// mirrors the spec's discriminator phrasing; clippy flags the family as
+// same-prefixed. The module-level allow covers it without spreading
+// attribute noise.
 #![allow(clippy::enum_variant_names)]
 
-use crate::error::ProtocolError;
-use crate::connection::handshake::{AuthPayload, HelloPayload};
+use crate::codec::cbor::{from_cbor_bytes, to_cbor_bytes};
 use crate::codec::opcode::Opcode;
-use crate::codec::rkyv::{from_rkyv_bytes, to_rkyv_bytes};
+use crate::connection::handshake::{AuthPayload, HelloPayload};
+use crate::error::ProtocolError;
 
 // ---------------------------------------------------------------------------
 // Helper aliases for spec-domain primitive types as carried on the wire.
 // ---------------------------------------------------------------------------
 
-/// 16-byte UUID-shaped identifier (`AgentId`, `RequestId`, `TxnId`).
+/// 16-byte UUID-shaped identifier (`SpaceId`, `RequestId`, `TxnId`).
 pub type WireUuid = [u8; 16];
 
-/// Wire-side `ContextId` — 8 bytes / `u64`.
-pub type WireContextId = u64;
+/// Wire-side `SessionId` — 8 bytes / `u64`.
+pub type WireSessionId = u64;
 
 /// Packed `MemoryId` (shard 16 + slot 48 + version 32 + reserved 32,
 /// all rolled into a `u128`).
@@ -52,12 +47,16 @@ pub use crate::connection::stream::{
     ByeRequest, CancelStreamRequest, ClientPongRequest, PingRequest,
 };
 pub use crate::ops::admin::*;
+pub use crate::ops::capabilities::*;
 pub use crate::ops::entity::*;
 pub use crate::ops::extractor::*;
+pub use crate::ops::graph::*;
 pub use crate::ops::memory::*;
 pub use crate::ops::procedural::*;
 pub use crate::ops::query::*;
 pub use crate::ops::relation::*;
+pub use crate::ops::session::*;
+pub use crate::ops::space::*;
 pub use crate::ops::statement::*;
 pub use crate::ops::subscribe::*;
 pub use crate::ops::txn::*;
@@ -66,7 +65,7 @@ pub use crate::shared::enums::*;
 pub use crate::shared::primitives::*;
 
 /// One variant per server-bound opcode. The variant carries the
-/// rkyv-archivable structured payload; raw vector blobs (for opcodes
+/// CBOR-encoded structured payload; raw vector blobs (for opcodes
 /// that include them) are appended by the [`crate::Frame`] layer as the
 /// trailing raw section, not by this enum.
 #[derive(Clone, Debug, PartialEq)]
@@ -76,14 +75,19 @@ pub enum RequestBody {
     /// Authentication frame following WELCOME.
     Auth(AuthPayload),
     Encode(EncodeRequest),
+    EncodeVectorDirect(EncodeVectorDirectRequest),
     Recall(RecallRequest),
     Plan(PlanRequest),
     Reason(ReasonRequest),
     Forget(ForgetRequest),
     Link(LinkRequest),
     Unlink(UnlinkRequest),
+    MemoryList(MemoryListRequest),
+    MemoryInspect(MemoryInspectRequest),
+    GraphFetch(GraphFetchRequest),
     Subscribe(SubscribeRequest),
     Unsubscribe(UnsubscribeRequest),
+    GetCapabilities(GetCapabilitiesRequest),
     TxnBegin(TxnBeginRequest),
     TxnCommit(TxnCommitRequest),
     TxnAbort(TxnAbortRequest),
@@ -96,11 +100,14 @@ pub enum RequestBody {
     AdminRestore(AdminRestoreRequest),
     AdminIntegrityCheck(AdminIntegrityCheckRequest),
     AdminMigrateEmbeddings(AdminMigrateEmbeddingsRequest),
-    AdminCreateContext(AdminCreateContextRequest),
-    AdminRenameContext(AdminRenameContextRequest),
+    AdminCreateSession(AdminCreateSessionRequest),
+    AdminRenameSession(AdminRenameSessionRequest),
     AdminMoveMemory(AdminMoveMemoryRequest),
     AdminReclassify(AdminReclassifyRequest),
     AdminListTombstoned(AdminListTombstonedRequest),
+    AdminListPendingContradictions(AdminListPendingContradictionsRequest),
+    AdminBackfill(AdminBackfillRequest),
+    AdminBackfillCancel(AdminBackfillCancelRequest),
 
     // Typed-graph namespace.
     EntityCreate(EntityCreateRequest),
@@ -136,22 +143,28 @@ pub enum RequestBody {
     SchemaGet(SchemaGetRequest),
     SchemaList(SchemaListRequest),
     SchemaValidate(SchemaValidateRequest),
+    SchemaReplace(SchemaReplaceRequest),
+    SchemaDrop(SchemaDropRequest),
 
-    // Extractor governance ops.
+    // Extractor introspection (read-only).
     ExtractorList(ExtractorListRequest),
-    ExtractorDisable(ExtractorDisableRequest),
-    ExtractorEnable(ExtractorEnableRequest),
 
-    // Hybrid query ops.
-    Query(QueryRequest),
+    // Retrieval query ops.
     QueryExplain(QueryExplainRequest),
     QueryTrace(QueryTraceRequest),
-    RecallHybrid(RecallHybridRequest),
 
-    // Procedural-memory materialization. Reads an agent's stored
+    // Procedural-memory materialization. Reads an space's stored
     // `brain:behavior_*` Preferences and renders a system block for
     // LLM prompt injection.
     MaterializeProcedural(MaterializeProceduralRequest),
+
+    // Space & session registry.
+    SpaceCreate(SpaceCreateRequest),
+    SpaceList(SpaceListRequest),
+    SpaceDelete(SpaceDeleteRequest),
+    SessionCreate(SessionCreateRequest),
+    SessionList(SessionListRequest),
+    SessionDelete(SessionDeleteRequest),
 }
 
 impl RequestBody {
@@ -162,14 +175,19 @@ impl RequestBody {
             Self::Hello(_) => Opcode::Hello,
             Self::Auth(_) => Opcode::Auth,
             Self::Encode(_) => Opcode::EncodeReq,
+            Self::EncodeVectorDirect(_) => Opcode::EncodeVectorDirectReq,
             Self::Recall(_) => Opcode::RecallReq,
             Self::Plan(_) => Opcode::PlanReq,
             Self::Reason(_) => Opcode::ReasonReq,
             Self::Forget(_) => Opcode::ForgetReq,
             Self::Link(_) => Opcode::LinkReq,
             Self::Unlink(_) => Opcode::UnlinkReq,
+            Self::MemoryList(_) => Opcode::MemoryListReq,
+            Self::MemoryInspect(_) => Opcode::MemoryInspectReq,
+            Self::GraphFetch(_) => Opcode::GraphFetchReq,
             Self::Subscribe(_) => Opcode::SubscribeReq,
             Self::Unsubscribe(_) => Opcode::UnsubscribeReq,
+            Self::GetCapabilities(_) => Opcode::GetCapabilitiesReq,
             Self::TxnBegin(_) => Opcode::TxnBegin,
             Self::TxnCommit(_) => Opcode::TxnCommit,
             Self::TxnAbort(_) => Opcode::TxnAbort,
@@ -182,11 +200,14 @@ impl RequestBody {
             Self::AdminRestore(_) => Opcode::AdminRestoreReq,
             Self::AdminIntegrityCheck(_) => Opcode::AdminIntegrityCheckReq,
             Self::AdminMigrateEmbeddings(_) => Opcode::AdminMigrateEmbeddingsReq,
-            Self::AdminCreateContext(_) => Opcode::AdminCreateContextReq,
-            Self::AdminRenameContext(_) => Opcode::AdminRenameContextReq,
+            Self::AdminCreateSession(_) => Opcode::AdminCreateSessionReq,
+            Self::AdminRenameSession(_) => Opcode::AdminRenameSessionReq,
             Self::AdminMoveMemory(_) => Opcode::AdminMoveMemoryReq,
             Self::AdminReclassify(_) => Opcode::AdminReclassifyReq,
             Self::AdminListTombstoned(_) => Opcode::AdminListTombstonedReq,
+            Self::AdminListPendingContradictions(_) => Opcode::AdminListPendingContradictionsReq,
+            Self::AdminBackfill(_) => Opcode::AdminBackfillReq,
+            Self::AdminBackfillCancel(_) => Opcode::AdminBackfillCancelReq,
             Self::EntityCreate(_) => Opcode::EntityCreateReq,
             Self::EntityGet(_) => Opcode::EntityGetReq,
             Self::EntityUpdate(_) => Opcode::EntityUpdateReq,
@@ -214,86 +235,106 @@ impl RequestBody {
             Self::SchemaGet(_) => Opcode::SchemaGetReq,
             Self::SchemaList(_) => Opcode::SchemaListReq,
             Self::SchemaValidate(_) => Opcode::SchemaValidateReq,
+            Self::SchemaReplace(_) => Opcode::SchemaReplaceReq,
+            Self::SchemaDrop(_) => Opcode::SchemaDropReq,
             Self::ExtractorList(_) => Opcode::ExtractorListReq,
-            Self::ExtractorDisable(_) => Opcode::ExtractorDisableReq,
-            Self::ExtractorEnable(_) => Opcode::ExtractorEnableReq,
-            Self::Query(_) => Opcode::QueryReq,
             Self::QueryExplain(_) => Opcode::QueryExplainReq,
             Self::QueryTrace(_) => Opcode::QueryTraceReq,
-            Self::RecallHybrid(_) => Opcode::RecallHybridReq,
             Self::MaterializeProcedural(_) => Opcode::MaterializeProceduralReq,
+            Self::SpaceCreate(_) => Opcode::SpaceCreateReq,
+            Self::SpaceList(_) => Opcode::SpaceListReq,
+            Self::SpaceDelete(_) => Opcode::SpaceDeleteReq,
+            Self::SessionCreate(_) => Opcode::SessionCreateReq,
+            Self::SessionList(_) => Opcode::SessionListReq,
+            Self::SessionDelete(_) => Opcode::SessionDeleteReq,
         }
     }
 
-    /// Encode the structured body to bytes via rkyv. The returned vector
+    /// Encode the structured body to bytes via CBOR. The returned vector
     /// is suitable for placement in a [`crate::Frame::payload`]; vector
     /// blobs (where this opcode supports them) are appended by callers.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         match self {
-            Self::Hello(r) => to_rkyv_bytes(r),
-            Self::Auth(r) => to_rkyv_bytes(r),
-            Self::Encode(r) => to_rkyv_bytes(r),
-            Self::Recall(r) => to_rkyv_bytes(r),
-            Self::Plan(r) => to_rkyv_bytes(r),
-            Self::Reason(r) => to_rkyv_bytes(r),
-            Self::Forget(r) => to_rkyv_bytes(r),
-            Self::Link(r) => to_rkyv_bytes(r),
-            Self::Unlink(r) => to_rkyv_bytes(r),
-            Self::Subscribe(r) => to_rkyv_bytes(r),
-            Self::Unsubscribe(r) => to_rkyv_bytes(r),
-            Self::TxnBegin(r) => to_rkyv_bytes(r),
-            Self::TxnCommit(r) => to_rkyv_bytes(r),
-            Self::TxnAbort(r) => to_rkyv_bytes(r),
-            Self::CancelStream(r) => to_rkyv_bytes(r),
-            Self::Ping(r) => to_rkyv_bytes(r),
-            Self::ClientPong(r) => to_rkyv_bytes(r),
-            Self::Bye(r) => to_rkyv_bytes(r),
-            Self::AdminStats(r) => to_rkyv_bytes(r),
-            Self::AdminSnapshot(r) => to_rkyv_bytes(r),
-            Self::AdminRestore(r) => to_rkyv_bytes(r),
-            Self::AdminIntegrityCheck(r) => to_rkyv_bytes(r),
-            Self::AdminMigrateEmbeddings(r) => to_rkyv_bytes(r),
-            Self::AdminCreateContext(r) => to_rkyv_bytes(r),
-            Self::AdminRenameContext(r) => to_rkyv_bytes(r),
-            Self::AdminMoveMemory(r) => to_rkyv_bytes(r),
-            Self::AdminReclassify(r) => to_rkyv_bytes(r),
-            Self::AdminListTombstoned(r) => to_rkyv_bytes(r),
-            Self::EntityCreate(r) => to_rkyv_bytes(r),
-            Self::EntityGet(r) => to_rkyv_bytes(r),
-            Self::EntityUpdate(r) => to_rkyv_bytes(r),
-            Self::EntityRename(r) => to_rkyv_bytes(r),
-            Self::EntityMerge(r) => to_rkyv_bytes(r),
-            Self::EntityUnmerge(r) => to_rkyv_bytes(r),
-            Self::EntityResolve(r) => to_rkyv_bytes(r),
-            Self::EntityList(r) => to_rkyv_bytes(r),
-            Self::EntityTombstone(r) => to_rkyv_bytes(r),
-            Self::StatementCreate(r) => to_rkyv_bytes(r),
-            Self::StatementGet(r) => to_rkyv_bytes(r),
-            Self::StatementSupersede(r) => to_rkyv_bytes(r),
-            Self::StatementTombstone(r) => to_rkyv_bytes(r),
-            Self::StatementRetract(r) => to_rkyv_bytes(r),
-            Self::StatementHistory(r) => to_rkyv_bytes(r),
-            Self::StatementList(r) => to_rkyv_bytes(r),
-            Self::RelationCreate(r) => to_rkyv_bytes(r),
-            Self::RelationGet(r) => to_rkyv_bytes(r),
-            Self::RelationSupersede(r) => to_rkyv_bytes(r),
-            Self::RelationTombstone(r) => to_rkyv_bytes(r),
-            Self::RelationListFrom(r) => to_rkyv_bytes(r),
-            Self::RelationListTo(r) => to_rkyv_bytes(r),
-            Self::RelationTraverse(r) => to_rkyv_bytes(r),
-            Self::SchemaUpload(r) => to_rkyv_bytes(r),
-            Self::SchemaGet(r) => to_rkyv_bytes(r),
-            Self::SchemaList(r) => to_rkyv_bytes(r),
-            Self::SchemaValidate(r) => to_rkyv_bytes(r),
-            Self::ExtractorList(r) => to_rkyv_bytes(r),
-            Self::ExtractorDisable(r) => to_rkyv_bytes(r),
-            Self::ExtractorEnable(r) => to_rkyv_bytes(r),
-            Self::Query(r) => to_rkyv_bytes(r),
-            Self::QueryExplain(r) => to_rkyv_bytes(r),
-            Self::QueryTrace(r) => to_rkyv_bytes(r),
-            Self::RecallHybrid(r) => to_rkyv_bytes(r),
-            Self::MaterializeProcedural(r) => to_rkyv_bytes(r),
+            Self::Hello(r) => to_cbor_bytes(r),
+            Self::Auth(r) => to_cbor_bytes(r),
+            Self::Encode(r) => to_cbor_bytes(r),
+            Self::EncodeVectorDirect(r) => {
+                let mut p = to_cbor_bytes(r);
+                p.extend_from_slice(&crate::codec::cbor::f32_slice_to_le_bytes(&r.vector));
+                p
+            }
+            Self::Recall(r) => to_cbor_bytes(r),
+            Self::Plan(r) => to_cbor_bytes(r),
+            Self::Reason(r) => to_cbor_bytes(r),
+            Self::Forget(r) => to_cbor_bytes(r),
+            Self::Link(r) => to_cbor_bytes(r),
+            Self::Unlink(r) => to_cbor_bytes(r),
+            Self::MemoryList(r) => to_cbor_bytes(r),
+            Self::MemoryInspect(r) => to_cbor_bytes(r),
+            Self::GraphFetch(r) => to_cbor_bytes(r),
+            Self::Subscribe(r) => to_cbor_bytes(r),
+            Self::Unsubscribe(r) => to_cbor_bytes(r),
+            Self::GetCapabilities(r) => to_cbor_bytes(r),
+            Self::TxnBegin(r) => to_cbor_bytes(r),
+            Self::TxnCommit(r) => to_cbor_bytes(r),
+            Self::TxnAbort(r) => to_cbor_bytes(r),
+            Self::CancelStream(r) => to_cbor_bytes(r),
+            Self::Ping(r) => to_cbor_bytes(r),
+            Self::ClientPong(r) => to_cbor_bytes(r),
+            Self::Bye(r) => to_cbor_bytes(r),
+            Self::AdminStats(r) => to_cbor_bytes(r),
+            Self::AdminSnapshot(r) => to_cbor_bytes(r),
+            Self::AdminRestore(r) => to_cbor_bytes(r),
+            Self::AdminIntegrityCheck(r) => to_cbor_bytes(r),
+            Self::AdminMigrateEmbeddings(r) => to_cbor_bytes(r),
+            Self::AdminCreateSession(r) => to_cbor_bytes(r),
+            Self::AdminRenameSession(r) => to_cbor_bytes(r),
+            Self::AdminMoveMemory(r) => to_cbor_bytes(r),
+            Self::AdminReclassify(r) => to_cbor_bytes(r),
+            Self::AdminListTombstoned(r) => to_cbor_bytes(r),
+            Self::AdminListPendingContradictions(r) => to_cbor_bytes(r),
+            Self::AdminBackfill(r) => to_cbor_bytes(r),
+            Self::AdminBackfillCancel(r) => to_cbor_bytes(r),
+            Self::EntityCreate(r) => to_cbor_bytes(r),
+            Self::EntityGet(r) => to_cbor_bytes(r),
+            Self::EntityUpdate(r) => to_cbor_bytes(r),
+            Self::EntityRename(r) => to_cbor_bytes(r),
+            Self::EntityMerge(r) => to_cbor_bytes(r),
+            Self::EntityUnmerge(r) => to_cbor_bytes(r),
+            Self::EntityResolve(r) => to_cbor_bytes(r),
+            Self::EntityList(r) => to_cbor_bytes(r),
+            Self::EntityTombstone(r) => to_cbor_bytes(r),
+            Self::StatementCreate(r) => to_cbor_bytes(r),
+            Self::StatementGet(r) => to_cbor_bytes(r),
+            Self::StatementSupersede(r) => to_cbor_bytes(r),
+            Self::StatementTombstone(r) => to_cbor_bytes(r),
+            Self::StatementRetract(r) => to_cbor_bytes(r),
+            Self::StatementHistory(r) => to_cbor_bytes(r),
+            Self::StatementList(r) => to_cbor_bytes(r),
+            Self::RelationCreate(r) => to_cbor_bytes(r),
+            Self::RelationGet(r) => to_cbor_bytes(r),
+            Self::RelationSupersede(r) => to_cbor_bytes(r),
+            Self::RelationTombstone(r) => to_cbor_bytes(r),
+            Self::RelationListFrom(r) => to_cbor_bytes(r),
+            Self::RelationListTo(r) => to_cbor_bytes(r),
+            Self::RelationTraverse(r) => to_cbor_bytes(r),
+            Self::SchemaUpload(r) => to_cbor_bytes(r),
+            Self::SchemaGet(r) => to_cbor_bytes(r),
+            Self::SchemaList(r) => to_cbor_bytes(r),
+            Self::SchemaValidate(r) => to_cbor_bytes(r),
+            Self::SchemaReplace(r) => to_cbor_bytes(r),
+            Self::SchemaDrop(r) => to_cbor_bytes(r),
+            Self::ExtractorList(r) => to_cbor_bytes(r),
+            Self::QueryExplain(r) => to_cbor_bytes(r),
+            Self::QueryTrace(r) => to_cbor_bytes(r),
+            Self::MaterializeProcedural(r) => to_cbor_bytes(r),
+            Self::SpaceCreate(r) => to_cbor_bytes(r),
+            Self::SpaceList(r) => to_cbor_bytes(r),
+            Self::SpaceDelete(r) => to_cbor_bytes(r),
+            Self::SessionCreate(r) => to_cbor_bytes(r),
+            Self::SessionList(r) => to_cbor_bytes(r),
+            Self::SessionDelete(r) => to_cbor_bytes(r),
         }
     }
 
@@ -302,75 +343,232 @@ impl RequestBody {
     /// don't carry a request body (responses, error frames).
     pub fn decode(opcode: Opcode, bytes: &[u8]) -> Result<Self, ProtocolError> {
         Ok(match opcode {
-            Opcode::Hello => Self::Hello(from_rkyv_bytes(bytes)?),
-            Opcode::Auth => Self::Auth(from_rkyv_bytes(bytes)?),
-            Opcode::EncodeReq => Self::Encode(from_rkyv_bytes(bytes)?),
-            Opcode::RecallReq => Self::Recall(from_rkyv_bytes(bytes)?),
-            Opcode::PlanReq => Self::Plan(from_rkyv_bytes(bytes)?),
-            Opcode::ReasonReq => Self::Reason(from_rkyv_bytes(bytes)?),
-            Opcode::ForgetReq => Self::Forget(from_rkyv_bytes(bytes)?),
-            Opcode::LinkReq => Self::Link(from_rkyv_bytes(bytes)?),
-            Opcode::UnlinkReq => Self::Unlink(from_rkyv_bytes(bytes)?),
-            Opcode::SubscribeReq => Self::Subscribe(from_rkyv_bytes(bytes)?),
-            Opcode::UnsubscribeReq => Self::Unsubscribe(from_rkyv_bytes(bytes)?),
-            Opcode::TxnBegin => Self::TxnBegin(from_rkyv_bytes(bytes)?),
-            Opcode::TxnCommit => Self::TxnCommit(from_rkyv_bytes(bytes)?),
-            Opcode::TxnAbort => Self::TxnAbort(from_rkyv_bytes(bytes)?),
-            Opcode::CancelStream => Self::CancelStream(from_rkyv_bytes(bytes)?),
-            Opcode::Ping => Self::Ping(from_rkyv_bytes(bytes)?),
-            Opcode::ClientPong => Self::ClientPong(from_rkyv_bytes(bytes)?),
-            Opcode::Bye => Self::Bye(from_rkyv_bytes(bytes)?),
-            Opcode::AdminStatsReq => Self::AdminStats(from_rkyv_bytes(bytes)?),
-            Opcode::AdminSnapshotReq => Self::AdminSnapshot(from_rkyv_bytes(bytes)?),
-            Opcode::AdminRestoreReq => Self::AdminRestore(from_rkyv_bytes(bytes)?),
-            Opcode::AdminIntegrityCheckReq => Self::AdminIntegrityCheck(from_rkyv_bytes(bytes)?),
+            Opcode::Hello => Self::Hello(from_cbor_bytes(bytes)?),
+            Opcode::Auth => Self::Auth(from_cbor_bytes(bytes)?),
+            Opcode::EncodeReq => Self::Encode(from_cbor_bytes(bytes)?),
+            Opcode::EncodeVectorDirectReq => {
+                let (mut req, consumed) = crate::codec::cbor::from_cbor_prefix::<
+                    crate::ops::memory::EncodeVectorDirectRequest,
+                >(bytes)?;
+                req.vector = crate::codec::cbor::le_bytes_to_f32_vec(&bytes[consumed..])?;
+                Self::EncodeVectorDirect(req)
+            }
+            Opcode::RecallReq => Self::Recall(from_cbor_bytes(bytes)?),
+            Opcode::PlanReq => Self::Plan(from_cbor_bytes(bytes)?),
+            Opcode::ReasonReq => Self::Reason(from_cbor_bytes(bytes)?),
+            Opcode::ForgetReq => Self::Forget(from_cbor_bytes(bytes)?),
+            Opcode::LinkReq => Self::Link(from_cbor_bytes(bytes)?),
+            Opcode::UnlinkReq => Self::Unlink(from_cbor_bytes(bytes)?),
+            Opcode::MemoryListReq => Self::MemoryList(from_cbor_bytes(bytes)?),
+            Opcode::MemoryInspectReq => Self::MemoryInspect(from_cbor_bytes(bytes)?),
+            Opcode::GraphFetchReq => Self::GraphFetch(from_cbor_bytes(bytes)?),
+            Opcode::SubscribeReq => Self::Subscribe(from_cbor_bytes(bytes)?),
+            Opcode::UnsubscribeReq => Self::Unsubscribe(from_cbor_bytes(bytes)?),
+            Opcode::GetCapabilitiesReq => Self::GetCapabilities(from_cbor_bytes(bytes)?),
+            Opcode::TxnBegin => Self::TxnBegin(from_cbor_bytes(bytes)?),
+            Opcode::TxnCommit => Self::TxnCommit(from_cbor_bytes(bytes)?),
+            Opcode::TxnAbort => Self::TxnAbort(from_cbor_bytes(bytes)?),
+            Opcode::CancelStream => Self::CancelStream(from_cbor_bytes(bytes)?),
+            Opcode::Ping => Self::Ping(from_cbor_bytes(bytes)?),
+            Opcode::ClientPong => Self::ClientPong(from_cbor_bytes(bytes)?),
+            Opcode::Bye => Self::Bye(from_cbor_bytes(bytes)?),
+            Opcode::AdminStatsReq => Self::AdminStats(from_cbor_bytes(bytes)?),
+            Opcode::AdminSnapshotReq => Self::AdminSnapshot(from_cbor_bytes(bytes)?),
+            Opcode::AdminRestoreReq => Self::AdminRestore(from_cbor_bytes(bytes)?),
+            Opcode::AdminIntegrityCheckReq => Self::AdminIntegrityCheck(from_cbor_bytes(bytes)?),
             Opcode::AdminMigrateEmbeddingsReq => {
-                Self::AdminMigrateEmbeddings(from_rkyv_bytes(bytes)?)
+                Self::AdminMigrateEmbeddings(from_cbor_bytes(bytes)?)
             }
-            Opcode::AdminCreateContextReq => Self::AdminCreateContext(from_rkyv_bytes(bytes)?),
-            Opcode::AdminRenameContextReq => Self::AdminRenameContext(from_rkyv_bytes(bytes)?),
-            Opcode::AdminMoveMemoryReq => Self::AdminMoveMemory(from_rkyv_bytes(bytes)?),
-            Opcode::AdminReclassifyReq => Self::AdminReclassify(from_rkyv_bytes(bytes)?),
-            Opcode::AdminListTombstonedReq => Self::AdminListTombstoned(from_rkyv_bytes(bytes)?),
-            Opcode::EntityCreateReq => Self::EntityCreate(from_rkyv_bytes(bytes)?),
-            Opcode::EntityGetReq => Self::EntityGet(from_rkyv_bytes(bytes)?),
-            Opcode::EntityUpdateReq => Self::EntityUpdate(from_rkyv_bytes(bytes)?),
-            Opcode::EntityRenameReq => Self::EntityRename(from_rkyv_bytes(bytes)?),
-            Opcode::EntityMergeReq => Self::EntityMerge(from_rkyv_bytes(bytes)?),
-            Opcode::EntityUnmergeReq => Self::EntityUnmerge(from_rkyv_bytes(bytes)?),
-            Opcode::EntityResolveReq => Self::EntityResolve(from_rkyv_bytes(bytes)?),
-            Opcode::EntityListReq => Self::EntityList(from_rkyv_bytes(bytes)?),
-            Opcode::EntityTombstoneReq => Self::EntityTombstone(from_rkyv_bytes(bytes)?),
-            Opcode::StatementCreateReq => Self::StatementCreate(from_rkyv_bytes(bytes)?),
-            Opcode::StatementGetReq => Self::StatementGet(from_rkyv_bytes(bytes)?),
-            Opcode::StatementSupersedeReq => Self::StatementSupersede(from_rkyv_bytes(bytes)?),
-            Opcode::StatementTombstoneReq => Self::StatementTombstone(from_rkyv_bytes(bytes)?),
-            Opcode::StatementRetractReq => Self::StatementRetract(from_rkyv_bytes(bytes)?),
-            Opcode::StatementHistoryReq => Self::StatementHistory(from_rkyv_bytes(bytes)?),
-            Opcode::StatementListReq => Self::StatementList(from_rkyv_bytes(bytes)?),
-            Opcode::RelationCreateReq => Self::RelationCreate(from_rkyv_bytes(bytes)?),
-            Opcode::RelationGetReq => Self::RelationGet(from_rkyv_bytes(bytes)?),
-            Opcode::RelationSupersedeReq => Self::RelationSupersede(from_rkyv_bytes(bytes)?),
-            Opcode::RelationTombstoneReq => Self::RelationTombstone(from_rkyv_bytes(bytes)?),
-            Opcode::RelationListFromReq => Self::RelationListFrom(from_rkyv_bytes(bytes)?),
-            Opcode::RelationListToReq => Self::RelationListTo(from_rkyv_bytes(bytes)?),
-            Opcode::RelationTraverseReq => Self::RelationTraverse(from_rkyv_bytes(bytes)?),
-            Opcode::SchemaUploadReq => Self::SchemaUpload(from_rkyv_bytes(bytes)?),
-            Opcode::SchemaGetReq => Self::SchemaGet(from_rkyv_bytes(bytes)?),
-            Opcode::SchemaListReq => Self::SchemaList(from_rkyv_bytes(bytes)?),
-            Opcode::SchemaValidateReq => Self::SchemaValidate(from_rkyv_bytes(bytes)?),
-            Opcode::ExtractorListReq => Self::ExtractorList(from_rkyv_bytes(bytes)?),
-            Opcode::ExtractorDisableReq => Self::ExtractorDisable(from_rkyv_bytes(bytes)?),
-            Opcode::ExtractorEnableReq => Self::ExtractorEnable(from_rkyv_bytes(bytes)?),
-            Opcode::QueryReq => Self::Query(from_rkyv_bytes(bytes)?),
-            Opcode::QueryExplainReq => Self::QueryExplain(from_rkyv_bytes(bytes)?),
-            Opcode::QueryTraceReq => Self::QueryTrace(from_rkyv_bytes(bytes)?),
-            Opcode::RecallHybridReq => Self::RecallHybrid(from_rkyv_bytes(bytes)?),
+            Opcode::AdminCreateSessionReq => Self::AdminCreateSession(from_cbor_bytes(bytes)?),
+            Opcode::AdminRenameSessionReq => Self::AdminRenameSession(from_cbor_bytes(bytes)?),
+            Opcode::AdminMoveMemoryReq => Self::AdminMoveMemory(from_cbor_bytes(bytes)?),
+            Opcode::AdminReclassifyReq => Self::AdminReclassify(from_cbor_bytes(bytes)?),
+            Opcode::AdminListTombstonedReq => Self::AdminListTombstoned(from_cbor_bytes(bytes)?),
+            Opcode::AdminListPendingContradictionsReq => {
+                Self::AdminListPendingContradictions(from_cbor_bytes(bytes)?)
+            }
+            Opcode::AdminBackfillReq => Self::AdminBackfill(from_cbor_bytes(bytes)?),
+            Opcode::AdminBackfillCancelReq => Self::AdminBackfillCancel(from_cbor_bytes(bytes)?),
+            Opcode::EntityCreateReq => Self::EntityCreate(from_cbor_bytes(bytes)?),
+            Opcode::EntityGetReq => Self::EntityGet(from_cbor_bytes(bytes)?),
+            Opcode::EntityUpdateReq => Self::EntityUpdate(from_cbor_bytes(bytes)?),
+            Opcode::EntityRenameReq => Self::EntityRename(from_cbor_bytes(bytes)?),
+            Opcode::EntityMergeReq => Self::EntityMerge(from_cbor_bytes(bytes)?),
+            Opcode::EntityUnmergeReq => Self::EntityUnmerge(from_cbor_bytes(bytes)?),
+            Opcode::EntityResolveReq => Self::EntityResolve(from_cbor_bytes(bytes)?),
+            Opcode::EntityListReq => Self::EntityList(from_cbor_bytes(bytes)?),
+            Opcode::EntityTombstoneReq => Self::EntityTombstone(from_cbor_bytes(bytes)?),
+            Opcode::StatementCreateReq => Self::StatementCreate(from_cbor_bytes(bytes)?),
+            Opcode::StatementGetReq => Self::StatementGet(from_cbor_bytes(bytes)?),
+            Opcode::StatementSupersedeReq => Self::StatementSupersede(from_cbor_bytes(bytes)?),
+            Opcode::StatementTombstoneReq => Self::StatementTombstone(from_cbor_bytes(bytes)?),
+            Opcode::StatementRetractReq => Self::StatementRetract(from_cbor_bytes(bytes)?),
+            Opcode::StatementHistoryReq => Self::StatementHistory(from_cbor_bytes(bytes)?),
+            Opcode::StatementListReq => Self::StatementList(from_cbor_bytes(bytes)?),
+            Opcode::RelationCreateReq => Self::RelationCreate(from_cbor_bytes(bytes)?),
+            Opcode::RelationGetReq => Self::RelationGet(from_cbor_bytes(bytes)?),
+            Opcode::RelationSupersedeReq => Self::RelationSupersede(from_cbor_bytes(bytes)?),
+            Opcode::RelationTombstoneReq => Self::RelationTombstone(from_cbor_bytes(bytes)?),
+            Opcode::RelationListFromReq => Self::RelationListFrom(from_cbor_bytes(bytes)?),
+            Opcode::RelationListToReq => Self::RelationListTo(from_cbor_bytes(bytes)?),
+            Opcode::RelationTraverseReq => Self::RelationTraverse(from_cbor_bytes(bytes)?),
+            Opcode::SchemaUploadReq => Self::SchemaUpload(from_cbor_bytes(bytes)?),
+            Opcode::SchemaGetReq => Self::SchemaGet(from_cbor_bytes(bytes)?),
+            Opcode::SchemaListReq => Self::SchemaList(from_cbor_bytes(bytes)?),
+            Opcode::SchemaValidateReq => Self::SchemaValidate(from_cbor_bytes(bytes)?),
+            Opcode::SchemaReplaceReq => Self::SchemaReplace(from_cbor_bytes(bytes)?),
+            Opcode::SchemaDropReq => Self::SchemaDrop(from_cbor_bytes(bytes)?),
+            Opcode::ExtractorListReq => Self::ExtractorList(from_cbor_bytes(bytes)?),
+            Opcode::QueryExplainReq => Self::QueryExplain(from_cbor_bytes(bytes)?),
+            Opcode::QueryTraceReq => Self::QueryTrace(from_cbor_bytes(bytes)?),
             Opcode::MaterializeProceduralReq => {
-                Self::MaterializeProcedural(from_rkyv_bytes(bytes)?)
+                Self::MaterializeProcedural(from_cbor_bytes(bytes)?)
             }
+            Opcode::SpaceCreateReq => Self::SpaceCreate(from_cbor_bytes(bytes)?),
+            Opcode::SpaceListReq => Self::SpaceList(from_cbor_bytes(bytes)?),
+            Opcode::SpaceDeleteReq => Self::SpaceDelete(from_cbor_bytes(bytes)?),
+            Opcode::SessionCreateReq => Self::SessionCreate(from_cbor_bytes(bytes)?),
+            Opcode::SessionListReq => Self::SessionList(from_cbor_bytes(bytes)?),
+            Opcode::SessionDeleteReq => Self::SessionDelete(from_cbor_bytes(bytes)?),
             other => return Err(ProtocolError::UnknownOpcode(other.as_u16())),
         })
+    }
+}
+
+/// Borrow the effective-identity selector (`act_as`) carried by a
+/// request body, if the op is one of the verbs that support acting on
+/// behalf of another `(namespace, space_id)`. Every other variant
+/// returns `None` — those ops always run as the connection's own
+/// key-bound identity and carry no `act_as` field on the wire.
+///
+/// This is the single point the server consults to decide whether a
+/// request wants to override its effective identity; keeping it here
+/// (next to `RequestBody`) means new act-as-capable ops are added in
+/// exactly one place.
+///
+/// # Examples
+///
+/// ```
+/// use brain_protocol::{act_as_of, RequestBody, EncodeRequest, ActAs, WaitMode};
+///
+/// let no_override = RequestBody::Encode(EncodeRequest {
+///     text: "hi".into(),
+///     session_id: 0,
+///     request_id: [0; 16],
+///     txn_id: None,
+///     occurred_at_unix_nanos: None,
+///     act_as: None,
+///     wait: WaitMode::Ack,
+///     allow_duplicates: false,
+/// });
+/// assert!(act_as_of(&no_override).is_none());
+///
+/// let with_override = RequestBody::Encode(EncodeRequest {
+///     text: "hi".into(),
+///     session_id: 0,
+///     request_id: [0; 16],
+///     txn_id: None,
+///     occurred_at_unix_nanos: None,
+///     act_as: Some(ActAs { namespace: "acme".into(), space_id: "acme:u1".into() }),
+///     wait: WaitMode::Ack,
+///     allow_duplicates: false,
+/// });
+/// assert_eq!(act_as_of(&with_override).map(|a| a.namespace.as_str()), Some("acme"));
+/// ```
+#[must_use]
+pub fn act_as_of(body: &RequestBody) -> Option<&ActAs> {
+    match body {
+        RequestBody::Encode(r) => r.act_as.as_ref(),
+        RequestBody::Recall(r) => r.act_as.as_ref(),
+        RequestBody::Forget(r) => r.act_as.as_ref(),
+        RequestBody::Plan(r) => r.act_as.as_ref(),
+        RequestBody::Reason(r) => r.act_as.as_ref(),
+        RequestBody::Link(r) => r.act_as.as_ref(),
+        RequestBody::Unlink(r) => r.act_as.as_ref(),
+        RequestBody::MemoryList(r) => r.act_as.as_ref(),
+        RequestBody::MemoryInspect(r) => r.act_as.as_ref(),
+        RequestBody::GraphFetch(r) => r.act_as.as_ref(),
+        RequestBody::EntityCreate(r) => r.act_as.as_ref(),
+        RequestBody::EntityGet(r) => r.act_as.as_ref(),
+        RequestBody::EntityList(r) => r.act_as.as_ref(),
+        RequestBody::EntityResolve(r) => r.act_as.as_ref(),
+        RequestBody::StatementCreate(r) => r.act_as.as_ref(),
+        RequestBody::StatementGet(r) => r.act_as.as_ref(),
+        RequestBody::StatementList(r) => r.act_as.as_ref(),
+        RequestBody::RelationCreate(r) => r.act_as.as_ref(),
+        RequestBody::RelationGet(r) => r.act_as.as_ref(),
+        RequestBody::RelationListFrom(r) => r.act_as.as_ref(),
+        RequestBody::RelationListTo(r) => r.act_as.as_ref(),
+        RequestBody::RelationTraverse(r) => r.act_as.as_ref(),
+        RequestBody::Subscribe(r) => r.act_as.as_ref(),
+        RequestBody::SpaceCreate(r) => r.act_as.as_ref(),
+        RequestBody::SpaceList(r) => r.act_as.as_ref(),
+        RequestBody::SpaceDelete(r) => r.act_as.as_ref(),
+        RequestBody::SessionCreate(r) => r.act_as.as_ref(),
+        RequestBody::SessionList(r) => r.act_as.as_ref(),
+        RequestBody::SessionDelete(r) => r.act_as.as_ref(),
+        // Delegation is established once, at begin, and is fixed for the
+        // life of the txn: TXN_BEGIN carries the `act_as` and every write
+        // buffered under this txn commits as that identity. TXN_COMMIT /
+        // TXN_ABORT deliberately carry none — the commit runs under the
+        // identity the begin fixed, not a fresh selector on the commit.
+        RequestBody::TxnBegin(r) => r.act_as.as_ref(),
+        // Exhaustive on purpose: no `_ => None`.
+        //
+        // Silently dropping an `act_as` is a tenancy violation that returns
+        // success — the op runs as the connection's own identity while the
+        // caller believes it ran as another. A catch-all made forgetting the
+        // arm for a new act-as-capable op invisible; listing every variant
+        // makes the compiler refuse to build until someone decides which of
+        // the two an op is.
+        //
+        // These carry no `act_as` field on the wire and always run as the
+        // connection's key-bound identity.
+        RequestBody::Hello(_) => None,
+        RequestBody::Auth(_) => None,
+        RequestBody::EncodeVectorDirect(_) => None,
+        RequestBody::Unsubscribe(_) => None,
+        RequestBody::GetCapabilities(_) => None,
+        RequestBody::TxnCommit(_) => None,
+        RequestBody::TxnAbort(_) => None,
+        RequestBody::CancelStream(_) => None,
+        RequestBody::Ping(_) => None,
+        RequestBody::ClientPong(_) => None,
+        RequestBody::Bye(_) => None,
+        RequestBody::AdminStats(_) => None,
+        RequestBody::AdminSnapshot(_) => None,
+        RequestBody::AdminRestore(_) => None,
+        RequestBody::AdminIntegrityCheck(_) => None,
+        RequestBody::AdminMigrateEmbeddings(_) => None,
+        RequestBody::AdminCreateSession(_) => None,
+        RequestBody::AdminRenameSession(_) => None,
+        RequestBody::AdminMoveMemory(_) => None,
+        RequestBody::AdminReclassify(_) => None,
+        RequestBody::AdminListTombstoned(_) => None,
+        RequestBody::AdminListPendingContradictions(_) => None,
+        RequestBody::AdminBackfill(_) => None,
+        RequestBody::AdminBackfillCancel(_) => None,
+        RequestBody::EntityUpdate(_) => None,
+        RequestBody::EntityRename(_) => None,
+        RequestBody::EntityMerge(_) => None,
+        RequestBody::EntityUnmerge(_) => None,
+        RequestBody::EntityTombstone(_) => None,
+        RequestBody::StatementSupersede(_) => None,
+        RequestBody::StatementTombstone(_) => None,
+        RequestBody::StatementRetract(_) => None,
+        RequestBody::StatementHistory(_) => None,
+        RequestBody::RelationSupersede(_) => None,
+        RequestBody::RelationTombstone(_) => None,
+        RequestBody::SchemaUpload(_) => None,
+        RequestBody::SchemaGet(_) => None,
+        RequestBody::SchemaList(_) => None,
+        RequestBody::SchemaValidate(_) => None,
+        RequestBody::SchemaReplace(_) => None,
+        RequestBody::SchemaDrop(_) => None,
+        RequestBody::ExtractorList(_) => None,
+        RequestBody::QueryExplain(_) => None,
+        RequestBody::QueryTrace(_) => None,
+        RequestBody::MaterializeProcedural(_) => None,
     }
 }
 
@@ -408,7 +606,43 @@ mod tests {
     fn encode_round_trips() {
         round_trip(RequestBody::Encode(EncodeRequest {
             text: "hello brain".into(),
-            context_id: 1_u64,
+            session_id: 1_u64,
+            request_id: sample_uuid(2),
+            txn_id: Some(sample_uuid(3)),
+            occurred_at_unix_nanos: Some(1_700_000_000_000_000_000),
+            act_as: None,
+            wait: WaitMode::Ack,
+            allow_duplicates: false,
+        }));
+    }
+
+    #[test]
+    fn encode_round_trips_with_act_as() {
+        round_trip(RequestBody::Encode(EncodeRequest {
+            text: "hello brain".into(),
+            session_id: 1_u64,
+            request_id: sample_uuid(2),
+            txn_id: None,
+            occurred_at_unix_nanos: None,
+            act_as: Some(ActAs {
+                namespace: "acme".into(),
+                space_id: "acme:space".into(),
+            }),
+            wait: WaitMode::Ack,
+            allow_duplicates: false,
+        }));
+    }
+
+    #[test]
+    fn encode_vector_direct_round_trips() {
+        // A unit-norm 4-element vector is enough for the wire round
+        // trip; the server-side normalisation check lives in the
+        // handler and is exercised elsewhere.
+        round_trip(RequestBody::EncodeVectorDirect(EncodeVectorDirectRequest {
+            text: "hello brain".into(),
+            vector: vec![1.0, 0.0, 0.0, 0.0],
+            model_fingerprint: [0xAB; 16],
+            session_id: 1_u64,
             kind: MemoryKindWire::Episodic,
             salience_hint: 0.25,
             edges: vec![EdgeRequest {
@@ -425,11 +659,14 @@ mod tests {
     #[test]
     fn recall_round_trips() {
         round_trip(RequestBody::Recall(RecallRequest {
+            scope: Default::default(),
             cue_text: "what about budgets".into(),
-            top_k: 10,
+            subject_name: "Alice".into(),
+            max_results: 10,
             confidence_threshold: 0.3,
-            context_filter: Some(vec![1_u64, 2_u64]),
+            session_filter: Some(vec![1_u64, 2_u64]),
             age_bound_unix_nanos: Some(1_700_000_000_000_000_000),
+            as_of_record_time_unix_nanos: Some(1_710_000_000_000_000_000),
             kind_filter: Some(vec![MemoryKindWire::Episodic, MemoryKindWire::Semantic]),
             salience_floor: 0.1,
             include_edges: true,
@@ -437,7 +674,8 @@ mod tests {
             include_text: true,
             request_id: Some(sample_uuid(7)),
             txn_id: None,
-            rerank: false,
+            trace: true,
+            act_as: None,
         }));
     }
 
@@ -460,9 +698,11 @@ mod tests {
                     max_branches_explored: 100,
                 },
                 strategy_hint: Some(PlanStrategy::AStar),
-                context_filter: None,
+                session_filter: None,
                 request_id: None,
                 txn_id: None,
+                trace: false,
+                act_as: None,
             }));
         }
     }
@@ -477,11 +717,13 @@ mod tests {
                 observation: obs,
                 depth: 5,
                 confidence_threshold: 0.4,
-                context_filter: None,
+                session_filter: None,
                 max_inferences: 50,
                 budget_wall_time_ms: 5_000,
                 request_id: None,
                 txn_id: None,
+                trace: false,
+                act_as: None,
             }));
         }
     }
@@ -494,25 +736,62 @@ mod tests {
                 mode,
                 request_id: sample_uuid(8),
                 txn_id: None,
+                act_as: None,
             }));
         }
+    }
+
+    #[test]
+    fn forget_round_trips_with_act_as() {
+        round_trip(RequestBody::Forget(ForgetRequest {
+            memory_id: sample_memory_id(),
+            mode: ForgetMode::Hard,
+            request_id: sample_uuid(8),
+            txn_id: None,
+            act_as: Some(ActAs {
+                namespace: "acme".into(),
+                space_id: "acme:space".into(),
+            }),
+        }));
     }
 
     #[test]
     fn subscribe_round_trips() {
         round_trip(RequestBody::Subscribe(SubscribeRequest {
             filter: SubscriptionFilter {
-                contexts: Some(vec![9_u64]),
+                session_filter: Some(vec![9_u64]),
                 kinds: None,
                 similar_to: Some(SimilarityFilter {
                     reference_memory_id: sample_memory_id(),
                     threshold: 0.85,
                 }),
-                agents: None,
+                spaces: None,
+                memory_ids: None,
             },
             include_history: true,
             from_lsn: Some(42),
             max_inflight: 16,
+            act_as: None,
+        }));
+    }
+
+    #[test]
+    fn subscribe_round_trips_with_act_as() {
+        round_trip(RequestBody::Subscribe(SubscribeRequest {
+            filter: SubscriptionFilter {
+                session_filter: None,
+                kinds: None,
+                similar_to: None,
+                spaces: None,
+                memory_ids: None,
+            },
+            include_history: false,
+            from_lsn: None,
+            max_inflight: 16,
+            act_as: Some(ActAs {
+                namespace: "acme".into(),
+                space_id: "acme:space".into(),
+            }),
         }));
     }
 
@@ -529,6 +808,16 @@ mod tests {
         round_trip(RequestBody::TxnBegin(TxnBeginRequest {
             txn_id: id,
             timeout_seconds: 60,
+            act_as: None,
+        }));
+        // A delegated begin must round-trip its `act_as` selector too.
+        round_trip(RequestBody::TxnBegin(TxnBeginRequest {
+            txn_id: id,
+            timeout_seconds: 60,
+            act_as: Some(crate::ops::memory::ActAs {
+                namespace: "acme".to_string(),
+                space_id: "support-bot:user123".to_string(),
+            }),
         }));
         round_trip(RequestBody::TxnCommit(TxnCommitRequest { txn_id: id }));
         round_trip(RequestBody::TxnAbort(TxnAbortRequest { txn_id: id }));
@@ -546,6 +835,11 @@ mod tests {
                 reason,
             }));
         }
+    }
+
+    #[test]
+    fn get_capabilities_request_round_trips() {
+        round_trip(RequestBody::GetCapabilities(GetCapabilitiesRequest {}));
     }
 
     #[test]
@@ -601,18 +895,18 @@ mod tests {
                 rate_limit_qps: 0,
             },
         ));
-        round_trip(RequestBody::AdminCreateContext(AdminCreateContextRequest {
+        round_trip(RequestBody::AdminCreateSession(AdminCreateSessionRequest {
             name: "personal".into(),
             description: "personal notes".into(),
             request_id: sample_uuid(14),
         }));
-        round_trip(RequestBody::AdminRenameContext(AdminRenameContextRequest {
-            context_id: 15_u64,
+        round_trip(RequestBody::AdminRenameSession(AdminRenameSessionRequest {
+            session_id: 15_u64,
             new_name: "renamed".into(),
         }));
         round_trip(RequestBody::AdminMoveMemory(AdminMoveMemoryRequest {
             memory_id: sample_memory_id(),
-            new_context_id: 16_u64,
+            new_session_id: 16_u64,
         }));
         round_trip(RequestBody::AdminReclassify(AdminReclassifyRequest {
             memory_id: sample_memory_id(),
@@ -620,9 +914,33 @@ mod tests {
         }));
         round_trip(RequestBody::AdminListTombstoned(
             AdminListTombstonedRequest {
-                context_id: Some(17_u64),
+                session_id: Some(17_u64),
                 max_age_seconds: 3600,
                 limit: 100,
+            },
+        ));
+        round_trip(RequestBody::AdminListPendingContradictions(
+            AdminListPendingContradictionsRequest { limit: 50 },
+        ));
+        round_trip(RequestBody::AdminBackfill(AdminBackfillRequest {
+            scope: BackfillScope::All,
+            extractor_ids: vec![1, 2, 3],
+            dry_run: true,
+            request_id: sample_uuid(21),
+        }));
+        round_trip(RequestBody::AdminBackfill(AdminBackfillRequest {
+            scope: BackfillScope::MemoryRange {
+                start: sample_memory_id(),
+                end_inclusive: sample_memory_id().saturating_add(1024),
+            },
+            extractor_ids: vec![7],
+            dry_run: false,
+            request_id: sample_uuid(22),
+        }));
+        round_trip(RequestBody::AdminBackfillCancel(
+            AdminBackfillCancelRequest {
+                backfill_id: sample_uuid(23),
+                request_id: sample_uuid(24),
             },
         ));
     }
@@ -635,38 +953,320 @@ mod tests {
 
         for body in [
             RequestBody::Hello(HelloPayload {
-                client_id: "brain-rust-sdk/0.5.0".into(),
+                client_id: "example-client/1.0".into(),
                 supported_versions: vec![crate::VERSION],
                 capabilities: HelloCapabilities {
                     streaming: true,
                     compression_zstd: false,
                     server_push: false,
                 },
-                client_session_token: None,
+                client_connection_token: None,
             }),
             RequestBody::Auth(AuthPayload {
                 method: AuthMethod::Token,
-                agent_id: sample_uuid(11),
                 credentials: AuthCredentials::Token(b"opaque".to_vec()),
             }),
             RequestBody::Auth(AuthPayload {
                 method: AuthMethod::Mtls,
-                agent_id: sample_uuid(12),
                 credentials: AuthCredentials::Mtls(MtlsClaim {
                     cert_fingerprint: [9u8; 32],
                     asserted_subject: "CN=client".into(),
                 }),
-            }),
-            RequestBody::Auth(AuthPayload {
-                method: AuthMethod::None,
-                agent_id: sample_uuid(13),
-                credentials: AuthCredentials::None,
             }),
         ] {
             let bytes = body.encode();
             let decoded = RequestBody::decode(body.opcode(), &bytes).unwrap();
             assert_eq!(decoded, body);
         }
+    }
+
+    #[test]
+    fn act_as_of_returns_selector_for_supported_ops() {
+        let selector = ActAs {
+            namespace: "acme".into(),
+            space_id: "acme:space".into(),
+        };
+
+        let encode = RequestBody::Encode(EncodeRequest {
+            text: "x".into(),
+            session_id: 0,
+            request_id: sample_uuid(1),
+            txn_id: None,
+            occurred_at_unix_nanos: None,
+            act_as: Some(selector.clone()),
+            wait: WaitMode::Ack,
+            allow_duplicates: false,
+        });
+        assert_eq!(act_as_of(&encode), Some(&selector));
+
+        let recall = RequestBody::Recall(RecallRequest {
+            scope: Default::default(),
+            cue_text: "x".into(),
+            subject_name: String::new(),
+            max_results: 1,
+            confidence_threshold: 0.0,
+            session_filter: None,
+            age_bound_unix_nanos: None,
+            as_of_record_time_unix_nanos: None,
+            kind_filter: None,
+            salience_floor: 0.0,
+            include_edges: false,
+            include_graph: false,
+            include_text: false,
+            request_id: None,
+            txn_id: None,
+            trace: false,
+            act_as: Some(selector.clone()),
+        });
+        assert_eq!(act_as_of(&recall), Some(&selector));
+
+        let forget = RequestBody::Forget(ForgetRequest {
+            memory_id: sample_memory_id(),
+            mode: ForgetMode::Soft,
+            request_id: sample_uuid(1),
+            txn_id: None,
+            act_as: Some(selector.clone()),
+        });
+        assert_eq!(act_as_of(&forget), Some(&selector));
+
+        let plan = RequestBody::Plan(PlanRequest {
+            start: PlanState::ByText("a".into()),
+            goal: PlanState::ByText("b".into()),
+            budget: PlanBudget {
+                max_steps: 1,
+                max_wall_time_ms: 1,
+                max_branches_explored: 1,
+            },
+            strategy_hint: None,
+            session_filter: None,
+            request_id: None,
+            txn_id: None,
+            trace: false,
+            act_as: Some(selector.clone()),
+        });
+        assert_eq!(act_as_of(&plan), Some(&selector));
+
+        let reason = RequestBody::Reason(ReasonRequest {
+            observation: ObservationInput::ByText("x".into()),
+            depth: 1,
+            confidence_threshold: 0.0,
+            session_filter: None,
+            max_inferences: 1,
+            budget_wall_time_ms: 1,
+            request_id: None,
+            txn_id: None,
+            trace: false,
+            act_as: Some(selector.clone()),
+        });
+        assert_eq!(act_as_of(&reason), Some(&selector));
+
+        let link = RequestBody::Link(LinkRequest {
+            source: sample_memory_id(),
+            target: sample_memory_id(),
+            kind: EdgeKindWire::Caused,
+            weight: 1.0,
+            request_id: sample_uuid(1),
+            txn_id: None,
+            act_as: Some(selector.clone()),
+        });
+        assert_eq!(act_as_of(&link), Some(&selector));
+
+        let unlink = RequestBody::Unlink(UnlinkRequest {
+            source: sample_memory_id(),
+            target: sample_memory_id(),
+            kind: EdgeKindWire::Caused,
+            request_id: sample_uuid(1),
+            txn_id: None,
+            act_as: Some(selector.clone()),
+        });
+        assert_eq!(act_as_of(&unlink), Some(&selector));
+
+        let entity_create = RequestBody::EntityCreate(EntityCreateRequest {
+            entity_type_id: 1,
+            canonical_name: "Ada".into(),
+            aliases: Vec::new(),
+            attributes_blob: Vec::new(),
+            session_id: 0,
+            request_id: sample_uuid(1),
+            act_as: Some(selector.clone()),
+        });
+        assert_eq!(act_as_of(&entity_create), Some(&selector));
+
+        let entity_resolve = RequestBody::EntityResolve(EntityResolveRequest {
+            candidate_name: "Ada".into(),
+            resolution_context: String::new(),
+            entity_type_hint: 0,
+            allow_create: false,
+            request_id: sample_uuid(1),
+            act_as: Some(selector.clone()),
+        });
+        assert_eq!(act_as_of(&entity_resolve), Some(&selector));
+
+        let entity_get = RequestBody::EntityGet(EntityGetRequest {
+            entity_id: sample_uuid(1),
+            act_as: Some(selector.clone()),
+        });
+        assert_eq!(act_as_of(&entity_get), Some(&selector));
+
+        let entity_list = RequestBody::EntityList(EntityListRequest {
+            entity_type_id: 0,
+            name_prefix: String::new(),
+            mention_count_min: 0,
+            include_tombstoned: false,
+            include_merged: false,
+            limit: 100,
+            cursor: Vec::new(),
+            act_as: Some(selector.clone()),
+        });
+        assert_eq!(act_as_of(&entity_list), Some(&selector));
+
+        let statement_create = RequestBody::StatementCreate(StatementCreateRequest {
+            kind: StatementKindWire::Fact,
+            subject: sample_uuid(1),
+            predicate: "p".into(),
+            object: StatementObjectWire::Value(StatementValueWire::Text("v".into())),
+            confidence: 1.0,
+            evidence: EvidenceRefWire::Inline(Vec::new()),
+            extractor_id: 0,
+            valid_from_unix_nanos: 0,
+            valid_to_unix_nanos: 0,
+            event_at_unix_nanos: 0,
+            schema_version: 0,
+            session_id: 0,
+            request_id: sample_uuid(1),
+            act_as: Some(selector.clone()),
+        });
+        assert_eq!(act_as_of(&statement_create), Some(&selector));
+
+        let relation_create = RequestBody::RelationCreate(RelationCreateRequest {
+            relation_type: "r".into(),
+            from_entity: sample_uuid(1),
+            to_entity: sample_uuid(2),
+            properties_blob: Vec::new(),
+            evidence: EvidenceRefWire::Inline(Vec::new()),
+            extractor_id: 0,
+            confidence: 1.0,
+            valid_from_unix_nanos: 0,
+            valid_to_unix_nanos: 0,
+            session_id: 0,
+            request_id: sample_uuid(1),
+            act_as: Some(selector.clone()),
+        });
+        assert_eq!(act_as_of(&relation_create), Some(&selector));
+
+        let relation_traverse = RequestBody::RelationTraverse(RelationTraverseRequest {
+            start_entity: sample_uuid(1),
+            relation_types: Vec::new(),
+            direction: 0,
+            max_depth: 3,
+            max_nodes: 100,
+            time_at_unix_nanos: 0,
+            include_superseded: false,
+            request_id: sample_uuid(1),
+            act_as: Some(selector.clone()),
+        });
+        assert_eq!(act_as_of(&relation_traverse), Some(&selector));
+
+        let statement_get = RequestBody::StatementGet(StatementGetRequest {
+            statement_id: sample_uuid(1),
+            follow_supersession: false,
+            act_as: Some(selector.clone()),
+        });
+        assert_eq!(act_as_of(&statement_get), Some(&selector));
+
+        let statement_list = RequestBody::StatementList(StatementListRequest {
+            subject: sample_uuid(1),
+            predicate: String::new(),
+            kind: 0,
+            min_confidence: 0.0,
+            time_range_start_unix_nanos: 0,
+            time_range_end_unix_nanos: 0,
+            only_current: false,
+            include_tombstoned: false,
+            limit: 100,
+            cursor: Vec::new(),
+            act_as: Some(selector.clone()),
+        });
+        assert_eq!(act_as_of(&statement_list), Some(&selector));
+
+        let relation_get = RequestBody::RelationGet(RelationGetRequest {
+            relation_id: sample_uuid(1),
+            follow_supersession: false,
+            act_as: Some(selector.clone()),
+        });
+        assert_eq!(act_as_of(&relation_get), Some(&selector));
+
+        let relation_list_from = RequestBody::RelationListFrom(RelationListFromRequest {
+            from_entity: sample_uuid(1),
+            relation_type_filter: String::new(),
+            time_range_start_unix_nanos: 0,
+            time_range_end_unix_nanos: 0,
+            include_superseded: false,
+            include_tombstoned: false,
+            limit: 100,
+            cursor: Vec::new(),
+            act_as: Some(selector.clone()),
+        });
+        assert_eq!(act_as_of(&relation_list_from), Some(&selector));
+
+        let relation_list_to = RequestBody::RelationListTo(RelationListToRequest {
+            to_entity: sample_uuid(1),
+            relation_type_filter: String::new(),
+            time_range_start_unix_nanos: 0,
+            time_range_end_unix_nanos: 0,
+            include_superseded: false,
+            include_tombstoned: false,
+            limit: 100,
+            cursor: Vec::new(),
+            act_as: Some(selector.clone()),
+        });
+        assert_eq!(act_as_of(&relation_list_to), Some(&selector));
+
+        // TXN_BEGIN carries the delegation for the whole transaction; the
+        // commit inherits it and carries none of its own.
+        let txn_begin = RequestBody::TxnBegin(TxnBeginRequest {
+            txn_id: sample_uuid(1),
+            timeout_seconds: 30,
+            act_as: Some(selector.clone()),
+        });
+        assert_eq!(act_as_of(&txn_begin), Some(&selector));
+    }
+
+    #[test]
+    fn act_as_of_returns_none_when_absent_or_unsupported() {
+        // Supported op, but no override set.
+        let encode = RequestBody::Encode(EncodeRequest {
+            text: "x".into(),
+            session_id: 0,
+            request_id: sample_uuid(1),
+            txn_id: None,
+            occurred_at_unix_nanos: None,
+            act_as: None,
+            wait: WaitMode::Ack,
+            allow_duplicates: false,
+        });
+        assert!(act_as_of(&encode).is_none());
+
+        // A non-delegated begin carries no selector.
+        let txn_begin = RequestBody::TxnBegin(TxnBeginRequest {
+            txn_id: sample_uuid(1),
+            timeout_seconds: 30,
+            act_as: None,
+        });
+        assert!(act_as_of(&txn_begin).is_none());
+
+        // TXN_COMMIT never carries a selector of its own — the identity is
+        // fixed at begin.
+        let txn_commit = RequestBody::TxnCommit(TxnCommitRequest {
+            txn_id: sample_uuid(1),
+        });
+        assert!(act_as_of(&txn_commit).is_none());
+
+        // Op that does not carry an `act_as` field at all.
+        let ping = RequestBody::Ping(PingRequest {
+            client_timestamp_unix_nanos: 0,
+        });
+        assert!(act_as_of(&ping).is_none());
     }
 
     #[test]
@@ -706,6 +1306,15 @@ mod tests {
         let garbage = vec![0xAAu8; 64];
         let err = RequestBody::decode(Opcode::EncodeReq, &garbage).unwrap_err();
         assert!(matches!(err, ProtocolError::MalformedPayload(_)));
+    }
+
+    #[test]
+    fn schema_replace_request_round_trips() {
+        round_trip(RequestBody::SchemaReplace(SchemaReplaceRequest {
+            schema_document: "namespace acme\ndefine entity_type Widget { attributes {} }\n".into(),
+            force_drop_existing: true,
+            request_id: [0xAB; 16],
+        }));
     }
 
     // Wire fuzz: arbitrary bytes fed to RecallReq / EncodeReq decode

@@ -1,4 +1,4 @@
-//! TLS server configuration loader (sub-task 9.9).
+//! TLS server configuration loader.
 //!
 //! TLS 1.3 only, ALPN `"brain/1"`.
 //!
@@ -49,8 +49,6 @@ pub fn install_default_crypto_provider() {
 
 /// Load a PEM cert chain + PEM private key from disk and build a
 /// rustls `ServerConfig` constrained to TLS 1.3 with ALPN `"brain/1"`.
-///
-/// (TLS 1.3 only) + §2.6 (ALPN).
 pub fn load_server_tls_config(
     cert_path: &Path,
     key_path: &Path,

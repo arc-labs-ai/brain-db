@@ -93,11 +93,13 @@ impl ClassifierExtractor {
     /// Build the (`simple_labels`, `qname_by_simple`) pair the classifier
     /// path uses to feed GLiNER plain labels and then remap them back
     /// to qnames on the way out. Pulled out of `run` so the batched
-    /// path can share it without copy-paste.
-    fn resolve_labels(&self) -> (Vec<String>, HashMap<String, String>) {
+    /// path can share it without copy-paste. `labels` is the effective
+    /// label set for this dispatch — the per-cycle schema snapshot when the
+    /// worker supplies one, else the set baked in at construction.
+    fn resolve_labels(&self, labels: &[String]) -> (Vec<String>, HashMap<String, String>) {
         let mut seen = std::collections::HashSet::new();
         let mut collision = false;
-        for q in self.target_labels.iter() {
+        for q in labels.iter() {
             if !seen.insert(simple_label(q.as_str())) {
                 collision = true;
                 break;
@@ -108,31 +110,31 @@ impl ClassifierExtractor {
                 target: "brain_extractors::classifier",
                 "simple-label collision across namespaces; passing underscore-encoded qnames to GLiNER — accuracy degraded"
             );
-            let simples: Vec<String> = self
-                .target_labels
-                .iter()
-                .map(|q| q.replace(':', "_"))
-                .collect();
-            let map: HashMap<String, String> = self
-                .target_labels
+            let simples: Vec<String> = labels.iter().map(|q| q.replace(':', "_")).collect();
+            let map: HashMap<String, String> = labels
                 .iter()
                 .zip(simples.iter())
                 .map(|(q, s)| (s.clone(), q.clone()))
                 .collect();
             (simples, map)
         } else {
-            let simples: Vec<String> = self
-                .target_labels
+            let simples: Vec<String> = labels
                 .iter()
                 .map(|q| simple_label(q.as_str()).to_string())
                 .collect();
-            let map: HashMap<String, String> = self
-                .target_labels
+            let map: HashMap<String, String> = labels
                 .iter()
                 .map(|q| (simple_label(q.as_str()).to_string(), q.clone()))
                 .collect();
             (simples, map)
         }
+    }
+
+    /// The effective label set for a dispatch: the worker's per-cycle schema
+    /// snapshot (so a runtime `SCHEMA_UPLOAD`'s new entity types take effect on
+    /// the next batch) when present, else the labels baked in at construction.
+    fn effective_labels<'a>(&'a self, ctx: &'a ExtractionContext<'a>) -> &'a [String] {
+        ctx.entity_type_labels.unwrap_or(&self.target_labels)
     }
 
     /// Project a vector of GLiNER spans for one memory into the
@@ -153,8 +155,35 @@ impl ClassifierExtractor {
                 Some(qname) => span.label = qname.clone(),
                 None => continue,
             }
+            // Drop non-referential spans the model tags as entities:
+            // pronouns ("I", "you", "they"), bare determiners, and
+            // single-character noise. These resolve to junk entities and
+            // pollute the entity graph (and its Mentions edges) without
+            // naming a real referent.
+            if is_non_referential_span(&span.text) {
+                continue;
+            }
+            // Drop temporal spans ("Last Friday", "yesterday") the model
+            // tags as entities: a date/relative-time phrase names no
+            // referent, so it must not become a Person / entity node.
+            if crate::resolver::is_temporal_expression_surface(&span.text) {
+                continue;
+            }
             if let Some(item) = self.project(span) {
-                items.push(item);
+                match item {
+                    // GLiNER frequently tags conjoined names ("Alice and
+                    // Carol") as a single Person span, collapsing multiple
+                    // people into one entity and killing relations between
+                    // them. Split those into one mention per name. The split
+                    // is conservative (Person-only, ≥2 name-like parts), so
+                    // the common single-name case passes through unchanged.
+                    ExtractedItem::EntityMention(m) => {
+                        for split in split_person_conjunction(m) {
+                            items.push(ExtractedItem::EntityMention(split));
+                        }
+                    }
+                    other => items.push(other),
+                }
             }
         }
         items
@@ -182,6 +211,77 @@ impl ClassifierExtractor {
             _ => None,
         }
     }
+}
+
+/// True for spans that name no real referent and must not become
+/// entities: a span with no alphabetic character (pure punctuation/digits),
+/// or a closed-class function word. The closed-class check is the shared
+/// `brain_core::is_non_referential_surface` backstop (one source of truth with
+/// the apply path). Conservative — exact whole-surface match — so real names
+/// like "Ian" or "Al" pass.
+fn is_non_referential_span(text: &str) -> bool {
+    let t = text.trim();
+    if !t.chars().any(|c| c.is_alphabetic()) {
+        return true;
+    }
+    brain_core::is_non_referential_surface(t)
+}
+
+/// Split a Person mention whose text is a conjunction of names
+/// ("Alice and Carol", "Alice, Bob, and Carol") into one mention per
+/// name. Conservative on purpose:
+///
+/// - Person entities only — conjoined Org/Concept names ("Research and
+///   Development") must stay whole, and GLiNER tags those as non-Person,
+///   so scoping to Person avoids the false splits.
+/// - Only splits when ≥2 non-empty, alphabetic parts result; otherwise
+///   the original mention is returned unchanged (the common single-name
+///   path allocates nothing extra beyond the one-element Vec).
+///
+/// Char offsets are best-effort: each part is located in the original
+/// span text and offset from the span start; a miss falls back to the
+/// whole span range.
+fn split_person_conjunction(m: EntityMention) -> Vec<EntityMention> {
+    // First-colon split (`namespace:name`), consistent with every other qname
+    // parse site; `name` is colon-free so this equals the last segment.
+    let type_name = m
+        .entity_type_qname
+        .split_once(':')
+        .map_or(m.entity_type_qname.as_str(), |(_, n)| n);
+    if type_name != "Person" {
+        return vec![m];
+    }
+    let parts: Vec<&str> = m
+        .text
+        .split([',', '&'])
+        .flat_map(|p| p.split(" and "))
+        .map(str::trim)
+        .filter(|p| !p.is_empty() && p.chars().any(char::is_alphabetic))
+        .collect();
+    if parts.len() < 2 {
+        return vec![m];
+    }
+    parts
+        .into_iter()
+        .map(|name| {
+            let (start, end) = match m.text.find(name) {
+                Some(byte_off) => {
+                    let start = m.start + m.text[..byte_off].chars().count();
+                    (start, start + name.chars().count())
+                }
+                None => (m.start, m.end),
+            };
+            EntityMention {
+                entity_type_qname: m.entity_type_qname.clone(),
+                text: name.to_string(),
+                start,
+                end,
+                confidence: m.confidence,
+                extractor_id: m.extractor_id,
+                extractor_version: m.extractor_version,
+            }
+        })
+        .collect()
 }
 
 impl Extractor for ClassifierExtractor {
@@ -218,7 +318,8 @@ impl Extractor for ClassifierExtractor {
                 return ExtractionResult::skipped(ExtractionStatus::SkippedDisabled, reason, at);
             };
 
-            if self.target_labels.is_empty() {
+            let labels = self.effective_labels(ctx);
+            if labels.is_empty() {
                 return ExtractionResult::skipped(
                     ExtractionStatus::SkippedDisabled,
                     "no entity-type labels declared by the active schema",
@@ -226,7 +327,7 @@ impl Extractor for ClassifierExtractor {
                 );
             }
 
-            let (label_owned, qname_by_label) = self.resolve_labels();
+            let (label_owned, qname_by_label) = self.resolve_labels(labels);
             let label_refs: Vec<&str> = label_owned.iter().map(String::as_str).collect();
             let spans = match model.predict(text, &label_refs) {
                 Ok(s) => s,
@@ -283,7 +384,8 @@ impl Extractor for ClassifierExtractor {
                     })
                     .collect();
             };
-            if self.target_labels.is_empty() {
+            let labels = self.effective_labels(ctx);
+            if labels.is_empty() {
                 return mems
                     .iter()
                     .map(|_| {
@@ -296,7 +398,7 @@ impl Extractor for ClassifierExtractor {
                     .collect();
             }
 
-            let (label_owned, qname_by_label) = self.resolve_labels();
+            let (label_owned, qname_by_label) = self.resolve_labels(labels);
             let label_refs: Vec<&str> = label_owned.iter().map(String::as_str).collect();
 
             // Hold an owned String for each memory's text so the
@@ -344,5 +446,80 @@ impl Extractor for ClassifierExtractor {
             }
             out
         })
+    }
+}
+
+#[cfg(test)]
+mod conjunction_tests {
+    use super::{is_non_referential_span, split_person_conjunction};
+    use crate::framework::item::EntityMention;
+
+    fn mention(qname: &str, text: &str) -> EntityMention {
+        EntityMention {
+            entity_type_qname: qname.to_string(),
+            text: text.to_string(),
+            start: 0,
+            end: text.chars().count(),
+            confidence: 0.9,
+            extractor_id: 2,
+            extractor_version: 1,
+        }
+    }
+
+    fn texts(ms: Vec<EntityMention>) -> Vec<String> {
+        ms.into_iter().map(|m| m.text).collect()
+    }
+
+    #[test]
+    fn non_referential_spans_are_rejected() {
+        // Pronouns / determiners / non-alpha noise → dropped.
+        for junk in [
+            "I", "you", "We", "they", "It", "the", "this", "Their", "someone", "  ", "123", "-",
+        ] {
+            assert!(
+                is_non_referential_span(junk),
+                "{junk:?} should be rejected as non-referential"
+            );
+        }
+        // Real names — including short ones — pass.
+        for name in ["Alice", "Ian", "Al", "Phoenix Project", "Caroline"] {
+            assert!(
+                !is_non_referential_span(name),
+                "{name:?} should pass as a real referent"
+            );
+        }
+    }
+
+    #[test]
+    fn splits_two_names() {
+        let out = split_person_conjunction(mention("brain:Person", "Alice and Carol"));
+        assert_eq!(texts(out), vec!["Alice", "Carol"]);
+    }
+
+    #[test]
+    fn splits_oxford_list() {
+        let out = split_person_conjunction(mention("brain:Person", "Alice, Bob, and Carol"));
+        assert_eq!(texts(out), vec!["Alice", "Bob", "Carol"]);
+    }
+
+    #[test]
+    fn keeps_single_multiword_name() {
+        let out = split_person_conjunction(mention("brain:Person", "Priya Sharma"));
+        assert_eq!(texts(out), vec!["Priya Sharma"]);
+    }
+
+    #[test]
+    fn does_not_split_non_person() {
+        // A conjoined Org/Concept name must stay whole — the split is
+        // Person-scoped precisely to avoid wrecking these.
+        let out = split_person_conjunction(mention("brain:Concept", "Research and Development"));
+        assert_eq!(texts(out), vec!["Research and Development"]);
+    }
+
+    #[test]
+    fn offsets_track_each_name() {
+        let out = split_person_conjunction(mention("brain:Person", "Alice and Carol"));
+        assert_eq!((out[0].start, out[0].end), (0, 5)); // "Alice"
+        assert_eq!((out[1].start, out[1].end), (10, 15)); // "Carol"
     }
 }

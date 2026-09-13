@@ -1,0 +1,84 @@
+{
+  "title": "Brain — Errors & Drops",
+  "uid": "brain-errors",
+  "schemaVersion": 39,
+  "tags": ["brain"],
+  "time": { "from": "now-6h", "to": "now" },
+  "refresh": "30s",
+  "templating": { "list": [] },
+  "annotations": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Request Error Rate (by op)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum by (op) (rate(brain_request_total{status=\"error\"}[5m]))", "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Request Timeout Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum by (op) (rate(brain_request_total{status=\"timeout\"}[5m]))", "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Worker Error Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum by (worker) (rate(brain_worker_errors_total[5m]))", "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Statement Embed Error Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum(rate(brain_statement_embed_errors_total[5m]))", "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Edge Drops Rate (auto / temporal)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum(rate(brain_auto_edge_drops_total[5m]))", "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" } },
+        { "expr": "sum(rate(brain_temporal_edge_drops_total[5m]))", "refId": "B", "datasource": { "type": "prometheus", "uid": "prometheus" } },
+        { "expr": "sum(rate(brain_causal_edge_drops_total[5m]))", "refId": "C", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Extractor Drops Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum(rate(brain_extractor_drops_total[5m]))", "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Rejected Connections Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum(rate(brain_connections_rejected_total[5m]))", "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ]
+    }
+  ]
+}

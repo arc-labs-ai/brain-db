@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+publish.workspace = true
 description = "Query planner and executor for Brain."
 
 [dependencies]
@@ -17,6 +18,10 @@ brain-rerank = { path = "../brain-rerank" }
 thiserror.workspace = true
 tracing.workspace = true
 parking_lot.workspace = true
+# 27.B: retrieval executor fans out independent retrievers concurrently.
+# We stay runtime-agnostic — the executor runs under whichever async
+# runtime the caller picks (Glommio in production, `block_on` in tests).
+futures-lite = { workspace = true }
 # 23.3: query router classification heuristics use regex over
 # query text (exact-id detection, Title-Case mention probe,
 # temporal expression detection).
@@ -41,7 +46,7 @@ criterion.workspace = true
 proptest.workspace = true
 
 [[bench]]
-name = "hybrid_query"
+name = "retrieval"
 harness = false
 
 [[bench]]

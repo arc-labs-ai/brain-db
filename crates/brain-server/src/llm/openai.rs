@@ -1,9 +1,9 @@
-//! OpenAI Chat Completions Summarizer adapter (sub-task 9.15).
+//! OpenAI Chat Completions Summarizer adapter.
 //!
-//! Posts to `<api_base>/chat/completions` with the
-//! prompt. API key read once from the env var named in
-//! `cfg.summarizer.openai_api_key_env`; the key never lives in TOML
-//! and is never logged.
+//! Posts to `<api_base>/chat/completions` with the prompt. The API key
+//! is the single shared credential (`[llm] api_key` / `BRAIN__LLM__API_KEY`),
+//! the same one every other LLM consumer uses. The resolved key is never
+//! logged.
 //!
 //! Errors:
 //! - HTTP 4xx → `SummarizerError::Failed(format!("openai {status}: …"))`.

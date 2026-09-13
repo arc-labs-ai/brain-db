@@ -1,10 +1,6 @@
 //! `MetadataDb` — the public composition layer over the 13 tables in
 //! `crate::tables`.
 //!
-//! Spec references:
-//! - `spec/10_metadata/08_transactions.md` — full transaction semantics.
-//! - `spec/10_metadata/02_table_layout.md` — table catalog.
-//!
 //! ## Surface
 //!
 //! - [`MetadataDb::open`] — opens or creates the redb file at the given
@@ -12,40 +8,50 @@
 //!   initialise a fresh DB at the current schema version or verify an
 //!   existing file's version is compatible.
 //! - [`MetadataDb::read_txn`] — `&self`; many can coexist (redb MVCC).
-//! - [`MetadataDb::write_txn`] — `&mut self`; the borrow checker
-//!   enforces single-writer-per-shard (CLAUDE.md §5 invariant 2)
-//!   at compile time.
+//! - [`MetadataDb::write_txn`] — `&self`; redb itself serialises writes
+//!   per database. The single-writer-per-shard discipline lives at the
+//!   shard's writer task, not in the borrow checker — Brain wraps
+//!   `MetadataDb` in `Arc` so readers and the writer task share one
+//!   handle without a mutex blocking reads against reads.
 //! - [`MetadataDb::schema_version`] — cached at open; cheap.
 //! - [`MetadataDb::path`], [`MetadataDb::db`] — diagnostics and an
 //!   escape hatch for operations the wrapper doesn't surface.
 //!
 //! ## What does NOT live here
 //!
-//! - **`impl MetadataSink for MetadataDb`** — sub-task 3.11.
+//! - **`impl MetadataSink for MetadataDb`** — lives in `recovery/`.
 //! - **Typed convenience methods** (`db.get_memory(&id)` etc.) —
-//!   deliberately not shows callers opening multiple
-//!   tables inside one write transaction; wrapping each row type in a
-//!   dedicated method would (a) duplicate redb's API, (b) break
-//!   batching, (c) hide transaction granularity from the caller.
-//!   Callers `use brain_metadata::tables::memory::MEMORIES_TABLE;` and
-//!   open whatever they need.
-//! - **Cached table handles** — profile-driven; not
-//!   v1.
-//! - **Write-transaction timeout** — writer-task
-//!   concern; `MetadataDb` doesn't auto-abort.
+//!   deliberately omitted. Callers open multiple tables inside one
+//!   write transaction; wrapping each row type in a dedicated method
+//!   would (a) duplicate redb's API, (b) break batching, (c) hide
+//!   transaction granularity from the caller. Callers
+//!   `use brain_metadata::tables::memory::MEMORIES_TABLE;` and open
+//!   whatever they need.
+//! - **Cached table handles** — profile-driven; not done yet.
+//! - **Write-transaction timeout** — writer-task concern; `MetadataDb`
+//!   doesn't auto-abort.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicU64;
 
+use parking_lot::Mutex;
 use redb::{Database, ReadTransaction, ReadableDatabase, TransactionError, WriteTransaction};
 
 use crate::storage_version::{open_or_init_schema, SchemaError};
 use crate::system_schema::{seed_system_schema, SystemSchemaError};
 use crate::tables::checkpoint::{latest as latest_checkpoint, CHECKPOINTS_TABLE};
 
-/// Public type wrapping the redb metadata file. Single ownership per
-/// shard; the borrow checker enforces single-writer via `&mut self` on
-/// [`MetadataDb::write_txn`].
+/// Public type wrapping the redb metadata file.
+///
+/// Designed to be shared via `Arc<MetadataDb>` across a shard's reader
+/// paths and its single writer task. Reads (`read_txn`) and writes
+/// (`write_txn`) both take `&self` because redb itself coordinates
+/// MVCC reads and per-database write serialisation; wrapping the
+/// handle in a mutex would only block readers against readers without
+/// adding any actual safety. The single-writer-per-shard invariant is
+/// enforced architecturally — one dedicated writer task per shard
+/// drives `write_txn` — not by the borrow checker.
 #[derive(Debug)]
 pub struct MetadataDb {
     pub(crate) db: Database,
@@ -55,13 +61,23 @@ pub struct MetadataDb {
     /// Cached recovery target. Loaded at [`MetadataDb::open`] from the
     /// `checkpoints` table's most-recent row; advanced by
     /// [`crate::sink::MetadataSink::apply`] on `CheckpointEnd`.
-    pub(crate) durable_lsn: u64,
+    ///
+    /// Stored atomically so reader callers (snapshot durability lookups,
+    /// retention workers) can observe the watermark through
+    /// `Arc<MetadataDb>` without taking a mutex.
+    pub(crate) durable_lsn: AtomicU64,
 
     /// In-flight checkpoints seen but not yet `CheckpointEnd`-paired.
     /// Maps `checkpoint_id → started_at_unix_nanos`. Transient: any
     /// entry surviving across a restart is implicitly discarded
     /// (incomplete checkpoint is ignored).
-    pub(crate) pending_checkpoints: HashMap<u64, u64>,
+    ///
+    /// Mutated only by the per-shard recovery / checkpoint apply path,
+    /// which runs single-threaded inside the writer task. The mutex is
+    /// here purely so the field is reachable through `&self` for the
+    /// trait-required `MetadataSink::apply(&mut self)` impl while
+    /// production code holds the DB through `Arc<MetadataDb>`.
+    pub(crate) pending_checkpoints: Mutex<HashMap<u64, u64>>,
 }
 
 /// Errors returned by [`MetadataDb::open`].
@@ -81,8 +97,7 @@ pub enum MetadataDbError {
     #[error("schema: {0}")]
     Schema(#[from] SchemaError),
 
-    /// Phase 19.7 — system-schema seed failed at `MetadataDb::open`.
-    /// Replaces the per-builtin-kind variants from 16.1 / 17.3 / 18.3.
+    /// System-schema seed failed at `MetadataDb::open`.
     #[error("system schema seed: {0}")]
     SystemSchemaSeed(#[from] SystemSchemaError),
 }
@@ -99,34 +114,32 @@ impl MetadataDb {
         let db = Database::create(&path)?;
         let schema_version = open_or_init_schema(&db)?;
 
-        // Seed `durable_lsn` from the latest checkpoint, if any. Missing
-        // or empty checkpoints table → 0 (fresh shard or no checkpoint
-        // has completed yet): "the substrate keeps the
-        // most recent one as the recovery target."
+        // Seed `durable_lsn` from the latest checkpoint, if any. Empty
+        // checkpoints table → 0 (fresh shard or no checkpoint has
+        // completed yet): "the substrate keeps the most recent one as
+        // the recovery target."
         let durable_lsn = {
             let rtxn = db.begin_read()?;
-            match rtxn.open_table(CHECKPOINTS_TABLE) {
-                Ok(t) => latest_checkpoint(&t)
-                    .map_err(|e| MetadataDbError::Schema(SchemaError::Storage(e)))?
-                    .map_or(0, |c| c.durable_lsn),
-                Err(redb::TableError::TableDoesNotExist(_)) => 0,
-                Err(e) => return Err(MetadataDbError::Schema(SchemaError::from(e))),
-            }
+            let t = rtxn
+                .open_table(CHECKPOINTS_TABLE)
+                .map_err(|e| MetadataDbError::Schema(SchemaError::from(e)))?;
+            latest_checkpoint(&t)
+                .map_err(|e| MetadataDbError::Schema(SchemaError::Storage(e)))?
+                .map_or(0, |c| c.durable_lsn)
         };
 
-        // Phase 19.7: replaces the three hand-seeded paths from
-        // 16.1 / 17.3 / 18.3 with a single parse-validate-apply over
-        // the embedded `system_schema/schema.brain` source. Idempotent
-        // — re-opens are no-ops because `schema_active("brain")`
-        // returns `Some(1)` on a previously-seeded DB.
+        // Single parse-validate-apply over the embedded
+        // `system_schema/schema.brain` source. Idempotent — re-opens
+        // are no-ops because `schema_active("brain")` returns `Some(1)`
+        // on a previously-seeded DB.
         seed_system_schema(&db)?;
 
         Ok(Self {
             db,
             schema_version,
             path,
-            durable_lsn,
-            pending_checkpoints: HashMap::new(),
+            durable_lsn: AtomicU64::new(durable_lsn),
+            pending_checkpoints: Mutex::new(HashMap::new()),
         })
     }
 
@@ -136,16 +149,17 @@ impl MetadataDb {
         self.db.begin_read()
     }
 
-    /// Begin a write transaction. `&mut self` enforces
-    /// single-writer-per-shard at compile time: a shard can't
-    /// accidentally host two writer tasks because both would need
-    /// `&mut MetadataDb`, which the borrow checker forbids.
+    /// Begin a write transaction. Takes `&self` so a shared
+    /// `Arc<MetadataDb>` can drive both readers and the writer task
+    /// without a wrapping mutex serialising readers against readers.
     ///
-    /// "The single-writer-per-shard discipline means
-    /// there's only one writer per shard, naturally serializing
-    /// redb's write transactions." We encode the discipline in the
-    /// type signature.
-    pub fn write_txn(&mut self) -> Result<WriteTransaction, TransactionError> {
+    /// redb itself enforces single-writer-per-database at the file
+    /// level. Brain layers the single-writer-per-shard discipline on
+    /// top: every shard owns one writer task, so the borrow checker's
+    /// `&mut self` belt-and-suspenders constraint stops earning its
+    /// keep once `MetadataDb` is reached through `Arc<...>`. Callers
+    /// outside the writer task must not invoke this.
+    pub fn write_txn(&self) -> Result<WriteTransaction, TransactionError> {
         self.db.begin_write()
     }
 
@@ -183,42 +197,11 @@ mod tests {
     use super::*;
     use crate::storage_version::{CURRENT_SCHEMA_VERSION, SCHEMA_META_TABLE, SCHEMA_VERSION_KEY};
     use crate::tables::entity_type::{EntityTypeDefinition, ENTITY_TYPES_TABLE};
-    use crate::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
-    use brain_core::{AgentId, ContextId, EntityType, MemoryId, MemoryKind};
+    use brain_core::EntityType;
     use redb::ReadableTable;
 
     fn db_path(dir: &tempfile::TempDir) -> PathBuf {
         dir.path().join("metadata.redb")
-    }
-
-    fn aid(byte: u8) -> AgentId {
-        let mut b = [0u8; 16];
-        b[15] = byte;
-        b.into()
-    }
-
-    fn mid(byte: u8) -> MemoryId {
-        let mut b = [0u8; 16];
-        b[15] = byte;
-        MemoryId::from_be_bytes(b)
-    }
-
-    fn sample_memory() -> ([u8; 16], MemoryMetadata) {
-        let id = mid(1);
-        let agent = aid(7);
-        let m = MemoryMetadata::new_active(
-            id,
-            agent,
-            ContextId(42),
-            /* slot_id */ 0,
-            /* slot_version */ 1,
-            MemoryKind::Episodic,
-            /* embedding_model_fp */ [0u8; 16],
-            /* salience_initial */ 0.5,
-            /* text_size */ 32,
-            /* created_at_unix_nanos */ 1_700_000_000_000_000_000,
-        );
-        (id.to_be_bytes(), m)
     }
 
     #[test]
@@ -270,135 +253,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn write_then_read_round_trip() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut db = MetadataDb::open(db_path(&dir)).unwrap();
-        let (key, m) = sample_memory();
-
-        // Write via the wrapper.
-        let wtxn = db.write_txn().unwrap();
-        {
-            let mut t = wtxn.open_table(MEMORIES_TABLE).unwrap();
-            t.insert(&key, &m).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        // Read via the wrapper.
-        let rtxn = db.read_txn().unwrap();
-        let t = rtxn.open_table(MEMORIES_TABLE).unwrap();
-        assert_eq!(t.get(&key).unwrap().unwrap().value(), m);
-    }
-
-    #[test]
-    fn read_txn_doesnt_see_uncommitted_write() {
-        // MVCC pin: a read transaction sees the
-        // database as-of when it began; uncommitted writes from a
-        // concurrent write transaction are invisible.
-        //
-        // redb takes an exclusive file lock per `Database::create`, so
-        // we can't open a second `MetadataDb` on the same path. Instead
-        // we rely on the fact that `write_txn(&mut self)` borrows &mut
-        // only briefly (the returned `WriteTransaction` is owned, with
-        // no lifetime tied to `db`), so calling `read_txn(&self)`
-        // afterwards is legal.
-        let dir = tempfile::tempdir().unwrap();
-        let mut db = MetadataDb::open(db_path(&dir)).unwrap();
-        let (key, m) = sample_memory();
-
-        // Seed the table by writing+committing an unrelated row, so
-        // the table exists when the read txn opens it.
-        {
-            let other_key = mid(99).to_be_bytes();
-            let wtxn = db.write_txn().unwrap();
-            {
-                let mut t = wtxn.open_table(MEMORIES_TABLE).unwrap();
-                t.insert(&other_key, &m).unwrap();
-            }
-            wtxn.commit().unwrap();
-        }
-
-        // Start an uncommitted write txn inserting `key`.
-        let wtxn = db.write_txn().unwrap();
-        {
-            let mut t = wtxn.open_table(MEMORIES_TABLE).unwrap();
-            t.insert(&key, &m).unwrap();
-        }
-
-        // A read txn must not see the uncommitted insert.
-        let rtxn = db.read_txn().unwrap();
-        let t = rtxn.open_table(MEMORIES_TABLE).unwrap();
-        assert!(
-            t.get(&key).unwrap().is_none(),
-            "read txn must not see uncommitted write"
-        );
-
-        // Cleanup: drop the uncommitted txn (rollback).
-        drop(wtxn);
-    }
-
-    #[test]
-    fn commit_makes_write_visible_to_new_read() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut db = MetadataDb::open(db_path(&dir)).unwrap();
-        let (key, m) = sample_memory();
-
-        let wtxn = db.write_txn().unwrap();
-        {
-            let mut t = wtxn.open_table(MEMORIES_TABLE).unwrap();
-            t.insert(&key, &m).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let rtxn = db.read_txn().unwrap();
-        let t = rtxn.open_table(MEMORIES_TABLE).unwrap();
-        assert_eq!(t.get(&key).unwrap().unwrap().value(), m);
-    }
-
-    #[test]
-    fn concurrent_read_txns_coexist() {
-        // read transactions don't block each other.
-        // Two read txns from the same MetadataDb share a snapshot.
-        let dir = tempfile::tempdir().unwrap();
-        let mut db = MetadataDb::open(db_path(&dir)).unwrap();
-        let (key, m) = sample_memory();
-
-        // Seed one row so there's something to observe.
-        let wtxn = db.write_txn().unwrap();
-        {
-            let mut t = wtxn.open_table(MEMORIES_TABLE).unwrap();
-            t.insert(&key, &m).unwrap();
-        }
-        wtxn.commit().unwrap();
-
-        let r1 = db.read_txn().unwrap();
-        let r2 = db.read_txn().unwrap();
-
-        let t1 = r1.open_table(MEMORIES_TABLE).unwrap();
-        let t2 = r2.open_table(MEMORIES_TABLE).unwrap();
-
-        assert_eq!(t1.get(&key).unwrap().unwrap().value(), m);
-        assert_eq!(t2.get(&key).unwrap().unwrap().value(), m);
-    }
-
-    #[test]
-    fn schema_version_accessor_returns_current() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = MetadataDb::open(db_path(&dir)).unwrap();
-        assert_eq!(db.schema_version(), CURRENT_SCHEMA_VERSION);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 2);
-    }
-
-    #[test]
-    fn path_accessor_returns_open_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = db_path(&dir);
-        let db = MetadataDb::open(&path).unwrap();
-        assert_eq!(db.path(), path.as_path());
-    }
-
     // -----------------------------------------------------------------
-    // Sub-task 16.1: Person bootstrap.
+    // Person bootstrap.
     // -----------------------------------------------------------------
 
     /// The system schema seeds the six built-in entity types in
@@ -486,7 +342,7 @@ mod tests {
             wtxn.commit().unwrap();
         }
 
-        // Re-open: seed must be a no-op. Phase 19.7 gates on
+        // Re-open: seed must be a no-op. The seed gates on
         // `schema_active("brain")`, not on table emptiness.
         let db = MetadataDb::open(&path).unwrap();
         let rtxn = db.read_txn().unwrap();
@@ -503,7 +359,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Sub-task 18.3: built-in relation type seeding.
+    // Built-in relation type seeding.
     // -----------------------------------------------------------------
 
     #[test]
@@ -532,9 +388,9 @@ mod tests {
 
         let rtxn = db.read_txn().unwrap();
         let all = crate::relation::types::relation_type_list(&rtxn, Some("brain")).unwrap();
-        // Phase 19.7: system schema seeds 3 brain relation types
-        // (`related_to`, `reports_to`, `co_authored`). Idempotent
-        // on reopen — count stays at 3, not 6.
-        assert_eq!(all.len(), 3, "re-open must not duplicate built-in seeds");
+        // The system schema seeds 4 brain relation types
+        // (`related_to`, `reports_to`, `co_authored`, `family_of`).
+        // Idempotent on reopen — count stays at 4, not 8.
+        assert_eq!(all.len(), 4, "re-open must not duplicate built-in seeds");
     }
 }

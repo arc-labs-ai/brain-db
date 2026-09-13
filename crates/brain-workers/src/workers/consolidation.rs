@@ -1,4 +1,4 @@
-//! Consolidation worker (sub-task 8.4).
+//! Consolidation worker.
 //!
 //! Identifies clusters of recent Episodic memories in the same
 //! context, asks the [`Summarizer`] for a summary, and encodes the
@@ -18,16 +18,20 @@
 //!
 //! ## Clustering
 //!
-//! calls for DBSCAN over vector cosine. v1's HNSW backend
-//! doesn't expose `vector_for(memory_id)` (the arena lookup lands in
-//! Phase 9), so the **worker can't run vector-based clustering yet**.
-//!
-//! The cycle therefore uses **window-based grouping**: within a
-//! (context, recency_window) bucket, the worker treats the candidates
-//! as a single cluster if at least `min_cluster_size` of them aren't
-//! already consolidated. The proper similarity clustering is shipped
-//! as a tested pure helper ([`cluster_by_similarity`]) for Phase 9 to
-//! wire up once vectors become id-accessible. Documented v1 deviation
+//! Consolidation always clusters recent Episodic memories in the same
+//! context by vector cosine similarity (DBSCAN-style density clustering
+//! per the spec). Each candidate's write-time vector is resolved by id
+//! from the live redb artifact store via
+//! [`brain_ops::memory_artifact::get_artifact_vector`] — the
+//! authoritative in-run vector source, not the memory-mapped arena
+//! (which is populated only by WAL recovery and is empty for memories
+//! encoded in the current run). A candidate whose stored vector can't
+//! be read (stale, tombstoned, hard-forgotten, or never produced) is
+//! dropped fail-soft, never mis-clustered. The surviving
+//! `(memory_id, vector)` pairs are grouped by [`cluster_by_similarity`]
+//! (single-linkage over cosine, dropping groups below
+//! `min_cluster_size`), and each returned cluster is consolidated
+//! independently.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::future::Future;
@@ -36,7 +40,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use brain_core::{
-    ContextId, EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NodeRef, RequestId, Salience,
+    EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NamespaceId, NodeRef, RequestId, Salience,
+    SessionId, SpaceId,
 };
 use brain_embed::VECTOR_DIM;
 use brain_metadata::tables::memory::MEMORIES_TABLE;
@@ -73,7 +78,7 @@ pub const DEFAULT_INITIAL_SALIENCE: f32 = 0.7;
 // ---------------------------------------------------------------------------
 
 /// Pure-helper input. Carries everything `cluster_by_similarity`
-/// needs; Phase 9 will produce these from the arena.
+/// needs; these are produced from the arena.
 #[derive(Clone, Debug)]
 pub struct ClusterCandidate {
     pub memory_id: MemoryId,
@@ -86,6 +91,30 @@ pub struct ClusterCandidate {
 struct WindowCandidate {
     memory_id: MemoryId,
     created_at_unix_nanos: u64,
+}
+
+/// The full tenant + conversation bucket a candidate belongs to.
+///
+/// Clustering MUST never cross this boundary: a `SessionId` is only
+/// unique within a `(namespace, space)` — two different spaces can both
+/// carry `SessionId(1)`, and `SessionId(0)` is the shared default every
+/// session-less encode uses. Bucketing by session alone would cluster
+/// and summarize memories from different tenants into one row; keying on
+/// the whole tuple keeps each tenant/space/session isolated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct BucketKey {
+    namespace_id: u32,
+    space_id_bytes: [u8; 16],
+    session: SessionId,
+}
+
+impl BucketKey {
+    fn namespace(&self) -> NamespaceId {
+        NamespaceId::from(self.namespace_id)
+    }
+    fn space(&self) -> SpaceId {
+        SpaceId::from(self.space_id_bytes)
+    }
 }
 
 /// Compute cosine similarity. Returns 0.0 if either vector is the
@@ -170,10 +199,10 @@ pub fn cluster_by_similarity(
 // Deterministic request_id (idempotency).
 // ---------------------------------------------------------------------------
 
-/// Hash the sorted source ids to a stable 16-byte `RequestId`. Spec
-/// §07/06 mandates that the same `RequestId` returns the same
-/// `MemoryId`; this lets a partial-crash retry land on the same
-/// Consolidated memory without duplication.
+/// Hash the sorted source ids to a stable 16-byte `RequestId`. The
+/// same `RequestId` must return the same `MemoryId`; this lets a
+/// partial-crash retry land on the same Consolidated memory without
+/// duplication.
 #[must_use]
 pub fn deterministic_request_id(source_ids: &[MemoryId]) -> RequestId {
     let mut sorted: Vec<MemoryId> = source_ids.to_vec();
@@ -289,7 +318,8 @@ async fn do_consolidation_cycle(
     let started = Instant::now();
     let mut consolidations = 0usize;
 
-    for (context_id, candidates) in by_context {
+    for (bucket, candidates) in by_context {
+        let session_id = bucket.session;
         if started.elapsed() >= cfg.max_runtime {
             break;
         }
@@ -300,23 +330,39 @@ async fn do_consolidation_cycle(
             break;
         }
 
-        // v1 window-based grouping. Sort by recency and take the
-        // oldest `min_cluster_size` ids as "the cluster" — older
-        // memories are the ones most likely to benefit from
-        // consolidation. ('s similarity clustering is the
-        // Phase 9 upgrade; `cluster_by_similarity` ships as a pure
-        // helper for that.)
-        let mut sorted: Vec<WindowCandidate> = candidates;
-        sorted.sort_by_key(|c| c.created_at_unix_nanos);
-        if sorted.len() < worker.min_cluster_size {
-            continue;
-        }
-        let cluster: Vec<MemoryId> = sorted
-            .iter()
-            .take(worker.min_cluster_size)
-            .map(|c| c.memory_id)
-            .collect();
-        let clusters = vec![cluster];
+        // Group this bucket into clusters by cosine similarity
+        // (DBSCAN-style). Resolve each candidate's write-time vector by
+        // id from the LIVE redb artifact store (`get_artifact_vector`) —
+        // NOT the memory-mapped arena, which is populated only by WAL
+        // recovery and is therefore empty for every memory encoded in the
+        // current run. A candidate whose stored vector can't be read
+        // (forgotten / never produced) is dropped fail-soft, never
+        // mis-clustered.
+        let clusters: Vec<Vec<MemoryId>> = {
+            let rtxn =
+                ctx.ops.executor.metadata.read_txn().map_err(|e| {
+                    WorkerError::Ops(format!("consolidation vector read_txn: {e:?}"))
+                })?;
+            let mut resolved: Vec<ClusterCandidate> = Vec::with_capacity(candidates.len());
+            for cand in &candidates {
+                let Some(vector) = brain_ops::memory_artifact::get_artifact_vector(
+                    &rtxn,
+                    cand.memory_id.to_be_bytes(),
+                ) else {
+                    continue; // fail-soft: no stored vector for this id
+                };
+                resolved.push(ClusterCandidate {
+                    memory_id: cand.memory_id,
+                    vector,
+                    created_at_unix_nanos: cand.created_at_unix_nanos,
+                });
+            }
+            cluster_by_similarity(
+                &resolved,
+                worker.similarity_threshold,
+                worker.min_cluster_size,
+            )
+        };
 
         for cluster in clusters {
             if consolidations >= cfg.batch_size {
@@ -355,6 +401,12 @@ async fn do_consolidation_cycle(
             // → WriteId so a restart-retry hits the writer's
             // idempotency cache instead of minting a duplicate row.
             let request_id = deterministic_request_id(&cluster);
+            // The consolidated memory belongs to the SOURCE cluster's
+            // tenant + space — never NIL/SYSTEM. Folding the source space
+            // into both the WriteId and the Write keeps the summary inside
+            // the same isolation boundary its sources live in.
+            let source_space = bucket.space();
+            let source_namespace = bucket.namespace();
             let memory_id = ctx
                 .ops
                 .executor
@@ -370,8 +422,11 @@ async fn do_consolidation_cycle(
                 vector: Box::new(vector),
                 kind: MemoryKind::Consolidated,
                 salience: Salience::new(worker.initial_salience),
-                context: context_id,
+                session_id,
                 created_at_unix_nanos: created_at,
+                // Consolidated memories synthesise content from their
+                // sources; they carry no single client event time.
+                occurred_at_unix_nanos: None,
                 arena_slot: memory_id.slot(),
                 embedding_model_fp: ctx.ops.executor.embedder.fingerprint(),
                 content_hash: None,
@@ -399,10 +454,11 @@ async fn do_consolidation_cycle(
                     WorkerError::Ops("consolidation: unified path requires RealWriterHandle".into())
                 })?;
             let write = Write::from_phases(
-                WriteId::from_request(request_id),
-                brain_core::AgentId::default(),
+                WriteId::from_request(request_id, source_space),
+                source_space,
                 phases,
-            );
+            )
+            .with_namespace(source_namespace);
             let _ack = real_writer
                 .submit(write)
                 .await
@@ -428,17 +484,16 @@ async fn do_consolidation_cycle(
 fn collect_candidates_by_context(
     ctx: &WorkerContext,
     recency_floor_nanos: u64,
-) -> Result<BTreeMap<ContextId, Vec<WindowCandidate>>, WorkerError> {
+) -> Result<BTreeMap<BucketKey, Vec<WindowCandidate>>, WorkerError> {
     let metadata = ctx.ops.executor.metadata.clone();
-    let db = metadata.lock();
-    let rtxn = db
+    let rtxn = metadata
         .read_txn()
         .map_err(|e| WorkerError::Ops(format!("consolidation read_txn: {e:?}")))?;
     let table = rtxn
         .open_table(MEMORIES_TABLE)
         .map_err(|e| WorkerError::Ops(format!("open MEMORIES: {e:?}")))?;
 
-    let mut by_context: BTreeMap<ContextId, Vec<WindowCandidate>> = BTreeMap::new();
+    let mut by_context: BTreeMap<BucketKey, Vec<WindowCandidate>> = BTreeMap::new();
     for entry in table
         .iter()
         .map_err(|e| WorkerError::Ops(format!("iter MEMORIES: {e:?}")))?
@@ -458,8 +513,15 @@ fn collect_candidates_by_context(
         if kind != MemoryKind::Episodic {
             continue;
         }
+        // Bucket by the full (namespace, space, session) tuple so no two
+        // tenants/spaces are ever clustered together — session alone is
+        // not tenant-unique (see BucketKey).
         by_context
-            .entry(meta.context())
+            .entry(BucketKey {
+                namespace_id: meta.namespace_id,
+                space_id_bytes: meta.space_id_bytes,
+                session: meta.session(),
+            })
             .or_default()
             .push(WindowCandidate {
                 memory_id: meta.memory_id(),
@@ -474,8 +536,7 @@ fn any_already_consolidated(
     cluster: &[MemoryId],
 ) -> Result<bool, WorkerError> {
     let metadata = ctx.ops.executor.metadata.clone();
-    let db = metadata.lock();
-    let rtxn = db
+    let rtxn = metadata
         .read_txn()
         .map_err(|e| WorkerError::Ops(format!("any-consol read_txn: {e:?}")))?;
     let table = rtxn
@@ -499,14 +560,13 @@ fn any_already_consolidated(
 /// we synthesize a stable string ("memory_<id>"). The text fed to
 /// the summarizer is therefore deterministic but synthetic. Real
 /// deployments inject a Summarizer that ignores the placeholder and
-/// fetches text from the arena (Phase 9).
+/// fetches text from the arena.
 fn fetch_texts(
     ctx: &WorkerContext,
     cluster: &[MemoryId],
 ) -> Result<Option<Vec<String>>, WorkerError> {
     let metadata = ctx.ops.executor.metadata.clone();
-    let db = metadata.lock();
-    let rtxn = db
+    let rtxn = metadata
         .read_txn()
         .map_err(|e| WorkerError::Ops(format!("fetch_texts read_txn: {e:?}")))?;
     let table = rtxn
@@ -539,8 +599,7 @@ fn stamp_sources(
     now_unix_nanos: u64,
 ) -> Result<(), WorkerError> {
     let metadata = ctx.ops.executor.metadata.clone();
-    let mut db = metadata.lock();
-    let wtxn = db
+    let wtxn = metadata
         .write_txn()
         .map_err(|e| WorkerError::Ops(format!("stamp write_txn: {e:?}")))?;
     {

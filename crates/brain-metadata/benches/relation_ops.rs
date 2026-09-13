@@ -1,8 +1,7 @@
-//! Relation-ops perf bench (sub-task 18.9b).
+//! Relation-ops perf bench.
 //!
-//! Spec targets per [`spec/20_benchmarks/02_latency_targets.md`](
-//! ../../spec/20_benchmarks/02_latency_targets.md) §2.4 at
-//! 1M relations per shard (operator-run on the reference rig):
+//! Latency targets at 1M relations per shard (operator-run on the
+//! reference rig):
 //!
 //! - `RELATION_CREATE`:          p50 3 ms, p99 15 ms.
 //! - `RELATION_GET`:              p50 0.5 ms, p99 2 ms.
@@ -21,6 +20,11 @@ use brain_metadata::relation::ops::{
 };
 use brain_metadata::relation::traversal::{traverse, TraversalConfig, TraversalDirection};
 use brain_metadata::MetadataDb;
+use brain_metadata::RowScope;
+
+fn bench_scope() -> RowScope {
+    RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xAB; 16])
+}
 use criterion::{black_box, criterion_group, Criterion};
 use tempfile::TempDir;
 
@@ -39,7 +43,7 @@ struct Fixture {
 
 fn build_fixture(n: usize) -> Fixture {
     let dir = TempDir::new().expect("tempdir");
-    let mut db = MetadataDb::open(dir.path().join("metadata.redb")).expect("open db");
+    let db = MetadataDb::open(dir.path().join("metadata.redb")).expect("open db");
     let now = 1_700_000_000_000_000_000u64;
 
     // Resolve the built-in `brain:related_to` relation type id
@@ -67,7 +71,8 @@ fn build_fixture(n: usize) -> Fixture {
                 normalize_name(&subj_name),
                 now,
             );
-            entity_put(&wtxn, &subj).expect("subj entity_put");
+            entity_put(&wtxn, bench_scope(), brain_core::SessionId::DEFAULT, &subj)
+                .expect("subj entity_put");
 
             let obj_id = EntityId::new();
             let obj_name = format!("robj_{i}");
@@ -78,7 +83,8 @@ fn build_fixture(n: usize) -> Fixture {
                 normalize_name(&obj_name),
                 now,
             );
-            entity_put(&wtxn, &obj).expect("obj entity_put");
+            entity_put(&wtxn, bench_scope(), brain_core::SessionId::DEFAULT, &obj)
+                .expect("obj entity_put");
 
             let rel_id = RelationId::new();
             let r = Relation::new_root(
@@ -92,7 +98,14 @@ fn build_fixture(n: usize) -> Fixture {
                 now,
                 /* symmetric */ false,
             );
-            relation_create(&wtxn, &r, now).expect("relation_create");
+            relation_create(
+                &wtxn,
+                bench_scope(),
+                brain_core::SessionId::DEFAULT,
+                &r,
+                now,
+            )
+            .expect("relation_create");
             seeded.push((subj_id, rel_id));
         }
         wtxn.commit().expect("commit");
@@ -111,7 +124,7 @@ fn build_fixture(n: usize) -> Fixture {
 // ---------------------------------------------------------------------------
 
 fn bench_relation_create(c: &mut Criterion) {
-    let mut fixture = build_fixture(N_RELATIONS);
+    let fixture = build_fixture(N_RELATIONS);
     let now = 1_700_000_000_000_000_001u64;
 
     // Pre-allocate fresh entity pairs so each create has unique
@@ -138,8 +151,8 @@ fn bench_relation_create(c: &mut Criterion) {
                 normalize_name(&o_name),
                 now,
             );
-            entity_put(&wtxn, &se).expect("se");
-            entity_put(&wtxn, &oe).expect("oe");
+            entity_put(&wtxn, bench_scope(), brain_core::SessionId::DEFAULT, &se).expect("se");
+            entity_put(&wtxn, bench_scope(), brain_core::SessionId::DEFAULT, &oe).expect("oe");
         }
         wtxn.commit().expect("commit");
     }
@@ -162,7 +175,14 @@ fn bench_relation_create(c: &mut Criterion) {
                 false,
             );
             let wtxn = fixture.db.write_txn().expect("write_txn");
-            relation_create(&wtxn, black_box(&r), now).expect("create");
+            relation_create(
+                &wtxn,
+                bench_scope(),
+                brain_core::SessionId::DEFAULT,
+                black_box(&r),
+                now,
+            )
+            .expect("create");
             wtxn.commit().expect("commit");
         });
     });
@@ -195,7 +215,8 @@ fn bench_relation_list_from(c: &mut Criterion) {
                 current_only: true,
                 limit: 10,
             };
-            let rows = relation_list_from(&rtxn, subj, black_box(&filter)).expect("list_from");
+            let rows = relation_list_from(&rtxn, bench_scope(), subj, black_box(&filter))
+                .expect("list_from");
             black_box(rows);
         });
     });
@@ -216,6 +237,7 @@ fn bench_relation_traverse_depth_1(c: &mut Criterion) {
             idx = idx.wrapping_add(1);
             let paths = traverse(
                 &rtxn,
+                bench_scope(),
                 subj,
                 &[fixture.relation_type],
                 TraversalDirection::Outgoing,

@@ -1,5 +1,4 @@
-//! Typed CRUD + interning over the extractor registry +
-//! §21/05 §1.
+//! Typed CRUD + interning over the extractor registry.
 //!
 //! Mirrors [`crate::schema::predicate`] / [`crate::relation::types`]
 //! patterns: qname-keyed uniqueness, idempotent intern,
@@ -40,13 +39,12 @@ pub enum ExtractorOpError {
 /// Intern (or look up) an extractor by its `(namespace, name)`
 /// qname.
 ///
-/// - No prior row: allocate fresh id, write row + qname index,
-///   `enabled = 1`.
+/// - No prior row: allocate fresh id, write row + qname index.
 /// - Prior row with identical kind + schema_version +
 ///   definition_blob: return the existing id (idempotent).
 /// - Prior row with diverging kind / definition_blob /
 ///   schema_version: `AlreadyExists` (caller decides whether to
-///   evict + re-intern — phase 22+ extractor versioning).
+///   evict + re-intern).
 #[allow(clippy::too_many_arguments)]
 pub fn extractor_intern(
     wtxn: &WriteTransaction,
@@ -107,7 +105,6 @@ pub fn extractor_intern(
         namespace.to_string(),
         name.to_string(),
         kind,
-        true, // enabled by default
         schema_version,
         definition_blob,
         now_unix_nanos,
@@ -124,35 +121,6 @@ pub fn extractor_intern(
     Ok(ExtractorId::from(next_id_raw))
 }
 
-/// Flip the `enabled` flag on an extractor. Returns the **previous**
-/// state, mirroring the `EXTRACTOR_DISABLE` / `_ENABLE` wire
-/// semantics (`previously_enabled` / `previously_disabled` per
-/// §28/05 §7.2).
-///
-/// Idempotent: setting an already-`enabled` extractor to enabled
-/// returns `true` (the previous state) and writes the row again
-/// (which redb deduplicates) without changing meaning.
-pub fn extractor_set_enabled(
-    wtxn: &WriteTransaction,
-    id: ExtractorId,
-    enabled: bool,
-) -> Result<bool, ExtractorOpError> {
-    let id_raw = id.raw();
-    let mut row = {
-        let t = wtxn.open_table(EXTRACTORS_TABLE)?;
-        let guard = t.get(&id_raw)?;
-        match guard {
-            Some(g) => g.value(),
-            None => return Err(ExtractorOpError::NotFound { id }),
-        }
-    };
-    let previous = row.is_enabled();
-    row.enabled = u8::from(enabled);
-    let mut t = wtxn.open_table(EXTRACTORS_TABLE)?;
-    t.insert(&id_raw, &row)?;
-    Ok(previous)
-}
-
 // ---------------------------------------------------------------------------
 // Reads.
 // ---------------------------------------------------------------------------
@@ -161,11 +129,7 @@ pub fn extractor_get(
     rtxn: &ReadTransaction,
     id: ExtractorId,
 ) -> Result<Option<ExtractorDefinition>, ExtractorOpError> {
-    let t = match rtxn.open_table(EXTRACTORS_TABLE) {
-        Ok(t) => t,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
+    let t = rtxn.open_table(EXTRACTORS_TABLE)?;
     let guard = t.get(&id.raw())?;
     Ok(guard.map(|g| g.value()))
 }
@@ -176,11 +140,7 @@ pub fn extractor_lookup_by_qname(
     name: &str,
 ) -> Result<Option<ExtractorDefinition>, ExtractorOpError> {
     let q = qname(namespace, name);
-    let idx = match rtxn.open_table(EXTRACTORS_BY_QNAME_TABLE) {
-        Ok(t) => t,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
+    let idx = rtxn.open_table(EXTRACTORS_BY_QNAME_TABLE)?;
     let id_raw: Option<u32> = idx.get(q.as_str())?.map(|g| g.value());
     drop(idx);
     let Some(id_raw) = id_raw else {
@@ -195,17 +155,53 @@ pub fn extractor_lookup_by_qname(
 pub fn extractor_list(
     rtxn: &ReadTransaction,
 ) -> Result<Vec<ExtractorDefinition>, ExtractorOpError> {
-    let t = match rtxn.open_table(EXTRACTORS_TABLE) {
-        Ok(t) => t,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-        Err(e) => return Err(e.into()),
-    };
+    let t = rtxn.open_table(EXTRACTORS_TABLE)?;
     let mut out = Vec::new();
     for entry in t.iter()? {
         let (_, v) = entry?;
         out.push(v.value());
     }
     Ok(out)
+}
+
+/// Drop every extractor row in `namespace`. Extractors don't track an
+/// implicit-vs-declared origin (every row is schema-declared in v1),
+/// so this is an unconditional namespace sweep. Counterpart to
+/// [`crate::schema::predicate::predicate_drop_schema_declared`] and
+/// [`crate::relation::types::relation_type_drop_schema_declared`];
+/// used by `SCHEMA_REPLACE`.
+pub fn extractor_drop_namespace(
+    wtxn: &WriteTransaction,
+    namespace: &str,
+) -> Result<usize, ExtractorOpError> {
+    validate_namespace(namespace)?;
+
+    let victims: Vec<(u32, String)> = {
+        let t = wtxn.open_table(EXTRACTORS_TABLE)?;
+        let mut out = Vec::new();
+        for entry in t.iter()? {
+            let (k, v) = entry?;
+            let row: ExtractorDefinition = v.value();
+            if row.namespace == namespace {
+                out.push((k.value(), qname(&row.namespace, &row.name)));
+            }
+        }
+        out
+    };
+    let count = victims.len();
+    {
+        let mut t = wtxn.open_table(EXTRACTORS_TABLE)?;
+        for (id, _) in &victims {
+            t.remove(id)?;
+        }
+    }
+    {
+        let mut idx = wtxn.open_table(EXTRACTORS_BY_QNAME_TABLE)?;
+        for (_, q) in &victims {
+            idx.remove(q.as_str())?;
+        }
+    }
+    Ok(count)
 }
 
 // ---------------------------------------------------------------------------
@@ -239,7 +235,10 @@ fn validate_name(s: &str) -> Result<(), ExtractorOpError> {
             reason: "name must be non-empty",
         });
     }
-    if s.len() > NAME_MAX_LEN {
+    // Code points, not bytes — matches the predicate/relation-type name
+    // validators so a multibyte name isn't clipped below the stated char
+    // limit. 64 code points is ≤ 256 bytes, within the wire identifier bound.
+    if s.chars().count() > NAME_MAX_LEN {
         return Err(ExtractorOpError::InvalidIdentifier {
             reason: "name exceeds 64-char limit",
         });
@@ -257,7 +256,11 @@ mod tests {
     use redb::{Database, ReadableDatabase};
 
     fn open_db(dir: &tempfile::TempDir) -> Database {
-        Database::create(dir.path().join("test.redb")).unwrap()
+        let db = Database::create(dir.path().join("test.redb")).unwrap();
+        let wtxn = db.begin_write().unwrap();
+        crate::tables::materialize_all_tables(&wtxn).unwrap();
+        wtxn.commit().unwrap();
+        db
     }
 
     fn intern_pattern(
@@ -368,68 +371,6 @@ mod tests {
         let rtxn = db.begin_read().unwrap();
         let all = extractor_list(&rtxn).unwrap();
         assert_eq!(all.len(), 2);
-    }
-
-    #[test]
-    fn set_enabled_toggles_and_returns_previous() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = open_db(&dir);
-        let id = {
-            let wtxn = db.begin_write().unwrap();
-            let id = intern_pattern(&wtxn, "acme", "p1", b"x").unwrap();
-            wtxn.commit().unwrap();
-            id
-        };
-        // Initial state: enabled = true.
-        {
-            let wtxn = db.begin_write().unwrap();
-            let prev = extractor_set_enabled(&wtxn, id, false).unwrap();
-            assert!(prev, "first call: extractor was enabled");
-            wtxn.commit().unwrap();
-        }
-        // Now disabled.
-        {
-            let rtxn = db.begin_read().unwrap();
-            let got = extractor_get(&rtxn, id).unwrap().unwrap();
-            assert!(!got.is_enabled());
-        }
-        // Re-enable.
-        {
-            let wtxn = db.begin_write().unwrap();
-            let prev = extractor_set_enabled(&wtxn, id, true).unwrap();
-            assert!(!prev, "second call: extractor was disabled");
-            wtxn.commit().unwrap();
-        }
-    }
-
-    #[test]
-    fn set_enabled_unknown_id_returns_not_found() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = open_db(&dir);
-        let wtxn = db.begin_write().unwrap();
-        let err = extractor_set_enabled(&wtxn, ExtractorId::from(99), false).unwrap_err();
-        assert!(matches!(err, ExtractorOpError::NotFound { .. }));
-        wtxn.commit().unwrap();
-    }
-
-    #[test]
-    fn set_enabled_idempotent_on_same_state() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = open_db(&dir);
-        let id = {
-            let wtxn = db.begin_write().unwrap();
-            let id = intern_pattern(&wtxn, "acme", "p1", b"x").unwrap();
-            wtxn.commit().unwrap();
-            id
-        };
-        // Enable an already-enabled extractor.
-        let wtxn = db.begin_write().unwrap();
-        let prev = extractor_set_enabled(&wtxn, id, true).unwrap();
-        assert!(prev);
-        wtxn.commit().unwrap();
-
-        let rtxn = db.begin_read().unwrap();
-        assert!(extractor_get(&rtxn, id).unwrap().unwrap().is_enabled());
     }
 
     #[test]

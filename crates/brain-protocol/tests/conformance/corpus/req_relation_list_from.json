@@ -1,0 +1,36 @@
+{
+  "from_entity": [
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68,
+    68
+  ],
+  "relation_type_filter": "org:mentors",
+  "time_range_start_unix_nanos": 1767225600000000000,
+  "time_range_end_unix_nanos": 1767229200000000000,
+  "include_superseded": true,
+  "include_tombstoned": false,
+  "limit": 250,
+  "cursor": [
+    1,
+    154,
+    47,
+    0
+  ],
+  "act_as": {
+    "namespace": "tenant-acme",
+    "space_id": "support-bot:user123"
+  }
+}

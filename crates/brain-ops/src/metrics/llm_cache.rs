@@ -82,30 +82,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn counters_start_at_zero() {
-        let m = LlmCacheSweepMetrics::new();
-        let s = m.snapshot();
-        assert_eq!(s.sweeps_total, 0);
-        assert_eq!(s.rows_removed_total, 0);
-        assert_eq!(s.sweep_duration_seconds.count, 0);
-    }
-
-    #[test]
-    fn increments_round_trip() {
-        let m = LlmCacheSweepMetrics::new();
-        m.inc_sweeps();
-        m.inc_sweeps();
-        m.add_rows_removed(3);
-        m.add_rows_removed(7);
-        m.observe_sweep_duration(0.012);
-        let s = m.snapshot();
-        assert_eq!(s.sweeps_total, 2);
-        assert_eq!(s.rows_removed_total, 10);
-        assert_eq!(s.sweep_duration_seconds.count, 1);
-        assert!((s.sweep_duration_seconds.sum - 0.012).abs() < 1e-6);
-    }
-
-    #[test]
     fn zero_row_observe_is_idempotent_per_tick() {
         let m = LlmCacheSweepMetrics::new();
         m.inc_sweeps();

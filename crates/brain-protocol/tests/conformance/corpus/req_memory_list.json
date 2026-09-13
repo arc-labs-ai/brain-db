@@ -1,0 +1,22 @@
+{
+  "sort": 0,
+  "dir": 1,
+  "limit": 50,
+  "cursor": [
+    42,
+    0,
+    255,
+    24,
+    123
+  ],
+  "kinds": [
+    0
+  ],
+  "include_tombstoned": false,
+  "time_axis": 0,
+  "from_unix_nanos": 0,
+  "to_unix_nanos": 0,
+  "salience_min": 0.0,
+  "salience_max": 1.0,
+  "text_contains": ""
+}

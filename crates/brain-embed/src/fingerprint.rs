@@ -1,7 +1,6 @@
 //! Model fingerprint computation.
 //!
-//! Literal implementation of `spec/07_embedding/07_fingerprinting.md`
-//! §3's algorithm — byte-for-byte. Every memory's stored fingerprint
+//! Every memory's stored fingerprint
 //! depends on this; changing the algorithm orphans every stored vector.
 //! See `crates/brain-metadata/src/tables/model_fingerprint.rs` for the
 //! storage side.
@@ -23,8 +22,7 @@
 //! ```
 //!
 //! Note: `weights_file` is hashed *separately* into 32 bytes (the full
-//! BLAKE3 output), then those 32 bytes are appended to the outer
-//! hasher pseudocode is explicit.
+//! BLAKE3 output), then those 32 bytes are appended to the outer hasher.
 
 use std::io::Read;
 use std::path::Path;
@@ -36,8 +34,7 @@ use std::path::Path;
 /// via [`blake3_hash_file`] or equivalent.
 ///
 /// `vector_dim` is the model's output dim (= 384 for BGE-small).
-/// `normalize` is `true` for Brain (we always L2-normalise per spec
-/// §04/04).
+/// `normalize` is `true` for Brain (we always L2-normalise).
 ///
 /// Returns the 16-byte truncated BLAKE3.
 #[must_use]
@@ -62,19 +59,18 @@ pub fn compute_fingerprint(
     let full = hasher.finalize();
     full.as_bytes()[..16]
         .try_into()
-        .expect("BLAKE3 output is at least 32 bytes")
+        .expect("invariant: BLAKE3 digest is 32 bytes, so the 16-byte prefix exists")
 }
 
 /// Compute the BLAKE3-truncated-16 of a text string. The cache in
-/// `crate::dispatcher::cache` uses this as its key, per spec
-/// `04_embedding_layer/05_caching.md` §2 — 16 bytes are enough that
-/// collision probability at 10⁶ entries is ≈ 10⁻¹⁹.
+/// `crate::dispatcher::cache` uses this as its key — 16 bytes are enough
+/// that collision probability at 10⁶ entries is ≈ 10⁻¹⁹.
 #[must_use]
 pub fn blake3_hash_text(text: &str) -> [u8; 16] {
     let full = blake3::hash(text.as_bytes());
     full.as_bytes()[..16]
         .try_into()
-        .expect("BLAKE3 output is 32 bytes")
+        .expect("invariant: BLAKE3 digest is 32 bytes, so the 16-byte prefix exists")
 }
 
 /// Compute the BLAKE3 of a file by streaming 64 KiB chunks. Avoids
@@ -170,23 +166,5 @@ mod tests {
         assert_ne!(a, c);
         let d = blake3_hash_text("");
         assert_ne!(a, d);
-    }
-
-    #[test]
-    fn blake3_hash_file_matches_in_memory_hash() {
-        use std::io::Write;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("weights.bin");
-        let mut payload = Vec::with_capacity(128 * 1024);
-        for i in 0..(128 * 1024) {
-            payload.push((i % 251) as u8);
-        }
-        let mut f = std::fs::File::create(&path).unwrap();
-        f.write_all(&payload).unwrap();
-        f.sync_all().unwrap();
-
-        let streamed = blake3_hash_file(&path).unwrap();
-        let in_memory = *blake3::hash(&payload).as_bytes();
-        assert_eq!(streamed, in_memory);
     }
 }

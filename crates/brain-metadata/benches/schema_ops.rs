@@ -1,8 +1,7 @@
-//! Schema-ops perf bench (sub-task 19.10b).
+//! Schema-ops perf bench.
 //!
-//! Spec targets per `spec/20_benchmarks/02_latency_targets.md`
-//! §2.6 at a typical 50-definition schema (operator-run on the
-//! reference rig):
+//! Latency targets at a typical 50-definition schema (operator-run
+//! on the reference rig):
 //!
 //! - `SCHEMA_UPLOAD`   (parse + validate + persist): p50 5 ms, p99 30 ms.
 //! - `SCHEMA_VALIDATE` (parse + validate only):     p50 3 ms, p99 20 ms.
@@ -31,7 +30,7 @@ const PREDICATES: usize = 30;
 const RELATION_TYPES: usize = 10;
 
 /// Renders the bench fixture (50 definitions) directly as DSL text.
-/// Avoids an SDK dev-dep and keeps the bench self-contained.
+/// Avoids a client dev-dep and keeps the bench self-contained.
 fn fixture_text() -> String {
     let mut s = String::from("namespace bench\n");
     for i in 0..ENTITY_TYPES {
@@ -78,7 +77,7 @@ struct UploadedFixture {
 fn build_uploaded_fixture() -> UploadedFixture {
     let dir = TempDir::new().expect("tempdir");
     let path: PathBuf = dir.path().join("metadata.redb");
-    let mut db = MetadataDb::open(&path).expect("open");
+    let db = MetadataDb::open(&path).expect("open");
     let text = fixture_text();
     let parsed = parse_schema(&text).expect("parse fixture");
     let validated = validate(&parsed).expect("validate fixture");
@@ -117,7 +116,7 @@ fn bench_upload(c: &mut Criterion) {
                 let db = MetadataDb::open(&path).expect("open");
                 (dir, db)
             },
-            |(dir, mut db)| {
+            |(dir, db)| {
                 let parsed = parse_schema(black_box(&text)).expect("parse");
                 let validated = validate(&parsed).expect("validate");
                 let wtxn = db.write_txn().expect("wtxn");

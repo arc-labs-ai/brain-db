@@ -1,12 +1,8 @@
 //! `extractors` table — interned extractor registry.
 //!
-//! (three-tier model) + §21/05 §1 (schema fan-out).
-//!
-//! Phase 15.1 declared a placeholder row. Phase 20.5 widens to the
-//! canonical pattern (namespace + name + qname index) matching
-//! [`crate::tables::predicate::PredicateDefinition`] /
+//! Row follows the canonical pattern (namespace + name + qname index)
+//! matching [`crate::tables::predicate::PredicateDefinition`] /
 //! [`crate::tables::relation_type::RelationTypeDefinition`].
-//! Type tag bumped `::v1` → `::v2`; v1 hasn't shipped.
 
 use crate::impl_redb_rkyv_value;
 use brain_core::{ExtractorId, ExtractorKind};
@@ -30,7 +26,7 @@ pub const EXTRACTORS_BY_QNAME_TABLE: TableDefinition<'static, &str, u32> =
 /// [`brain_core::ExtractorKind::as_u8`].
 ///
 /// `definition_blob`: `serde_json::to_vec(&ExtractorDef)` where
-/// `ExtractorDef` is the §19.2 AST. Opaque to brain-metadata;
+/// `ExtractorDef` is the schema-DSL AST. Opaque to brain-metadata;
 /// brain-extractors decodes it when materialising the runtime
 /// extractor at MetadataDb::open / `SCHEMA_UPLOAD` time.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
@@ -40,7 +36,6 @@ pub struct ExtractorDefinition {
     pub namespace: String,
     pub name: String,
     pub kind: u8,
-    pub enabled: u8,
     pub schema_version: u32,
     pub definition_blob: Vec<u8>,
     pub created_at_unix_nanos: u64,
@@ -54,7 +49,6 @@ impl ExtractorDefinition {
         namespace: String,
         name: String,
         kind: ExtractorKind,
-        enabled: bool,
         schema_version: u32,
         definition_blob: Vec<u8>,
         created_at_unix_nanos: u64,
@@ -64,7 +58,6 @@ impl ExtractorDefinition {
             namespace,
             name,
             kind: kind.as_u8(),
-            enabled: u8::from(enabled),
             schema_version,
             definition_blob,
             created_at_unix_nanos,
@@ -81,11 +74,6 @@ impl ExtractorDefinition {
         ExtractorKind::from_u8(self.kind)
     }
 
-    #[must_use]
-    pub fn is_enabled(&self) -> bool {
-        self.enabled != 0
-    }
-
     /// Canonical `"namespace:name"` qname.
     #[must_use]
     pub fn qname(&self) -> String {
@@ -93,10 +81,7 @@ impl ExtractorDefinition {
     }
 }
 
-impl_redb_rkyv_value!(
-    ExtractorDefinition,
-    "brain_metadata::ExtractorDefinition::v2"
-);
+impl_redb_rkyv_value!(ExtractorDefinition, "brain_metadata::ExtractorDefinition");
 
 #[cfg(all(test, not(miri)))]
 mod tests {
@@ -105,7 +90,7 @@ mod tests {
     use redb::ReadableDatabase;
 
     #[test]
-    fn round_trip() {
+    fn extractor_definition_round_trips_through_redb_preserving_fields() {
         let dir = tempfile::tempdir().unwrap();
         let db = fresh_db(&dir);
         let ex = ExtractorDefinition::new(
@@ -113,7 +98,6 @@ mod tests {
             "acme".into(),
             "person_mentions".into(),
             ExtractorKind::Pattern,
-            true,
             1,
             vec![1, 2, 3, 4],
             1_700_000_000_000_000_000,
@@ -135,7 +119,6 @@ mod tests {
         let got = t.get(&ex.extractor_id).unwrap().unwrap().value();
         assert_eq!(got, ex);
         assert_eq!(got.kind(), Some(ExtractorKind::Pattern));
-        assert!(got.is_enabled());
         assert_eq!(got.qname(), "acme:person_mentions");
 
         let idx = rtxn.open_table(EXTRACTORS_BY_QNAME_TABLE).unwrap();

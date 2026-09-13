@@ -24,7 +24,8 @@ use std::sync::{Arc, Mutex};
 use brain_core::{Entity, EntityId, EntityType, EntityTypeId};
 use brain_embed::{Dispatcher, EmbedError};
 use brain_extractors::resolver::{
-    resolve_or_create_with_deps, EmbeddingDeps, EntityDisambiguator, ResolutionTier,
+    resolve_or_create_with_deps, Disambiguation, EmbeddingDeps, EntityDisambiguator,
+    PrecomputedVerdicts, Resolution, ResolutionTier, StagedEntityVectors,
 };
 use brain_index::entity_hnsw::{EntityHnswIndex, EntityHnswParams};
 use brain_index::VECTOR_DIM;
@@ -33,6 +34,12 @@ use brain_llm::types::{LlmRequest, LlmResponse};
 use brain_llm::LlmClient;
 use brain_metadata::entity::ops::{entity_get, entity_put, normalize_name};
 use brain_metadata::MetadataDb;
+use brain_metadata::RowScope;
+
+/// Fixed (namespace, space) scope for these resolver e2e tests.
+fn test_scope() -> RowScope {
+    RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xA1; 16])
+}
 use parking_lot::RwLock;
 use tempfile::TempDir;
 
@@ -181,6 +188,7 @@ fn embed_deps_for(
     EmbeddingDeps {
         hnsw,
         embedder: embedder as Arc<dyn Dispatcher>,
+        embed_threshold: brain_extractors::resolver::EMBED_RESOLVE_THRESHOLD,
     }
 }
 
@@ -200,7 +208,7 @@ fn seed_entity(
         NOW,
     );
     let wtxn = db.write_txn().unwrap();
-    entity_put(&wtxn, &ent).unwrap();
+    entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &ent).unwrap();
     wtxn.commit().unwrap();
     hnsw.write().insert(id, &vector).unwrap();
     id
@@ -232,9 +240,197 @@ fn ambiguous_band_scenario(
     closer_id
 }
 
+/// Stage: a seed entity plus a surface form whose embedding lands
+/// ABOVE the auto-alias threshold (cosine ~0.95 against the seed) yet
+/// is semantically a different real-world entity (the "Japan" vs
+/// "Tokyo" failure: two same-type Places that embed close). The type
+/// filter cannot separate them, so the disambiguator is the only thing
+/// that can. Returns the seed id the auto-alias path would merge into.
+fn auto_alias_band_scenario(
+    db: &mut MetadataDb,
+    hnsw: &Arc<RwLock<EntityHnswIndex>>,
+    embedder: &Arc<ScriptedEmbedder>,
+) -> EntityId {
+    let seed_v = axis_pair(70, 71, 1.0, 0.0);
+    // Probe at cosine ~0.954 against the seed — comfortably above
+    // EMBED_RESOLVE_THRESHOLD = 0.78, so tier-3b returns AutoAlias.
+    let probe_v = axis_pair(70, 71, 0.954, 0.3);
+    embedder.set("Japan", probe_v);
+    seed_entity(db, hnsw, EntityType::PERSON_ID, "Tokyo", seed_v)
+}
+
+/// Drive the production two-phase disambiguation flow against `db`, exactly
+/// as `apply_outcome` does: a `Collect` plan pass (rolled back) discovers the
+/// ambiguous-band candidate, that candidate is `confirm`-ed off the txn, and a
+/// `Replay` apply pass commits the result. With no disambiguator it degrades to
+/// a single `Off` pass (cosine-only). The resolver itself never calls the LLM.
+fn two_phase_resolve(
+    db: &MetadataDb,
+    embed_deps: &EmbeddingDeps,
+    disambiguator: Option<&EntityDisambiguator>,
+    surface: &str,
+) -> Resolution {
+    let verdicts = if let Some(dis) = disambiguator {
+        let mut pending = Vec::new();
+        {
+            let plan_txn = db.write_txn().unwrap();
+            // The plan pass's staged entity vectors are NEVER flushed: they
+            // describe rows this rollback erases, and the HNSW cannot
+            // un-insert. Dropping the staging area with the txn is the
+            // rollback.
+            let mut plan_staged = StagedEntityVectors::new();
+            resolve_or_create_with_deps(
+                &plan_txn,
+                test_scope(),
+                surface,
+                "brain:Person",
+                0.9,
+                NOW + 1,
+                Some(embed_deps),
+                &mut plan_staged,
+                &mut Disambiguation::Collect(&mut pending),
+            )
+            .unwrap();
+            // drop plan_txn → rollback (its writes were only for discovery)
+        }
+        let mut v = PrecomputedVerdicts::new();
+        for p in pending {
+            let verdict = futures_lite::future::block_on(dis.confirm(&p.view, &p.raw_surface));
+            v.insert(p.norm_surface, p.candidate, verdict);
+        }
+        v
+    } else {
+        PrecomputedVerdicts::new()
+    };
+
+    let mut mode = if disambiguator.is_some() {
+        Disambiguation::Replay(&verdicts)
+    } else {
+        Disambiguation::Off
+    };
+    let wtxn = db.write_txn().unwrap();
+    let mut staged = StagedEntityVectors::new();
+    let res = resolve_or_create_with_deps(
+        &wtxn,
+        test_scope(),
+        surface,
+        "brain:Person",
+        0.9,
+        NOW + 1,
+        Some(embed_deps),
+        &mut staged,
+        &mut mode,
+    )
+    .unwrap();
+    wtxn.commit().unwrap();
+    // Committed → safe to publish into the in-RAM index.
+    staged.flush_into_hnsw(embed_deps);
+    res
+}
+
 // ---------------------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------------------
+
+#[test]
+fn auto_alias_rejected_by_disambiguator_creates_distinct_entity() {
+    // The m9/"Japan" regression: a high-cosine same-type neighbour must
+    // NOT be auto-merged when the disambiguator says the two are
+    // different entities.
+    let embedder = Arc::new(ScriptedEmbedder::new());
+    let (_dir, mut db) = fresh_db();
+    let hnsw = fresh_hnsw();
+    let seed_id = auto_alias_band_scenario(&mut db, &hnsw, &embedder);
+
+    let backend = FakeDisambiguator::rejecting();
+    let disambiguator = Arc::new(EntityDisambiguator::new(backend.clone(), "fake-model"));
+    let embed_deps = embed_deps_for(embedder, hnsw);
+
+    let res = two_phase_resolve(&db, &embed_deps, Some(disambiguator.as_ref()), "Japan");
+
+    assert_eq!(
+        res.tier,
+        ResolutionTier::Created,
+        "rejected high-cosine match -> fresh entity",
+    );
+    assert_ne!(
+        res.entity_id, seed_id,
+        "must not merge a distinct entity onto the seed",
+    );
+    assert_eq!(
+        backend.call_count(),
+        1,
+        "disambiguator must vet the auto-alias candidate",
+    );
+
+    // The seed must NOT have picked up the surface form as an alias.
+    let rtxn = db.read_txn().unwrap();
+    let seed = entity_get(&rtxn, seed_id).unwrap().unwrap();
+    assert!(
+        !seed.aliases.iter().any(|a| a == "Japan"),
+        "distinct entity wrongly aliased onto seed; got {:?}",
+        seed.aliases,
+    );
+
+    // A confirmed-distinct verdict leaves nothing to review.
+    let pending = brain_metadata::entity::review::list_proposals_by_status(
+        &rtxn,
+        brain_metadata::tables::merge_review_queue::proposal_status::PENDING,
+        16,
+    )
+    .unwrap();
+    assert!(
+        pending.is_empty(),
+        "rejected auto-alias must not enqueue a merge proposal; got {}",
+        pending.len(),
+    );
+}
+
+#[test]
+fn auto_alias_confirmed_by_disambiguator_still_merges() {
+    // The paraphrase-merge guard: a genuine same-entity match
+    // ("Stripe Inc." vs "Stripe Payments") confirmed by the
+    // disambiguator must still alias onto the existing entity.
+    let embedder = Arc::new(ScriptedEmbedder::new());
+    let (_dir, mut db) = fresh_db();
+    let hnsw = fresh_hnsw();
+    let seed_id = auto_alias_band_scenario(&mut db, &hnsw, &embedder);
+
+    let backend = FakeDisambiguator::confirming();
+    let disambiguator = Arc::new(EntityDisambiguator::new(backend.clone(), "fake-model"));
+    let embed_deps = embed_deps_for(embedder, hnsw);
+
+    let res = two_phase_resolve(&db, &embed_deps, Some(disambiguator.as_ref()), "Japan");
+
+    assert_eq!(res.entity_id, seed_id, "confirmed -> alias onto seed");
+    assert_eq!(res.tier, ResolutionTier::Disambiguated);
+    assert_eq!(backend.call_count(), 1);
+
+    let rtxn = db.read_txn().unwrap();
+    let seed = entity_get(&rtxn, seed_id).unwrap().unwrap();
+    assert!(
+        seed.aliases.iter().any(|a| a == "Japan"),
+        "confirmed match must alias onto seed; got {:?}",
+        seed.aliases,
+    );
+}
+
+#[test]
+fn auto_alias_with_no_disambiguator_merges_on_threshold_alone() {
+    // Back-compat: when no disambiguator is wired, the cosine threshold
+    // stays the sole arbiter and the high-cosine match auto-aliases.
+    let embedder = Arc::new(ScriptedEmbedder::new());
+    let (_dir, mut db) = fresh_db();
+    let hnsw = fresh_hnsw();
+    let seed_id = auto_alias_band_scenario(&mut db, &hnsw, &embedder);
+
+    let embed_deps = embed_deps_for(embedder, hnsw);
+
+    let res = two_phase_resolve(&db, &embed_deps, None, "Japan");
+
+    assert_eq!(res.entity_id, seed_id);
+    assert_eq!(res.tier, ResolutionTier::Embedding);
+}
 
 #[test]
 fn confirmed_verdict_aliases_onto_existing_entity() {
@@ -244,22 +440,15 @@ fn confirmed_verdict_aliases_onto_existing_entity() {
     let closer_id = ambiguous_band_scenario(&mut db, &hnsw, &embedder);
 
     let backend = FakeDisambiguator::confirming();
-    let disambiguator =
-        Arc::new(EntityDisambiguator::new(backend.clone(), "fake-model"));
+    let disambiguator = Arc::new(EntityDisambiguator::new(backend.clone(), "fake-model"));
     let embed_deps = embed_deps_for(embedder, hnsw);
 
-    let wtxn = db.write_txn().unwrap();
-    let res = resolve_or_create_with_deps(
-        &wtxn,
-        "Acme Holdings",
-        "brain:Person",
-        0.9,
-        NOW + 1,
-        Some(&embed_deps),
+    let res = two_phase_resolve(
+        &db,
+        &embed_deps,
         Some(disambiguator.as_ref()),
-    )
-    .unwrap();
-    wtxn.commit().unwrap();
+        "Acme Holdings",
+    );
 
     assert_eq!(res.entity_id, closer_id, "should alias onto closer seed");
     assert_eq!(res.tier, ResolutionTier::Disambiguated);
@@ -296,24 +485,21 @@ fn rejected_verdict_creates_fresh_entity_without_merge_proposal() {
     let closer_id = ambiguous_band_scenario(&mut db, &hnsw, &embedder);
 
     let backend = FakeDisambiguator::rejecting();
-    let disambiguator =
-        Arc::new(EntityDisambiguator::new(backend.clone(), "fake-model"));
+    let disambiguator = Arc::new(EntityDisambiguator::new(backend.clone(), "fake-model"));
     let embed_deps = embed_deps_for(embedder, hnsw);
 
-    let wtxn = db.write_txn().unwrap();
-    let res = resolve_or_create_with_deps(
-        &wtxn,
-        "Acme Holdings",
-        "brain:Person",
-        0.9,
-        NOW + 1,
-        Some(&embed_deps),
+    let res = two_phase_resolve(
+        &db,
+        &embed_deps,
         Some(disambiguator.as_ref()),
-    )
-    .unwrap();
-    wtxn.commit().unwrap();
+        "Acme Holdings",
+    );
 
-    assert_eq!(res.tier, ResolutionTier::Created, "rejected -> fresh entity");
+    assert_eq!(
+        res.tier,
+        ResolutionTier::Created,
+        "rejected -> fresh entity"
+    );
     assert_ne!(res.entity_id, closer_id, "must not reuse the rejected seed");
     assert_eq!(backend.call_count(), 1, "disambiguator must fire once");
 
@@ -341,22 +527,15 @@ fn uncertain_verdict_falls_through_to_create_plus_merge_proposal() {
     let closer_id = ambiguous_band_scenario(&mut db, &hnsw, &embedder);
 
     let backend = FakeDisambiguator::uncertain();
-    let disambiguator =
-        Arc::new(EntityDisambiguator::new(backend.clone(), "fake-model"));
+    let disambiguator = Arc::new(EntityDisambiguator::new(backend.clone(), "fake-model"));
     let embed_deps = embed_deps_for(embedder, hnsw);
 
-    let wtxn = db.write_txn().unwrap();
-    let res = resolve_or_create_with_deps(
-        &wtxn,
-        "Acme Holdings",
-        "brain:Person",
-        0.9,
-        NOW + 1,
-        Some(&embed_deps),
+    let res = two_phase_resolve(
+        &db,
+        &embed_deps,
         Some(disambiguator.as_ref()),
-    )
-    .unwrap();
-    wtxn.commit().unwrap();
+        "Acme Holdings",
+    );
 
     assert_eq!(res.tier, ResolutionTier::Created);
     assert_ne!(res.entity_id, closer_id);

@@ -14,8 +14,10 @@
 //! - [`list`]: listing, history-walk, contradiction surface, filter
 //!   struct.
 
+pub mod contradiction;
 pub mod crud;
 pub mod embed_queue;
+pub mod evidence;
 pub mod list;
 pub mod supersede;
 pub mod tombstone;
@@ -23,25 +25,32 @@ pub mod tombstone;
 // Flat re-exports so `brain_metadata::statement::*` covers the original
 // statement_ops API surface without consumers having to walk the
 // sub-modules.
+pub use contradiction::{contradiction_audit_list_pending, contradiction_audit_record};
 pub use crud::{
-    allocate_evidence_overflow, evidence_overflow_load, statement_create, statement_get,
+    add_to_predicate_index, allocate_evidence_overflow, backfill_statement_id_indexes,
+    evidence_overflow_load, flip_by_subject_to_current, rekey_predicate_index,
+    remove_from_predicate_index, statement_create, statement_get,
 };
 pub use embed_queue::{
     statement_embed_queue_len, statement_embed_queue_peek, statement_embed_queue_remove,
-    statement_embed_queue_remove_many,
+    statement_embed_queue_remove_many, statement_embed_queue_seed_all_live,
+};
+pub use evidence::{
+    pack_evidence_entries, pack_evidence_ids, read_evidence_entries_w, read_evidence_ids,
+    read_evidence_ids_w, reclaim_evidence_overflow,
 };
 pub use list::{
-    statement_history, statement_list, statements_citing_memory, statements_contradicting,
-    StatementListFilter, DEFAULT_LIST_LIMIT,
+    statement_history, statement_history_page, statement_list, statement_list_page,
+    statements_citing_memory, statements_contradicting, StatementHistoryPage, StatementListCursor,
+    StatementListFilter, StatementPage, StatementPageExtra, DEFAULT_LIST_LIMIT,
 };
 pub use supersede::{
-    statement_create_with_decision, statement_supersede, JudgeError, JudgeFuture, JudgeVerdict,
-    StatementJudge, StatementSimilarityCandidate, StatementSimilaritySource, SupersedeDecision,
-    TieredSupersedeDecider, TieredThresholds,
+    statement_supersede, JudgeError, JudgeFuture, JudgeVerdict, StatementJudge,
+    StatementSimilarityCandidate, StatementSimilaritySource,
 };
 pub use tombstone::{statement_retract, statement_tombstone};
 
-use brain_core::{EntityId, StatementId, StatementKind};
+use brain_core::{EntityId, EntityTypeId, StatementId, StatementKind};
 
 // ---------------------------------------------------------------------------
 // Errors.
@@ -55,6 +64,9 @@ pub enum StatementOpError {
     #[error("redb table error: {0}")]
     Table(#[from] redb::TableError),
 
+    #[error("kind registry: {0}")]
+    Kind(#[from] crate::schema::kind::KindOpError),
+
     #[error("statement {0:?} not found")]
     NotFound(StatementId),
 
@@ -66,6 +78,20 @@ pub enum StatementOpError {
 
     #[error("subject {0:?} not registered")]
     UnknownSubject(EntityId),
+
+    #[error("object entity {0:?} not registered")]
+    UnknownObjectEntity(EntityId),
+
+    /// The predicate declares `object: Entity<Type>` and the object
+    /// entity has a different entity type.
+    #[error(
+        "object entity {entity:?} has entity type {actual:?} but predicate requires {expected:?}"
+    )]
+    ObjectEntityTypeMismatch {
+        entity: EntityId,
+        expected: EntityTypeId,
+        actual: EntityTypeId,
+    },
 
     #[error("invalid argument: {0}")]
     InvalidArgument(&'static str),

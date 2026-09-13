@@ -1,11 +1,12 @@
 //! In-memory extractor registry.
 //!
 //! One per shard. Built from the `EXTRACTORS_TABLE` rows on shard
-//! open and updated whenever `SCHEMA_UPLOAD` / `EXTRACTOR_ENABLE`
-//! / `EXTRACTOR_DISABLE` lands. Reads only — write access is the
-//! shard executor's responsibility.
+//! open and refreshed whenever `SCHEMA_UPLOAD` lands. Reads only —
+//! write access is the shard executor's responsibility. Extraction is
+//! always-on (C0): every registered extractor runs, with no per-tier
+//! enable/disable gate.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use brain_core::ExtractorId;
@@ -15,7 +16,6 @@ use crate::framework::extractor::Extractor;
 #[derive(Default)]
 pub struct ExtractorRegistry {
     by_id: HashMap<ExtractorId, Arc<dyn Extractor>>,
-    enabled: HashSet<ExtractorId>,
 }
 
 impl ExtractorRegistry {
@@ -24,15 +24,12 @@ impl ExtractorRegistry {
         Self::default()
     }
 
-    /// Register an extractor. New registrations default to
-    /// `enabled = true`. Replaces any prior entry with the same id
-    /// (used when a `SCHEMA_UPLOAD` bumps `extractor_version` —
-    /// the registry swaps in the new impl, preserves the prior
-    /// `enabled` flag).
+    /// Register an extractor. Replaces any prior entry with the same id
+    /// (used when a `SCHEMA_UPLOAD` bumps `extractor_version` — the
+    /// registry swaps in the new impl).
     pub fn register(&mut self, ext: Arc<dyn Extractor>) {
         let id = ext.id();
         self.by_id.insert(id, ext);
-        self.enabled.insert(id);
     }
 
     #[must_use]
@@ -40,52 +37,12 @@ impl ExtractorRegistry {
         self.by_id.get(&id)
     }
 
-    #[must_use]
-    pub fn is_enabled(&self, id: ExtractorId) -> bool {
-        self.enabled.contains(&id)
-    }
-
-    pub fn set_enabled(&mut self, id: ExtractorId, enabled: bool) {
-        if enabled {
-            self.enabled.insert(id);
-        } else {
-            self.enabled.remove(&id);
-        }
-    }
-
-    /// Iterate all enabled extractors. Order is unspecified; the
+    /// Iterate every registered extractor. Order is unspecified; the
     /// dispatcher applies its own ordering rules (e.g. dependency
-    /// topology).
+    /// topology). Extraction is always-on (C0), so every registered
+    /// extractor is enabled — there is no per-tier gate to filter on.
     pub fn iter_enabled(&self) -> impl Iterator<Item = &Arc<dyn Extractor>> {
-        self.by_id
-            .iter()
-            .filter(|(id, _)| self.enabled.contains(id))
-            .map(|(_, ext)| ext)
-    }
-
-    /// Iterate every registered extractor regardless of enabled
-    /// state. Used by `EXTRACTOR_LIST` over the wire.
-    pub fn iter_all(&self) -> impl Iterator<Item = (&Arc<dyn Extractor>, bool)> {
-        self.by_id
-            .iter()
-            .map(|(id, ext)| (ext, self.enabled.contains(id)))
-    }
-
-    /// True iff at least one enabled, fully-wired extractor reports
-    /// [`ExtractorKind::Llm`]. "Wired" means a real LLM client is
-    /// attached — a degraded row (no API key, unknown model) is
-    /// registered but reports `is_wired() == false`, so this still
-    /// returns false. The encode response surfaces the bool so the
-    /// renderer can distinguish "0 statements because no LLM tier is
-    /// configured" from "0 statements because the input didn't match
-    /// any LLM-emitted predicate". Operators see actionable text in
-    /// the first case (set an API key) and per-memory text in the
-    /// second.
-    #[must_use]
-    pub fn has_enabled_llm_extractor(&self) -> bool {
-        use brain_core::ExtractorKind;
-        self.iter_enabled()
-            .any(|ext| ext.kind() == ExtractorKind::Llm && ext.is_wired())
+        self.by_id.values()
     }
 
     #[must_use]
@@ -156,22 +113,12 @@ mod tests {
     }
 
     #[test]
-    fn enabled_defaults_true_on_register() {
-        let mut r = ExtractorRegistry::new();
-        r.register(stub(1, "acme:p1"));
-        assert!(r.is_enabled(ExtractorId::from(1)));
-    }
-
-    #[test]
-    fn set_enabled_false_excludes_from_iter() {
+    fn register_is_visible_in_iter_enabled() {
         let mut r = ExtractorRegistry::new();
         r.register(stub(1, "acme:p1"));
         r.register(stub(2, "acme:p2"));
-        r.set_enabled(ExtractorId::from(2), false);
-        let enabled_names: Vec<_> = r.iter_enabled().map(|e| e.name().to_string()).collect();
-        assert_eq!(enabled_names, vec!["acme:p1".to_string()]);
-        // iter_all still sees both.
-        assert_eq!(r.iter_all().count(), 2);
+        let names: Vec<_> = r.iter_enabled().map(|e| e.name().to_string()).collect();
+        assert_eq!(names.len(), 2);
     }
 
     #[test]
@@ -181,15 +128,10 @@ mod tests {
     }
 
     #[test]
-    fn re_register_replaces_impl_but_preserves_enabled() {
+    fn re_register_replaces_impl() {
         let mut r = ExtractorRegistry::new();
         r.register(stub(1, "v1"));
-        r.set_enabled(ExtractorId::from(1), false);
         r.register(stub(1, "v2"));
-        // New impl is in.
         assert_eq!(r.lookup(ExtractorId::from(1)).unwrap().name(), "v2");
-        // Re-register flips enabled back to true (this is the
-        // documented semantic — new versions activate by default).
-        assert!(r.is_enabled(ExtractorId::from(1)));
     }
 }

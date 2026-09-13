@@ -16,13 +16,16 @@ build-release:
     cargo build --workspace --release
 
 # Run all tests (unit, integration, doc tests).
+# Unit + integration run under nextest (parallel process-per-test, faster on
+# our large suite); doctests stay on `cargo test --doc` since nextest doesn't
+# run them. Install once: `cargo install --locked cargo-nextest`.
 test:
-    cargo test --workspace --all-targets
+    cargo nextest run --workspace
     cargo test --workspace --doc
 
 # Run a specific crate's tests with output.
 test-one CRATE:
-    cargo test -p {{CRATE}} -- --nocapture
+    cargo nextest run -p {{CRATE}} --no-capture
 
 # Run clippy with strict lints.
 clippy:
@@ -38,7 +41,7 @@ fmt:
 
 # Validate .claude/skills/ frontmatter and references.
 check-skills:
-    @./scripts/check-skills.sh
+    @./.claude/scripts/check-skills.sh
 
 # Build (if needed) the Linux dev container and drop into a bash shell.
 # One-shot interactive container — for ad-hoc poking. For ongoing dev
@@ -104,6 +107,17 @@ docker *CMD:
     @devcontainer up --workspace-folder . >/dev/null
     @devcontainer exec --workspace-folder . {{CMD}}
 
+# brain-server tests, run in parallel. The VM has ~15 GB + 10 cores and links
+# with mold, so the old `--test-threads=1` (sized for a 7.75 GB VM that OOM-
+# killed under nextest's default 10-way parallelism) is wasteful — 4 threads
+# is ~4x faster and stays well under the memory cap. Pass a nextest filter to
+# scope it, e.g. `just docker-test-server --test schema_wire` or
+# `just docker-test-server -E 'test(namespace)'`. No arg runs the whole suite.
+# Drop THREADS if a smaller VM starts OOM-killing.
+docker-test-server FILTER='' THREADS='4':
+    @devcontainer up --workspace-folder . >/dev/null
+    @devcontainer exec --workspace-folder . cargo nextest run -p brain-server --no-fail-fast --test-threads {{THREADS}} {{FILTER}}
+
 # Linux verify suite (the gate for committing Linux-touching code).
 # Plain `cargo test` excludes benches by default — criterion benches
 # build a 100k-vector HNSW index and hang on ARM Linux emulation,
@@ -113,18 +127,44 @@ docker *CMD:
 docker-verify:
     @devcontainer up --workspace-folder . >/dev/null
     @devcontainer exec --workspace-folder . cargo fmt --all -- --check
-    @devcontainer exec --workspace-folder . cargo test --workspace
+    @devcontainer exec --workspace-folder . cargo nextest run --workspace
+    @devcontainer exec --workspace-folder . cargo test --workspace --doc
     @devcontainer exec --workspace-folder . cargo clippy --workspace --all-targets -- -D warnings
 
 # Linux tests, scoped. Example: just docker-test -p brain-storage -p brain-server
 docker-test *ARGS:
     @devcontainer up --workspace-folder . >/dev/null
-    @devcontainer exec --workspace-folder . cargo test {{ARGS}}
+    @devcontainer exec --workspace-folder . cargo nextest run {{ARGS}}
 
 # Linux clippy.
 docker-clippy:
     @devcontainer up --workspace-folder . >/dev/null
     @devcontainer exec --workspace-folder . cargo clippy --workspace --all-targets -- -D warnings
+
+# Bound the volume-backed target cache. cargo never GCs `target/`: every code
+# change mints a fresh artifact hash and the old one is kept forever, so a
+# churny multi-crate/multi-agent workflow accumulates dozens of stale hash
+# variants per crate (this repo hit 68 GiB / ~30 variants of each crate).
+# `cargo sweep --maxsize` removes the OLDEST artifacts until the dir is under
+# the cap — stale variants go first, the current build is kept, so no rebuild
+# is forced. Combined with incremental=false (.cargo/config.toml) this keeps
+# the cache bounded. Pass a size (default 15GB), e.g. `just docker-gc 10GB`.
+docker-gc SIZE='15GB':
+    @devcontainer up --workspace-folder . >/dev/null
+    @devcontainer exec --workspace-folder . bash -lc 'du -sh target 2>/dev/null; cargo sweep --maxsize {{SIZE}} . || { echo "cargo-sweep missing — rebuild the devcontainer image (just docker-rebuild) or: cargo install cargo-sweep"; exit 1; }; echo "after:"; du -sh target 2>/dev/null'
+
+# Hard reset of the target cache: full `cargo clean` in the container. Frees
+# everything (incl. the ~35 GiB dep-artifact accumulation) but forces a full
+# rebuild on the next `just docker …`. Use when the cache has bloated across
+# many dep/toolchain changes; `docker-gc` is the cheaper day-to-day option.
+docker-clean-target:
+    @devcontainer up --workspace-folder . >/dev/null
+    @devcontainer exec --workspace-folder . cargo clean
+
+# Print the current target-cache size (the volume-backed target dir).
+docker-target-size:
+    @devcontainer up --workspace-folder . >/dev/null
+    @devcontainer exec --workspace-folder . du -sh target target/debug/deps target/debug/incremental 2>/dev/null
 
 # The full verification suite — what CI runs.
 verify: fmt-check build clippy test check-skills
@@ -141,14 +181,14 @@ prod-verify:
     cargo test --workspace --all-targets --no-fail-fast -j 1
     cargo test --workspace --doc
     cargo doc --workspace --no-deps
-    cargo build --release --bin brain-server --bin brain-cli
-    ./scripts/check-skills.sh
+    cargo build --release --bin brain-server
+    ./.claude/scripts/check-skills.sh
 
 # Run the acceptance benches (asserted p50/p99 from spec §16/02).
 # Same gates the nightly-perf workflow runs.
 prod-bench:
     cargo bench -p brain-planner --bench relation_traverse
-    cargo bench -p brain-index --bench recall
+    cargo bench -p brain-index --bench lexical_retrieve
 
 # Run miri on brain-storage's lib tests. Miri doesn't shim our syscalls
 # (mmap/mremap/pwritev2/...), so syscall-bound tests are gated under
@@ -165,10 +205,6 @@ fix:
 # Run the server in dev mode.
 run-server:
     cargo run --bin brain-server -- --config config/dev.toml
-
-# Run the CLI.
-cli *ARGS:
-    cargo run --bin brain-cli -- {{ARGS}}
 
 # Run benchmarks for a crate.
 bench CRATE:
@@ -207,7 +243,6 @@ spec-stats:
 # Production Docker — distinct from the `.devcontainer/` recipes above
 # (those build a dev image for Linux cross-compile from macOS). The recipes
 # below build the runtime image that ships to operators and runs Brain itself.
-# Full guide: docs/guides/deployment/docker.md
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Build the production image. Uses BuildKit cache mounts — first build
@@ -220,20 +255,115 @@ image TAG="latest":
 image-run TAG="latest":
     @docker rm -f brain >/dev/null 2>&1 || true
     docker run --rm --name brain \
+        --security-opt seccomp=unconfined --ulimit memlock=-1 \
         -p 8080:8080 -p 9091:9091 \
         -v brain-data:/var/lib/brain/data \
         -v brain-models:/var/lib/brain/models \
         brain:{{TAG}}
 
-# Bring up the full compose stack (brain + prometheus + otel-collector + grafana).
-# See docs/guides/deployment/docker-compose.md for the walkthrough.
+# Bring up the brain service via compose (config/docker-compose.yml).
 compose-up:
-    docker compose up -d --build
+    docker compose -f config/docker-compose.yml up -d --build
     @echo
-    @echo "brain         : http://127.0.0.1:9091/healthz"
-    @echo "prometheus UI : http://127.0.0.1:9090"
-    @echo "grafana       : http://127.0.0.1:3000 (anonymous viewer enabled)"
+    @echo "brain  data plane : 127.0.0.1:8080"
+    @echo "brain  health     : http://127.0.0.1:9091/healthz"
 
 # Tear down the compose stack. Pass `-v` to also drop data volumes.
 compose-down *ARGS:
-    docker compose down {{ARGS}}
+    docker compose -f config/docker-compose.yml down {{ARGS}}
+
+# Generate config/.env.eval (0600) from ~/.brain_llm_key. Sourced by
+# `docker-serve` inside the dev container to satisfy the mandatory [llm] api_key
+# (write-time HyPE). The key never touches argv or stdout — piped into the file.
+eval-env:
+    @umask 077 && printf 'BRAIN__LLM__API_KEY=%s\nBRAIN__LLM__MODEL=gpt-4o-mini\n' "$(cat ${HOME}/.brain_llm_key | tr -d '[:space:]')" > config/.env.eval && chmod 600 config/.env.eval
+    @echo "wrote config/.env.eval (0600) from ~/.brain_llm_key"
+
+# ONE container, native logs, ONE source of truth for models + data:
+#   1. Shared volumes — models come from the `brain-models` volume and data
+#      persists in the `brain-data` volume, the SAME volumes the devcontainer
+#      mounts. So a single `bootstrap-model.sh` (devcontainer post-create)
+#      fills the model store both dev and serve read, with no host-dir vs.
+#      volume drift.
+#   1b. One container on the ports — serve and the devcontainer both bind
+#      9090-9092, so starting serve removes whatever publishes those ports
+#      (a stale serve container or the devcontainer). Volumes persist, so
+#      `just docker-up` brings the devcontainer back afterward.
+#   2. Logs visible — brain-server runs as the container's MAIN process via
+#      `docker run` (NOT `devcontainer exec`), so its stdout IS the container's
+#      stdout: `docker logs -f brain` and Docker Desktop's Logs tab show the full
+#      server output.
+# The repo is bind-mounted for the release build; dev.toml `data_dir = "./data"`
+# resolves to /workspaces/brain/data, which the `brain-data` volume backs — so
+# writes persist across restarts (`docker volume rm brain-data` for a fresh DB).
+# Detached: `docker logs -f brain` to watch; `docker stop brain` for a graceful
+# stop (brain-server is `exec`'d, so it gets SIGTERM directly). Run the eval from
+# the HOST against 127.0.0.1:9090 (admin 127.0.0.1:9092, token eval-admin-secret).
+docker-serve:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    test -f config/.env.eval || { echo "missing config/.env.eval — run: just eval-env"; exit 1; }
+    # Stable tag (not parsed from `docker images` — that output is reformatted by
+    # the rtk proxy and unscriptable). Tag once: docker tag <vsc-brain-…> brain-dev:latest
+    IMG=brain-dev:latest
+    docker image inspect "$IMG" >/dev/null 2>&1 || { echo "image $IMG missing — tag it once: docker tag <vsc-brain-devcontainer-image> brain-dev:latest"; exit 1; }
+    # ONE container on the serve ports: remove whatever currently publishes
+    # them — a stale serve container OR the running devcontainer, which also
+    # binds 9090-9092 and can't coexist. Port-scoped so it's robust whatever
+    # the image is tagged (the old `ancestor=brain-dev:latest` filter only
+    # matched when the devcontainer happened to carry that tag). Volumes
+    # persist, so the devcontainer is a cheap `just docker-up` to bring back.
+    docker ps -aq --filter "publish=9090" | xargs -r docker rm -f >/dev/null 2>&1 || true
+    docker rm -f brain >/dev/null 2>&1 || true
+    docker run -d --name brain --security-opt seccomp=unconfined \
+      -p 127.0.0.1:9090:9090 -p 127.0.0.1:9091:9091 -p 127.0.0.1:9092:9092 \
+      -v "$PWD":/workspaces/brain -w /workspaces/brain --env-file config/.env.eval \
+      -v brain-models:/root/.local/share/brain/models:ro \
+      -v brain-data:/workspaces/brain/data \
+      -e CARGO_HOME=/usr/local/cargo -e RUSTUP_HOME=/usr/local/rustup \
+      -e BRAIN__SERVER__LISTEN_ADDR=0.0.0.0:9090 -e BRAIN__SERVER__METRICS_ADDR=0.0.0.0:9091 \
+      -e BRAIN__SERVER__ADMIN_ADDR=0.0.0.0:9092 -e BRAIN__ADMIN__TOKEN=eval-admin-secret \
+      "$IMG" bash -lc 'export PATH=/usr/local/cargo/bin:$PATH; cargo build --release --bin brain-server && exec ./target/release/brain-server --config config/dev.toml'
+    echo "container 'brain' started (single, native logs). Watch: docker logs -f brain"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Local serve — run the production image on macOS/Docker Desktop so native
+# (non-container) clients (brain-shell, the SDKs) can reach it. Differs from
+# `image-run` (the operator smoke test on Linux) in the ways Docker Desktop +
+# a dev laptop need:
+#   • --security-opt seccomp=unconfined  → io_uring works under Docker Desktop
+#   • bind-mounts the already-bootstrapped BGE model (no HuggingFace download)
+#   • env-disables the model-hungry tiers (rerank / classifier / llm) so the
+#     shard spawns embed-only instead of hard-failing
+#   • PORT is a parameter (8080 is often taken locally; use 18080 etc.)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# One command: compile the DB code (Linux builder stage) into the image,
+# then start the server in a container with the port bound. This is the
+# "spin up Linux → compile → serve" one-liner. `just up 18080` if 8080 is
+# taken. The compile step is cached, so re-runs after no code change are fast.
+up PORT="8080": image (serve-local PORT)
+
+# Run the DB locally, detached, exposing the data plane on PORT (default 8080).
+# Prereqs: `just image` once, and `.devcontainer/bootstrap-model.sh --only embed`.
+# Example (8080 busy): `just serve-local 18080`   →  connect to 127.0.0.1:18080
+serve-local PORT="8080" TAG="latest":
+    @docker rm -f brain-local >/dev/null 2>&1 || true
+    docker run -d --name brain-local --security-opt seccomp=unconfined \
+        -p {{PORT}}:8080 -p 9091:9091 \
+        -v "$HOME/.local/share/brain/models/bge-small-en-v1.5:/models/bge-small-en-v1.5:ro" \
+        -v brain-local-data:/var/lib/brain/data \
+        -e BRAIN_EMBED_MODEL_DIR=/models/bge-small-en-v1.5 \
+        -e BRAIN__SHARD__ARENA_CAPACITY_BYTES=256MiB \
+        -e BRAIN__RERANK__ENABLED=false \
+        -e BRAIN__EXTRACTORS__CLASSIFIER__ENABLED=false \
+        -e BRAIN__EXTRACTORS__LLM__ENABLED=false \
+        brain:{{TAG}}
+    @echo "Brain DB starting on 127.0.0.1:{{PORT}} (health: http://127.0.0.1:9091/healthz)"
+    @echo "Connect a client:  export BRAIN_SERVER=127.0.0.1:{{PORT}}"
+    @echo "Stop:  just serve-stop"
+
+# Stop + remove the local serve container (keeps the brain-local-data volume).
+serve-stop:
+    @docker rm -f brain-local >/dev/null 2>&1 || true
+    @echo "stopped brain-local (data volume kept; `docker volume rm brain-local-data` to wipe)"

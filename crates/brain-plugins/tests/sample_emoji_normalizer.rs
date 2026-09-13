@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use brain_core::AgentId;
+use brain_core::SpaceId;
 use brain_extractors::framework::item::{EntityMention, ExtractedItem};
 use brain_plugins::{
     EnricherInput, EnricherOutput, EnricherPlugin, PluginError, PluginRegistry, PluginResult,
@@ -107,7 +107,7 @@ fn emoji_normalizer_mutates_entity_text() {
 
     let mut items = vec![rocket_mention()];
     let outcomes = reg.run_enrichers(EnricherInput {
-        agent_id: AgentId::NIL,
+        space_id: SpaceId::NIL,
         items: &mut items,
         source_text: "Project \u{1F680} Launch",
         now_unix_nanos: 0,
@@ -138,7 +138,7 @@ fn registry_skips_failing_plugin_and_continues() {
 
     let mut items = vec![rocket_mention()];
     let outcomes = reg.run_enrichers(EnricherInput {
-        agent_id: AgentId::NIL,
+        space_id: SpaceId::NIL,
         items: &mut items,
         source_text: "irrelevant",
         now_unix_nanos: 0,

@@ -1,13 +1,12 @@
-//! Pattern extractor perf bench (sub-task 20.10).
+//! Pattern extractor perf bench.
 //!
-//! Spec targets per `spec/20_benchmarks/02_latency_targets.md`
-//! §2.7 at a single-extractor dispatch over a 4 KiB memory:
+//! Latency targets at a single-extractor dispatch over a 4 KiB memory:
 //!
 //! - Pattern extractor: p50 30 µs, p99 100 µs.
 //!
 //! Run: `cargo bench -p brain-extractors --bench pattern_extract`.
 
-use brain_core::{AgentId, ContextId, ExtractorId, Memory, MemoryId, MemoryKind, Salience};
+use brain_core::{ExtractorId, Memory, MemoryId, MemoryKind, Salience, SessionId, SpaceId};
 use brain_extractors::{ExtractionContext, Extractor, ExtractorRegistry, PatternExtractor};
 use brain_protocol::schema::ExtractorTarget;
 use criterion::{black_box, criterion_group, Criterion};
@@ -45,13 +44,14 @@ fn build_memory(size_bytes: usize) -> Memory {
     text.truncate(size_bytes);
     Memory {
         id: MemoryId::pack(0, 1, 0),
-        agent: AgentId::new(),
-        context: ContextId(0),
+        space: SpaceId::new(),
+        session_id: SessionId(0),
         kind: MemoryKind::Episodic,
         salience: Salience::default(),
         text: Some(text),
         created_at_unix_ms: 0,
         last_accessed_at_unix_ms: 0,
+        occurred_at_unix_nanos: None,
     }
 }
 
@@ -60,6 +60,10 @@ fn bench_pattern_extract(c: &mut Criterion) {
     let mem = build_memory(4096);
     let reg = ExtractorRegistry::new();
     let ctx = ExtractionContext {
+        declared_entity_types: None,
+        candidate_predicates: None,
+        declared_kinds: None,
+        entity_type_labels: None,
         schema_version: 1,
         now_unix_nanos: 0,
         registry: &reg,
@@ -80,6 +84,10 @@ fn bench_pattern_extract_short(c: &mut Criterion) {
     let mem = build_memory(256);
     let reg = ExtractorRegistry::new();
     let ctx = ExtractionContext {
+        declared_entity_types: None,
+        candidate_predicates: None,
+        declared_kinds: None,
+        entity_type_labels: None,
         schema_version: 1,
         now_unix_nanos: 0,
         registry: &reg,
@@ -100,6 +108,10 @@ fn print_corpus_summary() {
     let mem = build_memory(4096);
     let reg = ExtractorRegistry::new();
     let ctx = ExtractionContext {
+        declared_entity_types: None,
+        candidate_predicates: None,
+        declared_kinds: None,
+        entity_type_labels: None,
         schema_version: 1,
         now_unix_nanos: 0,
         registry: &reg,

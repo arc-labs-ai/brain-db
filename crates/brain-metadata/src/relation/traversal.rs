@@ -1,9 +1,9 @@
-//! Relation graph traversal. Sub-task 18.5.
+//! Relation graph traversal.
 //!
 //! Iterative BFS. Bounded by `max_depth` (cap 5)
 //! and `max_branching_factor` (cap 10_000) with visited-set cycle
-//! detection. The wire `RELATION_TRAVERSE` opcode (`0x0156`, phase
-//! 18.6) routes through this module.
+//! detection. The wire `RELATION_TRAVERSE` opcode (`0x0156`) routes
+//! through this module.
 //!
 //! Pure read path — no writes, no side effects (one tracing::warn
 //! when a super-node truncates).
@@ -13,6 +13,7 @@ use std::collections::HashSet;
 use brain_core::{EntityId, RelationId, RelationTypeId};
 
 use super::ops::{relation_list_from, relation_list_to, RelationListFilter, RelationOpError};
+use crate::tables::scope::RowScope;
 
 // ---------------------------------------------------------------------------
 // Caps + defaults.
@@ -28,8 +29,8 @@ pub const DEFAULT_MAX_BRANCHING: u32 = 1_000;
 /// Hard cap on `max_branching_factor`.
 pub const MAX_BRANCHING: u32 = 10_000;
 /// Soft cap on total visited nodes. Past this, traversal returns
-/// early with what it has gathered (no error). Phase 23 may turn
-/// this into a wire-visible "truncated" flag.
+/// early with what it has gathered (no error). This may later become a
+/// wire-visible "truncated" flag.
 pub const MAX_TOTAL_VISITED: usize = 100_000;
 
 // ---------------------------------------------------------------------------
@@ -96,6 +97,7 @@ pub struct TraversalPath {
 /// matches any relation type.
 pub fn traverse(
     rtxn: &redb::ReadTransaction,
+    scope: RowScope,
     start: EntityId,
     type_filter: &[RelationTypeId],
     direction: TraversalDirection,
@@ -118,7 +120,14 @@ pub fn traverse(
         let mut next_frontier: Vec<(EntityId, Vec<TraversalStep>)> = Vec::new();
 
         for (node, partial) in frontier {
-            let mut neighbours = expand(rtxn, node, type_filter, direction, config.current_only)?;
+            let mut neighbours = expand(
+                rtxn,
+                scope,
+                node,
+                type_filter,
+                direction,
+                config.current_only,
+            )?;
 
             if neighbours.len() > max_branching as usize {
                 tracing::warn!(
@@ -183,6 +192,7 @@ struct Edge {
 
 fn expand(
     rtxn: &redb::ReadTransaction,
+    scope: RowScope,
     node: EntityId,
     type_filter: &[RelationTypeId],
     direction: TraversalDirection,
@@ -215,7 +225,7 @@ fn expand(
     );
 
     if direction_outgoing {
-        for r in relation_list_from(rtxn, node, &list_filter)? {
+        for r in relation_list_from(rtxn, scope, node, &list_filter)? {
             if !want_type(r.relation_type) {
                 continue;
             }
@@ -238,7 +248,7 @@ fn expand(
         }
     }
     if direction_incoming {
-        for r in relation_list_to(rtxn, node, &list_filter)? {
+        for r in relation_list_to(rtxn, scope, node, &list_filter)? {
             if !want_type(r.relation_type) {
                 continue;
             }
@@ -274,8 +284,11 @@ mod tests {
     use crate::entity::ops::{entity_put, normalize_name};
     use crate::relation::ops::relation_create;
     use crate::relation::types::relation_type_intern;
-    use brain_core::{Entity, EntityType, Relation};
     use brain_core::{Cardinality, ExtractorId};
+    use brain_core::{Entity, EntityType, Relation};
+    fn test_scope() -> RowScope {
+        RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xAB; 16])
+    }
 
     fn open_db() -> (tempfile::TempDir, crate::MetadataDb) {
         let dir = tempfile::tempdir().unwrap();
@@ -294,7 +307,7 @@ mod tests {
             1_700_000_000_000_000_000,
         );
         let wtxn = db.write_txn().unwrap();
-        entity_put(&wtxn, &e).unwrap();
+        entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
         wtxn.commit().unwrap();
         id
     }
@@ -342,7 +355,8 @@ mod tests {
             symmetric,
         );
         let wtxn = db.write_txn().unwrap();
-        let id = relation_create(&wtxn, &r, 0).unwrap();
+        let id =
+            relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &r, 0).unwrap();
         wtxn.commit().unwrap();
         id
     }
@@ -360,6 +374,7 @@ mod tests {
         let rtxn = db.read_txn().unwrap();
         let paths = traverse(
             &rtxn,
+            test_scope(),
             a,
             &[],
             TraversalDirection::Outgoing,
@@ -383,6 +398,7 @@ mod tests {
         let rtxn = db.read_txn().unwrap();
         let paths = traverse(
             &rtxn,
+            test_scope(),
             b,
             &[],
             TraversalDirection::Incoming,
@@ -397,7 +413,7 @@ mod tests {
     // ----- Two and three hops -----
 
     #[test]
-    fn two_hop() {
+    fn outgoing_traversal_returns_paths_at_each_depth_up_to_two_hops() {
         let (_dir, mut db) = open_db();
         let a = make_entity(&mut db, "a-2h");
         let b = make_entity(&mut db, "b-2h");
@@ -409,6 +425,7 @@ mod tests {
         let rtxn = db.read_txn().unwrap();
         let paths = traverse(
             &rtxn,
+            test_scope(),
             a,
             &[],
             TraversalDirection::Outgoing,
@@ -438,7 +455,15 @@ mod tests {
             current_only: true,
         };
         // Should not panic; depth clamped to MAX_DEPTH.
-        let paths = traverse(&rtxn, a, &[], TraversalDirection::Outgoing, &config).unwrap();
+        let paths = traverse(
+            &rtxn,
+            test_scope(),
+            a,
+            &[],
+            TraversalDirection::Outgoing,
+            &config,
+        )
+        .unwrap();
         assert_eq!(paths.len(), 1);
     }
 
@@ -456,6 +481,7 @@ mod tests {
         let rtxn = db.read_txn().unwrap();
         let paths = traverse(
             &rtxn,
+            test_scope(),
             a,
             &[],
             TraversalDirection::Outgoing,
@@ -478,6 +504,7 @@ mod tests {
         let rtxn = db.read_txn().unwrap();
         let paths = traverse(
             &rtxn,
+            test_scope(),
             a,
             &[],
             TraversalDirection::Outgoing,
@@ -503,6 +530,7 @@ mod tests {
         let rtxn = db.read_txn().unwrap();
         let from_a = traverse(
             &rtxn,
+            test_scope(),
             a,
             &[],
             TraversalDirection::Outgoing,
@@ -511,6 +539,7 @@ mod tests {
         .unwrap();
         let from_b = traverse(
             &rtxn,
+            test_scope(),
             b,
             &[],
             TraversalDirection::Outgoing,
@@ -525,7 +554,7 @@ mod tests {
     // ----- Type filter -----
 
     #[test]
-    fn type_filter() {
+    fn traversal_type_filter_follows_only_requested_relation_type() {
         let (_dir, mut db) = open_db();
         let a = make_entity(&mut db, "a-tf");
         let b = make_entity(&mut db, "b-tf");
@@ -538,6 +567,7 @@ mod tests {
         let rtxn = db.read_txn().unwrap();
         let paths = traverse(
             &rtxn,
+            test_scope(),
             a,
             &[knows],
             TraversalDirection::Outgoing,
@@ -570,7 +600,15 @@ mod tests {
             max_branching_factor: DEFAULT_MAX_BRANCHING,
             current_only: true,
         };
-        let paths = traverse(&rtxn, a, &[], TraversalDirection::Outgoing, &cfg).unwrap();
+        let paths = traverse(
+            &rtxn,
+            test_scope(),
+            a,
+            &[],
+            TraversalDirection::Outgoing,
+            &cfg,
+        )
+        .unwrap();
         assert!(paths.is_empty(), "tombstoned edge excluded");
     }
 
@@ -589,6 +627,7 @@ mod tests {
         let rtxn = db.read_txn().unwrap();
         let out = traverse(
             &rtxn,
+            test_scope(),
             a,
             &[],
             TraversalDirection::Outgoing,
@@ -597,6 +636,7 @@ mod tests {
         .unwrap();
         let inc = traverse(
             &rtxn,
+            test_scope(),
             a,
             &[],
             TraversalDirection::Incoming,
@@ -605,6 +645,7 @@ mod tests {
         .unwrap();
         let both = traverse(
             &rtxn,
+            test_scope(),
             a,
             &[],
             TraversalDirection::Both,

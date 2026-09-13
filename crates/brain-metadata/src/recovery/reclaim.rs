@@ -9,7 +9,7 @@
 //! Both share the property that they leave the arena slot in a new
 //! version; recovery just lays down the post-state.
 
-use brain_core::{AgentId, ContextId, MemoryKind};
+use brain_core::{MemoryKind, SessionId, SpaceId};
 use brain_storage::recovery::MetadataSinkError;
 use brain_storage::wal::payload::{ConsolidatePayload, ReclaimPayload};
 
@@ -22,15 +22,14 @@ use super::transient;
 
 impl MetadataDb {
     pub(super) fn apply_reclaim(
-        &mut self,
+        &self,
         lsn: u64,
         p: &ReclaimPayload,
     ) -> Result<(), MetadataSinkError> {
         let wtxn = self.db.begin_write().map_err(transient)?;
         {
             // O(1) delete: `ReclaimPayload.memory_id` carries the row's
-            // primary key directly (SD-3.11-3 supersedes the deferred
-            // SD-3.11-2 scan path).
+            // primary key directly, so no scan is needed.
             let key = p.memory_id.to_be_bytes();
             {
                 let mut mems = wtxn.open_table(MEMORIES_TABLE).map_err(transient)?;
@@ -54,7 +53,7 @@ impl MetadataDb {
     }
 
     pub(super) fn apply_consolidate(
-        &mut self,
+        &self,
         lsn: u64,
         timestamp_ns: u64,
         p: &ConsolidatePayload,
@@ -65,17 +64,17 @@ impl MetadataDb {
             let slot_id = memory_id.slot();
             let slot_version = memory_id.version();
 
-            // For Consolidated memories: the source-derived agent_id /
-            // context_id aren't in the payload describes
-            // consolidation as agent-scoped — every source shares an
-            // agent. v1 storage uses the brain-core NULL sentinels;
-            // wire layer (Phase 9) populates these via a richer
-            // payload. SD-3.11-3-style placeholder, but doesn't need a
-            // logged deviation since it's pure recovery-time fill.
+            // For Consolidated memories: the source-derived space_id /
+            // session_id aren't in the payload. Consolidation is
+            // space-scoped — every source shares an space. Storage uses
+            // the brain-core NULL sentinels here; the wire layer
+            // populates these via a richer payload. This is a pure
+            // recovery-time fill.
             let mem = MemoryMetadata {
                 memory_id_bytes: memory_id.to_be_bytes(),
-                agent_id_bytes: <[u8; 16]>::from(AgentId::default()),
-                context_id: ContextId::default().raw(),
+                namespace_id: brain_core::NamespaceId::SYSTEM.raw(),
+                space_id_bytes: <[u8; 16]>::from(SpaceId::default()),
+                session_id: SessionId::default().raw(),
                 slot_id,
                 slot_version,
                 kind: memory_kind_to_u8(MemoryKind::Consolidated),
@@ -85,6 +84,9 @@ impl MetadataDb {
                 forgot_at_unix_nanos: None,
                 tombstoned_at_unix_nanos: None,
                 consolidated_at_unix_nanos: Some(timestamp_ns),
+                // Consolidated rows synthesise content from sources; they
+                // carry no client-supplied event time.
+                occurred_at_unix_nanos: None,
                 salience: 0.5,
                 salience_initial: 0.5,
                 access_count: 0,

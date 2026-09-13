@@ -55,7 +55,7 @@ Full node via wire protocol:
 
 Spins up:
 - A real Brain process.
-- Multiple SDK clients.
+- Multiple concurrent clients.
 - Drives various operations.
 
 Verifies:
@@ -74,7 +74,7 @@ A short, fast test of basic functionality:
 
 Steps:
 1. Start Brain.
-2. Connect with SDK.
+2. Connect a client.
 3. ENCODE a memory.
 4. RECALL with the same text.
 5. Verify the memory is returned.
@@ -195,14 +195,13 @@ For deployments needing compliance:
 - Encryption at rest (when configured).
 - Encryption in transit (TLS).
 
-## 16. SDK tests
+## 16. Wire-protocol conformance tests
 
-Each SDK has its own test suite:
+Brain ships no client library; the contract a client must satisfy is the wire protocol itself. The conformance corpus pins that contract:
 
-- Unit tests of the SDK.
-- Integration with Brain.
-- Idempotency, retry, streaming.
-- Cross-SDK compatibility (a memory written via Rust SDK is readable via Python SDK).
+- **Golden fixtures.** Each fixture is a `(opcode, field-map) → request bytes → response bytes` triple. The request and response payloads are valid CBOR decodable by any standards-conformant CBOR reader — no Brain-supplied library required.
+- **Byte-reproducibility.** Under the deterministic profile, encoding a given `(opcode, field-map)` reproduces the golden request bytes exactly, and the same request reproduces the golden response bytes exactly (round-trip byte-for-byte).
+- **Cross-client interoperability.** A memory written via one client is readable by any other, because the on-wire bytes are canonical: the fixtures define the one correct encoding, and any conformant client converges on it.
 
 ## 17. Documentation tests
 
@@ -258,7 +257,7 @@ Phase-16 exit gate covers the typed graph's entity slice (statements, relations,
 cargo test -p brain-core knowledge
 cargo test -p brain-metadata --lib
 cargo test -p brain-protocol --lib
-cargo test -p brain-sdk-rust --lib
+cargo test -p brain-protocol --test conformance
 ```
 
 Must include:
@@ -277,14 +276,14 @@ cargo test -p brain-server --test knowledge_entity_wire
 cargo test -p brain-server --test knowledge_entity_merge_wire
 cargo test -p brain-server --test knowledge_entities_phase_exit
 cargo test -p brain-server --test knowledge_compat
-cargo test -p brain-sdk-rust --test knowledge_entity
+cargo test -p brain-protocol --test conformance_typed_graph
 ```
 
 Required to pass:
 
 - Full lifecycle: create → get → update → rename → merge → unmerge → rename → list → tombstone (`knowledge_entities_phase_exit.rs`, 16.9.3).
 - All 9 wire opcodes end-to-end (`knowledge_entity_wire.rs` + `knowledge_entity_merge_wire.rs`).
-- SDK mock-server round-trips for every builder (`knowledge_entity.rs`).
+- wire-conformance round-trips for every opcode (golden fixtures).
 - Schemaless mode regression (`knowledge_compat.rs`, 15.5) — knowledge tables stay empty when no schema is declared.
 
 ### 21.3 Performance benches

@@ -12,13 +12,27 @@ use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
-use brain_core::AgentId;
+use brain_core::SpaceId;
 use brain_extractors::enricher_hook::{EnricherHook, EnricherHookOutcome};
 use brain_extractors::framework::item::ExtractedItem;
 
 use crate::connector::{ConnectorPlugin, ConnectorRequest, ConnectorResponse};
 use crate::enricher::{EnricherInput, EnricherOutput, EnricherPlugin};
 use crate::errors::{PluginError, PluginResult};
+
+/// Per-batch ceiling on the number of [`ExtractedItem`]s the enricher
+/// chain may leave behind.
+///
+/// Enrichers receive `&mut Vec<ExtractedItem>` and may push freely; a
+/// misbehaving (or hostile) enricher could grow the vector without
+/// bound and exhaust the writer's Glommio shard. The host caps the
+/// batch after each enricher runs: anything past this ceiling is
+/// truncated and logged, matching the pipeline's fail-open policy (a
+/// contract-violating plugin degrades the batch, it never aborts the
+/// write). A single encode realistically yields dozens to low hundreds
+/// of items, so this leaves generous headroom while still bounding a
+/// runaway enricher.
+pub const MAX_ENRICHER_BATCH_ITEMS: usize = 10_000;
 
 /// One outcome row returned by [`PluginRegistry::run_enrichers`].
 ///
@@ -98,7 +112,7 @@ impl PluginRegistry {
     /// not — so the caller can fold metrics + audit rows.
     pub fn run_enrichers(&self, input: EnricherInput<'_>) -> Vec<EnricherOutcome> {
         let EnricherInput {
-            agent_id,
+            space_id,
             items,
             source_text,
             now_unix_nanos,
@@ -111,7 +125,7 @@ impl PluginRegistry {
             // borrow only lives for the duration of this iteration so
             // successive plugins see prior plugins' mutations.
             let per_plugin_input = EnricherInput {
-                agent_id,
+                space_id,
                 items,
                 source_text,
                 now_unix_nanos,
@@ -144,6 +158,22 @@ impl PluginRegistry {
                 }
             };
 
+            // Enforce the per-batch ceiling after every plugin so the
+            // cumulative enricher chain cannot grow the vector without
+            // bound. Truncate-and-warn (fail-open) rather than reject:
+            // the surrounding pipeline degrades a contract-violating
+            // plugin's output, it never aborts the write.
+            if items.len() > MAX_ENRICHER_BATCH_ITEMS {
+                let dropped = items.len() - MAX_ENRICHER_BATCH_ITEMS;
+                tracing::warn!(
+                    plugin_id = %plugin_id,
+                    ceiling = MAX_ENRICHER_BATCH_ITEMS,
+                    dropped,
+                    "enricher exceeded per-batch item ceiling; truncating (fail-open)"
+                );
+                items.truncate(MAX_ENRICHER_BATCH_ITEMS);
+            }
+
             outcomes.push(EnricherOutcome {
                 plugin_id,
                 result: outcome,
@@ -156,6 +186,12 @@ impl PluginRegistry {
     /// Fetch from one specific connector. Connector errors propagate
     /// (the connector scheduler decides retry policy). Panics are
     /// caught and surfaced as [`PluginError::Panicked`].
+    ///
+    /// `req.max_items` is a hard cap: a connector that returns more than
+    /// it requested is in contract violation. The host enforces the cap
+    /// itself (truncate-and-warn, fail-open) so an over-eager or hostile
+    /// connector cannot flood the encode pipeline with an unbounded
+    /// `Vec<ConnectorItem>`.
     pub fn fetch_from_connector(
         &self,
         id: &str,
@@ -166,9 +202,24 @@ impl PluginRegistry {
             .get(id)
             .ok_or_else(|| PluginError::ConnectorNotFound { id: id.to_string() })?;
         let plugin_id = plugin.plugin_id();
+        let max_items = req.max_items;
         let result = std::panic::catch_unwind(AssertUnwindSafe(|| plugin.fetch(req)));
         match result {
-            Ok(inner) => inner,
+            Ok(Ok(mut resp)) => {
+                let cap = max_items as usize;
+                if resp.items.len() > cap {
+                    let dropped = resp.items.len() - cap;
+                    tracing::warn!(
+                        plugin_id = %plugin_id,
+                        max_items,
+                        dropped,
+                        "connector returned more than max_items; truncating (fail-open)"
+                    );
+                    resp.items.truncate(cap);
+                }
+                Ok(resp)
+            }
+            Ok(Err(e)) => Err(e),
             Err(panic) => {
                 let message = panic_message(&panic);
                 tracing::warn!(
@@ -243,13 +294,13 @@ impl PluginRegistry {
 impl EnricherHook for PluginRegistry {
     fn run(
         &self,
-        agent_id: AgentId,
+        space_id: SpaceId,
         items: &mut Vec<ExtractedItem>,
         source_text: &str,
         now_unix_nanos: u64,
     ) -> Vec<EnricherHookOutcome> {
         let outcomes = self.run_enrichers(EnricherInput {
-            agent_id,
+            space_id,
             items,
             source_text,
             now_unix_nanos,
@@ -293,14 +344,14 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
 mod tests {
     use super::*;
     use crate::recall::RecallPlugin;
-    use brain_core::AgentId;
+    use brain_core::SpaceId;
     use brain_extractors::framework::item::{EntityMention, ExtractedItem};
     use serde_json::Value;
 
     // -- helpers -----------------------------------------------------
 
-    fn agent() -> AgentId {
-        AgentId::NIL
+    fn space() -> SpaceId {
+        SpaceId::NIL
     }
 
     fn em(text: &str) -> ExtractedItem {
@@ -491,7 +542,7 @@ mod tests {
 
         let mut items = vec![em("a rocket-shaped object")];
         let outcomes = reg.run_enrichers(EnricherInput {
-            agent_id: agent(),
+            space_id: space(),
             items: &mut items,
             source_text: "irrelevant",
             now_unix_nanos: 1_000,
@@ -527,7 +578,7 @@ mod tests {
 
         let mut items = Vec::<ExtractedItem>::new();
         let outcomes = reg.run_enrichers(EnricherInput {
-            agent_id: agent(),
+            space_id: space(),
             items: &mut items,
             source_text: "irrelevant",
             now_unix_nanos: 1_000,
@@ -550,7 +601,7 @@ mod tests {
 
         let mut items = Vec::<ExtractedItem>::new();
         let outcomes = reg.run_enrichers(EnricherInput {
-            agent_id: agent(),
+            space_id: space(),
             items: &mut items,
             source_text: "irrelevant",
             now_unix_nanos: 1_000,
@@ -594,7 +645,7 @@ mod tests {
 
         let reg_arc: Arc<dyn brain_extractors::enricher_hook::EnricherHook> = Arc::new(reg);
         let mut items = vec![em("a rocket-shaped object")];
-        let outcomes = EnricherHook::run(&*reg_arc, agent(), &mut items, "irrelevant", 1_000);
+        let outcomes = EnricherHook::run(&*reg_arc, space(), &mut items, "irrelevant", 1_000);
 
         assert_eq!(outcomes.len(), 2);
         assert_eq!(outcomes[0].plugin_id, "test:mutator");
@@ -616,11 +667,167 @@ mod tests {
         let reg_arc: Arc<dyn brain_extractors::enricher_hook::EnricherHook> = Arc::new(reg);
 
         let mut items = Vec::<ExtractedItem>::new();
-        let outcomes = EnricherHook::run(&*reg_arc, agent(), &mut items, "irrelevant", 0);
+        let outcomes = EnricherHook::run(&*reg_arc, space(), &mut items, "irrelevant", 0);
         assert_eq!(outcomes.len(), 2);
         assert!(!outcomes[0].ok);
         assert!(outcomes[1].ok);
         assert_eq!(items.len(), 1);
+    }
+
+    struct Flooder {
+        count: usize,
+    }
+
+    impl RecallPlugin for Flooder {
+        fn plugin_id(&self) -> &'static str {
+            "test:flooder"
+        }
+        fn plugin_name(&self) -> &'static str {
+            "Flooder"
+        }
+        fn initialize(&self, _config: &Value) -> PluginResult<()> {
+            Ok(())
+        }
+    }
+
+    impl EnricherPlugin for Flooder {
+        fn enrich(&self, input: EnricherInput<'_>) -> PluginResult<EnricherOutput> {
+            for _ in 0..self.count {
+                input.items.push(em("flood"));
+            }
+            Ok(EnricherOutput {
+                items_added: self.count as u32,
+                items_mutated: 0,
+                items_dropped: 0,
+            })
+        }
+    }
+
+    struct OverflowConnector {
+        count: usize,
+    }
+
+    impl RecallPlugin for OverflowConnector {
+        fn plugin_id(&self) -> &'static str {
+            "test:overflow-connector"
+        }
+        fn plugin_name(&self) -> &'static str {
+            "OverflowConnector"
+        }
+        fn initialize(&self, _config: &Value) -> PluginResult<()> {
+            Ok(())
+        }
+    }
+
+    impl ConnectorPlugin for OverflowConnector {
+        fn fetch(&self, _req: ConnectorRequest) -> PluginResult<ConnectorResponse> {
+            let items = (0..self.count)
+                .map(|i| crate::connector::ConnectorItem {
+                    external_id: format!("id-{i}"),
+                    text: "raw".into(),
+                    created_at_unix_nanos: 0,
+                    source_url: None,
+                    tags: Vec::new(),
+                })
+                .collect();
+            Ok(ConnectorResponse {
+                items,
+                next_since_unix_nanos: 1,
+            })
+        }
+    }
+
+    #[test]
+    fn enricher_output_is_capped_at_batch_ceiling() {
+        let mut reg = PluginRegistry::new();
+        reg.register_enricher(
+            Arc::new(Flooder {
+                count: MAX_ENRICHER_BATCH_ITEMS + 500,
+            }),
+            &Value::Null,
+        )
+        .unwrap();
+
+        let mut items = Vec::<ExtractedItem>::new();
+        let outcomes = reg.run_enrichers(EnricherInput {
+            space_id: space(),
+            items: &mut items,
+            source_text: "irrelevant",
+            now_unix_nanos: 0,
+        });
+
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0].result.is_ok());
+        // Host truncated the runaway growth to the ceiling.
+        assert_eq!(items.len(), MAX_ENRICHER_BATCH_ITEMS);
+    }
+
+    #[test]
+    fn cumulative_enricher_chain_is_capped_at_batch_ceiling() {
+        let mut reg = PluginRegistry::new();
+        // Two enrichers each pushing past the ceiling; the cumulative
+        // vector must still be bounded.
+        reg.register_enricher(
+            Arc::new(Flooder {
+                count: MAX_ENRICHER_BATCH_ITEMS,
+            }),
+            &Value::Null,
+        )
+        .unwrap();
+        reg.register_enricher(Arc::new(Adder), &Value::Null)
+            .unwrap();
+
+        let mut items = Vec::<ExtractedItem>::new();
+        let outcomes = reg.run_enrichers(EnricherInput {
+            space_id: space(),
+            items: &mut items,
+            source_text: "irrelevant",
+            now_unix_nanos: 0,
+        });
+
+        assert_eq!(outcomes.len(), 2);
+        assert!(items.len() <= MAX_ENRICHER_BATCH_ITEMS);
+    }
+
+    #[test]
+    fn connector_response_is_capped_at_max_items() {
+        let mut reg = PluginRegistry::new();
+        reg.register_connector(Arc::new(OverflowConnector { count: 50 }), &Value::Null)
+            .unwrap();
+
+        let resp = reg
+            .fetch_from_connector(
+                "test:overflow-connector",
+                ConnectorRequest {
+                    query: String::new(),
+                    since_unix_nanos: None,
+                    max_items: 10,
+                },
+            )
+            .unwrap();
+
+        // Host enforced the hard cap host-side.
+        assert_eq!(resp.items.len(), 10);
+    }
+
+    #[test]
+    fn connector_response_within_cap_is_untouched() {
+        let mut reg = PluginRegistry::new();
+        reg.register_connector(Arc::new(OverflowConnector { count: 3 }), &Value::Null)
+            .unwrap();
+
+        let resp = reg
+            .fetch_from_connector(
+                "test:overflow-connector",
+                ConnectorRequest {
+                    query: String::new(),
+                    since_unix_nanos: None,
+                    max_items: 10,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(resp.items.len(), 3);
     }
 
     #[test]

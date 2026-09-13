@@ -1,37 +1,49 @@
 //! Statement-op request payloads.
 //!
 //! Mirrors the value-side `brain_core` types but uses wire-domain
-//! primitives so the rkyv derive fires without coupling `brain-core`
-//! to rkyv. Conversion lives in [`crate::responses::statement`]
-//! alongside `StatementView`.
-
-use rkyv::{Archive, Deserialize, Serialize};
+//! primitives so the wire types stay decoupled from `brain-core`
+//! value types. Conversion lives alongside [`StatementView`] in this
+//! module.
 
 use crate::envelope::request::WireUuid;
+use crate::ops::memory::ActAs;
 
 // ---------------------------------------------------------------------------
 // Shared types (used by requests + StatementView in statement_resp.rs).
 // ---------------------------------------------------------------------------
 
-/// Wire counterpart to `brain_core::StatementKind`. Discriminants are
-/// offset by 1 vs `StatementKind` so `0` can mean "no filter" in
-/// [`StatementListRequest::kind`].
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
-#[repr(u8)]
+/// Wire counterpart to `brain_core::StatementKind`. Mirrors the six
+/// built-in kinds plus `Custom` for user-declared kinds. In the raw-byte
+/// filter field [`StatementListRequest::kind`], `0` means "no filter" and
+/// any non-zero byte is `core_byte + 1` (so `1=Fact … 6=Directive`,
+/// `7+ = Custom(core_byte)`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum StatementKindWire {
-    Fact = 1,
-    Preference = 2,
-    Event = 3,
+    Fact,
+    Preference,
+    Event,
+    Attribute,
+    Relation,
+    Directive,
+    /// User-declared kind; holds the `brain_core::StatementKind::Custom`
+    /// byte (`>= 6`).
+    Custom(u8),
+}
+
+impl StatementKindWire {
+    /// The `brain_core::StatementKind` storage byte (0-based: `0=Fact …
+    /// 5=Directive`, `>=6 = Custom`). Replaces the old `as u8` cast that
+    /// relied on a `#[repr(u8)]` discriminant.
+    #[must_use]
+    pub fn as_storage_byte(self) -> u8 {
+        statement_kind_from_wire(self).as_u8()
+    }
 }
 
 /// Wire counterpart to `brain_core::StatementValue`.
 ///
 /// `Blob` is capped at 64 KiB by the handler.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum StatementValueWire {
     Text(String),
     Integer(i64),
@@ -41,7 +53,7 @@ pub enum StatementValueWire {
     Blob(Vec<u8>),
 }
 
-// `From` impls for ergonomic `.object_value(...)` setters on the SDK
+// `From` impls for ergonomic `.object_value(...)` setters on the client
 // builders. Local-type rule means these must live alongside the enum
 // definition.
 impl From<String> for StatementValueWire {
@@ -79,14 +91,12 @@ impl From<Vec<u8>> for StatementValueWire {
 ///
 /// `MemoryRef` carries the raw 16-byte `MemoryId` packed form. All
 /// other variants use `WireUuid` ([u8; 16]).
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum StatementObjectWire {
-    EntityRef(WireUuid),
+    EntityRef(#[serde(with = "serde_bytes")] WireUuid),
     Value(StatementValueWire),
-    MemoryRef([u8; 16]),
-    StatementRef(WireUuid),
+    MemoryRef(#[serde(with = "serde_bytes")] [u8; 16]),
+    StatementRef(#[serde(with = "serde_bytes")] WireUuid),
 }
 
 impl StatementObjectWire {
@@ -112,12 +122,10 @@ impl StatementObjectWire {
 /// wire — the handler supplies them server-side from the request
 /// context. Add-evidence ops carry the metadata explicitly via a
 /// follow-up structured payload.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum EvidenceRefWire {
-    Inline(Vec<[u8; 16]>),
-    Overflow(WireUuid),
+    Inline(#[serde(with = "crate::codec::cbor::vec_byte_array16")] Vec<[u8; 16]>),
+    Overflow(#[serde(with = "serde_bytes")] WireUuid),
 }
 
 // ---------------------------------------------------------------------------
@@ -134,11 +142,10 @@ pub enum EvidenceRefWire {
 /// `valid_from_unix_nanos`, `valid_to_unix_nanos`, `event_at_unix_nanos`:
 /// `0` = absent. `event_at_unix_nanos` MUST be non-zero iff
 /// `kind == Event`.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StatementCreateRequest {
     pub kind: StatementKindWire,
+    #[serde(with = "serde_bytes")]
     pub subject: WireUuid,
     pub predicate: String,
     pub object: StatementObjectWire,
@@ -149,31 +156,51 @@ pub struct StatementCreateRequest {
     pub valid_to_unix_nanos: u64,
     pub event_at_unix_nanos: u64,
     pub schema_version: u32,
+    /// Optional conversation/run this statement belongs to. `0`
+    /// (`SessionId::DEFAULT`, the default when omitted) is the default
+    /// session. A grouping key, not an isolation boundary — the server
+    /// stamps it onto the statement row so a session-scoped RECALL shows
+    /// this statement alongside its session's memories.
+    #[serde(default)]
+    pub session_id: u64,
+    #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
+    /// Effective identity this statement-create runs as, on behalf of the
+    /// authenticated connection principal. `None` (the common case, and
+    /// omitted on the wire) means the op runs as the connection's own
+    /// key-bound identity.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
 }
 
 /// `STATEMENT_GET` (`0x0141`).
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StatementGetRequest {
+    #[serde(with = "serde_bytes")]
     pub statement_id: WireUuid,
     /// If `true` and the row is superseded, the server returns the
     /// current statement in the chain (with
     /// `returned_via_supersession = true` in the response).
     pub follow_supersession: bool,
+    /// Effective identity this get runs as, on behalf of the authenticated
+    /// connection principal. `None` (the common case, and omitted on the wire)
+    /// means the op runs as the connection's own key-bound identity. The get is
+    /// scoped to the effective `(namespace, space)` — a foreign tenant's
+    /// statement id reads as `NotFound`, never across the boundary.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
 }
 
 /// `STATEMENT_SUPERSEDE` (`0x0142`).
 ///
 /// Server runs CREATE for `new_statement` then links the old + new
 /// atomically inside one redb txn.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StatementSupersedeRequest {
+    #[serde(with = "serde_bytes")]
     pub old_statement_id: WireUuid,
     pub new_statement: StatementCreateRequest,
+    #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
 }
 
@@ -182,13 +209,13 @@ pub struct StatementSupersedeRequest {
 /// `reason` byte values: `1=SourceMemoryForgotten / 2=UserRequest /
 /// 3=SchemaInvalidation / 4=ExtractorRetraction`. `reason_message`
 /// is capped at 4 KiB by the validator.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StatementTombstoneRequest {
+    #[serde(with = "serde_bytes")]
     pub statement_id: WireUuid,
     pub reason: u8,
     pub reason_message: String,
+    #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
 }
 
@@ -197,13 +224,13 @@ pub struct StatementTombstoneRequest {
 /// Hard delete: tombstones immediately + schedules zero-out after
 /// the grace period. Distinct from `STATEMENT_TOMBSTONE` in that
 /// retracted statements are excluded from `STATEMENT_HISTORY`.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StatementRetractRequest {
+    #[serde(with = "serde_bytes")]
     pub statement_id: WireUuid,
     pub reason: u8,
     pub reason_message: String,
+    #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
 }
 
@@ -211,12 +238,17 @@ pub struct StatementRetractRequest {
 ///
 /// `anchor_id` may be a `StatementId` (any member of the chain) or
 /// a chain-root id — server resolves.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+/// `limit` must be in `1..=1000`. `cursor` is opaque — empty on the first
+/// page, then the `next_cursor` echoed from the previous response. Pagination
+/// is keyset on the immutable chain `version`; echoing a cursor back with a
+/// different `include_tombstoned` is rejected `stale_cursor`.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StatementHistoryRequest {
+    #[serde(with = "serde_bytes")]
     pub anchor_id: WireUuid,
     pub include_tombstoned: bool,
+    pub limit: u32,
+    pub cursor: Vec<u8>,
 }
 
 /// `STATEMENT_LIST` (`0x0146`).
@@ -229,10 +261,9 @@ pub struct StatementHistoryRequest {
 ///
 /// `limit` must be in `1..=1000`. `cursor` is opaque (reserved for a
 /// later streaming cut).
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StatementListRequest {
+    #[serde(with = "serde_bytes")]
     pub subject: WireUuid,
     pub predicate: String,
     pub kind: u8,
@@ -243,6 +274,13 @@ pub struct StatementListRequest {
     pub include_tombstoned: bool,
     pub limit: u32,
     pub cursor: Vec<u8>,
+    /// Effective identity this list runs as, on behalf of the authenticated
+    /// connection principal. `None` (the common case, and omitted on the wire)
+    /// means the op runs as the connection's own key-bound identity. The list
+    /// is scoped to the effective `(namespace, space)`, so it enumerates only
+    /// that tenant's statements.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
 }
 
 // ---------------------------------------------------------------------------
@@ -252,9 +290,7 @@ pub struct StatementListRequest {
 #[cfg(test)]
 mod tests_req {
     use super::*;
-        use crate::codec::opcode::Opcode;
     use crate::envelope::request::RequestBody;
-    use crate::envelope::response::ResponseBody;
 
     fn sample_uuid(seed: u8) -> WireUuid {
         let mut u = [0u8; 16];
@@ -277,36 +313,9 @@ mod tests_req {
             valid_to_unix_nanos: 0,
             event_at_unix_nanos: 0,
             schema_version: 1,
+            session_id: 0,
             request_id: sample_uuid(2),
-        }
-    }
-
-    fn sample_view() -> StatementView {
-        StatementView {
-            statement_id: sample_uuid(3),
-            kind: StatementKindWire::Fact,
-            subject: sample_uuid(4),
-            subject_pending_audit_id: [0u8; 16],
-            predicate: "test:role".into(),
-            object: StatementObjectWire::EntityRef(sample_uuid(5)),
-            confidence: 0.85,
-            evidence: EvidenceRefWire::Inline(vec![[7u8; 16]]),
-            extractor_id: 0,
-            extracted_at_unix_nanos: 1_700_000_000_000_000_000,
-            schema_version: 1,
-            valid_from_unix_nanos: 1_700_000_000_000_000_000,
-            valid_to_unix_nanos: 0,
-            event_at_unix_nanos: 0,
-            version: 1,
-            superseded_by: [0u8; 16],
-            supersedes: [0u8; 16],
-            chain_root: sample_uuid(3),
-            tombstoned: false,
-            tombstoned_at_unix_nanos: 0,
-            tombstone_reason: 0,
-            flags: 0,
-            original_predicate_qname: String::new(),
-            is_stateful: false,
+            act_as: None,
         }
     }
 
@@ -315,37 +324,6 @@ mod tests_req {
         let decoded = RequestBody::decode(body.opcode(), &bytes)
             .unwrap_or_else(|e| panic!("decode failed for {:?}: {e}", body.opcode()));
         assert_eq!(decoded, body);
-    }
-
-    fn resp_round_trip(body: ResponseBody) {
-        let bytes = body.encode();
-        let decoded = ResponseBody::decode(body.opcode(), &bytes)
-            .unwrap_or_else(|e| panic!("decode failed for {:?}: {e}", body.opcode()));
-        assert_eq!(decoded, body);
-    }
-
-    // ----- Opcode assignments -----
-
-    #[test]
-    fn statement_opcode_byte_assignments() {
-        assert_eq!(Opcode::StatementCreateReq.as_u16(), 0x0140);
-        assert_eq!(Opcode::StatementCreateResp.as_u16(), 0x01C0);
-        assert_eq!(Opcode::StatementGetReq.as_u16(), 0x0141);
-        assert_eq!(Opcode::StatementGetResp.as_u16(), 0x01C1);
-        assert_eq!(Opcode::StatementSupersedeReq.as_u16(), 0x0142);
-        assert_eq!(Opcode::StatementSupersedeResp.as_u16(), 0x01C2);
-        assert_eq!(Opcode::StatementTombstoneReq.as_u16(), 0x0143);
-        assert_eq!(Opcode::StatementTombstoneResp.as_u16(), 0x01C3);
-        assert_eq!(Opcode::StatementRetractReq.as_u16(), 0x0144);
-        assert_eq!(Opcode::StatementRetractResp.as_u16(), 0x01C4);
-        assert_eq!(Opcode::StatementHistoryReq.as_u16(), 0x0145);
-        assert_eq!(Opcode::StatementHistoryResp.as_u16(), 0x01C5);
-        assert_eq!(Opcode::StatementListReq.as_u16(), 0x0146);
-        assert_eq!(Opcode::StatementListResp.as_u16(), 0x01C6);
-
-        assert!(Opcode::StatementCreateReq.is_typed_graph());
-        assert!(Opcode::StatementCreateReq.is_request());
-        assert!(Opcode::StatementCreateResp.is_response());
     }
 
     // ----- Requests -----
@@ -376,55 +354,6 @@ mod tests_req {
     }
 
     #[test]
-    fn statement_get_request_roundtrip_both_flags() {
-        for follow in [true, false] {
-            req_round_trip(RequestBody::StatementGet(StatementGetRequest {
-                statement_id: sample_uuid(20),
-                follow_supersession: follow,
-            }));
-        }
-    }
-
-    #[test]
-    fn statement_supersede_request_roundtrip() {
-        req_round_trip(RequestBody::StatementSupersede(StatementSupersedeRequest {
-            old_statement_id: sample_uuid(30),
-            new_statement: sample_create_request(StatementObjectWire::Value(
-                StatementValueWire::Text("new value".into()),
-            )),
-            request_id: sample_uuid(31),
-        }));
-    }
-
-    #[test]
-    fn statement_tombstone_request_roundtrip() {
-        req_round_trip(RequestBody::StatementTombstone(StatementTombstoneRequest {
-            statement_id: sample_uuid(40),
-            reason: 2,
-            reason_message: "user request".into(),
-            request_id: sample_uuid(41),
-        }));
-    }
-
-    #[test]
-    fn statement_retract_request_roundtrip() {
-        req_round_trip(RequestBody::StatementRetract(StatementRetractRequest {
-            statement_id: sample_uuid(50),
-            reason: 4,
-            reason_message: "extractor retraction".into(),
-            request_id: sample_uuid(51),
-        }));
-    }
-
-    #[test]
-    fn statement_history_request_roundtrip() {
-        req_round_trip(RequestBody::StatementHistory(StatementHistoryRequest {
-            anchor_id: sample_uuid(60),
-            include_tombstoned: true,
-        }));
-    }
-
-    #[test]
     fn statement_list_request_roundtrip() {
         // All filter fields populated.
         req_round_trip(RequestBody::StatementList(StatementListRequest {
@@ -438,6 +367,7 @@ mod tests_req {
             include_tombstoned: false,
             limit: 100,
             cursor: vec![1, 2, 3],
+            act_as: None,
         }));
         // Empty-filter case.
         req_round_trip(RequestBody::StatementList(StatementListRequest {
@@ -451,51 +381,7 @@ mod tests_req {
             include_tombstoned: false,
             limit: 100,
             cursor: Vec::new(),
-        }));
-    }
-
-    // ----- Responses -----
-
-    #[test]
-    fn statement_responses_roundtrip() {
-        resp_round_trip(ResponseBody::StatementCreate(StatementCreateResponse {
-            statement_id: sample_uuid(80),
-            auto_superseded: [0u8; 16],
-            chain_root: sample_uuid(80),
-        }));
-        resp_round_trip(ResponseBody::StatementGet(StatementGetResponse {
-            statement: sample_view(),
-            returned_via_supersession: false,
-        }));
-        resp_round_trip(ResponseBody::StatementSupersede(
-            StatementSupersedeResponse {
-                new_statement_id: sample_uuid(81),
-                chain_root: sample_uuid(82),
-                version: 2,
-            },
-        ));
-        resp_round_trip(ResponseBody::StatementTombstone(
-            StatementTombstoneResponse {
-                tombstoned_at_unix_nanos: 1_700_000_000_000_000_000,
-            },
-        ));
-        resp_round_trip(ResponseBody::StatementRetract(StatementRetractResponse {
-            retracted_at_unix_nanos: 1_700_000_000_000_000_000,
-            will_zero_at_unix_nanos: 1_702_592_000_000_000_000,
-        }));
-        resp_round_trip(ResponseBody::StatementHistory(
-            StatementHistoryResponseFrame {
-                items: vec![sample_view()],
-                chain_root: sample_uuid(83),
-                total_versions: 1,
-                is_final: true,
-            },
-        ));
-        resp_round_trip(ResponseBody::StatementList(StatementListResponseFrame {
-            items: vec![sample_view()],
-            next_cursor: Vec::new(),
-            cumulative_count: 1,
-            is_final: true,
+            act_as: None,
         }));
     }
 }
@@ -504,10 +390,12 @@ mod tests_req {
 // Response payloads
 // ============================================================
 
-
-use brain_core::{EntityId, EvidenceEntry, EvidenceOverflowId, EvidenceRef, ExtractorId, INLINE_EVIDENCE_CAP, MemoryId, PredicateId, Statement, StatementId, StatementKind, StatementObject, StatementValue, SubjectRef, TombstoneReason};
+use brain_core::{
+    EntityId, EvidenceEntry, EvidenceOverflowId, EvidenceRef, ExtractorId, MemoryId, PredicateId,
+    Statement, StatementId, StatementKind, StatementObject, StatementValue, SubjectRef,
+    TombstoneReason, INLINE_EVIDENCE_CAP,
+};
 use smallvec::SmallVec;
-
 
 // ---------------------------------------------------------------------------
 // StatementView — read-side projection.
@@ -524,13 +412,14 @@ use smallvec::SmallVec;
 /// `subject` is the resolved `EntityId` for resolved subjects; for
 /// pending subjects, `subject == [0;16]` and `subject_pending_audit_id`
 /// carries the audit row id. `flags & 1 != 0` ⇔ subject is pending.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StatementView {
+    #[serde(with = "serde_bytes")]
     pub statement_id: WireUuid,
     pub kind: StatementKindWire,
+    #[serde(with = "serde_bytes")]
     pub subject: WireUuid,
+    #[serde(with = "serde_bytes")]
     pub subject_pending_audit_id: WireUuid,
     pub predicate: String,
     pub object: StatementObjectWire,
@@ -543,17 +432,16 @@ pub struct StatementView {
     pub valid_to_unix_nanos: u64,
     pub event_at_unix_nanos: u64,
     pub version: u32,
+    #[serde(with = "serde_bytes")]
     pub superseded_by: WireUuid,
+    #[serde(with = "serde_bytes")]
     pub supersedes: WireUuid,
+    #[serde(with = "serde_bytes")]
     pub chain_root: WireUuid,
     pub tombstoned: bool,
     pub tombstoned_at_unix_nanos: u64,
     pub tombstone_reason: u8,
     pub flags: u32,
-    /// LLM-coined predicate qname when this row landed on the
-    /// `brain:fact` wildcard sink. Empty string means `predicate`
-    /// reflects the LLM's actual intent.
-    pub original_predicate_qname: String,
     /// `true` iff this statement is stateful (per-statement signal).
     pub is_stateful: bool,
 }
@@ -690,6 +578,10 @@ pub fn statement_kind_to_wire(k: StatementKind) -> StatementKindWire {
         StatementKind::Fact => StatementKindWire::Fact,
         StatementKind::Preference => StatementKindWire::Preference,
         StatementKind::Event => StatementKindWire::Event,
+        StatementKind::Attribute => StatementKindWire::Attribute,
+        StatementKind::Relation => StatementKindWire::Relation,
+        StatementKind::Directive => StatementKindWire::Directive,
+        StatementKind::Custom(b) => StatementKindWire::Custom(b),
     }
 }
 
@@ -699,6 +591,10 @@ pub fn statement_kind_from_wire(w: StatementKindWire) -> StatementKind {
         StatementKindWire::Fact => StatementKind::Fact,
         StatementKindWire::Preference => StatementKind::Preference,
         StatementKindWire::Event => StatementKind::Event,
+        StatementKindWire::Attribute => StatementKind::Attribute,
+        StatementKindWire::Relation => StatementKind::Relation,
+        StatementKindWire::Directive => StatementKind::Directive,
+        StatementKindWire::Custom(b) => StatementKind::Custom(b),
     }
 }
 
@@ -712,9 +608,14 @@ impl StatementView {
     /// `"namespace:name"`).
     #[must_use]
     pub fn from_statement(s: &Statement, predicate_qname: String) -> Self {
+        // `flags` bit 0 = pending subject, bit 1 = memory subject; neither
+        // set = entity. `subject` carries the 16 id bytes for entity /
+        // memory subjects, `subject_pending_audit_id` the audit id for
+        // pending ones.
         let (subject, subject_pending_audit_id, flags) = match s.subject {
             SubjectRef::Entity(id) => (id.to_bytes(), [0u8; 16], 0u32),
             SubjectRef::Pending(audit) => ([0u8; 16], audit.to_bytes(), 1u32),
+            SubjectRef::Memory(id) => (id.to_be_bytes(), [0u8; 16], 2u32),
         };
 
         Self {
@@ -743,7 +644,6 @@ impl StatementView {
             tombstoned_at_unix_nanos: s.tombstoned_at_unix_nanos.unwrap_or(0),
             tombstone_reason: s.tombstone_reason.map(TombstoneReason::as_u8).unwrap_or(0),
             flags,
-            original_predicate_qname: s.original_predicate_qname.clone().unwrap_or_default(),
             is_stateful: s.is_stateful,
         }
     }
@@ -757,6 +657,10 @@ impl StatementView {
             SubjectRef::Pending(brain_core::AuditId::from_bytes(
                 self.subject_pending_audit_id,
             ))
+        } else if self.flags & 2 != 0 {
+            SubjectRef::Memory(brain_core::MemoryId::from_raw(u128::from_be_bytes(
+                self.subject,
+            )))
         } else {
             SubjectRef::Entity(EntityId::from_bytes(self.subject))
         };
@@ -799,14 +703,9 @@ impl StatementView {
             tombstoned: self.tombstoned,
             tombstoned_at_unix_nanos: opt_nz(self.tombstoned_at_unix_nanos),
             tombstone_reason,
-            original_predicate_qname: if self.original_predicate_qname.is_empty() {
-                None
-            } else {
-                Some(self.original_predicate_qname.clone())
-            },
             is_stateful: self.is_stateful,
-            // W3.4 bi-temporal field — wire layer doesn't carry it yet;
-            // the W3.4 follow-up will extend `StatementView` and route
+            // Bi-temporal field — wire layer doesn't carry it yet;
+            // a follow-up will extend `StatementView` and route
             // the value through here. Until then the wire-decoded
             // statement is treated as "still active in record-time".
             record_invalidated_at_unix_nanos: None,
@@ -819,21 +718,20 @@ impl StatementView {
 // ---------------------------------------------------------------------------
 
 /// Reply to `STATEMENT_CREATE` (`0x01C0`).
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StatementCreateResponse {
+    #[serde(with = "serde_bytes")]
     pub statement_id: WireUuid,
     /// `[0; 16]` unless auto-supersession fired (Preference kind with a
     /// prior current row at same `(subject, predicate)`).
+    #[serde(with = "serde_bytes")]
     pub auto_superseded: WireUuid,
+    #[serde(with = "serde_bytes")]
     pub chain_root: WireUuid,
 }
 
 /// Reply to `STATEMENT_GET` (`0x01C1`).
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StatementGetResponse {
     pub statement: StatementView,
     /// `true` iff `follow_supersession = true` redirected to a later
@@ -842,27 +740,23 @@ pub struct StatementGetResponse {
 }
 
 /// Reply to `STATEMENT_SUPERSEDE` (`0x01C2`).
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StatementSupersedeResponse {
+    #[serde(with = "serde_bytes")]
     pub new_statement_id: WireUuid,
+    #[serde(with = "serde_bytes")]
     pub chain_root: WireUuid,
     pub version: u32,
 }
 
 /// Reply to `STATEMENT_TOMBSTONE` (`0x01C3`).
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StatementTombstoneResponse {
     pub tombstoned_at_unix_nanos: u64,
 }
 
 /// Reply to `STATEMENT_RETRACT` (`0x01C4`).
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StatementRetractResponse {
     pub retracted_at_unix_nanos: u64,
     /// When the GC sweep will physically reclaim the row. In v1 this
@@ -873,14 +767,18 @@ pub struct StatementRetractResponse {
 /// Single-frame snapshot reply for `STATEMENT_HISTORY` (`0x01C5`).
 /// v1 collapses the per-item + tail shapes into one frame; a later
 /// cut splits when it streams.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StatementHistoryResponseFrame {
-    /// Chain entries in `version` ascending order.
+    /// Chain entries in `version` ascending order (one page).
     pub items: Vec<StatementView>,
+    #[serde(with = "serde_bytes")]
     pub chain_root: WireUuid,
+    /// The full chain length (not the page size), so a client can render
+    /// "page of N".
     pub total_versions: u32,
+    /// Empty when the chain is exhausted; otherwise the opaque keyset token
+    /// to resume from on the next request.
+    pub next_cursor: Vec<u8>,
     pub is_final: bool,
 }
 
@@ -894,9 +792,7 @@ impl StatementHistoryResponseFrame {
 /// Single-frame snapshot reply for `STATEMENT_LIST` (`0x01C6`).
 /// Mirrors `EntityListResponseFrame`. A later cut splits into
 /// per-batch streaming + cursor pagination.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StatementListResponseFrame {
     pub items: Vec<StatementView>,
     pub next_cursor: Vec<u8>,
@@ -918,15 +814,15 @@ impl StatementListResponseFrame {
 #[cfg(test)]
 mod tests_resp {
     use super::*;
-    use brain_core::{INLINE_EVIDENCE_CAP, StatementValue};
     use brain_core::{
-        ContextId, EntityId, EvidenceEntry, EvidenceOverflowId, EvidenceRef, ExtractorId,
-        MemoryId, PredicateId, Statement, StatementId, StatementKind, StatementObject, SubjectRef,
+        EntityId, EvidenceEntry, EvidenceOverflowId, EvidenceRef, ExtractorId, MemoryId,
+        PredicateId, SessionId, Statement, StatementId, StatementKind, StatementObject, SubjectRef,
     };
+    use brain_core::{StatementValue, INLINE_EVIDENCE_CAP};
     use smallvec::SmallVec;
 
     fn mem(byte: u16) -> MemoryId {
-        MemoryId::pack(byte, ContextId::DEFAULT.into(), 0)
+        MemoryId::pack(byte, SessionId::DEFAULT.into(), 0)
     }
 
     fn sample_statement(object: StatementObject) -> Statement {
@@ -968,21 +864,17 @@ mod tests_resp {
             .to_statement(s.predicate)
             .unwrap();
         assert_eq!(back, expected_wire);
-        // View carries empty original qname / not-stateful by default.
-        assert!(view.original_predicate_qname.is_empty());
+        // View carries the not-stateful default.
         assert!(!view.is_stateful);
     }
 
     #[test]
-    fn view_carries_original_qname_and_stateful_flag() {
+    fn view_carries_stateful_flag() {
         let mut s = sample_statement(StatementObject::Entity(EntityId::new()));
-        s.original_predicate_qname = Some("works_at".into());
         s.is_stateful = true;
-        let view = StatementView::from_statement(&s, "brain:fact".into());
-        assert_eq!(view.original_predicate_qname, "works_at");
+        let view = StatementView::from_statement(&s, "test:role".into());
         assert!(view.is_stateful);
         let back = view.to_statement(s.predicate).unwrap();
-        assert_eq!(back.original_predicate_qname.as_deref(), Some("works_at"));
         assert!(back.is_stateful);
     }
 

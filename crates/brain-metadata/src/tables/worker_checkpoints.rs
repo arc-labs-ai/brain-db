@@ -1,5 +1,4 @@
-//! Per-(worker, item) checkpoint table for state-carrying workers
-//! (— phase 24.1 introduces; 24.2 / 24.8 reuse).
+//! Per-(worker, item) checkpoint table for state-carrying workers.
 //!
 //! ## Layout
 //!
@@ -95,10 +94,7 @@ impl WorkerCheckpointRow {
     }
 }
 
-impl_redb_rkyv_value!(
-    WorkerCheckpointRow,
-    "brain_metadata::WorkerCheckpointRow::v1"
-);
+impl_redb_rkyv_value!(WorkerCheckpointRow, "brain_metadata::WorkerCheckpointRow");
 
 // ---------------------------------------------------------------------------
 // Pure ops over a transaction.
@@ -111,11 +107,7 @@ pub fn get(
     worker_id: &'static str,
     item_key: &[u8],
 ) -> Result<Option<WorkerCheckpointRow>, redb::Error> {
-    let table = match rtxn.open_table(WORKER_CHECKPOINTS_TABLE) {
-        Ok(t) => t,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
+    let table = rtxn.open_table(WORKER_CHECKPOINTS_TABLE)?;
     Ok(table.get(&(worker_id, item_key))?.map(|g| g.value()))
 }
 
@@ -217,11 +209,7 @@ pub fn list_non_terminal(
     worker_id: &'static str,
     limit: usize,
 ) -> Result<Vec<(Vec<u8>, WorkerCheckpointRow)>, redb::Error> {
-    let table = match rtxn.open_table(WORKER_CHECKPOINTS_TABLE) {
-        Ok(t) => t,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-        Err(e) => return Err(e.into()),
-    };
+    let table = rtxn.open_table(WORKER_CHECKPOINTS_TABLE)?;
     // redb's range over `(&str, &[u8])` keys: scan all rows for the
     // worker_id prefix by iterating the full table and filtering.
     // Optimisation (range-by-prefix) deferred.
@@ -257,6 +245,9 @@ mod tests {
     fn fresh_db() -> (TempDir, redb::Database) {
         let dir = TempDir::new().expect("tempdir");
         let db = redb::Database::create(dir.path().join("test.redb")).expect("create");
+        let wtxn = db.begin_write().expect("begin_write");
+        crate::tables::materialize_all_tables(&wtxn).expect("materialize");
+        wtxn.commit().expect("commit");
         (dir, db)
     }
 

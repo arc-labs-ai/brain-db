@@ -1,4 +1,4 @@
-//! Integration tests for the sub-task 9.10 frame dispatcher.
+//! Integration tests for the frame dispatcher.
 //!
 //! Each test brings up a fresh `ConnectionListener` plus a small pool
 //! of real `spawn_shard`'d Glommio executors on `127.0.0.1:0`, drives
@@ -12,14 +12,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use brain_protocol::codec::opcode::Opcode;
 use brain_protocol::connection::handshake::{
     AuthCredentials, AuthMethod, AuthOkPayload, AuthPayload, HelloCapabilities, HelloPayload,
     ServerCapabilities, WelcomePayload,
 };
-use brain_protocol::codec::opcode::Opcode;
 use brain_protocol::envelope::request::{
-    ByeRequest, EncodeRequest, ForgetMode, ForgetRequest, MemoryKindWire, PingRequest,
-    RecallRequest, RequestBody,
+    ByeRequest, EncodeRequest, ForgetMode, ForgetRequest, PingRequest, RecallRequest, RequestBody,
 };
 use brain_protocol::envelope::response::{
     EncodeResponse, ErrorResponse, ForgetResponse, PongResponse, ResponseBody,
@@ -89,7 +88,31 @@ struct Server {
     listener: tokio::task::JoinHandle<std::io::Result<SocketAddr>>,
     handles: Vec<ShardHandle>,
     joiners: Vec<Option<ShardJoiner>>,
+    auth_store: Arc<crate::auth::AuthStore>,
     _data_dir: TempDir,
+}
+
+impl Server {
+    /// Mint a FULL-permission key for `space_id` (namespace "test") and
+    /// return the raw secret bytes to present in AUTH.
+    fn mint(&self, space_id: [u8; 16]) -> Vec<u8> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        self.auth_store
+            .mint(
+                [0u8; 16],
+                [0u8; 16],
+                "test".to_string(),
+                space_id,
+                brain_metadata::api_keys::bits::FULL,
+                Vec::new(),
+                now,
+            )
+            .expect("mint test key")
+            .secret_bytes
+    }
 }
 
 impl Server {
@@ -120,23 +143,19 @@ async fn start_with_shards(n_shards: usize, limits: ConnectionLimits) -> Server 
     let routing = Arc::new(arc_swap::ArcSwap::from_pointee(
         RoutingTable::new(n_shards as u16, std::collections::HashMap::new()).unwrap(),
     ));
-    let __auth_store = {
-        let tmp = tempfile::TempDir::new().expect("tmpdir");
-        let p = tmp.path().join("api_keys.redb");
-        let store =
-            std::sync::Arc::new(crate::auth::AuthStore::open(&p, false).expect("open auth store"));
-        std::mem::forget(tmp);
-        store
+    let auth_store = {
+        let p = data_dir.path().join("api_keys.redb");
+        std::sync::Arc::new(crate::auth::AuthStore::open(&p).expect("open auth store"))
     };
     let topology = Topology {
         shards: Arc::new(handles.clone()),
         routing,
         server_caps: Arc::new(ServerCapabilities::v1_default(
             "brain-server/test",
-            vec![AuthMethod::None],
+            vec![AuthMethod::Token],
         )),
         request_metrics: Arc::new(metrics::request::RequestMetrics::new()),
-        auth_store: __auth_store.clone(),
+        auth_store: auth_store.clone(),
     };
 
     let (trigger, signal) = ShutdownSignal::channel();
@@ -158,6 +177,7 @@ async fn start_with_shards(n_shards: usize, limits: ConnectionLimits) -> Server 
         listener: listener_handle,
         handles,
         joiners,
+        auth_store,
         _data_dir: data_dir,
     }
 }
@@ -201,7 +221,7 @@ async fn send_frame(client: &mut TcpStream, frame: Frame) {
 
 async fn complete_handshake(
     client: &mut TcpStream,
-    agent_id: [u8; 16],
+    token: &[u8],
 ) -> (WelcomePayload, AuthOkPayload) {
     let hello = HelloPayload {
         client_id: "tester/0.1".to_owned(),
@@ -211,7 +231,7 @@ async fn complete_handshake(
             compression_zstd: false,
             server_push: false,
         },
-        client_session_token: None,
+        client_connection_token: None,
     };
     send_frame(
         client,
@@ -233,9 +253,8 @@ async fn complete_handshake(
     };
 
     let auth = AuthPayload {
-        method: AuthMethod::None,
-        agent_id,
-        credentials: AuthCredentials::None,
+        method: AuthMethod::Token,
+        credentials: AuthCredentials::Token(token.to_vec()),
     };
     send_frame(
         client,
@@ -263,12 +282,12 @@ async fn complete_handshake(
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn handshake_completes() {
+async fn handshake_binds_client_to_shard_and_echoes_space_id() {
     let server = start_with_shards(1, ConnectionLimits::default()).await;
     let mut client = TcpStream::connect(server.addr).await.expect("connect");
-    let agent_id = *uuid::Uuid::now_v7().as_bytes();
-    let (_welcome, auth_ok) = complete_handshake(&mut client, agent_id).await;
-    assert_eq!(auth_ok.agent_id, agent_id);
+    let space_id = *uuid::Uuid::now_v7().as_bytes();
+    let (_welcome, auth_ok) = complete_handshake(&mut client, &server.mint(space_id)).await;
+    assert_eq!(auth_ok.space_id, space_id);
     assert_eq!(auth_ok.bound_shard_id, 0, "only 1 shard → bound shard 0");
     server.stop().await;
 }
@@ -285,7 +304,7 @@ async fn hello_with_unsupported_version_errors_and_closes() {
             compression_zstd: false,
             server_push: false,
         },
-        client_session_token: None,
+        client_connection_token: None,
     };
     send_frame(
         &mut client,
@@ -322,7 +341,7 @@ async fn ops_before_auth_are_rejected() {
             compression_zstd: false,
             server_push: false,
         },
-        client_session_token: None,
+        client_connection_token: None,
     };
     send_frame(
         &mut client,
@@ -339,13 +358,13 @@ async fn ops_before_auth_are_rejected() {
     // Now send ENCODE — should get ERROR(NotAuthenticated).
     let encode = EncodeRequest {
         text: "hello".into(),
-        context_id: 0,
-        kind: MemoryKindWire::Episodic,
-        salience_hint: 0.5,
-        edges: Vec::new(),
+        session_id: 0,
         request_id: [0u8; 16],
         txn_id: None,
-        deduplicate: false,
+        occurred_at_unix_nanos: None,
+        act_as: None,
+        wait: brain_protocol::WaitMode::Ack,
+        allow_duplicates: false,
     };
     send_frame(
         &mut client,
@@ -367,8 +386,8 @@ async fn ops_before_auth_are_rejected() {
 async fn ping_pong_with_timestamp() {
     let server = start_with_shards(1, ConnectionLimits::default()).await;
     let mut client = TcpStream::connect(server.addr).await.expect("connect");
-    let agent_id = *uuid::Uuid::now_v7().as_bytes();
-    complete_handshake(&mut client, agent_id).await;
+    let space_id = *uuid::Uuid::now_v7().as_bytes();
+    complete_handshake(&mut client, &server.mint(space_id)).await;
 
     let ts = 1_234_567_890u64;
     send_frame(
@@ -404,8 +423,8 @@ async fn ping_pong_with_timestamp() {
 async fn bye_echoes_and_closes() {
     let server = start_with_shards(1, ConnectionLimits::default()).await;
     let mut client = TcpStream::connect(server.addr).await.expect("connect");
-    let agent_id = *uuid::Uuid::now_v7().as_bytes();
-    complete_handshake(&mut client, agent_id).await;
+    let space_id = *uuid::Uuid::now_v7().as_bytes();
+    complete_handshake(&mut client, &server.mint(space_id)).await;
 
     send_frame(
         &mut client,
@@ -435,8 +454,8 @@ async fn bye_echoes_and_closes() {
 async fn bad_opcode_errors_stream_not_connection() {
     let server = start_with_shards(1, ConnectionLimits::default()).await;
     let mut client = TcpStream::connect(server.addr).await.expect("connect");
-    let agent_id = *uuid::Uuid::now_v7().as_bytes();
-    complete_handshake(&mut client, agent_id).await;
+    let space_id = *uuid::Uuid::now_v7().as_bytes();
+    complete_handshake(&mut client, &server.mint(space_id)).await;
 
     // Send a *response* opcode (client→server is disallowed) on stream 1.
     let bogus = Frame::new(Opcode::EncodeResp.as_u16(), FLAG_EOS, 1, Vec::new());
@@ -468,18 +487,18 @@ async fn bad_opcode_errors_stream_not_connection() {
 async fn encode_round_trips_through_shard() {
     let server = start_with_shards(1, ConnectionLimits::default()).await;
     let mut client = TcpStream::connect(server.addr).await.expect("connect");
-    let agent_id = *uuid::Uuid::now_v7().as_bytes();
-    complete_handshake(&mut client, agent_id).await;
+    let space_id = *uuid::Uuid::now_v7().as_bytes();
+    complete_handshake(&mut client, &server.mint(space_id)).await;
 
     let encode = EncodeRequest {
         text: "hello world".into(),
-        context_id: 0,
-        kind: MemoryKindWire::Episodic,
-        salience_hint: 0.5,
-        edges: Vec::new(),
+        session_id: 0,
         request_id: *uuid::Uuid::now_v7().as_bytes(),
         txn_id: None,
-        deduplicate: false,
+        occurred_at_unix_nanos: None,
+        act_as: None,
+        wait: brain_protocol::WaitMode::Ack,
+        allow_duplicates: false,
     };
     send_frame(
         &mut client,
@@ -521,12 +540,12 @@ async fn encode_round_trips_through_shard() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn forget_routes_by_memory_id() {
     // Two shards. Forge a memory_id whose top-16-bit shard == 1; the
-    // dispatcher should route to shard 1, not the agent's bound shard
-    // (which could be either, depending on the agent_id hash).
+    // dispatcher should route to shard 1, not the space's bound shard
+    // (which could be either, depending on the space_id hash).
     let server = start_with_shards(2, ConnectionLimits::default()).await;
     let mut client = TcpStream::connect(server.addr).await.expect("connect");
-    let agent_id = *uuid::Uuid::now_v7().as_bytes();
-    complete_handshake(&mut client, agent_id).await;
+    let space_id = *uuid::Uuid::now_v7().as_bytes();
+    complete_handshake(&mut client, &server.mint(space_id)).await;
 
     let memory_id = brain_core::MemoryId::pack(1, 7, 1).raw();
     let forget = ForgetRequest {
@@ -534,6 +553,7 @@ async fn forget_routes_by_memory_id() {
         mode: ForgetMode::Soft,
         request_id: *uuid::Uuid::now_v7().as_bytes(),
         txn_id: None,
+        act_as: None,
     };
     send_frame(
         &mut client,
@@ -570,15 +590,19 @@ async fn forget_routes_by_memory_id() {
 async fn recall_returns_single_frame_eos_in_v1() {
     let server = start_with_shards(1, ConnectionLimits::default()).await;
     let mut client = TcpStream::connect(server.addr).await.expect("connect");
-    let agent_id = *uuid::Uuid::now_v7().as_bytes();
-    complete_handshake(&mut client, agent_id).await;
+    let space_id = *uuid::Uuid::now_v7().as_bytes();
+    complete_handshake(&mut client, &server.mint(space_id)).await;
 
     let recall = RecallRequest {
+        scope: Default::default(),
+        trace: false,
         cue_text: "anything".into(),
-        top_k: 5,
+        subject_name: String::new(),
+        max_results: 5,
         confidence_threshold: 0.0,
-        context_filter: None,
+        session_filter: None,
         age_bound_unix_nanos: None,
+        as_of_record_time_unix_nanos: None,
         kind_filter: None,
         salience_floor: 0.0,
         include_edges: false,
@@ -586,7 +610,7 @@ async fn recall_returns_single_frame_eos_in_v1() {
         include_text: false,
         request_id: Some(*uuid::Uuid::now_v7().as_bytes()),
         txn_id: None,
-        rerank: false,
+        act_as: None,
     };
     send_frame(
         &mut client,
@@ -600,8 +624,8 @@ async fn recall_returns_single_frame_eos_in_v1() {
     .await;
     let resp = read_one_frame(&mut client).await.expect("read recall resp");
     let opcode = resp.header.opcode_u16();
-    // 9.10 ships single-frame EOS responses for streaming ops. The
-    // frame *header* has the EOS bit set regardless of body opcode.
+    // The dispatcher ships single-frame EOS responses for streaming ops.
+    // The frame *header* has the EOS bit set regardless of body opcode.
     assert!(
         opcode == Opcode::RecallResp.as_u16() || opcode == Opcode::Error.as_u16(),
         "expected RecallResp or Error, got 0x{opcode:02x}"
@@ -623,8 +647,8 @@ async fn server_ping_fires_after_idle_timeout() {
     };
     let server = start_with_shards(1, limits).await;
     let mut client = TcpStream::connect(server.addr).await.expect("connect");
-    let agent_id = *uuid::Uuid::now_v7().as_bytes();
-    complete_handshake(&mut client, agent_id).await;
+    let space_id = *uuid::Uuid::now_v7().as_bytes();
+    complete_handshake(&mut client, &server.mint(space_id)).await;
 
     // Stay idle past idle_timeout. Server should emit SERVER_PING.
     let resp = tokio::time::timeout(Duration::from_secs(3), read_one_frame(&mut client))

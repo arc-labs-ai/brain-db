@@ -36,12 +36,18 @@ pub const DEFAULT_NEIGHBOURS_BUCKETS: &[f64] =
 /// `exact / alias / fuzzy / create` rather than tier kinds.
 pub const TIER_LABELS: &[&str] = &["pattern", "classifier", "llm"];
 pub const TIER_STATUS_LABELS: &[&str] = &["ran", "skipped", "failed"];
-pub const RESOLVER_OUTCOME_LABELS: &[&str] =
-    &["exact", "alias", "fuzzy", "embedding", "disambiguated", "create"];
+pub const RESOLVER_OUTCOME_LABELS: &[&str] = &[
+    "exact",
+    "alias",
+    "fuzzy",
+    "embedding",
+    "disambiguated",
+    "create",
+];
 
 /// Item kinds published by the `items_written_total` counter family
 /// on [`super::extractor::ExtractorMetrics`].
-pub const ITEM_KIND_LABELS: &[&str] = &["entity", "statement", "relation", "mention"];
+pub const ITEM_KIND_LABELS: &[&str] = &["entity", "statement", "relation", "mention", "hype"];
 
 // ---------------------------------------------------------------------
 // Fixed-bucket histogram (worker-local, allocation-free per observe).

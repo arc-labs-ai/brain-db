@@ -1,7 +1,6 @@
 //! Convert persisted
 //! [`brain_metadata::tables::extractor::ExtractorDefinition`]
-//! rows into runtime `Arc<dyn Extractor>` instances +
-//! §21/05 §1.
+//! rows into runtime `Arc<dyn Extractor>` instances.
 //!
 //! Called once at server / shard startup to populate the
 //! in-memory [`crate::ExtractorRegistry`] from
@@ -17,7 +16,9 @@ use brain_core::ExtractorKind;
 use brain_llm::ModelRouter;
 use brain_metadata::tables::extractor::ExtractorDefinition;
 use brain_metadata::LlmCacheDb;
-use brain_protocol::schema::ast::{CacheConfig, CostExpr, CostUnit, DurationAst, DurationUnit};
+use brain_protocol::schema::ast::{
+    CacheConfig, CostExpr, CostUnit, DurationAst, DurationUnit, TriggerExpr,
+};
 use brain_protocol::schema::{ExtractorDef, ExtractorField, ExtractorKindAst, ExtractorTarget};
 use parking_lot::Mutex;
 use serde_json::Value;
@@ -115,7 +116,8 @@ pub fn materialize_classifier_extractor(
             ast.target,
             def.schema_version,
             threshold,
-            "classifier model not loaded — set BRAIN_NER_MODEL_PATH",
+            "classifier model not loaded — set [extractors.classifier] model_path \
+             (or BRAIN__EXTRACTORS__CLASSIFIER__MODEL_PATH)",
         ),
     };
     Ok(ext)
@@ -132,6 +134,24 @@ pub fn materialize_classifier_extractor(
 /// registry stays populated; ENCODE stays non-blocking, and a
 /// missing API key does not look like a runtime failure.
 pub fn materialize_llm_extractor(
+    def: &ExtractorDefinition,
+    deps: &MaterializeDeps,
+) -> Result<LlmExtractor, ExtractorError> {
+    let ext = materialize_llm_extractor_core(def, deps)?;
+    // Thread the declared ENCODE-path trigger onto the built extractor so
+    // the worker's LLM tier can honor `on encode where <cond>` (and stay
+    // inert for `on demand` / `periodic` / `on schema_change`). The core
+    // already validated the blob; re-decoding here just to read the
+    // trigger is a once-at-startup cost. Absent trigger → the constructor
+    // default (`OnEncode`, run on every encode) stands.
+    let trigger = decode_definition_blob(&def.definition_blob)
+        .ok()
+        .and_then(|ast| extract_trigger(&ast))
+        .unwrap_or(TriggerExpr::OnEncode);
+    Ok(ext.with_trigger(trigger))
+}
+
+fn materialize_llm_extractor_core(
     def: &ExtractorDefinition,
     deps: &MaterializeDeps,
 ) -> Result<LlmExtractor, ExtractorError> {
@@ -190,7 +210,7 @@ pub fn materialize_llm_extractor(
             target,
             version,
             threshold,
-            "no llm clients configured (set ANTHROPIC_API_KEY or OPENAI_API_KEY)",
+            "no llm clients configured (set BRAIN__LLM__API_KEY or [llm] api_key)",
         ));
     };
     let Some(client) = router.resolve(model) else {
@@ -264,6 +284,12 @@ pub fn materialize_llm_extractor(
 /// The returned registry MAY be partial — the caller decides what
 /// to do with errors. The recommended pattern is `tracing::warn`
 /// each error then proceed.
+///
+/// Build the extractor registry from the persisted definitions. Extraction
+/// is always-on (C0): every materialisable definition is registered — there
+/// is no per-tier enable/disable gate. A definition that fails to
+/// materialise (e.g. an LLM extractor with no provider key) is returned in
+/// the error list, not silently skipped.
 #[must_use]
 pub fn build_registry_from_definitions(
     defs: &[ExtractorDefinition],
@@ -302,11 +328,6 @@ pub fn build_registry_from_definitions(
                     reason: format!("unknown extractor kind byte {}", def.kind),
                 },
             )),
-        }
-
-        // Respect the persisted `enabled` flag.
-        if !def.is_enabled() {
-            registry.set_enabled(id, false);
         }
     }
 
@@ -386,6 +407,15 @@ fn extract_response_schema(ast: &ExtractorDef) -> Option<Value> {
     None
 }
 
+fn extract_trigger(ast: &ExtractorDef) -> Option<TriggerExpr> {
+    for f in &ast.fields {
+        if let ExtractorField::Trigger(t) = f {
+            return Some(t.clone());
+        }
+    }
+    None
+}
+
 fn extract_cache_config(ast: &ExtractorDef) -> CacheConfig {
     for f in &ast.fields {
         if let ExtractorField::Cache(c) = f {
@@ -404,8 +434,8 @@ fn extract_cache_ttl(ast: &ExtractorDef) -> Option<Duration> {
     None
 }
 
-/// Outcome of cost-budget extraction. Phase 21 supports
-/// `PerRequest` only (§22/09 §5); the other variants land as
+/// Outcome of cost-budget extraction. v1 supports
+/// `PerRequest` only; the other variants land as
 /// degraded extractors with operator-actionable reasons.
 enum CostBudgetExtract {
     Unset,
@@ -521,7 +551,6 @@ mod tests {
             "brain".into(),
             "test".into(),
             kind,
-            true,
             1,
             blob,
             0,
@@ -663,6 +692,84 @@ mod tests {
         assert_eq!(ext.kind(), brain_core::ExtractorKind::Classifier);
     }
 
+    /// Diagnostic: the seeded system-schema `entity_mentions` pattern
+    /// extractor, materialised verbatim from the DB blob, must emit an
+    /// EntityMention for the obvious "Priya Sharma" surface form. This
+    /// isolates the pattern tier from GLiNER — if this passes, an
+    /// `entities=0` ENCODE is a write-stage or label-snapshot problem,
+    /// not a pattern-tier one.
+    #[cfg(not(miri))]
+    #[test]
+    fn seeded_pattern_extractor_emits_entity_for_priya_sharma() {
+        use crate::framework::extractor::ExtractionContext;
+        use crate::framework::item::ExtractedItem;
+        use crate::framework::registry::ExtractorRegistry;
+        use brain_core::{MemoryId, MemoryKind, Salience, SessionId, SpaceId};
+        use brain_metadata::MetadataDb;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let db =
+            MetadataDb::open(dir.path().join("metadata.redb")).expect("open seeds system schema");
+        let rtxn = db.read_txn().unwrap();
+        let defs = brain_metadata::extractor_list(&rtxn).expect("extractor_list");
+        drop(rtxn);
+
+        // Find the seeded pattern extractor (brain:entity_mentions).
+        let pattern_def = defs
+            .iter()
+            .find(|d| d.kind() == Some(ExtractorKind::Pattern))
+            .expect("system schema seeds a pattern extractor");
+        let ext = materialize_pattern_extractor(pattern_def)
+            .expect("materialize seeded pattern extractor");
+
+        let mem = brain_core::Memory {
+            id: MemoryId::pack(0, 1, 0),
+            space: SpaceId::new(),
+            session_id: SessionId(0),
+            kind: MemoryKind::Episodic,
+            salience: Salience::default(),
+            text: Some("Priya Sharma joined Stripe as a Senior Engineer in San Francisco".into()),
+            created_at_unix_ms: 0,
+            last_accessed_at_unix_ms: 0,
+            occurred_at_unix_nanos: None,
+        };
+        let reg = ExtractorRegistry::new();
+        let ctx = ExtractionContext {
+            declared_entity_types: None,
+            candidate_predicates: None,
+            declared_kinds: None,
+            entity_type_labels: None,
+            schema_version: 1,
+            now_unix_nanos: 0,
+            registry: &reg,
+            prior_tier_items: None,
+            extractor_context: None,
+        };
+        let result = futures_lite::future::block_on(ext.run(&ctx, &mem));
+        let entity_mentions: Vec<_> = result
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                ExtractedItem::EntityMention(em) => Some(em),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !entity_mentions.is_empty(),
+            "seeded pattern extractor must emit at least one entity for entity-rich text; got {:?}",
+            result.items,
+        );
+        assert!(
+            entity_mentions.iter().any(|em| em.text == "Priya Sharma"),
+            "expected 'Priya Sharma' among emitted mentions; got {:?}",
+            entity_mentions
+                .iter()
+                .map(|em| &em.text)
+                .collect::<Vec<_>>(),
+        );
+    }
+
     #[test]
     fn build_registry_collects_errors_per_row() {
         let defs = vec![
@@ -682,19 +789,8 @@ mod tests {
         let (reg, errs) = build_registry_from_definitions(&defs, &MaterializeDeps::default());
         assert_eq!(reg.len(), 1);
         assert!(errs.is_empty());
-        // It registers but iter_enabled returns it (enabled by default
-        // from the row's `is_enabled` flag).
+        // It registers and iter_enabled returns it.
         assert_eq!(reg.iter_enabled().count(), 1);
-    }
-
-    #[test]
-    fn build_registry_respects_disabled_flag() {
-        let mut def = row(1, ExtractorKind::Pattern, pattern_def_blob());
-        def.enabled = 0;
-        let defs = vec![def];
-        let (reg, _) = build_registry_from_definitions(&defs, &MaterializeDeps::default());
-        assert_eq!(reg.iter_enabled().count(), 0);
-        assert_eq!(reg.iter_all().count(), 1);
     }
 
     // ----- 21.4 LLM materialization -----------------------------------------
@@ -793,15 +889,20 @@ mod tests {
         let reg = ExtractorRegistry::new();
         let mem = brain_core::Memory {
             id: brain_core::MemoryId::pack(0, 1, 0),
-            agent: brain_core::AgentId::new(),
-            context: brain_core::ContextId(0),
+            space: brain_core::SpaceId::new(),
+            session_id: brain_core::SessionId(0),
             kind: brain_core::MemoryKind::Episodic,
             salience: brain_core::Salience::default(),
             text: Some("hi".into()),
             created_at_unix_ms: 0,
             last_accessed_at_unix_ms: 0,
+            occurred_at_unix_nanos: None,
         };
         let ctx = crate::framework::extractor::ExtractionContext {
+            declared_entity_types: None,
+            candidate_predicates: None,
+            declared_kinds: None,
+            entity_type_labels: None,
             schema_version: 1,
             now_unix_nanos: 0,
             registry: &reg,

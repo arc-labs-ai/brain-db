@@ -18,7 +18,7 @@ use crate::write::{Phase, PhaseAck, Write};
 pub fn apply_link(
     wtxn: &WriteTransaction,
     phase: &Phase,
-    _write: &Write,
+    write: &Write,
 ) -> Result<PhaseAck, ApplyError> {
     let Phase::Link {
         from,
@@ -33,6 +33,26 @@ pub fn apply_link(
     else {
         return Err(ApplyError::PhaseMisShape("expected Link"));
     };
+
+    // Tenant wall (authoritative, inside the write txn). Memory endpoints are
+    // enumerable packed u128s, so without this guard a caller could forge
+    // cross-tenant edges (or probe foreign-id existence) by id. Both memory
+    // endpoints must live in the caller's space; a foreign/missing endpoint
+    // reads as absent, so the edge is silently not created — the same
+    // NotFound-shaped leniency LINK already applies to a missing endpoint,
+    // with no foreign-exists vs absent distinction. The space id folds the
+    // namespace (disjoint per tenant) and is the scope field threaded
+    // reliably through every write path. Entity / Statement endpoints are
+    // produced only by scoped extractor / typed-graph writes, so only Memory
+    // endpoints need the by-id wall here.
+    let caller_space = <[u8; 16]>::from(write.space_id);
+    for endpoint in [from, to] {
+        if let NodeRef::Memory(mem_id) = endpoint {
+            if !memory_in_space(wtxn, *mem_id, caller_space)? {
+                return Ok(PhaseAck::Linked);
+            }
+        }
+    }
 
     let data = EdgeData::new(*weight, *origin, *derived_by, *created_at_unix_nanos);
 
@@ -134,6 +154,28 @@ pub fn apply_unlink(
     Ok(PhaseAck::Unlinked)
 }
 
+/// `true` when `memory_id` exists and its row is owned by `space`. A
+/// missing row and a foreign-space row both return `false` — the LINK
+/// apply guard treats them identically (no edge created, no existence
+/// oracle). The space id folds the namespace, so this is a complete
+/// tenant-isolation check.
+fn memory_in_space(
+    wtxn: &WriteTransaction,
+    memory_id: MemoryId,
+    space: [u8; 16],
+) -> Result<bool, ApplyError> {
+    let t = wtxn
+        .open_table(MEMORIES_TABLE)
+        .map_err(|e| ApplyError::Storage(format!("open MEMORIES: {e:?}")))?;
+    let Some(g) = t
+        .get(memory_id.to_be_bytes())
+        .map_err(|e| ApplyError::Storage(format!("MEMORIES get: {e:?}")))?
+    else {
+        return Ok(false);
+    };
+    Ok(g.value().space_id_bytes == space)
+}
+
 /// Adjust `edges_out_count` (`out=true`) or `edges_in_count` on
 /// `memory_id` by `delta`. No-op when the memory row doesn't exist —
 /// the apply path validates target existence before queuing the
@@ -199,10 +241,34 @@ mod tests {
         (dir, db)
     }
 
+    /// Insert an ACTIVE memory row owned by `space` so the LINK apply
+    /// tenant-wall (`memory_in_space`) admits it as an endpoint.
+    fn seed_memory(db: &MetadataDb, id: MemoryId, space: brain_core::SpaceId) {
+        let wtxn = db.write_txn().unwrap();
+        {
+            let mut t = wtxn.open_table(MEMORIES_TABLE).unwrap();
+            let row = MemoryMetadata::new_active(
+                id,
+                brain_core::NamespaceId::SYSTEM,
+                space,
+                brain_core::SessionId(0),
+                0,
+                id.version(),
+                brain_core::MemoryKind::Episodic,
+                [0u8; 16],
+                0.5,
+                0,
+                0,
+            );
+            t.insert(&id.to_be_bytes(), row).unwrap();
+        }
+        wtxn.commit().unwrap();
+    }
+
     fn empty_write() -> Write {
         Write::single(
             WriteId::new(),
-            brain_core::AgentId::default(),
+            brain_core::SpaceId::default(),
             Phase::Link {
                 from: NodeRef::Memory(MemoryId::pack(0, 1, 0)),
                 to: NodeRef::Memory(MemoryId::pack(0, 2, 0)),
@@ -218,7 +284,7 @@ mod tests {
 
     #[test]
     fn link_writes_a_row_then_unlink_removes_it() {
-        let (_dir, mut db) = open_db();
+        let (_dir, db) = open_db();
         let phase_link = Phase::Link {
             from: NodeRef::Memory(MemoryId::pack(0, 1, 0)),
             to: NodeRef::Memory(MemoryId::pack(0, 2, 0)),
@@ -236,6 +302,11 @@ mod tests {
             disambiguator: zero_disambiguator(),
         };
         let write = empty_write();
+
+        // Both endpoints must exist in the write's space for the LINK
+        // apply tenant-wall to admit them.
+        seed_memory(&db, MemoryId::pack(0, 1, 0), write.space_id);
+        seed_memory(&db, MemoryId::pack(0, 2, 0), write.space_id);
 
         {
             let wtxn = db.write_txn().unwrap();
@@ -284,7 +355,7 @@ mod tests {
 
     #[test]
     fn link_rejects_mis_shape() {
-        let (_dir, mut db) = open_db();
+        let (_dir, db) = open_db();
         let wtxn = db.write_txn().unwrap();
         let phase = Phase::Unlink {
             from: NodeRef::Memory(MemoryId::pack(0, 1, 0)),
@@ -294,5 +365,95 @@ mod tests {
         };
         let err = apply_link(&wtxn, &phase, &empty_write()).unwrap_err();
         assert!(matches!(err, ApplyError::PhaseMisShape(_)));
+    }
+
+    fn link_phase(src: MemoryId, tgt: MemoryId) -> Phase {
+        Phase::Link {
+            from: NodeRef::Memory(src),
+            to: NodeRef::Memory(tgt),
+            kind: EdgeKindRef::Builtin(EdgeKind::SimilarTo),
+            weight: 0.5,
+            origin: 1,
+            derived_by: 2,
+            disambiguator: zero_disambiguator(),
+            created_at_unix_nanos: 1,
+        }
+    }
+
+    fn edge_present(db: &MetadataDb, src: MemoryId, tgt: MemoryId) -> bool {
+        let rtxn = db.read_txn().unwrap();
+        brain_metadata::tables::edge::edge_get(
+            &rtxn,
+            NodeRef::Memory(src),
+            EdgeKindRef::Builtin(EdgeKind::SimilarTo),
+            NodeRef::Memory(tgt),
+            zero_disambiguator(),
+        )
+        .unwrap()
+        .is_some()
+    }
+
+    /// Tenant B linking two of tenant A's memories must NOT create an
+    /// edge — the apply tenant-wall reads foreign endpoints as absent and
+    /// no-ops (LINK leniency), so nothing is written to A's graph.
+    #[test]
+    fn link_apply_refuses_cross_tenant_endpoints() {
+        let (_dir, db) = open_db();
+        let space_a = brain_core::SpaceId::new();
+        let space_b = brain_core::SpaceId::new();
+        let a1 = MemoryId::pack(0, 1, 0);
+        let a2 = MemoryId::pack(0, 2, 0);
+        seed_memory(&db, a1, space_a);
+        seed_memory(&db, a2, space_a);
+
+        // A write scoped to tenant B links A's ids.
+        let write_b = Write::single(WriteId::new(), space_b, link_phase(a1, a2));
+        {
+            let wtxn = db.write_txn().unwrap();
+            let ack = apply_link(&wtxn, &link_phase(a1, a2), &write_b).unwrap();
+            assert!(matches!(ack, PhaseAck::Linked)); // lenient no-op
+            wtxn.commit().unwrap();
+        }
+        assert!(
+            !edge_present(&db, a1, a2),
+            "cross-tenant LINK must not create an edge in A's graph"
+        );
+
+        // Tenant A's own LINK of the same ids DOES create the edge.
+        let write_a = Write::single(WriteId::new(), space_a, link_phase(a1, a2));
+        {
+            let wtxn = db.write_txn().unwrap();
+            apply_link(&wtxn, &link_phase(a1, a2), &write_a).unwrap();
+            wtxn.commit().unwrap();
+        }
+        assert!(
+            edge_present(&db, a1, a2),
+            "same-tenant LINK must create the edge"
+        );
+    }
+
+    /// A LINK where only one endpoint is foreign is still a no-op — both
+    /// endpoints must be in the caller's space.
+    #[test]
+    fn link_apply_refuses_one_foreign_endpoint() {
+        let (_dir, db) = open_db();
+        let space_a = brain_core::SpaceId::new();
+        let space_b = brain_core::SpaceId::new();
+        let a1 = MemoryId::pack(0, 1, 0);
+        let b1 = MemoryId::pack(0, 9, 0);
+        seed_memory(&db, a1, space_a);
+        seed_memory(&db, b1, space_b);
+
+        // B owns b1 but not a1; linking b1 -> a1 must no-op.
+        let write_b = Write::single(WriteId::new(), space_b, link_phase(b1, a1));
+        {
+            let wtxn = db.write_txn().unwrap();
+            apply_link(&wtxn, &link_phase(b1, a1), &write_b).unwrap();
+            wtxn.commit().unwrap();
+        }
+        assert!(
+            !edge_present(&db, b1, a1),
+            "LINK with one foreign endpoint must not create an edge"
+        );
     }
 }

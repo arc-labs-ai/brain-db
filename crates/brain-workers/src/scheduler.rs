@@ -1,7 +1,7 @@
-//! The per-shard worker scheduler, §4.
+//! The per-shard worker scheduler.
 //!
-//! After sub-task 9.7 (audit §6 + §8.2), the scheduler runs **inside
-//! a Glommio executor** — one per shard. `register(...)` spawns one
+//! The scheduler runs **inside a Glommio executor** — one per shard.
+//! `register(...)` spawns one
 //! `glommio::Task` per worker via `spawn_local`. Each task runs the
 //! standard `worker_loop`:
 //!
@@ -16,6 +16,8 @@
 //! are cancelled (Glommio `Task::cancel`).
 
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -24,7 +26,7 @@ use brain_ops::OpsContext;
 use futures_lite::FutureExt;
 use glommio::timer::sleep;
 use glommio::Task;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::{WorkerConfig, WorkerKind};
 use crate::context::WorkerContext;
@@ -34,7 +36,7 @@ use crate::worker::Worker;
 
 const SHUTDOWN_DRAIN_BUDGET: Duration = Duration::from_secs(5);
 
-/// Per-worker control surface — F-13 .
+/// Per-worker control surface.
 ///
 /// - `paused`: when true, the loop skips `run_cycle` but keeps
 ///   ticking on its interval. Set by `WorkerScheduler::pause` /
@@ -71,9 +73,9 @@ pub struct WorkerHandle {
     task: Task<()>,
 }
 
-/// each shard owns one scheduler. After 9.7, lives on
-/// the shard's single Glommio executor. Construction is sync (no
-/// runtime needed); `register` requires Glommio executor context.
+/// each shard owns one scheduler, living on the shard's single Glommio
+/// executor. Construction is sync (no runtime needed); `register`
+/// requires Glommio executor context.
 pub struct WorkerScheduler {
     handles: HashMap<&'static str, WorkerHandle>,
     shutdown: Arc<AtomicBool>,
@@ -129,7 +131,7 @@ impl WorkerScheduler {
         Ok(())
     }
 
-    /// F-13: pause a registered worker. The loop keeps ticking on
+    /// Pause a registered worker. The loop keeps ticking on
     /// its interval but skips `run_cycle` until [`Self::resume`].
     /// Returns false if no such worker.
     pub fn pause(&self, name: &str) -> bool {
@@ -143,7 +145,7 @@ impl WorkerScheduler {
         }
     }
 
-    /// F-13: resume a paused worker. Returns false if no such worker.
+    /// Resume a paused worker. Returns false if no such worker.
     pub fn resume(&self, name: &str) -> bool {
         match self.handles.get(name) {
             Some(h) => {
@@ -158,7 +160,7 @@ impl WorkerScheduler {
         }
     }
 
-    /// F-13: request an immediate cycle. The loop wakes from its
+    /// Request an immediate cycle. The loop wakes from its
     /// current sleep and runs `run_cycle` once. No-op if the
     /// worker is paused. Returns false if no such worker.
     pub fn run_now(&self, name: &str) -> bool {
@@ -183,17 +185,27 @@ impl WorkerScheduler {
 
     /// snapshot every registered worker's metrics.
     /// Wraps each handle's atomics into a plain
-    /// [`crate::metrics::Snapshot`] so callers don't have to chase
+    /// [`crate::metrics::MetricsSnapshot`] so callers don't have to chase
     /// `Arc<AtomicU64>` instances. Used by `brain-server`'s admin
-    /// `/metrics` endpoint (sub-task 9.13).
+    /// `/metrics` endpoint.
     ///
     /// Returned order is HashMap iteration order (not registration
     /// order). Callers needing stable output should sort.
     #[must_use]
-    pub fn metrics_snapshot(&self) -> Vec<(&'static str, WorkerKind, crate::metrics::Snapshot)> {
+    pub fn metrics_snapshot(
+        &self,
+    ) -> Vec<(&'static str, WorkerKind, crate::metrics::MetricsSnapshot)> {
         self.handles
             .values()
-            .map(|h| (h.name, h.kind, h.metrics.snapshot()))
+            .map(|h| {
+                let mut snap = h.metrics.snapshot();
+                // `paused` lives in `WorkerControls`, not `WorkerMetrics`,
+                // so stamp it here where both are in scope. This is what
+                // lets the admin `GET /v1/workers` list report paused vs
+                // running.
+                snap.paused = h.controls.paused.load(Ordering::Relaxed);
+                (h.name, h.kind, snap)
+            })
             .collect()
     }
 
@@ -229,6 +241,16 @@ impl WorkerScheduler {
         let count = handles.len();
         shutdown.store(true, Ordering::Relaxed);
 
+        // Kick every worker's wake channel so a loop parked on
+        // `sleep(cfg.interval)` wakes immediately, observes the
+        // shutdown flag, and exits — instead of sleeping out a long
+        // interval and being force-timed-out below. Without this a
+        // worker with a multi-second interval would consume the whole
+        // drain budget on its own.
+        for handle in handles.values() {
+            let _ = handle.controls.wake_tx.try_send(());
+        }
+
         let drain_start = Instant::now();
         for (name, handle) in handles {
             let remaining = SHUTDOWN_DRAIN_BUDGET.saturating_sub(drain_start.elapsed());
@@ -240,20 +262,30 @@ impl WorkerScheduler {
                 handle.task.cancel().await;
                 continue;
             }
-            // Race the task against a timer. `done` resolves to
-            // `false` (didn't time out) when the worker loop returns;
-            // `timed_out` resolves to `true` after `remaining`.
-            let task = handle.task;
-            let done = async move {
-                task.await;
+            // Give the worker `remaining` to return on its own, then
+            // cancel it. Racing the task-join against a timer must not
+            // *drop* the still-running `Task` on timeout: a dropped
+            // Glommio `Task` detaches and keeps running, and a live
+            // detached task prevents the executor from terminating (the
+            // shard's join would then hang until the outer budget). So
+            // on timeout we keep the handle and `cancel()` it — matching
+            // this method's contract that alive tasks are cancelled.
+            //
+            // `Task` is `Unpin`, so `Pin::new(&mut task)` only *borrows*
+            // it for the race; once the race resolves the borrow ends and
+            // `task` is ours again to cancel.
+            let mut task = handle.task;
+            let join = async {
+                Pin::new(&mut task).await;
                 false
             };
-            let timed_out = async move {
+            let timed_out = async {
                 sleep(remaining).await;
                 true
             };
-            if done.or(timed_out).await {
-                warn!(worker = name, "shutdown drain timed out");
+            if join.or(timed_out).await {
+                warn!(worker = name, "shutdown drain timed out; cancelling task");
+                task.cancel().await;
             } else {
                 debug!(worker = name, "worker exited cleanly");
             }
@@ -272,7 +304,7 @@ impl Default for WorkerScheduler {
 /// The per-worker loop task lifecycle:
 /// `wake → run_cycle → update metrics → sleep`.
 ///
-/// F-13 extends the loop with two control points:
+/// The loop has two control points:
 ///
 /// - `controls.paused`: when true, skip `run_cycle` for this tick
 ///   (the loop still sleeps so it observes shutdown promptly).
@@ -295,15 +327,53 @@ async fn worker_loop(
 ) {
     let name = worker.name();
     let cfg = worker.config();
+    let skip_first_tick = worker.skip_first_tick();
+    let mut first_iter = true;
     loop {
         if ctx.is_shutdown() {
             break;
         }
         let paused = controls.paused.load(Ordering::Relaxed);
-        if cfg.enabled && !paused {
+        // `skip_first_tick` workers (Snapshot) sleep the first interval
+        // *before* ticking — see `Worker::skip_first_tick` for the
+        // rationale. All other workers tick immediately so any pending
+        // state from a previous run drains promptly.
+        let skip_this_cycle = first_iter && skip_first_tick;
+        if cfg.enabled && !paused && !skip_this_cycle {
             let start = Instant::now();
-            match worker.run_cycle(&ctx).await {
-                Ok(processed) => {
+            // Isolate the cycle behind `catch_unwind`. A panic in
+            // `run_cycle` (an `expect`, a slice OOB, arithmetic overflow on a
+            // malformed row) would otherwise unwind the whole worker task:
+            // the feature would silently cease with no metric and no restart,
+            // and the panicked `Task` — held in `WorkerHandle` — would re-raise
+            // at shutdown join, aborting the rest of clean shutdown. Instead we
+            // treat a caught panic like an `Err` (bump `errors_total`, plus the
+            // distinct `panics_total`), log, and continue to the next tick. The
+            // `async` wrapper ensures a
+            // panic during future *construction* is caught too, not only one
+            // during polling.
+            //
+            // UNWIND-SAFETY: `AssertUnwindSafe` asserts the future's captured
+            // state is safe to observe after a panic. That holds here by the
+            // resilience model — a worker cycle is retried on its next tick, and
+            // its durable state is transactional: a panic mid-cycle drops any
+            // open redb write txn uncommitted (ACID rollback, no partial
+            // commit), and any in-memory index left inconsistent is rebuilt by
+            // its maintenance worker. A panicked-then-retried cycle is the
+            // intended failure mode, not a poisoning one.
+            let cycle = AssertUnwindSafe(async { worker.run_cycle(&ctx).await });
+            let outcome = futures_util::future::FutureExt::catch_unwind(cycle).await;
+            // `last_run` tracks the last *attempted* cycle, updated on
+            // every arm (Ok / Err / caught-panic). A worker that errors or
+            // panics every tick is still running — freezing `last_run` to
+            // the last success would make it read as dead. The
+            // errors_total / panics_total counters remain the failure
+            // signal.
+            metrics
+                .last_run_unix_secs
+                .store(now_unix_secs(), Ordering::Relaxed);
+            match outcome {
+                Ok(Ok(processed)) => {
                     metrics.cycles_total.fetch_add(1, Ordering::Relaxed);
                     metrics
                         .processed_total
@@ -313,14 +383,26 @@ async fn worker_loop(
                     metrics
                         .last_cycle_duration_ms
                         .store(duration_ms, Ordering::Relaxed);
-                    metrics
-                        .last_run_unix_secs
-                        .store(now_unix_secs(), Ordering::Relaxed);
                     debug!(worker = name, processed, duration_ms, "cycle complete");
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     metrics.errors_total.fetch_add(1, Ordering::Relaxed);
                     warn!(worker = name, error = %e, "worker cycle error");
+                }
+                Err(panic) => {
+                    // Caught panic: count it and survive to the next tick. The
+                    // scheduler task must never unwind, so shutdown's join can
+                    // never observe a worker-cycle panic. Bump both errors_total
+                    // (the "all failures" series) and the distinct panics_total
+                    // so a panic isn't hidden among ordinary Err cycles.
+                    metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                    metrics.panics_total.fetch_add(1, Ordering::Relaxed);
+                    let payload = panic_message(&panic);
+                    error!(
+                        worker = name,
+                        panic = %payload,
+                        "worker cycle panicked; isolated and continuing to next tick"
+                    );
                 }
             }
         }
@@ -337,8 +419,22 @@ async fn worker_loop(
         if ctx.is_shutdown() {
             break;
         }
+        first_iter = false;
     }
     debug!(worker = name, "loop exiting");
+}
+
+/// Best-effort human-readable text for a caught panic payload. The
+/// standard library packages `panic!`/`expect` payloads as `&str` or
+/// `String`; anything else is reported opaquely.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
 }
 
 fn now_unix_secs() -> u64 {

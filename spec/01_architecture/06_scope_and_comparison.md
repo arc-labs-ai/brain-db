@@ -42,7 +42,7 @@ Brain does not try to be all things to all languages in v1.
 
 ## 4. A query language
 
-The first version exposes a typed RPC API, not a SQL-like text language. The wire protocol carries structured opcodes with rkyv-encoded parameters.
+The first version exposes a typed RPC API, not a SQL-like text language. The wire protocol carries structured opcodes with CBOR-encoded parameters.
 
 A query language might be added later if it earns its complexity:
 
@@ -50,7 +50,7 @@ A query language might be added later if it earns its complexity:
 - It could expose `PLAN` and `REASON` configuration in a more flexible way.
 - It would help users write queries by hand for debugging.
 
-But a proper query language has costs: parser, optimizer, error reporting, dialect drift. v1 doesn't take on that cost. The typed RPC interface is more discoverable from a typed SDK and adequate for operations.
+But a proper query language has costs: parser, optimizer, error reporting, dialect drift. v1 doesn't take on that cost. The typed RPC interface is more discoverable from a typed client and adequate for operations.
 
 ## 5. Built-in LLM inference
 
@@ -123,7 +123,7 @@ Brain is a server. There is no embedded mode that runs in a browser, a mobile pr
 
 The architecture (mmap'd files, glommio, io_uring, persistent connections) is fundamentally server-side. Embedded vector libraries exist ([usearch](https://github.com/unum-cloud/usearch), [annoy](https://github.com/spotify/annoy)) and serve a different need.
 
-For client applications that want local memory, a thin client SDK plus a Brain server is the recommended pattern.
+For client applications that want local memory, a thin client plus a Brain server is the recommended pattern.
 
 ## 12. SQL replacement
 

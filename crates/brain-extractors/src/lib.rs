@@ -22,7 +22,7 @@
 //! - [`enricher_hook`] — `EnricherPlugin` dispatch seam (lives here to
 //!   avoid a circular dep with `brain-plugins`).
 //! - [`supersede_source`] — adapter that exposes the statement HNSW as
-//!   a nearest-neighbour source for the W2.1 supersession judge.
+//!   a nearest-neighbour source for the supersession judge.
 
 #![allow(
     clippy::module_name_repetitions,
@@ -39,19 +39,18 @@ pub mod llm;
 pub mod materialize;
 pub mod pattern;
 pub mod resolver;
-pub mod resolver_llm;
 pub mod supersede_source;
 
 pub use classifier::{
-    classify_statement_kind_pattern, default_xdg_model_dir, ClassifiedSpan, ClassifierConfig,
-    ClassifierExtractor, ClassifierModel, GlinerClassifier, GlinerSpan, NER_MODEL_DIR_NAME,
-    NER_MODEL_PATH_ENV, NER_MODEL_REQUIRED_FILES, STATEMENT_KIND_PATTERN_THRESHOLD,
+    default_xdg_model_dir, ClassifiedSpan, ClassifierConfig, ClassifierExtractor, ClassifierModel,
+    GlinerClassifier, GlinerSpan, NER_MODEL_DIR_NAME, NER_MODEL_REQUIRED_FILES,
 };
 pub use enricher_hook::{run_pipeline_enrichers, EnricherHook, EnricherHookOutcome};
 pub use framework::{
-    EntityMention, ExtractedItem, ExtractionContext, ExtractionFuture, ExtractionResult,
-    ExtractionStatus, Extractor, ExtractorContext, ExtractorError, ExtractorRegistry,
-    ExtractorRunOptions, NeighborMemory, RelationMention, StatementMention,
+    evaluate_trigger_on_encode, EntityMention, ExtractedItem, ExtractionContext,
+    ExtractionFailureClass, ExtractionFuture, ExtractionResult, ExtractionStatus, Extractor,
+    ExtractorContext, ExtractorError, ExtractorRegistry, ExtractorRunOptions, NeighborMemory,
+    RelationMention, StatementMention, TriggerDecision, SYSTEM_NAMESPACE,
 };
 pub use idempotency::{hash_memory_text, IdempotencyKey};
 pub use llm::{estimate_cost, CostBudget, LlmExtractor, LlmExtractorInner, Pricing};
@@ -59,10 +58,10 @@ pub use materialize::{
     build_registry_from_definitions, materialize_classifier_extractor, materialize_llm_extractor,
     materialize_pattern_extractor, MaterializeDeps,
 };
-pub use pattern::{CompiledRegex, PatternExtractor};
+pub use pattern::{CompiledRegex, PatternExtractor, TemporalExtractor};
 pub use resolver::{
-    resolve_or_create, EntityDisambiguator, MatchVerdict, Resolution, ResolutionTier,
-    ResolverError, DEFAULT_DISAMBIGUATOR_MIN_CONFIDENCE,
+    is_temporal_expression_surface, resolve_or_create, strip_leading_vocative, EntityDisambiguator,
+    LlmCandidateView, MatchVerdict, Resolution, ResolutionTier, ResolverError, StagedEntityVectors,
+    DEFAULT_DISAMBIGUATOR_MIN_CONFIDENCE,
 };
-pub use resolver_llm::{BrainLlmDisambiguator, LlmCandidateView};
 pub use supersede_source::StatementHnswSource;

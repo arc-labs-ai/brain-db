@@ -1,8 +1,8 @@
-//! Embedder cache eviction worker (sub-task 8.12).
+//! Embedder cache eviction worker.
 //!
 //! The LRU on `brain_embed::CachingDispatcher` evicts on access
 //! automatically (size-bound). This worker handles the
-//! **age-based** prune (2 — "entries older than 7 days").
+//! **age-based** prune of entries older than 7 days.
 //!
 //! ## v1 deviation (documented)
 //!
@@ -11,10 +11,10 @@
 //! `OpsContext.executor.embedder` is `Arc<dyn Dispatcher>` — no way
 //! to reach the cache through the trait. So v1 ships the worker
 //! against a pluggable seam ([`CacheEvictionSource`]) with a no-op
-//! default. Phase 9 adds the brain-embed method and an
-//! `Arc<CachingDispatcher>` carrier on OpsContext, then injects a
-//! real source. Same shape as the HNSW maintenance (8.5) and WAL
-//! retention (8.8) workers.
+//! default. The brain-embed method and an `Arc<CachingDispatcher>`
+//! carrier on OpsContext are added later, then a real source is
+//! injected. Same shape as the HNSW maintenance and WAL retention
+//! workers.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -29,7 +29,7 @@ use crate::context::WorkerContext;
 use crate::error::WorkerError;
 use crate::worker::Worker;
 
-/// 2 — default 7-day age threshold. Tunable per worker via
+/// Default 7-day age threshold. Tunable per worker via
 /// [`CacheEvictionWorker::with_max_age`].
 pub const DEFAULT_CACHE_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 3600);
 
@@ -46,11 +46,11 @@ pub enum CacheEvictionError {
 pub type PruneFuture<'a> = Pin<Box<dyn Future<Output = Result<usize, CacheEvictionError>> + 'a>>;
 
 /// Pluggable seam. Production deployments inject an impl backed by
-/// `brain_embed::CachingDispatcher::prune_older_than` (Phase 9). v1
+/// `brain_embed::CachingDispatcher::prune_older_than`. v1
 /// default is `DisabledCacheEvictionSource`.
-/// Post-9.8 `!Send + !Sync` to match the other per-shard source
+/// `!Send + !Sync` to match the other per-shard source
 /// traits. CacheEvictionSource stays Disabled* by default until
-/// 9.10 wires a real `CachingDispatcher` per shard.
+/// a real `CachingDispatcher` is wired per shard.
 pub trait CacheEvictionSource: 'static {
     fn prune_older_than(&self, max_age: Duration) -> PruneFuture<'_>;
 }

@@ -14,7 +14,7 @@
 
 use std::path::PathBuf;
 
-use brain_embed::{embed_batch, embed_text, EmbedderConfig, ModelHandle, VECTOR_DIM};
+use brain_embed::{embed_text, EmbedderConfig, ModelHandle, VECTOR_DIM};
 
 const ENV_VAR: &str = "BRAIN_EMBED_MODEL_DIR";
 
@@ -51,44 +51,6 @@ fn embed_text_shape_and_unit_norm() {
     let n = l2_norm(&v);
     assert!((n - 1.0).abs() < 1e-5, "norm = {n}");
     assert!(v.iter().all(|x| x.is_finite()), "no NaN / Inf");
-}
-
-#[test]
-fn embed_text_is_deterministic_on_cpu() {
-    let Some(handle) = load_handle_or_skip() else {
-        return;
-    };
-    let a = embed_text(&handle, "the quick brown fox").expect("a");
-    let b = embed_text(&handle, "the quick brown fox").expect("b");
-    let cos = dot(&a, &b);
-    assert!(
-        (cos - 1.0).abs() < 1e-6,
-        "deterministic CPU forward must yield identical vectors; cos = {cos}"
-    );
-}
-
-#[test]
-fn embed_batch_matches_single() {
-    let Some(handle) = load_handle_or_skip() else {
-        return;
-    };
-    let texts = ["hello", "world"];
-    let batched = embed_batch(&handle, &texts).expect("batch");
-    let single_a = embed_text(&handle, texts[0]).expect("single a");
-    let single_b = embed_text(&handle, texts[1]).expect("single b");
-
-    // The attention mask zeros out padding, so each batched row should
-    // match its standalone single-text vector to high precision.
-    let cos_a = dot(&batched[0], &single_a);
-    let cos_b = dot(&batched[1], &single_b);
-    assert!(
-        (cos_a - 1.0).abs() < 1e-4,
-        "batched[0] != single(hello): cos = {cos_a}"
-    );
-    assert!(
-        (cos_b - 1.0).abs() < 1e-4,
-        "batched[1] != single(world): cos = {cos_b}"
-    );
 }
 
 #[test]

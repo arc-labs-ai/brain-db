@@ -209,7 +209,7 @@ For sizing: budget 20 GiB per million memories at production retention.
 
 The protocol runs over **TCP only**. UDP is not a fit for the structured request/response pattern with backpressure.
 
-For high-QPS deployments, TCP keepalive and connection reuse are critical. The SDK is responsible for connection pooling; the server accepts long-lived connections and multiplexes streams over them per the protocol specification.
+For high-QPS deployments, TCP keepalive and connection reuse are critical. The client is responsible for connection pooling; the server accepts long-lived connections and multiplexes streams over them per the protocol specification.
 
 ### 5.2 Bandwidth requirements
 
@@ -345,7 +345,7 @@ Cache-hit latency (cue text already embedded recently):
 |---|---|---|
 | `RECALL` (cue cache hit) | ≤ 1.5 ms | ≤ 4 ms |
 
-Latency targets are measured at the protocol layer — from receipt of the request frame at the server to the moment of writing the first response byte. Network transit is excluded; SDK overhead is included.
+Latency targets are measured at the protocol layer — from receipt of the request frame at the server to the moment of writing the first response byte. Network transit is excluded; client overhead is included.
 
 ### 1.3 Throughput
 

@@ -1,4 +1,4 @@
-//! System schema bootstrap (phase 19.7).
+//! System schema bootstrap.
 //!
 //! At `MetadataDb::open`, this module:
 //!
@@ -18,19 +18,17 @@
 //! `include_str!()` content; a failure is a build bug, not a
 //! runtime condition.
 
-use brain_protocol::schema::{parse_schema, validate_system_schema, SchemaItem, ValidatedSchema};
+use brain_protocol::schema::{parse_schema, validate_system_schema, ValidatedSchema};
 use redb::{Database, ReadableDatabase, WriteTransaction};
 
-use crate::extractor::ops::{extractor_intern, ExtractorOpError};
-use crate::schema::apply::map_extractor_kind;
+use crate::schema::apply::{apply_schema_definitions, SchemaApplyError};
 use crate::schema::store::{schema_active, schema_upload, SchemaStoreError};
 
 /// The embedded system-schema DSL source. Single source of truth
 /// for the built-in `brain:*` types.
 pub const SYSTEM_SCHEMA_SOURCE: &str = include_str!("schema.brain");
 
-/// The namespace name the system schema declares. Reserved per
-/// §21/04.
+/// The namespace name the system schema declares. Reserved.
 pub const SYSTEM_SCHEMA_NAMESPACE: &str = "brain";
 
 #[derive(thiserror::Error, Debug)]
@@ -41,33 +39,41 @@ pub enum SystemSchemaError {
     #[error("redb commit error: {0}")]
     Commit(#[from] redb::CommitError),
 
+    #[error("redb table error: {0}")]
+    Table(#[from] redb::TableError),
+
     #[error("schema_store: {0}")]
     Schema(#[from] SchemaStoreError),
 
-    /// The embedded schema's extractor row diverges from what's in
-    /// `EXTRACTORS_TABLE`. Surfaced by reconciliation so an
-    /// operator-edited `schema.brain` that breaks a prior
-    /// definition isn't silently overwritten. Bumping the schema
-    /// version (via a real SCHEMA_UPLOAD) is the recovery path.
-    #[error("embedded system schema diverges from stored extractor {qname:?}")]
-    DivergedExtractor { qname: String },
+    #[error("namespace registry: {0}")]
+    Namespace(#[from] crate::namespace::NamespaceOpError),
 
-    /// `extractor_intern` returned a non-divergence error during
-    /// reconciliation (storage, table, identifier validation).
-    #[error("extractor reconciliation: {0}")]
-    ExtractorOp(#[from] ExtractorOpError),
-
-    /// `serde_json::to_vec` failed on an extractor AST during
-    /// reconciliation. Build bug if it fires — the AST round-trips
-    /// through the same encoder in `apply_schema_definitions`.
-    #[error("extractor reconciliation encode: {0}")]
-    ExtractorEncode(String),
+    /// A stored `brain:` definition diverges from the embedded
+    /// schema during reconciliation. Surfaced so an operator-edited
+    /// `schema.brain` that breaks a prior definition (entity type,
+    /// predicate, relation type, or extractor) isn't silently
+    /// overwritten. Bumping the schema version (via a real
+    /// SCHEMA_UPLOAD) is the recovery path.
+    #[error("reconciliation of embedded system schema failed: {0}")]
+    Reconcile(#[from] SchemaApplyError),
 }
 
 /// Seed the system schema on first open; reconcile on subsequent
 /// opens. Both branches are idempotent for inputs that match the
 /// stored state.
 pub fn seed_system_schema(db: &Database) -> Result<(), SystemSchemaError> {
+    // Ensure every metadata table is materialized before any read.
+    // In production this is a no-op (MetadataDb::open already runs
+    // open_or_init_schema which calls materialize_all_tables), but
+    // direct callers (tests, internal tooling) get the same shape
+    // without each site having to remember the dance. The op is
+    // idempotent — see `materialize_all_tables_is_idempotent`.
+    {
+        let wtxn = db.begin_write()?;
+        crate::tables::materialize_all_tables(&wtxn)?;
+        wtxn.commit()?;
+    }
+
     let schema = parse_schema(SYSTEM_SCHEMA_SOURCE)
         .expect("system schema must parse — include_str!() content is compile-time");
     let validated = validate_system_schema(&schema).unwrap_or_else(|errs| {
@@ -87,64 +93,50 @@ pub fn seed_system_schema(db: &Database) -> Result<(), SystemSchemaError> {
         .unwrap_or(0);
 
     let wtxn = db.begin_write()?;
+    // Seed the reserved `brain` system namespace at id 0 so every shard
+    // has the tenant boundary's system slot present from byte zero.
+    // Idempotent on reopen.
+    crate::namespace::seed_system_namespace(&wtxn, now)?;
     match active {
         None => {
             schema_upload(&wtxn, &validated, now)?;
         }
         Some(version) => {
-            reconcile_system_extractors(&wtxn, &validated, version, now)?;
+            reconcile_system_schema(&wtxn, &validated, version, now)?;
         }
     }
     wtxn.commit()?;
     Ok(())
 }
 
-/// Diff the embedded schema's extractor definitions against
-/// `EXTRACTORS_TABLE` via `extractor_intern`. Same-content rows
-/// no-op; missing rows are written under the current active
-/// `schema_version`; diverged rows raise [`SystemSchemaError::DivergedExtractor`].
+/// Re-apply the embedded schema's full vocabulary against the stored
+/// `brain:` namespace on every reopen so a codebase upgrade that adds
+/// entity types, predicates, relation types, or extractors back-fills
+/// the missing rows. Same-content rows no-op (the intern paths are
+/// idempotent at the active version); genuinely diverged rows surface
+/// as an error so an operator-edited definition isn't silently
+/// overwritten.
 ///
-/// Scoped to extractors only. Predicate / entity_type /
-/// relation_type drift is a separate concern; if a similar gap
-/// surfaces there, a follow-up plan can extend this helper to
-/// cover them.
-fn reconcile_system_extractors(
+/// The earlier reconcile path covered extractors only, which meant a
+/// DB seeded before the rich entity-type vocabulary landed never grew
+/// the new `brain:` entity types. The classifier reads those types as
+/// its GLiNER label set, so a stale snapshot produced zero labels and
+/// the extraction pipeline yielded zero entities. Re-applying the whole
+/// definition set closes that gap.
+fn reconcile_system_schema(
     wtxn: &WriteTransaction,
     validated: &ValidatedSchema,
     schema_version: u32,
     now_unix_nanos: u64,
 ) -> Result<(), SystemSchemaError> {
-    let schema = validated.as_schema();
-    let namespace = schema.namespace.as_str();
-    for item in &schema.items {
-        let SchemaItem::Extractor(e) = item else {
-            continue;
-        };
-        let kind = map_extractor_kind(e.kind);
-        let blob = serde_json::to_vec(e)
-            .map_err(|err| SystemSchemaError::ExtractorEncode(err.to_string()))?;
-        match extractor_intern(
-            wtxn,
-            namespace,
-            &e.name,
-            kind,
-            schema_version,
-            blob,
-            now_unix_nanos,
-        ) {
-            Ok(_) => {}
-            Err(ExtractorOpError::AlreadyExists { qname, .. }) => {
-                return Err(SystemSchemaError::DivergedExtractor { qname });
-            }
-            Err(other) => return Err(SystemSchemaError::ExtractorOp(other)),
-        }
-    }
+    apply_schema_definitions(wtxn, validated, schema_version, now_unix_nanos)?;
     Ok(())
 }
 
 #[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
+    use crate::extractor::ops::ExtractorOpError;
     use crate::schema::store::{schema_get, schema_list};
     use brain_core::EntityType;
 
@@ -234,7 +226,6 @@ mod tests {
         assert!(names.contains(&"llm_predicate"));
         for ext in &all {
             assert_eq!(ext.namespace, "brain");
-            assert!(ext.is_enabled());
         }
     }
 
@@ -300,38 +291,30 @@ mod tests {
         seed_system_schema(&db).unwrap();
 
         let rtxn = db.begin_read().unwrap();
+        // Predicates are an OPEN vocabulary: the seed declares ONLY the five
+        // `behavior_*` predicates (resolved by qname by MATERIALIZE_PROCEDURAL).
+        // Every domain predicate is coined on the fly at write time and is
+        // deliberately absent from the seed.
         for (expected_id, name) in [
-            (1u32, "is_a"),
-            (2, "has_name"),
-            (3, "mentions"),
-            (4, "fact"),
-            (5, "related_to"),
-            (6, "prefers"),
-            (7, "scheduled"),
-            (8, "works_at"),
-            (9, "member_of"),
-            (10, "lives_in"),
-            (11, "located_in"),
-            (12, "owns"),
-            (13, "current_role"),
-            (14, "speaks"),
-            (15, "has_skill"),
-            (16, "likes"),
-            (17, "dislikes"),
-            (18, "occurred_at"),
-            (19, "mentioned_in"),
-            (20, "participated_in"),
-            (21, "behavior_tone"),
-            (22, "behavior_style"),
-            (23, "behavior_avoids"),
-            (24, "behavior_prefers"),
-            (25, "behavior_constraint"),
+            (1u32, "behavior_tone"),
+            (2, "behavior_style"),
+            (3, "behavior_avoids"),
+            (4, "behavior_prefers"),
+            (5, "behavior_constraint"),
         ] {
             let row = predicate_lookup_by_qname(&rtxn, "brain", name)
                 .unwrap()
                 .unwrap_or_else(|| panic!("brain:{name} predicate missing"));
             assert_eq!(row.id.raw(), expected_id, "brain:{name}");
         }
+
+        // A removed domain predicate must NOT be pre-seeded.
+        assert!(
+            predicate_lookup_by_qname(&rtxn, "brain", "works_at")
+                .unwrap()
+                .is_none(),
+            "brain:works_at must not be seeded — predicates are open-vocab"
+        );
     }
 
     #[test]
@@ -421,7 +404,6 @@ mod tests {
             .expect("gliner restored by reconciliation");
         assert_eq!(restored.namespace, "brain");
         assert_eq!(restored.name, "gliner");
-        assert!(restored.is_enabled());
     }
 
     /// Reconciliation is a no-op when the table already matches
@@ -452,7 +434,7 @@ mod tests {
     }
 
     /// A diverged extractor row (same qname, different
-    /// definition_blob) raises `DivergedExtractor` instead of
+    /// definition_blob) raises a `Reconcile` error instead of
     /// silently overwriting. Bumping the schema version via a
     /// real `SCHEMA_UPLOAD` is the recovery path; reconciliation
     /// refuses to make that decision unilaterally.
@@ -478,7 +460,6 @@ mod tests {
                     "brain".into(),
                     "entity_mentions".into(),
                     brain_core::ExtractorKind::Pattern,
-                    true,
                     1,
                     b"tampered-definition".to_vec(),
                     0,
@@ -491,10 +472,75 @@ mod tests {
         let db = Database::open(&path).unwrap();
         let err = seed_system_schema(&db).expect_err("diverged definition must surface");
         match err {
-            SystemSchemaError::DivergedExtractor { qname } => {
+            SystemSchemaError::Reconcile(SchemaApplyError::Extractor(
+                ExtractorOpError::AlreadyExists { qname, .. },
+            )) => {
                 assert_eq!(qname, "brain:entity_mentions");
             }
-            other => panic!("expected DivergedExtractor, got {other:?}"),
+            other => panic!("expected Reconcile/AlreadyExists, got {other:?}"),
+        }
+    }
+
+    /// Regression for the `entities=0` extraction bug: a DB seeded
+    /// before the full entity-type vocabulary landed (simulated here
+    /// by deleting the entity-type rows) must have those types
+    /// back-filled on reopen. The classifier reads them as its GLiNER
+    /// label set — a stale, empty snapshot yielded zero spans and the
+    /// pipeline persisted zero entities.
+    #[test]
+    fn reopen_backfills_missing_entity_types() {
+        use crate::tables::entity_type::ENTITY_TYPES_TABLE;
+        use redb::ReadableTable;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.redb");
+        {
+            let db = Database::create(&path).unwrap();
+            seed_system_schema(&db).unwrap();
+
+            // Simulate a stale seed: wipe every entity-type row while
+            // leaving the active schema-version row intact, so the next
+            // open takes the reconcile (Some(version)) branch with an
+            // empty entity-type table.
+            let wtxn = db.begin_write().unwrap();
+            {
+                let mut t = wtxn.open_table(ENTITY_TYPES_TABLE).unwrap();
+                let keys: Vec<u32> = t.iter().unwrap().map(|e| e.unwrap().0.value()).collect();
+                for k in keys {
+                    t.remove(&k).unwrap();
+                }
+            }
+            wtxn.commit().unwrap();
+
+            // Confirm the table really is empty before reopen.
+            let rtxn = db.begin_read().unwrap();
+            let t = rtxn.open_table(ENTITY_TYPES_TABLE).unwrap();
+            assert_eq!(t.iter().unwrap().count(), 0, "precondition: types wiped");
+        }
+
+        // Reopen takes the reconcile branch and must back-fill.
+        let db = Database::open(&path).unwrap();
+        seed_system_schema(&db).unwrap();
+
+        let rtxn = db.begin_read().unwrap();
+        let t = rtxn.open_table(ENTITY_TYPES_TABLE).unwrap();
+        let names: Vec<String> = t
+            .iter()
+            .unwrap()
+            .map(|e| e.unwrap().1.value().name)
+            .collect();
+        for expected in [
+            "Person",
+            "Organization",
+            "Project",
+            "Event",
+            "Place",
+            "Concept",
+        ] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "entity type {expected} must be back-filled on reopen; got {names:?}",
+            );
         }
     }
 }

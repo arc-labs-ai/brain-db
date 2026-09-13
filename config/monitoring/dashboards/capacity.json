@@ -1,0 +1,85 @@
+{
+  "title": "Brain — Capacity Planning",
+  "uid": "brain-capacity",
+  "schemaVersion": 39,
+  "tags": ["brain"],
+  "time": { "from": "now-6h", "to": "now" },
+  "refresh": "30s",
+  "templating": { "list": [] },
+  "annotations": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "title": "HNSW Nodes — 24h Projection",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum(brain_hnsw_node_count)", "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" } },
+        { "expr": "predict_linear(sum(brain_hnsw_node_count)[6h:], 86400)", "refId": "B", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Resident Memory — 24h Projection",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "process_resident_memory_bytes", "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" } },
+        { "expr": "predict_linear(process_resident_memory_bytes[6h:], 86400)", "refId": "B", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Virtual Memory",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "process_virtual_memory_bytes", "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "CPU Utilisation",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "rate(process_cpu_seconds_total[5m])", "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Active Connections vs Shards",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum(brain_connections_active)", "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" } },
+        { "expr": "brain_shards_total", "refId": "B", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "LLM Spend (micro USD)",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum(brain_extractor_llm_micro_usd_spent_total)", "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Open File Descriptors",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "max(process_open_fds)", "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+      ]
+    }
+  ]
+}

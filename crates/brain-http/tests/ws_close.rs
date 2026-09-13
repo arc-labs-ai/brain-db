@@ -1,4 +1,4 @@
-//! M6 WebSocket close-handshake tests.
+//! WebSocket close-handshake tests.
 //!
 //! Both directions: peer-initiated close (client closes, server's
 //! stream ends cleanly) and server-initiated close (server closes,

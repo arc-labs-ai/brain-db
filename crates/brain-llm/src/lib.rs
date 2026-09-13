@@ -26,7 +26,7 @@ pub mod router;
 pub mod types;
 
 pub use client::LlmClient;
-pub use error::LlmError;
+pub use error::{FailureClass, LlmError};
 pub use providers::{AnthropicClient, OpenAIClient};
 pub use router::{ModelRouter, Provider};
 pub use types::{LlmMessage, LlmRequest, LlmResponse, LlmRole};

@@ -1,6 +1,6 @@
 //! WebSocket server (RFC 6455).
 //!
-//! M6 ships server-side ([`accept`]); M7 adds the matching client
+//! Ships server-side ([`accept`]) plus the matching client
 //! ([`connect`] / [`ConnectBuilder`]). The HTTP/1.1
 //! `Upgrade: websocket` handshake is handled inside this module; the
 //! frame protocol below the upgrade is driven by

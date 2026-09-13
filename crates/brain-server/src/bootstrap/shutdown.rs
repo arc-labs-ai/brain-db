@@ -1,4 +1,4 @@
-//! Graceful shutdown helpers (sub-task 9.14).
+//! Graceful shutdown helpers.
 //!
 //! By the time these helpers run, the Tokio runtime has already
 //! observed the shared `ShutdownSignal` and both the connection
@@ -8,7 +8,7 @@
 //! 1. Drop every `ShardHandle` clone so each shard's
 //!    `flume::Receiver<ShardRequest>` returns `Err` → the shard's
 //!    `shard_main_loop` exits → in-shard drain runs (scheduler →
-//!    WAL → arena msync, per sub-task 9.7b).
+//!    WAL → arena msync).
 //! 2. `join()` every `ShardJoiner` with a per-shard timeout so a
 //!    stuck Glommio executor can't block process exit.
 //!
@@ -27,7 +27,7 @@ use tracing::{error, info};
 use crate::shard::{ShardHandle, ShardJoiner};
 
 /// Default upper bound on the shard-drain phase. The scheduler's own
-/// `SHUTDOWN_DRAIN_BUDGET` is 5s (sub-task 9.7); WAL flush is ~100 µs;
+/// `SHUTDOWN_DRAIN_BUDGET` is 5s; WAL flush is ~100 µs;
 /// arena msync is best-effort. 30s is comfortable for a clean exit
 /// and forgiving on a heavily-loaded shard.
 pub const DEFAULT_SHARD_DRAIN_BUDGET: Duration = Duration::from_secs(30);
@@ -60,7 +60,7 @@ pub fn graceful_shutdown_shards(
         "shard drain starting",
     );
 
-    // Phase 1: close every shard's request channel.
+    // Step 1: close every shard's request channel.
     let outstanding = Arc::strong_count(&shards);
     drop(shards);
     if outstanding > 1 {
@@ -73,7 +73,7 @@ pub fn graceful_shutdown_shards(
         );
     }
 
-    // Phase 2: per-shard timed join.
+    // Step 2: per-shard timed join.
     let deadline = Instant::now() + drain_budget;
     let mut rc = ExitCode::SUCCESS;
     for joiner in joiners {

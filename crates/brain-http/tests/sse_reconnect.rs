@@ -1,4 +1,4 @@
-//! M4 reconnect test: `Last-Event-ID` carries through.
+//! Reconnect test: `Last-Event-ID` carries through.
 //!
 //! Two sequential TCP connections from this test:
 //!

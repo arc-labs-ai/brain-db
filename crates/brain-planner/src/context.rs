@@ -1,15 +1,13 @@
-//! Planner-side context. Pure data — no async, no I/O
-//! says the planner has access to:
+//! Planner-side context. Pure data — no async, no I/O. The planner
+//! has access to:
 //!
 //! - The request itself (passed as an argument, not here).
 //! - Per-shard statistics ([`crate::ShardStats`]).
 //! - Configuration ([`crate::PlannerConfig`]).
-//! - Agent metadata (quotas) — deferred until a later sub-task adds
-//!   the wiring.
+//! - Space metadata (quotas) — deferred until the wiring is added.
 //!
-//! The planner does **not** have access to the storage layer
-//! (— "planning is computation only; no I/O"). The
-//! executor's context (lives in `executor.rs` when 6.7 lands) holds
+//! The planner does **not** have access to the storage layer —
+//! planning is computation only; no I/O. The executor's context holds
 //! the storage handles separately.
 
 use crate::config::PlannerConfig;
@@ -22,7 +20,7 @@ pub struct PlannerContext {
 }
 
 // `PlannerConfig` doesn't derive `Default` via the derive macro
-// because we wrote a hand-rolled Default with the spec numbers. The
+// because we wrote a hand-rolled Default with the default numbers. The
 // `Default` derive on `PlannerContext` would normally fail because
 // `PlannerConfig: Default` isn't a `derive`-generated impl. Rust
 // accepts hand-rolled `Default` impls in derive resolution though, so

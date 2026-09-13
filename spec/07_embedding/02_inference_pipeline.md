@@ -146,6 +146,32 @@ The tokenizer's vocabulary is part of the model. Different model versions may ha
 
 A mid-flight tokenizer change (without a model change) is not supported. The tokenizer is loaded at startup and immutable.
 
+### 12a. Asymmetric retrieval — query vs passage
+
+`bge-small-en-v1.5` was trained as an **asymmetric retrieval** model: stored passages are embedded raw, but query text is prepended with a fixed retrieval prefix before tokenization. Skipping the prefix is the single biggest recall-quality regression a deployment can take on short queries ("who is X", "where is Y") — the un-prefixed query vector points at a generic factual centroid rather than a "what looks like a useful passage for this query" centroid.
+
+The prefix is:
+
+```
+Represent this sentence for searching relevant passages:
+```
+
+(with a trailing space — the prefix is concatenated directly, no separator token).
+
+Brain applies this asymmetry through a dispatcher-level split:
+
+| Code path | Method | Why |
+|---|---|---|
+| ENCODE memory text | `Dispatcher::embed` | passage — stored vector |
+| Entity-create canonical name | `Dispatcher::embed` | passage — stored vector (resolver tier-3 looks up by passage similarity) |
+| RECALL cue, PLAN cue, REASON cue | `Dispatcher::embed_query` | query — looked up against passage vectors |
+| Retrieval SemanticRetriever query | `Dispatcher::embed_query` | query |
+| Statement embed worker | `Dispatcher::embed` | passage — stored vector |
+
+`embed_query` is a default-implemented trait method that concatenates the prefix and forwards to `embed`. Implementations may override the default (for example, a multilingual deployment swapping to a model whose prefix differs, or to no prefix). The model fingerprint covers the choice of model but **not** the prefix; a deployment that overrides the prefix and then changes back without rebuilding the index will see degraded recall until the cue cache cycles. (Operator-visible knob; not a correctness invariant.)
+
+Cue-cache impact: §05's cache is keyed on the input text. The prefix is applied **before** the cache lookup, so query and passage entries for the same surface text are independent cache rows. No new cache machinery is needed.
+
 ## Inference
 
 The model forward pass — the step that converts token IDs into a vector.

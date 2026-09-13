@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+publish.workspace = true
 description = "The Brain cognitive substrate server."
 
 [[bin]]
@@ -62,6 +63,7 @@ brain-index = { path = "../brain-index" }
 brain-embed = { path = "../brain-embed" }
 brain-planner = { path = "../brain-planner" }
 brain-ops = { path = "../brain-ops" }
+brain-rerank = { path = "../brain-rerank" }
 brain-workers = { path = "../brain-workers" }
 # `extract --backfill` walks `memories` + `texts` redb tables directly
 # inside the shard executor (avoiding the cost of a full dispatch
@@ -93,17 +95,14 @@ tokio = { workspace = true, features = [
 ] }
 proptest.workspace = true
 
-# Connection layer integration tests need to drive a TLS client.
-# 10.13 e2e tests drive the in-process harness via the real
-# Rust SDK + CLI library API.
+# Connection layer integration tests need to drive a TLS client over the
+# wire protocol directly.
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 tokio-rustls.workspace = true
 rustls.workspace = true
 rcgen.workspace = true
-brain-sdk-rust = { path = "../brain-sdk-rust" }
-brain-cli = { path = "../brain-cli" }
-# 15.5 substrate-only regression test opens metadata.redb directly to
-# assert knowledge-layer tables stayed empty.
+# Storage-regression test opens metadata.redb directly to assert
+# typed-graph tables stayed empty for memory-only writes.
 redb.workspace = true
 brain-storage = { path = "../brain-storage" }
 tracing.workspace = true

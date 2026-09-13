@@ -1,4 +1,4 @@
-//! Supersession sweeper (sub-task 24.3).
+//! Supersession sweeper.
 //!
 //! Periodic low-priority worker that hard-deletes superseded
 //! statements past the configured retention. **Off by default**
@@ -15,6 +15,12 @@ use crate::config::{WorkerConfig, WorkerKind};
 use crate::context::WorkerContext;
 use crate::error::WorkerError;
 use crate::worker::Worker;
+
+/// Default sweep cadence in seconds (1 day) for an operator who opts in
+/// by setting a non-zero retention. Mirrors the statement-reclaim
+/// worker's daily cadence — both are low-priority physical-reclamation
+/// passes where once-a-day is ample.
+pub const DEFAULT_PERIOD_SECONDS: u64 = 86_400;
 
 pub struct SupersessionSweeper {
     config: WorkerConfig,
@@ -44,6 +50,15 @@ impl SupersessionSweeper {
         self
     }
 
+    /// Set the sweep cadence (the scheduler reads this off `config`).
+    /// Clamped to a minimum of one second so a misconfigured `0` can't
+    /// busy-loop the scheduler.
+    #[must_use]
+    pub fn with_period_seconds(mut self, seconds: u64) -> Self {
+        self.config.interval = std::time::Duration::from_secs(seconds.max(1));
+        self
+    }
+
     #[must_use]
     pub fn dry_run(mut self) -> Self {
         self.dry_run = true;
@@ -58,7 +73,7 @@ impl SupersessionSweeper {
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
             .unwrap_or(0);
-        let mut metadata = ctx.ops.executor.metadata.lock();
+        let metadata = ctx.ops.executor.metadata.as_ref();
         let wtxn = metadata
             .write_txn()
             .map_err(|e| WorkerError::Internal(format!("supersession sweeper wtxn: {e}")))?;
@@ -118,8 +133,15 @@ mod tests {
     }
 
     #[test]
-    fn worker_kind_name() {
-        let w = SupersessionSweeper::new();
-        assert_eq!(w.name(), "supersession_sweeper");
+    fn with_period_seconds_sets_scheduler_interval() {
+        let w = SupersessionSweeper::new().with_period_seconds(3600);
+        assert_eq!(w.config().interval, std::time::Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn with_period_seconds_clamps_zero_to_one() {
+        // A misconfigured 0 must not become a zero-interval busy loop.
+        let w = SupersessionSweeper::new().with_period_seconds(0);
+        assert_eq!(w.config().interval, std::time::Duration::from_secs(1));
     }
 }

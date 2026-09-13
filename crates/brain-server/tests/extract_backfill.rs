@@ -19,11 +19,11 @@ use std::net::TcpStream as StdTcpStream;
 use std::time::Duration;
 
 use brain_core::MemoryId;
+use brain_protocol::codec::opcode::Opcode;
 use brain_protocol::connection::handshake::{
     AuthCredentials, AuthMethod, AuthPayload, HelloCapabilities, HelloPayload,
 };
-use brain_protocol::codec::opcode::Opcode;
-use brain_protocol::envelope::request::{EncodeRequest, MemoryKindWire, RequestBody};
+use brain_protocol::envelope::request::{EncodeRequest, RequestBody};
 use brain_protocol::envelope::response::ResponseBody;
 use brain_protocol::Frame;
 use tempfile::TempDir;
@@ -95,7 +95,7 @@ async fn send_frame(client: &mut TcpStream, frame: Frame) {
     client.flush().await.expect("flush");
 }
 
-async fn handshake(client: &mut TcpStream) {
+async fn handshake(client: &mut TcpStream, token: &[u8]) {
     let hello = HelloPayload {
         client_id: "extract-backfill-tester".into(),
         supported_versions: vec![brain_protocol::VERSION],
@@ -104,7 +104,7 @@ async fn handshake(client: &mut TcpStream) {
             compression_zstd: false,
             server_push: false,
         },
-        client_session_token: None,
+        client_connection_token: None,
     };
     send_frame(
         client,
@@ -120,9 +120,8 @@ async fn handshake(client: &mut TcpStream) {
     assert_eq!(welcome.header.opcode_u16(), Opcode::Welcome.as_u16());
 
     let auth = AuthPayload {
-        method: AuthMethod::None,
-        agent_id: *Uuid::now_v7().as_bytes(),
-        credentials: AuthCredentials::None,
+        method: AuthMethod::Token,
+        credentials: AuthCredentials::Token(token.to_vec()),
     };
     send_frame(
         client,
@@ -154,13 +153,13 @@ async fn round_trip(client: &mut TcpStream, stream_id: u32, req: RequestBody) ->
 async fn encode_one(client: &mut TcpStream, stream_id: u32, text: &str) -> MemoryId {
     let req = EncodeRequest {
         text: text.into(),
-        context_id: 1,
-        kind: MemoryKindWire::Episodic,
-        salience_hint: 0.5,
-        edges: vec![],
+        session_id: 1,
         request_id: *Uuid::now_v7().as_bytes(),
         txn_id: None,
-        deduplicate: false,
+        occurred_at_unix_nanos: None,
+        act_as: None,
+        wait: brain_protocol::WaitMode::Ack,
+        allow_duplicates: false,
     };
     let resp = round_trip(client, stream_id, RequestBody::Encode(req)).await;
     match resp {
@@ -168,6 +167,12 @@ async fn encode_one(client: &mut TcpStream, stream_id: u32, text: &str) -> Memor
         other => panic!("expected Encode, got {other:?}"),
     }
 }
+
+/// Overall budget for an admin response, independent of the per-read
+/// socket timeout below. Generous on purpose: this suite runs alongside
+/// every other test binary, and a starved executor answering in 15s is a
+/// slow server, not a broken one.
+const HTTP_READ_DEADLINE: Duration = Duration::from_secs(60);
 
 /// Blocking POST that runs inside a `spawn_blocking`. Returns
 /// `(status_code, body_string)`. The admin server uses hyper 1.x but
@@ -185,18 +190,63 @@ fn http_post_no_body(admin_addr: &str, path: &str) -> (u16, String) {
     stream
         .set_write_timeout(Some(Duration::from_secs(5)))
         .unwrap();
+    // Admin /v1 routes are gated on the operator secret; Config::for_tests
+    // sets it to "test-admin-token".
     let req = format!(
         "POST {path} HTTP/1.1\r\nHost: {admin_addr}\r\nContent-Length: 0\r\n\
+         Authorization: Bearer test-admin-token\r\n\
          Connection: close\r\nAccept: */*\r\n\r\n",
     );
     stream.write_all(req.as_bytes()).unwrap();
     stream.flush().unwrap();
+
+    // Read to EOF (the request sends `Connection: close`) against an overall
+    // deadline rather than a single `read_to_end`.
+    //
+    // `read_to_end` on a socket carrying `SO_RCVTIMEO` fails the whole call
+    // the first time the timeout expires and **discards the bytes already
+    // read**, so a slow-but-healthy admin response is indistinguishable from
+    // a dead one. On a loaded box that is exactly what happens: the busy
+    // executor takes longer than one read timeout to produce the backfill
+    // report, the `.unwrap()` panics inside `spawn_blocking`, and the test
+    // fails at its `join.unwrap()` with no indication that the server was
+    // merely slow. Retrying around a deadline keeps the partial buffer and
+    // only gives up when the server has genuinely stopped talking.
+    let deadline = std::time::Instant::now() + HTTP_READ_DEADLINE;
     let mut raw = Vec::with_capacity(1024);
-    stream.read_to_end(&mut raw).unwrap();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => raw.extend_from_slice(&chunk[..n]),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "admin {path} produced no response within {HTTP_READ_DEADLINE:?} \
+                     ({} bytes buffered)",
+                    raw.len(),
+                );
+            }
+            Err(e) => panic!("admin {path} read failed after {} bytes: {e}", raw.len()),
+        }
+    }
     let split = raw
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
-        .expect("response delimiter");
+        .unwrap_or_else(|| {
+            panic!(
+                "admin {path} response has no header/body delimiter ({} bytes): {:?}",
+                raw.len(),
+                String::from_utf8_lossy(&raw[..raw.len().min(256)]),
+            )
+        });
     let head = std::str::from_utf8(&raw[..split]).unwrap();
     let status: u16 = head
         .lines()
@@ -225,11 +275,12 @@ async fn backfill_all_enqueues_every_memory() {
     let mut client = TcpStream::connect(server.data_plane_addr)
         .await
         .expect("connect");
-    handshake(&mut client).await;
+    handshake(&mut client, &server.token).await;
 
+    // Client op streams must be non-zero and ODD (1, 3, 5…).
     let _ = encode_one(&mut client, 1, "alpha memory one").await;
-    let _ = encode_one(&mut client, 2, "beta memory two").await;
-    let _ = encode_one(&mut client, 3, "gamma memory three").await;
+    let _ = encode_one(&mut client, 3, "beta memory two").await;
+    let _ = encode_one(&mut client, 5, "gamma memory three").await;
 
     let admin_addr = server.admin_addr.to_string();
     let (status, body) = tokio::task::spawn_blocking(move || {
@@ -263,10 +314,10 @@ async fn backfill_since_zero_matches_all_active() {
     let mut client = TcpStream::connect(server.data_plane_addr)
         .await
         .expect("connect");
-    handshake(&mut client).await;
+    handshake(&mut client, &server.token).await;
 
     let _ = encode_one(&mut client, 1, "alpha").await;
-    let _ = encode_one(&mut client, 2, "beta").await;
+    let _ = encode_one(&mut client, 3, "beta").await;
 
     let admin_addr = server.admin_addr.to_string();
     let (status, body) = tokio::task::spawn_blocking(move || {
@@ -295,7 +346,7 @@ async fn backfill_memory_id_targets_one_row() {
     let mut client = TcpStream::connect(server.data_plane_addr)
         .await
         .expect("connect");
-    handshake(&mut client).await;
+    handshake(&mut client, &server.token).await;
 
     let mem = encode_one(&mut client, 1, "single memory body").await;
     let mem_u128: u128 = u128::from_be_bytes(mem.to_be_bytes());

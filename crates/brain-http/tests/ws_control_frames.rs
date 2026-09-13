@@ -1,4 +1,4 @@
-//! M6 WebSocket control-frame tests.
+//! WebSocket control-frame tests.
 //!
 //! Verifies that `tokio-tungstenite` auto-replies to a ping with a
 //! pong (the RFC 6455 requirement) and that oversized control frames

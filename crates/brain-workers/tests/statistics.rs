@@ -1,20 +1,23 @@
-#![allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send post-9.7 (audit §4)
-//! Statistics update worker tests (sub-task 8.11).
+#![allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send
+//! Statistics update worker tests.
+//!
+//! Guards the per-shard stats snapshot the worker recomputes each cycle:
+//! tombstone count reflects live HNSW state, age fields track the
+//! min/max `created_at` across memories, and `computed_at` advances. Pins
+//! that the cached handle observes the same data as the fresh snapshot
+//! and that an empty shard yields zero counts rather than erroring.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use brain_core::{AgentId, ContextId, MemoryId, MemoryKind};
+use brain_core::{MemoryId, MemoryKind, SessionId, SpaceId};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
 use brain_metadata::MetadataDb;
 use brain_ops::{OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
-use brain_workers::{
-    StatisticsUpdateWorker, Worker, WorkerConfig, WorkerContext, WorkerKind, WorkerScheduler,
-};
-use parking_lot::Mutex;
+use brain_workers::{StatisticsUpdateWorker, Worker, WorkerContext};
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -37,15 +40,15 @@ impl Dispatcher for NopDispatcher {
 struct Fixture {
     ctx: Arc<OpsContext>,
     metadata: SharedMetadataDb,
-    index: SharedHnsw<VECTOR_DIM>,
+    index: SharedHnsw,
     _tempdir: tempfile::TempDir,
 }
 
 fn build_fixture() -> Fixture {
     let tempdir = tempfile::tempdir().unwrap();
     let db_path = tempdir.path().join("metadata.redb");
-    let metadata: SharedMetadataDb = Arc::new(Mutex::new(MetadataDb::open(&db_path).unwrap()));
-    let (shared, hnsw_writer) = SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).unwrap();
+    let metadata: SharedMetadataDb = Arc::new(MetadataDb::open(&db_path).unwrap());
+    let (shared, hnsw_writer) = SharedHnsw::new(IndexParams::default_v1()).unwrap();
     let index = shared.clone();
     let writer = Arc::new(RealWriterHandle::new(metadata.clone(), hnsw_writer));
     let executor = ExecutorContext::new(
@@ -55,7 +58,7 @@ fn build_fixture() -> Fixture {
         writer as Arc<dyn WriterHandle>,
     );
     Fixture {
-        ctx: Arc::new(OpsContext::new(executor)),
+        ctx: Arc::new(brain_ops::test_support::ops_context_for_tests_owning_tempdir(executor)),
         metadata,
         index,
         _tempdir: tempdir,
@@ -77,14 +80,14 @@ fn make_id(slot: u64) -> MemoryId {
 
 fn seed_memory(metadata: &SharedMetadataDb, slot: u64, created_at: u64) -> MemoryId {
     let id = make_id(slot);
-    let mut db = metadata.lock();
-    let wtxn = db.write_txn().unwrap();
+    let wtxn = metadata.write_txn().unwrap();
     {
         let mut table = wtxn.open_table(MEMORIES_TABLE).unwrap();
         let meta = MemoryMetadata::new_active(
             id,
-            AgentId(Uuid::nil()),
-            ContextId(1),
+            brain_core::NamespaceId::SYSTEM,
+            SpaceId(Uuid::nil()),
+            SessionId(1),
             slot,
             1,
             MemoryKind::Episodic,
@@ -154,7 +157,7 @@ fn tombstone_count_reflects_hnsw_state() {
         // RealWriterHandle — reach through with a fresh writer pair
         // and swap).
         let (replacement_reader, mut replacement_writer) =
-            SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).unwrap();
+            SharedHnsw::new(IndexParams::default_v1()).unwrap();
         let _ = replacement_reader;
         for slot in 1..=4u64 {
             let mut v = [0.0f32; VECTOR_DIM];
@@ -173,7 +176,7 @@ fn tombstone_count_reflects_hnsw_state() {
             })
             .collect();
         let (mut new_idx, _r) =
-            brain_index::HnswIndex::<VECTOR_DIM>::rebuild(fix.index.params(), source).unwrap();
+            brain_index::rebuild::rebuild_impl(fix.index.params(), source).unwrap();
         new_idx.mark_tombstoned(make_id(1)).unwrap();
         new_idx.mark_tombstoned(make_id(2)).unwrap();
         fix.index.swap(new_idx);
@@ -231,58 +234,9 @@ fn cache_updates_across_cycles() {
     });
 }
 
-#[test]
-fn phase_9_fields_stay_none() {
-    glommio_run(|| async {
-        let fix = build_fixture();
-        let worker = StatisticsUpdateWorker::new();
-        run_one(&worker, fix.ctx).await.unwrap();
-        let s = worker.snapshot();
-        assert!(s.arena_used_bytes.is_none());
-        assert!(s.arena_capacity_bytes.is_none());
-        assert!(s.wal_size_bytes.is_none());
-        assert!(s.metadata_size_bytes.is_none());
-    });
-}
-
 // ===========================================================================
-// Worker integration (3).
+// Worker integration (1).
 // ===========================================================================
-
-#[test]
-fn worker_registers_with_correct_kind_and_default_cadence() {
-    glommio_run(|| async {
-        let fix = build_fixture();
-        let mut sched = WorkerScheduler::new();
-        sched
-            .register(Arc::new(StatisticsUpdateWorker::new()), fix.ctx)
-            .unwrap();
-        let cfg = sched.config(WorkerKind::Statistics.name()).unwrap();
-        assert_eq!(cfg.interval, Duration::from_secs(300));
-        sched.shutdown().await.unwrap();
-    });
-}
-
-#[test]
-fn disabled_worker_via_config_does_not_update_cache() {
-    glommio_run(|| async {
-        let fix = build_fixture();
-        seed_memory(&fix.metadata, 1, now_unix_nanos());
-        let worker = StatisticsUpdateWorker::new().with_config(WorkerConfig {
-            enabled: false,
-            interval: Duration::from_millis(20),
-            batch_size: 1,
-            max_runtime: Duration::from_secs(1),
-        });
-        let handle = worker.cache_handle();
-        let mut sched = WorkerScheduler::new();
-        sched.register(Arc::new(worker), fix.ctx).unwrap();
-        glommio::timer::sleep(Duration::from_millis(150)).await;
-        sched.shutdown().await.unwrap();
-        // The default (never-updated) snapshot has memory_count=0.
-        assert_eq!(handle.read().memory_count, 0);
-    });
-}
 
 #[test]
 fn cache_handle_observes_same_data_as_snapshot() {

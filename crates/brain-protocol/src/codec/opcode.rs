@@ -1,4 +1,4 @@
-//! Wire-protocol opcodes (u16). Canonical spec: `spec/04_wire_protocol/03_opcodes.md`.
+//! Wire-protocol opcodes (u16).
 //!
 //! ## Namespaces (high byte)
 //!
@@ -24,8 +24,7 @@
 
 use crate::error::ProtocolError;
 
-/// Wire-protocol opcode. See `spec/04_wire_protocol/03_opcodes.md` for
-/// the full table.
+/// Wire-protocol opcode.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 #[repr(u16)]
 pub enum Opcode {
@@ -59,6 +58,10 @@ pub enum Opcode {
     LinkResp = 0x00A5,
     UnlinkReq = 0x0026,
     UnlinkResp = 0x00A6,
+    MemoryListReq = 0x0027,
+    MemoryListResp = 0x00A7,
+    MemoryInspectReq = 0x0028,
+    MemoryInspectResp = 0x00A8,
     EncodeVectorDirectReq = 0x002A,
     EncodeVectorDirectResp = 0x00AA,
 
@@ -67,6 +70,12 @@ pub enum Opcode {
     SubscribeEvent = 0x00B0,
     UnsubscribeReq = 0x0031,
     UnsubscribeResp = 0x00B1,
+    /// Capability introspection. Returns the per-shard feature flags
+    /// (rerank, extractor tiers, schema namespaces, vector dim) so
+    /// clients can avoid issuing requests the shard can't serve.
+    /// Available to every authenticated client; not admin-only.
+    GetCapabilitiesReq = 0x0032,
+    GetCapabilitiesResp = 0x00B2,
 
     // Transactions
     TxnBegin = 0x0040,
@@ -91,10 +100,10 @@ pub enum Opcode {
     AdminIntegrityCheckResp = 0x00E3,
     AdminMigrateEmbeddingsReq = 0x0064,
     AdminMigrateEmbeddingsResp = 0x00E4,
-    AdminCreateContextReq = 0x0065,
-    AdminCreateContextResp = 0x00E5,
-    AdminRenameContextReq = 0x0066,
-    AdminRenameContextResp = 0x00E6,
+    AdminCreateSessionReq = 0x0065,
+    AdminCreateSessionResp = 0x00E5,
+    AdminRenameSessionReq = 0x0066,
+    AdminRenameSessionResp = 0x00E6,
     AdminMoveMemoryReq = 0x0067,
     AdminMoveMemoryResp = 0x00E7,
     AdminReclassifyReq = 0x0068,
@@ -111,6 +120,29 @@ pub enum Opcode {
     AdminAbortMigrationResp = 0x00EC,
     AdminRetireFingerprintReq = 0x006D,
     AdminRetireFingerprintResp = 0x00ED,
+    // Operator control surface for the per-shard backfill worker:
+    // re-run extractors over a `(memory_range × extractor_ids)` grid
+    // and cancel an in-flight run by request id.
+    AdminBackfillReq = 0x006E,
+    AdminBackfillResp = 0x00EE,
+    AdminBackfillCancelReq = 0x006F,
+    AdminBackfillCancelResp = 0x00EF,
+
+    // Space & session registry (cognitive namespace, non-admin, scoped to
+    // the caller's (namespace, space)). Allocated from the reserved
+    // 0x70–0x75 / 0xF0–0xF5 low-byte range.
+    SpaceCreateReq = 0x0070,
+    SpaceCreateResp = 0x00F0,
+    SpaceListReq = 0x0071,
+    SpaceListResp = 0x00F1,
+    SpaceDeleteReq = 0x0072,
+    SpaceDeleteResp = 0x00F2,
+    SessionCreateReq = 0x0073,
+    SessionCreateResp = 0x00F3,
+    SessionListReq = 0x0074,
+    SessionListResp = 0x00F4,
+    SessionDeleteReq = 0x0075,
+    SessionDeleteResp = 0x00F5,
 
     // Errors
     Error = 0x00FF,
@@ -120,7 +152,9 @@ pub enum Opcode {
     // schema is declared via SCHEMA_UPLOAD.
     // ============================================================
 
-    // Schema operations (0x0120-0x0123 low-byte range).
+    // Schema operations (0x0120-0x0123 low-byte range, plus
+    // `SchemaReplace` at 0x0127 / 0x01A7 — destructive namespace
+    // reset, paired with the associative-merge `SchemaUpload`).
     SchemaUploadReq = 0x0120,
     SchemaUploadResp = 0x01A0,
     SchemaGetReq = 0x0121,
@@ -130,13 +164,22 @@ pub enum Opcode {
     SchemaValidateReq = 0x0123,
     SchemaValidateResp = 0x01A3,
 
-    // Extractor governance (0x0124-0x0126 low-byte range).
+    // Extractor introspection (read-only).
     ExtractorListReq = 0x0124,
     ExtractorListResp = 0x01A4,
-    ExtractorDisableReq = 0x0125,
-    ExtractorDisableResp = 0x01A5,
-    ExtractorEnableReq = 0x0126,
-    ExtractorEnableResp = 0x01A6,
+
+    // Single-declaration schema drop (admin-only). Narrows the active
+    // schema set by removing one declared predicate / relation_type,
+    // paired with the associative-merge `SchemaUpload` and the
+    // namespace-wide `SchemaReplace`.
+    SchemaDropReq = 0x0125,
+    SchemaDropResp = 0x01A5,
+
+    // Destructive schema replace (admin-only). Tombstones every
+    // schema-declared predicate / relation_type / extractor row in
+    // the namespace before running the new schema's apply path.
+    SchemaReplaceReq = 0x0127,
+    SchemaReplaceResp = 0x01A7,
 
     // Entity operations (0x0130-0x013F low-byte range).
     EntityCreateReq = 0x0130,
@@ -190,21 +233,26 @@ pub enum Opcode {
     RelationTraverseReq = 0x0156,
     RelationTraverseResp = 0x01D6,
 
-    // Hybrid query operations (0x0160-0x0163).
-    QueryReq = 0x0160,
-    QueryResp = 0x01E0,
+    // Retrieval query operations (0x0161-0x0163).
     QueryExplainReq = 0x0161,
     QueryExplainResp = 0x01E1,
     QueryTraceReq = 0x0162,
     QueryTraceResp = 0x01E2,
-    RecallHybridReq = 0x0163,
-    RecallHybridResp = 0x01E3,
+    /// Paginated export of the caller's whole typed graph (nodes + edges).
+    GraphFetchReq = 0x0163,
+    GraphFetchResp = 0x01E3,
 
-    // Procedural-memory materialization. Renders an agent's stored
+    // Procedural-memory materialization. Renders an space's stored
     // `brain:behavior_*` Preferences into a system block for LLM prompt
     // injection.
     MaterializeProceduralReq = 0x0164,
     MaterializeProceduralResp = 0x01E4,
+
+    // Typed-graph admin operations (0x0170-0x017F req / 0x01F0-0x01FF
+    // resp). Operator-facing reconciliation surface. Only the
+    // contradiction list is implemented; 0x0170-0x0177 remain spec-only.
+    AdminListPendingContradictionsReq = 0x0178,
+    AdminListPendingContradictionsResp = 0x01F8,
 }
 
 impl Opcode {
@@ -237,6 +285,10 @@ impl Opcode {
             0x00A5 => Self::LinkResp,
             0x0026 => Self::UnlinkReq,
             0x00A6 => Self::UnlinkResp,
+            0x0027 => Self::MemoryListReq,
+            0x00A7 => Self::MemoryListResp,
+            0x0028 => Self::MemoryInspectReq,
+            0x00A8 => Self::MemoryInspectResp,
             0x002A => Self::EncodeVectorDirectReq,
             0x00AA => Self::EncodeVectorDirectResp,
 
@@ -244,6 +296,8 @@ impl Opcode {
             0x00B0 => Self::SubscribeEvent,
             0x0031 => Self::UnsubscribeReq,
             0x00B1 => Self::UnsubscribeResp,
+            0x0032 => Self::GetCapabilitiesReq,
+            0x00B2 => Self::GetCapabilitiesResp,
 
             0x0040 => Self::TxnBegin,
             0x00C0 => Self::TxnBeginResp,
@@ -265,10 +319,10 @@ impl Opcode {
             0x00E3 => Self::AdminIntegrityCheckResp,
             0x0064 => Self::AdminMigrateEmbeddingsReq,
             0x00E4 => Self::AdminMigrateEmbeddingsResp,
-            0x0065 => Self::AdminCreateContextReq,
-            0x00E5 => Self::AdminCreateContextResp,
-            0x0066 => Self::AdminRenameContextReq,
-            0x00E6 => Self::AdminRenameContextResp,
+            0x0065 => Self::AdminCreateSessionReq,
+            0x00E5 => Self::AdminCreateSessionResp,
+            0x0066 => Self::AdminRenameSessionReq,
+            0x00E6 => Self::AdminRenameSessionResp,
             0x0067 => Self::AdminMoveMemoryReq,
             0x00E7 => Self::AdminMoveMemoryResp,
             0x0068 => Self::AdminReclassifyReq,
@@ -283,6 +337,23 @@ impl Opcode {
             0x00EC => Self::AdminAbortMigrationResp,
             0x006D => Self::AdminRetireFingerprintReq,
             0x00ED => Self::AdminRetireFingerprintResp,
+            0x006E => Self::AdminBackfillReq,
+            0x00EE => Self::AdminBackfillResp,
+            0x006F => Self::AdminBackfillCancelReq,
+            0x00EF => Self::AdminBackfillCancelResp,
+
+            0x0070 => Self::SpaceCreateReq,
+            0x00F0 => Self::SpaceCreateResp,
+            0x0071 => Self::SpaceListReq,
+            0x00F1 => Self::SpaceListResp,
+            0x0072 => Self::SpaceDeleteReq,
+            0x00F2 => Self::SpaceDeleteResp,
+            0x0073 => Self::SessionCreateReq,
+            0x00F3 => Self::SessionCreateResp,
+            0x0074 => Self::SessionListReq,
+            0x00F4 => Self::SessionListResp,
+            0x0075 => Self::SessionDeleteReq,
+            0x00F5 => Self::SessionDeleteResp,
 
             0x00FF => Self::Error,
 
@@ -338,17 +409,18 @@ impl Opcode {
             0x0156 => Self::RelationTraverseReq,
             0x01D6 => Self::RelationTraverseResp,
 
-            0x0160 => Self::QueryReq,
-            0x01E0 => Self::QueryResp,
             0x0161 => Self::QueryExplainReq,
             0x01E1 => Self::QueryExplainResp,
             0x0162 => Self::QueryTraceReq,
             0x01E2 => Self::QueryTraceResp,
-            0x0163 => Self::RecallHybridReq,
-            0x01E3 => Self::RecallHybridResp,
+            0x0163 => Self::GraphFetchReq,
+            0x01E3 => Self::GraphFetchResp,
 
             0x0164 => Self::MaterializeProceduralReq,
             0x01E4 => Self::MaterializeProceduralResp,
+
+            0x0178 => Self::AdminListPendingContradictionsReq,
+            0x01F8 => Self::AdminListPendingContradictionsResp,
 
             0x0120 => Self::SchemaUploadReq,
             0x01A0 => Self::SchemaUploadResp,
@@ -361,10 +433,12 @@ impl Opcode {
 
             0x0124 => Self::ExtractorListReq,
             0x01A4 => Self::ExtractorListResp,
-            0x0125 => Self::ExtractorDisableReq,
-            0x01A5 => Self::ExtractorDisableResp,
-            0x0126 => Self::ExtractorEnableReq,
-            0x01A6 => Self::ExtractorEnableResp,
+
+            0x0125 => Self::SchemaDropReq,
+            0x01A5 => Self::SchemaDropResp,
+
+            0x0127 => Self::SchemaReplaceReq,
+            0x01A7 => Self::SchemaReplaceResp,
 
             other => return Err(ProtocolError::UnknownOpcode(other)),
         })
@@ -408,12 +482,29 @@ impl Opcode {
     }
 
     /// True if this opcode is in the admin range:
-    /// low byte `0x60..=0x6D` (req) or `0xE0..=0xED` (resp),
-    /// namespace `0x00`.
+    /// low byte `0x60..=0x6F` (req) or `0xE0..=0xEF` (resp),
+    /// namespace `0x00`. Widened past `0x6D / 0xED` when the
+    /// backfill-control opcodes (`ADMIN_BACKFILL`,
+    /// `ADMIN_BACKFILL_CANCEL`) landed.
+    ///
+    /// `SchemaReplace` (`0x0127` / `0x01A7`) and `SchemaDrop` (`0x0125` /
+    /// `0x01A5`) are admin-only by design — the destructive namespace
+    /// reset and the single-declaration narrow — but their low bytes fall
+    /// outside the typed-graph admin range, so they are called out
+    /// explicitly. The additive
+    /// `SchemaUpload`/`SchemaGet`/`SchemaList`/`SchemaValidate` and the
+    /// `Extractor*` introspection ops are intentionally *not* admin.
     #[inline]
     #[must_use]
     pub fn is_admin(self) -> bool {
-        self.namespace() == 0x00 && matches!(self.low_byte(), 0x60..=0x6D | 0xE0..=0xED)
+        matches!(
+            self,
+            Opcode::SchemaReplaceReq
+                | Opcode::SchemaReplaceResp
+                | Opcode::SchemaDropReq
+                | Opcode::SchemaDropResp
+        ) || (self.namespace() == 0x00 && matches!(self.low_byte(), 0x60..=0x6F | 0xE0..=0xEF))
+            || (self.namespace() == 0x01 && matches!(self.low_byte(), 0x70..=0x7F | 0xF0..=0xFF))
     }
 
     /// True if this opcode is in the typed-graph namespace (`0x01xx`).
@@ -453,10 +544,10 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    /// Every spec-assigned opcode. If a row is added/changed in
-    /// `spec/04_wire_protocol/03_opcodes.md`, this list is the single
-    /// update site. The `from_u16_covers_all` test prevents enum/decoder
-    /// drift; this `ALL` table prevents drift from the spec.
+    /// Every assigned opcode. If a row is added or changed, this list
+    /// is the single update site. The `from_u16_covers_all` test
+    /// prevents enum/decoder drift; this `ALL` table prevents drift
+    /// from the canonical opcode table.
     const ALL: &[(u16, Opcode)] = &[
         // Connection management
         (0x0001, Opcode::Hello),
@@ -483,6 +574,10 @@ mod tests {
         (0x00A5, Opcode::LinkResp),
         (0x0026, Opcode::UnlinkReq),
         (0x00A6, Opcode::UnlinkResp),
+        (0x0027, Opcode::MemoryListReq),
+        (0x00A7, Opcode::MemoryListResp),
+        (0x0028, Opcode::MemoryInspectReq),
+        (0x00A8, Opcode::MemoryInspectResp),
         (0x002A, Opcode::EncodeVectorDirectReq),
         (0x00AA, Opcode::EncodeVectorDirectResp),
         // Subscription
@@ -490,6 +585,9 @@ mod tests {
         (0x00B0, Opcode::SubscribeEvent),
         (0x0031, Opcode::UnsubscribeReq),
         (0x00B1, Opcode::UnsubscribeResp),
+        // Capability introspection
+        (0x0032, Opcode::GetCapabilitiesReq),
+        (0x00B2, Opcode::GetCapabilitiesResp),
         // Transactions
         (0x0040, Opcode::TxnBegin),
         (0x00C0, Opcode::TxnBeginResp),
@@ -511,10 +609,10 @@ mod tests {
         (0x00E3, Opcode::AdminIntegrityCheckResp),
         (0x0064, Opcode::AdminMigrateEmbeddingsReq),
         (0x00E4, Opcode::AdminMigrateEmbeddingsResp),
-        (0x0065, Opcode::AdminCreateContextReq),
-        (0x00E5, Opcode::AdminCreateContextResp),
-        (0x0066, Opcode::AdminRenameContextReq),
-        (0x00E6, Opcode::AdminRenameContextResp),
+        (0x0065, Opcode::AdminCreateSessionReq),
+        (0x00E5, Opcode::AdminCreateSessionResp),
+        (0x0066, Opcode::AdminRenameSessionReq),
+        (0x00E6, Opcode::AdminRenameSessionResp),
         (0x0067, Opcode::AdminMoveMemoryReq),
         (0x00E7, Opcode::AdminMoveMemoryResp),
         (0x0068, Opcode::AdminReclassifyReq),
@@ -529,6 +627,23 @@ mod tests {
         (0x00EC, Opcode::AdminAbortMigrationResp),
         (0x006D, Opcode::AdminRetireFingerprintReq),
         (0x00ED, Opcode::AdminRetireFingerprintResp),
+        (0x006E, Opcode::AdminBackfillReq),
+        (0x00EE, Opcode::AdminBackfillResp),
+        (0x006F, Opcode::AdminBackfillCancelReq),
+        (0x00EF, Opcode::AdminBackfillCancelResp),
+        // Space & session registry
+        (0x0070, Opcode::SpaceCreateReq),
+        (0x00F0, Opcode::SpaceCreateResp),
+        (0x0071, Opcode::SpaceListReq),
+        (0x00F1, Opcode::SpaceListResp),
+        (0x0072, Opcode::SpaceDeleteReq),
+        (0x00F2, Opcode::SpaceDeleteResp),
+        (0x0073, Opcode::SessionCreateReq),
+        (0x00F3, Opcode::SessionCreateResp),
+        (0x0074, Opcode::SessionListReq),
+        (0x00F4, Opcode::SessionListResp),
+        (0x0075, Opcode::SessionDeleteReq),
+        (0x00F5, Opcode::SessionDeleteResp),
         // Errors
         (0x00FF, Opcode::Error),
         // Typed-graph — schema
@@ -543,10 +658,12 @@ mod tests {
         // Typed-graph — extractor governance
         (0x0124, Opcode::ExtractorListReq),
         (0x01A4, Opcode::ExtractorListResp),
-        (0x0125, Opcode::ExtractorDisableReq),
-        (0x01A5, Opcode::ExtractorDisableResp),
-        (0x0126, Opcode::ExtractorEnableReq),
-        (0x01A6, Opcode::ExtractorEnableResp),
+        // Typed-graph — single-declaration schema drop
+        (0x0125, Opcode::SchemaDropReq),
+        (0x01A5, Opcode::SchemaDropResp),
+        // Typed-graph — destructive schema replace
+        (0x0127, Opcode::SchemaReplaceReq),
+        (0x01A7, Opcode::SchemaReplaceResp),
         // Typed-graph — entity
         (0x0130, Opcode::EntityCreateReq),
         (0x01B0, Opcode::EntityCreateResp),
@@ -596,18 +713,19 @@ mod tests {
         (0x01D5, Opcode::RelationListToResp),
         (0x0156, Opcode::RelationTraverseReq),
         (0x01D6, Opcode::RelationTraverseResp),
-        // Typed-graph — hybrid query
-        (0x0160, Opcode::QueryReq),
-        (0x01E0, Opcode::QueryResp),
+        // Typed-graph — retrieval query
         (0x0161, Opcode::QueryExplainReq),
         (0x01E1, Opcode::QueryExplainResp),
         (0x0162, Opcode::QueryTraceReq),
         (0x01E2, Opcode::QueryTraceResp),
-        (0x0163, Opcode::RecallHybridReq),
-        (0x01E3, Opcode::RecallHybridResp),
+        (0x0163, Opcode::GraphFetchReq),
+        (0x01E3, Opcode::GraphFetchResp),
         // Typed-graph — procedural memory materialization
         (0x0164, Opcode::MaterializeProceduralReq),
         (0x01E4, Opcode::MaterializeProceduralResp),
+        // Typed-graph — admin (contradiction reconciliation)
+        (0x0178, Opcode::AdminListPendingContradictionsReq),
+        (0x01F8, Opcode::AdminListPendingContradictionsResp),
     ];
 
     #[test]
@@ -629,10 +747,11 @@ mod tests {
             Opcode::from_u16(0x0000),
             Err(ProtocolError::UnknownOpcode(0x0000))
         ));
-        // 0x0070 is in the reserved server-bound range of the 0x00xx namespace.
+        // 0x0076 is still-unassigned in the server-bound range of the 0x00xx
+        // namespace (the registry ops occupy 0x70–0x75).
         assert!(matches!(
-            Opcode::from_u16(0x0070),
-            Err(ProtocolError::UnknownOpcode(0x0070))
+            Opcode::from_u16(0x0076),
+            Err(ProtocolError::UnknownOpcode(0x0076))
         ));
         // 0x0139 is a not-yet-assigned typed-graph entity opcode.
         assert!(matches!(
@@ -666,8 +785,26 @@ mod tests {
         assert!(!Opcode::EncodeReq.is_admin());
         assert!(!Opcode::Ping.is_admin());
         assert!(!Opcode::Error.is_admin());
-        // Typed-graph ops are never admin.
+        // Typed-graph *data* ops are never admin...
         assert!(!Opcode::EntityCreateReq.is_admin());
+        // ...but typed-graph admin ops (0x017x / 0x01Fx) are.
+        assert!(Opcode::AdminListPendingContradictionsReq.is_admin());
+        assert!(Opcode::AdminListPendingContradictionsResp.is_admin());
+    }
+
+    #[test]
+    fn schema_replace_is_admin_but_upload_is_not() {
+        // SCHEMA_REPLACE is the destructive namespace reset — admin-only by
+        // design — even though its low byte falls outside the typed-graph
+        // admin range. The additive SCHEMA_UPLOAD must stay non-admin.
+        assert!(Opcode::SchemaReplaceReq.is_admin());
+        assert!(Opcode::SchemaReplaceResp.is_admin());
+        assert!(!Opcode::SchemaUploadReq.is_admin());
+        assert!(!Opcode::SchemaUploadResp.is_admin());
+        // SCHEMA_DROP narrows one declaration — admin-only for the same
+        // reason, low byte likewise outside the typed-graph admin range.
+        assert!(Opcode::SchemaDropReq.is_admin());
+        assert!(Opcode::SchemaDropResp.is_admin());
     }
 
     #[test]
@@ -677,7 +814,7 @@ mod tests {
         assert!(Opcode::EntityCreateReq.is_typed_graph());
         assert!(Opcode::EntityRenameResp.is_typed_graph());
         assert!(Opcode::StatementCreateReq.is_typed_graph());
-        assert!(Opcode::QueryReq.is_typed_graph());
+        assert!(Opcode::QueryExplainReq.is_typed_graph());
     }
 
     #[test]
@@ -693,6 +830,12 @@ mod tests {
         assert!(Opcode::AdminAbortMigrationResp.is_admin());
         assert!(Opcode::AdminRetireFingerprintReq.is_admin());
         assert!(Opcode::AdminRetireFingerprintResp.is_admin());
+        // The backfill-control opcodes widened the range to 0x6F / 0xEF;
+        // confirm they classify as admin too.
+        assert!(Opcode::AdminBackfillReq.is_admin());
+        assert!(Opcode::AdminBackfillResp.is_admin());
+        assert!(Opcode::AdminBackfillCancelReq.is_admin());
+        assert!(Opcode::AdminBackfillCancelResp.is_admin());
     }
 
     /// Drift guard: every enum variant MUST appear in `ALL`. If a new

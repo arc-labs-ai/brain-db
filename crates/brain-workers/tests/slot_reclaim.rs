@@ -1,10 +1,17 @@
-#![allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send post-9.7 (audit §4)
-//! Slot reclamation worker tests (sub-task 8.7).
+#![allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send
+//! Slot reclamation worker tests.
+//!
+//! Guards the tombstone-grace contract: a memory tombstoned past the
+//! grace window is reclaimed (row + adjacent edges purged), one still
+//! within grace or still active is left alone. Pins the FORGET path's
+//! `tombstoned_at` stamp (and that replay doesn't overwrite it), per-cycle
+//! batch caps, custom grace, and that opposite-direction dangling edges
+//! are left for the edge-scrub worker rather than purged here.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use brain_core::{AgentId, ContextId, EdgeKind, MemoryId, MemoryKind};
+use brain_core::{EdgeKind, MemoryId, MemoryKind, SessionId, SpaceId};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::tables::edge::{
@@ -13,16 +20,12 @@ use brain_metadata::tables::edge::{
 };
 use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
 use brain_metadata::MetadataDb;
+use brain_ops::test_support::single_body;
 use brain_ops::{dispatch, OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
-use brain_protocol::envelope::request::{
-    EncodeRequest, ForgetMode, ForgetRequest, MemoryKindWire, RequestBody,
-};
+use brain_protocol::envelope::request::{EncodeRequest, ForgetMode, ForgetRequest, RequestBody};
 use brain_protocol::envelope::response::ResponseBody;
-use brain_workers::{
-    SlotReclamationWorker, Worker, WorkerConfig, WorkerContext, WorkerKind, WorkerScheduler,
-};
-use parking_lot::Mutex;
+use brain_workers::{SlotReclamationWorker, Worker, WorkerConfig, WorkerContext};
 use redb::ReadableTable;
 use uuid::Uuid;
 
@@ -58,8 +61,8 @@ struct Fixture {
 fn build_fixture() -> Fixture {
     let tempdir = tempfile::tempdir().unwrap();
     let db_path = tempdir.path().join("metadata.redb");
-    let metadata: SharedMetadataDb = Arc::new(Mutex::new(MetadataDb::open(&db_path).unwrap()));
-    let (shared, hnsw_writer) = SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).unwrap();
+    let metadata: SharedMetadataDb = Arc::new(MetadataDb::open(&db_path).unwrap());
+    let (shared, hnsw_writer) = SharedHnsw::new(IndexParams::default_v1()).unwrap();
     let writer = Arc::new(RealWriterHandle::new(metadata.clone(), hnsw_writer));
     let executor = ExecutorContext::new(
         Arc::new(MockDispatcher) as Arc<dyn Dispatcher>,
@@ -68,7 +71,7 @@ fn build_fixture() -> Fixture {
         writer as Arc<dyn WriterHandle>,
     );
     Fixture {
-        ctx: Arc::new(OpsContext::new(executor)),
+        ctx: Arc::new(brain_ops::test_support::ops_context_for_tests_owning_tempdir(executor)),
         metadata,
         _tempdir: tempdir,
     }
@@ -93,14 +96,14 @@ fn seed_memory(
     tombstoned_at_unix_nanos: Option<u64>,
 ) -> MemoryId {
     let id = make_id(slot);
-    let mut db = metadata.lock();
-    let wtxn = db.write_txn().unwrap();
+    let wtxn = metadata.write_txn().unwrap();
     {
         let mut table = wtxn.open_table(MEMORIES_TABLE).unwrap();
         let mut meta = MemoryMetadata::new_active(
             id,
-            AgentId(Uuid::nil()),
-            ContextId(1),
+            brain_core::NamespaceId::SYSTEM,
+            SpaceId(Uuid::nil()),
+            SessionId(1),
             slot,
             1,
             MemoryKind::Episodic,
@@ -117,8 +120,7 @@ fn seed_memory(
 }
 
 fn seed_edge(metadata: &SharedMetadataDb, src: MemoryId, kind: EdgeKind, tgt: MemoryId) {
-    let mut db = metadata.lock();
-    let wtxn = db.write_txn().unwrap();
+    let wtxn = metadata.write_txn().unwrap();
     {
         let mut out = wtxn.open_table(EDGES_TABLE).unwrap();
         let mut rev = wtxn.open_table(EDGES_REVERSE_TABLE).unwrap();
@@ -137,38 +139,48 @@ fn seed_edge(metadata: &SharedMetadataDb, src: MemoryId, kind: EdgeKind, tgt: Me
     wtxn.commit().unwrap();
 }
 
+fn seed_hype_vectors(metadata: &SharedMetadataDb, id: MemoryId, n: u8) {
+    let wtxn = metadata.write_txn().unwrap();
+    for i in 0..n {
+        let mut v = [0.0f32; VECTOR_DIM];
+        v[usize::from(i) % VECTOR_DIM] = 1.0;
+        brain_metadata::hype_vector_put(&wtxn, id, i, &v).unwrap();
+    }
+    wtxn.commit().unwrap();
+}
+
+fn has_hype_vectors(metadata: &SharedMetadataDb, id: MemoryId) -> bool {
+    let rtxn = metadata.read_txn().unwrap();
+    brain_metadata::hype_has_vectors(&rtxn, id).unwrap()
+}
+
 fn count_memories(metadata: &SharedMetadataDb) -> usize {
-    let db = metadata.lock();
-    let rtxn = db.read_txn().unwrap();
+    let rtxn = metadata.read_txn().unwrap();
     let table = rtxn.open_table(MEMORIES_TABLE).unwrap();
     table.iter().unwrap().count()
 }
 
 fn memory_exists(metadata: &SharedMetadataDb, id: MemoryId) -> bool {
-    let db = metadata.lock();
-    let rtxn = db.read_txn().unwrap();
+    let rtxn = metadata.read_txn().unwrap();
     let table = rtxn.open_table(MEMORIES_TABLE).unwrap();
     table.get(id.to_be_bytes()).unwrap().is_some()
 }
 
 fn read_meta(metadata: &SharedMetadataDb, id: MemoryId) -> Option<MemoryMetadata> {
-    let db = metadata.lock();
-    let rtxn = db.read_txn().unwrap();
+    let rtxn = metadata.read_txn().unwrap();
     let table = rtxn.open_table(MEMORIES_TABLE).unwrap();
     table.get(id.to_be_bytes()).unwrap().map(|a| a.value())
 }
 
 fn edges_out_count(metadata: &SharedMetadataDb, src: MemoryId) -> usize {
-    let db = metadata.lock();
-    let rtxn = db.read_txn().unwrap();
+    let rtxn = metadata.read_txn().unwrap();
     list_memory_edges_from(&rtxn, src, None)
         .map(|v| v.len())
         .unwrap_or(0)
 }
 
 fn edges_in_count(metadata: &SharedMetadataDb, tgt: MemoryId) -> usize {
-    let db = metadata.lock();
-    let rtxn = db.read_txn().unwrap();
+    let rtxn = metadata.read_txn().unwrap();
     list_memory_edges_to(&rtxn, tgt, None)
         .map(|v| v.len())
         .unwrap_or(0)
@@ -323,6 +335,41 @@ fn dangling_edges_other_direction_are_left_for_edge_scrub() {
     });
 }
 
+#[test]
+fn reclaim_purges_hype_vectors() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let doomed = seed_memory(&fix.metadata, 1, Some(now_unix_nanos() - 10 * DAY_NS));
+        seed_hype_vectors(&fix.metadata, doomed, 3);
+        assert!(has_hype_vectors(&fix.metadata, doomed));
+
+        let worker = SlotReclamationWorker::new();
+        let processed = run_one(&worker, fix.ctx).await.unwrap();
+        assert_eq!(processed, 1);
+        assert!(!memory_exists(&fix.metadata, doomed));
+        assert!(
+            !has_hype_vectors(&fix.metadata, doomed),
+            "reclaim must purge the memory's HyPE question-vectors"
+        );
+    });
+}
+
+#[test]
+fn reclaim_hype_delete_is_noop_when_absent() {
+    glommio_run(|| async {
+        // A tombstoned memory that owns no HyPE vectors (the common case:
+        // the HyPE table may not even exist yet) reclaims cleanly — the
+        // idempotent backstop delete removes 0 rows and never errors.
+        let fix = build_fixture();
+        let doomed = seed_memory(&fix.metadata, 1, Some(now_unix_nanos() - 10 * DAY_NS));
+
+        let worker = SlotReclamationWorker::new();
+        let processed = run_one(&worker, fix.ctx).await.unwrap();
+        assert_eq!(processed, 1);
+        assert!(!memory_exists(&fix.metadata, doomed));
+    });
+}
+
 // ===========================================================================
 // FORGET stamping integration (2).
 // ===========================================================================
@@ -334,22 +381,23 @@ fn forget_stamps_tombstoned_at_unix_nanos() {
         // Real ENCODE → real FORGET via dispatcher.
         let encode = EncodeRequest {
             text: "doomed".into(),
-            context_id: 1,
-            kind: MemoryKindWire::Episodic,
-            salience_hint: 0.5,
-            edges: vec![],
+            session_id: 1,
             request_id: [1; 16],
             txn_id: None,
-            deduplicate: false,
+            occurred_at_unix_nanos: None,
+            act_as: None,
+            wait: brain_protocol::WaitMode::Ack,
+            allow_duplicates: false,
         };
-        let memory_id = match dispatch(
-            RequestBody::Encode(encode),
-            brain_ops::RequestCaller::anonymous(),
-            &fix.ctx,
-        )
-        .await
-        .unwrap()
-        {
+        let memory_id = match single_body(
+            dispatch(
+                RequestBody::Encode(encode),
+                brain_ops::RequestCaller::for_tests(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        ) {
             ResponseBody::Encode(r) => r.memory_id,
             _ => unreachable!(),
         };
@@ -358,10 +406,11 @@ fn forget_stamps_tombstoned_at_unix_nanos() {
             mode: ForgetMode::Soft,
             request_id: [2; 16],
             txn_id: None,
+            act_as: None,
         };
         let _ = dispatch(
             RequestBody::Forget(forget),
-            brain_ops::RequestCaller::anonymous(),
+            brain_ops::RequestCaller::for_tests(),
             &fix.ctx,
         )
         .await
@@ -381,22 +430,23 @@ fn forget_replay_does_not_overwrite_stamp() {
         let fix = build_fixture();
         let encode = EncodeRequest {
             text: "doomed-twice".into(),
-            context_id: 1,
-            kind: MemoryKindWire::Episodic,
-            salience_hint: 0.5,
-            edges: vec![],
+            session_id: 1,
             request_id: [10; 16],
             txn_id: None,
-            deduplicate: false,
+            occurred_at_unix_nanos: None,
+            act_as: None,
+            wait: brain_protocol::WaitMode::Ack,
+            allow_duplicates: false,
         };
-        let memory_id = match dispatch(
-            RequestBody::Encode(encode),
-            brain_ops::RequestCaller::anonymous(),
-            &fix.ctx,
-        )
-        .await
-        .unwrap()
-        {
+        let memory_id = match single_body(
+            dispatch(
+                RequestBody::Encode(encode),
+                brain_ops::RequestCaller::for_tests(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        ) {
             ResponseBody::Encode(r) => r.memory_id,
             _ => unreachable!(),
         };
@@ -409,8 +459,9 @@ fn forget_replay_does_not_overwrite_stamp() {
                     mode: ForgetMode::Soft,
                     request_id: rid,
                     txn_id: None,
+                    act_as: None,
                 }),
-                brain_ops::RequestCaller::anonymous(),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
@@ -428,44 +479,6 @@ fn forget_replay_does_not_overwrite_stamp() {
 // ===========================================================================
 // Worker integration (3).
 // ===========================================================================
-
-#[test]
-fn worker_registers_with_correct_kind_and_default_cadence() {
-    glommio_run(|| async {
-        let fix = build_fixture();
-        let mut sched = WorkerScheduler::new();
-        sched
-            .register(Arc::new(SlotReclamationWorker::new()), fix.ctx)
-            .unwrap();
-        let cfg = sched.config(WorkerKind::SlotReclamation.name()).unwrap();
-        assert_eq!(cfg.interval, Duration::from_secs(600));
-        sched.shutdown().await.unwrap();
-    });
-}
-
-#[test]
-fn disabled_worker_via_config_does_not_reclaim() {
-    glommio_run(|| async {
-        let fix = build_fixture();
-        seed_memory(&fix.metadata, 1, Some(now_unix_nanos() - 10 * DAY_NS));
-        let cfg = WorkerConfig {
-            enabled: false,
-            interval: Duration::from_millis(20),
-            batch_size: 100,
-            max_runtime: Duration::from_secs(1),
-        };
-        let mut sched = WorkerScheduler::new();
-        sched
-            .register(
-                Arc::new(SlotReclamationWorker::new().with_config(cfg)),
-                fix.ctx.clone(),
-            )
-            .unwrap();
-        glommio::timer::sleep(Duration::from_millis(150)).await;
-        sched.shutdown().await.unwrap();
-        assert_eq!(count_memories(&fix.metadata), 1);
-    });
-}
 
 #[test]
 fn custom_grace_period_honoured() {

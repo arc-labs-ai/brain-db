@@ -1,5 +1,5 @@
-//! Integration tests for `handle_plan` (sub-task 7.5; refactored in
-//! 7.8 to insert edges through the wire LINK path).
+//! Integration tests for `handle_plan`. Edges are inserted through the
+//! wire LINK path.
 //!
 //! Drives the full pipeline:
 //!   dispatcher → handle_plan → plan_path_inner → execute_path
@@ -12,21 +12,22 @@
 
 use std::sync::Arc;
 
-use brain_core::{AgentId, ContextId, EdgeKind, MemoryId, MemoryKind};
+use brain_core::{EdgeKind, MemoryId, MemoryKind, SessionId, SpaceId};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
+use brain_metadata::tables::text::TEXTS_TABLE;
 use brain_metadata::MetadataDb;
 use brain_ops::test_support::run_in_glommio;
-use brain_ops::{dispatch, ErrorCode, OpError, OpsContext, RealWriterHandle};
+use brain_ops::{dispatch, DispatchOutcome, ErrorCode, OpError, OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_protocol::envelope::request::{
     EdgeKindWire, LinkRequest, PlanBudget, PlanRequest, PlanState, RequestBody,
 };
 use brain_protocol::envelope::response::{
-    PlanResponseFrame, PlanStatus as WirePlanStatus, ResponseBody, TransitionKind,
+    PlanResponseFrame, PlanStatus as WirePlanStatus, PlanTraceDirection, ResponseBody,
+    TransitionKind,
 };
-use parking_lot::Mutex;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -68,22 +69,24 @@ fn make_id(i: u64) -> MemoryId {
 async fn build_fixture(n_memories: usize, edges: &[(usize, EdgeKind, usize)]) -> Fixture {
     let tempdir = tempfile::tempdir().unwrap();
     let db_path = tempdir.path().join("metadata.redb");
-    let mut metadata = MetadataDb::open(&db_path).unwrap();
+    let metadata = MetadataDb::open(&db_path).unwrap();
 
-    let agent = AgentId(Uuid::nil());
+    let space = SpaceId(Uuid::nil());
     let mut ids = Vec::with_capacity(n_memories);
 
     // Insert memory rows directly so we can pin specific MemoryIds.
     let wtxn = metadata.write_txn().unwrap();
     {
         let mut table = wtxn.open_table(MEMORIES_TABLE).unwrap();
+        let mut texts = wtxn.open_table(TEXTS_TABLE).unwrap();
         for i in 0..n_memories {
             let id = make_id((i as u64) + 1);
             ids.push(id);
             let meta = MemoryMetadata::new_active(
                 id,
-                agent,
-                ContextId(42),
+                brain_core::NamespaceId::SYSTEM,
+                space,
+                SessionId(42),
                 (i + 1) as u64,
                 1,
                 MemoryKind::Episodic,
@@ -93,12 +96,14 @@ async fn build_fixture(n_memories: usize, edges: &[(usize, EdgeKind, usize)]) ->
                 1_000_000 + i as u64,
             );
             table.insert(id.to_be_bytes(), meta).unwrap();
+            let text = format!("plan fixture memory {i}");
+            texts.insert(id.to_be_bytes(), text.as_bytes()).unwrap();
         }
     }
     wtxn.commit().unwrap();
 
-    let (shared, hnsw_writer) = SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).unwrap();
-    let metadata: SharedMetadataDb = Arc::new(Mutex::new(metadata));
+    let (shared, hnsw_writer) = SharedHnsw::new(IndexParams::default_v1()).unwrap();
+    let metadata: SharedMetadataDb = Arc::new(metadata);
     let writer = Arc::new(RealWriterHandle::new(metadata.clone(), hnsw_writer));
     let executor = ExecutorContext::new(
         Arc::new(NopDispatcher) as Arc<dyn Dispatcher>,
@@ -106,7 +111,7 @@ async fn build_fixture(n_memories: usize, edges: &[(usize, EdgeKind, usize)]) ->
         metadata,
         writer as Arc<dyn WriterHandle>,
     );
-    let ctx = OpsContext::new(executor);
+    let ctx = brain_ops::test_support::ops_context_for_tests_owning_tempdir(executor);
 
     // Create edges via the wire LINK path so we exercise the real
     // code (idempotency + count maintenance + redb writes).
@@ -121,10 +126,11 @@ async fn build_fixture(n_memories: usize, edges: &[(usize, EdgeKind, usize)]) ->
             weight: 1.0,
             request_id,
             txn_id: None,
+            act_as: None,
         };
         let _ = dispatch(
             RequestBody::Link(req),
-            brain_ops::RequestCaller::anonymous(),
+            brain_ops::RequestCaller::for_tests(),
             &ctx,
         )
         .await
@@ -139,6 +145,15 @@ async fn build_fixture(n_memories: usize, edges: &[(usize, EdgeKind, usize)]) ->
 }
 
 fn plan_request(start: MemoryId, goal: MemoryId, max_depth: u32) -> PlanRequest {
+    plan_request_traced(start, goal, max_depth, false)
+}
+
+fn plan_request_traced(
+    start: MemoryId,
+    goal: MemoryId,
+    max_depth: u32,
+    trace: bool,
+) -> PlanRequest {
     PlanRequest {
         start: PlanState::ByMemoryId(start.into()),
         goal: PlanState::ByMemoryId(goal.into()),
@@ -148,16 +163,50 @@ fn plan_request(start: MemoryId, goal: MemoryId, max_depth: u32) -> PlanRequest 
             max_branches_explored: 256,
         },
         strategy_hint: None,
-        context_filter: None,
+        session_filter: None,
         request_id: None,
         txn_id: None,
+        trace,
+        act_as: None,
     }
 }
 
-fn unwrap_plan_resp(body: ResponseBody) -> PlanResponseFrame {
-    match body {
-        ResponseBody::Plan(p) => p,
-        other => panic!("expected ResponseBody::Plan, got {other:?}"),
+/// Collapse the streamed PLAN frames into a single observation:
+/// concatenated steps from every mid-stream frame and the terminal
+/// frame's `plan_status` + `is_final`. Mirrors the v1 single-frame
+/// shape so the existing assertions read unchanged.
+fn collect_plan_outcome(outcome: DispatchOutcome) -> PlanResponseFrame {
+    let frames = unwrap_plan_stream(outcome);
+    let mut steps = Vec::new();
+    let mut terminal = None;
+    for f in frames {
+        if f.is_final {
+            terminal = Some(f);
+        } else {
+            steps.extend(f.steps);
+        }
+    }
+    let terminal = terminal.expect("PLAN stream must end with a terminal frame");
+    PlanResponseFrame {
+        steps,
+        is_final: terminal.is_final,
+        plan_status: terminal.plan_status,
+        trace: terminal.trace,
+    }
+}
+
+fn unwrap_plan_stream(outcome: DispatchOutcome) -> Vec<PlanResponseFrame> {
+    match outcome {
+        DispatchOutcome::Stream(bodies) => bodies
+            .into_iter()
+            .map(|b| match b {
+                ResponseBody::Plan(p) => p,
+                other => panic!("expected ResponseBody::Plan in stream, got {other:?}"),
+            })
+            .collect(),
+        DispatchOutcome::Single(other) => {
+            panic!("expected DispatchOutcome::Stream of Plan frames, got Single({other:?})")
+        }
     }
 }
 
@@ -170,10 +219,10 @@ fn plan_full_pipeline_returns_path() {
     run_in_glommio(|| async {
         let fix = build_fixture(3, &[(0, EdgeKind::Caused, 1), (1, EdgeKind::FollowedBy, 2)]).await;
         let req = plan_request(fix.ids[0], fix.ids[2], 4);
-        let frame = unwrap_plan_resp(
+        let frame = collect_plan_outcome(
             dispatch(
                 RequestBody::Plan(req),
-                brain_ops::RequestCaller::anonymous(),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
@@ -201,10 +250,10 @@ fn plan_no_path_returns_no_path_status() {
     run_in_glommio(|| async {
         let fix = build_fixture(3, &[(0, EdgeKind::Caused, 1)]).await;
         let req = plan_request(fix.ids[0], fix.ids[2], 4);
-        let frame = unwrap_plan_resp(
+        let frame = collect_plan_outcome(
             dispatch(
                 RequestBody::Plan(req),
-                brain_ops::RequestCaller::anonymous(),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
@@ -224,10 +273,10 @@ fn plan_step_transitions_map_correctly() {
     run_in_glommio(|| async {
         let fix = build_fixture(2, &[(0, EdgeKind::Caused, 1)]).await;
         let req = plan_request(fix.ids[0], fix.ids[1], 2);
-        let frame = unwrap_plan_resp(
+        let frame = collect_plan_outcome(
             dispatch(
                 RequestBody::Plan(req),
-                brain_ops::RequestCaller::anonymous(),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
@@ -250,7 +299,7 @@ fn plan_invalid_budget_returns_plan_error() {
         req.budget.max_steps = 0;
         let err = dispatch(
             RequestBody::Plan(req),
-            brain_ops::RequestCaller::anonymous(),
+            brain_ops::RequestCaller::for_tests(),
             &fix.ctx,
         )
         .await
@@ -274,10 +323,10 @@ fn plan_by_memory_id_skips_recall() {
         // Plan with ByMemoryId on both endpoints; even though the
         // dispatcher is a no-op, the executor should not need to embed.
         let req = plan_request(fix.ids[0], fix.ids[1], 2);
-        let frame = unwrap_plan_resp(
+        let frame = collect_plan_outcome(
             dispatch(
                 RequestBody::Plan(req),
-                brain_ops::RequestCaller::anonymous(),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
@@ -289,5 +338,83 @@ fn plan_by_memory_id_skips_recall() {
         let id1: u128 = fix.ids[1].into();
         assert_eq!(frame.steps[0].memory_id, id0);
         assert_eq!(frame.steps[1].memory_id, id1);
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 6. trace = false (default): terminal frame carries no trace payload.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn plan_trace_false_omits_trace_payload() {
+    run_in_glommio(|| async {
+        let fix = build_fixture(3, &[(0, EdgeKind::Caused, 1), (1, EdgeKind::FollowedBy, 2)]).await;
+        let req = plan_request(fix.ids[0], fix.ids[2], 4);
+        let frame = collect_plan_outcome(
+            dispatch(
+                RequestBody::Plan(req),
+                brain_ops::RequestCaller::for_tests(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(frame.trace.is_none());
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 7. trace = true: terminal frame carries the full bidirectional-BFS trace,
+//    with real (non-empty) text on every explored node and meeting point.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn plan_trace_true_populates_explored_and_meeting_points() {
+    run_in_glommio(|| async {
+        let fix = build_fixture(3, &[(0, EdgeKind::Caused, 1), (1, EdgeKind::FollowedBy, 2)]).await;
+        let req = plan_request_traced(fix.ids[0], fix.ids[2], 4, true);
+        let frame = collect_plan_outcome(
+            dispatch(
+                RequestBody::Plan(req),
+                brain_ops::RequestCaller::for_tests(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(frame.plan_status, Some(WirePlanStatus::GoalReached));
+
+        let trace = frame
+            .trace
+            .expect("trace = true must populate the trace payload");
+        assert!(!trace.explored.is_empty());
+        assert!(!trace.meeting_points.is_empty());
+
+        let id0: u128 = fix.ids[0].raw();
+        let id2: u128 = fix.ids[2].raw();
+
+        // The forward seed (start) is explored at depth 0 with no parent.
+        let seed = trace
+            .explored
+            .iter()
+            .find(|n| n.memory_id == id0 && n.direction == PlanTraceDirection::Forward)
+            .expect("forward seed must be in the explored set");
+        assert_eq!(seed.depth, 0);
+        assert!(seed.parent_edge.is_none());
+        assert!(!seed.text.is_empty());
+
+        // Every explored node carries real text.
+        for n in &trace.explored {
+            assert!(!n.text.is_empty(), "explored node missing text");
+        }
+
+        // The goal node is a meeting point that made it into the result.
+        let meet = trace
+            .meeting_points
+            .iter()
+            .find(|m| m.memory_id == id2)
+            .expect("goal node must be a meeting point");
+        assert!(meet.included_in_result);
+        assert!(!meet.text.is_empty());
     })
 }

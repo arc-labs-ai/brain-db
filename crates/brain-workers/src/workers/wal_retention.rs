@@ -1,4 +1,4 @@
-//! WAL retention worker (sub-task 8.8).
+//! WAL retention worker.
 //!
 //! Deletes WAL segments whose entire LSN range is covered by the
 //! latest checkpoint, minus a configurable retention buffer.
@@ -10,14 +10,14 @@
 //! - There's no public `Wal::list_segments` / `delete_segment` API.
 //! - brain-ops's `RealWriterHandle` doesn't hold a `Wal` instance yet.
 //!
-//! Both land in Phase 9. v1 therefore exposes:
+//! Both are wired later. v1 therefore exposes:
 //! - A pure [`decide_deletions`] function that matches.
-//! - A pluggable [`WalRetentionSource`] trait where Phase 9 wires
-//!   the real WAL.
+//! - A pluggable [`WalRetentionSource`] trait where the real WAL is
+//!   wired in.
 //! - A [`DisabledWalRetentionSource`] default that makes the worker
 //!   a no-op until the source is replaced.
 //!
-//! Same shape as the HNSW maintenance worker (sub-task 8.5).
+//! Same shape as the HNSW maintenance worker.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -55,10 +55,21 @@ pub struct CheckpointDesc {
 // ---------------------------------------------------------------------------
 
 /// Return the ids of segments fully covered by the checkpoint, minus
-/// the retention buffer. A segment is deletable iff `last_lsn <
-/// (durable_lsn - retention_extra_lsns)`: "A segment is
-/// covered when its highest LSN is less than the checkpoint's
-/// `durable_lsn`."
+/// the retention buffer. A segment is deletable iff it is **not** the
+/// active segment **and** its true `last_lsn <
+/// (durable_lsn - retention_extra_lsns)`: every record it holds is
+/// already covered by the checkpoint.
+///
+/// Two safety rails, both about invariant #7 (no silent data loss):
+///
+/// - **Straddlers stay.** The comparison uses the segment's *true*
+///   `last_lsn` (supplied by the source). A segment straddling the
+///   cutoff (`first_lsn < cutoff <= last_lsn`) still holds records past
+///   the checkpoint that live only in the WAL, so it is kept. An
+///   under-reported `last_lsn` would wrongly delete such a segment.
+/// - **Active segment stays.** The highest-seq segment is the live
+///   append target; records appended after the last checkpoint live only
+///   there. It is never eligible, regardless of its reported `last_lsn`.
 ///
 /// The cutoff saturates at 0 when the buffer exceeds the checkpoint
 /// (early life of a shard), so nothing is deleted.
@@ -69,15 +80,17 @@ pub fn decide_deletions(
     retention_extra_lsns: u64,
 ) -> Vec<u64> {
     let safe_cutoff = checkpoint.durable_lsn.saturating_sub(retention_extra_lsns);
+    let active_segment_id = segments.iter().map(|s| s.segment_id).max();
     segments
         .iter()
+        .filter(|s| Some(s.segment_id) != active_segment_id)
         .filter(|s| s.last_lsn < safe_cutoff)
         .map(|s| s.segment_id)
         .collect()
 }
 
 // ---------------------------------------------------------------------------
-// Source trait — Phase 9 injects a brain-storage-backed impl.
+// Source trait — a brain-storage-backed impl is injected here.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Error)]
@@ -104,11 +117,11 @@ pub type SegmentListFuture<'a> =
 pub type DeleteFuture<'a> = Pin<Box<dyn Future<Output = Result<(), WalRetentionSourceError>> + 'a>>;
 
 /// Pluggable seam for the WAL retention worker. Production
-/// deployments inject an impl backed by `brain_storage::Wal` (Phase
-/// 9.8 `WalDirRetentionSource`). Same `Pin<Box<Future>>` pattern as
+/// deployments inject an impl backed by `brain_storage::Wal`
+/// (`WalDirRetentionSource`). Same `Pin<Box<Future>>` pattern as
 /// `Summarizer` / `RebuildSource`.
 ///
-/// Post-9.8 the trait is `!Send + !Sync`: the per-shard Glommio
+/// The trait is `!Send + !Sync`: the per-shard Glommio
 /// executor is single-threaded, so the trait only needs `'static`
 /// for `Arc<dyn …>` storage inside the worker.
 pub trait WalRetentionSource: 'static {
@@ -159,9 +172,9 @@ impl WalRetentionWorker {
         self
     }
 
-    /// Override the LSN retention buffer. v1 default is 0
-    /// talks bytes ("256 MiB"); LSN/byte ratio depends on record
-    /// size, so Phase 9's source impl will convert from
+    /// Override the LSN retention buffer. v1 default is 0. The
+    /// retention buffer is expressed in bytes ("256 MiB"); the LSN/byte
+    /// ratio depends on record size, so the source impl converts from
     /// `wal.segment_size`.
     #[must_use]
     pub fn with_retention_extra_lsns(mut self, n: u64) -> Self {

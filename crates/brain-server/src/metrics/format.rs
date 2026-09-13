@@ -42,7 +42,7 @@ pub struct Snapshot<'a> {
     pub shards: &'a [ShardHandle],
     pub connections: &'a ConnectionMetrics,
     pub request_metrics: &'a RequestMetrics,
-    /// 12.1c — read-only borrow of the loaded config, surfaces as
+    /// Read-only borrow of the loaded config, surfaces as
     /// `brain_config_info` labels.
     pub config: &'a Config,
 }
@@ -62,14 +62,48 @@ pub async fn format(snap: &Snapshot<'_>) -> String {
     emit_process_resource(&mut s);
     emit_worker_counters(&mut s, snap.shards).await;
     emit_hnsw_counts(&mut s, snap.shards).await;
+    emit_storage_gauges(&mut s, snap.shards).await;
     emit_request_metrics(&mut s, snap.request_metrics);
     emit_auto_edge_metrics(&mut s, snap.shards);
     emit_extractor_metrics(&mut s, snap.shards);
     emit_temporal_edge_metrics(&mut s, snap.shards);
     emit_causal_edge_metrics(&mut s, snap.shards);
     emit_statement_embed_metrics(&mut s, snap.shards);
+    emit_retriever_metrics(&mut s, snap.shards);
+    emit_query_metrics(&mut s, snap.shards);
+    emit_tracing_metrics(&mut s);
 
     s
+}
+
+/// OpenTelemetry trace-pipeline self-metrics. Process-global (the OTel
+/// error handler is a singleton), so this reads the shared counters
+/// directly rather than from the per-server `Snapshot`.
+fn emit_tracing_metrics(out: &mut String) {
+    let m = super::otel::global();
+    emit_header(
+        out,
+        "brain_tracing_spans_dropped_total",
+        "Spans dropped because the OTLP export buffer was full.",
+        "counter",
+    );
+    let _ = writeln!(
+        out,
+        "brain_tracing_spans_dropped_total {}",
+        m.spans_dropped.get()
+    );
+
+    emit_header(
+        out,
+        "brain_tracing_export_errors_total",
+        "OTLP export attempts that failed or timed out.",
+        "counter",
+    );
+    let _ = writeln!(
+        out,
+        "brain_tracing_export_errors_total {}",
+        m.export_errors.get()
+    );
 }
 
 fn emit_build_info(out: &mut String, info: BuildInfo) {
@@ -147,9 +181,20 @@ fn emit_connection_basic(out: &mut String, connections: &ConnectionMetrics) {
         connections.total.load(Ordering::Relaxed),
     );
 
-    // 12.7 (deferred-set burn-down): connection-extended families
-    // `brain_frame_size_bytes` histogram is
-    // still deferred — tracker `phase-12/histogram-unit-agnostic`.
+    emit_header(
+        out,
+        "brain_connections_rejected_total",
+        "Connections shed at accept time by the admission gate (global or per-IP cap).",
+        "counter",
+    );
+    let _ = writeln!(
+        out,
+        "brain_connections_rejected_total {}",
+        connections.rejected.load(Ordering::Relaxed),
+    );
+
+    // Connection-extended families: `brain_frame_size_bytes` histogram is
+    // still deferred.
     emit_header(
         out,
         "brain_connections_closed_total",
@@ -186,7 +231,7 @@ fn emit_connection_basic(out: &mut String, connections: &ConnectionMetrics) {
         connections.frame_recv_total.load(Ordering::Relaxed),
     );
 
-    // F-7: frame size histograms (raw-mode; `_sum` is the true byte
+    // Frame size histograms (raw-mode; `_sum` is the true byte
     // total).
     emit_header(
         out,
@@ -208,7 +253,7 @@ fn emit_connection_basic(out: &mut String, connections: &ConnectionMetrics) {
     );
 }
 
-/// 12.1c — `/proc/self`-derived resource metrics.
+/// `/proc/self`-derived resource metrics.
 /// Sampled fresh on every scrape; missing fields are skipped so a
 /// `/proc` access failure doesn't pollute dashboards with zeros.
 fn emit_process_resource(out: &mut String) {
@@ -289,7 +334,25 @@ async fn emit_worker_counters(out: &mut String, shards: &[ShardHandle]) {
     emit_header(
         out,
         "brain_worker_last_run_unixtime",
-        "Unix-time of the worker's last cycle.",
+        "Unix-time of the worker's last attempted cycle (success, error, or caught panic).",
+        "gauge",
+    );
+    emit_header(
+        out,
+        "brain_worker_panics_total",
+        "Worker cycles that panicked (a subset of errors_total). Nonzero is worth alerting on.",
+        "counter",
+    );
+    emit_header(
+        out,
+        "brain_worker_pending_work",
+        "Worker's last-observed estimate of outstanding work items.",
+        "gauge",
+    );
+    emit_header(
+        out,
+        "brain_worker_cycle_duration_ms",
+        "Duration of the worker's most recent successful cycle, in milliseconds.",
         "gauge",
     );
 
@@ -320,6 +383,21 @@ async fn emit_worker_counters(out: &mut String, shards: &[ShardHandle]) {
                         "brain_worker_last_run_unixtime{{shard=\"{shard_id}\",worker=\"{name}\"}} {}",
                         snap.last_run_unix_secs
                     );
+                    let _ = writeln!(
+                        out,
+                        "brain_worker_panics_total{{shard=\"{shard_id}\",worker=\"{name}\"}} {}",
+                        snap.panics_total
+                    );
+                    let _ = writeln!(
+                        out,
+                        "brain_worker_pending_work{{shard=\"{shard_id}\",worker=\"{name}\"}} {}",
+                        snap.pending_work_estimate
+                    );
+                    let _ = writeln!(
+                        out,
+                        "brain_worker_cycle_duration_ms{{shard=\"{shard_id}\",worker=\"{name}\"}} {}",
+                        snap.last_cycle_duration_ms
+                    );
                 }
             }
             Err(e) => {
@@ -329,11 +407,10 @@ async fn emit_worker_counters(out: &mut String, shards: &[ShardHandle]) {
     }
 }
 
-/// 12.8: HNSW basic counters (node_count, tombstone_count,
+/// HNSW basic counters (node_count, tombstone_count,
 /// tombstone_ratio). Sampled per-shard via
-/// `ShardHandle::hnsw_snapshot`. The richer §6 families
-/// (search_visits, recall_estimate, rebuild_*) stay deferred —
-/// tracker `phase-12/hnsw-sampling`.
+/// `ShardHandle::hnsw_snapshot`. The richer families
+/// (search_visits, recall_estimate, rebuild_*) stay deferred.
 async fn emit_hnsw_counts(out: &mut String, shards: &[ShardHandle]) {
     emit_header(
         out,
@@ -380,7 +457,101 @@ async fn emit_hnsw_counts(out: &mut String, shards: &[ShardHandle]) {
     }
 }
 
-/// Phase B: per-shard AutoEdgeWorker metric family. Reads through
+/// Per-shard storage-footprint gauges. Sampled per-shard via
+/// [`ShardHandle::storage_stats`], which stats the WAL directory and
+/// `metadata.redb` and reads the live arena occupancy. Operators watch
+/// these for "approaching capacity".
+async fn emit_storage_gauges(out: &mut String, shards: &[ShardHandle]) {
+    emit_header(
+        out,
+        "brain_wal_size_bytes",
+        "Total bytes across the shard's WAL segment files.",
+        "gauge",
+    );
+    emit_header(
+        out,
+        "brain_wal_segments",
+        "Number of WAL segment files on disk.",
+        "gauge",
+    );
+    emit_header(
+        out,
+        "brain_metadata_size_bytes",
+        "Byte size of the shard's metadata.redb file.",
+        "gauge",
+    );
+    emit_header(
+        out,
+        "brain_arena_capacity_bytes",
+        "Addressable arena capacity in bytes.",
+        "gauge",
+    );
+    emit_header(
+        out,
+        "brain_arena_used_bytes",
+        "Bytes backing allocated arena slots (occupied + tombstoned).",
+        "gauge",
+    );
+    emit_header(
+        out,
+        "brain_arena_slots_used",
+        "Allocated arena slots (occupied + tombstoned).",
+        "gauge",
+    );
+    emit_header(
+        out,
+        "brain_arena_slots_free",
+        "Reclaimed arena slots on the free list, ready to reuse.",
+        "gauge",
+    );
+    for shard in shards.iter() {
+        let shard_id = shard.shard_id();
+        match shard.storage_stats().await {
+            Ok(st) => {
+                let _ = writeln!(
+                    out,
+                    "brain_wal_size_bytes{{shard=\"{shard_id}\"}} {}",
+                    st.wal_size_bytes
+                );
+                let _ = writeln!(
+                    out,
+                    "brain_wal_segments{{shard=\"{shard_id}\"}} {}",
+                    st.wal_segments
+                );
+                let _ = writeln!(
+                    out,
+                    "brain_metadata_size_bytes{{shard=\"{shard_id}\"}} {}",
+                    st.metadata_size_bytes
+                );
+                let _ = writeln!(
+                    out,
+                    "brain_arena_capacity_bytes{{shard=\"{shard_id}\"}} {}",
+                    st.arena_capacity_bytes
+                );
+                let _ = writeln!(
+                    out,
+                    "brain_arena_used_bytes{{shard=\"{shard_id}\"}} {}",
+                    st.arena_used_bytes
+                );
+                let _ = writeln!(
+                    out,
+                    "brain_arena_slots_used{{shard=\"{shard_id}\"}} {}",
+                    st.arena_slots_used
+                );
+                let _ = writeln!(
+                    out,
+                    "brain_arena_slots_free{{shard=\"{shard_id}\"}} {}",
+                    st.arena_slots_free
+                );
+            }
+            Err(e) => {
+                warn!(shard_id, error = %e, "storage_stats failed");
+            }
+        }
+    }
+}
+
+/// Per-shard AutoEdgeWorker metric family. Reads through
 /// the metric handle attached to each `ShardHandle`. Shards with the
 /// worker disabled emit no rows for that shard (no `0` placeholder —
 /// PromQL distinguishes `absent()` from `0`).
@@ -456,7 +627,7 @@ fn emit_auto_edge_metrics(out: &mut String, shards: &[ShardHandle]) {
     }
 }
 
-/// Phase T: per-shard TemporalEdgeWorker metric family. Mirrors the
+/// Per-shard TemporalEdgeWorker metric family. Mirrors the
 /// AutoEdge emitter's shape.
 fn emit_temporal_edge_metrics(out: &mut String, shards: &[ShardHandle]) {
     emit_header(
@@ -506,7 +677,7 @@ fn emit_temporal_edge_metrics(out: &mut String, shards: &[ShardHandle]) {
                 ("no_prev", snap.skipped_no_prev),
                 ("out_of_order", snap.skipped_out_of_order),
                 ("tombstoned", snap.skipped_tombstoned),
-                ("cross_context", snap.skipped_cross_context),
+                ("cross_session", snap.skipped_cross_session),
                 ("window_exceeded", snap.skipped_window_exceeded),
             ] {
                 let labels = format!("{{shard=\"{}\",reason=\"{reason}\"}}", shard.shard_id());
@@ -552,7 +723,7 @@ fn emit_temporal_edge_metrics(out: &mut String, shards: &[ShardHandle]) {
     }
 }
 
-/// Phase C: per-shard CausalEdgeWorker metric family. Mirrors the
+/// Per-shard CausalEdgeWorker metric family. Mirrors the
 /// temporal-edge emitter; adds a `predicate_whitelist_resolved` gauge
 /// for operator triage on no-schema deployments where the worker
 /// runs but never finds a causal predicate.
@@ -737,7 +908,145 @@ fn emit_statement_embed_metrics(out: &mut String, shards: &[ShardHandle]) {
     }
 }
 
-/// Phase E: per-shard ExtractorWorker metric family. Same dispatch
+/// Per-shard read-path retriever metric family. Labeled by
+/// `retriever = semantic | lexical | graph` (a bounded enum — no
+/// unbounded cardinality). Same dispatch shape as
+/// [`emit_statement_embed_metrics`]; recorded by the RECALL handler
+/// after each `execute`.
+fn emit_retriever_metrics(out: &mut String, shards: &[ShardHandle]) {
+    emit_header(
+        out,
+        "brain_retriever_invocations_total",
+        "Times each retriever lane was invoked while serving a recall.",
+        "counter",
+    );
+    for shard in shards {
+        let snap = shard.retriever_metrics().snapshot();
+        for (idx, retriever) in brain_ops::RETRIEVER_LABELS.iter().enumerate() {
+            let labels = format!(
+                "{{shard=\"{}\",retriever=\"{retriever}\"}}",
+                shard.shard_id()
+            );
+            let _ = writeln!(
+                out,
+                "brain_retriever_invocations_total{labels} {}",
+                snap.invocations_total[idx]
+            );
+        }
+    }
+
+    emit_header(
+        out,
+        "brain_retriever_candidates_total",
+        "Candidates each retriever lane returned across served recalls.",
+        "counter",
+    );
+    for shard in shards {
+        let snap = shard.retriever_metrics().snapshot();
+        for (idx, retriever) in brain_ops::RETRIEVER_LABELS.iter().enumerate() {
+            let labels = format!(
+                "{{shard=\"{}\",retriever=\"{retriever}\"}}",
+                shard.shard_id()
+            );
+            let _ = writeln!(
+                out,
+                "brain_retriever_candidates_total{labels} {}",
+                snap.candidates_total[idx]
+            );
+        }
+    }
+
+    emit_header(
+        out,
+        "brain_retriever_latency_ms",
+        "Per-retriever lane wall-clock latency histogram (milliseconds).",
+        "histogram",
+    );
+    for shard in shards {
+        let snap = shard.retriever_metrics().snapshot();
+        for (idx, retriever) in brain_ops::RETRIEVER_LABELS.iter().enumerate() {
+            let inner = format!("shard=\"{}\",retriever=\"{retriever}\"", shard.shard_id());
+            emit_worker_histogram(
+                out,
+                "brain_retriever_latency_ms",
+                &inner,
+                &snap.latency_ms[idx],
+            );
+        }
+    }
+}
+
+/// Per-shard end-to-end RECALL (query) metric family. `outcome_total`
+/// is labeled by `outcome = single | many | none` (a bounded enum).
+/// Same dispatch shape as [`emit_statement_embed_metrics`].
+fn emit_query_metrics(out: &mut String, shards: &[ShardHandle]) {
+    emit_header(out, "brain_query_total", "Recalls served.", "counter");
+    for shard in shards {
+        let snap = shard.query_metrics().snapshot();
+        let labels = format!("{{shard=\"{}\"}}", shard.shard_id());
+        let _ = writeln!(out, "brain_query_total{labels} {}", snap.total);
+    }
+
+    emit_header(
+        out,
+        "brain_query_rerank_invoked_total",
+        "Recalls where the cross-encoder rerank stage reordered the fused list.",
+        "counter",
+    );
+    for shard in shards {
+        let snap = shard.query_metrics().snapshot();
+        let labels = format!("{{shard=\"{}\"}}", shard.shard_id());
+        let _ = writeln!(
+            out,
+            "brain_query_rerank_invoked_total{labels} {}",
+            snap.rerank_invoked_total
+        );
+    }
+
+    emit_header(
+        out,
+        "brain_query_outcome_total",
+        "Served recalls by answer shape (single / many / none).",
+        "counter",
+    );
+    for shard in shards {
+        let snap = shard.query_metrics().snapshot();
+        for (idx, outcome) in brain_ops::QUERY_OUTCOME_LABELS.iter().enumerate() {
+            let labels = format!("{{shard=\"{}\",outcome=\"{outcome}\"}}", shard.shard_id());
+            let _ = writeln!(
+                out,
+                "brain_query_outcome_total{labels} {}",
+                snap.outcome_total[idx]
+            );
+        }
+    }
+
+    emit_header(
+        out,
+        "brain_query_latency_ms",
+        "End-to-end recall latency histogram (milliseconds).",
+        "histogram",
+    );
+    for shard in shards {
+        let snap = shard.query_metrics().snapshot();
+        let inner = format!("shard=\"{}\"", shard.shard_id());
+        emit_worker_histogram(out, "brain_query_latency_ms", &inner, &snap.latency_ms);
+    }
+
+    emit_header(
+        out,
+        "brain_query_fusion_k",
+        "Effective adaptive fusion-k the engine fused at, per served recall (histogram).",
+        "histogram",
+    );
+    for shard in shards {
+        let snap = shard.query_metrics().snapshot();
+        let inner = format!("shard=\"{}\"", shard.shard_id());
+        emit_worker_histogram(out, "brain_query_fusion_k", &inner, &snap.fusion_k);
+    }
+}
+
+/// Per-shard ExtractorWorker metric family. Same dispatch
 /// shape as [`emit_auto_edge_metrics`].
 fn emit_extractor_metrics(out: &mut String, shards: &[ShardHandle]) {
     emit_header(
@@ -779,8 +1088,46 @@ fn emit_extractor_metrics(out: &mut String, shards: &[ShardHandle]) {
 
     emit_header(
         out,
+        "brain_extractor_apply_dropped_total",
+        "Real extracted items the apply pass could not persist, by reason. Any nonzero value is signal loss.",
+        "counter",
+    );
+    for shard in shards {
+        if let Some(m) = shard.extractor_metrics() {
+            let snap = m.snapshot();
+            for (reason, count) in snap.apply_dropped_total {
+                let labels = format!(
+                    "{{shard=\"{}\",reason=\"{}\"}}",
+                    shard.shard_id(),
+                    escape_label(&reason)
+                );
+                let _ = writeln!(out, "brain_extractor_apply_dropped_total{labels} {count}",);
+            }
+        }
+    }
+
+    emit_header(
+        out,
+        "brain_extractor_predicate_consolidated_total",
+        "Open-vocab predicate surface forms folded onto an existing near-synonym predicate id by embedding consolidation.",
+        "counter",
+    );
+    for shard in shards {
+        if let Some(m) = shard.extractor_metrics() {
+            let snap = m.snapshot();
+            let labels = format!("{{shard=\"{}\"}}", shard.shard_id());
+            let _ = writeln!(
+                out,
+                "brain_extractor_predicate_consolidated_total{labels} {}",
+                snap.predicate_consolidated_total
+            );
+        }
+    }
+
+    emit_header(
+        out,
         "brain_extractor_items_written_total",
-        "Knowledge-layer rows persisted by the extractor worker, by item kind.",
+        "Typed-graph rows persisted by the extractor worker, by item kind.",
         "counter",
     );
     for shard in shards {
@@ -927,7 +1274,7 @@ fn escape_label(value: &str) -> String {
     s
 }
 
-/// 12.1b: per-op request counters / in-flight gauge / duration
+/// Per-op request counters / in-flight gauge / duration
 /// histogram. Cross-references `crate::metrics::request`.
 fn emit_request_metrics(out: &mut String, m: &RequestMetrics) {
     emit_header(

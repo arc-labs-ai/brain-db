@@ -8,4 +8,4 @@ pub mod cache;
 pub mod cpu;
 
 pub use cache::{CacheStats, CachingDispatcher, DEFAULT_CACHE_SIZE};
-pub use cpu::{CpuDispatcher, Dispatcher};
+pub use cpu::{CpuDispatcher, Dispatcher, BGE_QUERY_PREFIX};

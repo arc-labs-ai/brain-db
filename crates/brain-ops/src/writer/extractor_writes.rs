@@ -11,7 +11,7 @@
 //! ## Why not call the wire handlers directly?
 //!
 //! Wire handlers consult `OpsContext` for the schema gate, emit
-//! knowledge events on the bus, and project to wire view types. The
+//! typed-graph events on the bus, and project to wire view types. The
 //! worker doesn't need those steps — the schema filter runs upstream
 //! (E.7), events fire via the parent ENCODE notification, and the
 //! mention edge / statement / relation rows are the worker's only
@@ -19,29 +19,31 @@
 //! would re-enter the metadata lock and duplicate events.
 
 use brain_core::{
-    EvidenceEntry, EvidenceRef, Relation, Statement, StatementKind, StatementObject, SubjectRef,
-    INLINE_EVIDENCE_CAP,
+    EntityId, ExtractorId, MemoryId, PredicateId, RelationId, RelationTypeId, SessionId,
+    StatementId,
 };
-use brain_core::{
-    EntityId, ExtractorId, MemoryId, PredicateId, RelationId, RelationTypeId, StatementId,
-};
+use brain_core::{Relation, Statement, StatementKind, StatementObject, SubjectRef};
 use brain_metadata::relation::ops::{relation_create, RelationOpError};
-use brain_metadata::statement::{statement_create, StatementOpError};
+use brain_metadata::statement::{pack_evidence_ids, statement_create, StatementOpError};
+use brain_metadata::RowScope;
 use redb::WriteTransaction;
-use smallvec::SmallVec;
 
 /// What the worker hands to [`statement_create_internal`]. Mirrors
 /// the wire `StatementCreateRequest` minus schema-gate / event fields.
 #[derive(Debug, Clone)]
 pub struct StatementCreatePayload {
     pub kind: StatementKind,
-    pub subject: EntityId,
+    /// The statement's subject — an entity, or the source memory itself
+    /// (temporal Events). Pending subjects are produced only by the
+    /// resolver, not this internal path.
+    pub subject: SubjectRef,
     pub predicate: PredicateId,
     pub object: StatementObject,
     pub confidence: f32,
-    /// Memories backing this statement. Always inline — overflow is
-    /// the wire path's concern (the worker emits at most one evidence
-    /// id per statement: the originating memory).
+    /// Memories backing this statement. The worker typically emits one
+    /// evidence id (the originating memory) but the slot accepts any
+    /// length — the helper spills to an overflow row when it exceeds
+    /// the inline cap.
     pub evidence_memory_ids: Vec<MemoryId>,
     pub extractor_id: ExtractorId,
     /// Schema version stamped on the row. The worker passes `0` when
@@ -49,14 +51,19 @@ pub struct StatementCreatePayload {
     /// mode); the predicate row's `SchemaOrigin` tracks provenance.
     pub schema_version: u32,
     pub extracted_at_unix_nanos: u64,
-    /// LLM-coined predicate qname when this row is being routed to the
-    /// `brain:fact` wildcard sink. `None` means `predicate` is the
-    /// actual interned predicate, not the sink.
-    pub original_predicate_qname: Option<String>,
-    /// Per-statement statefulness flag (verbatim from the extractor
-    /// proposal for `brain:fact` rows; copied from the predicate
+    /// Per-statement statefulness flag (copied from the predicate
     /// registry for schema-declared rows by the caller).
     pub is_stateful: bool,
+    /// Event time, in unix-nanos, for `kind == Event` statements. An Event
+    /// is rejected at create without one (`validate_statement_shape`); every
+    /// other kind must leave this `None`. Carries the resolved occurrence
+    /// time for temporal (memory-subject) events so they persist instead of
+    /// being dropped.
+    pub event_at_unix_nanos: Option<u64>,
+    /// The per-utterance session this statement is extracted from — the
+    /// source memory's `session_id`. Stamped onto the statement row so a
+    /// session-scoped read sees this statement with its session's memories.
+    pub session_id: SessionId,
 }
 
 /// Same shape for relations.
@@ -70,26 +77,30 @@ pub struct RelationCreatePayload {
     pub extractor_id: ExtractorId,
     pub is_symmetric: bool,
     pub extracted_at_unix_nanos: u64,
+    /// The per-utterance session this relation is extracted from — the
+    /// source memory's `session_id`. Stamped onto the relation row.
+    pub session_id: SessionId,
 }
 
 /// Build a `Statement` value from `payload` and call
 /// [`statement_create`]. Returns the newly-allocated `StatementId`.
 pub fn statement_create_internal(
     wtxn: &WriteTransaction,
+    scope: RowScope,
     payload: &StatementCreatePayload,
 ) -> Result<StatementId, StatementOpError> {
     let id = StatementId::new();
-    let evidence = build_inline_evidence(
-        &payload.evidence_memory_ids,
+    let evidence = pack_evidence_ids(
+        wtxn,
+        payload.evidence_memory_ids.clone(),
         payload.confidence,
         payload.extracted_at_unix_nanos,
         payload.extractor_id,
-    );
-    let subject = SubjectRef::Entity(payload.subject);
+    )?;
     let mut s = Statement::new_root(
         id,
         payload.kind,
-        subject,
+        payload.subject,
         payload.predicate,
         payload.object.clone(),
         payload.confidence,
@@ -98,16 +109,30 @@ pub fn statement_create_internal(
         payload.extracted_at_unix_nanos,
         payload.schema_version.max(1),
     );
-    s.valid_from_unix_nanos = Some(payload.extracted_at_unix_nanos);
-    s.original_predicate_qname = payload.original_predicate_qname.clone();
     s.is_stateful = payload.is_stateful;
-    statement_create(wtxn, &s, payload.extracted_at_unix_nanos)
+    // An Event is point-in-time: it carries event_at, never a validity range.
+    // The shape validator rejects an Event with valid_from/valid_to, so only a
+    // non-Event gets the valid_from default (= extracted_at). Event time is set
+    // strictly for Events so temporal events persist.
+    if payload.kind == StatementKind::Event {
+        s.event_at_unix_nanos = payload.event_at_unix_nanos;
+    } else {
+        s.valid_from_unix_nanos = Some(payload.extracted_at_unix_nanos);
+    }
+    statement_create(
+        wtxn,
+        scope,
+        payload.session_id,
+        &s,
+        payload.extracted_at_unix_nanos,
+    )
 }
 
 /// Build a `Relation` value from `payload` and call
 /// [`relation_create`]. Returns the newly-allocated `RelationId`.
 pub fn relation_create_internal(
     wtxn: &WriteTransaction,
+    scope: RowScope,
     payload: &RelationCreatePayload,
 ) -> Result<RelationId, RelationOpError> {
     let id = RelationId::new();
@@ -122,25 +147,13 @@ pub fn relation_create_internal(
         payload.extracted_at_unix_nanos,
         payload.is_symmetric,
     );
-    relation_create(wtxn, &r, payload.extracted_at_unix_nanos)
-}
-
-fn build_inline_evidence(
-    memory_ids: &[MemoryId],
-    confidence: f32,
-    now_unix_nanos: u64,
-    extractor_id: ExtractorId,
-) -> EvidenceRef {
-    let mut out: SmallVec<[EvidenceEntry; INLINE_EVIDENCE_CAP]> = SmallVec::new();
-    for &m in memory_ids.iter().take(INLINE_EVIDENCE_CAP) {
-        out.push(EvidenceEntry::from_parts(
-            m,
-            confidence,
-            now_unix_nanos,
-            extractor_id,
-        ));
-    }
-    EvidenceRef::inline(out)
+    relation_create(
+        wtxn,
+        scope,
+        payload.session_id,
+        &r,
+        payload.extracted_at_unix_nanos,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -150,8 +163,8 @@ fn build_inline_evidence(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brain_core::SubjectRef;
     use brain_core::EntityType;
+    use brain_core::SubjectRef;
     use brain_metadata::entity::ops::entity_put;
     use brain_metadata::entity::types::entity_type_intern;
     use brain_metadata::relation::ops::relation_get;
@@ -163,6 +176,10 @@ mod tests {
 
     const NOW: u64 = 1_700_000_000_000_000_000;
 
+    fn test_scope() -> RowScope {
+        RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xA1; 16])
+    }
+
     fn put_person(db: &mut MetadataDb, canonical: &str) -> EntityId {
         let e = brain_core::Entity::new_active(
             EntityId::new(),
@@ -173,7 +190,7 @@ mod tests {
         );
         let id = e.id;
         let wtxn = db.write_txn().unwrap();
-        entity_put(&wtxn, &e).unwrap();
+        entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
         wtxn.commit().unwrap();
         id
     }
@@ -189,7 +206,7 @@ mod tests {
             let pid = predicate_intern_or_get(&wtxn, "brain", "current_role", 0, NOW).unwrap();
             let payload = StatementCreatePayload {
                 kind: StatementKind::Fact,
-                subject,
+                subject: SubjectRef::Entity(subject),
                 predicate: pid,
                 object: StatementObject::Value(brain_core::StatementValue::Text(
                     "Senior Engineer".into(),
@@ -199,10 +216,11 @@ mod tests {
                 extractor_id: ExtractorId::from(11),
                 schema_version: 0,
                 extracted_at_unix_nanos: NOW,
-                original_predicate_qname: None,
                 is_stateful: false,
+                event_at_unix_nanos: None,
+                session_id: SessionId::DEFAULT,
             };
-            let sid = statement_create_internal(&wtxn, &payload).unwrap();
+            let sid = statement_create_internal(&wtxn, test_scope(), &payload).unwrap();
             wtxn.commit().unwrap();
             (pid, sid)
         };
@@ -233,7 +251,7 @@ mod tests {
                 NOW,
             );
             let id = e.id;
-            entity_put(&wtxn, &e).unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
             wtxn.commit().unwrap();
             id
         };
@@ -249,8 +267,9 @@ mod tests {
                 extractor_id: ExtractorId::from(12),
                 is_symmetric: false,
                 extracted_at_unix_nanos: NOW,
+                session_id: SessionId::DEFAULT,
             };
-            let rid = relation_create_internal(&wtxn, &payload).unwrap();
+            let rid = relation_create_internal(&wtxn, test_scope(), &payload).unwrap();
             wtxn.commit().unwrap();
             rid
         };

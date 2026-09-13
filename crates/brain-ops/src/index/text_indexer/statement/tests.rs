@@ -1,4 +1,4 @@
-//! Tests for the statement text indexer worker (phase 22.4).
+//! Tests for the statement text indexer worker.
 //!
 //! Same runtime discipline as `super::super::memory::tests` — both
 //! production and tests run under Glommio.
@@ -35,8 +35,13 @@ fn spawn_drain(
     policy: CommitPolicy,
 ) -> (StatementTextDispatcher, glommio::Task<()>) {
     let (dispatcher, rx) = StatementTextDispatcher::default_channel();
+    let (stop_tx, stop_rx) = flume::bounded::<()>(1);
+    let (_control_tx, control_rx) = flume::bounded::<crate::index::text_indexer::IndexerControl>(1);
     let task = glommio::spawn_local(async move {
-        run_statement_text_indexer(handle, rx, policy).await;
+        let _stop_tx = stop_tx;
+        // Held so the control channel never closes; see the memory test.
+        let _control_tx = _control_tx;
+        run_statement_text_indexer(handle, rx, policy, stop_rx, control_rx).await;
     });
     (dispatcher, task)
 }
@@ -61,10 +66,12 @@ fn confidence_bucket_round_trip() {
     assert_eq!(confidence_bucket(0.27), 2);
     assert_eq!(confidence_bucket(0.5), 5);
     assert_eq!(confidence_bucket(0.99), 9);
-    assert_eq!(confidence_bucket(1.0), 9, "1.0 clamps to bucket 9");
+    // Canonical 0..=10 bucketing (shared with the redb index): 1.0 is its
+    // own bucket 10, not folded into 9.
+    assert_eq!(confidence_bucket(1.0), 10, "1.0 is bucket 10");
     // Defensive: out-of-range inputs clamp.
     assert_eq!(confidence_bucket(-0.5), 0);
-    assert_eq!(confidence_bucket(1.5), 9);
+    assert_eq!(confidence_bucket(1.5), 10);
 }
 
 #[test]

@@ -1,0 +1,4 @@
+{
+  "trace_text": "semantic 0.4ms -> graph 1.1ms -> fuse 0.2ms",
+  "total_latency_ms": 2.5
+}

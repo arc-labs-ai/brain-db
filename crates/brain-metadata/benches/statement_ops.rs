@@ -1,9 +1,7 @@
-//! Statement-ops perf bench (sub-task 17.10b).
+//! Statement-ops perf bench.
 //!
-//! Spec targets per [`spec/20_benchmarks/02_latency_targets.md`](
-//! ../../spec/20_benchmarks/02_latency_targets.md) §2.3 at
-//! 1M statements per shard (operator-run on the 16-core / 64 GB /
-//! NVMe reference rig):
+//! Latency targets at 1M statements per shard (operator-run on the
+//! 16-core / 64 GB / NVMe reference rig):
 //!
 //! - `STATEMENT_CREATE` (Fact, 3 evidence): p50 2 ms, p99 10 ms.
 //! - `STATEMENT_GET`:                       p50 0.5 ms, p99 2 ms.
@@ -16,17 +14,23 @@
 //!
 //! Run: `cargo bench -p brain-metadata --bench statement_ops`.
 
-use brain_core::{StatementObject, SubjectRef};
 use brain_core::{
     Entity, EntityId, EntityType, EntityTypeId, ExtractorId, PredicateId, StatementId,
     StatementKind,
 };
+use brain_core::{StatementObject, SubjectRef};
 use brain_metadata::entity::ops::{entity_put, normalize_name};
+use brain_metadata::schema::predicate::predicate_intern_or_get;
 use brain_metadata::statement::{
     statement_create, statement_get, statement_list, statement_supersede, StatementListFilter,
 };
-use brain_metadata::tables::predicate::{PREDICATES_BY_QNAME_TABLE, PREDICATES_TABLE};
+use brain_metadata::tables::predicate::PREDICATES_TABLE;
 use brain_metadata::MetadataDb;
+use brain_metadata::RowScope;
+
+fn bench_scope() -> RowScope {
+    RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xAB; 16])
+}
 use criterion::{black_box, criterion_group, Criterion};
 use tempfile::TempDir;
 
@@ -47,25 +51,21 @@ struct Fixture {
 
 fn build_fixture(n: usize) -> Fixture {
     let dir = TempDir::new().expect("tempdir");
-    let mut db = MetadataDb::open(dir.path().join("metadata.redb")).expect("open db");
+    let db = MetadataDb::open(dir.path().join("metadata.redb")).expect("open db");
     let now = 1_700_000_000_000_000_000u64;
 
-    // Resolve the built-in `brain:related_to` predicate id (seeded
-    // at MetadataDb::open).
+    // Intern a predicate for the seeded Fact statements. `brain:related_to`
+    // is seeded as a relation_type, not a predicate, so the statement path
+    // needs its own interned predicate.
     let related_to: PredicateId = {
-        let rtxn = db.read_txn().expect("read_txn");
-        let idx = rtxn
-            .open_table(PREDICATES_BY_QNAME_TABLE)
-            .expect("open by_qname");
-        let raw: u32 = idx
-            .get("brain:related_to")
-            .expect("get qname")
-            .expect("brain:related_to seeded")
-            .value();
-        PredicateId::from(raw)
+        let wtxn = db.write_txn().expect("write_txn");
+        let id = predicate_intern_or_get(&wtxn, "brain", "related_to", 1, now)
+            .expect("intern predicate");
+        wtxn.commit().expect("commit predicate");
+        id
     };
 
-    // Sanity: predicate exists in the primary table too.
+    // Sanity: predicate exists in the primary table.
     {
         let rtxn = db.read_txn().expect("read_txn");
         let t = rtxn.open_table(PREDICATES_TABLE).expect("open predicates");
@@ -87,7 +87,8 @@ fn build_fixture(n: usize) -> Fixture {
                 normalize_name(&subj_name),
                 now,
             );
-            entity_put(&wtxn, &subj).expect("subj entity_put");
+            entity_put(&wtxn, bench_scope(), brain_core::SessionId::DEFAULT, &subj)
+                .expect("subj entity_put");
 
             let obj_id = EntityId::new();
             let obj_name = format!("obj_{i}");
@@ -98,7 +99,8 @@ fn build_fixture(n: usize) -> Fixture {
                 normalize_name(&obj_name),
                 now,
             );
-            entity_put(&wtxn, &obj).expect("obj entity_put");
+            entity_put(&wtxn, bench_scope(), brain_core::SessionId::DEFAULT, &obj)
+                .expect("obj entity_put");
 
             let stmt_id = StatementId::new();
             let s = brain_core::Statement::new_root(
@@ -113,7 +115,14 @@ fn build_fixture(n: usize) -> Fixture {
                 now,
                 1,
             );
-            statement_create(&wtxn, &s, now).expect("statement_create");
+            statement_create(
+                &wtxn,
+                bench_scope(),
+                brain_core::SessionId::DEFAULT,
+                &s,
+                now,
+            )
+            .expect("statement_create");
             seeded.push((subj_id, related_to, stmt_id));
         }
         wtxn.commit().expect("commit");
@@ -131,7 +140,7 @@ fn build_fixture(n: usize) -> Fixture {
 // ---------------------------------------------------------------------------
 
 fn bench_statement_create_fact(c: &mut Criterion) {
-    let mut fixture = build_fixture(N_STATEMENTS);
+    let fixture = build_fixture(N_STATEMENTS);
     let now = 1_700_000_000_000_000_001u64;
     // Pre-allocate two pools of unused entities so each create has
     // valid subject/object.
@@ -146,7 +155,8 @@ fn bench_statement_create_fact(c: &mut Criterion) {
         {
             let name = format!("xfix_{i}");
             let e = Entity::new_active(*id, PERSON, name.clone(), normalize_name(&name), now);
-            entity_put(&wtxn, &e).expect("entity_put");
+            entity_put(&wtxn, bench_scope(), brain_core::SessionId::DEFAULT, &e)
+                .expect("entity_put");
         }
         wtxn.commit().expect("commit");
     }
@@ -170,7 +180,14 @@ fn bench_statement_create_fact(c: &mut Criterion) {
                 1,
             );
             let wtxn = fixture.db.write_txn().expect("write_txn");
-            statement_create(&wtxn, black_box(&s), now).expect("create");
+            statement_create(
+                &wtxn,
+                bench_scope(),
+                brain_core::SessionId::DEFAULT,
+                black_box(&s),
+                now,
+            )
+            .expect("create");
             wtxn.commit().expect("commit");
         });
     });
@@ -216,7 +233,7 @@ fn bench_statement_list_subject_predicate(c: &mut Criterion) {
                 min_confidence: None,
                 limit: 10,
             };
-            let rows = statement_list(&rtxn, black_box(&filter)).expect("list");
+            let rows = statement_list(&rtxn, bench_scope(), black_box(&filter)).expect("list");
             black_box(rows);
         });
     });
@@ -227,7 +244,7 @@ fn bench_statement_list_subject_predicate(c: &mut Criterion) {
 // ---------------------------------------------------------------------------
 
 fn bench_statement_supersede(c: &mut Criterion) {
-    let mut fixture = build_fixture(N_STATEMENTS);
+    let fixture = build_fixture(N_STATEMENTS);
     let related_to = fixture.seeded[0].1;
     let now = 1_700_000_000_000_000_002u64;
     let mut idx = 0usize;
@@ -260,8 +277,15 @@ fn bench_statement_supersede(c: &mut Criterion) {
                 1,
             );
             let wtxn = fixture.db.write_txn().expect("write_txn");
-            let written =
-                statement_supersede(&wtxn, old_id, black_box(&new_stmt), now).expect("supersede");
+            let written = statement_supersede(
+                &wtxn,
+                bench_scope(),
+                brain_core::SessionId::DEFAULT,
+                old_id,
+                black_box(&new_stmt),
+                now,
+            )
+            .expect("supersede");
             wtxn.commit().expect("commit");
             heads[i].2 = written;
         });

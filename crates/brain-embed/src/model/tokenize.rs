@@ -2,14 +2,10 @@
 //! BERT's forward pass expects: `input_ids`, `token_type_ids` (always
 //! zero), `attention_mask`.
 //!
-//! See:
-//! - `spec/07_embedding/02_tokenization.md` §1–§3 — pipeline +
-//!   hard 512-token cap.
-//! - `spec/07_embedding/02_tokenization.md` §7–§8 — tokeniser is
-//!   loaded once at startup and immutable; thread-safe at encode time.
-//!
-//! Design notes (see `.claude/plans/phase-05-task-02.md`):
-//!
+//! Notes:
+//! - Pipeline enforces a hard 512-token cap.
+//! - The tokeniser is loaded once at startup and immutable; thread-safe
+//!   at encode time.
 //! - We do **not** mutate the shared tokeniser (no `with_truncation` /
 //!   `with_padding` at encode time). Truncation and padding happen
 //!   here, by hand, after a no-limit `encode` from the crate.
@@ -83,7 +79,7 @@ pub fn encode_batch(
 
     // 1. Encode every text with special tokens, no truncation, no
     //    padding. We do truncation + padding ourselves so the shared
-    //    tokeniser stays read-only (-§8).
+    //    tokeniser stays read-only.
     let inputs: Vec<tokenizers::EncodeInput> = texts
         .iter()
         .map(|t| tokenizers::EncodeInput::Single((*t).into()))
@@ -114,7 +110,9 @@ pub fn encode_batch(
             // because `encode` was called with `add_special_tokens=true`.
             let sep_id = full[pre_trunc_len - 1];
             let mut ids = full[..MAX_TOKEN_LENGTH].to_vec();
-            *ids.last_mut().expect("MAX_TOKEN_LENGTH > 0") = sep_id;
+            *ids.last_mut()
+                .expect("invariant: truncated branch leaves exactly MAX_TOKEN_LENGTH (>0) ids") =
+                sep_id;
             ids
         } else {
             full.to_vec()
@@ -136,7 +134,11 @@ pub fn encode_batch(
     }
 
     // 3. Pad to the longest row (capped at MAX_TOKEN_LENGTH).
-    let seq_len = raw_ids.iter().map(Vec::len).max().expect("batch non-empty");
+    let seq_len = raw_ids
+        .iter()
+        .map(Vec::len)
+        .max()
+        .expect("invariant: empty batch rejected above, so raw_ids is non-empty");
     let mut padded_ids: Vec<u32> = vec![pad_id; batch * seq_len];
     let mut mask: Vec<u32> = vec![0; batch * seq_len];
     for (row, ids) in raw_ids.iter().enumerate() {

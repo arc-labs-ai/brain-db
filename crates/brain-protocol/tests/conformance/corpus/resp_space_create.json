@@ -1,0 +1,8 @@
+{
+  "space_id": "support-bot:user123",
+  "created": true,
+  "created_at_unix_nanos": 1700000000000000000,
+  "last_active_unix_nanos": 1700000000000000000,
+  "memory_count": 0,
+  "session_count": 1
+}

@@ -13,30 +13,34 @@
 //!
 //! ## Single global version vs per-table versions
 //!
-//! Spec `§07/02 §6` reads "each table has a format version embedded in
-//! its metadata." A literal implementation would maintain 13 separate
-//! version rows. We instead carry one global row covering the whole
-//! metadata file. The 13 tables ship from the same crate and co-evolve
-//! — bumping one means bumping the whole file's format — and the
-//! per-table machinery (13× the open-time checks and migration registry
-//! entries) adds bookkeeping with no concrete benefit at v1. This is a
-//! coverage-scope decision, not a behavioral deviation; if a future
-//! version diverges per-table, we'll extend this module.
+//! In principle each table could carry its own format version embedded
+//! in its metadata. A literal implementation would maintain 13
+//! separate version rows. We instead carry one global row covering the
+//! whole metadata file. The 13 tables ship from the same crate and
+//! co-evolve — bumping one means bumping the whole file's format — and
+//! the per-table machinery (13× the open-time checks and migration
+//! registry entries) adds bookkeeping with no concrete benefit. If a
+//! future version diverges per-table, we'll extend this module.
 //!
 //! Internal "private" tables get an underscore-prefixed name; the 13
-//! spec'd domain tables in `§07/02 §1` never use that prefix.
+//! domain tables never use that prefix.
 
 use redb::{Database, ReadableDatabase, TableDefinition};
 
 /// The schema version this crate writes. Bumped on backward-incompatible
 /// changes to the redb table layout or value encoding.
 ///
-/// Phase C unified the substrate edge tables and the typed-relation
-/// tables under a single `NodeRef`-keyed layout. The on-disk shape is
+/// The v2 layout unified the substrate edge tables and the
+/// typed-relation tables under a single `NodeRef`-keyed layout. The on-disk shape is
 /// not readable by a v1 binary, and a v1 DB is not readable by a v2
 /// binary — operators must run the migration tool to copy data into a
 /// fresh v2 directory.
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+///
+/// v3 prepends a `slot` byte to each `statement_question_vectors` value
+/// (reified slot-filling): the stored value width changed from 1536 to
+/// 1537 bytes, so a v2 file's rows are not readable under the v3 fixed-size
+/// value type. No migration tool — pre-user, fresh-start on bump.
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 
 /// Singleton key inside [`SCHEMA_META_TABLE`].
 pub const SCHEMA_VERSION_KEY: &str = "schema_version";
@@ -81,53 +85,92 @@ pub enum SchemaError {
 /// See the module docs for behavior across the four cases (fresh, same,
 /// older, newer).
 pub fn open_or_init_schema(db: &Database) -> Result<u32, SchemaError> {
-    // Peek with a read transaction first.
-    {
+    // Peek with a read transaction first to decide fresh vs existing.
+    let mut fresh = false;
+    let stored_version = {
         let rtxn = db.begin_read()?;
         match rtxn.open_table(SCHEMA_META_TABLE) {
-            Ok(table) => {
-                if let Some(stored) = table.get(SCHEMA_VERSION_KEY)? {
-                    let v = stored.value();
-                    if v > CURRENT_SCHEMA_VERSION {
-                        return Err(SchemaError::SchemaVersionTooNew {
-                            found: v,
-                            supported: CURRENT_SCHEMA_VERSION,
-                        });
-                    }
-                    if v < CURRENT_SCHEMA_VERSION {
-                        // No in-place migration and no migration tool:
-                        // Brain is pre-user, fresh-start is acceptable.
-                        return Err(SchemaError::SchemaTooOld {
-                            found: v,
-                            current: CURRENT_SCHEMA_VERSION,
-                        });
-                    }
-                    tracing::info!(
-                        schema_version = v,
-                        "opened brain-metadata at existing schema"
-                    );
-                    return Ok(v);
+            Ok(table) => match table.get(SCHEMA_VERSION_KEY)? {
+                Some(stored) => Some(stored.value()),
+                // Meta table exists but key is missing — treat as fresh.
+                None => {
+                    fresh = true;
+                    None
                 }
-                // Table exists but the key is missing — treat as fresh.
-            }
+            },
             Err(redb::TableError::TableDoesNotExist(_)) => {
-                // Fresh DB; fall through to init.
+                fresh = true;
+                None
             }
             Err(e) => return Err(e.into()),
         }
+    };
+
+    if let Some(v) = stored_version {
+        if v > CURRENT_SCHEMA_VERSION {
+            return Err(SchemaError::SchemaVersionTooNew {
+                found: v,
+                supported: CURRENT_SCHEMA_VERSION,
+            });
+        }
+        if v < CURRENT_SCHEMA_VERSION {
+            // No in-place migration and no migration tool: Brain is
+            // pre-user, fresh-start is acceptable.
+            return Err(SchemaError::SchemaTooOld {
+                found: v,
+                current: CURRENT_SCHEMA_VERSION,
+            });
+        }
     }
 
-    // Initialize.
+    // Single write-txn does both jobs: stamp the version (if fresh) and
+    // materialize every catalog table. Running this on every open keeps
+    // the invariant "every table this binary knows about exists" in one
+    // place — read paths can drop their `TableDoesNotExist` arms.
     let wtxn = db.begin_write()?;
     {
         let mut table = wtxn.open_table(SCHEMA_META_TABLE)?;
-        table.insert(SCHEMA_VERSION_KEY, &CURRENT_SCHEMA_VERSION)?;
+        if fresh {
+            table.insert(SCHEMA_VERSION_KEY, &CURRENT_SCHEMA_VERSION)?;
+        }
     }
+    crate::tables::materialize_all_tables(&wtxn)?;
+    // Build the by-(scope, type) entity listing index from the primary
+    // rows if a pre-index DB is being opened. Idempotent — a no-op once
+    // the index holds any row. Derived data, rebuilt like the in-RAM
+    // indexes, so it is index construction, not a format migration.
+    let backfilled = crate::entity::ops::backfill_entity_by_type_index(&wtxn)?;
+    // Build the immutable id-ordered statement pagination indexes from the
+    // primary rows if a pre-index DB is being opened. Idempotent — a no-op
+    // once the index holds any row. Derived data, rebuilt like the in-RAM
+    // indexes, so it is index construction, not a format migration.
+    let statement_ids_backfilled = crate::statement::backfill_statement_id_indexes(&wtxn)?;
     wtxn.commit()?;
-    tracing::info!(
-        schema_version = CURRENT_SCHEMA_VERSION,
-        "initialized brain-metadata schema"
-    );
+
+    if backfilled > 0 {
+        tracing::info!(
+            entities_indexed = backfilled,
+            "backfilled entity_by_type listing index for pre-index DB"
+        );
+    }
+    if statement_ids_backfilled > 0 {
+        tracing::info!(
+            statements_indexed = statement_ids_backfilled,
+            "backfilled statement id-ordered pagination indexes for pre-index DB"
+        );
+    }
+
+    if fresh {
+        tracing::info!(
+            schema_version = CURRENT_SCHEMA_VERSION,
+            "initialized brain-metadata schema"
+        );
+    } else {
+        tracing::info!(
+            schema_version = CURRENT_SCHEMA_VERSION,
+            "opened brain-metadata at existing schema"
+        );
+    }
     Ok(CURRENT_SCHEMA_VERSION)
 }
 
@@ -136,8 +179,7 @@ pub fn open_or_init_schema(db: &Database) -> Result<u32, SchemaError> {
 // ---------------------------------------------------------------------------
 
 // redb internally uses mmap, which miri doesn't shim. Gate the test module
-// behind `not(miri)` (consistent with brain-storage's pattern). See
-// `.claude/plans/phase-02-miri.md` for context.
+// behind `not(miri)` (consistent with brain-storage's pattern).
 #[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
@@ -204,7 +246,7 @@ mod tests {
 
     #[test]
     fn schema_too_old_on_v1_db() {
-        // A v1 DB on disk is unreachable from the Phase C v2 layout. No
+        // A v1 DB on disk is unreachable from the v2 layout. No
         // migration tool exists — operators delete data/ and restart.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.redb");
@@ -225,7 +267,7 @@ mod tests {
             SchemaError::SchemaTooOld { found, current } => {
                 assert_eq!(found, 1);
                 assert_eq!(current, CURRENT_SCHEMA_VERSION);
-                assert_eq!(current, 2);
+                assert_eq!(current, 3);
             }
             other => panic!("expected SchemaTooOld, got {other:?}"),
         }

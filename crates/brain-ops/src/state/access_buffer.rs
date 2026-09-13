@@ -1,4 +1,4 @@
-//! Access-tracking buffer for the access-boost worker (sub-task 8.3).
+//! Access-tracking buffer for the access-boost worker.
 //!
 //! RECALL appends every returned memory's id; the
 //! boost worker drains the buffer on its 10 s cycle and applies a

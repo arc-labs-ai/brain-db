@@ -1,12 +1,12 @@
-#![allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send post-9.7 (audit §4)
-//! Phase 8 no-regression smoke gate (sub-task 8.14).
+#![allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send
+//! No-regression smoke gate.
 //!
 //! Goal: catch a worker implementation that catastrophically starves
 //! the foreground request path. Not the acceptance
 //! bench — that runs against 16-core x86_64 hardware on 1M memories
-//! for 10 minutes, and lives in Phase 9. Here we just compare a
-//! workers-off baseline to a workers-on run and assert the
-//! workers-on path is within a generous 5× multiplier.
+//! for 10 minutes. Here we just compare a workers-off baseline to a
+//! workers-on run and assert the workers-on path is within a generous
+//! 5× multiplier.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -15,9 +15,10 @@ use std::time::{Duration, Instant};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::MetadataDb;
+use brain_ops::test_support::single_body;
 use brain_ops::{dispatch, OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
-use brain_protocol::envelope::request::{EncodeRequest, MemoryKindWire, RecallRequest, RequestBody};
+use brain_protocol::envelope::request::{EncodeRequest, RecallRequest, RequestBody};
 use brain_protocol::envelope::response::ResponseBody;
 use brain_workers::{
     AccessBoostWorker, CacheEvictionWorker, ConsolidationWorker, CounterReconcileWorker,
@@ -26,7 +27,6 @@ use brain_workers::{
     IdempotencyCleanupWorker, SlotReclamationWorker, SnapshotWorker, StatisticsUpdateWorker,
     WalRetentionWorker, WorkerConfig, WorkerScheduler,
 };
-use parking_lot::Mutex;
 
 // ---------------------------------------------------------------------------
 // Mock dispatcher.
@@ -57,8 +57,8 @@ struct Fixture {
 fn build_fixture() -> Fixture {
     let tempdir = tempfile::tempdir().unwrap();
     let db_path = tempdir.path().join("metadata.redb");
-    let metadata: SharedMetadataDb = Arc::new(Mutex::new(MetadataDb::open(&db_path).unwrap()));
-    let (shared, hnsw_writer) = SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).unwrap();
+    let metadata: SharedMetadataDb = Arc::new(MetadataDb::open(&db_path).unwrap());
+    let (shared, hnsw_writer) = SharedHnsw::new(IndexParams::default_v1()).unwrap();
     let writer = Arc::new(RealWriterHandle::new(metadata.clone(), hnsw_writer));
     let executor = ExecutorContext::new(
         Arc::new(MockDispatcher) as Arc<dyn Dispatcher>,
@@ -67,7 +67,7 @@ fn build_fixture() -> Fixture {
         writer as Arc<dyn WriterHandle>,
     );
     Fixture {
-        ctx: Arc::new(OpsContext::new(executor)),
+        ctx: Arc::new(brain_ops::test_support::ops_context_for_tests_owning_tempdir(executor)),
         _tempdir: tempdir,
     }
 }
@@ -81,17 +81,17 @@ async fn encode_one(ctx: &OpsContext, rid: u32, text: &str) {
     request_id[..4].copy_from_slice(&rid.to_be_bytes());
     let req = EncodeRequest {
         text: text.into(),
-        context_id: 1,
-        kind: MemoryKindWire::Episodic,
-        salience_hint: 0.5,
-        edges: vec![],
+        session_id: 1,
         request_id,
         txn_id: None,
-        deduplicate: false,
+        occurred_at_unix_nanos: None,
+        act_as: None,
+        wait: brain_protocol::WaitMode::Ack,
+        allow_duplicates: false,
     };
     let _ = dispatch(
         RequestBody::Encode(req),
-        brain_ops::RequestCaller::anonymous(),
+        brain_ops::RequestCaller::for_tests(),
         ctx,
     )
     .await
@@ -100,11 +100,15 @@ async fn encode_one(ctx: &OpsContext, rid: u32, text: &str) {
 
 async fn recall_one(ctx: &OpsContext, cue: &str) -> usize {
     let req = RecallRequest {
+        scope: Default::default(),
+        trace: false,
         cue_text: cue.into(),
-        top_k: 5,
+        subject_name: String::new(),
+        max_results: 5,
         confidence_threshold: 0.0,
-        context_filter: None,
+        session_filter: None,
         age_bound_unix_nanos: None,
+        as_of_record_time_unix_nanos: None,
         kind_filter: None,
         salience_floor: 0.0,
         include_edges: false,
@@ -112,17 +116,17 @@ async fn recall_one(ctx: &OpsContext, cue: &str) -> usize {
         include_text: false,
         request_id: None,
         txn_id: None,
-        rerank: false,
+        act_as: None,
     };
-    match dispatch(
+    let outcome = dispatch(
         RequestBody::Recall(req),
-        brain_ops::RequestCaller::anonymous(),
+        brain_ops::RequestCaller::for_tests(),
         ctx,
     )
     .await
-    .unwrap()
-    {
-        ResponseBody::Recall(r) => r.results.len(),
+    .unwrap();
+    match single_body(outcome) {
+        ResponseBody::Recall(r) => r.memories.len(),
         _ => 0,
     }
 }
@@ -158,7 +162,7 @@ fn fast_worker_cfg() -> WorkerConfig {
     }
 }
 
-/// Register every Phase-8 worker on `sched`. Pluggable workers get
+/// Register every worker on `sched`. Pluggable workers get
 /// `Disabled*Source` so they tick (stressing the scheduler) but do
 /// no real work.
 fn register_all_workers(sched: &mut WorkerScheduler, ctx: Arc<OpsContext>) {

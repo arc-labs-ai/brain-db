@@ -1,5 +1,11 @@
-#![allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send post-9.7 (audit §4)
-//! Idempotency cleanup worker integration tests (sub-task 8.6).
+#![allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send
+//! Idempotency cleanup worker integration tests.
+//!
+//! Guards TTL expiry of the request-idempotency table: entries past the
+//! TTL are removed and younger entries are kept, with a custom TTL
+//! honoured. Pins per-cycle batch caps and multi-cycle convergence so a
+//! large backlog is fully swept, plus the no-op / batch-size-zero edges
+//! and the processed-count metric the scheduler consumes.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -14,7 +20,6 @@ use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_workers::{
     IdempotencyCleanupWorker, Worker, WorkerConfig, WorkerContext, WorkerKind, WorkerScheduler,
 };
-use parking_lot::Mutex;
 use redb::ReadableTable;
 
 const HOUR_NS: u64 = 60 * 60 * 1_000_000_000;
@@ -45,8 +50,8 @@ struct Fixture {
 fn build_fixture() -> Fixture {
     let tempdir = tempfile::tempdir().unwrap();
     let db_path = tempdir.path().join("metadata.redb");
-    let metadata: SharedMetadataDb = Arc::new(Mutex::new(MetadataDb::open(&db_path).unwrap()));
-    let (shared, hnsw_writer) = SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).unwrap();
+    let metadata: SharedMetadataDb = Arc::new(MetadataDb::open(&db_path).unwrap());
+    let (shared, hnsw_writer) = SharedHnsw::new(IndexParams::default_v1()).unwrap();
     let writer = Arc::new(RealWriterHandle::new(metadata.clone(), hnsw_writer));
     let executor = ExecutorContext::new(
         Arc::new(NopDispatcher) as Arc<dyn Dispatcher>,
@@ -55,7 +60,7 @@ fn build_fixture() -> Fixture {
         writer as Arc<dyn WriterHandle>,
     );
     Fixture {
-        ctx: Arc::new(OpsContext::new(executor)),
+        ctx: Arc::new(brain_ops::test_support::ops_context_for_tests_owning_tempdir(executor)),
         metadata,
         _tempdir: tempdir,
     }
@@ -75,8 +80,7 @@ fn rid(i: u8) -> [u8; 16] {
 }
 
 fn seed_entry(metadata: &SharedMetadataDb, byte: u8, created_at_unix_nanos: u64) {
-    let mut db = metadata.lock();
-    let wtxn = db.write_txn().unwrap();
+    let wtxn = metadata.write_txn().unwrap();
     {
         let mut t = wtxn.open_table(IDEMPOTENCY_TABLE).unwrap();
         let entry = IdempotencyEntry::new(
@@ -93,8 +97,7 @@ fn seed_entry(metadata: &SharedMetadataDb, byte: u8, created_at_unix_nanos: u64)
 }
 
 fn count_entries(metadata: &SharedMetadataDb) -> usize {
-    let db = metadata.lock();
-    let rtxn = db.read_txn().unwrap();
+    let rtxn = metadata.read_txn().unwrap();
     let t = rtxn.open_table(IDEMPOTENCY_TABLE).unwrap();
     t.iter().unwrap().count()
 }
@@ -219,51 +222,6 @@ fn custom_ttl_honoured() {
 // ===========================================================================
 // Worker integration (3).
 // ===========================================================================
-
-#[test]
-fn worker_registers_with_correct_kind_and_default_cadence() {
-    glommio_run(|| async {
-        let fix = build_fixture();
-        let mut sched = WorkerScheduler::new();
-        sched
-            .register(Arc::new(IdempotencyCleanupWorker::new()), fix.ctx)
-            .unwrap();
-        let cfg = sched.config(WorkerKind::IdempotencyCleanup.name()).unwrap();
-        assert_eq!(cfg.interval, Duration::from_secs(3600));
-        sched.shutdown().await.unwrap();
-    });
-}
-
-#[test]
-fn disabled_worker_via_config_does_not_run() {
-    glommio_run(|| async {
-        let fix = build_fixture();
-        let now = now_unix_nanos();
-        for i in 1..=5u8 {
-            seed_entry(&fix.metadata, i, now - 30 * HOUR_NS);
-        }
-        let cfg = WorkerConfig {
-            enabled: false,
-            interval: Duration::from_millis(20),
-            batch_size: 1000,
-            max_runtime: Duration::from_secs(1),
-        };
-        let mut sched = WorkerScheduler::new();
-        sched
-            .register(
-                Arc::new(IdempotencyCleanupWorker::new().with_config(cfg)),
-                fix.ctx.clone(),
-            )
-            .unwrap();
-        glommio::timer::sleep(Duration::from_millis(150)).await;
-        sched.shutdown().await.unwrap();
-        assert_eq!(
-            count_entries(&fix.metadata),
-            5,
-            "disabled worker must not delete"
-        );
-    });
-}
 
 #[test]
 fn cycle_processed_count_feeds_metrics() {

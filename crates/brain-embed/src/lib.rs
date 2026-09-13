@@ -29,7 +29,7 @@ pub mod model;
 
 pub use config::EmbedderConfig;
 pub use dispatcher::{
-    CacheStats, CachingDispatcher, CpuDispatcher, Dispatcher, DEFAULT_CACHE_SIZE,
+    CacheStats, CachingDispatcher, CpuDispatcher, Dispatcher, BGE_QUERY_PREFIX, DEFAULT_CACHE_SIZE,
 };
 pub use error::EmbedError;
 pub use fingerprint::{blake3_hash_file, blake3_hash_text, compute_fingerprint};

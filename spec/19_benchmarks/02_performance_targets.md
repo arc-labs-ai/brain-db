@@ -1,5 +1,9 @@
 # 19.02 Performance Targets
 
+> **v1.0 status — advisory, not a lock gate (owner decision, 2026-09-07).** Reference-hardware performance verification is **optional / off the grid for v1.0** — see [`06_complete_acceptance.md`](06_complete_acceptance.md) §"Performance acceptance". The numbers here are engineering targets to measure post-lock, not v1.0 lock criteria.
+>
+> **Reconciliation note.** The per-operation numbers in this file are **being reconciled** against [`../01_architecture/05_hardware_and_targets.md`](../01_architecture/05_hardware_and_targets.md) §7 and [`06_complete_acceptance.md`](06_complete_acceptance.md), which agree with each other (and split targets by CPU / GPU / `ENCODE_VECTOR_DIRECT` path). Where a number in §2 below disagrees with those two — FORGET/PLAN/REASON/STATEMENT_CREATE/RELATION_CREATE/entity-resolve latency, and the throughput lines — **treat §01/05 + §19/06 as authoritative** until this file's tables are refreshed (post-v1 tuning task). This file states single-number, older targets; the CPU/GPU-split figures supersede them.
+
 > **TL;DR.** Brain v1.0 performance gates: latency (per-operation p50/p95/p99 targets), throughput (per-shard sustained ops/s), and resource budgets (CPU, RAM, disk per shard / per node). All measured by the benchmark suite on reference hardware (16-core x86_64, 64 GiB RAM, NVMe SSD) at the 1M-memory primary scale.
 
 ## Latency Targets
@@ -92,7 +96,7 @@ TRAVERSE numbers assume default `max_branching_factor = 1000` per [`../13_retrie
 
 ### 2.5 typed graph — deferred targets
 
-- **ENTITY_RESOLVE (tier 3 — embedding HNSW)** lands when the entity HNSW is wired into the resolver. Target placeholder per the phase-16 doc: p50 ≤ 5 ms at 100K, ≤ 50 ms at 1M. Final numbers set here.
+- **ENTITY_RESOLVE (tier 3 — embedding HNSW)** is wired into the resolver (embed-on-create + top-k entity-HNSW search under a scope+type filter); what remains is the reference-hardware measurement, like every other §19.02 target. Target per the phase-16 doc: p50 ≤ 5 ms at 100K, ≤ 50 ms at 1M — final numbers captured on reference hardware.
 - **ENTITY_RESOLVE (tier 4 — LLM)** lands here with the LLM extractor. Latency is gated by the model + cache hit-rate; target is "tail under 1 s with cache warm, queued under 5 s cold."
 - **Statement HNSW semantic search** — gated on the embedding worker populating the HNSW. Brain writes / reads the table inline; the semantic-search target lands with the worker.
 - **Cross-shard RELATION_TRAVERSE** — gated on the query router. Brain ships same-shard only.
@@ -134,10 +138,10 @@ specificity. Classifier numbers assume the bundled `brain.basic_ner`
 (small distilled BERT or rule-based fallback) — larger classifiers
 scale linearly with inference cost.
 
-ENCODE's overall P99 (§2.1, 20 ms) absorbs at most one classifier
-extractor synchronously per memory; additional classifier
-extractors dispatch through the near-foreground queue and don't
-widen ENCODE's budget.
+Extraction is **not** part of ENCODE's latency: every tier (pattern,
+classifier, LLM) runs in the per-shard extractor worker, which ENCODE
+feeds via a single non-blocking enqueue. The classifier numbers above
+are a worker-throughput target, not a component of ENCODE's p99.
 
 ### 2.8 typed graph — LLM extractor
 
@@ -181,7 +185,7 @@ covers only the per-retriever LexicalRetriever numbers.
 
 Query latency is dominated by per-retriever wall-time;
 RRF fusion (see [`../13_retrievers/01_rrf_fusion.md`](../13_retrievers/01_rrf_fusion.md))
-and the filter chain (see [`../13_retrievers/05_hybrid_query.md`](../13_retrievers/05_hybrid_query.md))
+and the filter chain (see [`../13_retrievers/05_retrieval_query.md`](../13_retrievers/05_retrieval_query.md))
 add sub-ms overhead. The gate at this section measures three
 retrievers in parallel (semantic + lexical + graph at depth 1)
 plus the cross-cutting operations.
@@ -203,11 +207,11 @@ query end-to-end (parallel retrievers + RRF + filter):
 
 | Operation | p50 | p99 |
 |---|---|---|
-| Hybrid 3-retriever, push-down filters | 10 ms | 50 ms |
-| Hybrid 3-retriever, post-fusion filters only | 15 ms | 70 ms |
-| Hybrid single-retriever (router-degraded) | 7 ms | 30 ms |
+| Retrieval, 3-retriever, push-down filters | 10 ms | 50 ms |
+| Retrieval, 3-retriever, post-fusion filters only | 15 ms | 70 ms |
+| Retrieval, single-retriever (router-degraded) | 7 ms | 30 ms |
 | `EXPLAIN` (plan-only, no execution) | 500 µs | 2 ms |
-| `TRACE` (plan + per-retriever metadata, includes execution) | inherits hybrid + ~200 µs | inherits + ~1 ms |
+| `TRACE` (plan + per-retriever metadata, includes execution) | inherits retrieval + ~200 µs | inherits + ~1 ms |
 | Filter chain (1 K candidates, full chain) | 1 ms | 5 ms |
 | RRF fusion (3 lists × 100 items) | 100 µs | 500 µs |
 
@@ -216,7 +220,7 @@ Notes:
 - The query end-to-end is approximately `max(per-retriever) + filter + fusion`, not their sum — retrievers run in parallel on the shard's executor.
 - Production-scale validation (100 K memories / 1 M statements / 100 K entities) is the acceptance gate; this section validates these targets at the 10 K corpus scale used by the bench harnesses.
 - `EXPLAIN` skips the executor entirely — cost is plan construction (router + cost estimate + pre-filter computation).
-- Streaming queries (limit > 100; see streaming results in [`../13_retrievers/05_hybrid_query.md`](../13_retrievers/05_hybrid_query.md)) use the SUBSCRIBE wire path; per-emit latency is hybrid-query latency divided across the result chunks.
+- Streaming queries (limit > 100; see streaming results in [`../13_retrievers/05_retrieval_query.md`](../13_retrievers/05_retrieval_query.md)) use the SUBSCRIBE wire path; per-emit latency is retrieval-query latency divided across the result chunks.
 
 ### 2.11 Perf gates
 
@@ -336,7 +340,7 @@ A new TCP connection:
 - TLS handshake (if used): additional ~1-3 ms.
 - First request: above + normal request latency.
 
-Typical SDKs use connection pooling; subsequent requests skip the connection cost.
+Typical clients use connection pooling; subsequent requests skip the connection cost.
 
 ## 13. The variability
 
@@ -517,7 +521,7 @@ For a single client connection:
 For 100 connections:
 - ~10,000 ops/sec aggregate (if each does ~100/sec).
 
-Many parallel connections are needed for high throughput. SDKs handle this.
+Many parallel connections are needed for high throughput. Clients handle this.
 
 ## 9. The "concurrent" target
 
@@ -536,7 +540,7 @@ With pipelining (multiple requests in flight per connection):
 - Per-connection: ~10K ops/sec (vs ~1K without).
 - Aggregate: scales with the number of active connections.
 
-Brain's protocol supports pipelining; SDKs use it.
+Brain's protocol supports pipelining; clients use it.
 
 ## 11. The "load step" test
 

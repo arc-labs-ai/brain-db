@@ -39,7 +39,7 @@ pub struct SchemaVersionRow {
     pub validator_version: u32,
 }
 
-impl_redb_rkyv_value!(SchemaVersionRow, "brain_metadata::SchemaVersionRow::v1");
+impl_redb_rkyv_value!(SchemaVersionRow, "brain_metadata::SchemaVersionRow");
 
 #[cfg(all(test, not(miri)))]
 mod tests {

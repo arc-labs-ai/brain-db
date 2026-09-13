@@ -26,6 +26,7 @@ pub mod encode_helpers;
 pub mod entity;
 pub mod memory;
 pub mod reclaim;
+pub mod registry;
 pub mod relation;
 pub mod schema;
 pub mod statement;
@@ -107,7 +108,7 @@ impl From<redb::StorageError> for ApplyError {
 /// Apply one [`Phase`] against the writer's [`WriteTransaction`].
 ///
 /// `write` is the parent [`Write`] — handed in so apply functions
-/// have access to `agent_id`, `started_at_unix_nanos`, and the
+/// have access to `space_id`, `started_at_unix_nanos`, and the
 /// `write_id` for stamping audit metadata.
 ///
 /// The match is exhaustive — adding a `Phase` variant fails to compile
@@ -139,6 +140,7 @@ pub fn dispatch(
                 relation::apply_tombstone_relation(wtxn, phase, write)
             }
         },
+        Phase::RestoreMemory { .. } => memory::apply_restore_memory(wtxn, phase, write),
         Phase::Supersede { target, .. } => match target {
             crate::write::SupersedeTarget::Statement(_) => {
                 statement::apply_supersede_statement(wtxn, phase, write)
@@ -149,7 +151,7 @@ pub fn dispatch(
         },
         Phase::UpdateSalience { .. } => memory::apply_update_salience(wtxn, phase, write),
         Phase::UpdateKind { .. } => memory::apply_update_kind(wtxn, phase, write),
-        Phase::UpdateContext { .. } => memory::apply_update_context(wtxn, phase, write),
+        Phase::UpdateSession { .. } => memory::apply_update_session(wtxn, phase, write),
         Phase::UpdateEmbedding { .. } => memory::apply_update_embedding(wtxn, phase, write),
         Phase::UpdateEntity { .. } => entity::apply_update_entity(wtxn, phase, write),
         Phase::RenameEntity { .. } => entity::apply_rename_entity(wtxn, phase, write),
@@ -157,10 +159,11 @@ pub fn dispatch(
         Phase::MergeEntities { .. } => entity::apply_merge_entities(wtxn, phase, write),
         Phase::ApproveMerge { .. } => entity::apply_approve_merge(wtxn, phase, write),
         Phase::RejectMerge { .. } => entity::apply_reject_merge(wtxn, phase, write),
-        Phase::SetExtractorEnabled { .. } => {
-            schema::apply_set_extractor_enabled(wtxn, phase, write)
-        }
         Phase::ReclaimSlots { .. } => reclaim::apply_reclaim_slots(wtxn, phase, write),
+        Phase::SpaceCreate { .. } => registry::apply_space_create(wtxn, phase, write),
+        Phase::SpaceDelete { .. } => registry::apply_space_delete(wtxn, phase, write),
+        Phase::SessionCreate { .. } => registry::apply_session_create(wtxn, phase, write),
+        Phase::SessionDelete { .. } => registry::apply_session_delete(wtxn, phase, write),
     }
 }
 

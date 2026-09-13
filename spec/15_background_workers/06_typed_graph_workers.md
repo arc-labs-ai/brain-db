@@ -23,21 +23,26 @@ ENCODE(memory) → wtxn.commit() → emit("Encoded" event)
                                    │
                                    ▼
               ┌──────────────────────────────────────┐
-              │ for each active extractor:           │
-              │   if trigger(memory): dispatch       │
+              │ enqueue memory once (non-blocking)   │
+              │ onto the per-shard extractor queue   │
               └──────────────────────────────────────┘
                                    │
-              ┌────────────────────┼────────────────────┐
-              ▼                    ▼                    ▼
-        Pattern queue       Classifier queue        LLM queue
-        (foreground)        (near-foreground)       (background)
+                                   │ drained by the ExtractorWorker
+                                   ▼ on its scheduler cadence
+              ┌──────────────────────────────────────┐
+              │ run tiers in order, per memory:      │
+              │   pattern → classifier → LLM         │
+              └──────────────────────────────────────┘
 
 ```
 
-Dispatch order:
-1. Pattern extractors run **synchronously** inside the ENCODE op handler, before the response is returned. Their outputs are already persisted when ENCODE acknowledges.
-2. Classifier extractors are **enqueued** onto the near-foreground queue. ENCODE doesn't wait for them. Their outputs are visible 1–10 ms later (typical p99).
-3. LLM extractors are **enqueued** onto the background queue. The LLM dispatcher drains the queue out-of-band; outputs are visible once each call completes.
+Dispatch model — **all three tiers run asynchronously**. ENCODE never runs an extractor inline:
+
+1. On commit, the writer's post-commit step performs a **single non-blocking enqueue** of the memory onto the per-shard extractor queue, then ENCODE acknowledges. No extracted entity / statement / relation exists when ENCODE returns.
+2. The per-shard **ExtractorWorker** drains the queue on its scheduler cadence and runs the tiers **in order — pattern → classifier → LLM —** over each drained memory. Pattern output is cheap (~µs) but it too is produced by the worker, so it becomes visible only after the worker processes the memory (typically within one worker cycle), not at ENCODE-ack.
+3. The LLM tier runs last in the same pass; its outputs land once each (possibly cached) call completes.
+
+Why fully async: it keeps ENCODE's p99 independent of extraction cost. Pattern is microseconds, but the classifier forward pass (GLiNER, tens of ms to seconds on CPU) and the LLM round-trips vary by orders of magnitude — coupling any tier to the write path would make ENCODE latency hostage to model and inference cost. One queue gives one back-pressure / drop surface and one idempotency guard (the per-memory audit row); running the tiers together per memory lets later tiers supplement or replace earlier candidates and resolves `depends_on` in a single pass, and batching amortizes the GLiNER backbone GEMM across memories.
 
 ### Queue shapes
 
@@ -60,27 +65,23 @@ pub struct QueueItem {
 }
 ```
 
-Per-tier defaults (operator-configurable):
+Queue defaults (operator-configurable):
 
-| Tier | Capacity | Overflow |
+| Queue | Capacity | Overflow |
 |---|---|---|
-| Pattern | n/a (synchronous, no queue) | n/a |
-| Classifier | 1 000 | `Drop` + metric |
-| LLM | 10 000 | `Drop` + metric |
+| Per-shard extractor queue (feeds all three tiers) | 1 000 | `Drop` + metric |
 
-Overflow policy `Drop` records a metric counter and emits a warn-level trace event so the operator sees pressure. The dropped extraction writes an audit row `Skipped(reason: "queue full")`.
+There is **one** physical queue per shard: the memory is enqueued once and the worker runs every eligible tier on it. Overflow policy `Drop` records a metric counter and emits a warn-level trace event so the operator sees pressure. The dropped extraction writes an audit row `Skipped(reason: "queue full")`.
 
 ### Scheduling priorities
 
-Inherited from [`./00_purpose.md`](./00_purpose.md) §"Scheduling priorities":
+The ExtractorWorker runs under the per-shard scheduler's background allowance — it is never on the foreground (ENCODE) path. All three tiers share that one budget; there is no separate per-tier lane.
 
-| Tier | Priority | Budget |
+| Worker | Priority | Budget |
 |---|---|---|
-| Pattern | Foreground | shares the ENCODE op's allowance |
-| Classifier | Near-foreground | 25% of shard time |
-| LLM | Background | 20% of shard time |
+| ExtractorWorker (pattern + classifier + LLM) | Background | shares the shard's worker allowance |
 
-The per-shard executor's cooperative-yield model applies — a long classifier inference yields between memories to let foreground work proceed.
+The per-shard executor's cooperative-yield model applies — a long classifier or LLM inference yields between memories so foreground ops (ENCODE / RECALL) keep their latency.
 
 ### Dispatch eligibility check
 
@@ -96,7 +97,7 @@ fn is_dispatchable(ext: &ExtractorRow, mem: &Memory) -> bool {
 }
 ```
 
-Pattern dispatch runs this filter synchronously in ENCODE. Classifier dispatch runs the same filter — if the trigger doesn't match, no audit row is written (no row, no skip). The condition "trigger eval error" still writes `Skipped(reason: "trigger eval error")` because the extractor was eligible but the condition itself was malformed.
+The ExtractorWorker runs this filter when it drains each memory, once per eligible extractor — if the trigger doesn't match, no audit row is written (no row, no skip). The condition "trigger eval error" still writes `Skipped(reason: "trigger eval error")` because the extractor was eligible but the condition itself was malformed.
 
 ### Worker loop
 
@@ -130,11 +131,9 @@ On classifier queue overflow:
 
 Brain does not implement adaptive throttling.
 
-### Disabled extractors
+### Always-on extractors
 
-`extractor.enabled = false` (set via `EXTRACTOR_DISABLE`) means dispatch skips the extractor entirely at the eligibility filter. In-flight items already in the queue dequeue and run to completion ("disabling is non-disruptive").
-
-The audit row a disabled extractor would have written becomes `Skipped(reason: "disabled")` if the dispatcher caught it; in-flight items run normally and write `Success` / `Failure`.
+Extraction is always-on and non-configurable — there is no per-tier enable flag and no `EXTRACTOR_DISABLE` / `EXTRACTOR_ENABLE` op. Every registered extractor runs on every eligible item; there is no "disabled" eligibility-filter branch. A tier whose model can't load is a hard shard-spawn failure, not a silent skip (see [`../11_extractors/00_purpose.md`](../11_extractors/00_purpose.md)).
 
 ### Graceful shutdown
 
@@ -150,7 +149,7 @@ Brain ships steps 1+2; step 3 (timeout stub-writing) is deferred to avoid touchi
 Per [`./00_purpose.md`](./00_purpose.md) (Observability) plus extractor-specific:
 
 - `extractor_dispatch_total{tier, extractor_id}` — items dispatched.
-- `extractor_skipped_total{tier, extractor_id, reason}` — filter / disabled / queue-full / dep-not-ready.
+- `extractor_skipped_total{tier, extractor_id, reason}` — filter / queue-full / dep-not-ready.
 - `extractor_run_seconds{tier, extractor_id}` — histogram.
 - `extractor_audit_writes_total{status}` — Success / Failure / Skipped* / SkippedDuplicate.
 
@@ -158,9 +157,8 @@ Per [`./00_purpose.md`](./00_purpose.md) (Observability) plus extractor-specific
 
 Brain's tests verify:
 
-- Pattern dispatch is in-process synchronous (no queue).
+- All three tiers dispatch through the single extractor queue (no in-ENCODE synchronous path).
 - Classifier queue overflow drops + writes audit + emits metric.
-- `enabled = false` causes dispatch to skip.
 - `depends_on` chain blocks dequeue until parent's audit row appears.
 - Shutdown drains within 30 s timeout.
 
@@ -186,7 +184,7 @@ Both use **bounded queues** with capacity 4096 by default.
 
 Both use **backpressure-on-overflow**, NOT drop-on-overflow. This is the only worker class in this section that backpressures the foreground; every other typed-graph worker (classifier extractor, LLM extractor, entity resolver, embedding workers, audit-log sweeper) drops on queue full and records a metric.
 
-**Justification:** lexical recall is a correctness property of query (see [`../13_retrievers/05_hybrid_query.md`](../13_retrievers/05_hybrid_query.md)). Silent index drift — where a memory exists in redb but not in tantivy — would mean clients see incomplete results without any audit trail. Backpressure is preferable: the foreground op waits a few milliseconds, the user sees a slightly slower ENCODE, but the index stays consistent.
+**Justification:** lexical recall is a correctness property of query (see [`../13_retrievers/05_retrieval_query.md`](../13_retrievers/05_retrieval_query.md)). Silent index drift — where a memory exists in redb but not in tantivy — would mean clients see incomplete results without any audit trail. Backpressure is preferable: the foreground op waits a few milliseconds, the user sees a slightly slower ENCODE, but the index stays consistent.
 
 When the queue is at capacity:
 - The post-commit pipeline `await`s on the channel send.
@@ -242,7 +240,9 @@ enum StatementIndexOp {
 ```
 writer.delete_term(statement_id_term(id));
 if let Upsert { .. } = op {
-    let bucket = ((confidence * 10.0).floor() as u8).min(9) as u64;
+    // Canonical bucket: floor(c*10).clamp(0,10), 0..=10 — same formula as
+    // the redb statements_by_predicate index (§10/02), so both indexes agree.
+    let bucket = u64::from(confidence_bucket(confidence));
     writer.add_document(doc! {
         statement_id => id.to_u128(),
         subject_name => upsert.subject_canonical_name,
@@ -288,11 +288,10 @@ Ordering on the shard's post-commit fan-out (deterministic):
 
 1. WAL fsync.
 2. redb wtxn commit (memory + typed-graph tables).
-3. Pattern extractor (synchronous).
-4. Classifier extractor enqueue (near-foreground).
-5. LLM extractor enqueue (background).
-6. **MemoryTextIndexer enqueue** (near-foreground).
-7. **StatementTextIndexer enqueue** (near-foreground; only if extractors created statements, OR if this op was a direct STATEMENT_CREATE).
+3. Extractor enqueue (single queue; non-blocking).
+4. **MemoryTextIndexer enqueue** (near-foreground).
+
+Statement creation, entity resolution, and the **StatementTextIndexer enqueue** for extractor-derived statements happen later, inside the ExtractorWorker when it drains the memory (or, for a direct `STATEMENT_CREATE` op, in that op's own post-commit fan-out).
 
 Each is a separate shard-local queue; failures don't cascade (except text indexer failures, which "Commit policy" specifies as shard-fatal).
 
@@ -585,8 +584,9 @@ Tracked in [`.../00_overview/04_open_questions_archive.md`](../00_overview/04_op
 
 - Secondary indexes on `last_used_at_ns` (LLM cache) and `timestamp_ns` (audit table) for faster scans.
 - Touch-on-read for `last_used_at_ns` to make LLM cache LRU exact.
-- Per-statement-kind retention windows.
 - Watermark optimisation for stale extraction (skip re-flagging already-flagged rows).
+
+Per-statement-kind retention windows are **implemented** (no longer an open question): a predicate declares `retention: <duration>` in the schema DSL, and the `statement_reclaim` worker soft-tombstones expired statements (reason `RetentionExpired`) which then reclaim through the normal tombstone-grace flow.
 
 ## State-carrying workers
 
@@ -773,23 +773,29 @@ pub struct ForgetCascadeJob {
                               memory_id ‖ record_id, now)
 3. Open a write txn (batched, ≤ 256 records per txn).
 4. For each record in the batch:
-     a. Drop `memory_id` from `evidence`.
-     b. Recompute `confidence` per ../10_metadata/00_purpose.md.
-     c. If evidence.is_empty():
+     a. If the FORGET is soft, journal a ForgetUndoRecord to
+        forget_undo_log capturing the stripped evidence entry
+        and the row's prior confidence / is_current /
+        tombstone_reason / overflow id (hard FORGET journals
+        nothing — it is irreversible).
+     b. Drop `memory_id` from `evidence`.
+     c. Recompute `confidence` per ../10_metadata/00_purpose.md.
+     d. If evidence.is_empty():
           - confidence >= threshold:
               mark `stale_evidence` flag; keep row.
           - else:
               tombstone with reason=SourceMemoryForgotten;
               audit row.
-     d. mark_completed in the same wtxn.
+     e. mark_completed in the same wtxn.
 5. Commit. If more than 256 dependents remain, enqueue a
    continuation job for the leftover.
 ```
 
 #### Soft vs hard cascade
 
-- **Soft FORGET** (Brain's default with a grace window): the cascade marks dependent rows with the same grace expiry. If the FORGET is reverted within grace, the cascade receives a `CascadeKind::Revert` job and rolls back the pending-tombstone flag on each affected row.
-- **Hard FORGET**: the cascade hard-tombstones immediately.
+- **Soft FORGET** (Brain's default with a grace window): the `Apply` cascade mutates dependent rows immediately but additively journals each mutation to `forget_undo_log` (see step 4a above and [`../10_metadata/00_purpose.md`](../10_metadata/00_purpose.md) — the additive undo log). If the FORGET is reverted within grace, the worker receives a `CascadeKind::Revert` job and replays the undo log: it re-attaches evidence, re-adds the reverse-index row, recomputes confidence, and un-tombstones each row still carrying reason `SourceMemoryForgotten`, deleting each consumed undo row in the same txn so a re-run is a structural no-op.
+- **Hard FORGET**: the cascade hard-tombstones immediately and writes no undo records — it is irreversible.
+- **Post-grace**: once the grace window passes, slot reclamation reaps the forgotten memory's undo rows, so a soft FORGET becomes irreversible after grace too.
 
 #### Confidence threshold
 

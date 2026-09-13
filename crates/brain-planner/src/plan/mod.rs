@@ -31,9 +31,8 @@ pub use recall::{
 
 /// The planner's output. One variant per cognitive operation.
 ///
-/// Admin / Txn / Subscribe plans are deferred to later sub-tasks
-/// (they don't fit the cognitive-operation shape and their lifecycles
-/// differ — –§16).
+/// Admin / Txn / Subscribe plans are deferred (they don't fit the
+/// cognitive-operation shape and their lifecycles differ).
 #[derive(Debug, Clone)]
 pub enum ExecutionPlan {
     Encode(EncodePlan),

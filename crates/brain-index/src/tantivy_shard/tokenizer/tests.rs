@@ -1,4 +1,4 @@
-//! Unit tests for the brain tantivy analyzer (phase 22.2).
+//! Unit tests for the brain tantivy analyzer.
 
 use std::collections::HashSet;
 

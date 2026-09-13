@@ -5,9 +5,6 @@
 //! Operators run this opt-in by exporting `BRAIN_EMBED_MODEL_DIR`
 //! before `cargo test`. Without the env var, the test is logged and
 //! skipped — keeping the default `just test` workflow fast.
-//!
-//! See `spec/07_embedding/03_inference.md` §9 for the load
-//! sequence and §07 §3 for the fingerprint algorithm this exercises.
 
 use std::path::PathBuf;
 

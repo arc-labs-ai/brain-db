@@ -1,6 +1,6 @@
 //! Handshake codec — `HELLO`, `WELCOME`, `AUTH`, `AUTH_OK`.
 //!
-//! All four payloads use rkyv 0.7 like the rest of `brain-protocol`. The
+//! All four payloads encode as CBOR like the rest of `brain-protocol`. The
 //! four message structs are surfaced through `RequestBody` (HELLO, AUTH —
 //! server-bound) and `ResponseBody` (WELCOME, AUTH_OK — client-bound) so
 //! Frame dispatch is uniform.
@@ -11,12 +11,10 @@
 //! the server validates the AUTH frame against the methods it advertised
 //! in WELCOME, owned by the connection-layer AUTH handler.
 
-use rkyv::{Archive, Deserialize, Serialize};
-
-use crate::error::ProtocolError;
+use crate::codec::cbor::{from_cbor_bytes, to_cbor_bytes};
 use crate::codec::header::VERSION;
 use crate::envelope::request::WireUuid;
-use crate::codec::rkyv::{from_rkyv_bytes, to_rkyv_bytes};
+use crate::error::ProtocolError;
 
 // ---------------------------------------------------------------------------
 // Shared helper types.
@@ -25,9 +23,7 @@ use crate::codec::rkyv::{from_rkyv_bytes, to_rkyv_bytes};
 /// — feature flags exchanged during handshake. The same
 /// shape appears in HELLO (client-supported) and WELCOME (mutually-
 /// supported after intersection).
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HelloCapabilities {
     /// Streaming support. Always `true` in v1.
     pub streaming: bool,
@@ -38,9 +34,7 @@ pub struct HelloCapabilities {
 }
 
 /// — server-declared parameters carried in WELCOME.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ServerFeatures {
     /// Server's max accepted payload (spec default 16 MiB).
     pub max_payload_size: u32,
@@ -55,57 +49,56 @@ pub struct ServerFeatures {
 
 /// — supported authentication method.
 ///
-/// Numeric repr is stable wire-side: `Token = 0`, `Mtls = 1`, `None = 2`.
-/// Adding a new method requires a wire-version bump.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+/// Numeric repr is stable wire-side: `Token = 0`, `Mtls = 1`. Auth is
+/// mandatory — there is no anonymous method. Adding a new method requires
+/// a wire-version bump.
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, serde_repr::Serialize_repr, serde_repr::Deserialize_repr,
+)]
 #[repr(u8)]
 pub enum AuthMethod {
     /// Bearer token (opaque to the protocol; backend-validated).
     Token = 0,
     /// Mutual-TLS — the cert was presented during the TLS handshake.
     Mtls = 1,
-    /// No credentials — test/dev only; trusted-network deployments.
-    None = 2,
 }
 
 /// — credentials carried in the AUTH frame.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum AuthCredentials {
     /// Opaque bearer token bytes.
     Token(Vec<u8>),
     /// mTLS-presented certificate claim.
     Mtls(MtlsClaim),
-    /// No credentials.
-    None,
 }
 
 /// — mTLS claim accompanying an mTLS auth.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MtlsClaim {
     /// SHA-256 of the client's certificate.
+    #[serde(with = "serde_bytes")]
     pub cert_fingerprint: [u8; 32],
     /// Subject the client claims (typically Subject Alternative Name or CN).
     pub asserted_subject: String,
 }
 
-/// — the agent's permitted operations after AUTH_OK.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
-pub struct AgentPermissions {
+/// — the space's permitted operations after AUTH_OK.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SpacePermissions {
     pub can_encode: bool,
     pub can_recall: bool,
     pub can_plan: bool,
     pub can_reason: bool,
     pub can_forget: bool,
-    /// Typically `false` for normal agents; required for any `ADMIN_*` op.
+    /// Typically `false` for normal spaces; required for any `ADMIN_*` op.
     pub can_admin: bool,
+    /// Authorizes the connection to run an op *on behalf of another
+    /// identity* via the per-request `act_as` field. Distinct from the
+    /// other bits: it does not widen what the connection's own space may
+    /// do. Held only by a trusted service principal (an edge/gateway);
+    /// a normal space's key never carries it. Backed by the minted-key
+    /// bit `ACT_AS = 1 << 6`.
+    pub can_act_as: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -116,19 +109,18 @@ pub struct AgentPermissions {
 ///
 /// `client_id` and `supported_versions` are the negotiation inputs; the
 /// server intersects against its own capabilities and replies with
-/// `WelcomePayload`. `client_session_token` is reserved for future
-/// session-resumption (not used in v1).
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+/// `WelcomePayload`. `client_connection_token` is reserved for future
+/// connection-resumption (not used in v1).
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HelloPayload {
     /// Free-form client identifier (≤ 256 bytes).
     pub client_id: String,
     /// Wire-protocol versions the client can speak.
     pub supported_versions: Vec<u8>,
     pub capabilities: HelloCapabilities,
-    /// Reserved for v2 session-resumption.
-    pub client_session_token: Option<[u8; 32]>,
+    /// Reserved for v2 connection-resumption.
+    #[serde(with = "serde_bytes")]
+    pub client_connection_token: Option<[u8; 32]>,
 }
 
 // ---------------------------------------------------------------------------
@@ -136,10 +128,8 @@ pub struct HelloPayload {
 // ---------------------------------------------------------------------------
 
 /// — server's response to `HELLO`. The connection is bound
-/// to `chosen_version` and `session_id` once this frame is received.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+/// to `chosen_version` and `connection_id` once this frame is received.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct WelcomePayload {
     /// Free-form server identifier (≤ 256 bytes).
     pub server_id: String,
@@ -147,7 +137,8 @@ pub struct WelcomePayload {
     /// otherwise.
     pub chosen_version: u8,
     /// 16 cryptographically-random bytes; per-connection identifier
-    pub session_id: [u8; 16],
+    #[serde(with = "serde_bytes")]
+    pub connection_id: [u8; 16],
     /// Mutually-supported feature flags (intersection of client and
     /// server `HelloCapabilities`).
     pub capabilities: HelloCapabilities,
@@ -158,17 +149,15 @@ pub struct WelcomePayload {
 // AUTH (0x02) — client → server.
 // ---------------------------------------------------------------------------
 
-/// — credentials for the agent claiming identity.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+/// — credentials for the space claiming identity.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AuthPayload {
     /// Auth method. MUST be one of the methods declared in
     /// `WelcomePayload.server_features.auth_methods` (validated at the
     /// AUTH-frame handler in the connection layer, not by [`negotiate`]).
     pub method: AuthMethod,
-    /// The agent the client is identifying as.
-    pub agent_id: WireUuid,
+    /// The credential. Identity `(namespace, space, permissions)` is derived
+    /// entirely from this by the server — the client does NOT claim an space.
     pub credentials: AuthCredentials,
 }
 
@@ -179,15 +168,19 @@ pub struct AuthPayload {
 /// — server's acknowledgment of successful authentication.
 /// After this frame, the connection is in the "established" state and
 /// operations can flow.
-#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
-#[archive(check_bytes)]
-#[archive_attr(derive(Debug))]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AuthOkPayload {
-    /// Confirmed agent_id (echoed from AUTH).
-    pub agent_id: WireUuid,
-    /// Runtime shard ID this agent is bound to.
+    /// Server-assigned space_id. The client learns its identity here — it is
+    /// derived from the presented credential, never claimed by the client.
+    #[serde(with = "serde_bytes")]
+    pub space_id: WireUuid,
+    /// Runtime shard ID this space is bound to.
     pub bound_shard_id: u16,
-    pub permissions: AgentPermissions,
+    pub permissions: SpacePermissions,
+    /// Owning tenant the connection resolved to (server-derived from auth:
+    /// the API key's namespace). The client never sends this — it only
+    /// surfaces what the server bound the connection to.
+    pub namespace: String,
     /// Server's current time, for the client to detect clock skew
     pub server_time_unix_nanos: u64,
 }
@@ -303,40 +296,40 @@ pub fn negotiate(
 impl HelloPayload {
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        to_rkyv_bytes(self)
+        to_cbor_bytes(self)
     }
     pub fn decode(bytes: &[u8]) -> Result<Self, ProtocolError> {
-        from_rkyv_bytes::<Self>(bytes)
+        from_cbor_bytes::<Self>(bytes)
     }
 }
 
 impl WelcomePayload {
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        to_rkyv_bytes(self)
+        to_cbor_bytes(self)
     }
     pub fn decode(bytes: &[u8]) -> Result<Self, ProtocolError> {
-        from_rkyv_bytes::<Self>(bytes)
+        from_cbor_bytes::<Self>(bytes)
     }
 }
 
 impl AuthPayload {
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        to_rkyv_bytes(self)
+        to_cbor_bytes(self)
     }
     pub fn decode(bytes: &[u8]) -> Result<Self, ProtocolError> {
-        from_rkyv_bytes::<Self>(bytes)
+        from_cbor_bytes::<Self>(bytes)
     }
 }
 
 impl AuthOkPayload {
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        to_rkyv_bytes(self)
+        to_cbor_bytes(self)
     }
     pub fn decode(bytes: &[u8]) -> Result<Self, ProtocolError> {
-        from_rkyv_bytes::<Self>(bytes)
+        from_cbor_bytes::<Self>(bytes)
     }
 }
 
@@ -389,10 +382,10 @@ mod tests {
     #[test]
     fn hello_payload_round_trips() {
         let original = HelloPayload {
-            client_id: "brain-rust-sdk/0.5.0".into(),
+            client_id: "example-client/1.0".into(),
             supported_versions: vec![1, 2],
             capabilities: full_caps(),
-            client_session_token: Some(sample_token(1)),
+            client_connection_token: Some(sample_token(1)),
         };
         let bytes = original.encode();
         let decoded = HelloPayload::decode(&bytes).expect("hello round-trip");
@@ -405,7 +398,7 @@ mod tests {
             client_id: "client".into(),
             supported_versions: vec![crate::VERSION],
             capabilities: v1_caps(),
-            client_session_token: None,
+            client_connection_token: None,
         };
         assert_eq!(HelloPayload::decode(&original.encode()).unwrap(), original);
     }
@@ -417,7 +410,7 @@ mod tests {
         let original = WelcomePayload {
             server_id: "brain-server/0.5.0".into(),
             chosen_version: 1,
-            session_id: sample_session_id(2),
+            connection_id: sample_session_id(2),
             capabilities: v1_caps(),
             server_features: ServerFeatures {
                 max_payload_size: crate::MAX_PAYLOAD_BYTES as u32,
@@ -437,7 +430,6 @@ mod tests {
     fn auth_payload_round_trips_token() {
         let original = AuthPayload {
             method: AuthMethod::Token,
-            agent_id: sample_uuid(3),
             credentials: AuthCredentials::Token(b"opaque-token-bytes".to_vec()),
         };
         assert_eq!(AuthPayload::decode(&original.encode()).unwrap(), original);
@@ -447,21 +439,10 @@ mod tests {
     fn auth_payload_round_trips_mtls() {
         let original = AuthPayload {
             method: AuthMethod::Mtls,
-            agent_id: sample_uuid(4),
             credentials: AuthCredentials::Mtls(MtlsClaim {
                 cert_fingerprint: sample_token(5),
                 asserted_subject: "CN=client.example.com".into(),
             }),
-        };
-        assert_eq!(AuthPayload::decode(&original.encode()).unwrap(), original);
-    }
-
-    #[test]
-    fn auth_payload_round_trips_none() {
-        let original = AuthPayload {
-            method: AuthMethod::None,
-            agent_id: sample_uuid(6),
-            credentials: AuthCredentials::None,
         };
         assert_eq!(AuthPayload::decode(&original.encode()).unwrap(), original);
     }
@@ -471,16 +452,18 @@ mod tests {
     #[test]
     fn auth_ok_payload_round_trips() {
         let original = AuthOkPayload {
-            agent_id: sample_uuid(7),
+            space_id: sample_uuid(7),
             bound_shard_id: 3,
-            permissions: AgentPermissions {
+            permissions: SpacePermissions {
                 can_encode: true,
                 can_recall: true,
                 can_plan: true,
                 can_reason: true,
                 can_forget: true,
                 can_admin: false,
+                can_act_as: false,
             },
+            namespace: "acme".to_string(),
             server_time_unix_nanos: 1_700_000_000_000_000_000,
         };
         assert_eq!(AuthOkPayload::decode(&original.encode()).unwrap(), original);
@@ -494,9 +477,9 @@ mod tests {
             client_id: "c".into(),
             supported_versions: vec![1, 2, 3],
             capabilities: v1_caps(),
-            client_session_token: None,
+            client_connection_token: None,
         };
-        let mut server = ServerCapabilities::v1_default("s", vec![AuthMethod::None]);
+        let mut server = ServerCapabilities::v1_default("s", vec![AuthMethod::Token]);
         server.supported_versions = vec![1, 2];
         let session = negotiate(&client, &server).expect("overlap on 1, 2");
         assert_eq!(session.chosen_version, 2);
@@ -508,9 +491,9 @@ mod tests {
             client_id: "c".into(),
             supported_versions: vec![crate::VERSION],
             capabilities: v1_caps(),
-            client_session_token: None,
+            client_connection_token: None,
         };
-        let mut server = ServerCapabilities::v1_default("s", vec![AuthMethod::None]);
+        let mut server = ServerCapabilities::v1_default("s", vec![AuthMethod::Token]);
         server.supported_versions = vec![1, 2];
         // Client only speaks the current wire version; server speaks
         // both 1 and the current. Negotiation must pick the current,
@@ -526,9 +509,9 @@ mod tests {
             client_id: "c".into(),
             supported_versions: vec![3, 4],
             capabilities: v1_caps(),
-            client_session_token: None,
+            client_connection_token: None,
         };
-        let mut server = ServerCapabilities::v1_default("s", vec![AuthMethod::None]);
+        let mut server = ServerCapabilities::v1_default("s", vec![AuthMethod::Token]);
         server.supported_versions = vec![1, 2];
         let err = negotiate(&client, &server).expect_err("no overlap");
         assert!(matches!(
@@ -552,9 +535,9 @@ mod tests {
                 compression_zstd: true, // client supports
                 server_push: true,
             },
-            client_session_token: None,
+            client_connection_token: None,
         };
-        let mut server = ServerCapabilities::v1_default("s", vec![AuthMethod::None]);
+        let mut server = ServerCapabilities::v1_default("s", vec![AuthMethod::Token]);
         server.capabilities = HelloCapabilities {
             streaming: true,
             compression_zstd: false, // server doesn't
@@ -575,9 +558,9 @@ mod tests {
             client_id: "c".into(),
             supported_versions: vec![VERSION],
             capabilities: v1_caps(),
-            client_session_token: None,
+            client_connection_token: None,
         };
-        let server = ServerCapabilities::v1_default("s", vec![AuthMethod::None]);
+        let server = ServerCapabilities::v1_default("s", vec![AuthMethod::Token]);
         let session = negotiate(&client, &server).expect("happy path");
         assert!(session.capabilities.streaming);
     }

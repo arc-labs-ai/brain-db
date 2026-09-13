@@ -1,14 +1,14 @@
-//! Counter reconciliation worker (sub-task 8.10).
+//! Counter reconciliation worker.
 //!
 //! Walks `MEMORIES_TABLE` and verifies each row's `edges_out_count` /
 //! `edges_in_count` against the live edge tables. Drift gets fixed.
-//! 3 — drift is expected to be near-zero in normal operation;
-//! a non-trivial rate indicates a bug worth investigating.
+//! Drift is expected to be near-zero in normal operation; a non-trivial
+//! rate indicates a bug worth investigating.
 //!
-//! v1 reconciles **only** per-memory edge counts. Other counters spec
-//! §2.1 lists (`ContextMetadata.memory_count`, `AgentMetadata`
-//! counters, per-shard cluster totals) lack the v1 plumbing — no
-//! CONTEXTS_TABLE, no agent admin ops, no cluster layer. Phase 9.
+//! v1 reconciles **only** per-memory edge counts. Other counters
+//! (`SessionMetadata.memory_count`, `SpaceMetadata` counters, per-shard
+//! cluster totals) lack the v1 plumbing — no SESSIONS_TABLE, no space
+//! admin ops, no cluster layer.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -85,15 +85,14 @@ async fn do_reconcile_cycle(
     let started = Instant::now();
     let start_cursor = *worker.cursor.lock();
 
-    // ── Phase A: read txn — collect mismatches (id, true_out,
+    // ── Step A: read txn — collect mismatches (id, true_out,
     //    true_in) for candidates above the cursor. ────────────────
     let snapshot = collect_mismatches(&metadata, start_cursor, &cfg, &started)?;
 
-    // ── Phase B: wtxn fixes the rows. ────────────────────────────
+    // ── Step B: wtxn fixes the rows. ────────────────────────────
     let mut fixed = 0usize;
     if !snapshot.mismatches.is_empty() {
-        let mut db = metadata.lock();
-        let wtxn = db
+        let wtxn = metadata
             .write_txn()
             .map_err(|e| WorkerError::Ops(format!("reconcile wtxn: {e:?}")))?;
         {
@@ -108,7 +107,7 @@ async fn do_reconcile_cycle(
                     .map(|a| a.value());
                 let Some(mut row) = row else { continue };
                 // Re-check: drift may have been fixed by a writer
-                // between phase A and B. Idempotent.
+                // between step A and B. Idempotent.
                 if row.edges_out_count == *true_out && row.edges_in_count == *true_in {
                     continue;
                 }
@@ -164,8 +163,7 @@ fn collect_mismatches(
     cfg: &WorkerConfig,
     started: &Instant,
 ) -> Result<ReconcileSnapshot, WorkerError> {
-    let db = metadata.lock();
-    let rtxn = db
+    let rtxn = metadata
         .read_txn()
         .map_err(|e| WorkerError::Ops(format!("reconcile rtxn: {e:?}")))?;
     let memories = rtxn

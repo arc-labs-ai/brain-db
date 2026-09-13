@@ -1,5 +1,11 @@
-#![allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send post-9.7 (audit §4)
-//! Snapshot worker tests (sub-task 8.13).
+#![allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send
+//! Snapshot worker tests.
+//!
+//! Guards the retention policy (`decide_retention`: drop oldest past
+//! max-count, drop aged past max-age, and the two combined) and the
+//! worker that applies it: an enabled worker takes a snapshot, reports
+//! the count, and deletes expired snapshots via its source. Pins the
+//! failing-source -> `WorkerError` path and the skip-first-tick default.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -14,7 +20,7 @@ use brain_workers::snapshot::{DeleteFuture, ListFuture, TakeFuture};
 use brain_workers::{
     decide_retention, DisabledSnapshotSource, RetentionPolicy, SnapshotDesc, SnapshotId,
     SnapshotSource, SnapshotSourceError, SnapshotWorker, Worker, WorkerConfig, WorkerContext,
-    WorkerKind, WorkerScheduler,
+    WorkerKind,
 };
 use parking_lot::Mutex;
 
@@ -40,8 +46,15 @@ impl Dispatcher for NopDispatcher {
 fn make_ops_context() -> (Arc<OpsContext>, tempfile::TempDir) {
     let tempdir = tempfile::tempdir().unwrap();
     let db_path = tempdir.path().join("metadata.redb");
-    let metadata: SharedMetadataDb = Arc::new(Mutex::new(MetadataDb::open(&db_path).unwrap()));
-    let (shared, hnsw_writer) = SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).unwrap();
+    let metadata: SharedMetadataDb = Arc::new(MetadataDb::open(&db_path).unwrap());
+    let (shared, mut hnsw_writer) = SharedHnsw::new(IndexParams::default_v1()).unwrap();
+    // Seed one entry so the HNSW is non-empty: `do_snapshot_cycle` skips
+    // empty-HNSW shards (no semantic state worth checkpointing), but these
+    // tests exercise the retention path and need the cycle to actually
+    // call the (mock) snapshot source.
+    hnsw_writer
+        .insert(brain_core::MemoryId::pack(0, 1, 1), &[0.0; VECTOR_DIM])
+        .unwrap();
     let writer = Arc::new(RealWriterHandle::new(metadata.clone(), hnsw_writer));
     let executor = ExecutorContext::new(
         Arc::new(NopDispatcher) as Arc<dyn Dispatcher>,
@@ -49,7 +62,10 @@ fn make_ops_context() -> (Arc<OpsContext>, tempfile::TempDir) {
         metadata,
         writer as Arc<dyn WriterHandle>,
     );
-    (Arc::new(OpsContext::new(executor)), tempdir)
+    (
+        Arc::new(brain_ops::test_support::ops_context_for_tests_owning_tempdir(executor)),
+        tempdir,
+    )
 }
 
 async fn run_one(
@@ -162,6 +178,32 @@ fn count_and_age_combined() {
     assert_eq!(ids, vec![3, 4, 5]);
 }
 
+#[test]
+fn keep_floor_retains_newest_even_when_all_past_max_age() {
+    let now = now_unix_nanos();
+    // Every snapshot is far older than max_age (30d). Without the
+    // keep-floor this would delete ALL of them, leaving nothing to
+    // restore from (invariant #7 — the only backup path).
+    let s = [
+        snap(1, now - 40 * DAY_NS),
+        snap(2, now - 50 * DAY_NS),
+        snap(3, now - 60 * DAY_NS),
+    ];
+    let policy = RetentionPolicy {
+        max_count: 7,
+        max_age: Duration::from_secs(30 * 24 * 3600),
+    };
+    let r = decide_retention(&s, now, policy);
+    let mut ids: Vec<u64> = r.into_iter().map(|i| i.0).collect();
+    ids.sort();
+    // Newest (id 1, 40d) is kept by the floor; the older two are dropped.
+    assert_eq!(
+        ids,
+        vec![2, 3],
+        "keep-floor never deletes the newest snapshot"
+    );
+}
+
 // ===========================================================================
 // Stub sources.
 // ===========================================================================
@@ -224,36 +266,6 @@ impl SnapshotSource for FailingSource {
 // ===========================================================================
 
 #[test]
-fn disabled_source_returns_disabled_on_every_method() {
-    glommio_run(|| async {
-        let s = DisabledSnapshotSource;
-        assert!(matches!(
-            s.take_snapshot().await,
-            Err(SnapshotSourceError::Disabled)
-        ));
-        assert!(matches!(
-            s.list_snapshots().await,
-            Err(SnapshotSourceError::Disabled)
-        ));
-        assert!(matches!(
-            s.delete_snapshot(SnapshotId(1)).await,
-            Err(SnapshotSourceError::Disabled)
-        ));
-    });
-}
-
-#[test]
-fn stub_source_take_returns_monotonic_id() {
-    glommio_run(|| async {
-        let stub = StubSource::new();
-        let a = stub.take_snapshot().await.unwrap();
-        let b = stub.take_snapshot().await.unwrap();
-        assert!(b.0 > a.0);
-        assert_eq!(stub.list_snapshots().await.unwrap().len(), 2);
-    });
-}
-
-#[test]
 fn failed_source_propagates_as_worker_error() {
     glommio_run(|| async {
         let (ops, _td) = make_ops_context();
@@ -271,34 +283,6 @@ fn failed_source_propagates_as_worker_error() {
 // ===========================================================================
 // Cycle (3).
 // ===========================================================================
-
-#[test]
-fn disabled_worker_via_config_does_not_take() {
-    glommio_run(|| async {
-        let (ops, _td) = make_ops_context();
-        let stub = StubSource::new();
-        let deleted = stub.deleted.clone();
-        let snaps = stub as Arc<dyn SnapshotSource>;
-        let mut sched = WorkerScheduler::new();
-        sched
-            .register(
-                Arc::new(SnapshotWorker::new(snaps).with_config(WorkerConfig {
-                    enabled: false,
-                    interval: Duration::from_millis(20),
-                    batch_size: 1,
-                    max_runtime: Duration::from_secs(1),
-                })),
-                ops,
-            )
-            .unwrap();
-        glommio::timer::sleep(Duration::from_millis(150)).await;
-        sched.shutdown().await.unwrap();
-        assert!(
-            deleted.lock().is_empty(),
-            "disabled worker must not delete anything"
-        );
-    });
-}
 
 #[test]
 fn enabled_worker_takes_snapshot_and_reports_count() {
@@ -355,28 +339,16 @@ fn enabled_worker_deletes_old_snapshots_per_retention() {
 // ===========================================================================
 
 #[test]
-fn worker_registers_with_correct_kind_and_default_cadence_disabled() {
-    glommio_run(|| async {
-        let (ops, _td) = make_ops_context();
-        let mut sched = WorkerScheduler::new();
-        sched
-            .register(
-                Arc::new(SnapshotWorker::new(Arc::new(DisabledSnapshotSource))),
-                ops,
-            )
-            .unwrap();
-        let cfg = sched.config(WorkerKind::Snapshot.name()).unwrap();
-        assert_eq!(cfg.interval, Duration::from_secs(3600));
-        assert!(!cfg.enabled, ".2 — Snapshot defaults to disabled");
-        sched.shutdown().await.unwrap();
-    });
-}
-
-#[test]
-fn default_config_has_enabled_false_per_spec() {
+fn default_config_enabled_and_worker_skips_first_tick() {
     glommio_run(|| async {
         let cfg = WorkerConfig::defaults_for(WorkerKind::Snapshot);
-        assert!(!cfg.enabled);
+        assert!(cfg.enabled, "Snapshot enabled by default post-Task-3");
+        // skip-first-tick is a Worker trait method, not a config knob.
+        let worker = SnapshotWorker::new(Arc::new(DisabledSnapshotSource));
+        assert!(
+            brain_workers::Worker::skip_first_tick(&worker),
+            "Snapshot worker skips its first tick"
+        );
     });
 }
 

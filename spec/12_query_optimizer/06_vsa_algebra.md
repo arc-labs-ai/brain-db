@@ -1,6 +1,6 @@
 # 12.06 VSA Algebra
 
-Vector-Symbolic Architecture primitives for binding typed predicates and entities into high-dimensional vectors that compose under simple arithmetic operations. Ships as a callable algebra module; PLAN / REASON integration lands in a future version.
+Vector-Symbolic Architecture primitives for binding typed predicates and entities into high-dimensional vectors that compose under simple arithmetic operations. Ships as a callable algebra module; REASON's analogical-inference nudge (§6) is its first executor consumer. PLAN integration is not proposed and remains out of scope.
 
 ## 1. What VSA is
 
@@ -57,36 +57,56 @@ The first user-facing surface for the algebra module is `analogy_query`:
 
 ```rust
 pub fn analogy_query(
-    given: &[(Vsa /* role */, Vsa /* filler */)],
-    missing_role: Vsa,
-    corpus: &[(EntityId, Vsa)],
-) -> Vec<(EntityId, f32)>;
+    codebook: &mut Codebook,
+    triple_a: &VsaVec,       // reserved: unused today, locks the v1.1 signature
+    triple_c: &VsaVec,
+    role_to_extract: &str,
+) -> Result<Option<(String, f32)>, VsaError>;
 ```
 
-Solves "A is to B as C is to ?". Mechanically:
+Solves "A is to B as C is to ?" — but not against an arbitrary caller-supplied
+corpus. Mechanically (`crates/brain-planner/src/vsa/analogy.rs`):
 
-1. Compose the given pairs via bind + bundle into a composite.
-2. Unbind with `missing_role` to surface the candidate filler.
-3. Cosine-rank against the corpus to find the nearest entity.
+1. `triple_c` is an HRR vector already composed via `encode_triple`: bind
+   each role/filler pair, then bundle — `bundle(role⊛subject,
+   role⊛predicate, role⊛object)`.
+2. Unbind `triple_c` with the role named by `role_to_extract` (e.g.
+   `ROLE_OBJECT`) to recover a noisy filler vector.
+3. Argmax-cosine that noisy vector against the shared `Codebook`'s own
+   registered filler vocabulary (`Codebook::cleanup`) — not a
+   caller-supplied corpus — returning the single best-matching filler name
+   and its cosine score, or `None` if the codebook has no fillers yet.
 
-This is the structural similarity primitive that PLAN / REASON will lean on in a future version. The initial release exposes it for tools and experimentation.
+`triple_a` is accepted but unused in the implementation today (bound as
+`_triple_a`) — the parameter locks the public signature for richer analogy
+forms ("A : B :: C : ?" using both triples) in a future version; the answer
+is currently determined purely by `triple_c` and `role_to_extract`. Filler
+names are plain display strings (an entity's canonical name, or a rendered
+statement value) resolved by the caller, not `EntityId`s — the algebra
+module itself has no entity-table dependency.
 
-## 6. Why the module ships before the integration
+This is the structural similarity primitive REASON's analogical-inference
+nudge is built on (§6). The initial release also exposes it directly for
+tools and experimentation.
 
-The algebra module is small and standalone — it's worth shipping early because (a) the codebook discipline benefits from baking in before user predicate ids proliferate, and (b) it gives downstream consumers (tools, custom planners) a stable surface to build on.
+## 6. Integration status: REASON live, PLAN out of scope
 
-PLAN / REASON integration is deferred because:
+The algebra module was small and standalone enough to ship early — worth doing because (a) the codebook discipline benefits from baking in before user predicate ids proliferate, and (b) it gives downstream consumers (tools, custom planners) a stable surface to build on.
 
-1. The cost-model integration (where does VSA-similarity sit relative to RRF in the planner's cost estimator?) needs more bench data.
-2. The wire-level exposure (an `analogy` opcode, or a new field on `QUERY`?) is an open design call that's better made after the algebra has been used in anger.
+**REASON integration has landed** (`crates/brain-planner/src/executor/analogical.rs`, wired into `execute_reason` in `crates/brain-planner/src/executor/reason.rs`). The two blockers originally named here are resolved, for REASON specifically:
 
-Until that integration lands, the algebra module is callable from in-process consumers and from tests but does not appear on the wire. The integration's wire surface will require a wire-version bump if it warrants one.
+1. **Cost-model integration** — turned out not to be a blocker. REASON's cost estimator (`cost::cost_reason`, `crates/brain-planner/src/cost.rs`) is a standalone heuristic with no RRF dependency; RRF only fuses RECALL's semantic/lexical/graph lanes, and REASON never used RRF, so there was no "where does VSA-similarity sit relative to RRF" question to answer. `cost_reason` simply gained a small additive term for the new bind/unbind + cosine-rank work — `max_inferences * (bind_unbind_ms + cosine_rank_ms)`, using the ~10 µs bind/unbind and ~5 ms cosine-rank figures from §7. No cost-model redesign was needed.
+2. **Wire-level exposure** — resolved as: no new opcode, no new request field. The nudge is an automatic internal scoring signal inside `execute_reason` — REASON re-ranks its already-graph-qualified evidence by structural fit and reports the term in `ReasonTraceScoreBreakdown.analogical_fit` (trace mode only). The `InferenceKind::AnalogicalInference` wire value, defined on the wire since before this integration but never emitted, is now emitted when the nudge materially reshapes a step's result. See [01. Architecture](../01_architecture/03_primitives.md) §4.2 for the primitive-level description.
+
+**PLAN integration was never proposed** and remains out of scope — this spec has never documented a VSA tie-in for PLAN's A*/MCTS search, and this integration doesn't add one. If a PLAN integration is pursued in a future version, it needs its own cost-model and wire-exposure analysis; nothing here resolves that for PLAN.
+
+Until a PLAN integration is proposed and lands, the algebra module remains directly callable from in-process consumers and from tests, with REASON as its first and, for now, only executor consumer.
 
 ## 7. Performance
 
 The FFT-based bind/unbind path runs at D=512 in ~10 µs per op on commodity CPU. A bundle of 100 bound vectors at D=512 sits at ~1 ms total. Cosine-rank against a 10k-entity corpus is ~5 ms.
 
-These targets are loose because no executor consumes the algebra in latency-critical paths yet. The bench harness verifies they hold; tightening the budget happens when PLAN / REASON wire it in.
+These targets held up as the executor-consumption baseline: REASON's analogical-inference nudge (§6) uses exactly these two operations — one bind/unbind per evidence item's triple, one cosine-rank against the codebook — and its `cost_reason` term (`crates/brain-planner/src/cost.rs`) was set directly from these figures rather than fresh benchmarking. Tightening the budget further, if REASON's real-world latency profile calls for it, is now a REASON-side tuning question, not a blocked integration question.
 
 ## 8. Tests
 

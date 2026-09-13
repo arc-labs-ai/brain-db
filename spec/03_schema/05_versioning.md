@@ -1,8 +1,10 @@
-# 03.05 Schema Versioning
+# 03.05 Schema Versioning and Merge Semantics
 
-How `SCHEMA_UPLOAD` increments a namespace's version, persists the
-parsed document, and exposes the active version for downstream
-validation. **Migration plan computation is explicitly out of
+How `SCHEMA_UPLOAD` merges declarations into a namespace's active
+state, increments the namespace's version when something changes,
+persists the parsed document, and exposes the active version for
+downstream validation. Also covers the destructive `SCHEMA_REPLACE`
+opcode (§9 below). **Migration plan computation is explicitly out of
 scope for v1** — see [§07](../00_overview/04_open_questions_archive.md) Q3.
 
 Cross-references:
@@ -19,13 +21,22 @@ Cross-references:
 SCHEMA_UPLOAD(text or programmatic) →
     parse → AST
     validate → ValidatedSchema
+    classify_schema_merge(rtxn, &validated):
+        for each declared item:
+            existing = lookup in current active namespace
+            match (existing, declared) on byte-equal constraints:
+                None             → Insert
+                Some & match     → Idempotent
+                Some & mismatch  → Conflict → abort upload
+        if all Idempotent and a current version exists → return it
+                                                          (no bump)
     schema_upload(wtxn, &validated_schema, now):
         lookup current active version for namespace
         new_version = current + 1
         write SCHEMA_VERSIONS_TABLE row (namespace, new_version)
         write SCHEMA_ACTIVE_VERSIONS_TABLE (namespace -> new_version)
-        write entity_type / predicate / relation_type rows for
-          new + changed definitions (delegates to the existing
+        write / adopt entity_type / predicate / relation_type rows
+          for new + changed definitions (delegates to the existing
           17.3 / 18.3 intern paths)
         commit
     emit SchemaUpdated event
@@ -41,6 +52,90 @@ error, validator error, storage error) **nothing changes**:
 
 This is the atomicity contract — partial state from a failed
 upload is impossible.
+
+## 1a. Merge semantics
+
+`SCHEMA_UPLOAD` is **additive-merge**, not replace. Each upload
+classifies its declarations against the current persisted state
+for the same namespace and falls into one of three outcomes per
+item:
+
+| Outcome | Predicate | Effect |
+|---|---|---|
+| **Match** | byte-equal constraints with the active row | idempotent no-op; the row keeps its existing version stamp |
+| **Insert** | no prior declaration in the namespace | adds the row at `new_version = current + 1` |
+| **Conflict** | prior declaration exists with **incompatible constraints** | upload aborts with `SchemaConflict { kind, name, namespace, conflict }`; nothing commits |
+
+The classification is **all-or-nothing per upload**. A single
+conflict aborts the entire transaction — the prior active version
+stays untouched and no items from the upload land. This keeps the
+operator's view simple: an upload either fully applies or fully
+rejects; never half-merges.
+
+### What "byte-equal" means per declaration kind
+
+| Kind | Compared fields |
+|---|---|
+| Predicate | `kind_constraint`, `object_type_constraint_byte`, `description`, `is_stateful` |
+| Relation type | `cardinality`, `is_symmetric`, `description` (`from` / `to` entity-type ids re-resolve at apply time; divergent type names trip there) |
+| Extractor | `kind` byte (pattern / classifier / llm); the encoded `ExtractorDef` blob is compared at apply time |
+| Entity type | the stored `schema_blob` (empty in v1, so the check is "no prior non-empty blob"). Entity types are global — see §1c |
+
+### Idempotent re-upload
+
+If every item classifies as **Match** and the namespace already
+has an active version, `SCHEMA_UPLOAD` returns the current version
+without bumping. Operators can safely re-apply the same DSL after
+a deployment without producing a new version row.
+
+### Adoption of implicit definitions
+
+When an upload declares a predicate or relation_type qname that
+already exists in the registry with `SchemaOrigin::ImplicitFromWrite`
+(interned by a prior `STATEMENT_CREATE` / `RELATION_CREATE`), the
+existing id is **preserved** and its origin flips to
+`SchemaDeclared { version: new_version }`. This is the merge path
+for the open-vocabulary writes that landed before the schema. See
+§3.5 below for the post-commit flagging sweep that follows.
+
+## 1b. `SchemaConflict` error shape
+
+The wire-level conflict error carries enough detail for an
+operator to fix the offending declaration without inspecting
+storage:
+
+```rust
+SchemaConflict {
+    kind:       &'static str,   // "predicate" | "relation_type" |
+                                // "extractor" | "entity_type"
+    name:       String,         // local item name (unqualified)
+    namespace:  String,         // namespace the upload targeted
+    conflict:   String,         // comma-separated field diffs
+                                // e.g. "kind: stored=Fact new=Event,
+                                //       object_type: stored=1 new=2"
+}
+```
+
+A conflict aborts the upload before any writer txn opens; nothing
+commits.
+
+## 1c. Entity-type scope in v1
+
+Entity types are **global** in the v1 storage model — they live
+in a single shard-wide table without a namespace key. Two
+consequences flow from this:
+
+- A user upload to namespace `acme` that declares an entity type
+  `Person` shares the same row as a later upload to namespace
+  `crm` declaring `Person`. The merge predicate is "is there an
+  existing row with this name?", not "is there an existing row
+  with this name in this namespace?".
+- `SCHEMA_REPLACE` (§9) does **not** drop entity types. Dropping
+  them would race with rows in other namespaces that reference
+  the same shared type.
+
+This is a documented v1 limitation; namespacing entity types is
+tracked in [`./04_namespaces.md`](./04_namespaces.md) §8.
 
 ## 2. The redb rows
 
@@ -207,14 +302,16 @@ if this becomes load-bearing.
 
 Per [`../04_wire_protocol/09_typed_graph_admin.md`](../04_wire_protocol/09_typed_graph_admin.md):
 
-- `SCHEMA_UPLOAD` (`0x0120`): text or AST form; returns new version
-  or validation errors.
+- `SCHEMA_UPLOAD` (`0x0120`): additive-merge upload; returns new
+  version or `SchemaConflict` / validation errors.
 - `SCHEMA_GET` (`0x0121`): `(namespace, version)` → full
   `SchemaView` (parsed + canonical text).
 - `SCHEMA_LIST` (`0x0122`): `namespace` → version history (newest
   first).
 - `SCHEMA_VALIDATE` (`0x0123`): dry-run; returns errors or
   would-be-version.
+- `SCHEMA_REPLACE` (`0x0127`): destructive namespace reset;
+  admin-only; requires `force_drop_existing: true`. See §9.
 
 ## 8. Tests
 
@@ -230,7 +327,122 @@ This section verifies:
 - Two namespaces; versions independent.
 - `brain:` upload rejected.
 
-## 9. Open questions
+## 9. `SCHEMA_REPLACE` — destructive counterpart
+
+`SCHEMA_REPLACE` (`0x0127` request, `0x01A7` response) is the rare
+destructive opcode for "wipe this namespace's declarations and
+re-apply against a clean slate". The merge-only `SCHEMA_UPLOAD`
+path cannot express this — by design — so removing a declaration,
+narrowing a constraint, or changing an extractor kind requires the
+explicit replace path.
+
+### Semantics
+
+Inside a single redb wtxn:
+
+1. Drop every schema-declared predicate, relation_type, and
+   extractor row whose namespace matches the request.
+2. Run the supplied DSL through the same parse / validate / apply
+   pipeline `SCHEMA_UPLOAD` uses. With the prior declared rows
+   gone, the apply runs against a clean slate.
+3. Bump the namespace version, write the new
+   `SCHEMA_VERSIONS_TABLE` row, update
+   `SCHEMA_ACTIVE_VERSIONS_TABLE`.
+4. Commit. If the new schema's apply step fails (e.g. an
+   `Any`-target relation_type pointing at a missing entity type),
+   the whole wtxn drops and the previous schema state survives.
+
+What is **not** dropped:
+
+- **Implicit-from-write rows.** Predicates / relation_types
+  interned by prior `STATEMENT_CREATE` / `RELATION_CREATE` with
+  origin `ImplicitFromWrite` stay put — they are not part of the
+  declared vocabulary.
+- **Entity types.** They are global in v1 (see §1c). Dropping them
+  would race with rows in other namespaces.
+- **Existing statements / relations rows.** Rows that referenced a
+  now-dropped predicate / relation_type remain in storage. Reads
+  still return them; the post-upload flag sweep (§3.5) marks them
+  `OUTSIDE_ACTIVE_SCHEMA`.
+
+### Confirmation flag
+
+The request body carries `force_drop_existing: bool`. The handler
+rejects with `InvalidRequest` if the flag is not exactly `true`.
+The flag is the wire contract's explicit-confirmation step for an
+irreversible operation — a typo in a client cannot accidentally
+wipe a deployment's schema.
+
+### Permission
+
+`SCHEMA_REPLACE` is admin-only at the dispatch layer.
+`SCHEMA_UPLOAD` (additive-merge) is the operator-routine path;
+`SCHEMA_REPLACE` is the explicit destructive escape hatch.
+
+### Response shape
+
+```rust
+SchemaReplaceResponse {
+    namespace:        String,
+    schema_version:   u32,    // 0 on validation error
+    dropped_count:    u32,    // # of declared rows removed
+    validation_errors: Vec<SchemaValidationErrorWire>,
+}
+```
+
+Parse / validate errors ride in `validation_errors` (mirroring the
+`SCHEMA_UPLOAD` response shape), not as `OpError`.
+
+## 9a. `SCHEMA_DROP` — targeted narrowing
+
+Where `SCHEMA_REPLACE` wipes a namespace's whole declared vocabulary,
+`SCHEMA_DROP` (`0x0125`) removes exactly **one** declared item — a predicate
+or a relation_type — and re-versions the narrowed document. Entity types are
+global (§1c) and never dropped.
+
+### Semantics
+
+1. Resolve the target in the active version's document by `(target_kind,
+   target_name)`. `target_kind`: `0 = predicate`, `1 = relation_type`.
+2. **Not-declared → no-op success.** No active version, or the target isn't in
+   the document, returns `dropped = false` with the version unchanged (mirrors
+   FORGET's leniency on an already-absent target). This is also what a *re-drop*
+   of an already-removed target returns.
+3. **In-use safety gate.** Count live (non-tombstoned) rows keyed on the target
+   (statements-by-predicate / relations-by-type). If any exist and `force` is
+   unset, reject with `Conflict` and mutate nothing; with `force`, drop it and
+   leave those rows as orphans.
+4. Remove the declared row from the typed-graph tables, narrow the document
+   (the removed item is dropped so the re-apply can't re-create it), re-validate,
+   and upload it as a new version — then a post-commit `OUTSIDE_ACTIVE_SCHEMA`
+   flag sweep re-marks statements on the dropped declaration stale.
+
+### Durability + idempotency
+
+`SCHEMA_DROP` flows through the unified `submit(Write)` path (a
+`Phase::UpsertSchema` carrying the narrowed document plus the drop delta), so
+the mutation is WAL-durable and replayed on recovery like every other write
+(see [`../08_storage/02_wal.md`](../08_storage/02_wal.md) §21) — the narrowed
+document rides the record as serde_json (it has no DSL source to re-parse).
+Idempotency is the spec-standard **safe retry**: a same-`request_id` replay of a
+completed drop is a no-op success (the target is already gone), not a byte-cached
+echo; a same-`request_id` different-params replay conflicts. Admin-only.
+
+### Response shape
+
+```rust
+SchemaDropResponse {
+    namespace:        String,
+    schema_version:   u32,   // narrowed version; unchanged on a no-op drop
+    target_kind:      u8,
+    target_name:      String,
+    dropped:          bool,  // false = nothing to drop (idempotent no-op)
+    live_rows:        u32,   // orphaned rows the drop left, when forced
+    validation_errors: Vec<SchemaValidationErrorWire>,
+}
+```
+
+## 10. Open questions
 
 See [`.../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md). Notably:
 

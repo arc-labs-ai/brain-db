@@ -14,7 +14,7 @@ What can go wrong in the storage layer and Brain's response. Failures that span 
 - Brain retries the next attempt; if it succeeds, normal operation resumes.
 - If multiple consecutive failures occur within a window, the WAL is marked broken.
 
-**Implication.** Clients receiving `WalUnavailable` should back off and retry. The SDK does this with exponential backoff.
+**Implication.** Clients receiving `WalUnavailable` should back off and retry. Clients should do this with exponential backoff.
 
 ## 2. WAL write failure (persistent)
 

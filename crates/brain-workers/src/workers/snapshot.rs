@@ -1,21 +1,24 @@
-//! Snapshot worker (sub-task 8.13).
+//! Snapshot worker.
 //!
-//! Periodic snapshot trigger with retention policy marks
-//! this worker **off by default** ("many deployments prefer
-//! external backup tooling. The substrate's built-in snapshot worker
-//! is a convenience").
+//! Periodic snapshot trigger with retention policy. This worker is
+//! **on by default** (hourly): a periodic snapshot bounds the WAL
+//! replay the next restart has to do. Deployments that prefer external
+//! backup tooling disable it via `[workers.snapshot].enabled = false`
+//! (or leave the source `DisabledSnapshotSource`).
 //!
-//! ## v1 deviation (documented)
+//! ## v1 status
 //!
-//! No full-shard snapshot orchestration exists yet:
-//! - `SharedHnsw::save_snapshot` exists but no arena / metadata
-//!   wrappers do.
-//! - No `Wal` instance hangs off the writer, so the "trigger
-//!   checkpoint first" sequencing is Phase 9.
+//! Partial: the memory-HNSW graph is persisted (`SharedHnsw::save_snapshot`,
+//! driven by the real `ShardSnapshotSource` in brain-server), giving a
+//! fast memory-index cold-start. What is NOT yet wired is full-shard
+//! snapshot orchestration — the arena + metadata-redb + WAL-tail reflink
+//! bundle and its `manifest.json`,
+//! and therefore the checkpoint-then-copy sequencing.
 //!
-//! v1 ships the **worker shape + retention policy** as a pluggable
-//! seam (same pattern as 8.5/8.8/8.12). [`DisabledSnapshotSource`]
-//! is the default. Phase 9 plugs in a real source.
+//! The worker ships the **shape + retention policy** as a pluggable seam
+//! (same pattern as the HNSW / WAL-retention / cache-evict workers);
+//! [`DisabledSnapshotSource`] is the default for deployments that prefer
+//! external backup tooling, and `ShardSnapshotSource` is the live source.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -65,12 +68,21 @@ impl Default for RetentionPolicy {
 // Pure retention logic.
 // ---------------------------------------------------------------------------
 
+/// Absolute floor on retained snapshots: retention never deletes the
+/// newest `MIN_SNAPSHOTS_KEPT` snapshots, even when they are older than
+/// `max_age`. Without this floor a long-idle shard whose every snapshot
+/// has aged past `max_age` would delete *all* of them, leaving nothing
+/// to restore from (invariant #7 — this is the only backup path). Must
+/// be >= 1.
+const MIN_SNAPSHOTS_KEPT: usize = 1;
+
 /// Return ids of snapshots to delete given the current set + policy.
 /// A snapshot is deletable if **either**:
 ///   - its age >= `max_age` (oldness rule), or
-///   - it's outside the newest `max_count` (count rule).
+///   - it's outside the newest `max_count` (count rule),
 ///
-/// 2 leaves the combination unspecified; v1 uses "either".
+/// **and** it is not within the newest [`MIN_SNAPSHOTS_KEPT`] (the
+/// keep-floor always wins). The count/age combination is "either".
 #[must_use]
 pub fn decide_retention(
     snapshots: &[SnapshotDesc],
@@ -88,6 +100,11 @@ pub fn decide_retention(
 
     let mut out = Vec::new();
     for (idx, snap) in by_age.iter().enumerate() {
+        // Keep-floor: never delete the newest N. Guarantees at least one
+        // restorable backup always survives.
+        if idx < MIN_SNAPSHOTS_KEPT {
+            continue;
+        }
         let age = now_unix_nanos.saturating_sub(snap.taken_at_unix_nanos);
         let too_old = age >= max_age_nanos;
         let excess = idx >= policy.max_count;
@@ -99,7 +116,7 @@ pub fn decide_retention(
 }
 
 // ---------------------------------------------------------------------------
-// Source trait — Phase 9 injects an impl.
+// Source trait — a real impl is injected here.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Error)]
@@ -118,9 +135,9 @@ pub type DeleteFuture<'a> = Pin<Box<dyn Future<Output = Result<(), SnapshotSourc
 
 /// Pluggable seam for the snapshot worker. Production deployments
 /// inject an impl backed by the per-shard arena + WAL + metadata
-/// (Phase 9.8 `ShardSnapshotSource`).
+/// (`ShardSnapshotSource`).
 ///
-/// Post-9.8 the trait is `!Send + !Sync`: real adapters hold
+/// The trait is `!Send + !Sync`: real adapters hold
 /// `Rc<RefCell<…>>` per-shard state and run on the per-shard Glommio
 /// executor.
 pub trait SnapshotSource: 'static {
@@ -157,7 +174,7 @@ impl SnapshotWorker {
     #[must_use]
     pub fn new(source: Arc<dyn SnapshotSource>) -> Self {
         Self {
-            // WorkerKind::Snapshot defaults enabled=false.2.
+            // WorkerKind::Snapshot defaults enabled=true (hourly).
             config: WorkerConfig::defaults_for(WorkerKind::Snapshot),
             retention: RetentionPolicy::default(),
             source,
@@ -192,6 +209,10 @@ impl Worker for SnapshotWorker {
     fn config(&self) -> WorkerConfig {
         self.config.clone()
     }
+    fn skip_first_tick(&self) -> bool {
+        // Don't snapshot at shard spawn — see Worker::skip_first_tick.
+        true
+    }
     fn run_cycle<'a>(
         &'a self,
         ctx: &'a WorkerContext,
@@ -204,6 +225,18 @@ async fn do_snapshot_cycle(
     worker: &SnapshotWorker,
     ctx: &WorkerContext,
 ) -> Result<usize, WorkerError> {
+    // Skip when there's nothing meaningful to snapshot. The empty-HNSW
+    // case fires on every shard's first tick (workers run a cycle
+    // immediately at register, before any encodes have populated the
+    // index) — without this guard each shard would write a redundant
+    // CHECKPOINT_BEGIN/END pair to the WAL at startup, which throws
+    // off any consumer that reasons about exact LSN positions
+    // (recovery tests, downstream tooling). Admin-driven take_snapshot
+    // calls bypass the worker and don't need this gate.
+    if ctx.ops.executor.index.is_empty() {
+        return Ok(0);
+    }
+
     // Take the snapshot.
     let new_id = match worker.source.take_snapshot().await {
         Ok(id) => id,

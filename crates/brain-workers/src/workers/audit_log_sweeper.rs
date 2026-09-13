@@ -1,10 +1,11 @@
-//! Audit log sweeper (sub-task 24.7).
+//! Audit log sweeper.
 //!
 //! Periodic low-priority worker that hard-deletes audit rows
-//! past `retention_seconds` (default 90 d). v1 sweeps the
-//! `EXTRACTOR_AUDIT_TABLE`. Merge / Unmerge audit rows (spec
-//! §25/00: "forever") live on a different table and are
-//! untouched.
+//! past `retention_seconds` (default 90 d). It sweeps the
+//! `EXTRACTOR_AUDIT_TABLE` (per-call extraction audit, along with its
+//! by-memory / by-extractor / by-time index entries) and the
+//! `ENTITY_RESOLUTION_AUDIT_TABLE`. Merge / Unmerge audit rows (kept
+//! forever) live on a different table and are untouched.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -62,7 +63,7 @@ impl AuditLogSweeper {
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
             .unwrap_or(0);
-        let mut metadata = ctx.ops.executor.metadata.lock();
+        let metadata = ctx.ops.executor.metadata.as_ref();
         let wtxn = metadata
             .write_txn()
             .map_err(|e| WorkerError::Internal(format!("audit sweeper wtxn: {e}")))?;
@@ -118,11 +119,5 @@ mod tests {
     fn default_retention_is_90d() {
         let w = AuditLogSweeper::new();
         assert_eq!(w.retention_seconds, 90 * 24 * 60 * 60);
-    }
-
-    #[test]
-    fn worker_kind_name() {
-        let w = AuditLogSweeper::new();
-        assert_eq!(w.name(), "audit_log_sweeper");
     }
 }

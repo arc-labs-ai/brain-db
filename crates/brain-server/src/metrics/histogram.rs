@@ -19,8 +19,6 @@
 //!
 //! Constructed via [`Histogram::new`] (raw) or
 //! [`Histogram::new_default_ms`] (ms-scaled with buckets).
-//! F-7 introduced the unit-agnostic
-//! split.
 //!
 //! ## Allocation
 //!
@@ -315,7 +313,7 @@ mod tests {
         assert!(out.contains("brain_test_duration_ms_count 1"));
     }
 
-    /// F-7: raw-mode histograms emit the true integer sum, not
+    /// Raw-mode histograms emit the true integer sum, not
     /// scaled. Used by frame-size histograms where the observation
     /// is bytes.
     #[test]

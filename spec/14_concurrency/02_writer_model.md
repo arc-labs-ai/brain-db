@@ -209,9 +209,9 @@ Brain doesn't currently have replication. A future addition would extend the wri
 - A follower writer takes replicated operations.
 - Both apply to the same shard's state — but they're never both active at once (one is leader, one is follower).
 
-## 15. The implications for SDK
+## 15. The implications for clients
 
-The SDK:
+Clients:
 
 - Doesn't manage writer state.
 - Submits requests; awaits responses.

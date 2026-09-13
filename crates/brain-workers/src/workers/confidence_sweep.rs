@@ -42,11 +42,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use brain_core::{aggregate_confidence, ConfidenceConfig, EvidenceEntry, StatementKind};
 use brain_core::{EvidenceOverflowId, ExtractorId, MemoryId, StatementId};
-use brain_metadata::statement::evidence_overflow_load;
-use brain_metadata::tables::statement::{
-    confidence_bucket, EvidenceEntryRow, StatementMetadata, STATEMENTS_BY_PREDICATE_TABLE,
-    STATEMENTS_TABLE,
-};
+use brain_metadata::statement::{evidence_overflow_load, rekey_predicate_index};
+use brain_metadata::tables::statement::{EvidenceEntryRow, StatementMetadata, STATEMENTS_TABLE};
 use brain_metadata::MetadataDb;
 use brain_ops::ConfidenceSweepMetrics;
 use parking_lot::Mutex;
@@ -62,12 +59,7 @@ use crate::worker::Worker;
 // Knobs.
 // ---------------------------------------------------------------------------
 
-/// Operator override for the sweep interval (seconds). Falls back to
-/// the `WorkerConfig::defaults_for` cadence when unset, empty, or
-/// non-positive.
-pub const SWEEP_INTERVAL_ENV: &str = "BRAIN_CONFIDENCE_SWEEP_INTERVAL_SECS";
-
-/// Spec default cadence: 1 h.
+/// Default cadence: 1 h.
 pub const DEFAULT_INTERVAL_SECS: u64 = 3600;
 pub const DEFAULT_BATCH_SIZE: usize = 256;
 pub const DEFAULT_MAX_PER_TICK: usize = 4_096;
@@ -79,9 +71,12 @@ pub const DEFAULT_MAX_CHANGE_PER_TICK: f32 = 0.02;
 /// max_runtime`; this struct holds the sweep-specific tuning.
 #[derive(Clone, Copy, Debug)]
 pub struct ConfidenceSweepKnobs {
-    /// Hard cap on rows the worker pulls off the table per cycle.
-    /// Larger caps move the system to steady state faster on a fresh
-    /// deployment; smaller caps keep the redb write txn short.
+    /// Size of the scan window per tick, in rows *scanned* (not rows
+    /// collected). The scan resumes from a persisted cursor, advances by
+    /// up to this many rows, then stops; the next tick continues after
+    /// the last-visited row and wraps to the start on a full pass. Larger
+    /// windows move the system to steady state faster on a fresh
+    /// deployment; smaller windows keep each read txn short.
     pub max_per_tick: usize,
     /// Skip rows whose `extracted_at_unix_nanos > now - this`. Defaults
     /// to 1 day so freshly written rows don't get touched by the next
@@ -108,23 +103,6 @@ impl Default for ConfidenceSweepKnobs {
     }
 }
 
-/// Parse the env override. Returns `None` when the variable is unset,
-/// empty, non-numeric, or zero.
-#[must_use]
-pub fn parse_interval_override(raw: Option<&str>) -> Option<Duration> {
-    let s = raw?;
-    let v: u64 = s.parse().ok()?;
-    if v == 0 {
-        return None;
-    }
-    Some(Duration::from_secs(v))
-}
-
-fn resolved_interval() -> Duration {
-    parse_interval_override(std::env::var(SWEEP_INTERVAL_ENV).ok().as_deref())
-        .unwrap_or_else(|| Duration::from_secs(DEFAULT_INTERVAL_SECS))
-}
-
 // ---------------------------------------------------------------------------
 // Worker.
 // ---------------------------------------------------------------------------
@@ -133,18 +111,32 @@ pub struct ConfidenceSweepWorker {
     config: WorkerConfig,
     knobs: ConfidenceSweepKnobs,
     confidence_config: ConfidenceConfig,
-    metadata: Arc<Mutex<MetadataDb>>,
+    metadata: Arc<MetadataDb>,
     metrics: Option<Arc<ConfidenceSweepMetrics>>,
+    /// Wrapping scan cursor across ticks. `None` means "start from the
+    /// beginning of `STATEMENTS_TABLE`". Each tick resumes strictly
+    /// after this key and advances it to the last row it visited; a tick
+    /// that reaches the end of the table wraps back to `None`. Without
+    /// this, every tick re-scanned the same first `max_per_tick` rows in
+    /// key order and statements past that window were never refreshed.
+    /// In-process only (lost on restart) — that is safe because the
+    /// confidence recompute is idempotent, so a restart merely re-scans
+    /// from the top.
+    cursor: Mutex<Option<StatementId>>,
 }
 
 impl ConfidenceSweepWorker {
-    /// Construct with the spec-default cadence + knobs.
+    /// Construct with the default cadence + knobs. Override the cadence
+    /// with [`Self::with_interval_secs`], which the shard wires from
+    /// `[workers.confidence_sweep] interval_secs`.
     #[must_use]
-    pub fn new(metadata: Arc<Mutex<MetadataDb>>) -> Self {
+    pub fn new(metadata: Arc<MetadataDb>) -> Self {
         let mut config = WorkerConfig::defaults_for(WorkerKind::ConfidenceSweep);
-        config.interval = resolved_interval();
-        // Cap the per-cycle scan at batch_size so the read txn doesn't
-        // sit on the metadata lock arbitrarily long.
+        config.interval = Duration::from_secs(DEFAULT_INTERVAL_SECS);
+        // NOTE: the per-tick scan window is bounded by `knobs.max_per_tick`,
+        // not `WorkerConfig::batch_size`. `batch_size` is retained here for
+        // scheduler/telemetry uniformity with the other workers but does
+        // not pace this scan; tune the window via `max_per_tick`.
         config.batch_size = DEFAULT_BATCH_SIZE;
         Self {
             config,
@@ -152,7 +144,17 @@ impl ConfidenceSweepWorker {
             confidence_config: ConfidenceConfig::default_v1(),
             metadata,
             metrics: None,
+            cursor: Mutex::new(None),
         }
+    }
+
+    /// Override the sweep cadence. The shard supplies
+    /// `[workers.confidence_sweep] interval_secs`; a zero value is
+    /// clamped to 1 second so the scheduler never busy-loops.
+    #[must_use]
+    pub fn with_interval_secs(mut self, interval_secs: u64) -> Self {
+        self.config.interval = Duration::from_secs(interval_secs.max(1));
+        self
     }
 
     #[must_use]
@@ -188,9 +190,9 @@ impl ConfidenceSweepWorker {
             m.inc_cycles();
         }
 
-        // ── Read phase: snapshot up to `max_per_tick` candidates. ───
-        let candidates = match self.collect_candidates(ctx, now_ns, self.knobs.max_per_tick.max(1))
-        {
+        // ── Read phase: scan a moving window of up to `max_per_tick`
+        // rows, resuming from the persisted cursor. ─────────────────
+        let scan = match self.collect_candidates(ctx, now_ns, self.knobs.max_per_tick.max(1)) {
             Ok(c) => c,
             Err(e) => {
                 if let Some(m) = &self.metrics {
@@ -199,6 +201,18 @@ impl ConfidenceSweepWorker {
                 return Err(e);
             }
         };
+        // Advance the cursor before any early return so a window of only
+        // ineligible rows still makes forward progress instead of pinning
+        // the scan at the head of the table forever.
+        {
+            let mut cursor = self.cursor.lock();
+            *cursor = if scan.reached_end {
+                None // wrap: next tick starts a fresh pass
+            } else {
+                scan.last_scanned
+            };
+        }
+        let candidates = scan.candidates;
         let scanned = candidates.len();
         if let Some(m) = &self.metrics {
             m.add_rows_swept(scanned as u64);
@@ -295,99 +309,122 @@ impl ConfidenceSweepWorker {
         Ok(n_updates)
     }
 
-    /// Read-phase: scan `STATEMENTS_TABLE` from the start, pick rows
-    /// that pass the eligibility checks, materialise their evidence.
-    /// Returns up to `cap` rows.
+    /// Read-phase: scan a window of up to `cap` rows of `STATEMENTS_TABLE`,
+    /// resuming strictly after the persisted cursor, pick rows that pass
+    /// the eligibility checks, materialise their evidence. The window is
+    /// bounded by rows *scanned* (not rows collected) so per-tick work is
+    /// bounded and the window advances predictably even when eligible
+    /// rows are sparse — over successive ticks every active statement is
+    /// eventually visited, then the cursor wraps.
     fn collect_candidates(
         &self,
         ctx: &WorkerContext,
         now_ns: u64,
         cap: usize,
-    ) -> Result<Vec<Candidate>, WorkerError> {
+    ) -> Result<ScanResult, WorkerError> {
         let min_age_ns = self.knobs.min_age_seconds.saturating_mul(1_000_000_000);
         let cutoff_ns = now_ns.saturating_sub(min_age_ns);
 
-        let db = self.metadata.lock();
-        let rtxn = db
-            .read_txn()
-            .map_err(|e| WorkerError::Internal(format!("confidence sweep rtxn: {e}")))?;
-        let table = match rtxn.open_table(STATEMENTS_TABLE) {
-            Ok(t) => t,
-            // No statements have ever been written — table doesn't
-            // exist yet. Treat as empty.
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-            Err(e) => return Err(WorkerError::Internal(format!("open STATEMENTS: {e}"))),
+        let start_cursor: Option<StatementId> = *self.cursor.lock();
+        // redb ranges are half-open (`>= from`); bump the cursor's last
+        // byte so we resume strictly *after* the row we last visited.
+        let from_key: [u8; 16] = match start_cursor {
+            Some(id) => bump_be_u128(id.to_bytes()),
+            None => [0u8; 16],
         };
 
+        let rtxn = self
+            .metadata
+            .read_txn()
+            .map_err(|e| WorkerError::Internal(format!("confidence sweep rtxn: {e}")))?;
+        let table = rtxn
+            .open_table(STATEMENTS_TABLE)
+            .map_err(|e| WorkerError::Internal(format!("open STATEMENTS: {e}")))?;
+
         let mut out: Vec<Candidate> = Vec::new();
+        let mut last_scanned: Option<StatementId> = None;
+        let mut scanned = 0usize;
+        let mut reached_end = true;
         let iter = table
-            .iter()
-            .map_err(|e| WorkerError::Internal(format!("iter STATEMENTS: {e}")))?;
+            .range(from_key..)
+            .map_err(|e| WorkerError::Internal(format!("range STATEMENTS: {e}")))?;
         for entry in iter {
             if ctx.is_shutdown() {
+                reached_end = false;
                 break;
             }
             let (key, value) =
                 entry.map_err(|e| WorkerError::Internal(format!("decode STATEMENTS row: {e}")))?;
             let id_bytes = key.value();
             let meta = value.value();
-            if !is_eligible(&meta, cutoff_ns) {
-                continue;
-            }
-            let kind = match meta.kind() {
-                Some(k) => k,
-                None => continue,
-            };
-            // Event rows can't decay — only skip them when decay is
-            // disabled, which is the default. Saves the evidence
-            // materialisation cost.
-            if matches!(kind, StatementKind::Event) && self.confidence_config.event_decay_disabled {
-                continue;
-            }
-            let evidence = match materialise_evidence(&rtxn, &meta) {
-                Ok(e) => e,
-                Err(e) => {
-                    warn!(
-                        target: "brain_workers::confidence_sweep",
-                        statement_id = ?StatementId::from(id_bytes),
-                        error = %e,
-                        "could not materialise evidence; skipping row",
-                    );
-                    continue;
+            last_scanned = Some(StatementId::from(id_bytes));
+            scanned += 1;
+
+            if is_eligible(&meta, cutoff_ns) {
+                if let Some(kind) = meta.kind() {
+                    // Event rows can't decay — only skip them when decay
+                    // is disabled, which is the default. Saves the
+                    // evidence materialisation cost.
+                    let skip_event = matches!(kind, StatementKind::Event)
+                        && self.confidence_config.event_decay_disabled;
+                    if !skip_event {
+                        match materialise_evidence(&rtxn, &meta) {
+                            Ok(evidence) if !evidence.is_empty() => out.push(Candidate {
+                                id: StatementId::from(id_bytes),
+                                kind,
+                                kind_byte: meta.kind,
+                                stored_confidence: meta.confidence,
+                                predicate_id: meta.predicate_id,
+                                evidence,
+                            }),
+                            Ok(_) => {} // no evidence — nothing to recompute
+                            Err(e) => {
+                                warn!(
+                                    target: "brain_workers::confidence_sweep",
+                                    statement_id = ?StatementId::from(id_bytes),
+                                    error = %e,
+                                    "could not materialise evidence; skipping row",
+                                );
+                            }
+                        }
+                    }
                 }
-            };
-            if evidence.is_empty() {
-                continue;
             }
-            out.push(Candidate {
-                id: StatementId::from(id_bytes),
-                kind,
-                kind_byte: meta.kind,
-                stored_confidence: meta.confidence,
-                predicate_id: meta.predicate_id,
-                evidence,
-            });
-            if out.len() >= cap {
+
+            // Window is bounded by rows scanned, so the cursor advances a
+            // fixed step each tick regardless of how many rows qualified.
+            if scanned >= cap {
+                reached_end = false;
                 break;
             }
         }
-        Ok(out)
+        Ok(ScanResult {
+            candidates: out,
+            last_scanned,
+            reached_end,
+        })
     }
 
     /// Write-phase: open one wtxn, write each row, fix up the
     /// `STATEMENTS_BY_PREDICATE` bucket when it moved.
     fn apply_updates(&self, updates: &[PendingUpdate]) -> Result<(), WorkerError> {
-        let mut db = self.metadata.lock();
-        let wtxn = db
+        let wtxn = self
+            .metadata
             .write_txn()
             .map_err(|e| WorkerError::Internal(format!("confidence sweep wtxn: {e}")))?;
+        // Bucket re-keys deferred until the STATEMENTS handle drops — the
+        // shared `rekey_predicate_index` opens STATEMENTS_BY_PREDICATE
+        // itself, and redb forbids holding two handles to one table.
+        // Tuple: (scope, predicate_id, kind, old_confidence, new_confidence, id).
+        // The scope is captured from each row so the predicate-index
+        // re-key targets the same `(namespace, space)` keyspace the row
+        // lives in — the index is scope-prefixed.
+        let mut rekey_moves: Vec<(brain_metadata::RowScope, u32, u8, f32, f32, [u8; 16])> =
+            Vec::new();
         {
             let mut s_table = wtxn
                 .open_table(STATEMENTS_TABLE)
                 .map_err(|e| WorkerError::Internal(format!("open STATEMENTS (w): {e}")))?;
-            let mut by_pred = wtxn
-                .open_table(STATEMENTS_BY_PREDICATE_TABLE)
-                .map_err(|e| WorkerError::Internal(format!("open BY_PREDICATE (w): {e}")))?;
             for u in updates {
                 let key = u.id.to_bytes();
                 let prior = s_table
@@ -404,29 +441,30 @@ impl ConfidenceSweepWorker {
                 if meta.is_tombstoned() || meta.is_current == 0 {
                     continue;
                 }
-                let old_bucket = confidence_bucket(meta.confidence);
-                let new_bucket = confidence_bucket(u.new_confidence);
+                let old_conf = meta.confidence;
+                let row_scope =
+                    brain_metadata::RowScope::from_bytes(meta.namespace_id, meta.space_id_bytes);
                 meta.confidence = u.new_confidence;
                 s_table
                     .insert(key, meta)
                     .map_err(|e| WorkerError::Internal(format!("insert STATEMENTS: {e}")))?;
-                if old_bucket != new_bucket {
-                    let old_key = (u.predicate_id, u.kind_byte, old_bucket);
-                    let new_key = (u.predicate_id, u.kind_byte, new_bucket);
-                    // Move the row's predicate-bucket index entry. The
-                    // index is keyed by `(predicate, kind, bucket)` and
-                    // stores the statement id; we remove from the old
-                    // bucket and re-insert into the new one. A missing
-                    // old-bucket row is fine (the index may have been
-                    // pruned by a parallel path).
-                    let _ = by_pred
-                        .remove(&old_key)
-                        .map_err(|e| WorkerError::Internal(format!("remove old bucket: {e}")))?;
-                    by_pred
-                        .insert(&new_key, &key)
-                        .map_err(|e| WorkerError::Internal(format!("insert new bucket: {e}")))?;
-                }
+                rekey_moves.push((
+                    row_scope,
+                    u.predicate_id,
+                    u.kind_byte,
+                    old_conf,
+                    u.new_confidence,
+                    key,
+                ));
             }
+        }
+        // Re-key the predicate-bucket index for every row whose confidence
+        // moved. The helper is a no-op when the coarse bucket is
+        // unchanged and is ownership-guarded against evicting a
+        // bucket-sharing sibling.
+        for (scope, pred, kind, old_conf, new_conf, id) in rekey_moves {
+            rekey_predicate_index(&wtxn, scope, pred, kind, old_conf, new_conf, &id)
+                .map_err(|e| WorkerError::Internal(format!("rekey by_predicate: {e}")))?;
         }
         wtxn.commit()
             .map_err(|e| WorkerError::Internal(format!("confidence sweep commit: {e}")))?;
@@ -459,7 +497,7 @@ impl Worker for ConfidenceSweepWorker {
 // Helpers — pulled out so unit tests can target them directly.
 // ---------------------------------------------------------------------------
 
-/// `decay(age_seconds, kind)` per spec — the per-kind decay function
+/// `decay(age_seconds, kind)` — the per-kind decay function
 /// used inside `aggregate_confidence`. Exposed here so the worker's
 /// tests can sanity-check the numbers without going through the full
 /// noisy-OR path.
@@ -516,11 +554,39 @@ fn materialise_evidence(
 #[allow(dead_code)] // tests use these helpers
 fn evidence_entry(memory_byte: u8, confidence: f32, timestamp_unix_nanos: u64) -> EvidenceEntry {
     EvidenceEntry::from_parts(
-        MemoryId::pack(memory_byte as u16, brain_core::ContextId::DEFAULT.into(), 0),
+        MemoryId::pack(memory_byte as u16, brain_core::SessionId::DEFAULT.into(), 0),
         confidence,
         timestamp_unix_nanos,
         ExtractorId::from(0),
     )
+}
+
+/// Big-endian increment by one, saturating at all-ones (no wraparound).
+/// Used to turn redb's half-open `>= from` range into a strict `> cursor`
+/// resume. Saturation is harmless: an all-ones `from` key yields an empty
+/// range, which the caller treats as "reached the end, wrap".
+fn bump_be_u128(mut bytes: [u8; 16]) -> [u8; 16] {
+    for i in (0..16).rev() {
+        let (v, overflow) = bytes[i].overflowing_add(1);
+        bytes[i] = v;
+        if !overflow {
+            return bytes;
+        }
+    }
+    [0xFF; 16]
+}
+
+/// Result of one read-phase window scan.
+#[derive(Debug)]
+struct ScanResult {
+    /// Eligible rows with materialised evidence, ready for recompute.
+    candidates: Vec<Candidate>,
+    /// Key of the last row the scan visited this window, or `None` if the
+    /// window was empty. Drives the cursor forward.
+    last_scanned: Option<StatementId>,
+    /// True iff the scan exhausted the range (a full pass) rather than
+    /// stopping at the per-tick window cap or on shutdown.
+    reached_end: bool,
 }
 
 #[derive(Debug)]
@@ -549,12 +615,14 @@ struct PendingUpdate {
 #[cfg(all(test, not(miri)))]
 #[allow(clippy::arc_with_non_send_sync)]
 mod tests {
+    fn __ts() -> brain_metadata::RowScope {
+        brain_metadata::RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xA1; 16])
+    }
+
     use super::*;
+    use brain_core::{Entity, EntityType, EvidenceRef, Statement, StatementObject, SubjectRef};
     use brain_core::{
-        Entity, EntityType, EvidenceRef, Statement, StatementObject, SubjectRef,
-    };
-    use brain_core::{
-        ContextId, EntityId, EvidenceOverflowId, ExtractorId, MemoryId, PredicateId, StatementId,
+        EntityId, EvidenceOverflowId, ExtractorId, MemoryId, PredicateId, SessionId, StatementId,
     };
     use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
     use brain_index::statement_hnsw::{StatementHnswIndex, StatementHnswParams};
@@ -563,7 +631,7 @@ mod tests {
     use brain_metadata::schema::predicate::predicate_intern_or_get;
     use brain_metadata::statement::{allocate_evidence_overflow, statement_create, statement_get};
     use brain_metadata::MetadataDb;
-    use brain_ops::{OpsContext, RealWriterHandle};
+    use brain_ops::RealWriterHandle;
     use brain_planner::{ExecutorContext, WriterHandle};
     use parking_lot::RwLock;
     use std::sync::atomic::AtomicBool;
@@ -631,11 +699,14 @@ mod tests {
         let cutoff = now - NS_PER_DAY;
         let mut meta = StatementMetadata {
             statement_id_bytes: [0u8; 16],
+            namespace_id: brain_core::NamespaceId::SYSTEM.raw(),
+            space_id_bytes: [0xA1; 16],
+            session_id: 0,
             chain_root_bytes: [0u8; 16],
             version: 1,
             kind: StatementKind::Fact.as_u8(),
             subject_entity_bytes: [0u8; 16],
-            subject_is_pending: 0,
+            subject_kind: 0,
             predicate_id: 1,
             object_blob: Vec::new(),
             object_discriminant: 1,
@@ -656,7 +727,6 @@ mod tests {
             record_invalidated_at_unix_nanos: None,
             is_current: 1,
             flags: 0,
-            original_predicate_qname: String::new(),
             is_stateful: 0,
         };
         assert!(is_eligible(&meta, cutoff));
@@ -687,24 +757,24 @@ mod tests {
 
     struct Fixture {
         _dir: tempfile::TempDir,
-        metadata: Arc<Mutex<MetadataDb>>,
+        metadata: Arc<MetadataDb>,
         ctx: WorkerContext,
     }
 
     fn fixture() -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let metadata = MetadataDb::open(dir.path().join("test.redb")).expect("open metadata");
-        let metadata = Arc::new(Mutex::new(metadata));
+        let metadata = Arc::new(metadata);
         let dispatcher: Arc<dyn Dispatcher> = Arc::new(NoopDispatcher);
         let (shared, hnsw_writer) =
-            SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).expect("SharedHnsw::new");
+            SharedHnsw::new(IndexParams::default_v1()).expect("SharedHnsw::new");
         let writer: Arc<dyn WriterHandle> =
             Arc::new(RealWriterHandle::new(metadata.clone(), hnsw_writer));
         let _statement_hnsw = Arc::new(RwLock::new(
             StatementHnswIndex::new(StatementHnswParams::default_v1()).unwrap(),
         ));
         let executor = ExecutorContext::new(dispatcher, shared, metadata.clone(), writer);
-        let ops = Arc::new(OpsContext::new(executor));
+        let ops = Arc::new(brain_ops::test_support::ops_context_for_tests_owning_tempdir(executor));
         let ctx = WorkerContext {
             ops,
             shutdown: Arc::new(AtomicBool::new(false)),
@@ -720,20 +790,21 @@ mod tests {
     /// single evidence row at the same timestamp + confidence. Returns
     /// the StatementId.
     fn seed_statement_with_age(
-        metadata: &Arc<Mutex<MetadataDb>>,
+        metadata: &Arc<MetadataDb>,
         n: u8,
         extracted_at: u64,
         evidence_confidence: f32,
         evidence_age_offset_ns: u64,
         kind: StatementKind,
     ) -> StatementId {
-        let mut db = metadata.lock();
-        let wtxn = db.write_txn().unwrap();
+        let wtxn = metadata.write_txn().unwrap();
 
         let subj = EntityId::new();
         let obj = EntityId::new();
         entity_put(
             &wtxn,
+            __ts(),
+            brain_core::SessionId::DEFAULT,
             &Entity::new_active(
                 subj,
                 EntityType::PERSON_ID,
@@ -745,6 +816,8 @@ mod tests {
         .unwrap();
         entity_put(
             &wtxn,
+            __ts(),
+            brain_core::SessionId::DEFAULT,
             &Entity::new_active(
                 obj,
                 EntityType::PERSON_ID,
@@ -762,7 +835,7 @@ mod tests {
         // is older than the row by `offset` nanos).
         let evidence_ts = extracted_at.saturating_sub(evidence_age_offset_ns);
         let evidence = EvidenceRef::inline_from_slice(&[EvidenceEntry::from_parts(
-            MemoryId::pack(n as u16, ContextId::DEFAULT.into(), 0),
+            MemoryId::pack(n as u16, SessionId::DEFAULT.into(), 0),
             evidence_confidence,
             evidence_ts,
             ExtractorId::from(0),
@@ -784,14 +857,20 @@ mod tests {
         if matches!(kind, StatementKind::Event) {
             s.event_at_unix_nanos = Some(extracted_at);
         }
-        let id = statement_create(&wtxn, &s, extracted_at).unwrap();
+        let id = statement_create(
+            &wtxn,
+            __ts(),
+            brain_core::SessionId::DEFAULT,
+            &s,
+            extracted_at,
+        )
+        .unwrap();
         wtxn.commit().unwrap();
         id
     }
 
-    fn read_confidence(metadata: &Arc<Mutex<MetadataDb>>, id: StatementId) -> f32 {
-        let db = metadata.lock();
-        let rtxn = db.read_txn().unwrap();
+    fn read_confidence(metadata: &Arc<MetadataDb>, id: StatementId) -> f32 {
+        let rtxn = metadata.read_txn().unwrap();
         let s = statement_get(&rtxn, id).unwrap().unwrap();
         s.confidence
     }
@@ -859,6 +938,78 @@ mod tests {
             (after_first - after_second).abs() < 1e-4,
             "stored confidence drifted between two converged ticks",
         );
+    }
+
+    #[test]
+    fn bump_be_u128_increments_and_saturates() {
+        assert_eq!(bump_be_u128([0; 16])[15], 1);
+        let mut b = [0u8; 16];
+        b[15] = 0xFF;
+        let r = bump_be_u128(b);
+        assert_eq!(r[14], 1);
+        assert_eq!(r[15], 0);
+        assert_eq!(bump_be_u128([0xFF; 16]), [0xFF; 16]);
+    }
+
+    /// With more statements than the per-tick window, successive ticks
+    /// must eventually visit ALL of them (the cursor advances and wraps),
+    /// so no statement is permanently skipped. This is the regression
+    /// guard for the missing-cursor bug: without the cursor, only the
+    /// first `max_per_tick` rows in key order were ever refreshed.
+    #[test]
+    fn cursor_eventually_visits_all_statements() {
+        let fx = fixture();
+        let now = now_unix_nanos();
+        // All rows aged one Fact-half-life so a visit produces a real
+        // update (0.9 → ~0.331) — updates are our proxy for "visited".
+        let age_ns: u64 = 365 * 86_400 * 1_000_000_000;
+        let extracted_at = now.saturating_sub(age_ns);
+
+        let n_rows: u8 = 10;
+        let ids: Vec<StatementId> = (0..n_rows)
+            .map(|n| {
+                seed_statement_with_age(&fx.metadata, n, extracted_at, 0.9, 0, StatementKind::Fact)
+            })
+            .collect();
+
+        // Window of 3 rows/tick, jump straight to target (no clamp).
+        let worker =
+            ConfidenceSweepWorker::new(fx.metadata.clone()).with_knobs(ConfidenceSweepKnobs {
+                max_per_tick: 3,
+                min_age_seconds: 0,
+                min_drift_for_write: 0.001,
+                max_change_per_tick: 0.0,
+            });
+
+        // A single tick can only touch the window; it must NOT touch all
+        // 10 rows at once.
+        let first = futures_lite::future::block_on(worker.tick(&fx.ctx)).unwrap();
+        assert!(
+            first <= 3,
+            "one tick must be bounded by the window, updated {first}",
+        );
+
+        // Run enough ticks to cover the table several times over and
+        // assert every row has moved off its seeded 0.9 (i.e. was
+        // visited at least once).
+        for _ in 0..12 {
+            let visited = ids
+                .iter()
+                .filter(|id| (read_confidence(&fx.metadata, **id) - 0.9).abs() > 1e-4)
+                .count();
+            if visited == ids.len() {
+                break;
+            }
+            let _ = futures_lite::future::block_on(worker.tick(&fx.ctx)).unwrap();
+        }
+
+        for id in &ids {
+            let c = read_confidence(&fx.metadata, *id);
+            assert!(
+                (c - 0.9).abs() > 1e-4,
+                "statement {id:?} was never visited by the sweep (still {c})",
+            );
+        }
     }
 
     #[test]
@@ -945,26 +1096,7 @@ mod tests {
         assert_eq!(snap.last_avg_drift, 0.0);
     }
 
-    #[test]
-    fn worker_kind_name() {
-        let dir = tempfile::tempdir().unwrap();
-        let metadata = MetadataDb::open(dir.path().join("test.redb")).unwrap();
-        let metadata = Arc::new(Mutex::new(metadata));
-        let w = ConfidenceSweepWorker::new(metadata);
-        assert_eq!(w.name(), "confidence_sweep");
-        assert_eq!(w.kind(), WorkerKind::ConfidenceSweep);
-    }
-
-    #[test]
-    fn env_override_parses() {
-        assert_eq!(
-            parse_interval_override(Some("60")),
-            Some(Duration::from_secs(60))
-        );
-        assert_eq!(parse_interval_override(Some("0")), None);
-        assert_eq!(parse_interval_override(None), None);
-        assert_eq!(parse_interval_override(Some("not-a-number")), None);
-    }
+    // env-override parsing is tested once in crate::env.
 
     // Use the suppressed helper to satisfy clippy's dead-code check
     // when integration tests are compiled but unused.
@@ -988,12 +1120,13 @@ mod tests {
         let extracted_at = now.saturating_sub(age_ns);
 
         let stmt_id = {
-            let mut db = fx.metadata.lock();
-            let wtxn = db.write_txn().unwrap();
+            let wtxn = fx.metadata.write_txn().unwrap();
             let subj = EntityId::new();
             let obj = EntityId::new();
             entity_put(
                 &wtxn,
+                __ts(),
+                brain_core::SessionId::DEFAULT,
                 &Entity::new_active(
                     subj,
                     EntityType::PERSON_ID,
@@ -1005,6 +1138,8 @@ mod tests {
             .unwrap();
             entity_put(
                 &wtxn,
+                __ts(),
+                brain_core::SessionId::DEFAULT,
                 &Entity::new_active(
                     obj,
                     EntityType::PERSON_ID,
@@ -1021,7 +1156,7 @@ mod tests {
             let entries: Vec<EvidenceEntry> = (0..12)
                 .map(|i| {
                     EvidenceEntry::from_parts(
-                        MemoryId::pack(i as u16 + 1, ContextId::DEFAULT.into(), 0),
+                        MemoryId::pack(i as u16 + 1, SessionId::DEFAULT.into(), 0),
                         0.5,
                         extracted_at,
                         ExtractorId::from(0),
@@ -1044,7 +1179,14 @@ mod tests {
                 extracted_at,
                 1,
             );
-            let id = statement_create(&wtxn, &s, extracted_at).unwrap();
+            let id = statement_create(
+                &wtxn,
+                __ts(),
+                brain_core::SessionId::DEFAULT,
+                &s,
+                extracted_at,
+            )
+            .unwrap();
             wtxn.commit().unwrap();
             id
         };

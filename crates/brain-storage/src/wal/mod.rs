@@ -1,9 +1,7 @@
 //! Write-Ahead Log: per-shard, append-only, fsync-coordinated.
 //!
-//! See `spec/08_storage/04_wal_overview.md` and
-//! `05_wal_records.md` for the design. This module currently exposes the
-//! record-level framing only; segment writer/reader/recovery land in
-//! subsequent sub-tasks (2.6–2.10).
+//! This module exposes the record-level framing, segment
+//! writer/reader, and recovery.
 
 pub mod checkpoint;
 pub mod group_commit;
@@ -22,8 +20,8 @@ pub use payload::{
     EmbeddingModelFp, EncodePayload, ForgetMode, ForgetPayload, ForgetReason, LinkPayload,
     MigrateEmbeddingPayload, ReclaimPayload, RelationLinkPayload, RelationSupersedePayload,
     RelationTombstonePayload, SalienceReason, SalienceUpdate, TxnAbortPayload, TxnBeginPayload,
-    TxnCommitPayload, UnlinkPayload, UpdateContextPayload, UpdateKindPayload,
-    UpdateSaliencePayload, WalPayload, WalPayloadError, VECTOR_DIMS_MAX,
+    TxnCommitPayload, UnlinkPayload, UpdateKindPayload, UpdateSaliencePayload,
+    UpdateSessionPayload, WalPayload, WalPayloadError, VECTOR_DIMS_MAX,
 };
 pub use reader::{SegmentInfo, WalReadError, WalReader};
 pub use record::{

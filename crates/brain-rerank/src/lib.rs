@@ -1,6 +1,6 @@
 //! # brain-rerank
 //!
-//! Cross-encoder reranker for Brain's hybrid retrieval. Loads
+//! Cross-encoder reranker for Brain's retrieval. Loads
 //! `BAAI/bge-reranker-base` (a `BertForSequenceClassification`
 //! with `num_labels=1`) via candle and scores `(query, candidate)`
 //! pairs.
@@ -12,7 +12,7 @@
 //! and truncates to `final_top_k`.
 //!
 //! The reranker is **optional**. When the model is unavailable
-//! (no on-disk weights, unsupported device, etc.) the hybrid
+//! (no on-disk weights, unsupported device, etc.) the retrieval
 //! pipeline gracefully falls back to RRF-only ranking and logs
 //! the skip at `info` level.
 
@@ -20,8 +20,10 @@
 #![forbid(unsafe_code)]
 
 mod model;
+mod service;
 
 pub use model::{CrossEncoder, RerankError, DEFAULT_MAX_TOKEN_LEN};
+pub use service::RerankService;
 
 use std::env;
 use std::path::PathBuf;
@@ -69,7 +71,7 @@ pub fn auto_discover_model_dir() -> Option<PathBuf> {
 
 /// Best-effort load: returns `Ok(None)` (rather than an error) when
 /// auto-discovery succeeds but the directory is empty / missing.
-/// The hybrid pipeline treats `Ok(None)` as "reranker not
+/// The retrieval pipeline treats `Ok(None)` as "reranker not
 /// configured; fall back to RRF" and logs at `info`.
 ///
 /// Hard errors (corrupt weights, unsupported device on an
@@ -93,8 +95,21 @@ pub fn try_load() -> Result<Option<CrossEncoder>, RerankError> {
 mod tests {
     use super::*;
 
+    // These tests mutate the process-global `BRAIN_RERANK_MODEL_DIR`
+    // env var, so they must not run concurrently — otherwise one
+    // test's `remove_var` lets another fall through to XDG discovery
+    // (which finds a real bootstrapped model in a dev container).
+    // Serialise them through a module-local lock; recover from
+    // poisoning so one panicking test doesn't cascade.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn auto_discover_returns_a_path_in_test_env() {
+        let _env = env_guard();
         // CI / dev containers always set HOME at minimum.
         let path = auto_discover_model_dir();
         if env::var("HOME").is_ok() || env::var("XDG_DATA_HOME").is_ok() {
@@ -104,6 +119,7 @@ mod tests {
 
     #[test]
     fn auto_discover_honours_env_override() {
+        let _env = env_guard();
         // Use a unique sentinel value so we don't clash with the
         // ambient env on whatever workstation this runs on.
         env::set_var(ENV_VAR, "/tmp/brain-rerank-test-override");
@@ -114,6 +130,7 @@ mod tests {
 
     #[test]
     fn try_load_returns_none_when_directory_missing() {
+        let _env = env_guard();
         // Point at a path that definitely doesn't exist; expect
         // graceful disable (Ok(None)) not a hard error.
         env::set_var(ENV_VAR, "/tmp/nonexistent-brain-rerank-dir-xyzzy");

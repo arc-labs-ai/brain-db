@@ -19,10 +19,10 @@
 
 use std::convert::TryFrom;
 
-use brain_core::{
-    Entity, EntityAttributes, EntityId, EntityTypeId, ExtractorId, MergeId, RelationId, StatementId,
-};
 use brain_core::MemoryId;
+use brain_core::{
+    Entity, EntityAttributes, EntityId, EntityTypeId, MergeId, RelationId, StatementId,
+};
 use brain_storage::wal::record::Lsn;
 
 use crate::write::phase::{
@@ -130,10 +130,14 @@ mod tag {
     pub const ENTITY_RENAMED: u8 = 15;
     pub const ENTITIES_UNMERGED: u8 = 16;
     pub const ENTITY_MERGED: u8 = 17;
-    pub const EXTRACTOR_ENABLED_SET: u8 = 18;
+    pub const MEMORY_RESTORED: u8 = 18;
     pub const SLOTS_RECLAIMED: u8 = 19;
     pub const MERGE_PROPOSAL_APPROVED: u8 = 20;
     pub const MERGE_PROPOSAL_REJECTED: u8 = 21;
+    pub const SPACE_CREATED: u8 = 22;
+    pub const SPACE_DELETED: u8 = 23;
+    pub const SESSION_CREATED: u8 = 24;
+    pub const SESSION_DELETED: u8 = 25;
 }
 
 mod tomb_tag {
@@ -173,10 +177,15 @@ fn write_phase_ack(out: &mut Vec<u8>, pa: &PhaseAck) {
             out.extend_from_slice(&id.to_bytes());
             write_u32(out, *ver);
         }
-        PhaseAck::UpsertedSchema { namespace, version } => {
+        PhaseAck::UpsertedSchema {
+            namespace,
+            version,
+            dropped,
+        } => {
             out.push(tag::UPSERTED_SCHEMA);
             write_string(out, namespace);
             write_u32(out, *version);
+            write_u32(out, *dropped);
         }
         PhaseAck::Linked => out.push(tag::LINKED),
         PhaseAck::Unlinked => out.push(tag::UNLINKED),
@@ -187,6 +196,11 @@ fn write_phase_ack(out: &mut Vec<u8>, pa: &PhaseAck) {
             out.push(tag::TOMBSTONED);
             write_tombstone_target(out, target);
             write_u64(out, *tombstoned_at_unix_nanos);
+        }
+        PhaseAck::MemoryRestored { id, already_active } => {
+            out.push(tag::MEMORY_RESTORED);
+            write_memory_id(out, *id);
+            out.push(u8::from(*already_active));
         }
         PhaseAck::Superseded(target, replacement) => {
             out.push(tag::SUPERSEDED);
@@ -221,16 +235,15 @@ fn write_phase_ack(out: &mut Vec<u8>, pa: &PhaseAck) {
             source,
             target,
             audit_id,
+            statements_rerouted,
+            relations_rerouted,
         } => {
             out.push(tag::ENTITY_MERGED);
             out.extend_from_slice(&source.to_bytes());
             out.extend_from_slice(&target.to_bytes());
             out.extend_from_slice(&audit_id.to_bytes());
-        }
-        PhaseAck::ExtractorEnabledSet { id, enabled } => {
-            out.push(tag::EXTRACTOR_ENABLED_SET);
-            write_u32(out, id.raw());
-            out.push(u8::from(*enabled));
+            write_u32(out, *statements_rerouted);
+            write_u32(out, *relations_rerouted);
         }
         PhaseAck::SlotsReclaimed { count } => {
             out.push(tag::SLOTS_RECLAIMED);
@@ -247,6 +260,22 @@ fn write_phase_ack(out: &mut Vec<u8>, pa: &PhaseAck) {
         PhaseAck::MergeProposalRejected { proposal_id } => {
             out.push(tag::MERGE_PROPOSAL_REJECTED);
             out.extend_from_slice(&proposal_id.to_bytes());
+        }
+        PhaseAck::SpaceCreated { created } => {
+            out.push(tag::SPACE_CREATED);
+            out.push(u8::from(*created));
+        }
+        PhaseAck::SpaceDeleted { existed } => {
+            out.push(tag::SPACE_DELETED);
+            out.push(u8::from(*existed));
+        }
+        PhaseAck::SessionCreated { created } => {
+            out.push(tag::SESSION_CREATED);
+            out.push(u8::from(*created));
+        }
+        PhaseAck::SessionDeleted { existed } => {
+            out.push(tag::SESSION_DELETED);
+            out.push(u8::from(*existed));
         }
     }
 }
@@ -269,7 +298,12 @@ fn read_phase_ack(c: &mut Cursor<'_>) -> Result<PhaseAck, CodecError> {
         tag::UPSERTED_SCHEMA => {
             let namespace = c.string()?;
             let version = c.u32()?;
-            PhaseAck::UpsertedSchema { namespace, version }
+            let dropped = c.u32()?;
+            PhaseAck::UpsertedSchema {
+                namespace,
+                version,
+                dropped,
+            }
         }
         tag::LINKED => PhaseAck::Linked,
         tag::UNLINKED => PhaseAck::Unlinked,
@@ -280,6 +314,11 @@ fn read_phase_ack(c: &mut Cursor<'_>) -> Result<PhaseAck, CodecError> {
                 target,
                 tombstoned_at_unix_nanos,
             }
+        }
+        tag::MEMORY_RESTORED => {
+            let id = read_memory_id(c)?;
+            let already_active = c.u8()? != 0;
+            PhaseAck::MemoryRestored { id, already_active }
         }
         tag::SUPERSEDED => {
             let target = read_supersede_target(c)?;
@@ -317,16 +356,15 @@ fn read_phase_ack(c: &mut Cursor<'_>) -> Result<PhaseAck, CodecError> {
             let source = EntityId::from_bytes(c.bytes16()?);
             let target = EntityId::from_bytes(c.bytes16()?);
             let audit_id = MergeId::from_bytes(c.bytes16()?);
+            let statements_rerouted = c.u32()?;
+            let relations_rerouted = c.u32()?;
             PhaseAck::EntityMerged {
                 source,
                 target,
                 audit_id,
+                statements_rerouted,
+                relations_rerouted,
             }
-        }
-        tag::EXTRACTOR_ENABLED_SET => {
-            let id = ExtractorId::from(c.u32()?);
-            let enabled = c.u8()? != 0;
-            PhaseAck::ExtractorEnabledSet { id, enabled }
         }
         tag::SLOTS_RECLAIMED => {
             let count = c.u64()? as usize;
@@ -344,6 +382,18 @@ fn read_phase_ack(c: &mut Cursor<'_>) -> Result<PhaseAck, CodecError> {
             let proposal_id = MergeId::from_bytes(c.bytes16()?);
             PhaseAck::MergeProposalRejected { proposal_id }
         }
+        tag::SPACE_CREATED => PhaseAck::SpaceCreated {
+            created: c.u8()? != 0,
+        },
+        tag::SPACE_DELETED => PhaseAck::SpaceDeleted {
+            existed: c.u8()? != 0,
+        },
+        tag::SESSION_CREATED => PhaseAck::SessionCreated {
+            created: c.u8()? != 0,
+        },
+        tag::SESSION_DELETED => PhaseAck::SessionDeleted {
+            existed: c.u8()? != 0,
+        },
         other => return Err(CodecError::UnknownPhaseAckTag(other)),
     })
 }
@@ -657,6 +707,7 @@ mod tests {
         let pa = PhaseAck::UpsertedSchema {
             namespace: "acme".into(),
             version: 7,
+            dropped: 3,
         };
         let decoded = round_trip(ack_with(vec![pa.clone()]));
         assert_eq!(decoded.phase_acks, vec![pa]);

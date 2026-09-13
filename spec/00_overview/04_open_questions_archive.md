@@ -25,12 +25,30 @@ Question IDs (`OQ-V2-N`, `OQ-23-X`, etc.) are stable; once assigned, they don't 
 **Why deferred:** doubles per-statement storage cost; most users don't need it.
 **Path:** future versions if users request; storage cost is the gate.
 
-## OQ-V2-4: Multi-tenant schema isolation
+## OQ-V2-4: Multi-tenant schema isolation — RESOLVED
 
-**Current:** one schema per deployment; entities are global within the deployment.
-**Open:** per-tenant schemas with isolated entity spaces.
-**Why deferred:** affects sharding, query routing, ID spaces; substantial change.
-**Path:** future major-version design discussion.
+**Resolution (2026-06):** committed as **tenant = namespace**. A namespace
+is the company-level data + schema + entity boundary; the effective
+isolation scope of every record is `(namespace, agent)` (company outer
+wall, application inner wall). Per-tenant schemas and **isolated entity
+spaces** are realized: entity resolution is per-`(namespace, agent)`, so
+the same name resolves to distinct entities across tenants. Storage is
+namespace-partitioned (owner `namespace_id` on every record; namespace
+folded into secondary-index key prefixes). Cross-namespace access is
+forbidden; namespace is server-derived from the API key (never
+client-sent) and fail-closed (a write with no resolvable namespace is
+rejected — no implicit/default namespace). See
+[`../03_schema/04_namespaces.md`](../03_schema/04_namespaces.md) (the
+operational contract) and
+[`../04_wire_protocol/04_handshake.md`](../04_wire_protocol/04_handshake.md)
+§10 (the `(namespace, agent, permissions)` scope; `user` survives as a
+non-authoritative audit tag; `org` removed). This supersedes the
+"tenant = agent by convention" framing (DM-OQ-6 / OQ-1.6) for the
+namespace-as-tenant case.
+
+## OQ-V2-16: Anonymous / permissive auth posture — RESOLVED
+
+**Resolution (2026-06):** authentication is **mandatory** on every data-plane connection — no anonymous mode, no default agent, no default namespace, no client-claimed identity. Identity `(namespace, agent, permissions)` is derived 100% from the API key resolved at AUTH; a connection with no key, an unresolvable key, or a revoked key is rejected (`Unauthenticated`). Keys are provisioned out-of-band via the admin HTTP surface (gated by the operator admin secret); minting interns the namespace and binds the agent. This **reverses** the earlier "v1.0 ships permissive / scope-binding opt-in behind `BRAIN_AUTH_SCOPE_BINDING_REQUIRED`, token/mTLS deferred" posture. See [`../04_wire_protocol/04_handshake.md`](../04_wire_protocol/04_handshake.md) and [`../05_operations/06_admin.md`](../05_operations/06_admin.md) §16.
 
 ## OQ-V2-5: Statement derivation chains (meta-statements)
 
@@ -97,7 +115,7 @@ Question IDs (`OQ-V2-N`, `OQ-23-X`, etc.) are stable; once assigned, they don't 
 
 ## OQ-V2-14: GUI for schema management and audit review
 
-**Current:** CLI and SDK only.
+**Current:** wire protocol only.
 **Open:** web-based admin UI.
 **Why deferred:** out of scope.
 **Path:** separate project / community.
@@ -111,23 +129,23 @@ Question IDs (`OQ-V2-N`, `OQ-23-X`, etc.) are stable; once assigned, they don't 
 
 ## OQ-23-A: Streaming query results (`limit > 100`)
 
-**Current:** the hybrid `QUERY` opcode returns a single `QueryResponse` frame, items truncated to `limit`.
+**Current:** the `QUERY` opcode returns a single `QueryResponse` frame, items truncated to `limit`.
 **Open:** stream items over the SUBSCRIBE wire path as they pass the limit boundary, per spec §13/05 §"Streaming results".
-**Why deferred:** v1 deployments are local-first with modest result-set sizes; the streaming path adds wire-protocol surface (event types) and SDK iterator plumbing that wasn't worth the complexity at v1.
-**Path:** post-v1 — add a `QueryStream` event type on SUBSCRIBE; SDK gains `client.query()…stream().await` returning a `Stream<Item = QueryHit>`.
+**Why deferred:** v1 deployments are local-first with modest result-set sizes; the streaming path adds wire-protocol surface (event types) and client iterator plumbing that wasn't worth the complexity at v1.
+**Path:** post-v1 — add a `QueryStream` event type on SUBSCRIBE; clients gain a `query()…stream()` pattern returning a `Stream<Item = QueryHit>`.
 
 ## OQ-23-B: query + transactional read-your-writes
 
-**Current:** RECALL inside a txn falls back to Brain vector path even when a schema is declared. The hybrid pipeline doesn't see the txn buffer's pending statements / relations.
-**Open:** layer the txn buffer's pending writes (entities, statements, relations) on top of the hybrid retriever outputs before fusion + filter.
-**Why deferred:** lens layering for Brain's vector recall is bounded scope (one buffer, one corpus). Hybrid + RYW would need parallel lenses for the entity, statement, and relation tables, plus fusion logic that tolerates pending rows missing from secondary indexes (HNSW / tantivy commit cadence).
-**Path:** post-v1 — design a per-table `TxnLens` shared by Brain and hybrid paths; phase ordering would put it after the §11 sweepers stabilise.
+**Current:** RECALL inside a txn falls back to Brain vector path even when a schema is declared. The retrieval pipeline doesn't see the txn buffer's pending statements / relations.
+**Open:** layer the txn buffer's pending writes (entities, statements, relations) on top of the retriever outputs before fusion + filter.
+**Why deferred:** lens layering for Brain's vector recall is bounded scope (one buffer, one corpus). Retrieval + RYW would need parallel lenses for the entity, statement, and relation tables, plus fusion logic that tolerates pending rows missing from secondary indexes (HNSW / tantivy commit cadence).
+**Path:** post-v1 — design a per-table `TxnLens` shared by Brain and retrieval paths; phase ordering would put it after the §11 sweepers stabilise.
 
 ## OQ-23-C: Filter-only retriever mode (no text, no anchor)
 
 **Current:** the planner rejects requests with neither `text` nor `entity_anchor` as `PlanError::NoSignal`. A filter-only query like "all preferences with confidence ≥ 0.9 in the last week" is not expressible.
 **Open:** add an "everything" retriever (or a "filter scan" mode) that emits all candidates matching the pre-filter, then applies the post-fusion filter chain.
-**Why deferred:** v1 didn't have a clear use case; "filter-only" is also a query class that benefits from a dedicated index design rather than reusing the hybrid pipeline.
+**Why deferred:** v1 didn't have a clear use case; "filter-only" is also a query class that benefits from a dedicated index design rather than reusing the retrieval pipeline.
 **Path:** post-v1 — likely a new opcode or a planner-side filter-scan retriever; depends on how users land on filter-only patterns in practice.
 
 ## OQ-23-D: Learned router on top of the rule-based one
@@ -137,11 +155,13 @@ Question IDs (`OQ-V2-N`, `OQ-23-X`, etc.) are stable; once assigned, they don't 
 **Why deferred:** need real query traffic + labels. The rules ship as the stable fallback so cold start works.
 **Path:** future versions — feature-flag a learned classifier on top; rules stay as fallback. Labels come from click-through, explicit feedback, and synthetic teacher-LLM labels (per §13/05 §"Learned routing").
 
-## OQ-23-E: Cross-shard hybrid result merging
+## OQ-23-E: Cross-shard retrieval result merging
 
-**Current:** the hybrid pipeline runs per-shard. Multi-shard deployments fan RECALL / QUERY out at the connection layer and merge results by score upstream of the hybrid engine.
+**✅ RESOLVED — landed (2026-09).** RECALL now takes a `scope = Namespace`: the connection layer fans out to every shard, each returns raw scored candidates over its whole namespace (all its spaces), and the router does a global RRF merge with a single global membership/shaping pass. See `spec/05_operations/03_read_pipeline.md` §"Recall scope" and `spec/13_retrievers/01_rrf_fusion.md`. The original open question and its deferral rationale are retained below for historical reference.
+
+**Current:** the retrieval pipeline runs per-shard. Multi-shard deployments fan RECALL / QUERY out at the connection layer and merge results by score upstream of the retrieval engine.
 **Open:** push the cross-shard merge into the query layer — global RRF fusion across shards, with per-shard partial results streamed in.
-**Why deferred:** single-shard deployments are the v1 default; multi-shard with cross-shard hybrid fusion adds latency-budget pressure that's better tackled once production telemetry is in.
+**Why deferred:** single-shard deployments are the v1 default; multi-shard with cross-shard retrieval fusion adds latency-budget pressure that's better tackled once production telemetry is in.
 **Path:** post-v1 — extend the connection layer's fan-out to deliver per-retriever partial result lists, and fuse globally before the filter chain.
 
 
@@ -835,7 +855,7 @@ V1.0 ships best-effort: primary writes succeed; reverse index updates asynchrono
 
 ### S-OQ-11: `STATEMENT_LIST` cursor pagination
 
-V1.0 ships single-frame snapshot with limit cap 1000. Cursor pagination deferred.
+**✅ RESOLVED — landed.** `STATEMENT_LIST` (`0x0146`) and `STATEMENT_HISTORY` (`0x0145`) both take `limit` + opaque `cursor` and return a page + `next_cursor`, keyset-paginated on the immutable `version`. The original note ("V1.0 ships single-frame snapshot with limit cap 1000; cursor pagination deferred") no longer applies.
 
 ### S-OQ-12: Statement-on-statement (meta-statements)
 
@@ -1089,8 +1109,8 @@ upload is gated.
 
 ### Q13 — Derive macros + their generated schema contributions
 
-[`../06_sdk/07_typed_graph_sdk.md`](../06_sdk/07_typed_graph_sdk.md)
-lists `#[derive(BrainEntity)] / BrainFact /
+An earlier [client interface](../06_sdk/00_purpose.md) sketch
+listed `#[derive(BrainEntity)] / BrainFact /
 BrainRelation` macros. These auto-generate trait
 impls + a static schema fragment per type.
 
@@ -1247,11 +1267,13 @@ c) **Backpressure-aware streaming.** Server emits a frame, waits for ACK, emits 
 
 ---
 
-## OQ-WP-7: Client identity in multi-tenant deployments
+## OQ-WP-7: Client identity in multi-tenant deployments — RESOLVED
 
-**Issue.** The handshake authenticates a session to an `agent_id`. Some deployments may have multiple agents per session (an admin tool that operates across agents). The current protocol requires one agent per connection.
+**Resolution (2026-07):** adopt **per-request identity** — options (b)/(c) combined — **reversing** the v1 "status quo" deferral (the way OQ-V2-16 reversed permissive auth). A connection authenticates once as a trusted service principal (an edge or gateway); each data-plane op may carry an optional `act_as: { namespace, agent_id }` field naming the effective identity it runs as. `act_as` is honored **only** if the principal holds the `can_act_as` grant (permission bit `ACT_AS = 1 << 6`) **and** the target namespace is in the principal's minted `may_act` allowlist; otherwise it is hard-rejected (`Authorization`). When honored, the op runs under the effective `(namespace, agent_id)` for **all** scoping — write attribution, read `agent_filter` isolation, permission checks, idempotency key + shard routing, and audit — with **dual-principal audit** recording both the acting service principal and the effective identity (RFC 8693 delegation; the acting party is never erased). This is the standard impersonation pattern (Kubernetes API impersonation + RFC 8693 `act`/`may_act` + GCP/STS actor-permission), expressed as a stateless per-request wire field so one shared connection pool serves every tenant without pinning and the raw client secret is never forwarded. Cross-namespace acting beyond the `may_act` allowlist stays forbidden (`OQ-V2-4`). This is a breaking change made **in place** (pre-1.0, no back-compat shim). See [`../04_wire_protocol/04_handshake.md`](../04_wire_protocol/04_handshake.md) §"Per-request identity (`act_as`)" (the canonical contract — `can_act_as`, `act_as`, `may_act`), [`../05_operations/02_write_pipeline.md`](../05_operations/02_write_pipeline.md) §4 + [`../05_operations/03_read_pipeline.md`](../05_operations/03_read_pipeline.md) (effective-identity scoping), [`../10_metadata/03_substrate_tables.md`](../10_metadata/03_substrate_tables.md) §3a + [`../10_metadata/05_failure_and_audit.md`](../10_metadata/05_failure_and_audit.md) §10 (idempotency key + dual-principal audit), and [`../17_observability/04_admin_ops.md`](../17_observability/04_admin_ops.md) §12.1 (the `ACT_AS` mint + `may_act` allowlist).
 
-**Options.**
+**Original issue.** The handshake authenticates a session to an `agent_id`. Some deployments may have multiple agents per session (an admin tool that operates across agents). The current protocol requires one agent per connection.
+
+**Options considered.**
 
 a) **One agent per connection.** Status quo. Admin tools open multiple connections.
 
@@ -1259,7 +1281,7 @@ b) **Multi-agent sessions.** AUTH establishes a "principal" who can speak as mul
 
 c) **Principal + impersonation.** A principal authenticates; subsequent operations may include an "impersonate" agent_id, which is checked at the authorization layer.
 
-**Recommendation.** Status quo for v1. The added complexity isn't justified for the workloads we're targeting. Operations admin tools that span agents should use multiple connections — the cost is small.
+The v1 recommendation was status quo (a); the resolution above adopts (b)/(c) once the multi-tenant edge/gateway workload made the per-tenant-connection-pool cost load-bearing.
 
 ---
 
@@ -1363,11 +1385,13 @@ Default leaning: (a) until a real workload proves otherwise.
 
 ### OQ-WP-K9 — Schema removal (`SCHEMA_DROP`)
 
+**✅ RESOLVED — landed as a wire opcode.** `SCHEMA_DROP` (`0x0125` / resp `0x01A5`, admin-only) narrows the active schema by removing one predicate or relation type behind an in-use safety gate, and `SCHEMA_REPLACE` (`0x0127`, requires `force_drop_existing`) is the destructive whole-schema escape hatch. Both are routed through `submit(Write)`, so they are WAL-durable and replayed on recovery — not offline file surgery. The accidental-erasure concern below is handled by the in-use gate (drop) and the explicit force flag (replace). Original question retained for reference.
+
 Once a schema is declared, there's no opcode to revert. Should a `SCHEMA_DROP` opcode exist?
 
 **Trade-off:** symmetric API vs accidental-erasure risk. A deployment with 10M statements losing schema would orphan them entirely.
 
-**Status:** deferred. **Likely outcome:** never as a wire opcode; only as an offline admin action.
+**Status:** ~~deferred~~ → shipped (see resolution above).
 
 ### OQ-WP-K10 — `ENTITY_LIST` cursor pagination + multi-frame streaming
 
@@ -1378,7 +1402,7 @@ Deferred behaviors:
 - **Cursor resume.** Caller passes a non-empty `cursor` to fetch the next page. Wire-side currently rejects with `InvalidArgument`.
 - **Multi-frame streaming within a page.** The 1000-cap is comfortable; sub-1k responses fit in one frame.
 
-The query router already needs streaming infrastructure for `QUERY` (`0x0160`), `RECALL_HYBRID` (`0x0163`), and `STATEMENT_LIST` (`0x0146`); `ENTITY_LIST` pagination would piggyback on that work rather than duplicating it here.
+The query router already needs streaming infrastructure for `QUERY` (`0x0160`), `QUERY_TEXT` (`0x0163`), and `STATEMENT_LIST` (`0x0146`); `ENTITY_LIST` pagination would piggyback on that work rather than duplicating it here.
 
 **Status:** open.
 
@@ -1450,9 +1474,9 @@ a) **Single-shard only (status quo).**
 
 b) **Two-phase commit across shards.** Heavy; complex.
 
-c) **Saga pattern in SDK.** Application-level compensating actions.
+c) **Saga pattern in the client.** Application-level compensating actions.
 
-**Recommendation.** (c). The SDK provides saga helpers; Brain stays simple.
+**Recommendation.** (c). Clients provide saga helpers; Brain stays simple.
 
 ---
 
@@ -1602,7 +1626,7 @@ b) **Add a graph query language.** Substantial work.
 ## §06_sdk open questions
 
 
-SDK questions unresolved as of this spec version.
+**Superseded (standalone-DB pivot).** Brain ships no first-party SDK; the questions below are retained as historical record only and are moot.
 
 ---
 
@@ -1686,7 +1710,7 @@ a) **Hand-written (status quo).** Each SDK is its own codebase.
 
 b) **Generated from schema.** Single source of truth; multiple language outputs.
 
-c) **Hybrid: generate types, hand-write logic.**
+c) **Mixed: generate types, hand-write logic.**
 
 **Recommendation.** (c). Types are tedious to maintain by hand; logic benefits from manual care.
 
@@ -1969,7 +1993,7 @@ a) **mmap (status quo).** Page cache handles working set.
 
 b) **O_DIRECT reads.** Manual buffer management, more deterministic latency, but loses kernel readahead.
 
-c) **Hybrid.** Configurable per shard.
+c) **Mixed.** Configurable per shard.
 
 **Recommendation.** Stay with mmap. The page cache works well for our access patterns; manual buffer management would be a significant complexity increase for marginal benefit.
 
@@ -2111,7 +2135,7 @@ b) **GPU search.** Use a GPU-aware ANN library. Different architecture (FAISS-GP
 
 ---
 
-## OQ-AN-5: Hybrid index types
+## OQ-AN-5: Mixed index types
 
 **Issue.** Some workloads might benefit from non-HNSW index types (IVF for very large indexes, brute-force for very small).
 
@@ -2349,7 +2373,7 @@ b) **Two-phase commit across shards.** Heavy; Brain does not want to be a distri
 
 c) **Saga pattern.** Application-level compensating actions on failure.
 
-**Recommendation.** Stay with (a). For applications needing cross-shard atomicity, the SDK provides saga helpers.
+**Recommendation.** Stay with (a). For applications needing cross-shard atomicity, clients provide saga helpers.
 
 ---
 
@@ -2367,7 +2391,7 @@ Provenance / versioning deferrals.
 
 [`../11_extractors/04_audit.md`](../11_extractors/04_audit.md) §8 — audit query
 is available via `brain-metadata::audit_ops` but
-isn't exposed over the wire. Operators have to attach a CLI / SDK
+isn't exposed over the wire. Operators have to attach a client
 shim. A dedicated wire op is deferred.
 
 **Status:** deferred.
@@ -2875,19 +2899,19 @@ Brain ships BM25 over tantivy for lexical retrieval. SPLADE (sparse-neural) woul
 
 The `QUERY` opcode returns a single `QueryResponse` frame with items truncated to `limit`. For large result sets, streaming over SUBSCRIBE as items pass the limit boundary would lower client-side memory pressure.
 
-**Deferred because:** v1 deployments are local-first with modest result-set sizes. The streaming path adds wire-protocol surface (event types) and SDK iterator plumbing.
+**Deferred because:** v1 deployments are local-first with modest result-set sizes. The streaming path adds wire-protocol surface (event types) and client iterator plumbing.
 
-**Path:** post-v1. Add a `QueryStream` event type on SUBSCRIBE; SDK gains `client.query()…stream().await` returning a `Stream<Item = QueryHit>`.
+**Path:** post-v1. Add a `QueryStream` event type on SUBSCRIBE; clients gain a `query()…stream()` pattern returning a `Stream<Item = QueryHit>`.
 
 ---
 
 ### Q4 — Query inside a transaction + read-your-writes
 
-`RECALL` inside a txn falls back to memory-only ANN search even when a schema is declared. The hybrid pipeline does not see the txn buffer's pending statements / relations.
+`RECALL` inside a txn falls back to memory-only ANN search even when a schema is declared. The retrieval pipeline does not see the txn buffer's pending statements / relations.
 
-**Deferred because:** layering txn-buffer reads onto the hybrid pipeline requires parallel `TxnLens` instances for the entity, statement, and relation tables, plus fusion logic that tolerates pending rows missing from secondary indexes (HNSW / tantivy commit cadence).
+**Deferred because:** layering txn-buffer reads onto the retrieval pipeline requires parallel `TxnLens` instances for the entity, statement, and relation tables, plus fusion logic that tolerates pending rows missing from secondary indexes (HNSW / tantivy commit cadence).
 
-**Path:** post-v1. Design a per-table `TxnLens` shared by both the memory-only and hybrid paths.
+**Path:** post-v1. Design a per-table `TxnLens` shared by both the memory-only and retrieval paths.
 
 ---
 
@@ -2895,7 +2919,7 @@ The `QUERY` opcode returns a single `QueryResponse` frame with items truncated t
 
 The planner rejects requests with neither `text` nor `entity_anchor` as `PlanError::NoSignal`. A filter-only query like "all preferences with confidence ≥ 0.9 in the last week" is currently inexpressible.
 
-**Deferred because:** v1 has no clear use case. Filter-only also benefits from a dedicated index design rather than reusing the hybrid pipeline.
+**Deferred because:** v1 has no clear use case. Filter-only also benefits from a dedicated index design rather than reusing the retrieval pipeline.
 
 **Path:** post-v1. Likely a new opcode or a planner-side filter-scan retriever.
 
@@ -2903,7 +2927,7 @@ The planner rejects requests with neither `text` nor `entity_anchor` as `PlanErr
 
 ### Q6 — Cross-shard query result merging
 
-The hybrid pipeline runs per-shard. Multi-shard deployments fan `RECALL` / `QUERY` out at the connection layer and merge by score upstream of the hybrid engine.
+The retrieval pipeline runs per-shard. Multi-shard deployments fan `RECALL` / `QUERY` out at the connection layer and merge by score upstream of the retrieval engine.
 
 **Deferred because:** single-shard deployments are the v1 default. Multi-shard cross-shard fusion adds latency-budget pressure that is best tackled once production telemetry exists.
 
@@ -2918,6 +2942,8 @@ Pure HNSW (per §09) holds every full-precision 384-dim vector in RAM. At billio
 **Deferred because:** v1's target scale is millions, not billions. The added executor mode is non-trivial.
 
 **Path:** post-v1. New executor mode in §09 indexing; HNSW remains default for ≤10M vectors.
+
+**Partially resolved (v1.x):** HNSW + PQ (compressed graph payload, full-precision arena for re-rank) shipped per [§09.07](../09_indexing/07_hnsw_pq.md). Pure IVF (no HNSW graph) remains deferred — HNSW+PQ resolves the immediate memory pressure at Brain's mid-scale target.
 
 ---
 
@@ -3045,9 +3071,9 @@ a) **No support (status quo).**
 
 b) **Two-phase commit.** Heavy; adds complexity.
 
-c) **Saga pattern via SDK.** Application-level compensating actions.
+c) **Saga pattern via the client.** Application-level compensating actions.
 
-**Recommendation.** Stay with (a). For applications needing cross-shard atomicity, the SDK's saga pattern is sufficient.
+**Recommendation.** Stay with (a). For applications needing cross-shard atomicity, the client's saga pattern is sufficient.
 
 ---
 

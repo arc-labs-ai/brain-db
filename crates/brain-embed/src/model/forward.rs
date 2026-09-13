@@ -1,19 +1,13 @@
 //! Forward pass + `[CLS]` pooling + L2 normalise.
 //!
-//! Composes 5.1's [`ModelHandle`] with 5.2's [`Tokenized`] to produce
+//! Composes [`ModelHandle`] with [`Tokenized`] to produce
 //! substrate-owned 384-dim L2-normalised `f32` vectors.
 //!
-//! See:
-//! - `spec/07_embedding/03_inference.md` §3 — forward pass shape
-//!   (embeddings → encoder → `[CLS]` pool → 384-dim output). Step 5
-//!   (normalisation) is the *substrate's* job, applied here.
-//! - `spec/07_embedding/02_tokenization.md` §10 — for
-//!   `bge-small-en-v1.5`, the official approach is `[CLS]` pooling
-//!   (phase-doc's "mean-pool" claim was wrong; spec wins).
-//! - `spec/07_embedding/04_normalization.md` §1 + §4 — the
-//!   reference L2-normalise implementation we mirror.
-//! - `spec/07_embedding/04_normalization.md` §8 + §9 — NaN /
-//!   Inf / zero-norm outputs are rejected, not propagated.
+//! Forward pass shape: embeddings → encoder → `[CLS]` pool → 384-dim
+//! output, then normalisation (the substrate's job, applied here). For
+//! `bge-small-en-v1.5` the correct approach is `[CLS]` pooling, not
+//! mean-pooling. NaN / Inf / zero-norm outputs are rejected, not
+//! propagated.
 //!
 //! BGE-small specifically uses CLS pooling with **no** pooler MLP:
 //! `last_hidden_state[:, 0]` *is* the embedding. `candle_transformers`'
@@ -23,8 +17,8 @@
 use candle_core::Tensor;
 
 use crate::error::EmbedError;
-use crate::model::ModelHandle;
 use crate::model::tokenize::{encode_batch, encode_single, Tokenized};
+use crate::model::ModelHandle;
 
 /// Output dimensionality. Pinned at 384 for v1 (BGE-small).
 pub const VECTOR_DIM: usize = 384;
@@ -33,9 +27,8 @@ pub const VECTOR_DIM: usize = 384;
 /// pathological (zero-norm) and refuse to divide.
 const ZERO_NORM_EPS: f32 = 1e-8;
 
-/// L2-normalise in place. Reference scalar implementation per spec
-/// §04/04 §4. Returns the *original* norm (pre-normalisation) so the
-/// caller can decide whether to reject (zero-vector defence).
+/// L2-normalise in place. Returns the *original* norm (pre-normalisation)
+/// so the caller can decide whether to reject (zero-vector defence).
 ///
 /// On a near-zero vector (`norm < ZERO_NORM_EPS`), the contents are
 /// left untouched — the caller must check the returned norm.
@@ -56,7 +49,7 @@ pub fn l2_normalize_in_place(v: &mut [f32; VECTOR_DIM]) -> f32 {
 /// L2-normalise per row, return one unit vector per batch row.
 ///
 /// Rejects rows whose output contains NaN/Inf or whose pre-normalisation
-/// norm is below the configured zero-norm threshold (–§9).
+/// norm is below the configured zero-norm threshold.
 pub fn forward_pooled(
     handle: &ModelHandle,
     tokens: &Tokenized,

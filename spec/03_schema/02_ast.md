@@ -2,8 +2,8 @@
 
 Typed AST shape consumed by the parser ([§01](./01_grammar.md)),
 validator ([§03](./03_validator.md)), persistence
-([§05](./05_versioning.md)), and the SDK
-[`SchemaBuilder`](../06_sdk/07_typed_graph_sdk.md). One source of
+([§05](./05_versioning.md)), and any
+[client-side schema builder](../06_sdk/00_purpose.md). One source of
 truth for the schema's in-memory shape.
 
 Cross-references:
@@ -242,7 +242,7 @@ For `ExtractorField` and `AttributeDecl`, source order matters in
 exactly one place: validation diagnostics quote the line a problem
 appears on. Storage-side reads + writes don't depend on order.
 
-The SDK `SchemaBuilder` is order-agnostic; the round-trip
+A client-side schema builder is order-agnostic; the round-trip
 `build()` → DSL text → parse may reorder fields (canonical form is
 defined in [§05](./05_versioning.md) §6).
 

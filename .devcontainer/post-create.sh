@@ -53,10 +53,10 @@ else
   echo
   echo "==> Bootstrapping required models (BGE-small embed + urchade/gliner_small-v2.1)"
   echo "    set BRAIN_SKIP_MODEL_BOOTSTRAP=1 to opt out of this step"
-  if ! ./scripts/bootstrap-model.sh; then
+  if ! ./.devcontainer/bootstrap-model.sh; then
     echo
     echo "warning: model bootstrap failed; brain-server will refuse to start" >&2
-    echo "  re-run manually:  ./scripts/bootstrap-model.sh" >&2
+    echo "  re-run manually:  ./.devcontainer/bootstrap-model.sh" >&2
     echo "  or skip for now:  BRAIN_SKIP_MODEL_BOOTSTRAP=1 (env var)" >&2
   fi
 fi

@@ -10,8 +10,8 @@
 use brain_protocol::{Frame, MAX_PAYLOAD_BYTES};
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
-// Phase 16.6a widened the wire opcode from u8 to u16; this bench
-// still uses the substrate HELLO opcode value, just upcast.
+// The wire opcode is a u16; this bench still uses the substrate HELLO
+// opcode value, just upcast.
 const ENCODE_OPCODE: u16 = 0x0001;
 
 fn make_frame(size: usize) -> Frame {

@@ -1,18 +1,13 @@
 //! `predicates` table — interned predicate registry.
 //!
-//! See `spec/02_data_model/00_purpose.md` (predicate vocabulary) and
-//! `spec/26_knowledge_storage/00_purpose.md` (table catalog).
-//!
-//! Phase 15.1 declared the table with a minimal row. Phase 17.3 widens
-//! the row to match `spec/02_data_model/00_purpose.md` §"Predicate
-//! vocabulary" — adds `kind_constraint`, `object_type_constraint_byte`,
-//! `schema_version`, and `description`, and adds a `predicates_by_qname`
-//! lookup index. Schema DSL (phase 19) populates user predicates at
-//! `SCHEMA_UPLOAD` time; phase 17.3 owns the built-ins.
+//! The row carries `kind_constraint`, `object_type_constraint_byte`,
+//! `schema_version`, and `description`, plus a `predicates_by_qname`
+//! lookup index. The schema DSL populates user predicates at
+//! `SCHEMA_UPLOAD` time; built-ins are seeded by the substrate.
 
 use crate::impl_redb_rkyv_value;
-use brain_core::{Predicate, StatementKind};
 use brain_core::PredicateId;
+use brain_core::{Predicate, StatementKind};
 use redb::TableDefinition;
 
 /// `predicates` table. Key is `PredicateId.raw()` (u32); value is
@@ -21,10 +16,30 @@ pub const PREDICATES_TABLE: TableDefinition<'static, u32, PredicateDefinition> =
     TableDefinition::new("predicates");
 
 /// `predicates_by_qname` — secondary index for `(namespace, name) →
-/// PredicateId`. Phase 17.3. Key is the canonical `"namespace:name"`
-/// string; value is the predicate id.
+/// PredicateId`. Key is the canonical `"namespace:name"` string;
+/// value is the predicate id.
 pub const PREDICATES_BY_QNAME_TABLE: TableDefinition<'static, &str, u32> =
     TableDefinition::new("predicates_by_qname");
+
+/// `predicate_review_queue` — durable record of predicate qnames the
+/// extractor proposed but that are NOT declared in the active schema, so
+/// closed-vocab extraction dropped them from the live graph. Key is the
+/// canonical `"namespace:name"`; value is the number of times it was
+/// seen. Operators scan this to decide which coined predicates to promote
+/// into a schema via `SCHEMA_UPLOAD`. Nothing reads it on the hot path.
+pub const PREDICATE_REVIEW_QUEUE_TABLE: TableDefinition<'static, &str, u64> =
+    TableDefinition::new("predicate_review_queue");
+
+/// `predicate_embeddings` — per-predicate semantic vector, keyed by
+/// `PredicateId.raw()` (u32). Value is the embedding as little-endian
+/// `f32` bytes (BGE-small → 384 dims → 1536 bytes). Written when a
+/// predicate is first interned at extraction time; read by the grounded
+/// answer engine to match a query's relation against a subject's
+/// predicates by cosine (the "two-way match", alongside the exact qname
+/// index). Open-vocab predicates are never gated, so this is how a free
+/// predicate stays *findable* by a paraphrased question.
+pub const PREDICATE_EMBEDDINGS_TABLE: TableDefinition<'static, u32, &[u8]> =
+    TableDefinition::new("predicate_embeddings");
 
 /// Origin of a registered predicate. Tracks whether the row was
 /// authored by an explicit `SCHEMA_UPLOAD` (strict mode) or interned
@@ -99,6 +114,8 @@ impl SchemaOrigin {
 /// 1). `object_type_constraint_byte`: `0` means "any object type", else
 /// `1=Entity / 2=Value / 3=Memory / 4=Statement` (matches
 /// `StatementObject::discriminant()` offset by 1).
+/// `object_entity_type_id` narrows the `Entity` case to one declared
+/// entity type (`object: Entity<Person>`); `0` means any entity type.
 ///
 /// `origin_tag` + `origin_payload` encode the [`SchemaOrigin`].
 /// Implicit-from-write rows are how Brain supports open-vocabulary
@@ -111,6 +128,9 @@ pub struct PredicateDefinition {
     pub name: String,
     pub kind_constraint: u8,
     pub object_type_constraint_byte: u8,
+    /// Declared entity type of the object when
+    /// `object_type_constraint_byte == 1`. `0` = any entity type.
+    pub object_entity_type_id: u32,
     pub schema_version: u32,
     pub description: String,
     pub created_at_unix_nanos: u64,
@@ -120,6 +140,13 @@ pub struct PredicateDefinition {
     /// any prior active statement with the same `(subject, predicate)`
     /// before inserting the new row.
     pub is_stateful: bool,
+    /// Explicit time-to-live for statements of this predicate, in seconds.
+    /// `0` = no TTL (persist indefinitely, the default). When non-zero, the
+    /// reclaim worker soft-tombstones statements older than this (measured
+    /// per kind from `event_at` for Events, `valid_from` otherwise). Set from
+    /// the schema DSL `retention:` attribute at schema-apply time; lives only
+    /// on the persisted row, not on the projected `Predicate` value type.
+    pub retention_seconds: u64,
 }
 
 impl PredicateDefinition {
@@ -153,12 +180,17 @@ impl PredicateDefinition {
             name: p.name.clone(),
             kind_constraint: encode_kind_constraint(p.kind_constraint),
             object_type_constraint_byte: p.object_type_constraint_byte,
+            object_entity_type_id: p.object_entity_type_id,
             schema_version: p.schema_version,
             description: p.description.clone(),
             created_at_unix_nanos,
             origin_tag: origin.tag(),
             origin_payload: origin.payload(),
             is_stateful: p.is_stateful,
+            // Retention is a storage-only policy set separately at schema-apply
+            // via `predicate_set_retention`; a freshly-built row defaults to
+            // "no TTL" and the apply path stamps the declared value.
+            retention_seconds: 0,
         }
     }
 
@@ -177,6 +209,7 @@ impl PredicateDefinition {
             name: self.name.clone(),
             kind_constraint: decode_kind_constraint(self.kind_constraint),
             object_type_constraint_byte: self.object_type_constraint_byte,
+            object_entity_type_id: self.object_entity_type_id,
             schema_version: self.schema_version,
             description: self.description.clone(),
             is_stateful: self.is_stateful,
@@ -192,6 +225,11 @@ pub fn decode_kind_constraint(b: u8) -> Option<StatementKind> {
         1 => Some(StatementKind::Fact),
         2 => Some(StatementKind::Preference),
         3 => Some(StatementKind::Event),
+        4 => Some(StatementKind::Attribute),
+        5 => Some(StatementKind::Relation),
+        6 => Some(StatementKind::Directive),
+        // `0` (any) and any unknown byte collapse to None. User-declared
+        // Custom kinds are not used as a coarse predicate constraint.
         _ => None,
     }
 }
@@ -203,14 +241,15 @@ pub fn encode_kind_constraint(k: Option<StatementKind>) -> u8 {
         Some(StatementKind::Fact) => 1,
         Some(StatementKind::Preference) => 2,
         Some(StatementKind::Event) => 3,
-        None => 0,
+        Some(StatementKind::Attribute) => 4,
+        Some(StatementKind::Relation) => 5,
+        Some(StatementKind::Directive) => 6,
+        // No coarse constraint for Custom kinds (treated as "any").
+        Some(StatementKind::Custom(_)) | None => 0,
     }
 }
 
-impl_redb_rkyv_value!(
-    PredicateDefinition,
-    "brain_metadata::PredicateDefinition::v4"
-);
+impl_redb_rkyv_value!(PredicateDefinition, "brain_metadata::PredicateDefinition");
 
 #[cfg(all(test, not(miri)))]
 mod tests {
@@ -228,6 +267,7 @@ mod tests {
             name: "reports_to".into(),
             kind_constraint: Some(StatementKind::Fact),
             object_type_constraint_byte: 1,
+            object_entity_type_id: 5,
             schema_version: 3,
             description: "Reports-to relation".into(),
             is_stateful: false,

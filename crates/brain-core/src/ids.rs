@@ -7,7 +7,7 @@
 //!   lookup, and detects stale references after slot reclamation via the
 //!   version.
 //! - **UUIDv7** (16 bytes) for first-class records that need globally
-//!   unique IDs with time-ordering: `AgentId`, `RequestId`, `TxnId`,
+//!   unique IDs with time-ordering: `SpaceId`, `RequestId`, `TxnId`,
 //!   `EntityId`, `StatementId`, `RelationId`, `AuditId`, `MergeId`,
 //!   `EvidenceOverflowId`.
 //! - **u32 interned** for registry entries that are user-declared and
@@ -16,7 +16,7 @@
 //!   tens-to-hundreds of each, not millions — and small keys keep
 //!   secondary indexes compact.
 //!
-//! Other tiny aliases live here too: `ShardId` (`u16`), `ContextId`
+//! Other tiny aliases live here too: `ShardId` (`u16`), `SessionId`
 //! (`u64`), `SlotIndex` (`u64`), `SlotVersion` (`u32`).
 
 use serde::{Deserialize, Serialize};
@@ -37,14 +37,14 @@ pub type SlotVersion = u32;
 /// Maximum representable slot index: `(1 << 48) - 1`.
 pub const MAX_SLOT_INDEX: u64 = (1u64 << 48) - 1;
 
-/// Externally-supplied agent identifier.
+/// Externally-supplied space identifier.
 ///
 /// Brain treats this as opaque bytes. Most clients use UUIDv7.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-pub struct AgentId(pub Uuid);
+pub struct SpaceId(pub Uuid);
 
-impl AgentId {
-    /// All-zero "anonymous / unauthenticated" agent. Stable across
+impl SpaceId {
+    /// All-zero "anonymous / unauthenticated" space. Stable across
     /// calls — unlike [`Self::new`] which mints a fresh v7 UUID
     /// every time. Use this for:
     /// - Test fixtures that don't authenticate a connection
@@ -59,27 +59,52 @@ impl AgentId {
     pub fn new() -> Self {
         Self(Uuid::now_v7())
     }
+
+    /// Deterministically derive the 16-byte storage `SpaceId` from a
+    /// wire-supplied structured space string, scoped to a namespace.
+    ///
+    /// `SpaceId = UUIDv5(UUIDv5(BRAIN_ROOT_NAMESPACE_UUID, namespace), space_string)`.
+    ///
+    /// The seed folds the namespace, so the same space string under two
+    /// different namespaces resolves to disjoint ids — isolation holds at
+    /// the id level, not only at the row-scope prefix. The derivation is
+    /// **frozen**: changing [`BRAIN_ROOT_NAMESPACE_UUID`] or the folding
+    /// scheme re-keys every existing space, so it is pinned by a golden
+    /// test.
+    #[must_use]
+    pub fn derive_from_string(namespace: &str, space_string: &str) -> Self {
+        let ns_uuid = Uuid::new_v5(&BRAIN_ROOT_NAMESPACE_UUID, namespace.as_bytes());
+        Self(Uuid::new_v5(&ns_uuid, space_string.as_bytes()))
+    }
 }
 
-/// `Default::default()` returns [`AgentId::NIL`] — the stable
+/// Root namespace UUID for the `space_id` derivation. Any random,
+/// fixed UUID works — it only needs to be stable forever, because it
+/// seeds [`SpaceId::derive_from_string`] and changing it re-keys every
+/// space in every deployment. Pinned by a golden test; do not edit.
+pub const BRAIN_ROOT_NAMESPACE_UUID: Uuid = Uuid::from_bytes([
+    0x6b, 0x72, 0x61, 0x69, 0x6e, 0x2d, 0x73, 0x70, 0x61, 0x63, 0x65, 0x2d, 0x72, 0x6f, 0x6f, 0x74,
+]);
+
+/// `Default::default()` returns [`SpaceId::NIL`] — the stable
 /// anonymous sentinel, NOT a fresh UUID. Code that wanted a fresh
-/// agent id should call [`Self::new`] explicitly.
-impl Default for AgentId {
+/// space id should call [`Self::new`] explicitly.
+impl Default for SpaceId {
     fn default() -> Self {
         Self::NIL
     }
 }
 
-/// Server-assigned context identifier. Agent-scoped
-/// — two agents can both have `ContextId(1)` and they are unrelated.
-/// `ContextId(0)` is reserved for the default context.
+/// Client-supplied session (conversation) identifier. Space-scoped
+/// — two spaces can both have `SessionId(1)` and they are unrelated.
+/// `SessionId(0)` is reserved for the default session.
 #[derive(
     Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
 )]
-pub struct ContextId(pub u64);
+pub struct SessionId(pub u64);
 
-impl ContextId {
-    /// The default context, automatically present for every agent.
+impl SessionId {
+    /// The default session, automatically present for every space.
     pub const DEFAULT: Self = Self(0);
 
     #[must_use]
@@ -90,8 +115,7 @@ impl ContextId {
 
 /// Client-supplied UUIDv7 used for write-side idempotency.
 ///
-/// See `spec/05_operations/` for idempotency semantics and the
-/// 24-hour TTL.
+/// Idempotency entries are retained for a 24-hour TTL.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct RequestId(pub Uuid);
 
@@ -205,8 +229,8 @@ impl MemoryId {
         Self(u128::from_be_bytes(bytes))
     }
 
-    /// Whether this is the null sentinel (`Self::NULL`). Per spec
-    /// §02/03 §2.4, no operation ever returns a null `MemoryId`.
+    /// Whether this is the null sentinel (`Self::NULL`).
+    /// No operation ever returns a null `MemoryId`.
     #[must_use]
     pub const fn is_null(self) -> bool {
         self.0 == 0
@@ -217,9 +241,9 @@ impl MemoryId {
 // Primitive-representation conversions.
 //
 // These are placed here (rather than in `brain-protocol`'s `convert` module)
-// so the orphan rules cooperate: `MemoryId` / `ContextId` / `AgentId` / etc.
+// so the orphan rules cooperate: `MemoryId` / `SessionId` / `SpaceId` / etc.
 // are local to brain-core, and the "wire-domain" aliases in brain-protocol
-// (`WireMemoryId = u128`, `WireUuid = [u8; 16]`, `WireContextId = u64`)
+// (`WireMemoryId = u128`, `WireUuid = [u8; 16]`, `WireSessionId = u64`)
 // are just type aliases for primitives — so impls written here against the
 // primitives apply transparently in brain-protocol.
 // ---------------------------------------------------------------------------
@@ -238,31 +262,31 @@ impl From<u128> for MemoryId {
     }
 }
 
-impl From<ContextId> for u64 {
+impl From<SessionId> for u64 {
     #[inline]
-    fn from(c: ContextId) -> Self {
+    fn from(c: SessionId) -> Self {
         c.0
     }
 }
 
-impl From<u64> for ContextId {
+impl From<u64> for SessionId {
     #[inline]
     fn from(raw: u64) -> Self {
-        ContextId(raw)
+        SessionId(raw)
     }
 }
 
-impl From<AgentId> for [u8; 16] {
+impl From<SpaceId> for [u8; 16] {
     #[inline]
-    fn from(id: AgentId) -> Self {
+    fn from(id: SpaceId) -> Self {
         *id.0.as_bytes()
     }
 }
 
-impl From<[u8; 16]> for AgentId {
+impl From<[u8; 16]> for SpaceId {
     #[inline]
     fn from(bytes: [u8; 16]) -> Self {
-        AgentId(Uuid::from_bytes(bytes))
+        SpaceId(Uuid::from_bytes(bytes))
     }
 }
 
@@ -456,10 +480,78 @@ u32_id! {
     ExtractorId
 }
 
+u32_id! {
+    /// Interned namespace (tenant) identifier — the company-level data
+    /// boundary. Every memory, entity, statement, and relation is owned
+    /// by exactly one namespace; combined with the owning `SpaceId` it
+    /// forms the `(namespace, space)` scope key under which all data is
+    /// isolated. Distinct from the *schema* namespace prefix on a type
+    /// name (`acme:Person`): a row owned by namespace `acme` may still
+    /// reference a shared `brain:`-namespace type. The reserved system
+    /// namespace `brain` is [`NamespaceId::SYSTEM`].
+    NamespaceId
+}
+
+impl NamespaceId {
+    /// The always-present `brain` system namespace. Reserved at id `0`;
+    /// user namespaces are interned starting at `1`.
+    pub const SYSTEM: NamespaceId = NamespaceId(0);
+
+    /// Whether this is the reserved system namespace.
+    #[must_use]
+    pub const fn is_system(self) -> bool {
+        self.0 == Self::SYSTEM.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    /// GOLDEN: the `space_id` derivation is frozen. A fixed
+    /// `(namespace, space_string)` maps to a fixed 16 bytes forever —
+    /// changing the derivation re-keys every space in every deployment,
+    /// so this test must be updated only by a deliberate, migration-aware
+    /// decision. If it fails, the derivation changed; do not "fix" it by
+    /// editing the expected bytes.
+    #[test]
+    fn derive_space_id_is_frozen_golden() {
+        // The root constant is itself pinned — it seeds every derivation.
+        assert_eq!(
+            *BRAIN_ROOT_NAMESPACE_UUID.as_bytes(),
+            [
+                0x6b, 0x72, 0x61, 0x69, 0x6e, 0x2d, 0x73, 0x70, 0x61, 0x63, 0x65, 0x2d, 0x72, 0x6f,
+                0x6f, 0x74,
+            ],
+        );
+        let got = SpaceId::derive_from_string("acme", "support-bot:user123");
+        assert_eq!(
+            *got.0.as_bytes(),
+            [
+                0x11, 0x90, 0x61, 0xcc, 0xb6, 0xdb, 0x5c, 0xde, 0x8e, 0xdd, 0x0c, 0xef, 0xa3, 0x34,
+                0x52, 0xeb,
+            ],
+            "space_id derivation drifted: {got:?}",
+        );
+    }
+
+    /// Two namespaces with an identical space string MUST resolve to
+    /// disjoint ids — the seed folds the namespace, so isolation holds at
+    /// the id level and not only at the row-scope prefix.
+    #[test]
+    fn same_space_string_diverges_across_namespaces() {
+        let a = SpaceId::derive_from_string("nsA", "u1");
+        let b = SpaceId::derive_from_string("nsB", "u1");
+        assert_ne!(
+            a, b,
+            "equal space strings must not collide across namespaces"
+        );
+        // Determinism: the same inputs always reproduce the same id.
+        assert_eq!(a, SpaceId::derive_from_string("nsA", "u1"));
+        // A real non-empty string never collides with the NIL sentinel.
+        assert_ne!(a, SpaceId::NIL);
+    }
 
     #[test]
     fn pack_unpack_roundtrip() {
@@ -526,9 +618,9 @@ mod tests {
     }
 
     #[test]
-    fn context_id_default_is_zero() {
-        assert_eq!(ContextId::default(), ContextId::DEFAULT);
-        assert_eq!(ContextId::DEFAULT.raw(), 0);
+    fn session_id_default_is_zero() {
+        assert_eq!(SessionId::default(), SessionId::DEFAULT);
+        assert_eq!(SessionId::DEFAULT.raw(), 0);
     }
 
     proptest! {

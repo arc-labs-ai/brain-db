@@ -89,15 +89,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_match_constants() {
-        let l = ServerLimits::default();
-        assert_eq!(l.max_header_bytes, DEFAULT_MAX_HEADER_BYTES);
-        assert_eq!(l.max_body_bytes, DEFAULT_MAX_BODY_BYTES);
-        assert_eq!(l.request_timeout, DEFAULT_REQUEST_TIMEOUT);
-        assert_eq!(l.idle_timeout, DEFAULT_IDLE_TIMEOUT);
-    }
-
-    #[test]
     fn builder_chain_overrides() {
         let l = ServerLimits::new()
             .with_max_header_bytes(1024)

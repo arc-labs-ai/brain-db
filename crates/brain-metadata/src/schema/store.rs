@@ -1,7 +1,6 @@
 //! Per-namespace schema persistence.
 //!
-//! Single transactional path for the four schema-management
-//! opcodes (§28/05 / phase 19.6):
+//! Single transactional path for the four schema-management opcodes:
 //!
 //! - `SCHEMA_UPLOAD` → [`schema_upload`]: bumps the active version
 //!   counter for the namespace and persists the parsed AST.
@@ -11,8 +10,7 @@
 //!   `parse_schema` + `validate` + [`schema_active`] (for the
 //!   would-be-next version hint).
 //!
-//! Migration-time compatibility checks are out of scope for v1
-//! (§21/07 Q3).
+//! Migration-time compatibility checks are out of scope.
 
 use brain_protocol::schema::ValidatedSchema;
 use redb::{ReadTransaction, ReadableTable, WriteTransaction};
@@ -134,18 +132,13 @@ fn next_version_in(wtxn: &WriteTransaction, namespace: &str) -> Result<u32, Sche
 // ---------------------------------------------------------------------------
 
 /// Fetch a specific version of a namespace's schema. Returns
-/// `Ok(None)` if the row doesn't exist (or the table itself hasn't
-/// been initialised — `redb` opens lazily on first write).
+/// `Ok(None)` if the row doesn't exist.
 pub fn schema_get(
     rtxn: &ReadTransaction,
     namespace: &str,
     version: u32,
 ) -> Result<Option<SchemaVersionRow>, SchemaStoreError> {
-    let versions = match rtxn.open_table(SCHEMA_VERSIONS_TABLE) {
-        Ok(t) => t,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
+    let versions = rtxn.open_table(SCHEMA_VERSIONS_TABLE)?;
     let guard = versions.get(&(namespace, version))?;
     Ok(guard.map(|g| g.value()))
 }
@@ -155,11 +148,7 @@ pub fn schema_active(
     rtxn: &ReadTransaction,
     namespace: &str,
 ) -> Result<Option<u32>, SchemaStoreError> {
-    let active = match rtxn.open_table(SCHEMA_ACTIVE_VERSIONS_TABLE) {
-        Ok(t) => t,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
+    let active = rtxn.open_table(SCHEMA_ACTIVE_VERSIONS_TABLE)?;
     let guard = active.get(&namespace)?;
     Ok(guard.map(|g| g.value()))
 }
@@ -180,11 +169,7 @@ pub fn schema_list(
     rtxn: &ReadTransaction,
     namespace: &str,
 ) -> Result<Vec<SchemaVersionRow>, SchemaStoreError> {
-    let versions = match rtxn.open_table(SCHEMA_VERSIONS_TABLE) {
-        Ok(t) => t,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-        Err(e) => return Err(e.into()),
-    };
+    let versions = rtxn.open_table(SCHEMA_VERSIONS_TABLE)?;
     let lo = (namespace, 0u32);
     let hi = (namespace, u32::MAX);
     let mut out = Vec::new();
@@ -198,11 +183,7 @@ pub fn schema_list(
 
 /// All namespaces with at least one active schema.
 pub fn schema_namespaces(rtxn: &ReadTransaction) -> Result<Vec<String>, SchemaStoreError> {
-    let active = match rtxn.open_table(SCHEMA_ACTIVE_VERSIONS_TABLE) {
-        Ok(t) => t,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-        Err(e) => return Err(e.into()),
-    };
+    let active = rtxn.open_table(SCHEMA_ACTIVE_VERSIONS_TABLE)?;
     let mut out = Vec::new();
     for entry in active.iter()? {
         let (k, _v) = entry?;
@@ -218,11 +199,20 @@ pub fn schema_namespaces(rtxn: &ReadTransaction) -> Result<Vec<String>, SchemaSt
 #[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
+    use crate::tables::scope::RowScope;
     use brain_protocol::schema::{parse_schema, validate};
     use redb::{Database, ReadableDatabase};
 
+    fn test_scope() -> RowScope {
+        RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xAB; 16])
+    }
+
     fn open_db(dir: &tempfile::TempDir) -> Database {
-        Database::create(dir.path().join("test.redb")).unwrap()
+        let db = Database::create(dir.path().join("test.redb")).unwrap();
+        let wtxn = db.begin_write().unwrap();
+        crate::tables::materialize_all_tables(&wtxn).unwrap();
+        wtxn.commit().unwrap();
+        db
     }
 
     fn validated(src: &str) -> ValidatedSchema {
@@ -366,10 +356,10 @@ mod tests {
         use crate::schema::predicate::{predicate_intern_or_get, predicates_active_for_schema};
         use crate::statement::crud::statement_create;
         use crate::tables::statement::{statement_flags, STATEMENTS_TABLE};
+        use brain_core::{EntityId, ExtractorId, MemoryId, SessionId, StatementId, StatementKind};
         use brain_core::{
             EvidenceEntry, EvidenceRef, Statement, StatementObject, StatementValue, SubjectRef,
         };
-        use brain_core::{ContextId, EntityId, ExtractorId, MemoryId, StatementId, StatementKind};
 
         let dir = tempfile::tempdir().unwrap();
         // Use the seeded wrapper so EntityTypeId(1) (Person) exists.
@@ -387,6 +377,8 @@ mod tests {
             let now = 0u64;
             entity_put(
                 &wtxn,
+                test_scope(),
+                brain_core::SessionId::DEFAULT,
                 &Entity::new_active(
                     subject,
                     brain_core::EntityTypeId(1),
@@ -402,7 +394,7 @@ mod tests {
             let mk_stmt = |pid| {
                 let id = StatementId::new();
                 let evidence_entry = EvidenceEntry::from_parts(
-                    MemoryId::pack(1, ContextId::DEFAULT.into(), 0),
+                    MemoryId::pack(1, SessionId::DEFAULT.into(), 0),
                     1.0,
                     0,
                     ExtractorId::default(),
@@ -422,8 +414,22 @@ mod tests {
             };
             let s_in = mk_stmt(p_in);
             let s_out = mk_stmt(p_out);
-            let sid_in = statement_create(&wtxn, &s_in, 0).unwrap();
-            let sid_out = statement_create(&wtxn, &s_out, 0).unwrap();
+            let sid_in = statement_create(
+                &wtxn,
+                test_scope(),
+                brain_core::SessionId::DEFAULT,
+                &s_in,
+                0,
+            )
+            .unwrap();
+            let sid_out = statement_create(
+                &wtxn,
+                test_scope(),
+                brain_core::SessionId::DEFAULT,
+                &s_out,
+                0,
+            )
+            .unwrap();
             wtxn.commit().unwrap();
             (sid_in, sid_out)
         };

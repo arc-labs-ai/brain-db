@@ -14,7 +14,7 @@
 use brain_core::StatementId;
 use redb::{ReadTransaction, ReadableTable, ReadableTableMetadata, WriteTransaction};
 
-use crate::tables::statement::STATEMENT_EMBED_QUEUE_TABLE;
+use crate::tables::statement::{STATEMENTS_TABLE, STATEMENT_EMBED_QUEUE_TABLE};
 
 use super::StatementOpError;
 
@@ -35,11 +35,7 @@ pub fn statement_embed_queue_peek(
     if limit == 0 {
         return Ok(Vec::new());
     }
-    let t = match rtxn.open_table(STATEMENT_EMBED_QUEUE_TABLE) {
-        Ok(t) => t,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-        Err(e) => return Err(StatementOpError::Table(e)),
-    };
+    let t = rtxn.open_table(STATEMENT_EMBED_QUEUE_TABLE)?;
     let mut out = Vec::with_capacity(limit.min(1024));
     for entry in t.iter()? {
         let (k, v) = entry?;
@@ -54,11 +50,7 @@ pub fn statement_embed_queue_peek(
 /// Total queued statement count. Used by metrics + the worker's
 /// "is there work?" check.
 pub fn statement_embed_queue_len(rtxn: &ReadTransaction) -> Result<u64, StatementOpError> {
-    let t = match rtxn.open_table(STATEMENT_EMBED_QUEUE_TABLE) {
-        Ok(t) => t,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
-        Err(e) => return Err(StatementOpError::Table(e)),
-    };
+    let t = rtxn.open_table(STATEMENT_EMBED_QUEUE_TABLE)?;
     Ok(t.len()?)
 }
 
@@ -90,6 +82,44 @@ pub fn statement_embed_queue_remove_many(
         }
     }
     Ok(removed)
+}
+
+/// Re-enqueue every live (non-tombstoned) statement for embedding.
+///
+/// The Statement HNSW is in-RAM only and not persisted — on restart it
+/// is empty, and the embed queue (which survives in redb) holds only the
+/// statements that hadn't been embedded yet at crash time. That leaves
+/// already-embedded statements absent from the rebuilt HNSW. This helper
+/// seeds the queue with *all* live statements so the `StatementEmbedWorker`
+/// repopulates the index after a restart.
+///
+/// Idempotent: re-seeding an id already in the queue upserts the same row,
+/// and the worker skips any statement already present in the HNSW. The
+/// queue value is the statement's `extracted_at_unix_nanos`, matching what
+/// `insert_new_statement` writes. Returns the number of statements seeded.
+pub fn statement_embed_queue_seed_all_live(
+    wtxn: &WriteTransaction,
+) -> Result<u64, StatementOpError> {
+    // Collect live (id, extracted_at) first so the STATEMENTS_TABLE read
+    // borrow is released before the queue table is opened for writes.
+    let seeds: Vec<([u8; 16], u64)> = {
+        let s = wtxn.open_table(STATEMENTS_TABLE)?;
+        let mut v = Vec::new();
+        for entry in s.iter()? {
+            let (k, val) = entry?;
+            let m = val.value();
+            if m.is_tombstoned() {
+                continue;
+            }
+            v.push((k.value(), m.extracted_at_unix_nanos));
+        }
+        v
+    };
+    let mut q = wtxn.open_table(STATEMENT_EMBED_QUEUE_TABLE)?;
+    for (id, ts) in &seeds {
+        q.insert(id, ts)?;
+    }
+    Ok(seeds.len() as u64)
 }
 
 // ---------------------------------------------------------------------------

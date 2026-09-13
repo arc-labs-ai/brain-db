@@ -1,7 +1,7 @@
-//! M7 WebSocket client tests.
+//! WebSocket client tests.
 //!
 //! Uses brain-http's own `ws::connect` against an `ws::accept`-based
-//! server, closing the M6/M7 loop end-to-end.
+//! server, closing the client/server loop end-to-end.
 
 mod common;
 

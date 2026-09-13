@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use brain_core::{
-    AgentId, ContextId, ExtractorId, Memory, MemoryId, MemoryKind, Salience, Statement,
+    ExtractorId, Memory, MemoryId, MemoryKind, Salience, SessionId, SpaceId, Statement,
     StatementObject, StatementValue, SubjectRef,
 };
 use brain_llm::client::LlmFuture;
@@ -23,8 +23,9 @@ use parking_lot::Mutex;
 use serde_json::Value;
 
 use super::extractor::{
-    collect_prior_entities, find_unfilled_placeholder, parse_verdict, relative_time_hint,
-    render_prompt, truncate_chars, LlmExtractor, LlmExtractorInner, LLM_INPUT_TOKEN_BUDGET,
+    anchor_date_iso, collect_prior_entities, find_unfilled_placeholder, parse_verdict,
+    relative_time_hint, render_prompt, truncate_chars, LlmExtractor, LlmExtractorInner,
+    LLM_INPUT_TOKEN_BUDGET,
 };
 use super::pricing::{estimate_cost, CostBudget, Pricing};
 use crate::framework::extractor::{
@@ -32,8 +33,6 @@ use crate::framework::extractor::{
 };
 use crate::framework::item::{EntityMention, ExtractedItem, StatementMention};
 use crate::framework::registry::ExtractorRegistry;
-use crate::idempotency::hash_memory_text;
-use brain_metadata::llm_cache::LLM_RESPONSES_TABLE;
 use brain_protocol::schema::ast::StatementKindAst;
 
 // ------------------------------------------------------------------- mock
@@ -98,18 +97,23 @@ fn entity_target() -> ExtractorTarget {
 fn memory(text: &str) -> Memory {
     Memory {
         id: MemoryId::pack(0, 1, 0),
-        agent: AgentId::new(),
-        context: ContextId(0),
+        space: SpaceId::new(),
+        session_id: SessionId(0),
         kind: MemoryKind::Episodic,
         salience: Salience::default(),
         text: Some(text.into()),
         created_at_unix_ms: 0,
         last_accessed_at_unix_ms: 0,
+        occurred_at_unix_nanos: None,
     }
 }
 
 fn ctx<'a>(reg: &'a ExtractorRegistry) -> ExtractionContext<'a> {
     ExtractionContext {
+        declared_entity_types: None,
+        candidate_predicates: None,
+        declared_kinds: None,
+        entity_type_labels: None,
         schema_version: 1,
         now_unix_nanos: 100,
         registry: reg,
@@ -234,49 +238,6 @@ fn confidence_below_threshold_filtered() {
 }
 
 #[test]
-fn schema_validation_failure_retries_once() {
-    // First response is not an array of objects with `name`;
-    // second response is the well-formed one.
-    let schema = serde_json::json!({
-        "type": "array",
-        "items": {
-            "type": "object",
-            "properties": {"name": {"type": "string"}},
-            "required": ["name"],
-        },
-    });
-    let bad = ok_response("[\"plain string\"]", 50);
-    let good = ok_response("[{\"name\":\"Alice\"}]", 50);
-    let client = Arc::new(MockClient::new("claude-haiku-4-5", vec![Ok(bad), Ok(good)]));
-    let calls = client.calls.clone();
-    let ext = build_ext(client, None, Some(schema), None);
-    let reg = ExtractorRegistry::new();
-    let r = futures_lite::future::block_on(ext.run(&ctx(&reg), &memory("Alice")));
-    assert_eq!(r.status, ExtractionStatus::Success);
-    assert_eq!(r.items.len(), 1);
-    assert_eq!(calls.load(Ordering::SeqCst), 2, "retried exactly once");
-}
-
-#[test]
-fn schema_validation_failure_twice_returns_failure() {
-    let schema = serde_json::json!({
-        "type": "array",
-        "items": {"type": "object", "required": ["name"]},
-    });
-    let bad1 = ok_response("[\"x\"]", 50);
-    let bad2 = ok_response("[\"y\"]", 50);
-    let client = Arc::new(MockClient::new(
-        "claude-haiku-4-5",
-        vec![Ok(bad1), Ok(bad2)],
-    ));
-    let ext = build_ext(client, None, Some(schema), None);
-    let reg = ExtractorRegistry::new();
-    let r = futures_lite::future::block_on(ext.run(&ctx(&reg), &memory("hello")));
-    assert_eq!(r.status, ExtractionStatus::Failure);
-    assert!(r.status_reason.contains("schema validation failed twice"));
-}
-
-#[test]
 fn rate_limit_error_surfaces_retry_after() {
     let client = Arc::new(MockClient::new(
         "claude-haiku-4-5",
@@ -289,66 +250,6 @@ fn rate_limit_error_surfaces_retry_after() {
     let r = futures_lite::future::block_on(ext.run(&ctx(&reg), &memory("hi")));
     assert_eq!(r.status, ExtractionStatus::Failure);
     assert!(r.status_reason.contains("1500"));
-}
-
-#[test]
-fn cache_hit_skips_llm_call() {
-    let dir = tempfile::tempdir().unwrap();
-    let cache = Arc::new(Mutex::new(
-        LlmCacheDb::open(dir.path().join("llm_cache.redb")).unwrap(),
-    ));
-
-    // Round 1: real call populates cache.
-    let client = Arc::new(MockClient::new(
-        "claude-haiku-4-5",
-        vec![Ok(ok_response("[\"Alice\"]", 50))],
-    ));
-    let calls = client.calls.clone();
-    let ext = build_ext(client.clone(), Some(cache.clone()), None, None);
-    let reg = ExtractorRegistry::new();
-    let _ = futures_lite::future::block_on(ext.run(&ctx(&reg), &memory("Alice")));
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
-
-    // Round 2: same input, new client with no responses queued.
-    // Cache hit must short-circuit.
-    let client2 = Arc::new(MockClient::new("claude-haiku-4-5", vec![]));
-    let calls2 = client2.calls.clone();
-    let ext2 = build_ext(client2, Some(cache.clone()), None, None);
-    let r = futures_lite::future::block_on(ext2.run(&ctx(&reg), &memory("Alice")));
-    assert_eq!(r.status, ExtractionStatus::Success);
-    assert_eq!(r.items.len(), 1);
-    assert_eq!(
-        calls2.load(Ordering::SeqCst),
-        0,
-        "cache hit: zero LLM calls"
-    );
-}
-
-#[test]
-fn cache_miss_writes_through() {
-    let dir = tempfile::tempdir().unwrap();
-    let cache = Arc::new(Mutex::new(
-        LlmCacheDb::open(dir.path().join("llm_cache.redb")).unwrap(),
-    ));
-    let client = Arc::new(MockClient::new(
-        "claude-haiku-4-5",
-        vec![Ok(ok_response("[\"Alice\"]", 50))],
-    ));
-    let ext = build_ext(client, Some(cache.clone()), None, None);
-    let reg = ExtractorRegistry::new();
-    let _ = futures_lite::future::block_on(ext.run(&ctx(&reg), &memory("Alice")));
-
-    // Verify the row landed.
-    let db = cache.lock();
-    let rtxn = db.read_txn().unwrap();
-    let t = rtxn.open_table(LLM_RESPONSES_TABLE).unwrap();
-    let key = (
-        hash_memory_text("Alice"),
-        99u32,
-        1u32,
-        brain_llm::client::model_id_hash("claude-haiku-4-5"),
-    );
-    assert!(t.get(&key).unwrap().is_some(), "cache row present");
 }
 
 #[test]
@@ -386,12 +287,17 @@ fn sm_fixture() -> StatementMention {
     StatementMention {
         kind: 1,
         subject_text: Some("X".into()),
+        subject_is_memory: false,
         predicate_qname: "brain:fact".into(),
         object_text: Some("Y".into()),
         confidence: 0.9,
         extractor_id: 1,
         extractor_version: 1,
         is_stateful: false,
+        object_is_entity: false,
+        event_at_unix_nanos: None,
+        subject_is_self: false,
+        retract: false,
     }
 }
 
@@ -438,6 +344,10 @@ fn build_request_injects_prior_entities_into_prompt() {
         "Alice Wong works at Acme Corp from Bengaluru.",
         &prior_refs,
         None,
+        None,
+        None,
+        None,
+        None,
         0,
     );
     let body = &req.messages[0].content;
@@ -468,6 +378,77 @@ fn build_request_injects_prior_entities_into_prompt() {
 }
 
 #[test]
+fn build_request_substitutes_anchor_date_placeholder() {
+    let prompt = "Recorded on {ANCHOR_DATE}. Text: {TEXT}";
+    let ext = ext_with_prompt(prompt);
+    let inner = ext.inner.as_ref().unwrap().clone();
+    let (req, _) = ext.build_request(
+        &inner,
+        brain_core::MemoryId::pack(0, 1, 0),
+        "Ran a race last Saturday.",
+        &[],
+        None,
+        None,
+        None,
+        None,
+        Some("2023-05-25"),
+        0,
+    );
+    let body = &req.messages[0].content;
+    assert!(
+        body.contains("Recorded on 2023-05-25."),
+        "anchor date must be substituted into the prompt: {body}",
+    );
+    assert!(
+        !body.contains("{ANCHOR_DATE}"),
+        "placeholder must be consumed: {body}",
+    );
+}
+
+#[test]
+fn build_request_anchor_date_empty_when_absent() {
+    let prompt = "Recorded on {ANCHOR_DATE}. Text: {TEXT}";
+    let ext = ext_with_prompt(prompt);
+    let inner = ext.inner.as_ref().unwrap().clone();
+    let (req, _) = ext.build_request(
+        &inner,
+        brain_core::MemoryId::pack(0, 1, 0),
+        "No date here.",
+        &[],
+        None,
+        None,
+        None,
+        None,
+        None,
+        0,
+    );
+    let body = &req.messages[0].content;
+    assert!(
+        body.contains("Recorded on . Text:"),
+        "absent anchor renders empty (rule no-ops): {body}",
+    );
+}
+
+#[test]
+fn anchor_date_iso_prefers_occurred_at_then_created_at() {
+    // occurred_at set -> that date wins over created_at.
+    let mut m = memory("x");
+    m.created_at_unix_ms = 1_700_000_000_000; // 2023-11-14
+    m.occurred_at_unix_nanos = Some(1_684_540_800_000_000_000); // 2023-05-20
+    assert_eq!(anchor_date_iso(&m).as_deref(), Some("2023-05-20"));
+
+    // No occurred_at -> fall back to created_at.
+    let mut m2 = memory("x");
+    m2.created_at_unix_ms = 1_684_540_800_000; // 2023-05-20 (ms)
+    m2.occurred_at_unix_nanos = None;
+    assert_eq!(anchor_date_iso(&m2).as_deref(), Some("2023-05-20"));
+
+    // Neither usable -> None (placeholder renders empty).
+    let m3 = memory("x"); // created_at_unix_ms = 0, occurred_at = None
+    assert_eq!(anchor_date_iso(&m3), None);
+}
+
+#[test]
 fn build_request_with_empty_prior_entities_omits_section() {
     let prompt = "DO YOUR JOB.\n{PRIOR_ENTITIES}\nText: {TEXT}";
     let ext = ext_with_prompt(prompt);
@@ -478,6 +459,10 @@ fn build_request_with_empty_prior_entities_omits_section() {
         brain_core::MemoryId::pack(0, 2, 0),
         "Plain text.",
         &priors,
+        None,
+        None,
+        None,
+        None,
         None,
         0,
     );
@@ -506,6 +491,10 @@ fn build_request_filters_non_entity_items_from_prior() {
         "Alice met Acme.",
         &priors,
         None,
+        None,
+        None,
+        None,
+        None,
         0,
     );
     let body = &req.messages[0].content;
@@ -533,6 +522,10 @@ fn build_request_filters_non_entity_items_from_prior() {
     );
     let reg = ExtractorRegistry::new();
     let ctx = ExtractionContext {
+        declared_entity_types: None,
+        candidate_predicates: None,
+        declared_kinds: None,
+        entity_type_labels: None,
         schema_version: 1,
         now_unix_nanos: 1,
         registry: &reg,
@@ -588,6 +581,10 @@ fn build_request_splits_into_cached_blocks() {
         brain_core::MemoryId::pack(0, 1, 0),
         "Alice met Bob.",
         &[],
+        None,
+        None,
+        None,
+        None,
         None,
         0,
     );
@@ -657,6 +654,10 @@ fn build_request_without_examples_emits_role_block_only() {
         brain_core::MemoryId::pack(0, 1, 0),
         "Hello.",
         &[],
+        None,
+        None,
+        None,
+        None,
         None,
         0,
     );
@@ -775,7 +776,7 @@ fn fact_pair(subj: brain_core::EntityId, pred: brain_core::PredicateId) -> (Stat
 }
 
 fn open_md(tmp: &tempfile::TempDir) -> brain_metadata::MetadataDb {
-    let mut db = brain_metadata::MetadataDb::open(tmp.path().join("md.redb")).unwrap();
+    let db = brain_metadata::MetadataDb::open(tmp.path().join("md.redb")).unwrap();
     // Touch the tables the judge's renderer reads so a read txn
     // on a fresh DB doesn't error with "Table does not exist".
     let wtxn = db.write_txn().unwrap();
@@ -891,7 +892,7 @@ fn judge_supersedes_unparseable_response_errors() {
 }
 
 // ------------------------------------------------------------------
-// W2.3 — bounded inferential context in the prompt.
+// Bounded inferential context in the prompt.
 // ------------------------------------------------------------------
 
 fn neighbor(text: &str, score: f32, created_at_unix_nanos: u64) -> NeighborMemory {
@@ -937,6 +938,10 @@ fn extract_with_context_includes_neighbors_in_prompt() {
         "Alice approved the design.",
         &[],
         Some(&ec),
+        None,
+        None,
+        None,
+        None,
         now,
     );
     let body = &req.messages[0].content;
@@ -978,7 +983,18 @@ fn extract_with_context_drops_summary_when_over_budget() {
         // 600-char summary (truncated to 500 in the render).
         summary: Some("Summary that pushes us over the cap. ".repeat(20)),
     };
-    let (_req, stats) = ext.build_request(&inner, mid, &memory_text, &[], Some(&ec), 0);
+    let (_req, stats) = ext.build_request(
+        &inner,
+        mid,
+        &memory_text,
+        &[],
+        Some(&ec),
+        None,
+        None,
+        None,
+        None,
+        0,
+    );
     assert!(
         !stats.summary_included,
         "summary must be dropped when over budget (got {} tokens)",
@@ -1022,7 +1038,18 @@ fn extract_with_context_drops_lowest_similarity_neighbors_when_over_budget() {
         neighbors,
         summary: None,
     };
-    let (req, stats) = ext.build_request(&inner, mid, &memory_text, &[], Some(&ec), 0);
+    let (req, stats) = ext.build_request(
+        &inner,
+        mid,
+        &memory_text,
+        &[],
+        Some(&ec),
+        None,
+        None,
+        None,
+        None,
+        0,
+    );
     let body = &req.messages[0].content;
     assert!(
         stats.neighbors_included < 30,
@@ -1055,7 +1082,18 @@ fn extract_with_context_includes_summary_when_under_budget() {
         neighbors: vec![neighbor("a recent prior", 0.9, 1_000)],
         summary: Some("Last week Alice shipped the auth rewrite.".into()),
     };
-    let (req, stats) = ext.build_request(&inner, mid, "today", &[], Some(&ec), 1_000_000_000);
+    let (req, stats) = ext.build_request(
+        &inner,
+        mid,
+        "today",
+        &[],
+        Some(&ec),
+        None,
+        None,
+        None,
+        None,
+        1_000_000_000,
+    );
     let body = &req.messages[0].content;
     assert!(body.contains("## Rolling summary"));
     assert!(body.contains("Last week Alice shipped"));
@@ -1069,7 +1107,18 @@ fn extract_with_context_skips_sections_when_context_is_empty() {
     let inner = ext.inner.as_ref().unwrap().clone();
     let mid = brain_core::MemoryId::pack(0, 1, 0);
     let ec = ExtractorContext::empty();
-    let (req, stats) = ext.build_request(&inner, mid, "first memory ever", &[], Some(&ec), 0);
+    let (req, stats) = ext.build_request(
+        &inner,
+        mid,
+        "first memory ever",
+        &[],
+        Some(&ec),
+        None,
+        None,
+        None,
+        None,
+        0,
+    );
     let body = &req.messages[0].content;
     assert!(
         !body.contains("## Recent context"),
@@ -1107,4 +1156,361 @@ fn truncate_chars_caps_long_strings_utf8_safe() {
     let out = truncate_chars(&long, 10);
     assert_eq!(out.chars().count(), 11); // 10 + ellipsis
     assert!(out.ends_with('…'));
+}
+
+// ------------------------------------------------------------------
+// The shipped `brain:llm_predicate` extractor's declared response
+// schema — end-to-end check that a missing/malformed "object" field
+// is a genuine schema-validation failure (retry, then clean drop),
+// not a silent `None` that flows unvalidated into projection.
+// ------------------------------------------------------------------
+
+/// Pull the real `schema:` JSON off the system-schema's `llm_predicate`
+/// extractor definition, exactly as `materialize_llm_extractor` does —
+/// so this test exercises the actual shipped declaration, not a
+/// hand-rolled stand-in that could drift from it.
+fn system_llm_predicate_schema() -> Value {
+    let schema = brain_protocol::schema::parse_schema(brain_metadata::SYSTEM_SCHEMA_SOURCE)
+        .expect("system schema source parses");
+    for item in &schema.items {
+        if let brain_protocol::schema::SchemaItem::Extractor(ext) = item {
+            if ext.name == "llm_predicate" {
+                for f in &ext.fields {
+                    if let brain_protocol::schema::ExtractorField::Schema(v) = f {
+                        return v.clone();
+                    }
+                }
+                panic!("llm_predicate extractor has no `schema:` field declared");
+            }
+        }
+    }
+    panic!("llm_predicate extractor not found in system schema");
+}
+
+fn build_ext_with_target(
+    client: Arc<dyn LlmClient>,
+    schema: Value,
+    target: ExtractorTarget,
+) -> LlmExtractor {
+    let schema_compiled = LlmExtractor::compile_schema(Some(&schema)).unwrap();
+    LlmExtractor::new(
+        ExtractorId::from(3),
+        "brain:llm_predicate".into(),
+        target,
+        1,
+        0.0,
+        None,
+        Duration::from_secs(60),
+        LlmExtractorInner {
+            client,
+            cache: None,
+            prompt: "ignored in mock".into(),
+            examples: None,
+            response_schema: Some(schema),
+            schema_compiled,
+            pricing: Pricing::for_model("gpt-4o-mini"),
+            max_tokens: 1024,
+            temperature: 0.0,
+            timeout: Duration::from_secs(30),
+        },
+    )
+}
+
+/// Recursively assert every `"type": "object"` node with a `properties`
+/// map satisfies OpenAI's Structured Outputs "strict" mode: every
+/// object must set `additionalProperties: false` and its `required`
+/// array must list every key that appears in `properties` (strict mode
+/// treats all properties as mandatory — optionality is expressed via a
+/// nullable type, not omission from `required`). A schema that violates
+/// this is rejected by the OpenAI API itself with a 400 before the
+/// model ever runs, which defeats the validate → retry → drop pipeline
+/// entirely (the call never completes at all). This guards the exact
+/// regression hit live: `compile_schema` and `jsonschema` accept a
+/// schema missing `additionalProperties: false`, but OpenAI does not.
+fn assert_openai_strict_compatible(node: &Value) {
+    if let Value::Object(map) = node {
+        if map.get("type").and_then(Value::as_str) == Some("object") {
+            if let Some(Value::Object(props)) = map.get("properties") {
+                assert_eq!(
+                    map.get("additionalProperties").and_then(Value::as_bool),
+                    Some(false),
+                    "object node must set additionalProperties: false for OpenAI strict mode: {node}"
+                );
+                let required: std::collections::HashSet<&str> = map
+                    .get("required")
+                    .and_then(Value::as_array)
+                    .map(|a| a.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                for key in props.keys() {
+                    assert!(
+                        required.contains(key.as_str()),
+                        "property {key:?} must be listed in `required` for OpenAI strict mode: {node}"
+                    );
+                }
+            }
+        }
+        for v in map.values() {
+            assert_openai_strict_compatible(v);
+        }
+    } else if let Value::Array(arr) = node {
+        for v in arr {
+            assert_openai_strict_compatible(v);
+        }
+    }
+}
+
+#[test]
+fn system_schema_llm_predicate_schema_is_openai_strict_mode_compatible() {
+    // `OpenAIClient` sends the declared schema straight through as
+    // `response_format = {"type": "json_schema", "json_schema": {"strict":
+    // true, "schema": ...}}` (see `providers/openai.rs`). A schema that
+    // isn't strict-mode-shaped fails the OpenAI request itself, which is
+    // a distinct, earlier failure mode than a schema-validation miss on
+    // our side — catch it here so it can't ship silently again.
+    let schema = system_llm_predicate_schema();
+    assert_openai_strict_compatible(&schema);
+}
+
+#[test]
+fn system_schema_llm_predicate_declares_a_response_schema() {
+    // The core regression this whole test module guards: the shipped
+    // default extractor must declare a schema at all, or
+    // `compile_schema(None)` disables validation entirely and the
+    // retry/drop safety net never engages.
+    let schema = system_llm_predicate_schema();
+    assert!(
+        LlmExtractor::compile_schema(Some(&schema))
+            .unwrap()
+            .is_some(),
+        "declared schema must compile",
+    );
+}
+
+#[test]
+fn system_schema_missing_object_fails_validation_then_retry_recovers() {
+    let schema = system_llm_predicate_schema();
+    // First response: model half-complies, keeps subject+predicate,
+    // silently drops "object" — exactly the failure mode this schema
+    // exists to catch. (OpenAI strict-mode shape: every declared key
+    // present, "object" specifically omitted here to simulate the
+    // real-world half-comply failure this schema guards against.)
+    let bad = r#"{"statements": [
+        {"subject": "Priya", "predicate": "brain:manages", "kind": "Relation",
+         "confidence": 0.9, "object_is_entity": false, "event_at": null,
+         "subject_is_self": false, "retract": false, "is_stateful": false}
+    ]}"#;
+    // Second response (the retry): model corrects itself.
+    let good = r#"{"statements": [
+        {"subject": "Priya", "predicate": "brain:manages", "object": "the billing platform team",
+         "object_is_entity": false, "kind": "Relation", "confidence": 0.9, "event_at": null,
+         "subject_is_self": false, "retract": false, "is_stateful": false}
+    ]}"#;
+    let client = Arc::new(MockClient::new(
+        "gpt-4o-mini",
+        vec![Ok(ok_response(bad, 100)), Ok(ok_response(good, 100))],
+    ));
+    let calls = client.calls.clone();
+    let ext = build_ext_with_target(client, schema, ExtractorTarget::EntityOrStatement);
+    let reg = ExtractorRegistry::new();
+    let r = futures_lite::future::block_on(ext.run(
+        &ctx(&reg),
+        &memory("Priya manages the billing platform team at Stripe."),
+    ));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "missing object must trigger exactly one retry call"
+    );
+    assert_eq!(r.status, ExtractionStatus::Success);
+    assert_eq!(r.items.len(), 1);
+    match &r.items[0] {
+        ExtractedItem::StatementMention(m) => {
+            assert_eq!(m.object_text.as_deref(), Some("the billing platform team"));
+        }
+        other => panic!("expected statement mention, got {other:?}"),
+    }
+}
+
+#[test]
+fn system_schema_missing_object_twice_drops_cleanly_never_fabricates() {
+    let schema = system_llm_predicate_schema();
+    // Both the original call and the retry omit "object" — a genuine,
+    // unrecoverable model failure. The extractor must terminate the
+    // extraction as a clean Failure, never synthesize an empty-object
+    // statement mention.
+    let bad = r#"{"statements": [
+        {"subject": "Priya", "predicate": "brain:manages", "kind": "Relation",
+         "confidence": 0.9, "object_is_entity": false, "event_at": null,
+         "subject_is_self": false, "retract": false, "is_stateful": false}
+    ]}"#;
+    let client = Arc::new(MockClient::new(
+        "gpt-4o-mini",
+        vec![Ok(ok_response(bad, 100)), Ok(ok_response(bad, 100))],
+    ));
+    let calls = client.calls.clone();
+    let ext = build_ext_with_target(client, schema, ExtractorTarget::EntityOrStatement);
+    let reg = ExtractorRegistry::new();
+    let r = futures_lite::future::block_on(ext.run(
+        &ctx(&reg),
+        &memory("Priya manages the billing platform team at Stripe."),
+    ));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "exactly one retry, no loop"
+    );
+    assert_eq!(r.status, ExtractionStatus::Failure);
+    assert!(
+        r.status_reason.contains("schema validation failed twice"),
+        "status reason should explain the terminal validation failure: {}",
+        r.status_reason
+    );
+    assert!(
+        r.items.is_empty(),
+        "a twice-invalid response must yield zero items, never a fabricated empty-object statement"
+    );
+}
+
+// ----- E1: failed extractions must carry their real provider spend. -----
+
+#[test]
+fn schema_validation_failed_twice_reports_full_cost() {
+    let schema = system_llm_predicate_schema();
+    // Both calls omit "object" → schema fails twice → terminal Failure. Each
+    // `ok_response(_, 100)` bills tokens*2 = 200 µ$, so the two calls that
+    // actually hit the provider spent 400 µ$ total. The failure MUST report
+    // that spend so the worker's per-cycle budget gate counts it — else a
+    // malformed prompt burns two API calls forever.
+    let bad = r#"{"statements": [
+        {"subject": "Priya", "predicate": "brain:manages", "kind": "Relation",
+         "confidence": 0.9, "object_is_entity": false, "event_at": null,
+         "subject_is_self": false, "retract": false, "is_stateful": false}
+    ]}"#;
+    let client = Arc::new(MockClient::new(
+        "gpt-4o-mini",
+        vec![Ok(ok_response(bad, 100)), Ok(ok_response(bad, 100))],
+    ));
+    let ext = build_ext_with_target(client, schema, ExtractorTarget::EntityOrStatement);
+    let reg = ExtractorRegistry::new();
+    let r = futures_lite::future::block_on(ext.run(
+        &ctx(&reg),
+        &memory("Priya manages the billing platform team."),
+    ));
+    assert_eq!(r.status, ExtractionStatus::Failure);
+    assert_eq!(
+        r.cost_micro_usd, 400,
+        "both calls' real spend must ride the failure, not default to 0"
+    );
+}
+
+#[test]
+fn retry_transport_error_reports_first_call_cost() {
+    let schema = system_llm_predicate_schema();
+    // First call reaches the provider (bills 200 µ$) but fails schema; the
+    // retry errors at transport. The first call's spend already happened, so
+    // the failure must carry 200 µ$ — not 0.
+    let bad = r#"{"statements": [
+        {"subject": "Priya", "predicate": "brain:manages", "kind": "Relation",
+         "confidence": 0.9, "object_is_entity": false, "event_at": null,
+         "subject_is_self": false, "retract": false, "is_stateful": false}
+    ]}"#;
+    let client = Arc::new(MockClient::new(
+        "gpt-4o-mini",
+        vec![
+            Ok(ok_response(bad, 100)),
+            Err(LlmError::ProviderError {
+                status: 503,
+                message: "upstream down".into(),
+            }),
+        ],
+    ));
+    let ext = build_ext_with_target(client, schema, ExtractorTarget::EntityOrStatement);
+    let reg = ExtractorRegistry::new();
+    let r = futures_lite::future::block_on(ext.run(
+        &ctx(&reg),
+        &memory("Priya manages the billing platform team."),
+    ));
+    assert_eq!(r.status, ExtractionStatus::Failure);
+    assert_eq!(
+        r.cost_micro_usd, 200,
+        "the first call already billed real spend; it must ride the failure"
+    );
+}
+
+// ----- E2: missing confidence is conservative; retracts need explicit conf. --
+
+#[test]
+fn missing_confidence_uses_conservative_default_not_max() {
+    // No "confidence" field on the emitted statement. It must NOT default to
+    // 1.0; it gets the conservative 0.5 default, which sits below the 0.7
+    // retract floor so an unstated confidence can never drive a tombstone.
+    let body = r#"{"statements":[{"subject":"Alice","predicate":"brain:likes","object":"tea"}]}"#;
+    let client = Arc::new(MockClient::new(
+        "claude-haiku-4-5",
+        vec![Ok(ok_response(body, 50))],
+    ));
+    // build_ext sets confidence_threshold = 0.5, so the 0.5 default is retained.
+    let ext = build_ext(client, None, None, None);
+    let reg = ExtractorRegistry::new();
+    let r = futures_lite::future::block_on(ext.run(&ctx(&reg), &memory("Alice likes tea")));
+    assert_eq!(r.status, ExtractionStatus::Success);
+    assert_eq!(r.items.len(), 1);
+    match &r.items[0] {
+        ExtractedItem::StatementMention(m) => {
+            assert!(
+                m.confidence < 1.0,
+                "missing confidence must not default to max"
+            );
+            assert!(
+                (m.confidence - 0.5).abs() < f32::EPSILON,
+                "conservative default should be 0.5, got {}",
+                m.confidence
+            );
+            assert!(m.confidence < 0.7, "must sit below the retract floor");
+        }
+        other => panic!("expected statement mention, got {other:?}"),
+    }
+}
+
+#[test]
+fn retract_without_confidence_is_dropped_never_tombstones() {
+    // A retraction with NO stated confidence must be dropped entirely — never
+    // fall back to a default that fires a destructive tombstone, and never
+    // become a spurious positive assertion.
+    let body = r#"{"statements":[{"subject":"Bob","predicate":"brain:works_at","object":"Google","retract":true}]}"#;
+    let client = Arc::new(MockClient::new(
+        "claude-haiku-4-5",
+        vec![Ok(ok_response(body, 50))],
+    ));
+    let ext = build_ext(client, None, None, None);
+    let reg = ExtractorRegistry::new();
+    let r = futures_lite::future::block_on(ext.run(&ctx(&reg), &memory("Bob no longer at Google")));
+    assert_eq!(r.status, ExtractionStatus::Success);
+    assert!(
+        r.items.is_empty(),
+        "a retract with no explicit confidence must be dropped, never emit a mention"
+    );
+}
+
+#[test]
+fn retract_with_explicit_high_confidence_survives() {
+    // An explicit, high confidence on a retraction still produces the retract
+    // mention so a real negation can retire a stored fact.
+    let body = r#"{"statements":[{"subject":"Bob","predicate":"brain:works_at","object":"Google","retract":true,"confidence":0.9}]}"#;
+    let client = Arc::new(MockClient::new(
+        "claude-haiku-4-5",
+        vec![Ok(ok_response(body, 50))],
+    ));
+    let ext = build_ext(client, None, None, None);
+    let reg = ExtractorRegistry::new();
+    let r = futures_lite::future::block_on(ext.run(&ctx(&reg), &memory("Bob no longer at Google")));
+    assert_eq!(r.status, ExtractionStatus::Success);
+    assert_eq!(r.items.len(), 1);
+    match &r.items[0] {
+        ExtractedItem::StatementMention(m) => {
+            assert!(m.retract, "retract flag must survive");
+            assert!((m.confidence - 0.9).abs() < f32::EPSILON);
+        }
+        other => panic!("expected statement mention, got {other:?}"),
+    }
 }

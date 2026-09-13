@@ -1,4 +1,4 @@
-//! `build_summarizer(&Config) -> Arc<dyn Summarizer>` (sub-task 9.15).
+//! `build_summarizer(&Config) -> Arc<dyn Summarizer>`.
 //!
 //! Conditional on Cargo features:
 //!
@@ -36,15 +36,10 @@ pub(crate) enum BuildSummarizerError {
     )]
     OllamaFeatureMissing,
     #[error(
-        "summarizer.backend = \"openai\" requires summarizer.openai_api_key_env to \
-         name an environment variable holding the API key"
+        "summarizer.backend = \"openai\" requires the shared LLM key: set \
+         BRAIN__LLM__API_KEY in the environment or `[llm] api_key` in the config"
     )]
-    OpenAiKeyEnvUnset,
-    #[error(
-        "summarizer.openai_api_key_env = {env_var:?}, but that environment variable \
-         is not set or is empty"
-    )]
-    OpenAiKeyMissing { env_var: String },
+    OpenAiKeyMissing,
     #[error("summarizer bridge runtime initialisation failed: {0}")]
     BridgeInit(#[from] std::io::Error),
 }
@@ -63,17 +58,16 @@ pub(crate) fn build_summarizer(cfg: &Config) -> Result<Arc<dyn Summarizer>, Buil
 
 #[cfg(feature = "summarizer-openai")]
 fn build_openai(cfg: &Config) -> Result<Arc<dyn Summarizer>, BuildSummarizerError> {
-    let env_var = cfg
-        .summarizer
-        .openai_api_key_env
-        .as_deref()
-        .ok_or(BuildSummarizerError::OpenAiKeyEnvUnset)?;
-    let api_key = std::env::var(env_var)
-        .ok()
+    // The summarizer shares the single LLM credential like every other
+    // consumer: `[llm] api_key`, into which the generic
+    // `BRAIN__LLM__API_KEY` override has already folded. Empty strings
+    // count as unset.
+    let api_key = cfg
+        .llm
+        .api_key
+        .clone()
         .filter(|v| !v.is_empty())
-        .ok_or_else(|| BuildSummarizerError::OpenAiKeyMissing {
-            env_var: env_var.to_owned(),
-        })?;
+        .ok_or(BuildSummarizerError::OpenAiKeyMissing)?;
     let bridge = crate::llm::bridge::SummarizerBridge::new(Duration::from_secs(u64::from(
         cfg.summarizer.request_timeout_sec,
     )))?;

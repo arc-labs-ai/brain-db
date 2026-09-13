@@ -1,6 +1,6 @@
-//! Planner configuration with spec defaults baked in.
+//! Planner configuration with defaults baked in.
 //!
-//! Values pinned by the spec:
+//! Default values:
 //! - `default_ef_search = 64`
 //! - `max_ef_search = 500`
 //! - `max_candidates_per_search = 1000`
@@ -19,9 +19,9 @@ pub struct PlannerConfig {
     pub cost_budget_ms: f32,
     pub max_k: usize,
     pub max_edges_per_encode: usize,
-    /// — PLAN / REASON traversal hard cap.
+    /// PLAN / REASON traversal hard cap.
     pub max_traversal_depth: usize,
-    /// — PLAN / REASON result cap.
+    /// PLAN / REASON result cap.
     pub max_plan_results: usize,
 }
 

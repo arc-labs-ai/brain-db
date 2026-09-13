@@ -219,9 +219,9 @@ fn same_name_different_namespaces_are_independent_types() {
 
 #[test]
 fn implicit_intern_defaults_to_many_to_many() {
-    // Spec guarantee: schemaless writers don't pick a cardinality.
-    // Anything other than ManyToMany would silently auto-supersede
-    // pre-existing rows on the next create — surprising and lossy.
+    // Schemaless writers don't pick a cardinality. Anything other than
+    // ManyToMany would silently auto-supersede pre-existing rows on the
+    // next create — surprising and lossy.
     let dir = tempfile::tempdir().unwrap();
     let db = fresh_db(&dir);
     let wtxn = db.begin_write().unwrap();

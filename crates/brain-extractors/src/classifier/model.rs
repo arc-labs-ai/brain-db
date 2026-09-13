@@ -23,7 +23,7 @@ pub trait ClassifierModel: Send + Sync {
     /// keeps the worker's drain throughput ahead of the encode arrival
     /// rate.
     ///
-    /// The default impl falls back to per-row [`predict`] for any
+    /// The default impl falls back to per-row [`Self::predict`] for any
     /// model that doesn't override; downstream callers can still call
     /// `predict_batch` unconditionally. Real impls (`GlinerClassifier`)
     /// override to run a single batched forward pass.
@@ -207,7 +207,7 @@ fn fingerprint_weights(path: &std::path::Path) -> Result<String, ExtractorError>
     let hash = blake3::hash(&bytes);
     let bytes16: [u8; 16] = hash.as_bytes()[..16]
         .try_into()
-        .expect("blake3 >= 16 bytes");
+        .expect("invariant: blake3 digest is 32 bytes, slicing the first 16 always succeeds");
     let mut hex = String::with_capacity(32);
     for b in &bytes16 {
         hex.push_str(&format!("{b:02x}"));

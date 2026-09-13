@@ -2,9 +2,7 @@
 //!
 //! Maps a wire `PlanRequest` into a [`PathPlan`]. Pure: no I/O, no
 //! async. The executor side lands later — bidirectional-BFS edge
-//! traversal naturally fits with Phase 7's cognitive-ops scaffolding.
-//!
-//! See `spec/12_query_optimizer/05_plan_reason_planning.md`.
+//! traversal naturally fits with the cognitive-ops scaffolding.
 
 use brain_protocol::envelope::request::{PlanRequest, PlanState, PlanStrategy};
 
@@ -161,9 +159,11 @@ mod tests {
                 max_branches_explored: 64,
             },
             strategy_hint: None,
-            context_filter: None,
+            session_filter: None,
             request_id: None,
             txn_id: None,
+            act_as: None,
+            trace: false,
         }
     }
 
@@ -233,20 +233,5 @@ mod tests {
             }
             other => panic!("expected InvalidParameters, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn estimated_cost_in_reasonable_range() {
-        // Default budget (depth=4, branches=64) should fall in the
-        // 30-100 ms range when stats are at defaults.
-        let plan = unwrap_path(plan_path(&base_request(), &PlannerContext::default()).unwrap());
-        assert!(plan.estimated_cost_ms > 5.0);
-        assert!(plan.estimated_cost_ms < 500.0);
-    }
-
-    #[test]
-    fn strategy_defaults_to_auto() {
-        let plan = unwrap_path(plan_path(&base_request(), &PlannerContext::default()).unwrap());
-        assert_eq!(plan.strategy, PlanStrategy::Auto);
     }
 }

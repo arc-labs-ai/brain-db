@@ -240,11 +240,11 @@ If validation fails, an error response is sent on the same stream.
 
 ## 4. Phase 3: Decode payload
 
-The payload is rkyv-decoded into a typed request:
+The payload is CBOR-decoded into a typed request:
 
 - `Request::Encode(EncodeRequest)`, etc.
 
-Decoding is a zero-copy operation; rkyv's archived form is read directly. The actual deserialization (to Rust types) only happens for fields the planner needs.
+Decoding parses the CBOR payload into the typed request the planner needs.
 
 If decoding fails (malformed payload), an error response is sent.
 
@@ -293,7 +293,7 @@ The marshaller doesn't do work; it copies and rearranges. Fast.
 
 ## 9. Phase 8: Frame response
 
-The response payload is rkyv-encoded. The 32-byte frame header is filled in:
+The response payload is CBOR-encoded. The 32-byte frame header is filled in:
 
 - Magic, version, opcode (the response opcode), flags.
 - Stream ID matching the request.

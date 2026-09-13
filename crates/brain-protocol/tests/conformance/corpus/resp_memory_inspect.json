@@ -1,0 +1,140 @@
+{
+  "found": true,
+  "memory_id": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    7,
+    0,
+    42,
+    0,
+    0,
+    0,
+    0,
+    18,
+    52,
+    86
+  ],
+  "text": "niraj works on brain",
+  "artifact": {
+    "vector": [
+      0.1,
+      -0.2,
+      0.3,
+      0.4
+    ],
+    "record": {
+      "memory_id": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        7,
+        0,
+        42,
+        0,
+        0,
+        0,
+        0,
+        18,
+        52,
+        86
+      ],
+      "kind": 0,
+      "salience": 0.5,
+      "created_at_unix_nanos": 1700000000000000000,
+      "occurred_at_unix_nanos": 0,
+      "vector_dim": 384,
+      "text_len": 20,
+      "lsn": 42
+    },
+    "hype_questions": [
+      "Who works on brain?"
+    ],
+    "keyword_fields": [
+      {
+        "field": "memory_text",
+        "terms": [
+          "niraj",
+          "brain",
+          "works"
+        ]
+      }
+    ],
+    "graph": {
+      "nodes": [
+        {
+          "id": [
+            68,
+            68,
+            68,
+            68,
+            68,
+            68,
+            68,
+            68,
+            68,
+            68,
+            68,
+            68,
+            68,
+            68,
+            68,
+            68
+          ],
+          "name": "niraj",
+          "kind": "entity",
+          "type_qname": "org:person"
+        }
+      ],
+      "edges": [
+        {
+          "source": [
+            68,
+            68,
+            68,
+            68,
+            68,
+            68,
+            68,
+            68,
+            68,
+            68,
+            68,
+            68,
+            68,
+            68,
+            68,
+            68
+          ],
+          "target": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            7,
+            0,
+            42,
+            0,
+            0,
+            0,
+            0,
+            18,
+            52,
+            86
+          ],
+          "predicate": "org:works_on",
+          "kind": "statement",
+          "confidence": 0.9
+        }
+      ]
+    }
+  }
+}

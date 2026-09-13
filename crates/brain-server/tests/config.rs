@@ -13,7 +13,7 @@ use std::path::PathBuf;
 #[path = "../src/config/mod.rs"]
 mod config;
 
-use config::{AuthMode, Config, ConfigError, LoggingConfig};
+use config::{Config, ConfigError, LoggingConfig};
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -62,6 +62,12 @@ model = "bge-small-en-v1.5"
 cache_size = 10000
 batch_size = 32
 batch_window_ms = 5
+
+# Dummy provider key so these config-parser fixtures clear the hard
+# LLM-provider startup gate (the LLM extractor tier is on by default and
+# requires a provider). These tests exercise the parser, not the LLM.
+[llm]
+api_key = "sk-test-config-parser"
 "#;
 
 // ---------------------------------------------------------------------------
@@ -72,11 +78,15 @@ batch_window_ms = 5
 fn dev_toml_round_trips_cleanly() {
     let path = dev_toml_path();
     assert!(path.exists(), "expected dev.toml at {}", path.display());
-    let env: HashMap<String, String> = HashMap::new();
+    // dev.toml leaves the LLM provider key to the environment; supply one
+    // via the generic override so the hard provider gate is satisfied and
+    // the parse round-trip can be checked.
+    let mut env: HashMap<String, String> = HashMap::new();
+    env.insert("BRAIN__LLM__API_KEY".into(), "sk-test".into());
     let cfg = Config::load_with_env(&path, &env).expect("dev.toml must load");
 
     assert_eq!(cfg.server.listen_addr.to_string(), "127.0.0.1:9090");
-    assert_eq!(cfg.storage.shard_count, 4);
+    assert_eq!(cfg.storage.shard_count, 1);
     assert_eq!(cfg.shard.arena_capacity_bytes, 1u64 << 30);
     assert_eq!(cfg.shard.wal_segment_size_bytes, 256u64 << 20);
     assert_eq!(cfg.shard.wal_retention_segments, 4);
@@ -84,24 +94,31 @@ fn dev_toml_round_trips_cleanly() {
     assert_eq!(cfg.hnsw.ef_construction, 200);
     assert_eq!(cfg.hnsw.ef_search, 64);
     assert_eq!(cfg.embedder.model, "bge-small-en-v1.5");
-    assert_eq!(cfg.auth.mode, AuthMode::None);
+    assert_eq!(cfg.admin.token.as_deref(), Some("dev-admin-token"));
     assert!(!cfg.server.tls.enabled);
-    assert_eq!(cfg.logging.format, "json");
+    assert_eq!(cfg.monitoring.logging.format, "json");
+}
+
+#[test]
+fn dev_toml_without_provider_key_refuses_to_start() {
+    // The hard constraint: with the LLM extractor tier on (dev.toml's
+    // default) and no provider key in the environment or config, the
+    // server must refuse to boot rather than silently degrade to a
+    // substrate-only shell.
+    let path = dev_toml_path();
+    let err = Config::load_with_env(&path, &HashMap::new())
+        .expect_err("no provider key must fail startup");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("LLM provider") || msg.contains("provider key"),
+        "expected an LLM-provider startup error, got: {msg}"
+    );
 }
 
 // ---------------------------------------------------------------------------
 // 2-5. Parser (covered as unit tests in config.rs). Add one belt-and-suspenders
 //      integration check that ShardConfig wires through the deserializer.
 // ---------------------------------------------------------------------------
-
-#[test]
-fn shard_config_parses_human_byte_strings() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = write_tmp(&dir, MINIMAL_CONFIG);
-    let cfg = Config::load_with_env(&path, &HashMap::new()).unwrap();
-    assert_eq!(cfg.shard.arena_capacity_bytes, 1u64 << 30);
-    assert_eq!(cfg.shard.wal_segment_size_bytes, 256u64 << 20);
-}
 
 #[test]
 fn shard_config_rejects_bad_byte_suffix() {
@@ -243,6 +260,98 @@ fn env_override_byte_size_string_parses() {
     assert_eq!(cfg.shard.arena_capacity_bytes, 2u64 << 30);
 }
 
+#[test]
+fn env_numeric_looking_secret_stays_string() {
+    // A pure-digit admin token / API key must be accepted verbatim as a
+    // string, not re-typed to an integer (which would fail deserialization
+    // and make the server refuse to boot with a confusing "config
+    // validation error").
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_tmp(&dir, MINIMAL_CONFIG);
+    let mut env = HashMap::new();
+    env.insert("BRAIN__ADMIN__TOKEN".into(), "48291057".into());
+    env.insert("BRAIN__LLM__API_KEY".into(), "99999".into());
+    let cfg = Config::load_with_env(&path, &env).expect("digit secrets must load as strings");
+    assert_eq!(cfg.admin.token.as_deref(), Some("48291057"));
+    assert_eq!(cfg.llm.api_key.as_deref(), Some("99999"));
+}
+
+#[test]
+fn env_bool_looking_secret_stays_string() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_tmp(&dir, MINIMAL_CONFIG);
+    let mut env = HashMap::new();
+    env.insert("BRAIN__ADMIN__TOKEN".into(), "true".into());
+    let cfg = Config::load_with_env(&path, &env).expect("bool-looking secret must load as string");
+    assert_eq!(cfg.admin.token.as_deref(), Some("true"));
+}
+
+#[test]
+fn env_numeric_field_still_accepts_numeric_override() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_tmp(&dir, MINIMAL_CONFIG);
+    let mut env = HashMap::new();
+    env.insert("BRAIN__STORAGE__SHARD_COUNT".into(), "8".into());
+    let cfg = Config::load_with_env(&path, &env).unwrap();
+    assert_eq!(cfg.storage.shard_count, 8);
+}
+
+#[test]
+fn env_wrong_typed_numeric_field_still_errors() {
+    // A non-numeric value for a genuinely numeric field must still fail
+    // fast — the string-preserving fix only covers string-typed targets.
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_tmp(&dir, MINIMAL_CONFIG);
+    let mut env = HashMap::new();
+    env.insert("BRAIN__STORAGE__SHARD_COUNT".into(), "notanumber".into());
+    let err = Config::load_with_env(&path, &env)
+        .expect_err("a string for a numeric field must fail deserialization");
+    assert!(matches!(err, ConfigError::Validate { .. }), "got: {err:?}");
+}
+
+#[test]
+fn validate_post_rejects_zero_worker_interval() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_tmp(&dir, MINIMAL_CONFIG);
+    let mut env = HashMap::new();
+    env.insert("BRAIN__WORKERS__AUTO_EDGE__INTERVAL_MS".into(), "0".into());
+    let err = Config::load_with_env(&path, &env).expect_err("interval_ms = 0 must be rejected");
+    assert!(
+        matches!(err, ConfigError::Invariant(ref m) if m.contains("interval_ms")),
+        "got: {err:?}"
+    );
+}
+
+#[test]
+fn validate_post_rejects_zero_channel_capacity() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_tmp(&dir, MINIMAL_CONFIG);
+    let mut env = HashMap::new();
+    env.insert(
+        "BRAIN__WORKERS__EXTRACTOR__CHANNEL_CAPACITY".into(),
+        "0".into(),
+    );
+    let err =
+        Config::load_with_env(&path, &env).expect_err("channel_capacity = 0 must be rejected");
+    assert!(
+        matches!(err, ConfigError::Invariant(ref m) if m.contains("channel_capacity")),
+        "got: {err:?}"
+    );
+}
+
+#[test]
+fn validate_post_rejects_zero_optional_cadence() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_tmp(&dir, MINIMAL_CONFIG);
+    let mut env = HashMap::new();
+    env.insert("BRAIN__WORKERS__DECAY_INTERVAL_SEC".into(), "0".into());
+    let err = Config::load_with_env(&path, &env).expect_err("decay_interval_sec = 0 must reject");
+    assert!(
+        matches!(err, ConfigError::Invariant(ref m) if m.contains("decay_interval_sec")),
+        "got: {err:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 12. Defaults
 // ---------------------------------------------------------------------------
@@ -254,8 +363,8 @@ fn omitted_optional_sections_use_defaults() {
     let cfg = Config::load_with_env(&path, &HashMap::new()).unwrap();
 
     assert_eq!(cfg.workers, Default::default());
-    assert_eq!(cfg.logging, LoggingConfig::default());
-    assert!(!cfg.tracing.enabled);
-    assert_eq!(cfg.auth.mode, AuthMode::None);
+    assert_eq!(cfg.monitoring.logging, LoggingConfig::default());
+    assert!(!cfg.monitoring.tracing.enabled);
+    assert!(cfg.admin.token.is_none());
     assert!(!cfg.server.tls.enabled);
 }

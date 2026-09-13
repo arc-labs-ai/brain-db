@@ -1,13 +1,12 @@
 //! Bidirectional `MemoryId ↔ u32` map for the HNSW index.
 //!
-//! See `spec/09_indexing/03_insertion.md` §1–2 (id_map pattern), §10
-//! (duplicate-MemoryId is a bug — we detect and reject rather than
-//! letting hnsw_rs silently overwrite).
+//! Duplicate-MemoryId is a bug — we detect and reject rather than
+//! letting hnsw_rs silently overwrite.
 //!
 //! ## Type choices
 //!
 //! - **Internal id is `u32`**. Saves ~80 MB at the
-//!   spec's 10M-memory per-shard ceiling vs `usize`. Cast to `usize`
+//!   10M-memory per-shard ceiling vs `usize`. Cast to `usize`
 //!   at the hnsw_rs API boundary; overflow at `u32::MAX` returns
 //!   [`IdMapError::Exhausted`] (sibling of `AlreadyInserted`).
 //! - **Forward key is `[u8; 16]`** (the MemoryId's wire-form bytes),
@@ -15,7 +14,7 @@
 //!   coupling to MemoryId's internal `u128` hashing.
 //! - **No atomic counter.** Brain's `HnswIndex::insert(&mut self, ...)`
 //!   borrow discipline rules out concurrent inserts at compile time;
-//!   's `AtomicU32::fetch_add` example assumes a
+//!   an `AtomicU32::fetch_add` approach assumes a
 //!   multi-writer path Brain doesn't have.
 
 use brain_core::MemoryId;
@@ -24,8 +23,8 @@ use thiserror::Error;
 
 /// `MemoryId ↔ u32` bidirectional map plus a sequential allocator.
 ///
-/// Insert-only at this layer. Removal of stale entries (slot reclamation
-/// ) lives in the Phase 8 maintenance worker.
+/// Insert-only at this layer. Removal of stale entries (slot reclamation)
+/// lives in the maintenance worker.
 #[derive(Default)]
 pub struct IdMap {
     forward: HashMap<[u8; 16], u32>,
@@ -41,7 +40,7 @@ pub enum IdMapError {
     #[error("memory_id already inserted: {memory_id_bytes:?}")]
     AlreadyInserted { memory_id_bytes: [u8; 16] },
 
-    /// `u32::MAX` internal IDs have been allocated. At the spec's 10M
+    /// `u32::MAX` internal IDs have been allocated. At the 10M
     /// per-shard ceiling this is unreachable; the check is defensive.
     #[error("id_map exhausted: u32::MAX internal ids allocated")]
     Exhausted,
@@ -116,7 +115,7 @@ impl IdMap {
     }
 
     /// Iterate the forward mapping as `([u8; 16], u32)` pairs. Used by
-    /// snapshot persistence (sub-task 4.5) to serialise the map.
+    /// snapshot persistence to serialise the map.
     /// Order is unspecified — callers must not depend on it.
     pub fn iter_forward(&self) -> impl Iterator<Item = ([u8; 16], u32)> + '_ {
         self.forward.iter().map(|(k, v)| (*k, *v))
@@ -199,7 +198,7 @@ mod tests {
     }
 
     #[test]
-    fn contains_pin() {
+    fn contains_reports_membership_only_for_inserted_ids() {
         let mut m = IdMap::new();
         assert!(!m.contains(mid(7)));
         m.insert(mid(7)).unwrap();

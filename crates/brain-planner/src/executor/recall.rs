@@ -15,10 +15,10 @@
 //! 6. Build `RecallResult`.
 //!
 //! No cooperative `.await` yields in this version — the per-shard
-//! pipeline is synchronous from the planner's perspective and 6.7
-//! will introduce yield points when Glommio's runtime arrives.
+//! pipeline is synchronous from the planner's perspective; yield
+//! points are introduced when Glommio's runtime arrives.
 
-use brain_core::{ContextId, MemoryId, MemoryKind};
+use brain_core::{MemoryId, MemoryKind, SessionId};
 use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
 use brain_metadata::tables::text::TEXTS_TABLE;
 
@@ -28,17 +28,18 @@ use super::context::ExecutorContext;
 use super::error::ExecError;
 use super::result::{RecallHit, RecallResult};
 
-/// Execute a single-shard `RecallPlan`. Async to match
-/// even though the body has no `.await`; 6.7 wires runtime-specific
-/// yields.
+/// Execute a single-shard `RecallPlan`. Async even though the body
+/// has no `.await`; runtime-specific yields are wired later.
 pub async fn execute_recall(
     plan: RecallPlan,
     ctx: &ExecutorContext,
 ) -> Result<RecallResult, ExecError> {
-    // 1. Embed.
-    let cue_vector = ctx.embedder.embed(&plan.embedding.text)?;
+    // 1. Embed the cue text as a query (BGE asymmetric retrieval) —
+    //    the prefix points the vector at "what looks like a useful
+    //    passage for this query" rather than the generic centroid.
+    let cue_vector = ctx.embedder.embed_query(&plan.embedding.text)?;
 
-    // 2. ANN search. Single shard for v1 (orientation §4.7).
+    // 2. ANN search. Single shard for v1.
     let shard = plan
         .shards
         .first()
@@ -51,8 +52,8 @@ pub async fn execute_recall(
     // 3. Metadata lookup for each candidate (single read txn).
     let mut enriched: Vec<(RecallHit, f32)> = Vec::with_capacity(raw_hits.len());
     {
-        let metadata_guard = ctx.metadata.lock();
-        let txn = metadata_guard
+        let txn = ctx
+            .metadata
             .read_txn()
             .map_err(|e| ExecError::MetadataReadFailed(e.to_string()))?;
         let table = txn
@@ -65,7 +66,7 @@ pub async fn execute_recall(
                 .map_err(|e| ExecError::MetadataReadFailed(e.to_string()))?;
             let Some(access) = row else {
                 // HNSW returned an id the metadata doesn't know about —
-                // says surface, don't swallow.
+                // surface it, don't swallow.
                 return Err(ExecError::MemoryNotFound { memory_id });
             };
             let meta = access.value();
@@ -107,42 +108,31 @@ pub async fn execute_recall(
     let mut hits: Vec<RecallHit> = enriched.into_iter().map(|(h, _)| h).collect();
 
     if plan.text_fetch.is_some() && !hits.is_empty() {
-        let metadata_guard = ctx.metadata.lock();
-        let txn = metadata_guard
+        let txn = ctx
+            .metadata
             .read_txn()
             .map_err(|e| ExecError::MetadataReadFailed(e.to_string()))?;
-        // A shard that hasn't received an encode yet won't have a
-        // texts table — treat that as "no texts available" rather
-        // than failing the recall.
-        let table = match txn.open_table(TEXTS_TABLE) {
-            Ok(t) => Some(t),
-            Err(redb::TableError::TableDoesNotExist(_)) => None,
-            Err(e) => return Err(ExecError::MetadataReadFailed(e.to_string())),
-        };
+        let table = txn
+            .open_table(TEXTS_TABLE)
+            .map_err(|e| ExecError::MetadataReadFailed(e.to_string()))?;
         for hit in &mut hits {
-            hit.text = if let Some(tbl) = table.as_ref() {
-                let row = tbl
-                    .get(hit.memory_id.to_be_bytes())
-                    .map_err(|e| ExecError::MetadataReadFailed(e.to_string()))?;
-                match row {
-                    Some(guard) => Some(
-                        std::str::from_utf8(guard.value())
-                            .map_err(|e| {
-                                ExecError::Internal(format!(
-                                    "texts row for {:?} is not UTF-8: {e}",
-                                    hit.memory_id
-                                ))
-                            })?
-                            .to_owned(),
-                    ),
-                    // Hit survived the memories-table read but the
-                    // texts row is gone — a hard-FORGET landed in
-                    // between. Return empty rather than failing.
-                    None => Some(String::new()),
-                }
-            } else {
-                Some(String::new())
-            };
+            let row = table
+                .get(hit.memory_id.to_be_bytes())
+                .map_err(|e| ExecError::MetadataReadFailed(e.to_string()))?;
+            hit.text = Some(match row {
+                Some(guard) => std::str::from_utf8(guard.value())
+                    .map_err(|e| {
+                        ExecError::Internal(format!(
+                            "texts row for {:?} is not UTF-8: {e}",
+                            hit.memory_id
+                        ))
+                    })?
+                    .to_owned(),
+                // Hit survived the memories-table read but the
+                // texts row is gone — a hard-FORGET landed in
+                // between. Return empty rather than failing.
+                None => String::new(),
+            });
         }
     }
 
@@ -161,7 +151,7 @@ fn build_hit(
         memory_id,
         score,
         kind,
-        context_id: ContextId::from(meta.context_id),
+        session_id: SessionId::from(meta.session_id),
         salience: meta.salience,
         created_at_unix_nanos: meta.created_at_unix_nanos,
         text: None,
@@ -179,7 +169,7 @@ fn build_hit(
 fn rule_matches(rule: &FilterRule, hit: &RecallHit) -> bool {
     match rule {
         FilterRule::KindIn(kinds) => kinds.contains(&hit.kind),
-        FilterRule::ContextIn(ctx_ids) => ctx_ids.contains(&hit.context_id),
+        FilterRule::SessionIn(ctx_ids) => ctx_ids.contains(&hit.session_id),
         FilterRule::SalienceFloor(threshold) => hit.salience >= *threshold,
         FilterRule::AgeBound {
             not_older_than_unix_nanos,

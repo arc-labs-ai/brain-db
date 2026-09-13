@@ -1,4 +1,4 @@
-//! Idempotency cleanup worker (sub-task 8.6).
+//! Idempotency cleanup worker.
 //!
 //! Sweeps the idempotency table on a 1 h cadence (configurable),
 //! removing entries whose `created_at + ttl` is past. Calls
@@ -105,8 +105,7 @@ async fn do_cleanup_cycle(
         }
 
         let (deleted, scanned_to_end) = {
-            let mut db = metadata.lock();
-            let wtxn = db
+            let wtxn = metadata
                 .write_txn()
                 .map_err(|e| WorkerError::Ops(format!("cleanup write_txn: {e:?}")))?;
             let result = {
@@ -126,7 +125,7 @@ async fn do_cleanup_cycle(
             break;
         }
         // Yield between batches so we don't monopolise the mutex.
-        // CLAUDE.md §9 guard: only `await` here, outside the lock.
+        // Only `await` here, outside the lock.
         glommio::executor().yield_if_needed().await;
     }
 

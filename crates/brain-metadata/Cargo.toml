@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+publish.workspace = true
 description = "Metadata store (redb) and graph storage for Brain."
 
 [dependencies]
@@ -25,12 +26,20 @@ smallvec.workspace = true
 # Phase 8.dedup: BLAKE3 over canonical UTF-8 text for the
 # `fingerprints` opt-in content-dedup index.
 blake3.workspace = true
+# Interior mutability for `MetadataDb::pending_checkpoints` — shared
+# `Arc<MetadataDb>` callers can still drive `MetadataSink::apply`
+# without an outer mutex.
+parking_lot.workspace = true
+# Entity-name normalization folds to Unicode NFC before casefolding so
+# composed vs decomposed spellings of the same name ("São Paulo") share one
+# canonical key instead of splitting into duplicate entities.
+unicode-normalization = { workspace = true }
 
 [dev-dependencies]
 criterion.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
-# Used by fingerprint dedup tests to fabricate AgentIds.
+# Used by fingerprint dedup tests to fabricate SpaceIds.
 uuid.workspace = true
 # Hosts the async WAL writer in integration tests (sub-task 9.6a port).
 glommio.workspace = true

@@ -2,9 +2,8 @@
 //!
 //! Generic over the inbound body type so handlers can be tested
 //! against synthetic bodies (e.g. `Full<Bytes>`) without needing a
-//! real `hyper::body::Incoming`. This was the M1 plan §8.1 open
-//! question; the recommendation was generic-over-Body and that's
-//! what's implemented here.
+//! real `hyper::body::Incoming`. Generic-over-Body is the
+//! approach implemented here.
 
 use std::future::Future;
 
@@ -15,7 +14,7 @@ use crate::body::ResponseBody;
 /// What every Brain HTTP handler implements.
 ///
 /// The signature differs from [`hyper::service::Service::call`] only
-/// in that it's a plain `async fn`. M2's router adapts any
+/// in that it's a plain `async fn`. The router adapts any
 /// `AsyncHandler` impl to a `hyper::Service` so it can be wired into
 /// `hyper::server::conn::http1::Builder::serve_connection`.
 ///

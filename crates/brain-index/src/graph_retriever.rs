@@ -1,6 +1,5 @@
-//! Graph retriever trait + value types (phase 23.2).
+//! Graph retriever trait + value types.
 //!
-//! The trait surface matches `spec/13_retrievers/04_graph_retriever.md`.
 //! The production impl (`BrainGraphRetriever`) lives in
 //! `brain-ops::ops::graph_retriever` for the same reason as
 //! `SemanticRetriever`: it needs `brain-metadata` (which
@@ -15,7 +14,7 @@ pub const DEFAULT_TOP_K: usize = 64;
 /// Default per-hop depth.
 pub const DEFAULT_DEPTH: u8 = 3;
 
-/// Hard cap on traversal depth (§23/04 §4).
+/// Hard cap on traversal depth.
 pub const MAX_DEPTH_HARD_CAP: u8 = 5;
 
 /// Default per-node child cap.
@@ -39,13 +38,13 @@ pub trait GraphRetriever: Send + Sync {
 /// The graph retriever walks two different physical tables
 /// depending on which node it's anchored at:
 ///
-/// - [`GraphAnchor::Entity`] — the typed knowledge graph
+/// - [`GraphAnchor::Entity`] — the typed graph
 ///   (relations, predicates). Requires a declared schema for
 ///   useful results; on schemaless deployments this anchor will
 ///   simply find no entities.
 /// - [`GraphAnchor::Memory`] — the substrate memory graph
 ///   (edges_out / edges_in). Works on every deployment; lights
-///   up the hybrid path's graph contribution even without a
+///   up the retrieval path's graph contribution even without a
 ///   schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GraphAnchor {
@@ -62,7 +61,7 @@ impl From<GraphAnchor> for NodeRef {
     }
 }
 
-/// Per-query traversal spec (§23/04 §1).
+/// Per-query traversal spec.
 #[derive(Debug, Clone)]
 pub enum GraphQuery {
     /// BFS from `anchor` outward up to `depth`. Anchor may be
@@ -119,13 +118,37 @@ pub enum Direction {
     Both,
 }
 
-/// Search config (§23/04 §1).
+/// Search config.
 #[derive(Debug, Clone, Copy)]
 pub struct GraphRetrieverConfig {
     pub top_k: usize,
     pub max_depth: u8,
     pub max_branching: u32,
     pub timeout_ms: u32,
+    /// The caller's owning namespace (tenant) — the outer half of the
+    /// `(namespace, space)` scope. The graph walk reads scoped secondary
+    /// indexes (statement-by-subject, relation directional), so the
+    /// scope is threaded into every such read; a walk anchored in one
+    /// tenant can never traverse into another's typed-graph rows.
+    ///
+    /// Carried as raw bytes (not `brain_metadata::RowScope`) so
+    /// `brain-index` keeps its lean dependency set — `brain-metadata`
+    /// is not a dependency here, and the consumer (`brain-ops`) rebuilds
+    /// the `RowScope` from these fields at the read boundary. The
+    /// `Default` is the system namespace + zero space (tests / fallback).
+    pub caller_namespace: u32,
+    /// The caller's owning space (app) — the inner half of the scope.
+    pub caller_space_bytes: [u8; 16],
+    /// Read-scope width. `false` (the default) pins the walk to the
+    /// caller's single `(namespace, space)`. `true` widens the *space*
+    /// half only — the walk admits every space the caller owns within
+    /// its own namespace (namespace-wide RECALL). The namespace wall is
+    /// **never** relaxed: even namespace-wide, a walk can only ever reach
+    /// the caller's own tenant. Carried as a plain `bool` (not
+    /// `brain_metadata::ScopeMode`) so `brain-index` keeps its lean
+    /// dependency set; `brain-ops` maps it to `ScopeMode` at the read
+    /// boundary.
+    pub namespace_wide: bool,
 }
 
 impl Default for GraphRetrieverConfig {
@@ -135,11 +158,14 @@ impl Default for GraphRetrieverConfig {
             max_depth: DEFAULT_DEPTH,
             max_branching: DEFAULT_MAX_BRANCHING,
             timeout_ms: DEFAULT_TIMEOUT_MS,
+            caller_namespace: brain_core::NamespaceId::SYSTEM.raw(),
+            caller_space_bytes: [0u8; 16],
+            namespace_wide: false,
         }
     }
 }
 
-/// Error taxonomy (§23/04 §7).
+/// Error taxonomy.
 #[derive(Debug, thiserror::Error)]
 pub enum GraphError {
     #[error("anchor entity not found: {0:?}")]
@@ -161,13 +187,13 @@ pub enum GraphError {
     Internal(String),
 }
 
-/// Proximity score per §23/04 §2: `1 / (hop_distance + 1)`.
+/// Proximity score: `1 / (hop_distance + 1)`.
 #[must_use]
 pub fn proximity_score(hop_distance: u8) -> f32 {
     1.0 / (f32::from(hop_distance) + 1.0)
 }
 
-/// Validate depth caps per §23/04 §4. Returns early
+/// Validate depth caps. Returns early
 /// `MaxDepthExceeded` for any of the three modes.
 pub fn validate_depth(query: &GraphQuery, config: &GraphRetrieverConfig) -> Result<(), GraphError> {
     if query.depth() > MAX_DEPTH_HARD_CAP {

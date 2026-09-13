@@ -1,6 +1,6 @@
 //! WAL record framing.
 //!
-//! On-disk layout per `spec/08_storage/05_wal_records.md`:
+//! On-disk layout:
 //!
 //! ```text
 //! header (32 bytes, all little-endian):
@@ -10,7 +10,7 @@
 //!   10..12  reserved          [u8; 2]   (zero)
 //!   12..16  payload_length    u32
 //!   16..24  timestamp_ns      u64
-//!   24..32  agent_id_lo64     u64
+//!   24..32  space_id_lo64     u64
 //!
 //! payload (variable, exactly payload_length bytes)
 //!
@@ -67,17 +67,34 @@ pub const FOOTER_LEN: usize = 8;
 /// Maximum payload size (default 16 MiB).
 pub const MAX_PAYLOAD: u32 = 16 * 1024 * 1024;
 
+/// `flags` bit marking a record as a **subscribe-replay change-feed
+/// event**, not a state mutation.
+///
+/// Typed-graph ops are WAL-logged twice: once as the durable write
+/// record (rkyv-encoded row / first-class payload, the source of truth
+/// recovery replays into the metadata store) and once as a CBOR-encoded
+/// `GraphEventPayload` so subscribe-replay can reconstruct the change
+/// feed after a restart. Both records carry the same `WalRecordKind`
+/// (e.g. `EntityCreate`), so the kind byte alone can't tell them apart.
+///
+/// The event record sets this flag. Recovery skips flagged records (the
+/// durable record already carries the state; replaying the CBOR body as
+/// a row would fail decode and, if it didn't, would duplicate the row).
+/// Subscribe-replay does the inverse — it projects flagged records into
+/// change-feed events and ignores the unflagged durable records.
+pub const FLAG_SUBSCRIBE_EVENT: u8 = 0x01;
+
 /// In-memory representation of one WAL record.
 ///
 /// Holds every header field so encode/decode is a lossless round-trip.
-/// `payload` is the raw bytes; per-kind interpretation lands in sub-task 2.2.
+/// `payload` is the raw bytes; per-kind interpretation is layered above.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalRecord {
     pub lsn: Lsn,
     pub kind: WalRecordKind,
     pub flags: u8,
     pub timestamp_ns: u64,
-    pub agent_id_lo64: u64,
+    pub space_id_lo64: u64,
     pub payload: Vec<u8>,
 }
 
@@ -115,7 +132,7 @@ impl WalRecord {
         out.extend_from_slice(&[0u8, 0u8]); // reserved
         out.extend_from_slice(&payload_len_u32.to_le_bytes());
         out.extend_from_slice(&self.timestamp_ns.to_le_bytes());
-        out.extend_from_slice(&self.agent_id_lo64.to_le_bytes());
+        out.extend_from_slice(&self.space_id_lo64.to_le_bytes());
 
         // Payload.
         out.extend_from_slice(&self.payload);
@@ -156,7 +173,7 @@ impl WalRecord {
         let reserved_hi = &buf[10..12];
         let payload_length = read_u32_le(&buf[12..16]);
         let timestamp_ns = read_u64_le(&buf[16..24]);
-        let agent_id_lo64 = read_u64_le(&buf[24..32]);
+        let space_id_lo64 = read_u64_le(&buf[24..32]);
 
         if reserved_hi != [0, 0] {
             return Err(WalRecordError::NonZeroReserved);
@@ -196,7 +213,7 @@ impl WalRecord {
                 kind,
                 flags,
                 timestamp_ns,
-                agent_id_lo64,
+                space_id_lo64,
                 payload,
             },
             consumed: total,
@@ -212,7 +229,7 @@ impl WalRecord {
         lsn: Lsn,
         flags: u8,
         timestamp_ns: u64,
-        agent_id_lo64: u64,
+        space_id_lo64: u64,
         payload: &crate::wal::payload::WalPayload,
     ) -> Self {
         Self {
@@ -220,7 +237,7 @@ impl WalRecord {
             kind: payload.kind(),
             flags,
             timestamp_ns,
-            agent_id_lo64,
+            space_id_lo64,
             payload: payload.encode_to_bytes(),
         }
     }
@@ -245,7 +262,7 @@ pub enum DecodeOutcome {
 
 /// Validation failures that are *not* truncation.
 ///
-/// Per, recovery may collapse these into "truncate here". We
+/// Recovery may collapse these into "truncate here". We
 /// keep them distinct at this layer so callers (`WalReader`, recovery, audit
 /// tooling) can decide policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -290,7 +307,7 @@ mod tests {
             kind,
             flags: 0b0000_0011,
             timestamp_ns: 1_700_000_000_000_000_000,
-            agent_id_lo64: 0xDEAD_BEEF_CAFE_F00D,
+            space_id_lo64: 0xDEAD_BEEF_CAFE_F00D,
             payload,
         }
     }
@@ -397,7 +414,7 @@ mod tests {
     fn unknown_record_type_rejected() {
         let rec = sample(WalRecordKind::Encode, vec![]);
         let mut buf = rec.encode();
-        buf[8] = 0; // 0 is reserved per spec
+        buf[8] = 0; // 0 is reserved
                     // Recompute CRC so we hit UnknownRecordType, not CrcMismatch.
         let crc = crc32c::crc32c(&buf[..HEADER_LEN]);
         let crc_off = HEADER_LEN; // payload is empty
@@ -407,14 +424,14 @@ mod tests {
             Err(WalRecordError::UnknownRecordType(0))
         );
 
-        // A reserved-future byte (e.g. 0x60 — past the audit kind, still
-        // inside the v1 reserved range) likewise rejected.
-        buf[8] = 0x60;
+        // A reserved-future byte (0x7F — inside the reserved v1-minor band
+        // 0x52..=0x7F, unallocated) likewise rejected.
+        buf[8] = 0x7F;
         let crc = crc32c::crc32c(&buf[..HEADER_LEN]);
         buf[crc_off..crc_off + 4].copy_from_slice(&crc.to_le_bytes());
         assert_eq!(
             WalRecord::decode_one(&buf),
-            Err(WalRecordError::UnknownRecordType(0x60))
+            Err(WalRecordError::UnknownRecordType(0x7F))
         );
     }
 
@@ -521,17 +538,17 @@ mod tests {
     }
 
     #[test]
-    fn knowledge_payload_round_trips_through_framing() {
-        // Sub-task 15.2: a knowledge-layer record carries an opaque body
+    fn graph_payload_round_trips_through_framing() {
+        // Sub-task 15.2: a opaque-body record carries an opaque body
         // through the full framing layer (header + payload + footer +
         // CRC). The framing is byte-identical to substrate records; only
         // the `record_type` byte and body interpretation differ.
-        use crate::wal::payload::{KnowledgeRecord, WalPayload};
+        use crate::wal::payload::{PhaseBodyRecord, WalPayload};
 
-        // One example per discriminant boundary in the knowledge block.
-        // RelationCreate / RelationSupersede / RelationTombstone became
-        // first-class typed payloads in Phase C, so they are no longer
-        // valid kinds for an opaque-body KnowledgeRecord.
+        // One example per discriminant boundary in the typed-graph block.
+        // RelationCreate / RelationSupersede / RelationTombstone are
+        // first-class typed payloads, so they are no longer
+        // valid kinds for an opaque-body PhaseBodyRecord.
         for kind in [
             WalRecordKind::EntityCreate,
             WalRecordKind::StatementCreate,
@@ -539,9 +556,9 @@ mod tests {
             WalRecordKind::Audit,
         ] {
             let body: Vec<u8> = (0..48u8).map(|i| i.wrapping_mul(kind.as_u8())).collect();
-            let payload = WalPayload::Knowledge(KnowledgeRecord::new(
+            let payload = WalPayload::PhaseBody(PhaseBodyRecord::new(
                 kind,
-                brain_core::AgentId::default(),
+                brain_core::SpaceId::default(),
                 body.clone(),
             ));
             let record = WalRecord::from_typed(Lsn(7), 0, 9999, 0xBB, &payload);
@@ -554,11 +571,11 @@ mod tests {
             };
             assert_eq!(back, record);
             match back.typed_payload().unwrap() {
-                WalPayload::Knowledge(r) => {
+                WalPayload::PhaseBody(r) => {
                     assert_eq!(r.kind, kind);
                     assert_eq!(r.body, body);
                 }
-                other => panic!("expected Knowledge, got {other:?}"),
+                other => panic!("expected PhaseBody, got {other:?}"),
             }
         }
     }

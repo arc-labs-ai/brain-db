@@ -19,7 +19,7 @@
 //! The contract is **"no silent corruption"** — recovery must NOT
 //! return a corrupted record as if it were valid. Either the CRC
 //! detects it (and recovery stops or skips) or the run fails-stop;
-//! both are acceptable spec-faithful outcomes.
+//! both are acceptable outcomes.
 
 #![allow(clippy::cast_possible_truncation)]
 
@@ -27,7 +27,7 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use brain_core::{AgentId, ContextId, MemoryId, MemoryKind, RequestId};
+use brain_core::{MemoryId, MemoryKind, RequestId, SessionId, SpaceId};
 use brain_storage::arena::ArenaFile;
 use brain_storage::recovery::{recover, InMemoryMetadataSink};
 use brain_storage::wal::{EncodePayload, Lsn, Wal, WalPayload, WalRecord, WAL_SEGMENT_HEADER_LEN};
@@ -56,8 +56,9 @@ fn gen_record(slot: u64) -> WalRecord {
     let payload = EncodePayload {
         memory_id: MemoryId::pack(1, slot, 1),
         request_id: RequestId::from(bytes16_from(slot * 7 + 1)),
-        agent_id: AgentId::from(bytes16_from(slot * 11 + 2)),
-        context_id: ContextId(slot * 13 + 3),
+        space_id: SpaceId::from(bytes16_from(slot * 11 + 2)),
+        namespace_id: brain_core::NamespaceId::SYSTEM,
+        session_id: SessionId(slot * 13 + 3),
         kind: MemoryKind::Episodic,
         salience_initial: 0.5,
         embedding_model_fp: bytes16_from(slot * 17 + 4),
@@ -67,6 +68,7 @@ fn gen_record(slot: u64) -> WalRecord {
         request_hash: [0; 32],
         response_payload: vec![],
         deduplicate: false,
+        occurred_at_unix_nanos: None,
     };
     WalRecord::from_typed(
         Lsn(0),
@@ -137,7 +139,7 @@ fn flip_bit(path: &Path, byte_offset: u64, bit_offset: u8) {
 
 /// The contract: recovery is non-silent on a corrupted byte. Returns
 /// `Ok(n)` where `n` is the number of records recovered (≤ original
-/// count) or `Err(_)`. Either is spec-faithful — the assertion is
+/// count) or `Err(_)`. Either is acceptable — the assertion is
 /// "no silent corruption", not a specific error shape.
 fn recover_count(wal_dir: &Path, arena_path: &Path) -> Result<u64, String> {
     let mut arena = ArenaFile::open(arena_path, shard_uuid(), 256).expect("arena open");
@@ -178,7 +180,7 @@ fn flipping_bit_in_record_payload_is_detected() {
 
     // Recovery must not silently return the corrupted record as valid.
     // Either it errors out, or it stops at the bad record (returning
-    // the prefix). Both outcomes are spec-faithful.
+    // the prefix). Both outcomes are acceptable.
     match recover_count(&wal_dir, &arena_path) {
         Ok(n) => {
             assert!(
@@ -204,7 +206,7 @@ fn flipping_bit_in_segment_header_is_detected() {
     let seg_path = find_segment(&wal_dir);
 
     // Flip a bit in the segment header (byte 4 is inside the shard
-    // UUID region per `spec/08_storage/03_wal_layout.md`).
+    // UUID region).
     flip_bit(&seg_path, 4, 0);
 
     match recover_count(&wal_dir, &arena_path) {

@@ -21,6 +21,8 @@ Entities are distinct from:
 ```rust
 struct Entity {
     id: EntityId,                       // UUIDv7
+    namespace_id: NamespaceId,          // owning tenant; 0 = reserved `brain` system namespace
+    agent_id: AgentId,                  // owning agent
     entity_type_id: EntityTypeId,       // interned u32; "Person", "Organization", ...
     canonical_name: String,             // normalized display name
     aliases: Vec<String>,               // alternative surface forms
@@ -34,6 +36,8 @@ struct Entity {
 
 The `entity_type_id` is interned from the schema's entity-type declarations. Built-in types (`Person`, `Organization`, `Project`, `Place`, `Concept`, `Event`) are seeded in the system schema; user schemas add deployment-specific types.
 
+**Owner scope (`namespace_id` + `agent_id`).** Every entity is owned by exactly one `(namespace, agent)` tenant pair, stamped from the caller's authenticated scope at create time (fail-closed by construction). This owner namespace is **distinct** from the qname namespace of `entity_type_id` — an entity owned by `acme` may have the shared `brain:Person` type. The reserved `brain` system namespace (id `0`) owns only seeded rows and is never a valid owner of user-written entities.
+
 ### Identity
 
 `EntityId` is a UUIDv7 — time-ordered, 128 bits. The id is stable across:
@@ -43,6 +47,8 @@ The `entity_type_id` is interned from the schema's entity-type declarations. Bui
 - **Attribute updates**: attributes change in place, the id does not change.
 
 `EntityId` changes only via merge (the merged-away entity's id becomes a redirect — see §"Entity merge" below).
+
+**Resolution is per `(namespace, agent)`.** The resolver's exact-name, alias, and trigram indexes are all keyed under a leading `(namespace_id, agent_id)` scope prefix, so a surface form resolves only against entities the caller's own tenant owns. The same name resolves to **distinct** `EntityId`s under different scopes: `"Priya Patel"` in tenant `acme` and `"Priya Patel"` in tenant `globex` are two separate entities with two separate ids — one tenant's resolution can never reach another's rows.
 
 ## Entity merge
 

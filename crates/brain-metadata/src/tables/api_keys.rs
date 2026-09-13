@@ -4,8 +4,8 @@
 //! secret never lives on disk; clients send the secret on the wire and
 //! the server hashes it to look up the row.
 //!
-//! A secondary index `api_keys_by_agent` lets admin ops list every key
-//! issued to a given agent without scanning the primary table.
+//! A secondary index `api_keys_by_space` lets admin ops list every key
+//! issued to a given space without scanning the primary table.
 
 use crate::impl_redb_rkyv_value;
 use redb::TableDefinition;
@@ -14,11 +14,11 @@ use redb::TableDefinition;
 pub const API_KEYS_TABLE: TableDefinition<'static, [u8; 32], ApiKeyRow> =
     TableDefinition::new("api_keys");
 
-/// Secondary index: `(agent_id, key_hash)` → `()`. Lets the admin
-/// surface enumerate keys per agent in O(log N) without scanning the
+/// Secondary index: `(space_id, key_hash)` → `()`. Lets the admin
+/// surface enumerate keys per space in O(log N) without scanning the
 /// primary table.
-pub const API_KEYS_BY_AGENT_TABLE: TableDefinition<'static, ([u8; 16], [u8; 32]), ()> =
-    TableDefinition::new("api_keys_by_agent");
+pub const API_KEYS_BY_SPACE_TABLE: TableDefinition<'static, ([u8; 16], [u8; 32]), ()> =
+    TableDefinition::new("api_keys_by_space");
 
 /// Permission bitfield. The on-wire value is a `u32` so future
 /// capabilities can land without a schema bump.
@@ -35,9 +35,15 @@ pub mod permissions {
     pub const SCHEMA_UPLOAD: u32 = 1 << 4;
     /// May call ADMIN_* ops (including key minting and revocation).
     pub const ADMIN: u32 = 1 << 5;
+    /// May run data-plane ops on behalf of another identity via the
+    /// per-request `act_as` field, bounded by the key's `may_act`
+    /// allowlist. Held only by a trusted service principal (edge or
+    /// gateway) — never a normal space key, and never part of a default
+    /// bundle; it is always explicitly granted.
+    pub const ACT_AS: u32 = 1 << 6;
 
-    /// Common bundles. A standard agent gets read + write + link.
-    pub const STANDARD_AGENT: u32 = ENCODE | RECALL | FORGET | LINK;
+    /// Common bundles. A standard space gets read + write + link.
+    pub const STANDARD_SPACE: u32 = ENCODE | RECALL | FORGET | LINK;
     /// Read-only observer (no mutation).
     pub const READ_ONLY: u32 = RECALL;
     /// Everything but admin.
@@ -66,11 +72,20 @@ pub struct ApiKeyRow {
     /// keys; rejected when strict mode is on and the request requires
     /// a namespace).
     pub namespace: String,
-    /// The agent identity this key acts as. Every operation issued
-    /// while authenticated with this key is stamped with this agent.
-    pub agent_id: [u8; 16],
+    /// The space identity this key acts as. Every operation issued
+    /// while authenticated with this key is stamped with this space.
+    pub space_id: [u8; 16],
     /// Permission bitfield (see [`permissions`]).
     pub permissions: u32,
+    /// Allowlist of namespaces this key may act *for* when it carries the
+    /// [`permissions::ACT_AS`] bit and a request supplies an `act_as`
+    /// target. Brain honors an `act_as` request only when the target
+    /// namespace is in this set; a principal can never act as a namespace
+    /// outside it. Empty for every non-`ACT_AS` key. A single `"*"` entry
+    /// is the wildcard grant: the key may act as any namespace (the trusted
+    /// gateway/edge front-door case, where the tenant set grows at runtime
+    /// and can't be enumerated at mint time).
+    pub may_act: Vec<String>,
     pub created_at_unix_nanos: u64,
     /// Updated by the auth path; eventually consistent (single
     /// background touch). Zero on a never-used key.
@@ -87,7 +102,7 @@ impl ApiKeyRow {
         org_id: [u8; 16],
         user_id: [u8; 16],
         namespace: String,
-        agent_id: [u8; 16],
+        space_id: [u8; 16],
         permissions: u32,
         created_at_unix_nanos: u64,
     ) -> Self {
@@ -96,8 +111,9 @@ impl ApiKeyRow {
             org_id,
             user_id,
             namespace,
-            agent_id,
+            space_id,
             permissions,
+            may_act: Vec::new(),
             created_at_unix_nanos,
             last_used_at_unix_nanos: 0,
             revoked: false,
@@ -111,7 +127,7 @@ impl ApiKeyRow {
     }
 }
 
-impl_redb_rkyv_value!(ApiKeyRow, "brain_metadata::ApiKeyRow::v1");
+impl_redb_rkyv_value!(ApiKeyRow, "brain_metadata::ApiKeyRow");
 
 #[cfg(all(test, not(miri)))]
 mod tests {
@@ -126,15 +142,15 @@ mod tests {
         org[15] = byte;
         let mut user = [0u8; 16];
         user[14] = byte;
-        let mut agent = [0u8; 16];
-        agent[13] = byte;
+        let mut space = [0u8; 16];
+        space[13] = byte;
         ApiKeyRow::new(
             hash,
             org,
             user,
             "acme".into(),
-            agent,
-            permissions::STANDARD_AGENT,
+            space,
+            permissions::STANDARD_SPACE,
             1_700_000_000_000_000_000,
         )
     }

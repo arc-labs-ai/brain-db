@@ -12,8 +12,8 @@ use tracing::Span;
 /// Construct a span describing one inbound request.
 ///
 /// `http.response.status_code` starts empty and is recorded onto the
-/// span by [`record_status`] after the handler returns. M8 enters
-/// this span around the request body of
+/// span by [`record_status`] after the handler returns. The server
+/// enters this span around the request body of
 /// `connection::handle_request`.
 #[must_use]
 pub fn request_span<B>(req: &Request<B>) -> Span {
@@ -36,7 +36,7 @@ pub fn record_status(span: &Span, status: u16) {
     span.record("http.response.status_code", status);
 }
 
-/// Construct a span describing one accepted TCP connection. M2
+/// Construct a span describing one accepted TCP connection. The server
 /// enters this span on each accept; child request spans descend
 /// from it.
 #[must_use]

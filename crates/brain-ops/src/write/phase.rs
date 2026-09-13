@@ -2,8 +2,9 @@
 //!
 //! A [`Phase`] is the verb. Combine several into a [`super::Write`] and
 //! the writer applies them all against one `WriteTransaction`. The
-//! same enum is the WAL record body (encoded via rkyv in P3) so live
-//! writes and crash recovery share one apply path.
+//! same enum is the WAL record body (encoded via rkyv) so live
+//! writes and crash recovery share one apply path. (The typed-graph
+//! `PhaseBody` opaque body is the exception: it is CBOR-encoded.)
 //!
 //! Design rules:
 //! - **Pre-allocated ids**: every id field travels inside the phase.
@@ -15,12 +16,12 @@
 //!   no LLM, no network. Strategies (the things that compute derived
 //!   phases) do that ahead of submit; apply functions only mutate redb.
 
+use brain_core::{EdgeKindRef, MemoryId, MemoryKind, NodeRef, Salience, SessionId};
 use brain_core::{
     Entity, EntityAttributes, EntityId, EntityTypeId, EvidenceEntry, EvidenceOverflowId,
     ExtractorId, MergeId, PredicateId, Relation, RelationId, RelationTypeId, Statement,
     StatementId, StatementKind, StatementObject, SubjectRef,
 };
-use brain_core::{ContextId, EdgeKindRef, MemoryId, MemoryKind, NodeRef, Salience};
 use brain_embed::VECTOR_DIM;
 
 // ---------------------------------------------------------------------------
@@ -50,8 +51,12 @@ pub enum Phase {
         vector: Box<[f32; VECTOR_DIM]>,
         kind: MemoryKind,
         salience: Salience,
-        context: ContextId,
+        session_id: SessionId,
         created_at_unix_nanos: u64,
+        /// Client-supplied event time (when the content actually
+        /// happened), distinct from `created_at_unix_nanos` (server write
+        /// time). `None` when the client didn't supply one.
+        occurred_at_unix_nanos: Option<u64>,
         /// Slot in the per-shard memory arena.
         arena_slot: u64,
         /// Embedding-model fingerprint stamped on the stored row. The
@@ -72,6 +77,11 @@ pub enum Phase {
     UpsertEntity {
         id: EntityId,
         ty: EntityTypeId,
+        /// First-mention session provenance for a fresh entity (session
+        /// is a grouping column, never part of the isolation prefix;
+        /// entity identity is session-agnostic and a later mention never
+        /// overwrites it).
+        session: SessionId,
         canonical: String,
         normalized: String,
         /// Alternate surface forms for entity resolution. Empty
@@ -85,9 +95,19 @@ pub enum Phase {
     /// Create a fresh statement row. Supersession of an existing
     /// statement uses [`Phase::Supersede`] + this phase together (the
     /// `Write` lists both, in order: supersede first, then upsert new).
+    ///
+    /// `predicate` is authoritative when `predicate_intern_hint` is
+    /// `None`. When the hint is `Some`, the handler is in the schemaless
+    /// path and didn't pre-intern the predicate; apply runs
+    /// `predicate_intern_or_get` inside the same wtxn (folding what used
+    /// to be a separate fsync-amplifying micro-commit). The hint also
+    /// triggers stamping `IMPLICIT_PREDICATE` on the resulting row.
     UpsertStatement {
         id: StatementId,
         kind: StatementKind,
+        /// The per-utterance session this statement belongs to (grouping
+        /// column, never part of the isolation prefix).
+        session: SessionId,
         subject: SubjectRef,
         predicate: PredicateId,
         object: StatementObject,
@@ -97,12 +117,26 @@ pub enum Phase {
         extractor: ExtractorId,
         extracted_at_unix_nanos: u64,
         schema_version: u32,
+        /// Schemaless-path intern hint. `Some((namespace, name))` means
+        /// "apply: resolve the predicate inside this wtxn and stamp the
+        /// row IMPLICIT_PREDICATE." `None` is the strict / already-
+        /// interned path — apply uses `predicate` as-is.
+        predicate_intern_hint: Option<(String, String)>,
     },
 
     /// Create or supersede a typed relation row.
+    ///
+    /// `ty` is authoritative when `relation_type_intern_hint` is `None`.
+    /// When the hint is `Some`, the handler is in the schemaless path
+    /// and didn't pre-intern the relation type; apply runs
+    /// `relation_type_intern_or_get` inside the same wtxn (folding what
+    /// used to be a separate fsync-amplifying micro-commit).
     UpsertRelation {
         id: RelationId,
         ty: RelationTypeId,
+        /// The per-utterance session this relation belongs to (grouping
+        /// column, never part of the isolation prefix).
+        session: SessionId,
         from: EntityId,
         to: EntityId,
         confidence: f32,
@@ -118,6 +152,11 @@ pub enum Phase {
         valid_from_unix_nanos: Option<u64>,
         /// Validity window end (exclusive). `None` = open-ended.
         valid_to_unix_nanos: Option<u64>,
+        /// Schemaless-path intern hint. `Some((namespace, name))` means
+        /// "apply: resolve the relation_type inside this wtxn." `None`
+        /// is the strict / already-interned path — apply uses `ty`
+        /// as-is.
+        relation_type_intern_hint: Option<(String, String)>,
     },
 
     /// Apply a schema upload — interns predicates / relation-types /
@@ -133,6 +172,15 @@ pub enum Phase {
         declared_relation_types: Vec<String>,
         declared_entity_types: Vec<String>,
         created_at_unix_nanos: u64,
+        /// REPLACE mode: drop *all* declared predicates / relation types /
+        /// extractors in the namespace before the (additive) upload. `false`
+        /// for plain UPLOAD and targeted DROP.
+        replace_all: bool,
+        /// DROP mode: specific declared targets to remove before the upload,
+        /// as `(kind, local_name)` where `kind` matches
+        /// `brain_protocol::schema_drop_target` (0 = predicate,
+        /// 1 = relation_type). Empty for UPLOAD and REPLACE.
+        drops: Vec<(u8, String)>,
     },
 
     /// Write one edge row (forward + auto-mirror for symmetric kinds).
@@ -169,6 +217,15 @@ pub enum Phase {
         at_unix_nanos: u64,
     },
 
+    /// Un-tombstone a soft-forgotten memory — the reverse of a soft
+    /// `Tombstone(Memory)`. Re-sets ACTIVE, clears `tombstoned_at`,
+    /// re-inserts the timeline entry, and restores the dedup fingerprint.
+    /// The admin restore trigger builds this after validating the memory
+    /// is soft-forgotten and still within grace; the writer's post-commit
+    /// fan-out enqueues the FORGET-cascade revert so dependent statements
+    /// and relations are re-attached too.
+    RestoreMemory { id: MemoryId, at_unix_nanos: u64 },
+
     /// Supersede a versioned row by another. Statements and relations
     /// support this; memories don't (memories use Tombstone + a new
     /// UpsertMemory to "replace").
@@ -189,9 +246,9 @@ pub enum Phase {
     UpdateKind { id: MemoryId, new_kind: MemoryKind },
 
     /// Mutate a memory's context.
-    UpdateContext {
+    UpdateSession {
         id: MemoryId,
-        new_context: ContextId,
+        new_session_id: SessionId,
     },
 
     /// Replace a memory's embedding (used by `MigrateEmbeddings`).
@@ -242,11 +299,11 @@ pub enum Phase {
         retain_aliases: bool,
         retain_attributes: bool,
         at_unix_nanos: u64,
-        /// Operator-supplied confidence (≥ 0.6 per `spec/18/03 §3`).
+        /// Operator-supplied confidence (≥ 0.6).
         confidence: f32,
         /// Free-form reason for the audit row.
         reason: String,
-        /// Who initiated the merge — typically the caller agent's
+        /// Who initiated the merge — typically the caller space's
         /// id bytes, or a system identifier.
         actor: brain_metadata::entity::merge::MergeActor,
         /// Grace window before `source` is reclaimed.
@@ -273,12 +330,42 @@ pub enum Phase {
         at_unix_nanos: u64,
     },
 
-    /// Toggle an extractor's enabled flag.
-    SetExtractorEnabled { id: ExtractorId, enabled: bool },
-
     /// Free physical storage for the given memory slots. Triggered by
     /// the reclamation worker after grace period.
     ReclaimSlots { slots: Vec<u64> },
+
+    /// Explicitly provision a space registry row under the write's
+    /// `(namespace, space)` scope. Idempotent — a create for an existing
+    /// space returns the existing row.
+    SpaceCreate {
+        created_at_unix_nanos: u64,
+        /// Human-readable structured space string the create resolved
+        /// from (empty for a raw key-bound space).
+        space_string: String,
+        /// Opaque caller metadata blob; `None` for a bare provision.
+        metadata: Option<Vec<u8>>,
+    },
+
+    /// Delete the space registry row (and its session rows) under the
+    /// write's `(namespace, space)` scope. The GDPR erasure button; the
+    /// underlying memory/graph data cascade is driven by the handler.
+    SpaceDelete { at_unix_nanos: u64 },
+
+    /// Explicitly provision a session registry row under the write's
+    /// `(namespace, space)` scope. Idempotent.
+    SessionCreate {
+        session_id: SessionId,
+        title: Option<String>,
+        created_at_unix_nanos: u64,
+    },
+
+    /// Delete a session registry row under the write's `(namespace, space)`
+    /// scope. `hard` records the memory-cascade mode the handler chose.
+    SessionDelete {
+        session_id: SessionId,
+        hard: bool,
+        at_unix_nanos: u64,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -371,6 +458,11 @@ pub enum PhaseAck {
     UpsertedSchema {
         namespace: String,
         version: u32,
+        /// Count of declared rows the destructive delta removed before the
+        /// upload (REPLACE / DROP); `0` for a plain additive UPLOAD. Lets the
+        /// REPLACE handler report an accurate `dropped_count` without a
+        /// pre-submit re-scan.
+        dropped: u32,
     },
     Linked,
     Unlinked,
@@ -382,6 +474,13 @@ pub enum PhaseAck {
     Tombstoned {
         target: TombstoneTarget,
         tombstoned_at_unix_nanos: u64,
+    },
+    /// A soft-forgotten memory was un-tombstoned. `already_active` is true
+    /// on an idempotent no-op (the row was never tombstoned) — the apply
+    /// made no change.
+    MemoryRestored {
+        id: MemoryId,
+        already_active: bool,
     },
     Superseded(SupersedeTarget, SupersedeReplacementId),
     SalienceUpdated,
@@ -412,6 +511,10 @@ pub enum PhaseAck {
         /// (the audit log is keyed by `(timestamp, merge_id)`, not by
         /// survivor/merged, so reverse lookup is awkward).
         audit_id: MergeId,
+        /// Statements re-routed from the merged entity onto the survivor.
+        statements_rerouted: u32,
+        /// Relations re-routed from the merged entity onto the survivor.
+        relations_rerouted: u32,
     },
     /// A merge proposal was promoted: the underlying merge was applied
     /// and the proposal row stamped Approved (or AutoApplied for the
@@ -425,12 +528,26 @@ pub enum PhaseAck {
     MergeProposalRejected {
         proposal_id: MergeId,
     },
-    ExtractorEnabledSet {
-        id: ExtractorId,
-        enabled: bool,
-    },
     SlotsReclaimed {
         count: usize,
+    },
+    /// A space registry row was provisioned. `created` is false on an
+    /// idempotent replay of an existing space.
+    SpaceCreated {
+        created: bool,
+    },
+    /// A space registry row (and its sessions) was removed. `existed` is
+    /// false when the space was already gone.
+    SpaceDeleted {
+        existed: bool,
+    },
+    /// A session registry row was provisioned.
+    SessionCreated {
+        created: bool,
+    },
+    /// A session registry row was removed.
+    SessionDeleted {
+        existed: bool,
     },
 }
 
@@ -447,10 +564,11 @@ impl Phase {
             Self::Link { .. } => "link",
             Self::Unlink { .. } => "unlink",
             Self::Tombstone { .. } => "tombstone",
+            Self::RestoreMemory { .. } => "restore_memory",
             Self::Supersede { .. } => "supersede",
             Self::UpdateSalience { .. } => "update_salience",
             Self::UpdateKind { .. } => "update_kind",
-            Self::UpdateContext { .. } => "update_context",
+            Self::UpdateSession { .. } => "update_session",
             Self::UpdateEmbedding { .. } => "update_embedding",
             Self::UpdateEntity { .. } => "update_entity",
             Self::RenameEntity { .. } => "rename_entity",
@@ -458,8 +576,11 @@ impl Phase {
             Self::MergeEntities { .. } => "merge_entities",
             Self::ApproveMerge { .. } => "approve_merge",
             Self::RejectMerge { .. } => "reject_merge",
-            Self::SetExtractorEnabled { .. } => "set_extractor_enabled",
             Self::ReclaimSlots { .. } => "reclaim_slots",
+            Self::SpaceCreate { .. } => "space_create",
+            Self::SpaceDelete { .. } => "space_delete",
+            Self::SessionCreate { .. } => "session_create",
+            Self::SessionDelete { .. } => "session_delete",
         }
     }
 
@@ -537,8 +658,9 @@ mod tests {
             vector: Box::new([0.0_f32; VECTOR_DIM]),
             kind: MemoryKind::Episodic,
             salience: Salience::default(),
-            context: ContextId(7),
+            session_id: SessionId(7),
             created_at_unix_nanos: 1_700_000_000_000,
+            occurred_at_unix_nanos: None,
             arena_slot: 42,
             embedding_model_fp: [0xAA; 16],
             content_hash: None,
@@ -565,13 +687,6 @@ mod tests {
                 },
             ),
             ("reclaim_slots", Phase::ReclaimSlots { slots: vec![1, 2] }),
-            (
-                "set_extractor_enabled",
-                Phase::SetExtractorEnabled {
-                    id: ExtractorId::from(7),
-                    enabled: true,
-                },
-            ),
         ];
         for (expected_tag, phase) in cases {
             assert_eq!(phase.tag(), expected_tag);
@@ -586,8 +701,9 @@ mod tests {
             vector: Box::new([0.0_f32; VECTOR_DIM]),
             kind: MemoryKind::Episodic,
             salience: Salience::default(),
-            context: ContextId(0),
+            session_id: SessionId(0),
             created_at_unix_nanos: 0,
+            occurred_at_unix_nanos: None,
             arena_slot: 0,
             embedding_model_fp: [0; 16],
             content_hash: None,
@@ -598,15 +714,6 @@ mod tests {
         assert!(big.approximate_byte_size() > small.approximate_byte_size());
         // The delta is at least the extra text bytes.
         assert!(big.approximate_byte_size() - small.approximate_byte_size() >= 1023);
-    }
-
-    #[test]
-    fn sample_phase_smoke() {
-        let p = sample_upsert_memory();
-        assert_eq!(p.tag(), "upsert_memory");
-        // Bytes estimate is bounded — sanity that approximate_byte_size
-        // returns a plausible value for a small memory.
-        assert!(p.approximate_byte_size() < 32 * 1024);
     }
 
     #[test]

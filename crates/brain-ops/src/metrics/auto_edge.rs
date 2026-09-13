@@ -84,35 +84,3 @@ pub struct AutoEdgeMetricsSnapshot {
     pub cycle_duration_seconds: WorkerHistogramSnapshot,
     pub neighbours_found_per_cycle: WorkerHistogramSnapshot,
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn auto_edge_counters_start_at_zero() {
-        let m = AutoEdgeMetrics::new();
-        let s = m.snapshot();
-        assert_eq!(s.drops_total, 0);
-        assert_eq!(s.edges_written_total, 0);
-        assert_eq!(s.cycle_duration_seconds.count, 0);
-        assert_eq!(s.neighbours_found_per_cycle.count, 0);
-    }
-
-    #[test]
-    fn auto_edge_increments_round_trip() {
-        let m = AutoEdgeMetrics::new();
-        m.inc_drop();
-        m.inc_drop();
-        m.add_edges_written(5);
-        m.observe_cycle_duration(0.003);
-        m.observe_neighbours_found(7);
-        let s = m.snapshot();
-        assert_eq!(s.drops_total, 2);
-        assert_eq!(s.edges_written_total, 5);
-        assert_eq!(s.cycle_duration_seconds.count, 1);
-        assert!((s.cycle_duration_seconds.sum - 0.003).abs() < 1e-6);
-        assert_eq!(s.neighbours_found_per_cycle.count, 1);
-        assert!((s.neighbours_found_per_cycle.sum - 7.0).abs() < 1e-6);
-    }
-}

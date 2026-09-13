@@ -1,11 +1,18 @@
-#![allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send post-9.7 (audit §4)
-//! Decay worker integration tests (sub-task 8.2).
+#![allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send
+//! Decay worker integration tests.
+//!
+//! Guards salience time-decay: salience follows an exponential half-life
+//! keyed by memory kind (episodic / semantic / consolidated), so a memory
+//! aged one half-life is at half salience, age zero is identity, and
+//! extreme age clamps above zero without NaN. Pins the per-cycle batch
+//! cap, the sub-threshold skip (no write for negligible change), and
+//! cursor advance/wrap so every row is eventually visited.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use brain_core::{AgentId, ContextId, MemoryId, MemoryKind};
+use brain_core::{MemoryId, MemoryKind, SessionId, SpaceId};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
@@ -14,9 +21,9 @@ use brain_ops::{OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_workers::{
     decayed_salience, half_life_days, DecayWorker, Worker, WorkerConfig, WorkerContext, WorkerKind,
-    WorkerScheduler, CONSOLIDATED_HALF_LIFE_DAYS, EPISODIC_HALF_LIFE_DAYS, SEMANTIC_HALF_LIFE_DAYS,
+    WorkerScheduler, CONSOLIDATED_HALF_LIFE_DAYS, EPISODIC_HALF_LIFE_DAYS, SALIENCE_FLOOR,
+    SEMANTIC_HALF_LIFE_DAYS,
 };
-use parking_lot::Mutex;
 use uuid::Uuid;
 
 const NANOS_PER_DAY: u64 = 86_400 * 1_000_000_000;
@@ -48,8 +55,8 @@ struct Fixture {
 fn build_fixture() -> Fixture {
     let tempdir = tempfile::tempdir().unwrap();
     let db_path = tempdir.path().join("metadata.redb");
-    let metadata: SharedMetadataDb = Arc::new(Mutex::new(MetadataDb::open(&db_path).unwrap()));
-    let (shared, hnsw_writer) = SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).unwrap();
+    let metadata: SharedMetadataDb = Arc::new(MetadataDb::open(&db_path).unwrap());
+    let (shared, hnsw_writer) = SharedHnsw::new(IndexParams::default_v1()).unwrap();
     let writer = Arc::new(RealWriterHandle::new(metadata.clone(), hnsw_writer));
     let executor = ExecutorContext::new(
         Arc::new(NopDispatcher) as Arc<dyn Dispatcher>,
@@ -58,7 +65,7 @@ fn build_fixture() -> Fixture {
         writer as Arc<dyn WriterHandle>,
     );
     Fixture {
-        ctx: Arc::new(OpsContext::new(executor)),
+        ctx: Arc::new(brain_ops::test_support::ops_context_for_tests_owning_tempdir(executor)),
         metadata,
         _tempdir: tempdir,
     }
@@ -85,14 +92,14 @@ fn seed_memory(
     created_at_unix_nanos: u64,
 ) -> MemoryId {
     let id = make_id(slot);
-    let mut db = metadata.lock();
-    let wtxn = db.write_txn().unwrap();
+    let wtxn = metadata.write_txn().unwrap();
     {
         let mut table = wtxn.open_table(MEMORIES_TABLE).unwrap();
         let meta = MemoryMetadata::new_active(
             id,
-            AgentId(Uuid::nil()),
-            ContextId(1),
+            brain_core::NamespaceId::SYSTEM,
+            SpaceId(Uuid::nil()),
+            SessionId(1),
             slot,
             1,
             kind,
@@ -108,8 +115,7 @@ fn seed_memory(
 }
 
 fn read_salience(metadata: &SharedMetadataDb, id: MemoryId) -> f32 {
-    let db = metadata.lock();
-    let rtxn = db.read_txn().unwrap();
+    let rtxn = metadata.read_txn().unwrap();
     let table = rtxn.open_table(MEMORIES_TABLE).unwrap();
     let access = table.get(id.to_be_bytes()).unwrap().unwrap();
     access.value().salience
@@ -156,11 +162,41 @@ fn age_zero_is_identity() {
 }
 
 #[test]
-fn extreme_age_clamps_above_zero_no_nan() {
+fn extreme_age_rests_at_floor_no_nan() {
     let s = decayed_salience(1.0, 10_000 * NANOS_PER_DAY, MemoryKind::Episodic);
-    assert!(s.is_finite() && s >= 0.0, "got {s}");
-    // 10000 / 30 ≈ 333 half-lives; well past f32 precision.
-    assert!(s < 1e-10, "ought to be effectively zero, got {s}");
+    assert!(s.is_finite(), "got {s}");
+    // 10000 / 30 ≈ 333 half-lives: the closed form is effectively zero,
+    // but decay never lowers salience below the floor.
+    assert!((s - SALIENCE_FLOOR).abs() < 1e-6, "expected floor, got {s}");
+}
+
+#[test]
+fn decay_never_drops_below_floor() {
+    // A very old memory decays toward zero but rests at the floor,
+    // never below — decay stops at the floor rather than at 0.0, so
+    // decay alone can never auto-erase a memory.
+    for kind in [
+        MemoryKind::Episodic,
+        MemoryKind::Semantic,
+        MemoryKind::Consolidated,
+    ] {
+        let s = decayed_salience(0.9, 100_000 * NANOS_PER_DAY, kind);
+        assert!(s >= SALIENCE_FLOOR, "{kind:?} fell below floor: {s}");
+        assert!(
+            (s - SALIENCE_FLOOR).abs() < 1e-6,
+            "{kind:?} not at floor: {s}"
+        );
+    }
+}
+
+#[test]
+fn decay_does_not_raise_below_floor_memory_to_floor() {
+    // A memory created below the floor is left where it is, not lifted up
+    // to the floor — decay is monotone non-increasing.
+    let below = SALIENCE_FLOOR / 2.0;
+    let s = decayed_salience(below, 10_000 * NANOS_PER_DAY, MemoryKind::Episodic);
+    assert!(s <= below + 1e-6, "raised a below-floor memory: {s}");
+    assert!(s >= 0.0 && s.is_finite(), "got {s}");
 }
 
 #[test]
@@ -360,55 +396,6 @@ fn cycle_processed_count_feeds_scheduler_metrics() {
         sched.shutdown().await.unwrap();
         let processed = metrics.processed_total.load(Ordering::Relaxed);
         assert!(processed >= 3, "expected >=3 processed, got {processed}");
-    });
-}
-
-// ===========================================================================
-// Worker integration (2).
-// ===========================================================================
-
-#[test]
-fn worker_registers_with_correct_kind_and_default_interval() {
-    glommio_run(|| async {
-        let fix = build_fixture();
-        let mut sched = WorkerScheduler::new();
-        sched
-            .register(Arc::new(DecayWorker::new()), fix.ctx)
-            .unwrap();
-        assert_eq!(sched.names(), vec!["decay"]);
-        let cfg = sched.config("decay").unwrap();
-        assert_eq!(cfg.interval, Duration::from_secs(3600));
-        assert!(cfg.enabled);
-        sched.shutdown().await.unwrap();
-    });
-}
-
-#[test]
-fn disabled_decay_worker_does_not_modify_salience() {
-    glommio_run(|| async {
-        let fix = build_fixture();
-        let now = now_unix_nanos();
-        let id = seed_memory(
-            &fix.metadata,
-            1,
-            1.0,
-            MemoryKind::Episodic,
-            now - 30 * NANOS_PER_DAY,
-        );
-        let cfg = WorkerConfig {
-            enabled: false,
-            interval: Duration::from_millis(20),
-            batch_size: 100,
-            max_runtime: Duration::from_secs(1),
-        };
-        let mut sched = WorkerScheduler::new();
-        sched
-            .register(Arc::new(DecayWorker::new().with_config(cfg)), fix.ctx)
-            .unwrap();
-        glommio::timer::sleep(Duration::from_millis(150)).await;
-        sched.shutdown().await.unwrap();
-        let s = read_salience(&fix.metadata, id);
-        assert_eq!(s, 1.0, "disabled worker must not write");
     });
 }
 

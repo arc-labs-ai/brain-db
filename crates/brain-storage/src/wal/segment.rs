@@ -1,24 +1,19 @@
 //! WAL segment writer.
 //!
-//! See `spec/08_storage/04_wal_overview.md` and `05_wal_records.md`
-//! §1 (segment header) + §17 (record packing).
-//!
 //! A `WalSegment` owns one `*.wal` file. The file starts with a 4 KB header
-//! (``) followed by `WalRecord`s packed back-to-back
-//! (``).
+//! followed by `WalRecord`s packed back-to-back.
 //!
-//! ## I/O model (sub-task 9.6a)
+//! ## I/O model
 //!
 //! Backed by `glommio::io::BufferedFile`: all open/write/fsync ops go through
 //! io_uring on the shard's executor. Durability is `write_at` + `fdatasync`
-//! (two io_uring syscalls) — see `docs/development/spec-deviations.md` SD-2.8-2-b for
-//! the rationale vs. the spec's single `pwritev2(RWF_DSYNC)` syscall.
+//! (two io_uring syscalls).
 //!
 //! ## What's *not* in this layer
 //!
-//! - **No `O_DIRECT`** — see SD-2.8-1 (still open).
-//! - **No reader / open-existing.** The recovery path is `WalReader`
-//!   (sub-task 2.7); it reads via `mmap` and stays sync.
+//! - **No `O_DIRECT`**.
+//! - **No reader / open-existing.** The recovery path is `WalReader`;
+//!   it reads via `mmap` and stays sync.
 //! - **No LSN allocation.** Records arrive with their `lsn` field already
 //!   set by the caller. LSN allocation lives in `Wal`.
 //! - **No rollover decision.** The segment exposes `size_bytes()` and
@@ -267,10 +262,10 @@ impl WalSegment {
     ///
     /// Idempotent on an empty buffer.
     ///
-    /// **Spec deviation (SD-2.8-2-b):** two-syscall fsync vs. the spec's
-    /// single `pwritev2(RWF_DSYNC)`. Glommio's typed BufferedFile API does
-    /// not expose `RWF_DSYNC`; the equivalent is `write_at` + `fdatasync`.
-    /// Same durability guarantee; one extra syscall per batch.
+    /// Uses a two-syscall fsync rather than a single `pwritev2(RWF_DSYNC)`:
+    /// Glommio's typed BufferedFile API does not expose `RWF_DSYNC`, so the
+    /// equivalent is `write_at` + `fdatasync`. Same durability guarantee;
+    /// one extra syscall per batch.
     pub async fn flush_durable(&mut self) -> Result<(), WalSegmentError> {
         if self.write_buf.is_empty() {
             return Ok(());
@@ -405,7 +400,7 @@ mod tests {
             kind,
             flags: 0,
             timestamp_ns: 1_700_000_000_000_000_000,
-            agent_id_lo64: 0xDEAD_BEEF_CAFE_F00D,
+            space_id_lo64: 0xDEAD_BEEF_CAFE_F00D,
             payload,
         }
     }

@@ -1,11 +1,10 @@
 //! Determinism property test for the forward path.
 //!
-//! Spec `04_embedding_layer/03_inference.md` §12:
-//! > "For a given input, the model is deterministic — repeated
-//! > inference produces the same vector. We rely on this for the cue
-//! > cache to be useful."
+//! For a given input, the model is deterministic — repeated
+//! inference produces the same vector. We rely on this for the cue
+//! cache to be useful.
 //!
-//! Spec caveats — out of scope for this test:
+//! Caveats — out of scope for this test:
 //! - CPU vs GPU may differ.
 //! - AVX-512 vs AVX2 may differ.
 //!

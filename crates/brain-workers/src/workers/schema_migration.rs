@@ -35,7 +35,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
 
-use brain_metadata::schema::apply::flag_statements_outside_schema;
 use brain_metadata::schema::predicate::predicates_active_for_schema;
 use brain_ops::{SchemaFlagSweepJob, SchemaMigrationMetrics};
 
@@ -165,7 +164,7 @@ impl SchemaMigrationWorker {
         ctx: &WorkerContext,
         job: &SchemaFlagSweepJob,
     ) -> Result<SweepStats, WorkerError> {
-        let mut metadata = ctx.ops.executor.metadata.lock();
+        let metadata = ctx.ops.executor.metadata.as_ref();
 
         // Read phase: snapshot the active vocabulary for the namespace
         // + version the upload just committed. The wtxn we'll open
@@ -179,67 +178,53 @@ impl SchemaMigrationWorker {
                 .map_err(|e| WorkerError::Internal(format!("flag_sweep active vocab: {e}")))?
         };
 
-        // Write phase: walk STATEMENTS_TABLE for this namespace's
-        // predicates and flip flag bits to match the active set. The
-        // helper internally separates "should flag now but isn't" from
-        // "is flagged but shouldn't be" — we have to re-derive the
-        // counts because the helper only returns the total count of
-        // changed rows. Pre-snapshot the prior-flag state for an
-        // exact `(flagged, cleared)` split.
-        let pre_flagged_in_namespace = {
-            let rtxn = metadata
-                .read_txn()
-                .map_err(|e| WorkerError::Internal(format!("flag_sweep rtxn-2: {e}")))?;
-            count_flagged_in_namespace(&rtxn, &job.namespace)?
-        };
-
+        // Write phase: a single scan of the namespace's statements that
+        // both flips flag bits to match `active` and tallies the exact
+        // per-direction transition counts. This replaces the previous
+        // approach that derived counts from a before/after net diff
+        // (which mis-attributes a mixed pass — a "+5 gained / -3 lost"
+        // sweep collapses to "+2 flagged / 0 cleared") and ran two extra
+        // full-table scans on top of the sweep's own scan.
         let wtxn = metadata
             .write_txn()
             .map_err(|e| WorkerError::Internal(format!("flag_sweep wtxn: {e}")))?;
-        let _changed = flag_statements_outside_schema(&wtxn, &job.namespace, &active)
-            .map_err(|e| WorkerError::Internal(format!("flag_sweep: {e}")))?;
+        let stats = sweep_and_count(&wtxn, &job.namespace, &active)?;
         wtxn.commit()
             .map_err(|e| WorkerError::Internal(format!("flag_sweep commit: {e}")))?;
 
-        let post_flagged_in_namespace = {
-            let rtxn = metadata
-                .read_txn()
-                .map_err(|e| WorkerError::Internal(format!("flag_sweep rtxn-3: {e}")))?;
-            count_flagged_in_namespace(&rtxn, &job.namespace)?
-        };
-
-        // Diff before/after the sweep: rows that gained the flag
-        // versus rows that lost it. `_changed` is the helper's
-        // total-change count and matches `|gained| + |lost|`.
-        let (rows_flagged, rows_cleared) = if post_flagged_in_namespace >= pre_flagged_in_namespace
-        {
-            (post_flagged_in_namespace - pre_flagged_in_namespace, 0)
-        } else {
-            (0, pre_flagged_in_namespace - post_flagged_in_namespace)
-        };
-
-        Ok(SweepStats {
-            rows_flagged,
-            rows_cleared,
-        })
+        Ok(stats)
     }
 }
 
-/// Count statements whose predicate lives in `namespace` AND that
-/// currently carry the `OUTSIDE_ACTIVE_SCHEMA` bit. Used by the worker
-/// to derive an exact `(flagged, cleared)` split across one sweep.
-fn count_flagged_in_namespace(
-    rtxn: &redb::ReadTransaction,
+/// One-pass flag-sweep over `namespace`'s statements. Flips the
+/// `OUTSIDE_ACTIVE_SCHEMA` bit on every in-namespace statement to match
+/// `active_predicate_ids` and returns the exact `(rows_flagged,
+/// rows_cleared)` split observed during the scan.
+///
+/// Counting the two directions directly from the single sweep scan is
+/// what makes a mixed pass report faithfully: a net before/after diff
+/// would cancel gains against losses (5 gained and 3 lost would look
+/// like 2 flagged / 0 cleared), and it would also require two additional
+/// full-table scans. Here the scan that computes the updates is the same
+/// one that produces the counts.
+fn sweep_and_count(
+    wtxn: &redb::WriteTransaction,
     namespace: &str,
-) -> Result<usize, WorkerError> {
+    active_predicate_ids: &std::collections::HashSet<brain_core::PredicateId>,
+) -> Result<SweepStats, WorkerError> {
     use brain_core::PredicateId;
     use brain_metadata::tables::predicate::{PredicateDefinition, PREDICATES_TABLE};
     use brain_metadata::tables::statement::{statement_flags, StatementMetadata, STATEMENTS_TABLE};
     use redb::ReadableTable;
     use std::collections::HashSet;
 
-    let mut in_ns: HashSet<PredicateId> = HashSet::new();
-    if let Ok(t) = rtxn.open_table(PREDICATES_TABLE) {
+    // Which predicate ids belong to this namespace — so we skip rows
+    // owned by other namespaces entirely.
+    let in_namespace: HashSet<PredicateId> = {
+        let t = wtxn
+            .open_table(PREDICATES_TABLE)
+            .map_err(|e| WorkerError::Internal(format!("flag_sweep predicates open: {e}")))?;
+        let mut set = HashSet::new();
         for entry in t
             .iter()
             .map_err(|e| WorkerError::Internal(format!("flag_sweep predicates iter: {e}")))?
@@ -248,36 +233,64 @@ fn count_flagged_in_namespace(
                 .map_err(|e| WorkerError::Internal(format!("flag_sweep predicates entry: {e}")))?;
             let row: PredicateDefinition = v.value();
             if row.namespace == namespace {
-                in_ns.insert(PredicateId::from(k.value()));
+                set.insert(PredicateId::from(k.value()));
             }
         }
-    } else {
-        // No predicates table → nothing to count.
-        return Ok(0);
+        set
+    };
+
+    // Single scan: compute the rows that need a transition, tallying the
+    // gained / lost split as we go.
+    let mut rows_flagged = 0usize;
+    let mut rows_cleared = 0usize;
+    let updates: Vec<([u8; 16], StatementMetadata)> = {
+        let t = wtxn
+            .open_table(STATEMENTS_TABLE)
+            .map_err(|e| WorkerError::Internal(format!("flag_sweep stmts open: {e}")))?;
+        let mut out = Vec::new();
+        for entry in t
+            .iter()
+            .map_err(|e| WorkerError::Internal(format!("flag_sweep stmts iter: {e}")))?
+        {
+            let (k, v) =
+                entry.map_err(|e| WorkerError::Internal(format!("flag_sweep stmts entry: {e}")))?;
+            let row: StatementMetadata = v.value();
+            let pid = PredicateId::from(row.predicate_id);
+            if !in_namespace.contains(&pid) {
+                continue;
+            }
+            let should_flag = !active_predicate_ids.contains(&pid);
+            let has_flag = row.has_flag(statement_flags::OUTSIDE_ACTIVE_SCHEMA);
+            if should_flag == has_flag {
+                continue;
+            }
+            let mut new_row = row;
+            if should_flag {
+                new_row.set_flag(statement_flags::OUTSIDE_ACTIVE_SCHEMA);
+                rows_flagged += 1;
+            } else {
+                new_row.clear_flag(statement_flags::OUTSIDE_ACTIVE_SCHEMA);
+                rows_cleared += 1;
+            }
+            out.push((k.value(), new_row));
+        }
+        out
+    };
+
+    {
+        let mut t = wtxn
+            .open_table(STATEMENTS_TABLE)
+            .map_err(|e| WorkerError::Internal(format!("flag_sweep stmts open-w: {e}")))?;
+        for (k, row) in updates {
+            t.insert(&k, &row)
+                .map_err(|e| WorkerError::Internal(format!("flag_sweep stmts insert: {e}")))?;
+        }
     }
 
-    let mut count = 0usize;
-    let stmts = match rtxn.open_table(STATEMENTS_TABLE) {
-        Ok(t) => t,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
-        Err(e) => return Err(WorkerError::Internal(format!("flag_sweep stmts open: {e}"))),
-    };
-    for entry in stmts
-        .iter()
-        .map_err(|e| WorkerError::Internal(format!("flag_sweep stmts iter: {e}")))?
-    {
-        let (_, v) =
-            entry.map_err(|e| WorkerError::Internal(format!("flag_sweep stmts entry: {e}")))?;
-        let row: StatementMetadata = v.value();
-        let pid = PredicateId::from(row.predicate_id);
-        if !in_ns.contains(&pid) {
-            continue;
-        }
-        if row.has_flag(statement_flags::OUTSIDE_ACTIVE_SCHEMA) {
-            count += 1;
-        }
-    }
-    Ok(count)
+    Ok(SweepStats {
+        rows_flagged,
+        rows_cleared,
+    })
 }
 
 impl Worker for SchemaMigrationWorker {
@@ -301,13 +314,17 @@ impl Worker for SchemaMigrationWorker {
 #[cfg(test)]
 #[allow(clippy::arc_with_non_send_sync)]
 mod tests {
+    fn __ts() -> brain_metadata::RowScope {
+        brain_metadata::RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xA1; 16])
+    }
+
     use super::*;
     use brain_core::{
         Entity, EntityType, EvidenceEntry, EvidenceRef, Statement, StatementObject, StatementValue,
         SubjectRef,
     };
     use brain_core::{
-        AgentId, ContextId, EntityId, ExtractorId, MemoryId, PredicateId, StatementId,
+        EntityId, ExtractorId, MemoryId, PredicateId, SessionId, SpaceId, StatementId,
         StatementKind,
     };
     use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
@@ -318,10 +335,10 @@ mod tests {
     use brain_metadata::statement::statement_create;
     use brain_metadata::tables::statement::{statement_flags, STATEMENTS_TABLE};
     use brain_metadata::MetadataDb;
-    use brain_ops::{OpsContext, RealWriterHandle};
+    use brain_ops::RealWriterHandle;
     use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
     use brain_protocol::schema::{parse_schema, validate, ValidatedSchema};
-    use parking_lot::Mutex;
+
     use std::sync::atomic::AtomicBool;
     use tempfile::TempDir;
 
@@ -351,9 +368,8 @@ mod tests {
     fn build_fixture() -> Fixture {
         let tempdir = tempfile::tempdir().unwrap();
         let db_path = tempdir.path().join("metadata.redb");
-        let metadata: SharedMetadataDb = Arc::new(Mutex::new(MetadataDb::open(&db_path).unwrap()));
-        let (shared, hnsw_writer) =
-            SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).unwrap();
+        let metadata: SharedMetadataDb = Arc::new(MetadataDb::open(&db_path).unwrap());
+        let (shared, hnsw_writer) = SharedHnsw::new(IndexParams::default_v1()).unwrap();
         let writer = Arc::new(RealWriterHandle::new(metadata.clone(), hnsw_writer));
 
         let (tx, rx) = flume::unbounded::<SchemaFlagSweepJob>();
@@ -366,7 +382,7 @@ mod tests {
             metadata.clone(),
             writer as Arc<dyn WriterHandle>,
         );
-        let ops = Arc::new(OpsContext::new(executor));
+        let ops = Arc::new(brain_ops::test_support::ops_context_for_tests_owning_tempdir(executor));
         let ctx = WorkerContext {
             ops,
             shutdown: Arc::new(AtomicBool::new(false)),
@@ -399,13 +415,14 @@ mod tests {
         ))
     }
 
-    fn put_subject(metadata: &SharedMetadataDb, agent: AgentId) -> EntityId {
-        let _ = agent;
+    fn put_subject(metadata: &SharedMetadataDb, space: SpaceId) -> EntityId {
+        let _ = space;
         let id = EntityId::new();
-        let mut db = metadata.lock();
-        let wtxn = db.write_txn().unwrap();
+        let wtxn = metadata.write_txn().unwrap();
         entity_put(
             &wtxn,
+            __ts(),
+            brain_core::SessionId::DEFAULT,
             &Entity::new_active(
                 id,
                 EntityType::PERSON_ID,
@@ -425,11 +442,10 @@ mod tests {
         namespace: &str,
         predicate_name: &str,
     ) -> (StatementId, PredicateId) {
-        let mut db = metadata.lock();
-        let wtxn = db.write_txn().unwrap();
+        let wtxn = metadata.write_txn().unwrap();
         let pid = predicate_intern_or_get(&wtxn, namespace, predicate_name, 0, NOW).unwrap();
         let evidence_entry = EvidenceEntry::from_parts(
-            MemoryId::pack(1, ContextId::DEFAULT.into(), 0),
+            MemoryId::pack(1, SessionId::DEFAULT.into(), 0),
             1.0,
             0,
             ExtractorId::default(),
@@ -446,22 +462,21 @@ mod tests {
             NOW,
             1,
         );
-        let sid = statement_create(&wtxn, &stmt, NOW).unwrap();
+        let sid =
+            statement_create(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &stmt, NOW).unwrap();
         wtxn.commit().unwrap();
         (sid, pid)
     }
 
     fn upload_schema(metadata: &SharedMetadataDb, schema: &ValidatedSchema) -> u32 {
-        let mut db = metadata.lock();
-        let wtxn = db.write_txn().unwrap();
+        let wtxn = metadata.write_txn().unwrap();
         let v = schema_upload(&wtxn, schema, NOW).unwrap();
         wtxn.commit().unwrap();
         v
     }
 
     fn statement_has_outside_flag(metadata: &SharedMetadataDb, sid: StatementId) -> bool {
-        let db = metadata.lock();
-        let rtxn = db.read_txn().unwrap();
+        let rtxn = metadata.read_txn().unwrap();
         let t = rtxn.open_table(STATEMENTS_TABLE).unwrap();
         let row = t.get(&sid.to_bytes()).unwrap().unwrap().value();
         row.has_flag(statement_flags::OUTSIDE_ACTIVE_SCHEMA)
@@ -503,7 +518,7 @@ mod tests {
         // predicate `acme:ghost`. Then upload a schema that declares
         // only `prefers`. The worker's sweep must flag the ghost row.
         let fx = build_fixture();
-        let subject = put_subject(&fx.metadata, AgentId::default());
+        let subject = put_subject(&fx.metadata, SpaceId::default());
         let (sid_ghost, _) = write_statement(&fx.metadata, subject, "acme", "ghost");
 
         let v = upload_schema(&fx.metadata, &schema_with_predicates("acme", &["prefers"]));
@@ -536,7 +551,7 @@ mod tests {
         // — sweep flags it. v2 schema adds `ghost`. Sweep against v2
         // must CLEAR the flag.
         let fx = build_fixture();
-        let subject = put_subject(&fx.metadata, AgentId::default());
+        let subject = put_subject(&fx.metadata, SpaceId::default());
         let (sid_ghost, _) = write_statement(&fx.metadata, subject, "acme", "ghost");
 
         // v1: ghost is OUT.
@@ -575,11 +590,85 @@ mod tests {
     }
 
     #[test]
+    fn mixed_pass_reports_both_flagged_and_cleared_counts() {
+        // A single sweep that both flags some rows and clears others must
+        // report each direction faithfully — not the net. Set up 5 rows
+        // that gain the flag and 3 that lose it in one pass; expect
+        // (flagged=5, cleared=3), not the net (2, 0).
+        let fx = build_fixture();
+        let subject = put_subject(&fx.metadata, SpaceId::default());
+
+        // "Clear" group: 3 predicates. "Flag" group: 5 predicates.
+        let clear_preds = ["cx1", "cx2", "cx3"];
+        let flag_preds = ["fy1", "fy2", "fy3", "fy4", "fy5"];
+        let mut clear_sids = Vec::new();
+        let mut flag_sids = Vec::new();
+        for p in clear_preds {
+            let (sid, _) = write_statement(&fx.metadata, subject, "acme", p);
+            clear_sids.push(sid);
+        }
+        for p in flag_preds {
+            let (sid, _) = write_statement(&fx.metadata, subject, "acme", p);
+            flag_sids.push(sid);
+        }
+
+        // v1 declares only the flag-group predicates. Sweep flags the 3
+        // clear-group rows; the flag-group rows stay clear.
+        let v1 = upload_schema(&fx.metadata, &schema_with_predicates("acme", &flag_preds));
+        fx.tx
+            .send(SchemaFlagSweepJob {
+                namespace: "acme".into(),
+                new_version: v1,
+                enqueued_at_unix_nanos: NOW,
+            })
+            .unwrap();
+        drive_once(&fx.worker, &fx.ctx);
+        for sid in &clear_sids {
+            assert!(statement_has_outside_flag(&fx.metadata, *sid));
+        }
+        for sid in &flag_sids {
+            assert!(!statement_has_outside_flag(&fx.metadata, *sid));
+        }
+        let snap_v1 = fx.worker.metrics().snapshot();
+
+        // v2 declares only the clear-group predicates. The single sweep
+        // now clears the 3 clear-group rows AND flags the 5 flag-group
+        // rows — a mixed pass.
+        let v2 = upload_schema(&fx.metadata, &schema_with_predicates("acme", &clear_preds));
+        fx.tx
+            .send(SchemaFlagSweepJob {
+                namespace: "acme".into(),
+                new_version: v2,
+                enqueued_at_unix_nanos: NOW + 1,
+            })
+            .unwrap();
+        drive_once(&fx.worker, &fx.ctx);
+        for sid in &clear_sids {
+            assert!(!statement_has_outside_flag(&fx.metadata, *sid));
+        }
+        for sid in &flag_sids {
+            assert!(statement_has_outside_flag(&fx.metadata, *sid));
+        }
+
+        let snap_v2 = fx.worker.metrics().snapshot();
+        let flagged_delta = snap_v2.rows_flagged_total - snap_v1.rows_flagged_total;
+        let cleared_delta = snap_v2.rows_cleared_total - snap_v1.rows_cleared_total;
+        assert_eq!(
+            flagged_delta, 5,
+            "mixed pass must report 5 rows flagged, not the net",
+        );
+        assert_eq!(
+            cleared_delta, 3,
+            "mixed pass must report 3 rows cleared, not 0",
+        );
+    }
+
+    #[test]
     fn sweep_idempotent_on_replay() {
         // Two ticks on the same enqueued job: the second is a no-op
         // (every row is already at its correct flag state).
         let fx = build_fixture();
-        let subject = put_subject(&fx.metadata, AgentId::default());
+        let subject = put_subject(&fx.metadata, SpaceId::default());
         let (sid, _) = write_statement(&fx.metadata, subject, "acme", "ghost");
         let v = upload_schema(&fx.metadata, &schema_with_predicates("acme", &["prefers"]));
 
@@ -605,12 +694,5 @@ mod tests {
             "replay sweep must not double-count flagged rows",
         );
         assert_eq!(snap2.sweeps_completed_total, 2);
-    }
-
-    #[test]
-    fn worker_kind_name() {
-        let (_tx, rx) = flume::unbounded::<SchemaFlagSweepJob>();
-        let w = SchemaMigrationWorker::new(rx);
-        assert_eq!(w.name(), "schema_migration");
     }
 }

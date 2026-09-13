@@ -1,11 +1,11 @@
 //! Apply functions for memory-shaped phases.
 //!
-//! Covers: UpsertMemory, UpdateSalience, UpdateKind, UpdateContext,
+//! Covers: UpsertMemory, UpdateSalience, UpdateKind, UpdateSession,
 //! UpdateEmbedding, and Tombstone(Memory).
 
-use brain_core::{AgentId, ContextId, MemoryId, MemoryKind};
+use brain_core::{MemoryId, MemoryKind, SessionId, SpaceId};
 use brain_metadata::tables::memory::{
-    agent_timeline_key, MemoryMetadata, MEMORIES_BY_AGENT_TIMELINE_TABLE, MEMORIES_TABLE,
+    space_timeline_key, MemoryMetadata, MEMORIES_BY_SPACE_TIMELINE_TABLE, MEMORIES_TABLE,
 };
 use brain_metadata::tables::text::TEXTS_TABLE;
 use redb::{ReadableTable, WriteTransaction};
@@ -14,7 +14,7 @@ use super::ApplyError;
 use crate::write::{Phase, PhaseAck, TombstoneTarget, Write};
 
 /// Apply [`Phase::UpsertMemory`]. Inserts the memory row + writes the
-/// per-agent timeline index entry inside the same wtxn.
+/// per-space timeline index entry inside the same wtxn.
 pub fn apply_upsert_memory(
     wtxn: &WriteTransaction,
     phase: &Phase,
@@ -23,11 +23,12 @@ pub fn apply_upsert_memory(
     let Phase::UpsertMemory {
         id,
         text,
-        vector: _,
+        vector,
         kind,
         salience,
-        context,
+        session_id,
         created_at_unix_nanos,
+        occurred_at_unix_nanos,
         arena_slot,
         embedding_model_fp,
         content_hash,
@@ -39,8 +40,9 @@ pub fn apply_upsert_memory(
 
     let mut row = MemoryMetadata::new_active(
         *id,
-        write.agent_id,
-        *context,
+        write.namespace,
+        write.space_id,
+        *session_id,
         *arena_slot,
         id.version(),
         *kind,
@@ -48,12 +50,16 @@ pub fn apply_upsert_memory(
         salience.raw(),
         text.len() as u32,
         *created_at_unix_nanos,
-    );
+    )
+    .with_occurred_at(*occurred_at_unix_nanos);
     if *deduplicate {
         if let Some(ch) = content_hash {
             row = row.with_content_hash(*ch);
         }
     }
+    // Capture the owning namespace before `row` is moved into the table;
+    // the timeline key is namespace-prefixed and must match the row.
+    let namespace_id = row.namespace_id;
 
     // Memory row.
     {
@@ -69,12 +75,13 @@ pub fn apply_upsert_memory(
     // descending-time order to find each new memory's predecessor.
     {
         let mut timeline_t = wtxn
-            .open_table(MEMORIES_BY_AGENT_TIMELINE_TABLE)
+            .open_table(MEMORIES_BY_SPACE_TIMELINE_TABLE)
             .map_err(|e| ApplyError::Storage(format!("open TIMELINE: {e:?}")))?;
-        let key = agent_timeline_key(
-            agent_id_bytes(write.agent_id),
+        let key = space_timeline_key(
+            namespace_id,
+            space_id_bytes(write.space_id),
             *created_at_unix_nanos,
-            context.raw(),
+            session_id.raw(),
             id.to_be_bytes(),
         );
         timeline_t
@@ -94,16 +101,56 @@ pub fn apply_upsert_memory(
             .map_err(|e| ApplyError::Storage(format!("TEXTS insert: {e:?}")))?;
     }
 
+    // Durable extraction trigger. Enqueue this memory for asynchronous
+    // extraction INSIDE the same wtxn as the memory row, so the trigger
+    // commits atomically with the memory — a crash or restart can never
+    // lose the work. This is the source of truth for "this memory needs
+    // extraction"; the writer's flume channel is only a low-latency
+    // wakeup hint. `created_at` is the enqueue stamp.
+    brain_metadata::extraction_queue_enqueue(wtxn, *id, *created_at_unix_nanos)
+        .map_err(|e| ApplyError::Storage(format!("extraction_queue enqueue: {e:?}")))?;
+
+    // Sync half of the durable write-artifact bundle (MEMORY_INSPECT): the
+    // embedding vector + the record fields, written into the SAME wtxn so
+    // they commit atomically with the memory row at no extra transaction
+    // cost. The async workers (extractor → graph, text-indexer → keywords,
+    // HyPE → questions) merge the rest of the bundle in later.
+    {
+        let kind_byte = match kind {
+            MemoryKind::Episodic => 0,
+            MemoryKind::Semantic => 1,
+            MemoryKind::Consolidated => 2,
+        };
+        let record = crate::memory_artifact::sync_record(
+            id.to_be_bytes(),
+            kind_byte,
+            salience.raw(),
+            *created_at_unix_nanos,
+            occurred_at_unix_nanos.unwrap_or(0),
+            vector.len() as u32,
+            text.len() as u32,
+        );
+        let keyword_fields = crate::memory_artifact::analyze_memory_keywords(text);
+        crate::memory_artifact::put_sync_artifact(
+            wtxn,
+            id.to_be_bytes(),
+            vector.to_vec(),
+            record,
+            keyword_fields,
+        )
+        .map_err(|e| ApplyError::Storage(format!("artifact sync write: {e}")))?;
+    }
+
     // FINGERPRINTS_TABLE entry when the encode opted into content-
-    // hash dedup. The row keys (agent_id, context_id, content_hash) →
-    // this memory id, so a future ENCODE with matching text/agent/ctx
+    // hash dedup. The row keys (space_id, session_id, content_hash) →
+    // this memory id, so a future ENCODE with matching text/space/ctx
     // can dedupe-to-existing without minting a fresh row.
     if *deduplicate {
         if let Some(ch) = content_hash {
             use brain_metadata::tables::fingerprint::{
                 fingerprint_key, FingerprintEntry, FINGERPRINTS_TABLE,
             };
-            let key = fingerprint_key(write.agent_id, *context, ch);
+            let key = fingerprint_key(write.space_id, *session_id, ch);
             let entry = FingerprintEntry::new(*id, *created_at_unix_nanos);
             let mut fp_t = wtxn
                 .open_table(FINGERPRINTS_TABLE)
@@ -113,6 +160,20 @@ pub fn apply_upsert_memory(
         }
     }
 
+    // Implicit registry upsert — create the space + session registry rows on
+    // first sight and bump last_active + memory_count, in the SAME wtxn as the
+    // memory. Recovery's apply_encode runs the identical touch, so a crash
+    // never desyncs the registry from the memory it summarizes.
+    brain_metadata::touch_on_write(
+        wtxn,
+        namespace_id,
+        space_id_bytes(write.space_id),
+        &write.space_string,
+        session_id.raw(),
+        *created_at_unix_nanos,
+    )
+    .map_err(|e| ApplyError::Storage(format!("registry touch: {e}")))?;
+
     Ok(PhaseAck::UpsertedMemory(*id))
 }
 
@@ -120,7 +181,7 @@ pub fn apply_upsert_memory(
 pub fn apply_tombstone_memory(
     wtxn: &WriteTransaction,
     phase: &Phase,
-    _write: &Write,
+    write: &Write,
 ) -> Result<PhaseAck, ApplyError> {
     let Phase::Tombstone {
         target,
@@ -130,7 +191,7 @@ pub fn apply_tombstone_memory(
     else {
         return Err(ApplyError::PhaseMisShape("expected Tombstone"));
     };
-    let TombstoneTarget::Memory { id, mode: _ } = target else {
+    let TombstoneTarget::Memory { id, mode } = target else {
         return Err(ApplyError::PhaseMisShape("expected Tombstone(Memory)"));
     };
 
@@ -150,15 +211,43 @@ pub fn apply_tombstone_memory(
         guard.value()
     };
 
+    // Tenant wall (authoritative, inside the write txn). A MemoryId is an
+    // enumerable packed u128, so without this guard any caller holding the
+    // FORGET bit could delete rows across every tenant by id. A row owned
+    // by another space is indistinguishable from a missing one — FORGET is
+    // lenient, so this reads as NotFound and the handler maps it to a no-op
+    // success (no existence leak). The space id is the complete tenant key:
+    // it is a UUIDv5 that folds the namespace, so a foreign namespace always
+    // yields a disjoint space id, and it is the one scope field threaded
+    // reliably through both the non-txn and TXN_COMMIT write paths.
+    if row.space_id_bytes != <[u8; 16]>::from(write.space_id) {
+        return Err(ApplyError::NotFound {
+            what: "memory",
+            detail: format!("{id:?}"),
+        });
+    }
+
     // Stamp tombstoned_at + clear the ACTIVE flag. The actual slot
     // reclamation happens later via Phase::ReclaimSlots once the
     // grace period passes.
     row.tombstoned_at_unix_nanos = Some(*at_unix_nanos);
     row.flags &= !brain_metadata::tables::memory::flags::ACTIVE;
 
+    // Hard forget sets the HARD_FORGOTTEN flag + forgot_at so the state is
+    // irreversible and self-describing: the FORGET-revert path checks this
+    // bit to refuse resurrecting a memory whose plaintext + artifacts have
+    // been purged (invariant #6). This converges the live apply with the
+    // recovery replay (crates/brain-metadata apply_forget), which already
+    // stamps the same fields, so a crash mid-forget replays identically.
+    if matches!(mode, crate::write::phase::TombstoneMode::Hard) {
+        row.flags |= brain_metadata::tables::memory::flags::HARD_FORGOTTEN;
+        row.forgot_at_unix_nanos = Some(*at_unix_nanos);
+    }
+
     let created_at = row.created_at_unix_nanos;
-    let agent_bytes = row.agent_id_bytes;
-    let ctx_raw = row.context_id;
+    let namespace_id = row.namespace_id;
+    let space_bytes = row.space_id_bytes;
+    let ctx_raw = row.session_id;
     let mid_bytes = row.memory_id_bytes;
     let dedup_hash = row.content_hash;
 
@@ -176,9 +265,9 @@ pub fn apply_tombstone_memory(
     // surface as a temporal predecessor for future encodes.
     {
         let mut timeline_t = wtxn
-            .open_table(MEMORIES_BY_AGENT_TIMELINE_TABLE)
+            .open_table(MEMORIES_BY_SPACE_TIMELINE_TABLE)
             .map_err(|e| ApplyError::Storage(format!("open TIMELINE: {e:?}")))?;
-        let key = agent_timeline_key(agent_bytes, created_at, ctx_raw, mid_bytes);
+        let key = space_timeline_key(namespace_id, space_bytes, created_at, ctx_raw, mid_bytes);
         let _ = timeline_t
             .remove(key.as_slice())
             .map_err(|e| ApplyError::Storage(format!("TIMELINE remove: {e:?}")))?;
@@ -194,8 +283,8 @@ pub fn apply_tombstone_memory(
             .open_table(FINGERPRINTS_TABLE)
             .map_err(|e| ApplyError::Storage(format!("open FINGERPRINTS: {e:?}")))?;
         let key = fingerprint_key(
-            brain_core::AgentId::from(agent_bytes),
-            ContextId(ctx_raw),
+            brain_core::SpaceId::from(space_bytes),
+            SessionId(ctx_raw),
             &hash,
         );
         let _ = fp_t
@@ -203,9 +292,155 @@ pub fn apply_tombstone_memory(
             .map_err(|e| ApplyError::Storage(format!("FINGERPRINTS remove: {e:?}")))?;
     }
 
+    // Hard FORGET is the privacy escape hatch: the spec promises the
+    // plaintext is "no longer recoverable from the file" once the OS
+    // flushes. The text lives in the metadata (redb) TEXTS_TABLE, so
+    // drop that row in the same wtxn as the tombstone — a soft forget
+    // keeps it (reclamation handles it after grace), a hard forget
+    // purges it now. The arena-side vector (only present for a memory
+    // recovered from a prior run — the live encode path never writes the
+    // arena) is zeroed live at the shard/storage boundary via
+    // `ArenaFile::hard_forget_slot`, which this apply layer cannot reach
+    // (it holds only the redb wtxn); the recovery replay re-zeroes it too
+    // so the guarantee also holds across a crash before writeback.
+    if matches!(mode, crate::write::phase::TombstoneMode::Hard) {
+        let mut texts_t = wtxn
+            .open_table(TEXTS_TABLE)
+            .map_err(|e| ApplyError::Storage(format!("open TEXTS: {e:?}")))?;
+        let _ = texts_t
+            .remove(&id.to_be_bytes())
+            .map_err(|e| ApplyError::Storage(format!("TEXTS remove (hard forget): {e:?}")))?;
+
+        // The write-artifact bundle carries the embedding vector + the
+        // derived graph — recoverable information about the memory — so a
+        // hard forget purges it in the same wtxn as the text.
+        crate::memory_artifact::delete_memory_artifact(wtxn, id.to_be_bytes())
+            .map_err(|e| ApplyError::Storage(format!("artifact remove (hard forget): {e}")))?;
+    }
+
     Ok(PhaseAck::Tombstoned {
         target: *target,
         tombstoned_at_unix_nanos: *at_unix_nanos,
+    })
+}
+
+/// Apply [`Phase::RestoreMemory`] — reverse a soft `Tombstone(Memory)`.
+///
+/// Re-sets the ACTIVE flag, clears `tombstoned_at`, re-inserts the
+/// timeline-index entry, and restores the dedup fingerprint the forget
+/// evicted. Idempotent: restoring an already-active memory is a no-op
+/// (`already_active = true`) so a recovery replay after the live commit
+/// changes nothing. A hard-forgotten memory is irreversible (invariant
+/// #6): the caller validates that before submitting, and apply refuses it
+/// defensively so a stray restore can never resurrect purged plaintext.
+pub fn apply_restore_memory(
+    wtxn: &WriteTransaction,
+    phase: &Phase,
+    write: &Write,
+) -> Result<PhaseAck, ApplyError> {
+    let Phase::RestoreMemory { id, at_unix_nanos } = phase else {
+        return Err(ApplyError::PhaseMisShape("expected RestoreMemory"));
+    };
+    let _ = at_unix_nanos;
+
+    let mut row = {
+        let memories_t = wtxn
+            .open_table(MEMORIES_TABLE)
+            .map_err(|e| ApplyError::Storage(format!("open MEMORIES: {e:?}")))?;
+        let row_guard = memories_t
+            .get(&id.to_be_bytes())
+            .map_err(|e| ApplyError::Storage(format!("MEMORIES get: {e:?}")))?;
+        let Some(guard) = row_guard else {
+            return Err(ApplyError::NotFound {
+                what: "memory",
+                detail: format!("{id:?}"),
+            });
+        };
+        guard.value()
+    };
+
+    // Tenant wall (authoritative, inside the write txn) — same guard the
+    // tombstone apply uses: a row owned by another space reads as NotFound
+    // so restore can never touch another tenant's memory by id.
+    if row.space_id_bytes != <[u8; 16]>::from(write.space_id) {
+        return Err(ApplyError::NotFound {
+            what: "memory",
+            detail: format!("{id:?}"),
+        });
+    }
+
+    // Hard forget is irreversible; refuse to resurrect a purged memory.
+    if row.flags & brain_metadata::tables::memory::flags::HARD_FORGOTTEN != 0 {
+        return Err(ApplyError::Invariant(
+            "cannot restore a hard-forgotten memory (invariant #6)".to_owned(),
+        ));
+    }
+
+    // Already active → idempotent no-op (recovery replay after the live
+    // commit, or a redundant restore). No mutation, no index churn.
+    if row.flags & brain_metadata::tables::memory::flags::ACTIVE != 0 {
+        return Ok(PhaseAck::MemoryRestored {
+            id: *id,
+            already_active: true,
+        });
+    }
+
+    // Re-activate: set ACTIVE, drop tombstoned_at.
+    row.flags |= brain_metadata::tables::memory::flags::ACTIVE;
+    row.tombstoned_at_unix_nanos = None;
+
+    let created_at = row.created_at_unix_nanos;
+    let namespace_id = row.namespace_id;
+    let space_bytes = row.space_id_bytes;
+    let ctx_raw = row.session_id;
+    let mid_bytes = row.memory_id_bytes;
+    let dedup_hash = row.content_hash;
+
+    // Persist the re-activated row.
+    {
+        let mut memories_t = wtxn
+            .open_table(MEMORIES_TABLE)
+            .map_err(|e| ApplyError::Storage(format!("open MEMORIES: {e:?}")))?;
+        memories_t
+            .insert(&id.to_be_bytes(), row)
+            .map_err(|e| ApplyError::Storage(format!("MEMORIES insert (restore): {e:?}")))?;
+    }
+
+    // Re-insert the timeline-index entry the tombstone removed so the
+    // restored memory is once again a temporal predecessor.
+    {
+        let mut timeline_t = wtxn
+            .open_table(MEMORIES_BY_SPACE_TIMELINE_TABLE)
+            .map_err(|e| ApplyError::Storage(format!("open TIMELINE: {e:?}")))?;
+        let key = space_timeline_key(namespace_id, space_bytes, created_at, ctx_raw, mid_bytes);
+        timeline_t
+            .insert(key.as_slice(), ())
+            .map_err(|e| ApplyError::Storage(format!("TIMELINE insert (restore): {e:?}")))?;
+    }
+
+    // Restore the dedup fingerprint the forget evicted so a re-encode of
+    // the same text once again folds onto this memory. Only present when
+    // the original encode opted into content-hash dedup.
+    if let Some(hash) = dedup_hash {
+        use brain_metadata::tables::fingerprint::{
+            fingerprint_key, FingerprintEntry, FINGERPRINTS_TABLE,
+        };
+        let key = fingerprint_key(
+            brain_core::SpaceId::from(space_bytes),
+            SessionId(ctx_raw),
+            &hash,
+        );
+        let entry = FingerprintEntry::new(*id, created_at);
+        let mut fp_t = wtxn
+            .open_table(FINGERPRINTS_TABLE)
+            .map_err(|e| ApplyError::Storage(format!("open FINGERPRINTS: {e:?}")))?;
+        fp_t.insert(&key, entry)
+            .map_err(|e| ApplyError::Storage(format!("FINGERPRINTS insert (restore): {e:?}")))?;
+    }
+
+    Ok(PhaseAck::MemoryRestored {
+        id: *id,
+        already_active: false,
     })
 }
 
@@ -239,45 +474,47 @@ pub fn apply_update_kind(
     Ok(PhaseAck::KindUpdated)
 }
 
-/// Apply [`Phase::UpdateContext`].
-pub fn apply_update_context(
+/// Apply [`Phase::UpdateSession`].
+pub fn apply_update_session(
     wtxn: &WriteTransaction,
     phase: &Phase,
     _write: &Write,
 ) -> Result<PhaseAck, ApplyError> {
-    let Phase::UpdateContext { id, new_context } = phase else {
-        return Err(ApplyError::PhaseMisShape("expected UpdateContext"));
+    let Phase::UpdateSession { id, new_session_id } = phase else {
+        return Err(ApplyError::PhaseMisShape("expected UpdateSession"));
     };
     let mut row = load_memory(wtxn, *id)?;
-    let old_context = ContextId(row.context_id);
+    let old_session_id = SessionId(row.session_id);
     let old_created = row.created_at_unix_nanos;
-    row.context_id = new_context.raw();
+    row.session_id = new_session_id.raw();
     write_memory(wtxn, *id, row.clone())?;
 
-    // Update the timeline index — the key includes context_id, so we
+    // Update the timeline index — the key includes session_id, so we
     // remove the old entry and insert the new one.
     {
         let mut timeline_t = wtxn
-            .open_table(MEMORIES_BY_AGENT_TIMELINE_TABLE)
+            .open_table(MEMORIES_BY_SPACE_TIMELINE_TABLE)
             .map_err(|e| ApplyError::Storage(format!("open TIMELINE: {e:?}")))?;
-        let old_key = agent_timeline_key(
-            row.agent_id_bytes,
+        let old_key = space_timeline_key(
+            row.namespace_id,
+            row.space_id_bytes,
             old_created,
-            old_context.raw(),
+            old_session_id.raw(),
             id.to_be_bytes(),
         );
         let _ = timeline_t
             .remove(old_key.as_slice())
-            .map_err(|e| ApplyError::Storage(format!("TIMELINE remove (context change): {e:?}")))?;
-        let new_key = agent_timeline_key(
-            row.agent_id_bytes,
+            .map_err(|e| ApplyError::Storage(format!("TIMELINE remove (session change): {e:?}")))?;
+        let new_key = space_timeline_key(
+            row.namespace_id,
+            row.space_id_bytes,
             old_created,
-            new_context.raw(),
+            new_session_id.raw(),
             id.to_be_bytes(),
         );
         timeline_t
             .insert(new_key.as_slice(), ())
-            .map_err(|e| ApplyError::Storage(format!("TIMELINE insert (context change): {e:?}")))?;
+            .map_err(|e| ApplyError::Storage(format!("TIMELINE insert (session change): {e:?}")))?;
     }
 
     Ok(PhaseAck::ContextUpdated)
@@ -338,7 +575,7 @@ fn write_memory(
     Ok(())
 }
 
-fn agent_id_bytes(a: AgentId) -> [u8; 16] {
+fn space_id_bytes(a: SpaceId) -> [u8; 16] {
     a.into()
 }
 
@@ -372,8 +609,9 @@ mod tests {
             vector: Box::new([0.0_f32; VECTOR_DIM]),
             kind: MemoryKind::Episodic,
             salience: brain_core::Salience::default(),
-            context: ContextId(7),
+            session_id: SessionId(7),
             created_at_unix_nanos: 1_700_000_000_000,
+            occurred_at_unix_nanos: None,
             arena_slot: 42,
             embedding_model_fp: [0xAA; 16],
             content_hash: None,
@@ -381,10 +619,12 @@ mod tests {
         }
     }
 
-    fn fresh_write_for(agent: AgentId) -> Write {
+    fn fresh_write_for(space: SpaceId) -> Write {
         Write {
             write_id: WriteId::new(),
-            agent_id: agent,
+            space_id: space,
+            namespace: brain_core::NamespaceId::SYSTEM,
+            space_string: String::new(),
             started_at_unix_nanos: 0,
             phases: Vec::new(),
             request_hash: None,
@@ -393,11 +633,11 @@ mod tests {
 
     #[test]
     fn upsert_memory_writes_row_and_timeline() {
-        let (_dir, mut db) = open_db();
+        let (_dir, db) = open_db();
         let id = MemoryId::pack(0, 1, 0);
-        let agent = AgentId::new();
+        let space = SpaceId::new();
         let phase = fixture_phase(id);
-        let write = fresh_write_for(agent);
+        let write = fresh_write_for(space);
 
         {
             let wtxn = db.write_txn().unwrap();
@@ -411,15 +651,16 @@ mod tests {
         let t = rtxn.open_table(MEMORIES_TABLE).unwrap();
         let row = t.get(&id.to_be_bytes()).unwrap().unwrap().value();
         assert_eq!(row.memory_id(), id);
-        assert_eq!(row.agent_id(), agent);
-        assert_eq!(row.context(), ContextId(7));
+        assert_eq!(row.space_id(), space);
+        assert_eq!(row.session(), SessionId(7));
         assert_eq!(row.created_at_unix_nanos, 1_700_000_000_000);
         assert!(row.flags & brain_metadata::tables::memory::flags::ACTIVE != 0);
 
         // Timeline index has the entry.
-        let timeline_t = rtxn.open_table(MEMORIES_BY_AGENT_TIMELINE_TABLE).unwrap();
-        let key = agent_timeline_key(
-            agent_id_bytes(agent),
+        let timeline_t = rtxn.open_table(MEMORIES_BY_SPACE_TIMELINE_TABLE).unwrap();
+        let key = space_timeline_key(
+            brain_core::NamespaceId::SYSTEM.raw(),
+            space_id_bytes(space),
             1_700_000_000_000,
             7,
             id.to_be_bytes(),
@@ -427,12 +668,58 @@ mod tests {
         assert!(timeline_t.get(key.as_slice()).unwrap().is_some());
     }
 
+    /// Invariant guard: the timeline index key and the memory row must agree
+    /// on `created_at_unix_nanos` (and every other key component). If they
+    /// diverge — e.g. a future refactor reads the clock twice, once for the
+    /// row and once for the key — a resume cursor reconstructed from a row's
+    /// fields would miss the real key and MEMORY_LIST descending pagination
+    /// would re-emit boundary rows. This asserts the key derived from the
+    /// stored row is exactly the key that was written.
+    #[test]
+    fn upsert_memory_index_key_matches_row_fields() {
+        let (_dir, db) = open_db();
+        let id = MemoryId::pack(0, 1, 0);
+        let space = SpaceId::new();
+        let write = fresh_write_for(space);
+
+        {
+            let wtxn = db.write_txn().unwrap();
+            apply_upsert_memory(&wtxn, &fixture_phase(id), &write).unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        let rtxn = db.read_txn().unwrap();
+        let row = rtxn
+            .open_table(MEMORIES_TABLE)
+            .unwrap()
+            .get(&id.to_be_bytes())
+            .unwrap()
+            .unwrap()
+            .value();
+
+        // Reconstruct the key purely from the row (as the MEMORY_LIST cursor
+        // does) and require the real stored index entry to sit at that key.
+        let derived = space_timeline_key(
+            row.namespace_id,
+            row.space_id_bytes,
+            row.created_at_unix_nanos,
+            row.session_id,
+            row.memory_id_bytes,
+        );
+        let timeline_t = rtxn.open_table(MEMORIES_BY_SPACE_TIMELINE_TABLE).unwrap();
+        assert!(
+            timeline_t.get(derived.as_slice()).unwrap().is_some(),
+            "index key derived from the row must equal the stored key \
+             (row and key must share one created_at)",
+        );
+    }
+
     #[test]
     fn tombstone_memory_clears_active_flag_and_timeline() {
-        let (_dir, mut db) = open_db();
+        let (_dir, db) = open_db();
         let id = MemoryId::pack(0, 1, 0);
-        let agent = AgentId::new();
-        let write = fresh_write_for(agent);
+        let space = SpaceId::new();
+        let write = fresh_write_for(space);
 
         // Set up: upsert first.
         {
@@ -465,9 +752,10 @@ mod tests {
         assert_eq!(row.tombstoned_at_unix_nanos, Some(1_700_000_001_000));
 
         // Timeline entry gone.
-        let timeline_t = rtxn.open_table(MEMORIES_BY_AGENT_TIMELINE_TABLE).unwrap();
-        let key = agent_timeline_key(
-            agent_id_bytes(agent),
+        let timeline_t = rtxn.open_table(MEMORIES_BY_SPACE_TIMELINE_TABLE).unwrap();
+        let key = space_timeline_key(
+            brain_core::NamespaceId::SYSTEM.raw(),
+            space_id_bytes(space),
             1_700_000_000_000,
             7,
             id.to_be_bytes(),
@@ -476,11 +764,141 @@ mod tests {
     }
 
     #[test]
+    fn hard_forget_purges_text_row_soft_keeps_it() {
+        let (_dir, db) = open_db();
+        let space = SpaceId::new();
+        let write = fresh_write_for(space);
+        let soft_id = MemoryId::pack(0, 1, 0);
+        let hard_id = MemoryId::pack(0, 2, 0);
+
+        // Upsert both — fixture text is "hello world".
+        {
+            let wtxn = db.write_txn().unwrap();
+            apply_upsert_memory(&wtxn, &fixture_phase(soft_id), &write).unwrap();
+            let mut hard_phase = fixture_phase(hard_id);
+            if let Phase::UpsertMemory { id, .. } = &mut hard_phase {
+                *id = hard_id;
+            }
+            apply_upsert_memory(&wtxn, &hard_phase, &write).unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        let tombstone = |id, mode| Phase::Tombstone {
+            target: TombstoneTarget::Memory { id, mode },
+            reason: 1,
+            at_unix_nanos: 1_700_000_001_000,
+        };
+        {
+            let wtxn = db.write_txn().unwrap();
+            apply_tombstone_memory(
+                &wtxn,
+                &tombstone(soft_id, crate::write::phase::TombstoneMode::Soft),
+                &write,
+            )
+            .unwrap();
+            apply_tombstone_memory(
+                &wtxn,
+                &tombstone(hard_id, crate::write::phase::TombstoneMode::Hard),
+                &write,
+            )
+            .unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        let rtxn = db.read_txn().unwrap();
+        let texts = rtxn.open_table(TEXTS_TABLE).unwrap();
+        assert!(
+            texts.get(&soft_id.to_be_bytes()).unwrap().is_some(),
+            "soft forget must retain the plaintext text row"
+        );
+        assert!(
+            texts.get(&hard_id.to_be_bytes()).unwrap().is_none(),
+            "hard forget must purge the plaintext text row"
+        );
+    }
+
+    /// Hard forget must leave no plaintext-derived embedding at rest in
+    /// redb: the artifact bundle's `vector` (the write-time embedding)
+    /// must be gone (invariant #6). Soft forget keeps it until grace.
+    #[test]
+    fn hard_forget_purges_artifact_vector_soft_keeps_it() {
+        let (_dir, db) = open_db();
+        let space = SpaceId::new();
+        let write = fresh_write_for(space);
+        let soft_id = MemoryId::pack(0, 1, 0);
+        let hard_id = MemoryId::pack(0, 2, 0);
+
+        // Upsert both with a recognizably non-zero embedding.
+        let mut nonzero = Box::new([0.0_f32; VECTOR_DIM]);
+        for (i, x) in nonzero.iter_mut().enumerate() {
+            *x = (i as f32) * 0.001 + 0.5;
+        }
+        {
+            let wtxn = db.write_txn().unwrap();
+            for id in [soft_id, hard_id] {
+                let mut p = fixture_phase(id);
+                if let Phase::UpsertMemory {
+                    id: pid, vector, ..
+                } = &mut p
+                {
+                    *pid = id;
+                    *vector = nonzero.clone();
+                }
+                apply_upsert_memory(&wtxn, &p, &write).unwrap();
+            }
+            wtxn.commit().unwrap();
+        }
+
+        // Both artifact vectors present pre-forget.
+        {
+            let rtxn = db.read_txn().unwrap();
+            assert!(
+                crate::memory_artifact::get_artifact_vector(&rtxn, soft_id.to_be_bytes()).is_some()
+            );
+            assert!(
+                crate::memory_artifact::get_artifact_vector(&rtxn, hard_id.to_be_bytes()).is_some()
+            );
+        }
+
+        let tombstone = |id, mode| Phase::Tombstone {
+            target: TombstoneTarget::Memory { id, mode },
+            reason: 1,
+            at_unix_nanos: 1_700_000_001_000,
+        };
+        {
+            let wtxn = db.write_txn().unwrap();
+            apply_tombstone_memory(
+                &wtxn,
+                &tombstone(soft_id, crate::write::phase::TombstoneMode::Soft),
+                &write,
+            )
+            .unwrap();
+            apply_tombstone_memory(
+                &wtxn,
+                &tombstone(hard_id, crate::write::phase::TombstoneMode::Hard),
+                &write,
+            )
+            .unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        let rtxn = db.read_txn().unwrap();
+        assert!(
+            crate::memory_artifact::get_artifact_vector(&rtxn, soft_id.to_be_bytes()).is_some(),
+            "soft forget must retain the artifact embedding until grace"
+        );
+        assert!(
+            crate::memory_artifact::get_artifact_vector(&rtxn, hard_id.to_be_bytes()).is_none(),
+            "hard forget must purge the artifact embedding at rest"
+        );
+    }
+
+    #[test]
     fn update_salience_persists() {
-        let (_dir, mut db) = open_db();
+        let (_dir, db) = open_db();
         let id = MemoryId::pack(0, 1, 0);
-        let agent = AgentId::new();
-        let write = fresh_write_for(agent);
+        let space = SpaceId::new();
+        let write = fresh_write_for(space);
         {
             let wtxn = db.write_txn().unwrap();
             apply_upsert_memory(&wtxn, &fixture_phase(id), &write).unwrap();
@@ -503,10 +921,10 @@ mod tests {
 
     #[test]
     fn update_kind_persists() {
-        let (_dir, mut db) = open_db();
+        let (_dir, db) = open_db();
         let id = MemoryId::pack(0, 1, 0);
-        let agent = AgentId::new();
-        let write = fresh_write_for(agent);
+        let space = SpaceId::new();
+        let write = fresh_write_for(space);
         {
             let wtxn = db.write_txn().unwrap();
             apply_upsert_memory(&wtxn, &fixture_phase(id), &write).unwrap();
@@ -529,7 +947,7 @@ mod tests {
 
     #[test]
     fn tombstone_missing_memory_returns_not_found() {
-        let (_dir, mut db) = open_db();
+        let (_dir, db) = open_db();
         let phase = Phase::Tombstone {
             target: TombstoneTarget::Memory {
                 id: MemoryId::pack(0, 999, 0),
@@ -539,8 +957,229 @@ mod tests {
             at_unix_nanos: 0,
         };
         let wtxn = db.write_txn().unwrap();
-        let err = apply_tombstone_memory(&wtxn, &phase, &fresh_write_for(AgentId::default()))
+        let err = apply_tombstone_memory(&wtxn, &phase, &fresh_write_for(SpaceId::default()))
             .unwrap_err();
+        assert!(matches!(err, ApplyError::NotFound { what: "memory", .. }));
+    }
+
+    /// Tenant B tombstoning tenant A's MemoryId must NOT touch A's row: the
+    /// apply tenant-wall reads a foreign-space row as NotFound (FORGET's
+    /// lenient no-op), while A's own tombstone still works.
+    #[test]
+    fn tombstone_refuses_cross_tenant_memory() {
+        let (_dir, db) = open_db();
+        let id = MemoryId::pack(0, 1, 0);
+        let space_a = SpaceId::new();
+        let space_b = SpaceId::new();
+        let write_a = fresh_write_for(space_a);
+
+        // A writes the memory.
+        {
+            let wtxn = db.write_txn().unwrap();
+            apply_upsert_memory(&wtxn, &fixture_phase(id), &write_a).unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        let tombstone = Phase::Tombstone {
+            target: TombstoneTarget::Memory {
+                id,
+                mode: crate::write::phase::TombstoneMode::Soft,
+            },
+            reason: 1,
+            at_unix_nanos: 1_700_000_001_000,
+        };
+
+        // B tries to forget A's id — rejected as NotFound, no mutation.
+        {
+            let wtxn = db.write_txn().unwrap();
+            let err =
+                apply_tombstone_memory(&wtxn, &tombstone, &fresh_write_for(space_b)).unwrap_err();
+            assert!(matches!(err, ApplyError::NotFound { what: "memory", .. }));
+            wtxn.commit().unwrap();
+        }
+        {
+            let rtxn = db.read_txn().unwrap();
+            let t = rtxn.open_table(MEMORIES_TABLE).unwrap();
+            let row = t.get(&id.to_be_bytes()).unwrap().unwrap().value();
+            assert!(
+                row.flags & brain_metadata::tables::memory::flags::ACTIVE != 0,
+                "cross-tenant FORGET must leave A's row ACTIVE"
+            );
+            assert_eq!(row.tombstoned_at_unix_nanos, None);
+        }
+
+        // A's own FORGET works.
+        {
+            let wtxn = db.write_txn().unwrap();
+            apply_tombstone_memory(&wtxn, &tombstone, &write_a).unwrap();
+            wtxn.commit().unwrap();
+        }
+        {
+            let rtxn = db.read_txn().unwrap();
+            let t = rtxn.open_table(MEMORIES_TABLE).unwrap();
+            let row = t.get(&id.to_be_bytes()).unwrap().unwrap().value();
+            assert_eq!(row.flags & brain_metadata::tables::memory::flags::ACTIVE, 0);
+            assert_eq!(row.tombstoned_at_unix_nanos, Some(1_700_000_001_000));
+        }
+    }
+
+    fn soft_tombstone(id: MemoryId) -> Phase {
+        Phase::Tombstone {
+            target: TombstoneTarget::Memory {
+                id,
+                mode: crate::write::phase::TombstoneMode::Soft,
+            },
+            reason: 1,
+            at_unix_nanos: 1_700_000_001_000,
+        }
+    }
+
+    fn restore(id: MemoryId) -> Phase {
+        Phase::RestoreMemory {
+            id,
+            at_unix_nanos: 1_700_000_002_000,
+        }
+    }
+
+    #[test]
+    fn restore_reactivates_soft_tombstoned_memory() {
+        let (_dir, db) = open_db();
+        let id = MemoryId::pack(0, 1, 0);
+        let space = SpaceId::new();
+        let write = fresh_write_for(space);
+
+        // Upsert + soft-forget.
+        {
+            let wtxn = db.write_txn().unwrap();
+            apply_upsert_memory(&wtxn, &fixture_phase(id), &write).unwrap();
+            apply_tombstone_memory(&wtxn, &soft_tombstone(id), &write).unwrap();
+            wtxn.commit().unwrap();
+        }
+        // Confirm tombstoned + timeline gone.
+        {
+            let rtxn = db.read_txn().unwrap();
+            let row = rtxn
+                .open_table(MEMORIES_TABLE)
+                .unwrap()
+                .get(&id.to_be_bytes())
+                .unwrap()
+                .unwrap()
+                .value();
+            assert_eq!(row.flags & brain_metadata::tables::memory::flags::ACTIVE, 0);
+        }
+
+        // Restore.
+        {
+            let wtxn = db.write_txn().unwrap();
+            let ack = apply_restore_memory(&wtxn, &restore(id), &write).unwrap();
+            assert!(matches!(
+                ack,
+                PhaseAck::MemoryRestored {
+                    already_active: false,
+                    ..
+                }
+            ));
+            wtxn.commit().unwrap();
+        }
+
+        // ACTIVE re-set, tombstoned_at cleared, timeline entry back.
+        let rtxn = db.read_txn().unwrap();
+        let row = rtxn
+            .open_table(MEMORIES_TABLE)
+            .unwrap()
+            .get(&id.to_be_bytes())
+            .unwrap()
+            .unwrap()
+            .value();
+        assert!(row.flags & brain_metadata::tables::memory::flags::ACTIVE != 0);
+        assert_eq!(row.tombstoned_at_unix_nanos, None);
+        let timeline_t = rtxn.open_table(MEMORIES_BY_SPACE_TIMELINE_TABLE).unwrap();
+        let key = space_timeline_key(
+            brain_core::NamespaceId::SYSTEM.raw(),
+            space_id_bytes(space),
+            row.created_at_unix_nanos,
+            row.session_id,
+            id.to_be_bytes(),
+        );
+        assert!(timeline_t.get(key.as_slice()).unwrap().is_some());
+    }
+
+    #[test]
+    fn restore_already_active_is_idempotent_noop() {
+        let (_dir, db) = open_db();
+        let id = MemoryId::pack(0, 1, 0);
+        let space = SpaceId::new();
+        let write = fresh_write_for(space);
+        {
+            let wtxn = db.write_txn().unwrap();
+            apply_upsert_memory(&wtxn, &fixture_phase(id), &write).unwrap();
+            wtxn.commit().unwrap();
+        }
+        // Restore of a never-tombstoned memory: no-op success.
+        let wtxn = db.write_txn().unwrap();
+        let ack = apply_restore_memory(&wtxn, &restore(id), &write).unwrap();
+        assert!(matches!(
+            ack,
+            PhaseAck::MemoryRestored {
+                already_active: true,
+                ..
+            }
+        ));
+        wtxn.commit().unwrap();
+    }
+
+    #[test]
+    fn restore_refuses_hard_forgotten() {
+        let (_dir, db) = open_db();
+        let id = MemoryId::pack(0, 1, 0);
+        let space = SpaceId::new();
+        let write = fresh_write_for(space);
+        let hard = Phase::Tombstone {
+            target: TombstoneTarget::Memory {
+                id,
+                mode: crate::write::phase::TombstoneMode::Hard,
+            },
+            reason: 1,
+            at_unix_nanos: 1_700_000_001_000,
+        };
+        {
+            let wtxn = db.write_txn().unwrap();
+            apply_upsert_memory(&wtxn, &fixture_phase(id), &write).unwrap();
+            apply_tombstone_memory(&wtxn, &hard, &write).unwrap();
+            wtxn.commit().unwrap();
+        }
+        // The hard tombstone stamped HARD_FORGOTTEN; restore must refuse.
+        let wtxn = db.write_txn().unwrap();
+        let err = apply_restore_memory(&wtxn, &restore(id), &write).unwrap_err();
+        assert!(matches!(err, ApplyError::Invariant(_)));
+    }
+
+    #[test]
+    fn restore_missing_memory_not_found() {
+        let (_dir, db) = open_db();
+        let write = fresh_write_for(SpaceId::default());
+        let wtxn = db.write_txn().unwrap();
+        let err =
+            apply_restore_memory(&wtxn, &restore(MemoryId::pack(0, 999, 0)), &write).unwrap_err();
+        assert!(matches!(err, ApplyError::NotFound { what: "memory", .. }));
+    }
+
+    #[test]
+    fn restore_refuses_cross_tenant() {
+        let (_dir, db) = open_db();
+        let id = MemoryId::pack(0, 1, 0);
+        let space_a = SpaceId::new();
+        let space_b = SpaceId::new();
+        let write_a = fresh_write_for(space_a);
+        {
+            let wtxn = db.write_txn().unwrap();
+            apply_upsert_memory(&wtxn, &fixture_phase(id), &write_a).unwrap();
+            apply_tombstone_memory(&wtxn, &soft_tombstone(id), &write_a).unwrap();
+            wtxn.commit().unwrap();
+        }
+        // B tries to restore A's id — reads as NotFound (tenant wall).
+        let wtxn = db.write_txn().unwrap();
+        let err = apply_restore_memory(&wtxn, &restore(id), &fresh_write_for(space_b)).unwrap_err();
         assert!(matches!(err, ApplyError::NotFound { what: "memory", .. }));
     }
 }

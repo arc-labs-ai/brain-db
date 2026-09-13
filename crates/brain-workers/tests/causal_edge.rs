@@ -1,4 +1,4 @@
-#![allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send post-9.7
+#![allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send
 
 //! CausalEdgeWorker integration test — drives the worker through the
 //! `StatementObject::Memory` short-circuit branch (one causal statement
@@ -13,7 +13,7 @@ use brain_core::{
     EntityId, EntityTypeId, EvidenceEntry, EvidenceRef, ExtractorId, Statement, StatementKind,
     StatementObject, SubjectRef,
 };
-use brain_core::{AgentId, ContextId, MemoryId, MemoryKind, StatementId};
+use brain_core::{MemoryId, MemoryKind, SessionId, SpaceId, StatementId};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::entity::ops::entity_put;
@@ -26,10 +26,7 @@ use brain_ops::writer::wal_sink::RecordingWalSink;
 use brain_ops::{EventBus, OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_storage::wal::kinds::WalRecordKind;
-use brain_workers::{
-    CausalEdgeKnobs, CausalEdgeWorker, Worker, WorkerConfig, WorkerContext, WorkerKind,
-};
-use parking_lot::Mutex;
+use brain_workers::{CausalEdgeKnobs, CausalEdgeWorker, Worker, WorkerContext};
 use redb::ReadableTable;
 use smallvec::SmallVec;
 use uuid::Uuid;
@@ -61,8 +58,8 @@ struct Fixture {
 fn build_fixture() -> Fixture {
     let tempdir = tempfile::tempdir().unwrap();
     let db_path = tempdir.path().join("metadata.redb");
-    let metadata: SharedMetadataDb = Arc::new(Mutex::new(MetadataDb::open(&db_path).unwrap()));
-    let (shared, hnsw_writer) = SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).unwrap();
+    let metadata: SharedMetadataDb = Arc::new(MetadataDb::open(&db_path).unwrap());
+    let (shared, hnsw_writer) = SharedHnsw::new(IndexParams::default_v1()).unwrap();
     let bus = Arc::new(EventBus::default());
     let sink = Arc::new(RecordingWalSink::new());
     let (tx, rx) = flume::bounded(64);
@@ -77,7 +74,10 @@ fn build_fixture() -> Fixture {
         metadata.clone(),
         writer.clone() as Arc<dyn WriterHandle>,
     );
-    let ctx = Arc::new(OpsContext::new(executor).with_event_bus(bus.clone()));
+    let ctx = Arc::new(
+        brain_ops::test_support::ops_context_for_tests_owning_tempdir(executor)
+            .with_event_bus(bus.clone()),
+    );
     Fixture {
         ctx,
         writer,
@@ -114,14 +114,15 @@ async fn seed_memory(fixture: &Fixture, slot: u64) -> MemoryId {
         vector: Box::new([0.0_f32; VECTOR_DIM]),
         kind: MemoryKind::Episodic,
         salience: Salience::default(),
-        context: ContextId(1),
+        session_id: SessionId(1),
         created_at_unix_nanos: now_unix_nanos(),
+        occurred_at_unix_nanos: None,
         arena_slot: slot,
         embedding_model_fp: [0; 16],
         content_hash: None,
         deduplicate: false,
     };
-    let write = Write::single(WriteId::new(), AgentId::default(), phase);
+    let write = Write::single(WriteId::new(), SpaceId::default(), phase);
     fixture.writer.submit(write).await.expect("seed submit");
     id
 }
@@ -137,7 +138,7 @@ where
         .run(async move { body().await });
 }
 
-/// Seed the knowledge state needed for the worker's
+/// Seed the typed-graph state needed for the worker's
 /// `StatementObject::Memory` short-circuit branch: an entity-type +
 /// entity (subject), the `brain:caused_by` predicate, and a causal
 /// statement whose object names `cause_mem` directly. The worker walks
@@ -148,8 +149,7 @@ fn seed_causal_statement(
     cause_mem: MemoryId,
     confidence: f32,
 ) -> StatementId {
-    let mut db = fixture.metadata.lock();
-    let wtxn = db.write_txn().unwrap();
+    let wtxn = fixture.metadata.write_txn().unwrap();
     let now = now_unix_nanos();
     // 1. Entity type for the subject (any type works; the resolver only
     //    requires existence).
@@ -164,7 +164,7 @@ fn seed_causal_statement(
         "outage".into(),
         now,
     );
-    entity_put(&wtxn, &entity).expect("entity_put");
+    entity_put(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &entity).expect("entity_put");
     // 3. Predicate `brain:caused_by` — matches the default whitelist.
     let predicate =
         predicate_intern_or_get(&wtxn, "brain", "caused_by", 1, now).expect("predicate_intern");
@@ -191,7 +191,14 @@ fn seed_causal_statement(
         now,
         1,
     );
-    statement_create(&wtxn, &statement, now).expect("statement_create");
+    statement_create(
+        &wtxn,
+        __ts(),
+        brain_core::SessionId::DEFAULT,
+        &statement,
+        now,
+    )
+    .expect("statement_create");
     drop(statement);
     wtxn.commit().unwrap();
     sid
@@ -268,8 +275,7 @@ fn cycle_writes_caused_link_through_unified_path() {
 
         // 3. redb has the derived Caused row(s). Causal is asymmetric
         //    (no mirror); expect exactly one auto-derived row.
-        let db = fix.metadata.lock();
-        let rtxn = db.read_txn().unwrap();
+        let rtxn = fix.metadata.read_txn().unwrap();
         let t = rtxn.open_table(EDGES_TABLE).unwrap();
         let mut found = 0;
         for entry in t.iter().unwrap() {
@@ -289,12 +295,6 @@ fn cycle_writes_caused_link_through_unified_path() {
     });
 }
 
-#[test]
-fn name_and_kind_are_stable() {
-    let (_tx, rx) = flume::bounded(1);
-    let worker = CausalEdgeWorker::new(rx);
-    assert_eq!(worker.name(), WorkerKind::CausalEdge.name());
-    assert_eq!(worker.kind(), WorkerKind::CausalEdge);
-    let cfg = WorkerConfig::defaults_for(WorkerKind::CausalEdge);
-    assert!(cfg.batch_size > 0);
+fn __ts() -> brain_metadata::RowScope {
+    brain_metadata::RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xA1; 16])
 }

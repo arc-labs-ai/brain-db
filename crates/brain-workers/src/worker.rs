@@ -33,13 +33,25 @@ pub trait Worker: 'static {
     /// Configuration knobs (interval, batch_size, max_runtime).
     fn config(&self) -> WorkerConfig;
 
+    /// When `true`, the scheduler sleeps one `interval` *before* this
+    /// worker's first `run_cycle` instead of ticking immediately on
+    /// register. Defaults to `false` — most workers tick promptly so
+    /// any pending state from a previous run drains right away. The
+    /// Snapshot worker overrides this to `true`: an immediate tick at
+    /// shard spawn would write a CHECKPOINT_BEGIN/END pair to the WAL
+    /// before any user work, shifting LSN positions in ways that
+    /// surprise recovery tooling and tests.
+    fn skip_first_tick(&self) -> bool {
+        false
+    }
+
     /// Execute one bounded cycle. Returns the number of units
     /// processed — the scheduler adds it to `processed_total`.
     ///
     /// Implementations typically delegate to [`drive_batch`], which
-    /// honours the batch / runtime bounds and the
-    /// §11/01 §6 yield discipline. Workers with monolithic cycles
-    /// (e.g., HNSW rebuild) may implement their own bounded body.
+    /// honours the batch / runtime bounds and the yield discipline.
+    /// Workers with monolithic cycles (e.g., HNSW rebuild) may implement
+    /// their own bounded body.
     fn run_cycle<'a>(
         &'a self,
         ctx: &'a WorkerContext,
@@ -48,7 +60,7 @@ pub trait Worker: 'static {
 
 /// drive a stream of work-units, bounded by batch
 /// size, wall-clock time, and shutdown. Yields every
-/// `YIELD_EVERY` units (§11/01 §6).
+/// `YIELD_EVERY` units.
 ///
 /// `unit` returns `Ok(true)` when work was done and more *may* exist,
 /// `Ok(false)` when there's nothing else to do (cycle ends early),

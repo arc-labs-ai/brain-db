@@ -74,10 +74,10 @@ pub async fn handle_admin_list_merge_proposals(
     ctx: &OpsContext,
 ) -> Result<Vec<MergeProposalView>, OpError> {
     let limit = limit.unwrap_or(DEFAULT_LIST_LIMIT);
-    let metadata = ctx.executor.metadata.clone();
     let rows = {
-        let db = metadata.lock();
-        let rtxn = db
+        let rtxn = ctx
+            .executor
+            .metadata
             .read_txn()
             .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
         list_proposals_by_status(&rtxn, proposal_status::PENDING, limit)
@@ -96,9 +96,9 @@ pub async fn handle_admin_approve_merge(
     // Cheap pre-check so operators see "not found" instead of a generic
     // submit failure when the id is bogus.
     {
-        let metadata = ctx.executor.metadata.clone();
-        let db = metadata.lock();
-        let rtxn = db
+        let rtxn = ctx
+            .executor
+            .metadata
             .read_txn()
             .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
         let row = proposal_get(&rtxn, proposal_id)
@@ -118,14 +118,14 @@ pub async fn handle_admin_approve_merge(
     }
 
     let now = crate::txn::now_unix_nanos_pub();
-    let actor = MergeActor::Agent(ctx.executor.caller_agent.into());
+    let actor = MergeActor::Space(ctx.executor.caller_space.into());
     let phase = Phase::ApproveMerge {
         proposal_id,
         actor,
         grace_seconds: DEFAULT_ADMIN_APPROVE_GRACE_SECS,
         at_unix_nanos: now,
     };
-    let write = Write::single(WriteId::new(), ctx.executor.caller_agent, phase);
+    let write = Write::single(WriteId::new(), ctx.executor.caller_space, phase);
     let real_writer = downcast_writer_pub(ctx)?;
     let ack = real_writer
         .submit(write)
@@ -152,9 +152,9 @@ pub async fn handle_admin_reject_merge(
     ctx: &OpsContext,
 ) -> Result<(), OpError> {
     {
-        let metadata = ctx.executor.metadata.clone();
-        let db = metadata.lock();
-        let rtxn = db
+        let rtxn = ctx
+            .executor
+            .metadata
             .read_txn()
             .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
         let row = proposal_get(&rtxn, proposal_id)
@@ -178,7 +178,7 @@ pub async fn handle_admin_reject_merge(
         proposal_id,
         at_unix_nanos: now,
     };
-    let write = Write::single(WriteId::new(), ctx.executor.caller_agent, phase);
+    let write = Write::single(WriteId::new(), ctx.executor.caller_space, phase);
     let real_writer = downcast_writer_pub(ctx)?;
     let ack = real_writer
         .submit(write)

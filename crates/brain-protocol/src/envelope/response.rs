@@ -1,7 +1,7 @@
 //! Response-frame payload codecs.
 //!
 //! One variant of [`ResponseBody`] per client-bound opcode. Mirrors
-//! `crate::request` exactly: rkyv-archivable structs for the structured
+//! `crate::request` exactly: CBOR-encoded structs for the structured
 //! fields, raw vector blobs (where applicable) appended at the
 //! [`crate::Frame`] layer.
 //!
@@ -19,14 +19,14 @@
 //!
 //! The ERROR body ties to `ErrorCode` / `ErrorCategory`. Those enums
 //! live in [`crate::error`] and are intentionally `#[non_exhaustive]`
-//! for forward-compat. We mirror them here as plain rkyv-archivable
+//! for forward-compat. We mirror them here as plain closed
 //! enums so wire encoding/decoding is closed, and convert at the
 //! boundary via `From` impls.
 
-use crate::error::ProtocolError;
-use crate::connection::handshake::{AuthOkPayload, WelcomePayload};
+use crate::codec::cbor::{from_cbor_bytes, to_cbor_bytes};
 use crate::codec::opcode::Opcode;
-use crate::codec::rkyv::{from_rkyv_bytes, to_rkyv_bytes};
+use crate::connection::handshake::{AuthOkPayload, WelcomePayload};
+use crate::error::ProtocolError;
 
 // ---------------------------------------------------------------------------
 // Helper enums shared by multiple response bodies.
@@ -40,12 +40,16 @@ use crate::codec::rkyv::{from_rkyv_bytes, to_rkyv_bytes};
 pub use crate::connection::stream::{CancelStreamAck, PongResponse, ServerPingResponse};
 pub use crate::envelope::error::{ErrorDetails, ErrorResponse};
 pub use crate::ops::admin::*;
+pub use crate::ops::capabilities::*;
 pub use crate::ops::entity::*;
 pub use crate::ops::extractor::*;
+pub use crate::ops::graph::*;
 pub use crate::ops::memory::*;
 pub use crate::ops::procedural::*;
 pub use crate::ops::query::*;
 pub use crate::ops::relation::*;
+pub use crate::ops::session::*;
+pub use crate::ops::space::*;
 pub use crate::ops::statement::*;
 pub use crate::ops::subscribe::*;
 pub use crate::ops::txn::*;
@@ -56,7 +60,7 @@ pub use crate::shared::primitives::*;
 /// One variant per client-bound opcode. Mirrors
 /// [`crate::envelope::request::RequestBody`]; raw vector blobs (where applicable)
 /// live in the trailing section of [`crate::Frame::payload`] and are
-/// not part of the rkyv-encoded bytes this module produces.
+/// not part of the CBOR-encoded bytes this module produces.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ResponseBody {
     /// Server reply to HELLO (connection-level, stream 0).
@@ -64,14 +68,27 @@ pub enum ResponseBody {
     /// Server confirmation of authentication.
     AuthOk(AuthOkPayload),
     Encode(EncodeResponse),
+    /// Reply to `ENCODE_VECTOR_DIRECT_REQ`. Carries the same payload
+    /// shape as a regular `EncodeResponse`; the separate wire opcode
+    /// (`0x00AA`) lets clients tell the two paths apart and lets the
+    /// clients route by opcode without inspecting the body.
+    EncodeVectorDirect(EncodeResponse),
     Recall(RecallResponseFrame),
     Plan(PlanResponseFrame),
     Reason(ReasonResponseFrame),
     Forget(ForgetResponse),
     Link(LinkResponse),
     Unlink(UnlinkResponse),
+    /// Paginated enumeration page. Single-frame in v1; a later cut may
+    /// split into per-batch streaming.
+    MemoryList(MemoryListResponseFrame),
+    MemoryInspect(MemoryInspectResponse),
+    /// Paginated typed-graph export page (nodes + edges). Single-frame in
+    /// v1; nodes/edges may repeat across pages (dedup by id).
+    GraphFetch(GraphFetchResponseFrame),
     SubscribeEvent(SubscriptionEvent),
     Unsubscribe(UnsubscribeResponse),
+    GetCapabilities(GetCapabilitiesResponse),
     TxnBegin(TxnBeginResponse),
     TxnCommit(TxnCommitResponse),
     TxnAbort(TxnAbortResponse),
@@ -83,11 +100,14 @@ pub enum ResponseBody {
     AdminRestore(AdminRestoreResponse),
     AdminIntegrityCheck(AdminIntegrityCheckResponse),
     AdminMigrateEmbeddings(AdminMigrateEmbeddingsResponseFrame),
-    AdminCreateContext(AdminCreateContextResponse),
-    AdminRenameContext(AdminRenameContextResponse),
+    AdminCreateSession(AdminCreateSessionResponse),
+    AdminRenameSession(AdminRenameSessionResponse),
     AdminMoveMemory(AdminMoveMemoryResponse),
     AdminReclassify(AdminReclassifyResponse),
     AdminListTombstoned(AdminListTombstonedResponseFrame),
+    AdminListPendingContradictions(AdminListPendingContradictionsResponse),
+    AdminBackfill(AdminBackfillResponse),
+    AdminBackfillCancel(AdminBackfillCancelResponse),
 
     // Typed-graph namespace.
     EntityCreate(EntityCreateResponse),
@@ -131,22 +151,28 @@ pub enum ResponseBody {
     /// Single-frame snapshot in v1; a later cut may split into streaming.
     SchemaList(SchemaListResponseFrame),
     SchemaValidate(SchemaValidateResponse),
+    SchemaReplace(SchemaReplaceResponse),
+    SchemaDrop(SchemaDropResponse),
 
-    // Extractor governance ops.
+    // Extractor introspection (read-only).
     /// Single-frame snapshot in v1.
     ExtractorList(ExtractorListResponseFrame),
-    ExtractorDisable(ExtractorDisableResponse),
-    ExtractorEnable(ExtractorEnableResponse),
 
-    // Hybrid query ops.
-    Query(QueryResponse),
+    // Retrieval query ops.
     QueryExplain(QueryExplainResponse),
     QueryTrace(QueryTraceResponse),
-    RecallHybrid(RecallHybridResponse),
 
     // Procedural-memory materialization. Carries the rendered system
     // block plus the statement ids that contributed.
     MaterializeProcedural(MaterializeProceduralResponse),
+
+    // Space & session registry.
+    SpaceCreate(SpaceCreateResponse),
+    SpaceList(SpaceListResponse),
+    SpaceDelete(SpaceDeleteResponse),
+    SessionCreate(SessionCreateResponse),
+    SessionList(SessionListResponse),
+    SessionDelete(SessionDeleteResponse),
 
     Error(ErrorResponse),
 }
@@ -159,14 +185,19 @@ impl ResponseBody {
             Self::Welcome(_) => Opcode::Welcome,
             Self::AuthOk(_) => Opcode::AuthOk,
             Self::Encode(_) => Opcode::EncodeResp,
+            Self::EncodeVectorDirect(_) => Opcode::EncodeVectorDirectResp,
             Self::Recall(_) => Opcode::RecallResp,
             Self::Plan(_) => Opcode::PlanResp,
             Self::Reason(_) => Opcode::ReasonResp,
             Self::Forget(_) => Opcode::ForgetResp,
             Self::Link(_) => Opcode::LinkResp,
             Self::Unlink(_) => Opcode::UnlinkResp,
+            Self::MemoryList(_) => Opcode::MemoryListResp,
+            Self::MemoryInspect(_) => Opcode::MemoryInspectResp,
+            Self::GraphFetch(_) => Opcode::GraphFetchResp,
             Self::SubscribeEvent(_) => Opcode::SubscribeEvent,
             Self::Unsubscribe(_) => Opcode::UnsubscribeResp,
+            Self::GetCapabilities(_) => Opcode::GetCapabilitiesResp,
             Self::TxnBegin(_) => Opcode::TxnBeginResp,
             Self::TxnCommit(_) => Opcode::TxnCommitResp,
             Self::TxnAbort(_) => Opcode::TxnAbortResp,
@@ -178,11 +209,14 @@ impl ResponseBody {
             Self::AdminRestore(_) => Opcode::AdminRestoreResp,
             Self::AdminIntegrityCheck(_) => Opcode::AdminIntegrityCheckResp,
             Self::AdminMigrateEmbeddings(_) => Opcode::AdminMigrateEmbeddingsResp,
-            Self::AdminCreateContext(_) => Opcode::AdminCreateContextResp,
-            Self::AdminRenameContext(_) => Opcode::AdminRenameContextResp,
+            Self::AdminCreateSession(_) => Opcode::AdminCreateSessionResp,
+            Self::AdminRenameSession(_) => Opcode::AdminRenameSessionResp,
             Self::AdminMoveMemory(_) => Opcode::AdminMoveMemoryResp,
             Self::AdminReclassify(_) => Opcode::AdminReclassifyResp,
             Self::AdminListTombstoned(_) => Opcode::AdminListTombstonedResp,
+            Self::AdminListPendingContradictions(_) => Opcode::AdminListPendingContradictionsResp,
+            Self::AdminBackfill(_) => Opcode::AdminBackfillResp,
+            Self::AdminBackfillCancel(_) => Opcode::AdminBackfillCancelResp,
             Self::EntityCreate(_) => Opcode::EntityCreateResp,
             Self::EntityGet(_) => Opcode::EntityGetResp,
             Self::EntityUpdate(_) => Opcode::EntityUpdateResp,
@@ -210,14 +244,18 @@ impl ResponseBody {
             Self::SchemaGet(_) => Opcode::SchemaGetResp,
             Self::SchemaList(_) => Opcode::SchemaListResp,
             Self::SchemaValidate(_) => Opcode::SchemaValidateResp,
+            Self::SchemaReplace(_) => Opcode::SchemaReplaceResp,
+            Self::SchemaDrop(_) => Opcode::SchemaDropResp,
             Self::ExtractorList(_) => Opcode::ExtractorListResp,
-            Self::ExtractorDisable(_) => Opcode::ExtractorDisableResp,
-            Self::ExtractorEnable(_) => Opcode::ExtractorEnableResp,
-            Self::Query(_) => Opcode::QueryResp,
             Self::QueryExplain(_) => Opcode::QueryExplainResp,
             Self::QueryTrace(_) => Opcode::QueryTraceResp,
-            Self::RecallHybrid(_) => Opcode::RecallHybridResp,
             Self::MaterializeProcedural(_) => Opcode::MaterializeProceduralResp,
+            Self::SpaceCreate(_) => Opcode::SpaceCreateResp,
+            Self::SpaceList(_) => Opcode::SpaceListResp,
+            Self::SpaceDelete(_) => Opcode::SpaceDeleteResp,
+            Self::SessionCreate(_) => Opcode::SessionCreateResp,
+            Self::SessionList(_) => Opcode::SessionListResp,
+            Self::SessionDelete(_) => Opcode::SessionDeleteResp,
             Self::Error(_) => Opcode::Error,
         }
     }
@@ -241,78 +279,92 @@ impl ResponseBody {
             Self::RelationTraverse(r) => Some(r.is_final),
             Self::SchemaList(r) => Some(r.is_final),
             Self::ExtractorList(r) => Some(r.is_final),
+            Self::MemoryList(r) => Some(r.is_final),
+            Self::GraphFetch(r) => Some(r.is_final),
             _ => None,
         }
     }
 
-    /// Encode the structured body to bytes via rkyv. Vector blobs (where
+    /// Encode the structured body to bytes via CBOR. Vector blobs (where
     /// supported) are appended by callers at the [`crate::Frame`] layer.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         match self {
-            Self::Welcome(r) => to_rkyv_bytes(r),
-            Self::AuthOk(r) => to_rkyv_bytes(r),
-            Self::Encode(r) => to_rkyv_bytes(r),
-            Self::Recall(r) => to_rkyv_bytes(r),
-            Self::Plan(r) => to_rkyv_bytes(r),
-            Self::Reason(r) => to_rkyv_bytes(r),
-            Self::Forget(r) => to_rkyv_bytes(r),
-            Self::Link(r) => to_rkyv_bytes(r),
-            Self::Unlink(r) => to_rkyv_bytes(r),
-            Self::SubscribeEvent(r) => to_rkyv_bytes(r),
-            Self::Unsubscribe(r) => to_rkyv_bytes(r),
-            Self::TxnBegin(r) => to_rkyv_bytes(r),
-            Self::TxnCommit(r) => to_rkyv_bytes(r),
-            Self::TxnAbort(r) => to_rkyv_bytes(r),
-            Self::CancelStreamAck(r) => to_rkyv_bytes(r),
-            Self::Pong(r) => to_rkyv_bytes(r),
-            Self::ServerPing(r) => to_rkyv_bytes(r),
-            Self::AdminStats(r) => to_rkyv_bytes(r),
-            Self::AdminSnapshot(r) => to_rkyv_bytes(r),
-            Self::AdminRestore(r) => to_rkyv_bytes(r),
-            Self::AdminIntegrityCheck(r) => to_rkyv_bytes(r),
-            Self::AdminMigrateEmbeddings(r) => to_rkyv_bytes(r),
-            Self::AdminCreateContext(r) => to_rkyv_bytes(r),
-            Self::AdminRenameContext(r) => to_rkyv_bytes(r),
-            Self::AdminMoveMemory(r) => to_rkyv_bytes(r),
-            Self::AdminReclassify(r) => to_rkyv_bytes(r),
-            Self::AdminListTombstoned(r) => to_rkyv_bytes(r),
-            Self::EntityCreate(r) => to_rkyv_bytes(r),
-            Self::EntityGet(r) => to_rkyv_bytes(r),
-            Self::EntityUpdate(r) => to_rkyv_bytes(r),
-            Self::EntityRename(r) => to_rkyv_bytes(r),
-            Self::EntityMerge(r) => to_rkyv_bytes(r),
-            Self::EntityUnmerge(r) => to_rkyv_bytes(r),
-            Self::EntityResolve(r) => to_rkyv_bytes(r),
-            Self::EntityList(r) => to_rkyv_bytes(r),
-            Self::EntityTombstone(r) => to_rkyv_bytes(r),
-            Self::StatementCreate(r) => to_rkyv_bytes(r),
-            Self::StatementGet(r) => to_rkyv_bytes(r),
-            Self::StatementSupersede(r) => to_rkyv_bytes(r),
-            Self::StatementTombstone(r) => to_rkyv_bytes(r),
-            Self::StatementRetract(r) => to_rkyv_bytes(r),
-            Self::StatementHistory(r) => to_rkyv_bytes(r),
-            Self::StatementList(r) => to_rkyv_bytes(r),
-            Self::RelationCreate(r) => to_rkyv_bytes(r),
-            Self::RelationGet(r) => to_rkyv_bytes(r),
-            Self::RelationSupersede(r) => to_rkyv_bytes(r),
-            Self::RelationTombstone(r) => to_rkyv_bytes(r),
-            Self::RelationListFrom(r) => to_rkyv_bytes(r),
-            Self::RelationListTo(r) => to_rkyv_bytes(r),
-            Self::RelationTraverse(r) => to_rkyv_bytes(r),
-            Self::SchemaUpload(r) => to_rkyv_bytes(r),
-            Self::SchemaGet(r) => to_rkyv_bytes(r),
-            Self::SchemaList(r) => to_rkyv_bytes(r),
-            Self::SchemaValidate(r) => to_rkyv_bytes(r),
-            Self::ExtractorList(r) => to_rkyv_bytes(r),
-            Self::ExtractorDisable(r) => to_rkyv_bytes(r),
-            Self::ExtractorEnable(r) => to_rkyv_bytes(r),
-            Self::Query(r) => to_rkyv_bytes(r),
-            Self::QueryExplain(r) => to_rkyv_bytes(r),
-            Self::QueryTrace(r) => to_rkyv_bytes(r),
-            Self::RecallHybrid(r) => to_rkyv_bytes(r),
-            Self::MaterializeProcedural(r) => to_rkyv_bytes(r),
-            Self::Error(r) => to_rkyv_bytes(r),
+            Self::Welcome(r) => to_cbor_bytes(r),
+            Self::AuthOk(r) => to_cbor_bytes(r),
+            Self::Encode(r) => to_cbor_bytes(r),
+            Self::EncodeVectorDirect(r) => to_cbor_bytes(r),
+            Self::Recall(r) => to_cbor_bytes(r),
+            Self::Plan(r) => to_cbor_bytes(r),
+            Self::Reason(r) => to_cbor_bytes(r),
+            Self::Forget(r) => to_cbor_bytes(r),
+            Self::Link(r) => to_cbor_bytes(r),
+            Self::Unlink(r) => to_cbor_bytes(r),
+            Self::MemoryList(r) => to_cbor_bytes(r),
+            Self::MemoryInspect(r) => to_cbor_bytes(r),
+            Self::GraphFetch(r) => to_cbor_bytes(r),
+            Self::SubscribeEvent(r) => to_cbor_bytes(r),
+            Self::Unsubscribe(r) => to_cbor_bytes(r),
+            Self::GetCapabilities(r) => to_cbor_bytes(r),
+            Self::TxnBegin(r) => to_cbor_bytes(r),
+            Self::TxnCommit(r) => to_cbor_bytes(r),
+            Self::TxnAbort(r) => to_cbor_bytes(r),
+            Self::CancelStreamAck(r) => to_cbor_bytes(r),
+            Self::Pong(r) => to_cbor_bytes(r),
+            Self::ServerPing(r) => to_cbor_bytes(r),
+            Self::AdminStats(r) => to_cbor_bytes(r),
+            Self::AdminSnapshot(r) => to_cbor_bytes(r),
+            Self::AdminRestore(r) => to_cbor_bytes(r),
+            Self::AdminIntegrityCheck(r) => to_cbor_bytes(r),
+            Self::AdminMigrateEmbeddings(r) => to_cbor_bytes(r),
+            Self::AdminCreateSession(r) => to_cbor_bytes(r),
+            Self::AdminRenameSession(r) => to_cbor_bytes(r),
+            Self::AdminMoveMemory(r) => to_cbor_bytes(r),
+            Self::AdminReclassify(r) => to_cbor_bytes(r),
+            Self::AdminListTombstoned(r) => to_cbor_bytes(r),
+            Self::AdminListPendingContradictions(r) => to_cbor_bytes(r),
+            Self::AdminBackfill(r) => to_cbor_bytes(r),
+            Self::AdminBackfillCancel(r) => to_cbor_bytes(r),
+            Self::EntityCreate(r) => to_cbor_bytes(r),
+            Self::EntityGet(r) => to_cbor_bytes(r),
+            Self::EntityUpdate(r) => to_cbor_bytes(r),
+            Self::EntityRename(r) => to_cbor_bytes(r),
+            Self::EntityMerge(r) => to_cbor_bytes(r),
+            Self::EntityUnmerge(r) => to_cbor_bytes(r),
+            Self::EntityResolve(r) => to_cbor_bytes(r),
+            Self::EntityList(r) => to_cbor_bytes(r),
+            Self::EntityTombstone(r) => to_cbor_bytes(r),
+            Self::StatementCreate(r) => to_cbor_bytes(r),
+            Self::StatementGet(r) => to_cbor_bytes(r),
+            Self::StatementSupersede(r) => to_cbor_bytes(r),
+            Self::StatementTombstone(r) => to_cbor_bytes(r),
+            Self::StatementRetract(r) => to_cbor_bytes(r),
+            Self::StatementHistory(r) => to_cbor_bytes(r),
+            Self::StatementList(r) => to_cbor_bytes(r),
+            Self::RelationCreate(r) => to_cbor_bytes(r),
+            Self::RelationGet(r) => to_cbor_bytes(r),
+            Self::RelationSupersede(r) => to_cbor_bytes(r),
+            Self::RelationTombstone(r) => to_cbor_bytes(r),
+            Self::RelationListFrom(r) => to_cbor_bytes(r),
+            Self::RelationListTo(r) => to_cbor_bytes(r),
+            Self::RelationTraverse(r) => to_cbor_bytes(r),
+            Self::SchemaUpload(r) => to_cbor_bytes(r),
+            Self::SchemaGet(r) => to_cbor_bytes(r),
+            Self::SchemaList(r) => to_cbor_bytes(r),
+            Self::SchemaValidate(r) => to_cbor_bytes(r),
+            Self::SchemaReplace(r) => to_cbor_bytes(r),
+            Self::SchemaDrop(r) => to_cbor_bytes(r),
+            Self::ExtractorList(r) => to_cbor_bytes(r),
+            Self::QueryExplain(r) => to_cbor_bytes(r),
+            Self::QueryTrace(r) => to_cbor_bytes(r),
+            Self::MaterializeProcedural(r) => to_cbor_bytes(r),
+            Self::SpaceCreate(r) => to_cbor_bytes(r),
+            Self::SpaceList(r) => to_cbor_bytes(r),
+            Self::SpaceDelete(r) => to_cbor_bytes(r),
+            Self::SessionCreate(r) => to_cbor_bytes(r),
+            Self::SessionList(r) => to_cbor_bytes(r),
+            Self::SessionDelete(r) => to_cbor_bytes(r),
+            Self::Error(r) => to_cbor_bytes(r),
         }
     }
 
@@ -321,73 +373,87 @@ impl ResponseBody {
     /// response body (request opcodes).
     pub fn decode(opcode: Opcode, bytes: &[u8]) -> Result<Self, ProtocolError> {
         Ok(match opcode {
-            Opcode::Welcome => Self::Welcome(from_rkyv_bytes(bytes)?),
-            Opcode::AuthOk => Self::AuthOk(from_rkyv_bytes(bytes)?),
-            Opcode::EncodeResp => Self::Encode(from_rkyv_bytes(bytes)?),
-            Opcode::RecallResp => Self::Recall(from_rkyv_bytes(bytes)?),
-            Opcode::PlanResp => Self::Plan(from_rkyv_bytes(bytes)?),
-            Opcode::ReasonResp => Self::Reason(from_rkyv_bytes(bytes)?),
-            Opcode::ForgetResp => Self::Forget(from_rkyv_bytes(bytes)?),
-            Opcode::LinkResp => Self::Link(from_rkyv_bytes(bytes)?),
-            Opcode::UnlinkResp => Self::Unlink(from_rkyv_bytes(bytes)?),
-            Opcode::SubscribeEvent => Self::SubscribeEvent(from_rkyv_bytes(bytes)?),
-            Opcode::UnsubscribeResp => Self::Unsubscribe(from_rkyv_bytes(bytes)?),
-            Opcode::TxnBeginResp => Self::TxnBegin(from_rkyv_bytes(bytes)?),
-            Opcode::TxnCommitResp => Self::TxnCommit(from_rkyv_bytes(bytes)?),
-            Opcode::TxnAbortResp => Self::TxnAbort(from_rkyv_bytes(bytes)?),
-            Opcode::CancelStreamAck => Self::CancelStreamAck(from_rkyv_bytes(bytes)?),
-            Opcode::Pong => Self::Pong(from_rkyv_bytes(bytes)?),
-            Opcode::ServerPing => Self::ServerPing(from_rkyv_bytes(bytes)?),
-            Opcode::AdminStatsResp => Self::AdminStats(from_rkyv_bytes(bytes)?),
-            Opcode::AdminSnapshotResp => Self::AdminSnapshot(from_rkyv_bytes(bytes)?),
-            Opcode::AdminRestoreResp => Self::AdminRestore(from_rkyv_bytes(bytes)?),
-            Opcode::AdminIntegrityCheckResp => Self::AdminIntegrityCheck(from_rkyv_bytes(bytes)?),
+            Opcode::Welcome => Self::Welcome(from_cbor_bytes(bytes)?),
+            Opcode::AuthOk => Self::AuthOk(from_cbor_bytes(bytes)?),
+            Opcode::EncodeResp => Self::Encode(from_cbor_bytes(bytes)?),
+            Opcode::EncodeVectorDirectResp => Self::EncodeVectorDirect(from_cbor_bytes(bytes)?),
+            Opcode::RecallResp => Self::Recall(from_cbor_bytes(bytes)?),
+            Opcode::PlanResp => Self::Plan(from_cbor_bytes(bytes)?),
+            Opcode::ReasonResp => Self::Reason(from_cbor_bytes(bytes)?),
+            Opcode::ForgetResp => Self::Forget(from_cbor_bytes(bytes)?),
+            Opcode::LinkResp => Self::Link(from_cbor_bytes(bytes)?),
+            Opcode::UnlinkResp => Self::Unlink(from_cbor_bytes(bytes)?),
+            Opcode::MemoryListResp => Self::MemoryList(from_cbor_bytes(bytes)?),
+            Opcode::MemoryInspectResp => Self::MemoryInspect(from_cbor_bytes(bytes)?),
+            Opcode::GraphFetchResp => Self::GraphFetch(from_cbor_bytes(bytes)?),
+            Opcode::SubscribeEvent => Self::SubscribeEvent(from_cbor_bytes(bytes)?),
+            Opcode::UnsubscribeResp => Self::Unsubscribe(from_cbor_bytes(bytes)?),
+            Opcode::GetCapabilitiesResp => Self::GetCapabilities(from_cbor_bytes(bytes)?),
+            Opcode::TxnBeginResp => Self::TxnBegin(from_cbor_bytes(bytes)?),
+            Opcode::TxnCommitResp => Self::TxnCommit(from_cbor_bytes(bytes)?),
+            Opcode::TxnAbortResp => Self::TxnAbort(from_cbor_bytes(bytes)?),
+            Opcode::CancelStreamAck => Self::CancelStreamAck(from_cbor_bytes(bytes)?),
+            Opcode::Pong => Self::Pong(from_cbor_bytes(bytes)?),
+            Opcode::ServerPing => Self::ServerPing(from_cbor_bytes(bytes)?),
+            Opcode::AdminStatsResp => Self::AdminStats(from_cbor_bytes(bytes)?),
+            Opcode::AdminSnapshotResp => Self::AdminSnapshot(from_cbor_bytes(bytes)?),
+            Opcode::AdminRestoreResp => Self::AdminRestore(from_cbor_bytes(bytes)?),
+            Opcode::AdminIntegrityCheckResp => Self::AdminIntegrityCheck(from_cbor_bytes(bytes)?),
             Opcode::AdminMigrateEmbeddingsResp => {
-                Self::AdminMigrateEmbeddings(from_rkyv_bytes(bytes)?)
+                Self::AdminMigrateEmbeddings(from_cbor_bytes(bytes)?)
             }
-            Opcode::AdminCreateContextResp => Self::AdminCreateContext(from_rkyv_bytes(bytes)?),
-            Opcode::AdminRenameContextResp => Self::AdminRenameContext(from_rkyv_bytes(bytes)?),
-            Opcode::AdminMoveMemoryResp => Self::AdminMoveMemory(from_rkyv_bytes(bytes)?),
-            Opcode::AdminReclassifyResp => Self::AdminReclassify(from_rkyv_bytes(bytes)?),
-            Opcode::AdminListTombstonedResp => Self::AdminListTombstoned(from_rkyv_bytes(bytes)?),
-            Opcode::EntityCreateResp => Self::EntityCreate(from_rkyv_bytes(bytes)?),
-            Opcode::EntityGetResp => Self::EntityGet(from_rkyv_bytes(bytes)?),
-            Opcode::EntityUpdateResp => Self::EntityUpdate(from_rkyv_bytes(bytes)?),
-            Opcode::EntityRenameResp => Self::EntityRename(from_rkyv_bytes(bytes)?),
-            Opcode::EntityMergeResp => Self::EntityMerge(from_rkyv_bytes(bytes)?),
-            Opcode::EntityUnmergeResp => Self::EntityUnmerge(from_rkyv_bytes(bytes)?),
-            Opcode::EntityResolveResp => Self::EntityResolve(from_rkyv_bytes(bytes)?),
-            Opcode::EntityListResp => Self::EntityList(from_rkyv_bytes(bytes)?),
-            Opcode::EntityTombstoneResp => Self::EntityTombstone(from_rkyv_bytes(bytes)?),
-            Opcode::StatementCreateResp => Self::StatementCreate(from_rkyv_bytes(bytes)?),
-            Opcode::StatementGetResp => Self::StatementGet(from_rkyv_bytes(bytes)?),
-            Opcode::StatementSupersedeResp => Self::StatementSupersede(from_rkyv_bytes(bytes)?),
-            Opcode::StatementTombstoneResp => Self::StatementTombstone(from_rkyv_bytes(bytes)?),
-            Opcode::StatementRetractResp => Self::StatementRetract(from_rkyv_bytes(bytes)?),
-            Opcode::StatementHistoryResp => Self::StatementHistory(from_rkyv_bytes(bytes)?),
-            Opcode::StatementListResp => Self::StatementList(from_rkyv_bytes(bytes)?),
-            Opcode::RelationCreateResp => Self::RelationCreate(from_rkyv_bytes(bytes)?),
-            Opcode::RelationGetResp => Self::RelationGet(from_rkyv_bytes(bytes)?),
-            Opcode::RelationSupersedeResp => Self::RelationSupersede(from_rkyv_bytes(bytes)?),
-            Opcode::RelationTombstoneResp => Self::RelationTombstone(from_rkyv_bytes(bytes)?),
-            Opcode::RelationListFromResp => Self::RelationListFrom(from_rkyv_bytes(bytes)?),
-            Opcode::RelationListToResp => Self::RelationListTo(from_rkyv_bytes(bytes)?),
-            Opcode::RelationTraverseResp => Self::RelationTraverse(from_rkyv_bytes(bytes)?),
-            Opcode::SchemaUploadResp => Self::SchemaUpload(from_rkyv_bytes(bytes)?),
-            Opcode::SchemaGetResp => Self::SchemaGet(from_rkyv_bytes(bytes)?),
-            Opcode::SchemaListResp => Self::SchemaList(from_rkyv_bytes(bytes)?),
-            Opcode::SchemaValidateResp => Self::SchemaValidate(from_rkyv_bytes(bytes)?),
-            Opcode::ExtractorListResp => Self::ExtractorList(from_rkyv_bytes(bytes)?),
-            Opcode::ExtractorDisableResp => Self::ExtractorDisable(from_rkyv_bytes(bytes)?),
-            Opcode::ExtractorEnableResp => Self::ExtractorEnable(from_rkyv_bytes(bytes)?),
-            Opcode::QueryResp => Self::Query(from_rkyv_bytes(bytes)?),
-            Opcode::QueryExplainResp => Self::QueryExplain(from_rkyv_bytes(bytes)?),
-            Opcode::QueryTraceResp => Self::QueryTrace(from_rkyv_bytes(bytes)?),
-            Opcode::RecallHybridResp => Self::RecallHybrid(from_rkyv_bytes(bytes)?),
+            Opcode::AdminCreateSessionResp => Self::AdminCreateSession(from_cbor_bytes(bytes)?),
+            Opcode::AdminRenameSessionResp => Self::AdminRenameSession(from_cbor_bytes(bytes)?),
+            Opcode::AdminMoveMemoryResp => Self::AdminMoveMemory(from_cbor_bytes(bytes)?),
+            Opcode::AdminReclassifyResp => Self::AdminReclassify(from_cbor_bytes(bytes)?),
+            Opcode::AdminListTombstonedResp => Self::AdminListTombstoned(from_cbor_bytes(bytes)?),
+            Opcode::AdminListPendingContradictionsResp => {
+                Self::AdminListPendingContradictions(from_cbor_bytes(bytes)?)
+            }
+            Opcode::AdminBackfillResp => Self::AdminBackfill(from_cbor_bytes(bytes)?),
+            Opcode::AdminBackfillCancelResp => Self::AdminBackfillCancel(from_cbor_bytes(bytes)?),
+            Opcode::EntityCreateResp => Self::EntityCreate(from_cbor_bytes(bytes)?),
+            Opcode::EntityGetResp => Self::EntityGet(from_cbor_bytes(bytes)?),
+            Opcode::EntityUpdateResp => Self::EntityUpdate(from_cbor_bytes(bytes)?),
+            Opcode::EntityRenameResp => Self::EntityRename(from_cbor_bytes(bytes)?),
+            Opcode::EntityMergeResp => Self::EntityMerge(from_cbor_bytes(bytes)?),
+            Opcode::EntityUnmergeResp => Self::EntityUnmerge(from_cbor_bytes(bytes)?),
+            Opcode::EntityResolveResp => Self::EntityResolve(from_cbor_bytes(bytes)?),
+            Opcode::EntityListResp => Self::EntityList(from_cbor_bytes(bytes)?),
+            Opcode::EntityTombstoneResp => Self::EntityTombstone(from_cbor_bytes(bytes)?),
+            Opcode::StatementCreateResp => Self::StatementCreate(from_cbor_bytes(bytes)?),
+            Opcode::StatementGetResp => Self::StatementGet(from_cbor_bytes(bytes)?),
+            Opcode::StatementSupersedeResp => Self::StatementSupersede(from_cbor_bytes(bytes)?),
+            Opcode::StatementTombstoneResp => Self::StatementTombstone(from_cbor_bytes(bytes)?),
+            Opcode::StatementRetractResp => Self::StatementRetract(from_cbor_bytes(bytes)?),
+            Opcode::StatementHistoryResp => Self::StatementHistory(from_cbor_bytes(bytes)?),
+            Opcode::StatementListResp => Self::StatementList(from_cbor_bytes(bytes)?),
+            Opcode::RelationCreateResp => Self::RelationCreate(from_cbor_bytes(bytes)?),
+            Opcode::RelationGetResp => Self::RelationGet(from_cbor_bytes(bytes)?),
+            Opcode::RelationSupersedeResp => Self::RelationSupersede(from_cbor_bytes(bytes)?),
+            Opcode::RelationTombstoneResp => Self::RelationTombstone(from_cbor_bytes(bytes)?),
+            Opcode::RelationListFromResp => Self::RelationListFrom(from_cbor_bytes(bytes)?),
+            Opcode::RelationListToResp => Self::RelationListTo(from_cbor_bytes(bytes)?),
+            Opcode::RelationTraverseResp => Self::RelationTraverse(from_cbor_bytes(bytes)?),
+            Opcode::SchemaUploadResp => Self::SchemaUpload(from_cbor_bytes(bytes)?),
+            Opcode::SchemaGetResp => Self::SchemaGet(from_cbor_bytes(bytes)?),
+            Opcode::SchemaListResp => Self::SchemaList(from_cbor_bytes(bytes)?),
+            Opcode::SchemaValidateResp => Self::SchemaValidate(from_cbor_bytes(bytes)?),
+            Opcode::SchemaReplaceResp => Self::SchemaReplace(from_cbor_bytes(bytes)?),
+            Opcode::SchemaDropResp => Self::SchemaDrop(from_cbor_bytes(bytes)?),
+            Opcode::ExtractorListResp => Self::ExtractorList(from_cbor_bytes(bytes)?),
+            Opcode::QueryExplainResp => Self::QueryExplain(from_cbor_bytes(bytes)?),
+            Opcode::QueryTraceResp => Self::QueryTrace(from_cbor_bytes(bytes)?),
             Opcode::MaterializeProceduralResp => {
-                Self::MaterializeProcedural(from_rkyv_bytes(bytes)?)
+                Self::MaterializeProcedural(from_cbor_bytes(bytes)?)
             }
-            Opcode::Error => Self::Error(from_rkyv_bytes(bytes)?),
+            Opcode::SpaceCreateResp => Self::SpaceCreate(from_cbor_bytes(bytes)?),
+            Opcode::SpaceListResp => Self::SpaceList(from_cbor_bytes(bytes)?),
+            Opcode::SpaceDeleteResp => Self::SpaceDelete(from_cbor_bytes(bytes)?),
+            Opcode::SessionCreateResp => Self::SessionCreate(from_cbor_bytes(bytes)?),
+            Opcode::SessionListResp => Self::SessionList(from_cbor_bytes(bytes)?),
+            Opcode::SessionDeleteResp => Self::SessionDelete(from_cbor_bytes(bytes)?),
+            Opcode::Error => Self::Error(from_cbor_bytes(bytes)?),
             other => return Err(ProtocolError::UnknownOpcode(other.as_u16())),
         })
     }
@@ -400,8 +466,9 @@ impl ResponseBody {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::{ErrorCategory, ErrorCode};
-    use crate::envelope::request::{EdgeKindWire, ForgetMode, MemoryKindWire, WireMemoryId, WireUuid};
+    use crate::envelope::request::{
+        EdgeKindWire, ForgetMode, MemoryKindWire, WireMemoryId, WireUuid,
+    };
 
     fn round_trip(body: ResponseBody) {
         let bytes = body.encode();
@@ -430,8 +497,8 @@ mod tests {
             salience: 0.5,
             auto_edges_added: 3,
             lsn: 42,
-            agent_id: [0xAA; 16],
-            context_id: 7,
+            space_id: [0xAA; 16],
+            session_id: 7,
             kind: MemoryKindWire::Episodic,
             created_at_unix_nanos: 1_700_000_000_000_000_000,
             edges_out_count: 3,
@@ -442,21 +509,47 @@ mod tests {
                 StageKind::Extractor,
             ],
             has_active_schema: true,
-            has_llm_extractor: true,
+            trace: None,
+        }));
+    }
+
+    #[test]
+    fn encode_vector_direct_response_round_trips() {
+        // Same payload shape as `EncodeResponse` — the separate
+        // variant only exists so the wire opcode (`0x00AA`) is
+        // recoverable from the body.
+        round_trip(ResponseBody::EncodeVectorDirect(EncodeResponse {
+            memory_id: sample_memory_id(),
+            was_deduplicated: false,
+            salience: 0.5,
+            auto_edges_added: 0,
+            lsn: 99,
+            space_id: [0xAA; 16],
+            session_id: 7,
+            kind: MemoryKindWire::Episodic,
+            created_at_unix_nanos: 1_700_000_000_000_000_000,
+            edges_out_count: 0,
+            embedding_model_fp: [0xBB; 16],
+            pending_stages: Vec::new(),
+            has_active_schema: false,
+            trace: None,
         }));
     }
 
     #[test]
     fn recall_response_round_trips() {
         round_trip(ResponseBody::Recall(RecallResponseFrame {
-            results: vec![MemoryResult {
+            trace: None,
+            answer_kind: AnswerKindWire::Single,
+            memories: vec![MemoryResult {
                 memory_id: sample_memory_id(),
                 text: "first result".into(),
                 similarity_score: 0.92,
                 confidence: 0.85,
                 salience: 0.5,
                 kind: MemoryKindWire::Episodic,
-                context_id: 1_u64,
+                space_id: sample_uuid(42),
+                session_id: 1_u64,
                 created_at_unix_nanos: 1_700_000_000_000_000_000,
                 last_accessed_at_unix_nanos: 1_700_000_001_000_000_000,
                 contributing_retrievers: vec![
@@ -464,6 +557,7 @@ mod tests {
                     crate::shared::enums::RetrieverNameWire::Lexical,
                 ],
                 fused_score: 0.0164,
+                rerank_score: Some(2.31),
                 edges: Some(vec![EdgeView {
                     target: sample_memory_id(),
                     kind: EdgeKindWire::Caused,
@@ -474,6 +568,7 @@ mod tests {
                 lsn: 100,
                 flags: 0x1,
                 consolidated_at_unix_nanos: None,
+                occurred_at_unix_nanos: Some(1_699_990_000_000_000_000),
                 edges_out_count: 2,
                 edges_in_count: 3,
                 graph: None,
@@ -481,6 +576,76 @@ mod tests {
             is_final: false,
             cumulative_count: 1,
             estimated_remaining: Some(9),
+        }));
+    }
+
+    #[test]
+    fn recall_response_round_trips_with_trace() {
+        use crate::ops::memory::{
+            RankedItemKindWire, RecallTrace, RecallTraceDroppedId, RecallTraceFilterChain,
+            RecallTraceRerank, RecallTraceRetriever, RecallTraceRetrieverStatus,
+        };
+        round_trip(ResponseBody::Recall(RecallResponseFrame {
+            answer_kind: AnswerKindWire::None,
+            memories: Vec::new(),
+            is_final: true,
+            cumulative_count: 0,
+            estimated_remaining: Some(0),
+            trace: Some(RecallTrace {
+                retrievers: vec![
+                    RecallTraceRetriever {
+                        name: crate::shared::enums::RetrieverNameWire::Semantic,
+                        status: RecallTraceRetrieverStatus::Success,
+                        status_detail: String::new(),
+                        latency_ms: 1.5,
+                        candidate_count: 12,
+                        candidates: Vec::new(),
+                    },
+                    RecallTraceRetriever {
+                        name: crate::shared::enums::RetrieverNameWire::Graph,
+                        status: RecallTraceRetrieverStatus::Skipped,
+                        status_detail: "no anchor".into(),
+                        latency_ms: 0.0,
+                        candidate_count: 0,
+                        candidates: Vec::new(),
+                    },
+                ],
+                filter_chain: RecallTraceFilterChain {
+                    before: 12,
+                    after_type: 12,
+                    after_temporal: 10,
+                    after_confidence: 8,
+                    after_tombstone: 8,
+                    after_supersession: 7,
+                    after_as_of: 7,
+                    after_limit: 5,
+                    dropped_by_type: Vec::new(),
+                    dropped_by_temporal: Vec::new(),
+                    dropped_by_confidence: Vec::new(),
+                    dropped_by_tombstone: Vec::new(),
+                    dropped_by_supersession: vec![RecallTraceDroppedId {
+                        kind: RankedItemKindWire::Statement,
+                        id: sample_memory_id(),
+                    }],
+                    dropped_by_as_of: vec![RecallTraceDroppedId {
+                        kind: RankedItemKindWire::Relation,
+                        id: sample_memory_id(),
+                    }],
+                    dropped_by_limit: vec![RecallTraceDroppedId {
+                        kind: RankedItemKindWire::Memory,
+                        id: sample_memory_id(),
+                    }],
+                },
+                rerank: Some(RecallTraceRerank {
+                    applied: true,
+                    candidates: 5,
+                    latency_ms: 2.25,
+                    before_order: Vec::new(),
+                    after_order: Vec::new(),
+                }),
+                total_latency_ms: 4.75,
+                fusion: None,
+            }),
         }));
     }
 
@@ -504,12 +669,14 @@ mod tests {
                 }],
                 is_final: false,
                 plan_status: None,
+                trace: None,
             }));
         }
         round_trip(ResponseBody::Plan(PlanResponseFrame {
             steps: vec![],
             is_final: true,
             plan_status: Some(PlanStatus::GoalReached),
+            trace: None,
         }));
     }
 
@@ -526,11 +693,13 @@ mod tests {
             }],
             is_final: false,
             reason_status: None,
+            trace: None,
         }));
         round_trip(ResponseBody::Reason(ReasonResponseFrame {
             inferences: vec![],
             is_final: true,
             reason_status: Some(ReasonStatus::Complete),
+            trace: None,
         }));
     }
 
@@ -548,13 +717,13 @@ mod tests {
         round_trip(ResponseBody::SubscribeEvent(SubscriptionEvent {
             event_type: EventType::Encoded,
             memory_id: sample_memory_id(),
-            context_id: 2_u64,
+            session_id: 2_u64,
             text: "new memory".into(),
             kind: MemoryKindWire::Episodic,
             salience: 0.5,
             timestamp_unix_nanos: 1_700_000_000_000_000_000,
             lsn: 1234,
-            knowledge_payload: None,
+            graph_payload: None,
             edge_payload: None,
             stage_kind: None,
             stage_outcome: None,
@@ -567,6 +736,32 @@ mod tests {
         round_trip(ResponseBody::Unsubscribe(UnsubscribeResponse {
             target_stream_id: 7,
             final_lsn: 9999,
+        }));
+    }
+
+    #[test]
+    fn get_capabilities_response_round_trips() {
+        round_trip(ResponseBody::GetCapabilities(GetCapabilitiesResponse {
+            capabilities: Capabilities {
+                rerank: true,
+                llm_extractor: false,
+                classifier_extractor: true,
+                pattern_extractor: true,
+                schema_namespaces: vec!["acme".into(), "personal".into()],
+                vector_dim: 384,
+            },
+        }));
+        // Empty namespace list (no user schema declared) — exercise
+        // the Vec encoding's empty-collection path.
+        round_trip(ResponseBody::GetCapabilities(GetCapabilitiesResponse {
+            capabilities: Capabilities {
+                rerank: false,
+                llm_extractor: false,
+                classifier_extractor: false,
+                pattern_extractor: true,
+                schema_namespaces: Vec::new(),
+                vector_dim: 384,
+            },
         }));
     }
 
@@ -615,7 +810,7 @@ mod tests {
                 total_memories: 1_000_000,
                 total_active_memories: 999_000,
                 total_tombstoned_memories: 1_000,
-                total_contexts: 10,
+                total_sessions: 10,
                 encode_qps: 100.5,
                 recall_qps: 50.25,
                 p99_encode_latency_ms: 2.0,
@@ -631,8 +826,8 @@ mod tests {
                 last_checkpoint_lsn: 1_000_000,
                 arena_used_bytes: 1024 * 1024,
             }]),
-            per_context: Some(vec![ContextStats {
-                context_id: 4_u64,
+            per_session: Some(vec![SessionStats {
+                session_id: 4_u64,
                 name: "default".into(),
                 memory_count: 100,
                 last_encoded_at_unix_nanos: 1,
@@ -696,23 +891,23 @@ mod tests {
                 status: Some(MigrationStatus::Completed),
             },
         ));
-        round_trip(ResponseBody::AdminCreateContext(
-            AdminCreateContextResponse {
-                context_id: 6_u64,
+        round_trip(ResponseBody::AdminCreateSession(
+            AdminCreateSessionResponse {
+                session_id: 6_u64,
                 name: "personal".into(),
             },
         ));
-        round_trip(ResponseBody::AdminRenameContext(
-            AdminRenameContextResponse {
-                context_id: 7_u64,
+        round_trip(ResponseBody::AdminRenameSession(
+            AdminRenameSessionResponse {
+                session_id: 7_u64,
                 new_name: "renamed".into(),
                 old_name: "original".into(),
             },
         ));
         round_trip(ResponseBody::AdminMoveMemory(AdminMoveMemoryResponse {
             memory_id: sample_memory_id(),
-            new_context_id: 8_u64,
-            old_context_id: 9_u64,
+            new_session_id: 8_u64,
+            old_session_id: 9_u64,
         }));
         round_trip(ResponseBody::AdminReclassify(AdminReclassifyResponse {
             memory_id: sample_memory_id(),
@@ -732,6 +927,53 @@ mod tests {
                 is_final: false,
             },
         ));
+        round_trip(ResponseBody::AdminListPendingContradictions(
+            AdminListPendingContradictionsResponse {
+                contradictions: vec![ContradictionAuditView {
+                    audit_id: [7u8; 16],
+                    subject_id: [9u8; 16],
+                    predicate_id: 42,
+                    contradicting_statement_ids: vec![[1u8; 16], [2u8; 16]],
+                    detected_at_unix_nanos: 1234,
+                    outcome: 0,
+                }],
+            },
+        ));
+        round_trip(ResponseBody::AdminBackfill(AdminBackfillResponse {
+            backfill_id: sample_uuid(31),
+            progress: BackfillProgress {
+                running: true,
+                completed: 12,
+                failed: 1,
+                skipped_already_completed: 4,
+                last_processed_memory_id_present: true,
+                last_processed_memory_id: sample_memory_id(),
+            },
+        }));
+        round_trip(ResponseBody::AdminBackfillCancel(
+            AdminBackfillCancelResponse {
+                backfill_id: sample_uuid(32),
+                cancelled: true,
+                progress: BackfillProgress::idle(),
+            },
+        ));
+        round_trip(ResponseBody::AdminBackfillCancel(
+            AdminBackfillCancelResponse {
+                backfill_id: sample_uuid(33),
+                cancelled: false,
+                progress: BackfillProgress::idle(),
+            },
+        ));
+    }
+
+    #[test]
+    fn schema_replace_response_round_trips() {
+        round_trip(ResponseBody::SchemaReplace(SchemaReplaceResponse {
+            namespace: "acme".into(),
+            schema_version: 7,
+            dropped_count: 12,
+            validation_errors: Vec::new(),
+        }));
     }
 
     #[test]
@@ -756,19 +998,25 @@ mod tests {
         // 3-frame sequence and verify ordering survives.
         let seq: Vec<ResponseBody> = vec![
             ResponseBody::Recall(RecallResponseFrame {
-                results: vec![],
+                trace: None,
+                answer_kind: AnswerKindWire::None,
+                memories: vec![],
                 is_final: false,
                 cumulative_count: 0,
                 estimated_remaining: Some(10),
             }),
             ResponseBody::Recall(RecallResponseFrame {
-                results: vec![],
+                trace: None,
+                answer_kind: AnswerKindWire::None,
+                memories: vec![],
                 is_final: false,
                 cumulative_count: 5,
                 estimated_remaining: Some(5),
             }),
             ResponseBody::Recall(RecallResponseFrame {
-                results: vec![],
+                trace: None,
+                answer_kind: AnswerKindWire::None,
+                memories: vec![],
                 is_final: true,
                 cumulative_count: 10,
                 estimated_remaining: Some(0),
@@ -795,7 +1043,9 @@ mod tests {
         // Streaming variants report Some(...).
         assert_eq!(
             ResponseBody::Recall(RecallResponseFrame {
-                results: vec![],
+                trace: None,
+                answer_kind: AnswerKindWire::None,
+                memories: vec![],
                 is_final: true,
                 cumulative_count: 0,
                 estimated_remaining: None,
@@ -817,13 +1067,13 @@ mod tests {
             ResponseBody::SubscribeEvent(SubscriptionEvent {
                 event_type: EventType::Encoded,
                 memory_id: 0,
-                context_id: 0,
+                session_id: 0,
                 text: String::new(),
                 kind: MemoryKindWire::Episodic,
                 salience: 0.0,
                 timestamp_unix_nanos: 0,
                 lsn: 0,
-                knowledge_payload: None,
+                graph_payload: None,
                 edge_payload: None,
                 stage_kind: None,
                 stage_outcome: None,
@@ -851,14 +1101,14 @@ mod tests {
     #[test]
     fn handshake_response_bodies_round_trip() {
         use crate::connection::handshake::{
-            AgentPermissions, AuthMethod, AuthOkPayload, HelloCapabilities, ServerFeatures,
+            AuthMethod, AuthOkPayload, HelloCapabilities, ServerFeatures, SpacePermissions,
             WelcomePayload,
         };
 
         let welcome = ResponseBody::Welcome(WelcomePayload {
             server_id: "brain-server/0.5.0".into(),
             chosen_version: 1,
-            session_id: sample_uuid(20),
+            connection_id: sample_uuid(20),
             capabilities: HelloCapabilities {
                 streaming: true,
                 compression_zstd: false,
@@ -868,20 +1118,22 @@ mod tests {
                 max_payload_size: 16 * 1024 * 1024 - 1,
                 max_concurrent_streams: 1024,
                 idle_timeout_seconds: 300,
-                auth_methods: vec![AuthMethod::Token, AuthMethod::None],
+                auth_methods: vec![AuthMethod::Token, AuthMethod::Mtls],
             },
         });
         let auth_ok = ResponseBody::AuthOk(AuthOkPayload {
-            agent_id: sample_uuid(21),
+            space_id: sample_uuid(21),
             bound_shard_id: 5,
-            permissions: AgentPermissions {
+            permissions: SpacePermissions {
                 can_encode: true,
                 can_recall: true,
                 can_plan: true,
                 can_reason: true,
                 can_forget: true,
                 can_admin: false,
+                can_act_as: false,
             },
+            namespace: "acme".to_string(),
             server_time_unix_nanos: 1_700_000_000_000_000_000,
         });
 
@@ -889,42 +1141,6 @@ mod tests {
             let bytes = body.encode();
             let decoded = ResponseBody::decode(body.opcode(), &bytes).unwrap();
             assert_eq!(decoded, body);
-        }
-    }
-
-    #[test]
-    fn error_code_wire_round_trips_through_canonical() {
-        // ErrorCode → ErrorCodeWire → ErrorCode is the identity for every
-        // code (sanity-check on the From mappings).
-        for code in [
-            ErrorCode::BadMagic,
-            ErrorCode::Unauthenticated,
-            ErrorCode::PermissionDenied,
-            ErrorCode::InvalidArgument,
-            ErrorCode::MemoryNotFound,
-            ErrorCode::IdempotencyConflict,
-            ErrorCode::OutOfSlots,
-            ErrorCode::Internal,
-            ErrorCode::ShardUnavailable,
-        ] {
-            let wire: ErrorCodeWire = code.into();
-            let back: ErrorCode = wire.into();
-            assert_eq!(back, code);
-        }
-        for cat in [
-            ErrorCategory::Protocol,
-            ErrorCategory::Authentication,
-            ErrorCategory::Authorization,
-            ErrorCategory::Validation,
-            ErrorCategory::NotFound,
-            ErrorCategory::Conflict,
-            ErrorCategory::ResourceExhausted,
-            ErrorCategory::Internal,
-            ErrorCategory::Unavailable,
-        ] {
-            let wire: ErrorCategoryWire = cat.into();
-            let back: ErrorCategory = wire.into();
-            assert_eq!(back, cat);
         }
     }
 }

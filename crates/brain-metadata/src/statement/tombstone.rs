@@ -2,13 +2,11 @@
 //!
 //! Physical reclamation lives in [`crate::extractor::sweep`].
 
-use brain_core::TombstoneReason;
 use brain_core::StatementId;
+use brain_core::TombstoneReason;
 use redb::{ReadableTable, WriteTransaction};
 
-use crate::tables::statement::{
-    StatementMetadata, STATEMENTS_BY_SUBJECT_TABLE, STATEMENTS_TABLE, STATEMENT_EMBED_QUEUE_TABLE,
-};
+use crate::tables::statement::{StatementMetadata, STATEMENTS_TABLE, STATEMENT_EMBED_QUEUE_TABLE};
 
 use super::StatementOpError;
 
@@ -33,6 +31,8 @@ pub fn statement_tombstone(
     let subject_bytes = row.subject_entity_bytes;
     let kind_byte = row.kind;
     let pred = row.predicate_id;
+    // Tear down the SAME scoped index keys the row was written under.
+    let scope = row.scope();
 
     row.tombstoned = 1;
     row.tombstoned_at_unix_nanos = Some(now_unix_nanos);
@@ -50,10 +50,24 @@ pub fn statement_tombstone(
         t.insert(&row.statement_id_bytes, &row)?;
     }
     if was_current {
-        let mut bys = wtxn.open_table(STATEMENTS_BY_SUBJECT_TABLE)?;
-        bys.remove(&(subject_bytes, kind_byte, pred, 1u8))?;
-        bys.insert(
-            &(subject_bytes, kind_byte, pred, 0u8),
+        super::crud::flip_by_subject_to_noncurrent(
+            wtxn,
+            scope,
+            subject_bytes,
+            kind_byte,
+            pred,
+            &row.statement_id_bytes,
+        )?;
+        // A tombstoned row is no longer current — drop its
+        // predicate-bucket entry so predicate-anchored queries stop
+        // returning it. Ownership-guarded (a superseded row's entry is
+        // already gone; this is then a no-op).
+        super::remove_from_predicate_index(
+            wtxn,
+            scope,
+            pred,
+            kind_byte,
+            row.confidence,
             &row.statement_id_bytes,
         )?;
     }
@@ -68,20 +82,21 @@ pub fn statement_tombstone(
     Ok(())
 }
 
-/// Hard-delete intent. v1 implementation = `tombstone` with reason
-/// `ExtractorRetraction` (caller may override). Physical reclamation
-/// happens later via the phase-21+ GC worker.
-//
-// TODO(phase 21): wire the periodic reclamation worker so retracted
-// rows are physically removed from STATEMENTS_TABLE + indexes after
-// `RETRACT_GRACE_NANOS`.
+/// Hard-delete intent. Tombstones the row and stamps the durable
+/// [`TombstoneReason::Retract`] marker so the periodic reclamation GC
+/// worker ([`crate::extractor::sweep::reclaim_retracted_statements`])
+/// physically removes it from every table after the grace period. The
+/// caller's `reason` is ignored for the stored byte — retract is its
+/// own reason — but kept in the signature for call-site symmetry with
+/// [`statement_tombstone`]; pass the audit reason for any out-of-band
+/// logging the caller does.
 pub fn statement_retract(
     wtxn: &WriteTransaction,
     id: StatementId,
-    reason: TombstoneReason,
+    _reason: TombstoneReason,
     now_unix_nanos: u64,
 ) -> Result<(), StatementOpError> {
-    statement_tombstone(wtxn, id, reason, now_unix_nanos)
+    statement_tombstone(wtxn, id, TombstoneReason::Retract, now_unix_nanos)
 }
 
 #[cfg(all(test, not(miri)))]
@@ -95,6 +110,13 @@ mod tests {
         SubjectRef,
     };
     use brain_core::{EntityId, ExtractorId, PredicateId};
+
+    fn test_scope() -> crate::tables::scope::RowScope {
+        crate::tables::scope::RowScope::from_bytes(
+            brain_core::NamespaceId::SYSTEM.raw(),
+            [0xAB; 16],
+        )
+    }
 
     fn open_db() -> (tempfile::TempDir, crate::MetadataDb) {
         let dir = tempfile::tempdir().unwrap();
@@ -112,7 +134,7 @@ mod tests {
             1_700_000_000_000_000_000,
         );
         let wtxn = db.write_txn().unwrap();
-        entity_put(&wtxn, &e).unwrap();
+        entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
         wtxn.commit().unwrap();
         id
     }
@@ -157,7 +179,14 @@ mod tests {
         let pred = intern_fact(&mut db, "knows");
         let s = fresh_fact(subj, pred, "lovelace");
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, &s, 1_700_000_000_000_000_000).unwrap();
+        statement_create(
+            &wtxn,
+            test_scope(),
+            brain_core::SessionId::DEFAULT,
+            &s,
+            1_700_000_000_000_000_000,
+        )
+        .unwrap();
         wtxn.commit().unwrap();
 
         let tomb_now: u64 = 1_700_000_000_000_000_750;
@@ -173,6 +202,67 @@ mod tests {
     }
 
     #[test]
+    fn tombstone_removes_predicate_bucket_entry() {
+        use crate::tables::statement::{confidence_bucket, STATEMENTS_BY_PREDICATE_TABLE};
+        let (_dir, mut db) = open_db();
+        let subj = make_entity(&mut db, "ada-byp");
+        let pred = intern_fact(&mut db, "byp");
+        let s = fresh_fact(subj, pred, "v"); // confidence 0.9 -> bucket 9
+        let bucket = confidence_bucket(0.9);
+        let stmt_id = s.id;
+        let sid_bytes = stmt_id.to_bytes();
+        let wtxn = db.write_txn().unwrap();
+        statement_create(
+            &wtxn,
+            test_scope(),
+            brain_core::SessionId::DEFAULT,
+            &s,
+            1_700_000_000_000_000_000,
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+
+        let sc = test_scope();
+        // The predicate-bucket key now carries the scope prefix + the
+        // trailing statement id (multi-value). Build the exact key.
+        let pkey = (
+            sc.namespace_id,
+            sc.space_id_bytes,
+            pred.raw(),
+            StatementKind::Fact.as_u8(),
+            bucket,
+            sid_bytes,
+        );
+
+        // Live row has a predicate-bucket entry pointing at it.
+        {
+            let rtxn = db.read_txn().unwrap();
+            let t = rtxn.open_table(STATEMENTS_BY_PREDICATE_TABLE).unwrap();
+            let got = t.get(&pkey).unwrap();
+            assert_eq!(got.map(|g| g.value()), Some(sid_bytes));
+        }
+
+        let wtxn = db.write_txn().unwrap();
+        statement_tombstone(
+            &wtxn,
+            stmt_id,
+            TombstoneReason::UserRequest,
+            1_700_000_000_000_000_500,
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+
+        // Tombstoned row is gone from the predicate-bucket index.
+        let rtxn = db.read_txn().unwrap();
+        let t = rtxn.open_table(STATEMENTS_BY_PREDICATE_TABLE).unwrap();
+        let got = t.get(&pkey).unwrap();
+        assert!(
+            got.is_none(),
+            "tombstone must remove the predicate-bucket entry"
+        );
+    }
+
+    #[test]
     fn double_tombstone_keeps_first_invalidation_timestamp() {
         // Re-tombstoning is a no-op (early return), so the
         // `record_invalidated_at` stays at the first call's wall-clock.
@@ -181,7 +271,14 @@ mod tests {
         let pred = intern_fact(&mut db, "knows_double");
         let s = fresh_fact(subj, pred, "lovelace");
         let wtxn = db.write_txn().unwrap();
-        statement_create(&wtxn, &s, 1_700_000_000_000_000_000).unwrap();
+        statement_create(
+            &wtxn,
+            test_scope(),
+            brain_core::SessionId::DEFAULT,
+            &s,
+            1_700_000_000_000_000_000,
+        )
+        .unwrap();
         wtxn.commit().unwrap();
 
         let first: u64 = 1_700_000_000_000_000_500;

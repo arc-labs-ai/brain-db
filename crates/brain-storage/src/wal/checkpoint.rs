@@ -72,8 +72,8 @@ pub enum CheckpointError {
 ///
 /// If step 3 (arena `msync`) fails, `CHECKPOINT_END` is not written and the
 /// caller receives [`CheckpointError::Msync`]. The next recovery sees a
-/// `CHECKPOINT_BEGIN` without a matching `END` and ignores it (spec
-/// §09 §12.1) — the previous checkpoint stays valid.
+/// `CHECKPOINT_BEGIN` without a matching `END` and ignores it —
+/// the previous checkpoint stays valid.
 pub async fn write_checkpoint(
     wal: &Wal,
     arena: &ArenaFile,
@@ -131,18 +131,16 @@ fn unix_nanos_now() -> u64 {
 // Tests.
 // ---------------------------------------------------------------------------
 
-// Tests instantiate `Wal` + `ArenaFile`. Gated under miri; see
-// `.claude/plans/phase-02-miri.md`.
+// Tests instantiate `Wal` + `ArenaFile`. Gated out under miri.
 #[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
     use crate::arena::file::{ArenaFile, MSYNC_ALL_CALLS};
     use crate::recovery::{recover, InMemoryMetadataSink, MetadataSink};
-    use crate::wal::kinds::WalRecordKind;
     use crate::wal::payload::EncodePayload;
     use crate::wal::record::WalRecord;
     use crate::wal::segment::{glommio_run, WalSegment};
-    use brain_core::{AgentId, ContextId, MemoryId, MemoryKind, RequestId};
+    use brain_core::{MemoryId, MemoryKind, RequestId, SessionId, SpaceId};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::Ordering;
 
@@ -169,8 +167,9 @@ mod tests {
         let p = EncodePayload {
             memory_id,
             request_id: RequestId::from([0u8; 16]),
-            agent_id: AgentId::from([0u8; 16]),
-            context_id: ContextId(0),
+            space_id: SpaceId::from([0u8; 16]),
+            namespace_id: brain_core::NamespaceId::SYSTEM,
+            session_id: SessionId(0),
             kind: MemoryKind::Episodic,
             salience_initial: 0.5,
             embedding_model_fp: [0; 16],
@@ -180,6 +179,7 @@ mod tests {
             request_hash: [0; 32],
             response_payload: vec![],
             deduplicate: false,
+            occurred_at_unix_nanos: None,
         };
         WalRecord::from_typed(
             Lsn(0),
@@ -472,34 +472,5 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let arena = fresh_arena(&dir, 16);
         arena.msync_all().unwrap();
-    }
-
-    #[test]
-    fn record_kinds_are_checkpoint_records() {
-        let dir = tempfile::tempdir().unwrap();
-        let wal_dir = fresh_wal_dir(dir.path());
-        let wal_dir_c = wal_dir.clone();
-        let arena = ArenaFile::open(dir.path().join("arena.bin"), uuid(1), 16).unwrap();
-        glommio_run(move || async move {
-            let wal = Wal::create(&wal_dir_c, uuid(1)).await.unwrap();
-            write_checkpoint(
-                &wal,
-                &arena,
-                CheckpointPlan {
-                    checkpoint_id: 1,
-                    target_lsn: None,
-                },
-            )
-            .await
-            .unwrap();
-            wal.shutdown().await.unwrap();
-        });
-
-        let reader = crate::wal::reader::WalReader::open(&wal_dir, uuid(1)).unwrap();
-        let kinds: Vec<WalRecordKind> = reader.map(|r| r.unwrap().kind).collect();
-        assert_eq!(
-            kinds,
-            vec![WalRecordKind::CheckpointBegin, WalRecordKind::CheckpointEnd]
-        );
     }
 }

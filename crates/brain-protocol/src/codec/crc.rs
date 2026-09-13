@@ -2,8 +2,7 @@
 //!
 //! Brain uses **CRC32C** (Castagnoli polynomial `0x1EDC6F41`, the iSCSI
 //! variant — *not* the Ethernet CRC32). Hardware-accelerated on x86 (SSE
-//! 4.2) and ARM (CRC32 extension); and
-//! §01/05 §2.1.
+//! 4.2) and ARM (CRC32 extension).
 //!
 //! Two CRCs are computed independently per frame:
 //!

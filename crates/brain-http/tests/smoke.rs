@@ -1,7 +1,7 @@
-//! M1 smoke: prove brain-http types compose with hyper's `Service`
+//! Smoke: prove brain-http types compose with hyper's `Service`
 //! infrastructure.
 //!
-//! This is NOT a server test — that's M2. The point is to verify
+//! This is NOT a server test. The point is to verify
 //! that:
 //!
 //! 1. `service_fn` accepts a Brain handler shape.
@@ -9,7 +9,7 @@
 //!    trait, producing a `Response<ResponseBody>`.
 //! 3. `body::full` round-trips through the body collection helper.
 //!
-//! M1 plan §8.1 resolved: the handler is generic over `B: Body` so
+//! The handler is generic over `B: Body` so
 //! we can drive the smoke test with a synthetic `Full<Bytes>` body
 //! rather than the production `hyper::body::Incoming`.
 

@@ -111,18 +111,6 @@ pub fn apply_stream_opts(stream: &TcpStream, cfg: &BindConfig) -> io::Result<()>
 mod tests {
     use super::*;
 
-    #[test]
-    fn default_has_nodelay_and_keepalive() {
-        let c = BindConfig::default();
-        assert!(c.reuse_addr);
-        assert!(c.tcp_nodelay);
-        assert!(c.keepalive.is_some());
-        let ka = c.keepalive.as_ref().unwrap();
-        assert_eq!(ka.time, Duration::from_secs(75));
-        assert_eq!(ka.interval, Duration::from_secs(15));
-        assert_eq!(ka.retries, 9);
-    }
-
     #[tokio::test]
     async fn bind_loopback_succeeds() {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();

@@ -1,23 +1,23 @@
-//! Phase-8 worker source adapters wired to per-shard state (sub-task 9.8).
+//! Background-worker source adapters wired to per-shard state.
 //!
-//! Phase 8 shipped four pluggable "source" traits with `Disabled*` defaults:
+//! There are four pluggable "source" traits with `Disabled*` defaults:
 //!
 //! - `RebuildSource`: feeds `HnswMaintenanceWorker` the active
 //!   `(MemoryId, vector)` pairs for full rebuild.
 //! - `WalRetentionSource`: tells `WalRetentionWorker` which segments
 //!   are past `durable_lsn` and removes them.
 //! - `SnapshotSource`: backs `SnapshotWorker`'s take / list / delete.
-//! - `CacheEvictionSource`: stays `Disabled*` until 9.10 wires a real
-//!   `CachingDispatcher` per shard.
+//! - `CacheEvictionSource`: stays `Disabled*` until a real
+//!   `CachingDispatcher` is wired per shard.
 //!
-//! 9.7b registered all 12 Phase-8 workers against the per-shard
-//! scheduler with the `Disabled*` defaults; 9.8 plugs in real adapters
-//! for the first three. The fourth — cache eviction — stays disabled
-//! and is constructed at the call-site (no adapter struct here).
+//! Every worker is registered against the per-shard scheduler with the
+//! `Disabled*` defaults; real adapters are plugged in for the first
+//! three. The fourth — cache eviction — stays disabled and is
+//! constructed at the call-site (no adapter struct here).
 //!
 //! All adapters are `!Send + !Sync` by construction (they hold
 //! `Rc<RefCell<…>>` references into per-shard state). Their trait
-//! contracts dropped `Send + Sync` in 9.8 to match.
+//! contracts dropped `Send + Sync` to match.
 
 #![cfg(target_os = "linux")]
 // `ShardSnapshotSource::take_snapshot` holds immutable `borrow()` on
@@ -33,16 +33,18 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use brain_core::{MemoryId, ShardId};
-use brain_embed::VECTOR_DIM;
-use brain_index::SharedHnsw;
+use brain_core::{MemoryId, ShardId, SlotIndex, SlotVersion};
+use brain_index::{SharedHnsw, SpaceVectorSource, VECTOR_DIM};
+use brain_metadata::tables::memory::MEMORIES_TABLE;
+use brain_ops::memory_artifact::get_artifact_vector;
+use brain_ops::RedbCommittedWatermark;
 use brain_planner::SharedMetadataDb;
 use brain_storage::arena::ArenaFile;
 use brain_storage::wal::payload::{CheckpointBeginPayload, CheckpointEndPayload, WalPayload};
 use brain_storage::wal::reader::WalReader;
 use brain_storage::wal::record::{Lsn, WalRecord};
 use brain_storage::wal::Wal;
-use brain_workers::hnsw_maint::{RebuildSource, SnapshotFuture};
+use brain_workers::hnsw_maint::{RebuildSource, RebuildSourceError, SnapshotFuture};
 use brain_workers::snapshot::{
     DeleteFuture as SnapshotDeleteFuture, ListFuture as SnapshotListFuture, SnapshotDesc,
     SnapshotId, SnapshotSource, SnapshotSourceError, TakeFuture,
@@ -51,15 +53,69 @@ use brain_workers::wal_retention::{
     CheckpointDesc, CheckpointFuture, DeleteFuture as WalDeleteFuture, SegmentDesc,
     SegmentListFuture, WalRetentionSource, WalRetentionSourceError,
 };
+use redb::ReadableTable;
+
+use crate::shard::snapshot_manifest::{blake3_hex, FileDigest, SnapshotManifest, MANIFEST_FILE};
+
+// ---------------------------------------------------------------------------
+// EntityVectorIndex — expose the per-shard entity HNSW to the resolver's
+// tier-3 embedding tie-break (brain-ops queries through the trait object).
+// ---------------------------------------------------------------------------
+
+/// Adapts the shard's `Arc<RwLock<EntityHnswIndex>>` to the object-safe
+/// [`brain_index::EntityVectorIndex`] the resolve handler holds. Reads under a
+/// short lock and returns an empty result on a wrong-width query or an empty
+/// index, matching the resolver's "no in-band hit ⇒ create fallback" contract.
+pub(crate) struct ShardEntityVectorIndex {
+    index: std::sync::Arc<parking_lot::RwLock<brain_index::entity_hnsw::EntityHnswIndex>>,
+}
+
+impl ShardEntityVectorIndex {
+    pub(crate) fn new(
+        index: std::sync::Arc<parking_lot::RwLock<brain_index::entity_hnsw::EntityHnswIndex>>,
+    ) -> Self {
+        Self { index }
+    }
+}
+
+impl brain_index::EntityVectorIndex for ShardEntityVectorIndex {
+    fn search(&self, query: &[f32], k: usize) -> Vec<(brain_core::EntityId, f32)> {
+        let Ok(vector) = <&[f32; VECTOR_DIM]>::try_from(query) else {
+            return Vec::new();
+        };
+        let guard = self.index.read();
+        if guard.is_empty() {
+            return Vec::new();
+        }
+        guard.search(vector, k).unwrap_or_default()
+    }
+
+    fn insert(&self, entity_id: brain_core::EntityId, vector: &[f32]) {
+        let Ok(vector) = <&[f32; VECTOR_DIM]>::try_from(vector) else {
+            return;
+        };
+        let mut guard = self.index.write();
+        if guard.contains(entity_id) {
+            return;
+        }
+        if let Err(e) = guard.insert(entity_id, vector) {
+            tracing::warn!(
+                target: "brain_server::shard",
+                ?entity_id,
+                error = %e,
+                "entity-HNSW insert failed; entity is durable but tier-3-unreachable until a rebuild",
+            );
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // RebuildSource — scan the shard's arena for occupied/non-tombstoned slots.
 // ---------------------------------------------------------------------------
 
 /// Walks the shard's `ArenaFile` and yields a `(MemoryId, vector)` for
-/// every occupied, non-tombstoned, non-hard-forgotten slot. Spec
-/// §11/04 §7 — the rebuild source is the substrate for full HNSW
-/// rebuild.
+/// every occupied, non-tombstoned, non-hard-forgotten slot. The
+/// rebuild source is the substrate for full HNSW rebuild.
 ///
 /// Holds an `Rc<RefCell<ArenaFile>>` so the per-shard main loop can
 /// mutate the arena (via `borrow_mut`) between the adapter's
@@ -117,6 +173,135 @@ impl<const D: usize> RebuildSource<D> for ArenaRebuildSource<D> {
 }
 
 // ---------------------------------------------------------------------------
+// RedbRebuildSource — enumerate live vectors from the authoritative redb store.
+// ---------------------------------------------------------------------------
+
+/// Yields a `(MemoryId, vector)` for every live (active, non-hard-forgotten)
+/// memory by joining `MEMORIES_TABLE` (membership + tombstone state) with the
+/// per-memory `MEMORY_ARTIFACTS_TABLE` (the durable write-time vector).
+///
+/// This is the rebuild substrate for **runtime** full rebuilds (the HNSW
+/// maintenance worker and the admin `rebuild-ann` route). Unlike
+/// [`ArenaRebuildSource`], it sees memories encoded in the current run: the
+/// arena is populated only by WAL recovery on restart, so a live encode never
+/// reaches it, whereas its vector is committed to redb on the ENCODE ack path.
+/// Rebuilding from the arena alone would silently drop every same-run memory;
+/// rebuilding from redb yields the complete live set.
+///
+/// Holds the shared `MetadataDb` handle; the scan runs under a single redb
+/// read txn (snapshot-isolated), so a concurrent writer on the shard can't
+/// tear the enumeration.
+pub(crate) struct RedbRebuildSource<const D: usize> {
+    metadata: SharedMetadataDb,
+}
+
+impl<const D: usize> RedbRebuildSource<D> {
+    pub(crate) fn new(metadata: SharedMetadataDb) -> Self {
+        Self { metadata }
+    }
+}
+
+impl<const D: usize> RebuildSource<D> for RedbRebuildSource<D> {
+    fn snapshot_vectors(&self) -> SnapshotFuture<'_, D> {
+        let metadata = self.metadata.clone();
+        Box::pin(async move {
+            let rtxn = metadata
+                .read_txn()
+                .map_err(|e| RebuildSourceError::Failed(format!("read_txn: {e}")))?;
+            let table = rtxn
+                .open_table(MEMORIES_TABLE)
+                .map_err(|e| RebuildSourceError::Failed(format!("open memories: {e}")))?;
+            let mut out = Vec::new();
+            for entry in table
+                .iter()
+                .map_err(|e| RebuildSourceError::Failed(format!("memories iter: {e}")))?
+            {
+                let (key_guard, row_guard) =
+                    entry.map_err(|e| RebuildSourceError::Failed(format!("memories row: {e}")))?;
+                let row = row_guard.value();
+                // A tombstoned (inactive) or hard-forgotten memory must not
+                // re-enter the searchable graph. Mirrors ArenaRebuildSource's
+                // occupied-and-live filter.
+                if !row.is_active() || row.is_hard_forgotten() {
+                    continue;
+                }
+                let key = key_guard.value();
+                // The vector lives in the artifact bundle, written on the ack
+                // path. A missing bundle means the memory has no stored vector
+                // (partial write / pre-feature row) — skip rather than insert
+                // a zero vector that would pollute nearest-neighbour scores.
+                let Some(vec) = get_artifact_vector(&rtxn, key) else {
+                    continue;
+                };
+                let mut v = [0.0_f32; D];
+                // D == VECTOR_DIM in every shard monomorphisation; the min
+                // guard keeps a mismatched const from panicking.
+                let n = v.len().min(vec.len());
+                v[..n].copy_from_slice(&vec[..n]);
+                out.push((MemoryId::from_be_bytes(key), v));
+            }
+            Ok(out)
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ArenaSpaceVectorSource — read a live memory's vector by arena slot.
+// ---------------------------------------------------------------------------
+
+/// Backs the per-space brute-force retrieval lane: given an arena slot +
+/// the expected slot version, copy that slot's full-precision vector out
+/// of the mmap'd arena. The retriever range-scans one space's memory ids
+/// from redb, then calls this per surviving id.
+///
+/// Holds an `Rc<RefCell<ArenaFile>>` shared with the main loop; the read
+/// takes a short immutable borrow, copies the vector, and releases it —
+/// no `.await` is held across the borrow. `!Send` by construction (the
+/// mmap), which is why it reaches the retriever as a borrowed
+/// `&dyn SpaceVectorSource`, never stored on the `Send + Sync` retriever.
+pub(crate) struct ArenaSpaceVectorSource {
+    arena: Rc<RefCell<ArenaFile>>,
+}
+
+impl ArenaSpaceVectorSource {
+    pub(crate) fn new(arena: Rc<RefCell<ArenaFile>>) -> Self {
+        Self { arena }
+    }
+}
+
+impl SpaceVectorSource for ArenaSpaceVectorSource {
+    fn vector_at(
+        &self,
+        slot: SlotIndex,
+        expected_version: SlotVersion,
+    ) -> Option<[f32; VECTOR_DIM]> {
+        let arena = self.arena.borrow();
+        if slot >= arena.capacity_slots() {
+            return None;
+        }
+        let s = arena.slot(slot);
+        // A stale id (invariant #4), an unoccupied slot, or a
+        // tombstoned / hard-forgotten memory yields no vector — the
+        // candidate is dropped from the brute-force set.
+        if !s.is_occupied() || s.is_tombstoned() || s.is_hard_forgotten() {
+            return None;
+        }
+        if s.metadata.slot_version != expected_version {
+            return None;
+        }
+        // No per-read CRC. This mirrors `ArenaRebuildSource` — the only
+        // other vector-read path, which feeds every HNSW rebuild — so the
+        // two are consistent; verify-on-read is a deliberate non-goal on
+        // the hot brute-force lane. Copy element-wise: `Slot::vector` and
+        // the return type are both `[f32; VECTOR_DIM]` (384).
+        let mut v = [0.0_f32; VECTOR_DIM];
+        let n = v.len().min(s.vector.len());
+        v[..n].copy_from_slice(&s.vector[..n]);
+        Some(v)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // WalRetentionSource — list & delete on-disk segments past durable_lsn.
 // ---------------------------------------------------------------------------
 
@@ -156,9 +341,9 @@ impl WalRetentionSource for WalDirRetentionSource {
     fn current_checkpoint(&self) -> CheckpointFuture<'_> {
         let metadata = self.metadata.clone();
         Box::pin(async move {
-            // brain_metadata::MetadataDb caches durable_lsn in memory
-            // (sink.rs §616-§622); the lookup is a single u64 read.
-            let lsn = brain_storage::recovery::MetadataSink::durable_lsn(&*metadata.lock());
+            // brain_metadata::MetadataDb caches durable_lsn in memory;
+            // the lookup is a single u64 read.
+            let lsn = brain_storage::recovery::MetadataSink::durable_lsn(metadata.as_ref());
             Ok(CheckpointDesc { durable_lsn: lsn })
         })
     }
@@ -166,27 +351,40 @@ impl WalRetentionSource for WalDirRetentionSource {
     fn list_segments(&self) -> SegmentListFuture<'_> {
         let dir = self.wal_dir.clone();
         let uuid = self.shard_uuid;
+        // The active segment's true highest LSN is only knowable from live
+        // WAL state, which this source doesn't hold. `durable_lsn` is a
+        // safe floor: it is at least as high as any completed segment's
+        // last record and lies within (or just before) the active segment.
+        // Under-reporting the active segment here is harmless — the worker
+        // never deletes it — but reporting the true last_lsn of every
+        // *completed* segment is essential.
+        let durable_lsn =
+            brain_storage::recovery::MetadataSink::durable_lsn(self.metadata.as_ref());
         Box::pin(async move {
             let reader = WalReader::open(&dir, uuid)
                 .map_err(|e| WalRetentionSourceError::Failed(format!("WalReader::open: {e}")))?;
-            let segs = reader
-                .segments()
-                .iter()
-                .map(|s| {
-                    // We don't know `last_lsn` without scanning every
-                    // record. Reporting `starting_lsn` is the safe
-                    // (conservative) lower bound: `decide_deletions`
-                    // compares `last_lsn < safe_cutoff`, so an
-                    // underestimate only *delays* retention — never
-                    // deletes a segment that still covers durable_lsn.
-                    SegmentDesc {
-                        segment_id: s.segment_seq,
-                        first_lsn: s.starting_lsn,
-                        last_lsn: s.starting_lsn,
-                        size_bytes: s.file_size,
-                    }
-                })
-                .collect::<Vec<_>>();
+            let infos = reader.segments();
+            let mut segs = Vec::with_capacity(infos.len());
+            for (i, s) in infos.iter().enumerate() {
+                // Segments carry a contiguous, gap-free LSN range (the
+                // reader enforces `next.starting_lsn == prev.last + 1`), so
+                // a completed segment's true last LSN is the next segment's
+                // `starting_lsn - 1`. The active (highest-seq) segment has
+                // no successor; use `durable_lsn` as a lower bound. Both
+                // are correct for retention: they never *under*-report a
+                // completed segment (which would risk deleting a straddler),
+                // and the active segment is guarded against deletion anyway.
+                let last_lsn = match infos.get(i + 1) {
+                    Some(next) => next.starting_lsn.saturating_sub(1),
+                    None => durable_lsn,
+                };
+                segs.push(SegmentDesc {
+                    segment_id: s.segment_seq,
+                    first_lsn: s.starting_lsn,
+                    last_lsn: last_lsn.max(s.starting_lsn),
+                    size_bytes: s.file_size,
+                });
+            }
             Ok(segs)
         })
     }
@@ -236,11 +434,19 @@ pub(crate) struct ShardSnapshotSource {
     snapshots_root: PathBuf,
     arena_path: PathBuf,
     metadata_path: PathBuf,
+    wal_dir: PathBuf,
     arena: Rc<RefCell<ArenaFile>>,
     wal: Rc<RefCell<Option<Wal>>>,
     metadata: SharedMetadataDb,
-    hnsw: SharedHnsw<{ VECTOR_DIM }>,
+    hnsw: SharedHnsw,
     next_checkpoint_id: RefCell<u64>,
+    /// The per-shard writer's redb-committed-LSN watermark. The
+    /// checkpoint's `durable_lsn` must be this value (clamped to the
+    /// WAL-durable tail at CHECKPOINT_BEGIN), NOT the WAL-appended tail:
+    /// the WAL tail advances at enqueue time, before the writer's redb
+    /// commit, so stamping it would let recovery skip a WAL-durable
+    /// record whose redb commit had not run at power loss.
+    redb_committed_watermark: RedbCommittedWatermark,
 }
 
 impl ShardSnapshotSource {
@@ -253,18 +459,35 @@ impl ShardSnapshotSource {
         arena: Rc<RefCell<ArenaFile>>,
         wal: Rc<RefCell<Option<Wal>>>,
         metadata: SharedMetadataDb,
-        hnsw: SharedHnsw<{ VECTOR_DIM }>,
+        hnsw: SharedHnsw,
+        redb_committed_watermark: RedbCommittedWatermark,
     ) -> Self {
+        // metadata.redb lives at the shard root; the WAL directory is a
+        // sibling. Derive it through ShardPaths so the snapshot bundle's
+        // WAL-tail copy reads from the same layout the writer uses.
+        let wal_dir = metadata_path
+            .parent()
+            .map(|root| brain_storage::ShardPaths::at(root).wal_dir())
+            .unwrap_or_else(|| metadata_path.clone());
+        // Resume the checkpoint counter past the highest snapshot id that
+        // already exists on disk. Snapshot directory names *are* the id
+        // (`snapshots/{id:020}`), and `reflink_or_copy` truncates an
+        // existing destination — so if we restarted at 1 the next cycle
+        // would overwrite the oldest surviving bundle, destroying a valid
+        // backup (invariant #7). A missing/empty dir yields 0 → start at 1.
+        let next_id = scan_max_snapshot_id(&snapshots_root).saturating_add(1);
         Self {
             shard_uuid,
             snapshots_root,
             arena_path,
             metadata_path,
+            wal_dir,
             arena,
             wal,
             metadata,
             hnsw,
-            next_checkpoint_id: RefCell::new(1),
+            next_checkpoint_id: RefCell::new(next_id),
+            redb_committed_watermark,
         }
     }
 
@@ -285,6 +508,33 @@ fn now_unix_nanos() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
         .unwrap_or(0)
+}
+
+/// Highest numeric snapshot id present under `root`, or 0 if the
+/// directory is missing, empty, or holds no numerically-named
+/// sub-directories. Non-numeric entries are ignored (mirrors
+/// `list_snapshots`). A read error is treated as "no snapshots" (0) so a
+/// transient stat failure never lets the counter reset and overwrite a
+/// prior bundle — the worst case is a delayed id, never a reused one.
+fn scan_max_snapshot_id(root: &std::path::Path) -> u64 {
+    let entries = match std::fs::read_dir(root) {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+    let mut max_id = 0u64;
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        if let Some(id) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            max_id = max_id.max(id);
+        }
+    }
+    max_id
 }
 
 impl SnapshotSource for ShardSnapshotSource {
@@ -334,6 +584,20 @@ impl SnapshotSource for ShardSnapshotSource {
                 arena.capacity_slots()
             };
 
+            // The checkpoint's durable_lsn is the redb-committed
+            // watermark, NOT the WAL-appended tail (`target_lsn_hint`).
+            // The watermark only advances after `wtxn.commit()`, so
+            // every record at or below it is durable in metadata; a
+            // record that is WAL-durable but whose redb commit had not
+            // yet run sits strictly above it and is therefore replayed
+            // (not skipped) on recovery. Clamp to `target_lsn_hint` so
+            // the checkpoint never claims a durable_lsn past the WAL
+            // tail bundled with this snapshot — the watermark is always
+            // <= the true WAL tail, but a concurrent commit could push
+            // it past the tail we sampled at CHECKPOINT_BEGIN, and
+            // `min` keeps the checkpoint consistent with the copied WAL.
+            let checkpoint_durable_lsn = self.redb_committed_watermark.load().min(target_lsn_hint);
+
             // Step 6: CHECKPOINT_END.
             {
                 let wal_guard = self.wal.borrow();
@@ -347,7 +611,7 @@ impl SnapshotSource for ShardSnapshotSource {
                 };
                 let payload = WalPayload::CheckpointEnd(CheckpointEndPayload {
                     checkpoint_id: ckpt_id,
-                    durable_lsn: target_lsn_hint,
+                    durable_lsn: checkpoint_durable_lsn,
                     arena_capacity: arena_capacity_at_checkpoint,
                 });
                 let record = WalRecord::from_typed(Lsn(0), 0, now_unix_nanos(), 0, &payload);
@@ -363,34 +627,99 @@ impl SnapshotSource for ShardSnapshotSource {
                 SnapshotSourceError::Failed(format!("create_dir_all {}: {e}", dir.display()))
             })?;
 
-            // 5. Copy arena.bin. msync_all already ran inside
-            //    write_checkpoint; the on-disk image at this instant is
-            //    consistent with the checkpoint's durable_lsn.
+            // 5. Reflink arena.bin. msync_all already ran inside the
+            //    checkpoint sequence; the on-disk image at this instant
+            //    is consistent with the checkpoint's durable_lsn. The
+            //    reflink (FICLONE) shares blocks copy-on-write where the
+            //    filesystem supports it, falling back to a full copy.
             let arena_dst = dir.join("arena.bin");
-            std::fs::copy(&self.arena_path, &arena_dst).map_err(|e| {
+            brain_storage::reflink_or_copy(&self.arena_path, &arena_dst).map_err(|e| {
                 SnapshotSourceError::Failed(format!(
-                    "copy arena.bin → {}: {e}",
+                    "reflink arena.bin → {}: {e}",
                     arena_dst.display()
                 ))
             })?;
 
-            // 6. Copy metadata.redb. Take a read txn first to flush any
-            //    in-memory state to disk; release it before copying so
-            //    redb's file lock is dropped. (redb's read txns are
+            // 6. Reflink metadata.redb. Take a read txn first to flush
+            //    any in-memory state to disk; release it before copying
+            //    so redb's file lock is dropped. (redb's read txns are
             //    snapshot-isolated; a copy of the file *while a read txn
             //    is alive* gives a consistent point-in-time image.)
             let metadata_dst = dir.join("metadata.redb");
             {
-                let md = self.metadata.lock();
-                let _rtxn = md
+                let _rtxn = self
+                    .metadata
                     .read_txn()
                     .map_err(|e| SnapshotSourceError::Failed(format!("metadata read_txn: {e}")))?;
-                std::fs::copy(&self.metadata_path, &metadata_dst).map_err(|e| {
-                    SnapshotSourceError::Failed(format!(
-                        "copy metadata.redb → {}: {e}",
-                        metadata_dst.display()
-                    ))
+                brain_storage::reflink_or_copy(&self.metadata_path, &metadata_dst).map_err(
+                    |e| {
+                        SnapshotSourceError::Failed(format!(
+                            "reflink metadata.redb → {}: {e}",
+                            metadata_dst.display()
+                        ))
+                    },
+                )?;
+            }
+
+            // 6a. Copy shard.uuid so the bundle is self-describing and a
+            //     restore onto a freshly-laid-out data dir lands the
+            //     identity file too. Best-effort: the manifest's
+            //     shard_uuid is the authoritative identity, so a missing
+            //     uuid file here doesn't fail the snapshot.
+            let uuid_src = self
+                .metadata_path
+                .parent()
+                .map(|root| brain_storage::ShardPaths::at(root).shard_uuid());
+            if let Some(uuid_src) = uuid_src {
+                if uuid_src.exists() {
+                    let uuid_dst = dir.join(brain_storage::layout::SHARD_UUID_FILE);
+                    if let Err(e) = brain_storage::reflink_or_copy(&uuid_src, &uuid_dst) {
+                        tracing::warn!(
+                            error = %e,
+                            "snapshot: copying shard.uuid into bundle failed (non-fatal)"
+                        );
+                    }
+                }
+            }
+
+            // 6b. Copy the WAL tail. A snapshot that can't be replayed
+            //     back to its LSN is useless, so the bundle must carry
+            //     every segment that covers [.. durable_lsn]. We copy
+            //     each segment whose starting_lsn <= durable_lsn — that
+            //     set always includes the segment containing durable_lsn
+            //     and every earlier one, so recovery can replay the WAL
+            //     to the snapshot LSN. Segments live in `<dir>/wal/`.
+            let wal_dst_dir = dir.join("wal");
+            std::fs::create_dir_all(&wal_dst_dir).map_err(|e| {
+                SnapshotSourceError::Failed(format!(
+                    "create_dir_all {}: {e}",
+                    wal_dst_dir.display()
+                ))
+            })?;
+            let mut wal_segment_rel_paths: Vec<String> = Vec::new();
+            {
+                let reader = WalReader::open(&self.wal_dir, self.shard_uuid).map_err(|e| {
+                    SnapshotSourceError::Failed(format!("WalReader::open for snapshot tail: {e}"))
                 })?;
+                for seg in reader.segments() {
+                    if seg.starting_lsn > target_lsn_hint {
+                        // Segment begins after the snapshot LSN — its
+                        // records are entirely post-snapshot. Skip so the
+                        // bundle is a true point-in-time view.
+                        continue;
+                    }
+                    let name = format!("{:010}.wal", seg.segment_seq);
+                    let src = self.wal_dir.join(&name);
+                    let dst = wal_dst_dir.join(&name);
+                    brain_storage::reflink_or_copy(&src, &dst).map_err(|e| {
+                        SnapshotSourceError::Failed(format!(
+                            "reflink wal segment {} → {}: {e}",
+                            src.display(),
+                            dst.display()
+                        ))
+                    })?;
+                    wal_segment_rel_paths.push(format!("wal/{name}"));
+                }
             }
 
             // 7. HNSW snapshot (graph + data + brain wrapper). Writes
@@ -399,25 +728,44 @@ impl SnapshotSource for ShardSnapshotSource {
             //    the wrapper carries shard_uuid + durable_lsn + the
             //    BLAKE3 footer.
             let durable_lsn_for_hnsw =
-                brain_storage::recovery::MetadataSink::durable_lsn(&*self.metadata.lock());
+                brain_storage::recovery::MetadataSink::durable_lsn(self.metadata.as_ref());
             self.hnsw
                 .save_snapshot(&dir, "hnsw", durable_lsn_for_hnsw, self.shard_uuid)
                 .map_err(|e| SnapshotSourceError::Failed(format!("hnsw save_snapshot: {e}")))?;
 
-            // 8. Manifest.
-            let durable_lsn =
-                brain_storage::recovery::MetadataSink::durable_lsn(&*self.metadata.lock());
-            let manifest = format!(
-                "shard_uuid_hex = \"{}\"\n\
-                 checkpoint_id = {}\n\
-                 durable_lsn = {}\n\
-                 taken_at_unix_nanos = {}\n",
-                hex_lower(&self.shard_uuid),
-                ckpt_id,
-                durable_lsn,
-                started,
-            );
-            std::fs::write(dir.join("manifest.toml"), manifest)
+            // 8. Manifest. The snapshot's LSN is the checkpoint's
+            //    durable_lsn — the point recovery replays the bundled WAL
+            //    up to. Hash every bundle file (arena, metadata, each WAL
+            //    segment) with BLAKE3 so restore can verify integrity
+            //    before swapping files into the live data dir. The HNSW
+            //    triple is intentionally excluded: it's rebuilt on
+            //    restore, never trusted from the bundle.
+            let mut files = std::collections::BTreeMap::new();
+            for rel in std::iter::once("arena.bin".to_string())
+                .chain(std::iter::once("metadata.redb".to_string()))
+                .chain(wal_segment_rel_paths.iter().cloned())
+            {
+                let path = dir.join(&rel);
+                let size = std::fs::metadata(&path)
+                    .map_err(|e| {
+                        SnapshotSourceError::Failed(format!("stat {}: {e}", path.display()))
+                    })?
+                    .len();
+                let blake3 = blake3_hex(&path).map_err(|e| {
+                    SnapshotSourceError::Failed(format!("blake3 {}: {e}", path.display()))
+                })?;
+                files.insert(rel, FileDigest { size, blake3 });
+            }
+
+            let manifest = SnapshotManifest {
+                snapshot_lsn: target_lsn_hint,
+                checkpoint_id: ckpt_id,
+                shard_uuid: hex_lower(&self.shard_uuid),
+                taken_at_unix_nanos: started,
+                files,
+            };
+            manifest
+                .write_to(&dir.join(MANIFEST_FILE))
                 .map_err(|e| SnapshotSourceError::Failed(format!("write manifest: {e}")))?;
 
             Ok(snap_id)
@@ -452,8 +800,10 @@ impl SnapshotSource for ShardSnapshotSource {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                let manifest_path = entry.path().join("manifest.toml");
-                let taken_at = read_manifest_taken_at(&manifest_path).unwrap_or(0);
+                let manifest_path = entry.path().join(MANIFEST_FILE);
+                let taken_at = SnapshotManifest::read_from(&manifest_path)
+                    .map(|m| m.taken_at_unix_nanos)
+                    .unwrap_or(0);
                 let size_bytes = dir_size_bytes(&entry.path()).unwrap_or(0);
                 out.push(SnapshotDesc {
                     id: SnapshotId(id_u64),
@@ -506,17 +856,6 @@ fn dir_size_bytes(dir: &std::path::Path) -> std::io::Result<u64> {
     Ok(total)
 }
 
-fn read_manifest_taken_at(path: &std::path::Path) -> Option<u64> {
-    let text = std::fs::read_to_string(path).ok()?;
-    for line in text.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("taken_at_unix_nanos = ") {
-            return rest.trim().parse().ok();
-        }
-    }
-    None
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -531,7 +870,6 @@ mod tests {
     use brain_storage::arena::ArenaFile;
     use brain_storage::wal::{Wal, WalConfig};
     use glommio::LocalExecutorBuilder;
-    use parking_lot::Mutex;
     use tempfile::TempDir;
 
     fn fresh_arena(dir: &std::path::Path, capacity_slots: u64) -> (ArenaFile, [u8; 16], PathBuf) {
@@ -610,6 +948,104 @@ mod tests {
         assert!((v4[5] - 0.5).abs() < f32::EPSILON);
     }
 
+    // ---- RedbRebuildSource ------------------------------------------------
+
+    /// The runtime rebuild source must enumerate the durable redb store, not
+    /// the arena: a memory encoded in the current run has its vector in redb
+    /// (written on the ENCODE ack path) but never in the arena (populated only
+    /// by WAL recovery). This proves the source returns exactly the live
+    /// (active, vector-bearing) memories and skips tombstoned rows and rows
+    /// with no stored vector.
+    #[test]
+    fn redb_rebuild_source_enumerates_live_same_run_memories() {
+        use brain_core::{MemoryId, MemoryKind, NamespaceId, SessionId, SpaceId};
+        use brain_metadata::tables::memory::{flags, MemoryMetadata, MEMORIES_TABLE};
+        use brain_ops::memory_artifact::merge_memory_artifact;
+
+        let tmp = TempDir::new().unwrap();
+        let md_path = tmp.path().join("metadata.redb");
+        let md = MetadataDb::open(&md_path).expect("MetadataDb::open");
+        let metadata: SharedMetadataDb = Arc::new(md);
+
+        let space: SpaceId = [0u8; 16].into();
+        let row = |slot: u64| {
+            MemoryMetadata::new_active(
+                MemoryId::pack(0, slot, 1),
+                NamespaceId::SYSTEM,
+                space,
+                SessionId(1),
+                slot,
+                1,
+                MemoryKind::Episodic,
+                [0u8; 16],
+                0.5,
+                8,
+                1_700_000_000_000_000_000,
+            )
+        };
+        let live_vec = |first: f32| {
+            let mut v = vec![0.0_f32; VECTOR_DIM];
+            v[0] = first;
+            v
+        };
+
+        // slot 1 + 2: active with a stored vector → returned.
+        // slot 3: tombstoned (ACTIVE cleared) but has a vector → skipped.
+        // slot 4: active but no artifact bundle → skipped.
+        {
+            let wtxn = metadata.write_txn().expect("write_txn");
+            {
+                let mut t = wtxn.open_table(MEMORIES_TABLE).expect("open memories");
+                let m1 = row(1);
+                let m2 = row(2);
+                let mut m3 = row(3);
+                m3.set_flag(flags::ACTIVE, false);
+                let m4 = row(4);
+                t.insert(&m1.memory_id_bytes, &m1).unwrap();
+                t.insert(&m2.memory_id_bytes, &m2).unwrap();
+                t.insert(&m3.memory_id_bytes, &m3).unwrap();
+                t.insert(&m4.memory_id_bytes, &m4).unwrap();
+            }
+            for (slot, first) in [(1u64, 0.25_f32), (2, 0.5), (3, 0.75)] {
+                let id = MemoryId::pack(0, slot, 1);
+                merge_memory_artifact(&wtxn, id.to_be_bytes(), |b| {
+                    b.vector = live_vec(first);
+                })
+                .expect("merge artifact");
+            }
+            wtxn.commit().expect("commit");
+        }
+
+        let pairs = glommio_run({
+            let metadata = metadata.clone();
+            move || async move {
+                let src: RedbRebuildSource<{ VECTOR_DIM }> = RedbRebuildSource::new(metadata);
+                src.snapshot_vectors().await
+            }
+        })
+        .expect("snapshot_vectors");
+
+        assert_eq!(pairs.len(), 2, "only the two live vector-bearing memories");
+        let (_m1, v1) = pairs
+            .iter()
+            .find(|(m, _)| m.slot() == 1)
+            .expect("slot 1 present");
+        assert!((v1[0] - 0.25).abs() < f32::EPSILON);
+        let (_m2, v2) = pairs
+            .iter()
+            .find(|(m, _)| m.slot() == 2)
+            .expect("slot 2 present");
+        assert!((v2[0] - 0.5).abs() < f32::EPSILON);
+        assert!(
+            pairs.iter().all(|(m, _)| m.slot() != 3),
+            "tombstoned memory must be excluded"
+        );
+        assert!(
+            pairs.iter().all(|(m, _)| m.slot() != 4),
+            "vectorless memory must be excluded"
+        );
+    }
+
     // ---- WalDirRetentionSource --------------------------------------------
 
     #[test]
@@ -620,12 +1056,11 @@ mod tests {
         let uuid: [u8; 16] = *uuid::Uuid::now_v7().as_bytes();
         let md_path = tmp.path().join("metadata.redb");
         let md = MetadataDb::open(&md_path).expect("MetadataDb::open");
-        let metadata: SharedMetadataDb = Arc::new(Mutex::new(md));
+        let metadata: SharedMetadataDb = Arc::new(md);
 
-        // The source is `!Send` because of the `Arc<Mutex<MetadataDb>>`
-        // → `parking_lot::Mutex` is `Send + Sync` but the source's
-        // future returns are `!Send` (their trait dropped + Send in
-        // 9.8). Construct inside the executor closure.
+        // The source's future returns are `!Send` (their trait dropped
+        // Send), so construct it inside the executor closure
+        // rather than across the spawn boundary.
         let cp = glommio_run(move || async move {
             let src = WalDirRetentionSource::new(wal_dir, uuid, metadata);
             src.current_checkpoint().await
@@ -642,7 +1077,7 @@ mod tests {
         let uuid: [u8; 16] = *uuid::Uuid::now_v7().as_bytes();
         let md_path = tmp.path().join("metadata.redb");
         let md = MetadataDb::open(&md_path).expect("MetadataDb::open");
-        let metadata: SharedMetadataDb = Arc::new(Mutex::new(md));
+        let metadata: SharedMetadataDb = Arc::new(md);
 
         glommio_run(move || async move {
             let src = WalDirRetentionSource::new(wal_dir, uuid, metadata);
@@ -659,7 +1094,7 @@ mod tests {
         let uuid: [u8; 16] = *uuid::Uuid::now_v7().as_bytes();
         let md_path = tmp.path().join("metadata.redb");
         let md = MetadataDb::open(&md_path).expect("MetadataDb::open");
-        let metadata: SharedMetadataDb = Arc::new(Mutex::new(md));
+        let metadata: SharedMetadataDb = Arc::new(md);
 
         let segs = glommio_run(move || async move {
             std::fs::create_dir_all(&wal_dir).unwrap();
@@ -681,32 +1116,46 @@ mod tests {
 
     // ---- ShardSnapshotSource ----------------------------------------------
 
+    /// Take a snapshot of a populated shard (≥1 HNSW vector + ≥1 WAL
+    /// record) and assert the bundle is complete: arena.bin,
+    /// metadata.redb, ≥1 WAL segment, and a manifest.json whose BLAKE3
+    /// digests match the on-disk files. Then list + delete it.
     #[test]
-    fn snapshot_take_list_delete_round_trips() {
+    fn snapshot_bundle_is_complete_and_blake3_matches() {
+        use crate::shard::snapshot_manifest::{blake3_hex, SnapshotManifest, MANIFEST_FILE};
+        use brain_core::MemoryId;
+
         let tmp = TempDir::new().unwrap();
         let snapshots_root = tmp.path().join("snapshots");
+        // metadata.redb at the root, wal/ as a sibling — the layout
+        // ShardSnapshotSource::new derives the WAL dir from.
         let arena_path = tmp.path().join("arena.bin");
         let md_path = tmp.path().join("metadata.redb");
         let wal_dir = tmp.path().join("wal");
         std::fs::create_dir_all(&wal_dir).unwrap();
         let uuid: [u8; 16] = *uuid::Uuid::now_v7().as_bytes();
 
-        // MetadataDb is `Send + Sync` (wrapped in `parking_lot::Mutex`)
-        // so it crosses the spawn boundary. ArenaFile + Wal must be
-        // opened inside the executor (Wal::create is async; ArenaFile
-        // is Send but we keep all `Rc<RefCell<…>>` construction local).
         let md = brain_metadata::MetadataDb::open(&md_path).expect("MetadataDb::open");
-        let metadata: SharedMetadataDb = std::sync::Arc::new(Mutex::new(md));
+        let metadata: SharedMetadataDb = std::sync::Arc::new(md);
 
         let arena_path_cloned = arena_path.clone();
         let md_path_cloned = md_path.clone();
         let snapshots_root_cloned = snapshots_root.clone();
         let wal_dir_cloned = wal_dir.clone();
 
-        glommio_run({
+        let snap_dir = glommio_run({
             let metadata = metadata.clone();
             move || async move {
-                let arena = ArenaFile::open(&arena_path_cloned, uuid, 8).expect("ArenaFile::open");
+                let mut arena =
+                    ArenaFile::open(&arena_path_cloned, uuid, 8).expect("ArenaFile::open");
+                // Occupy a slot so the arena image isn't all-zero.
+                {
+                    let s = arena.slot_mut(0);
+                    s.metadata.flags = brain_storage::arena::slot::flags::OCCUPIED;
+                    s.metadata.slot_version = 1;
+                    s.vector[0] = 0.25;
+                }
+                arena.msync_all().expect("arena msync");
                 let arena_cell = Rc::new(RefCell::new(arena));
 
                 let wal = Wal::create_with_config(&wal_dir_cloned, uuid, WalConfig::default())
@@ -714,10 +1163,26 @@ mod tests {
                     .expect("Wal::create_with_config");
                 let wal_cell = Rc::new(RefCell::new(Some(wal)));
 
-                let (hnsw_shared, _hnsw_writer) = brain_index::SharedHnsw::<{ VECTOR_DIM }>::new(
-                    brain_index::IndexParams::default_v1(),
-                )
-                .expect("SharedHnsw::new");
+                // Populate the HNSW so save_snapshot isn't a no-op.
+                let (hnsw_shared, _hnsw_writer) =
+                    brain_index::SharedHnsw::new(brain_index::IndexParams::default_v1())
+                        .expect("SharedHnsw::new");
+                let mut v = [0.0_f32; VECTOR_DIM];
+                v[0] = 1.0;
+                let mid = MemoryId::pack(0, 0, 1);
+                hnsw_shared.insert_recovery(mid, &v);
+                // Publish pending into the main epoch so save_snapshot
+                // (which snapshots `main`) isn't an empty-graph no-op.
+                let params = hnsw_shared.params();
+                hnsw_shared
+                    .flush_with_rebuild(move |pending| {
+                        let pairs: Vec<_> =
+                            pending.iter().map(|e| (e.memory_id, e.vector)).collect();
+                        let (idx, _) = brain_index::rebuild::rebuild_impl(params, pairs)?;
+                        Ok(idx)
+                    })
+                    .expect("flush_with_rebuild publishes the vector");
+                assert!(!hnsw_shared.is_empty(), "HNSW main must be non-empty");
 
                 let src = ShardSnapshotSource::new(
                     uuid,
@@ -728,6 +1193,14 @@ mod tests {
                     wal_cell.clone(),
                     metadata,
                     hnsw_shared,
+                    // Watermark seeded past the WAL tail so this
+                    // bundle-completeness test exercises the normal
+                    // (all-committed) checkpoint path.
+                    {
+                        let wm = RedbCommittedWatermark::new();
+                        wm.advance_to(u64::MAX);
+                        wm
+                    },
                 );
 
                 let id = src.take_snapshot().await.expect("take_snapshot");
@@ -737,21 +1210,419 @@ mod tests {
                 assert_eq!(listed.len(), 1);
                 assert_eq!(listed[0].id, id);
 
-                src.delete_snapshot(id).await.expect("delete_snapshot");
-
-                let listed_after = src.list_snapshots().await.expect("list_snapshots empty");
-                assert!(listed_after.is_empty());
+                let dir = snapshots_root_cloned.join(format!("{:020}", id.0));
 
                 // Drain the WAL cleanly so the test doesn't leak.
                 let mut g = wal_cell.borrow_mut();
                 if let Some(w) = g.take() {
                     w.shutdown().await.expect("Wal::shutdown");
                 }
+                dir
             }
         });
 
-        // The snapshot directory was created and then cleaned by
-        // `delete_snapshot`; the root itself should still exist.
+        // Bundle assertions (sync, outside the executor).
+        assert!(snap_dir.join("arena.bin").is_file(), "arena.bin present");
+        assert!(
+            snap_dir.join("metadata.redb").is_file(),
+            "metadata.redb present"
+        );
+        let wal_segs: Vec<_> = std::fs::read_dir(snap_dir.join("wal"))
+            .expect("bundle wal/ dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("wal"))
+            .collect();
+        assert!(
+            !wal_segs.is_empty(),
+            "bundle must carry ≥1 WAL segment (the checkpoint tail)"
+        );
+        assert!(
+            snap_dir.join("hnsw.brain").is_file(),
+            "non-empty HNSW snapshot marker present"
+        );
+
+        let manifest =
+            SnapshotManifest::read_from(&snap_dir.join(MANIFEST_FILE)).expect("manifest.json");
+        assert!(manifest.files.contains_key("arena.bin"));
+        assert!(manifest.files.contains_key("metadata.redb"));
+        assert!(
+            manifest.files.keys().any(|k| k.starts_with("wal/")),
+            "manifest lists ≥1 wal segment"
+        );
+        // Every manifest digest matches the on-disk file.
+        for (rel, digest) in &manifest.files {
+            let path = snap_dir.join(rel);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().len(),
+                digest.size,
+                "size mismatch for {rel}"
+            );
+            assert_eq!(
+                blake3_hex(&path).unwrap(),
+                digest.blake3,
+                "blake3 mismatch for {rel}"
+            );
+        }
+
+        // Delete cleans the directory; the root persists.
+        glommio_run({
+            let metadata = metadata.clone();
+            let snapshots_root = snapshots_root.clone();
+            let arena_path = arena_path.clone();
+            let md_path = md_path.clone();
+            move || async move {
+                let arena = ArenaFile::open(&arena_path, uuid, 8).expect("reopen arena");
+                let arena_cell = Rc::new(RefCell::new(arena));
+                let wal_cell = Rc::new(RefCell::new(None));
+                let (hnsw_shared, _w) =
+                    brain_index::SharedHnsw::new(brain_index::IndexParams::default_v1()).unwrap();
+                let src = ShardSnapshotSource::new(
+                    uuid,
+                    snapshots_root,
+                    arena_path,
+                    md_path,
+                    arena_cell,
+                    wal_cell,
+                    metadata,
+                    hnsw_shared,
+                    RedbCommittedWatermark::new(),
+                );
+                src.delete_snapshot(SnapshotId(1))
+                    .await
+                    .expect("delete_snapshot");
+                let after = src.list_snapshots().await.expect("list after delete");
+                assert!(after.is_empty());
+            }
+        });
         assert!(snapshots_root.exists());
+    }
+
+    // ---- HIGH-1: snapshot-id resume across restart ------------------------
+
+    #[test]
+    fn scan_max_snapshot_id_handles_missing_empty_and_populated() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("snapshots");
+        // Missing dir → 0.
+        assert_eq!(scan_max_snapshot_id(&root), 0);
+        // Empty dir → 0.
+        std::fs::create_dir_all(&root).unwrap();
+        assert_eq!(scan_max_snapshot_id(&root), 0);
+        // Populated {1,2,3} using the 20-digit names take_snapshot writes,
+        // plus a stray non-numeric entry that must be ignored.
+        for id in [1u64, 2, 3] {
+            std::fs::create_dir_all(root.join(format!("{id:020}"))).unwrap();
+        }
+        std::fs::create_dir_all(root.join("not-a-snapshot")).unwrap();
+        assert_eq!(scan_max_snapshot_id(&root), 3);
+    }
+
+    /// After a restart the checkpoint counter must resume past the highest
+    /// existing snapshot id — restarting at 1 would let the next cycle's
+    /// `reflink_or_copy` truncate and overwrite bundle #1 (invariant #7).
+    #[test]
+    fn new_resumes_checkpoint_counter_past_existing_snapshots() {
+        let tmp = TempDir::new().unwrap();
+        let tmp_path = tmp.path().to_path_buf();
+        let next_id = glommio_run(move || async move {
+            let snapshots_root = tmp_path.join("snapshots");
+            for id in [1u64, 2, 3] {
+                std::fs::create_dir_all(snapshots_root.join(format!("{id:020}"))).unwrap();
+            }
+            let arena_path = tmp_path.join("arena.bin");
+            let md_path = tmp_path.join("metadata.redb");
+            let uuid: [u8; 16] = *uuid::Uuid::now_v7().as_bytes();
+            let md = MetadataDb::open(&md_path).expect("MetadataDb::open");
+            let metadata: SharedMetadataDb = Arc::new(md);
+            let arena = ArenaFile::open(&arena_path, uuid, 8).expect("ArenaFile::open");
+            let arena_cell = Rc::new(RefCell::new(arena));
+            let wal_cell = Rc::new(RefCell::new(None));
+            let (hnsw_shared, _w) =
+                brain_index::SharedHnsw::new(brain_index::IndexParams::default_v1()).unwrap();
+            let src = ShardSnapshotSource::new(
+                uuid,
+                snapshots_root,
+                arena_path,
+                md_path,
+                arena_cell,
+                wal_cell,
+                metadata,
+                hnsw_shared,
+                RedbCommittedWatermark::new(),
+            );
+            // The next allocated checkpoint id is 4 → bundle #3 is safe.
+            src.next_ckpt_id()
+        });
+        assert_eq!(next_id, 4);
+    }
+
+    // ---- CORE-DURABILITY: checkpoint durable_lsn vs redb-committed watermark
+
+    /// A minimal Encode WAL record for a given arena slot. Mirrors the
+    /// storage crate's recovery-test fixture: recovery decodes + applies
+    /// it, so it counts toward `records_replayed` / `applied()`.
+    fn encode_record(slot: u64) -> WalRecord {
+        use brain_core::{MemoryId, MemoryKind, NamespaceId, SessionId, SpaceId};
+        use brain_storage::wal::payload::{EncodePayload, WalPayload};
+
+        let p = EncodePayload {
+            memory_id: MemoryId::pack(1, slot, 1),
+            request_id: [0u8; 16].into(),
+            space_id: SpaceId::default(),
+            namespace_id: NamespaceId::SYSTEM,
+            session_id: SessionId(0),
+            kind: MemoryKind::Episodic,
+            salience_initial: 0.5,
+            embedding_model_fp: [0xAB; 16],
+            text: "hello".to_string(),
+            vector: vec![0.5; VECTOR_DIM],
+            edges: vec![],
+            request_hash: [0; 32],
+            response_payload: vec![],
+            deduplicate: false,
+            occurred_at_unix_nanos: None,
+        };
+        WalRecord::from_typed(
+            Lsn(0),
+            0,
+            1_700_000_000_000_000_000,
+            0xCAFE,
+            &WalPayload::Encode(p),
+        )
+    }
+
+    /// Append `n_data` Encode records (LSN `1..=n_data`), set the
+    /// redb-committed watermark to `watermark`, take exactly one
+    /// snapshot, then drain the WAL. Returns `(tempdir, wal_dir, uuid,
+    /// arena_path)` for a subsequent recovery pass. The tempdir is
+    /// returned so the caller keeps it alive.
+    fn snapshot_with_watermark(
+        n_data: u64,
+        watermark: u64,
+    ) -> (TempDir, std::path::PathBuf, [u8; 16], std::path::PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().to_path_buf();
+        let arena_path = base.join("arena.bin");
+        let md_path = base.join("metadata.redb");
+        let wal_dir = base.join("wal");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+        let uuid: [u8; 16] = *uuid::Uuid::now_v7().as_bytes();
+        let md = MetadataDb::open(&md_path).expect("MetadataDb::open");
+        let metadata: SharedMetadataDb = Arc::new(md);
+
+        let wm = RedbCommittedWatermark::new();
+        wm.advance_to(watermark);
+
+        {
+            let arena_path = arena_path.clone();
+            let md_path = md_path.clone();
+            let wal_dir = wal_dir.clone();
+            let snap_root = base.join("snapshots");
+            let metadata = metadata.clone();
+            glommio_run(move || async move {
+                let arena = ArenaFile::open(&arena_path, uuid, 16).expect("ArenaFile::open");
+                let arena_cell = Rc::new(RefCell::new(arena));
+                let wal = Wal::create_with_config(&wal_dir, uuid, WalConfig::default())
+                    .await
+                    .expect("Wal::create_with_config");
+                for slot in 0..n_data {
+                    wal.append(encode_record(slot)).await.expect("wal append");
+                }
+                let wal_cell = Rc::new(RefCell::new(Some(wal)));
+                let (hnsw, _w) =
+                    brain_index::SharedHnsw::new(brain_index::IndexParams::default_v1()).unwrap();
+                let src = ShardSnapshotSource::new(
+                    uuid,
+                    snap_root,
+                    arena_path.clone(),
+                    md_path,
+                    arena_cell,
+                    wal_cell.clone(),
+                    metadata,
+                    hnsw,
+                    wm,
+                );
+                src.take_snapshot().await.expect("take_snapshot");
+                let mut g = wal_cell.borrow_mut();
+                if let Some(w) = g.take() {
+                    w.shutdown().await.expect("Wal::shutdown");
+                }
+            });
+        }
+        (tmp, wal_dir, uuid, arena_path)
+    }
+
+    /// The gap: three writes are WAL-durable (LSN 1,2,3) but only the
+    /// first has been committed to redb (watermark = 1). The periodic
+    /// snapshot stamps CHECKPOINT_END while records 2 and 3 are still
+    /// uncommitted. The checkpoint's `durable_lsn` MUST be the
+    /// redb-committed watermark (1), NOT the WAL tail — otherwise a
+    /// crash-then-recovery would skip LSN 2 and 3 and silently drop
+    /// WAL-durable data.
+    #[test]
+    fn checkpoint_durable_lsn_is_redb_watermark_not_wal_tail() {
+        use brain_storage::recovery::MetadataSink;
+        let (_tmp, wal_dir, uuid, arena_path) = snapshot_with_watermark(3, 1);
+
+        // Pass 1 (fresh sink): reads the CHECKPOINT_END record, which
+        // carries durable_lsn = watermark.
+        let mut arena = ArenaFile::open(&arena_path, uuid, 16).expect("reopen arena");
+        let mut sink = brain_storage::recovery::InMemoryMetadataSink::new();
+        let (report1, _alloc) =
+            brain_storage::recovery::recover(&mut arena, &wal_dir, uuid, &mut sink)
+                .expect("recover pass 1");
+        assert_eq!(
+            sink.durable_lsn(),
+            1,
+            "CHECKPOINT_END.durable_lsn must equal the redb-committed watermark (1), \
+             not the WAL tail",
+        );
+        assert!(
+            sink.durable_lsn() < report1.next_lsn.saturating_sub(1),
+            "durable_lsn ({}) must be strictly below the WAL tail (next_lsn-1 = {})",
+            sink.durable_lsn(),
+            report1.next_lsn.saturating_sub(1),
+        );
+
+        // Pass 2 (sink seeded with the checkpoint's durable_lsn): proves
+        // recovery REPLAYS the WAL-durable-but-redb-uncommitted records
+        // rather than skipping them.
+        let mut arena2 = ArenaFile::open(&arena_path, uuid, 16).expect("reopen arena 2");
+        let mut sink2 =
+            brain_storage::recovery::InMemoryMetadataSink::with_durable_lsn(sink.durable_lsn());
+        let (report2, _alloc2) =
+            brain_storage::recovery::recover(&mut arena2, &wal_dir, uuid, &mut sink2)
+                .expect("recover pass 2");
+        assert!(
+            sink2.applied().contains_key(&2),
+            "LSN 2 (WAL-durable, redb-uncommitted) must be REPLAYED",
+        );
+        assert!(
+            sink2.applied().contains_key(&3),
+            "LSN 3 (WAL-durable, redb-uncommitted) must be REPLAYED",
+        );
+        assert_eq!(
+            report2.records_skipped, 1,
+            "only LSN 1 (at/below the watermark) may be skipped",
+        );
+    }
+
+    /// Normal case: every write has committed to redb (watermark past
+    /// the WAL tail). The checkpoint then advances `durable_lsn` to the
+    /// latest LSN (clamped to the WAL tail sampled at CHECKPOINT_BEGIN),
+    /// so recovery correctly skips the whole already-durable prefix.
+    #[test]
+    fn checkpoint_durable_lsn_advances_when_all_writes_committed() {
+        use brain_storage::recovery::MetadataSink;
+        // watermark = u64::MAX → "everything committed"; durable_lsn is
+        // clamped to the WAL tail (the CHECKPOINT_BEGIN LSN, 4).
+        let (_tmp, wal_dir, uuid, arena_path) = snapshot_with_watermark(3, u64::MAX);
+
+        let mut arena = ArenaFile::open(&arena_path, uuid, 16).expect("reopen arena");
+        let mut sink = brain_storage::recovery::InMemoryMetadataSink::new();
+        brain_storage::recovery::recover(&mut arena, &wal_dir, uuid, &mut sink).expect("recover");
+        // Three data records (1,2,3) + CHECKPOINT_BEGIN (4); the tail
+        // sampled at BEGIN is 4, so the checkpoint advances there.
+        assert_eq!(
+            sink.durable_lsn(),
+            4,
+            "with all writes committed the checkpoint advances durable_lsn to the WAL tail",
+        );
+    }
+
+    /// One gap case: `n_data` Encode records are WAL-durable (LSN
+    /// `1..=n_data`) but only the first `watermark` (`1 <= watermark <
+    /// n_data`) have committed to redb. A snapshot stamps CHECKPOINT_END
+    /// while records `watermark+1..=n_data` are still uncommitted.
+    ///
+    /// Asserts the watermark contract holds end-to-end:
+    /// - the checkpoint's `durable_lsn` equals the redb-committed watermark
+    ///   (`< n_data`, strictly below the WAL tail);
+    /// - recovery seeded with that `durable_lsn` REPLAYS every
+    ///   WAL-durable-but-redb-uncommitted record (`watermark+1..=n_data`)
+    ///   and skips exactly the `watermark` truly-committed ones — never
+    ///   silently dropping a WAL-durable record.
+    fn assert_watermark_gap_replays(n_data: u64, watermark: u64) {
+        use brain_storage::recovery::MetadataSink;
+        assert!(
+            (1..n_data).contains(&watermark),
+            "gap case requires 1 <= watermark < n_data (got n_data={n_data}, watermark={watermark})",
+        );
+        let (_tmp, wal_dir, uuid, arena_path) = snapshot_with_watermark(n_data, watermark);
+
+        // Pass 1 (fresh sink): CHECKPOINT_END carries durable_lsn = watermark.
+        let mut arena = ArenaFile::open(&arena_path, uuid, 16).expect("reopen arena");
+        let mut sink = brain_storage::recovery::InMemoryMetadataSink::new();
+        let (report1, _alloc) =
+            brain_storage::recovery::recover(&mut arena, &wal_dir, uuid, &mut sink)
+                .expect("recover pass 1");
+        assert_eq!(
+            sink.durable_lsn(),
+            watermark,
+            "n_data={n_data}: durable_lsn must equal the redb-committed watermark",
+        );
+        assert!(
+            sink.durable_lsn() < report1.next_lsn.saturating_sub(1),
+            "n_data={n_data}: durable_lsn ({}) must be strictly below the WAL tail ({})",
+            sink.durable_lsn(),
+            report1.next_lsn.saturating_sub(1),
+        );
+
+        // Pass 2 (sink seeded with the checkpoint's durable_lsn): every
+        // uncommitted record is replayed; exactly `watermark` are skipped.
+        let mut arena2 = ArenaFile::open(&arena_path, uuid, 16).expect("reopen arena 2");
+        let mut sink2 =
+            brain_storage::recovery::InMemoryMetadataSink::with_durable_lsn(sink.durable_lsn());
+        let (report2, _alloc2) =
+            brain_storage::recovery::recover(&mut arena2, &wal_dir, uuid, &mut sink2)
+                .expect("recover pass 2");
+        for lsn in (watermark + 1)..=n_data {
+            assert!(
+                sink2.applied().contains_key(&lsn),
+                "n_data={n_data}, watermark={watermark}: LSN {lsn} \
+                 (WAL-durable, redb-uncommitted) must be REPLAYED",
+            );
+        }
+        assert_eq!(
+            report2.records_skipped, watermark,
+            "n_data={n_data}, watermark={watermark}: only records at/below the \
+             watermark may be skipped",
+        );
+    }
+
+    /// The S5 scenario, swept across several deterministic watermark/tail
+    /// gaps: for each `(n_data, watermark)` the checkpoint's durable_lsn is
+    /// the redb-committed watermark and recovery replays every uncommitted
+    /// record. Extends the single-case
+    /// `checkpoint_durable_lsn_is_redb_watermark_not_wal_tail` with wider
+    /// coverage of the gap size.
+    #[test]
+    fn checkpoint_watermark_gap_replays_uncommitted_records() {
+        for (n_data, watermark) in [(3, 1), (4, 2), (4, 3), (5, 1), (5, 4), (6, 3), (8, 5)] {
+            assert_watermark_gap_replays(n_data, watermark);
+        }
+    }
+
+    /// Randomized watermark/tail gaps over a handful of deterministic seeds:
+    /// the same replay-never-skip invariant must hold for arbitrary gap
+    /// positions, not just the hand-picked ones above.
+    #[test]
+    fn checkpoint_watermark_gap_replays_uncommitted_records_randomized() {
+        // Deterministic xorshift64* — reproducible, no dependency.
+        let mut state: u64 = 0x1234_5678_9ABC_DEF0;
+        let mut next = || {
+            let mut x = state;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            state = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        };
+        for _ in 0..10 {
+            // n_data in 3..=9; watermark in 1..n_data.
+            let n_data = 3 + next() % 7;
+            let watermark = 1 + next() % (n_data - 1);
+            assert_watermark_gap_replays(n_data, watermark);
+        }
     }
 }

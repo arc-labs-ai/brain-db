@@ -20,28 +20,41 @@
 //!    score is at or above [`EMBED_RESOLVE_THRESHOLD`], add the
 //!    surface form as an alias and return that EntityId. This catches
 //!    paraphrases trigrams miss (e.g. "Stripe Inc." vs
-//!    "Stripe Payments").
-//! 5. **Create** — mint a fresh UUIDv7 EntityId, intern the type if
-//!    needed, embed the canonical name (when an HNSW is wired), and
-//!    write the entity row + the HNSW slot. Synchronous population
-//!    means subsequent resolves can hit the embedding tier immediately;
-//!    a worker-driven HNSW backfill isn't required because entity
-//!    creation is rare relative to statement creation.
+//!    "Stripe Payments"). A candidate that lands in the lower,
+//!    ambiguous partial-match band is not aliased outright — it goes
+//!    to the disambiguator (tier 5) for a second opinion.
+//! 5. **Disambiguate (second opinion)** — when the embedding probe
+//!    lands a candidate in the ambiguous partial-match band, ask the
+//!    pluggable disambiguator whether it is the same entity. The
+//!    backend is LLM-driven today (via [`brain_llm::LlmClient`];
+//!    heuristics or a classifier could slot in later). A confirmed
+//!    match aliases the surface form and returns
+//!    ([`ResolutionTier::Disambiguated`]); an explicit rejection, or an
+//!    uncertain / absent disambiguator, falls through to create. This
+//!    tier is live today, not planned.
+//! 6. **Create** — mint a fresh UUIDv7 EntityId, intern the type if
+//!    needed, embed the canonical name (when an HNSW is wired), write
+//!    the entity row + the durable vector row, and STAGE the HNSW
+//!    insert in a [`StagedEntityVectors`] the caller flushes after its
+//!    write txn commits. Staged vectors are visible to the embedding
+//!    tier for the rest of the pass, so subsequent resolves still
+//!    short-circuit immediately; a worker-driven HNSW backfill isn't
+//!    required because entity creation is rare relative to statement
+//!    creation.
 //!
 //! Determinism comes from the lookup contract: given the same DB
 //! state + same surface form, the resolver always returns the same
-//! EntityId. Tier-5 creates use UUIDv7 (time + random), so two
+//! EntityId. Tier-6 creates use UUIDv7 (time + random), so two
 //! independent resolves of the same brand-new surface form against
 //! the same DB produce different IDs only if both observe a
-//! tier-1/2/3/4 miss — which is the intended split-brain semantics
+//! tier-1/2/3/4/5 miss — which is the intended split-brain semantics
 //! for two simultaneous extractions.
 //!
-//! The embedding threshold defaults to 0.78 cosine. Operators can
-//! tighten or loosen it via `BRAIN_RESOLVER_EMBED_THRESHOLD` (parsed
-//! as an f32 in `[0.0, 1.0]`; invalid values fall back to the
-//! default with a `tracing::warn!`). Callers that have no HNSW or no
-//! embedder pass `None` for either and the tier silently skips —
-//! the gauntlet still flows through tier-1/2/3/5 unchanged.
+//! The embedding threshold defaults to 0.78 cosine, carried on
+//! [`EmbeddingDeps::embed_threshold`]; the shard ferries
+//! `[extractors.resolver] embed_threshold` there. Callers that have no
+//! HNSW or no embedder pass `None` for either and tiers 4–5 silently
+//! skip — the gauntlet still flows through tier-1/2/3/6 unchanged.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -53,7 +66,10 @@ use brain_embed::Dispatcher;
 use brain_index::entity_hnsw::EntityHnswIndex;
 use brain_index::VECTOR_DIM;
 use brain_llm::LlmClient;
-use brain_metadata::entity::ops::{entity_add_alias, entity_put, normalize_name, EntityOpError};
+use brain_metadata::entity::ops::{
+    entity_add_alias, entity_put, entity_resolve_canonical_all_types_wtxn, entity_vector_put,
+    normalize_name, EntityOpError,
+};
 use brain_metadata::entity::review::{enqueue_merge_proposal, MergeReviewError};
 use brain_metadata::entity::trigram::TrigramOpError;
 use brain_metadata::entity::types::{
@@ -64,10 +80,20 @@ use brain_metadata::tables::entity::{
     ENTITY_TRIGRAMS_TABLE,
 };
 use brain_metadata::tables::merge_review_queue::proposal_tier;
+use brain_metadata::RowScope;
 use parking_lot::RwLock;
 use redb::{ReadableTable, WriteTransaction};
 
-use crate::resolver_llm::LlmCandidateView;
+/// Read-side projection of one candidate entity, snapshotted from
+/// storage and handed to the disambiguator so it can build a useful
+/// prompt. The disambiguator matches on `entity_id`.
+#[derive(Debug, Clone)]
+pub struct LlmCandidateView {
+    pub entity_id: EntityId,
+    pub canonical_name: String,
+    pub aliases: Vec<String>,
+    pub entity_type_name: String,
+}
 
 /// Jaccard floor for tier-3 fuzzy matching. Below this, the resolver
 /// treats the candidate as a near-miss and skips it. Tuned conservatively
@@ -96,54 +122,35 @@ pub const EMBED_RESOLVE_THRESHOLD: f32 = 0.78;
 /// — "0.7 to 0.95 goes to review".
 pub const PARTIAL_MATCH_FLOOR: f32 = 0.7;
 
-/// Env-var override for [`EMBED_RESOLVE_THRESHOLD`]. Parsed as an
-/// f32 in `[0.0, 1.0]`; invalid / out-of-range values fall back to
-/// the default with a `tracing::warn!`.
-pub const EMBED_RESOLVE_THRESHOLD_ENV: &str = "BRAIN_RESOLVER_EMBED_THRESHOLD";
-
 /// Top-K asked of the entity HNSW during a tier-3 embedding probe.
 /// 8 balances "enough candidates to break a near-tie" against the
 /// cost of `entity_get`-ing each one for the type-filter pass.
 const EMBED_RESOLVE_TOP_K: usize = 8;
 
-/// Resolved effective threshold for the current process. Reads the
-/// env var once (per call) so tests can flip it inside `with_var`.
-fn embed_resolve_threshold() -> f32 {
-    parse_embed_threshold_env(std::env::var(EMBED_RESOLVE_THRESHOLD_ENV).ok().as_deref())
-}
+/// Minimum length (in characters) of a single-token Person surface for
+/// the diminutive / prefix coref tier to treat it as a nickname. Below
+/// this ("Al", "Jo", "Ed") the shared prefix is too weak a signal — many
+/// distinct names share a 2-character stem — so the resolver declines and
+/// mints rather than risk merging distinct people.
+const MIN_DIMINUTIVE_LEN: usize = 3;
 
-/// Pure-logic parser for [`EMBED_RESOLVE_THRESHOLD_ENV`]. Exposed for
-/// unit tests that don't want to race the process-wide env.
-pub fn parse_embed_threshold_env(raw: Option<&str>) -> f32 {
-    let Some(raw) = raw else {
-        return EMBED_RESOLVE_THRESHOLD;
-    };
-    if raw.is_empty() {
-        return EMBED_RESOLVE_THRESHOLD;
-    }
-    match raw.parse::<f32>() {
-        Ok(v) if (0.0..=1.0).contains(&v) => v,
-        Ok(v) => {
-            tracing::warn!(
-                target: "brain_extractors::resolver",
-                env_var = EMBED_RESOLVE_THRESHOLD_ENV,
-                value = v,
-                "embed-resolve threshold outside [0.0, 1.0]; using default",
-            );
-            EMBED_RESOLVE_THRESHOLD
-        }
-        Err(e) => {
-            tracing::warn!(
-                target: "brain_extractors::resolver",
-                env_var = EMBED_RESOLVE_THRESHOLD_ENV,
-                value = %raw,
-                error = %e,
-                "embed-resolve threshold env var is not a valid f32; using default",
-            );
-            EMBED_RESOLVE_THRESHOLD
-        }
-    }
-}
+/// Small closed set of leading greeting / vocative interjections stripped
+/// from a Person surface before resolution. These are domain-general
+/// English discourse markers that essentially never begin a real person
+/// name — NOT a per-name list. Kept deliberately tight: words that could
+/// plausibly begin a name ("well", "so", "man") are excluded.
+const GREETING_TOKENS: &[&str] = &[
+    "hey", "hi", "hiya", "heya", "hello", "hullo", "yo", "thanks", "thx", "thankyou", "yeah",
+    "yea", "yep", "yup", "yes", "wow", "oh", "ohh", "ooh", "hmm", "hm", "uh", "um", "er", "ah",
+    "please", "dear",
+];
+
+/// Timeout for the LLM disambiguation confirm call. The call is now
+/// `.await`-ed off the shard reactor (in the worker's plan step, before
+/// any write txn opens), so this bounds only one memory's own extraction
+/// latency, not a shard-wide freeze — a natural value is fine. A hung
+/// provider degrades to the merge/create fallback. See `ask_if_same_entity`.
+const DISAMBIGUATOR_LLM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Outcome of one resolve attempt. The worker uses the tier to bump
 /// per-tier counters on the pipeline audit row.
@@ -164,10 +171,19 @@ pub enum ResolutionTier {
 }
 
 /// Successful resolution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Resolution {
     pub entity_id: EntityId,
     pub tier: ResolutionTier,
+    /// The resolver's confidence in this match, in `[0.0, 1.0]`. The
+    /// deterministic identity tiers (exact / alias / coref / created)
+    /// carry `1.0`; the score-based tiers surface their real match
+    /// score — trigram Jaccard for fuzzy, cosine for embedding, and the
+    /// disambiguator's own confidence for a confirmed ambiguous-band
+    /// match. Consumed by the per-mention resolution audit so a logged
+    /// derivation records how strong the match was, not just which tier
+    /// fired.
+    pub confidence: f32,
 }
 
 /// Errors the resolver can surface to the worker. Most are storage-level;
@@ -201,6 +217,165 @@ pub enum ResolverError {
 /// whole input if the colon is absent.
 fn qname_to_type_name(qname: &str) -> &str {
     qname.split_once(':').map(|(_, n)| n).unwrap_or(qname)
+}
+
+/// True when the entity-type qname denotes a Person. Person is the only
+/// type the greeting-strip and diminutive-coref guards touch: both are
+/// person-name phenomena, and widening them risks mangling legitimate
+/// org / product names ("Hello Fresh" the company, "Goog" → "Google").
+fn surface_type_is_person(entity_type_qname: &str) -> bool {
+    qname_to_type_name(entity_type_qname).eq_ignore_ascii_case("person")
+}
+
+/// Strip leading greeting / vocative tokens from `surface`, returning the
+/// remainder when at least one was removed and something non-empty is
+/// left. Returns `None` when the surface carries no leading greeting — so a
+/// bare "Hey" (no following name) or a plain "Mel" is never altered, and
+/// the caller keeps the original surface.
+///
+/// Extractors routinely tag conversational vocatives ("Hey Mel", "Thanks
+/// Mel", "Yeah Mel") as standalone Person surfaces; each would otherwise
+/// mint a distinct entity and fragment Mel's facts. Case-insensitive;
+/// trailing punctuation on the greeting token ("Hey,") is tolerated; the
+/// surviving name tokens keep their original casing.
+///
+/// ```
+/// use brain_extractors::resolver::strip_leading_vocative;
+/// assert_eq!(strip_leading_vocative("Hey Mel").as_deref(), Some("Mel"));
+/// assert_eq!(strip_leading_vocative("Thanks Mel").as_deref(), Some("Mel"));
+/// assert_eq!(strip_leading_vocative("Mel"), None);
+/// ```
+#[must_use]
+pub fn strip_leading_vocative(surface: &str) -> Option<String> {
+    let mut tokens: Vec<&str> = surface.split_whitespace().collect();
+    let mut stripped = false;
+    // Never reduce below one token: a greeting with no trailing name is not
+    // a name at all, so leave it for the ordinary (empty-name) rejection.
+    while tokens.len() >= 2 {
+        let head_clean: String = tokens[0]
+            .trim_matches(|c: char| !c.is_alphanumeric())
+            .to_lowercase();
+        // Two-word "thank you <name>".
+        if head_clean == "thank"
+            && tokens.len() >= 3
+            && tokens[1]
+                .trim_matches(|c: char| !c.is_alphanumeric())
+                .eq_ignore_ascii_case("you")
+        {
+            tokens.drain(0..2);
+            stripped = true;
+            continue;
+        }
+        if GREETING_TOKENS.contains(&head_clean.as_str()) {
+            tokens.remove(0);
+            stripped = true;
+            continue;
+        }
+        break;
+    }
+    if stripped && !tokens.is_empty() {
+        Some(tokens.join(" "))
+    } else {
+        None
+    }
+}
+
+/// True when `surface` is, in its entirety, a date or relative-time phrase
+/// — "Last Friday", "Last Fri", "yesterday", "next week", "3 days ago",
+/// "in 2 weeks", "January 2026", "January 5, 2026", "2026", an ISO date —
+/// and therefore names no entity. The extractor tiers call this to drop
+/// temporal spans the LLM / classifier occasionally tag as Person / entity
+/// surfaces; such a span belongs in the graph as an Event statement, never
+/// as a node of its own.
+///
+/// Conservative on the axis that matters: it never rejects a BARE weekday
+/// or month name ("Friday", "Sun", "May"), any of which can legitimately be
+/// a person name. It rejects only forms that are unambiguously temporal — a
+/// deictic, a relative lead ("last / this / next / …") before a weekday or
+/// period, an explicit offset ("N units ago", "in N units"), or a calendar
+/// date that pins a year.
+///
+/// ```
+/// use brain_extractors::resolver::is_temporal_expression_surface;
+/// assert!(is_temporal_expression_surface("Last Friday"));
+/// assert!(is_temporal_expression_surface("yesterday"));
+/// assert!(is_temporal_expression_surface("January 2026"));
+/// assert!(!is_temporal_expression_surface("Melanie"));
+/// assert!(!is_temporal_expression_surface("Friday")); // could be a name
+/// assert!(!is_temporal_expression_surface("January")); // could be a name
+/// ```
+#[must_use]
+pub fn is_temporal_expression_surface(surface: &str) -> bool {
+    let lowered = surface.trim().to_lowercase();
+    if lowered.is_empty() {
+        return false;
+    }
+    const DEICTIC: &[&str] = &["yesterday", "today", "tomorrow", "tonight", "tonite"];
+    const WEEKDAY: &[&str] = &[
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
+        "sunday",
+        "mon",
+        "tue",
+        "tues",
+        "wed",
+        "weds",
+        "thu",
+        "thur",
+        "thurs",
+        "fri",
+        "sat",
+        "sun",
+    ];
+    const PERIOD: &[&str] = &["week", "weekend", "month", "year", "quarter"];
+    const RELATIVE_LEAD: &[&str] = &[
+        "last", "this", "next", "past", "coming", "previous", "upcoming",
+    ];
+    // Full calendar dates — "January 2026", "January 5, 2026", "8 May 2023",
+    // "2020-01-15", a bare "2026". Delegated to the pattern tier's date
+    // recognizers, the one authority on what parses as a date here, rather
+    // than re-deriving the forms token-wise (the comma in "January 5, 2026"
+    // alone defeats whitespace splitting). Whole-surface anchored there, so a
+    // year embedded in a name ("Room 2026") still passes.
+    if crate::pattern::temporal::is_full_date_surface(&lowered) {
+        return true;
+    }
+    // Match ergonomics on `&[&str]` bind `one`/`unit`/… as `&&str`. `contains`
+    // takes `&&str` directly; the `is_*` helpers take `&str` and get it via the
+    // `&&str` -> `&str` deref coercion at the argument position.
+    let tokens: Vec<&str> = lowered.split_whitespace().collect();
+    match tokens.as_slice() {
+        [one] => DEICTIC.contains(one) || is_iso_date_token(one),
+        [lead, rest] => {
+            RELATIVE_LEAD.contains(lead) && (WEEKDAY.contains(rest) || PERIOD.contains(rest))
+        }
+        [count, unit, "ago"] => count.chars().all(|c| c.is_ascii_digit()) && is_time_unit(unit),
+        ["in", count, unit] => count.chars().all(|c| c.is_ascii_digit()) && is_time_unit(unit),
+        _ => false,
+    }
+}
+
+/// A single date/time counting unit, plural tolerated ("day", "weeks").
+fn is_time_unit(tok: &str) -> bool {
+    matches!(
+        tok.strip_suffix('s').unwrap_or(tok),
+        "day" | "week" | "weekend" | "month" | "year" | "hour" | "minute" | "quarter" | "decade"
+    )
+}
+
+/// Whole-token ISO date test (`YYYY-MM-DD`), digits-and-hyphens only.
+fn is_iso_date_token(tok: &str) -> bool {
+    let b = tok.as_bytes();
+    b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b[..4].iter().all(u8::is_ascii_digit)
+        && b[5..7].iter().all(u8::is_ascii_digit)
+        && b[8..10].iter().all(u8::is_ascii_digit)
 }
 
 /// Look up (or auto-intern) the [`EntityTypeId`] for `qname`. New
@@ -243,28 +418,53 @@ fn trigram_set_for_entity(
 /// write txn so the resolve + downstream writes commit atomically.
 fn lookup_canonical_wtxn(
     wtxn: &WriteTransaction,
+    scope: RowScope,
     type_id: EntityTypeId,
     normalized: &str,
 ) -> Result<Option<EntityId>, ResolverError> {
     let t = wtxn.open_table(ENTITY_BY_CANONICAL_NAME_TABLE)?;
-    let bytes: Option<[u8; 16]> = t.get(&(type_id.raw(), normalized))?.map(|g| g.value());
+    let bytes: Option<[u8; 16]> = t
+        .get(&(
+            scope.namespace_id,
+            scope.space_id_bytes,
+            type_id.raw(),
+            normalized,
+        ))?
+        .map(|g| g.value());
     Ok(bytes.map(EntityId::from))
 }
 
 /// Wtxn-friendly mirror of `entity_lookup_by_alias`.
 fn lookup_alias_wtxn(
     wtxn: &WriteTransaction,
+    scope: RowScope,
     type_id: EntityTypeId,
     normalized: &str,
 ) -> Result<Vec<EntityId>, ResolverError> {
     let t = wtxn.open_table(ENTITY_ALIASES_TABLE)?;
-    let lo = (type_id.raw(), normalized, [0u8; 16]);
-    let hi = (type_id.raw(), normalized, [0xFFu8; 16]);
+    let lo = (
+        scope.namespace_id,
+        scope.space_id_bytes,
+        type_id.raw(),
+        normalized,
+        [0u8; 16],
+    );
+    let hi = (
+        scope.namespace_id,
+        scope.space_id_bytes,
+        type_id.raw(),
+        normalized,
+        [0xFFu8; 16],
+    );
     let mut out = Vec::new();
     for entry in t.range(lo..=hi)? {
         let (k, _) = entry?;
-        let (k_type, k_alias, k_id) = k.value();
-        if k_type == type_id.raw() && k_alias == normalized {
+        let (k_ns, k_space, k_type, k_alias, k_id) = k.value();
+        if k_ns == scope.namespace_id
+            && k_space == scope.space_id_bytes
+            && k_type == type_id.raw()
+            && k_alias == normalized
+        {
             out.push(EntityId::from(k_id));
         }
     }
@@ -274,6 +474,7 @@ fn lookup_alias_wtxn(
 /// Wtxn-friendly mirror of `candidates_for_query`.
 fn trigram_candidates_wtxn(
     wtxn: &WriteTransaction,
+    scope: RowScope,
     type_id: EntityTypeId,
     normalized: &str,
 ) -> Result<HashSet<EntityId>, ResolverError> {
@@ -284,12 +485,28 @@ fn trigram_candidates_wtxn(
     }
     let t = wtxn.open_table(ENTITY_TRIGRAMS_TABLE)?;
     for tg in qg {
-        let lo = (type_id.raw(), tg, [0u8; 16]);
-        let hi = (type_id.raw(), tg, [0xFFu8; 16]);
+        let lo = (
+            scope.namespace_id,
+            scope.space_id_bytes,
+            type_id.raw(),
+            tg,
+            [0u8; 16],
+        );
+        let hi = (
+            scope.namespace_id,
+            scope.space_id_bytes,
+            type_id.raw(),
+            tg,
+            [0xFFu8; 16],
+        );
         for entry in t.range(lo..=hi)? {
             let (k, _) = entry?;
-            let (k_type, k_tg, k_id) = k.value();
-            if k_type == type_id.raw() && k_tg == tg {
+            let (k_ns, k_space, k_type, k_tg, k_id) = k.value();
+            if k_ns == scope.namespace_id
+                && k_space == scope.space_id_bytes
+                && k_type == type_id.raw()
+                && k_tg == tg
+            {
                 out.insert(EntityId::from(k_id));
             }
         }
@@ -306,12 +523,151 @@ fn trigram_candidates_wtxn(
 pub struct EmbeddingDeps {
     pub hnsw: Arc<RwLock<EntityHnswIndex>>,
     pub embedder: Arc<dyn Dispatcher>,
+    /// Cosine floor for tier-3 auto-aliasing. Surface forms whose top
+    /// neighbour scores at or above this are aliased onto that entity;
+    /// scores in `[PARTIAL_MATCH_FLOOR, embed_threshold)` enter the
+    /// merge-review queue. Defaults to [`EMBED_RESOLVE_THRESHOLD`] —
+    /// the shard ferries `[extractors.resolver] embed_threshold` here.
+    pub embed_threshold: f32,
 }
 
 impl std::fmt::Debug for EmbeddingDeps {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EmbeddingDeps").finish_non_exhaustive()
     }
+}
+
+/// Entity-HNSW insertions produced by one resolver pass, held back until
+/// that pass's write transaction commits.
+///
+/// The entity HNSW is in-RAM and NOT transactional, and `hnsw_rs` has no
+/// point removal — an insert made while a write txn is open can never be
+/// taken back if that txn rolls back, leaving a vector that points at an
+/// entity id redb never kept. Rollback is a live path, not a theoretical
+/// one: the extractor's two-phase disambiguation discards its plan pass
+/// whenever an ambiguous candidate needs an LLM verdict, and any error
+/// out of an apply body drops the txn too. So tier-4 stages here and the
+/// caller flushes with [`flush_into_hnsw`](Self::flush_into_hnsw) after
+/// `commit()` returns; a rolled-back pass just drops the staging area.
+///
+/// Staging is per-pass and must never be shared between passes — that is
+/// exactly what makes "drop it" a correct rollback.
+///
+/// Within a pass the staged vectors stay visible to the embedding tier
+/// (see `tier_embedding`), so two paraphrases inside one memory still
+/// collapse onto a single entity, as they did when the insert was inline.
+///
+/// ```no_run
+/// # use brain_extractors::resolver::{
+/// #     resolve_or_create_with_deps, Disambiguation, EmbeddingDeps, StagedEntityVectors,
+/// # };
+/// # use brain_metadata::RowScope;
+/// # fn demo(wtxn: redb::WriteTransaction, scope: RowScope, deps: &EmbeddingDeps, now: u64) {
+/// let mut staged = StagedEntityVectors::new();
+/// let res = resolve_or_create_with_deps(
+///     &wtxn,
+///     scope,
+///     "Stripe Payments",
+///     "brain:Organization",
+///     0.9,
+///     now,
+///     Some(deps),
+///     &mut staged,
+///     &mut Disambiguation::Off,
+/// );
+/// if wtxn.commit().is_ok() {
+///     // Durable now — safe to publish the vectors to the in-RAM index.
+///     staged.flush_into_hnsw(deps);
+/// }
+/// # let _ = res;
+/// # }
+/// ```
+#[derive(Debug, Default)]
+pub struct StagedEntityVectors(Vec<(EntityId, [f32; VECTOR_DIM])>);
+
+impl StagedEntityVectors {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Publish every staged vector into the entity HNSW. Call ONLY once
+    /// the transaction that wrote the corresponding entity rows has
+    /// committed. Returns the number of points actually inserted.
+    ///
+    /// Consumes `self` so a staging area cannot be flushed twice, and
+    /// skips ids the index already carries, so an entity can never end up
+    /// with two points (the `(id, vector)` pair is also idempotent — the
+    /// same entity staged twice inserts once).
+    pub fn flush_into_hnsw(self, deps: &EmbeddingDeps) -> usize {
+        if self.0.is_empty() {
+            return 0;
+        }
+        let mut hnsw = deps.hnsw.write();
+        let mut inserted = 0usize;
+        for (entity_id, vector) in self.0 {
+            if hnsw.contains(entity_id) {
+                continue;
+            }
+            match hnsw.insert(entity_id, &vector) {
+                Ok(()) => inserted += 1,
+                Err(e) => tracing::warn!(
+                    target: "brain_extractors::resolver",
+                    ?entity_id,
+                    error = %e,
+                    "entity-HNSW insert failed; entity is durable but unreachable via tier-3b until a rebuild",
+                ),
+            }
+        }
+        inserted
+    }
+
+    fn stage(&mut self, entity_id: EntityId, vector: [f32; VECTOR_DIM]) {
+        self.0.push((entity_id, vector));
+    }
+
+    /// Cosine-score every staged vector against `query` and return the
+    /// best `k`, descending. Brute force is right here: a staging area
+    /// holds the handful of entities one memory minted, and an exact scan
+    /// avoids the approximate index entirely for them.
+    fn probe(&self, query: &[f32; VECTOR_DIM], k: usize) -> Vec<(EntityId, f32)> {
+        let mut scored: Vec<(EntityId, f32)> = self
+            .0
+            .iter()
+            .map(|(id, v)| (*id, cosine(query, v)))
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(k);
+        scored
+    }
+}
+
+/// Cosine similarity of two equal-length vectors. The embedder returns
+/// L2-normalised output so this is usually just the dot product, but the
+/// normalisation is cheap and keeps the score honest for any dispatcher.
+fn cosine(a: &[f32; VECTOR_DIM], b: &[f32; VECTOR_DIM]) -> f32 {
+    let mut dot = 0.0_f32;
+    let mut na = 0.0_f32;
+    let mut nb = 0.0_f32;
+    for i in 0..VECTOR_DIM {
+        dot += a[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
+    }
+    if na == 0.0 || nb == 0.0 {
+        return 0.0;
+    }
+    dot / (na.sqrt() * nb.sqrt())
 }
 
 /// Per-shard handle to a disambiguator capable of distinguishing
@@ -327,10 +683,10 @@ impl std::fmt::Debug for EmbeddingDeps {
 /// The current backend is LLM-driven: the disambiguator owns an
 /// [`LlmClient`] + model identifier and issues a single yes/no/uncertain
 /// prompt per ambiguous partial match. The prompt grammar is narrower
-/// than the multi-candidate one [`BrainLlmDisambiguator`] uses because
+/// than the multi-candidate LLM disambiguation path uses because
 /// the resolver's question is binary. Swapping in a heuristic or
 /// classifier backend later is a localised change to
-/// [`confirm_partial_match`].
+/// `confirm_partial_match`.
 pub struct EntityDisambiguator {
     client: Arc<dyn LlmClient>,
     model: String,
@@ -367,6 +723,34 @@ impl EntityDisambiguator {
         self.min_confidence = min_confidence;
         self
     }
+
+    /// Ask the LLM whether `surface_form` refers to the same real-world
+    /// entity as `view`. This is `.await`-ed OFF the shard reactor by the
+    /// extractor worker — in the disambiguation *plan* step, before any
+    /// write transaction is open — so, unlike the old in-txn `block_on`,
+    /// it never parks the shard core. The resulting [`MatchVerdict`] is
+    /// stashed in a [`PrecomputedVerdicts`] map the apply step consults
+    /// synchronously. Any soft failure (transport error, unparseable
+    /// reply) degrades to [`MatchVerdict::Skipped`], which the resolver
+    /// treats as "fall through to the no-disambiguator path".
+    pub async fn confirm(&self, view: &LlmCandidateView, surface_form: &str) -> MatchVerdict {
+        let candidate = view.entity_id;
+        match ask_if_same_entity(self, view, surface_form).await {
+            Ok(SameEntityReply::Yes(confidence)) => {
+                if confidence >= self.min_confidence {
+                    MatchVerdict::Confirmed {
+                        entity: candidate,
+                        confidence,
+                    }
+                } else {
+                    MatchVerdict::Uncertain
+                }
+            }
+            Ok(SameEntityReply::No) => MatchVerdict::Rejected,
+            Ok(SameEntityReply::Uncertain) => MatchVerdict::Uncertain,
+            Err(reason) => MatchVerdict::Skipped { reason },
+        }
+    }
 }
 
 impl std::fmt::Debug for EntityDisambiguator {
@@ -379,13 +763,9 @@ impl std::fmt::Debug for EntityDisambiguator {
 }
 
 /// What the disambiguator concluded about a single ambiguous-band
-/// candidate.
-///
-/// Distinct from the multi-candidate
-/// [`brain_core::resolution::ResolverLlmDecision`] because the
-/// production resolver's question is narrower: "is this candidate the
-/// same entity as the surface form?". The four variants spell out how
-/// the resolver should act on the answer.
+/// candidate. The resolver's question is a binary one — "is this
+/// candidate the same entity as the surface form?" — and the four
+/// variants spell out how the resolver should act on the answer.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MatchVerdict {
     /// The surface form refers to the same entity as the candidate.
@@ -408,48 +788,139 @@ pub enum MatchVerdict {
     Skipped { reason: String },
 }
 
+/// One ambiguous-band candidate discovered during the disambiguation
+/// *plan* pass. The worker awaits an LLM verdict for each of these
+/// off the reactor, then re-runs resolution with the verdicts in hand.
+#[derive(Debug, Clone)]
+pub struct PendingVerdict {
+    /// Normalized surface form — the map key the apply pass looks up.
+    pub norm_surface: String,
+    /// Raw surface form — fed to the LLM prompt verbatim.
+    pub raw_surface: String,
+    /// The candidate entity the embedding tier proposed.
+    pub candidate: EntityId,
+    /// Snapshot of the candidate for the LLM prompt.
+    pub view: LlmCandidateView,
+}
+
+/// Disambiguation verdicts computed off-reactor and consulted
+/// synchronously by the apply pass. Keyed by `(normalized surface,
+/// candidate)` — the exact pair the resolver's embedding tier lands on.
+#[derive(Debug, Default)]
+pub struct PrecomputedVerdicts(std::collections::HashMap<(String, EntityId), MatchVerdict>);
+
+impl PrecomputedVerdicts {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record the verdict for one `(normalized surface, candidate)` pair.
+    pub fn insert(&mut self, norm_surface: String, candidate: EntityId, verdict: MatchVerdict) {
+        self.0.insert((norm_surface, candidate), verdict);
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Look up the verdict for a pair. A miss means the apply pass landed
+    /// a candidate the plan pass did not — the registry shifted between
+    /// snapshots — so degrade to the no-disambiguator path rather than
+    /// ever blocking on the LLM inside the write txn.
+    fn get(&self, norm_surface: &str, candidate: EntityId) -> MatchVerdict {
+        self.0
+            .get(&(norm_surface.to_string(), candidate))
+            .cloned()
+            .unwrap_or_else(|| MatchVerdict::Skipped {
+                reason: "no precomputed verdict (plan/apply divergence)".to_string(),
+            })
+    }
+}
+
+/// How `resolve_or_create_with_deps` obtains a verdict when the embedding
+/// tier lands an ambiguous-band candidate. The LLM is never called from
+/// inside the write txn; it is called off-reactor between the two passes.
+pub enum Disambiguation<'a> {
+    /// No disambiguator wired — behave as the pre-disambiguator resolver
+    /// (the cosine threshold is the sole arbiter).
+    Off,
+    /// Plan pass: record each ambiguous candidate for later async
+    /// resolution and take the no-disambiguator path for now.
+    Collect(&'a mut Vec<PendingVerdict>),
+    /// Apply pass: consult the precomputed verdicts; a miss degrades to
+    /// the no-disambiguator path.
+    Replay(&'a PrecomputedVerdicts),
+}
+
+/// Resolve the disambiguation verdict for an ambiguous-band candidate
+/// WITHOUT ever calling the LLM inline: `Off` skips, `Collect` records
+/// the candidate (reading its view from the txn) and skips, `Replay`
+/// looks up the precomputed verdict.
+fn resolve_verdict(
+    mode: &mut Disambiguation<'_>,
+    candidate: EntityId,
+    surface_form: &str,
+    wtxn: &WriteTransaction,
+    entity_type_qname: &str,
+) -> MatchVerdict {
+    match mode {
+        Disambiguation::Off => MatchVerdict::Skipped {
+            reason: "no disambiguator wired".to_string(),
+        },
+        Disambiguation::Replay(verdicts) => verdicts.get(&normalize_name(surface_form), candidate),
+        Disambiguation::Collect(out) => {
+            match read_candidate_view(wtxn, candidate, entity_type_qname) {
+                Ok(Some(view)) => {
+                    out.push(PendingVerdict {
+                        norm_surface: normalize_name(surface_form),
+                        raw_surface: surface_form.to_string(),
+                        candidate,
+                        view,
+                    });
+                    MatchVerdict::Skipped {
+                        reason: "deferred to async disambiguation".to_string(),
+                    }
+                }
+                Ok(None) => MatchVerdict::Skipped {
+                    reason: format!("candidate entity {candidate:?} not found"),
+                },
+                Err(e) => MatchVerdict::Skipped {
+                    reason: format!("read candidate view: {e}"),
+                },
+            }
+        }
+    }
+}
+
 /// Resolve `surface_form` against the entity registry without the
 /// embedding tier or the disambiguator. Equivalent to
 /// [`resolve_or_create_with_deps`] called with both dep slots `None`.
 pub fn resolve_or_create(
     wtxn: &WriteTransaction,
+    scope: RowScope,
     surface_form: &str,
     entity_type_qname: &str,
     confidence: f32,
     now_unix_nanos: u64,
 ) -> Result<Resolution, ResolverError> {
-    resolve_or_create_with_deps(
+    // No embedding deps means tier-4 has nothing to embed, so this
+    // staging area always comes back empty and there is nothing to flush.
+    let mut staged = StagedEntityVectors::new();
+    let res = resolve_or_create_with_deps(
         wtxn,
+        scope,
         surface_form,
         entity_type_qname,
         confidence,
         now_unix_nanos,
         None,
-        None,
-    )
-}
-
-/// Transitional alias: existing callers wired before the disambiguator
-/// landed pass only the embedding bundle here. Forwards to
-/// [`resolve_or_create_with_deps`] with the disambiguator slot empty.
-/// New code should call [`resolve_or_create_with_deps`] directly.
-pub fn resolve_or_create_with_hnsw(
-    wtxn: &WriteTransaction,
-    surface_form: &str,
-    entity_type_qname: &str,
-    confidence: f32,
-    now_unix_nanos: u64,
-    embed_deps: Option<&EmbeddingDeps>,
-) -> Result<Resolution, ResolverError> {
-    resolve_or_create_with_deps(
-        wtxn,
-        surface_form,
-        entity_type_qname,
-        confidence,
-        now_unix_nanos,
-        embed_deps,
-        None,
-    )
+        &mut staged,
+        &mut Disambiguation::Off,
+    );
+    debug_assert!(staged.is_empty(), "invariant: no embed deps, no staging");
+    res
 }
 
 /// Resolve `surface_form` against the entity registry, creating a new
@@ -458,29 +929,57 @@ pub fn resolve_or_create_with_hnsw(
 /// downstream writes (mention edges, statement creation).
 ///
 /// When `embed_deps` is `Some`, the resolver consults the entity
-/// HNSW between the trigram-fuzzy tier and the create tier, and
-/// inserts the canonical-name embedding of every newly-minted entity
-/// into the HNSW so the next resolve of a paraphrase can short-circuit
-/// at the embedding tier. Failures inside the embedding path (embedder
-/// errors, HNSW lock contention) degrade gracefully: the resolver logs
-/// at `warn` and falls through to the next tier, never aborts the txn.
+/// HNSW between the trigram-fuzzy tier and the create tier, and stages
+/// the canonical-name embedding of every newly-minted entity in
+/// `staged` so the next resolve of a paraphrase can short-circuit at the
+/// embedding tier. The caller MUST call
+/// [`StagedEntityVectors::flush_into_hnsw`] once — and only once — the
+/// txn has committed; a rolled-back pass drops its staging area instead
+/// (the HNSW cannot un-insert). Failures inside the embedding path
+/// (embedder errors, HNSW lock contention) degrade gracefully: the
+/// resolver logs at `warn` and falls through to the next tier, never
+/// aborts the txn.
 ///
-/// When `disambiguator` is `Some` *and* the embedding probe lands in
-/// the ambiguous band, the resolver asks the disambiguator whether the
-/// surface form matches that candidate. A
+/// When the embedding probe lands a candidate in the ambiguous band, the
+/// `disambiguation` mode decides the verdict WITHOUT calling the LLM
+/// inline: [`Disambiguation::Off`] takes the cosine-only path;
+/// [`Disambiguation::Collect`] records the candidate for the worker to
+/// resolve off-reactor, then takes the cosine-only path; and
+/// [`Disambiguation::Replay`] consults a [`PrecomputedVerdicts`] map. A
 /// [`MatchVerdict::Confirmed`] aliases onto the existing entity; a
 /// [`MatchVerdict::Rejected`] mints a fresh entity with no merge
 /// proposal (the two are confirmed distinct); the other verdicts fall
 /// through to the existing Create + enqueue-merge-proposal flow.
+// Each argument is a distinct, non-bundleable concern (txn, tenant scope,
+// surface form, type, confidence, clock, embedding deps, disambiguation mode);
+// folding them into a params struct would obscure the call sites, not clarify.
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_or_create_with_deps(
     wtxn: &WriteTransaction,
+    scope: RowScope,
     surface_form: &str,
     entity_type_qname: &str,
     _confidence: f32,
     now_unix_nanos: u64,
     embed_deps: Option<&EmbeddingDeps>,
-    disambiguator: Option<&EntityDisambiguator>,
+    staged: &mut StagedEntityVectors,
+    disambiguation: &mut Disambiguation<'_>,
 ) -> Result<Resolution, ResolverError> {
+    // Greeting / vocative phantom guard (Person only). "Hey Mel", "Thanks
+    // Mel", "Yeah Mel" arrive as standalone Person surfaces; each would mint
+    // a distinct entity that fragments Mel's facts. Strip the leading
+    // greeting so they resolve to the bare name and its existing entity.
+    // Person-gated because stripping a leading word from a non-person name is
+    // unsafe (the company "Hello Fresh" must stay intact). The cleaned form
+    // then flows through the whole gauntlet, so a freshly-minted entity also
+    // gets the clean canonical name ("Mel", not "Hey Mel").
+    let stripped = if surface_type_is_person(entity_type_qname) {
+        strip_leading_vocative(surface_form)
+    } else {
+        None
+    };
+    let surface_form: &str = stripped.as_deref().unwrap_or(surface_form);
+
     let normalized = normalize_name(surface_form);
     if normalized.is_empty() {
         return Err(ResolverError::EmptyNormalizedName);
@@ -488,10 +987,11 @@ pub fn resolve_or_create_with_deps(
     let type_id = resolve_entity_type(wtxn, entity_type_qname, now_unix_nanos)?;
 
     // Tier 1 — exact canonical-name lookup.
-    if let Some(id) = lookup_canonical_wtxn(wtxn, type_id, &normalized)? {
+    if let Some(id) = lookup_canonical_wtxn(wtxn, scope, type_id, &normalized)? {
         return Ok(Resolution {
             entity_id: id,
             tier: ResolutionTier::Exact,
+            confidence: 1.0,
         });
     }
 
@@ -501,23 +1001,48 @@ pub fn resolve_or_create_with_deps(
     // stays stable across re-runs. A future ambiguity-aware resolver
     // could surface the conflict; the worker drops mentions with
     // ambiguous aliases at the cost of one extra resolve.
-    let alias_hits = lookup_alias_wtxn(wtxn, type_id, &normalized)?;
+    let alias_hits = lookup_alias_wtxn(wtxn, scope, type_id, &normalized)?;
     if let Some(id) = alias_hits.into_iter().min() {
         return Ok(Resolution {
             entity_id: id,
             tier: ResolutionTier::Alias,
+            confidence: 1.0,
         });
+    }
+
+    // Tier 1b — cross-type exact canonical. Every tier above is scoped to the
+    // hinted `type_id`, but the pattern and LLM extractor tiers routinely assign
+    // DIFFERENT type ids to the SAME referent (e.g. "Atlas" under one type and
+    // "The Atlas" — normalized to the same `atlas` key — under another). Without
+    // a cross-type check the referent fragments into two nodes and its relations
+    // split across them, which silently breaks multi-hop traversal even though
+    // every individual fact was extracted. An EXACT normalized-name match under a
+    // different type is the same referent at very high precision, so reuse it.
+    // Guard: only when EXACTLY ONE cross-type entity matches — a normalized name
+    // shared by two different-typed entities is a genuine homograph ("Apple" the
+    // company vs the fruit), so fall through to mint rather than conflate them.
+    {
+        let cross = entity_resolve_canonical_all_types_wtxn(wtxn, scope, surface_form)?;
+        if cross.len() == 1 {
+            let id = cross[0];
+            entity_add_alias(wtxn, id, surface_form.to_string(), now_unix_nanos)?;
+            return Ok(Resolution {
+                entity_id: id,
+                tier: ResolutionTier::Exact,
+                confidence: 1.0,
+            });
+        }
     }
 
     // Tier 3a — trigram fuzzy lookup. Candidates whose Jaccard against
     // the query is above `DEFAULT_FUZZY_THRESHOLD` get the surface
     // form added as an alias and are returned as the match.
-    let candidate_ids = trigram_candidates_wtxn(wtxn, type_id, &normalized)?;
+    let candidate_ids = trigram_candidates_wtxn(wtxn, scope, type_id, &normalized)?;
     if !candidate_ids.is_empty() {
         let query_tgs = trigrams::extract_trigrams(&normalized);
         if !query_tgs.is_empty() {
             let mut best: Option<(EntityId, f32)> = None;
-            for cid in candidate_ids {
+            for &cid in &candidate_ids {
                 let cid_tgs = trigram_set_for_entity(wtxn, cid)?;
                 if cid_tgs.is_empty() {
                     continue;
@@ -531,14 +1056,195 @@ pub fn resolve_or_create_with_deps(
                     _ => best = Some((cid, score)),
                 }
             }
-            if let Some((cid, _)) = best {
+            if let Some((cid, score)) = best {
                 // The surface form is now associated with this entity;
                 // re-runs of the same string hit tier 2 directly.
                 entity_add_alias(wtxn, cid, surface_form.to_string(), now_unix_nanos)?;
                 return Ok(Resolution {
                     entity_id: cid,
                     tier: ResolutionTier::Alias,
+                    confidence: score,
                 });
+            }
+        }
+
+        // Tier 3a' — partial-name (token-subset) coref. A short reference
+        // ("Niraj") whose normalized tokens are a STRICT subset of an
+        // existing same-type entity's canonical name ("Niraj Georgian") is
+        // the same entity. Jaccard misses this — the longer name dilutes the
+        // trigram overlap below the fuzzy floor — yet in a personal-knowledge
+        // graph first-name / short references are the dominant coref case, and
+        // missing them mints duplicate person nodes that fragment every
+        // relation across name variants (Niraj's reports_to lands on one node,
+        // his family_of on another), which is what breaks multi-hop reads.
+        // Token containment is far stricter than cosine (no "Tokyo"≈"Japan"
+        // risk), so it's safe where the embedding tier is deliberately
+        // conservative. Merge ONLY when EXACTLY ONE candidate contains the
+        // surface tokens — "John" with both "John Smith" and "John Doe" is
+        // genuinely ambiguous, so fall through to create rather than guess.
+        let q_tokens: Vec<&str> = normalized.split_whitespace().collect();
+        if !q_tokens.is_empty() {
+            let mut containment: Option<EntityId> = None;
+            let mut ambiguous = false;
+            for &cid in &candidate_ids {
+                let Some(cn) = read_entity_canonical(wtxn, cid)? else {
+                    continue;
+                };
+                let c_norm = normalize_name(&cn);
+                let c_tokens: Vec<&str> = c_norm.split_whitespace().collect();
+                // Strict superset: candidate carries every query token and at
+                // least one more (so "Niraj" → "Niraj Georgian", never the
+                // reverse, which would alias a full name onto a bare first).
+                if c_tokens.len() > q_tokens.len()
+                    && q_tokens.iter().all(|qt| c_tokens.contains(qt))
+                {
+                    if containment.is_some() {
+                        ambiguous = true;
+                        break;
+                    }
+                    containment = Some(cid);
+                }
+            }
+            if !ambiguous {
+                if let Some(cid) = containment {
+                    entity_add_alias(wtxn, cid, surface_form.to_string(), now_unix_nanos)?;
+                    return Ok(Resolution {
+                        entity_id: cid,
+                        tier: ResolutionTier::Alias,
+                        confidence: 1.0,
+                    });
+                }
+            }
+        }
+
+        // Tier 3a'' — diminutive / prefix coref (Person only). A nickname
+        // such as "Mel" → "Melanie" or "Caro" → "Caroline" is a strict PREFIX
+        // of a longer first name, not a token subset, so tier-3a' misses it,
+        // and the trigram Jaccard of a 3-char query against a 7-char name sits
+        // far below the fuzzy floor. In a personal-knowledge graph nicknames
+        // are a dominant coref case; missing them fragments a person's facts
+        // across "Mel" / "Melanie" nodes so a query for one can't see the
+        // other's memories.
+        //
+        // Deliberately narrow so it can never merge two DISTINCT people:
+        //   * Person type only — a diminutive is a person-name phenomenon; org
+        //     / product prefixes ("Goog" → "Google") stay separate.
+        //   * single-token query of >= MIN_DIMINUTIVE_LEN chars — a bare
+        //     first-name reference, never a phrase.
+        //   * strict prefix of the FIRST token of EXACTLY ONE same-(scope,type)
+        //     candidate. Two matches ("Sam" → {Samuel, Samantha}) are
+        //     ambiguous, so the resolver abstains and mints rather than guess.
+        //     The candidate set is already scope- and type-filtered, so this
+        //     only ever unifies within one tenant's own graph.
+        //
+        // No embedding floor is applied: short-nickname embeddings are
+        // unreliable, and the exactly-one-in-scope prefix is a stricter
+        // identity signal than cosine here — the same reasoning tier-3a'
+        // already relies on for token containment.
+        if surface_type_is_person(entity_type_qname)
+            && q_tokens.len() == 1
+            && normalized.chars().count() >= MIN_DIMINUTIVE_LEN
+        {
+            let query = q_tokens[0];
+            let mut prefix_of: Option<EntityId> = None;
+            let mut ambiguous = false;
+            for &cid in &candidate_ids {
+                let Some(cn) = read_entity_canonical(wtxn, cid)? else {
+                    continue;
+                };
+                let c_norm = normalize_name(&cn);
+                let Some(c_first) = c_norm.split_whitespace().next() else {
+                    continue;
+                };
+                // Strict prefix: the candidate's first name carries the query
+                // as a leading substring AND is strictly longer ("mel" →
+                // "melanie", never "mel" → "mel", which tiers 1 / 3a' handle).
+                if c_first != query && c_first.starts_with(query) {
+                    if prefix_of.is_some() {
+                        ambiguous = true;
+                        break;
+                    }
+                    prefix_of = Some(cid);
+                }
+            }
+            if !ambiguous {
+                if let Some(cid) = prefix_of {
+                    entity_add_alias(wtxn, cid, surface_form.to_string(), now_unix_nanos)?;
+                    return Ok(Resolution {
+                        entity_id: cid,
+                        tier: ResolutionTier::Alias,
+                        confidence: 1.0,
+                    });
+                }
+            }
+        }
+
+        // Tier 3a''' — retroactive nickname absorption (Person only). The
+        // mirror of tier 3a''. Tier 3a'' merges a NEW nickname onto an
+        // EXISTING full name; it can only fire when the full name arrived
+        // first. When the ORDER is reversed — "Mel" mentioned before
+        // "Melanie" — "Mel" mints its own node and the later "Melanie" node
+        // never absorbs it, so the person fragments across two entities.
+        // Here, when a fuller name arrives, we look for the pre-existing
+        // single-token nickname it extends and alias the fuller surface onto
+        // THAT node, collapsing both to one entity. Same `entity_add_alias`
+        // mechanism as every other coref tier — no new storage path.
+        //
+        // Deliberately narrow so it can never merge two DISTINCT people:
+        //   * Person type only.
+        //   * the nickname candidate is a SINGLE token, >= MIN_DIMINUTIVE_LEN
+        //     chars, and a STRICT prefix of the new name's FIRST token
+        //     ("mel" -> "melanie", never equal).
+        //   * EXACTLY ONE such nickname candidate — two ("mel" AND "mela"
+        //     both prefixing "melanie") is ambiguous, so abstain and mint.
+        //   * the nickname node must not already be BOUND to a different
+        //     fuller form. Once "Mel" has absorbed "Melanie", a later
+        //     "Melissa" must NOT also fold in — that would put two distinct
+        //     people behind one nickname. The first fuller to arrive claims
+        //     the nickname; distinct later fullers stay separate. (This is
+        //     the residual over-merge boundary: the FIRST fuller always
+        //     wins the bare nickname even if a later, equally-plausible
+        //     fuller would have been just as valid — an unavoidable cost of
+        //     resolving the nickname the moment its first fuller appears.)
+        if surface_type_is_person(entity_type_qname) {
+            if let Some(&q_first) = q_tokens.first() {
+                let mut nickname: Option<(EntityId, String)> = None;
+                let mut ambiguous = false;
+                for &cid in &candidate_ids {
+                    let Some(cn) = read_entity_canonical(wtxn, cid)? else {
+                        continue;
+                    };
+                    let c_norm = normalize_name(&cn);
+                    let mut c_toks = c_norm.split_whitespace();
+                    // Single-token candidate only: a phrase ("Mel Gibson") is
+                    // a full name, not a bare nickname, so it never absorbs.
+                    let (Some(c_only), None) = (c_toks.next(), c_toks.next()) else {
+                        continue;
+                    };
+                    if c_only.chars().count() < MIN_DIMINUTIVE_LEN {
+                        continue;
+                    }
+                    // Strict prefix of the new name's first token.
+                    if c_only != q_first && q_first.starts_with(c_only) {
+                        if nickname.is_some() {
+                            ambiguous = true;
+                            break;
+                        }
+                        nickname = Some((cid, c_only.to_string()));
+                    }
+                }
+                if !ambiguous {
+                    if let Some((cid, nick_tok)) = nickname {
+                        if nickname_entity_free_for_fuller(wtxn, cid, &nick_tok, q_first)? {
+                            entity_add_alias(wtxn, cid, surface_form.to_string(), now_unix_nanos)?;
+                            return Ok(Resolution {
+                                entity_id: cid,
+                                tier: ResolutionTier::Alias,
+                                confidence: 1.0,
+                            });
+                        }
+                    }
+                }
             }
         }
     }
@@ -554,13 +1260,68 @@ pub fn resolve_or_create_with_deps(
     // worker, which re-checks them as the HNSW grows.
     let mut partial_match: Option<(EntityId, f32)> = None;
     if let Some(deps) = embed_deps {
-        match tier_embedding(deps, type_id, surface_form, wtxn) {
-            Ok(EmbeddingProbe::AutoAlias { entity_id, .. }) => {
-                entity_add_alias(wtxn, entity_id, surface_form.to_string(), now_unix_nanos)?;
-                return Ok(Resolution {
+        match tier_embedding(deps, staged, scope, type_id, surface_form, wtxn) {
+            Ok(EmbeddingProbe::AutoAlias { entity_id, score }) => {
+                // A high cosine alone is not proof of identity: two
+                // distinct same-type entities ("Japan" vs "Tokyo", both
+                // Places) can sit above the auto-alias threshold and the
+                // tier is type-scoped, so the type filter never separates
+                // them. When a disambiguator is wired, get a second
+                // opinion before merging; only an explicit rejection
+                // blocks the alias, so genuine paraphrases ("Stripe Inc."
+                // vs "Stripe Payments") — confirmed or merely uncertain —
+                // still merge as before. With no disambiguator, the
+                // cosine threshold remains the sole arbiter.
+                match resolve_verdict(
+                    disambiguation,
                     entity_id,
-                    tier: ResolutionTier::Embedding,
-                });
+                    surface_form,
+                    wtxn,
+                    entity_type_qname,
+                ) {
+                    MatchVerdict::Rejected => {
+                        // Confirmed distinct despite the high cosine.
+                        // Fall through to Create without enqueuing a
+                        // merge proposal — there is nothing to review.
+                        tracing::info!(
+                            target: "brain_extractors::resolver",
+                            ?entity_id,
+                            surface_form,
+                            "high-cosine auto-alias rejected by disambiguator; minting a distinct entity",
+                        );
+                    }
+                    MatchVerdict::Confirmed { entity, confidence } => {
+                        entity_add_alias(wtxn, entity, surface_form.to_string(), now_unix_nanos)?;
+                        tracing::info!(
+                            target: "brain_extractors::resolver",
+                            ?entity,
+                            confidence,
+                            "high-cosine auto-alias confirmed by disambiguator",
+                        );
+                        return Ok(Resolution {
+                            entity_id: entity,
+                            tier: ResolutionTier::Disambiguated,
+                            confidence,
+                        });
+                    }
+                    // No disambiguator, or it declined to commit either
+                    // way (Uncertain / Skipped). The cosine already
+                    // cleared the auto-alias threshold, so preserve the
+                    // pre-disambiguator behaviour and merge.
+                    MatchVerdict::Uncertain | MatchVerdict::Skipped { .. } => {
+                        entity_add_alias(
+                            wtxn,
+                            entity_id,
+                            surface_form.to_string(),
+                            now_unix_nanos,
+                        )?;
+                        return Ok(Resolution {
+                            entity_id,
+                            tier: ResolutionTier::Embedding,
+                            confidence: score,
+                        });
+                    }
+                }
             }
             Ok(EmbeddingProbe::PartialMatch { entity_id, score }) => {
                 partial_match = Some((entity_id, score));
@@ -584,9 +1345,14 @@ pub fn resolve_or_create_with_deps(
     // entity: a confirmed match aliases and returns; an explicit
     // rejection lets us skip the (now-unnecessary) merge proposal;
     // uncertainty falls through to the existing Create + enqueue path.
-    if let (Some(disambiguator), Some((candidate, _score))) = (disambiguator, partial_match) {
-        match confirm_partial_match(disambiguator, candidate, surface_form, wtxn, entity_type_qname)
-        {
+    if let Some((candidate, _score)) = partial_match {
+        match resolve_verdict(
+            disambiguation,
+            candidate,
+            surface_form,
+            wtxn,
+            entity_type_qname,
+        ) {
             MatchVerdict::Confirmed { entity, confidence } => {
                 entity_add_alias(wtxn, entity, surface_form.to_string(), now_unix_nanos)?;
                 tracing::info!(
@@ -598,6 +1364,7 @@ pub fn resolve_or_create_with_deps(
                 return Ok(Resolution {
                     entity_id: entity,
                     tier: ResolutionTier::Disambiguated,
+                    confidence,
                 });
             }
             MatchVerdict::Rejected => {
@@ -624,6 +1391,21 @@ pub fn resolve_or_create_with_deps(
     // re-running this branch with the same surface form produces a
     // different id because the previous one is still around for
     // tiers 1/2 to short-circuit.
+    //
+    // Reaching create means tiers 1/2/3a (and 3b when wired) all
+    // missed. Without the embedding tier the gauntlet cannot catch
+    // paraphrases the trigram tier misses ("Stripe Inc." vs "Stripe
+    // Payments"), so a missing embedding tier here is the prime cause
+    // of one real-world entity splitting into many duplicate nodes.
+    // Warn so an operator can correlate a creeping entity-cardinality
+    // blowup with an absent embedding tier instead of chasing it blind.
+    if embed_deps.is_none() {
+        tracing::warn!(
+            target: "brain_extractors::resolver",
+            surface_form,
+            "resolver fell through to create with no embedding tier wired; paraphrases the trigram tier misses will over-split into duplicate entities",
+        );
+    }
     let new_id = EntityId::new();
     let mut entity = Entity::new_active(
         new_id,
@@ -633,18 +1415,43 @@ pub fn resolve_or_create_with_deps(
         now_unix_nanos,
     );
     entity.mention_count = 1;
-    entity_put(wtxn, &entity)?;
+    // Entity identity is session-agnostic; the resolver runs the same
+    // gauntlet across every session, so a resolver-minted entity carries
+    // the default session as its (non-load-bearing) first-mention
+    // provenance sentinel. The per-utterance session lives on the
+    // statements/relations that cite this entity, not on the entity.
+    entity_put(wtxn, scope, brain_core::SessionId::DEFAULT, &entity)?;
 
-    // Populate the entity HNSW so the next paraphrase can hit tier-3b.
-    // Failures here are non-fatal: the entity row is durable; the
-    // worst case is a near-miss future resolve.
+    // Minting a new node is normal much of the time, but it is also the
+    // exact event that grows entity cardinality. Record it at debug so a
+    // suspected over-split can be reconstructed from logs — which surface
+    // forms produced fresh entities, and how many collapse onto the same
+    // real-world thing once aliased.
+    tracing::debug!(
+        target: "brain_extractors::resolver",
+        surface_form,
+        entity_id = ?new_id,
+        "all resolver tiers missed; created a new entity",
+    );
+
+    // Feed the entity to tier-3b so the next paraphrase can match it:
+    // the durable vector row goes into `wtxn` (committing or rolling back
+    // with the entity row it describes), the in-RAM HNSW insert is staged
+    // for the caller to flush after commit. Failures here are non-fatal:
+    // the entity row is durable; the worst case is a near-miss future
+    // resolve until the next boot rebuild.
+    //
+    // Staged in EVERY disambiguation mode. The HNSW cannot un-insert, so
+    // an inline insert would outlive any rollback — the two-phase
+    // disambiguation's discarded plan pass, or an error out of the apply
+    // body — and point at an entity id no committed txn ever wrote.
     if let Some(deps) = embed_deps {
-        if let Err(reason) = insert_into_entity_hnsw(deps, new_id, surface_form) {
+        if let Err(reason) = stage_entity_vector(wtxn, deps, staged, new_id, surface_form) {
             tracing::warn!(
                 target: "brain_extractors::resolver",
                 entity_id = ?new_id,
                 reason,
-                "tier-4 entity-HNSW population failed; entity is durable but unreachable via tier-3b until a rebuild",
+                "tier-4 entity-vector staging failed; entity is durable but unreachable via tier-3b until a rebuild",
             );
         }
     }
@@ -672,6 +1479,7 @@ pub fn resolve_or_create_with_deps(
     Ok(Resolution {
         entity_id: new_id,
         tier: ResolutionTier::Created,
+        confidence: 1.0,
     })
 }
 
@@ -689,9 +1497,10 @@ enum EmbeddingProbe {
     None,
 }
 
-/// Tier-3b worker: embed the surface form, ask the HNSW for the top-K
-/// nearest entities, type-filter, classify the top score against the
-/// auto-alias / partial-match / drop thresholds.
+/// Tier-3b worker: embed the surface form, ask the HNSW (plus the
+/// pass-local staging area) for the top-K nearest entities, type-filter,
+/// classify the top score against the auto-alias / partial-match / drop
+/// thresholds.
 ///
 /// - `score >= EMBED_RESOLVE_THRESHOLD` → [`EmbeddingProbe::AutoAlias`].
 /// - `PARTIAL_MATCH_FLOOR <= score < EMBED_RESOLVE_THRESHOLD`
@@ -700,34 +1509,60 @@ enum EmbeddingProbe {
 /// - `Err(reason)` for transient backend failures (embedder, HNSW lock).
 fn tier_embedding(
     deps: &EmbeddingDeps,
+    staged: &StagedEntityVectors,
+    scope: RowScope,
     type_id: EntityTypeId,
     surface_form: &str,
     wtxn: &WriteTransaction,
 ) -> Result<EmbeddingProbe, String> {
-    let threshold = embed_resolve_threshold();
+    let threshold = deps.embed_threshold;
     let vector = deps
         .embedder
         .embed(surface_form)
         .map_err(|e| format!("embedder failed: {e}"))?;
-    let hits = {
+    // Over-fetch: the per-shard entity HNSW mixes tenants + types, and the
+    // scope+type filter below runs AFTER the search. Fetching only
+    // EMBED_RESOLVE_TOP_K would let a same-tenant alias ranked just past the
+    // top-k be starved out by foreign/wrong-type neighbours (→ a missed alias
+    // → entity fragmentation). Pull a wider pool so the filter has same-scope
+    // candidates to keep. Bounded by the entity HNSW's ef_search (64).
+    let pool = EMBED_RESOLVE_TOP_K * 4;
+    let mut hits = {
         let hnsw = deps.hnsw.read();
         if hnsw.is_empty() {
-            return Ok(EmbeddingProbe::None);
+            Vec::new()
+        } else {
+            hnsw.search(&vector, pool)
+                .map_err(|e| format!("hnsw search failed: {e}"))?
         }
-        hnsw.search(&vector, EMBED_RESOLVE_TOP_K)
-            .map_err(|e| format!("hnsw search failed: {e}"))?
     };
+    // Entities minted earlier in THIS pass aren't in the index yet — their
+    // insert is held back until the txn commits — but their rows are in
+    // `wtxn`, so they're legitimate candidates for a later surface in the
+    // same memory. Scan them alongside the index hits and re-sort.
+    if !staged.is_empty() {
+        hits.extend(staged.probe(&vector, pool));
+        hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let mut seen = HashSet::with_capacity(hits.len());
+        hits.retain(|(id, _)| seen.insert(*id));
+        hits.truncate(pool);
+    }
     if hits.is_empty() {
         return Ok(EmbeddingProbe::None);
     }
-    // Filter by entity_type. The HNSW shares one global index for all
-    // entity types per shard, so a Person lookup might surface an
-    // Organization neighbour at the top; pre-filtering before
-    // threshold-checking keeps us honest.
+    // Filter by (scope, entity_type). The entity HNSW is a single
+    // per-shard index shared across every tenant + space + type, so a
+    // probe can surface a neighbour belonging to a foreign
+    // `(namespace, space)` or a different type. The tenant wall is
+    // unconditional: a candidate from another scope is dropped before
+    // the threshold check so `acme/chatbot`'s "John" can never resolve
+    // onto `globex`'s or `acme/research`'s "John". The type filter is
+    // the same honesty guard as before (a Person lookup must not alias
+    // onto an Organization neighbour).
     let typed_hits: Vec<(EntityId, f32)> = hits
         .into_iter()
-        .filter_map(|(eid, score)| match read_entity_type(wtxn, eid) {
-            Ok(Some(t)) if t == type_id => Some((eid, score)),
+        .filter_map(|(eid, score)| match read_entity_type_and_scope(wtxn, eid) {
+            Ok(Some((t, s))) if t == type_id && s == scope => Some((eid, score)),
             _ => None,
         })
         .collect();
@@ -750,25 +1585,87 @@ fn tier_embedding(
     Ok(EmbeddingProbe::None)
 }
 
-/// Read just the `entity_type_id` field for `id` inside an existing
-/// write txn. Lighter than `entity_get_inside_wtxn` (no aliases, no
-/// blob decoding) — tier-3b only needs the type filter.
-fn read_entity_type(
+/// Read the `entity_type_id` + `(namespace, space)` scope for `id`
+/// inside an existing write txn. Lighter than `entity_get_inside_wtxn`
+/// (no aliases, no blob decoding) — tier-3b only needs the type +
+/// scope filter to drop foreign-type and foreign-tenant HNSW hits.
+fn read_entity_type_and_scope(
     wtxn: &WriteTransaction,
     id: EntityId,
-) -> Result<Option<EntityTypeId>, ResolverError> {
+) -> Result<Option<(EntityTypeId, RowScope)>, ResolverError> {
     let t = wtxn.open_table(ENTITIES_TABLE)?;
     let row: Option<EntityMetadata> = t.get(&id.to_bytes())?.map(|g| g.value());
-    Ok(row.map(|m| EntityTypeId::from(m.entity_type_id)))
+    Ok(row.map(|m| {
+        (
+            EntityTypeId::from(m.entity_type_id),
+            RowScope::from_bytes(m.namespace_id, m.space_id_bytes),
+        )
+    }))
 }
 
-/// Embed the entity's canonical name and insert into the HNSW. Best-
-/// effort: returns `Err(reason)` so the caller can decide whether to
-/// log or proceed. The resolver currently logs at `warn` and proceeds
-/// (the entity row is already committed; tier-3b becomes unreachable
-/// for paraphrases of this entity until a future HNSW rebuild).
-fn insert_into_entity_hnsw(
+/// Read just the `canonical_name` for `id` inside an existing write txn.
+/// Used by the partial-name coref tier to compare token sets.
+fn read_entity_canonical(
+    wtxn: &WriteTransaction,
+    id: EntityId,
+) -> Result<Option<String>, ResolverError> {
+    let t = wtxn.open_table(ENTITIES_TABLE)?;
+    let row: Option<EntityMetadata> = t.get(&id.to_bytes())?.map(|g| g.value());
+    Ok(row.map(|m| m.canonical_name))
+}
+
+/// True when the single-token nickname entity `cid` is still FREE to bind
+/// to the fuller first name `new_first` — i.e. it does not already carry a
+/// DIFFERENT fuller form (in its canonical name or aliases).
+///
+/// Used by the retroactive nickname tier (3a''') to stop a nickname that has
+/// already absorbed one fuller name from absorbing a second, distinct one:
+/// once "Mel" holds the alias "Melanie", a later "Melissa" must not fold in,
+/// or two different people end up behind one nickname. A stored form equal to
+/// `new_first` (an idempotent re-merge of the same fuller) does not count as a
+/// conflicting bind, so re-resolving "Melanie" onto "Mel" stays a no-op merge.
+fn nickname_entity_free_for_fuller(
+    wtxn: &WriteTransaction,
+    cid: EntityId,
+    nick_tok: &str,
+    new_first: &str,
+) -> Result<bool, ResolverError> {
+    let t = wtxn.open_table(ENTITIES_TABLE)?;
+    let row: Option<EntityMetadata> = t.get(&cid.to_bytes())?.map(|g| g.value());
+    let Some(row) = row else {
+        return Ok(true);
+    };
+    let mut names = Vec::with_capacity(1 + row.aliases.len());
+    names.push(row.canonical_name);
+    names.extend(row.aliases);
+    for name in names {
+        let norm = normalize_name(&name);
+        let Some(first) = norm.split_whitespace().next() else {
+            continue;
+        };
+        // A fuller form of the nickname whose first token strictly extends the
+        // nickname and differs from the incoming one — the nickname is taken.
+        if first != nick_tok
+            && first != new_first
+            && first.starts_with(nick_tok)
+            && first.chars().count() > nick_tok.chars().count()
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Embed the entity's canonical name, persist the vector in `wtxn`, and
+/// stage the HNSW insert for post-commit publication. Best-effort:
+/// returns `Err(reason)` so the caller can decide whether to log or
+/// proceed. The resolver logs at `warn` and proceeds (the entity row
+/// still lands; tier-3b is merely unreachable for paraphrases of this
+/// entity until a future HNSW rebuild).
+fn stage_entity_vector(
+    wtxn: &redb::WriteTransaction,
     deps: &EmbeddingDeps,
+    staged: &mut StagedEntityVectors,
     entity_id: EntityId,
     canonical_name: &str,
 ) -> Result<(), String> {
@@ -776,63 +1673,22 @@ fn insert_into_entity_hnsw(
         .embedder
         .embed(canonical_name)
         .map_err(|e| format!("embedder failed: {e}"))?;
-    let mut hnsw = deps.hnsw.write();
-    if hnsw.contains(entity_id) {
-        return Ok(());
+    // The stored vector is the durability hook for restart: on next boot
+    // the entity HNSW rebuilds from these rows without re-embedding. It
+    // is written INSIDE `wtxn`, so it lands exactly when the entity row
+    // does. A failure here is non-fatal — log + still stage, so the
+    // entity is resolvable for the rest of this process; on restart the
+    // absent row drops back to the re-embed fallback.
+    if let Err(e) = entity_vector_put(wtxn, entity_id, &vector) {
+        tracing::warn!(
+            target: "brain_extractors::resolver",
+            entity_id = ?entity_id,
+            error = %e,
+            "entity_vector_put failed; HNSW will reseed via re-embed on next restart",
+        );
     }
-    hnsw.insert(entity_id, &vector)
-        .map_err(|e| format!("hnsw insert failed: {e}"))?;
+    staged.stage(entity_id, vector);
     Ok(())
-}
-
-/// Ask the disambiguator whether `surface_form` refers to the existing
-/// `candidate` entity. Returns [`MatchVerdict::Skipped`] on any soft
-/// failure (entity row missing, backend transport error, unparseable
-/// reply) — never aborts the surrounding write transaction.
-///
-/// Builds the candidate snapshot from the live write transaction so
-/// the disambiguator sees the same canonical name + alias set the
-/// resolver just considered. Issues a single yes/no/uncertain LLM call
-/// inside the txn; the reply grammar (`YES <conf>` / `NO` /
-/// `UNCERTAIN`) is intentionally narrower than the multi-candidate
-/// grammar handled by [`BrainLlmDisambiguator`] — the resolver's
-/// partial-match question is a binary one.
-fn confirm_partial_match(
-    disambiguator: &EntityDisambiguator,
-    candidate: EntityId,
-    surface_form: &str,
-    wtxn: &WriteTransaction,
-    entity_type_qname: &str,
-) -> MatchVerdict {
-    let view = match read_candidate_view(wtxn, candidate, entity_type_qname) {
-        Ok(Some(v)) => v,
-        Ok(None) => {
-            return MatchVerdict::Skipped {
-                reason: format!("candidate entity {candidate:?} not found"),
-            };
-        }
-        Err(e) => {
-            return MatchVerdict::Skipped {
-                reason: format!("read candidate row: {e}"),
-            };
-        }
-    };
-
-    match ask_if_same_entity(disambiguator, &view, surface_form) {
-        Ok(SameEntityReply::Yes(confidence)) => {
-            if confidence >= disambiguator.min_confidence {
-                MatchVerdict::Confirmed {
-                    entity: candidate,
-                    confidence,
-                }
-            } else {
-                MatchVerdict::Uncertain
-            }
-        }
-        Ok(SameEntityReply::No) => MatchVerdict::Rejected,
-        Ok(SameEntityReply::Uncertain) => MatchVerdict::Uncertain,
-        Err(reason) => MatchVerdict::Skipped { reason },
-    }
 }
 
 /// Three-way reply to the "is this the same entity?" question. Mirrors
@@ -846,10 +1702,12 @@ enum SameEntityReply {
 }
 
 /// Send the candidate view + surface form to the LLM backend and parse
-/// the reply. Sync-over-async via `block_on` — the resolver runs
-/// inside a redb write transaction, and the LLM future is `Send +
-/// 'static`-safe to block on a single-threaded executor.
-fn ask_if_same_entity(
+/// the reply. `.await`-ed off the shard reactor by the worker's
+/// disambiguation *plan* step, before any write txn is open — so it
+/// never parks the shard core. Any soft failure (transport error,
+/// unparseable reply) surfaces as `Err`, which the caller maps to
+/// [`MatchVerdict::Skipped`] (the no-disambiguator fallback).
+async fn ask_if_same_entity(
     disambiguator: &EntityDisambiguator,
     view: &LlmCandidateView,
     surface_form: &str,
@@ -868,9 +1726,16 @@ fn ask_if_same_entity(
         response_schema: None,
         temperature: 0.0,
         max_tokens: 64,
-        timeout: std::time::Duration::from_secs(30),
+        // Off the reactor now, so this bounds only this memory's own
+        // extraction latency (not a shard-wide freeze); a natural value
+        // is fine. A slow/hung provider still degrades to the
+        // merge/create fallback via the `Err` path.
+        timeout: DISAMBIGUATOR_LLM_TIMEOUT,
     };
-    let resp = futures_lite::future::block_on(disambiguator.client.complete(req))
+    let resp = disambiguator
+        .client
+        .complete(req)
+        .await
         .map_err(|e| format!("llm transport: {e}"))?;
     parse_confirm_reply(&resp.content)
         .ok_or_else(|| format!("unparseable disambiguator reply: {:?}", resp.content))
@@ -957,6 +1822,14 @@ mod tests {
 
     const NOW: u64 = 1_700_000_000_000_000_000;
 
+    /// Fixed `(namespace, space)` scope for resolver unit tests. The
+    /// system namespace + a stable space are enough to exercise the
+    /// scoped gauntlet; cross-scope distinctness is proven at the
+    /// brain-ops handler layer (`typed_graph_namespace_isolation.rs`).
+    fn test_scope() -> RowScope {
+        RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xA1; 16])
+    }
+
     fn db(dir: &TempDir) -> MetadataDb {
         MetadataDb::open(dir.path().join("metadata.redb")).expect("open")
     }
@@ -964,7 +1837,7 @@ mod tests {
     #[test]
     fn tier_exact_returns_existing_entity_by_canonical_name() {
         let dir = TempDir::new().unwrap();
-        let mut d = db(&dir);
+        let d = db(&dir);
         let existing = Entity::new_active(
             EntityId::new(),
             EntityType::PERSON_ID,
@@ -975,11 +1848,18 @@ mod tests {
         let existing_id = existing.id;
         {
             let wtxn = d.write_txn().unwrap();
-            entity_put(&wtxn, &existing).unwrap();
+            entity_put(
+                &wtxn,
+                test_scope(),
+                brain_core::SessionId::DEFAULT,
+                &existing,
+            )
+            .unwrap();
             wtxn.commit().unwrap();
         }
         let wtxn = d.write_txn().unwrap();
-        let res = resolve_or_create(&wtxn, "Priya Patel", "brain:Person", 0.9, NOW).unwrap();
+        let res = resolve_or_create(&wtxn, test_scope(), "Priya Patel", "brain:Person", 0.9, NOW)
+            .unwrap();
         assert_eq!(res.entity_id, existing_id);
         assert_eq!(res.tier, ResolutionTier::Exact);
         wtxn.commit().unwrap();
@@ -988,7 +1868,7 @@ mod tests {
     #[test]
     fn tier_alias_returns_existing_entity_via_alias() {
         let dir = TempDir::new().unwrap();
-        let mut d = db(&dir);
+        let d = db(&dir);
         let mut existing = Entity::new_active(
             EntityId::new(),
             EntityType::PERSON_ID,
@@ -1000,20 +1880,509 @@ mod tests {
         let id = existing.id;
         {
             let wtxn = d.write_txn().unwrap();
-            entity_put(&wtxn, &existing).unwrap();
+            entity_put(
+                &wtxn,
+                test_scope(),
+                brain_core::SessionId::DEFAULT,
+                &existing,
+            )
+            .unwrap();
             wtxn.commit().unwrap();
         }
         let wtxn = d.write_txn().unwrap();
-        let res = resolve_or_create(&wtxn, "priya", "brain:Person", 0.7, NOW).unwrap();
+        let res =
+            resolve_or_create(&wtxn, test_scope(), "priya", "brain:Person", 0.7, NOW).unwrap();
         assert_eq!(res.entity_id, id);
         assert_eq!(res.tier, ResolutionTier::Alias);
         wtxn.commit().unwrap();
     }
 
     #[test]
+    fn tier_partial_name_subset_resolves_to_full_entity() {
+        let dir = TempDir::new().unwrap();
+        let d = db(&dir);
+        let full = Entity::new_active(
+            EntityId::new(),
+            EntityType::PERSON_ID,
+            "Niraj Georgian".into(),
+            normalize_name("Niraj Georgian"),
+            NOW,
+        );
+        let full_id = full.id;
+        {
+            let wtxn = d.write_txn().unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &full).unwrap();
+            wtxn.commit().unwrap();
+        }
+        // A bare first-name reference must coref onto the full-name entity
+        // (token subset) instead of minting a duplicate person node.
+        let wtxn = d.write_txn().unwrap();
+        let res =
+            resolve_or_create(&wtxn, test_scope(), "Niraj", "brain:Person", 0.8, NOW + 1).unwrap();
+        assert_eq!(
+            res.entity_id, full_id,
+            "Niraj should coref to Niraj Georgian"
+        );
+        assert_eq!(res.tier, ResolutionTier::Alias);
+        wtxn.commit().unwrap();
+    }
+
+    #[test]
+    fn tier_partial_name_ambiguous_does_not_merge() {
+        let dir = TempDir::new().unwrap();
+        let d = db(&dir);
+        for name in ["Niraj Georgian", "Niraj Patel"] {
+            let e = Entity::new_active(
+                EntityId::new(),
+                EntityType::PERSON_ID,
+                name.into(),
+                normalize_name(name),
+                NOW,
+            );
+            let wtxn = d.write_txn().unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
+            wtxn.commit().unwrap();
+        }
+        // "Niraj" is a subset of TWO distinct people → ambiguous → must not
+        // guess; mint a fresh entity instead of mis-merging.
+        let wtxn = d.write_txn().unwrap();
+        let res =
+            resolve_or_create(&wtxn, test_scope(), "Niraj", "brain:Person", 0.8, NOW + 1).unwrap();
+        assert_eq!(
+            res.tier,
+            ResolutionTier::Created,
+            "ambiguous partial name must not merge"
+        );
+        wtxn.commit().unwrap();
+    }
+
+    #[test]
+    fn tier_diminutive_prefix_resolves_to_full_first_name() {
+        // A nickname ("Mel") that is a strict prefix of exactly one same-scope
+        // Person's first name ("Melanie") must coref onto that entity — not
+        // mint a duplicate that would hide Mel's facts from a Melanie query.
+        let dir = TempDir::new().unwrap();
+        let d = db(&dir);
+        let full = Entity::new_active(
+            EntityId::new(),
+            EntityType::PERSON_ID,
+            "Melanie".into(),
+            normalize_name("Melanie"),
+            NOW,
+        );
+        let full_id = full.id;
+        {
+            let wtxn = d.write_txn().unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &full).unwrap();
+            wtxn.commit().unwrap();
+        }
+        let wtxn = d.write_txn().unwrap();
+        let res =
+            resolve_or_create(&wtxn, test_scope(), "Mel", "brain:Person", 0.8, NOW + 1).unwrap();
+        assert_eq!(res.entity_id, full_id, "Mel should coref to Melanie");
+        assert_eq!(res.tier, ResolutionTier::Alias);
+        wtxn.commit().unwrap();
+    }
+
+    #[test]
+    fn tier_diminutive_prefix_ambiguous_does_not_merge() {
+        // "Mel" is a prefix of TWO distinct people ("Melanie", "Melissa") →
+        // ambiguous → must mint rather than merge onto the wrong person. This
+        // is the guard that keeps the nickname tier from over-merging.
+        let dir = TempDir::new().unwrap();
+        let d = db(&dir);
+        for name in ["Melanie", "Melissa"] {
+            let e = Entity::new_active(
+                EntityId::new(),
+                EntityType::PERSON_ID,
+                name.into(),
+                normalize_name(name),
+                NOW,
+            );
+            let wtxn = d.write_txn().unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
+            wtxn.commit().unwrap();
+        }
+        let wtxn = d.write_txn().unwrap();
+        let res =
+            resolve_or_create(&wtxn, test_scope(), "Mel", "brain:Person", 0.8, NOW + 1).unwrap();
+        assert_eq!(
+            res.tier,
+            ResolutionTier::Created,
+            "ambiguous diminutive prefix must not merge"
+        );
+        wtxn.commit().unwrap();
+    }
+
+    #[test]
+    fn tier_diminutive_prefix_never_merges_distinct_full_names() {
+        // Two distinct FULL names sharing no prefix must never collapse: "Mel"
+        // resolving must not touch "Caroline". Belt-and-suspenders regression
+        // against the nickname tier reaching beyond a genuine prefix.
+        let dir = TempDir::new().unwrap();
+        let d = db(&dir);
+        let caroline = Entity::new_active(
+            EntityId::new(),
+            EntityType::PERSON_ID,
+            "Caroline".into(),
+            normalize_name("Caroline"),
+            NOW,
+        );
+        let caroline_id = caroline.id;
+        {
+            let wtxn = d.write_txn().unwrap();
+            entity_put(
+                &wtxn,
+                test_scope(),
+                brain_core::SessionId::DEFAULT,
+                &caroline,
+            )
+            .unwrap();
+            wtxn.commit().unwrap();
+        }
+        let wtxn = d.write_txn().unwrap();
+        let res =
+            resolve_or_create(&wtxn, test_scope(), "Mel", "brain:Person", 0.8, NOW + 1).unwrap();
+        assert_ne!(
+            res.entity_id, caroline_id,
+            "Mel must not merge onto Caroline"
+        );
+        assert_eq!(res.tier, ResolutionTier::Created);
+        wtxn.commit().unwrap();
+    }
+
+    #[test]
+    fn retroactive_nickname_then_full_name_unifies() {
+        // Ordering mirror of the diminutive tier: the NICKNAME is minted first
+        // ("Mel"), then the FULLER name arrives ("Melanie"). Tier 3a'' can't
+        // fire (no full name existed when "Mel" was created); the retroactive
+        // tier must fold "Melanie" onto the pre-existing "Mel" node so the two
+        // don't fragment.
+        let dir = TempDir::new().unwrap();
+        let d = db(&dir);
+        let mel_id = {
+            let wtxn = d.write_txn().unwrap();
+            let res =
+                resolve_or_create(&wtxn, test_scope(), "Mel", "brain:Person", 0.8, NOW).unwrap();
+            assert_eq!(res.tier, ResolutionTier::Created);
+            wtxn.commit().unwrap();
+            res.entity_id
+        };
+        let wtxn = d.write_txn().unwrap();
+        let res = resolve_or_create(&wtxn, test_scope(), "Melanie", "brain:Person", 0.8, NOW + 1)
+            .unwrap();
+        assert_eq!(
+            res.entity_id, mel_id,
+            "Melanie should retroactively absorb the earlier Mel node"
+        );
+        assert_eq!(res.tier, ResolutionTier::Alias);
+        wtxn.commit().unwrap();
+        // "Melanie" is now an alias of the unified node → re-resolve hits tier 2.
+        let rtxn = d.read_txn().unwrap();
+        let got = entity_get(&rtxn, mel_id).unwrap().unwrap();
+        assert!(
+            got.aliases.iter().any(|a| a == "Melanie"),
+            "retroactive merge should alias the fuller surface; got {:?}",
+            got.aliases
+        );
+    }
+
+    #[test]
+    fn retroactive_nickname_ambiguous_second_fuller_not_merged() {
+        // "Mel" created, then "Melanie" folds onto it. A LATER, equally-valid
+        // fuller "Melissa" must NOT also fold in — that would put two distinct
+        // people behind one nickname. The freeze guard keeps them apart: the
+        // first fuller claims the nickname; distinct later fullers stay their
+        // own node.
+        let dir = TempDir::new().unwrap();
+        let d = db(&dir);
+        let mel_id = {
+            let wtxn = d.write_txn().unwrap();
+            let res =
+                resolve_or_create(&wtxn, test_scope(), "Mel", "brain:Person", 0.8, NOW).unwrap();
+            wtxn.commit().unwrap();
+            res.entity_id
+        };
+        let melanie_id = {
+            let wtxn = d.write_txn().unwrap();
+            let res =
+                resolve_or_create(&wtxn, test_scope(), "Melanie", "brain:Person", 0.8, NOW + 1)
+                    .unwrap();
+            assert_eq!(res.entity_id, mel_id, "Melanie claims the Mel nickname");
+            wtxn.commit().unwrap();
+            res.entity_id
+        };
+        let wtxn = d.write_txn().unwrap();
+        let melissa =
+            resolve_or_create(&wtxn, test_scope(), "Melissa", "brain:Person", 0.8, NOW + 2)
+                .unwrap();
+        assert_eq!(
+            melissa.tier,
+            ResolutionTier::Created,
+            "second fuller must not fold into an already-claimed nickname"
+        );
+        assert_ne!(
+            melissa.entity_id, melanie_id,
+            "Melissa and Melanie are distinct people, must not share a node"
+        );
+        wtxn.commit().unwrap();
+    }
+
+    #[test]
+    fn retroactive_two_prefix_nicknames_do_not_merge() {
+        // Two single-token nicknames both prefix the new name ("mel" AND
+        // "mela" both prefix "melanie"). Which one owns "Melanie" is
+        // ambiguous, so the retroactive tier abstains and mints.
+        let dir = TempDir::new().unwrap();
+        let d = db(&dir);
+        // Seed the two nicknames directly: resolving "Mela" after "Mel" would
+        // itself fold them together, so plant them as distinct nodes to set up
+        // the two-candidate ambiguity the tier must decline.
+        for nick in ["Mel", "Mela"] {
+            let e = Entity::new_active(
+                EntityId::new(),
+                EntityType::PERSON_ID,
+                nick.into(),
+                normalize_name(nick),
+                NOW,
+            );
+            let wtxn = d.write_txn().unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
+            wtxn.commit().unwrap();
+        }
+        let wtxn = d.write_txn().unwrap();
+        let res = resolve_or_create(&wtxn, test_scope(), "Melanie", "brain:Person", 0.8, NOW + 1)
+            .unwrap();
+        assert_eq!(
+            res.tier,
+            ResolutionTier::Created,
+            "two candidate nicknames is ambiguous; must not guess"
+        );
+        wtxn.commit().unwrap();
+    }
+
+    #[test]
+    fn retroactive_never_merges_multi_token_full_name() {
+        // A pre-existing MULTI-token full name ("Mel Gibson") shares its first
+        // token with the newcomer "Melanie" but is a real full name, not a
+        // bare nickname. The single-token guard keeps them distinct — the
+        // retroactive tier only absorbs bare nicknames.
+        let dir = TempDir::new().unwrap();
+        let d = db(&dir);
+        let gibson_id = {
+            let wtxn = d.write_txn().unwrap();
+            let res =
+                resolve_or_create(&wtxn, test_scope(), "Mel Gibson", "brain:Person", 0.8, NOW)
+                    .unwrap();
+            wtxn.commit().unwrap();
+            res.entity_id
+        };
+        let wtxn = d.write_txn().unwrap();
+        let res = resolve_or_create(&wtxn, test_scope(), "Melanie", "brain:Person", 0.8, NOW + 1)
+            .unwrap();
+        assert_ne!(
+            res.entity_id, gibson_id,
+            "Melanie must not absorb the multi-token full name Mel Gibson"
+        );
+        assert_eq!(res.tier, ResolutionTier::Created);
+        wtxn.commit().unwrap();
+    }
+
+    #[test]
+    fn retroactive_never_merges_two_distinct_full_first_names() {
+        // Two distinct single-token full names that merely share a stem
+        // ("Melanie" and "Melissa", neither a prefix of the other) must never
+        // collapse via the retroactive tier.
+        let dir = TempDir::new().unwrap();
+        let d = db(&dir);
+        let melanie_id = {
+            let wtxn = d.write_txn().unwrap();
+            let res = resolve_or_create(&wtxn, test_scope(), "Melanie", "brain:Person", 0.8, NOW)
+                .unwrap();
+            wtxn.commit().unwrap();
+            res.entity_id
+        };
+        let wtxn = d.write_txn().unwrap();
+        let res = resolve_or_create(&wtxn, test_scope(), "Melissa", "brain:Person", 0.8, NOW + 1)
+            .unwrap();
+        assert_ne!(
+            res.entity_id, melanie_id,
+            "Melissa and Melanie share a stem but neither is a prefix of the other"
+        );
+        assert_eq!(res.tier, ResolutionTier::Created);
+        wtxn.commit().unwrap();
+    }
+
+    #[test]
+    fn greeting_prefixed_surface_resolves_to_existing_person() {
+        // "Hey Mel" must strip the vocative and resolve to the existing "Mel"
+        // entity (tier-1 exact after the strip), not mint a "Hey Mel" node.
+        let dir = TempDir::new().unwrap();
+        let d = db(&dir);
+        let mel = Entity::new_active(
+            EntityId::new(),
+            EntityType::PERSON_ID,
+            "Mel".into(),
+            normalize_name("Mel"),
+            NOW,
+        );
+        let mel_id = mel.id;
+        {
+            let wtxn = d.write_txn().unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &mel).unwrap();
+            wtxn.commit().unwrap();
+        }
+        for surface in ["Hey Mel", "Thanks Mel", "Yeah Mel", "Wow Mel"] {
+            let wtxn = d.write_txn().unwrap();
+            let res = resolve_or_create(&wtxn, test_scope(), surface, "brain:Person", 0.8, NOW + 1)
+                .unwrap();
+            assert_eq!(res.entity_id, mel_id, "{surface} should resolve to Mel");
+            assert_eq!(res.tier, ResolutionTier::Exact);
+            wtxn.commit().unwrap();
+        }
+    }
+
+    #[test]
+    fn greeting_strip_is_person_gated() {
+        // A non-Person surface keeps its leading word: the company "Hello
+        // Fresh" must not be mangled into "Fresh". Resolve under a non-Person
+        // type and confirm the created canonical name is intact.
+        let dir = TempDir::new().unwrap();
+        let d = db(&dir);
+        let wtxn = d.write_txn().unwrap();
+        let res = resolve_or_create(
+            &wtxn,
+            test_scope(),
+            "Hello Fresh",
+            "brain:Organization",
+            0.8,
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(res.tier, ResolutionTier::Created);
+        wtxn.commit().unwrap();
+        let rtxn = d.read_txn().unwrap();
+        let got = entity_get(&rtxn, res.entity_id).unwrap().unwrap();
+        assert_eq!(got.canonical_name, "Hello Fresh");
+    }
+
+    // ----- Pure-logic surface normalization -------------------------------
+
+    #[test]
+    fn strip_leading_vocative_removes_greetings() {
+        assert_eq!(strip_leading_vocative("Hey Mel").as_deref(), Some("Mel"));
+        assert_eq!(strip_leading_vocative("Thanks Mel").as_deref(), Some("Mel"));
+        assert_eq!(strip_leading_vocative("Yeah Mel").as_deref(), Some("Mel"));
+        assert_eq!(strip_leading_vocative("Wow Mel").as_deref(), Some("Mel"));
+        assert_eq!(strip_leading_vocative("Hey, Mel").as_deref(), Some("Mel"));
+        assert_eq!(strip_leading_vocative("oh hey Mel").as_deref(), Some("Mel"));
+        assert_eq!(
+            strip_leading_vocative("thank you Mel").as_deref(),
+            Some("Mel"),
+        );
+        // Multi-token names survive the strip whole.
+        assert_eq!(
+            strip_leading_vocative("Hey Mary Jane").as_deref(),
+            Some("Mary Jane"),
+        );
+    }
+
+    #[test]
+    fn strip_leading_vocative_leaves_plain_names_untouched() {
+        // No leading greeting → None (caller keeps the original surface).
+        assert_eq!(strip_leading_vocative("Mel"), None);
+        assert_eq!(strip_leading_vocative("Melanie Cross"), None);
+        // A bare greeting with no trailing name is not reduced to empty.
+        assert_eq!(strip_leading_vocative("Hey"), None);
+        assert_eq!(strip_leading_vocative("thank you"), None);
+    }
+
+    #[test]
+    fn is_temporal_expression_surface_rejects_relative_dates() {
+        for t in [
+            "Last Friday",
+            "last fri",
+            "Next Monday",
+            "this weekend",
+            "next week",
+            "yesterday",
+            "Today",
+            "tomorrow",
+            "3 days ago",
+            "in 2 weeks",
+            "2020-01-15",
+            // Full calendar dates: the forms that used to slip through and
+            // become orphan Event-typed entity nodes.
+            "January 2026",
+            "january 2026",
+            "Jan 2026",
+            "January 5, 2026",
+            "January 5 2026",
+            "5 January 2026",
+            "8 May, 2023",
+            "2026",
+            "  January 2026  ",
+        ] {
+            assert!(
+                is_temporal_expression_surface(t),
+                "{t} should be a temporal expression"
+            );
+        }
+    }
+
+    #[test]
+    fn is_temporal_expression_surface_keeps_names() {
+        // Bare weekday / month names can be people — never reject them; and
+        // real names are obviously not temporal.
+        for t in [
+            "Friday",
+            "Sun",
+            "May",
+            "June",
+            // A bare month name stays eligible: it can be a person or a
+            // product. Only a month paired with a year is a date.
+            "January",
+            "Jan",
+            "Melanie",
+            "Mel",
+            "Last Name",
+            "next door",
+        ] {
+            assert!(
+                !is_temporal_expression_surface(t),
+                "{t} must not be treated as temporal"
+            );
+        }
+    }
+
+    #[test]
+    fn is_temporal_expression_surface_does_not_over_match_names_containing_dates() {
+        // The date recognizers are whole-surface anchored, so a year or month
+        // merely embedded in a longer name is not a date — these are genuine
+        // entities and must survive the guard.
+        for t in [
+            "Room 2026",
+            "Project 2026",
+            "Apollo 1969",
+            "2026 Roadmap",
+            "Q1 2026",
+            "Diego",
+            "billing team",
+            "Stripe",
+            "May Fourth Movement",
+            "January Jones",
+        ] {
+            assert!(
+                !is_temporal_expression_surface(t),
+                "{t} must not be treated as temporal"
+            );
+        }
+    }
+
+    #[test]
     fn tier_fuzzy_matches_close_surface_form_and_adds_alias() {
         let dir = TempDir::new().unwrap();
-        let mut d = db(&dir);
+        let d = db(&dir);
         // Two entities to make the candidate set non-trivial.
         let target = Entity::new_active(
             EntityId::new(),
@@ -1032,13 +2401,21 @@ mod tests {
         let target_id = target.id;
         {
             let wtxn = d.write_txn().unwrap();
-            entity_put(&wtxn, &target).unwrap();
-            entity_put(&wtxn, &other).unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &target).unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &other).unwrap();
             wtxn.commit().unwrap();
         }
         // Tier-3 fuzzy: typo'd surface form should resolve to target.
         let wtxn = d.write_txn().unwrap();
-        let res = resolve_or_create(&wtxn, "Priya  Patel", "brain:Person", 0.8, NOW + 1).unwrap();
+        let res = resolve_or_create(
+            &wtxn,
+            test_scope(),
+            "Priya  Patel",
+            "brain:Person",
+            0.8,
+            NOW + 1,
+        )
+        .unwrap();
         // "priya  patel" normalises to "priya patel" → tier-1 hit.
         assert_eq!(res.entity_id, target_id);
         assert_eq!(res.tier, ResolutionTier::Exact);
@@ -1046,7 +2423,15 @@ mod tests {
 
         // Now a true fuzzy match — a partial name share.
         let wtxn = d.write_txn().unwrap();
-        let res = resolve_or_create(&wtxn, "Priya Patell", "brain:Person", 0.8, NOW + 2).unwrap();
+        let res = resolve_or_create(
+            &wtxn,
+            test_scope(),
+            "Priya Patell",
+            "brain:Person",
+            0.8,
+            NOW + 2,
+        )
+        .unwrap();
         assert_eq!(res.entity_id, target_id);
         // First fuzzy hit promotes via alias index. Re-resolve picks
         // tier-2 next time.
@@ -1066,9 +2451,17 @@ mod tests {
     #[test]
     fn tier_create_mints_new_entity_when_no_match() {
         let dir = TempDir::new().unwrap();
-        let mut d = db(&dir);
+        let d = db(&dir);
         let wtxn = d.write_txn().unwrap();
-        let res = resolve_or_create(&wtxn, "Brand New Name", "brain:Person", 0.5, NOW).unwrap();
+        let res = resolve_or_create(
+            &wtxn,
+            test_scope(),
+            "Brand New Name",
+            "brain:Person",
+            0.5,
+            NOW,
+        )
+        .unwrap();
         assert_eq!(res.tier, ResolutionTier::Created);
         wtxn.commit().unwrap();
         let rtxn = d.read_txn().unwrap();
@@ -1078,32 +2471,119 @@ mod tests {
         // A second resolve on the same surface form should hit tier 1
         // (deterministic re-resolve).
         let wtxn = d.write_txn().unwrap();
-        let res2 =
-            resolve_or_create(&wtxn, "Brand New Name", "brain:Person", 0.5, NOW + 1).unwrap();
+        let res2 = resolve_or_create(
+            &wtxn,
+            test_scope(),
+            "Brand New Name",
+            "brain:Person",
+            0.5,
+            NOW + 1,
+        )
+        .unwrap();
         assert_eq!(res2.entity_id, res.entity_id);
         assert_eq!(res2.tier, ResolutionTier::Exact);
         wtxn.commit().unwrap();
     }
 
     #[test]
+    fn cross_type_exact_reuses_existing_entity_under_different_type() {
+        // The pattern and LLM extractor tiers routinely assign DIFFERENT type
+        // ids to the same referent: "The Atlas" (determiner-stripped to the
+        // normalized key "atlas") under one type and "Atlas" under another.
+        // Without cross-type reuse these fragment into two nodes and split the
+        // entity's relations across them, silently breaking multi-hop traversal.
+        let dir = TempDir::new().unwrap();
+        let d = db(&dir);
+        // First mention mints under Concept; determiner-strip → key "atlas".
+        let wtxn = d.write_txn().unwrap();
+        let first =
+            resolve_or_create(&wtxn, test_scope(), "The Atlas", "brain:Concept", 0.9, NOW).unwrap();
+        assert_eq!(first.tier, ResolutionTier::Created);
+        wtxn.commit().unwrap();
+        // Second mention, DIFFERENT type hint, bare form → must reuse, not mint.
+        let wtxn = d.write_txn().unwrap();
+        let second =
+            resolve_or_create(&wtxn, test_scope(), "Atlas", "brain:Person", 0.9, NOW + 1).unwrap();
+        assert_eq!(
+            second.entity_id, first.entity_id,
+            "cross-type exact name match must reuse the existing node, not fragment"
+        );
+        assert_eq!(second.tier, ResolutionTier::Exact);
+        wtxn.commit().unwrap();
+    }
+
+    #[test]
+    fn cross_type_exact_declines_on_homograph_ambiguity() {
+        // A normalized name shared by two DIFFERENT-typed entities is a genuine
+        // homograph ("Apple" the company vs the fruit). Cross-type reuse must
+        // NOT pick one arbitrarily — with >1 match it falls through to mint a
+        // distinct entity.
+        let dir = TempDir::new().unwrap();
+        let d = db(&dir);
+        // Mint "Apple" as an Organization (registers the Organization type).
+        let wtxn = d.write_txn().unwrap();
+        let org = resolve_or_create(&wtxn, test_scope(), "Apple", "brain:Organization", 0.9, NOW)
+            .unwrap();
+        wtxn.commit().unwrap();
+        // Seed a second "apple" under the (already-registered) Person type.
+        let person_apple = Entity::new_active(
+            EntityId::new(),
+            EntityType::PERSON_ID,
+            "Apple".into(),
+            normalize_name("Apple"),
+            NOW,
+        );
+        let person_id = person_apple.id;
+        let wtxn = d.write_txn().unwrap();
+        entity_put(
+            &wtxn,
+            test_scope(),
+            brain_core::SessionId::DEFAULT,
+            &person_apple,
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+        // Now resolve "Apple" under a THIRD type: two cross-type matches exist
+        // → ambiguous → mint a fresh entity rather than conflate them.
+        let wtxn = d.write_txn().unwrap();
+        let res =
+            resolve_or_create(&wtxn, test_scope(), "Apple", "brain:Event", 0.9, NOW + 1).unwrap();
+        assert!(
+            res.entity_id != org.entity_id && res.entity_id != person_id,
+            "ambiguous cross-type homograph must not be reused"
+        );
+        assert_eq!(res.tier, ResolutionTier::Created);
+        wtxn.commit().unwrap();
+    }
+
+    #[test]
     fn empty_surface_form_is_rejected() {
         let dir = TempDir::new().unwrap();
-        let mut d = db(&dir);
+        let d = db(&dir);
         let wtxn = d.write_txn().unwrap();
-        let err = resolve_or_create(&wtxn, "   ", "brain:Person", 0.5, NOW).expect_err("empty");
+        let err = resolve_or_create(&wtxn, test_scope(), "   ", "brain:Person", 0.5, NOW)
+            .expect_err("empty");
         assert!(matches!(err, ResolverError::EmptyNormalizedName));
     }
 
     #[test]
     fn unknown_entity_type_qname_is_interned_on_demand() {
         let dir = TempDir::new().unwrap();
-        let mut d = db(&dir);
+        let d = db(&dir);
         let wtxn = d.write_txn().unwrap();
-        let res = resolve_or_create(&wtxn, "Acme Corp", "brain:Organization", 0.7, NOW).unwrap();
+        let res = resolve_or_create(
+            &wtxn,
+            test_scope(),
+            "Acme Corp",
+            "brain:Organization",
+            0.7,
+            NOW,
+        )
+        .unwrap();
         assert_eq!(res.tier, ResolutionTier::Created);
         wtxn.commit().unwrap();
         // The new type lives in the registry now.
-        let mut d = d;
+        let d = d;
         let wtxn = d.write_txn().unwrap();
         let def = entity_type_lookup_by_name(&wtxn, "Organization").unwrap();
         assert!(def.is_some());
@@ -1194,7 +2674,39 @@ mod tests {
         EmbeddingDeps {
             hnsw,
             embedder: embedder as Arc<dyn Dispatcher>,
+            embed_threshold: EMBED_RESOLVE_THRESHOLD,
         }
+    }
+
+    /// Resolve with the embedding tier wired and publish whatever tier-4
+    /// staged, mirroring the production `commit()`-then-flush sequence
+    /// (these tests commit on the next line and never roll back, so the
+    /// flush is ordered with the commit either way).
+    fn resolve_and_publish(
+        wtxn: &WriteTransaction,
+        scope: RowScope,
+        surface_form: &str,
+        entity_type_qname: &str,
+        confidence: f32,
+        now_unix_nanos: u64,
+        embed_deps: Option<&EmbeddingDeps>,
+    ) -> Result<Resolution, ResolverError> {
+        let mut staged = StagedEntityVectors::new();
+        let res = resolve_or_create_with_deps(
+            wtxn,
+            scope,
+            surface_form,
+            entity_type_qname,
+            confidence,
+            now_unix_nanos,
+            embed_deps,
+            &mut staged,
+            &mut Disambiguation::Off,
+        );
+        if let Some(deps) = embed_deps {
+            staged.flush_into_hnsw(deps);
+        }
+        res
     }
 
     /// Stage an entity in redb + the HNSW with a chosen embedding.
@@ -1214,7 +2726,7 @@ mod tests {
             NOW,
         );
         let wtxn = d.write_txn().unwrap();
-        entity_put(&wtxn, &ent).unwrap();
+        entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &ent).unwrap();
         wtxn.commit().unwrap();
         hnsw.write().insert(id, &vector).unwrap();
         id
@@ -1244,8 +2756,9 @@ mod tests {
 
         let deps = deps(embedder, hnsw);
         let wtxn = d.write_txn().unwrap();
-        let res = resolve_or_create_with_hnsw(
+        let res = resolve_and_publish(
             &wtxn,
+            test_scope(),
             "Stripe Payments",
             "brain:Person",
             0.9,
@@ -1292,8 +2805,9 @@ mod tests {
 
         let deps = deps(embedder, hnsw.clone());
         let wtxn = d.write_txn().unwrap();
-        let res = resolve_or_create_with_hnsw(
+        let res = resolve_and_publish(
             &wtxn,
+            test_scope(),
             "Bitcoin",
             "brain:Person",
             0.9,
@@ -1313,19 +2827,26 @@ mod tests {
 
     #[test]
     fn tier_embedding_respects_entity_type() {
-        // Both Person and Organization entries share the SAME embedding
-        // peak so the HNSW returns both at the top. The type filter
-        // must drop the Organization candidate before the threshold
-        // check.
+        // A Person and an Organization share the SAME embedding peak, so
+        // the HNSW returns both at the top. The embedding tier's type
+        // filter must drop the Organization candidate before the
+        // threshold check, resolving to the Person.
+        //
+        // The query is a paraphrase that surface-matches neither seeded
+        // name (shares only the leading token, like "Stripe Payments" vs
+        // "Stripe Inc." in `tier_embedding_resolves_near_paraphrase`), so
+        // the exact / alias / partial-name tiers all miss and tier-3
+        // (embedding) is the one under test. ("Wong" alone would be a
+        // partial-name subset of both seeded names and resolve earlier.)
         let shared_v = shared_axis(42, 43, 1.0, 0.0);
-        // Slightly off-axis for Alice's Cafe so HNSW orders Alice Wong
-        // higher when the query vector matches Alice Wong exactly —
-        // but this test is really about the type filter rejecting the
+        // Slightly off-axis for the Org so the HNSW orders the Person
+        // higher when the query vector matches the Person exactly — but
+        // this test is really about the type filter rejecting the
         // wrong-type top hit.
-        let cafe_v = shared_axis(42, 43, 0.999, 0.045);
+        let org_v = shared_axis(42, 43, 0.999, 0.045);
 
         let embedder = Arc::new(ScriptedEmbedder::new());
-        embedder.set("Alice", shared_v);
+        embedder.set("Wong Group", shared_v);
 
         let dir = TempDir::new().unwrap();
         let mut d = db(&dir);
@@ -1339,43 +2860,31 @@ mod tests {
             id
         };
 
-        let alice_person_id = seed_entity(
+        let wong_person_id = seed_entity(
             &mut d,
             &hnsw,
             brain_core::EntityType::PERSON_ID,
-            "Alice Wong",
+            "Wong Industries",
             shared_v,
         );
-        let _cafe_id = seed_entity(&mut d, &hnsw, org_type_id, "Alice's Cafe", cafe_v);
+        let _org_id = seed_entity(&mut d, &hnsw, org_type_id, "Wong Holdings", org_v);
 
         let deps = deps(embedder, hnsw);
         let wtxn = d.write_txn().unwrap();
-        let res =
-            resolve_or_create_with_hnsw(&wtxn, "Alice", "brain:Person", 0.9, NOW + 1, Some(&deps))
-                .unwrap();
+        let res = resolve_and_publish(
+            &wtxn,
+            test_scope(),
+            "Wong Group",
+            "brain:Person",
+            0.9,
+            NOW + 1,
+            Some(&deps),
+        )
+        .unwrap();
         wtxn.commit().unwrap();
 
-        assert_eq!(res.entity_id, alice_person_id);
+        assert_eq!(res.entity_id, wong_person_id);
         assert_eq!(res.tier, ResolutionTier::Embedding);
-    }
-
-    #[test]
-    fn tier_embedding_env_threshold_override_parser() {
-        // Direct parser test — avoids racing the process-wide env.
-        assert!((parse_embed_threshold_env(None) - EMBED_RESOLVE_THRESHOLD).abs() < 1e-6);
-        assert!((parse_embed_threshold_env(Some("")) - EMBED_RESOLVE_THRESHOLD).abs() < 1e-6);
-        assert!((parse_embed_threshold_env(Some("0.6")) - 0.6).abs() < 1e-6);
-        assert!((parse_embed_threshold_env(Some("0.0")) - 0.0).abs() < 1e-6);
-        assert!((parse_embed_threshold_env(Some("1.0")) - 1.0).abs() < 1e-6);
-        // Out-of-range + non-numeric → default.
-        assert!(
-            (parse_embed_threshold_env(Some("1.5")) - EMBED_RESOLVE_THRESHOLD).abs() < 1e-6,
-            "out-of-range must fall back to default",
-        );
-        assert!(
-            (parse_embed_threshold_env(Some("nope")) - EMBED_RESOLVE_THRESHOLD).abs() < 1e-6,
-            "non-numeric must fall back to default",
-        );
     }
 
     #[test]
@@ -1391,13 +2900,14 @@ mod tests {
         embedder.set("Brand New Company", paraphrase_v);
 
         let dir = TempDir::new().unwrap();
-        let mut d = db(&dir);
+        let d = db(&dir);
         let hnsw = fresh_hnsw();
 
         let deps = deps(embedder, hnsw.clone());
         let wtxn = d.write_txn().unwrap();
-        let r1 = resolve_or_create_with_hnsw(
+        let r1 = resolve_and_publish(
             &wtxn,
+            test_scope(),
             "Brand New Co",
             "brain:Person",
             0.9,
@@ -1411,8 +2921,9 @@ mod tests {
 
         // Second resolve with a paraphrase hits tier-3b.
         let wtxn = d.write_txn().unwrap();
-        let r2 = resolve_or_create_with_hnsw(
+        let r2 = resolve_and_publish(
             &wtxn,
+            test_scope(),
             "Brand New Company",
             "brain:Person",
             0.9,
@@ -1458,8 +2969,9 @@ mod tests {
 
         let deps_holder = deps(embedder, hnsw.clone());
         let wtxn = d.write_txn().unwrap();
-        let res = resolve_or_create_with_hnsw(
+        let res = resolve_and_publish(
             &wtxn,
+            test_scope(),
             "Acme Holdings",
             "brain:Person",
             0.9,
@@ -1505,10 +3017,10 @@ mod tests {
         // because the worker can momentarily run without deps wired
         // (test fixtures, substrate-only deployments).
         let dir = TempDir::new().unwrap();
-        let mut d = db(&dir);
+        let d = db(&dir);
         let wtxn = d.write_txn().unwrap();
-        let res =
-            resolve_or_create_with_hnsw(&wtxn, "Solo", "brain:Person", 0.9, NOW, None).unwrap();
+        let res = resolve_and_publish(&wtxn, test_scope(), "Solo", "brain:Person", 0.9, NOW, None)
+            .unwrap();
         assert_eq!(res.tier, ResolutionTier::Created);
         wtxn.commit().unwrap();
     }

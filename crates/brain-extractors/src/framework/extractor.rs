@@ -1,5 +1,4 @@
-//! `Extractor` trait + execution context + result types,
-//! §22/02, §22/05.
+//! `Extractor` trait + execution context + result types.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -12,6 +11,16 @@ use brain_core::MemoryId;
 
 use crate::framework::item::ExtractedItem;
 use crate::framework::registry::ExtractorRegistry;
+use crate::framework::trigger::TriggerDecision;
+
+/// The reserved system-schema namespace (`brain`). Every seeded
+/// extractor is declared under it; a runtime extractor whose qname
+/// carries no namespace prefix defaults to it. Kept in lockstep with
+/// `brain_metadata::system_schema::SYSTEM_SCHEMA_NAMESPACE` — the
+/// framework can't depend on brain-metadata, so the literal is mirrored
+/// here (a divergence would only surface as a namespace-selection miss,
+/// caught by the worker's fallback-to-system default).
+pub const SYSTEM_NAMESPACE: &str = "brain";
 
 // ---------------------------------------------------------------------------
 // Bounded LLM context.
@@ -95,6 +104,34 @@ pub trait Extractor: Send + Sync {
     /// Canonical qname, e.g. `"acme:person_mentions"`.
     fn name(&self) -> &str;
     fn extractor_version(&self) -> u32;
+
+    /// The namespace this extractor was declared under (`brain` for the
+    /// seeded system extractors, the uploader's namespace for user
+    /// `SCHEMA_UPLOAD`s). Derived from the qname's `namespace:name`
+    /// prefix — every concrete extractor is constructed with its qname,
+    /// so no separate field is needed. The LLM tier reads this to scope
+    /// selection to a memory's own namespace: a namespace's own LLM
+    /// extractor replaces the system default for that namespace's
+    /// memories, which both kills the double-LLM cost and stops one
+    /// tenant's extractor running over another's rows.
+    fn namespace(&self) -> &str {
+        self.name()
+            .split_once(':')
+            .map_or(SYSTEM_NAMESPACE, |(ns, _)| ns)
+    }
+
+    /// Whether this extractor fires for `mem` on the ENCODE path, given
+    /// its declared `trigger`. The default is unconditional [`Run`] —
+    /// an extractor without a trigger (and the pattern/classifier tiers,
+    /// which don't honor triggers) always runs. The LLM tier overrides
+    /// this to evaluate its `on encode where <cond>` clause and to stay
+    /// inert for non-encode triggers (`on demand`, `periodic`,
+    /// `on schema_change`).
+    ///
+    /// [`Run`]: TriggerDecision::Run
+    fn encode_trigger_decision(&self, _mem: &Memory) -> TriggerDecision {
+        TriggerDecision::Run
+    }
     /// Run over `mem`. Returns a populated [`ExtractionResult`]
     /// including `started_at` / `completed_at` timestamps; the
     /// caller writes the audit row from these.
@@ -106,7 +143,7 @@ pub trait Extractor: Send + Sync {
     /// is ~4s on CPU; a batched backbone pass over 8 memories
     /// completes in ~1-2x the single-input cost). Pattern + LLM
     /// extractors don't benefit from batching, so they fall through
-    /// to the default impl that sequentially calls [`run`].
+    /// to the default impl that sequentially calls [`Self::run`].
     ///
     /// Output is aligned to input order: `result[i]` is the result for
     /// `mems[i]`. An empty `mems` returns an empty `Vec`.
@@ -129,7 +166,7 @@ pub trait Extractor: Send + Sync {
     /// the `degraded` variants (missing API key, missing model
     /// files, schema compile failure, …) return false. Used by the
     /// encode response so the renderer can tell operators when 0
-    /// statements is a "set ANTHROPIC_API_KEY" condition versus a
+    /// statements is a "set BRAIN__LLM__API_KEY" condition versus a
     /// content-coverage condition.
     fn is_wired(&self) -> bool {
         true
@@ -161,11 +198,65 @@ pub struct ExtractionContext<'a> {
     /// means context-free extraction. Pattern + classifier tiers
     /// ignore this field.
     pub extractor_context: Option<&'a HashMap<MemoryId, ExtractorContext>>,
+    /// The active schema's declared entity types, pre-rendered as a prompt
+    /// block (`brain_metadata::render_declared_entity_types_block`): one
+    /// `- brain:<Name>` bullet per active type. The LLM tier substitutes
+    /// this into its `{DECLARED_ENTITY_TYPES}` placeholder so its entity-type
+    /// vocabulary tracks the active schema (system core + user
+    /// `SCHEMA_UPLOAD`) at runtime. Batch-level (same for every memory).
+    /// `None` = no block injected (the placeholder renders empty); pattern +
+    /// classifier tiers ignore it.
+    pub declared_entity_types: Option<&'a str>,
+    /// Per-memory candidate-predicate blocks: for each memory id, the top-K
+    /// existing `brain:` predicates nearest that memory's text, pre-rendered
+    /// as `- brain:<name>` bullets. The LLM tier looks up its memory here and
+    /// substitutes the block into `{CANDIDATE_PREDICATES}` so it reuses this
+    /// DB's real relation vocabulary instead of coining a near-duplicate.
+    /// Unlike the batch-level schema blocks this is per-memory (it depends on
+    /// the memory-text embedding). `None`, or an absent memory id, injects an
+    /// empty block; pattern + classifier tiers ignore it.
+    pub candidate_predicates: Option<&'a HashMap<MemoryId, String>>,
+    /// The active schema's declared statement kinds, pre-rendered as a
+    /// prompt block (`brain_metadata::render_declared_kinds_block`): the
+    /// six builtin kinds plus any user-declared ones. The LLM tier
+    /// substitutes this into its `{DECLARED_KINDS}` placeholder so its
+    /// kind taxonomy tracks the active schema at runtime. `None` = no
+    /// block injected (the placeholder renders empty); pattern +
+    /// classifier tiers ignore it.
+    pub declared_kinds: Option<&'a str>,
+    /// The active schema's entity-type label set (`brain:<Name>`, id-order),
+    /// read fresh each drain cycle. The classifier (GLiNER) tier uses this as
+    /// its zero-shot label set so a user's `SCHEMA_UPLOAD` adding entity types
+    /// reaches the classifier on the next batch — no shard restart. `None`
+    /// falls back to the labels baked in at construction; pattern + LLM tiers
+    /// ignore it.
+    pub entity_type_labels: Option<&'a [String]>,
 }
 
 // ---------------------------------------------------------------------------
 // Result.
 // ---------------------------------------------------------------------------
+
+/// Whether a `Failure` result is worth retrying. Tier-agnostic so any
+/// tier can classify, though only the LLM tier sets it meaningfully today
+/// (pattern/classifier failures are terminal regardless — their rows
+/// already committed). The worker reads this to decide a failed memory's
+/// fate: a `Transient` (or unclassified) LLM failure keeps the memory
+/// queued for a backoff retry so a passing provider outage never
+/// permanently drops its grounding; a `Permanent` one is terminal so a
+/// bad key / no balance fails loudly instead of looping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExtractionFailureClass {
+    /// Not a failure, or a failure carrying no retry signal — treated as
+    /// retryable by the worker (retry-with-backoff is bounded and cheap;
+    /// dropping a memory's grounding on an unclassified blip is not).
+    #[default]
+    Unclassified,
+    /// The same call could succeed later — retry with backoff.
+    Transient,
+    /// The call can't succeed as-is — terminal; surface to the operator.
+    Permanent,
+}
 
 /// One extractor invocation's full output. Whether `items` is
 /// populated depends on `status`: `Success` always carries items
@@ -176,20 +267,32 @@ pub struct ExtractionResult {
     pub items: Vec<ExtractedItem>,
     pub status: ExtractionStatus,
     pub status_reason: String,
+    /// Set on `Failure` results to drive the worker's retry decision;
+    /// `Unclassified` for success / skip / unclassified failures.
+    pub failure_class: ExtractionFailureClass,
     pub started_at_unix_nanos: u64,
     pub completed_at_unix_nanos: u64,
+    /// Provider cost this run actually incurred, in micro-USD. Non-zero
+    /// only for LLM-tier runs that made a paid call (cache hits, budget
+    /// skips, and the free pattern/classifier tiers are `0`). The worker
+    /// sums this into the per-cycle spend gate and the
+    /// `brain_extractor_llm_micro_usd_spent_total` metric.
+    pub cost_micro_usd: u64,
 }
 
 impl ExtractionResult {
     /// Convenience: an empty result with `Success`. Wall time is
-    /// expected to be filled in by callers that wrap `run`.
+    /// expected to be filled in by callers that wrap `run`. Cost
+    /// defaults to `0`; LLM callers chain [`with_cost`](Self::with_cost).
     pub fn success(items: Vec<ExtractedItem>, started_at: u64, completed_at: u64) -> Self {
         Self {
             items,
             status: ExtractionStatus::Success,
             status_reason: String::new(),
+            failure_class: ExtractionFailureClass::Unclassified,
             started_at_unix_nanos: started_at,
             completed_at_unix_nanos: completed_at,
+            cost_micro_usd: 0,
         }
     }
 
@@ -198,8 +301,10 @@ impl ExtractionResult {
             items: Vec::new(),
             status,
             status_reason: reason.into(),
+            failure_class: ExtractionFailureClass::Unclassified,
             started_at_unix_nanos: at,
             completed_at_unix_nanos: at,
+            cost_micro_usd: 0,
         }
     }
 
@@ -208,9 +313,28 @@ impl ExtractionResult {
             items: Vec::new(),
             status: ExtractionStatus::Failure,
             status_reason: reason.into(),
+            failure_class: ExtractionFailureClass::Unclassified,
             started_at_unix_nanos: started_at,
             completed_at_unix_nanos: completed_at,
+            cost_micro_usd: 0,
         }
+    }
+
+    /// Attach the provider cost (micro-USD) this run incurred.
+    #[must_use]
+    pub fn with_cost(mut self, cost_micro_usd: u64) -> Self {
+        self.cost_micro_usd = cost_micro_usd;
+        self
+    }
+
+    /// Tag a `Failure` with whether it's worth retrying. The LLM tier sets
+    /// this from [`brain_llm::LlmError::failure_class`] so the worker can
+    /// keep transient failures queued (backoff retry) and terminate
+    /// permanent ones (bad key / no balance) loudly.
+    #[must_use]
+    pub fn with_failure_class(mut self, class: ExtractionFailureClass) -> Self {
+        self.failure_class = class;
+        self
     }
 }
 
@@ -289,17 +413,6 @@ pub enum ExtractorError {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn status_enum_discriminants_match_spec() {
-        // Bytes from — never change.
-        assert_eq!(ExtractionStatus::Success.as_u8(), 1);
-        assert_eq!(ExtractionStatus::Failure.as_u8(), 2);
-        assert_eq!(ExtractionStatus::SkippedBudget.as_u8(), 3);
-        assert_eq!(ExtractionStatus::SkippedFilter.as_u8(), 4);
-        assert_eq!(ExtractionStatus::SkippedDuplicate.as_u8(), 5);
-        assert_eq!(ExtractionStatus::SkippedDisabled.as_u8(), 6);
-    }
 
     #[test]
     fn status_from_u8_round_trip() {

@@ -6,14 +6,13 @@
 //! downstream storage code that takes `&ValidatedSchema` cannot be
 //! handed a raw `Schema`.
 //!
-//! Migration-time compatibility checks are out of scope for v1
-//! (§21/07 Q3).
+//! Migration-time compatibility checks are out of scope for v1.
 
 use std::collections::HashMap;
 
 use crate::schema::ast::{
     AttrType, AttributeDecl, CardinalityAst, ExtractorDef, ExtractorField, ExtractorKindAst,
-    ExtractorTarget, LiteralValue, ObjectTypeDecl, PredicateDef, RelationTypeDef, Schema,
+    ExtractorTarget, KindDef, LiteralValue, ObjectTypeDecl, PredicateDef, RelationTypeDef, Schema,
     SchemaItem, StatementKindAst,
 };
 
@@ -77,6 +76,12 @@ pub enum ValidationErrorCode {
 const RESERVED_NAMESPACE: &str = "brain";
 const NAMESPACE_MAX_LEN: usize = 32;
 const ATTRIBUTE_NAME_MAX_LEN: usize = 64;
+/// Upper bound on a declared type name (entity_type / predicate /
+/// relation_type / extractor). These names are interned as redb keys, so
+/// an unbounded name would let a caller write a multi-megabyte key. Set
+/// above the attribute-name cap (64) to leave room for descriptive
+/// compound names while still bounding the key.
+const TYPE_NAME_MAX_LEN: usize = 128;
 const ANY_TYPE_LITERAL: &str = "Any";
 
 // ---------------------------------------------------------------------------
@@ -131,6 +136,7 @@ fn validate_inner(
             SchemaItem::Extractor(x) => {
                 check_extractor(x, &entity_names, &relation_names, &mut errors);
             }
+            SchemaItem::Kind(k) => check_kind(k, &mut errors),
         }
     }
 
@@ -142,7 +148,7 @@ fn validate_inner(
 }
 
 // ---------------------------------------------------------------------------
-// §2.1 Namespace.
+// Namespace.
 // ---------------------------------------------------------------------------
 
 fn check_namespace(schema: &Schema, errors: &mut ValidationErrors, mode: ValidatorMode) {
@@ -189,7 +195,7 @@ fn is_lower_snake_ident(s: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// §2.2 Duplicate definitions.
+// Duplicate definitions.
 // ---------------------------------------------------------------------------
 
 fn check_duplicates(schema: &Schema, errors: &mut ValidationErrors) {
@@ -197,6 +203,7 @@ fn check_duplicates(schema: &Schema, errors: &mut ValidationErrors) {
     let mut predicates: HashMap<&str, usize> = HashMap::new();
     let mut relations: HashMap<&str, usize> = HashMap::new();
     let mut extractors: HashMap<&str, usize> = HashMap::new();
+    let mut kinds: HashMap<&str, usize> = HashMap::new();
 
     for item in &schema.items {
         match item {
@@ -236,12 +243,21 @@ fn check_duplicates(schema: &Schema, errors: &mut ValidationErrors) {
                     });
                 }
             }
+            SchemaItem::Kind(k) => {
+                if kinds.insert(k.name.as_str(), 0).is_some() {
+                    errors.push(ValidationError {
+                        code: ValidationErrorCode::DuplicateDefinition,
+                        message: format!("duplicate kind {:?}", k.name),
+                        source_span: None,
+                    });
+                }
+            }
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// §2.3 helpers.
+// Helpers.
 // ---------------------------------------------------------------------------
 
 fn collect_entity_names(schema: &Schema) -> Vec<&str> {
@@ -270,14 +286,34 @@ fn resolves_to_entity(name: &str, entity_names: &[&str]) -> bool {
     name == ANY_TYPE_LITERAL || entity_names.contains(&name)
 }
 
+/// Bound a declared item's own name: reject empty names and names past
+/// [`TYPE_NAME_MAX_LEN`]. `item_label` is the DSL keyword (`entity_type`,
+/// `predicate`, …) used in the error message.
+fn check_type_name(name: &str, item_label: &str, errors: &mut ValidationErrors) {
+    if name.is_empty() {
+        errors.push(ValidationError {
+            code: ValidationErrorCode::NameInvalidIdentifier,
+            message: format!("{item_label} name must not be empty"),
+            source_span: None,
+        });
+    } else if name.len() > TYPE_NAME_MAX_LEN {
+        errors.push(ValidationError {
+            code: ValidationErrorCode::NameTooLong,
+            message: format!("{item_label} name {name:?} exceeds {TYPE_NAME_MAX_LEN} bytes"),
+            source_span: None,
+        });
+    }
+}
+
 // ---------------------------------------------------------------------------
-// §2.6 Entity attributes.
+// Entity attributes.
 // ---------------------------------------------------------------------------
 
 fn check_entity_attributes(
     entity: &crate::schema::ast::EntityTypeDef,
     errors: &mut ValidationErrors,
 ) {
+    check_type_name(&entity.name, "entity_type", errors);
     for attr in &entity.attributes {
         check_attribute_decl(attr, &entity.name, errors);
     }
@@ -298,7 +334,7 @@ fn check_attribute_decl(attr: &AttributeDecl, owner_label: &str, errors: &mut Va
         errors.push(ValidationError {
             code: ValidationErrorCode::NameTooLong,
             message: format!(
-                "{owner_label}.{}: attribute name exceeds {ATTRIBUTE_NAME_MAX_LEN} chars",
+                "{owner_label}.{}: attribute name exceeds {ATTRIBUTE_NAME_MAX_LEN} bytes",
                 attr.name
             ),
             source_span: None,
@@ -350,10 +386,12 @@ fn default_matches_attr_type(default: &LiteralValue, attr: &AttrType) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// §2.3 + §2.4 Predicate.
+// Predicate.
 // ---------------------------------------------------------------------------
 
 fn check_predicate(pred: &PredicateDef, entity_names: &[&str], errors: &mut ValidationErrors) {
+    check_type_name(&pred.name, "predicate", errors);
+
     // Type ref resolution for Entity<...>.
     if let ObjectTypeDecl::Entity { entity_type } = &pred.object {
         if !resolves_to_entity(entity_type, entity_names) {
@@ -383,22 +421,68 @@ fn check_predicate(pred: &PredicateDef, entity_names: &[&str], errors: &mut Vali
 
 fn predicate_kind_object_compatible(kind: StatementKindAst, object: &ObjectTypeDecl) -> bool {
     match kind {
-        StatementKindAst::Fact | StatementKindAst::Any => true,
+        // Fact/Attribute/Any accept any object shape.
+        StatementKindAst::Fact | StatementKindAst::Attribute | StatementKindAst::Any => true,
         StatementKindAst::Preference => {
             matches!(object, ObjectTypeDecl::Value { .. } | ObjectTypeDecl::Any)
+        }
+        // Relations link two entities.
+        StatementKindAst::Relation => {
+            matches!(object, ObjectTypeDecl::Entity { .. } | ObjectTypeDecl::Any)
         }
         StatementKindAst::Event => matches!(
             object,
             ObjectTypeDecl::Value { .. } | ObjectTypeDecl::Entity { .. } | ObjectTypeDecl::Any
         ),
+        // Directives carry a value (the behavioral instruction).
+        StatementKindAst::Directive => {
+            matches!(object, ObjectTypeDecl::Value { .. } | ObjectTypeDecl::Any)
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
-// §2.3 + §2.5 + §2.6 Relation.
+// Kind (user-declared statement kind).
+// ---------------------------------------------------------------------------
+
+/// Names of the built-in statement kinds. A user-declared kind may not
+/// reuse one (case-insensitively) — those shapes are fixed.
+const BUILTIN_KIND_NAMES: [&str; 6] = [
+    "fact",
+    "preference",
+    "event",
+    "attribute",
+    "relation",
+    "directive",
+];
+
+fn check_kind(k: &KindDef, errors: &mut ValidationErrors) {
+    if !is_lower_snake_ident(&k.name) {
+        errors.push(ValidationError {
+            code: ValidationErrorCode::NamespaceInvalidIdentifier,
+            message: format!("kind name {:?} must match `[a-z][a-z0-9_]*`", k.name),
+            source_span: None,
+        });
+    }
+    if BUILTIN_KIND_NAMES.contains(&k.name.to_ascii_lowercase().as_str()) {
+        errors.push(ValidationError {
+            code: ValidationErrorCode::DuplicateDefinition,
+            message: format!(
+                "kind name {:?} collides with a built-in kind; pick a distinct name",
+                k.name
+            ),
+            source_span: None,
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Relation.
 // ---------------------------------------------------------------------------
 
 fn check_relation(rel: &RelationTypeDef, entity_names: &[&str], errors: &mut ValidationErrors) {
+    check_type_name(&rel.name, "relation_type", errors);
+
     if !resolves_to_entity(&rel.from_type, entity_names) {
         errors.push(ValidationError {
             code: ValidationErrorCode::UnresolvedTypeRef,
@@ -440,7 +524,7 @@ fn check_relation(rel: &RelationTypeDef, entity_names: &[&str], errors: &mut Val
 }
 
 // ---------------------------------------------------------------------------
-// §2.7 Extractor.
+// Extractor.
 // ---------------------------------------------------------------------------
 
 fn check_extractor(
@@ -449,6 +533,8 @@ fn check_extractor(
     relation_names: &[&str],
     errors: &mut ValidationErrors,
 ) {
+    check_type_name(&ext.name, "extractor", errors);
+
     // Target ref resolution.
     match &ext.target {
         ExtractorTarget::Entity { entity_type } => {
@@ -702,6 +788,54 @@ mod tests {
                 "matrix entry kind={kind:?} obj={obj:?}"
             );
         }
+    }
+
+    #[test]
+    fn overlong_predicate_name_rejected() {
+        let mut s = base_schema();
+        s.items.push(SchemaItem::Predicate(PredicateDef {
+            name: "p".repeat(TYPE_NAME_MAX_LEN + 1),
+            kind: StatementKindAst::Fact,
+            object: ObjectTypeDecl::Any,
+            stateful: None,
+            description: None,
+            retention: None,
+        }));
+        let errs = validate(&s).unwrap_err();
+        assert!(errs
+            .iter()
+            .any(|e| e.code == ValidationErrorCode::NameTooLong));
+    }
+
+    #[test]
+    fn empty_type_name_rejected() {
+        let mut s = base_schema();
+        s.items.push(SchemaItem::Predicate(PredicateDef {
+            name: String::new(),
+            kind: StatementKindAst::Fact,
+            object: ObjectTypeDecl::Any,
+            stateful: None,
+            description: None,
+            retention: None,
+        }));
+        let errs = validate(&s).unwrap_err();
+        assert!(errs
+            .iter()
+            .any(|e| e.code == ValidationErrorCode::NameInvalidIdentifier));
+    }
+
+    #[test]
+    fn normal_type_name_accepted() {
+        let mut s = base_schema();
+        s.items.push(SchemaItem::Predicate(PredicateDef {
+            name: "works_at".into(),
+            kind: StatementKindAst::Fact,
+            object: ObjectTypeDecl::Any,
+            stateful: None,
+            description: None,
+            retention: None,
+        }));
+        assert!(validate(&s).is_ok());
     }
 
     #[test]

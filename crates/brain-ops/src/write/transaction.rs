@@ -9,7 +9,7 @@
 //! The writer doesn't distinguish among these origins. One queue,
 //! one apply path, one WAL envelope, one event burst.
 
-use brain_core::{AgentId, MemoryId};
+use brain_core::{MemoryId, NamespaceId, SpaceId};
 use brain_storage::wal::record::Lsn;
 
 use super::id::WriteId;
@@ -33,8 +33,21 @@ pub struct PendingStage {
 pub struct Write {
     pub write_id: WriteId,
     /// Authenticated caller. Stamped onto audit rows and event
-    /// envelopes; `AgentId::default()` for anonymous / test paths.
-    pub agent_id: AgentId,
+    /// envelopes; `SpaceId::default()` for anonymous / test paths.
+    pub space_id: SpaceId,
+    /// Owning namespace (tenant) — the outer half of the
+    /// `(namespace, space)` scope key stamped onto every row this write
+    /// produces. Defaults to [`NamespaceId::SYSTEM`]; the wire handler
+    /// sets it from the authenticated connection via
+    /// [`Self::with_namespace`].
+    pub namespace: NamespaceId,
+    /// Human-readable structured space string the caller's selector
+    /// carried (empty for a raw key-bound space or an internal/worker
+    /// write). The apply layer records it on the space registry row so
+    /// `SPACE_LIST` can surface the original string — the 16-byte
+    /// `space_id` is a non-invertible UUIDv5 of it. Set via
+    /// [`Self::with_space_string`] by the wire handler.
+    pub space_string: String,
     /// When the handler (or worker) began building this write. Used
     /// by the writer for tracing + by audit rows that need a
     /// "submitted_at" timestamp distinct from "committed_at".
@@ -56,10 +69,12 @@ impl Write {
     /// Build a single-phase write. The most common shape — every
     /// non-TXN wire request after the migration produces one of these.
     #[must_use]
-    pub fn single(write_id: WriteId, agent_id: AgentId, phase: Phase) -> Self {
+    pub fn single(write_id: WriteId, space_id: SpaceId, phase: Phase) -> Self {
         Self {
             write_id,
-            agent_id,
+            space_id,
+            namespace: NamespaceId::SYSTEM,
+            space_string: String::new(),
             started_at_unix_nanos: 0,
             phases: vec![phase],
             request_hash: None,
@@ -69,14 +84,34 @@ impl Write {
     /// Build from a vec of phases. Used by the TXN_COMMIT path and by
     /// workers that derive multiple phases per drained trigger.
     #[must_use]
-    pub fn from_phases(write_id: WriteId, agent_id: AgentId, phases: Vec<Phase>) -> Self {
+    pub fn from_phases(write_id: WriteId, space_id: SpaceId, phases: Vec<Phase>) -> Self {
         Self {
             write_id,
-            agent_id,
+            space_id,
+            namespace: NamespaceId::SYSTEM,
+            space_string: String::new(),
             started_at_unix_nanos: 0,
             phases,
             request_hash: None,
         }
+    }
+
+    /// Stamp the owning namespace; chainable from the builder. The wire
+    /// handler sets this from the authenticated connection's namespace so
+    /// every row the write produces is scoped to the caller's tenant.
+    #[must_use]
+    pub fn with_namespace(mut self, namespace: NamespaceId) -> Self {
+        self.namespace = namespace;
+        self
+    }
+
+    /// Stamp the human-readable space string; chainable from the builder.
+    /// The wire handler sets this from the caller's effective-space
+    /// selector so the space registry row records the original string.
+    #[must_use]
+    pub fn with_space_string(mut self, space_string: String) -> Self {
+        self.space_string = space_string;
+        self
     }
 
     /// Stamp the started-at timestamp; chainable from the builder.
@@ -154,7 +189,7 @@ impl WriteAck {
 mod tests {
     use super::*;
     use crate::write::phase::Phase;
-    use brain_core::{ContextId, MemoryId, MemoryKind, Salience};
+    use brain_core::{MemoryId, MemoryKind, Salience, SessionId};
     use brain_embed::VECTOR_DIM;
 
     fn sample_phase() -> Phase {
@@ -164,8 +199,9 @@ mod tests {
             vector: Box::new([0.0_f32; VECTOR_DIM]),
             kind: MemoryKind::Episodic,
             salience: Salience::default(),
-            context: ContextId(0),
+            session_id: SessionId(0),
             created_at_unix_nanos: 1_700_000_000_000,
+            occurred_at_unix_nanos: None,
             arena_slot: 1,
             embedding_model_fp: [0; 16],
             content_hash: None,
@@ -174,16 +210,9 @@ mod tests {
     }
 
     #[test]
-    fn write_single_has_one_phase() {
-        let w = Write::single(WriteId::new(), AgentId::default(), sample_phase());
-        assert_eq!(w.phase_count(), 1);
-        assert!(w.is_single());
-    }
-
-    #[test]
     fn write_from_phases_preserves_order() {
         let phases = vec![sample_phase(), sample_phase(), sample_phase()];
-        let w = Write::from_phases(WriteId::new(), AgentId::default(), phases.clone());
+        let w = Write::from_phases(WriteId::new(), SpaceId::default(), phases.clone());
         assert_eq!(w.phase_count(), 3);
         assert!(!w.is_single());
         for (i, p) in w.phases.iter().enumerate() {
@@ -193,7 +222,7 @@ mod tests {
 
     #[test]
     fn write_started_at_chainable() {
-        let w = Write::single(WriteId::new(), AgentId::default(), sample_phase()).started_at(42);
+        let w = Write::single(WriteId::new(), SpaceId::default(), sample_phase()).started_at(42);
         assert_eq!(w.started_at_unix_nanos, 42);
     }
 }

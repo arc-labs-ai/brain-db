@@ -6,7 +6,7 @@ use super::histograms::{WorkerHistogram, WorkerHistogramSnapshot, DEFAULT_CYCLE_
 
 /// Bucket boundaries (seconds) for the temporal gap histogram. Tuned
 /// for the 0–5 minute default window with logarithmic spacing past
-/// 60 s so operators can see both "tight agent loops" and "near the
+/// 60 s so operators can see both "tight space loops" and "near the
 /// window edge."
 const DEFAULT_TEMPORAL_GAP_BUCKETS_SECONDS: &[f64] = &[
     0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0,
@@ -17,7 +17,7 @@ const DEFAULT_TEMPORAL_GAP_BUCKETS_SECONDS: &[f64] = &[
 /// answer "why no temporal edges?" without trawling logs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TemporalSkipReason {
-    /// No predecessor found in the agent-timeline index.
+    /// No predecessor found in the space-timeline index.
     NoPrev = 0,
     /// Candidate predecessor's `created_at` is ≥ this memory's
     /// (clock-skew / replay).
@@ -25,7 +25,7 @@ pub enum TemporalSkipReason {
     /// Candidate predecessor is tombstoned.
     Tombstoned = 2,
     /// Candidate predecessor is in a different context (and
-    /// `cross_context = false`).
+    /// `cross_session = false`).
     CrossContext = 3,
     /// Gap exceeded the temporal window.
     WindowExceeded = 4,
@@ -48,7 +48,7 @@ pub struct TemporalEdgeMetrics {
     skipped_no_prev: AtomicU64,
     skipped_out_of_order: AtomicU64,
     skipped_tombstoned: AtomicU64,
-    skipped_cross_context: AtomicU64,
+    skipped_cross_session: AtomicU64,
     skipped_window_exceeded: AtomicU64,
     skipped_below_topical: AtomicU64,
     cycle_duration_seconds: WorkerHistogram,
@@ -64,7 +64,7 @@ impl TemporalEdgeMetrics {
             skipped_no_prev: AtomicU64::new(0),
             skipped_out_of_order: AtomicU64::new(0),
             skipped_tombstoned: AtomicU64::new(0),
-            skipped_cross_context: AtomicU64::new(0),
+            skipped_cross_session: AtomicU64::new(0),
             skipped_window_exceeded: AtomicU64::new(0),
             skipped_below_topical: AtomicU64::new(0),
             cycle_duration_seconds: WorkerHistogram::new(DEFAULT_CYCLE_BUCKETS_SECONDS),
@@ -85,7 +85,7 @@ impl TemporalEdgeMetrics {
             TemporalSkipReason::NoPrev => &self.skipped_no_prev,
             TemporalSkipReason::OutOfOrder => &self.skipped_out_of_order,
             TemporalSkipReason::Tombstoned => &self.skipped_tombstoned,
-            TemporalSkipReason::CrossContext => &self.skipped_cross_context,
+            TemporalSkipReason::CrossContext => &self.skipped_cross_session,
             TemporalSkipReason::WindowExceeded => &self.skipped_window_exceeded,
             TemporalSkipReason::BelowTopical => &self.skipped_below_topical,
         };
@@ -108,7 +108,7 @@ impl TemporalEdgeMetrics {
             skipped_no_prev: self.skipped_no_prev.load(Ordering::Relaxed),
             skipped_out_of_order: self.skipped_out_of_order.load(Ordering::Relaxed),
             skipped_tombstoned: self.skipped_tombstoned.load(Ordering::Relaxed),
-            skipped_cross_context: self.skipped_cross_context.load(Ordering::Relaxed),
+            skipped_cross_session: self.skipped_cross_session.load(Ordering::Relaxed),
             skipped_window_exceeded: self.skipped_window_exceeded.load(Ordering::Relaxed),
             skipped_below_topical: self.skipped_below_topical.load(Ordering::Relaxed),
             cycle_duration_seconds: self.cycle_duration_seconds.snapshot(),
@@ -130,7 +130,7 @@ pub struct TemporalEdgeMetricsSnapshot {
     pub skipped_no_prev: u64,
     pub skipped_out_of_order: u64,
     pub skipped_tombstoned: u64,
-    pub skipped_cross_context: u64,
+    pub skipped_cross_session: u64,
     pub skipped_window_exceeded: u64,
     pub skipped_below_topical: u64,
     pub cycle_duration_seconds: WorkerHistogramSnapshot,

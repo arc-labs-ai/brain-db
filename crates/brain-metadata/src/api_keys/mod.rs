@@ -1,8 +1,8 @@
 //! Scope-bound API key store.
 //!
-//! API keys bind `(org_id, user_id, namespace, agent_id, permissions)`
+//! API keys bind `(org_id, user_id, namespace, space_id, permissions)`
 //! at issuance — the server derives every request's scope from the
-//! AUTH-time key, so client-supplied agent / namespace fields can never
+//! AUTH-time key, so client-supplied space / namespace fields can never
 //! escalate beyond what the key permits.
 //!
 //! The store lives in its own redb file (`api_keys.redb`) — independent
@@ -11,11 +11,9 @@
 
 use std::path::{Path, PathBuf};
 
-use redb::{
-    Database, ReadTransaction, ReadableDatabase, ReadableTable, TableError, WriteTransaction,
-};
+use redb::{Database, ReadTransaction, ReadableDatabase, ReadableTable, WriteTransaction};
 
-use crate::tables::api_keys::{permissions, ApiKeyRow, API_KEYS_BY_AGENT_TABLE, API_KEYS_TABLE};
+use crate::tables::api_keys::{permissions, ApiKeyRow, API_KEYS_BY_SPACE_TABLE, API_KEYS_TABLE};
 
 pub use crate::tables::api_keys::permissions as bits;
 
@@ -43,6 +41,9 @@ pub enum ApiKeyError {
 
     #[error("duplicate key hash on insert")]
     Duplicate,
+
+    #[error("namespace registry: {0}")]
+    Namespace(#[from] crate::namespace::NamespaceOpError),
 }
 
 /// Hash a raw secret into the lookup key (BLAKE3-256).
@@ -72,7 +73,7 @@ impl ApiKeyDb {
         let wtxn = db.begin_write()?;
         {
             let _ = wtxn.open_table(API_KEYS_TABLE)?;
-            let _ = wtxn.open_table(API_KEYS_BY_AGENT_TABLE)?;
+            let _ = wtxn.open_table(API_KEYS_BY_SPACE_TABLE)?;
         }
         wtxn.commit()?;
         Ok(Self { db, path })
@@ -101,7 +102,7 @@ impl ApiKeyDb {
 // ---------------------------------------------------------------------------
 
 /// Insert a fresh key row, populating both the primary table and the
-/// per-agent index. Fails with [`ApiKeyError::Duplicate`] if the key
+/// per-space index. Fails with [`ApiKeyError::Duplicate`] if the key
 /// hash is already present (collision means the same secret was minted
 /// twice, which the caller should treat as a server bug).
 #[allow(clippy::too_many_arguments)]
@@ -111,20 +112,32 @@ pub fn api_key_create(
     org_id: [u8; 16],
     user_id: [u8; 16],
     namespace: String,
-    agent_id: [u8; 16],
+    space_id: [u8; 16],
     permissions: u32,
+    may_act: Vec<String>,
     now_unix_nanos: u64,
 ) -> Result<ApiKeyRow, ApiKeyError> {
     let key_hash = hash_secret(secret);
-    let row = ApiKeyRow::new(
+    let mut row = ApiKeyRow::new(
         key_hash,
         org_id,
         user_id,
         namespace,
-        agent_id,
+        space_id,
         permissions,
         now_unix_nanos,
     );
+    row.may_act = may_act;
+
+    // Provision the tenant: interning the key's namespace makes it a
+    // real, resolvable owner so the dispatch path resolves it to a
+    // NamespaceId (rather than falling back to the system namespace).
+    // Idempotent — re-minting a key for an existing namespace is a no-op.
+    // An empty namespace ("no lock") is left un-interned. `brain` always
+    // resolves to NamespaceId::SYSTEM and is never created here.
+    if !row.namespace.is_empty() {
+        crate::namespace::namespace_intern_or_get(wtxn, &row.namespace, now_unix_nanos)?;
+    }
 
     let mut primary = wtxn.open_table(API_KEYS_TABLE)?;
     if primary.get(&key_hash)?.is_some() {
@@ -132,8 +145,8 @@ pub fn api_key_create(
     }
     primary.insert(&key_hash, &row)?;
 
-    let mut by_agent = wtxn.open_table(API_KEYS_BY_AGENT_TABLE)?;
-    by_agent.insert(&(agent_id, key_hash), &())?;
+    let mut by_space = wtxn.open_table(API_KEYS_BY_SPACE_TABLE)?;
+    by_space.insert(&(space_id, key_hash), &())?;
 
     Ok(row)
 }
@@ -155,11 +168,7 @@ pub fn api_key_lookup_by_hash(
     rtxn: &ReadTransaction,
     key_hash: &[u8; 32],
 ) -> Result<Option<ApiKeyRow>, ApiKeyError> {
-    let table = match rtxn.open_table(API_KEYS_TABLE) {
-        Ok(t) => t,
-        Err(TableError::TableDoesNotExist(_)) => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
+    let table = rtxn.open_table(API_KEYS_TABLE)?;
     Ok(table.get(key_hash)?.map(|g| g.value()))
 }
 
@@ -199,29 +208,21 @@ pub fn api_key_touch_last_used(
     Ok(true)
 }
 
-/// List every (non-tombstoned) key issued to `agent_id`. Used by admin
-/// `list keys for agent X`.
-pub fn api_key_list_for_agent(
+/// List every (non-tombstoned) key issued to `space_id`. Used by admin
+/// `list keys for space X`.
+pub fn api_key_list_for_space(
     rtxn: &ReadTransaction,
-    agent_id: &[u8; 16],
+    space_id: &[u8; 16],
 ) -> Result<Vec<ApiKeyRow>, ApiKeyError> {
-    let index = match rtxn.open_table(API_KEYS_BY_AGENT_TABLE) {
-        Ok(t) => t,
-        Err(TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-        Err(e) => return Err(e.into()),
-    };
-    let primary = match rtxn.open_table(API_KEYS_TABLE) {
-        Ok(t) => t,
-        Err(TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-        Err(e) => return Err(e.into()),
-    };
+    let index = rtxn.open_table(API_KEYS_BY_SPACE_TABLE)?;
+    let primary = rtxn.open_table(API_KEYS_TABLE)?;
 
-    let lo = (*agent_id, [0u8; 32]);
-    let hi = (*agent_id, [0xFFu8; 32]);
+    let lo = (*space_id, [0u8; 32]);
+    let hi = (*space_id, [0xFFu8; 32]);
     let mut out = Vec::new();
     for entry in index.range(lo..=hi)? {
         let (k, _) = entry?;
-        let (_agent, key_hash) = k.value();
+        let (_space, key_hash) = k.value();
         if let Some(row) = primary.get(&key_hash)? {
             out.push(row.value());
         }
@@ -243,8 +244,13 @@ pub struct ResolvedScope {
     pub org_id: [u8; 16],
     pub user_id: [u8; 16],
     pub namespace: String,
-    pub agent_id: [u8; 16],
+    pub space_id: [u8; 16],
     pub permissions: u32,
+    /// Allowlist of namespaces this scope may act *for* under the
+    /// [`permissions::ACT_AS`] grant. Carried verbatim from the key row so
+    /// the dispatch path can validate a request's `act_as` target against
+    /// it. Empty for every non-`ACT_AS` key.
+    pub may_act: Vec<String>,
 }
 
 impl ResolvedScope {
@@ -256,23 +262,25 @@ impl ResolvedScope {
             org_id: row.org_id,
             user_id: row.user_id,
             namespace: row.namespace.clone(),
-            agent_id: row.agent_id,
+            space_id: row.space_id,
             permissions: row.permissions,
+            may_act: row.may_act.clone(),
         }
     }
 
     /// Permissive scope used when scope-binding is disabled (the v1.0
-    /// default). Carries the agent the client claimed, full
+    /// default). Carries the space the client claimed, full
     /// permissions, no namespace lock, zero org/user.
     #[must_use]
-    pub fn permissive(agent_id: [u8; 16]) -> Self {
+    pub fn permissive(space_id: [u8; 16]) -> Self {
         Self {
             key_hash: [0u8; 32],
             org_id: [0u8; 16],
             user_id: [0u8; 16],
             namespace: String::new(),
-            agent_id,
+            space_id,
             permissions: permissions::FULL,
+            may_act: Vec::new(),
         }
     }
 
@@ -295,7 +303,7 @@ mod tests {
         ApiKeyDb::open(dir.path().join("api_keys.redb")).expect("open")
     }
 
-    fn agent(byte: u8) -> [u8; 16] {
+    fn space(byte: u8) -> [u8; 16] {
         let mut a = [0u8; 16];
         a[15] = byte;
         a
@@ -321,8 +329,9 @@ mod tests {
                 org(1),
                 [0u8; 16],
                 "acme".into(),
-                agent(7),
-                bits::STANDARD_AGENT,
+                space(7),
+                bits::STANDARD_SPACE,
+                Vec::new(),
                 1_700_000_000_000_000_000,
             )
             .unwrap();
@@ -361,8 +370,9 @@ mod tests {
                 org(2),
                 [0u8; 16],
                 "acme".into(),
-                agent(2),
+                space(2),
                 bits::READ_ONLY,
+                Vec::new(),
                 1_700_000_000_000_000_000,
             )
             .unwrap();
@@ -389,7 +399,7 @@ mod tests {
     }
 
     #[test]
-    fn api_key_list_for_agent_returns_only_that_agents_keys() {
+    fn api_key_list_for_space_returns_only_that_spaces_keys() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = db(&dir);
 
@@ -401,8 +411,9 @@ mod tests {
                 org(who),
                 [0u8; 16],
                 "acme".into(),
-                agent(who),
-                bits::STANDARD_AGENT,
+                space(who),
+                bits::STANDARD_SPACE,
+                Vec::new(),
                 1_700_000_000_000_000_000,
             )
             .unwrap();
@@ -410,12 +421,12 @@ mod tests {
         }
 
         let rtxn = store.read_txn().unwrap();
-        let agent_1 = api_key_list_for_agent(&rtxn, &agent(1)).unwrap();
-        let agent_2 = api_key_list_for_agent(&rtxn, &agent(2)).unwrap();
-        assert_eq!(agent_1.len(), 2);
-        assert_eq!(agent_2.len(), 1);
-        for row in &agent_1 {
-            assert_eq!(row.agent_id, agent(1));
+        let space_1 = api_key_list_for_space(&rtxn, &space(1)).unwrap();
+        let space_2 = api_key_list_for_space(&rtxn, &space(2)).unwrap();
+        assert_eq!(space_1.len(), 2);
+        assert_eq!(space_2.len(), 1);
+        for row in &space_1 {
+            assert_eq!(row.space_id, space(1));
         }
     }
 
@@ -432,8 +443,9 @@ mod tests {
             org(1),
             [0u8; 16],
             "n".into(),
-            agent(1),
-            bits::STANDARD_AGENT,
+            space(1),
+            bits::STANDARD_SPACE,
+            Vec::new(),
             1,
         )
         .unwrap();
@@ -446,8 +458,9 @@ mod tests {
             org(1),
             [0u8; 16],
             "n".into(),
-            agent(1),
-            bits::STANDARD_AGENT,
+            space(1),
+            bits::STANDARD_SPACE,
+            Vec::new(),
             2,
         );
         assert!(matches!(err, Err(ApiKeyError::Duplicate)));
@@ -466,8 +479,9 @@ mod tests {
                 org(1),
                 [0u8; 16],
                 "n".into(),
-                agent(1),
-                bits::STANDARD_AGENT,
+                space(1),
+                bits::STANDARD_SPACE,
+                Vec::new(),
                 1_000,
             )
             .unwrap();
@@ -488,10 +502,10 @@ mod tests {
 
     #[test]
     fn resolved_scope_permissive_grants_full() {
-        let scope = ResolvedScope::permissive(agent(9));
+        let scope = ResolvedScope::permissive(space(9));
         assert!(scope.allows(bits::ENCODE));
         assert!(scope.allows(bits::ADMIN));
         assert!(scope.allows(bits::FULL));
-        assert_eq!(scope.agent_id, agent(9));
+        assert_eq!(scope.space_id, space(9));
     }
 }

@@ -19,7 +19,7 @@ use brain_core::{
     Entity, EntityType, EvidenceEntry, EvidenceRef, Statement, StatementId, StatementKind,
     StatementObject, StatementValue, SubjectRef,
 };
-use brain_core::{AgentId, ContextId, EntityId, ExtractorId, MemoryId};
+use brain_core::{EntityId, ExtractorId, MemoryId, SessionId, SpaceId};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::entity::ops::{entity_put, normalize_name};
@@ -28,12 +28,11 @@ use brain_metadata::statement::statement_create;
 use brain_metadata::tables::statement::{statement_flags, STATEMENTS_TABLE};
 use brain_metadata::MetadataDb;
 use brain_ops::{
-    OpsContext, Phase, RealWriterHandle, SchemaFlagSweepJob, SchemaMigrationMetrics, Write, WriteId,
+    Phase, RealWriterHandle, SchemaFlagSweepJob, SchemaMigrationMetrics, Write, WriteId,
 };
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_workers::workers::schema_migration::SchemaMigrationWorker;
 use brain_workers::WorkerContext;
-use parking_lot::Mutex;
 use tempfile::TempDir;
 
 const NOW: u64 = 1_700_000_000_000_000_000;
@@ -62,8 +61,8 @@ struct Fixture {
 fn build_fixture() -> Fixture {
     let tempdir = tempfile::tempdir().unwrap();
     let db_path = tempdir.path().join("metadata.redb");
-    let metadata: SharedMetadataDb = Arc::new(Mutex::new(MetadataDb::open(&db_path).unwrap()));
-    let (shared, hnsw_writer) = SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).unwrap();
+    let metadata: SharedMetadataDb = Arc::new(MetadataDb::open(&db_path).unwrap());
+    let (shared, hnsw_writer) = SharedHnsw::new(IndexParams::default_v1()).unwrap();
     let mut writer_raw = RealWriterHandle::new(metadata.clone(), hnsw_writer);
 
     let (tx, rx) = flume::unbounded::<SchemaFlagSweepJob>();
@@ -80,7 +79,7 @@ fn build_fixture() -> Fixture {
         metadata.clone(),
         writer.clone() as Arc<dyn WriterHandle>,
     );
-    let ops = Arc::new(OpsContext::new(executor));
+    let ops = Arc::new(brain_ops::test_support::ops_context_for_tests_owning_tempdir(executor));
     let ctx = WorkerContext {
         ops,
         shutdown: Arc::new(AtomicBool::new(false)),
@@ -96,10 +95,11 @@ fn build_fixture() -> Fixture {
 
 fn put_subject(metadata: &SharedMetadataDb) -> EntityId {
     let id = EntityId::new();
-    let mut db = metadata.lock();
-    let wtxn = db.write_txn().unwrap();
+    let wtxn = metadata.write_txn().unwrap();
     entity_put(
         &wtxn,
+        __ts(),
+        brain_core::SessionId::DEFAULT,
         &Entity::new_active(
             id,
             EntityType::PERSON_ID,
@@ -119,11 +119,10 @@ fn write_statement(
     namespace: &str,
     predicate_name: &str,
 ) -> StatementId {
-    let mut db = metadata.lock();
-    let wtxn = db.write_txn().unwrap();
+    let wtxn = metadata.write_txn().unwrap();
     let pid = predicate_intern_or_get(&wtxn, namespace, predicate_name, 0, NOW).unwrap();
     let evidence_entry = EvidenceEntry::from_parts(
-        MemoryId::pack(1, ContextId::DEFAULT.into(), 0),
+        MemoryId::pack(1, SessionId::DEFAULT.into(), 0),
         1.0,
         0,
         ExtractorId::default(),
@@ -141,14 +140,13 @@ fn write_statement(
         1,
     );
     let sid = stmt.id;
-    statement_create(&wtxn, &stmt, NOW).unwrap();
+    statement_create(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &stmt, NOW).unwrap();
     wtxn.commit().unwrap();
     sid
 }
 
 fn statement_has_outside_flag(metadata: &SharedMetadataDb, sid: StatementId) -> bool {
-    let db = metadata.lock();
-    let rtxn = db.read_txn().unwrap();
+    let rtxn = metadata.read_txn().unwrap();
     let t = rtxn.open_table(STATEMENTS_TABLE).unwrap();
     let row = t.get(&sid.to_bytes()).unwrap().unwrap().value();
     row.has_flag(statement_flags::OUTSIDE_ACTIVE_SCHEMA)
@@ -163,8 +161,10 @@ fn submit_upload(writer: &RealWriterHandle, source: &str) {
         declared_relation_types: Vec::new(),
         declared_entity_types: Vec::new(),
         created_at_unix_nanos: NOW,
+        replace_all: false,
+        drops: Vec::new(),
     };
-    let write = Write::single(WriteId::new(), AgentId::default(), phase);
+    let write = Write::single(WriteId::new(), SpaceId::default(), phase);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -233,4 +233,8 @@ define predicate prefers {
     assert_eq!(s.rows_flagged_total, 1);
     assert_eq!(s.rows_cleared_total, 0);
     assert_eq!(s.errors_total, 0);
+}
+
+fn __ts() -> brain_metadata::RowScope {
+    brain_metadata::RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xA1; 16])
 }

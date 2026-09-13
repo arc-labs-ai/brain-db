@@ -16,8 +16,13 @@ pub mod error;
 pub mod ids;
 pub mod migration;
 pub mod nodes;
+pub mod precision_config;
 pub mod resolution;
+pub mod retrieval_config;
 pub mod worker_state;
+
+pub use precision_config::{PrecisionTuning, MAX_SUPPORT};
+pub use retrieval_config::RetrievalTuning;
 
 pub use edges::{
     edge::{Edge, EdgeKind, EdgeOrigin},
@@ -26,30 +31,28 @@ pub use edges::{
 };
 pub use error::{Error, Result};
 pub use ids::{
-    AgentId, AuditId, ContextId, EntityId, EntityTypeId, EvidenceOverflowId, ExtractorId, MemoryId,
-    MergeId, PredicateId, RelationId, RelationTypeId, RequestId, ShardId, SlotIndex, SlotVersion,
-    StatementId, TxnId, MAX_SLOT_INDEX,
+    AuditId, EntityId, EntityTypeId, EvidenceOverflowId, ExtractorId, MemoryId, MergeId,
+    NamespaceId, PredicateId, RelationId, RelationTypeId, RequestId, SessionId, ShardId, SlotIndex,
+    SlotVersion, SpaceId, StatementId, TxnId, MAX_SLOT_INDEX,
 };
 pub use migration::{
     MigrationByReason, MigrationId, MigrationItem, MigrationPlan, MigrationReason, MigrationSummary,
 };
 pub use nodes::{
     entity::{Entity, EntityAttributes, EntityType},
-    kinds::{Cardinality, ExtractorKind, StatementKind},
+    kinds::{
+        Cardinality, ExtractorKind, KindBehavior, KindCardinality, StatementKind, TemporalModel,
+    },
     memory::{Memory, MemoryKind, Salience},
     relation::{canonical_pair, Relation, RelationType},
     statement::{
-        EvidenceEntry, EvidenceRef, Predicate, Statement, StatementObject, StatementValue,
+        EvidenceEntry, EvidenceRef, Predicate, Slot, Statement, StatementObject, StatementValue,
         SubjectRef, TombstoneReason, INLINE_EVIDENCE_CAP,
     },
 };
 pub use resolution::{
     confidence::{aggregate_confidence, ConfidenceConfig},
-    resolver::{
-        resolve_entity, ResolutionOutcome, ResolverConfig, ResolverEmbedder, ResolverError,
-        ResolverIndex, ResolverLlm, ResolverLlmDecision, ResolverStorage, ResolverTier,
-        TypeConstraint, VECTOR_DIM,
-    },
+    referential::is_non_referential_surface,
     trigrams::{extract_trigrams, jaccard},
 };
 pub use worker_state::{

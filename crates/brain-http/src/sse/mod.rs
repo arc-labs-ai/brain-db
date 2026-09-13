@@ -1,7 +1,7 @@
 //! Server-Sent Events (server side).
 //!
-//! Spec: WHATWG HTML §9.2. Server-side only in M4; a reconnecting
-//! `EventSource` client is a follow-up paired with M5's HTTP-client
+//! Wire format per WHATWG HTML §9.2. Server-side only for now; a reconnecting
+//! `EventSource` client is a follow-up paired with the HTTP-client
 //! decision. Server-side reconnect works through the standard
 //! `Request<_>::headers()` API: the handler reads `Last-Event-ID`
 //! itself and resumes from the right position.
@@ -50,9 +50,8 @@
 //!
 //! `SseStream::poll_frame` yields exactly one event per frame.
 //! Each frame becomes its own chunked-transfer chunk and gets
-//! flushed. The R3 bug pattern from the design report (framework
-//! buffers multiple events into one chunk) is structurally
-//! impossible here.
+//! flushed. A common bug pattern — the framework buffering multiple
+//! events into one chunk — is structurally impossible here.
 
 mod encoder;
 mod event;

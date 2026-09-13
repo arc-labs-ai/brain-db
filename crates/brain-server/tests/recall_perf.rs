@@ -7,7 +7,7 @@
 //!   path over a 5-doc fixture has no HNSW pressure beyond the
 //!   substrate memory index and no tantivy round-trip; this is
 //!   the cache-warm floor reachable from RECALL inside a txn.
-//! - **Hybrid path** — must hold p95 ≤ 12 ms. Hybrid is the
+//! - **Retrieval path** — must hold p95 ≤ 12 ms. Retrieval is the
 //!   default for every wire RECALL; a 12 ms p95 keeps interactive
 //!   flows responsive at K=10 without text.
 //!
@@ -16,7 +16,7 @@
 //! 1. The 100-iteration loop dominates wall time in `cargo test`.
 //! 2. The thresholds are workstation-tuned; CI hardware skew can
 //!    legitimately blow past 12 ms without the underlying code
-//!    being slower. The phase-23 acceptance suite is the
+//!    being slower. The acceptance suite is the
 //!    production-reference gate.
 //!
 //! Run with: `cargo test -p brain-server --test recall_perf --
@@ -37,11 +37,10 @@ use brain_index::{
     SharedHnsw,
 };
 use brain_metadata::MetadataDb;
-use brain_ops::test_support::run_in_glommio;
+use brain_ops::test_support::{run_in_glommio, single_body};
 use brain_ops::{OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
-use brain_protocol::envelope::request::{EncodeRequest, MemoryKindWire, RecallRequest, TxnBeginRequest};
-use parking_lot::Mutex;
+use brain_protocol::envelope::request::{EncodeRequest, RecallRequest, TxnBeginRequest};
 
 const ITERATIONS: usize = 100;
 const WARMUP_ITERATIONS: usize = 10;
@@ -71,7 +70,7 @@ impl Dispatcher for MockDispatcher {
 }
 
 // ---------------------------------------------------------------------------
-// Canned retrievers — return one hit each so the hybrid path
+// Canned retrievers — return one hit each so the retrieval path
 // exercises the full RRF + projection codepath. Production deployments
 // hit real tantivy and HNSW shards; this measurement is the in-process
 // floor, not an upper bound.
@@ -88,6 +87,7 @@ impl SemanticRetriever for CannedSemantic {
         _query: &SemanticQuery,
         _scope: SemanticScope,
         _config: &SemanticRetrieverConfig,
+        _arena: Option<&dyn brain_index::SpaceVectorSource>,
     ) -> Result<Vec<RankedItem>, SemanticError> {
         Ok(self.items.lock().expect("canned semantic lock").clone())
     }
@@ -136,12 +136,9 @@ struct Fixture {
 fn build_fixture() -> Fixture {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let db_path = tempdir.path().join("metadata.redb");
-    let metadata: SharedMetadataDb = Arc::new(Mutex::new(
-        MetadataDb::open(&db_path).expect("open metadata"),
-    ));
+    let metadata: SharedMetadataDb = Arc::new(MetadataDb::open(&db_path).expect("open metadata"));
 
-    let (shared, hnsw_writer) =
-        SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).expect("hnsw");
+    let (shared, hnsw_writer) = SharedHnsw::new(IndexParams::default_v1()).expect("hnsw");
     let writer = Arc::new(RealWriterHandle::new(metadata.clone(), hnsw_writer));
 
     let executor = ExecutorContext::new(
@@ -152,12 +149,12 @@ fn build_fixture() -> Fixture {
     );
 
     Fixture {
-        ctx: OpsContext::new(executor),
+        ctx: brain_ops::test_support::ops_context_for_tests_owning_tempdir(executor),
         _tempdir: tempdir,
     }
 }
 
-fn attach_hybrid_mocks(fix: &mut Fixture, memory_id: u128) {
+fn attach_retrieval_mocks(fix: &mut Fixture, memory_id: u128) {
     let item = RankedItem {
         id: RankedItemId::Memory(MemoryId::from_raw(memory_id)),
         rank: 1,
@@ -176,9 +173,9 @@ fn attach_hybrid_mocks(fix: &mut Fixture, memory_id: u128) {
     fix.ctx = fix
         .ctx
         .clone()
-        .with_semantic_retriever(Some(Arc::new(semantic) as Arc<dyn SemanticRetriever>))
-        .with_lexical_retriever(Some(Arc::new(lexical) as Arc<dyn LexicalRetriever>))
-        .with_graph_retriever(Some(Arc::new(graph) as Arc<dyn GraphRetriever>));
+        .with_semantic_retriever(Arc::new(semantic) as Arc<dyn SemanticRetriever>)
+        .with_lexical_retriever(Arc::new(lexical) as Arc<dyn LexicalRetriever>)
+        .with_graph_retriever(Arc::new(graph) as Arc<dyn GraphRetriever>);
 }
 
 async fn encode(fix: &Fixture, request_id: [u8; 16], text: &str) -> u128 {
@@ -187,22 +184,22 @@ async fn encode(fix: &Fixture, request_id: [u8; 16], text: &str) -> u128 {
 
     let req = EncodeRequest {
         text: text.into(),
-        context_id: 0,
-        kind: MemoryKindWire::Episodic,
-        salience_hint: 0.5,
-        edges: Vec::new(),
+        session_id: 0,
         request_id,
         txn_id: None,
-        deduplicate: false,
+        occurred_at_unix_nanos: None,
+        act_as: None,
+        wait: brain_protocol::WaitMode::Ack,
+        allow_duplicates: false,
     };
-    let body = brain_ops::dispatch(
+    let outcome = brain_ops::dispatch(
         RequestBody::Encode(req),
-        brain_ops::RequestCaller::anonymous(),
+        brain_ops::RequestCaller::for_tests(),
         &fix.ctx,
     )
     .await
     .expect("encode");
-    match body {
+    match single_body(outcome) {
         ResponseBody::Encode(EncodeResponse { memory_id, .. }) => memory_id,
         other => panic!("expected Encode response, got {other:?}"),
     }
@@ -230,11 +227,15 @@ async fn seed(fix: &Fixture) -> u128 {
 
 fn recall_req(txn_id: Option<[u8; 16]>) -> RecallRequest {
     RecallRequest {
+        scope: Default::default(),
+        trace: false,
         cue_text: "meeting preferences".into(),
-        top_k: 5,
+        subject_name: String::new(),
+        max_results: 5,
         confidence_threshold: 0.0,
-        context_filter: None,
+        session_filter: None,
         age_bound_unix_nanos: None,
+        as_of_record_time_unix_nanos: None,
         kind_filter: None,
         salience_floor: 0.0,
         include_edges: false,
@@ -242,7 +243,7 @@ fn recall_req(txn_id: Option<[u8; 16]>) -> RecallRequest {
         include_text: false,
         request_id: Some(*uuid::Uuid::now_v7().as_bytes()),
         txn_id,
-        rerank: false,
+        act_as: None,
     }
 }
 
@@ -292,7 +293,9 @@ fn recall_p95_substrate_via_internal_entry_point() {
             TxnBeginRequest {
                 txn_id,
                 timeout_seconds: 60,
+                act_as: None,
             },
+            [0u8; 16],
             &fix.ctx,
         )
         .await
@@ -308,7 +311,7 @@ fn recall_p95_substrate_via_internal_entry_point() {
 }
 
 // ---------------------------------------------------------------------------
-// PERF1B — hybrid path. Reached by `handle_recall` when no txn is
+// PERF1B — retrieval path. Reached by `handle_recall` when no txn is
 // attached and all three retrievers are wired. Gated at 12 ms p95;
 // canned retrievers keep this an in-process floor measurement, not
 // an end-to-end wire test.
@@ -316,17 +319,17 @@ fn recall_p95_substrate_via_internal_entry_point() {
 
 #[test]
 #[ignore = "perf gate: workstation-tuned thresholds, run explicitly"]
-fn recall_p95_hybrid_via_handle_recall() {
+fn recall_p95_retrieval_via_handle_recall() {
     run_in_glommio(|| async {
         let mut fix = build_fixture();
         let first = seed(&fix).await;
-        attach_hybrid_mocks(&mut fix, first);
+        attach_retrieval_mocks(&mut fix, first);
 
         let (p50, p95) = measure(&fix, None).await;
         let budget = Duration::from_millis(12);
         assert!(
             p95 <= budget,
-            "hybrid p95 {p95:?} exceeds budget {budget:?} (p50 {p50:?})",
+            "retrieval p95 {p95:?} exceeds budget {budget:?} (p50 {p50:?})",
         );
     })
 }

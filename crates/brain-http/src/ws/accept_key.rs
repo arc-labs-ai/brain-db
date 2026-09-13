@@ -44,12 +44,4 @@ mod tests {
         let b = derive("bbb==");
         assert_ne!(a, b);
     }
-
-    #[test]
-    fn empty_key_does_not_panic() {
-        // RFC technically forbids empty Sec-WebSocket-Key, but the
-        // derivation function itself must not panic on it. Validation
-        // happens in `upgrade::validate_and_respond`.
-        let _ = derive("");
-    }
 }

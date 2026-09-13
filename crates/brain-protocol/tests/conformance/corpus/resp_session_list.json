@@ -1,0 +1,29 @@
+{
+  "space_id": [
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34,
+    34
+  ],
+  "sessions": [
+    {
+      "session_id": 7,
+      "created_at_unix_nanos": 1700000000000000000,
+      "last_active_unix_nanos": 1700000000900000000,
+      "title": "project alpha",
+      "memory_count": 12
+    }
+  ]
+}

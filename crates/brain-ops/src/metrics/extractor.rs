@@ -69,6 +69,11 @@ pub enum ExtractorItemKind {
     Statement = 1,
     Relation = 2,
     Mention = 3,
+    /// Hypothetical-question vectors written by the HyPE generator. Folded
+    /// into `items_written_total` so the eval's extraction-drain barrier
+    /// (which waits for that counter to plateau) also waits for HyPE
+    /// generation to finish before querying.
+    HyPe = 4,
 }
 
 impl ExtractorItemKind {
@@ -118,17 +123,50 @@ impl TierStatus {
     }
 }
 
+/// Upper bound on the number of distinct predicate qnames the
+/// `schema_filtered_total` map will track as their own series. Predicate
+/// qnames are open-vocab, user-text-shaped strings, so on diverse or
+/// adversarial input the distinct-key count would otherwise grow without
+/// limit — a per-shard memory leak and a Prometheus cardinality blow-up.
+///
+/// At the cap, further novel qnames stop minting new keys and fold into
+/// a single [`SCHEMA_FILTERED_OVERFLOW_KEY`] bucket, keeping both memory
+/// and series count bounded while preserving per-predicate detail below
+/// the cap. One slot is reserved for the overflow bucket, so at most
+/// `MAX_TRACKED_PREDICATES - 1` real predicates get their own series and
+/// the map length never exceeds `MAX_TRACKED_PREDICATES`.
+pub const MAX_TRACKED_PREDICATES: usize = 1024;
+
+/// Reserved key that accumulates schema-filtered counts for predicate
+/// qnames beyond the [`MAX_TRACKED_PREDICATES`] cap. Surfaced as a
+/// normal entry in the snapshot so operators still see the aggregate
+/// volume of untracked filtering.
+pub const SCHEMA_FILTERED_OVERFLOW_KEY: &str = "__other__";
+
 /// Metric family for `ExtractorWorker`. Same shared-by-Arc pattern as
 /// [`super::auto_edge::AutoEdgeMetrics`].
 ///
 /// `schema_filtered_total` tracks per-predicate label cardinality via
-/// a `Mutex<HashMap>` because predicate qnames are deployment-shaped
-/// (low cardinality in practice but unbounded in theory). The
+/// a `Mutex<HashMap>` because predicate qnames are deployment-shaped.
+/// The distinct-key count is capped at [`MAX_TRACKED_PREDICATES`]; past
+/// the cap, novel qnames fold into [`SCHEMA_FILTERED_OVERFLOW_KEY`] so
+/// the map stays bounded in memory and exposed series count. The
 /// exposition layer reads the snapshot under a short-lived lock.
 #[derive(Debug)]
 pub struct ExtractorMetrics {
     drops_total: AtomicU64,
     schema_filtered_total: parking_lot::Mutex<std::collections::HashMap<String, u64>>,
+    /// Real extracted items the apply pass could not persist, keyed by a
+    /// low-cardinality `reason` (e.g. `subject_unresolved`,
+    /// `predicate_invalid`, `create_rejected`). A memory database must never
+    /// lose signal silently — any nonzero value here is a fact that did not
+    /// land, surfaced for alerting rather than buried in a trace log.
+    apply_dropped_total: parking_lot::Mutex<std::collections::HashMap<String, u64>>,
+    /// Open-vocab predicate surface forms folded onto an existing near-
+    /// synonym predicate id by embedding-cosine consolidation instead of
+    /// minting a fragmenting duplicate. A rising count means the extractor
+    /// vocabulary is converging rather than sprawling.
+    predicate_consolidated_total: AtomicU64,
     /// Indexed by [`ExtractorItemKind`].
     items_written_total: Vec<AtomicU64>,
     llm_micro_usd_spent_total: AtomicU64,
@@ -168,6 +206,8 @@ impl ExtractorMetrics {
         Self {
             drops_total: AtomicU64::new(0),
             schema_filtered_total: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            apply_dropped_total: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            predicate_consolidated_total: AtomicU64::new(0),
             items_written_total,
             llm_micro_usd_spent_total: AtomicU64::new(0),
             cycle_duration_seconds: WorkerHistogram::new(DEFAULT_CYCLE_BUCKETS_SECONDS),
@@ -191,7 +231,39 @@ impl ExtractorMetrics {
     /// fails the active-schema admission check.
     pub fn inc_schema_filtered(&self, predicate_qname: &str) {
         let mut guard = self.schema_filtered_total.lock();
-        *guard.entry(predicate_qname.to_string()).or_insert(0) += 1;
+        // Fast path: an already-tracked key (including the overflow
+        // bucket itself) just increments — no growth.
+        if let Some(count) = guard.get_mut(predicate_qname) {
+            *count += 1;
+            return;
+        }
+        // Novel key: mint its own series only while under the cap,
+        // reserving one slot for the overflow bucket. Past that, fold
+        // into the single overflow bucket so the map length is bounded
+        // by MAX_TRACKED_PREDICATES.
+        if guard.len() < MAX_TRACKED_PREDICATES - 1 {
+            guard.insert(predicate_qname.to_string(), 1);
+        } else {
+            *guard
+                .entry(SCHEMA_FILTERED_OVERFLOW_KEY.to_string())
+                .or_insert(0) += 1;
+        }
+    }
+
+    /// Bumped by the apply pass when a genuine extracted item (entity,
+    /// statement, or relation) could not be persisted, keyed by `reason`.
+    /// Distinct from `schema_filtered` (a deliberate admission decision) —
+    /// this is unintended signal loss the operator should see.
+    pub fn inc_apply_dropped(&self, reason: &str) {
+        let mut guard = self.apply_dropped_total.lock();
+        *guard.entry(reason.to_string()).or_insert(0) += 1;
+    }
+
+    /// Bumped when a would-be-fresh open-vocab predicate is folded onto an
+    /// existing near-synonym predicate id instead of minting a duplicate.
+    pub fn inc_predicate_consolidated(&self) {
+        self.predicate_consolidated_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Bumped by the worker per successfully-written item, by kind.
@@ -251,6 +323,7 @@ impl ExtractorMetrics {
     #[must_use]
     pub fn snapshot(&self) -> ExtractorMetricsSnapshot {
         let schema_filtered_total = self.schema_filtered_total.lock().clone();
+        let apply_dropped_total = self.apply_dropped_total.lock().clone();
         let items_written_total = self
             .items_written_total
             .iter()
@@ -269,6 +342,8 @@ impl ExtractorMetrics {
         ExtractorMetricsSnapshot {
             drops_total: self.drops_total.load(Ordering::Relaxed),
             schema_filtered_total,
+            apply_dropped_total,
+            predicate_consolidated_total: self.predicate_consolidated_total.load(Ordering::Relaxed),
             items_written_total,
             llm_micro_usd_spent_total: self.llm_micro_usd_spent_total.load(Ordering::Relaxed),
             cycle_duration_seconds: self.cycle_duration_seconds.snapshot(),
@@ -292,6 +367,12 @@ impl Default for ExtractorMetrics {
 pub struct ExtractorMetricsSnapshot {
     pub drops_total: u64,
     pub schema_filtered_total: std::collections::HashMap<String, u64>,
+    /// Apply-pass signal loss keyed by `reason`. Any nonzero entry is a real
+    /// extracted item that did not persist.
+    pub apply_dropped_total: std::collections::HashMap<String, u64>,
+    /// Open-vocab predicate surface forms folded onto an existing near-
+    /// synonym id by embedding consolidation.
+    pub predicate_consolidated_total: u64,
     /// Indexed in the same order as [`ITEM_KIND_LABELS`].
     pub items_written_total: Vec<u64>,
     pub llm_micro_usd_spent_total: u64,
@@ -355,6 +436,46 @@ mod tests {
         assert_eq!(
             s.resolver_outcome_total[ResolverOutcome::Create as usize],
             1
+        );
+    }
+
+    #[test]
+    fn schema_filtered_cardinality_is_bounded() {
+        let m = ExtractorMetrics::new();
+        // Push far more distinct predicates than the cap.
+        let distinct = MAX_TRACKED_PREDICATES * 3;
+        for i in 0..distinct {
+            m.inc_schema_filtered(&format!("acme:pred_{i}"));
+        }
+        let s = m.snapshot();
+
+        // Map never exceeds the cap, no matter how many novel keys arrive.
+        assert!(
+            s.schema_filtered_total.len() <= MAX_TRACKED_PREDICATES,
+            "tracked map grew past cap: {} > {}",
+            s.schema_filtered_total.len(),
+            MAX_TRACKED_PREDICATES
+        );
+
+        // The overflow bucket must account for every distinct key that
+        // did not get its own series.
+        let real_series = MAX_TRACKED_PREDICATES - 1;
+        let overflow = s
+            .schema_filtered_total
+            .get(SCHEMA_FILTERED_OVERFLOW_KEY)
+            .copied()
+            .unwrap_or(0);
+        assert_eq!(overflow, (distinct - real_series) as u64);
+
+        // Every observation is accounted for (one per distinct key here).
+        let total: u64 = s.schema_filtered_total.values().sum();
+        assert_eq!(total, distinct as u64);
+
+        // Below-cap keys keep their own exact per-predicate counts.
+        m.inc_schema_filtered("acme:pred_0");
+        assert_eq!(
+            m.snapshot().schema_filtered_total.get("acme:pred_0"),
+            Some(&2)
         );
     }
 }

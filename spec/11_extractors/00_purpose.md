@@ -1,6 +1,6 @@
 # 11. Extractors
 
-> **TL;DR.** Three-tier pipeline that derives Entities, Statements, and Relations from Memories. Pattern (regex, tens of microseconds, free) runs synchronously on ENCODE. Classifier (pinned model, milliseconds, cheap) runs near-foreground. LLM (cached, hundreds of milliseconds to seconds, dollar-significant) runs in background workers with strict cost budgets, schema-validated output, and a per-call cache keyed by `(input_hash, extractor_version, model_version)`. All tiers are required to be idempotent. Built-in extractors ship for common entity types, temporal expressions, and basic relations.
+> **TL;DR.** Three-tier pipeline that derives Entities, Statements, and Relations from Memories. **Extractors are always wired** — every shard runs them on every ENCODE regardless of whether a user schema is declared. All three tiers run **asynchronously** in the per-shard extractor worker — ENCODE enqueues the memory and acknowledges, then the worker runs pattern (regex, tens of microseconds, free) → classifier (pinned model, milliseconds, cheap) → LLM (cached, hundreds of milliseconds to seconds, dollar-significant) over it, with strict cost budgets, schema-validated output, and a per-call cache keyed by `(input_hash, extractor_version, model_version)`. No extractor output exists when ENCODE returns. Persistence is **per-entity gated**: an extracted entity / statement / relation whose type exists in some active schema namespace is persisted; one whose type is undeclared is silently dropped (extraction is best-effort). All three tiers are always-on (no per-tier enable flag — extraction is architectural, like the embedder); a tier that fails to load at shard spawn → `ShardError::ExtractorInitFailed`. All tiers are required to be idempotent. Built-in extractors ship for common entity types, temporal expressions, and basic relations.
 
 ## Status
 
@@ -18,6 +18,33 @@ The three-tier extractor pipeline that turns raw Memory text into typed Entities
 
 The pipeline's design goal: **reject ~80-90% of naive candidates before storage**. The cheaper tiers handle the bulk; the LLM tier only sees what survives. This is the cost moat against extract-everything-via-LLM systems.
 
+## Always-on, persistence-gated
+
+Extractors are **not** a schema-gated capability. They run on every ENCODE, on every shard, regardless of how many user namespaces are active. The model is:
+
+```
+ENCODE → extract (pattern → classifier → LLM tiers per config)
+       → per-candidate persistence check:
+           candidate.type ∈ some active schema namespace
+             → persist into typed-graph tables
+           else
+             → drop silently (best-effort)
+```
+
+The seeded `brain:` system namespace already declares the common entity types (Person, Place, Organization) the built-in extractors target, so even shards without any user `SCHEMA_UPLOAD` produce useful typed-graph rows. Adding a user namespace declaring `Project` (say) extends the persisted set — extracted Person candidates still land via `brain:Person`, and extracted Project candidates now also land via `acme:Project`.
+
+### All tiers are always-on (no gate)
+
+All three tiers run on every shard — there is **no per-tier enable flag**. Extraction
+populates the typed graph that reads fuse, so a write with extraction disabled would
+leave graph-backed reads silently incoherent; extraction is therefore architectural
+(always-on), like the embedder and write-time HyPE, not a deploy-time toggle.
+
+- A tier that fails to load at shard spawn (pattern regex compile error, classifier model file missing / weights corrupt, LLM client init error) is a hard spawn failure: `ShardError::ExtractorInitFailed { tier, source }`. The shard refuses to start rather than running with a quietly-missing tier. The classifier's model (GLiNER) is thus a hard boot requirement, exactly like the embedder; the LLM tier relies on the same mandatory `[llm] api_key` that HyPE already requires.
+- There is no `has_llm_extractor` planning input and no `[extractors.<tier>].enabled` config. `GET_CAPABILITIES` (§04/03) reports extraction as always-live.
+
+Extraction cannot be paused at runtime either: the former `EXTRACTOR_DISABLE` / `EXTRACTOR_ENABLE` admin wire ops were removed, so there is no deploy-time *and* no runtime way to turn extraction off (write/read coherence). `EXTRACTOR_LIST` (§04/03) remains as read-only introspection over the always-on extractors.
+
 ## Purpose
 
 An extractor is a pipeline that derives structured data (Entities, Statements, Relations) from unstructured Memories. Extractors are declared in the schema and run as background workers.
@@ -30,7 +57,14 @@ Three kinds, in increasing order of capability and cost:
 | **Classifier** | 1-10 ms | Low | Yes (pinned model) | Medium | High |
 | **LLM** | 100 ms - 10 s | High (per-call) | No (cached) | High | High (with validation) |
 
-Brain runs them as a pipeline: pattern first (fast, free), then classifier (slow, cheap), then LLM (slowest, expensive). Each tier can be configured to either *replace* or *supplement* the previous tier's output.
+Brain runs them as a pipeline: pattern first (fast, free), then classifier (slow, cheap), then LLM (slowest, expensive). Within one namespace every declared extractor across all tiers *supplements* the others — their outputs are merged, not replaced. There is no per-tier replace/supplement switch; the pattern/classifier tiers always contribute alongside the LLM tier.
+
+The one replace-shaped rule is namespace-scoped and lives inside the LLM tier: a namespace that declares its own enabled LLM extractor(s) **replaces** the seeded `brain:` default LLM extractor for that namespace's memories (auto-suppress by declaration). The system default runs only for memories in namespaces that declare no LLM extractor of their own. Multiple LLM extractors declared in the *same* namespace supplement each other.
+
+Extractor lifecycle notes:
+- **`trigger` is honored on the encode path.** `on encode` and `on encode where <cond>` gate whether the extractor runs for a given memory, where `<cond>` supports `memory.text matches <regex>` / `memory.kind = <kind>` / `memory.kind in (…)`, combined with `and` / `or`. `on demand`, `periodic`, and `on schema_change` triggers do **not** run on the encode path.
+- **The registry refreshes on `SCHEMA_UPLOAD`** — no shard restart. After the upload commits, the per-shard extractor worker rebuilds the in-memory registry from the persisted `EXTRACTORS_TABLE` rows on its next cycle, so a newly-declared extractor fires against subsequent encodes.
+- **`depends_on` ordering is not yet honored** (known limitation / follow-up): all extractors in a namespace run and their outputs merge, but a declared inter-extractor dependency order is not currently enforced.
 
 ## Pattern extractors
 
@@ -48,7 +82,7 @@ define extractor person_mentions {
 ```
 
 Pattern semantics:
-- Run on every ENCODE (foreground or queued background).
+- Run on every ENCODE (enqueued to the per-shard extractor worker; never inline).
 - Apply regex to memory text.
 - For each match: invoke `resolve_entity` (or `resolve_predicate`, etc., per the target).
 - Confidence is fixed at the declared value (patterns don't compute per-match confidence).
@@ -76,7 +110,7 @@ Classifier semantics:
 - Output: structured prediction with confidence.
 - Determinism: pinned weights + pinned tokenizer + pinned random seed → identical output across runs.
 
-Cost: bounded by model size and CPU. Typically 1-10 ms per memory on a CPU. Latency: low; runs in foreground or near-foreground.
+Cost: bounded by model size and CPU. Typically 1-10 ms per memory on a CPU. It runs in the background extractor worker (after the pattern tier), never on the ENCODE path.
 
 The tier is **live in v1.0** — both the entity-mention head and the statement-kind head (Fact / Preference / Event) run a real forward pass over the shared GLiNER encoder. Earlier phases shipped the head wired but degraded; v1.0 is the first cut where the statement-kind classification gate fires before the LLM tier on the hot path.
 
@@ -214,13 +248,13 @@ When used, they run alongside user-declared extractors.
 
 ## Concurrency and ordering
 
-Multiple extractors can run on the same memory. Default execution:
+Multiple extractors can run on the same memory. All extraction is asynchronous — ENCODE enqueues the memory and the per-shard extractor worker runs the tiers in order when it drains the queue:
 
-1. Pattern extractors run synchronously during ENCODE (foreground, fast).
-2. Classifier extractors run synchronously or in near-foreground (low latency).
-3. LLM extractors run in background workers (high latency, batched).
+1. Pattern extractors run first (fast, deterministic).
+2. Classifier extractors run next (pinned model, low per-memory latency).
+3. LLM extractors run last (high latency, cached).
 
-Pattern and classifier outputs are visible immediately after ENCODE returns. LLM outputs appear within seconds to minutes.
+No extractor output exists when ENCODE returns. Pattern and classifier outputs typically appear within one worker cycle; LLM outputs appear within seconds to minutes.
 
 Ordering matters when later extractors depend on earlier ones' outputs:
 

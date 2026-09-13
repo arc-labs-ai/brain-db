@@ -1,15 +1,15 @@
 //! EXPLAIN-style pretty-printer for execution plans.
 //!
 //! Operators read this output in logs or via the future
-//! `ADMIN_EXPLAIN_PLAN` opcode (Phase 9). The format is human-only —
+//! `ADMIN_EXPLAIN_PLAN` opcode. The format is human-only —
 //! no parser, no machine consumer.
 //!
 //! Renders as a tree using ASCII box-drawing characters
 //! (`├─ │ └─`). Each plan-type's title line carries `(est. X.YZ ms)`
 //! so cost is visible without scanning.
 //!
-//! Phase doc 6.8 said "impl Debug"; we ship `Display` instead because
-//! the derive-generated `Debug` is still used in test panic messages
+//! We ship `Display` rather than overriding `Debug` because the
+//! derive-generated `Debug` is still used in test panic messages
 //! (`assert!(format!("{plan:?}").contains(...))`). Overriding `Debug`
 //! would break that. `Display` is the idiomatic home for human
 //! formatting in Rust.
@@ -175,7 +175,7 @@ impl fmt::Display for EncodePlan {
             ContextResolutionStep::Explicit(id) => {
                 writeln!(f, "{BRANCH}context_resolution: Explicit({id:?})")?;
             }
-            ContextResolutionStep::GetOrCreate { agent_id: _, name } => {
+            ContextResolutionStep::GetOrCreate { space_id: _, name } => {
                 writeln!(
                     f,
                     "{BRANCH}context_resolution: GetOrCreate(\"{}\")",
@@ -367,7 +367,7 @@ fn substep_one_liner(s: &Option<RecallSubStep>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brain_core::{ContextId, MemoryId, MemoryKind, RequestId};
+    use brain_core::{MemoryId, MemoryKind, RequestId, SessionId};
     use brain_protocol::envelope::request::{
         ForgetMode, ObservationInput, PlanBudget, PlanState, PlanStrategy,
     };
@@ -439,7 +439,7 @@ mod tests {
                 text: "hello".into(),
                 cache_lookup: true,
             },
-            context_resolution: crate::plan::encode::ContextResolutionStep::Explicit(ContextId(42)),
+            context_resolution: crate::plan::encode::ContextResolutionStep::Explicit(SessionId(42)),
             allocation: SlotAllocationStep {
                 arena_grow_if_needed: true,
             },

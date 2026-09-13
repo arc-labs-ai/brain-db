@@ -1,7 +1,7 @@
 //! `StatementHnswIndex` — per-shard HNSW over statement embeddings.
 //!
-//! Sub-task 17.5. Distinct from the substrate's [`crate::HnswIndex`] over
-//! memory embeddings and the [`crate::EntityHnswIndex`] (16.3) over
+//! Distinct from the substrate's [`crate::HnswIndex`] over
+//! memory embeddings and the [`crate::EntityHnswIndex`] over
 //! entity embeddings:
 //!
 //! | Index | M | ef_construction | ef_search | capacity_hint |
@@ -10,28 +10,23 @@
 //! | Entity | 16 | 100 | 64 | 256 |
 //! | Statement (this module) | **32** | 200 | **128** | 1024 |
 //!
-//! §"statement.hnsw" — statement counts are typically 0.1–1×
+//! Statement counts are typically 0.1–1×
 //! memory counts per shard, so the index is sized similarly to memory
 //! and the wider `M`+`ef_search` give better recall on the denser
 //! semantic neighbourhoods statements form.
 //!
-//! ## Surface (17.5 only)
-//!
-//! - In-memory only; no `statement.hnsw` persistence (deferred to
-//!   phase 23 — see plan `.claude/plans/phase-17-task-05.md`).
+//! - In-memory only; no `statement.hnsw` persistence.
 //! - Single-owner; no concurrency wrapper. The shard's worker
 //!   discipline (one writer per shard) is enough.
 //! - Inlined `StatementId ↔ u32` mapping (`Vec` + `HashMap`) — mirrors
-//!   the entity HNSW. Generalising the id-map across all three HNSWs
-//!   is a phase-23 refactor.
+//!   the entity HNSW.
 //!
 //! ## Population
 //!
-//! Phase 17.5 wires the index type and surfaces. The embedding worker
-//! that produces vectors from
+//! The embedding worker produces vectors from
 //! `subject_canonical_name + " " + predicate_name + " " + object_text`
 //! and subscribes to `STATEMENT_CREATED / _SUPERSEDED / _TOMBSTONED`
-//! events lands in **phase 21**.
+//! events.
 
 use std::collections::HashMap;
 
@@ -52,8 +47,8 @@ const OVER_FACTOR: usize = 2;
 // ---------------------------------------------------------------------------
 
 /// HNSW knobs for the statement index. Defaults from
-/// [`Self::default_v1`] match `spec/26_knowledge_storage/00_purpose.md`:
-/// `M=32, ef_construction=200, ef_search=128`, capacity hint 1024.
+/// [`Self::default_v1`]: `M=32, ef_construction=200, ef_search=128`,
+/// capacity hint 1024.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StatementHnswParams {
     /// Max edges per non-bottom-layer node range:
@@ -73,8 +68,7 @@ pub struct StatementHnswParams {
 }
 
 impl StatementHnswParams {
-    /// Per §"statement.hnsw". Differences vs entity HNSW
-    /// are commented inline.
+    /// Differences vs entity HNSW are commented inline.
     #[must_use]
     pub const fn default_v1() -> Self {
         Self {
@@ -161,7 +155,7 @@ pub struct RebuildReport {
 
 /// Per-shard HNSW over statement embeddings (384-dim, BGE-small).
 ///
-/// **Single-writer** by `&mut self` discipline (CLAUDE.md §5 inv. 2).
+/// **Single-writer** by `&mut self` discipline.
 pub struct StatementHnswIndex {
     inner: Hnsw<'static, f32, DistCosine>,
     params: StatementHnswParams,
@@ -207,7 +201,7 @@ impl StatementHnswIndex {
             return Err(StatementHnswError::DuplicateStatement(statement_id));
         }
         let internal_id = u32::try_from(self.forward.len())
-            .expect("statement HNSW id-space exhausted (> u32::MAX statements per shard)");
+            .expect("invariant: statement count per shard never reaches u32::MAX");
         self.forward.push(Some(statement_id));
         self.reverse.insert(statement_id, internal_id);
         self.inner
@@ -256,27 +250,60 @@ impl StatementHnswIndex {
             }
         };
 
-        let fetch_k = k.saturating_mul(OVER_FACTOR).min(self.forward.len());
-        let neighbours: Vec<Neighbour> = self.inner.search(query.as_slice(), fetch_k, ef);
+        // Escalate the fetch width (and `ef`) when tombstone attrition
+        // starves the post-filter result set. A single fixed fetch can
+        // return fewer than `k` live neighbours if more than half of the
+        // top candidates were tombstoned by FORGET/consolidation before
+        // the next rebuild; widen until we have `k` live results or the
+        // graph is exhausted. Termination is guaranteed: `fetch_k` is
+        // capped at the node count and `ef` at `ef_search_max`.
+        let total_nodes = self.forward.len();
+        let mut ef = ef;
+        let mut fetch_multiplier = OVER_FACTOR;
         let mut out: Vec<(StatementId, f32)> = Vec::with_capacity(k);
-        for n in neighbours {
+        loop {
+            out.clear();
+            let fetch_k = k.saturating_mul(fetch_multiplier).min(total_nodes);
+            let neighbours: Vec<Neighbour> = self.inner.search(query.as_slice(), fetch_k, ef);
+            for n in neighbours {
+                if out.len() >= k {
+                    break;
+                }
+                let Ok(internal_id) = u32::try_from(n.d_id) else {
+                    continue;
+                };
+                if self.tombstones.is_set(internal_id) {
+                    continue;
+                }
+                let Some(Some(statement_id)) = self.forward.get(internal_id as usize) else {
+                    tracing::warn!(
+                        internal_id,
+                        "statement HNSW returned an internal id with no StatementId mapping; dropping"
+                    );
+                    continue;
+                };
+                out.push((*statement_id, 1.0 - n.distance));
+            }
+
             if out.len() >= k {
                 break;
             }
-            let Ok(internal_id) = u32::try_from(n.d_id) else {
-                continue;
-            };
-            if self.tombstones.is_set(internal_id) {
-                continue;
-            }
-            let Some(Some(statement_id)) = self.forward.get(internal_id as usize) else {
-                tracing::warn!(
-                    internal_id,
-                    "statement HNSW returned an internal id with no StatementId mapping; dropping"
+            let fetch_saturated = fetch_k >= total_nodes;
+            let ef_saturated = ef >= self.params.ef_search_max;
+            if fetch_saturated && ef_saturated {
+                tracing::debug!(
+                    requested_k = k,
+                    returned = out.len(),
+                    "statement HNSW search bailout exhausted; returning partial results"
                 );
-                continue;
-            };
-            out.push((*statement_id, 1.0 - n.distance));
+                break;
+            }
+            if !fetch_saturated {
+                fetch_multiplier = fetch_multiplier.saturating_mul(2);
+            }
+            if !ef_saturated {
+                ef = ef.saturating_mul(2).min(self.params.ef_search_max);
+            }
         }
         // hnsw_rs returns ascending by distance → descending by
         // similarity once we convert. Already in the right order;
@@ -364,7 +391,7 @@ impl StatementHnswIndex {
                 continue;
             }
             let internal_id = u32::try_from(self.forward.len())
-                .expect("statement HNSW id-space exhausted during rebuild");
+                .expect("invariant: rebuilt statement count never reaches u32::MAX");
             self.forward.push(Some(id));
             self.reverse.insert(id, internal_id);
             self.inner
@@ -393,6 +420,26 @@ mod tests {
     fn one_hot(seed: usize) -> [f32; VECTOR_DIM] {
         let mut v = zeros();
         v[seed % VECTOR_DIM] = 1.0;
+        v
+    }
+
+    /// The query / anchor vector the widening tests probe with.
+    fn query() -> [f32; VECTOR_DIM] {
+        one_hot(0)
+    }
+
+    /// A vector in a tight cluster around [`query`]: a dominant query
+    /// component plus a unique perturbation of magnitude `mag` on dimension
+    /// `1 + seed`. Cosine to the query is ~1.0 and every such point occupies
+    /// a distinct location (no duplicate cluster to trap the traversal), so
+    /// the small graphs stay well-connected and HNSW returns them with
+    /// essentially full recall. `mag` sets the (small) distance from the
+    /// query: smaller = nearer. The tests never depend on HNSW surfacing
+    /// genuinely far nodes, which it does not guarantee on tiny graphs.
+    fn near_at(seed: usize, mag: f32) -> [f32; VECTOR_DIM] {
+        let mut v = zeros();
+        v[0] = 1.0;
+        v[1 + (seed % (VECTOR_DIM - 1))] = mag;
         v
     }
 
@@ -557,6 +604,96 @@ mod tests {
         let ids: Vec<StatementId> = r.iter().map(|(id, _)| *id).collect();
         assert!(!ids.contains(&b), "tombstoned id surfaced in search");
         assert!(ids.contains(&a), "expected a in results");
+    }
+
+    #[test]
+    fn search_widens_past_tombstone_attrition() {
+        // A dense hub of 24 tombstoned statements occupies the query's
+        // nearest ring — far more than the initial fetch window (k*OVER_FACTOR
+        // = 5*2 = 10) — so a single fixed fetch lands entirely on tombstoned
+        // neighbours and collapses to zero live results. A comfortable surplus
+        // of 12 live statements sits in a slightly farther ring of the same
+        // tight cluster (each ~cosine 1.0 to the query, all on distinct
+        // dimensions so the graph is densely connected and HNSW recalls them
+        // reliably). Escalation must widen the fetch past the tombstoned front
+        // until the k live results survive.
+        //
+        // Density is load-bearing: a large, well-connected cluster (as in the
+        // reliable statement-question widening test) lets the widened search
+        // reach the live ring; a sparse handful of points can leave the far
+        // ring unreachable on the approximate graph.
+        let mut idx = StatementHnswIndex::new(StatementHnswParams::default_v1()).unwrap();
+        let tombstoned: Vec<StatementId> = (0..24).map(|_| StatementId::new()).collect();
+        for (i, id) in tombstoned.iter().enumerate() {
+            idx.insert(*id, &near_at(i, 0.01)).unwrap();
+        }
+        let live: Vec<StatementId> = (0..12).map(|_| StatementId::new()).collect();
+        for (i, id) in live.iter().enumerate() {
+            idx.insert(*id, &near_at(30 + i, 0.02)).unwrap();
+        }
+        for id in &tombstoned {
+            idx.mark_tombstoned(*id).unwrap();
+        }
+
+        let r = idx.search(&query(), 5).unwrap();
+        assert_eq!(r.len(), 5, "escalation should still return k live results");
+        let got: Vec<StatementId> = r.iter().map(|(id, _)| *id).collect();
+        for id in &tombstoned {
+            assert!(!got.contains(id), "tombstoned id surfaced after widening");
+        }
+        for id in &got {
+            assert!(
+                live.contains(id),
+                "unexpected non-live statement in results"
+            );
+        }
+    }
+
+    #[test]
+    fn search_exhausts_cleanly_when_fewer_than_k_live() {
+        // Only 3 live of 6 total; search(k=5) can never reach k, so it must
+        // terminate cleanly (no infinite escalation loop) and return only live
+        // survivors — never fabricate up to k, never leak a tombstoned entry.
+        // The 3 live statements sit in a tight cluster around the query (cosine
+        // ~1.0) while the 3 tombstoned statements are orthogonal to it (cosine
+        // ~0, distinct far dimensions), so the live trio is unambiguously the
+        // query's nearest neighbourhood.
+        //
+        // The assertions bound the exhaustion behaviour — a non-empty subset
+        // of the live set, strictly fewer than k, with no tombstoned leak —
+        // rather than demanding exact full recall. Exactly how many of the
+        // few live points HNSW surfaces from a tiny graph is an approximate-
+        // recall property of the index itself (even ef widened to its maximum
+        // occasionally drops one node on a near-degenerate graph), not of the
+        // exhaustion/termination logic this test exists to pin down.
+        let mut idx = StatementHnswIndex::new(StatementHnswParams::default_v1()).unwrap();
+        let live: Vec<StatementId> = (0..3).map(|_| StatementId::new()).collect();
+        for (i, id) in live.iter().enumerate() {
+            idx.insert(*id, &near_at(i, 0.01)).unwrap();
+        }
+        let tombstoned: Vec<StatementId> = (0..3).map(|_| StatementId::new()).collect();
+        for (i, id) in tombstoned.iter().enumerate() {
+            idx.insert(*id, &one_hot(100 + i)).unwrap();
+            idx.mark_tombstoned(*id).unwrap();
+        }
+
+        let r = idx.search(&query(), 5).unwrap();
+        assert!(!r.is_empty(), "live survivors must remain reachable");
+        assert!(
+            r.len() <= live.len(),
+            "must not return more than the live count on exhaustion"
+        );
+        assert!(
+            r.len() < 5,
+            "cannot reach k when fewer than k live entries exist"
+        );
+        let got: Vec<StatementId> = r.iter().map(|(id, _)| *id).collect();
+        for id in &got {
+            assert!(live.contains(id), "returned id must be a live survivor");
+        }
+        for id in &tombstoned {
+            assert!(!got.contains(id), "tombstoned id must not surface");
+        }
     }
 
     #[test]

@@ -48,7 +48,7 @@ Both should be in place for production.
 After a snapshot is created:
 
 ```bash
-brain-cli snapshot create daily-2026-05-07
+curl -s -X POST http://127.0.0.1:9092/v1/snapshots -d '{"name":"daily-2026-05-07"}'
 # Snapshot is at /var/lib/brain/snapshots/daily-2026-05-07
 ```
 

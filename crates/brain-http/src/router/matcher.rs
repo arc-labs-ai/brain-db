@@ -92,7 +92,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_match() {
+    fn exact_route_matches_identical_method_and_path() {
         let e = vec![exact(Method::GET, "/healthz")];
         assert_eq!(
             match_route(&e, &[], &Method::GET, "/healthz"),

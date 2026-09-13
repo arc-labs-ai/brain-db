@@ -1,7 +1,6 @@
 //! Fixed 32-byte frame header.
 //!
-//! Implements `spec/04_wire_protocol/02_wire_format.md`. All multi-byte
-//! header fields are big-endian.
+//! All multi-byte header fields are big-endian.
 //!
 //! Multi-byte fields are stored as raw big-endian byte arrays rather than
 //! native integers so the struct is trivially `bytemuck::Pod` and matches

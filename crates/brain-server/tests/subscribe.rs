@@ -1,4 +1,4 @@
-//! Integration tests for sub-task 9.11 — cross-shard SUBSCRIBE fan-out.
+//! Integration tests for cross-shard SUBSCRIBE fan-out.
 
 #![cfg(target_os = "linux")]
 
@@ -6,13 +6,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use brain_protocol::codec::opcode::Opcode;
 use brain_protocol::connection::handshake::{
     AuthCredentials, AuthMethod, AuthPayload, HelloCapabilities, HelloPayload, ServerCapabilities,
 };
-use brain_protocol::codec::opcode::Opcode;
 use brain_protocol::envelope::request::{
     CancelStreamRequest, CancellationReason, EncodeRequest, MemoryKindWire, RequestBody,
-    SubscribeRequest, SubscriptionFilter, UnsubscribeRequest,
+    SimilarityFilter, SubscribeRequest, SubscriptionFilter, UnsubscribeRequest,
 };
 use brain_protocol::envelope::response::ResponseBody;
 use brain_protocol::Frame;
@@ -66,6 +66,47 @@ fn stub_dispatcher() -> Arc<dyn Dispatcher> {
     Arc::new(TestStubDispatcher)
 }
 
+/// Text-sensitive stub: a normalized bag-of-words embedding so that
+/// texts sharing tokens land close in cosine space and disjoint texts
+/// land orthogonal. Lets the `similar_to` SUBSCRIBE filter be exercised
+/// end-to-end (the zero-vector `TestStubDispatcher` makes every memory
+/// cosine-degenerate).
+struct BagOfWordsDispatcher;
+
+impl BagOfWordsDispatcher {
+    fn embed_text(text: &str) -> [f32; VECTOR_DIM] {
+        let mut v = [0.0_f32; VECTOR_DIM];
+        for token in text.split_whitespace() {
+            // Cheap deterministic token hash → basis dimension.
+            let mut h: u64 = 1469598103934665603;
+            for b in token.as_bytes() {
+                h ^= u64::from(*b);
+                h = h.wrapping_mul(1099511628211);
+            }
+            v[(h as usize) % VECTOR_DIM] += 1.0;
+        }
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            for x in &mut v {
+                *x /= norm;
+            }
+        }
+        v
+    }
+}
+
+impl Dispatcher for BagOfWordsDispatcher {
+    fn embed(&self, text: &str) -> Result<[f32; VECTOR_DIM], EmbedError> {
+        Ok(Self::embed_text(text))
+    }
+    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<[f32; VECTOR_DIM]>, EmbedError> {
+        Ok(texts.iter().map(|t| Self::embed_text(t)).collect())
+    }
+    fn fingerprint(&self) -> [u8; 16] {
+        [1; 16]
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Scaffold (mirrors tests/dispatch.rs)
 // ---------------------------------------------------------------------------
@@ -78,10 +119,31 @@ struct Server {
     listener: tokio::task::JoinHandle<std::io::Result<SocketAddr>>,
     handles: Vec<ShardHandle>,
     joiners: Vec<Option<ShardJoiner>>,
+    auth_store: Arc<crate::auth::AuthStore>,
     _data_dir: TempDir,
 }
 
 impl Server {
+    /// Mint a FULL-permission key for `space_id` (namespace "test").
+    fn mint(&self, space_id: [u8; 16]) -> Vec<u8> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        self.auth_store
+            .mint(
+                [0u8; 16],
+                [0u8; 16],
+                "test".to_string(),
+                space_id,
+                brain_metadata::api_keys::bits::FULL,
+                Vec::new(),
+                now,
+            )
+            .expect("mint test key")
+            .secret_bytes
+    }
+
     async fn stop(mut self) {
         self.trigger.signal();
         let _ = tokio::time::timeout(Duration::from_secs(2), &mut self.listener).await;
@@ -95,11 +157,23 @@ impl Server {
 }
 
 async fn start_with_shards(n_shards: usize) -> Server {
+    start_with_shards_and_limits(n_shards, ConnectionLimits::default()).await
+}
+
+async fn start_with_shards_and_limits(n_shards: usize, limits: ConnectionLimits) -> Server {
+    start_with_shards_limits_dispatcher(n_shards, limits, stub_dispatcher()).await
+}
+
+async fn start_with_shards_limits_dispatcher(
+    n_shards: usize,
+    limits: ConnectionLimits,
+    dispatcher: Arc<dyn Dispatcher>,
+) -> Server {
     let data_dir = TempDir::new().expect("tmp");
     let mut handles = Vec::with_capacity(n_shards);
     let mut joiners = Vec::with_capacity(n_shards);
     for shard_id in 0..n_shards {
-        let cfg = ShardSpawnConfig::new(data_dir.path(), stub_dispatcher());
+        let cfg = ShardSpawnConfig::new(data_dir.path(), dispatcher.clone());
         let (h, j) = spawn_shard(shard_id as u16, cfg).expect("spawn shard");
         handles.push(h);
         joiners.push(Some(j));
@@ -107,23 +181,19 @@ async fn start_with_shards(n_shards: usize) -> Server {
     let routing = Arc::new(arc_swap::ArcSwap::from_pointee(
         RoutingTable::new(n_shards as u16, std::collections::HashMap::new()).unwrap(),
     ));
-    let __auth_store = {
-        let tmp = tempfile::TempDir::new().expect("tmpdir");
-        let p = tmp.path().join("api_keys.redb");
-        let store =
-            std::sync::Arc::new(crate::auth::AuthStore::open(&p, false).expect("open auth store"));
-        std::mem::forget(tmp);
-        store
+    let auth_store = {
+        let p = data_dir.path().join("api_keys.redb");
+        std::sync::Arc::new(crate::auth::AuthStore::open(&p).expect("open auth store"))
     };
     let topology = Topology {
         shards: Arc::new(handles.clone()),
         routing,
         server_caps: Arc::new(ServerCapabilities::v1_default(
             "brain-server/test",
-            vec![AuthMethod::None],
+            vec![AuthMethod::Token],
         )),
         request_metrics: Arc::new(metrics::request::RequestMetrics::new()),
-        auth_store: __auth_store.clone(),
+        auth_store: auth_store.clone(),
     };
 
     let (trigger, signal) = ShutdownSignal::channel();
@@ -132,7 +202,7 @@ async fn start_with_shards(n_shards: usize) -> Server {
         None,
         topology,
         Arc::new(connection::ConnectionMetrics::default()),
-        ConnectionLimits::default(),
+        limits,
         signal,
     );
     let bound = listener.bind().expect("bind");
@@ -145,6 +215,7 @@ async fn start_with_shards(n_shards: usize) -> Server {
         listener: listener_handle,
         handles,
         joiners,
+        auth_store,
         _data_dir: data_dir,
     }
 }
@@ -185,7 +256,7 @@ async fn send_frame(client: &mut TcpStream, frame: Frame) {
     client.flush().await.expect("flush");
 }
 
-async fn complete_handshake(client: &mut TcpStream, agent_id: [u8; 16]) {
+async fn complete_handshake(client: &mut TcpStream, token: &[u8]) {
     let hello = HelloPayload {
         client_id: "tester".into(),
         supported_versions: vec![brain_protocol::VERSION],
@@ -194,7 +265,7 @@ async fn complete_handshake(client: &mut TcpStream, agent_id: [u8; 16]) {
             compression_zstd: false,
             server_push: false,
         },
-        client_session_token: None,
+        client_connection_token: None,
     };
     send_frame(
         client,
@@ -209,9 +280,8 @@ async fn complete_handshake(client: &mut TcpStream, agent_id: [u8; 16]) {
     let _ = read_one_frame(client).await.expect("WELCOME");
 
     let auth = AuthPayload {
-        method: AuthMethod::None,
-        agent_id,
-        credentials: AuthCredentials::None,
+        method: AuthMethod::Token,
+        credentials: AuthCredentials::Token(token.to_vec()),
     };
     send_frame(
         client,
@@ -226,12 +296,17 @@ async fn complete_handshake(client: &mut TcpStream, agent_id: [u8; 16]) {
     let _ = read_one_frame(client).await.expect("AUTH_OK");
 }
 
-fn open_filter() -> SubscriptionFilter {
+/// A filter scoped to the caller's own space. Under mandatory auth a
+/// subscriber may only receive its own space's events, so `spaces` must
+/// name exactly the connection's bound space (a bare `None`/empty filter
+/// is rejected as a cross-tenant leak).
+fn own_filter(space: [u8; 16]) -> SubscriptionFilter {
     SubscriptionFilter {
-        contexts: None,
+        session_filter: None,
         kinds: None,
         similar_to: None,
-        agents: None,
+        spaces: Some(vec![space]),
+        memory_ids: None,
     }
 }
 
@@ -241,19 +316,22 @@ fn subscribe_request(filter: SubscriptionFilter) -> SubscribeRequest {
         include_history: false,
         from_lsn: None,
         max_inflight: 100,
+        act_as: None,
     }
 }
 
-fn encode_request(text: &str, kind: MemoryKindWire) -> EncodeRequest {
+// `_kind` is accepted for call-site compatibility but ignored: the
+// write router decides the memory kind now (always Episodic).
+fn encode_request(text: &str, _kind: MemoryKindWire) -> EncodeRequest {
     EncodeRequest {
         text: text.into(),
-        context_id: 0,
-        kind,
-        salience_hint: 0.5,
-        edges: Vec::new(),
+        session_id: 0,
         request_id: *uuid::Uuid::now_v7().as_bytes(),
         txn_id: None,
-        deduplicate: false,
+        occurred_at_unix_nanos: None,
+        act_as: None,
+        wait: brain_protocol::WaitMode::Ack,
+        allow_duplicates: false,
     }
 }
 
@@ -276,16 +354,16 @@ async fn read_event_within(client: &mut TcpStream, within: Duration) -> Option<F
 async fn subscribe_receives_encode_events() {
     let server = start_with_shards(1).await;
 
-    // Open two connections under the SAME agent_id so encodes land on
+    // Open two connections under the SAME space_id so encodes land on
     // the same shard.
-    let agent_id = *uuid::Uuid::now_v7().as_bytes();
+    let space_id = *uuid::Uuid::now_v7().as_bytes();
     let mut sub_client = TcpStream::connect(server.addr).await.expect("connect sub");
-    complete_handshake(&mut sub_client, agent_id).await;
+    complete_handshake(&mut sub_client, &server.mint(space_id)).await;
 
     let mut writer_client = TcpStream::connect(server.addr)
         .await
         .expect("connect writer");
-    complete_handshake(&mut writer_client, agent_id).await;
+    complete_handshake(&mut writer_client, &server.mint(space_id)).await;
 
     // SUBSCRIBE.
     let sub_stream = 5u32;
@@ -295,7 +373,7 @@ async fn subscribe_receives_encode_events() {
             Opcode::SubscribeReq.as_u16(),
             FLAG_EOS,
             sub_stream,
-            RequestBody::Subscribe(subscribe_request(open_filter())).encode(),
+            RequestBody::Subscribe(subscribe_request(own_filter(space_id))).encode(),
         ),
     )
     .await;
@@ -344,8 +422,8 @@ async fn subscribe_receives_encode_events() {
 async fn unsubscribe_emits_final_eos_and_response() {
     let server = start_with_shards(1).await;
     let mut client = TcpStream::connect(server.addr).await.expect("connect");
-    let agent_id = *uuid::Uuid::now_v7().as_bytes();
-    complete_handshake(&mut client, agent_id).await;
+    let space_id = *uuid::Uuid::now_v7().as_bytes();
+    complete_handshake(&mut client, &server.mint(space_id)).await;
 
     let sub_stream = 7u32;
     send_frame(
@@ -354,7 +432,7 @@ async fn unsubscribe_emits_final_eos_and_response() {
             Opcode::SubscribeReq.as_u16(),
             FLAG_EOS,
             sub_stream,
-            RequestBody::Subscribe(subscribe_request(open_filter())).encode(),
+            RequestBody::Subscribe(subscribe_request(own_filter(space_id))).encode(),
         ),
     )
     .await;
@@ -405,8 +483,8 @@ async fn unsubscribe_emits_final_eos_and_response() {
 async fn cancel_stream_terminates_subscription() {
     let server = start_with_shards(1).await;
     let mut client = TcpStream::connect(server.addr).await.expect("connect");
-    let agent_id = *uuid::Uuid::now_v7().as_bytes();
-    complete_handshake(&mut client, agent_id).await;
+    let space_id = *uuid::Uuid::now_v7().as_bytes();
+    complete_handshake(&mut client, &server.mint(space_id)).await;
 
     let sub_stream = 3u32;
     send_frame(
@@ -415,7 +493,7 @@ async fn cancel_stream_terminates_subscription() {
             Opcode::SubscribeReq.as_u16(),
             FLAG_EOS,
             sub_stream,
-            RequestBody::Subscribe(subscribe_request(open_filter())).encode(),
+            RequestBody::Subscribe(subscribe_request(own_filter(space_id))).encode(),
         ),
     )
     .await;
@@ -467,14 +545,15 @@ async fn subscribe_from_lsn_past_tail_is_accepted() {
     // a placeholder while WAL replay was unimplemented.
     let server = start_with_shards(1).await;
     let mut client = TcpStream::connect(server.addr).await.expect("connect");
-    let agent_id = *uuid::Uuid::now_v7().as_bytes();
-    complete_handshake(&mut client, agent_id).await;
+    let space_id = *uuid::Uuid::now_v7().as_bytes();
+    complete_handshake(&mut client, &server.mint(space_id)).await;
 
     let req = SubscribeRequest {
-        filter: open_filter(),
+        filter: own_filter(space_id),
         include_history: true,
         from_lsn: Some(123),
         max_inflight: 100,
+        act_as: None,
     };
     let sub_stream = 13u32;
     send_frame(
@@ -509,11 +588,11 @@ async fn double_subscribe_with_same_stream_id_errors() {
     // (— stream IDs in use).
     let server = start_with_shards(1).await;
     let mut client = TcpStream::connect(server.addr).await.expect("connect");
-    let agent_id = *uuid::Uuid::now_v7().as_bytes();
-    complete_handshake(&mut client, agent_id).await;
+    let space_id = *uuid::Uuid::now_v7().as_bytes();
+    complete_handshake(&mut client, &server.mint(space_id)).await;
 
     let sub_stream = 15u32;
-    let req = RequestBody::Subscribe(subscribe_request(open_filter())).encode();
+    let req = RequestBody::Subscribe(subscribe_request(own_filter(space_id))).encode();
     send_frame(
         &mut client,
         Frame::new(
@@ -550,7 +629,7 @@ async fn double_subscribe_with_same_stream_id_errors() {
 // registry's contract end-to-end on the wire.)
 
 // ---------------------------------------------------------------------------
-// WAL-replay end-to-end (sub-task 9.x; subscribe --start-lsn). Encodes
+// WAL-replay end-to-end (subscribe --start-lsn). Encodes
 // memories BEFORE the subscriber connects, then subscribes with
 // from_lsn=1 and asserts the historical events arrive — proof that
 // the writer is WAL-recording substrate ops and the connection-layer
@@ -560,14 +639,14 @@ async fn double_subscribe_with_same_stream_id_errors() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn subscribe_from_lsn_replays_historical_encodes() {
     let server = start_with_shards(1).await;
-    let agent_id = *uuid::Uuid::now_v7().as_bytes();
+    let space_id = *uuid::Uuid::now_v7().as_bytes();
 
     // 1. ENCODE two memories on a writer connection BEFORE any
     //    subscriber exists. The live event bus has no listeners, so
     //    these events are only durable in the WAL — making this a
     //    real replay test, not a live-tail test in disguise.
     let mut writer = TcpStream::connect(server.addr).await.expect("writer");
-    complete_handshake(&mut writer, agent_id).await;
+    complete_handshake(&mut writer, &server.mint(space_id)).await;
     for (i, text) in ["alpha", "beta"].iter().enumerate() {
         let stream_id = ((i * 2) + 1) as u32; // 1, 3 — odd
         send_frame(
@@ -595,7 +674,7 @@ async fn subscribe_from_lsn_replays_historical_encodes() {
 
     // 2. Now open a fresh subscriber and request --start-lsn=1.
     let mut sub = TcpStream::connect(server.addr).await.expect("sub");
-    complete_handshake(&mut sub, agent_id).await;
+    complete_handshake(&mut sub, &server.mint(space_id)).await;
     let sub_stream = 11u32;
     send_frame(
         &mut sub,
@@ -604,10 +683,11 @@ async fn subscribe_from_lsn_replays_historical_encodes() {
             FLAG_EOS,
             sub_stream,
             RequestBody::Subscribe(SubscribeRequest {
-                filter: open_filter(),
+                filter: own_filter(space_id),
                 include_history: false,
                 from_lsn: Some(1),
                 max_inflight: 100,
+                act_as: None,
             })
             .encode(),
         ),
@@ -647,33 +727,123 @@ async fn subscribe_from_lsn_replays_historical_encodes() {
     server.stop().await;
 }
 
-/// `agents` filter — encodes from agent A and B; subscriber listening
-/// only to agent A receives ONLY A's events even though B's events
-/// hit the same shard. Without this filter, a multi-tenant shard
-/// leaks every agent's events to every subscriber.
-///
-/// Enabled after the per-request agent flow landed: each op now
-/// carries `agent_id` (populated from `ConnPhase::Established.agent`
-/// via `dispatch(req, caller, ctx)` → `ExecutorContext.caller_agent`
-/// → `EncodeOp.agent_id` → `EventEnvelope.agent_id`). The
-/// `SubscriptionFilter.agents` set filters server-side; subscribers
-/// only see events from agents they declared interest in.
+/// `include_history: true` with no explicit `from_lsn` must replay the
+/// retained WAL history, exactly as `from_lsn: Some(_)` does. Encodes
+/// two memories BEFORE any subscriber exists (so they live only in the
+/// WAL, not a live listener's buffer), then subscribes with
+/// `include_history: true` / `from_lsn: None` and asserts the historical
+/// events arrive. Before `include_history` was wired, the flag was
+/// silently ignored and this subscription would have started at the live
+/// tail, seeing nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn subscribe_agents_filter_isolates_per_agent() {
+async fn subscribe_include_history_replays_historical_encodes() {
+    let server = start_with_shards(1).await;
+    let space_id = *uuid::Uuid::now_v7().as_bytes();
+
+    // ENCODE two memories with no subscriber attached — durable only in
+    // the WAL, so this exercises replay, not a live-tail path.
+    let mut writer = TcpStream::connect(server.addr).await.expect("writer");
+    complete_handshake(&mut writer, &server.mint(space_id)).await;
+    for (i, text) in ["gamma", "delta"].iter().enumerate() {
+        let stream_id = ((i * 2) + 1) as u32; // 1, 3 — odd client streams
+        send_frame(
+            &mut writer,
+            Frame::new(
+                Opcode::EncodeReq.as_u16(),
+                FLAG_EOS,
+                stream_id,
+                RequestBody::Encode(encode_request(text, MemoryKindWire::Episodic)).encode(),
+            ),
+        )
+        .await;
+        let resp = read_one_frame(&mut writer).await.expect("encode resp");
+        assert_eq!(
+            resp.header.opcode_u16(),
+            Opcode::EncodeResp.as_u16(),
+            "encode {text} expected EncodeResp, got 0x{:02x}",
+            resp.header.opcode_u16(),
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Subscribe with include_history=true and NO from_lsn — the flag
+    // alone must trigger retained-history replay.
+    let mut sub = TcpStream::connect(server.addr).await.expect("sub");
+    complete_handshake(&mut sub, &server.mint(space_id)).await;
+    let sub_stream = 11u32;
+    send_frame(
+        &mut sub,
+        Frame::new(
+            Opcode::SubscribeReq.as_u16(),
+            FLAG_EOS,
+            sub_stream,
+            RequestBody::Subscribe(SubscribeRequest {
+                filter: own_filter(space_id),
+                include_history: true,
+                from_lsn: None,
+                max_inflight: 100,
+                act_as: None,
+            })
+            .encode(),
+        ),
+    )
+    .await;
+
+    let mut replayed_events = 0;
+    for _ in 0..10 {
+        let Some(frame) = read_event_within(&mut sub, Duration::from_secs(3)).await else {
+            break;
+        };
+        if frame.header.opcode_u16() == Opcode::Error.as_u16() {
+            let body = ResponseBody::decode(Opcode::Error, &frame.payload).expect("decode");
+            panic!("got Error frame from include_history replay: {body:?}");
+        }
+        if frame.header.opcode_u16() == Opcode::SubscribeEvent.as_u16()
+            && frame.header.stream_id_u32() == sub_stream
+            && frame.header.flags_u8() & FLAG_EOS == 0
+        {
+            replayed_events += 1;
+            if replayed_events >= 2 {
+                break;
+            }
+        }
+    }
+    assert!(
+        replayed_events >= 2,
+        "expected >=2 replayed SUBSCRIBE_EVENT frames from include_history, got {replayed_events}"
+    );
+
+    server.stop().await;
+}
+
+/// `spaces` filter — encodes from space A and B; subscriber listening
+/// only to space A receives ONLY A's events even though B's events
+/// hit the same shard. Without this filter, a multi-tenant shard
+/// leaks every space's events to every subscriber.
+///
+/// Enabled after the per-request space flow landed: each op now
+/// carries `space_id` (populated from `ConnPhase::Established.space`
+/// via `dispatch(req, caller, ctx)` → `ExecutorContext.caller_space`
+/// → `EncodeOp.space_id` → `EventEnvelope.space_id`). The
+/// `SubscriptionFilter.spaces` set filters server-side; subscribers
+/// only see events from spaces they declared interest in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subscribe_spaces_filter_isolates_per_space() {
     let server = start_with_shards(1).await;
 
-    let agent_a = *uuid::Uuid::now_v7().as_bytes();
-    let agent_b = *uuid::Uuid::now_v7().as_bytes();
+    let space_a = *uuid::Uuid::now_v7().as_bytes();
+    let space_b = *uuid::Uuid::now_v7().as_bytes();
 
-    // SUBSCRIBE with agents=[A] on a connection authed as A.
+    // SUBSCRIBE with spaces=[A] on a connection authed as A.
     let mut sub_a = TcpStream::connect(server.addr).await.expect("sub_a");
-    complete_handshake(&mut sub_a, agent_a).await;
+    complete_handshake(&mut sub_a, &server.mint(space_a)).await;
     let sub_stream = 21u32;
     let filter = SubscriptionFilter {
-        contexts: None,
+        session_filter: None,
         kinds: None,
         similar_to: None,
-        agents: Some(vec![agent_a]),
+        spaces: Some(vec![space_a]),
+        memory_ids: None,
     };
     send_frame(
         &mut sub_a,
@@ -688,10 +858,10 @@ async fn subscribe_agents_filter_isolates_per_agent() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Encode from B first, then from A — both land on shard 0
-    // (single-shard test). Without the agents filter, sub_a would
+    // (single-shard test). Without the spaces filter, sub_a would
     // observe both.
     let mut writer_b = TcpStream::connect(server.addr).await.expect("writer_b");
-    complete_handshake(&mut writer_b, agent_b).await;
+    complete_handshake(&mut writer_b, &server.mint(space_b)).await;
     send_frame(
         &mut writer_b,
         Frame::new(
@@ -702,10 +872,15 @@ async fn subscribe_agents_filter_isolates_per_agent() {
         ),
     )
     .await;
-    let _ = read_one_frame(&mut writer_b).await.expect("enc B resp");
+    let enc_b_frame = read_one_frame(&mut writer_b).await.expect("enc B resp");
+    let b_mem = match ResponseBody::decode(Opcode::EncodeResp, &enc_b_frame.payload).expect("dec B")
+    {
+        ResponseBody::Encode(r) => r.memory_id,
+        other => panic!("expected Encode, got {other:?}"),
+    };
 
     let mut writer_a = TcpStream::connect(server.addr).await.expect("writer_a");
-    complete_handshake(&mut writer_a, agent_a).await;
+    complete_handshake(&mut writer_a, &server.mint(space_a)).await;
     send_frame(
         &mut writer_a,
         Frame::new(
@@ -716,12 +891,26 @@ async fn subscribe_agents_filter_isolates_per_agent() {
         ),
     )
     .await;
-    let _ = read_one_frame(&mut writer_a).await.expect("enc A resp");
+    let enc_a_frame = read_one_frame(&mut writer_a).await.expect("enc A resp");
+    let a_mem = match ResponseBody::decode(Opcode::EncodeResp, &enc_a_frame.payload).expect("dec A")
+    {
+        ResponseBody::Encode(r) => r.memory_id,
+        other => panic!("expected Encode, got {other:?}"),
+    };
 
-    // Collect events on sub_a for up to ~1s. Expect EXACTLY 1 event
-    // (from-A); the B event must be filtered out.
-    let mut a_events = 0;
-    for _ in 0..4 {
+    // Collect events on sub_a for up to ~1s and inspect each one. A
+    // single ENCODE now emits several live-progress events (the
+    // `Encoded` event plus one `StageCompleted` per async derivation
+    // stage), so the count is deliberately NOT asserted — that would be
+    // fragile against the write pipeline's stage set. What the space
+    // wall guarantees is *provenance*: every event sub_a sees must
+    // belong to A's write, and B's write must be invisible. The wire
+    // event carries no space_id, but A's and B's memories have distinct
+    // ids, so the memory_id is a faithful proxy for the originating
+    // space here.
+    let mut saw_a = false;
+    let mut saw_b = false;
+    for _ in 0..6 {
         let Some(frame) = read_event_within(&mut sub_a, Duration::from_millis(500)).await else {
             break;
         };
@@ -729,12 +918,24 @@ async fn subscribe_agents_filter_isolates_per_agent() {
             && frame.header.stream_id_u32() == sub_stream
             && frame.header.flags_u8() & FLAG_EOS == 0
         {
-            a_events += 1;
+            if let Ok(ResponseBody::SubscribeEvent(ev)) =
+                ResponseBody::decode(Opcode::SubscribeEvent, &frame.payload)
+            {
+                if ev.memory_id == a_mem {
+                    saw_a = true;
+                } else if ev.memory_id == b_mem {
+                    saw_b = true;
+                }
+            }
         }
     }
-    assert_eq!(
-        a_events, 1,
-        "agents=[A] filter should let through exactly the A event, not B's"
+    assert!(
+        saw_a,
+        "spaces=[A] filter must let A's own events through (saw none for a_mem={a_mem})"
+    );
+    assert!(
+        !saw_b,
+        "spaces=[A] filter must NOT leak B's events across the space wall (saw b_mem={b_mem})"
     );
 
     server.stop().await;
@@ -745,10 +946,10 @@ async fn subscribe_from_lsn_zero_replays_everything_in_wal() {
     // from_lsn=0 means "everything still in the WAL"
     // says this is not an error.
     let server = start_with_shards(1).await;
-    let agent_id = *uuid::Uuid::now_v7().as_bytes();
+    let space_id = *uuid::Uuid::now_v7().as_bytes();
 
     let mut writer = TcpStream::connect(server.addr).await.expect("writer");
-    complete_handshake(&mut writer, agent_id).await;
+    complete_handshake(&mut writer, &server.mint(space_id)).await;
     send_frame(
         &mut writer,
         Frame::new(
@@ -763,7 +964,7 @@ async fn subscribe_from_lsn_zero_replays_everything_in_wal() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let mut sub = TcpStream::connect(server.addr).await.expect("sub");
-    complete_handshake(&mut sub, agent_id).await;
+    complete_handshake(&mut sub, &server.mint(space_id)).await;
     let sub_stream = 17u32;
     send_frame(
         &mut sub,
@@ -772,10 +973,11 @@ async fn subscribe_from_lsn_zero_replays_everything_in_wal() {
             FLAG_EOS,
             sub_stream,
             RequestBody::Subscribe(SubscribeRequest {
-                filter: open_filter(),
+                filter: own_filter(space_id),
                 include_history: false,
                 from_lsn: Some(0),
                 max_inflight: 100,
+                act_as: None,
             })
             .encode(),
         ),
@@ -800,6 +1002,247 @@ async fn subscribe_from_lsn_zero_replays_everything_in_wal() {
         }
     }
     assert!(got_event, "from_lsn=0 should replay the WAL");
+
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subscribe_over_stream_cap_returns_stream_limit_exceeded() {
+    // Cap concurrent streams at 2 for this connection. The third
+    // subscription must be rejected with StreamLimitExceeded rather
+    // than registering an unbounded number of per-sub tasks.
+    let limits = ConnectionLimits {
+        max_concurrent_streams: 2,
+        ..ConnectionLimits::default()
+    };
+    let server = start_with_shards_and_limits(1, limits).await;
+
+    let space_id = *uuid::Uuid::now_v7().as_bytes();
+    let mut client = TcpStream::connect(server.addr).await.expect("connect");
+    complete_handshake(&mut client, &server.mint(space_id)).await;
+
+    // The receiver loop awaits each SUBSCRIBE's registration inline
+    // before reading the next frame, so by the time stream 5 is handled
+    // streams 1 and 3 are already registered — no sleep needed. A
+    // successful subscribe sends no synchronous frame; only the
+    // over-cap one produces a response (an Error).
+    for stream in [1u32, 3u32] {
+        send_frame(
+            &mut client,
+            Frame::new(
+                Opcode::SubscribeReq.as_u16(),
+                FLAG_EOS,
+                stream,
+                RequestBody::Subscribe(subscribe_request(own_filter(space_id))).encode(),
+            ),
+        )
+        .await;
+    }
+    // Third subscription — over the cap.
+    send_frame(
+        &mut client,
+        Frame::new(
+            Opcode::SubscribeReq.as_u16(),
+            FLAG_EOS,
+            5,
+            RequestBody::Subscribe(subscribe_request(own_filter(space_id))).encode(),
+        ),
+    )
+    .await;
+
+    let frame = read_one_frame(&mut client).await.expect("error frame");
+    assert_eq!(
+        frame.header.opcode_u16(),
+        Opcode::Error.as_u16(),
+        "over-cap subscribe must return an Error frame"
+    );
+    assert_eq!(
+        frame.header.stream_id_u32(),
+        5,
+        "the error must ride the rejected stream's id"
+    );
+    let body = ResponseBody::decode(Opcode::Error, &frame.payload).expect("decode error body");
+    match body {
+        ResponseBody::Error(e) => assert!(
+            e.message.contains("stream limit"),
+            "unexpected error message: {}",
+            e.message
+        ),
+        other => panic!("expected Error body, got {other:?}"),
+    }
+
+    server.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// similar_to (subscribe-by-similarity)
+// ---------------------------------------------------------------------------
+
+/// Encode `text` on `client` and return the assigned `MemoryId` raw
+/// value. Panics if the response isn't an `Encode` frame.
+async fn encode_and_get_id(client: &mut TcpStream, stream: u32, text: &str) -> u128 {
+    send_frame(
+        client,
+        Frame::new(
+            Opcode::EncodeReq.as_u16(),
+            FLAG_EOS,
+            stream,
+            RequestBody::Encode(encode_request(text, MemoryKindWire::Episodic)).encode(),
+        ),
+    )
+    .await;
+    let frame = read_one_frame(client).await.expect("encode resp");
+    let body =
+        ResponseBody::decode(Opcode::EncodeResp, &frame.payload).expect("decode encode resp");
+    match body {
+        ResponseBody::Encode(e) => e.memory_id,
+        other => panic!("expected Encode response, got {other:?}"),
+    }
+}
+
+fn similarity_filter(space: [u8; 16], reference: u128, threshold: f32) -> SubscriptionFilter {
+    SubscriptionFilter {
+        session_filter: None,
+        kinds: None,
+        similar_to: Some(SimilarityFilter {
+            reference_memory_id: reference,
+            threshold,
+        }),
+        spaces: Some(vec![space]),
+        memory_ids: None,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subscribe_similar_to_delivers_near_duplicate_not_unrelated() {
+    let server = start_with_shards_limits_dispatcher(
+        1,
+        ConnectionLimits::default(),
+        Arc::new(BagOfWordsDispatcher),
+    )
+    .await;
+
+    let space_id = *uuid::Uuid::now_v7().as_bytes();
+    let mut sub_client = TcpStream::connect(server.addr).await.expect("connect sub");
+    complete_handshake(&mut sub_client, &server.mint(space_id)).await;
+    let mut writer_client = TcpStream::connect(server.addr)
+        .await
+        .expect("connect writer");
+    complete_handshake(&mut writer_client, &server.mint(space_id)).await;
+
+    // Encode the reference memory BEFORE subscribing (live-tail, so the
+    // reference itself is not re-delivered).
+    let reference_id =
+        encode_and_get_id(&mut writer_client, 1, "the quick brown fox jumps over").await;
+
+    // SUBSCRIBE anchored on the reference vector.
+    let sub_stream = 5u32;
+    send_frame(
+        &mut sub_client,
+        Frame::new(
+            Opcode::SubscribeReq.as_u16(),
+            FLAG_EOS,
+            sub_stream,
+            RequestBody::Subscribe(subscribe_request(similarity_filter(
+                space_id,
+                reference_id,
+                0.5,
+            )))
+            .encode(),
+        ),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Near-duplicate (shares most tokens) → cosine ≥ 0.5 → delivered.
+    let near_id = encode_and_get_id(&mut writer_client, 3, "the quick brown fox jumps far").await;
+
+    let event = read_event_within(&mut sub_client, Duration::from_secs(3)).await;
+    let frame = event.expect("expected a SUBSCRIBE_EVENT for the near-duplicate");
+    assert_eq!(
+        frame.header.opcode_u16(),
+        Opcode::SubscribeEvent.as_u16(),
+        "expected a SUBSCRIBE_EVENT, got opcode 0x{:02x}",
+        frame.header.opcode_u16()
+    );
+    let body =
+        ResponseBody::decode(Opcode::SubscribeEvent, &frame.payload).expect("decode sub event");
+    match body {
+        ResponseBody::SubscribeEvent(ev) => assert_eq!(
+            ev.memory_id, near_id,
+            "delivered event must be the near-duplicate encode"
+        ),
+        other => panic!("expected SubscribeEvent, got {other:?}"),
+    }
+
+    // Unrelated (disjoint tokens) → cosine 0.0 < 0.5 → NOT delivered.
+    let _unrelated_id =
+        encode_and_get_id(&mut writer_client, 5, "stock market crashed hard today").await;
+    let unrelated_event = read_event_within(&mut sub_client, Duration::from_millis(800)).await;
+    assert!(
+        unrelated_event.is_none(),
+        "unrelated encode must not be delivered on a similarity subscription"
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subscribe_similar_to_bad_reference_is_rejected() {
+    let server = start_with_shards_limits_dispatcher(
+        1,
+        ConnectionLimits::default(),
+        Arc::new(BagOfWordsDispatcher),
+    )
+    .await;
+
+    let space_id = *uuid::Uuid::now_v7().as_bytes();
+    let mut client = TcpStream::connect(server.addr).await.expect("connect");
+    complete_handshake(&mut client, &server.mint(space_id)).await;
+
+    // A reference id that was never encoded → the shard resolves no
+    // vector → the subscribe is rejected with InvalidArgument.
+    let bogus_reference = u128::from_be_bytes(*uuid::Uuid::now_v7().as_bytes());
+    let sub_stream = 5u32;
+    send_frame(
+        &mut client,
+        Frame::new(
+            Opcode::SubscribeReq.as_u16(),
+            FLAG_EOS,
+            sub_stream,
+            RequestBody::Subscribe(subscribe_request(similarity_filter(
+                space_id,
+                bogus_reference,
+                0.5,
+            )))
+            .encode(),
+        ),
+    )
+    .await;
+
+    // This is the first shard interaction in the test (no prior encode
+    // warms the executor), so the reference-resolution round-trip waits
+    // on the shard's cold main-loop startup — which can exceed many seconds
+    // under full-suite CPU contention. Give it a generous window (30s) so
+    // the timeout tests rejection, not cold-start latency; the read returns
+    // the instant the error frame arrives, so a passing case isn't slowed.
+    let frame = read_event_within(&mut client, Duration::from_secs(30))
+        .await
+        .expect("expected an error frame");
+    assert_eq!(
+        frame.header.opcode_u16(),
+        Opcode::Error.as_u16(),
+        "a bad similarity reference must return an Error frame"
+    );
+    let body = ResponseBody::decode(Opcode::Error, &frame.payload).expect("decode error body");
+    match body {
+        ResponseBody::Error(e) => assert!(
+            e.message.contains("similar_to"),
+            "unexpected error message: {}",
+            e.message
+        ),
+        other => panic!("expected Error body, got {other:?}"),
+    }
 
     server.stop().await;
 }

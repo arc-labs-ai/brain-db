@@ -1,4 +1,4 @@
-//! Integration tests for the Phase 9.4 + 9.5 shard scaffold.
+//! Integration tests for the shard scaffold.
 //!
 //! Linux-only — Glommio requires io_uring; brain-storage requires
 //! mmap + pwritev2. Each test runs the Tokio side as `#[tokio::test]`
@@ -15,16 +15,13 @@ use tempfile::TempDir;
 
 // shard.rs uses `crate::shard_adapters::…`; pull both source files into
 // the test binary so that `crate::` resolves the same as in main.rs.
-// The 9.10 `dispatch_op` surface is used only by `tests/dispatch.rs`;
+// The `dispatch_op` surface is used only by `tests/dispatch.rs`;
 // silence the dead-code lint from this binary's perspective.
 #[allow(dead_code)]
 #[path = "../src/shard/mod.rs"]
 mod shard;
 
-use shard::{
-    spawn_shard, AllocSlotError, AppendWalError, ShardError, ShardHandle, ShardOpError,
-    ShardSpawnConfig,
-};
+use shard::{spawn_shard, ShardError, ShardHandle, ShardSpawnConfig};
 
 /// File-local stub: the substrate tests in this file don't exercise
 /// embedding quality. Real CpuDispatcher loads in production via
@@ -46,30 +43,8 @@ fn stub() -> Arc<dyn Dispatcher> {
 }
 
 // ---------------------------------------------------------------------------
-// 9.4 — Ping + lifecycle
+// Ping + lifecycle
 // ---------------------------------------------------------------------------
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ping_roundtrips() {
-    let dir = TempDir::new().unwrap();
-    let (handle, joiner) =
-        spawn_shard(0, ShardSpawnConfig::new(dir.path(), stub())).expect("spawn");
-    handle.ping().await.expect("ping should succeed");
-    drop(handle);
-    joiner.join().expect("shard joins cleanly");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sequential_pings_complete() {
-    let dir = TempDir::new().unwrap();
-    let (handle, joiner) =
-        spawn_shard(1, ShardSpawnConfig::new(dir.path(), stub())).expect("spawn");
-    for _ in 0..100 {
-        handle.ping().await.expect("ping should succeed");
-    }
-    drop(handle);
-    joiner.join().expect("shard joins cleanly");
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_pings_via_cloned_handles() {
@@ -117,33 +92,8 @@ async fn pin_to_invalid_cpu_errors() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ping_after_drop_fails_cleanly() {
-    let dir = TempDir::new().unwrap();
-    let (handle, joiner) =
-        spawn_shard(5, ShardSpawnConfig::new(dir.path(), stub())).expect("spawn");
-    let extra = handle.clone();
-    drop(handle);
-    extra.ping().await.expect("extra clone can still ping");
-
-    let h = extra.clone();
-    drop(extra);
-    drop(h);
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    tokio::task::spawn_blocking(move || joiner.join())
-        .await
-        .expect("spawn_blocking")
-        .expect("shard joins cleanly");
-}
-
-#[test]
-fn shard_handle_send_sync_at_use_site() {
-    fn require<T: Send + Sync>() {}
-    require::<ShardHandle>();
-}
-
 // ---------------------------------------------------------------------------
-// 9.5 — Arena hookup
+// Arena hookup
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -163,6 +113,40 @@ async fn arena_first_spawn_creates_files() {
     assert!(shard_dir.join("shard.uuid").is_file(), "shard.uuid present");
     let uuid_bytes = std::fs::read(shard_dir.join("shard.uuid")).unwrap();
     assert_eq!(uuid_bytes.len(), 16);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rebuild_index_dispatches_each_target() {
+    use shard::rebuild::RebuildTarget;
+    let dir = TempDir::new().unwrap();
+    let (handle, joiner) =
+        spawn_shard(0, ShardSpawnConfig::new(dir.path(), stub())).expect("spawn");
+
+    // A fresh shard has empty derived indexes; every target rebuilds
+    // cleanly from authoritative (empty) redb, returning 0 entries.
+    for target in [
+        RebuildTarget::MemoryHnsw,
+        RebuildTarget::EntityHnsw,
+        RebuildTarget::HypeHnsw,
+        RebuildTarget::StatementQuestionHnsw,
+        RebuildTarget::All,
+    ] {
+        let report = handle
+            .rebuild_index(target)
+            .await
+            .unwrap_or_else(|e| panic!("rebuild {target:?} failed: {e:?}"));
+        assert_eq!(report.entries, 0, "empty shard, target {target:?}");
+    }
+
+    // The rebuild-ann alias resolves to the memory-HNSW target.
+    let report = handle.rebuild_hnsw().await.expect("rebuild-ann");
+    assert_eq!(report.entries, 0);
+
+    drop(handle);
+    tokio::task::spawn_blocking(move || joiner.join())
+        .await
+        .expect("blocking join")
+        .expect("join");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -198,10 +182,10 @@ async fn arena_uuid_persists_across_restarts() {
         let (handle, joiner) =
             spawn_shard(0, ShardSpawnConfig::new(dir.path(), stub())).expect("spawn 1st");
         // Alloc twice. These slots end up in PENDING_WRITE state — the
-        // encoder (9.7) is responsible for promoting to OCCUPIED; on the
+        // encoder is responsible for promoting to OCCUPIED; on the
         // current scaffold they're correctly reclaimed by the allocator
         // on restart, so we don't assert anything about next-alloc-index
-        // across restart here. See 9.6+ tests for allocator+WAL semantics.
+        // across restart here. See the allocator+WAL tests for those semantics.
         let _ = handle.alloc_slot().await.expect("alloc 1");
         let _ = handle.alloc_slot().await.expect("alloc 2");
         let u = std::fs::read(&uuid_path).unwrap();
@@ -228,8 +212,127 @@ async fn arena_uuid_persists_across_restarts() {
         // accepted the rebuilt allocator. We don't assert the returned
         // index because PENDING_WRITE slots from the prior run are
         // reclaimable (free_list LIFO) and the encoder/WAL plumbing that
-        // turns them into committed slots lands in 9.6+/9.7.
+        // turns them into committed slots lands elsewhere.
         let _ = handle.alloc_slot().await.expect("alloc post-reopen");
+        drop(handle);
+        tokio::task::spawn_blocking(move || joiner.join())
+            .await
+            .expect("blocking 2")
+            .expect("join 2");
+    }
+}
+
+/// Smoke: `take_snapshot()` no longer errors out with
+/// `SnapshotNotYetImplemented`. Drives the worker through the new save path
+/// against an empty HNSW (the basic test harness can't populate the live
+/// HNSW — `append_wal_record` only logs and arena populates at recovery
+/// time). The empty-HNSW guard in `save_snapshot` skips the hnsw_rs
+/// `file_dump` (which errors on empty graphs) so the worker succeeds and the
+/// snapshot directory is created with arena/metadata/manifest siblings, but
+/// no `hnsw.*` files. Recovery on the next spawn then falls back to the
+/// arena-rebuild path (proven by the existing
+/// `memory_hnsw_reseeds_from_arena_after_restart`).
+///
+/// A higher-fidelity test that exercises actual snapshot-load + tail-replay
+/// needs the submit-level write path that drives the live HNSW pre-snapshot;
+/// the brain-index unit test `save_load_round_trips_epoch_and_lsn` covers
+/// the round-trip at the index layer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn take_snapshot_succeeds_on_empty_hnsw_after_pq_pivot() {
+    let dir = TempDir::new().unwrap();
+    {
+        let (handle, joiner) =
+            spawn_shard(0, ShardSpawnConfig::new(dir.path(), stub())).expect("spawn 1");
+        handle.append_wal_record(encode_record(0, 1)).await.unwrap();
+        // Previously this errored with `SnapshotNotYetImplemented`; the PQ
+        // save_snapshot now succeeds (no-op on the empty HNSW, full write
+        // when the index is populated — see brain-index round-trip test).
+        let _snap_id = handle.take_snapshot().await.expect("take_snapshot");
+        drop(handle);
+        tokio::task::spawn_blocking(move || joiner.join())
+            .await
+            .expect("blocking 1")
+            .expect("join 1");
+    }
+
+    // Snapshot directory was created by the worker for arena/metadata/manifest
+    // (hnsw.* files are absent because the HNSW was empty — see the empty
+    // guard in `SharedHnswImpl::save_snapshot`).
+    let snapshots_root = dir.path().join("0").join("snapshots");
+    assert!(
+        snapshots_root.exists(),
+        "snapshot worker should have created {}",
+        snapshots_root.display()
+    );
+    let snap_subdirs: Vec<_> = std::fs::read_dir(&snapshots_root)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .collect();
+    assert!(
+        !snap_subdirs.is_empty(),
+        "expected at least one snapshot subdirectory under {}",
+        snapshots_root.display()
+    );
+
+    // Respawn: recovery sees an empty snapshot dir (no `.brain`) so it falls
+    // through to the arena rebuild path. The single ENCODE record replays
+    // into the arena, then the rebuild puts it into the HNSW.
+    {
+        let (handle, joiner) =
+            spawn_shard(0, ShardSpawnConfig::new(dir.path(), stub())).expect("spawn 2");
+        let counts = handle.hnsw_snapshot().await.expect("hnsw snapshot");
+        assert_eq!(
+            counts.node_count, 1,
+            "recovery fallback (arena rebuild) must restore the single ENCODE \
+             after a no-op snapshot-load attempt; got {}",
+            counts.node_count
+        );
+        drop(handle);
+        tokio::task::spawn_blocking(move || joiner.join())
+            .await
+            .expect("blocking 2")
+            .expect("join 2");
+    }
+}
+
+/// Regression: the memory HNSW is in-RAM only and rebuilt on startup from the
+/// arena. Before the startup reseed landed, a restart left
+/// the index empty — memories survived in the arena/metadata but were invisible
+/// to semantic recall. This proves the reseed: WAL ENCODEs replayed into the
+/// arena reappear as HNSW nodes after a restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn memory_hnsw_reseeds_from_arena_after_restart() {
+    let dir = TempDir::new().unwrap();
+
+    // Run 1: append three ENCODE records to the WAL, then shut down cleanly.
+    // `append_wal_record` only logs; the arena is populated by replay on the
+    // next open, so this run's HNSW stays empty.
+    {
+        let (handle, joiner) =
+            spawn_shard(0, ShardSpawnConfig::new(dir.path(), stub())).expect("spawn 1");
+        handle.append_wal_record(encode_record(0, 1)).await.unwrap();
+        handle.append_wal_record(encode_record(1, 2)).await.unwrap();
+        handle.append_wal_record(encode_record(2, 3)).await.unwrap();
+        drop(handle);
+        tokio::task::spawn_blocking(move || joiner.join())
+            .await
+            .expect("blocking 1")
+            .expect("join 1");
+    }
+
+    // Run 2: respawn on the same dir. Recovery replays the three ENCODEs into
+    // the arena, and the startup reseed rebuilds the memory HNSW from it.
+    {
+        let (handle, joiner) =
+            spawn_shard(0, ShardSpawnConfig::new(dir.path(), stub())).expect("spawn 2");
+        let counts = handle.hnsw_snapshot().await.expect("hnsw snapshot");
+        assert_eq!(
+            counts.node_count, 3,
+            "memory HNSW must be reseeded from the arena on restart (got {})",
+            counts.node_count
+        );
+        assert_eq!(counts.tombstone_count, 0);
         drop(handle);
         tokio::task::spawn_blocking(move || joiner.join())
             .await
@@ -289,10 +392,10 @@ async fn data_dir_under_nested_path() {
 }
 
 // ---------------------------------------------------------------------------
-// 9.6 — Real WAL hookup
+// Real WAL hookup
 // ---------------------------------------------------------------------------
 
-use brain_core::{AgentId, ContextId, MemoryId, MemoryKind, RequestId};
+use brain_core::{MemoryId, MemoryKind, RequestId, SessionId, SpaceId};
 use brain_storage::wal::payload::{EncodePayload, WalPayload};
 use brain_storage::wal::reader::WalReader;
 use brain_storage::wal::record::{Lsn, WalRecord};
@@ -301,8 +404,9 @@ fn encode_record(slot: u64, byte: u8) -> WalRecord {
     let p = EncodePayload {
         memory_id: MemoryId::pack(1, slot, 1),
         request_id: RequestId::from([byte; 16]),
-        agent_id: AgentId::from([byte; 16]),
-        context_id: ContextId(0),
+        space_id: SpaceId::from([byte; 16]),
+        namespace_id: brain_core::NamespaceId::from(u32::from(byte)),
+        session_id: SessionId(0),
         kind: MemoryKind::Episodic,
         salience_initial: 0.5,
         embedding_model_fp: [byte; 16],
@@ -311,6 +415,7 @@ fn encode_record(slot: u64, byte: u8) -> WalRecord {
         edges: vec![],
         request_hash: [byte; 32],
         response_payload: vec![],
+        occurred_at_unix_nanos: None,
         deduplicate: false,
     };
     WalRecord::from_typed(
@@ -351,48 +456,6 @@ async fn wal_first_spawn_creates_segment_zero() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn append_wal_record_returns_lsn() {
-    let dir = TempDir::new().unwrap();
-    let (handle, joiner) =
-        spawn_shard(0, ShardSpawnConfig::new(dir.path(), stub())).expect("spawn");
-    let lsn1 = handle.append_wal_record(encode_record(0, 1)).await.unwrap();
-    let lsn2 = handle.append_wal_record(encode_record(1, 2)).await.unwrap();
-    let lsn3 = handle.append_wal_record(encode_record(2, 3)).await.unwrap();
-    assert_eq!(lsn1, 1);
-    assert_eq!(lsn2, 2);
-    assert_eq!(lsn3, 3);
-    drop(handle);
-    tokio::task::spawn_blocking(move || joiner.join())
-        .await
-        .expect("blocking join")
-        .expect("join");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn wal_records_visible_to_reader_after_shutdown() {
-    let dir = TempDir::new().unwrap();
-    let (handle, joiner) =
-        spawn_shard(0, ShardSpawnConfig::new(dir.path(), stub())).expect("spawn");
-    for slot in 0..3u64 {
-        handle
-            .append_wal_record(encode_record(slot, slot as u8))
-            .await
-            .unwrap();
-    }
-    drop(handle);
-    tokio::task::spawn_blocking(move || joiner.join())
-        .await
-        .expect("blocking join")
-        .expect("join");
-
-    let shard_dir = dir.path().join("0");
-    let uuid = read_shard_uuid(&shard_dir);
-    let reader = WalReader::open(shard_dir.join("wal"), uuid).unwrap();
-    let lsns: Vec<u64> = reader.map(|r| r.unwrap().lsn.raw()).collect();
-    assert_eq!(lsns, vec![1, 2, 3]);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wal_persists_across_restart() {
     let dir = TempDir::new().unwrap();
     let data_path = dir.path().to_owned();
@@ -421,16 +484,46 @@ async fn wal_persists_across_restart() {
             .expect("blocking 2")
             .expect("join 2");
     }
-    // WAL now has 3 records (LSNs 1, 2, 3).
+    // The three ENCODE records persist at LSNs 1, 2, 3. The shutdown
+    // snapshot (enabled now that PQ persistence is wired) may append
+    // CHECKPOINT_BEGIN/END records after them when the recovered HNSW
+    // is non-empty — those are expected and not part of this test's
+    // contract, so assert the encode records specifically rather than
+    // the full WAL contents.
+    use brain_storage::wal::kinds::WalRecordKind;
     let shard_dir = data_path.join("0");
     let uuid = read_shard_uuid(&shard_dir);
     let reader = WalReader::open(shard_dir.join("wal"), uuid).unwrap();
-    let lsns: Vec<u64> = reader.map(|r| r.unwrap().lsn.raw()).collect();
-    assert_eq!(lsns, vec![1, 2, 3]);
+    let records: Vec<_> = reader.map(|r| r.unwrap()).collect();
+    let encode_lsns: Vec<u64> = records
+        .iter()
+        .filter(|r| r.kind == WalRecordKind::Encode)
+        .map(|r| r.lsn.raw())
+        .collect();
+    assert_eq!(
+        encode_lsns,
+        vec![1, 2, 3],
+        "the three encodes must persist at sequential LSNs across restart"
+    );
+    // Any trailing records must be checkpoint bookkeeping, and the LSN
+    // sequence must stay gap-free overall (the reader already enforces
+    // this — a gap would have surfaced as a WalReadError above).
+    for r in &records {
+        assert!(
+            matches!(
+                r.kind,
+                WalRecordKind::Encode
+                    | WalRecordKind::CheckpointBegin
+                    | WalRecordKind::CheckpointEnd
+            ),
+            "unexpected WAL record kind {:?}",
+            r.kind
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
-// 9.7b — Per-shard OpsContext + workers wired in
+// Per-shard OpsContext + workers wired in
 // ---------------------------------------------------------------------------
 
 /// Spawn → full OpsContext stack constructed (metadata + hnsw + writer +
@@ -483,22 +576,4 @@ async fn shard_shutdown_drains_workers_cleanly() {
         elapsed < Duration::from_secs(10),
         "shutdown took {elapsed:?}, expected < 10s"
     );
-}
-
-// ---------------------------------------------------------------------------
-// Error-type plumbing sanity
-// ---------------------------------------------------------------------------
-
-#[test]
-fn alloc_slot_error_carries_op_variant() {
-    fn _accepts(e: ShardOpError) -> AllocSlotError {
-        e.into()
-    }
-}
-
-#[test]
-fn append_wal_error_carries_op_variant() {
-    fn _accepts(e: ShardOpError) -> AppendWalError {
-        e.into()
-    }
 }

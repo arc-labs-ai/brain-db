@@ -1,7 +1,5 @@
 //! Arena slot byte layout.
 //!
-//! Layout per `spec/08_storage/02_arena_layout.md` §§3–4:
-//!
 //! ```text
 //! Slot (1600 bytes, 64-byte aligned):
 //!    0..1536    vector       384 × f32 LE
@@ -19,24 +17,22 @@
 //!
 //! ## CRC coverage
 //!
-//! 2 prints "metadata bytes [0..36]" but byte 36 splits the
-//! `last_modified_at` u64 (which spans 32..40). Almost certainly a typo.
-//! We cover `[0..40]` of the metadata — every field before
-//! `metadata_crc32c` itself — plus the 1536 vector bytes. This matches the
-//! more general "CRC excludes only itself + reserved" pattern used
-//! elsewhere in the spec (e.g. arena header, WAL record footer).
+//! Byte 36 would split the `last_modified_at` u64 (which spans 32..40),
+//! so we cover `[0..40]` of the metadata — every field before
+//! `metadata_crc32c` itself — plus the 1536 vector bytes. This follows
+//! the general "CRC excludes only itself + reserved" pattern used
+//! elsewhere (arena header, WAL record footer).
 //!
 //! ## What's *not* in SlotMeta
 //!
-//! `agent_id`, `context_id`, `kind`, `salience`, and `text` live in the
+//! `space_id`, `session_id`, `kind`, `salience`, and `text` live in the
 //! metadata store (redb), not the arena. The arena holds the vector and
 //! the bookkeeping needed to validate it (version, flags, fp, timestamps,
-//! CRC). The phase doc's task-2.3 sketch lists agent/context/kind/salience
-//! as slot fields — that's at odds with the spec; the spec wins.
+//! CRC).
 //!
 //! ## What's *not* enforced here
 //!
-//! - **Vector finiteness / L2 norm** (1). Bytemuck::Pod admits any
+//! - **Vector finiteness / L2 norm.** Bytemuck::Pod admits any
 //!   bit pattern; finite/normalized validation is a separate helper added
 //!   alongside the encode path.
 //! - **CRC freshness on read.** Computing `metadata_crc32c` on every read
@@ -51,7 +47,7 @@ pub const VECTOR_DIM: usize = 384;
 /// Vector size in bytes (`VECTOR_DIM * 4`).
 pub const VECTOR_BYTES: usize = VECTOR_DIM * size_of::<f32>();
 
-/// Slot metadata size in bytes (2).
+/// Slot metadata size in bytes.
 pub const META_BYTES: usize = 64;
 
 /// Total slot size in bytes.
@@ -241,7 +237,7 @@ mod tests {
 
     #[test]
     fn reserved_mask_covers_high_bits() {
-        // Bits 0..=3 are spec'd; bits 4..=31 are reserved.
+        // Bits 0..=3 are defined; bits 4..=31 are reserved.
         assert_eq!(flags::RESERVED_MASK & 0xFu32, 0);
         assert_eq!(flags::RESERVED_MASK | 0xFu32, u32::MAX);
     }
@@ -369,7 +365,7 @@ mod tests {
     // proptest's failure-persistence loader calls `std::env::current_dir`,
     // which miri's default isolation mode disallows. Gate the proptest
     // block (the rest of this module's tests are pure-data and run under
-    // miri). See `.claude/plans/phase-02-miri.md`.
+    // miri).
     #[cfg(not(miri))]
     proptest! {
         #[test]

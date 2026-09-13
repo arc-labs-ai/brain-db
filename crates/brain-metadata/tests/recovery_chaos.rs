@@ -1,4 +1,4 @@
-//! Chaos tests for Phase C — recovery of typed-relation payloads
+//! Chaos tests for recovery of typed-relation payloads
 //! under partial WAL writes, replay idempotency, and corruption
 //! diagnostics on a tombstone without its sidecar.
 //!
@@ -11,8 +11,8 @@ use std::fs::OpenOptions;
 use std::path::PathBuf;
 
 use brain_core::{
-    AgentId, ContextId, EdgeKind, EdgeKindRef, EdgeOrigin, EntityId, MemoryId, MemoryKind, NodeRef,
-    RelationId, RelationTypeId, RequestId,
+    EdgeKind, EdgeKindRef, EdgeOrigin, EntityId, MemoryId, MemoryKind, NodeRef, RelationId,
+    RelationTypeId, RequestId, SessionId, SpaceId,
 };
 use brain_metadata::tables::edge::EDGES_TABLE;
 use brain_metadata::tables::memory::MEMORIES_TABLE;
@@ -104,7 +104,7 @@ fn mid(slot: u64, version: u32) -> MemoryId {
     MemoryId::pack(1, slot, version)
 }
 
-fn aid(byte: u8) -> AgentId {
+fn aid(byte: u8) -> SpaceId {
     let mut b = [0u8; 16];
     b[15] = byte;
     b.into()
@@ -133,8 +133,9 @@ fn encode_payload(slot: u64, byte: u8) -> EncodePayload {
     EncodePayload {
         memory_id: mid(slot, 1),
         request_id: rid(byte),
-        agent_id: aid(byte),
-        context_id: ContextId(42),
+        space_id: aid(byte),
+        namespace_id: brain_core::NamespaceId::from(u32::from(byte)),
+        session_id: SessionId(42),
         kind: MemoryKind::Episodic,
         salience_initial: 0.5,
         embedding_model_fp: [byte; 16],
@@ -144,6 +145,7 @@ fn encode_payload(slot: u64, byte: u8) -> EncodePayload {
         request_hash: [byte; 32],
         response_payload: vec![],
         deduplicate: false,
+        occurred_at_unix_nanos: None,
     }
 }
 
@@ -162,7 +164,10 @@ fn sample_relation_link(rid_byte: u8) -> RelationLinkPayload {
         extractor_id: 3,
         is_symmetric: false,
         properties_blob: vec![0xDE, 0xAD, 0xBE, 0xEF],
-        agent_id: aid(7),
+        space_id: aid(7),
+        namespace_id: brain_core::NamespaceId::from(7),
+        session_id: brain_core::SessionId::DEFAULT,
+        relation_type_intern_hint: None,
     }
 }
 
@@ -412,7 +417,7 @@ fn tombstone_without_sidecar_errors_as_corruption() {
             relation_id: ghost,
             reason: "no prior create".into(),
             at_unix_nanos: T0,
-            agent_id: aid(0xAA),
+            space_id: aid(0xAA),
         }),
         T0,
     )]);

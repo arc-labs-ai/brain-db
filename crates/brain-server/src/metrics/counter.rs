@@ -1,8 +1,8 @@
 //! Monotonic counter primitive — `AtomicU64` under the hood.
 //!
-//! Counters never decrease. Reset only happens on process restart (spec
-//! §14/01 §11 acknowledges this; PromQL `rate()` handles resets via
-//! Prometheus' counter-reset detection).
+//! Counters never decrease. Reset only happens on process restart;
+//! PromQL `rate()` handles resets via
+//! Prometheus' counter-reset detection.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 

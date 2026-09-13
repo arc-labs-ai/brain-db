@@ -1,16 +1,16 @@
-//! Unit tests for tantivy recovery (phase 22.7).
+//! Unit tests for tantivy recovery.
 
 use std::fs;
 
+use brain_core::{Entity, EntityId, EntityTypeId};
 use brain_core::{
     EvidenceRef, Statement, StatementKind, StatementObject, StatementValue, SubjectRef,
 };
-use brain_core::{Entity, EntityId, EntityTypeId};
 use brain_core::{ExtractorId, PredicateId, StatementId};
 use brain_index::{IndexStatus, TantivyShard};
 use brain_metadata::entity::ops::entity_put;
 use brain_metadata::entity::types::entity_type_intern;
-use brain_metadata::schema::predicate::predicate_intern;
+use brain_metadata::schema::predicate::predicate_intern_or_get;
 use brain_metadata::statement::statement_create;
 use brain_metadata::MetadataDb;
 use tempfile::TempDir;
@@ -77,7 +77,7 @@ fn recover_with_version_mismatch_rebuilds() {
     let _ = TantivyShard::open(dir.path()).expect("first open");
 
     // Stamp a stale payload directly into meta.json (matches the
-    // 22.1 version-mismatch test pattern).
+    // version-mismatch test pattern).
     let meta_path = dir.path().join("memory_text.tantivy").join("meta.json");
     let raw = fs::read_to_string(&meta_path).expect("read meta");
     let mut json: serde_json::Value = serde_json::from_str(&raw).expect("parse");
@@ -99,7 +99,7 @@ fn recover_with_version_mismatch_rebuilds() {
 
 #[test]
 fn recover_rebuilds_statements_with_join() {
-    let (dir, mut metadata) = fresh();
+    let (dir, metadata) = fresh();
 
     // Set up entity + predicate + statement.
     let type_id: EntityTypeId = {
@@ -113,13 +113,12 @@ fn recover_rebuilds_statements_with_join() {
     {
         let entity = Entity::new_active(alice, type_id, "Alice".into(), "alice".into(), 0);
         let wtxn = metadata.write_txn().expect("wtxn");
-        entity_put(&wtxn, &entity).expect("entity_put");
+        entity_put(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &entity).expect("entity_put");
         wtxn.commit().expect("commit");
     }
     let pred: PredicateId = {
         let wtxn = metadata.write_txn().expect("wtxn");
-        let id =
-            predicate_intern(&wtxn, "brain", "knows", None, 0, 1, "", false, 0).expect("predicate");
+        let id = predicate_intern_or_get(&wtxn, "brain", "knows", 0, 0).expect("predicate");
         wtxn.commit().expect("commit");
         id
     };
@@ -137,7 +136,8 @@ fn recover_rebuilds_statements_with_join() {
             1,
         );
         let wtxn = metadata.write_txn().expect("wtxn");
-        let id = statement_create(&wtxn, &stmt, 0).expect("create");
+        let id = statement_create(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &stmt, 0)
+            .expect("create");
         wtxn.commit().expect("commit");
         id
     };
@@ -178,4 +178,8 @@ fn recover_rebuilds_statements_with_join() {
         1,
         "post-recovery statements must contain the row"
     );
+}
+
+fn __ts() -> brain_metadata::RowScope {
+    brain_metadata::RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xA1; 16])
 }

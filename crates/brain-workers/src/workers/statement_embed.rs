@@ -7,8 +7,8 @@
 //! `Both` modes, but until this worker landed there was no producer:
 //! statements were committed to redb by the extractor pipeline and
 //! nothing ever added their embeddings to the HNSW. As a result the
-//! hybrid query path's statement-corpus semantic retriever returned
-//! zero hits and hybrid recall over statements degenerated to BM25 +
+//! retrieval query path's statement-corpus semantic retriever returned
+//! zero hits and retrieval recall over statements degenerated to BM25 +
 //! graph only — the single biggest gap on the Recall@10 path.
 //!
 //! ## Flow
@@ -16,7 +16,7 @@
 //! 1. `statement_create` / `statement_supersede` insert a row into the
 //!    `STATEMENT_EMBED_QUEUE_TABLE` redb table inside the same write
 //!    txn that lands the statement (see
-//!    [`brain_metadata::statement::crud::insert_new_statement`]). The
+//!    `brain_metadata::statement::crud::insert_new_statement`). The
 //!    queue is durable so a shard restart between the extractor commit
 //!    and the worker drain doesn't lose embeddings.
 //! 2. Every `interval` (default 1 s) the worker reads up to
@@ -43,18 +43,22 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
 
-use brain_core::{Statement, StatementObject, StatementValue, SubjectRef};
 use brain_core::StatementId;
+use brain_core::{Slot, Statement, StatementKind, StatementObject, StatementValue, SubjectRef};
 use brain_embed::Dispatcher;
 use brain_index::statement_hnsw::StatementHnswIndex;
+use brain_index::statement_question_hnsw::StatementQuestionHnswIndex;
 use brain_metadata::entity::ops::entity_get;
 use brain_metadata::schema::predicate::predicate_get;
 use brain_metadata::statement::{
     statement_embed_queue_peek, statement_embed_queue_remove_many, statement_get,
 };
+use brain_metadata::statement_question::ops::{
+    statement_question_has_vectors, statement_question_put,
+};
 use brain_metadata::MetadataDb;
 use brain_ops::StatementEmbedMetrics;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 
 use crate::config::{WorkerConfig, WorkerKind};
 use crate::context::WorkerContext;
@@ -94,10 +98,17 @@ impl Default for StatementEmbedKnobs {
 pub struct StatementEmbedWorker {
     config: WorkerConfig,
     knobs: StatementEmbedKnobs,
-    metadata: Arc<Mutex<MetadataDb>>,
+    metadata: Arc<MetadataDb>,
     statement_hnsw: Arc<RwLock<StatementHnswIndex>>,
     embedder: Arc<dyn Dispatcher>,
     metrics: Option<Arc<StatementEmbedMetrics>>,
+    /// Optional per-statement question-bridge index. When wired (the shard
+    /// constructs it only when the bridge capability is enabled), each
+    /// eligible statement also gets a few templated questions embedded into
+    /// this pool — the per-statement analogue of HyPE. `None` leaves the
+    /// worker doing exactly its original statement-embed work (zero extra
+    /// cost on the default path).
+    question_bridge: Option<Arc<RwLock<StatementQuestionHnswIndex>>>,
 }
 
 impl StatementEmbedWorker {
@@ -106,7 +117,7 @@ impl StatementEmbedWorker {
     /// `SemanticRetriever` and the extractor worker.
     #[must_use]
     pub fn new(
-        metadata: Arc<Mutex<MetadataDb>>,
+        metadata: Arc<MetadataDb>,
         statement_hnsw: Arc<RwLock<StatementHnswIndex>>,
         embedder: Arc<dyn Dispatcher>,
     ) -> Self {
@@ -117,7 +128,17 @@ impl StatementEmbedWorker {
             statement_hnsw,
             embedder,
             metrics: None,
+            question_bridge: None,
         }
+    }
+
+    /// Wire the per-statement question-bridge index. When set, each tick also
+    /// generates + embeds templated questions for the eligible statements it
+    /// processes, idempotent on the statement's own stored question vectors.
+    #[must_use]
+    pub fn with_question_bridge(mut self, bridge: Arc<RwLock<StatementQuestionHnswIndex>>) -> Self {
+        self.question_bridge = Some(bridge);
+        self
     }
 
     #[must_use]
@@ -148,8 +169,8 @@ impl StatementEmbedWorker {
 
         // 1. Snapshot the queue head.
         let pending: Vec<StatementId> = {
-            let db = self.metadata.lock();
-            let rtxn = db
+            let rtxn = self
+                .metadata
                 .read_txn()
                 .map_err(|e| WorkerError::Internal(format!("read_txn: {e}")))?;
             statement_embed_queue_peek(&rtxn, self.knobs.max_per_tick)
@@ -174,8 +195,8 @@ impl StatementEmbedWorker {
         let mut already_in_hnsw: Vec<StatementId> = Vec::new();
         let mut to_drop: Vec<StatementId> = Vec::new();
         {
-            let db = self.metadata.lock();
-            let rtxn = db
+            let rtxn = self
+                .metadata
                 .read_txn()
                 .map_err(|e| WorkerError::Internal(format!("read_txn: {e}")))?;
             let hnsw = self.statement_hnsw.read();
@@ -288,14 +309,30 @@ impl StatementEmbedWorker {
             removable.extend_from_slice(&embedded);
             removable.extend_from_slice(&already_in_hnsw);
             removable.extend_from_slice(&to_drop);
-            let mut db = self.metadata.lock();
-            let wtxn = db
+            let wtxn = self
+                .metadata
                 .write_txn()
                 .map_err(|e| WorkerError::Internal(format!("write_txn: {e}")))?;
             statement_embed_queue_remove_many(&wtxn, &removable)
                 .map_err(|e| WorkerError::Internal(format!("queue remove: {e}")))?;
             wtxn.commit()
                 .map_err(|e| WorkerError::Internal(format!("queue commit: {e}")))?;
+        }
+
+        // 5. Per-statement question bridge (best-effort, only when wired).
+        //    Generates a few templated questions per eligible statement and
+        //    embeds them into the question-bridge pool, idempotent on the
+        //    statement's own stored question vectors. A failure here never
+        //    fails the tick — the bridge is read-time enrichment, not the
+        //    durable statement embed.
+        if self.question_bridge.is_some() {
+            if let Err(e) = self.embed_question_bridge(&pending, ctx) {
+                tracing::warn!(
+                    target: "brain_workers::statement_embed",
+                    error = %e,
+                    "question-bridge generation failed this tick; will retry on next ingest",
+                );
+            }
         }
 
         if let Some(m) = &self.metrics {
@@ -305,6 +342,102 @@ impl StatementEmbedWorker {
         }
 
         Ok(embedded.len() + already_in_hnsw.len() + to_drop.len())
+    }
+
+    /// Generate + embed + persist templated questions for the eligible
+    /// statements in `pending`, skipping any that already own question
+    /// vectors. Inserts the vectors into the bridge HNSW and persists them to
+    /// the `statement_question_vectors` table so a restart rebuilds without
+    /// re-embedding.
+    fn embed_question_bridge(
+        &self,
+        pending: &[StatementId],
+        ctx: &WorkerContext,
+    ) -> Result<(), WorkerError> {
+        let Some(bridge) = self.question_bridge.as_ref() else {
+            return Ok(());
+        };
+
+        // Render questions for statements that lack them. Each question is
+        // tagged with the reified-fact slot it leaves unbound (Object / Subject
+        // / Time) so a read-time hit projects the matched slot's value.
+        let mut to_generate: Vec<(StatementId, Vec<(Slot, String)>)> = Vec::new();
+        {
+            let rtxn = self
+                .metadata
+                .read_txn()
+                .map_err(|e| WorkerError::Internal(format!("read_txn: {e}")))?;
+            for &id in pending {
+                if ctx.is_shutdown() {
+                    break;
+                }
+                if statement_question_has_vectors(&rtxn, id)
+                    .map_err(|e| WorkerError::Internal(format!("has_question_vectors: {e}")))?
+                {
+                    continue;
+                }
+                let Some(statement) = statement_get(&rtxn, id)
+                    .map_err(|e| WorkerError::Internal(format!("statement_get: {e}")))?
+                else {
+                    continue;
+                };
+                if !is_eligible_for_embedding(&statement) {
+                    continue;
+                }
+                let questions = render_bridge_questions(&rtxn, &statement);
+                if !questions.is_empty() {
+                    to_generate.push((id, questions));
+                }
+            }
+        }
+        if to_generate.is_empty() {
+            return Ok(());
+        }
+
+        // Embed every question (one flat batch), then insert + persist per
+        // statement. `u8` index caps a statement at 256 questions; we generate
+        // a handful, so the cast is safe.
+        for (id, questions) in to_generate {
+            if ctx.is_shutdown() {
+                break;
+            }
+            let refs: Vec<&str> = questions.iter().map(|(_, q)| q.as_str()).collect();
+            let vectors = match self.embedder.embed_batch(&refs) {
+                Ok(v) if v.len() == refs.len() => v,
+                Ok(_) => continue,
+                Err(e) => {
+                    tracing::debug!(
+                        target: "brain_workers::statement_embed",
+                        statement_id = ?id,
+                        error = %e,
+                        "question-bridge embed failed for statement; skipping",
+                    );
+                    continue;
+                }
+            };
+            {
+                let mut idx = bridge.write();
+                // Insert each question under the slot it leaves unbound, so a
+                // read-time hit knows exactly which slot to project.
+                for ((slot, _q), v) in questions.iter().zip(&vectors) {
+                    idx.insert(id, *slot, v);
+                }
+            }
+            let wtxn = self
+                .metadata
+                .write_txn()
+                .map_err(|e| WorkerError::Internal(format!("write_txn: {e}")))?;
+            for (i, ((slot, _q), v)) in questions.iter().zip(&vectors).enumerate() {
+                let qi = u8::try_from(i).unwrap_or(u8::MAX);
+                // Persist the (question_index, slot, vector) triple so a restart
+                // rebuilds the slot-tagged index without re-embedding.
+                statement_question_put(&wtxn, id, qi, *slot, v)
+                    .map_err(|e| WorkerError::Internal(format!("question_put: {e}")))?;
+            }
+            wtxn.commit()
+                .map_err(|e| WorkerError::Internal(format!("question commit: {e}")))?;
+        }
+        Ok(())
     }
 }
 
@@ -370,13 +503,8 @@ fn render_embed_text(rtxn: &redb::ReadTransaction, s: &Statement) -> Result<Stri
         .ok_or("predicate missing")?;
     // The qname's namespace prefix carries no semantic signal for an
     // embedding model — "brain:" or "user_ns:" are bookkeeping. Use
-    // only the predicate name (and the original qname if the row
-    // landed on a wildcard sink).
-    let predicate_text = s
-        .original_predicate_qname
-        .as_deref()
-        .map(|qn| qn.rsplit(':').next().unwrap_or(qn))
-        .unwrap_or(&predicate.name);
+    // only the predicate name.
+    let predicate_text = predicate.name.as_str();
 
     let object_text = match &s.object {
         StatementObject::Entity(eid) => {
@@ -394,6 +522,94 @@ fn render_embed_text(rtxn: &redb::ReadTransaction, s: &Statement) -> Result<Stri
         "{} {} {}",
         subject_entity.canonical_name, predicate_text, object_text
     ))
+}
+
+/// Render a few templated questions whose answer is this statement — the
+/// zero-LLM per-statement question bridge — one question PER FILLED SLOT of the
+/// reified fact, each tagged with the [`Slot`] it leaves unbound.
+///
+/// A statement is a slotted record `(subject, predicate, object, time)`. A
+/// bridge question is generated by omitting exactly one slot, so the omitted
+/// slot is known by construction — no interrogative-word heuristics. At read
+/// time a hit's slot tells the reader which slot to project:
+///   - **Object** (always): "what is {subject}'s {predicate}?" — the object is
+///     the unbound slot, answered by the stored object.
+///   - **Subject** (when the object renders to natural text): "who {predicate}
+///     {object}?" — the subject is unbound, answered by the subject entity.
+///   - **Time** (for any `kind == Event`, with or without a distinct
+///     `event_at_unix_nanos`): "when did {subject} {predicate}?" — the time is
+///     unbound, answered by the statement's event time when present, else the
+///     evidence memory's `occurred_at`.
+///
+/// Each question embeds the FULL surface (subject name + predicate words + when
+/// present the object), never a bare predicate name, so the embedding is
+/// discriminative and avoids the short-name cosine trap. Returns empty when the
+/// subject entity or predicate can't be resolved (the statement then simply
+/// contributes no bridge questions).
+fn render_bridge_questions(rtxn: &redb::ReadTransaction, s: &Statement) -> Vec<(Slot, String)> {
+    let SubjectRef::Entity(subject_id) = s.subject else {
+        return Vec::new();
+    };
+    let Some(subject) = entity_get(rtxn, subject_id).ok().flatten() else {
+        return Vec::new();
+    };
+    let Some(predicate) = predicate_get(rtxn, s.predicate).ok().flatten() else {
+        return Vec::new();
+    };
+    let subj = subject.canonical_name;
+    // Predicate names are snake/compound; render as spaced words so the
+    // question reads naturally ("works_at" → "works at").
+    let pred = predicate.name.replace(['_', '-'], " ");
+    let pred = pred.trim();
+    if subj.trim().is_empty() || pred.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out: Vec<(Slot, String)> = Vec::new();
+    // Object slot — always. Same surface as the original object-only bridge.
+    out.push((Slot::Object, format!("what is {subj}'s {pred}?")));
+    out.push((Slot::Object, format!("what {pred} does {subj} have?")));
+    out.push((Slot::Object, format!("{subj} {pred}")));
+
+    // Subject slot — only when the object renders to a natural surface (an
+    // entity name or a literal value). A memory/statement-ref object has no
+    // readable surface, so the "who … {object}?" question would be nonsense.
+    if let Some(obj) = render_object_text(rtxn, &s.object) {
+        let obj = obj.trim();
+        if !obj.is_empty() {
+            out.push((Slot::Subject, format!("who {pred} {obj}?")));
+        }
+    }
+
+    // Time slot — for ANY Event, whether or not it carries a distinct
+    // `event_at_unix_nanos`. An Event temporally happened, so "when did S P?" is
+    // always a meaningful question: the reader answers it from the statement's
+    // own `event_at` when present, else falls back to the evidence memory's
+    // `occurred_at`. Gating on `event_at.is_some()` would leave every dateless
+    // action (the common case for extracted actions) with no "when" bridge and
+    // therefore unanswerable to a temporal cue. A non-Event fact has no
+    // occurrence time, so it contributes no Time question.
+    if s.kind == StatementKind::Event {
+        out.push((Slot::Time, format!("when did {subj} {pred}?")));
+    }
+
+    out
+}
+
+/// Render a statement object to natural text for a bridge question, or `None`
+/// when it has no readable surface (a memory/statement reference). Reuses the
+/// same entity-name / value rendering as the durable statement-embed text so
+/// the subject-slot question reads the object the same way the object-slot
+/// question reads the subject.
+fn render_object_text(rtxn: &redb::ReadTransaction, object: &StatementObject) -> Option<String> {
+    match object {
+        StatementObject::Entity(eid) => entity_get(rtxn, *eid)
+            .ok()
+            .flatten()
+            .map(|e| e.canonical_name),
+        StatementObject::Value(v) => Some(render_value(v)),
+        StatementObject::Memory(_) | StatementObject::Statement(_) => None,
+    }
 }
 
 fn render_value(v: &StatementValue) -> String {
@@ -425,11 +641,15 @@ fn uuid_hex(bytes: &[u8; 16]) -> String {
 // ---------------------------------------------------------------------------
 
 #[cfg(all(test, not(miri)))]
-#[allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send post-9.7 (audit §4)
+#[allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send
 mod tests {
+    fn __ts() -> brain_metadata::RowScope {
+        brain_metadata::RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xA1; 16])
+    }
+
     use super::*;
     use brain_core::{Entity, EntityType, EvidenceEntry, EvidenceRef};
-    use brain_core::{ContextId, EntityId, ExtractorId, MemoryId, PredicateId, StatementKind};
+    use brain_core::{EntityId, ExtractorId, MemoryId, PredicateId, SessionId, StatementKind};
     use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
     use brain_index::statement_hnsw::StatementHnswParams;
     use brain_index::{IndexParams, SharedHnsw};
@@ -438,7 +658,7 @@ mod tests {
     use brain_metadata::statement::{statement_create, statement_tombstone};
     use brain_metadata::tables::statement::STATEMENT_EMBED_QUEUE_TABLE;
     use brain_metadata::MetadataDb;
-    use brain_ops::{OpsContext, RealWriterHandle};
+    use brain_ops::RealWriterHandle;
     use brain_planner::{ExecutorContext, WriterHandle};
     use redb::ReadableTableMetadata;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -499,14 +719,14 @@ mod tests {
 
     struct Fixture {
         _dir: tempfile::TempDir,
-        metadata: Arc<Mutex<MetadataDb>>,
+        metadata: Arc<MetadataDb>,
         hnsw: Arc<RwLock<StatementHnswIndex>>,
         dispatcher: Arc<HashDispatcher>,
         worker_ctx: WorkerContext,
     }
 
     fn build_worker_ctx(
-        metadata: Arc<Mutex<MetadataDb>>,
+        metadata: Arc<MetadataDb>,
         dispatcher: Arc<dyn Dispatcher>,
     ) -> WorkerContext {
         // The StatementEmbedWorker only reads `ctx.is_shutdown()`; the
@@ -515,11 +735,11 @@ mod tests {
         // to satisfy WorkerContext's shape — mirrors the decay /
         // consolidation integration-test fixtures.
         let (shared, hnsw_writer) =
-            SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).expect("SharedHnsw::new");
+            SharedHnsw::new(IndexParams::default_v1()).expect("SharedHnsw::new");
         let writer: Arc<dyn WriterHandle> =
             Arc::new(RealWriterHandle::new(metadata.clone(), hnsw_writer));
         let executor = ExecutorContext::new(dispatcher, shared, metadata, writer);
-        let ops = Arc::new(OpsContext::new(executor));
+        let ops = Arc::new(brain_ops::test_support::ops_context_for_tests_owning_tempdir(executor));
         WorkerContext {
             ops,
             shutdown: Arc::new(AtomicBool::new(false)),
@@ -529,7 +749,7 @@ mod tests {
     fn fixture() -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let metadata = MetadataDb::open(dir.path().join("test.redb")).expect("open metadata");
-        let metadata = Arc::new(Mutex::new(metadata));
+        let metadata = Arc::new(metadata);
         let hnsw = Arc::new(RwLock::new(
             StatementHnswIndex::new(StatementHnswParams::default_v1()).unwrap(),
         ));
@@ -550,14 +770,15 @@ mod tests {
 
     /// Seed a single Fact statement with a Person subject + object and
     /// an `is_stateful = false` predicate. Returns the StatementId.
-    fn seed_statement(metadata: &Arc<Mutex<MetadataDb>>, n: u8) -> StatementId {
-        let mut db = metadata.lock();
-        let wtxn = db.write_txn().unwrap();
+    fn seed_statement(metadata: &Arc<MetadataDb>, n: u8) -> StatementId {
+        let wtxn = metadata.write_txn().unwrap();
 
         let subj_id = EntityId::new();
         let obj_id = EntityId::new();
         entity_put(
             &wtxn,
+            __ts(),
+            brain_core::SessionId::DEFAULT,
             &Entity::new_active(
                 subj_id,
                 EntityType::PERSON_ID,
@@ -569,6 +790,8 @@ mod tests {
         .unwrap();
         entity_put(
             &wtxn,
+            __ts(),
+            brain_core::SessionId::DEFAULT,
             &Entity::new_active(
                 obj_id,
                 EntityType::PERSON_ID,
@@ -587,7 +810,7 @@ mod tests {
 
         let stmt_id = StatementId::new();
         let evidence = EvidenceRef::inline_from_slice(&[EvidenceEntry::from_parts(
-            MemoryId::pack(1, ContextId::DEFAULT.into(), 0),
+            MemoryId::pack(1, SessionId::DEFAULT.into(), 0),
             0.9,
             now(),
             ExtractorId::from(0),
@@ -605,19 +828,15 @@ mod tests {
             1,
         );
 
-        let id = statement_create(&wtxn, &s, now()).unwrap();
+        let id =
+            statement_create(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &s, now()).unwrap();
         wtxn.commit().unwrap();
         id
     }
 
-    fn queue_len(metadata: &Arc<Mutex<MetadataDb>>) -> u64 {
-        let db = metadata.lock();
-        let rtxn = db.read_txn().unwrap();
-        let t = match rtxn.open_table(STATEMENT_EMBED_QUEUE_TABLE) {
-            Ok(t) => t,
-            Err(redb::TableError::TableDoesNotExist(_)) => return 0,
-            Err(e) => panic!("open queue: {e}"),
-        };
+    fn queue_len(metadata: &Arc<MetadataDb>) -> u64 {
+        let rtxn = metadata.read_txn().unwrap();
+        let t = rtxn.open_table(STATEMENT_EMBED_QUEUE_TABLE).unwrap();
         t.len().unwrap()
     }
 
@@ -651,6 +870,193 @@ mod tests {
         s.superseded_by = None;
         s.subject = SubjectRef::Pending(brain_core::AuditId::new());
         assert!(!is_eligible_for_embedding(&s));
+    }
+
+    /// Seed an entity-subject statement with an entity object and an optional
+    /// `event_at`, returning its id. Used to drive `render_bridge_questions`
+    /// against real entity/predicate rows.
+    fn seed_event_statement(
+        metadata: &Arc<MetadataDb>,
+        n: u8,
+        event_at: Option<u64>,
+    ) -> StatementId {
+        let wtxn = metadata.write_txn().unwrap();
+        let subj_id = EntityId::new();
+        let obj_id = EntityId::new();
+        entity_put(
+            &wtxn,
+            __ts(),
+            brain_core::SessionId::DEFAULT,
+            &Entity::new_active(
+                subj_id,
+                EntityType::PERSON_ID,
+                format!("Melanie{n}"),
+                format!("melanie{n}"),
+                now(),
+            ),
+        )
+        .unwrap();
+        entity_put(
+            &wtxn,
+            __ts(),
+            brain_core::SessionId::DEFAULT,
+            &Entity::new_active(
+                obj_id,
+                EntityType::PERSON_ID,
+                format!("CharityRace{n}"),
+                format!("charityrace{n}"),
+                now(),
+            ),
+        )
+        .unwrap();
+        let pred_id = predicate_intern_or_get(&wtxn, "test", "ran", 0, now()).unwrap();
+        let stmt_id = StatementId::new();
+        let evidence = EvidenceRef::inline_from_slice(&[EvidenceEntry::from_parts(
+            MemoryId::pack(1, SessionId::DEFAULT.into(), 0),
+            0.9,
+            now(),
+            ExtractorId::from(0),
+        )]);
+        let kind = if event_at.is_some() {
+            StatementKind::Event
+        } else {
+            StatementKind::Fact
+        };
+        let mut s = Statement::new_root(
+            stmt_id,
+            kind,
+            SubjectRef::Entity(subj_id),
+            pred_id,
+            StatementObject::Entity(obj_id),
+            0.9,
+            evidence,
+            ExtractorId::from(0),
+            now(),
+            1,
+        );
+        s.event_at_unix_nanos = event_at;
+        let id =
+            statement_create(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &s, now()).unwrap();
+        wtxn.commit().unwrap();
+        id
+    }
+
+    #[test]
+    fn bridge_questions_tag_every_filled_slot() {
+        // An entity-subject event fact with an entity object and an event time
+        // yields Object + Subject + Time questions, each tagged with the slot
+        // it leaves unbound.
+        let fx = fixture();
+        let id = seed_event_statement(&fx.metadata, 0, Some(now()));
+        let rtxn = fx.metadata.read_txn().unwrap();
+        let s = statement_get(&rtxn, id).unwrap().unwrap();
+        let qs = render_bridge_questions(&rtxn, &s);
+
+        let has = |slot: Slot| qs.iter().any(|(sl, _)| *sl == slot);
+        assert!(has(Slot::Object), "object slot always generated");
+        assert!(
+            has(Slot::Subject),
+            "subject slot generated for entity object"
+        );
+        assert!(has(Slot::Time), "time slot generated when event_at is set");
+        // Surfaces are natural text (full subject/object names, spaced pred).
+        assert!(qs
+            .iter()
+            .any(|(sl, q)| *sl == Slot::Time && q.contains("Melanie0") && q.contains("ran")));
+        assert!(qs
+            .iter()
+            .any(|(sl, q)| *sl == Slot::Subject && q.contains("CharityRace0")));
+    }
+
+    #[test]
+    fn bridge_questions_omit_time_slot_without_event_at() {
+        // A fact with no event time carries no answerable "when …" question, so
+        // the Time slot is not generated; Object + Subject still are.
+        let fx = fixture();
+        let id = seed_event_statement(&fx.metadata, 1, None);
+        let rtxn = fx.metadata.read_txn().unwrap();
+        let s = statement_get(&rtxn, id).unwrap().unwrap();
+        let qs = render_bridge_questions(&rtxn, &s);
+        assert!(qs.iter().any(|(sl, _)| *sl == Slot::Object));
+        assert!(qs.iter().any(|(sl, _)| *sl == Slot::Subject));
+        assert!(
+            !qs.iter().any(|(sl, _)| *sl == Slot::Time),
+            "no time slot without event_at"
+        );
+    }
+
+    #[test]
+    fn bridge_questions_include_time_slot_for_dateless_event() {
+        // C1 temporal: a dateless Event (an extracted action with no distinct
+        // date) still gets a "when did S P?" Time question — the reader answers
+        // it from the evidence memory's `occurred_at`. Built in-memory because
+        // `statement_create` rejects an Event with `event_at = None`; here we
+        // exercise the pure renderer over persisted entity/predicate deps.
+        let fx = fixture();
+        let subj_id = EntityId::new();
+        let obj_id = EntityId::new();
+        let pred_id;
+        {
+            let wtxn = fx.metadata.write_txn().unwrap();
+            entity_put(
+                &wtxn,
+                __ts(),
+                brain_core::SessionId::DEFAULT,
+                &Entity::new_active(
+                    subj_id,
+                    EntityType::PERSON_ID,
+                    "Melanie".to_string(),
+                    "melanie".to_string(),
+                    now(),
+                ),
+            )
+            .unwrap();
+            entity_put(
+                &wtxn,
+                __ts(),
+                brain_core::SessionId::DEFAULT,
+                &Entity::new_active(
+                    obj_id,
+                    EntityType::PERSON_ID,
+                    "CharityRace".to_string(),
+                    "charityrace".to_string(),
+                    now(),
+                ),
+            )
+            .unwrap();
+            pred_id = predicate_intern_or_get(&wtxn, "test", "participated_in", 0, now()).unwrap();
+            wtxn.commit().unwrap();
+        }
+        let evidence = EvidenceRef::inline_from_slice(&[EvidenceEntry::from_parts(
+            MemoryId::pack(1, SessionId::DEFAULT.into(), 0),
+            0.9,
+            now(),
+            ExtractorId::from(0),
+        )]);
+        let mut s = Statement::new_root(
+            StatementId::new(),
+            StatementKind::Event,
+            SubjectRef::Entity(subj_id),
+            pred_id,
+            StatementObject::Entity(obj_id),
+            0.9,
+            evidence,
+            ExtractorId::from(0),
+            now(),
+            1,
+        );
+        // The whole point: an Event with NO distinct event time.
+        s.event_at_unix_nanos = None;
+
+        let rtxn = fx.metadata.read_txn().unwrap();
+        let qs = render_bridge_questions(&rtxn, &s);
+        assert!(
+            qs.iter()
+                .any(|(sl, q)| *sl == Slot::Time && q.contains("Melanie")),
+            "dateless Event must still get a Time bridge question",
+        );
+        assert!(qs.iter().any(|(sl, _)| *sl == Slot::Object));
+        assert!(qs.iter().any(|(sl, _)| *sl == Slot::Subject));
     }
 
     #[test]
@@ -694,15 +1100,9 @@ mod tests {
         let active = seed_statement(&fx.metadata, 0);
         let dead = seed_statement(&fx.metadata, 1);
         {
-            let mut db = fx.metadata.lock();
-            let wtxn = db.write_txn().unwrap();
-            statement_tombstone(
-                &wtxn,
-                dead,
-                brain_core::TombstoneReason::UserRequest,
-                now(),
-            )
-            .unwrap();
+            let wtxn = fx.metadata.write_txn().unwrap();
+            statement_tombstone(&wtxn, dead, brain_core::TombstoneReason::UserRequest, now())
+                .unwrap();
             wtxn.commit().unwrap();
         }
         // statement_tombstone removed the queue row already; only the
@@ -778,14 +1178,5 @@ mod tests {
             "embed_errors_total = {}",
             s.embed_errors_total
         );
-    }
-
-    #[test]
-    fn worker_kind_name() {
-        let fx = fixture();
-        let worker =
-            StatementEmbedWorker::new(fx.metadata.clone(), fx.hnsw.clone(), fx.dispatcher.clone());
-        assert_eq!(worker.name(), "statement_embed");
-        assert_eq!(worker.kind(), WorkerKind::StatementEmbed);
     }
 }

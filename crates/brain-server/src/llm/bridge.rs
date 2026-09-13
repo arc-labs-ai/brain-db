@@ -3,7 +3,7 @@
 //!
 //! ## Why this exists
 //!
-//! Sub-task 9.7a moved every per-shard task onto a Glommio
+//! Every per-shard task runs on a Glommio
 //! `LocalExecutor`. Glommio has its own I/O reactor (io_uring) and
 //! doesn't share Tokio's. A `reqwest::Response::text().await` polled
 //! inside a Glommio task hangs (its waker is never armed by Glommio's

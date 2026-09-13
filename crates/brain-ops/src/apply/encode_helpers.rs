@@ -30,7 +30,6 @@ use brain_index::{
 };
 use brain_metadata::tables::memory::MEMORIES_TABLE;
 use brain_metadata::tables::text::TEXTS_TABLE;
-use redb::TableError;
 
 use crate::context::OpsContext;
 
@@ -47,7 +46,7 @@ pub const DEFAULT_EXTRACTOR_CONTEXT_TOP_M: usize = 10;
 const NEIGHBOR_TEXT_CHAR_CAP: usize = 200;
 
 /// Knobs for [`fetch_extractor_context`]. Defaults come from
-/// [`DEFAULT_EXTRACTOR_CONTEXT_TOP_M`] and `same_context_only = true`;
+/// [`DEFAULT_EXTRACTOR_CONTEXT_TOP_M`] and `same_session_only = true`;
 /// callers override per-deployment as needed.
 #[derive(Debug, Clone, Copy)]
 pub struct ExtractorContextFetchConfig {
@@ -55,18 +54,18 @@ pub struct ExtractorContextFetchConfig {
     /// is asked for `top_m + 1` rows so the self-match (the memory
     /// being extracted) can be dropped without sacrificing a slot.
     pub top_m: usize,
-    /// When true, restrict neighbors to the same `context_id` as the
+    /// When true, restrict neighbors to the same `session_id` as the
     /// memory being extracted. The LLM's "this user / this thread"
     /// signal is the high-value channel — cross-context noise dilutes
     /// the prompt.
-    pub same_context_only: bool,
+    pub same_session_only: bool,
 }
 
 impl Default for ExtractorContextFetchConfig {
     fn default() -> Self {
         Self {
             top_m: DEFAULT_EXTRACTOR_CONTEXT_TOP_M,
-            same_context_only: true,
+            same_session_only: true,
         }
     }
 }
@@ -77,8 +76,6 @@ impl Default for ExtractorContextFetchConfig {
 /// HNSW from a missing memory row.
 #[derive(Debug, thiserror::Error)]
 pub enum ExtractorContextError {
-    #[error("semantic retriever not wired")]
-    NoRetriever,
     #[error("memory not found: {0:?}")]
     MemoryNotFound(MemoryId),
     #[error("metadata read failed: {0}")]
@@ -90,19 +87,19 @@ pub enum ExtractorContextError {
 /// Build the bounded LLM extractor context for `memory_id`.
 ///
 /// Steps:
-///   1. Look up the memory row to find its `context_id` (needed for
-///      the `same_context_only` filter — `SemanticRetriever` doesn't
+///   1. Look up the memory row to find its `session_id` (needed for
+///      the `same_session_only` filter — `SemanticRetriever` doesn't
 ///      key on context, so we filter post-search).
 ///   2. Run the semantic retriever with `cue_text` against the memory
 ///      HNSW for `top_m + 1` hits.
 ///   3. Drop the self-match (the memory being extracted is often the
 ///      top result — including it as its own context is noise).
-///   4. Drop hits from other contexts when `same_context_only`.
+///   4. Drop hits from other sessions when `same_session_only`.
 ///   5. For each surviving hit, fetch the neighbor's text body from
 ///      `TEXTS_TABLE` and its `created_at_unix_nanos` from
 ///      `MEMORIES_TABLE`. Both reads happen in the same `read_txn`
 ///      so the snapshot is consistent.
-///   6. Truncate each neighbor's text at [`NEIGHBOR_TEXT_CHAR_CAP`]
+///   6. Truncate each neighbor's text at `NEIGHBOR_TEXT_CHAR_CAP`
 ///      so the prompt budget can't blow up on long memories.
 ///   7. The rolling summary is left as `None` — the summarizer
 ///      worker isn't part of W2.3. The slot is preserved so a future
@@ -114,36 +111,25 @@ pub async fn fetch_extractor_context(
     config: ExtractorContextFetchConfig,
 ) -> Result<ExtractorContext, ExtractorContextError> {
     let started = Instant::now();
-    let Some(retriever) = ctx.semantic_retriever.as_ref() else {
-        return Err(ExtractorContextError::NoRetriever);
-    };
+    let retriever = &ctx.semantic_retriever;
 
-    // Step 1 + 5 prep: open one read txn against metadata. Borrows
-    // the same Arc the writer uses; the per-shard Mutex makes the
-    // lock contention nil (single shard drains one queue).
+    // Step 1 + 5 prep: open one read txn against metadata. The shared
+    // `Arc<MetadataDb>` lets every reader path open its own redb read
+    // txn without serialising on a wrapping mutex.
     let metadata = ctx.executor.metadata.clone();
-    let memory_context_id: u64 = {
-        let db_guard = metadata.lock();
-        let rtxn = db_guard
+    let memory_session_id: u64 = {
+        let rtxn = metadata
             .read_txn()
             .map_err(|e| ExtractorContextError::Metadata(format!("read_txn: {e}")))?;
-        let table = match rtxn.open_table(MEMORIES_TABLE) {
-            Ok(t) => t,
-            Err(TableError::TableDoesNotExist(_)) => {
-                return Err(ExtractorContextError::MemoryNotFound(memory_id));
-            }
-            Err(e) => {
-                return Err(ExtractorContextError::Metadata(format!(
-                    "open MEMORIES_TABLE: {e}"
-                )));
-            }
-        };
+        let table = rtxn
+            .open_table(MEMORIES_TABLE)
+            .map_err(|e| ExtractorContextError::Metadata(format!("open MEMORIES_TABLE: {e}")))?;
         let key = memory_id.raw().to_be_bytes();
         let row = table
             .get(&key)
             .map_err(|e| ExtractorContextError::Metadata(format!("memory get: {e}")))?
             .ok_or(ExtractorContextError::MemoryNotFound(memory_id))?;
-        row.value().context_id
+        row.value().session_id
     };
 
     // Step 2: top_m + 1 semantic hits over the memory HNSW. The "+1"
@@ -157,41 +143,34 @@ pub async fn fetch_extractor_context(
         // recall at this scale.
         ..SemanticRetrieverConfig::default()
     };
-    let filters = SemanticFilters::default();
+    // Scope the neighbor fetch to the caller's tenant: the enrichment
+    // context handed to the extractor must never surface another
+    // namespace's memories.
+    let filters = SemanticFilters {
+        namespace_id: ctx.executor.caller_namespace.raw(),
+        ..SemanticFilters::default()
+    };
     let cfg = SemanticRetrieverConfig {
         filters: SemanticFiltersConfigSlot(filters),
         ..cfg
     };
     let query = SemanticQuery::Text(cue_text.to_string());
     let hits = retriever
-        .retrieve(&query, SemanticScope::Memory, &cfg)
+        .retrieve(&query, SemanticScope::Memory, &cfg, None)
         .map_err(|e| ExtractorContextError::Semantic(format!("{e}")))?;
 
     // Step 3-6: materialise neighbor entries inside a fresh read txn so
     // step-1's txn doesn't outlive the await above (Glommio shards
     // are single-threaded but we still keep txns short for redb's GC).
-    let db_guard = metadata.lock();
-    let rtxn = db_guard
+    let rtxn = metadata
         .read_txn()
         .map_err(|e| ExtractorContextError::Metadata(format!("read_txn (neighbors): {e}")))?;
-    let memories_t = match rtxn.open_table(MEMORIES_TABLE) {
-        Ok(t) => t,
-        Err(TableError::TableDoesNotExist(_)) => return Ok(ExtractorContext::empty()),
-        Err(e) => {
-            return Err(ExtractorContextError::Metadata(format!(
-                "open MEMORIES_TABLE: {e}"
-            )));
-        }
-    };
-    let texts_t = match rtxn.open_table(TEXTS_TABLE) {
-        Ok(t) => t,
-        Err(TableError::TableDoesNotExist(_)) => return Ok(ExtractorContext::empty()),
-        Err(e) => {
-            return Err(ExtractorContextError::Metadata(format!(
-                "open TEXTS_TABLE: {e}"
-            )));
-        }
-    };
+    let memories_t = rtxn
+        .open_table(MEMORIES_TABLE)
+        .map_err(|e| ExtractorContextError::Metadata(format!("open MEMORIES_TABLE: {e}")))?;
+    let texts_t = rtxn
+        .open_table(TEXTS_TABLE)
+        .map_err(|e| ExtractorContextError::Metadata(format!("open TEXTS_TABLE: {e}")))?;
 
     let mut neighbors: Vec<NeighborMemory> = Vec::with_capacity(config.top_m);
     for hit in hits {
@@ -216,7 +195,7 @@ pub async fn fetch_extractor_context(
             None => continue,
         };
         let row = row.value();
-        if config.same_context_only && row.context_id != memory_context_id {
+        if config.same_session_only && row.session_id != memory_session_id {
             continue;
         }
         let text_bytes = match texts_t
@@ -237,7 +216,6 @@ pub async fn fetch_extractor_context(
         });
     }
     drop(rtxn);
-    drop(db_guard);
 
     tracing::debug!(
         target: "brain_ops::apply::encode_helpers",
@@ -275,7 +253,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use brain_core::{AgentId, ContextId, MemoryId, MemoryKind, Salience};
+    use brain_core::{MemoryId, MemoryKind, Salience, SessionId, SpaceId};
     use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
     use brain_index::{IndexParams, RankedItem, SemanticError, SemanticRetriever, SharedHnsw};
     use brain_metadata::tables::memory::MemoryMetadata;
@@ -320,6 +298,7 @@ mod tests {
             _query: &SemanticQuery,
             _scope: SemanticScope,
             _config: &SemanticRetrieverConfig,
+            _arena: Option<&dyn brain_index::SpaceVectorSource>,
         ) -> Result<Vec<RankedItem>, SemanticError> {
             Ok(self.hits.clone())
         }
@@ -328,35 +307,33 @@ mod tests {
     fn fresh_ctx() -> (tempfile::TempDir, OpsContext) {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("metadata.redb");
-        let metadata = Arc::new(parking_lot::Mutex::new(
-            brain_metadata::MetadataDb::open(&db_path).unwrap(),
-        ));
-        let (shared, _writer) = SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).unwrap();
+        let metadata = Arc::new(brain_metadata::MetadataDb::open(&db_path).unwrap());
+        let (shared, _writer) = SharedHnsw::new(IndexParams::default_v1()).unwrap();
         let executor = ExecutorContext::new(
             Arc::new(NopDispatcher) as Arc<dyn Dispatcher>,
             shared,
             metadata,
             Arc::new(NopWriter) as Arc<dyn WriterHandle>,
         );
-        let ops = OpsContext::new(executor);
+        let ops = crate::test_support::ops_context_for_tests_owning_tempdir(executor);
         (dir, ops)
     }
 
     fn insert_memory(
         ctx: &OpsContext,
         id: MemoryId,
-        context_id: ContextId,
+        session_id: SessionId,
         text: &str,
         created_at_unix_nanos: u64,
     ) {
-        let mut db = ctx.executor.metadata.lock();
-        let wtxn = db.write_txn().unwrap();
+        let wtxn = ctx.executor.metadata.write_txn().unwrap();
         {
             let mut memories = wtxn.open_table(MEMORIES_TABLE).unwrap();
             let row = MemoryMetadata::new_active(
                 id,
-                AgentId::new(),
-                context_id,
+                brain_core::NamespaceId::SYSTEM,
+                SpaceId::new(),
+                session_id,
                 0,
                 id.version(),
                 MemoryKind::Episodic,
@@ -392,7 +369,7 @@ mod tests {
         let n1 = MemoryId::pack(0, 2, 0);
         let n2 = MemoryId::pack(0, 3, 0);
         let n3 = MemoryId::pack(0, 4, 0);
-        let cx = ContextId(7);
+        let cx = SessionId(7);
         insert_memory(&ops, self_id, cx, "self", 100);
         insert_memory(&ops, n1, cx, "neighbor one", 200);
         insert_memory(&ops, n2, cx, "neighbor two", 300);
@@ -406,11 +383,11 @@ mod tests {
                 hit(n3, 0.71),
             ],
         });
-        ops.semantic_retriever = Some(stub);
+        ops.semantic_retriever = stub;
 
         let cfg = ExtractorContextFetchConfig {
             top_m: 10,
-            same_context_only: true,
+            same_session_only: true,
         };
         let ec = futures_lite::future::block_on(fetch_extractor_context(&ops, self_id, "cue", cfg))
             .expect("fetch succeeds");
@@ -430,33 +407,33 @@ mod tests {
     }
 
     #[test]
-    fn fetch_extractor_context_respects_same_context_only() {
+    fn fetch_extractor_context_respects_same_session_only() {
         let (_dir, mut ops) = fresh_ctx();
         let self_id = MemoryId::pack(0, 1, 0);
         let near_ctx = MemoryId::pack(0, 2, 0);
         let far_ctx = MemoryId::pack(0, 3, 0);
-        insert_memory(&ops, self_id, ContextId(7), "self", 100);
-        insert_memory(&ops, near_ctx, ContextId(7), "same-context neighbor", 200);
-        insert_memory(&ops, far_ctx, ContextId(8), "other-context neighbor", 300);
+        insert_memory(&ops, self_id, SessionId(7), "self", 100);
+        insert_memory(&ops, near_ctx, SessionId(7), "same-context neighbor", 200);
+        insert_memory(&ops, far_ctx, SessionId(8), "other-context neighbor", 300);
 
         let stub = Arc::new(StubRetriever {
             hits: vec![hit(near_ctx, 0.9), hit(far_ctx, 0.8)],
         });
-        ops.semantic_retriever = Some(stub);
+        ops.semantic_retriever = stub;
 
         let cfg = ExtractorContextFetchConfig {
             top_m: 10,
-            same_context_only: true,
+            same_session_only: true,
         };
         let ec = futures_lite::future::block_on(fetch_extractor_context(&ops, self_id, "cue", cfg))
             .expect("fetch succeeds");
         assert_eq!(ec.neighbors.len(), 1, "cross-context neighbor dropped");
         assert_eq!(ec.neighbors[0].memory_id, near_ctx);
 
-        // Same fixture, same_context_only=false → far-context neighbor lands too.
+        // Same fixture, same_session_only=false → far-context neighbor lands too.
         let cfg = ExtractorContextFetchConfig {
             top_m: 10,
-            same_context_only: false,
+            same_session_only: false,
         };
         let ec = futures_lite::future::block_on(fetch_extractor_context(&ops, self_id, "cue", cfg))
             .expect("fetch succeeds");
@@ -467,13 +444,13 @@ mod tests {
     fn fetch_extractor_context_returns_empty_for_first_memory() {
         let (_dir, mut ops) = fresh_ctx();
         let self_id = MemoryId::pack(0, 1, 0);
-        insert_memory(&ops, self_id, ContextId(7), "only memory", 100);
+        insert_memory(&ops, self_id, SessionId(7), "only memory", 100);
 
         // Retriever returns only the self-match — which we drop.
         let stub = Arc::new(StubRetriever {
             hits: vec![hit(self_id, 0.99)],
         });
-        ops.semantic_retriever = Some(stub);
+        ops.semantic_retriever = stub;
 
         let cfg = ExtractorContextFetchConfig::default();
         let ec = futures_lite::future::block_on(fetch_extractor_context(&ops, self_id, "cue", cfg))
@@ -490,37 +467,22 @@ mod tests {
     fn fetch_extractor_context_caps_at_top_m() {
         let (_dir, mut ops) = fresh_ctx();
         let self_id = MemoryId::pack(0, 1, 0);
-        insert_memory(&ops, self_id, ContextId(7), "self", 100);
+        insert_memory(&ops, self_id, SessionId(7), "self", 100);
         let mut hits = vec![hit(self_id, 0.99)];
         for slot in 2..=15u64 {
             let id = MemoryId::pack(0, slot, 0);
-            insert_memory(&ops, id, ContextId(7), &format!("n{slot}"), 100 + slot);
+            insert_memory(&ops, id, SessionId(7), &format!("n{slot}"), 100 + slot);
             hits.push(hit(id, 0.9 - (slot as f32) * 0.01));
         }
-        ops.semantic_retriever = Some(Arc::new(StubRetriever { hits }));
+        ops.semantic_retriever = Arc::new(StubRetriever { hits });
 
         let cfg = ExtractorContextFetchConfig {
             top_m: 5,
-            same_context_only: true,
+            same_session_only: true,
         };
         let ec = futures_lite::future::block_on(fetch_extractor_context(&ops, self_id, "cue", cfg))
             .expect("fetch succeeds");
         assert_eq!(ec.neighbors.len(), 5, "top_m is the hard cap");
-    }
-
-    #[test]
-    fn fetch_extractor_context_no_retriever_errors_cleanly() {
-        let (_dir, ops) = fresh_ctx();
-        let self_id = MemoryId::pack(0, 1, 0);
-        insert_memory(&ops, self_id, ContextId(7), "self", 100);
-        let err = futures_lite::future::block_on(fetch_extractor_context(
-            &ops,
-            self_id,
-            "cue",
-            ExtractorContextFetchConfig::default(),
-        ))
-        .expect_err("no retriever wired");
-        assert!(matches!(err, ExtractorContextError::NoRetriever));
     }
 
     #[test]

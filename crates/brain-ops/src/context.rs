@@ -1,168 +1,304 @@
 //! `OpsContext` — the per-shard handle bag handlers consume.
 //!
 //! Thin wrapper over `brain_planner::ExecutorContext` for v1. Each
-//! later sub-task that needs new shared state (txn store in 7.9,
-//! subscribe broadcast in 7.10) adds a field non-breakingly.
+//! later addition that needs new shared state (txn store, subscribe
+//! broadcast) adds a field non-breakingly.
 //!
-//! After sub-task 9.7 (audit §4) `OpsContext` is transitively `!Send`
-//! because `ExecutorContext` holds `Arc<dyn WriterHandle>` and
-//! `WriterHandle` is no longer `Send + Sync`. The interior `Arc<...>`
-//! fields are kept (vs the audit's suggested `Rc<...>` swap) to avoid
-//! gratuitous test churn — single-threaded usage is enforced by the
-//! per-shard Glommio executor, not by the field types.
+//! `OpsContext` is transitively `!Send` because `ExecutorContext`
+//! holds `Arc<dyn WriterHandle>` and `WriterHandle` is no longer
+//! `Send + Sync`. The interior `Arc<...>` fields are kept (rather than
+//! swapping to `Rc<...>`) to avoid gratuitous test churn —
+//! single-threaded usage is enforced by the per-shard Glommio
+//! executor, not by the field types.
 
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
 use brain_extractors::{ClassifierConfig, ExtractorRegistry};
-use brain_index::{GraphRetriever, LexicalRetriever, SemanticRetriever, TantivyShard};
+use brain_index::{
+    EntityVectorIndex, GraphRetriever, LexicalRetriever, SemanticRetriever, TantivyShard,
+};
 use brain_metadata::LlmCacheDb;
 use brain_planner::{ExecutorContext, PlannerContext};
-use brain_rerank::CrossEncoder;
+use brain_rerank::RerankService;
 use parking_lot::{Mutex, RwLock};
 
 use crate::index::text_indexer::{MemoryTextDispatcher, StatementTextDispatcher};
+use crate::metrics::{QueryMetrics, RetrieverMetrics};
 use crate::state::access_buffer::AccessBuffer;
-use crate::state::schema_gate::SchemaGate;
 use crate::subscribe::{EventBus, EventEnvelope, SubscriptionRegistry};
 use crate::txn::TxnStore;
 use crate::writer::WalSink;
 
 /// Default bounded poll window for the one-shot SUBSCRIBE dispatcher
-/// path. Phase 9's long-lived stream bypasses this entirely.
+/// path. The long-lived stream bypasses this entirely.
 pub const DEFAULT_SUBSCRIBE_POLL_WINDOW: Duration = Duration::from_secs(5);
+
+/// Default window a traced ENCODE (`trace = true`) waits for this write's
+/// async background stages — extractor, auto-edge, temporal-edge — to
+/// publish their completion before the trace gives up and marks the
+/// stragglers `Timeout`. The wait is event-driven and returns the instant
+/// the last stage completes, so this bounds only the pathological
+/// never-completes case; the common path returns in extraction latency
+/// (~1–10s). Sized to comfortably cover the LLM extractor's own 30s
+/// per-call timeout plus queue + apply, so a slow-but-succeeding extraction
+/// is captured in the trace instead of being misreported as a timeout.
+/// Trace is opt-in, so this only ever blocks a caller that explicitly asked
+/// to observe the drained stages.
+pub const DEFAULT_ENCODE_TRACE_DRAIN_WINDOW: Duration = Duration::from_secs(35);
+
+/// Per-shard cross-encoder slot. Replaces an earlier
+/// `Option<Arc<CrossEncoder>>` whose `None` conflated "model failed to
+/// load" with "operator turned this off" — two different failure modes
+/// the shard spawn path must keep distinct.
+///
+/// The shard spawn path resolves which variant applies: an
+/// enabled-but-unloadable model is a spawn failure (an operator
+/// misconfiguration we refuse to mask), and an explicitly disabled
+/// model lands as `Disabled`.
+///
+/// Rerank is first-class and always-on: when the slot is `Enabled`,
+/// every RECALL / QUERY reranks automatically. `Disabled` means the
+/// operator opted out of the load — recall succeeds with RRF-only
+/// ordering, never an error. There is no per-request toggle to
+/// conflict with the slot state.
+#[derive(Clone)]
+pub enum CrossEncoderSlot {
+    /// Operator enabled rerank and the model loaded cleanly. The
+    /// inner handle is the off-core rerank service: every concurrent
+    /// rerank call on this shard funnels through its worker thread,
+    /// so the forward pass never blocks the shard core.
+    Enabled(Arc<RerankService>),
+    /// Operator set `rerank.enabled = false` in config. Recall runs
+    /// RRF-only — no rerank stage, no error.
+    Disabled,
+}
+
+impl CrossEncoderSlot {
+    /// True iff the operator enabled rerank and the model loaded.
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        matches!(self, Self::Enabled(_))
+    }
+
+    /// Borrow the underlying rerank service. `None` when the slot is
+    /// `Disabled` — the executor's always-on rerank stage skips and
+    /// returns RRF-only ordering.
+    #[must_use]
+    pub fn as_arc(&self) -> Option<&Arc<RerankService>> {
+        match self {
+            Self::Enabled(e) => Some(e),
+            Self::Disabled => None,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct OpsContext {
     /// Inner executor context — embedder, index, metadata, writer.
     /// Handlers borrow this to call brain-planner's `execute_*`.
     pub executor: ExecutorContext,
+    /// Wire-level session that issued **this request**, stamped
+    /// per-request by `brain-ops::dispatch` from the authenticated
+    /// caller. Transaction handlers compare it against the opener's
+    /// `TxnEntry::connection_id` so only the connection that opened a
+    /// txn can read its pending writes, buffer into it, or commit/abort
+    /// it. All-zero means "no session" (in-process test path); a txn
+    /// opened without a session imposes no ownership binding.
+    pub caller_connection_id: [u8; 16],
     /// Planner-side config + budgets. Defaults are fine for v1; the
     /// builder is here so the server can override budgets at startup.
     pub planner_ctx: PlannerContext,
     /// Per-shard transaction registry.
     pub txn_store: Arc<TxnStore>,
     /// Per-shard change-feed bus. Cross-shard fan-out is the
-    /// connection layer's job (9.11).
+    /// connection layer's job.
     pub events: Arc<EventBus>,
     /// Per-shard subscription registry.
     pub subscriptions: Arc<SubscriptionRegistry>,
     /// One-shot dispatcher poll window for `handle_subscribe`. Tests
     /// override this to keep the timeout-path test fast.
     pub subscribe_poll_window: Duration,
-    /// Recently-accessed memory ids (sub-task 8.3).
+    /// How long a traced ENCODE waits for this write's async background
+    /// stages to drain before marking the stragglers `Timeout`. See
+    /// [`DEFAULT_ENCODE_TRACE_DRAIN_WINDOW`]. Tests override this to keep
+    /// the timeout-path fast.
+    pub encode_trace_drain_window: Duration,
+    /// Recently-accessed memory ids.
     pub access_buffer: Arc<AccessBuffer>,
-    /// Live extractor registry. Populated at server startup by
-    /// phase 20.7's system-schema bootstrap; defaults to empty.
-    /// Wrapped in `RwLock` because `EXTRACTOR_DISABLE` / `_ENABLE`
-    /// wire ops (phase 20.8) mutate it.
+    /// Live extractor registry. Populated at server startup by the
+    /// system-schema bootstrap; defaults to empty.
+    /// Wrapped in `RwLock` because a `SCHEMA_UPLOAD` that declares a
+    /// new extractor rebuilds and swaps the registry live (via the
+    /// extractor worker; see [`Self::extractors_dirty`]).
     pub extractor_registry: Arc<RwLock<ExtractorRegistry>>,
+    /// Set by the `SCHEMA_UPLOAD` handler after a schema that may have
+    /// added or changed extractor rows commits durably. The per-shard
+    /// extractor worker consumes this at the top of its next cycle:
+    /// when set, it rebuilds the registry from the freshly-persisted
+    /// `EXTRACTORS_TABLE` rows and swaps it into `extractor_registry`,
+    /// so a newly-declared extractor fires without a shard restart.
+    /// Rebuilding off the request path keeps the heavy materialize
+    /// dependencies (classifier model, LLM router) off the hot handler
+    /// path — the handler only flips this flag.
+    pub extractors_dirty: Arc<AtomicBool>,
     /// Per-deployment classifier config (operator-provided NER
     /// model path). Defaults to `unloaded`; operators wire
-    /// `BRAIN_NER_MODEL_PATH` via `with_classifier_config`.
+    /// `[extractors.classifier] model_path` via `with_classifier_config`.
     pub classifier_config: Arc<ClassifierConfig>,
-    /// Per-shard LLM extractor response cache (4 / §26).
+    /// Per-shard LLM extractor response cache.
     /// `None` when no API keys are configured, the cache file
     /// failed to open, or no LLM extractors are registered.
     /// LLM extractors thread this into their cache lookups via
     /// the registry; later ops (RECALL provenance lookups, cache
     /// admin endpoints) can read through this field directly.
     pub llm_cache: Option<Arc<Mutex<LlmCacheDb>>>,
-    /// Per-shard tantivy index handle (phase 22.1). `None` until
+    /// Per-shard tantivy index handle. `None` until
     /// the server's shard-spawn path wires it via
-    /// [`OpsContext::with_tantivy`]. The retriever (22.5) and
-    /// indexer workers (22.3 / 22.4) borrow through this field;
+    /// [`OpsContext::with_tantivy`]. The retriever and
+    /// indexer workers borrow through this field;
     /// no-schema deployments leave it `None`.
     pub tantivy: Option<Arc<TantivyShard>>,
-    /// Memory text indexer dispatcher (phase 22.3). `None` for
+    /// Memory text indexer dispatcher. `None` for
     /// no-schema deployments and tests that don't spawn the
     /// drain task. ENCODE / FORGET handlers check this slot
     /// post-WAL-commit and enqueue an indexer op when present.
     pub memory_text_dispatcher: Option<Arc<MemoryTextDispatcher>>,
-    /// Statement text indexer dispatcher (phase 22.4). Wired
+    /// Statement text indexer dispatcher. Wired
     /// alongside `memory_text_dispatcher`; statement_create /
     /// supersede / tombstone / retract handlers enqueue
     /// Upsert / Delete events post-commit.
     pub statement_text_dispatcher: Option<Arc<StatementTextDispatcher>>,
-    /// Per-shard lexical retriever (phase 22.5). Reads the
-    /// tantivy indexes maintained by the 22.3 + 22.4 workers.
-    /// Phase 23's hybrid query consumes this slot; substrate-
-    /// only deployments leave it `None`.
-    pub lexical_retriever: Option<Arc<dyn LexicalRetriever>>,
-    /// Per-shard semantic retriever (phase 23.1). Reads the
-    /// substrate memory HNSW + (when wired) the statement
-    /// HNSW. Phase 23's hybrid query consumes this slot
-    /// alongside [`Self::lexical_retriever`].
-    pub semantic_retriever: Option<Arc<dyn SemanticRetriever>>,
-    /// Per-shard graph retriever (phase 23.2). Reads the
-    /// entity / relation / statement redb tables. Phase 23's
-    /// hybrid query consumes this slot alongside the lexical
-    /// + semantic retrievers.
-    pub graph_retriever: Option<Arc<dyn GraphRetriever>>,
+    /// Per-shard lexical retriever. Reads the tantivy indexes
+    /// maintained by the text-indexer workers. Mandatory: tantivy
+    /// is a core shard capability, and a shard that can't serve
+    /// lexical queries refuses to spawn (see `ShardError::TantivyInitFailed`).
+    pub lexical_retriever: Arc<dyn LexicalRetriever>,
+    /// Per-shard semantic retriever. Reads the memory HNSW + the
+    /// statement HNSW. Mandatory once the shard is spawned — the
+    /// HNSW is constructed at spawn time and can't be missing.
+    pub semantic_retriever: Arc<dyn SemanticRetriever>,
+    /// Per-shard graph retriever. Reads the entity / relation /
+    /// statement redb tables. Mandatory: the metadata DB is open
+    /// the moment the shard spawns; the retriever just dispatches
+    /// into it.
+    pub graph_retriever: Arc<dyn GraphRetriever>,
+    /// Per-shard entity vector index for the resolver's tier-3 embedding
+    /// tie-break. `None` until the shard-spawn path wires it via
+    /// [`OpsContext::with_entity_vector_index`]; when absent the resolver
+    /// skips tier 3 and falls through to the create fallback.
+    pub entity_vector_index: Option<Arc<dyn EntityVectorIndex>>,
     /// Per-shard cross-encoder (W2.2 rerank pass). Shared across
-    /// shards because the model is read-only and CPU-heavy; the
-    /// hybrid executor's rerank stage runs only when this slot is
-    /// `Some` and the caller opted in via `RecallRequest.rerank=true`.
-    pub cross_encoder: Option<Arc<CrossEncoder>>,
-    /// Schema-declared gate (phase 23.11). Lock-free read on
-    /// the RECALL hot path; flipped to `true` by
-    /// `handle_schema_upload` after a successful commit. Spec
-    /// §28/08 §1.
-    pub schema_gate: SchemaGate,
-    /// WAL append sink for the knowledge-layer subscribe-replay
-    /// pipeline. Knowledge handlers (the `crate::handlers::knowledge_*`
-    /// modules) call [`OpsContext::publish_knowledge`] after their successful
-    /// redb commit; that helper appends a `WalPayload::Knowledge`
-    /// record carrying the rkyv-encoded
-    /// [`brain_protocol::KnowledgeEventPayload`] body, then
+    /// shards because the model is read-only and CPU-heavy.
+    ///
+    /// The enum carries semantic intent the old `Option` lost: a
+    /// `Disabled` slot means the operator turned reranking off in
+    /// config and an opt-in request must hard-fail (so the client
+    /// knows to drop the flag), whereas a previous `None` was
+    /// ambiguous between "operator disabled it" and "model failed to
+    /// load — silently fall back to RRF". Spawn now refuses to start
+    /// when `rerank.enabled = true` but loading fails, so by the
+    /// time we get here `Enabled(encoder)` always means a working
+    /// encoder.
+    pub cross_encoder: CrossEncoderSlot,
+    /// WAL append sink for the opaque-body subscribe-replay
+    /// pipeline. typed-graph handlers (the `crate::handlers`
+    /// modules) call the typed-graph WAL-append helper after their successful
+    /// redb commit; that helper appends a `WalPayload::PhaseBody`
+    /// record carrying the CBOR-encoded
+    /// [`brain_protocol::GraphEventPayload`] body, then
     /// publishes the matching [`EventEnvelope`] on the bus with the
     /// WAL-assigned LSN. When `None`, the helper falls back to a
     /// pure bus publish (test wiring / no-schema deployments).
     ///
-    /// Knowledge ops are post-commit WAL'd (not pre-commit like
+    /// typed-graph ops are post-commit WAL'd (not pre-commit like
     /// substrate ENCODE/FORGET): redb is the source of truth for
-    /// knowledge state; the WAL record exists purely so subscribe-
+    /// typed-graph state; the WAL record exists purely so subscribe-
     /// replay can reconstruct the event stream. A crash between
     /// commit and WAL append loses the matching subscribe event for
-    /// that op, not the underlying knowledge data.
+    /// that op, not the underlying typed-graph data.
     pub wal_sink: Option<Arc<dyn WalSink>>,
+    /// Per-shard read-path retriever metric family. Shared by `Arc`
+    /// with `brain-server`'s `/metrics` exposition. The RECALL handler
+    /// records per-lane invocations / candidates / latency here after
+    /// `execute` returns — the hot fan-out loop is untouched. Always
+    /// present (recall runs on every shard); tests get a fresh zeroed
+    /// instance.
+    pub retriever_metrics: Arc<RetrieverMetrics>,
+    /// Per-shard end-to-end RECALL metric family. Same shared-by-`Arc`
+    /// shape as [`Self::retriever_metrics`]; recorded once per served
+    /// recall with the end-to-end latency, effective fusion `k`, rerank
+    /// flag, and answer shape.
+    pub query_metrics: Arc<QueryMetrics>,
 }
 
 impl OpsContext {
+    /// Build an `OpsContext` with all three retrievers wired up. Every
+    /// production shard provides real impls (tantivy + brain-index
+    /// HNSW + brain-index graph); tests build mock impls via
+    /// [`crate::test_support`].
     #[must_use]
-    pub fn new(executor: ExecutorContext) -> Self {
+    pub fn new(
+        executor: ExecutorContext,
+        lexical_retriever: Arc<dyn LexicalRetriever>,
+        semantic_retriever: Arc<dyn SemanticRetriever>,
+        graph_retriever: Arc<dyn GraphRetriever>,
+    ) -> Self {
         let events = Arc::new(EventBus::default());
         let subscriptions = Arc::new(SubscriptionRegistry::new(events.clone()));
         Self {
             executor,
+            caller_connection_id: [0u8; 16],
             planner_ctx: PlannerContext::default(),
             txn_store: Arc::new(TxnStore::new()),
             events,
             subscriptions,
             subscribe_poll_window: DEFAULT_SUBSCRIBE_POLL_WINDOW,
+            encode_trace_drain_window: DEFAULT_ENCODE_TRACE_DRAIN_WINDOW,
             access_buffer: Arc::new(AccessBuffer::default()),
             extractor_registry: Arc::new(RwLock::new(ExtractorRegistry::new())),
+            extractors_dirty: Arc::new(AtomicBool::new(false)),
             classifier_config: Arc::new(ClassifierConfig::unloaded()),
             llm_cache: None,
             tantivy: None,
             memory_text_dispatcher: None,
             statement_text_dispatcher: None,
-            lexical_retriever: None,
-            semantic_retriever: None,
-            graph_retriever: None,
-            cross_encoder: None,
-            schema_gate: SchemaGate::default(),
+            lexical_retriever,
+            semantic_retriever,
+            graph_retriever,
+            entity_vector_index: None,
+            cross_encoder: CrossEncoderSlot::Disabled,
             wal_sink: None,
+            retriever_metrics: Arc::new(RetrieverMetrics::new()),
+            query_metrics: Arc::new(QueryMetrics::new()),
         }
+    }
+
+    /// Wire the per-shard entity vector index for the resolver's tier-3
+    /// embedding tie-break. The shard-spawn path calls this with an adapter
+    /// over its `EntityHnswIndex`; left unset (tests), tier 3 is skipped.
+    #[must_use]
+    pub fn with_entity_vector_index(mut self, index: Arc<dyn EntityVectorIndex>) -> Self {
+        self.entity_vector_index = Some(index);
+        self
     }
 
     /// Override the bounded poll window for the one-shot subscribe
     /// dispatcher path. Mostly useful for tests; production servers
-    /// drive streaming via [`SubscriptionRegistry::register`] directly
-    /// (Phase 9).
+    /// drive streaming via [`SubscriptionRegistry::register`] directly.
     #[must_use]
     pub fn with_subscribe_poll_window(mut self, window: Duration) -> Self {
         self.subscribe_poll_window = window;
+        self
+    }
+
+    /// Override how long a traced ENCODE waits for async background stages
+    /// to drain. Tests set a short window so the timeout path is fast; the
+    /// server leaves the default.
+    #[must_use]
+    pub fn with_encode_trace_drain_window(mut self, window: Duration) -> Self {
+        self.encode_trace_drain_window = window;
         self
     }
 
@@ -175,6 +311,17 @@ impl OpsContext {
     #[must_use]
     pub fn with_txn_store(mut self, store: Arc<TxnStore>) -> Self {
         self.txn_store = store;
+        self
+    }
+
+    /// Stamp the per-request wire-level session id. Called by
+    /// `brain-ops::dispatch` from the authenticated caller so the
+    /// transaction handlers can enforce connection ownership on every
+    /// in-txn op. Tests set it directly to simulate distinct
+    /// connections.
+    #[must_use]
+    pub fn with_caller_connection_id(mut self, connection_id: [u8; 16]) -> Self {
+        self.caller_connection_id = connection_id;
         self
     }
 
@@ -207,15 +354,15 @@ impl OpsContext {
     }
 
     /// Replace the classifier config. Operators wire
-    /// `BRAIN_NER_MODEL_PATH` here at server startup.
+    /// `[extractors.classifier] model_path` here at server startup.
     #[must_use]
     pub fn with_classifier_config(mut self, cfg: ClassifierConfig) -> Self {
         self.classifier_config = Arc::new(cfg);
         self
     }
 
-    /// Install (or clear) the per-shard LLM cache handle. Phase
-    /// 21.5 calls this once at shard startup with an open
+    /// Install (or clear) the per-shard LLM cache handle. The server
+    /// calls this once at shard startup with an open
     /// `LlmCacheDb`; no-schema deployments and tests pass
     /// `None`.
     #[must_use]
@@ -224,8 +371,8 @@ impl OpsContext {
         self
     }
 
-    /// Install (or clear) the per-shard tantivy handle. Phase
-    /// 22.1 calls this once at shard startup with the
+    /// Install (or clear) the per-shard tantivy handle. The server
+    /// calls this once at shard startup with the
     /// `TantivyShard` returned by `TantivyShard::open`. Tests
     /// and no-schema deployments pass `None`.
     #[must_use]
@@ -234,10 +381,9 @@ impl OpsContext {
         self
     }
 
-    /// Install (or clear) the memory text indexer dispatcher
-    /// (phase 22.3). The matching drain task is spawned
-    /// separately by the caller (server spawn path uses
-    /// `glommio::spawn_local`).
+    /// Install (or clear) the memory text indexer dispatcher.
+    /// The matching drain task is spawned separately by the caller
+    /// (server spawn path uses `glommio::spawn_local`).
     #[must_use]
     pub fn with_memory_text_dispatcher(
         mut self,
@@ -247,9 +393,8 @@ impl OpsContext {
         self
     }
 
-    /// Install (or clear) the statement text indexer dispatcher
-    /// (phase 22.4). Server-spawn pairs this with the drain
-    /// task; tests pass `None`.
+    /// Install (or clear) the statement text indexer dispatcher.
+    /// Server-spawn pairs this with the drain task; tests pass `None`.
     #[must_use]
     pub fn with_statement_text_dispatcher(
         mut self,
@@ -259,53 +404,43 @@ impl OpsContext {
         self
     }
 
-    /// Install (or clear) the lexical retriever (phase 22.5).
-    /// Phase 23's hybrid query path reads through this slot.
+    /// Replace the lexical retriever. Constructed mandatorily by
+    /// the server's shard spawn from the per-shard `TantivyShard`;
+    /// tests inject mocks via [`crate::test_support`].
     #[must_use]
-    pub fn with_lexical_retriever(mut self, retriever: Option<Arc<dyn LexicalRetriever>>) -> Self {
+    pub fn with_lexical_retriever(mut self, retriever: Arc<dyn LexicalRetriever>) -> Self {
         self.lexical_retriever = retriever;
         self
     }
 
-    /// Install (or clear) the semantic retriever (phase 23.1).
-    /// Phase 23's hybrid query path reads through this slot.
+    /// Replace the semantic retriever.
     #[must_use]
-    pub fn with_semantic_retriever(
-        mut self,
-        retriever: Option<Arc<dyn SemanticRetriever>>,
-    ) -> Self {
+    pub fn with_semantic_retriever(mut self, retriever: Arc<dyn SemanticRetriever>) -> Self {
         self.semantic_retriever = retriever;
         self
     }
 
-    /// Install (or clear) the graph retriever (phase 23.2).
-    /// Phase 23's hybrid query path reads through this slot.
+    /// Replace the graph retriever.
     #[must_use]
-    pub fn with_graph_retriever(mut self, retriever: Option<Arc<dyn GraphRetriever>>) -> Self {
+    pub fn with_graph_retriever(mut self, retriever: Arc<dyn GraphRetriever>) -> Self {
         self.graph_retriever = retriever;
         self
     }
 
-    /// Install (or clear) the cross-encoder used by the W2.2
-    /// rerank pass on the hybrid RECALL path.
+    /// Install the cross-encoder slot used by the rerank pass on
+    /// the retrieval RECALL path. Pass `CrossEncoderSlot::Enabled(arc)`
+    /// when the model is loaded; pass `CrossEncoderSlot::Disabled`
+    /// when the operator opted out via `rerank.enabled = false` so
+    /// request-time clients learn the slot's intent.
     #[must_use]
-    pub fn with_cross_encoder(mut self, encoder: Option<Arc<CrossEncoder>>) -> Self {
-        self.cross_encoder = encoder;
+    pub fn with_cross_encoder(mut self, slot: CrossEncoderSlot) -> Self {
+        self.cross_encoder = slot;
         self
     }
 
-    /// Install the schema-declared gate (phase 23.11). The
-    /// server's per-shard spawn path seeds this from the
-    /// metadata DB at startup.
-    #[must_use]
-    pub fn with_schema_gate(mut self, gate: SchemaGate) -> Self {
-        self.schema_gate = gate;
-        self
-    }
-
-    /// Install (or clear) the WAL sink for knowledge-layer event
+    /// Install (or clear) the WAL sink for opaque-body event
     /// publishing. The shard's spawn path wires the same sink that
-    /// the writer uses, so substrate and knowledge events share one
+    /// the writer uses, so substrate and typed-graph events share one
     /// LSN domain.
     #[must_use]
     pub fn with_wal_sink(mut self, sink: Option<Arc<dyn WalSink>>) -> Self {
@@ -313,44 +448,83 @@ impl OpsContext {
         self
     }
 
-    /// Publish a knowledge-layer event: WAL-append the rkyv-encoded
-    /// payload (if a sink is wired), then publish to the bus with
-    /// the assigned LSN. The `kind` discriminates the WAL record
-    /// type so subscribe-replay can decode it back into the matching
-    /// `KnowledgeEventPayload` variant.
+    /// Install the shared read-path metric families. The server calls
+    /// this once at shard startup with the same `Arc`s it stashes on
+    /// the `ShardHandle`, so the RECALL handler and `/metrics`
+    /// exposition observe one counter set. Tests that don't care keep
+    /// the fresh zeroed instances from [`Self::new`].
+    #[must_use]
+    pub fn with_recall_metrics(
+        mut self,
+        retriever_metrics: Arc<RetrieverMetrics>,
+        query_metrics: Arc<QueryMetrics>,
+    ) -> Self {
+        self.retriever_metrics = retriever_metrics;
+        self.query_metrics = query_metrics;
+        self
+    }
+
+    /// Publish a opaque-body notification event: WAL-append the
+    /// CBOR-encoded payload (if a sink is wired), then publish to the
+    /// bus with the assigned LSN. The `kind` discriminates the WAL
+    /// record type so subscribe-replay can decode it back into the
+    /// matching payload variant.
+    ///
+    /// Generic over the payload type so every category of durable,
+    /// subscribe-replayable notification (typed-graph events today,
+    /// `StageCompleted` events as of this method) shares one
+    /// append-then-publish path instead of each growing its own copy.
+    /// There's nothing graph-specific left in the body of this
+    /// function — `P` only needs to be CBOR-serialisable.
     ///
     /// `make_envelope` builds the bus envelope from the assigned LSN.
     /// Most callers will just stamp `lsn` and clone their payload in.
-    pub async fn publish_knowledge<F>(
+    pub async fn publish_notification<F, P>(
         &self,
         kind: brain_storage::wal::kinds::WalRecordKind,
-        payload: brain_protocol::KnowledgeEventPayload,
+        payload: P,
+        space_id: brain_core::SpaceId,
         make_envelope: F,
     ) where
-        F: FnOnce(u64, brain_protocol::KnowledgeEventPayload) -> EventEnvelope,
+        P: serde::Serialize,
+        F: FnOnce(u64, P) -> EventEnvelope,
     {
         debug_assert!(
-            kind.is_knowledge(),
-            "publish_knowledge expects a knowledge-layer WalRecordKind, got {kind:?}"
+            kind.has_opaque_body(),
+            "publish_notification expects a opaque-body WalRecordKind, got {kind:?}"
         );
         let lsn = if let Some(sink) = &self.wal_sink {
-            // rkyv-encode the typed payload as the WAL record body.
-            // Subscribe-replay's `from_wal_record` decodes it back.
-            let body = match rkyv::to_bytes::<_, 1024>(&payload) {
-                Ok(b) => b.into_vec(),
-                Err(e) => {
-                    tracing::warn!(error = %e, "rkyv encode of knowledge event failed; publishing bus-only");
-                    let _ = self.events.publish(make_envelope(0, payload));
-                    return;
+            // CBOR-encode the notification event, then frame it in the same
+            // opaque-body envelope every other opaque-body record uses:
+            // `space_id (16 B) || body`. `WalPayload::decode` strips that
+            // 16-byte prefix before handing the body to subscribe-replay's
+            // `from_wal_record`, so the prefix is mandatory — without it the
+            // CBOR body would be decoded starting 16 bytes in and fail.
+            let body = {
+                let mut buf = Vec::with_capacity(16);
+                buf.extend_from_slice(&<[u8; 16]>::from(space_id));
+                match ciborium::into_writer(&payload, &mut buf) {
+                    Ok(()) => buf,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "CBOR encode of notification event failed; publishing bus-only");
+                        let _ = self.events.publish(make_envelope(0, payload));
+                        return;
+                    }
                 }
             };
             let body_len = body.len();
             let record = brain_storage::wal::record::WalRecord {
                 lsn: brain_storage::wal::record::Lsn(0),
                 kind,
-                flags: 0,
+                // Mark as a subscribe-replay change-feed event so recovery
+                // skips it — the durable write record (if this notification
+                // has one, as typed-graph events do) carries the state.
+                // Without this flag, recovery would try to rkyv-decode this
+                // CBOR body as a row and fail (kinds collide across the two
+                // record classes).
+                flags: brain_storage::wal::record::FLAG_SUBSCRIBE_EVENT,
                 timestamp_ns: now_unix_nanos_ctx(),
-                agent_id_lo64: 0,
+                space_id_lo64: 0,
                 payload: body,
             };
             match sink.append(record).await {
@@ -359,12 +533,12 @@ impl OpsContext {
                         ?kind,
                         body_len,
                         lsn = lsn.raw(),
-                        "knowledge event WAL-recorded"
+                        "notification event WAL-recorded"
                     );
                     lsn.raw()
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "knowledge event WAL append failed; bus-only publish");
+                    tracing::warn!(error = %e, "notification event WAL append failed; bus-only publish");
                     self.events.current_lsn().saturating_add(1)
                 }
             }
@@ -379,12 +553,55 @@ impl OpsContext {
             self.events.publish_prestamped(env);
         }
     }
+
+    /// Publish a `StageCompleted` event durably: WAL-append a
+    /// [`brain_protocol::StageCompletedEventBody`] notification record
+    /// (via [`Self::publish_notification`]) and publish to the bus, so
+    /// a subscriber that registers *after* the stage already finished
+    /// can still recover the event through WAL-tail replay — closing
+    /// the same ack-then-subscribe race that typed-graph events solved
+    /// via [`Self::publish_notification`] already.
+    ///
+    /// Callers (background workers) build the full [`EventEnvelope`]
+    /// themselves — same shape as their current bus-only
+    /// `ctx.ops.events.publish(envelope)` call — and hand it here
+    /// instead. `env.stage_kind` / `env.stage_outcome` /
+    /// `env.stage_payload` MUST all be `Some(_)`; every real stage
+    /// publisher populates all three together (see
+    /// [`EventEnvelope::stage_kind`]'s doc). The `lsn` field is
+    /// overwritten with the assigned LSN before publishing —
+    /// callers don't need to pre-stamp it.
+    pub async fn publish_stage_event(&self, mut env: EventEnvelope) {
+        let (Some(stage_kind), Some(stage_outcome), Some(stage_payload)) =
+            (env.stage_kind, env.stage_outcome, env.stage_payload.clone())
+        else {
+            tracing::warn!(
+                "publish_stage_event: envelope missing stage_kind/stage_outcome/stage_payload; \
+                 publishing bus-only (not durable, replay can't recover this event)"
+            );
+            self.events.publish(env);
+            return;
+        };
+        let body = brain_protocol::StageCompletedEventBody {
+            memory_id: env.memory_id.into(),
+            stage_kind,
+            stage_outcome,
+            stage_payload,
+        };
+        let space_id = env.space_id;
+        self.publish_notification(
+            brain_storage::wal::kinds::WalRecordKind::StageCompleted,
+            body,
+            space_id,
+            move |lsn, _body| {
+                env.lsn = lsn;
+                env
+            },
+        )
+        .await;
+    }
 }
 
 fn now_unix_nanos_ctx() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
+    crate::clock::now_unix_nanos()
 }

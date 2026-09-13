@@ -13,14 +13,11 @@ use std::sync::Arc;
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::MetadataDb;
-use brain_ops::test_support::run_in_glommio;
-use brain_ops::{dispatch, OpError, OpsContext, RealWriterHandle};
+use brain_ops::test_support::{run_in_glommio, single_body};
+use brain_ops::{dispatch, DispatchOutcome, OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
-use brain_protocol::envelope::request::{
-    EdgeKindWire, EdgeRequest, EncodeRequest, MemoryKindWire, RequestBody,
-};
+use brain_protocol::envelope::request::{EncodeRequest, RequestBody};
 use brain_protocol::envelope::response::{EncodeResponse, ResponseBody};
-use parking_lot::Mutex;
 
 // ---------------------------------------------------------------------------
 // Mock dispatcher: deterministic per-text vector + stable fingerprint.
@@ -64,16 +61,16 @@ fn build_fixture() -> Fixture {
 fn build_fixture_with_embedder(embedder: Arc<dyn Dispatcher>) -> Fixture {
     let tempdir = tempfile::tempdir().unwrap();
     let db_path = tempdir.path().join("metadata.redb");
-    let metadata: SharedMetadataDb = Arc::new(Mutex::new(MetadataDb::open(&db_path).unwrap()));
+    let metadata: SharedMetadataDb = Arc::new(MetadataDb::open(&db_path).unwrap());
 
-    let (shared, hnsw_writer) = SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).unwrap();
+    let (shared, hnsw_writer) = SharedHnsw::new(IndexParams::default_v1()).unwrap();
     let writer = Arc::new(RealWriterHandle::new(metadata.clone(), hnsw_writer));
 
     let executor =
         ExecutorContext::new(embedder, shared, metadata, writer as Arc<dyn WriterHandle>);
 
     Fixture {
-        ctx: OpsContext::new(executor),
+        ctx: brain_ops::test_support::ops_context_for_tests_owning_tempdir(executor),
         _tempdir: tempdir,
     }
 }
@@ -81,18 +78,18 @@ fn build_fixture_with_embedder(embedder: Arc<dyn Dispatcher>) -> Fixture {
 fn encode_req(request_id: [u8; 16], text: &str) -> EncodeRequest {
     EncodeRequest {
         text: text.into(),
-        context_id: 42,
-        kind: MemoryKindWire::Episodic,
-        salience_hint: 0.5,
-        edges: vec![],
+        session_id: 42,
         request_id,
         txn_id: None,
-        deduplicate: false,
+        occurred_at_unix_nanos: None,
+        act_as: None,
+        wait: brain_protocol::WaitMode::Ack,
+        allow_duplicates: false,
     }
 }
 
-fn unwrap_encode_resp(body: ResponseBody) -> EncodeResponse {
-    match body {
+fn unwrap_encode_resp(outcome: DispatchOutcome) -> EncodeResponse {
+    match single_body(outcome) {
         ResponseBody::Encode(r) => r,
         other => panic!("expected ResponseBody::Encode, got {other:?}"),
     }
@@ -109,7 +106,7 @@ fn encode_full_pipeline_returns_memory_id() {
         let req = encode_req([1; 16], "hello world");
         let resp = dispatch(
             RequestBody::Encode(req),
-            brain_ops::RequestCaller::anonymous(),
+            brain_ops::RequestCaller::for_tests(),
             &fix.ctx,
         )
         .await
@@ -118,8 +115,91 @@ fn encode_full_pipeline_returns_memory_id() {
 
         assert_ne!(enc.memory_id, 0, "memory_id must be non-zero");
         assert!(!enc.was_deduplicated);
-        assert_eq!(enc.salience, 0.5, "salience echoes the request hint");
+        assert_eq!(enc.salience, 0.5, "salience is the router default");
         assert_eq!(enc.auto_edges_added, 0);
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Opt-in synchronous write-analysis trace. `trace = false` leaves the
+// response's `trace` field `None` (zero-cost, unchanged payload); `trace =
+// true` populates an `EncodeTrace` — the synchronous phase timeline plus the
+// artifacts the write produced. The unit fixture wires no background workers,
+// so no async stages are queued: the drain returns immediately and the trace
+// carries only the synchronous phases (no timeout wait).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn encode_trace_absent_when_not_requested() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        let enc = unwrap_encode_resp(
+            dispatch(
+                RequestBody::Encode(encode_req([0xE0; 16], "no trace please")),
+                brain_ops::RequestCaller::for_tests(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(
+            enc.trace.is_none(),
+            "trace=false must leave the response trace unpopulated",
+        );
+    })
+}
+
+#[test]
+fn encode_trace_populated_when_requested() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        let mut req = encode_req([0xE1; 16], "trace this write");
+        req.wait = brain_protocol::WaitMode::Derived;
+        let enc = unwrap_encode_resp(
+            dispatch(
+                RequestBody::Encode(req),
+                brain_ops::RequestCaller::for_tests(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+
+        let trace = enc
+            .trace
+            .expect("trace=true must populate the response trace");
+        assert!(
+            !trace.stages.is_empty(),
+            "trace must record the synchronous write phases",
+        );
+        let names: Vec<&str> = trace.stages.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&"embed"),
+            "trace must include the embed phase"
+        );
+        assert!(
+            names.contains(&"persist"),
+            "trace must include the persist phase",
+        );
+        // Every recorded phase carries a status and a latency reading.
+        assert!(
+            trace.stages.iter().all(|s| s.latency_us < u64::MAX),
+            "each phase latency is a real microsecond reading",
+        );
+        // The memory landed in the mandatory HNSW; the artifacts section is
+        // always present (possibly empty) so a caller can render it.
+        assert!(
+            trace
+                .artifacts
+                .indexes
+                .iter()
+                .any(|i| i.name == "memory_hnsw"),
+            "artifacts must record the memory HNSW insertion",
+        );
+        assert!(
+            !trace.artifacts.dedup.was_deduplicated,
+            "a fresh write is not a dedup hit",
+        );
     })
 }
 
@@ -130,7 +210,7 @@ fn encode_full_pipeline_returns_memory_id() {
 // same `RequestId` retried returns the original
 // responsea: idempotency replay does NOT set
 // `was_deduplicated` — that flag is for fingerprint dedup
-// (`deduplicate = true`) only, see §07/07 §6. The two mechanisms
+// (`deduplicate = true`) only. The two mechanisms
 // are intentionally separate.
 
 #[test]
@@ -142,7 +222,7 @@ fn encode_replay_returns_same_response_transparently() {
         let first = unwrap_encode_resp(
             dispatch(
                 RequestBody::Encode(req.clone()),
-                brain_ops::RequestCaller::anonymous(),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
@@ -156,7 +236,7 @@ fn encode_replay_returns_same_response_transparently() {
         let second = unwrap_encode_resp(
             dispatch(
                 RequestBody::Encode(req),
-                brain_ops::RequestCaller::anonymous(),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
@@ -188,14 +268,14 @@ fn encode_conflict_returns_conflict_error_code() {
 
         let _ok = dispatch(
             RequestBody::Encode(first),
-            brain_ops::RequestCaller::anonymous(),
+            brain_ops::RequestCaller::for_tests(),
             &fix.ctx,
         )
         .await
         .unwrap();
         let err = dispatch(
             RequestBody::Encode(conflicting),
-            brain_ops::RequestCaller::anonymous(),
+            brain_ops::RequestCaller::for_tests(),
             &fix.ctx,
         )
         .await
@@ -205,162 +285,75 @@ fn encode_conflict_returns_conflict_error_code() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Consolidated kind rejected at planning.
+// 4. Memory kind is router-decided.
 // ---------------------------------------------------------------------------
-
-#[test]
-fn encode_consolidated_kind_rejected() {
-    run_in_glommio(|| async {
-        let fix = build_fixture();
-        let mut req = encode_req([4; 16], "no consolidated");
-        req.kind = MemoryKindWire::Consolidated;
-
-        let err = dispatch(
-            RequestBody::Encode(req),
-            brain_ops::RequestCaller::anonymous(),
-            &fix.ctx,
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            matches!(err, OpError::PlanError(_)),
-            "Consolidated rejection comes from the planner, got {err:?}"
-        );
-        assert_eq!(
-            err.error_code(),
-            brain_ops::ErrorCode::InvalidRequest,
-            "Consolidated kind must map to InvalidRequest"
-        );
-    })
-}
-
-// ---------------------------------------------------------------------------
-// 5. Edges: insert count is reflected in auto_edges_added.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn encode_auto_edges_added_counts_inserted_only() {
-    run_in_glommio(|| async {
-        let fix = build_fixture();
-
-        // First, write a target memory we can link to.
-        let target = unwrap_encode_resp(
-            dispatch(
-                RequestBody::Encode(encode_req([5; 16], "target")),
-                brain_ops::RequestCaller::anonymous(),
-                &fix.ctx,
-            )
-            .await
-            .unwrap(),
-        );
-        assert_ne!(target.memory_id, 0);
-
-        // Now encode with two edges: one valid, one to a non-existent id.
-        let mut req = encode_req([6; 16], "linker");
-        req.edges = vec![
-            EdgeRequest {
-                target: target.memory_id,
-                kind: EdgeKindWire::References,
-                weight: 0.5,
-            },
-            EdgeRequest {
-                target: 0xDEAD_BEEF_u128,
-                kind: EdgeKindWire::References,
-                weight: 0.5,
-            },
-        ];
-        let resp = unwrap_encode_resp(
-            dispatch(
-                RequestBody::Encode(req),
-                brain_ops::RequestCaller::anonymous(),
-                &fix.ctx,
-            )
-            .await
-            .unwrap(),
-        );
-        assert_eq!(
-            resp.auto_edges_added, 1,
-            "only the edge to the live target counts"
-        );
-    })
-}
+//
+// The client can no longer choose the memory kind (the `kind` field is
+// gone from ENCODE); the write router files every text encode as
+// Episodic. The old "Consolidated is rejected" test exercised a
+// capability that no longer exists on this path.
 
 // ---------------------------------------------------------------------------
 // 5b. Fingerprint dedup (a).
 // ---------------------------------------------------------------------------
 //
-// Distinct from idempotency (§4). Opt-in via `EncodeRequest.deduplicate`;
-// scoped per `(shard, agent_id, context_id)`; tombstone-aware.
+// Dedup is a DB policy — on by default for text ENCODE, scoped per
+// `(shard, space_id, session_id)`, tombstone-aware. The client's only
+// control is the per-request `allow_duplicates` opt-out; the default
+// builder produces a dedup-on encode (only request_id / text / context
+// vary), and `encode_req_allow_dup` sets the opt-out to force a distinct
+// memory for byte-identical text.
 
-fn encode_req_with_dedup(
-    request_id: [u8; 16],
-    text: &str,
-    context_id: u64,
-    deduplicate: bool,
-) -> EncodeRequest {
+fn encode_req_with_dedup(request_id: [u8; 16], text: &str, session_id: u64) -> EncodeRequest {
     EncodeRequest {
         text: text.into(),
-        context_id,
-        kind: MemoryKindWire::Episodic,
-        salience_hint: 0.5,
-        edges: vec![],
+        session_id,
         request_id,
         txn_id: None,
-        deduplicate,
+        occurred_at_unix_nanos: None,
+        act_as: None,
+        wait: brain_protocol::WaitMode::Ack,
+        allow_duplicates: false,
+    }
+}
+
+fn encode_req_allow_dup(request_id: [u8; 16], text: &str, session_id: u64) -> EncodeRequest {
+    EncodeRequest {
+        text: text.into(),
+        session_id,
+        request_id,
+        txn_id: None,
+        occurred_at_unix_nanos: None,
+        act_as: None,
+        wait: brain_protocol::WaitMode::Ack,
+        allow_duplicates: true,
     }
 }
 
 #[test]
-fn dedup_off_always_returns_fresh_slot() {
-    run_in_glommio(|| async {
-        let fix = build_fixture();
-        let a = unwrap_encode_resp(
-            dispatch(
-                RequestBody::Encode(encode_req_with_dedup([1; 16], "same text", 1, false)),
-                brain_ops::RequestCaller::anonymous(),
-                &fix.ctx,
-            )
-            .await
-            .unwrap(),
-        );
-        let b = unwrap_encode_resp(
-            dispatch(
-                RequestBody::Encode(encode_req_with_dedup([2; 16], "same text", 1, false)),
-                brain_ops::RequestCaller::anonymous(),
-                &fix.ctx,
-            )
-            .await
-            .unwrap(),
-        );
-        assert_ne!(a.memory_id, b.memory_id, "no dedup → distinct slots");
-        assert!(!a.was_deduplicated);
-        assert!(!b.was_deduplicated);
-    })
-}
-
-#[test]
-fn dedup_hit_returns_existing_memory_id() {
+fn same_text_dedupes_to_one_memory() {
+    // Content dedup is on by default: byte-identical text under the same
+    // `(space_id, session_id)` collapses to one memory even across distinct
+    // request_ids. The second encode reports `was_deduplicated = true` and
+    // returns the first memory's id — no new slot, WAL record, or index node.
     run_in_glommio(|| async {
         let fix = build_fixture();
         let first = unwrap_encode_resp(
             dispatch(
-                RequestBody::Encode(encode_req_with_dedup([3; 16], "dedup me", 1, true)),
-                brain_ops::RequestCaller::anonymous(),
+                RequestBody::Encode(encode_req_with_dedup([3; 16], "dedup me", 1)),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
             .unwrap(),
         );
-        assert!(
-            !first.was_deduplicated,
-            "first encode is a fresh slot (miss)"
-        );
+        assert!(!first.was_deduplicated);
 
-        // Same text + same context + different request_id + dedup=true.
+        // Same text + same context, different request_id → dedup hit.
         let second = unwrap_encode_resp(
             dispatch(
-                RequestBody::Encode(encode_req_with_dedup([4; 16], "dedup me", 1, true)),
-                brain_ops::RequestCaller::anonymous(),
+                RequestBody::Encode(encode_req_with_dedup([4; 16], "dedup me", 1)),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
@@ -368,9 +361,50 @@ fn dedup_hit_returns_existing_memory_id() {
         );
         assert!(
             second.was_deduplicated,
-            "second encode hits the fingerprint"
+            "byte-identical text under the same context must dedup",
         );
-        assert_eq!(first.memory_id, second.memory_id);
+        assert_eq!(
+            first.memory_id, second.memory_id,
+            "dedup returns the existing memory id",
+        );
+    })
+}
+
+#[test]
+fn allow_duplicates_forces_distinct_memories() {
+    // The `allow_duplicates` opt-out bypasses content dedup: byte-identical
+    // text under the same context becomes two distinct memories, neither
+    // reporting a dedup hit.
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        let first = unwrap_encode_resp(
+            dispatch(
+                RequestBody::Encode(encode_req_allow_dup([7; 16], "keep both", 1)),
+                brain_ops::RequestCaller::for_tests(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(!first.was_deduplicated);
+
+        let second = unwrap_encode_resp(
+            dispatch(
+                RequestBody::Encode(encode_req_allow_dup([8; 16], "keep both", 1)),
+                brain_ops::RequestCaller::for_tests(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(
+            !second.was_deduplicated,
+            "allow_duplicates must not dedup byte-identical text",
+        );
+        assert_ne!(
+            first.memory_id, second.memory_id,
+            "allow_duplicates yields a distinct memory",
+        );
     })
 }
 
@@ -380,8 +414,8 @@ fn dedup_different_context_no_hit() {
         let fix = build_fixture();
         let ctx_a = unwrap_encode_resp(
             dispatch(
-                RequestBody::Encode(encode_req_with_dedup([5; 16], "same text", 1, true)),
-                brain_ops::RequestCaller::anonymous(),
+                RequestBody::Encode(encode_req_with_dedup([5; 16], "same text", 1)),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
@@ -389,8 +423,8 @@ fn dedup_different_context_no_hit() {
         );
         let ctx_b = unwrap_encode_resp(
             dispatch(
-                RequestBody::Encode(encode_req_with_dedup([6; 16], "same text", 2, true)),
-                brain_ops::RequestCaller::anonymous(),
+                RequestBody::Encode(encode_req_with_dedup([6; 16], "same text", 2)),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
@@ -409,44 +443,13 @@ fn dedup_different_context_no_hit() {
 }
 
 #[test]
-fn dedup_off_then_on_still_misses() {
-    run_in_glommio(|| async {
-        // The dedup-off encode does NOT populate the fingerprint table.
-        // A later dedup-on encode of the same text must miss.
-        let fix = build_fixture();
-        let _bare = unwrap_encode_resp(
-            dispatch(
-                RequestBody::Encode(encode_req_with_dedup([7; 16], "wash me", 1, false)),
-                brain_ops::RequestCaller::anonymous(),
-                &fix.ctx,
-            )
-            .await
-            .unwrap(),
-        );
-        let dedup_attempt = unwrap_encode_resp(
-            dispatch(
-                RequestBody::Encode(encode_req_with_dedup([8; 16], "wash me", 1, true)),
-                brain_ops::RequestCaller::anonymous(),
-                &fix.ctx,
-            )
-            .await
-            .unwrap(),
-        );
-        assert!(
-            !dedup_attempt.was_deduplicated,
-            "dedup-off encode does not populate the index; dedup-on must miss",
-        );
-    })
-}
-
-#[test]
 fn dedup_after_forget_evicts_and_misses() {
     run_in_glommio(|| async {
         let fix = build_fixture();
         let first = unwrap_encode_resp(
             dispatch(
-                RequestBody::Encode(encode_req_with_dedup([9; 16], "evict me", 1, true)),
-                brain_ops::RequestCaller::anonymous(),
+                RequestBody::Encode(encode_req_with_dedup([9; 16], "evict me", 1)),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
@@ -460,10 +463,11 @@ fn dedup_after_forget_evicts_and_misses() {
             mode: brain_protocol::envelope::request::ForgetMode::Soft,
             request_id: [0xAA; 16],
             txn_id: None,
+            act_as: None,
         };
         dispatch(
             RequestBody::Forget(forget),
-            brain_ops::RequestCaller::anonymous(),
+            brain_ops::RequestCaller::for_tests(),
             &fix.ctx,
         )
         .await
@@ -473,8 +477,8 @@ fn dedup_after_forget_evicts_and_misses() {
         // was evicted in the same txn as the tombstone — must miss.
         let after = unwrap_encode_resp(
             dispatch(
-                RequestBody::Encode(encode_req_with_dedup([10; 16], "evict me", 1, true)),
-                brain_ops::RequestCaller::anonymous(),
+                RequestBody::Encode(encode_req_with_dedup([10; 16], "evict me", 1)),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
@@ -501,7 +505,7 @@ fn encode_persists_text_to_texts_table_atomically() {
         let resp = unwrap_encode_resp(
             dispatch(
                 RequestBody::Encode(encode_req([0x60; 16], text)),
-                brain_ops::RequestCaller::anonymous(),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
@@ -512,9 +516,7 @@ fn encode_persists_text_to_texts_table_atomically() {
         // and equals exactly what we encoded. Same redb file the live
         // writer just wrote.
         let memory_id_bytes = resp.memory_id.to_be_bytes();
-        let metadata = fix.ctx.executor.metadata.clone();
-        let guard = metadata.lock();
-        let rtxn = guard.read_txn().expect("read_txn");
+        let rtxn = fix.ctx.executor.metadata.read_txn().expect("read_txn");
         let table = rtxn.open_table(TEXTS_TABLE).expect("texts table exists");
         let row = table
             .get(memory_id_bytes)
@@ -529,8 +531,7 @@ fn encode_persists_text_to_texts_table_atomically() {
 /// (open / get / borrow) — tests use this on the happy path only.
 fn read_text(fix: &Fixture, memory_id: u128) -> Option<Vec<u8>> {
     use brain_metadata::tables::text::TEXTS_TABLE;
-    let guard = fix.ctx.executor.metadata.lock();
-    let rtxn = guard.read_txn().expect("read_txn");
+    let rtxn = fix.ctx.executor.metadata.read_txn().expect("read_txn");
     let table = rtxn.open_table(TEXTS_TABLE).expect("texts table exists");
     table
         .get(memory_id.to_be_bytes())
@@ -545,7 +546,7 @@ fn encode_empty_text_is_rejected_at_planner() {
         let fix = build_fixture();
         let err = dispatch(
             RequestBody::Encode(encode_req([0x61; 16], "")),
-            brain_ops::RequestCaller::anonymous(),
+            brain_ops::RequestCaller::for_tests(),
             &fix.ctx,
         )
         .await
@@ -569,7 +570,7 @@ fn encode_unicode_text_round_trips_byte_for_byte() {
         let resp = unwrap_encode_resp(
             dispatch(
                 RequestBody::Encode(encode_req([0x62; 16], text)),
-                brain_ops::RequestCaller::anonymous(),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
@@ -591,7 +592,7 @@ fn encode_large_text_round_trips() {
         let resp = unwrap_encode_resp(
             dispatch(
                 RequestBody::Encode(encode_req([0x63; 16], &text)),
-                brain_ops::RequestCaller::anonymous(),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
@@ -613,7 +614,7 @@ fn encode_idempotent_retry_keeps_single_text_row_unchanged() {
         let first = unwrap_encode_resp(
             dispatch(
                 RequestBody::Encode(req.clone()),
-                brain_ops::RequestCaller::anonymous(),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
@@ -622,7 +623,7 @@ fn encode_idempotent_retry_keeps_single_text_row_unchanged() {
         let second = unwrap_encode_resp(
             dispatch(
                 RequestBody::Encode(req),
-                brain_ops::RequestCaller::anonymous(),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
@@ -640,15 +641,15 @@ fn encode_idempotent_retry_keeps_single_text_row_unchanged() {
 }
 
 #[test]
-fn encode_dedup_hit_does_not_clobber_original_text_row() {
+fn same_text_second_encode_leaves_first_text_row_intact() {
     run_in_glommio(|| async {
         let fix = build_fixture();
         let original_text = "dedup-original-text";
 
         let first = unwrap_encode_resp(
             dispatch(
-                RequestBody::Encode(encode_req_with_dedup([0x70; 16], original_text, 9, true)),
-                brain_ops::RequestCaller::anonymous(),
+                RequestBody::Encode(encode_req_allow_dup([0x70; 16], original_text, 9)),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
@@ -660,89 +661,30 @@ fn encode_dedup_hit_does_not_clobber_original_text_row() {
             Some(original_text.as_bytes().to_vec())
         );
 
-        // Same text + context + dedup=true under a different request_id:
-        // server returns the existing memory_id and must NOT mutate the
-        // original text row.
+        // Same text + context under a different request_id, opting OUT of
+        // dedup (`allow_duplicates`): the write path stores it faithfully as a
+        // second, independent memory — the first memory's text row is never
+        // mutated or collapsed.
         let second = unwrap_encode_resp(
             dispatch(
-                RequestBody::Encode(encode_req_with_dedup([0x71; 16], original_text, 9, true)),
-                brain_ops::RequestCaller::anonymous(),
+                RequestBody::Encode(encode_req_allow_dup([0x71; 16], original_text, 9)),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
             .unwrap(),
         );
-        assert!(second.was_deduplicated);
-        assert_eq!(first.memory_id, second.memory_id);
+        assert!(!second.was_deduplicated);
+        assert_ne!(first.memory_id, second.memory_id);
         assert_eq!(
             read_text(&fix, first.memory_id),
             Some(original_text.as_bytes().to_vec()),
-            "dedup hit must not rewrite the texts row",
+            "the first text row is untouched by the second encode",
         );
-    })
-}
-
-// ---------------------------------------------------------------------------
-// 6b. was_deduplicated round-trips through idempotency replay.
-// ---------------------------------------------------------------------------
-//
-// The two flags (`replayed` and `was_deduplicated`) are orthogonal.
-// Idempotency replay is transparent — clients see the
-// same shape on retry as on first attempt. If the first attempt was a
-// fingerprint dedup hit, the cached response carries that signal; a
-// retry MUST surface it too. Otherwise the same `request_id` returns
-// two different response shapes, breaking the "same params → cached
-// response" invariant in CLAUDE.md §5.
-
-#[test]
-fn encode_dedup_then_replay_returns_was_deduplicated_true() {
-    run_in_glommio(|| async {
-        let fix = build_fixture();
-
-        // First: dedup=true with no existing memory → miss, fresh slot.
-        let first = unwrap_encode_resp(
-            dispatch(
-                RequestBody::Encode(encode_req_with_dedup([0x80; 16], "round-trip me", 11, true)),
-                brain_ops::RequestCaller::anonymous(),
-                &fix.ctx,
-            )
-            .await
-            .unwrap(),
-        );
-        assert!(!first.was_deduplicated, "first encode is a fresh slot");
-
-        // Second: same text, dedup=true, different request_id → dedup hit.
-        let second_req = encode_req_with_dedup([0x81; 16], "round-trip me", 11, true);
-        let second = unwrap_encode_resp(
-            dispatch(
-                RequestBody::Encode(second_req.clone()),
-                brain_ops::RequestCaller::anonymous(),
-                &fix.ctx,
-            )
-            .await
-            .unwrap(),
-        );
-        assert!(
-            second.was_deduplicated,
-            "second encode hits the fingerprint"
-        );
-        assert_eq!(first.memory_id, second.memory_id);
-
-        // Third: retry the SAME request_id as `second` → idempotency
-        // replay must surface `was_deduplicated: true`.
-        let third = unwrap_encode_resp(
-            dispatch(
-                RequestBody::Encode(second_req),
-                brain_ops::RequestCaller::anonymous(),
-                &fix.ctx,
-            )
-            .await
-            .unwrap(),
-        );
-        assert_eq!(third.memory_id, second.memory_id);
-        assert!(
-            third.was_deduplicated,
-            "idempotency replay must round-trip was_deduplicated=true",
+        assert_eq!(
+            read_text(&fix, second.memory_id),
+            Some(original_text.as_bytes().to_vec()),
+            "the second encode stores its own faithful text row",
         );
     })
 }
@@ -756,7 +698,7 @@ fn encode_fresh_then_replay_returns_was_deduplicated_false() {
         let first = unwrap_encode_resp(
             dispatch(
                 RequestBody::Encode(req.clone()),
-                brain_ops::RequestCaller::anonymous(),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
@@ -767,7 +709,7 @@ fn encode_fresh_then_replay_returns_was_deduplicated_false() {
         let second = unwrap_encode_resp(
             dispatch(
                 RequestBody::Encode(req),
-                brain_ops::RequestCaller::anonymous(),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await
@@ -803,7 +745,7 @@ fn encode_with_real_embedder_end_to_end() {
         let resp = unwrap_encode_resp(
             dispatch(
                 RequestBody::Encode(req),
-                brain_ops::RequestCaller::anonymous(),
+                brain_ops::RequestCaller::for_tests(),
                 &fix.ctx,
             )
             .await

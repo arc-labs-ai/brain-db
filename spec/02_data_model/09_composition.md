@@ -82,7 +82,7 @@ Every Statement carries four timestamps, splitting object time (when the claim i
 
 Object time answers "when was this true?"; record time answers "when did Brain believe this?". The split is what makes `as_of(record_time)` queries possible: "what did Brain believe about Priya's role on March 1st?" returns rows whose record window contains March 1st, even if those rows have since been superseded.
 
-See [`07_statement.md`](07_statement.md) for the storage layout and [`../13_retrievers/05_hybrid_query.md`](../13_retrievers/05_hybrid_query.md) for the filter-chain integration.
+See [`07_statement.md`](07_statement.md) for the storage layout and [`../13_retrievers/05_retrieval_query.md`](../13_retrievers/05_retrieval_query.md) for the filter-chain integration.
 
 ## Rule 6: Schemas can evolve; data must be migratable
 
@@ -99,14 +99,14 @@ This is detailed in [`../03_schema/`](../03_schema/00_purpose.md) and [`../10_me
 
 A user can deploy Brain and never declare a schema. In this case:
 
-- ENCODE, RECALL, and the knowledge opcodes (STATEMENT_CREATE, RELATION_CREATE, QUERY) all accept traffic.
+- ENCODE, RECALL, and the knowledge opcodes (STATEMENT_CREATE, RELATION_CREATE, STATEMENT_LIST) all accept traffic.
 - The Entity, Statement, and Relation tables populate from writes against an open vocabulary — predicates and relation types are interned on first use with origin `ImplicitFromWrite`.
 - The lexical (tantivy) index and statement HNSW are populated by the extractors as memories arrive.
 - The query router runs in both modes — it is the default RECALL path for every deployment.
 
 This is the open-vocabulary mode. It is a first-class deployment posture, not a degraded one.
 
-When the user declares their first schema, extractors gain a typed vocabulary and may optionally trigger a backfill over existing memories. Declaring a schema activates **strict validation** for statements, relations, and predicate filters within that namespace — unknown qnames produce `PredicateNotInSchema` / `RelationTypeNotInSchema`, and declared cardinalities are enforced. It does NOT activate hybrid retrieval; hybrid (semantic + lexical + memory-edge graph) is already the default. What schema adds is typed entity-anchored graph traversal and predicate-vocabulary checking.
+When the user declares their first schema, extractors gain a typed vocabulary and may optionally trigger a backfill over existing memories. Declaring a schema activates **strict validation** for statements, relations, and predicate filters within that namespace — unknown qnames produce `PredicateNotInSchema` / `RelationTypeNotInSchema`, and declared cardinalities are enforced. It does NOT activate retrieval; the retrieval pipeline (semantic + lexical + memory-edge graph) is already the default. What schema adds is typed entity-anchored graph traversal and predicate-vocabulary checking.
 
 ## What gets stored where: summary
 
@@ -216,7 +216,7 @@ The pattern is clear: **operational knowledge graphs use property graphs; semant
 
 Two things are worth borrowing:
 
-1. **The triple as an API abstraction.** When a user writes a Fact, they think `(Priya, role, "engineering manager")`. The SDK accepts this shape. Internally it becomes a property-graph edge or node-with-property.
+1. **The triple as an API abstraction.** When a user writes a Fact, they think `(Priya, role, "engineering manager")`. A client constructs this shape. Internally it becomes a property-graph edge or node-with-property.
 
 2. **URI-style identifiers for predicates.** Brain uses namespaced predicate strings like `brain:prefers` or `crm:reports_to` to avoid collisions. This is RDF's convention and it's good.
 

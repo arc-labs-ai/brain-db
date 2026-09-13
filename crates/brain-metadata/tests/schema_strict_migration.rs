@@ -20,7 +20,7 @@ use brain_core::{
     Entity, EvidenceEntry, EvidenceRef, Statement, StatementObject, StatementValue, SubjectRef,
 };
 use brain_core::{
-    ContextId, EntityId, EntityTypeId, ExtractorId, MemoryId, StatementId, StatementKind,
+    EntityId, EntityTypeId, ExtractorId, MemoryId, SessionId, StatementId, StatementKind,
 };
 use brain_metadata::entity::ops::entity_put;
 use brain_metadata::schema::apply::flag_statements_outside_schema;
@@ -29,6 +29,7 @@ use brain_metadata::schema::store::schema_upload;
 use brain_metadata::statement::{statement_create, statement_get};
 use brain_metadata::tables::statement::{statement_flags, STATEMENTS_TABLE};
 use brain_metadata::MetadataDb;
+use brain_metadata::RowScope;
 use brain_protocol::schema::{parse_schema, validate, ValidatedSchema};
 use redb::{ReadableDatabase, ReadableTable};
 
@@ -65,6 +66,8 @@ fn put_anchor_entity(db: &redb::Database) -> EntityId {
     let wtxn = db.begin_write().unwrap();
     entity_put(
         &wtxn,
+        RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xAB; 16]),
+        brain_core::SessionId::DEFAULT,
         &Entity::new_active(id, EntityTypeId(1), "anchor".into(), "anchor".into(), T0),
     )
     .unwrap();
@@ -81,7 +84,7 @@ fn write_statement(
     let wtxn = db.begin_write().unwrap();
     let pid = predicate_intern_or_get(&wtxn, predicate_ns, predicate_name, 0, T0).unwrap();
     let evidence_entry = EvidenceEntry::from_parts(
-        MemoryId::pack(1, ContextId::DEFAULT.into(), 0),
+        MemoryId::pack(1, SessionId::DEFAULT.into(), 0),
         1.0,
         0,
         ExtractorId::default(),
@@ -98,7 +101,14 @@ fn write_statement(
         0,
         1,
     );
-    let sid = statement_create(&wtxn, &stmt, T0).unwrap();
+    let sid = statement_create(
+        &wtxn,
+        RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xAB; 16]),
+        brain_core::SessionId::DEFAULT,
+        &stmt,
+        T0,
+    )
+    .unwrap();
     wtxn.commit().unwrap();
     sid
 }

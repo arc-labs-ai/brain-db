@@ -2,19 +2,20 @@
 //! wire-mirror enums.
 //!
 //! The primitive-aliased conversions (`MemoryId ⇄ WireMemoryId`,
-//! `ContextId ⇄ WireContextId`, `AgentId / RequestId / TxnId ⇄ WireUuid`)
+//! `SessionId ⇄ WireSessionId`, `SpaceId / RequestId / TxnId ⇄ WireUuid`)
 //! live in `brain_core` rather than here — the wire-domain aliases are
 //! type-aliases for primitives, so the From impls must live where the
 //! domain types are local (orphan rules).
 //!
 //! What stays here are the enum mirrors that exist only in this crate
-//! because rkyv's closed-world derive needs concrete enums:
+//! because the wire needs closed, concrete enums:
 //! `MemoryKindWire`, `EdgeKindWire`. Those map back to `brain_core`'s
 //! `MemoryKind` / `EdgeKind` via the impls below.
 
 use brain_core::{EdgeKind, MemoryKind};
 
 use crate::envelope::request::{EdgeKindWire, MemoryKindWire};
+use crate::ops::graph::GraphEdgeKindWire;
 
 // ---------------------------------------------------------------------------
 // MemoryKind  ⇄  MemoryKindWire
@@ -78,12 +79,35 @@ impl From<EdgeKindWire> for EdgeKind {
     }
 }
 
+// ---------------------------------------------------------------------------
+// EdgeKind  →  GraphEdgeKindWire
+// ---------------------------------------------------------------------------
+
+/// One-way: `GraphEdgeKindWire` is a superset (it also carries the typed-graph
+/// projections `Relation` / `Fact` / `HasStatement` / `Mentions`, which have no
+/// `EdgeKind` counterpart), so only the memory↔memory direction is total.
+impl From<EdgeKind> for GraphEdgeKindWire {
+    #[inline]
+    fn from(k: EdgeKind) -> Self {
+        match k {
+            EdgeKind::Caused => Self::Caused,
+            EdgeKind::FollowedBy => Self::FollowedBy,
+            EdgeKind::DerivedFrom => Self::DerivedFrom,
+            EdgeKind::SimilarTo => Self::SimilarTo,
+            EdgeKind::Contradicts => Self::Contradicts,
+            EdgeKind::Supports => Self::Supports,
+            EdgeKind::References => Self::References,
+            EdgeKind::PartOf => Self::PartOf,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use brain_core::{AgentId, ContextId, EdgeKind, MemoryId, MemoryKind, RequestId, TxnId};
+    use brain_core::{EdgeKind, MemoryId, MemoryKind, RequestId, SessionId, SpaceId, TxnId};
 
     use super::*;
-    use crate::envelope::request::{WireContextId, WireMemoryId, WireUuid};
+    use crate::envelope::request::{WireMemoryId, WireSessionId, WireUuid};
 
     #[test]
     fn memory_id_round_trips_via_wire() {
@@ -97,24 +121,24 @@ mod tests {
     }
 
     #[test]
-    fn context_id_round_trips_via_wire() {
-        let id = ContextId(0x0123_4567_89AB_CDEF);
-        let wire: WireContextId = id.into();
-        let back: ContextId = wire.into();
+    fn session_id_round_trips_via_wire() {
+        let id = SessionId(0x0123_4567_89AB_CDEF);
+        let wire: WireSessionId = id.into();
+        let back: SessionId = wire.into();
         assert_eq!(back, id);
     }
 
     #[test]
-    fn agent_request_txn_round_trip_via_wire() {
-        let agent = AgentId::new();
+    fn space_request_txn_round_trip_via_wire() {
+        let space = SpaceId::new();
         let request = RequestId::new();
         let txn = TxnId::new();
 
-        let agent_wire: WireUuid = agent.into();
+        let space_wire: WireUuid = space.into();
         let request_wire: WireUuid = request.into();
         let txn_wire: WireUuid = txn.into();
 
-        assert_eq!(AgentId::from(agent_wire), agent);
+        assert_eq!(SpaceId::from(space_wire), space);
         assert_eq!(RequestId::from(request_wire), request);
         assert_eq!(TxnId::from(txn_wire), txn);
     }
@@ -147,6 +171,40 @@ mod tests {
             let wire: EdgeKindWire = k.into();
             let back: EdgeKind = wire.into();
             assert_eq!(back, k);
+        }
+    }
+
+    /// Each memory↔memory kind must land on its own `GraphEdgeKindWire`
+    /// byte, disjoint from the four typed-graph projections. This is what
+    /// lets a client tell `SimilarTo` from `FollowedBy` off the single
+    /// `GraphEdge.kind` byte, with no companion field.
+    #[test]
+    fn edge_kind_maps_to_distinct_graph_edge_kind_bytes() {
+        let mut seen = std::collections::HashSet::new();
+        for k in [
+            EdgeKind::Caused,
+            EdgeKind::FollowedBy,
+            EdgeKind::DerivedFrom,
+            EdgeKind::SimilarTo,
+            EdgeKind::Contradicts,
+            EdgeKind::Supports,
+            EdgeKind::References,
+            EdgeKind::PartOf,
+        ] {
+            let wire: GraphEdgeKindWire = k.into();
+            assert_eq!(wire as u8, 4 + k as u8, "{k:?} discriminant offset");
+            assert!(seen.insert(wire as u8), "{k:?} collides");
+        }
+        for projection in [
+            GraphEdgeKindWire::Relation,
+            GraphEdgeKindWire::Fact,
+            GraphEdgeKindWire::HasStatement,
+            GraphEdgeKindWire::Mentions,
+        ] {
+            assert!(
+                !seen.contains(&(projection as u8)),
+                "{projection:?} collides with a memory-edge kind"
+            );
         }
     }
 }

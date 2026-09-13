@@ -6,7 +6,7 @@ The procedure for bringing a shard back to a consistent state after a crash. The
 
 After recovery, the shard's state satisfies:
 
-- All WAL records that were durably written before the crash are reflected in the in-memory state, arena, metadata, and HNSW index.
+- All WAL records that were durably written before the crash are reflected in the in-memory state, arena, metadata, and HNSW indexes.
 - All WAL records that weren't durably written are absent from all derived state (as if they never happened).
 - The shard is ready to accept new operations.
 
@@ -21,7 +21,7 @@ After recovery, the shard's state satisfies:
    b. If CRC fails, this is the truncation point — stop here.
    c. If CRC succeeds, apply the record's effect.
 5. Verify integrity (slot versions match metadata, arena norms reasonable).
-6. Rebuild the HNSW index from the arena and metadata.
+6. Restore the HNSW indexes (memory, entity, statement) per [09.06 §2 + §6](../09_indexing/06_persistence.md). The memory HNSW tries the most-recent snapshot first and replays only the WAL tail past `taken_at_lsn`; on any snapshot failure, falls through to a full rebuild from the arena. Entity / statement HNSW reseed from durable source-of-truth (entity vectors persisted at write time; statement embed queue).
 7. Open the WAL for new appends.
 8. Mark the shard ready.
 ```
@@ -162,19 +162,19 @@ If a check fails, Brain logs the inconsistency. Depending on severity:
 - Minor: log and continue (e.g., a salience field that didn't get its update applied; recovery will re-apply on next checkpoint).
 - Major: refuse to start (e.g., a slot's metadata is internally inconsistent; the operator must investigate).
 
-## 8. Rebuilding the HNSW index
+## 8. Restoring the HNSW indexes
 
-The HNSW index is not persisted independently; it's rebuilt on startup from the arena and metadata.
+The three HNSW indexes (memory, statement, entity) are derived state. See [09.06 Index Persistence & Recovery](../09_indexing/06_persistence.md) for the per-index recovery model. Summary:
 
-After WAL replay, Brain:
+- **Memory HNSW** — try snapshot-load first (`SharedHnsw::load_snapshot` against the most-recent checkpoint directory). On success, replay any arena entries whose `encoded_at_lsn > snapshot.taken_at_lsn` into the pending buffer (so writes between the snapshot and the crash are not lost). On any snapshot failure (missing, CRC / version / shard_uuid mismatch), fall through to a **full rebuild** from the arena: iterate occupied, non-tombstoned arena slots and insert each `(MemoryId, vector)`. The fallback path matches the original v1 behavior.
+- **Entity HNSW** — rebuild from `ENTITIES_TABLE`. Each row's vector is read from `ENTITY_VECTORS_TABLE` (persisted at write time, [09.06 §6](../09_indexing/06_persistence.md)); rows without a stored vector re-embed `canonical_name` as the fallback.
+- **Statement HNSW** — seed the embed queue with every live statement; the per-shard `StatementEmbedWorker` repopulates the index in the background.
 
-1. Iterates over all active (non-tombstoned) memories in the metadata store.
-2. For each, reads the vector from the arena.
-3. Calls `hnsw_index.insert(memory_id, vector)`.
+Memory and entity restores complete before the shard is marked ready (step 8); the statement restore proceeds asynchronously after ready.
 
-For a 1M-memory shard, HNSW rebuild takes ~30 seconds (single-threaded) or ~5 seconds (parallel). For larger shards, the time scales linearly. See [09. Indexing](../09_indexing/00_purpose.md) §Rebuild for details.
+For a 1M-memory shard with a fresh snapshot: load is dominated by the on-disk graph read (~1–5 seconds); WAL-tail replay is bounded by the snapshot cadence. The full-rebuild fallback takes ~30 seconds (single-threaded) or ~5 seconds (parallel). Each shard's indexes are owned by that shard's executor; multiple shards restore concurrently.
 
-The rebuild can be parallelized across cores. Each shard's HNSW is owned by that shard's executor; multiple shards rebuild concurrently.
+**No silent corruption.** A snapshot whose header CRC, footer hash, file-level BLAKE3, or shard_uuid fails verification is refused with a warn-level log; the shard then runs the full-rebuild fallback rather than loading a possibly-wrong graph (CLAUDE invariant 7).
 
 ## 9. Recovery time
 

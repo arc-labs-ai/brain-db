@@ -1,4 +1,4 @@
-//! M6 WebSocket integration tests — echo round-trip for text and
+//! WebSocket integration tests — echo round-trip for text and
 //! binary, plus a multi-message sequence.
 //!
 //! Server uses `brain_http::ws::accept`; client uses

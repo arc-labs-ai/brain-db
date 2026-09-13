@@ -13,7 +13,7 @@ use brain_core::{
     StatementKind, StatementObject, StatementValue, SubjectRef,
 };
 use brain_core::{
-    AgentId, ContextId, EntityId, ExtractorId, MemoryId, MemoryKind, NodeRef, Salience,
+    EntityId, ExtractorId, MemoryId, MemoryKind, NodeRef, Salience, SessionId, SpaceId,
 };
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
@@ -24,13 +24,12 @@ use brain_metadata::tables::statement::STATEMENTS_TABLE;
 use brain_metadata::MetadataDb;
 use brain_ops::write::phase::TombstoneMode;
 use brain_ops::{
-    ForgetCascadeJob, ForgetCascadeMetrics, OpsContext, Phase, RealWriterHandle, TombstoneTarget,
-    Write, WriteId,
+    ForgetCascadeJob, ForgetCascadeMetrics, Phase, RealWriterHandle, TombstoneTarget, Write,
+    WriteId,
 };
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_workers::workers::forget_cascade::ForgetCascadeWorker;
 use brain_workers::WorkerContext;
-use parking_lot::Mutex;
 use smallvec::SmallVec;
 use std::sync::atomic::AtomicBool;
 use tempfile::TempDir;
@@ -61,8 +60,8 @@ struct Fixture {
 fn build_fixture() -> Fixture {
     let tempdir = tempfile::tempdir().unwrap();
     let db_path = tempdir.path().join("metadata.redb");
-    let metadata: SharedMetadataDb = Arc::new(Mutex::new(MetadataDb::open(&db_path).unwrap()));
-    let (shared, hnsw_writer) = SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).unwrap();
+    let metadata: SharedMetadataDb = Arc::new(MetadataDb::open(&db_path).unwrap());
+    let (shared, hnsw_writer) = SharedHnsw::new(IndexParams::default_v1()).unwrap();
     let mut writer_raw = RealWriterHandle::new(metadata.clone(), hnsw_writer);
 
     let (tx, rx) = flume::unbounded::<ForgetCascadeJob>();
@@ -79,7 +78,7 @@ fn build_fixture() -> Fixture {
         metadata.clone(),
         writer.clone() as Arc<dyn WriterHandle>,
     );
-    let ops = Arc::new(OpsContext::new(executor));
+    let ops = Arc::new(brain_ops::test_support::ops_context_for_tests_owning_tempdir(executor));
     let ctx = WorkerContext {
         ops,
         shutdown: Arc::new(AtomicBool::new(false)),
@@ -102,16 +101,14 @@ fn make_entity(metadata: &SharedMetadataDb, name: &str) -> EntityId {
         normalize_name(name),
         NOW,
     );
-    let mut db = metadata.lock();
-    let wtxn = db.write_txn().unwrap();
-    entity_put(&wtxn, &e).unwrap();
+    let wtxn = metadata.write_txn().unwrap();
+    entity_put(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &e).unwrap();
     wtxn.commit().unwrap();
     id
 }
 
 fn intern_predicate(metadata: &SharedMetadataDb, name: &str) -> PredicateId {
-    let mut db = metadata.lock();
-    let wtxn = db.write_txn().unwrap();
+    let wtxn = metadata.write_txn().unwrap();
     let id = predicate_intern(
         &wtxn,
         "test",
@@ -157,9 +154,8 @@ fn seed_statement(
         1,
     );
     s.confidence = stmt_conf;
-    let mut db = metadata.lock();
-    let wtxn = db.write_txn().unwrap();
-    statement_create(&wtxn, &s, NOW).unwrap();
+    let wtxn = metadata.write_txn().unwrap();
+    statement_create(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &s, NOW).unwrap();
     wtxn.commit().unwrap();
     id
 }
@@ -171,14 +167,15 @@ fn upsert_memory(writer: &RealWriterHandle, id: MemoryId) {
         vector: Box::new([0.0f32; VECTOR_DIM]),
         kind: MemoryKind::Episodic,
         salience: Salience::default(),
-        context: ContextId::DEFAULT,
+        session_id: SessionId::DEFAULT,
         created_at_unix_nanos: NOW,
+        occurred_at_unix_nanos: None,
         arena_slot: id.slot(),
         embedding_model_fp: [0u8; 16],
         content_hash: None,
         deduplicate: false,
     };
-    let write = Write::single(WriteId::new(), AgentId::default(), phase);
+    let write = Write::single(WriteId::new(), SpaceId::default(), phase);
     // We block on the future via a dummy tokio runtime — the writer
     // returns immediately for the in-process test path.
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -195,7 +192,7 @@ fn tombstone_memory(writer: &RealWriterHandle, id: MemoryId, mode: TombstoneMode
         reason: 0,
         at_unix_nanos: NOW + 1,
     };
-    let write = Write::single(WriteId::new(), AgentId::default(), phase);
+    let write = Write::single(WriteId::new(), SpaceId::default(), phase);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -244,8 +241,7 @@ fn hard_forget_cascade_tombstones_single_evidence_statement() {
 
     // Pre-FORGET: the dependent surfaces.
     {
-        let db = fx.metadata.lock();
-        let rtxn = db.read_txn().unwrap();
+        let rtxn = fx.metadata.read_txn().unwrap();
         let deps = statements_citing_memory(&rtxn, m).unwrap();
         assert_eq!(deps, vec![s], "pre-FORGET dependent must surface");
     }
@@ -264,9 +260,9 @@ fn hard_forget_cascade_tombstones_single_evidence_statement() {
     assert_eq!(processed, 1);
     assert_eq!(fx.worker.queue_depth(), 0);
 
-    let db = fx.metadata.lock();
+    let db = fx.metadata.as_ref();
     assert!(
-        statement_is_tombstoned(&db, s),
+        statement_is_tombstoned(db, s),
         "single-evidence statement must be tombstoned post-cascade"
     );
     let metrics = fx.worker.metrics().snapshot();
@@ -291,8 +287,8 @@ fn soft_forget_also_enqueues_cascade() {
     assert_eq!(fx.worker.queue_depth(), 1, "soft FORGET must enqueue");
     drive_worker_once(&fx.worker, &fx.ctx);
 
-    let db = fx.metadata.lock();
-    assert!(statement_is_tombstoned(&db, s));
+    let db = fx.metadata.as_ref();
+    assert!(statement_is_tombstoned(db, s));
 }
 
 #[test]
@@ -309,9 +305,9 @@ fn cascade_rederives_confidence_when_other_evidence_remains() {
     tombstone_memory(&fx.writer, m1, TombstoneMode::Hard);
     drive_worker_once(&fx.worker, &fx.ctx);
 
-    let db = fx.metadata.lock();
-    assert!(!statement_is_tombstoned(&db, s));
-    let post = statement_confidence(&db, s).unwrap();
+    let db = fx.metadata.as_ref();
+    assert!(!statement_is_tombstoned(db, s));
+    let post = statement_confidence(db, s).unwrap();
     // Noisy-OR over a single c=0.8 entry at age=0 → ~0.8.
     assert!(
         (post - 0.8).abs() < 1e-3,
@@ -329,10 +325,16 @@ fn cascade_drains_multiple_pending_jobs() {
     upsert_memory(&fx.writer, m1);
     upsert_memory(&fx.writer, m2);
 
+    // Distinct subjects so the two statements are genuinely different rows.
+    // seed_statement writes the same object/predicate/kind for every call, so
+    // sharing a subject would make s1 and s2 byte-identical — statement_create
+    // legitimately dedups those into one row (extractor-retry idempotency),
+    // which is not what this cascade test means to exercise.
     let pred = intern_predicate(&fx.metadata, "prefers_color");
-    let subj = make_entity(&fx.metadata, "alice-many");
-    let s1 = seed_statement(&fx.metadata, pred, subj, vec![(m1, 0.7)]);
-    let s2 = seed_statement(&fx.metadata, pred, subj, vec![(m2, 0.7)]);
+    let subj1 = make_entity(&fx.metadata, "alice-many-1");
+    let subj2 = make_entity(&fx.metadata, "alice-many-2");
+    let s1 = seed_statement(&fx.metadata, pred, subj1, vec![(m1, 0.7)]);
+    let s2 = seed_statement(&fx.metadata, pred, subj2, vec![(m2, 0.7)]);
 
     tombstone_memory(&fx.writer, m1, TombstoneMode::Hard);
     tombstone_memory(&fx.writer, m2, TombstoneMode::Hard);
@@ -340,7 +342,11 @@ fn cascade_drains_multiple_pending_jobs() {
 
     let processed = drive_worker_once(&fx.worker, &fx.ctx);
     assert!(processed >= 2);
-    let db = fx.metadata.lock();
-    assert!(statement_is_tombstoned(&db, s1));
-    assert!(statement_is_tombstoned(&db, s2));
+    let db = fx.metadata.as_ref();
+    assert!(statement_is_tombstoned(db, s1));
+    assert!(statement_is_tombstoned(db, s2));
+}
+
+fn __ts() -> brain_metadata::RowScope {
+    brain_metadata::RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xA1; 16])
 }

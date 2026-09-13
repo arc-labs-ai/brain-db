@@ -1,14 +1,13 @@
 //! Bit-packed tombstone bitmap.
 //!
-//! See `spec/09_indexing/05_deletion.md`. HNSW doesn't support efficient
+//! HNSW doesn't support efficient
 //! eager deletion, so forgotten memories are *tombstoned*: their node
 //! stays in the graph and is filtered out at search time. This module
-//! owns the filter state; the search wiring lives in `hnsw.rs`
-//! (sub-task 4.4).
+//! owns the filter state; the search wiring lives in `hnsw.rs`.
 //!
 //! ## Representation
 //!
-//! `Vec<u64>` — 64 bits per word. At the spec's per-shard ceiling of
+//! `Vec<u64>` — 64 bits per word. At the per-shard ceiling of
 //! 10M memories, this is ~1.25 MB; a `Vec<bool>` would be 10 MB.
 //! Grows lazily — fresh bitmaps allocate nothing.
 //!
@@ -68,7 +67,7 @@ impl TombstoneBitmap {
     }
 
     /// Clear all tombstones. Used by [`crate::hnsw::HnswIndex`] during
-    /// rebuild (sub-task 4.6): a fresh post-rebuild index skips the
+    /// rebuild: a fresh post-rebuild index skips the
     /// previously-tombstoned memories, so the new bitmap starts empty.
     pub fn clear(&mut self) {
         self.bits.fill(0);
@@ -91,7 +90,7 @@ impl TombstoneBitmap {
         self.count
     }
 
-    /// Raw bitmap words. Used by snapshot persistence (sub-task 4.5)
+    /// Raw bitmap words. Used by snapshot persistence
     /// to serialise the bitmap byte-for-byte.
     #[must_use]
     pub fn raw_words(&self) -> &[u64] {

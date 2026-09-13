@@ -21,7 +21,7 @@ Documents not present in retriever `i`'s output contribute 0 to the sum.
 
 ## Why this formula
 
-RRF has three properties that make it the production-default for hybrid retrieval:
+RRF has three properties that make it the production-default for retrieval:
 
 1. **Score-scale invariance.** It doesn't matter that cosine returns [0, 1] while BM25 returns unbounded positives. Only ranks are used.
 
@@ -41,6 +41,22 @@ For Brain:
 - `k = 60` is the default.
 - Per-query override is allowed.
 - The query router may select `k` based on query class (e.g., higher `k` for ambiguous queries where no single retriever is trusted; lower `k` for entity-anchored queries where graph is trusted).
+
+## Cross-shard merge (namespace-wide RECALL)
+
+RRF fuses per-retriever lanes on one shard. A **namespace-wide** RECALL
+(`scope = Namespace`, see [`../05_operations/03_read_pipeline.md`](../05_operations/03_read_pipeline.md)
+§"Recall scope") fans out to every shard and applies RRF a **second time to merge
+the per-shard candidate pools**. Raw fused scores are normalized per shard and are
+not comparable across shards, so the cross-shard merge keys on each hit's
+**within-shard rank** — the one cross-comparable signal — with the same `k = 60`:
+a rank-`r` hit contributes `1/(60 + r)`. A memory is owned by exactly one shard, so
+the pools' ids are disjoint; the merge dedups defensively (keeping the higher RRF
+score), orders by the cross-shard RRF score (ties broken on memory id for
+determinism), and truncates to the candidate-pool budget so the single downstream
+shaping pass stays bounded regardless of shard count. Membership/precision shaping
+then runs **once** over this merged pool, so `Single`/`Many`/`None` is decided
+globally, never per shard.
 
 ## Per-retriever weights
 
@@ -64,9 +80,38 @@ The shipped defaults bias toward semantic on free-text queries and lift graph fo
 
 Tuning weights requires evaluation data; Brain provides metrics on per-retriever contribution to fused results to inform tuning.
 
+## Recency ranking (the `temporal` weight)
+
+`PerRetrieverWeights` carries a fourth, `temporal` weight (default `0.5`)
+that is **not** a retriever lane — there is no temporal retriever — but a
+post-fusion **event-time recency boost** folded into `fused_score` after
+the filter chain and before rerank.
+
+It is a soft, additive, RRF-scale term applied to memory hits only:
+
+```
+boost(d) = temporal_weight · (1 / (k + 1)) · 0.5^(age(d) / half_life)
+age(d)   = reference_time − event_time(d)        # saturates at 0 for future-dated events
+event_time(d) = occurred_at(d)  ?? created_at(d)  # client event time, else write time
+```
+
+- **RRF-scale.** `1/(k+1)` is one top-rank retriever vote (≈ 0.0164 at
+  `k=60`), so a brand-new memory at the default weight earns at most half
+  of one such vote — a tie-breaker that re-orders comparably-relevant
+  hits, never one that overrides genuine relevance. This is why `0.5` is
+  the default (half-strength) and why the term is capped at the RRF unit.
+- **Exponential decay** on event time with a default half-life of **90
+  days**. Statements/relations are untouched (their bi-temporal validity
+  is the filter chain's job).
+- **Gated on a temporal signal.** The boost runs only when the query
+  carries one — a temporal expression detected by the router, an explicit
+  time filter, or an `as_of_record_time_unix_nanos` anchor — so timeless
+  facts ("what's my wife's name") are never penalised for being old. The
+  reference point is the `as_of` anchor when set, otherwise wall-clock now.
+
 ## Adaptive top-K from the router
 
-The query router (see [`./05_hybrid_query.md`](./05_hybrid_query.md) §"Query router") classifies the incoming query and emits an **adaptive top-K hint** alongside the weight set. The hint lets fusion bound work per query class without pinning a single global `top_n`:
+The query router (see [`./05_retrieval_query.md`](./05_retrieval_query.md) §"Query router") classifies the incoming query and emits an **adaptive top-K hint** alongside the weight set. The hint lets fusion bound work per query class without pinning a single global `top_n`:
 
 | Query class | top-K hint per retriever |
 |---|---|
@@ -135,7 +180,7 @@ Considered and rejected. Reasons:
 
 - Cosine and BM25 distributions are not Gaussian; min-max normalization is unstable.
 - Per-retriever calibration requires labeled data per deployment.
-- RRF is simpler and benchmarks equivalent or better in published hybrid-retrieval evaluations.
+- RRF is simpler and benchmarks equivalent or better in published retrieval evaluations.
 
 Brain may revisit in a future version if specific use cases demand learned fusion. The current default is RRF.
 

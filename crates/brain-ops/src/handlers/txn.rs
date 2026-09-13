@@ -1,4 +1,4 @@
-//! Transactions (sub-task 7.9).
+//! Transactions.
 //!
 //! True buffer-and-apply transaction semantics.
 //! Operations carrying a `txn_id` push into a per-txn `TxnBuffer`
@@ -7,16 +7,16 @@
 //! write path — every phase commits in one redb wtxn. TXN_ABORT
 //! drops the buffer.
 //!
-//! Out of scope for v1: WAL records (Phase 9 wires the shard's Wal),
-//! cross-shard txns, substrate-level nested-txn detection. See the
-//! plan in `.claude/plans/phase-07-task-09.md` for the full design.
+//! Out of scope for v1: WAL records, cross-shard txns,
+//! substrate-level nested-txn detection.
 
 use std::collections::{HashMap, HashSet};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use brain_core::{EdgeKind, MemoryId};
 use brain_metadata::tables::memory::MemoryMetadata;
-use brain_protocol::envelope::request::{ForgetMode, TxnAbortRequest, TxnBeginRequest, TxnCommitRequest};
+use brain_protocol::envelope::request::{
+    ForgetMode, TxnAbortRequest, TxnBeginRequest, TxnCommitRequest,
+};
 use brain_protocol::envelope::response::{TxnAbortResponse, TxnBeginResponse, TxnCommitResponse};
 use parking_lot::Mutex;
 
@@ -28,6 +28,17 @@ pub type TxnId = [u8; 16];
 const MIN_TIMEOUT_SECONDS: u32 = 1;
 const MAX_TIMEOUT_SECONDS: u32 = 300;
 const DEFAULT_TIMEOUT_SECONDS: u32 = 30;
+
+/// Maximum number of buffered operations (ENCODE + FORGET + LINK +
+/// UNLINK) a single transaction may hold. The limit is 1000; beyond
+/// it, TXN_COMMIT returns `TransactionTooLarge`
+/// and the client splits into multiple transactions.
+///
+/// Fixed at a compile-time constant in v1.0: the value is a protocol
+/// commitment, not an operational knob. If a future deployment needs a
+/// different cap, it becomes a runtime setting at that point — keeping
+/// it static now avoids accumulating a config knob no one tunes.
+pub const MAX_TXN_OPS: u32 = 1000;
 
 // ---------------------------------------------------------------------------
 // State + entries.
@@ -58,6 +69,22 @@ pub enum TxnFinalResponse {
     Abort(TxnFinalAbort),
 }
 
+/// Effective identity every write buffered in a transaction commits as.
+///
+/// Captured once, at `TXN_BEGIN`, from the authorized `act_as` selector the
+/// begin carried (delegation is fixed for the life of the txn). `TXN_COMMIT`
+/// arrives under the connection's own key-bound identity — it carries no
+/// `act_as` of its own — so the commit path reads the frozen identity from
+/// here to submit the buffered writes as the delegated `(namespace, space)`
+/// rather than the committing connection's identity. The three fields mirror
+/// the per-request `ExecutorContext` caller triple.
+#[derive(Debug, Clone)]
+pub struct DelegatedIdentity {
+    pub space_id: brain_core::SpaceId,
+    pub namespace: brain_core::NamespaceId,
+    pub space_string: String,
+}
+
 pub struct TxnEntry {
     pub state: TxnState,
     pub started_at_unix_nanos: u64,
@@ -65,6 +92,16 @@ pub struct TxnEntry {
     pub timeout_seconds: u32,
     pub final_response: Option<TxnFinalResponse>,
     pub buffer: Option<TxnBuffer>,
+    /// Frozen delegated identity for a txn begun with `act_as`. `None` for a
+    /// non-delegated txn, which commits as the connection's own identity.
+    pub delegated: Option<DelegatedIdentity>,
+    /// Wire-level session that opened this txn. The connection layer
+    /// fans out [`TxnStore::abort_orphaned_for_connection`] when this
+    /// session's TCP/TLS connection drops, so buffered work doesn't
+    /// linger occupying RAM until the per-txn expiry sweep. All-zero
+    /// means "no session" (in-process tests) — the sweep treats it as
+    /// "never owned by any disconnect" and leaves the entry alone.
+    pub connection_id: [u8; 16],
 }
 
 // ---------------------------------------------------------------------------
@@ -81,13 +118,17 @@ pub struct BufferedEncode {
     pub vector: [f32; brain_embed::VECTOR_DIM],
     pub edges: Vec<BufferedEdgeSpec>,
     pub kind: brain_core::MemoryKind,
-    pub context_id: brain_core::ContextId,
+    pub session_id: brain_core::SessionId,
     pub salience_initial: f32,
     pub fingerprint: [u8; 16],
     pub request_id: [u8; 16],
     pub request_hash: [u8; 32],
     pub created_at_unix_nanos: u64,
-    pub agent_id: brain_core::AgentId,
+    /// Client-supplied event time, echoed from the buffered ENCODE so the
+    /// committed `Phase::UpsertMemory` carries the same timeline a
+    /// non-transactional encode would.
+    pub occurred_at_unix_nanos: Option<u64>,
+    pub space_id: brain_core::SpaceId,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -106,7 +147,7 @@ pub struct BufferedLink {
     pub request_id: [u8; 16],
     pub request_hash: [u8; 32],
     pub created_at_unix_nanos: u64,
-    pub agent_id: brain_core::AgentId,
+    pub space_id: brain_core::SpaceId,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -117,7 +158,7 @@ pub struct BufferedUnlink {
     pub request_id: [u8; 16],
     pub request_hash: [u8; 32],
     pub created_at_unix_nanos: u64,
-    pub agent_id: brain_core::AgentId,
+    pub space_id: brain_core::SpaceId,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -127,7 +168,7 @@ pub struct BufferedForget {
     pub request_id: [u8; 16],
     pub request_hash: [u8; 32],
     pub created_at_unix_nanos: u64,
-    pub agent_id: brain_core::AgentId,
+    pub space_id: brain_core::SpaceId,
 }
 
 /// Cached per-`request_id` response within a txn so we can replay
@@ -180,6 +221,23 @@ impl TxnBuffer {
         let n = self.encodes.len() + self.forgets.len() + self.links.len() + self.unlinks.len();
         u32::try_from(n).unwrap_or(u32::MAX)
     }
+
+    /// Reject a buffer mutation that would push past the per-transaction
+    /// op cap. Called at the top of every buffer-mutating in-txn handler
+    /// so the 1001st op fails fast — the space learns about the cap
+    /// immediately instead of buffering thousands of doomed ops only to
+    /// be rejected at TXN_COMMIT. `handle_txn_commit` runs the same
+    /// check on the taken buffer as defense-in-depth.
+    pub fn check_capacity_for_push(&self) -> Result<(), OpError> {
+        let current = self.ops_count();
+        if current >= MAX_TXN_OPS {
+            return Err(OpError::TransactionTooLarge {
+                ops: current,
+                cap: MAX_TXN_OPS,
+            });
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -210,36 +268,92 @@ impl TxnStore {
         }
     }
 
-    /// Validate that `txn_id` exists and is `Active`. Touches the
-    /// sweeper inline so a stale "Active" entry past its expiry is
-    /// observed as `Expired`. Bumps the txn's `expires_at` to
-    /// `now + timeout_seconds` — every in-flight op resets the
-    /// deadline, so an interactive REPL session doesn't expire
-    /// while the user is typing. Returns Ok with the (new) expiry.
-    pub fn validate_active(&self, txn_id: TxnId) -> Result<u64, OpError> {
+    /// Validate that `txn_id` exists, is owned by the calling
+    /// connection, and is `Active`. Touches the sweeper inline so a
+    /// stale "Active" entry past its expiry is observed as `Expired`.
+    /// Bumps the txn's `expires_at` to `now + timeout_seconds` — every
+    /// in-flight op resets the deadline, so an interactive REPL session
+    /// doesn't expire while the user is typing. Returns Ok with the
+    /// (new) expiry.
+    ///
+    /// `caller_connection_id` is the wire-level session issuing the op.
+    /// A txn opened by a *different* connection is reported as
+    /// `TxnNotFound` — the same shape as a never-created id, so a
+    /// connection that guesses another's `txn_id` learns nothing about
+    /// its existence and cannot read its uncommitted writes. See
+    /// [`txn_owned_by`].
+    pub fn validate_active(
+        &self,
+        txn_id: TxnId,
+        caller_connection_id: [u8; 16],
+    ) -> Result<u64, OpError> {
         let mut entries = self.entries.lock();
         let now = now_unix_nanos();
         Self::sweep_expired_locked(&mut entries, now);
         match entries.get_mut(&txn_id) {
             None => Err(OpError::TxnNotFound),
-            Some(e) => match e.state {
-                TxnState::Active => {
-                    e.expires_at_unix_nanos =
-                        now.saturating_add(u64::from(e.timeout_seconds) * 1_000_000_000);
-                    Ok(e.expires_at_unix_nanos)
+            Some(e) => {
+                if !txn_owned_by(e.connection_id, caller_connection_id) {
+                    return Err(OpError::TxnNotFound);
                 }
-                _ => Err(OpError::TxnExpired),
-            },
+                match e.state {
+                    TxnState::Active => {
+                        e.expires_at_unix_nanos =
+                            now.saturating_add(u64::from(e.timeout_seconds) * 1_000_000_000);
+                        Ok(e.expires_at_unix_nanos)
+                    }
+                    _ => Err(OpError::TxnExpired),
+                }
+            }
         }
     }
 
-    /// Apply `f` to the mutable buffer of an Active txn. Errors with
-    /// `TxnNotFound` if no such id was ever created, `TxnExpired`
-    /// otherwise. Bumps `expires_at` on success — every buffer
-    /// mutation counts as activity.
+    /// Auto-abort every Active txn opened by the given wire session.
+    /// Called by the connection layer when a TCP/TLS connection drops
+    /// before the client COMMIT/ABORT — buffered work from a dropped
+    /// connection must not take effect, and the per-txn timeout sweep
+    /// is too lazy:
+    /// the entries would otherwise occupy RAM for up to
+    /// `timeout_seconds` after the socket closed.
+    ///
+    /// `connection_id == [0u8; 16]` is treated as a no-op so in-process
+    /// callers (tests, embedded harnesses) can't accidentally wipe
+    /// their own txns by passing the default.
+    ///
+    /// Returns the list of txn ids that were aborted (for logging).
+    pub fn abort_orphaned_for_connection(&self, connection_id: [u8; 16]) -> Vec<TxnId> {
+        if connection_id == [0u8; 16] {
+            return Vec::new();
+        }
+        let mut entries = self.entries.lock();
+        let mut aborted = Vec::new();
+        for (txn_id, entry) in entries.iter_mut() {
+            if entry.connection_id != connection_id {
+                continue;
+            }
+            if !matches!(entry.state, TxnState::Active) {
+                continue;
+            }
+            let ops = entry.buffer.as_ref().map(TxnBuffer::ops_count).unwrap_or(0);
+            entry.state = TxnState::Aborted;
+            entry.buffer = None;
+            entry.final_response = Some(TxnFinalResponse::Abort(TxnFinalAbort {
+                operations_discarded: ops,
+            }));
+            aborted.push(*txn_id);
+        }
+        aborted
+    }
+
+    /// Apply `f` to the mutable buffer of an Active txn owned by the
+    /// calling connection. Errors with `TxnNotFound` if no such id was
+    /// ever created *or* it belongs to another connection (see
+    /// [`txn_owned_by`]), `TxnExpired` otherwise. Bumps `expires_at` on
+    /// success — every buffer mutation counts as activity.
     pub fn with_buffer<R>(
         &self,
         txn_id: TxnId,
+        caller_connection_id: [u8; 16],
         f: impl FnOnce(&mut TxnBuffer) -> Result<R, OpError>,
     ) -> Result<R, OpError> {
         let mut entries = self.entries.lock();
@@ -247,24 +361,40 @@ impl TxnStore {
         Self::sweep_expired_locked(&mut entries, now);
         match entries.get_mut(&txn_id) {
             None => Err(OpError::TxnNotFound),
-            Some(entry) => match (&entry.state, &mut entry.buffer) {
-                (TxnState::Active, Some(buf)) => {
-                    let r = f(buf)?;
-                    entry.expires_at_unix_nanos =
-                        now.saturating_add(u64::from(entry.timeout_seconds) * 1_000_000_000);
-                    Ok(r)
+            Some(entry) => {
+                if !txn_owned_by(entry.connection_id, caller_connection_id) {
+                    return Err(OpError::TxnNotFound);
                 }
-                _ => Err(OpError::TxnExpired),
-            },
+                match (&entry.state, &mut entry.buffer) {
+                    (TxnState::Active, Some(buf)) => {
+                        let r = f(buf)?;
+                        entry.expires_at_unix_nanos =
+                            now.saturating_add(u64::from(entry.timeout_seconds) * 1_000_000_000);
+                        Ok(r)
+                    }
+                    _ => Err(OpError::TxnExpired),
+                }
+            }
         }
     }
 }
 
+/// True iff a connection presenting `caller_connection_id` may act on a
+/// txn opened by `entry_connection_id`.
+///
+/// A txn opened without a session (`entry_connection_id == [0; 16]` — the
+/// in-process test path) imposes no ownership binding, so any caller may
+/// act on it. Once a txn carries a real opener session, only that exact
+/// session may touch it; every other connection (including a session-less
+/// one) is turned away. Callers surface a rejection as `TxnNotFound` so a
+/// foreign connection can't probe for another's transactions.
+#[must_use]
+pub fn txn_owned_by(entry_connection_id: [u8; 16], caller_connection_id: [u8; 16]) -> bool {
+    entry_connection_id == [0u8; 16] || entry_connection_id == caller_connection_id
+}
+
 fn now_unix_nanos() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
+    crate::clock::now_unix_nanos()
 }
 
 // ---------------------------------------------------------------------------
@@ -273,6 +403,7 @@ fn now_unix_nanos() -> u64 {
 
 pub async fn handle_txn_begin(
     req: TxnBeginRequest,
+    connection_id: [u8; 16],
     ctx: &OpsContext,
 ) -> Result<TxnBeginResponse, OpError> {
     let timeout_seconds = clamp_timeout(req.timeout_seconds);
@@ -290,6 +421,23 @@ pub async fn handle_txn_begin(
         });
     }
 
+    // Freeze the delegated identity when the begin carried an `act_as`.
+    // Authorization (R1: the ACT_AS grant, R2: the `may_act` allowlist) has
+    // already run in the dispatch layer before this handler is reached, and by
+    // this point `ctx.executor` carries the resolved effective identity — the
+    // same triple the direct delegated-write path (ENCODE with `act_as`) runs
+    // under. TXN_COMMIT arrives with no `act_as`, so we capture the identity
+    // here and the commit reads it back rather than re-deriving one.
+    let delegated = if req.act_as.is_some() {
+        Some(DelegatedIdentity {
+            space_id: ctx.executor.caller_space,
+            namespace: ctx.executor.caller_namespace,
+            space_string: ctx.executor.caller_space_string.clone(),
+        })
+    } else {
+        None
+    };
+
     let expires_at = now.saturating_add(u64::from(timeout_seconds) * 1_000_000_000);
     let entry = TxnEntry {
         state: TxnState::Active,
@@ -298,6 +446,8 @@ pub async fn handle_txn_begin(
         timeout_seconds,
         final_response: None,
         buffer: Some(TxnBuffer::default()),
+        delegated,
+        connection_id,
     };
     entries.insert(req.txn_id, entry);
 
@@ -315,11 +465,18 @@ pub async fn handle_txn_commit(
     let store = &*ctx.txn_store;
 
     // Take the buffer + mark in-progress while we apply (under lock).
-    let (buffer, started_at) = {
+    let (buffer, started_at, delegated) = {
         let mut entries = store.entries.lock();
         let now = now_unix_nanos();
         TxnStore::sweep_expired_locked(&mut entries, now);
         let entry = entries.get_mut(&req.txn_id).ok_or(OpError::TxnNotFound)?;
+        // Connection ownership: only the connection that opened the txn
+        // may commit it. A foreign connection is turned away as
+        // TxnNotFound before it can learn the txn's state or apply the
+        // opener's buffered writes under its own identity.
+        if !txn_owned_by(entry.connection_id, ctx.caller_connection_id) {
+            return Err(OpError::TxnNotFound);
+        }
         // Replay support.
         if let Some(TxnFinalResponse::Commit(c)) = entry.final_response {
             return Ok(TxnCommitResponse {
@@ -333,10 +490,30 @@ pub async fn handle_txn_commit(
         }
         let buf = entry.buffer.take().ok_or(OpError::TxnExpired)?;
         let started_at = entry.started_at_unix_nanos;
-        (buf, started_at)
+        // The identity frozen at begin. `None` for a non-delegated txn.
+        let delegated = entry.delegated.clone();
+        (buf, started_at, delegated)
     };
 
     let ops_applied = buffer.ops_count();
+
+    // Defense-in-depth: the append-time guard rejects any push that
+    // would breach `MAX_TXN_OPS`, but a future code path that extends
+    // the buffer through a different route would slip past it. Reject
+    // an oversized buffer here too, before we touch the writer.
+    if ops_applied > MAX_TXN_OPS {
+        let mut entries = store.entries.lock();
+        if let Some(entry) = entries.get_mut(&req.txn_id) {
+            entry.state = TxnState::Aborted;
+            entry.final_response = Some(TxnFinalResponse::Abort(TxnFinalAbort {
+                operations_discarded: ops_applied,
+            }));
+        }
+        return Err(OpError::TransactionTooLarge {
+            ops: ops_applied,
+            cap: MAX_TXN_OPS,
+        });
+    }
 
     // Build a single multi-phase Write from the buffer. The WAL
     // envelope (TxnBegin/Phase×N/TxnCommit) makes the whole commit
@@ -350,7 +527,22 @@ pub async fn handle_txn_commit(
     // instead of silently returning the cached ack.
     let write_id = write_id_from_txn(req.txn_id);
     let request_hash = hash_txn_commit_request(req.txn_id, &phases);
-    let write = crate::write::Write::from_phases(write_id, ctx.executor.caller_agent, phases)
+    // A txn begun with `act_as` commits every buffered write as the delegated
+    // identity frozen at begin — not the identity of the connection that
+    // happens to issue the commit. A non-delegated txn commits as the
+    // committing connection's own key-bound identity (the two coincide when a
+    // txn is opened and committed on one plain connection).
+    let (space_id, namespace, space_string) = match &delegated {
+        Some(d) => (d.space_id, d.namespace, d.space_string.clone()),
+        None => (
+            ctx.executor.caller_space,
+            ctx.executor.caller_namespace,
+            ctx.executor.caller_space_string.clone(),
+        ),
+    };
+    let write = crate::write::Write::from_phases(write_id, space_id, phases)
+        .with_namespace(namespace)
+        .with_space_string(space_string)
         .with_request_hash(request_hash);
     let real_writer = crate::handlers::link::downcast_writer_pub(ctx)?;
     match real_writer.submit(write).await {
@@ -367,6 +559,38 @@ pub async fn handle_txn_commit(
                 err,
             )));
         }
+    }
+
+    // Post-commit index cleanup for the txn's tombstones, mirroring the
+    // direct FORGET handler. The writer's Tombstone phase updates redb +
+    // the memory HNSW, but the lexical (tantivy) row and the HyPE
+    // question-vectors are maintained outside the write path — without
+    // this, an in-txn FORGET would leave the memory searchable via the
+    // lexical lane and keep its hypothetical-question vectors live.
+    // `buffer.tombstoned` holds exactly the ids an in-txn FORGET
+    // tombstoned; both cleanups are idempotent and best-effort, so a
+    // memory that was encoded-then-forgotten in the same txn (never
+    // indexed) is a harmless no-op.
+    // Which tombstoned ids were hard-forgotten — the lexical indexer must
+    // physically purge their text, not just tombstone the doc. An id
+    // forgotten more than once in the txn counts as hard if any of its
+    // forgets was Hard.
+    let hard_forgotten: HashSet<MemoryId> = buffer
+        .forgets
+        .iter()
+        .filter(|f| matches!(f.mode, ForgetMode::Hard))
+        .map(|f| f.memory_id)
+        .collect();
+    for memory_id in &buffer.tombstoned {
+        if let Some(dispatcher) = ctx.memory_text_dispatcher.as_ref() {
+            dispatcher
+                .dispatch(crate::index::text_indexer::MemoryTextOp::Forget {
+                    id: *memory_id,
+                    hard: hard_forgotten.contains(memory_id),
+                })
+                .await;
+        }
+        crate::handlers::forget::delete_hype_vectors(ctx, *memory_id);
     }
 
     let committed_at = now_unix_nanos();
@@ -399,6 +623,13 @@ pub async fn handle_txn_abort(
     TxnStore::sweep_expired_locked(&mut entries, now);
 
     let entry = entries.get_mut(&req.txn_id).ok_or(OpError::TxnNotFound)?;
+    // Connection ownership: only the opening connection may abort. A
+    // foreign connection is rejected as TxnNotFound so it can neither
+    // discard another connection's buffered work nor probe for its
+    // existence.
+    if !txn_owned_by(entry.connection_id, ctx.caller_connection_id) {
+        return Err(OpError::TxnNotFound);
+    }
     if let Some(TxnFinalResponse::Abort(a)) = entry.final_response {
         return Ok(TxnAbortResponse {
             txn_id: req.txn_id,
@@ -467,8 +698,9 @@ pub(crate) fn build_phases(buffer: &TxnBuffer) -> Vec<crate::write::Phase> {
             vector: Box::new(e.vector),
             kind: e.kind,
             salience: Salience::new(e.salience_initial),
-            context: e.context_id,
+            session_id: e.session_id,
             created_at_unix_nanos: e.created_at_unix_nanos,
+            occurred_at_unix_nanos: e.occurred_at_unix_nanos,
             arena_slot: e.memory_id.slot(),
             embedding_model_fp: e.fingerprint,
             content_hash: None,
@@ -563,4 +795,104 @@ fn hash_txn_commit_request(txn_id: TxnId, phases: &[crate::write::Phase]) -> [u8
         h.update(b"\0");
     }
     *h.finalize().as_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Stuff `count` no-op forgets into the buffer to drive
+    /// `ops_count` to a known value. The contents don't matter — the
+    /// cap check looks only at the running total.
+    fn fill_buffer(buf: &mut TxnBuffer, count: usize) {
+        for i in 0..count {
+            buf.forgets.push(BufferedForget {
+                memory_id: MemoryId::from(u128::from(i as u64) + 1),
+                mode: ForgetMode::Soft,
+                request_id: [0u8; 16],
+                request_hash: [0u8; 32],
+                created_at_unix_nanos: 0,
+                space_id: brain_core::SpaceId(uuid::Uuid::nil()),
+            });
+        }
+    }
+
+    #[test]
+    fn check_capacity_for_push_passes_below_cap() {
+        let mut buf = TxnBuffer::default();
+        fill_buffer(&mut buf, (MAX_TXN_OPS - 1) as usize);
+        // Pushing the 1000th op is fine — the cap is exclusive of the
+        // pending push, so a count of 999 still has room.
+        buf.check_capacity_for_push()
+            .expect("999/1000 buffer must accept one more push");
+    }
+
+    #[test]
+    fn check_capacity_for_push_rejects_at_cap() {
+        let mut buf = TxnBuffer::default();
+        fill_buffer(&mut buf, MAX_TXN_OPS as usize);
+        // Pushing the 1001st op fails — the buffer is already at
+        // MAX_TXN_OPS and one more would breach the cap.
+        let err = buf
+            .check_capacity_for_push()
+            .expect_err("at-cap buffer must reject the next push");
+        match err {
+            OpError::TransactionTooLarge { ops, cap } => {
+                assert_eq!(ops, MAX_TXN_OPS);
+                assert_eq!(cap, MAX_TXN_OPS);
+            }
+            other => panic!("expected TransactionTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_capacity_for_push_rejects_when_already_over_cap() {
+        // Defense-in-depth case: if a future code path somehow pushed
+        // past the cap, the check must still reject — never silently
+        // accept an over-sized buffer.
+        let mut buf = TxnBuffer::default();
+        fill_buffer(&mut buf, (MAX_TXN_OPS as usize) + 5);
+        let err = buf
+            .check_capacity_for_push()
+            .expect_err("over-cap buffer must reject");
+        match err {
+            OpError::TransactionTooLarge { ops, cap } => {
+                assert_eq!(ops, MAX_TXN_OPS + 5);
+                assert_eq!(cap, MAX_TXN_OPS);
+            }
+            other => panic!("expected TransactionTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ops_count_sums_across_kinds() {
+        // Sanity: the cap is enforced against the total — encodes +
+        // forgets + links + unlinks all count equally. Future cap
+        // refactors must preserve this property.
+        let mut buf = TxnBuffer::default();
+        fill_buffer(&mut buf, 3);
+        // Forge three different op kinds via direct pushes (the
+        // BufferedX shapes don't need plausible payloads for the
+        // count check).
+        buf.links.push(BufferedLink {
+            source: MemoryId::from(1u128),
+            target: MemoryId::from(2u128),
+            kind: EdgeKind::Caused,
+            weight: 1.0,
+            request_id: [0u8; 16],
+            request_hash: [0u8; 32],
+            created_at_unix_nanos: 0,
+            space_id: brain_core::SpaceId(uuid::Uuid::nil()),
+        });
+        buf.unlinks.push(BufferedUnlink {
+            source: MemoryId::from(3u128),
+            target: MemoryId::from(4u128),
+            kind: EdgeKind::Caused,
+            request_id: [0u8; 16],
+            request_hash: [0u8; 32],
+            created_at_unix_nanos: 0,
+            space_id: brain_core::SpaceId(uuid::Uuid::nil()),
+        });
+        assert_eq!(buf.ops_count(), 5);
+    }
 }

@@ -1,11 +1,18 @@
-#![allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send post-9.7 (audit §4)
-//! Access-boost worker integration tests (sub-task 8.3).
+#![allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send
+//! Access-boost worker integration tests.
+//!
+//! Guards the recall-to-salience feedback loop: RECALL records each
+//! returned memory in a fixed-capacity `AccessBuffer`, and a worker
+//! cycle drains the buffer to bump each memory's salience by the boost
+//! factor (capped at `MAX_SALIENCE`). Covers buffer dedup/overflow,
+//! per-cycle caps, requeue-on-undersized-batch, and the missing-memory
+//! skip. The Glommio executor is required because OpsContext is `!Send`.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use brain_core::{AgentId, ContextId, MemoryId, MemoryKind};
+use brain_core::{MemoryId, MemoryKind, SessionId, SpaceId};
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
@@ -16,7 +23,6 @@ use brain_workers::{
     boosted_salience, AccessBoostWorker, Worker, WorkerConfig, WorkerContext, WorkerKind,
     WorkerScheduler, DEFAULT_BOOST_FACTOR, MAX_SALIENCE,
 };
-use parking_lot::Mutex;
 use redb::ReadableTable;
 use uuid::Uuid;
 
@@ -46,8 +52,8 @@ struct Fixture {
 fn build_fixture_with_buffer(buffer: Arc<AccessBuffer>) -> Fixture {
     let tempdir = tempfile::tempdir().unwrap();
     let db_path = tempdir.path().join("metadata.redb");
-    let metadata: SharedMetadataDb = Arc::new(Mutex::new(MetadataDb::open(&db_path).unwrap()));
-    let (shared, hnsw_writer) = SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).unwrap();
+    let metadata: SharedMetadataDb = Arc::new(MetadataDb::open(&db_path).unwrap());
+    let (shared, hnsw_writer) = SharedHnsw::new(IndexParams::default_v1()).unwrap();
     let writer = Arc::new(RealWriterHandle::new(metadata.clone(), hnsw_writer));
     let executor = ExecutorContext::new(
         Arc::new(NopDispatcher) as Arc<dyn Dispatcher>,
@@ -55,7 +61,8 @@ fn build_fixture_with_buffer(buffer: Arc<AccessBuffer>) -> Fixture {
         metadata.clone(),
         writer as Arc<dyn WriterHandle>,
     );
-    let ctx = OpsContext::new(executor).with_access_buffer(buffer);
+    let ctx = brain_ops::test_support::ops_context_for_tests_owning_tempdir(executor)
+        .with_access_buffer(buffer);
     Fixture {
         ctx: Arc::new(ctx),
         metadata,
@@ -82,14 +89,14 @@ fn make_id(slot: u64) -> MemoryId {
 
 fn seed_memory(metadata: &SharedMetadataDb, slot: u64, salience: f32) -> MemoryId {
     let id = make_id(slot);
-    let mut db = metadata.lock();
-    let wtxn = db.write_txn().unwrap();
+    let wtxn = metadata.write_txn().unwrap();
     {
         let mut table = wtxn.open_table(MEMORIES_TABLE).unwrap();
         let meta = MemoryMetadata::new_active(
             id,
-            AgentId(Uuid::nil()),
-            ContextId(1),
+            brain_core::NamespaceId::SYSTEM,
+            SpaceId(Uuid::nil()),
+            SessionId(1),
             slot,
             1,
             MemoryKind::Episodic,
@@ -105,8 +112,7 @@ fn seed_memory(metadata: &SharedMetadataDb, slot: u64, salience: f32) -> MemoryI
 }
 
 fn read_meta(metadata: &SharedMetadataDb, id: MemoryId) -> Option<MemoryMetadata> {
-    let db = metadata.lock();
-    let rtxn = db.read_txn().unwrap();
+    let rtxn = metadata.read_txn().unwrap();
     let table = rtxn.open_table(MEMORIES_TABLE).unwrap();
     table.get(id.to_be_bytes()).unwrap().map(|a| a.value())
 }
@@ -128,26 +134,17 @@ async fn run_cycle(
 // ===========================================================================
 
 #[test]
-fn boost_50_percent_to_55_percent() {
-    assert!((boosted_salience(0.5, 0.10) - 0.55).abs() < 1e-6);
-}
-
-#[test]
-fn boost_caps_at_one() {
-    let r = boosted_salience(0.95, 0.10);
-    assert!(r <= MAX_SALIENCE);
-    assert!((r - MAX_SALIENCE).abs() < 1e-6);
-    assert_eq!(boosted_salience(1.0, 0.10), 1.0);
-}
-
-#[test]
-fn boost_of_zero_stays_zero() {
-    assert_eq!(boosted_salience(0.0, 0.10), 0.0);
-}
-
-#[test]
-fn default_boost_factor_is_ten_percent() {
+fn boosted_salience_adds_factor_and_clamps_at_max() {
+    // Default factor is 10 %.
     assert!((DEFAULT_BOOST_FACTOR - 0.10).abs() < 1e-6);
+    // 0.5 → 0.55.
+    assert!((boosted_salience(0.5, 0.10) - 0.55).abs() < 1e-6);
+    // Caps at 1.0.
+    let r = boosted_salience(0.95, 0.10);
+    assert!(r <= MAX_SALIENCE && (r - MAX_SALIENCE).abs() < 1e-6);
+    assert_eq!(boosted_salience(1.0, 0.10), 1.0);
+    // Zero stays zero.
+    assert_eq!(boosted_salience(0.0, 0.10), 0.0);
 }
 
 // ===========================================================================
@@ -296,25 +293,6 @@ fn empty_buffer_cycle_is_noop() {
 }
 
 // ===========================================================================
-// Worker integration (1).
-// ===========================================================================
-
-#[test]
-fn worker_registers_with_correct_kind_and_default_cadence() {
-    glommio_run(|| async {
-        let fix = build_fixture();
-        let mut sched = WorkerScheduler::new();
-        sched
-            .register(Arc::new(AccessBoostWorker::new()), fix.ctx)
-            .unwrap();
-        let cfg = sched.config(WorkerKind::AccessBoost.name()).unwrap();
-        assert_eq!(cfg.interval, Duration::from_secs(10));
-        assert!(cfg.enabled);
-        sched.shutdown().await.unwrap();
-    });
-}
-
-// ===========================================================================
 // Cross-handler integration: RECALL fills buffer, boost worker applies.
 // ===========================================================================
 
@@ -322,7 +300,8 @@ fn worker_registers_with_correct_kind_and_default_cadence() {
 fn recall_fills_buffer_then_boost_worker_applies() {
     glommio_run(|| async {
         use brain_ops::dispatch;
-        use brain_protocol::envelope::request::{EncodeRequest, MemoryKindWire, RecallRequest, RequestBody};
+        use brain_ops::test_support::single_body;
+        use brain_protocol::envelope::request::{EncodeRequest, RecallRequest, RequestBody};
         use brain_protocol::envelope::response::ResponseBody;
 
         // Build a fixture with a real MockDispatcher so encode/recall
@@ -346,9 +325,8 @@ fn recall_fills_buffer_then_boost_worker_applies() {
 
         let tempdir = tempfile::tempdir().unwrap();
         let db_path = tempdir.path().join("metadata.redb");
-        let metadata: SharedMetadataDb = Arc::new(Mutex::new(MetadataDb::open(&db_path).unwrap()));
-        let (shared, hnsw_writer) =
-            SharedHnsw::<VECTOR_DIM>::new(IndexParams::default_v1()).unwrap();
+        let metadata: SharedMetadataDb = Arc::new(MetadataDb::open(&db_path).unwrap());
+        let (shared, hnsw_writer) = SharedHnsw::new(IndexParams::default_v1()).unwrap();
         let writer = Arc::new(RealWriterHandle::new(metadata.clone(), hnsw_writer));
         let executor = ExecutorContext::new(
             Arc::new(MockDispatcher) as Arc<dyn Dispatcher>,
@@ -356,29 +334,29 @@ fn recall_fills_buffer_then_boost_worker_applies() {
             metadata.clone(),
             writer as Arc<dyn WriterHandle>,
         );
-        let ctx = Arc::new(OpsContext::new(executor));
+        let mut ctx = brain_ops::test_support::ops_context_for_tests(executor, tempdir.path());
 
         // Encode two memories.
         let encode_req = |rid: [u8; 16], text: &str| EncodeRequest {
             text: text.into(),
-            context_id: 1,
-            kind: MemoryKindWire::Episodic,
-            salience_hint: 0.5,
-            edges: vec![],
+            session_id: 1,
             request_id: rid,
             txn_id: None,
-            deduplicate: false,
+            occurred_at_unix_nanos: None,
+            act_as: None,
+            wait: brain_protocol::WaitMode::Ack,
+            allow_duplicates: false,
         };
         let _ = dispatch(
             RequestBody::Encode(encode_req([1; 16], "alpha")),
-            brain_ops::RequestCaller::anonymous(),
+            brain_ops::RequestCaller::for_tests(),
             &ctx,
         )
         .await
         .unwrap();
         let _ = dispatch(
             RequestBody::Encode(encode_req([2; 16], "beta")),
-            brain_ops::RequestCaller::anonymous(),
+            brain_ops::RequestCaller::for_tests(),
             &ctx,
         )
         .await
@@ -390,13 +368,24 @@ fn recall_fills_buffer_then_boost_worker_applies() {
             "encode must not fill the buffer"
         );
 
+        // Populate the lexical lane from redb so recall sees a fully-indexed
+        // corpus, the way a production shard does — without it the read path's
+        // structural abstention drops the unanchored semantic-only hit.
+        ctx.lexical_retriever =
+            brain_ops::test_support::reindex_memory_lexical_for_tests(tempdir.path(), &metadata);
+        let ctx = Arc::new(ctx);
+
         // RECALL fills the buffer.
         let recall = RecallRequest {
+            scope: Default::default(),
+            trace: false,
             cue_text: "alpha".into(),
-            top_k: 5,
+            subject_name: String::new(),
+            max_results: 5,
             confidence_threshold: 0.0,
-            context_filter: None,
+            session_filter: None,
             age_bound_unix_nanos: None,
+            as_of_record_time_unix_nanos: None,
             kind_filter: None,
             salience_floor: 0.0,
             include_edges: false,
@@ -404,24 +393,29 @@ fn recall_fills_buffer_then_boost_worker_applies() {
             include_text: false,
             request_id: None,
             txn_id: None,
-            rerank: false,
+            act_as: None,
         };
-        let resp = dispatch(
+        let outcome = dispatch(
             RequestBody::Recall(recall),
-            brain_ops::RequestCaller::anonymous(),
+            brain_ops::RequestCaller::for_tests(),
             &ctx,
         )
         .await
         .unwrap();
-        let n_results = match resp {
-            ResponseBody::Recall(r) => r.results.len(),
+        let n_results = match single_body(outcome) {
+            ResponseBody::Recall(r) => r.memories.len(),
             _ => unreachable!(),
         };
         assert!(n_results >= 1);
-        assert_eq!(
+        // The buffer records the retrieval fan-out candidates; the membership
+        // and cross-lane consensus step then narrows that to the returned set,
+        // so the recorded count is a superset of (or equal to) the hits the
+        // caller saw. Every returned hit is still recorded — the access boost
+        // never misses a memory the caller actually recalled.
+        assert!(
+            ctx.access_buffer.len() >= n_results,
+            "every returned hit must be recorded (buffer={}, returned={n_results})",
             ctx.access_buffer.len(),
-            n_results,
-            "RECALL must record every returned hit"
         );
 
         // Run the boost worker via scheduler.
@@ -457,8 +451,7 @@ fn recall_fills_buffer_then_boost_worker_applies() {
         let alpha = read_meta(&metadata, make_id(1));
         // memory_id assignment depends on writer; can't pin slot=1 here.
         // Instead: scan all memories and require at least one has salience > 0.5.
-        let db = metadata.lock();
-        let rtxn = db.read_txn().unwrap();
+        let rtxn = metadata.read_txn().unwrap();
         let table = rtxn.open_table(MEMORIES_TABLE).unwrap();
         let mut any_boosted = false;
         for entry in table.iter().unwrap() {

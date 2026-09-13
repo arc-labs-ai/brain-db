@@ -111,7 +111,7 @@ Level 3: Per-operation health.
   Are encodes/recalls/etc. fast and successful?
 
 Level 4: Per-tenant health.
-  Are specific agents (scoped by org_id / user_id / namespace_id / agent_id) experiencing issues?
+  Are specific agents (scoped by namespace / agent) experiencing issues?
 ```
 
 Operators monitor at all levels; alerts fire at the level appropriate to the issue.
@@ -169,9 +169,9 @@ When something goes wrong:
 
 These three together usually identify the issue. Brain exposes them readily.
 
-## 13. The role of the SDK
+## 13. The role of the client
 
-Client SDKs contribute observability:
+Clients contribute observability:
 
 - Per-request client-side metrics (latency from client perspective).
 - Trace propagation (so server-side traces include client context).

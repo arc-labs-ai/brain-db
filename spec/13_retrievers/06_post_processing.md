@@ -1,6 +1,6 @@
 # 13.06 Post-Processing (Enrichment, Rerank, Traversal)
 
-> **TL;DR.** Three optional post-processing stages applied after RRF fusion and before final response: per-hit enrichment (attach entities / statements / relations to each hit via the include_graph side-channel), opt-in cross-encoder rerank (bge-reranker-base, 110M params) for the top-K, and multi-hop relation traversal with depth caps and cycle detection.
+> **TL;DR.** Three post-processing stages applied after RRF fusion and before final response: per-hit enrichment (attach entities / statements / relations to each hit via the include_graph side-channel, opt-in via the request flag), always-on cross-encoder rerank (bge-reranker-base, 110M params) for the top-K whenever the model is loaded — gated only by the deploy-time `config.rerank.enabled` load switch, with no per-request toggle — and multi-hop relation traversal with depth caps and cycle detection.
 
 ## Per-Hit Enrichment
 
@@ -87,7 +87,7 @@ This gives the correct behaviour for both schemaless deployments (no knowledge t
 
 ## Interaction with schemaless vs schema-declared paths
 
-The enrichment payload is identical on both server-side paths. The schemaless path opens its own `ReadTransaction`; the schema-declared (hybrid retrieval) path reuses the transaction already open for the `MEMORIES_TABLE` scan (no double-lock). Both paths populate `MemoryResult.graph` exactly when `req.include_graph` is set; the rest of `MemoryResult` (`similarity_score`, `confidence`, `fused_score`, `contributing_retrievers`, …) is unaffected.
+The enrichment payload is identical on both server-side paths. The schemaless path opens its own `ReadTransaction`; the schema-declared (retrieval) path reuses the transaction already open for the `MEMORIES_TABLE` scan (no double-lock). Both paths populate `MemoryResult.graph` exactly when `req.include_graph` is set; the rest of `MemoryResult` (`similarity_score`, `confidence`, `fused_score`, `contributing_retrievers`, …) is unaffected.
 
 ## Cost note
 
@@ -106,15 +106,40 @@ Clients sensitive to RECALL latency leave `include_graph` off and issue targeted
 
 ## Rerank
 
-An optional post-fusion stage that re-ranks the top of the RRF-fused list with a cross-encoder model. Opt-in per RECALL call; gated by default.
+A first-class, always-on post-fusion stage that re-ranks the top of the RRF-fused list with a cross-encoder model. Whenever the cross-encoder is loaded on a shard, every RECALL (and the `QUERY_TRACE` debug op) reranks automatically — there is no per-request flag. The only control is the deploy-time `config.rerank.enabled` load gate: when the operator turns it off, no model loads and the pipeline returns RRF-only ordering (no error).
 
 Where it sits in the pipeline:
 
 ```
-retrievers → RRF fusion → [rerank, if opt-in] → filter chain → limit
+retrievers → RRF fusion → filter chain → [recency boost] → [rerank, if cross-encoder loaded] → [merge/diversity, if list intent] → limit
 ```
 
-The rerank fires after fusion and before the filter chain, on the top-50 fused candidates only. It surfaces a re-ordered top-10 that the filter chain then consumes.
+The rerank fires on the top-50 fused candidates only. It surfaces a re-ordered head that the membership stage then shapes into the answer set (bounded by the `max_results` safety cap, not a caller `top_k`).
+
+## Merge / diversity (MMR) — internal, list-intent only
+
+A post-rerank stage that spreads near-duplicate memories so a set
+question returns *distinct* members, not paraphrases of the most salient
+one. It runs **only** when the router detected list/aggregation intent
+(see [`./05_retrieval_query.md`](./05_retrieval_query.md) Rule 6) — there
+is no client knob; the database decides. This is the read half of list
+handling; the router's wider candidate pool is the coverage half (a
+member that never reached fusion can't be diversified into the result).
+
+- **Algorithm:** greedy Maximal Marginal Relevance over the top
+  candidates (window 50). Each pick maximises `λ·rel(d) − (1−λ)·max
+  redundancy(d, already-picked)`, `λ = 0.5`. Relevance is the rerank
+  score (else fused score), min-max normalized; redundancy is **Jaccard
+  over lowercased text token sets** (candidate vectors aren't reachable
+  post-fusion without a retriever round-trip, and token overlap is a
+  cheap near-duplicate signal).
+- **Cannot regress a single answer:** greedy MMR's first pick is always
+  the highest-relevance item, so a lone strong answer stays at rank 1.
+  Only positions 2..N are reordered, and only on detected list intent —
+  a factoid that slips the detector keeps its top hit. (Resolves
+  OQ-AN-9, which nominated MMR for this slot.)
+- the membership band still decides the returned set; MMR changes *which* items
+  fill the slots.
 
 ## Model
 
@@ -124,24 +149,21 @@ bge-reranker-base.
 - **Params:** ~110M.
 - **License:** MIT.
 
-bge-reranker-base is the production-default cross-encoder for hybrid retrieval in the field — best precision-per-MB among the MIT-licensed options and small enough to keep CPU rerank cost in budget for the 50→10 cut.
+bge-reranker-base is the production-default cross-encoder for retrieval in the field — best precision-per-MB among the MIT-licensed options and small enough to keep CPU rerank cost in budget for the 50→10 cut.
 
 ## Triggering
 
-The rerank is opt-in per RECALL call:
+The rerank has no client toggle. A bare recall reranks automatically when the shard has the cross-encoder loaded:
 
 ```rust
 let response = brain.recall()
     .cue("budget pushback in Q4")
     .top_k(10)
-    .rerank(true)        // opt in
     .execute()
     .await?;
 ```
 
-Default off. Operators may set a deployment-level default via the `brain.recall.rerank_default` config key.
-
-When `rerank = true`, the planner inserts a rerank step into the execution DAG between fusion and the filter chain. When `false`, the step is elided and the pipeline matches the no-rerank path exactly.
+The only control is the deploy-time load gate `config.rerank.enabled`. When it is on (the default) and the model loads cleanly, the executor inserts a rerank step into the execution DAG between fusion and the filter chain for every query. When the operator sets `config.rerank.enabled = false`, no model loads, the step is never inserted, and the pipeline matches the RRF-only path exactly. Clients read the `rerank` bit from `GET_CAPABILITIES` purely to know whether the results they get back are reranked.
 
 ## Operation
 
@@ -157,23 +179,22 @@ Step 3 is the cost driver. On CPU, 50 pairs through bge-reranker-base land at ~6
 
 ## Latency budget
 
-Rerank-enabled RECALL widens the p99 target from 20 ms to ~30 ms — the entire cost added by the rerank lands in that delta. Opt-in is the discipline that keeps the default path under spec budget while letting accuracy-sensitive callers buy a precision lift.
+A rerank-enabled shard widens the RECALL p99 target from 20 ms to ~30 ms — the entire cost added by the rerank lands in that delta. Because rerank is always-on, that wider budget is the default budget for any shard with the model loaded. Operators who cannot afford the tail set `config.rerank.enabled = false` at spawn, which returns the shard to the 20 ms RRF-only path.
 
 ## Why a cross-encoder and not a bi-encoder
 
 Bi-encoders (the same family the embedder uses) score query and candidate independently and dot-product. Cross-encoders score them jointly through a single forward pass, attending across the boundary.
 
-For the rerank position — small candidate set, latency budget already widened by opt-in — cross-encoders are the field-standard winner on precision. The bi-encoder embedding already runs upstream at retrieval; running another bi-encoder for rerank would be redundant.
+For the rerank position — small candidate set, latency budget already widened — cross-encoders are the field-standard winner on precision. The bi-encoder embedding already runs upstream at retrieval; running another bi-encoder for rerank would be redundant.
 
 ## Gating discipline
 
-The rerank is **gated** in three senses:
+The rerank is **gated** in two senses:
 
-1. **Opt-in.** Off by default; callers explicitly request it.
-2. **Top-50 cut.** Even when enabled, only the top of the fused list pays the rerank cost — the rest of the corpus is unaffected.
-3. **No model load on the no-rerank path.** The cross-encoder is loaded lazily on first opt-in call per shard; shards that never see a rerank-enabled RECALL never pay the load cost.
+1. **Deploy-time load gate.** `config.rerank.enabled` decides whether the cross-encoder loads at shard spawn. When it loads, every query reranks; when the operator opts out, no model loads and recall is RRF-only. There is no per-request toggle.
+2. **Top-50 cut.** Only the top of the fused list pays the rerank cost — the rest of the corpus is unaffected.
 
-The three gates are what let the rerank ship without breaking the default-path latency target.
+The load gate plus the top-50 cut are what bound the always-on rerank's cost: operators who need the tighter latency target turn the load gate off; everyone else pays only for re-scoring the head of the list.
 
 ## Configuration
 
@@ -181,15 +202,20 @@ The three gates are what let the rerank ship without breaking the default-path l
 [recall.rerank]
 model = "bge-reranker-base"
 top_n_in = 50           # candidates fed into the reranker
-top_k_out = 10          # candidates emitted to the filter chain
+rerank_head = 10        # size of the re-ordered head the reranker promotes
 batch_size = 50         # one forward pass per call by default
 ```
 
-`top_n_in` and `top_k_out` can be tuned per deployment; the defaults reflect the design point above.
+`top_n_in` and `rerank_head` can be tuned per deployment; the defaults reflect
+the design point above. `rerank_head` is the size of the head the cross-encoder
+re-orders and promotes — **not** a final result cap. Candidates below the head
+keep their RRF order and stay in the filtered pool that the membership stage
+shapes; the answer size is decided by the relevance band and bounded only by
+`max_results`.
 
 ## Observability
 
-Per-call metrics on rerank-enabled RECALL:
+Per-call metrics on every RECALL (and `QUERY_TRACE`) served by a rerank-enabled shard:
 
 - `rerank_latency_seconds` — histogram of the rerank step's wall time.
 - `rerank_input_count` — how many candidates entered the reranker (usually 50, sometimes less if fusion returned fewer).

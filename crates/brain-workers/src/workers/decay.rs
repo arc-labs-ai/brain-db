@@ -1,9 +1,9 @@
-//! Decay worker (sub-task 8.2).
+//! Decay worker.
 //!
 //! Applies time-based salience decay to memories. The closed-form
 //! `s(t) = s_0 × 2^(-t/h)` is recomputed each cycle from
 //! `salience_initial` and `created_at_unix_nanos`.
-//! Boost (sub-task 8.3) re-asserts its 10 % bump on the next 10 s
+//! Boost re-asserts its 10 % bump on the next 10 s
 //! cycle; decay re-asserts the closed form on the next 1 h cycle.
 //! Decay is therefore idempotent and restart-safe.
 //!
@@ -37,6 +37,12 @@ pub const EPISODIC_HALF_LIFE_DAYS: f64 = 30.0;
 pub const SEMANTIC_HALF_LIFE_DAYS: f64 = 365.0;
 pub const CONSOLIDATED_HALF_LIFE_DAYS: f64 = 90.0;
 
+/// Decay never lowers salience below this floor; a memory that has
+/// decayed to it stays there indefinitely and is never auto-erased by
+/// decay alone. Distinct from the eviction threshold (0.1) used by the
+/// consolidation worker.
+pub const SALIENCE_FLOOR: f32 = 0.05;
+
 /// — writes below this delta are skipped (avoids many tiny
 /// no-op updates dirtying redb pages).
 pub const MIN_DELTA_FOR_WRITE: f32 = 0.001;
@@ -56,13 +62,19 @@ pub fn half_life_days(kind: MemoryKind) -> f64 {
 /// — closed-form decay. Reads only immutable post-ENCODE
 /// fields (`salience_initial`, `created_at_unix_nanos`, `kind`),
 /// so the result is deterministic regardless of prior decay/boost
-/// writes. Clamps at `>= 0.0`.
+/// writes. Clamps at `>= salience_floor`: decay never lowers salience
+/// below [`SALIENCE_FLOOR`], and a memory that was created below the
+/// floor is left where it is rather than raised to it.
 #[must_use]
 pub fn decayed_salience(salience_initial: f32, age_unix_nanos: u64, kind: MemoryKind) -> f32 {
     let age_days = (age_unix_nanos as f64) / NANOS_PER_DAY;
     let h = half_life_days(kind);
     let factor = (-age_days / h).exp2();
-    let s = (f64::from(salience_initial) * factor).max(0.0);
+    // The floor is the resting point for decay, but we never raise a
+    // memory that started below it — so the effective floor is capped at
+    // `salience_initial`.
+    let floor = f64::from(SALIENCE_FLOOR).min(f64::from(salience_initial));
+    let s = (f64::from(salience_initial) * factor).max(floor);
     // f64 → f32 cast saturates at f32::MAX; we never get NaN/Inf here
     // because age_days is finite and h > 0.
     s as f32
@@ -148,8 +160,7 @@ async fn do_decay_cycle(worker: &DecayWorker, ctx: &WorkerContext) -> Result<usi
     let mut scanned = 0usize;
     let mut scanned_to_end = true;
     {
-        let db = metadata.lock();
-        let rtxn = db
+        let rtxn = metadata
             .read_txn()
             .map_err(|e| WorkerError::Ops(format!("decay read_txn: {e:?}")))?;
         let table = rtxn
@@ -164,7 +175,7 @@ async fn do_decay_cycle(worker: &DecayWorker, ctx: &WorkerContext) -> Result<usi
             None => [0u8; 16],
         };
 
-        // CLAUDE.md anti-pattern: don't hold a lock across `.await`.
+        // Don't hold a lock across `.await`.
         // The read txn holds `db` (a parking_lot MutexGuard); we keep
         // the entire scan synchronous inside this block. max_runtime
         // still bounds wall-clock; yields happen between phases.
@@ -207,8 +218,7 @@ async fn do_decay_cycle(worker: &DecayWorker, ctx: &WorkerContext) -> Result<usi
     // ── Write phase: apply updates atomically in one wtxn. ───────
     let n_updates = updates.len();
     if !updates.is_empty() {
-        let mut db = metadata.lock();
-        let wtxn = db
+        let wtxn = metadata
             .write_txn()
             .map_err(|e| WorkerError::Ops(format!("decay write_txn: {e:?}")))?;
         {

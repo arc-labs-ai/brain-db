@@ -22,15 +22,16 @@ use http::{Method, Request, Response};
 use hyper::body::Incoming;
 
 use crate::admin::handlers::{
-    agent, api_keys, audit, config, diagnostics, extract, healthz, metrics, rebuild, shard,
-    snapshot, worker,
+    api_keys, audit, backfill, config, diagnostics, extract, healthz, memory, metrics, readyz,
+    rebuild, shard, snapshot, space, worker,
 };
 use crate::admin::AdminState;
 
-/// `/healthz` + `/metrics`. Operator-safe to expose.
+/// `/healthz` + `/readyz` + `/metrics`. Operator-safe to expose.
 pub fn build_public(state: Arc<AdminState>) -> Router<Incoming> {
     let r = Router::new();
     let r = r.get("/healthz", healthz::handle);
+    let r = with_state(r, Method::GET, "/readyz", state.clone(), readyz::handle);
     with_state(r, Method::GET, "/metrics", state, metrics::handle)
 }
 
@@ -48,14 +49,38 @@ pub fn build_unified(state: Arc<AdminState>) -> Router<Incoming> {
     // ──────── /healthz — string OK, no state ───────────────────────────
     let r = r.get("/healthz", healthz::handle);
 
+    // ──────── /readyz — shard-liveness readiness probe ─────────────────
+    let r = with_state(r, Method::GET, "/readyz", state.clone(), readyz::handle);
+
     // ──────── /metrics — Prometheus text exposition ────────────────────
     let r = with_state(r, Method::GET, "/metrics", state.clone(), metrics::handle);
 
     attach_v1_routes(r, state)
 }
 
+/// True iff `req` presents the operator admin secret as
+/// `Authorization: Bearer <token>`. Fail-closed: if no admin token is
+/// configured, or the header is missing / malformed / wrong, returns
+/// `false`. The token comparison is constant-time.
+fn admin_authorized(req: &Request<Incoming>, state: &AdminState) -> bool {
+    let Some(expected) = state.config.admin.token.as_deref() else {
+        return false;
+    };
+    let Some(value) = req.headers().get(http::header::AUTHORIZATION) else {
+        return false;
+    };
+    let Ok(value) = value.to_str() else {
+        return false;
+    };
+    let Some(presented) = value.strip_prefix("Bearer ") else {
+        return false;
+    };
+    crate::admin::util::constant_time_eq(presented.as_bytes(), expected.as_bytes())
+}
+
 /// Register every `/v1/*` route on `r`. Shared between
-/// [`build_admin`] and [`build_unified`].
+/// [`build_admin`] and [`build_unified`]. Every route is gated on the
+/// operator admin secret.
 fn attach_v1_routes(r: Router<Incoming>, state: Arc<AdminState>) -> Router<Incoming> {
     // ──────── Snapshot family (POST / GET / DELETE) ────────────────────
     // One handler dispatches on (method, path) internally.
@@ -90,6 +115,15 @@ fn attach_v1_routes(r: Router<Incoming>, state: Arc<AdminState>) -> Router<Incom
         rebuild::handle,
     );
 
+    // ──────── /v1/rebuild ──────────────────────────────────────────────
+    let r = with_state(
+        r,
+        Method::POST,
+        "/v1/rebuild",
+        state.clone(),
+        rebuild::handle_index,
+    );
+
     // ──────── /v1/extract/backfill ─────────────────────────────────────
     let r = with_state(
         r,
@@ -97,6 +131,31 @@ fn attach_v1_routes(r: Router<Incoming>, state: Arc<AdminState>) -> Router<Incom
         "/v1/extract/backfill",
         state.clone(),
         extract::handle,
+    );
+
+    // ──────── /v1/backfill (resumable worker) ─────────────────────────
+    // Distinct from /v1/extract/backfill above (one-shot re-enqueue):
+    // these drive the durable, checkpointed, cancellable BackfillWorker.
+    let r = with_state(
+        r,
+        Method::POST,
+        "/v1/backfill",
+        state.clone(),
+        backfill::submit,
+    );
+    let r = with_state(
+        r,
+        Method::GET,
+        "/v1/backfill",
+        state.clone(),
+        backfill::status,
+    );
+    let r = with_state_prefix(
+        r,
+        Method::DELETE,
+        "/v1/backfill/",
+        state.clone(),
+        backfill::cancel,
     );
 
     // ──────── /v1/workers ──────────────────────────────────────────────
@@ -153,18 +212,30 @@ fn attach_v1_routes(r: Router<Incoming>, state: Arc<AdminState>) -> Router<Incom
         api_keys::handle,
     );
 
-    // ──────── /v1/agents ───────────────────────────────────────────────
-    let r = with_state(r, Method::GET, "/v1/agents", state.clone(), agent::list);
-    // /v1/agents/{id} prefix handler dispatches GET vs DELETE internally.
+    // ──────── /v1/spaces ───────────────────────────────────────────────
+    let r = with_state(r, Method::GET, "/v1/spaces", state.clone(), space::list);
+    // /v1/spaces/{id} prefix handler dispatches GET vs DELETE internally.
     // brain-http's match_route(MethodMismatch) handles wrong method;
     // we register both methods on the same prefix so they hit `by_id`.
-    let r = with_state_prefix(r, Method::GET, "/v1/agents/", state.clone(), agent::by_id);
+    let r = with_state_prefix(r, Method::GET, "/v1/spaces/", state.clone(), space::by_id);
     let r = with_state_prefix(
         r,
         Method::DELETE,
-        "/v1/agents/",
+        "/v1/spaces/",
         state.clone(),
-        agent::by_id,
+        space::by_id,
+    );
+
+    // ──────── /v1/memories ─────────────────────────────────────────────
+    // POST /v1/memories/{id}/restore — un-tombstone a soft-forgotten
+    // memory (FORGET soft-cascade revert). Prefix route; the handler
+    // parses the `{id}/restore` tail.
+    let r = with_state_prefix(
+        r,
+        Method::POST,
+        "/v1/memories/",
+        state.clone(),
+        memory::restore::handle,
     );
 
     // ──────── /v1/shards ───────────────────────────────────────────────
@@ -195,7 +266,9 @@ fn attach_v1_routes(r: Router<Incoming>, state: Arc<AdminState>) -> Router<Incom
     )
 }
 
-/// Register an exact-match route bound to an `Arc<AdminState>`.
+/// Register an exact-match route bound to an `Arc<AdminState>`. Routes
+/// under `/v1` are gated on the operator admin secret; public routes
+/// (`/healthz`, `/readyz`, `/metrics`) are not.
 fn with_state<F, Fut>(
     r: Router<Incoming>,
     method: Method,
@@ -207,13 +280,20 @@ where
     F: Fn(Request<Incoming>, Arc<AdminState>) -> Fut + Send + Sync + Copy + 'static,
     Fut: std::future::Future<Output = brain_http::Result<Response<ResponseBody>>> + Send + 'static,
 {
+    let gated = path.starts_with("/v1");
     r.route(method, path, move |req| {
         let s = state.clone();
-        handler(req, s)
+        async move {
+            if gated && !admin_authorized(&req, &s) {
+                return Ok(crate::admin::util::unauthorized());
+            }
+            handler(req, s).await
+        }
     })
 }
 
-/// Register a prefix-match route bound to an `Arc<AdminState>`.
+/// Register a prefix-match route bound to an `Arc<AdminState>`. Routes
+/// under `/v1` are gated on the operator admin secret.
 fn with_state_prefix<F, Fut>(
     r: Router<Incoming>,
     method: Method,
@@ -225,8 +305,14 @@ where
     F: Fn(Request<Incoming>, Arc<AdminState>) -> Fut + Send + Sync + Copy + 'static,
     Fut: std::future::Future<Output = brain_http::Result<Response<ResponseBody>>> + Send + 'static,
 {
+    let gated = prefix.starts_with("/v1");
     r.route_prefix(method, prefix, move |req| {
         let s = state.clone();
-        handler(req, s)
+        async move {
+            if gated && !admin_authorized(&req, &s) {
+                return Ok(crate::admin::util::unauthorized());
+            }
+            handler(req, s).await
+        }
     })
 }

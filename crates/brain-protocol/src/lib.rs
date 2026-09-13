@@ -6,7 +6,7 @@
 //!
 //! The crate is laid out by **role**, not by wire direction:
 //!
-//! - [`codec`] — bytes-on-the-wire plumbing (header, frame, CRC, rkyv,
+//! - [`codec`] — bytes-on-the-wire plumbing (header, frame, CRC, CBOR,
 //!   opcode). Nothing in this module knows what an operation means.
 //! - [`envelope`] — the [`RequestBody`] / [`ResponseBody`] dispatch
 //!   enums, the [`ErrorResponse`] payload, and core ↔ wire conversions.
@@ -45,7 +45,7 @@ pub use codec::opcode::Opcode;
 
 // -- Envelope layer --
 pub use envelope::error::{ErrorDetails, ErrorResponse};
-pub use envelope::request::{RequestBody, WireContextId, WireMemoryId, WireUuid};
+pub use envelope::request::{act_as_of, RequestBody, WireMemoryId, WireSessionId, WireUuid};
 pub use envelope::response::ResponseBody;
 
 // -- Error taxonomy --
@@ -53,13 +53,13 @@ pub use error::{ErrorCategory, ErrorCode, ProtocolError};
 
 // -- Connection layer --
 pub use connection::handshake::{
-    AgentPermissions, AuthCredentials, AuthMethod, AuthOkPayload, AuthPayload, HelloCapabilities,
-    HelloPayload, MtlsClaim, NegotiatedSession, ServerCapabilities, ServerFeatures, WelcomePayload,
-    negotiate,
+    negotiate, AuthCredentials, AuthMethod, AuthOkPayload, AuthPayload, HelloCapabilities,
+    HelloPayload, MtlsClaim, NegotiatedSession, ServerCapabilities, ServerFeatures,
+    SpacePermissions, WelcomePayload,
 };
 pub use connection::stream::{
-    ByeRequest, CancelStreamAck, CancelStreamRequest, ClientPongRequest, PingRequest,
-    PongResponse, ServerPingResponse,
+    ByeRequest, CancelStreamAck, CancelStreamRequest, ClientPongRequest, PingRequest, PongResponse,
+    ServerPingResponse,
 };
 
 // -- Shared wire primitives + enums --
@@ -71,10 +71,13 @@ pub use shared::primitives::*;
 pub use ops::admin::*;
 pub use ops::entity::*;
 pub use ops::extractor::*;
+pub use ops::graph::*;
 pub use ops::memory::*;
 pub use ops::procedural::*;
 pub use ops::query::*;
 pub use ops::relation::*;
+pub use ops::session::*;
+pub use ops::space::*;
 pub use ops::statement::*;
 pub use ops::subscribe::*;
 pub use ops::txn::*;

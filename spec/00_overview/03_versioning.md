@@ -5,7 +5,7 @@ How the spec series, the wire protocol, and on-disk formats are versioned.
 ## Three things get versioned
 
 1. **The spec series** — this collection of documents.
-2. **The wire protocol** — the binary format described in [03. Wire Protocol](../04_wire_protocol/00_purpose.md).
+2. **The wire protocol** — the binary format described in [04. Wire Protocol](../04_wire_protocol/00_purpose.md).
 3. **The on-disk formats** — arena, WAL, redb tables.
 
 The spec series tracks the documentation. The wire protocol and on-disk formats are tied to a single Brain release: each release ships one wire version and one storage format, and a server only speaks to clients at the same wire version.
@@ -39,7 +39,7 @@ Within a format version, individual spec documents are revised freely. Revisions
 
 The wire protocol carries a single version field in every frame. The version is **1**. Clients that send any other version are rejected at handshake with `WireVersionMismatch` and the connection is closed.
 
-There is no version negotiation. There is no support for prior wire versions. The wire format ships in lockstep with the server: each Brain release defines one wire version, and the matching SDKs are pinned to it.
+There is no version negotiation. There is no support for prior wire versions. The wire format ships in lockstep with the server: each Brain release defines exactly one wire version. Because Brain ships no first-party client, third-party clients target a specific wire version and are rejected at handshake if it does not match the server's.
 
 The full wire framing rules live in [`../04_wire_protocol/03_opcodes.md`](../04_wire_protocol/03_opcodes.md).
 

@@ -15,9 +15,9 @@ Cargo.lock.bak
 .DS_Store
 Thumbs.db
 
-# Claude Code local overrides (don't commit personal settings)
-.claude/settings.local.json
-.claude/.session-state/
+# Claude Code config and project context (kept out of version control)
+.claude/
+CLAUDE.md
 
 # Brain runtime data
 /data/
@@ -25,6 +25,15 @@ Thumbs.db
 *.wal
 *.arena
 *.redb
+
+# Polyglot SDK scratch (Python / TypeScript). Real homes are
+# per-language repos under arc-labs-ai; the local /clients/ tree
+# is for working-set experiments only.
+/clients/
+
+# Local research scratch (prior-art notes, papers, OSS clones, prototype
+# experiments, forensics). Working-set only — never part of the shipped repo.
+/research/
 
 # Benchmarks
 /criterion/
@@ -50,3 +59,10 @@ Thumbs.db
 
 # Editor temp files
 .envrc
+
+# Eval overlay secret (LLM provider key) — never commit
+config/.env.eval
+
+# Deployment secrets (LLM key, admin token) — never commit. `.env.example`
+# is the committed template; `.env` is the operator's real values.
+.env

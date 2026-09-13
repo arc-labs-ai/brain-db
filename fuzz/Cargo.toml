@@ -32,5 +32,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "schema_parser"
+path = "fuzz_targets/schema_parser.rs"
+test = false
+doc = false
+bench = false
+
 # Fuzz targets are built outside the workspace.
 [workspace]

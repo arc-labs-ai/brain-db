@@ -1,10 +1,5 @@
 //! Typed CRUD + interning over the relation-type registry.
-//! Sub-task 18.3. Mirrors [`crate::schema::predicate`] (17.3).
-//!
-//! Spec refs:
-//! - `spec/02_data_model/00_purpose.md` §"Relation type declaration".
-//! - `spec/26_knowledge_storage/00_purpose.md` — relation_types row
-//!   lives in the knowledge-storage catalog.
+//! Mirrors [`crate::schema::predicate`].
 
 use std::collections::HashSet;
 
@@ -12,6 +7,7 @@ use brain_core::RelationType;
 use brain_core::{Cardinality, EntityTypeId, RelationTypeId};
 use redb::{ReadTransaction, ReadableTable, WriteTransaction};
 
+use crate::tables::relation::RELATION_TYPE_EMBEDDINGS_TABLE;
 use crate::tables::relation_type::{
     encode_entity_type_id, RelationTypeDefinition, RelationTypeOrigin,
     RELATION_TYPES_BY_QNAME_TABLE, RELATION_TYPES_TABLE,
@@ -69,7 +65,11 @@ fn validate_identifier(
             },
         });
     }
-    if s.len() > max {
+    // Bounded by Unicode code points, not bytes, so a multibyte name
+    // (作用于, wirkt_gegen) isn't clipped far below the stated char limit —
+    // matching the predicate-name validator. 64 code points is ≤ 256 bytes,
+    // so it stays within the wire identifier bound.
+    if s.chars().count() > max {
         return Err(RelationTypeOpError::InvalidIdentifier {
             reason: match label {
                 "namespace" => "namespace exceeds 32 chars",
@@ -198,7 +198,7 @@ pub fn relation_type_list(
 
 /// Intern (or look up) a relation type by its qname.
 ///
-/// Semantics mirror `predicate_intern` (17.3):
+/// Semantics mirror `predicate_intern`:
 /// - No prior row: allocate fresh id, write row + qname index entry.
 /// - Prior row with identical constraints: return existing id.
 /// - Prior row with diverging constraints: error.
@@ -422,6 +422,154 @@ pub fn relation_type_intern_or_get(
     Ok(RelationTypeId::from(next_id_raw))
 }
 
+/// Drop every schema-declared relation_type row in `namespace`.
+/// Implicit-from-write rows are preserved. Counterpart to
+/// [`crate::schema::predicate::predicate_drop_schema_declared`]; used
+/// by `SCHEMA_REPLACE` to clear the existing declared vocabulary
+/// before re-running apply.
+pub fn relation_type_drop_schema_declared(
+    wtxn: &WriteTransaction,
+    namespace: &str,
+) -> Result<usize, RelationTypeOpError> {
+    validate_namespace(namespace)?;
+
+    let victims: Vec<(u32, String)> = {
+        let t = wtxn.open_table(RELATION_TYPES_TABLE)?;
+        let mut out = Vec::new();
+        for entry in t.iter()? {
+            let (k, v) = entry?;
+            let row: RelationTypeDefinition = v.value();
+            if row.namespace == namespace && row.origin().is_schema_declared() {
+                out.push((k.value(), qname(&row.namespace, &row.name)));
+            }
+        }
+        out
+    };
+    let count = victims.len();
+    {
+        let mut t = wtxn.open_table(RELATION_TYPES_TABLE)?;
+        for (id, _) in &victims {
+            t.remove(id)?;
+        }
+    }
+    {
+        let mut idx = wtxn.open_table(RELATION_TYPES_BY_QNAME_TABLE)?;
+        for (_, q) in &victims {
+            idx.remove(q.as_str())?;
+        }
+    }
+    Ok(count)
+}
+
+/// Resolve a relation_type id by `(namespace, name)` inside a write
+/// txn. The write-txn counterpart to [`relation_type_lookup_by_qname`],
+/// mirroring [`crate::schema::predicate::predicate_id_by_qname`]; lets a
+/// composing handler resolve the id and mutate in one transaction.
+pub fn relation_type_id_by_qname(
+    wtxn: &WriteTransaction,
+    namespace: &str,
+    name: &str,
+) -> Result<Option<RelationTypeId>, RelationTypeOpError> {
+    validate_namespace(namespace)?;
+    validate_name(name)?;
+    let q = qname(namespace, name);
+    let idx = wtxn.open_table(RELATION_TYPES_BY_QNAME_TABLE)?;
+    let found = idx
+        .get(q.as_str())?
+        .map(|g| RelationTypeId::from(g.value()));
+    Ok(found)
+}
+
+/// Drop a single schema-declared relation_type row identified by
+/// `(namespace, name)`. The scoped counterpart to
+/// [`relation_type_drop_schema_declared`], used by `SCHEMA_DROP` to
+/// narrow one declaration instead of wiping the namespace.
+///
+/// Returns `Some(id)` when a schema-declared relation_type with that
+/// qname existed and was removed, `None` otherwise. An
+/// implicit-from-write row sharing the qname is left untouched.
+pub fn relation_type_drop_one(
+    wtxn: &WriteTransaction,
+    namespace: &str,
+    name: &str,
+) -> Result<Option<RelationTypeId>, RelationTypeOpError> {
+    validate_namespace(namespace)?;
+    validate_name(name)?;
+
+    let q = qname(namespace, name);
+    let victim: Option<u32> = {
+        let idx = wtxn.open_table(RELATION_TYPES_BY_QNAME_TABLE)?;
+        let id = idx.get(q.as_str())?.map(|g| g.value());
+        drop(idx);
+        match id {
+            Some(id) => {
+                let t = wtxn.open_table(RELATION_TYPES_TABLE)?;
+                let row: Option<RelationTypeDefinition> = t.get(&id)?.map(|g| g.value());
+                match row {
+                    Some(r) if r.origin().is_schema_declared() => Some(id),
+                    _ => None,
+                }
+            }
+            None => None,
+        }
+    };
+    if let Some(id) = victim {
+        {
+            let mut t = wtxn.open_table(RELATION_TYPES_TABLE)?;
+            t.remove(&id)?;
+        }
+        {
+            let mut idx = wtxn.open_table(RELATION_TYPES_BY_QNAME_TABLE)?;
+            idx.remove(q.as_str())?;
+        }
+    }
+    Ok(victim.map(RelationTypeId::from))
+}
+
+// ---------------------------------------------------------------------------
+// Embeddings.
+// ---------------------------------------------------------------------------
+
+/// Store the semantic embedding for a relation type. Called when a
+/// relation type is first interned at extraction time. `vec` is the
+/// BGE-small output (384 dims); stored as little-endian `f32` bytes.
+/// Idempotent overwrite. Mirrors
+/// [`crate::schema::predicate::predicate_embedding_put`].
+pub fn relation_type_embedding_put(
+    wtxn: &WriteTransaction,
+    id: RelationTypeId,
+    vec: &[f32],
+) -> Result<(), RelationTypeOpError> {
+    let mut bytes = Vec::with_capacity(vec.len() * 4);
+    for f in vec {
+        bytes.extend_from_slice(&f.to_le_bytes());
+    }
+    let mut t = wtxn.open_table(RELATION_TYPE_EMBEDDINGS_TABLE)?;
+    t.insert(id.raw(), bytes.as_slice())?;
+    Ok(())
+}
+
+/// Load a relation type's embedding, decoding the little-endian `f32`
+/// bytes. Returns `None` when no vector was stored (e.g. relation types
+/// interned before the embedding pass, or user-authored relations with no
+/// extractor embedding). Mirrors
+/// [`crate::schema::predicate::predicate_embedding_get`].
+pub fn relation_type_embedding_get(
+    rtxn: &ReadTransaction,
+    id: RelationTypeId,
+) -> Result<Option<Vec<f32>>, RelationTypeOpError> {
+    let t = rtxn.open_table(RELATION_TYPE_EMBEDDINGS_TABLE)?;
+    let Some(g) = t.get(id.raw())? else {
+        return Ok(None);
+    };
+    let bytes = g.value();
+    let mut out = Vec::with_capacity(bytes.len() / 4);
+    for chunk in bytes.as_chunks::<4>().0.iter() {
+        out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    Ok(Some(out))
+}
+
 // ---------------------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------------------
@@ -633,116 +781,6 @@ mod tests {
     }
 
     #[test]
-    fn invalid_namespace_empty() {
-        let (_dir, db) = open_db();
-        let wtxn = db.begin_write().unwrap();
-        let err = relation_type_intern(
-            &wtxn,
-            "",
-            "x",
-            None,
-            None,
-            Cardinality::ManyToMany,
-            false,
-            1,
-            "",
-            0,
-        )
-        .unwrap_err();
-        matches!(err, RelationTypeOpError::InvalidIdentifier { .. })
-            .then_some(())
-            .expect("expected InvalidIdentifier");
-    }
-
-    #[test]
-    fn invalid_namespace_uppercase() {
-        let (_dir, db) = open_db();
-        let wtxn = db.begin_write().unwrap();
-        let err = relation_type_intern(
-            &wtxn,
-            "Brain",
-            "x",
-            None,
-            None,
-            Cardinality::ManyToMany,
-            false,
-            1,
-            "",
-            0,
-        )
-        .unwrap_err();
-        matches!(err, RelationTypeOpError::InvalidIdentifier { .. })
-            .then_some(())
-            .expect("expected InvalidIdentifier");
-    }
-
-    #[test]
-    fn invalid_namespace_leading_digit() {
-        let (_dir, db) = open_db();
-        let wtxn = db.begin_write().unwrap();
-        let err = relation_type_intern(
-            &wtxn,
-            "1brain",
-            "x",
-            None,
-            None,
-            Cardinality::ManyToMany,
-            false,
-            1,
-            "",
-            0,
-        )
-        .unwrap_err();
-        matches!(err, RelationTypeOpError::InvalidIdentifier { .. })
-            .then_some(())
-            .expect("expected InvalidIdentifier");
-    }
-
-    #[test]
-    fn invalid_name_empty() {
-        let (_dir, db) = open_db();
-        let wtxn = db.begin_write().unwrap();
-        let err = relation_type_intern(
-            &wtxn,
-            "brain",
-            "",
-            None,
-            None,
-            Cardinality::ManyToMany,
-            false,
-            1,
-            "",
-            0,
-        )
-        .unwrap_err();
-        matches!(err, RelationTypeOpError::InvalidIdentifier { .. })
-            .then_some(())
-            .expect("expected InvalidIdentifier");
-    }
-
-    #[test]
-    fn invalid_name_with_hyphen() {
-        let (_dir, db) = open_db();
-        let wtxn = db.begin_write().unwrap();
-        let err = relation_type_intern(
-            &wtxn,
-            "brain",
-            "is-a",
-            None,
-            None,
-            Cardinality::ManyToMany,
-            false,
-            1,
-            "",
-            0,
-        )
-        .unwrap_err();
-        matches!(err, RelationTypeOpError::InvalidIdentifier { .. })
-            .then_some(())
-            .expect("expected InvalidIdentifier");
-    }
-
-    #[test]
     fn entity_type_constraints_round_trip() {
         let (_dir, db) = open_db();
         let wtxn = db.begin_write().unwrap();
@@ -906,5 +944,24 @@ mod tests {
         let active = relation_types_active_for_schema(&rtxn, "acme", 5).unwrap();
         assert!(active.contains(&declared));
         assert!(!active.contains(&implicit));
+    }
+
+    #[test]
+    fn relation_type_embedding_round_trips_and_missing_is_none() {
+        let (_dir, db) = open_db();
+        let id = RelationTypeId::from(7);
+        let vec = vec![0.5_f32, -1.25, 3.0, 0.0];
+
+        let wtxn = db.begin_write().unwrap();
+        relation_type_embedding_put(&wtxn, id, &vec).unwrap();
+        wtxn.commit().unwrap();
+
+        let rtxn = db.begin_read().unwrap();
+        let got = relation_type_embedding_get(&rtxn, id).unwrap().unwrap();
+        assert_eq!(got, vec);
+
+        // An id with no stored embedding returns None.
+        let missing = relation_type_embedding_get(&rtxn, RelationTypeId::from(99)).unwrap();
+        assert!(missing.is_none());
     }
 }

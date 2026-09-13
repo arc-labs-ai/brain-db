@@ -73,11 +73,15 @@ Up to 64 edges per encode (configurable).
 
 Required. A `RequestId` for idempotency. The same RequestId returns the original response for retries.
 
-#### deduplicate
+#### Content deduplication (text ENCODE)
 
-Optional, default `false`. When `true`, Brain consults a per-`(shard, agent_id, context_id)` fingerprint index (see [`../10_metadata/03_substrate_tables.md`](../10_metadata/03_substrate_tables.md) §"Fingerprint deduplication") before allocating a new slot. On a hit, the existing `MemoryId` is returned and no new slot, WAL record, or HNSW node is created; `EncodeResponse.was_deduplicated = true`.
+Text `ENCODE` deduplicates by content as a **DB policy — always on**, not a client flag. Before allocating a slot, Brain consults a per-`(shard, agent_id, context_id)` fingerprint index keyed on `BLAKE3(text)` (see [`../10_metadata/03_substrate_tables.md`](../10_metadata/03_substrate_tables.md) §"Fingerprint deduplication"). On a hit, the existing `MemoryId` is returned and no new slot, WAL record, or HNSW node is created; `EncodeResponse.was_deduplicated = true`. So re-saving byte-identical text under the same identity and context yields one memory, never a pile of identical rows.
 
-Default-off: the simpler "one ENCODE → one memory" model is Brain's primitive. Callers opt in explicitly when they know the content is dedup-safe (template outputs, idempotent ingestion).
+This is distinct from `request_id` idempotency (§4), which dedupes exact *replays* by request identity; content dedup dedupes by *content identity*. Genuine near-duplicates that are **not** byte-identical (paraphrases, the same fact re-stated) are not collapsed here — they are reconciled asynchronously by the near-dup consolidation worker. `ENCODE_VECTOR_DIRECT` keeps an explicit opt-in `deduplicate` field (default `false`) because a caller supplying raw vectors owns the "is this a duplicate" decision.
+
+#### occurred_at_unix_nanos
+
+Optional, default `None`. The client's **event time** — when the memory's content actually happened — distinct from `created_at` (the server write time stamped during commit). Stored verbatim on the memory row, carried durably through the WAL so it survives recovery, and echoed back on `RECALL` as `MemoryResult.occurred_at_unix_nanos`. It does not affect dedup, slot allocation, or ranking in this slice; it is a recorded fact about the memory's timeline. See [`../02_data_model/02_memory.md`](../02_data_model/02_memory.md) §2 (`created_at` vs `occurred_at`). `ENCODE_VECTOR_DIRECT` has no such field.
 
 ### 3. The response
 
@@ -95,7 +99,7 @@ struct EncodeResponse {
 
 The MemoryId is the agent's primary handle. Stable. Use it to refer to this memory in all future operations.
 
-`was_deduplicated` is `true` only when the request asked for dedup AND Brain found a matching fingerprint (see §4a and [`../10_metadata/03_substrate_tables.md`](../10_metadata/03_substrate_tables.md) §"Fingerprint deduplication"). Idempotency-replay does not set this flag — replay is transparent to the caller and returns whatever the original response carried.
+`was_deduplicated` is `true` when Brain found a matching content fingerprint — always-on for text `ENCODE`, opt-in (`deduplicate = true`) for `ENCODE_VECTOR_DIRECT` (see §4a and [`../10_metadata/03_substrate_tables.md`](../10_metadata/03_substrate_tables.md) §"Fingerprint deduplication"). Idempotency-replay does not set this flag — replay is transparent to the caller and returns whatever the original response carried.
 
 ### 4. Idempotency
 
@@ -106,6 +110,8 @@ If the same RequestId is sent twice (e.g., due to network retry):
 - No additional WAL record is written.
 
 This is Brain's commitment: at-most-once execution per RequestId, with replay-safe responses. Idempotency replay is **transparent** — `was_deduplicated` reports whatever the original response carried, not whether the wire-level replay occurred.
+
+**Under `act_as` the key is the effective identity, not the connection principal.** When a request carries the `act_as` field (a trusted service principal running the op on behalf of a tenant agent; defined in [`../04_wire_protocol/04_handshake.md`](../04_wire_protocol/04_handshake.md) §"Per-request identity (`act_as`)"), both the idempotency key **and** the shard-routing key MUST be scoped by the **effective** `(namespace, agent_id)` — the identity named in `act_as` — never by the connection principal. This is a load-bearing safety rule, not an optimization. The idempotency key is otherwise the bare 16-byte RequestId: a single service principal issuing ops for many tenants over one shared connection could reuse a RequestId across distinct effective identities, and a bare-RequestId key would then **collide across tenants** — serving one tenant's cached acknowledgement to another. Because the idempotency pool and the connection are shared, the leak is invisible at the wire. Keying on the effective `(namespace_id, agent_id)` + RequestId, and routing to the shard by the effective agent, makes the collision impossible: two tenants reusing one RequestId land on disjoint keys.
 
 ### 4a. Fingerprint deduplication
 
@@ -252,6 +258,172 @@ If Brain crashes between WAL fsync and the ack:
 - The client may see a network error; on retry with the same RequestId, the cached response is returned.
 
 So the agent never sees a half-encoded memory.
+
+### 17. The ENCODE write-analysis trace (`wait = derived`)
+
+ENCODE completion is governed by a single argument, `EncodeRequest.wait`
+([`WaitMode`]) — the one write knob (see the API convention below). It has two
+values:
+
+- **`ack`** (the default, omitted from the wire map): the handler returns as
+  soon as the WAL record is durable — the synchronous ack. The async derivation
+  runs in the background and flows through SUBSCRIBE; the response carries `lsn`
+  + `pending_stages` and `trace` is `None`. The hot path pays nothing: no
+  timestamps, no bus receiver, no drain wait.
+- **`derived`**: the handler blocks until the async derivation completes, then
+  returns a populated `EncodeTrace` — the full per-stage timeline **plus the
+  concrete output each stage produced** (embedding vector, stored record,
+  analyzed keyword terms, write-time HyPE questions, entities / statements /
+  relations / graph), so a caller inspects *what was built* at every step, not
+  just how long it took. Bounded by the shard's trace drain window; a stalled
+  worker can't hang the call (stragglers → `Timeout`, still land in
+  `MEMORY_INSPECT`).
+
+**API convention — `wait` for writes, `trace` for reads.** A write's completion
+timing and its observability payload are one decision: the only reason to wait
+for async derivation is to observe it, and the only way to observe it is to
+wait — so writes carry a single `wait` enum (its payload follows its timing). A
+read (RECALL / PLAN / REASON) is fully synchronous with nothing to wait for, so
+it carries `trace: bool`, a pure observability toggle with no timing effect. No
+op carries both.
+
+#### 17a. The pipeline the trace describes — synchronous then asynchronous
+
+The write is two phases split by the **acknowledgement barrier** (WAL fsync).
+Everything up to and including `persist` is synchronous — the handler blocks and
+the client's `EncodeResponse` is not sent until it completes. Everything after is
+asynchronous derivation, enqueued post-commit and settled by per-shard workers;
+it is observable live on SUBSCRIBE keyed by the write's `lsn`.
+
+**Synchronous phases** (in execution order):
+
+| Phase | What it does | Stage output (`artifact`) |
+|---|---|---|
+| `validate` | Input validation + router policy (kind, salience); idempotency peek. | — |
+| `embed` | BGE-small → the 384-dim vector (the memory's semantic key). | the embedding `vector` |
+| `reserve` | Allocates the arena slot + mints the version-stamped `MemoryId`. | (id in `detail`) |
+| `persist` | Writes the vector to the arena, **fsyncs the WAL** (the ack barrier), commits the redb metadata row, inserts the memory HNSW point. | the redb `record` (id, kind, salience, created/occurred time, vector dim, text length, lsn) |
+
+**Asynchronous stages** (post-ack; the four first-class `StageKind`s that emit
+`StageCompleted` events):
+
+| Stage | `StageKind` | What it does | Stage output (`artifact`) |
+|---|---|---|---|
+| `auto_edge` | `AutoEdge` | HNSW k-NN of the new vector → `SimilarTo` edges. | edges (in `graph`) |
+| `temporal_edge` | `TemporalEdge` | Session adjacency → `FollowedBy` edges. | edges (in `graph`) |
+| `extractor` | `Extractor` | Three-tier pipeline (pattern → classifier → LLM): entities, statements, relations → the typed graph; statement-text indexing. | the knowledge `graph` (nodes + edges), plus the `keyword_fields` (analyzed text-index terms) |
+| `hype` | `Hype` | Write-time HyPE: hypothetical questions generated for the new memory, embedded, and inserted into the memory HNSW index. | `hype_questions` (the generated question text) |
+
+One derivation runs asynchronously but is **not** a `StageKind` (it does not
+emit `StageCompleted`): the `memory_text` tantivy index upsert. Its output
+isn't captured as a stage artifact.
+
+Note the question *text* in `hype_questions` is not otherwise persisted (only
+its embedding is), so it is available only through the trace or
+`MEMORY_INSPECT` (§17d) — the live `StageCompleted` event for `Hype` carries
+only a compact summary (`questions_written`, `cost_micro_usd`), not the text
+itself. See [04. Wire Protocol](../04_wire_protocol/05_frame_layouts.md)
+§32.2 for the wire payload shapes and §17e below for the live-progress
+pattern built on top of them.
+
+#### 17b. The per-stage artifact contract
+
+Each `EncodeTraceStage` carries an optional `artifact: EncodeStageArtifact` — a
+per-stage output bag; every field is optional and a stage populates only what it
+generated:
+
+```rust
+struct EncodeStageArtifact {
+    vector: Vec<f32>,                       // embed → the full embedding
+    record: Option<EncodeStageRecord>,      // persist → the redb row
+    hype_questions: Vec<String>,            // HyPE → generated question variations
+    keyword_fields: Vec<EncodeStageKeywordField>, // text index → analyzed terms per field
+    graph: Option<EncodeStageGraph>,        // extractor → nodes + edges (renderable graph)
+}
+
+struct EncodeStageRecord {                  // the durable metadata row
+    memory_id: [u8; 16], kind: u8, salience: f32,
+    created_at_unix_nanos: u64, occurred_at_unix_nanos: u64,
+    vector_dim: u32, text_len: u32, lsn: u64,
+}
+struct EncodeStageKeywordField { field: String, terms: Vec<String> }
+struct EncodeStageGraph { nodes: Vec<EncodeGraphNode>, edges: Vec<EncodeGraphEdge> }
+struct EncodeGraphNode { id: [u8;16], name: String, kind: String, type_qname: String }
+struct EncodeGraphEdge { source: [u8;16], target: [u8;16], predicate: String, kind: String, confidence: f32 }
+```
+
+The top-level `EncodeTrace.artifacts` still carries the resolved
+entities/statements/relations/indexes/dedup summary (unchanged); the per-stage
+`artifact` is the finer-grained "what this step emitted" view layered on top.
+
+#### 17c. The synchronous drain window
+
+With `trace = true` the handler, after the durable ack, waits up to a bounded
+`encode_trace_drain_window` for this write's async stages to publish their
+`StageCompleted` events, then resolves the artifacts they produced and returns
+the whole timeline in one response. A stage that does not finish inside the
+window is recorded with status `Timeout` (its `StageCompleted` still arrives on
+SUBSCRIBE later). The wait is additive convenience for the opted-in caller; the
+async stages run identically whether or not anyone traced them.
+
+#### 17d. Durable per-memory inspection (`MEMORY_INSPECT`)
+
+The live trace is a one-shot view of a *fresh* write, bounded by the drain
+window. The same `EncodeStageArtifact` shape is *also* persisted per memory in
+the `memory_artifacts` table (§10.9a), so **any** memory — not just the one just
+written — can be inspected later via `MEMORY_INSPECT` (§04, `0x0028`). The
+bundle is written by the same producers that emit the trace stages, but as
+durable state rather than a transient event:
+
+- **sync**, on this write's ack txn (`apply_upsert_memory`): `vector`, `record`,
+  and `keyword_fields` — committed atomically with the memory row, no extra
+  transaction on the ack path.
+- **async**, off the ack path: the extractor worker merges `graph` after its
+  typed-graph commit; the HyPE worker merges `hype_questions`.
+
+Each producer merges its own portion via a read-modify-write inside a single
+redb write txn, so a later stage never clobbers an earlier stage's fields. This
+is why `MEMORY_INSPECT` on a just-written memory can return the sync fields
+immediately while the graph / HyPE fields are still empty — the durable analogue
+of a `Timeout` stage in the live trace. The one intentional divergence:
+`record.lsn` is `0` in the durable bundle (the WAL position isn't known at apply
+time), whereas the live trace's `persist` stage carries the real LSN from the
+ack.
+
+#### 17e. The recommended live-progress pattern (`wait: ack` + scoped SUBSCRIBE)
+
+A client wanting genuine per-stage progress on a write — not the batched,
+post-hoc view `wait: derived` gives, and without paying its blocking cost —
+combines two calls instead of leaning on `wait` alone:
+
+1. `ENCODE` with `wait: ack` (the default). The handler returns as soon as
+   the WAL record is durable, with `memory_id` and `lsn` in hand, before any
+   async stage has even started.
+2. Immediately `SUBSCRIBE` with `filter.memory_ids: [that memory_id]` (no
+   other filter dimension is needed — the stream only ever concerns this one
+   write). Each of the four async stages (`auto_edge`, `temporal_edge`,
+   `extractor`, `hype`) publishes its own `StageCompleted` event (§32.2 of
+   [04. Wire Protocol](../04_wire_protocol/05_frame_layouts.md)) onto the
+   same event bus the instant it commits; the client renders each as it
+   arrives instead of waiting for all of them. Because the four stages are
+   independent background workers, they do **not** complete in a fixed
+   order — a client MUST NOT assume `auto_edge` → `temporal_edge` →
+   `extractor` → `hype` sequencing.
+3. The client considers the write's derivation complete once it has received
+   a `StageCompleted` for all four `StageKind`s, or applies its own bounded
+   timeout as a safety cap. A stage that doesn't report within the timeout
+   should be surfaced honestly as "unknown" / "timed out" — never silently
+   marked complete.
+
+If the connection is a shared service-principal pool (one credential, many
+tenants), scope the SUBSCRIBE the same way any other op does: pass `act_as`
+(see [04. Wire Protocol](../04_wire_protocol/04_handshake.md) §10a and
+[05_subscribe.md](05_subscribe.md) §22) naming the effective
+`(namespace, agent_id)` the subscription should observe.
+
+This is a general-purpose pattern, not tied to any particular client — any
+caller that wants live write-pipeline observability without the blocking
+cost of `wait: derived` should use it.
 
 ## FORGET
 
@@ -882,7 +1054,7 @@ The op is a structured read — no WAL record, no idempotency-table write. The `
 
 A client could do this themselves by issuing a `STATEMENT_LIST` with the right filters and rendering the result. MATERIALIZE_PROCEDURAL exists because:
 
-1. **The renderer is opinionated.** Brain's renderer encodes the canonical phrasing for each `behavior_*` predicate, so the system block is consistent across agents and across SDK versions.
+1. **The renderer is opinionated.** Brain's renderer encodes the canonical phrasing for each `behavior_*` predicate, so the system block is consistent across agents and across clients.
 2. **The fingerprint is stable.** Clients that build their own renderer get a different hash on every re-render; the server-side renderer pins canonical ordering.
 3. **Future evolution.** A future version may add learning hooks (e.g., "agent updates its own preferences after a failed task") that go through the same op for auditability.
 

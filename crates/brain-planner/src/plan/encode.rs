@@ -1,19 +1,19 @@
-//! `EncodePlan` and its step structs. Mirrors 's shape.
+//! `EncodePlan` and its step structs.
 //!
-//! Phase order in the spec:
-//! 1. Idempotency check (§4)
-//! 2. Embedding (§5)
-//! 3. Context resolution (§6)
-//! 4. Slot allocation (§7)
-//! 5. WAL append + fsync — durability barrier (§8)
-//! 6. Apply: arena + metadata + HNSW (§9)
-//! 7. Edges (§10)
-//! 8. Response (§11)
+//! Phase order:
+//! 1. Idempotency check
+//! 2. Embedding
+//! 3. Context resolution
+//! 4. Slot allocation
+//! 5. WAL append + fsync — durability barrier
+//! 6. Apply: arena + metadata + HNSW
+//! 7. Edges
+//! 8. Response
 //!
-//! Per orientation plan §4.7, Phase 6 ships single-shard only; the
-//! `shard` field is always the local shard.
+//! Single-shard only for now; the `shard` field is always the local
+//! shard.
 
-use brain_core::{AgentId, ContextId, MemoryKind, RequestId};
+use brain_core::{MemoryKind, RequestId, SessionId, SpaceId};
 
 use super::common::{EdgeSpec, ShardId};
 use super::recall::EmbeddingStep;
@@ -30,10 +30,9 @@ pub struct EncodePlan {
     pub edges: Vec<EdgeStep>,
     pub response: EncodeResponseStep,
     pub estimated_cost_ms: f32,
-    /// — when `true`, the executor computes a
-    /// content hash and consults the per-shard `fingerprints`
-    /// table; on a hit, the existing `MemoryId` is returned
-    /// without allocating a new slot.
+    /// When `true`, the executor computes a content hash and consults
+    /// the per-shard `fingerprints` table; on a hit, the existing
+    /// `MemoryId` is returned without allocating a new slot.
     pub deduplicate: bool,
 }
 
@@ -42,24 +41,24 @@ pub struct IdempotencyCheckStep {
     pub request_id: RequestId,
 }
 
-/// — explicit `ContextId` short-circuits; named
-/// contexts are resolved or created in `brain-metadata`.
+/// Explicit `SessionId` short-circuits; named sessions are resolved
+/// or created in `brain-metadata`.
 #[derive(Debug, Clone)]
 pub enum ContextResolutionStep {
-    Explicit(ContextId),
-    GetOrCreate { agent_id: AgentId, name: String },
+    Explicit(SessionId),
+    GetOrCreate { space_id: SpaceId, name: String },
 }
 
-/// — the arena grows asynchronously if near full;
-/// this step doesn't block on growth.
+/// The arena grows asynchronously if near full; this step doesn't
+/// block on growth.
 #[derive(Debug, Clone, Copy)]
 pub struct SlotAllocationStep {
     pub arena_grow_if_needed: bool,
 }
 
-/// — the WAL append is the durability barrier; after
-/// fsync, the encode is durable. Group commit batches multiple
-/// in-flight encodes into a single fsync.
+/// The WAL append is the durability barrier; after fsync, the encode
+/// is durable. Group commit batches multiple in-flight encodes into a
+/// single fsync.
 #[derive(Debug, Clone, Copy)]
 pub struct WalAppendStep {
     pub kind: MemoryKind,
@@ -67,7 +66,7 @@ pub struct WalAppendStep {
     pub fsync: bool,
 }
 
-/// — applied *after* the durability barrier.
+/// Applied *after* the durability barrier.
 #[derive(Debug, Clone, Copy)]
 pub struct ApplyStep {
     pub arena_write: bool,

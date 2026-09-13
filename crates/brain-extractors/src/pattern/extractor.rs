@@ -104,6 +104,16 @@ impl PatternExtractor {
 
     fn project(&self, text: String, start: usize, end: usize) -> Option<ExtractedItem> {
         let id_raw = self.id.raw();
+        // A pure date / relative-time span ("Last Friday", "yesterday") names
+        // no entity — drop it before it mints a phantom node. Statement /
+        // relation targets are unaffected (a temporal object stays text).
+        if matches!(
+            self.target,
+            ExtractorTarget::Entity { .. } | ExtractorTarget::EntityOrStatement
+        ) && crate::resolver::is_temporal_expression_surface(&text)
+        {
+            return None;
+        }
         match &self.target {
             ExtractorTarget::Entity { entity_type } => {
                 Some(ExtractedItem::EntityMention(EntityMention {
@@ -120,7 +130,7 @@ impl PatternExtractor {
                 Some(ExtractedItem::StatementMention(StatementMention {
                     kind: statement_kind_byte(*kind),
                     subject_text: None,
-                    // §22/07 Q6 — predicate qname inference is out of v1 scope.
+                    // Predicate qname inference is out of v1 scope.
                     predicate_qname: String::new(),
                     object_text: Some(text),
                     confidence: self.confidence,
@@ -129,6 +139,17 @@ impl PatternExtractor {
                     // Pattern extractor can't infer statefulness — schemaless
                     // pattern matches default to cumulative.
                     is_stateful: false,
+                    subject_is_memory: false,
+                    // Pattern tier can't tell entity from value or resolve an
+                    // event time — keep the safe defaults.
+                    object_is_entity: false,
+                    event_at_unix_nanos: None,
+                    // Pattern tier can't judge first-person self-reference;
+                    // that's the LLM's call.
+                    subject_is_self: false,
+                    // Pattern matches are positive assertions; negation/retraction
+                    // is a meaning judgement only the LLM tier makes.
+                    retract: false,
                 }))
             }
             ExtractorTarget::Relation { .. } => None, // handled by run_for_relation below
@@ -228,8 +249,11 @@ fn statement_kind_byte(k: StatementKindAst) -> u8 {
         StatementKindAst::Fact => StatementKind::Fact.as_u8(),
         StatementKindAst::Preference => StatementKind::Preference.as_u8(),
         StatementKindAst::Event => StatementKind::Event.as_u8(),
+        StatementKindAst::Attribute => StatementKind::Attribute.as_u8(),
+        StatementKindAst::Relation => StatementKind::Relation.as_u8(),
+        StatementKindAst::Directive => StatementKind::Directive.as_u8(),
         // `Any` carries no specific kind. Storage-side maps Any to "no constraint";
-        // emitted statements default to Fact discriminant (1) so downstream
+        // emitted statements default to Fact discriminant so downstream
         // resolution has something concrete to write.
         StatementKindAst::Any => StatementKind::Fact.as_u8(),
     }
@@ -243,7 +267,7 @@ fn statement_kind_byte(k: StatementKindAst) -> u8 {
 mod tests {
     use super::*;
     use crate::framework::registry::ExtractorRegistry;
-    use brain_core::{AgentId, ContextId, MemoryId, MemoryKind, Salience};
+    use brain_core::{MemoryId, MemoryKind, Salience, SessionId, SpaceId};
 
     fn build(target: ExtractorTarget, patterns: &[&str], confidence: f32) -> PatternExtractor {
         let raw: Vec<String> = patterns.iter().map(|p| (*p).to_string()).collect();
@@ -261,18 +285,23 @@ mod tests {
     fn memory(text: &str) -> Memory {
         Memory {
             id: MemoryId::pack(0, 1, 0),
-            agent: AgentId::new(),
-            context: ContextId(0),
+            space: SpaceId::new(),
+            session_id: SessionId(0),
             kind: MemoryKind::Episodic,
             salience: Salience::default(),
             text: Some(text.to_string()),
             created_at_unix_ms: 0,
             last_accessed_at_unix_ms: 0,
+            occurred_at_unix_nanos: None,
         }
     }
 
     fn ctx<'a>(reg: &'a ExtractorRegistry) -> ExtractionContext<'a> {
         ExtractionContext {
+            declared_entity_types: None,
+            candidate_predicates: None,
+            declared_kinds: None,
+            entity_type_labels: None,
             schema_version: 1,
             now_unix_nanos: 0,
             registry: reg,
@@ -310,7 +339,7 @@ mod tests {
 
     #[test]
     fn try_new_resource_limit_is_wired() {
-        // The 1 MiB size cap (§22/01 §2) is plumbed through
+        // The 1 MiB size cap is plumbed through
         // `RegexBuilder::size_limit` / `dfa_size_limit`. We verify
         // the error mapping rather than synthesising a pathological
         // input — the regex crate is efficient enough that the
@@ -487,7 +516,7 @@ mod tests {
         };
         assert_eq!(m.object_text.as_deref(), Some("ship phase 20"));
         assert_eq!(m.kind, StatementKind::Fact.as_u8());
-        // §22/07 Q6: predicate inference is deferred.
+        // Predicate inference is deferred.
         assert!(m.predicate_qname.is_empty());
     }
 }

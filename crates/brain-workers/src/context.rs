@@ -1,12 +1,12 @@
 //! Worker runtime context — the handle
 //! bag every worker reads from while a cycle is in flight.
 //!
-//! After sub-task 9.7 (audit §6 + §8.2): shutdown is `Arc<AtomicBool>`
-//! instead of `tokio::sync::watch` — removes the tokio runtime dependency
-//! and works under either Tokio (tests) or Glommio (production scheduler).
-//! `Arc<OpsContext>` is kept (vs the audit's suggested `Rc<OpsContext>`)
-//! because `OpsContext` is already transitively `!Send` via `WriterHandle`
-//! losing `Sync`; the Arc wrapper is harmless on a single-threaded executor.
+//! Shutdown is `Arc<AtomicBool>` instead of `tokio::sync::watch` — removes
+//! the tokio runtime dependency and works under either Tokio (tests) or
+//! Glommio (production scheduler). `Arc<OpsContext>` is kept (rather than
+//! `Rc<OpsContext>`) because `OpsContext` is already transitively `!Send`
+//! via `WriterHandle` losing `Sync`; the Arc wrapper is harmless on a
+//! single-threaded executor.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

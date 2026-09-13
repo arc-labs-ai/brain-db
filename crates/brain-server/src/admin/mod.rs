@@ -1,8 +1,7 @@
 //! Admin / observability HTTP server.
 //!
-//! Built on `brain-http` (hyper 1.x) as of Phase 11 M3. Replaces the
-//! hand-rolled HTTP/1.1 parser + writeln-chain that lived here through
-//! Phase 10.
+//! Built on `brain-http` (hyper 1.x). Replaces an earlier
+//! hand-rolled HTTP/1.1 parser + writeln-chain.
 //!
 //! ## Two listeners
 //!
@@ -15,19 +14,19 @@
 //! - **Admin** (constructed via [`AdminServer::admin`], bound to
 //!   `cfg.server.admin_addr`, default `127.0.0.1:9092` — loopback):
 //!   every `/v1/*` route (snapshots, rebuild-ann, workers, config,
-//!   audit, agents, shards, diagnostics). Operationally sensitive;
-//!   v1 has no built-in authentication so the loopback default
-//!   matters. Front with mTLS / a token-checking reverse proxy if
-//!   you bind it to a public interface.
+//!   audit, spaces, shards, diagnostics). Operationally sensitive and the
+//!   bootstrap channel for minting data-plane API keys, so every `/v1/*`
+//!   request is gated on the operator admin secret (`[admin] token` /
+//!   `BRAIN__ADMIN__TOKEN`) presented as `Authorization: Bearer <token>`.
+//!   The server refuses to start the admin listener when no token is
+//!   configured (fail-closed).
 //!
-//! Unknown paths → `404 Not Found` (was `400 Bad Request` pre-M3 —
-//! wire-behaviour delta documented in the M3 commit message). Routes
+//! Unknown paths → `404 Not Found`. Routes
 //! that exist on the "other" listener also 404 — `/v1/workers` on
 //! `metrics_addr` and `/metrics` on `admin_addr` both fail closed.
 //!
-//! (metrics) + §14/06 (admin). The unified
-//! [`AdminServer::new`] constructor still exists for the test
-//! harness; production must not use it.
+//! The unified [`AdminServer::new`] constructor still exists for the
+//! test harness; production must not use it.
 
 #![cfg(target_os = "linux")]
 
@@ -38,6 +37,7 @@ mod util;
 
 use std::io;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -75,16 +75,33 @@ pub struct AdminState {
     pub build_info: BuildInfo,
     pub shards: Arc<Vec<ShardHandle>>,
     pub connections: Arc<ConnectionMetrics>,
-    /// Sub-task 10.11: read-only view of the loaded config, surfaced
+    /// Read-only view of the loaded config, surfaced
     /// by `GET /v1/config`.
     pub config: Arc<Config>,
-    /// 12.1b: per-op request counters / histograms / in-flight gauges.
+    /// Per-op request counters / histograms / in-flight gauges.
     /// Same instance shared with `Topology::request_metrics`.
     pub request_metrics: Arc<RequestMetrics>,
     /// Scope-bound API key store (W2.5). Mint / revoke / list endpoints
     /// read and write through this handle.
     pub auth_store: Arc<AuthStore>,
+    /// Path to the config file this server booted from. `Some` in
+    /// production (wired from the `--config` arg); `None` in the test
+    /// harness, which constructs [`Config::for_tests`] with no file
+    /// behind it. `POST /v1/config/reload` needs this to re-read the
+    /// file; without it the endpoint reports that reload is unavailable.
+    pub config_path: Option<PathBuf>,
+    /// Applies a new log level to the live tracing subscriber, returning
+    /// whether the reload took effect. Wraps the logging reload handle so
+    /// `admin` stays decoupled from the tracing internals (and test crates
+    /// that mount only `admin` need not mount `logging`). `Some` in
+    /// production; `None` in the test harness.
+    pub apply_log_level: Option<ApplyLogLevel>,
 }
+
+/// Callback that applies a log level to the running subscriber. `Send +
+/// Sync` because [`AdminState`] is shared across the Tokio connection
+/// layer and the admin server.
+pub type ApplyLogLevel = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 impl AdminState {
     pub fn new(
@@ -107,7 +124,23 @@ impl AdminState {
             config,
             request_metrics,
             auth_store,
+            config_path: None,
+            apply_log_level: None,
         }
+    }
+
+    /// Wire the live-config-reload dependencies: the path the config was
+    /// loaded from and a callback that applies a log level to the running
+    /// subscriber. Production calls this immediately after [`Self::new`];
+    /// the test harness leaves both unset, so `POST /v1/config/reload`
+    /// reports reload unavailable there rather than acting on a
+    /// non-existent file.
+    #[must_use]
+    #[allow(dead_code)] // called from main.rs; test crates construct via `new` only.
+    pub fn with_reload(mut self, config_path: PathBuf, apply_log_level: ApplyLogLevel) -> Self {
+        self.config_path = Some(config_path);
+        self.apply_log_level = Some(apply_log_level);
+        self
     }
 
     /// Borrow-only view consumed by `crate::metrics::format::format`.
@@ -257,8 +290,7 @@ impl BoundAdminServer {
 
     /// Run the accept loop until the brain-server shutdown signal
     /// fires, then drain in-flight connections via brain-http's
-    /// graceful shutdown (30 s cap). Returns the bound local address
-    /// — same shape as the pre-M3 API.
+    /// graceful shutdown (30 s cap). Returns the bound local address.
     pub async fn serve(mut self) -> io::Result<SocketAddr> {
         let local_addr = self.local_addr;
         let log_name = self.log_name;
