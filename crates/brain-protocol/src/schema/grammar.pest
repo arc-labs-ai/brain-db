@@ -90,12 +90,14 @@ predicate_field = _{
     | predicate_object_field
     | predicate_stateful_field
     | predicate_description_field
+    | predicate_retention_field
 }
 
 predicate_kind_field        = { "kind" ~ ":" ~ statement_kind }
 predicate_object_field      = { "object" ~ ":" ~ object_type }
 predicate_stateful_field    = { "stateful" ~ ":" ~ bool_literal }
 predicate_description_field = { "description" ~ ":" ~ string_literal }
+predicate_retention_field   = { "retention" ~ ":" ~ duration_literal }
 
 statement_kind = @{ "Fact" | "Preference" | "Event" | "Attribute" | "Relation" | "Directive" | "Any" }
 

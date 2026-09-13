@@ -28,7 +28,7 @@ use brain_planner::retrieval::planner::{plan as retrieval_plan, PlanError};
 use brain_planner::retrieval::router::{
     QueryRequest as PlannerQueryRequest, Retriever, RetrieverSelection,
 };
-use brain_protocol::envelope::request::{MemoryKindWire, RecallRequest};
+use brain_protocol::envelope::request::{MemoryKindWire, RecallRequest, RecallScopeWire};
 use brain_protocol::envelope::response::{
     AnswerKindWire, MemoryResult, RankedItemKindWire, RecallResponseFrame, RecallTrace,
     RecallTraceCandidate, RecallTraceDroppedId, RecallTraceFilterChain, RecallTraceFusion,
@@ -101,10 +101,37 @@ pub const MAX_CUE_SURFACES: usize = 32;
 /// scan on the shard core. Far above any real cue length.
 pub const MAX_CUE_TOKENS_SCANNED: usize = 256;
 
+/// The read-scope width this request runs under, as the centralized
+/// [`brain_metadata::ScopeMode`] the `admits` predicate takes. `Space` (the
+/// default) pins reads to the caller's single `(namespace, space)`;
+/// `Namespace` widens the space half within the caller's own namespace.
+///
+/// While `handle_recall` still refuses `scope = Namespace` at the door (the
+/// cross-shard fan-out lands in a later phase), this is the single point
+/// that maps the wire scope onto the retrieval mode, so the whole read path
+/// is already threaded for when the gate lifts.
+fn recall_scope_mode(req: &RecallRequest) -> brain_metadata::ScopeMode {
+    match req.scope {
+        RecallScopeWire::Namespace => brain_metadata::ScopeMode::Namespace,
+        RecallScopeWire::Space => brain_metadata::ScopeMode::Space,
+    }
+}
+
 pub async fn handle_recall(
     mut req: RecallRequest,
     ctx: &OpsContext,
 ) -> Result<RecallResponseFrame, OpError> {
+    // Namespace-wide recall (scope = Namespace) requires cross-shard fan-out +
+    // global merge at the connection layer (spec §"Recall scope"). A single
+    // shard's handler cannot serve it — it would see only this shard's spaces —
+    // so it is refused here until that fan-out path lands. Single-space recall
+    // (the default) is unaffected. Lifts when the router-level fan-out is wired.
+    if matches!(req.scope, RecallScopeWire::Namespace) {
+        return Err(OpError::InvalidRequest(
+            "namespace-wide recall (scope=Namespace) is not yet supported".into(),
+        ));
+    }
+
     // End-to-end wall clock for the query metric family. One `Instant`
     // per recall (cheap), covering the whole read — fan-out, grounding
     // overlay, membership shaping, and abstention — not just the
@@ -117,36 +144,7 @@ pub async fn handle_recall(
     // default window when the caller never asked for a count — and the
     // normalisation overwrites `0` with the default, erasing the distinction.
     let client_requested_count = req.max_results != 0;
-
-    // Normalise the safety cap. `0` means "server default"; anything
-    // above the hard ceiling is clamped (not rejected) — the cap is a
-    // bound, never the caller's intent. The answer's shape comes from
-    // the data, so there is no "zero results" request to honour here.
-    if req.max_results == 0 {
-        req.max_results = DEFAULT_RECALL_RESULTS;
-    }
-    if req.max_results > MAX_RECALL_RESULTS {
-        req.max_results = MAX_RECALL_RESULTS;
-    }
-    // A memory without its text is useless to the caller — recall always
-    // returns the remembered text. `include_text` is not a knob anyone
-    // wants set to false; force it on regardless of what the client sent.
-    // (The wire field is retained for now; a later lockstep pass drops it.)
-    req.include_text = true;
-    if let Some(ref ctxs) = req.session_filter {
-        if ctxs.len() > MAX_RECALL_FILTER_ENTRIES {
-            return Err(OpError::InvalidRequest(format!(
-                "recall: session_filter must have <= {MAX_RECALL_FILTER_ENTRIES} entries"
-            )));
-        }
-    }
-    if let Some(ref kinds) = req.kind_filter {
-        if kinds.len() > MAX_RECALL_FILTER_ENTRIES {
-            return Err(OpError::InvalidRequest(format!(
-                "recall: kind_filter must have <= {MAX_RECALL_FILTER_ENTRIES} entries"
-            )));
-        }
-    }
+    normalize_recall_request(&mut req)?;
 
     // Brain is a memory database: a recall returns one memory, an array of
     // memories, or none — never raw retrieval lanes. There is ONE unified read
@@ -164,23 +162,124 @@ pub async fn handle_recall(
     //      always-on without the subject-dump flooding that sinks recall.
     //   3. The answer's shape (Single / Many / None) follows the count.
 
+    // The read runs in two composable stages so namespace-wide RECALL reuses the
+    // EXACT same shaping as single-space RECALL (no second copy of the answer
+    // logic). `gather_recall` is the associative + typed-graph fan-out over the
+    // caller's read scope, producing a raw candidate pool; `shape_recall` turns a
+    // pool into the shaped answer (grounding overlay + membership + abstention).
+    // A single-space recall runs both here on one shard. A namespace-wide recall
+    // fans `gather_recall` out to every shard (`recall_gather_namespace`), merges
+    // the pools at the connection layer, and runs `shape_recall` once over the
+    // merged pool on the bound shard (`recall_shape_namespace`).
+    let gathered = gather_recall(&req, ctx).await?;
+    shape_recall(gathered, &req, ctx, client_requested_count, recall_started)
+}
+
+/// The raw candidate pool a single shard produced for a recall, plus the
+/// per-request shaping signals it computed locally (`grounded`, `hype_scores`).
+/// For namespace-wide recall the connection layer collects one of these per
+/// shard and merges all three signals ([`merge_recall_pools`] for the pool,
+/// plus the HyPE union and best-grounded pick) before a single global shaping
+/// pass — so a grounded commit and the HyPE answer-lead work ACROSS shards, not
+/// just on the coordinator.
+struct RecallGathered {
+    memories: Vec<MemoryResult>,
+    trace: Option<RecallTrace>,
+    metric_sample: RecallMetricSample,
+    cue_vec: Option<[f32; brain_embed::VECTOR_DIM]>,
+    anchor: Option<EntityId>,
+    /// The typed-graph grounded answer computed on this shard (over its own
+    /// spaces). `NoAnswer` when no cue vector, or no subject/predicate cleared
+    /// the match floor here.
+    grounded: GroundedOutcome,
+    /// HyPE answer-lead scores (memory_id → best question-bridge cosine) from
+    /// this shard's HyPE index. Empty when no cue vector.
+    hype_scores: HashMap<u128, f32>,
+}
+
+/// Stage 1 — the associative (semantic + lexical) + typed-graph fan-out over the
+/// caller's read scope, RRF-fused and reranked into a raw candidate pool. No
+/// membership shaping happens here, so the pool is safe to merge with other
+/// shards' pools before a single global shaping pass.
+async fn gather_recall(req: &RecallRequest, ctx: &OpsContext) -> Result<RecallGathered, OpError> {
     // Embed the cue once for the grounding overlay. A failed embed degrades to
     // the plain fan-out — grounding is an overlay, never a reason to fail the
     // read.
     let cue_vec = ctx.executor.embedder.embed(&req.cue_text).ok();
-
-    // Statement lanes are always searched inside `retrieve_memories` (cue-driven,
-    // never gated). The entity-graph traversal lane is ALSO always lit: we anchor
-    // it on the cue's resolved subject and `retrieve_memories` cue-conditions the
-    // graph candidates (scaling each by its cosine to the query), so the
-    // structural walk can't re-introduce the subject-dump flood. No flags: every
-    // read traverses everything the write built, ranked by relevance to the cue.
-    let anchor = resolve_graph_anchor(&req, ctx);
-    // `trace` is `Some` only when the caller opted in (`req.trace`); it carries
-    // the read pipeline's per-stage observability the executor already computed
-    // and otherwise discards. It rides through to the final frame untouched.
+    // The entity-graph traversal lane is anchored on the cue's resolved subject;
+    // `retrieve_memories` cue-conditions the graph candidates so the structural
+    // walk can't re-introduce the subject-dump flood.
+    let anchor = resolve_graph_anchor(req, ctx);
     let (memories, trace, metric_sample) =
-        retrieve_memories(&req, ctx, anchor, cue_vec.as_ref()).await?;
+        retrieve_memories(req, ctx, anchor, cue_vec.as_ref()).await?;
+    // Compute the grounding overlay + HyPE answer-lead HERE (per shard), not in
+    // `shape_recall`, so a namespace-wide fan-out can gather each shard's local
+    // signals and merge them — letting the grounded commit and the HyPE ordering
+    // reflect the whole namespace, not just the coordinator's spaces.
+    let (grounded, hype_scores) = compute_grounding(req, ctx, cue_vec.as_ref())?;
+    Ok(RecallGathered {
+        memories,
+        trace,
+        metric_sample,
+        cue_vec,
+        anchor,
+        grounded,
+        hype_scores,
+    })
+}
+
+/// Compute the typed-graph grounded answer + the HyPE answer-lead scores for a
+/// cue on THIS shard (over its own spaces). Factored out of the read stages so
+/// both the single-shard gather and any future re-computation share one
+/// definition. Returns `(NoAnswer, empty)` when there is no cue vector.
+fn compute_grounding(
+    req: &RecallRequest,
+    ctx: &OpsContext,
+    cue_vec: Option<&[f32; brain_embed::VECTOR_DIM]>,
+) -> Result<(GroundedOutcome, HashMap<u128, f32>), OpError> {
+    let Some(cue_vec) = cue_vec else {
+        return Ok((GroundedOutcome::NoAnswer, HashMap::new()));
+    };
+    let grounded = best_grounded_for_cue(req, ctx, cue_vec)?;
+    // HyPE questions are stored query-side (embed_query, BGE query prefix), so
+    // the cue must be embedded the SAME way for the answer-lead cosine to be
+    // in-distribution; fall back to the plain cue if the prefixed embed fails.
+    let hype_cue_vec = ctx
+        .executor
+        .embedder
+        .embed_query(&req.cue_text)
+        .unwrap_or(*cue_vec);
+    let hype_scores: HashMap<u128, f32> = ctx
+        .semantic_retriever
+        .hype_scores_for_query(&hype_cue_vec, RECALL_CANDIDATE_POOL as usize)
+        .into_iter()
+        .map(|(id, s)| (id.raw(), s))
+        .collect();
+    Ok((grounded, hype_scores))
+}
+
+/// Stage 2 — turn a candidate pool (this shard's, or the cross-shard merge)
+/// into the shaped answer: typed-graph grounding overlay, the membership set,
+/// and the two abstention gates. Cross-shard members degrade gracefully — the
+/// per-shard signals (`vector_for`, grounding, HyPE) simply miss for a member
+/// owned by another shard and fall back to the score already on the
+/// `MemoryResult`, so the merged answer is coherent without those refinements.
+fn shape_recall(
+    gathered: RecallGathered,
+    req: &RecallRequest,
+    ctx: &OpsContext,
+    client_requested_count: bool,
+    recall_started: Instant,
+) -> Result<RecallResponseFrame, OpError> {
+    let RecallGathered {
+        memories,
+        trace,
+        metric_sample,
+        cue_vec,
+        anchor,
+        grounded,
+        hype_scores,
+    } = gathered;
 
     let Some(cue_vec) = cue_vec else {
         // No cue embedding → no grounding overlay, so no committed shape; the
@@ -190,49 +289,19 @@ pub async fn handle_recall(
         return Ok(frame);
     };
 
-    let grounded = best_grounded_for_cue(&req, ctx, &cue_vec)?;
+    // `grounded` + `hype_scores` are supplied by the gather stage (single shard),
+    // or merged across shards for a namespace-wide read — shaping never
+    // recomputes them, so the grounded commit + HyPE ordering are global.
 
-    // Answer-lead signal via the HyPE question-bridge: one HNSW probe of the
-    // hypothetical-question pool with the cue yields, per memory, the best "does
-    // this memory ANSWER the cue?" cosine — the signal the passage↔cue cosine
-    // (topical adjacency) lacks. Computed ONCE here and threaded into both the
-    // membership ordering and the kind-presence abstention gate, so the two agree
-    // on which members genuinely answer.
-    // HyPE questions are stored query-side (embed_query, with the BGE query
-    // prefix — see workers/hype.rs), so the cue must be embedded the SAME way
-    // for the answer-lead cosine to be in-distribution. The plain `cue_vec`
-    // above (correct for passage search + grounding) would score the cue across
-    // a prefix gap against the prefixed question vectors, silently weakening the
-    // answer-lead signal. Embed a prefixed cue just for this probe; fall back to
-    // the plain cue if the prefixed embed fails (array is Copy — `cue_vec` stays
-    // valid for later use).
-    let hype_cue_vec = ctx
-        .executor
-        .embedder
-        .embed_query(&req.cue_text)
-        .unwrap_or(cue_vec);
-    let hype_scores: HashMap<u128, f32> = ctx
-        .semantic_retriever
-        .hype_scores_for_query(&hype_cue_vec, RECALL_CANDIDATE_POOL as usize)
-        .into_iter()
-        .map(|(id, s)| (id.raw(), s))
-        .collect();
-
-    // MEMBERSHIP MODEL — recall is not a top-k pile, it is the SET of memories
-    // that belong to this cue. Two signals decide belonging and are UNIONed:
-    //   S_struct — the precise typed-graph answer: source memories of the
-    //              grounded values (Single → one, Set → its members).
-    //   S_sem    — the associative belonging set: the fan-out cut at its natural
-    //              score cliff (adaptive gap), never a fixed count.
-    // A memory in BOTH is the most-confirmed (both lanes agree) and ranks first.
-    // The answer's SHAPE is the grounded commit's shape when one fired (the
-    // committed value leads, episodic retained below), else it follows the set's
-    // cardinality: 0 → None, 1 → Single, N → Many. There is no caller-supplied
-    // count anywhere in this path.
+    // MEMBERSHIP MODEL — recall is the SET of memories that belong to this cue,
+    // unioning the typed-graph grounded answer (S_struct) with the associative
+    // fan-out cut at its natural score cliff (S_sem). The answer SHAPE is the
+    // grounded commit's shape when one fired, else it follows the set's
+    // cardinality: 0 → None, 1 → Single, N → Many.
     let (membership, committed_shape, any_belongs) = build_membership(
         memories,
         &grounded,
-        &req,
+        req,
         ctx,
         &cue_vec,
         anchor,
@@ -241,26 +310,13 @@ pub async fn handle_recall(
     );
 
     // ── ABSTENTION PIPELINE ─────────────────────────────────────────────────
-    // Two honest, structural abstention gates, both keyed on the cue having no
-    // real anchor for its answer. In-txn reads are exempt from BOTH: they are
-    // read-your-writes, and a pending write the caller just made is not topical
-    // noise — it carries no retrieval-lane confirmation only because it isn't
-    // committed/indexed yet, so abstaining it would break the guarantee.
+    // Two structural abstention gates keyed on the cue having no real anchor for
+    // its answer. In-txn reads are exempt from BOTH (read-your-writes: a pending
+    // write carries no retrieval-lane confirmation only because it isn't indexed
+    // yet, so abstaining it would break the guarantee).
     let membership = if req.txn_id.is_some() {
         membership
     } else {
-        // Both gates key on `any_belongs`: at least one surviving member carries a
-        // belonging signal BEYOND the raw passage cosine (strong HyPE / lexical /
-        // graph / grounded). They abstain (empty → None) only when NO member does
-        // and the grounded layer produced no answer. A lone semantic-cosine
-        // member never blocks abstention — under BGE compression a nonsense cue
-        // reaches the same low-0.6 cosine as a weak-but-real hit, so passage
-        // magnitude alone can't tell them apart; corroboration across an
-        // independent lane can. This keeps genuinely answerable cues (which
-        // corroborate across lanes, or match the HyPE question-bridge) while
-        // letting an unsupported adversarial/nonsense cue fall to None. The two
-        // gates keep their distinct anchor-state preconditions so each only acts
-        // in its own domain (no-anchor vs subject-resolved).
         // 1. No subject resolved at all.
         let membership = apply_anchor_abstention(membership, anchor, &grounded, any_belongs);
         // 2. Subject resolved but no fact of the matching KIND/role for it.
@@ -270,6 +326,257 @@ pub async fn handle_recall(
     let frame = recall_frame(membership, committed_shape, trace);
     record_recall_metrics(ctx, recall_started, &metric_sample, frame.answer_kind);
     Ok(frame)
+}
+
+/// Normalise a recall request in place: clamp the safety cap into
+/// `[DEFAULT, MAX]` (`0` = server default), force `include_text` on (a memory
+/// without its text is useless), and bound the filter list sizes. Shared by the
+/// single-space handler and the namespace-wide fan-out entry points so both
+/// apply identical bounds. Capture `client_requested_count = req.max_results
+/// != 0` BEFORE calling this — it overwrites a `0` cap.
+fn normalize_recall_request(req: &mut RecallRequest) -> Result<(), OpError> {
+    if req.max_results == 0 {
+        req.max_results = DEFAULT_RECALL_RESULTS;
+    }
+    if req.max_results > MAX_RECALL_RESULTS {
+        req.max_results = MAX_RECALL_RESULTS;
+    }
+    req.include_text = true;
+    if let Some(ref ctxs) = req.session_filter {
+        if ctxs.len() > MAX_RECALL_FILTER_ENTRIES {
+            return Err(OpError::InvalidRequest(format!(
+                "recall: session_filter must have <= {MAX_RECALL_FILTER_ENTRIES} entries"
+            )));
+        }
+    }
+    if let Some(ref kinds) = req.kind_filter {
+        if kinds.len() > MAX_RECALL_FILTER_ENTRIES {
+            return Err(OpError::InvalidRequest(format!(
+                "recall: kind_filter must have <= {MAX_RECALL_FILTER_ENTRIES} entries"
+            )));
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Namespace-wide fan-out (cross-shard) — Phase C.
+//
+// A namespace's spaces are spread across shards, so a namespace-wide RECALL
+// must run on EVERY shard and merge. The connection layer orchestrates it:
+//   1. `recall_gather_namespace` on each shard → that shard's raw candidate
+//      pool (its own spaces, widened by Phase B's namespace read scope).
+//   2. `merge_recall_pools` at the connection layer → one global pool (RRF by
+//      within-shard rank, deduped, bounded).
+//   3. `recall_shape_namespace` on the bound (coordinator) shard → the single
+//      global shaping pass over the merged pool, reusing the identical
+//      `shape_recall` used by single-space RECALL.
+// The per-shard gather never shapes, so no shard decides Single/Many/None over
+// a partial view; the shape is decided once, globally. The `handle_recall`
+// door still refuses `scope = Namespace` — a single shard cannot serve it — so
+// this path is only ever reached through the connection-layer fan-out.
+// ---------------------------------------------------------------------------
+
+/// RRF smoothing constant for the cross-shard merge. Matches the intra-shard
+/// fusion `k` so a rank-1 hit from one shard and a rank-1 hit from another are
+/// weighted identically.
+const CROSS_SHARD_RRF_K: f32 = 60.0;
+
+/// One shard's namespace-wide gather partial: its raw candidate pool plus the
+/// shaping signals it computed locally (the grounded answer over its spaces, its
+/// HyPE answer-lead scores, and the graph anchor it resolved). The connection
+/// layer collects one per shard and merges them ([`merge_namespace_partials`]);
+/// brain-server holds these opaquely and never inspects the fields.
+pub struct NamespaceRecallPartial {
+    memories: Vec<MemoryResult>,
+    grounded: GroundedOutcome,
+    hype_scores: HashMap<u128, f32>,
+    anchor: Option<EntityId>,
+}
+
+/// The merged cross-shard shaping inputs for a namespace-wide recall: the global
+/// candidate pool plus the winning grounded answer, unioned HyPE scores, and the
+/// anchor from the shard that produced the grounded answer. Fed to
+/// [`recall_shape_namespace`] for the single global shaping pass. Opaque to
+/// brain-server.
+pub struct MergedNamespaceRecall {
+    memories: Vec<MemoryResult>,
+    grounded: GroundedOutcome,
+    hype_scores: HashMap<u128, f32>,
+    anchor: Option<EntityId>,
+}
+
+/// Phase-C/D stage 1 (per shard): produce this shard's namespace-wide gather
+/// partial — its raw candidate pool AND the grounding/HyPE signals it computed
+/// over its own spaces. Normalises the request and forces the widened read
+/// scope, then runs the shared `gather_recall` (no shaping).
+pub async fn recall_gather_namespace(
+    mut req: RecallRequest,
+    ctx: &OpsContext,
+) -> Result<NamespaceRecallPartial, OpError> {
+    normalize_recall_request(&mut req)?;
+    // Force the widened read scope regardless of the wire value that reached
+    // this shard — this entry point IS the namespace fan-out.
+    req.scope = RecallScopeWire::Namespace;
+    let gathered = gather_recall(&req, ctx).await?;
+    Ok(NamespaceRecallPartial {
+        memories: gathered.memories,
+        grounded: gathered.grounded,
+        hype_scores: gathered.hype_scores,
+        anchor: gathered.anchor,
+    })
+}
+
+/// Merge every shard's namespace-wide gather partial into one set of global
+/// shaping inputs:
+///   - **pool**: [`merge_recall_pools`] (RRF by within-shard rank, deduped, bounded);
+///   - **HyPE**: union of the per-shard score maps (a memory is owned by exactly
+///     one shard, so the keys are disjoint) — the answer-lead is now global;
+///   - **grounded**: the best-scoring [`GroundedOutcome::Answer`] across shards
+///     (a namespace-wide subject typically resolves on one shard), preferring an
+///     anchor-scoped answer on a near-tie — so a grounded commit fires even when
+///     the subject's facts live on a shard other than the coordinator.
+/// The anchor travels with the winning grounded answer's shard.
+pub fn merge_namespace_partials(partials: Vec<NamespaceRecallPartial>) -> MergedNamespaceRecall {
+    let mut pools: Vec<Vec<MemoryResult>> = Vec::with_capacity(partials.len());
+    let mut hype_scores: HashMap<u128, f32> = HashMap::new();
+    // Best grounded answer across shards, with the anchor from the same shard.
+    let mut best_grounded: GroundedOutcome = GroundedOutcome::NoAnswer;
+    let mut best_score = f32::NEG_INFINITY;
+    let mut best_anchor: Option<EntityId> = None;
+    // A Some anchor from any shard, used as a fallback when no shard grounded.
+    let mut fallback_anchor: Option<EntityId> = None;
+
+    for p in partials {
+        pools.push(p.memories);
+        for (id, s) in p.hype_scores {
+            // Disjoint keys across shards; `max` is a harmless tie-break if a
+            // memory ever appeared under two shards' HyPE maps.
+            hype_scores
+                .entry(id)
+                .and_modify(|cur| {
+                    if s > *cur {
+                        *cur = s;
+                    }
+                })
+                .or_insert(s);
+        }
+        if fallback_anchor.is_none() {
+            fallback_anchor = p.anchor;
+        }
+        if let GroundedOutcome::Answer(ref answer, anchor_scoped) = p.grounded {
+            let score = grounded_answer_score(answer);
+            // Prefer a strictly higher score; on a near-tie prefer an
+            // anchor-scoped answer (it is the one allowed to COMMIT the lead).
+            let take = score > best_score + GROUNDED_MERGE_TIE_EPS
+                || ((score - best_score).abs() <= GROUNDED_MERGE_TIE_EPS
+                    && anchor_scoped
+                    && !matches!(best_grounded, GroundedOutcome::Answer(_, true)));
+            if take {
+                best_score = score;
+                best_anchor = p.anchor;
+                best_grounded = p.grounded;
+            }
+        }
+    }
+
+    let anchor = if matches!(best_grounded, GroundedOutcome::Answer(..)) {
+        best_anchor
+    } else {
+        fallback_anchor
+    };
+    MergedNamespaceRecall {
+        memories: merge_recall_pools(pools),
+        grounded: best_grounded,
+        hype_scores,
+        anchor,
+    }
+}
+
+/// Phase-C/D stage 3 (coordinator shard): shape the MERGED cross-shard inputs
+/// into the final answer, reusing the identical `shape_recall` single-space
+/// RECALL uses. The cue vector is recomputed here (deterministic); the grounded
+/// answer, HyPE scores, and anchor come pre-merged from every shard, so the
+/// grounded commit + answer-lead reflect the whole namespace. Members owned by
+/// other shards still degrade gracefully in `shape_recall`'s per-member
+/// `vector_for` re-score (they fall back to the score on the `MemoryResult`).
+pub async fn recall_shape_namespace(
+    merged: MergedNamespaceRecall,
+    mut req: RecallRequest,
+    ctx: &OpsContext,
+) -> Result<RecallResponseFrame, OpError> {
+    let recall_started = Instant::now();
+    let client_requested_count = req.max_results != 0;
+    normalize_recall_request(&mut req)?;
+    req.scope = RecallScopeWire::Namespace;
+    let cue_vec = ctx.executor.embedder.embed(&req.cue_text).ok();
+    let gathered = RecallGathered {
+        memories: merged.memories,
+        // Per-shard trace/metrics don't compose across a fan-out; the merged
+        // answer records a minimal sample (namespace-wide observability is a
+        // follow-up).
+        trace: None,
+        metric_sample: RecallMetricSample::empty(),
+        cue_vec,
+        anchor: merged.anchor,
+        grounded: merged.grounded,
+        hype_scores: merged.hype_scores,
+    };
+    shape_recall(gathered, &req, ctx, client_requested_count, recall_started)
+}
+
+/// Near-tie epsilon for picking the best grounded answer across shards. Mirrors
+/// the intra-shard `TIE_EPS` used by `best_grounded_for_cue`.
+const GROUNDED_MERGE_TIE_EPS: f32 = 1e-4;
+
+/// The comparable score of a grounded answer — its top value's match cosine,
+/// the same key `best_grounded_for_cue` ranks candidates by within a shard.
+fn grounded_answer_score(answer: &GroundedAnswer) -> f32 {
+    answer.values.first().map(|v| v.match_score).unwrap_or(0.0)
+}
+
+/// Merge per-shard candidate pools into one global pool for namespace-wide
+/// recall. Each pool is that shard's fan-out result, best-first. A memory is
+/// owned by exactly one shard, so there are normally no cross-shard duplicates;
+/// this dedups defensively by id (keeping the higher RRF score) and orders the
+/// union by Reciprocal-Rank-Fusion over each hit's WITHIN-SHARD rank — the one
+/// cross-shard-comparable signal (raw fused scores are normalised per pool and
+/// are not comparable across shards). The result is truncated to the candidate
+/// pool budget so the downstream shaping pass stays bounded regardless of the
+/// shard count.
+///
+/// This ordering primarily bounds and assembles the pool; `shape_recall`
+/// re-scores members by cue cosine, so the exact merge order only decides the
+/// no-cue fast path and the truncation cut.
+pub fn merge_recall_pools(pools: Vec<Vec<MemoryResult>>) -> Vec<MemoryResult> {
+    let mut best: HashMap<u128, (MemoryResult, f32)> = HashMap::new();
+    for pool in pools {
+        for (rank0, m) in pool.into_iter().enumerate() {
+            let rrf = 1.0 / (CROSS_SHARD_RRF_K + (rank0 as f32) + 1.0);
+            match best.get_mut(&m.memory_id) {
+                Some((_, score)) => {
+                    // Same memory from two shards (should not happen — one owner
+                    // — but be defensive): keep the higher-ranked appearance.
+                    if rrf > *score {
+                        *score = rrf;
+                    }
+                }
+                None => {
+                    best.insert(m.memory_id, (m, rrf));
+                }
+            }
+        }
+    }
+    let mut merged: Vec<(MemoryResult, f32)> = best.into_values().collect();
+    // Descending RRF; ties broken on memory_id so the merge is deterministic
+    // across runs and shard-arrival order.
+    merged.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.memory_id.cmp(&b.0.memory_id))
+    });
+    merged.truncate(RECALL_CANDIDATE_POOL as usize);
+    merged.into_iter().map(|(m, _)| m).collect()
 }
 
 /// Lightweight always-on read-path stats the executor already MEASURED,
@@ -291,6 +598,17 @@ struct RecallMetricSample {
 }
 
 impl RecallMetricSample {
+    /// A no-signal sample for the namespace-wide merged-shape path, where the
+    /// per-shard executor metadata does not compose across the fan-out. Records
+    /// the query outcome (latency + answer kind) with no per-lane detail.
+    fn empty() -> Self {
+        Self {
+            per_lane: Vec::new(),
+            effective_fusion_k: 0,
+            rerank_invoked: false,
+        }
+    }
+
     /// Extract the always-on stats from the executor's returned
     /// metadata. Populated on every recall (not gated on `trace_detail`)
     /// — the per-lane latency / total / outcome vectors and the
@@ -1127,20 +1445,26 @@ fn build_membership(
     // FIX B: `grounded_commit` now enforces corroboration internally (a lead
     // source must clear `SUPPORT_CORROBORATED`), so an uncorroborated grounded
     // value returns `None` here and falls through to `no_commit`.
-    let (mut out, committed_shape) = match grounded_commit(grounded, &support_of) {
-        // Honor the commit only when at least one lead memory is actually present
-        // in the visible set: a grounded source filtered out by the visibility
-        // pass (space/kind/context/tombstone) must not set a shape with no backing
-        // member. Otherwise fall through to plain answer-relevance ordering.
-        Some(lead) if lead.ids.iter().any(|id| placed.contains(id)) => {
-            let shape = lead.shape;
-            (
-                apply_grounded_commit(out, &lead, hype_scores, &cos_by_id),
-                Some(shape),
-            )
-        }
-        _ => no_commit(out),
-    };
+    let (mut out, committed_shape, committed_lead_count) =
+        match grounded_commit(grounded, &support_of) {
+            // Honor the commit only when at least one lead memory is actually present
+            // in the visible set: a grounded source filtered out by the visibility
+            // pass (space/kind/context/tombstone) must not set a shape with no backing
+            // member. Otherwise fall through to plain answer-relevance ordering.
+            Some(lead) if lead.ids.iter().any(|id| placed.contains(id)) => {
+                let shape = lead.shape;
+                let lead_n = lead.ids.iter().filter(|id| placed.contains(id)).count();
+                (
+                    apply_grounded_commit(out, &lead, hype_scores, &cos_by_id),
+                    Some(shape),
+                    lead_n,
+                )
+            }
+            _ => {
+                let (out, shape) = no_commit(out);
+                (out, shape, 0)
+            }
+        };
 
     // ── EXACT-PATH INTRINSIC CARDINALITY ───────────────────────────────────
     // Ablatable block (revert by deleting it and keeping the plain
@@ -1203,6 +1527,69 @@ fn build_membership(
             || grounded_sources.contains(&id)
     };
     let any_belongs = out.iter().any(|m| belongs_of(m.memory_id));
+
+    // ── PRECISION DECISION ──────────────────────────────────────────────────
+    // Calibrated selective shaping over the assembled set: commit a Single/Many
+    // only when the lead is corroborated enough, else abstain with an honest None;
+    // keep a committed Many minimal. The confidence signal is the SAME cross-lane
+    // `support` the commit and abstention gates already use — the one signal that
+    // separates correct from wrong answers; retrieval score is deliberately not an
+    // input. Defaults are no-ops (commit_min_support = many_min_support = 0), so an
+    // uncalibrated deploy reproduces the prior shape and abstention exactly; a
+    // fitted `[precision]` calibration is what makes None reachable and Many tight.
+    //
+    // In-txn reads are EXEMPT — exactly as the caller's `any_belongs` abstention
+    // is. An in-txn read is read-your-writes: a write the caller just made isn't
+    // indexed yet, so it carries no cross-lane support and would be wrongly
+    // abstained. The precision decision therefore never runs on the txn path.
+    let (out, committed_shape) = if req.txn_id.is_some() {
+        (out, committed_shape)
+    } else {
+        let supports: Vec<u8> = out.iter().map(|m| support_of(m.memory_id)).collect();
+        let decision = crate::precision::decide(
+            &crate::precision::DecisionInput {
+                supports: &supports,
+                committed_shape,
+                committed_lead_count,
+            },
+            brain_core::PrecisionTuning::active(),
+        );
+        // Observability: emit the decision + every member's support (leads first) so
+        // a calibration can be fit from a single eval run's logs — no threshold
+        // sweep needed. This is the raw material for choosing the thresholds offline.
+        tracing::debug!(
+            target: "brain_ops::precision",
+            cue = %req.cue_text,
+            lead_support = supports.first().copied().unwrap_or(0),
+            shape = ?decision.shape,
+            lead_count = decision.lead_count,
+            abstained = decision.abstained,
+            members = out.len(),
+            support_hist = ?supports,
+            "recall: precision decision"
+        );
+        match decision.shape {
+            // Calibrated abstention: drop the set so `recall_frame` yields an
+            // explicit None. Only reachable when a `commit_min_support` is set.
+            AnswerKindWire::None => (Vec::new(), None),
+            shape => {
+                // Minimal-Many trim: for an UNCOMMITTED decision, drop the members
+                // below the committed lead set so a `Many` returns only its tight
+                // answer (fewer, higher-consensus memories). Guarded: grounded
+                // commits keep their full retained tail (their guardrail is that a
+                // wrong commit can only mis-order); and with the default
+                // many_min_support = 0 lead_count == out.len(), so nothing is
+                // dropped. Only fires when an operator calibrates a trim.
+                let out = if committed_shape.is_none() && decision.lead_count < out.len() {
+                    out.into_iter().take(decision.lead_count).collect()
+                } else {
+                    out
+                };
+                (out, Some(shape))
+            }
+        }
+    };
+    let any_belongs = any_belongs && !out.is_empty();
 
     (out, committed_shape, any_belongs)
 }
@@ -1851,15 +2238,20 @@ fn hydrate_memories_by_id(
 ) -> Result<Vec<MemoryResult>, OpError> {
     use brain_metadata::tables::memory::MEMORIES_TABLE as MEM_T;
 
-    // Strict per-space isolation: every row belongs to exactly one space, and
-    // the scope is the caller's own space derived from the key. There is no
-    // client-supplied space filter on the wire, so a key can never reach
-    // another space's data.
-    let space_scope: Option<HashSet<[u8; 16]>> = Some(
-        [<[u8; 16]>::from(ctx.executor.caller_space)]
-            .into_iter()
-            .collect(),
-    );
+    // Space scope of the structured projector. The namespace (tenant) wall is
+    // applied separately and unconditionally on every row below; this is only
+    // the inner space narrowing. Space-scoped recall pins the caller's own
+    // space; namespace-wide recall drops it (`None` = any space the caller
+    // owns within its namespace), so a namespace-wide answer spans the
+    // caller's spaces but never crosses the namespace wall.
+    let space_scope: Option<HashSet<[u8; 16]>> = match recall_scope_mode(req) {
+        brain_metadata::ScopeMode::Space => Some(
+            [<[u8; 16]>::from(ctx.executor.caller_space)]
+                .into_iter()
+                .collect(),
+        ),
+        brain_metadata::ScopeMode::Namespace => None,
+    };
     let kind_filter: Option<HashSet<MemoryKindWire>> = req
         .kind_filter
         .as_ref()
@@ -2178,6 +2570,7 @@ async fn retrieve_memories(
         metadata: ctx.executor.metadata.clone(),
         caller_namespace: ctx.executor.caller_namespace.raw(),
         caller_space: ctx.executor.caller_space,
+        scope_mode: recall_scope_mode(req),
         cross_encoder: ctx.cross_encoder.as_arc().cloned(),
         space_vectors: ctx.executor.space_vectors.clone(),
     };
@@ -2279,7 +2672,11 @@ async fn retrieve_memories(
     // observability; without `req.trace` we drop it exactly as before, so the
     // common path pays nothing. When asked, we hand it to the final frame.
     let trace = if req.trace {
-        Some(build_recall_trace(&result.metadata, ctx)?)
+        Some(build_recall_trace(
+            &result.metadata,
+            ctx,
+            recall_scope_mode(req),
+        )?)
     } else {
         None
     };
@@ -2337,7 +2734,11 @@ async fn retrieve_memories(
 /// empty `Vec`s when the executor ran with `trace_detail = false`, so this
 /// degrades to the count-only shape automatically — it never has to guess
 /// which mode produced `meta`.
-fn build_recall_trace(meta: &QueryMetadata, ctx: &OpsContext) -> Result<RecallTrace, OpError> {
+fn build_recall_trace(
+    meta: &QueryMetadata,
+    ctx: &OpsContext,
+    mode: brain_metadata::ScopeMode,
+) -> Result<RecallTrace, OpError> {
     let latency_of = |r: Retriever| -> f64 {
         meta.retriever_latencies_ms
             .iter()
@@ -2377,7 +2778,7 @@ fn build_recall_trace(meta: &QueryMetadata, ctx: &OpsContext) -> Result<RecallTr
     // answer path's per-row `(namespace_id, space_id)` re-check.
     let caller_scope =
         brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_space);
-    let candidate_texts = fetch_candidate_texts(&candidate_ids, caller_scope, ctx)?;
+    let candidate_texts = fetch_candidate_texts(&candidate_ids, caller_scope, mode, ctx)?;
 
     // The graph lane surfaces typed items (entities / relations), not memories —
     // resolving those to display labels needs the metadata tables. Open one read
@@ -2727,6 +3128,7 @@ fn render_statement_label(rtxn: &redb::ReadTransaction, sid: brain_core::Stateme
 fn fetch_candidate_texts(
     ids: &HashSet<MemoryId>,
     caller_scope: brain_metadata::RowScope,
+    mode: brain_metadata::ScopeMode,
     ctx: &OpsContext,
 ) -> Result<HashMap<MemoryId, String>, OpError> {
     if ids.is_empty() {
@@ -2754,8 +3156,7 @@ fn fetch_candidate_texts(
         let in_scope = match memories_table.get(&id.to_be_bytes()) {
             Ok(Some(guard)) => {
                 let row = guard.value();
-                row.namespace_id == caller_scope.namespace_id
-                    && row.space_id_bytes == caller_scope.space_id_bytes
+                caller_scope.admits(row.namespace_id, &row.space_id_bytes, mode)
             }
             Ok(None) => false,
             Err(e) => {
@@ -3305,11 +3706,20 @@ fn build_planner_request(
     caller_space: brain_core::SpaceId,
     entity_anchor: Option<EntityId>,
 ) -> PlannerQueryRequest {
-    // Strict per-space isolation: retrieval is always scoped to the calling
-    // space (from the key). Every row belongs to exactly one space, and there
-    // is no client-supplied space filter on the wire, so a key can never reach
-    // another space's memories.
-    let space_filter: Vec<brain_core::SpaceId> = vec![caller_space];
+    // Space scope of the front-gate prefilter. In the default (space-scoped)
+    // recall this pins retrieval to the calling space — every row belongs to
+    // exactly one space and there is no client-supplied space filter on the
+    // wire, so a key can never reach another space's memories. Under a
+    // namespace-wide recall the space filter is left EMPTY, which the
+    // retrievers read as "any space"; the namespace wall is enforced
+    // separately and unconditionally on every lane (semantic
+    // `namespace_id`, graph `admits`, and the projector post-filters), so
+    // an empty space filter widens across the caller's own spaces without
+    // ever crossing namespaces.
+    let space_filter: Vec<brain_core::SpaceId> = match recall_scope_mode(req) {
+        brain_metadata::ScopeMode::Space => vec![caller_space],
+        brain_metadata::ScopeMode::Namespace => Vec::new(),
+    };
 
     PlannerQueryRequest {
         text: Some(req.cue_text.clone()),
@@ -3440,18 +3850,25 @@ fn project_memory_results(
             continue;
         }
 
-        // Tenant wall — unconditional, defense-in-depth at the projector. The
-        // semantic (and per-space brute-force) lane scopes at the index, but the
-        // lexical and graph lanes do not push the `(namespace, space)` scope
-        // down, so a fused hit could otherwise carry a foreign-tenant OR
-        // foreign-space memory into the answer. Re-check the row's own owner
-        // scope here — both halves — so no lane can leak across the namespace or
-        // the space boundary (space is a hard tenant wall, and every
-        // id-keyed read re-verifies `(namespace_id, space_id)`).
-        if row.namespace_id != ctx.executor.caller_namespace.raw() {
-            continue;
-        }
-        if row.space_id_bytes != <[u8; 16]>::from(ctx.executor.caller_space) {
+        // Tenant wall — the authoritative, defense-in-depth scope gate at the
+        // projector. The semantic (and per-space brute-force) lane scopes at
+        // the index, but the lexical and graph lanes do NOT push the scope
+        // down (the tantivy query carries no namespace clause), so a fused hit
+        // could otherwise carry a foreign-tenant OR foreign-space memory into
+        // the answer. Re-check the row's own owner scope here via the one
+        // centralized `admits` predicate: the **namespace half is always
+        // enforced** (the tenant wall, never relaxed), while the space half is
+        // relaxed only under a namespace-wide recall — so a namespace-wide
+        // read spans the caller's own spaces yet can never cross namespaces,
+        // even though the lexical lane over-returns when its space filter is
+        // dropped. This projector is what makes that widening safe.
+        let caller_scope =
+            brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_space);
+        if !caller_scope.admits(
+            row.namespace_id,
+            &row.space_id_bytes,
+            recall_scope_mode(req),
+        ) {
             continue;
         }
 
@@ -3665,6 +4082,258 @@ mod tests {
     use super::*;
     use brain_planner::retrieval::router::Retriever;
 
+    /// Minimal `MemoryResult` for merge tests — only `memory_id` matters to the
+    /// cross-shard merge (it ranks by within-shard position, dedups by id).
+    fn mr_min(id: u128) -> MemoryResult {
+        MemoryResult {
+            memory_id: id,
+            text: String::new(),
+            similarity_score: 0.0,
+            confidence: 0.0,
+            salience: 0.0,
+            kind: MemoryKindWire::Semantic,
+            space_id: [0u8; 16],
+            session_id: 0,
+            created_at_unix_nanos: 0,
+            last_accessed_at_unix_nanos: 0,
+            edges: None,
+            graph: None,
+            contributing_retrievers: Vec::new(),
+            fused_score: 0.0,
+            rerank_score: None,
+            salience_initial: 0.0,
+            access_count: 0,
+            lsn: 0,
+            flags: 0,
+            consolidated_at_unix_nanos: None,
+            occurred_at_unix_nanos: None,
+            edges_out_count: 0,
+            edges_in_count: 0,
+        }
+    }
+
+    fn ids(pool: &[MemoryResult]) -> Vec<u128> {
+        pool.iter().map(|m| m.memory_id).collect()
+    }
+
+    #[test]
+    fn merge_pools_empty_is_empty() {
+        assert!(merge_recall_pools(Vec::new()).is_empty());
+        assert!(merge_recall_pools(vec![Vec::new(), Vec::new()]).is_empty());
+    }
+
+    #[test]
+    fn merge_pools_single_pool_preserves_order() {
+        let pool = vec![mr_min(10), mr_min(20), mr_min(30)];
+        assert_eq!(ids(&merge_recall_pools(vec![pool])), vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn merge_pools_interleaves_by_within_shard_rank() {
+        // Two shards. RRF by rank: both rank-1 hits outrank both rank-2 hits,
+        // etc. Within an equal rank, ties break on ascending memory_id.
+        let shard_a = vec![mr_min(1), mr_min(3), mr_min(5)];
+        let shard_b = vec![mr_min(2), mr_min(4)];
+        // rank1: {1,2} → 1,2 ; rank2: {3,4} → 3,4 ; rank3: {5} → 5
+        assert_eq!(
+            ids(&merge_recall_pools(vec![shard_a, shard_b])),
+            vec![1, 2, 3, 4, 5]
+        );
+    }
+
+    #[test]
+    fn merge_pools_dedups_by_id_keeping_best_rank() {
+        // A defensive case: the same memory appears in two pools at different
+        // ranks. It must appear ONCE, at its best (highest-RRF = lowest) rank.
+        let shard_a = vec![mr_min(1), mr_min(9)]; // 9 at rank 2
+        let shard_b = vec![mr_min(9), mr_min(2)]; // 9 at rank 1 (better)
+        let out = ids(&merge_recall_pools(vec![shard_a, shard_b]));
+        assert_eq!(out.iter().filter(|&&x| x == 9).count(), 1, "9 deduped");
+        // 9's best rank is 1 (from shard_b), tying with 1 (rank 1 shard_a) →
+        // ordered by id: 1, 9, then 2 (rank 2).
+        assert_eq!(out, vec![1, 9, 2]);
+    }
+
+    #[test]
+    fn merge_pools_truncates_to_candidate_budget() {
+        let big: Vec<MemoryResult> = (0..(RECALL_CANDIDATE_POOL as u128 + 50))
+            .map(mr_min)
+            .collect();
+        let out = merge_recall_pools(vec![big]);
+        assert_eq!(out.len(), RECALL_CANDIDATE_POOL as usize);
+    }
+
+    // ---- merge_namespace_partials (Phase D: cross-shard grounded + HyPE) ----
+
+    use brain_core::{StatementObject, StatementValue};
+
+    fn grounded(score: f32, anchor_scoped: bool) -> GroundedOutcome {
+        GroundedOutcome::Answer(
+            GroundedAnswer {
+                kind: crate::grounded::AnswerKind::Single,
+                values: vec![GroundedValue {
+                    predicate: "brain:x".into(),
+                    object: StatementObject::Value(StatementValue::Text("v".into())),
+                    confidence: 1.0,
+                    source_memory: None,
+                    match_score: score,
+                    recency: 0,
+                }],
+            },
+            anchor_scoped,
+        )
+    }
+
+    fn part(
+        memories: Vec<MemoryResult>,
+        grounded: GroundedOutcome,
+        hype: &[(u128, f32)],
+        anchor: Option<EntityId>,
+    ) -> NamespaceRecallPartial {
+        NamespaceRecallPartial {
+            memories,
+            grounded,
+            hype_scores: hype.iter().copied().collect(),
+            anchor,
+        }
+    }
+
+    #[test]
+    fn merge_partials_picks_highest_scoring_grounded_answer() {
+        let a1 = EntityId::new();
+        let a2 = EntityId::new();
+        let merged = merge_namespace_partials(vec![
+            part(vec![mr_min(1)], grounded(0.60, true), &[], Some(a1)),
+            part(vec![mr_min(2)], grounded(0.80, true), &[], Some(a2)),
+        ]);
+        match &merged.grounded {
+            GroundedOutcome::Answer(ans, _) => {
+                assert!(
+                    (grounded_answer_score(ans) - 0.80).abs() < 1e-6,
+                    "kept the 0.80 answer"
+                );
+            }
+            GroundedOutcome::NoAnswer => panic!("expected an Answer"),
+        }
+        assert_eq!(
+            merged.anchor,
+            Some(a2),
+            "anchor travels with the winning shard"
+        );
+    }
+
+    #[test]
+    fn merge_partials_prefers_anchor_scoped_on_tie() {
+        let a_scoped = EntityId::new();
+        let a_unscoped = EntityId::new();
+        // Unscoped answer arrives FIRST at an equal score; the anchor-scoped one
+        // must still win (only an anchor-scoped answer may commit the lead).
+        let merged = merge_namespace_partials(vec![
+            part(
+                vec![mr_min(1)],
+                grounded(0.70, false),
+                &[],
+                Some(a_unscoped),
+            ),
+            part(vec![mr_min(2)], grounded(0.70, true), &[], Some(a_scoped)),
+        ]);
+        match merged.grounded {
+            GroundedOutcome::Answer(_, anchor_scoped) => {
+                assert!(anchor_scoped, "anchor-scoped wins the tie")
+            }
+            GroundedOutcome::NoAnswer => panic!("expected an Answer"),
+        }
+        assert_eq!(merged.anchor, Some(a_scoped));
+    }
+
+    #[test]
+    fn merge_partials_unions_hype_scores_across_shards() {
+        let merged = merge_namespace_partials(vec![
+            part(
+                vec![mr_min(1)],
+                GroundedOutcome::NoAnswer,
+                &[(1, 0.5)],
+                None,
+            ),
+            part(
+                vec![mr_min(2)],
+                GroundedOutcome::NoAnswer,
+                &[(2, 0.9)],
+                None,
+            ),
+        ]);
+        assert_eq!(merged.hype_scores.get(&1), Some(&0.5));
+        assert_eq!(merged.hype_scores.get(&2), Some(&0.9));
+        assert_eq!(merged.hype_scores.len(), 2);
+    }
+
+    #[test]
+    fn merge_partials_no_grounded_uses_first_some_anchor() {
+        let a = EntityId::new();
+        let merged = merge_namespace_partials(vec![
+            part(vec![mr_min(1)], GroundedOutcome::NoAnswer, &[], None),
+            part(vec![mr_min(2)], GroundedOutcome::NoAnswer, &[], Some(a)),
+        ]);
+        assert!(matches!(merged.grounded, GroundedOutcome::NoAnswer));
+        assert_eq!(
+            merged.anchor,
+            Some(a),
+            "falls back to a resolved anchor when no shard grounded"
+        );
+        // Pools still merged across both shards.
+        assert_eq!(merged.memories.len(), 2);
+    }
+
+    // ---- merge_recall_pools property invariants (Phase E hardening) ----
+
+    mod merge_property {
+        use super::{mr_min, RECALL_CANDIDATE_POOL};
+        use crate::handlers::recall::merge_recall_pools;
+        use proptest::collection::vec as pvec;
+        use proptest::prelude::*;
+        use std::collections::HashSet;
+
+        proptest! {
+            #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
+
+            /// The cross-shard merge is a pure set-and-order operation. Whatever
+            /// the per-shard pools (any shard count, any sizes, overlapping ids
+            /// included), the merge must never fabricate an id, never duplicate
+            /// one, stay within the candidate budget, keep every id when the
+            /// union fits the budget, and be deterministic.
+            #[test]
+            fn merge_pools_invariants(
+                // Up to 8 shards, each up to 40 ids drawn from a small space so
+                // cross-pool id collisions actually occur and exercise dedup.
+                pools_ids in pvec(pvec(0u128..60, 0..40), 0..8),
+            ) {
+                let union: HashSet<u128> = pools_ids.iter().flatten().copied().collect();
+                let pools: Vec<Vec<_>> = pools_ids
+                    .iter()
+                    .map(|ids| ids.iter().map(|&id| mr_min(id)).collect())
+                    .collect();
+
+                let out = merge_recall_pools(pools.clone());
+                let out_ids: Vec<u128> = out.iter().map(|m| m.memory_id).collect();
+                let out_set: HashSet<u128> = out_ids.iter().copied().collect();
+
+                // No fabrication: every emitted id came from some input pool.
+                prop_assert!(out_set.is_subset(&union));
+                // No duplicates.
+                prop_assert_eq!(out_ids.len(), out_set.len(), "merge must dedup by id");
+                // Bounded by the candidate budget.
+                prop_assert!(out_ids.len() <= RECALL_CANDIDATE_POOL as usize);
+                // Completeness: when the whole union fits the budget, keep it all.
+                if union.len() <= RECALL_CANDIDATE_POOL as usize {
+                    prop_assert_eq!(out_set, union.clone());
+                }
+                // Deterministic across runs (same input → identical order).
+                let out2: Vec<u128> = merge_recall_pools(pools).iter().map(|m| m.memory_id).collect();
+                prop_assert_eq!(out_ids, out2);
+            }
+        }
+    }
+
     #[test]
     fn age_bound_none_admits_everything() {
         assert!(passes_age_bound(None, Some(1), 2));
@@ -3815,6 +4484,7 @@ mod tests {
     /// matters here; everything else is a benign zero/empty value.
     fn req_with_max(max_results: u32) -> RecallRequest {
         RecallRequest {
+            scope: Default::default(),
             cue_text: String::new(),
             subject_name: String::new(),
             max_results,
@@ -5115,7 +5785,8 @@ mod tests {
 
         let scope_a = brain_metadata::RowScope::new(NamespaceId::SYSTEM, space_a);
         let ids: HashSet<MemoryId> = [mid_a, mid_b].into_iter().collect();
-        let texts = fetch_candidate_texts(&ids, scope_a, &ctx).unwrap();
+        let texts =
+            fetch_candidate_texts(&ids, scope_a, brain_metadata::ScopeMode::Space, &ctx).unwrap();
 
         assert_eq!(
             texts.get(&mid_a).map(String::as_str),

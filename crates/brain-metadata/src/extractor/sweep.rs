@@ -6,14 +6,16 @@
 
 use redb::{ReadableTable, WriteTransaction};
 
-use brain_core::{StatementKind, StatementObject};
+use brain_core::{StatementId, StatementKind, StatementObject, TombstoneReason};
 
 use crate::statement::evidence::reclaim_evidence_overflow;
+use crate::statement::statement_tombstone;
 use crate::statement::StatementOpError;
 use crate::tables::audit::{
     ENTITY_RESOLUTION_AUDIT_TABLE, EXTRACTOR_AUDIT_BY_EXTRACTOR_TABLE,
     EXTRACTOR_AUDIT_BY_MEMORY_TABLE, EXTRACTOR_AUDIT_BY_TIME_TABLE, EXTRACTOR_AUDIT_TABLE,
 };
+use crate::tables::predicate::PREDICATES_TABLE;
 use crate::tables::statement::{
     confidence_bucket, statement_from_metadata, tombstone_reason, StatementMetadata,
     STATEMENTS_BY_EVENT_TIME_TABLE, STATEMENTS_BY_EVIDENCE_TABLE,
@@ -232,11 +234,107 @@ pub fn reclaim_retracted_statements(
 }
 
 /// True iff a row is a retract past its grace cutoff.
+/// Time anchor a retention TTL is measured from, per kind: `event_at` for
+/// Events, `valid_from` for Facts/Preferences, falling back to the always-present
+/// arrival timestamp (`extracted_at`) when the kind-specific anchor is unset.
+fn retention_anchor(row: &StatementMetadata) -> u64 {
+    let by_kind = match StatementKind::from_u8(row.kind) {
+        StatementKind::Event => row.event_at_unix_nanos,
+        _ => row.valid_from_unix_nanos,
+    };
+    by_kind.unwrap_or(row.extracted_at_unix_nanos)
+}
+
+/// Soft-tombstone current statements that have outlived their predicate's
+/// declared `retention` TTL (reason [`TombstoneReason::RetentionExpired`]), so
+/// the standard grace→reclaim flow ([`reclaim_retracted_statements`]) then
+/// physically removes them. Two-phase like the reclaim: collect victim ids under
+/// an immutable bounded scan (`batch_cap`), then re-check + tombstone each in the
+/// same write txn. Per-predicate retention is cached so a hot predicate costs one
+/// lookup. A predicate with `retention_seconds == 0` (the default) is skipped —
+/// so this is a no-op until a schema declares `retention`. `dry_run` counts
+/// without mutating.
+pub fn sweep_expired_by_retention(
+    wtxn: &WriteTransaction,
+    now_unix_nanos: u64,
+    batch_cap: usize,
+    dry_run: bool,
+) -> Result<SweepSummary, StatementOpError> {
+    use std::collections::HashMap;
+    let mut summary = SweepSummary::default();
+
+    let victims: Vec<[u8; 16]> = {
+        let stmts = wtxn.open_table(STATEMENTS_TABLE)?;
+        let preds = wtxn.open_table(PREDICATES_TABLE)?;
+        let mut retention_cache: HashMap<u32, u64> = HashMap::new();
+        let mut out = Vec::new();
+        for entry in stmts.iter()? {
+            let (_, v) = entry?;
+            let row = v.value();
+            summary.scanned += 1;
+            // Only the live set — current (not superseded), not already tombstoned.
+            if row.is_tombstoned() || row.is_current != 1 {
+                continue;
+            }
+            let ttl_secs = match retention_cache.get(&row.predicate_id) {
+                Some(&t) => t,
+                None => {
+                    let t = preds
+                        .get(&row.predicate_id)?
+                        .map_or(0, |g| g.value().retention_seconds);
+                    retention_cache.insert(row.predicate_id, t);
+                    t
+                }
+            };
+            if ttl_secs == 0 {
+                continue;
+            }
+            let ttl_ns = ttl_secs.saturating_mul(1_000_000_000);
+            let age_ns = now_unix_nanos.saturating_sub(retention_anchor(&row));
+            if age_ns <= ttl_ns {
+                continue;
+            }
+            out.push(row.statement_id_bytes);
+            if out.len() == batch_cap {
+                break;
+            }
+        }
+        out
+    };
+
+    if dry_run {
+        summary.dry_run_would_delete = victims.len() as u64;
+        return Ok(summary);
+    }
+
+    for key in &victims {
+        // `statement_tombstone` re-reads the row and handles all index/audit
+        // bookkeeping; a row that vanished or was tombstoned between scan and now
+        // is a benign skip (idempotent under replay / concurrent writers).
+        match statement_tombstone(
+            wtxn,
+            StatementId::from_bytes(*key),
+            TombstoneReason::RetentionExpired,
+            now_unix_nanos,
+        ) {
+            Ok(()) => summary.deleted += 1,
+            Err(StatementOpError::NotFound(_)) => summary.skipped += 1,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(summary)
+}
+
 fn is_reclaimable(row: &StatementMetadata, cutoff_ns: u64) -> bool {
     if !row.is_tombstoned() {
         return false;
     }
-    if row.tombstone_reason != tombstone_reason::RETRACT {
+    // Rows the operator/policy asked to REMOVE (vs. plain tombstones and
+    // superseded rows, which are kept for audit): explicit retract, or expiry
+    // past a declared retention TTL.
+    if row.tombstone_reason != tombstone_reason::RETRACT
+        && row.tombstone_reason != tombstone_reason::RETENTION_EXPIRED
+    {
         return false;
     }
     match row.tombstoned_at_unix_nanos {
@@ -534,7 +632,7 @@ pub fn scan_stale_statements(
 mod reclaim_tests {
     use super::*;
     use crate::entity::ops::{entity_put, normalize_name};
-    use crate::schema::predicate::predicate_intern;
+    use crate::schema::predicate::{predicate_intern, predicate_set_retention};
     use crate::statement::crud::{statement_create, statement_get};
     use crate::statement::tombstone::{statement_retract, statement_tombstone};
     use brain_core::{
@@ -644,6 +742,89 @@ mod reclaim_tests {
         assert_eq!(summary.deleted, 1);
         let rtxn = db.read_txn().unwrap();
         assert!(statement_get(&rtxn, id).unwrap().is_none());
+    }
+
+    const TEN_DAYS_SECS: u64 = 10 * 24 * 60 * 60;
+    const DAY_NS: u64 = 24 * 60 * 60 * 1_000_000_000;
+
+    /// Intern a Fact predicate and stamp a retention TTL on it.
+    fn intern_fact_with_retention(
+        db: &mut crate::MetadataDb,
+        name: &str,
+        ttl_secs: u64,
+    ) -> PredicateId {
+        let p = intern_fact(db, name, false);
+        let wtxn = db.write_txn().unwrap();
+        predicate_set_retention(&wtxn, p, ttl_secs).unwrap();
+        wtxn.commit().unwrap();
+        p
+    }
+
+    /// Create one live Fact at `T0` under a retention-bearing predicate.
+    fn live_fact(db: &mut crate::MetadataDb, tag: &str, ttl_secs: u64) -> brain_core::StatementId {
+        let subj = make_entity(db, &format!("subj-{tag}"));
+        let obj = make_entity(db, &format!("obj-{tag}"));
+        let p = intern_fact_with_retention(db, tag, ttl_secs);
+        let s = fresh_fact(subj, p, obj);
+        let wtxn = db.write_txn().unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &s, T0).unwrap();
+        wtxn.commit().unwrap();
+        s.id
+    }
+
+    #[test]
+    fn retention_ttl_not_elapsed_is_kept() {
+        let (_d, mut db) = open_db();
+        let id = live_fact(&mut db, "ret_keep", TEN_DAYS_SECS);
+        // 5 days < 10-day TTL → not expired.
+        let now = T0 + 5 * DAY_NS;
+        let wtxn = db.write_txn().unwrap();
+        let s = sweep_expired_by_retention(&wtxn, now, 256, false).unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(s.deleted, 0, "within TTL, nothing is tombstoned");
+        let rtxn = db.read_txn().unwrap();
+        assert!(statement_get(&rtxn, id).unwrap().is_some());
+    }
+
+    #[test]
+    fn retention_ttl_expired_soft_tombstones_then_reclaims_past_grace() {
+        let (_d, mut db) = open_db();
+        let id = live_fact(&mut db, "ret_exp", TEN_DAYS_SECS);
+        // 11 days > 10-day TTL → expired: the sweep soft-tombstones it.
+        let expire_at = T0 + 11 * DAY_NS;
+        let wtxn = db.write_txn().unwrap();
+        let s = sweep_expired_by_retention(&wtxn, expire_at, 256, false).unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(s.deleted, 1, "past TTL, the live statement is tombstoned");
+
+        // A second sweep is idempotent — the row is already tombstoned.
+        let wtxn = db.write_txn().unwrap();
+        let again = sweep_expired_by_retention(&wtxn, expire_at, 256, false).unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(again.deleted, 0, "already-tombstoned rows are not re-swept");
+
+        // The retention tombstone rides the standard grace → hard-reclaim path.
+        let reclaim_at = expire_at + GRACE;
+        let wtxn = db.write_txn().unwrap();
+        let r = reclaim_retracted_statements(&wtxn, GRACE, reclaim_at, 256, false).unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(r.deleted, 1, "RetentionExpired row is reclaimed past grace");
+        let rtxn = db.read_txn().unwrap();
+        assert!(statement_get(&rtxn, id).unwrap().is_none());
+    }
+
+    #[test]
+    fn no_retention_declared_is_a_noop() {
+        let (_d, mut db) = open_db();
+        // TTL 0 = no policy (the default).
+        let id = live_fact(&mut db, "ret_none", 0);
+        let now = T0 + 100 * DAY_NS;
+        let wtxn = db.write_txn().unwrap();
+        let s = sweep_expired_by_retention(&wtxn, now, 256, false).unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(s.deleted, 0, "a predicate without retention is never swept");
+        let rtxn = db.read_txn().unwrap();
+        assert!(statement_get(&rtxn, id).unwrap().is_some());
     }
 
     #[test]

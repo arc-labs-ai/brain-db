@@ -34,7 +34,7 @@ use brain_metadata::schema::predicate::{
 };
 use brain_metadata::schema::store::schema_active;
 use brain_metadata::statement::{
-    evidence_overflow_load, statement_get, statement_history, statement_list_page,
+    evidence_overflow_load, statement_get, statement_history_page, statement_list_page,
     StatementListCursor, StatementListFilter, StatementPageExtra,
 };
 use brain_planner::WriterError;
@@ -652,26 +652,25 @@ pub async fn handle_statement_history(
     req: StatementHistoryRequest,
     ctx: &OpsContext,
 ) -> Result<StatementHistoryResponseFrame, OpError> {
+    if req.limit == 0 || req.limit > LIST_LIMIT_MAX {
+        return Err(OpError::InvalidRequest("limit must be in 1..=1000".into()));
+    }
     let anchor = StatementId::from(req.anchor_id);
+    let scope =
+        brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_space);
+    // Decode the resume point. The cursor binds the `include_tombstoned` toggle,
+    // so echoing one back with a different toggle is rejected (`stale_cursor`).
+    let resume = decode_history_cursor(&req.cursor, scope, req.include_tombstoned)?;
+    let first_page = resume.is_none();
+    let after_version = resume.map(|(_, v)| v);
 
-    let (items_storage, chain_root) = {
+    let (items_storage, chain_root, total, next_cursor) = {
         let rtxn = ctx
             .executor
             .metadata
             .read_txn()
             .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
-        let chain = statement_history(
-            &rtxn,
-            brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_space),
-            anchor,
-        )
-        .map_err(OpError::from)?;
-        if chain.is_empty() {
-            return Err(OpError::NotFound {
-                what: "statement",
-                detail: format!("{anchor:?}"),
-            });
-        }
+
         // Tenant wall (unconditional): never surface another tenant's
         // supersession chain via a foreign anchor id.
         if !statement_id_in_caller_scope(ctx, anchor) {
@@ -680,24 +679,108 @@ pub async fn handle_statement_history(
                 detail: format!("{anchor:?}"),
             });
         }
-        let root = chain[0].chain_root;
-        let mut items = Vec::with_capacity(chain.len());
-        for s in chain {
+
+        let page = statement_history_page(&rtxn, scope, anchor, after_version, req.limit as usize)
+            .map_err(OpError::from)?;
+
+        // A resumed cursor must name the same chain the anchor resolves to — a
+        // cursor minted for one anchor cannot be replayed against another chain.
+        if let Some((cursor_root, _)) = resume {
+            if cursor_root != page.chain_root {
+                return Err(OpError::InvalidRequest(
+                    "stale_cursor: anchor changed between pages".into(),
+                ));
+            }
+        }
+
+        // First-page-only absence: an anchor that resolves but whose whole chain
+        // has no present rows is NotFound, preserving the prior contract. A
+        // resumed page past exhaustion is a valid empty final page, not an error.
+        if first_page && page.total == 0 {
+            return Err(OpError::NotFound {
+                what: "statement",
+                detail: format!("{anchor:?}"),
+            });
+        }
+
+        let mut items = Vec::with_capacity(page.rows.len());
+        for s in &page.rows {
             if !req.include_tombstoned && s.tombstoned {
                 continue;
             }
-            let view = project_view(&rtxn, &s)?;
-            items.push(view);
+            items.push(project_view(&rtxn, s)?);
         }
-        (items, root)
+        let next = match (page.has_more, page.last_version) {
+            (true, Some(v)) => {
+                encode_history_cursor(scope, req.include_tombstoned, page.chain_root, v)
+            }
+            _ => Vec::new(),
+        };
+        (items, page.chain_root, page.total, next)
     };
 
     Ok(StatementHistoryResponseFrame {
-        total_versions: items_storage.len() as u32,
+        total_versions: total,
         items: items_storage,
-        chain_root: chain_root.to_bytes(),
+        chain_root,
+        next_cursor,
         is_final: true,
     })
+}
+
+// History pagination cursor: `[ver | ns(4) | space(16) | include_tombstoned(1) |
+// chain_root(16) | last_version(4)]`. Keyset is the immutable chain `version`;
+// the toggle byte is the stale-cursor guard (a toggled request can't resume a
+// filtered tiling without gap/dup). Bound to the caller's tenant scope.
+const HISTORY_CURSOR_VERSION: u8 = 1;
+const HISTORY_CURSOR_LEN: usize = 1 + 4 + 16 + 1 + 16 + 4;
+
+fn encode_history_cursor(
+    scope: brain_metadata::RowScope,
+    include_tombstoned: bool,
+    chain_root: [u8; 16],
+    last_version: u32,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(HISTORY_CURSOR_LEN);
+    out.push(HISTORY_CURSOR_VERSION);
+    out.extend_from_slice(&scope.namespace_id.to_le_bytes());
+    out.extend_from_slice(&scope.space_id_bytes);
+    out.push(u8::from(include_tombstoned));
+    out.extend_from_slice(&chain_root);
+    out.extend_from_slice(&last_version.to_le_bytes());
+    out
+}
+
+/// Decode a history cursor to `(chain_root, last_version)`. Empty ⇒ first page
+/// (`None`). Verifies tenant scope and the `include_tombstoned` toggle.
+fn decode_history_cursor(
+    cursor: &[u8],
+    scope: brain_metadata::RowScope,
+    include_tombstoned: bool,
+) -> Result<Option<([u8; 16], u32)>, OpError> {
+    if cursor.is_empty() {
+        return Ok(None);
+    }
+    if cursor.len() != HISTORY_CURSOR_LEN || cursor[0] != HISTORY_CURSOR_VERSION {
+        return Err(OpError::InvalidRequest("malformed cursor".into()));
+    }
+    let mut ns = [0u8; 4];
+    ns.copy_from_slice(&cursor[1..5]);
+    if u32::from_le_bytes(ns) != scope.namespace_id || cursor[5..21] != scope.space_id_bytes {
+        return Err(OpError::InvalidRequest(
+            "cursor does not belong to the caller's tenant".into(),
+        ));
+    }
+    if cursor[21] != u8::from(include_tombstoned) {
+        return Err(OpError::InvalidRequest(
+            "stale_cursor: include_tombstoned changed between pages".into(),
+        ));
+    }
+    let mut root = [0u8; 16];
+    root.copy_from_slice(&cursor[22..38]);
+    let mut ver = [0u8; 4];
+    ver.copy_from_slice(&cursor[38..42]);
+    Ok(Some((root, u32::from_le_bytes(ver))))
 }
 
 // ---------------------------------------------------------------------------
@@ -1295,6 +1378,52 @@ async fn dispatch_upsert_for(
         id,
     )
     .await;
+}
+
+#[cfg(test)]
+mod history_cursor_tests {
+    use super::{decode_history_cursor, encode_history_cursor};
+    use brain_metadata::RowScope;
+
+    fn scope() -> RowScope {
+        RowScope::from_bytes(1, [7u8; 16])
+    }
+
+    #[test]
+    fn round_trips_chain_root_and_version() {
+        let root = [0xAB; 16];
+        let c = encode_history_cursor(scope(), false, root, 42);
+        let got = decode_history_cursor(&c, scope(), false).unwrap();
+        assert_eq!(got, Some((root, 42)));
+    }
+
+    #[test]
+    fn empty_cursor_is_first_page() {
+        assert_eq!(decode_history_cursor(&[], scope(), false).unwrap(), None);
+    }
+
+    #[test]
+    fn toggled_include_tombstoned_is_stale() {
+        let c = encode_history_cursor(scope(), false, [1; 16], 3);
+        assert!(decode_history_cursor(&c, scope(), true).is_err());
+    }
+
+    #[test]
+    fn foreign_tenant_cursor_rejected() {
+        let c = encode_history_cursor(scope(), false, [1; 16], 3);
+        let other = RowScope::from_bytes(2, [7u8; 16]);
+        assert!(decode_history_cursor(&c, other, false).is_err());
+        let other_space = RowScope::from_bytes(1, [9u8; 16]);
+        assert!(decode_history_cursor(&c, other_space, false).is_err());
+    }
+
+    #[test]
+    fn malformed_cursor_rejected() {
+        assert!(decode_history_cursor(&[1, 2, 3], scope(), false).is_err());
+        let mut c = encode_history_cursor(scope(), false, [1; 16], 3);
+        c[0] = 0xFF; // wrong version byte
+        assert!(decode_history_cursor(&c, scope(), false).is_err());
+    }
 }
 
 #[cfg(test)]

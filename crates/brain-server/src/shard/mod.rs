@@ -144,6 +144,28 @@ pub(crate) enum ShardRequest {
         /// follow the Tokio→Glommio hop on its own.
         parent_span: tracing::Span,
     },
+    /// Namespace-wide RECALL — Phase C stage 1 (per shard). Runs the associative
+    /// + typed-graph fan-out over THIS shard's spaces (widened to the caller's
+    /// whole namespace) and returns the raw candidate pool WITHOUT any
+    /// membership shaping, so the connection layer can merge every shard's pool
+    /// and shape once globally. Fanned out to all shards.
+    RecallGather {
+        req: Box<brain_protocol::ops::memory::RecallRequest>,
+        caller: brain_ops::RequestCaller,
+        reply_tx: Sender<Result<brain_ops::NamespaceRecallPartial, OpError>>,
+        parent_span: tracing::Span,
+    },
+    /// Namespace-wide RECALL — Phase C stage 3 (coordinator shard only). Shapes
+    /// the MERGED cross-shard inputs (pool + grounded + HyPE, merged by the
+    /// connection layer) into the final answer, reusing the identical
+    /// membership/abstention path single-space RECALL uses.
+    RecallShapeMerged {
+        merged: Box<brain_ops::MergedNamespaceRecall>,
+        req: Box<brain_protocol::ops::memory::RecallRequest>,
+        caller: brain_ops::RequestCaller,
+        reply_tx: Sender<Result<brain_protocol::ops::memory::RecallResponseFrame, OpError>>,
+        parent_span: tracing::Span,
+    },
     /// Append a pre-built record to the WAL. Returns the durable LSN.
     /// Low-level op — `RealWriterHandle` wraps the real
     /// encode/forget/link payload construction inside a higher-level op.
@@ -1462,6 +1484,61 @@ impl ShardHandle {
         let (reply_tx, reply_rx) = flume::bounded(1);
         self.tx
             .send_async(ShardRequest::DispatchOp {
+                req: Box::new(req),
+                caller,
+                reply_tx,
+                parent_span,
+            })
+            .await
+            .map_err(|_| DispatchError::ShardDisconnected)?;
+        reply_rx
+            .recv_async()
+            .await
+            .map_err(|_| DispatchError::ShardDisconnected)?
+            .map_err(DispatchError::Op)
+    }
+
+    /// Namespace-wide RECALL — stage 1 on THIS shard: gather the raw candidate
+    /// pool over the shard's own spaces (widened to the caller's namespace),
+    /// without any membership shaping. The connection layer fans this out to
+    /// every shard and merges the pools before a single global shaping pass.
+    pub async fn recall_gather(
+        &self,
+        req: brain_protocol::ops::memory::RecallRequest,
+        caller: brain_ops::RequestCaller,
+        parent_span: tracing::Span,
+    ) -> Result<brain_ops::NamespaceRecallPartial, DispatchError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.tx
+            .send_async(ShardRequest::RecallGather {
+                req: Box::new(req),
+                caller,
+                reply_tx,
+                parent_span,
+            })
+            .await
+            .map_err(|_| DispatchError::ShardDisconnected)?;
+        reply_rx
+            .recv_async()
+            .await
+            .map_err(|_| DispatchError::ShardDisconnected)?
+            .map_err(DispatchError::Op)
+    }
+
+    /// Namespace-wide RECALL — stage 3 on the coordinator shard: shape the
+    /// merged cross-shard candidate pool into the final answer, reusing the
+    /// identical membership/abstention path single-space RECALL uses.
+    pub async fn recall_shape_merged(
+        &self,
+        merged: brain_ops::MergedNamespaceRecall,
+        req: brain_protocol::ops::memory::RecallRequest,
+        caller: brain_ops::RequestCaller,
+        parent_span: tracing::Span,
+    ) -> Result<brain_protocol::ops::memory::RecallResponseFrame, DispatchError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.tx
+            .send_async(ShardRequest::RecallShapeMerged {
+                merged: Box::new(merged),
                 req: Box::new(req),
                 caller,
                 reply_tx,
@@ -4531,6 +4608,47 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
                     warn!(
                         shard_id = shard.shard_id,
                         "DispatchOp reply dropped (caller gone)"
+                    );
+                }
+            }
+            ShardRequest::RecallGather {
+                req,
+                caller,
+                reply_tx,
+                parent_span,
+            } => {
+                // Namespace-wide RECALL, stage 1: this shard's raw candidate
+                // pool over its own spaces (widened to the caller's namespace).
+                // Runs entirely on the Glommio executor, same shape as
+                // DispatchOp; no shaping happens here.
+                let out = brain_ops::dispatch::dispatch_recall_gather(*req, caller, &shard.ops)
+                    .instrument(parent_span)
+                    .await;
+                if reply_tx.send_async(out).await.is_err() {
+                    warn!(
+                        shard_id = shard.shard_id,
+                        "RecallGather reply dropped (caller gone)"
+                    );
+                }
+            }
+            ShardRequest::RecallShapeMerged {
+                merged,
+                req,
+                caller,
+                reply_tx,
+                parent_span,
+            } => {
+                // Namespace-wide RECALL, stage 3 (coordinator shard): shape the
+                // merged cross-shard pool into the final answer.
+                let out = brain_ops::dispatch::dispatch_recall_shape_merged(
+                    *merged, *req, caller, &shard.ops,
+                )
+                .instrument(parent_span)
+                .await;
+                if reply_tx.send_async(out).await.is_err() {
+                    warn!(
+                        shard_id = shard.shard_id,
+                        "RecallShapeMerged reply dropped (caller gone)"
                     );
                 }
             }

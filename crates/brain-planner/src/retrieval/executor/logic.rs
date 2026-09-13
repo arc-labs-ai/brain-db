@@ -78,6 +78,16 @@ pub struct RetrievalExecutorContext {
     /// `acme/chatbot` can never anchor on or expand into `acme/research`'s
     /// or `globex`'s typed-graph rows.
     pub caller_space: brain_core::SpaceId,
+    /// Read-scope width for this request. [`ScopeMode::Space`] (the
+    /// default) pins every scoped read to the caller's single
+    /// `(namespace, space)`. [`ScopeMode::Namespace`] widens the *space*
+    /// half only — the read admits every space the caller owns within its
+    /// own namespace (namespace-wide RECALL). The namespace wall is never
+    /// relaxed by this: even namespace-wide, a read stays inside the
+    /// caller's tenant. Threaded into the graph config and every scoped
+    /// post-filter; the semantic lane expresses the same widening by
+    /// leaving its `space_ids` filter empty.
+    pub scope_mode: brain_metadata::ScopeMode,
     /// Off-core cross-encoder handle for the always-on rerank pass.
     /// When `Some`, the executor reranks the top fused candidates on
     /// every query — there is no per-request opt-in. The forward pass
@@ -1807,10 +1817,12 @@ fn invoke_graph(
         max_depth: *max_depth,
         max_branching: *max_branching,
         timeout_ms: *timeout_ms,
-        // Tenant wall: the graph lane walks only the caller's
-        // `(namespace, space)` typed-graph rows.
+        // Tenant wall: the graph lane walks only the caller's namespace.
+        // Space is pinned in Space mode, relaxed across the caller's own
+        // spaces in Namespace mode — the namespace half is never relaxed.
         caller_namespace: ctx.caller_namespace,
         caller_space_bytes: ctx.caller_space.into(),
+        namespace_wide: matches!(ctx.scope_mode, brain_metadata::ScopeMode::Namespace),
     };
 
     match anchor_mode {

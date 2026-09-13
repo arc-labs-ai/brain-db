@@ -214,6 +214,7 @@ fn make_ctx(
         metadata: Arc::new(metadata),
         caller_namespace: brain_core::NamespaceId::SYSTEM.raw(),
         caller_space: brain_core::SpaceId::default(),
+        scope_mode: brain_metadata::ScopeMode::Space,
         cross_encoder: None,
         space_vectors: None,
     };
@@ -788,6 +789,7 @@ fn dynamic_k_deepens_when_filters_thin_the_pool() {
         metadata: Arc::new(metadata),
         caller_namespace: brain_core::NamespaceId::SYSTEM.raw(),
         caller_space: brain_core::SpaceId::default(),
+        scope_mode: brain_metadata::ScopeMode::Space,
         cross_encoder: None,
         space_vectors: None,
     };
@@ -953,6 +955,7 @@ fn cue_ctx(metadata: MetadataDb) -> RetrievalExecutorContext {
         metadata: Arc::new(metadata),
         caller_namespace: brain_core::NamespaceId::SYSTEM.raw(),
         caller_space: brain_core::SpaceId::default(),
+        scope_mode: brain_metadata::ScopeMode::Space,
         cross_encoder: None,
         space_vectors: None,
     }
@@ -1198,6 +1201,7 @@ fn prf_reprobes_lexical_with_expansion_on_low_specificity_query() {
         metadata: Arc::new(metadata),
         caller_namespace: brain_core::NamespaceId::SYSTEM.raw(),
         caller_space: brain_core::SpaceId::default(),
+        scope_mode: brain_metadata::ScopeMode::Space,
         cross_encoder: None,
         space_vectors: None,
     };
@@ -1248,6 +1252,7 @@ fn prf_skips_high_specificity_query() {
         metadata: Arc::new(metadata),
         caller_namespace: brain_core::NamespaceId::SYSTEM.raw(),
         caller_space: brain_core::SpaceId::default(),
+        scope_mode: brain_metadata::ScopeMode::Space,
         cross_encoder: None,
         space_vectors: None,
     };

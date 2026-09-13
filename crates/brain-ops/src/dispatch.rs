@@ -213,81 +213,7 @@ pub async fn dispatch(
     // to `caller.space_id` unconditionally. There is no cross-space read path
     // to gate here.
 
-    // Per-request override: stamp the caller's space onto a clone
-    // of the shared ctx so handlers that build writer Ops can pull
-    // it via `ctx.executor.caller_space` without taking another
-    // function param. The clone is cheap — every field is Arc'd.
-    // Stamp the caller's wire session onto the per-request ctx so the
-    // transaction handlers can enforce connection ownership (an in-txn
-    // op is served only for the connection that opened the txn). This is
-    // stamped even for the default-space test path — the ownership check
-    // reads it directly.
-    let needs_session = caller.connection_id != [0u8; 16];
-    let per_request_ctx = if caller.space_id == brain_core::SpaceId::default() {
-        // Test-only default-space caller — no space/namespace override
-        // needed. Only clone when a session id must be stamped.
-        if needs_session {
-            let mut owned = ctx.clone();
-            owned.caller_connection_id = caller.connection_id;
-            Some(owned)
-        } else {
-            None
-        }
-    } else {
-        let mut owned = ctx.clone();
-        owned.caller_connection_id = caller.connection_id;
-        owned.executor = owned
-            .executor
-            .with_caller_space(caller.space_id)
-            .with_caller_space_string(caller.space_string.clone());
-        // Fail-closed tenancy: an authenticated caller MUST carry a namespace
-        // that resolves to a real per-shard NamespaceId. There is no SYSTEM
-        // default for user data — falling back to the reserved system namespace
-        // would silently cross tenant boundaries. The namespace name is the
-        // cross-shard identity; NamespaceId is the shard-local interning, which
-        // key-mint performs in a separate store, so the namespace may not yet
-        // exist in this shard's metadata DB on first use here. Resolve via a
-        // read fast-path, then intern-or-get on a miss.
-        if caller.namespace.is_empty() {
-            return Err(OpError::Unauthorized(
-                "authenticated connection has no namespace; the API key must be bound to one"
-                    .into(),
-            ));
-        }
-        let ns = {
-            let read = owned.executor.metadata.read_txn().ok().and_then(|rtxn| {
-                brain_metadata::namespace::namespace_lookup_by_name(&rtxn, &caller.namespace)
-                    .ok()
-                    .flatten()
-            });
-            match read {
-                Some(ns) => ns,
-                None => {
-                    let wtxn = owned
-                        .executor
-                        .metadata
-                        .write_txn()
-                        .map_err(|e| OpError::Internal(format!("namespace intern txn: {e}")))?;
-                    let ns = brain_metadata::namespace::namespace_intern_or_get(
-                        &wtxn,
-                        &caller.namespace,
-                        0,
-                    )
-                    .map_err(|e| OpError::Internal(format!("namespace intern: {e}")))?;
-                    wtxn.commit()
-                        .map_err(|e| OpError::Internal(format!("namespace intern commit: {e}")))?;
-                    ns
-                }
-            }
-        };
-        if ns == brain_core::NamespaceId::SYSTEM {
-            return Err(OpError::Unauthorized(
-                "namespace resolved to the reserved system namespace; user data requires a real namespace".into(),
-            ));
-        }
-        owned.executor = owned.executor.with_caller_namespace(ns);
-        Some(owned)
-    };
+    let per_request_ctx = build_per_request_ctx(&caller, ctx)?;
     let ctx = per_request_ctx.as_ref().unwrap_or(ctx);
     // Shorthand: one frame, wrap into DispatchOutcome::Single.
     let single = DispatchOutcome::Single;
@@ -618,6 +544,116 @@ pub async fn dispatch(
             .await
             .map(|b| single(ResponseBody::SessionDelete(b))),
     }
+}
+
+/// Build the per-request `OpsContext` for a caller: stamp the caller's wire
+/// session, space, and resolved namespace onto a cheap clone of the shared
+/// shard ctx (every field is `Arc`'d). Returns `None` for the test-only
+/// default-space caller that carries no session (use the shared ctx as-is).
+///
+/// Fail-closed: an authenticated (non-default-space) caller MUST carry a
+/// namespace that resolves to a real per-shard `NamespaceId` — never the
+/// reserved SYSTEM namespace, which would silently cross tenant boundaries.
+/// Shared by `dispatch` and the namespace-wide fan-out entry points so all
+/// three stamp identity identically.
+pub fn build_per_request_ctx(
+    caller: &RequestCaller,
+    ctx: &OpsContext,
+) -> Result<Option<OpsContext>, OpError> {
+    let needs_session = caller.connection_id != [0u8; 16];
+    if caller.space_id == brain_core::SpaceId::default() {
+        // Test-only default-space caller — no space/namespace override needed.
+        // Only clone when a session id must be stamped.
+        if needs_session {
+            let mut owned = ctx.clone();
+            owned.caller_connection_id = caller.connection_id;
+            return Ok(Some(owned));
+        }
+        return Ok(None);
+    }
+    let mut owned = ctx.clone();
+    owned.caller_connection_id = caller.connection_id;
+    owned.executor = owned
+        .executor
+        .with_caller_space(caller.space_id)
+        .with_caller_space_string(caller.space_string.clone());
+    if caller.namespace.is_empty() {
+        return Err(OpError::Unauthorized(
+            "authenticated connection has no namespace; the API key must be bound to one".into(),
+        ));
+    }
+    let ns = {
+        let read = owned.executor.metadata.read_txn().ok().and_then(|rtxn| {
+            brain_metadata::namespace::namespace_lookup_by_name(&rtxn, &caller.namespace)
+                .ok()
+                .flatten()
+        });
+        match read {
+            Some(ns) => ns,
+            None => {
+                let wtxn = owned
+                    .executor
+                    .metadata
+                    .write_txn()
+                    .map_err(|e| OpError::Internal(format!("namespace intern txn: {e}")))?;
+                let ns =
+                    brain_metadata::namespace::namespace_intern_or_get(&wtxn, &caller.namespace, 0)
+                        .map_err(|e| OpError::Internal(format!("namespace intern: {e}")))?;
+                wtxn.commit()
+                    .map_err(|e| OpError::Internal(format!("namespace intern commit: {e}")))?;
+                ns
+            }
+        }
+    };
+    if ns == brain_core::NamespaceId::SYSTEM {
+        return Err(OpError::Unauthorized(
+            "namespace resolved to the reserved system namespace; user data requires a real namespace".into(),
+        ));
+    }
+    owned.executor = owned.executor.with_caller_namespace(ns);
+    Ok(Some(owned))
+}
+
+/// Namespace-wide RECALL — stage 1 dispatch (per shard). Applies the same
+/// permission + namespace gates and per-request ctx stamping `dispatch` does,
+/// then runs the raw-candidate + grounding/HyPE gather over this shard's spaces
+/// (widened to the caller's namespace). Returns the unshaped partial for the
+/// connection layer to merge. Called on every shard in the fan-out.
+pub async fn dispatch_recall_gather(
+    req: brain_protocol::ops::memory::RecallRequest,
+    caller: RequestCaller,
+    ctx: &OpsContext,
+) -> Result<crate::handlers::recall::NamespaceRecallPartial, OpError> {
+    // Reuse the exact permission + namespace gates via a Recall body.
+    let body = RequestBody::Recall(req);
+    enforce_permission(&caller, &body)?;
+    enforce_namespace(&caller, &body)?;
+    let RequestBody::Recall(req) = body else {
+        unreachable!("wrapped a Recall body above")
+    };
+    let per_request_ctx = build_per_request_ctx(&caller, ctx)?;
+    let ctx = per_request_ctx.as_ref().unwrap_or(ctx);
+    crate::handlers::recall::recall_gather_namespace(req, ctx).await
+}
+
+/// Namespace-wide RECALL — stage 3 dispatch (coordinator shard). Shapes the
+/// merged cross-shard inputs into the final answer, applying the same gates +
+/// ctx stamping as a normal recall.
+pub async fn dispatch_recall_shape_merged(
+    merged: crate::handlers::recall::MergedNamespaceRecall,
+    req: brain_protocol::ops::memory::RecallRequest,
+    caller: RequestCaller,
+    ctx: &OpsContext,
+) -> Result<brain_protocol::ops::memory::RecallResponseFrame, OpError> {
+    let body = RequestBody::Recall(req);
+    enforce_permission(&caller, &body)?;
+    enforce_namespace(&caller, &body)?;
+    let RequestBody::Recall(req) = body else {
+        unreachable!("wrapped a Recall body above")
+    };
+    let per_request_ctx = build_per_request_ctx(&caller, ctx)?;
+    let ctx = per_request_ctx.as_ref().unwrap_or(ctx);
+    crate::handlers::recall::recall_shape_namespace(merged, req, ctx).await
 }
 
 /// Default cap on returned open contradictions when the request passes

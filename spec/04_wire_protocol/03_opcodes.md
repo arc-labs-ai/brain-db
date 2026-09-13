@@ -183,7 +183,7 @@ The low byte's high bit selects direction within this namespace, mirroring the s
 | 0x0142 | `STATEMENT_SUPERSEDE` | old_id, new_statement | new StatementId |
 | 0x0143 | `STATEMENT_TOMBSTONE` | StatementId, reason | confirmation |
 | 0x0144 | `STATEMENT_RETRACT` | StatementId | confirmation |
-| 0x0145 | `STATEMENT_HISTORY` | StatementId or chain_root | full chain |
+| 0x0145 | `STATEMENT_HISTORY` | StatementId or chain_root, limit, cursor | page of versions + next_cursor (keyset) |
 | 0x0146 | `STATEMENT_LIST` | filter (subject, predicate, kind, time, confidence) | StatementIds |
 
 ### 2.4 Relation operations (0x0150–0x015F)

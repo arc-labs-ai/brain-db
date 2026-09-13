@@ -161,6 +161,7 @@ async fn round_trip(
 
 fn recall_request(txn_id: Option<[u8; 16]>) -> RecallRequest {
     RecallRequest {
+        scope: Default::default(),
         trace: false,
         cue_text: "meeting preferences".into(),
         subject_name: String::new(),

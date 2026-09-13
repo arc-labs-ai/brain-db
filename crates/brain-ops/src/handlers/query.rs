@@ -307,6 +307,9 @@ fn build_executor_context(ctx: &OpsContext) -> Result<RetrievalExecutorContext, 
         metadata: ctx.executor.metadata.clone(),
         caller_namespace: ctx.executor.caller_namespace.raw(),
         caller_space: ctx.executor.caller_space,
+        // QUERY is always single-space scoped — namespace-wide is a
+        // RECALL-only capability.
+        scope_mode: brain_metadata::ScopeMode::Space,
         // Rerank is always-on for QUERY just as for RECALL: the
         // executor reranks whenever the cross-encoder is loaded. When
         // the operator disabled the load this is `None` and the query

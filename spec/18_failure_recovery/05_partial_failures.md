@@ -74,7 +74,7 @@ Quarantine prevents repeated failures from cascading.
 
 ## 6. Operator-triggered shard restart
 
-Administer via the admin HTTP API (`/v1/*` on the admin listener); see [§17.04](../17_observability/04_admin_ops.md). (Operator action: stop and restart a single shard's executor in place — WAL replay brings it back up — without touching the other shards. Route name TBD.)
+Restarting a single shard's executor in place (WAL replay brings it back up, without touching the other shards) is **not exposed as a dedicated admin route today** (planned, post-v1). Today the operator-level recovery unit is a full process restart, which replays every shard's WAL independently; a single shard whose executor task has died is surfaced by `GET /v1/shards` (and `/readyz`) so it can be acted on. A per-shard in-place restart route is a future convenience, not a correctness requirement.
 
 If the issue is transient (e.g., a stuck task), restart resolves it.
 

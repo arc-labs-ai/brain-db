@@ -29,7 +29,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::SystemTime;
 
-use brain_metadata::extractor::sweep::{reclaim_retracted_statements, SweepSummary};
+use brain_metadata::extractor::sweep::{
+    reclaim_retracted_statements, sweep_expired_by_retention, SweepSummary,
+};
 
 use crate::config::{WorkerConfig, WorkerKind};
 use crate::context::WorkerContext;
@@ -117,6 +119,24 @@ impl StatementReclaimWorker {
         let wtxn = metadata
             .write_txn()
             .map_err(|e| WorkerError::Internal(format!("statement reclaim wtxn: {e}")))?;
+        // First, soft-tombstone statements past their predicate's declared
+        // retention TTL (reason RetentionExpired). They then flow through the
+        // same grace → hard-reclaim path below on a later cycle. No-op until a
+        // schema declares `retention:`. A per-row failure warns and retries next
+        // tick rather than poisoning the scheduler.
+        let expired: SweepSummary =
+            match sweep_expired_by_retention(&wtxn, now_ns, self.config.batch_size, false) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "brain_workers::statement_reclaim",
+                        error = %e,
+                        "retention TTL sweep failed; retrying next tick",
+                    );
+                    return Ok(0);
+                }
+            };
+
         // One bounded reclaim per cycle. A per-row failure inside the
         // sweeper surfaces as an Err here; we warn and continue (return
         // 0 for this tick) rather than poison the scheduler — the next
@@ -141,22 +161,23 @@ impl StatementReclaimWorker {
         wtxn.commit()
             .map_err(|e| WorkerError::Internal(format!("statement reclaim commit: {e}")))?;
 
-        if summary.deleted > 0 {
+        if summary.deleted > 0 || expired.deleted > 0 {
             tracing::info!(
                 target: "brain_workers::statement_reclaim",
                 scanned = summary.scanned,
-                deleted = summary.deleted,
+                reclaimed = summary.deleted,
+                retention_expired = expired.deleted,
                 skipped = summary.skipped,
-                "reclaimed retracted statements",
+                "statement reclaim: expired past TTL + hard-reclaimed past grace",
             );
         } else {
             tracing::debug!(
                 target: "brain_workers::statement_reclaim",
                 scanned = summary.scanned,
-                "statement reclaim tick (nothing past grace)",
+                "statement reclaim tick (nothing past TTL or grace)",
             );
         }
-        Ok(summary.deleted as usize)
+        Ok((summary.deleted + expired.deleted) as usize)
     }
 }
 

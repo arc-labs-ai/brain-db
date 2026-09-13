@@ -70,7 +70,7 @@ Pin a version in `.env`: `BRAIN_VERSION=0.1.0`.
 |---|---|---|
 | **8080** | Data plane — binary wire protocol (CBOR). SDKs connect here. | yes (`-p 8080`) |
 | **9091** | Public HTTP — `/healthz`, `/metrics` only. | yes (`-p 9091`) |
-| **9092** | Admin HTTP — `/v1/*` (API-key mint, stats, revoke). | **no** — loopback inside the container |
+| **9092** | Admin HTTP — `/v1/*` (API-key mint/revoke, worker control, audit, snapshots, per-shard status). Stats/metrics live on the public `:9091/metrics`, not here. | **no** — loopback inside the container |
 
 The admin plane has no built-in auth beyond the operator token — it stays on
 container loopback by design. Reach it via `docker compose exec`:

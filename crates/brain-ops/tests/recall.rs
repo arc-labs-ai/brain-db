@@ -16,7 +16,7 @@ use brain_ops::test_support::{run_in_glommio, single_body};
 use brain_ops::{dispatch, DispatchOutcome, OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_protocol::envelope::request::{
-    EncodeRequest, MemoryKindWire, RecallRequest, RequestBody,
+    EncodeRequest, MemoryKindWire, RecallRequest, RecallScopeWire, RequestBody,
 };
 use brain_protocol::envelope::response::{
     EncodeResponse, RankedItemKindWire, RecallResponseFrame, ResponseBody,
@@ -119,6 +119,7 @@ fn encode_req(request_id: [u8; 16], text: &str, _kind: MemoryKindWire) -> Encode
 
 fn recall_req(cue: &str, max_results: u32) -> RecallRequest {
     RecallRequest {
+        scope: Default::default(),
         trace: false,
         cue_text: cue.into(),
         subject_name: String::new(),
@@ -158,6 +159,31 @@ fn unwrap_recall_resp(outcome: DispatchOutcome) -> RecallResponseFrame {
         ResponseBody::Recall(r) => r,
         other => panic!("expected ResponseBody::Recall, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// 0. Namespace-wide scope gate (Phase A — fan-out not yet wired).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn namespace_scope_recall_is_refused_until_fanout_lands() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        let mut req = recall_req("anything", 5);
+        req.scope = RecallScopeWire::Namespace;
+        // A single shard can't serve namespace-wide recall; the handler refuses
+        // it until the cross-shard fan-out + global merge path is wired.
+        let result = dispatch(
+            RequestBody::Recall(req),
+            brain_ops::RequestCaller::for_tests(),
+            &fix.ctx,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "scope=Namespace must be refused until fan-out lands, got {result:?}"
+        );
+    });
 }
 
 // ---------------------------------------------------------------------------

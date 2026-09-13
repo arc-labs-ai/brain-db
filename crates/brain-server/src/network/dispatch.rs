@@ -902,6 +902,37 @@ pub(crate) async fn run_op_dispatch(
             request_span.record("span_id", span_ctx.span_id().to_string());
         }
     }
+    // Namespace-wide RECALL cannot be served by a single shard — a namespace's
+    // spaces are spread across shards. Fan the raw-candidate gather out to every
+    // shard, merge the pools, and shape once on the bound (coordinator) shard.
+    if let RequestBody::Recall(r) = &op.req {
+        if matches!(
+            r.scope,
+            brain_protocol::ops::memory::RecallScopeWire::Namespace
+        ) {
+            // A transaction lives on exactly one shard; a namespace-wide read
+            // fans out to all of them, where the txn does not exist. The two
+            // are incoherent — reject rather than fail with TxnNotFound on the
+            // other shards.
+            if r.txn_id.is_some() {
+                return vec![error_frame(
+                    stream_id,
+                    ErrorCode::InvalidArgument,
+                    "namespace-wide recall (scope=Namespace) is not supported inside a transaction",
+                )];
+            }
+            return run_namespace_recall(
+                stream_id,
+                r.clone(),
+                caller,
+                op.target_shard,
+                shards,
+                request_span,
+            )
+            .await;
+        }
+    }
+
     // Capture the txn identity before the request is consumed by dispatch, so
     // the confirmed outcome can be reported back to the router once the shard
     // answers. Only txn ops carry a kind; everything else reports nothing.
@@ -938,6 +969,102 @@ pub(crate) async fn run_op_dispatch(
             stream_id,
             ErrorCode::ShardUnavailable,
             "shard is no longer accepting requests",
+        )],
+        Err(DispatchError::Op(e)) => vec![error_frame_from_op_error(stream_id, &e)],
+    }
+}
+
+/// Namespace-wide RECALL fan-out (Phase C). A namespace's spaces are spread
+/// across shards, so this:
+///   1. fans the raw-candidate gather out to EVERY shard in parallel (each
+///      shard scopes to the caller's namespace across its own spaces),
+///   2. merges the pools into one global candidate pool (RRF by within-shard
+///      rank, deduped, bounded),
+///   3. shapes once on the bound (coordinator) shard, over the merged pool.
+///
+/// Fail-closed: if any shard's gather errors, the whole read fails rather than
+/// silently returning a partial answer that drops a shard's spaces. The tenant
+/// wall is enforced per shard (Phase B `admits`, namespace unconditional), so
+/// the fan-out can never gather another tenant's rows.
+async fn run_namespace_recall(
+    stream_id: u32,
+    req: brain_protocol::ops::memory::RecallRequest,
+    caller: brain_ops::RequestCaller,
+    coordinator_shard: u16,
+    shards: Arc<Vec<ShardHandle>>,
+    request_span: tracing::Span,
+) -> Vec<Frame> {
+    use brain_protocol::envelope::response::ResponseBody;
+
+    if shards.is_empty() {
+        return vec![error_frame(
+            stream_id,
+            ErrorCode::ShardUnavailable,
+            "no shards available for namespace-wide recall",
+        )];
+    }
+
+    // Stage 1 — parallel fan-out of the raw-candidate gather to every shard.
+    let mut set = tokio::task::JoinSet::new();
+    for shard in shards.iter() {
+        let shard = shard.clone();
+        let req = req.clone();
+        let caller = caller.clone();
+        let span = request_span.clone();
+        set.spawn(async move { shard.recall_gather(req, caller, span).await });
+    }
+    let mut partials: Vec<brain_ops::NamespaceRecallPartial> = Vec::with_capacity(shards.len());
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok(Ok(partial)) => partials.push(partial),
+            Ok(Err(DispatchError::ShardDisconnected)) => {
+                return vec![error_frame(
+                    stream_id,
+                    ErrorCode::ShardUnavailable,
+                    "a shard is no longer accepting requests (namespace recall)",
+                )];
+            }
+            Ok(Err(DispatchError::Op(e))) => return vec![error_frame_from_op_error(stream_id, &e)],
+            Err(join_err) => {
+                return vec![error_frame(
+                    stream_id,
+                    ErrorCode::Internal,
+                    &format!("namespace recall gather task failed: {join_err}"),
+                )];
+            }
+        }
+    }
+
+    // Stage 2 — global merge across shards: candidate pool + HyPE union + the
+    // best grounded answer (so a grounded commit fires even when the subject's
+    // facts live off the coordinator).
+    let merged = brain_ops::merge_namespace_partials(partials);
+
+    // Stage 3 — single global shaping pass on the coordinator (bound) shard.
+    let Some(coordinator) = shards.get(coordinator_shard as usize) else {
+        return vec![error_frame(
+            stream_id,
+            ErrorCode::ShardUnavailable,
+            &format!(
+                "coordinator shard {} out of range [0, {})",
+                coordinator_shard,
+                shards.len()
+            ),
+        )];
+    };
+    match coordinator
+        .recall_shape_merged(merged, req, caller, request_span)
+        .await
+    {
+        Ok(frame) => vec![build_response_frame(
+            stream_id,
+            true,
+            ResponseBody::Recall(frame),
+        )],
+        Err(DispatchError::ShardDisconnected) => vec![error_frame(
+            stream_id,
+            ErrorCode::ShardUnavailable,
+            "coordinator shard is no longer accepting requests",
         )],
         Err(DispatchError::Op(e)) => vec![error_frame_from_op_error(stream_id, &e)],
     }

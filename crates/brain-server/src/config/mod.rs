@@ -43,6 +43,11 @@ pub struct Config {
     pub index: IndexConfig,
     #[serde(default)]
     pub retrieval: RetrievalConfig,
+    /// Deploy-time precision-decision tuning (calibrated selective shaping of
+    /// the RECALL answer). Every field defaults to a no-op, so the section may
+    /// be omitted and an uncalibrated deploy behaves as before.
+    #[serde(default)]
+    pub precision: PrecisionConfig,
     #[serde(default)]
     pub monitoring: MonitoringConfig,
     /// Operator admin-plane config. The admin HTTP listener (key mint /
@@ -643,6 +648,26 @@ impl Default for RetrievalConfig {
 
 fn default_fusion_method() -> String {
     "rrf".to_string()
+}
+
+/// `[precision]` TOML section. Deploy-time tuning for the read path's calibrated
+/// precision decision (RECALL membership → answer shape / abstention). Both
+/// fields default to `0`, a no-op that reproduces the pre-precision behaviour, so
+/// the section may be omitted. The generic `BRAIN__PRECISION__FIELD` override
+/// applies like any other section. See `spec/13_retrievers/07_precision_engine.md`.
+/// The derived `Default` is all-zero — the no-op that reproduces the
+/// pre-precision behaviour, so the whole section may be omitted.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct PrecisionConfig {
+    /// Minimum cross-lane `support` (0..=5) the uncommitted lead must carry to
+    /// commit rather than abstain with `None`. `0` never abstains on this signal.
+    #[serde(default)]
+    pub commit_min_support: u8,
+    /// Minimum `support` a member needs to join a `Many` answer's committed set
+    /// (vs. retained context). `0` keeps every band member (no trim).
+    #[serde(default)]
+    pub many_min_support: u8,
 }
 
 /// `[workers.auto_edge]` TOML section. Controls the substrate
@@ -1429,6 +1454,7 @@ impl Config {
             workers: WorkersConfig::default(),
             index: IndexConfig::default(),
             retrieval: RetrievalConfig::default(),
+            precision: PrecisionConfig::default(),
             monitoring: MonitoringConfig::default(),
             admin: AdminConfig {
                 // Non-empty so the admin listener boots in tests; admin

@@ -250,7 +250,7 @@ After a recovery from snapshot:
 - Verify counters match expectations against the metrics listener (`curl -s http://127.0.0.1:9091/metrics | grep '^brain_'` — e.g. `brain_shards_total`, `brain_hnsw_node_count`), and check per-shard status via `curl -s http://127.0.0.1:9092/v1/shards`. (Database-wide counters are exposed via `GET /metrics` on the metrics listener; a dedicated JSON stats-summary route is not yet implemented.)
 - Test sample queries.
 
-The consistency check (arena/metadata/HNSW agreement plus a sample-query sanity pass) is an operator action driven through the admin HTTP API (`/v1/*` on the admin listener); see [§17.04](../17_observability/04_admin_ops.md). (Operator action: verify arena/metadata/HNSW consistency for a shard and confirm sample queries return reasonable results. Route name TBD.)
+The consistency check (arena/metadata/HNSW agreement plus a sample-query sanity pass) is **not exposed as a single dedicated admin route today** (planned, post-v1). Today an operator runs it as the steps above: compare the metrics-listener counters (`brain_hnsw_node_count`, `brain_shards_total`, storage gauges on `:9091`), check per-shard status via `GET /v1/shards` (`:9092`), and run sample queries. A shard that detects on-disk corruption fails its own CRC checks fail-stop (invariant #7) rather than relying on a periodic scan.
 
 Verification gives confidence the recovery worked.
 

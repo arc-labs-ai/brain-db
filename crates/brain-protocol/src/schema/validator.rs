@@ -799,6 +799,7 @@ mod tests {
             object: ObjectTypeDecl::Any,
             stateful: None,
             description: None,
+            retention: None,
         }));
         let errs = validate(&s).unwrap_err();
         assert!(errs
@@ -815,6 +816,7 @@ mod tests {
             object: ObjectTypeDecl::Any,
             stateful: None,
             description: None,
+            retention: None,
         }));
         let errs = validate(&s).unwrap_err();
         assert!(errs
@@ -831,6 +833,7 @@ mod tests {
             object: ObjectTypeDecl::Any,
             stateful: None,
             description: None,
+            retention: None,
         }));
         assert!(validate(&s).is_ok());
     }

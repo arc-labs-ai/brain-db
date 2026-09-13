@@ -1,5 +1,9 @@
 # 19.02 Performance Targets
 
+> **v1.0 status — advisory, not a lock gate (owner decision, 2026-09-07).** Reference-hardware performance verification is **optional / off the grid for v1.0** — see [`06_complete_acceptance.md`](06_complete_acceptance.md) §"Performance acceptance". The numbers here are engineering targets to measure post-lock, not v1.0 lock criteria.
+>
+> **Reconciliation note.** The per-operation numbers in this file are **being reconciled** against [`../01_architecture/05_hardware_and_targets.md`](../01_architecture/05_hardware_and_targets.md) §7 and [`06_complete_acceptance.md`](06_complete_acceptance.md), which agree with each other (and split targets by CPU / GPU / `ENCODE_VECTOR_DIRECT` path). Where a number in §2 below disagrees with those two — FORGET/PLAN/REASON/STATEMENT_CREATE/RELATION_CREATE/entity-resolve latency, and the throughput lines — **treat §01/05 + §19/06 as authoritative** until this file's tables are refreshed (post-v1 tuning task). This file states single-number, older targets; the CPU/GPU-split figures supersede them.
+
 > **TL;DR.** Brain v1.0 performance gates: latency (per-operation p50/p95/p99 targets), throughput (per-shard sustained ops/s), and resource budgets (CPU, RAM, disk per shard / per node). All measured by the benchmark suite on reference hardware (16-core x86_64, 64 GiB RAM, NVMe SSD) at the 1M-memory primary scale.
 
 ## Latency Targets

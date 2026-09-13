@@ -180,6 +180,7 @@ async fn encode(client: &mut TcpStream, stream_id: u32, text: &str) -> u128 {
 /// set. Scope is always the caller's own space — there is no client filter.
 async fn recall_ids(client: &mut TcpStream, stream_id: u32, cue: &str) -> Vec<u128> {
     let req = RecallRequest {
+        scope: Default::default(),
         trace: false,
         cue_text: cue.into(),
         subject_name: String::new(),

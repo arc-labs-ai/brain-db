@@ -105,8 +105,9 @@ pub use schema::kind::{
 };
 pub use schema::predicate::{
     predicate_embedding_get, predicate_embedding_put, predicate_get, predicate_intern,
-    predicate_list, predicate_lookup_by_qname, predicate_review_list, predicate_review_record,
-    render_declared_predicates_block, PredicateOpError,
+    predicate_list, predicate_lookup_by_qname, predicate_retention_seconds, predicate_review_list,
+    predicate_review_record, predicate_set_retention, render_declared_predicates_block,
+    PredicateOpError,
 };
 pub use schema::store::{
     schema_active, schema_active_row, schema_get, schema_list, schema_namespaces, schema_upload,
@@ -116,9 +117,10 @@ pub use statement::{
     allocate_evidence_overflow, backfill_statement_id_indexes, evidence_overflow_load,
     pack_evidence_entries, pack_evidence_ids, read_evidence_entries_w, read_evidence_ids,
     read_evidence_ids_w, reclaim_evidence_overflow, statement_create, statement_get,
-    statement_history, statement_list, statement_list_page, statement_retract, statement_supersede,
-    statement_tombstone, statements_contradicting, StatementListCursor, StatementListFilter,
-    StatementOpError, StatementPage, StatementPageExtra, DEFAULT_LIST_LIMIT,
+    statement_history, statement_history_page, statement_list, statement_list_page,
+    statement_retract, statement_supersede, statement_tombstone, statements_contradicting,
+    StatementHistoryPage, StatementListCursor, StatementListFilter, StatementOpError,
+    StatementPage, StatementPageExtra, DEFAULT_LIST_LIMIT,
 };
 pub use system_schema::{seed_system_schema, SystemSchemaError, SYSTEM_SCHEMA_SOURCE};
 pub use tables::extractor_audit::{
@@ -135,4 +137,4 @@ pub use tables::memory::{
 pub use tables::schema_version::{
     SchemaVersionRow, SCHEMA_ACTIVE_VERSIONS_TABLE, SCHEMA_VERSIONS_TABLE, VALIDATOR_VERSION,
 };
-pub use tables::scope::RowScope;
+pub use tables::scope::{RowScope, ScopeMode};

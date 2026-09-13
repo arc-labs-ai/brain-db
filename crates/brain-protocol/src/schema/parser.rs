@@ -422,6 +422,7 @@ fn parse_predicate_def(pair: Pair<'_, Rule>) -> Result<PredicateDef, ParseError>
     let mut object: Option<ObjectTypeDecl> = None;
     let mut stateful: Option<bool> = None;
     let mut description: Option<String> = None;
+    let mut retention: Option<DurationAst> = None;
 
     for child in pair.into_inner() {
         match child.as_rule() {
@@ -454,6 +455,13 @@ fn parse_predicate_def(pair: Pair<'_, Rule>) -> Result<PredicateDef, ParseError>
                     .expect("description field always has string_literal child");
                 description = Some(unquote_string(s));
             }
+            Rule::predicate_retention_field => {
+                let d = child
+                    .into_inner()
+                    .find(|p| p.as_rule() == Rule::duration_literal)
+                    .expect("retention field always has duration_literal child");
+                retention = Some(parse_duration_literal(d)?);
+            }
             _ => {}
         }
     }
@@ -475,6 +483,7 @@ fn parse_predicate_def(pair: Pair<'_, Rule>) -> Result<PredicateDef, ParseError>
         object,
         stateful,
         description,
+        retention,
     })
 }
 
@@ -1371,6 +1380,42 @@ mod tests {
             p.resolved_stateful(),
             "explicit stateful: true overrides Fact default"
         );
+    }
+
+    #[test]
+    fn predicate_def_with_retention_ttl() {
+        let src = r#"
+            namespace t
+            define predicate visited {
+                kind: Event
+                object: Entity<Place>
+                retention: 90d
+            }
+        "#;
+        let s = parse_ok(src);
+        let SchemaItem::Predicate(p) = &s.items[0] else {
+            panic!("predicate expected")
+        };
+        let d = p.retention.expect("retention parsed");
+        assert_eq!(d.amount, 90);
+        assert_eq!(d.unit, DurationUnit::Days);
+        assert_eq!(d.to_seconds(), 90 * 86_400);
+    }
+
+    #[test]
+    fn predicate_def_without_retention_is_none() {
+        let src = r#"
+            namespace t
+            define predicate works_at {
+                kind: Fact
+                object: Entity<Organization>
+            }
+        "#;
+        let s = parse_ok(src);
+        let SchemaItem::Predicate(p) = &s.items[0] else {
+            panic!("predicate expected")
+        };
+        assert_eq!(p.retention, None, "omitted retention defaults to None");
     }
 
     #[test]

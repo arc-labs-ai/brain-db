@@ -1789,3 +1789,227 @@ fn __ts() -> brain_metadata::RowScope {
     // reads with; these tests exercise graph topology, not isolation.
     brain_metadata::RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0u8; 16])
 }
+
+// ---------------------------------------------------------------------------
+// Namespace-wide read scope — tenant-isolation acceptance gate.
+//
+// A single shard physically holds multiple spaces, and multiple namespaces.
+// Namespace-wide RECALL widens the *space* half of the read scope so a caller
+// sees every space it owns WITHIN ITS OWN NAMESPACE — and never a byte of
+// another namespace. These tests pin that guarantee at the graph lane, which
+// resolves client-supplied anchors against a flat, non-scope-keyed entity
+// table (the exact surface where a widened scope could leak if the namespace
+// wall were ever relaxed). They exercise `GraphRetrieverConfig.namespace_wide`
+// end to end through `BrainGraphRetriever::retrieve`.
+// ---------------------------------------------------------------------------
+
+/// Put an entity row under an explicit `(namespace, space)` scope, so a single
+/// metadata DB can host several tenants at once.
+fn put_entity_scoped(
+    metadata: &Arc<MetadataDb>,
+    scope: brain_metadata::RowScope,
+    name: &str,
+    type_id: EntityTypeId,
+) -> EntityId {
+    let id = EntityId::new();
+    let entity = Entity::new_active(id, type_id, name.into(), name.to_lowercase(), 0);
+    let wtxn = metadata.write_txn().expect("wtxn");
+    entity_put(&wtxn, scope, brain_core::SessionId::DEFAULT, &entity).expect("entity_put");
+    wtxn.commit().expect("commit");
+    id
+}
+
+/// Create a relation stamped under an explicit scope. The endpoints may live
+/// in other spaces/namespaces (the entity table is flat and `relation_create`
+/// only asserts endpoint existence, not endpoint scope) — which is exactly the
+/// cross-tenant edge shape the walk's per-node re-check must contain.
+fn create_relation_scoped(
+    metadata: &Arc<MetadataDb>,
+    scope: brain_metadata::RowScope,
+    relation_type: RelationTypeId,
+    from: EntityId,
+    to: EntityId,
+) -> RelationId {
+    let id = RelationId::new();
+    let r = Relation::new_root(
+        id,
+        relation_type,
+        from,
+        to,
+        0.9,
+        Vec::new(),
+        ExtractorId::from(0),
+        0,
+        false,
+    );
+    let wtxn = metadata.write_txn().expect("wtxn");
+    let created = relation_create(&wtxn, scope, brain_core::SessionId::DEFAULT, &r, 0)
+        .expect("relation_create");
+    wtxn.commit().expect("commit");
+    created
+}
+
+/// A star-anchor graph config for a specific caller scope + read width.
+fn anchor_config(caller: brain_metadata::RowScope, namespace_wide: bool) -> GraphRetrieverConfig {
+    GraphRetrieverConfig {
+        caller_namespace: caller.namespace_id,
+        caller_space_bytes: caller.space_id_bytes,
+        namespace_wide,
+        ..GraphRetrieverConfig::default()
+    }
+}
+
+fn star_anchor(anchor: EntityId) -> GraphQuery {
+    GraphQuery::Star {
+        anchor: GraphAnchor::Entity(anchor),
+        depth: 1,
+        direction: Direction::Both,
+        relation_types: None,
+        include_statements: false,
+    }
+}
+
+#[test]
+fn namespace_wide_admits_own_spaces_never_foreign_namespace() {
+    let (_dir, metadata) = fresh_with_metadata();
+    let type_id = current_person_type(&metadata);
+
+    // Two spaces of namespace A on the same shard, plus one space of a
+    // DIFFERENT namespace B.
+    let ns_a = brain_core::NamespaceId::from(100);
+    let ns_b = brain_core::NamespaceId::from(200);
+    let space1 = brain_core::SpaceId::new();
+    let space2 = brain_core::SpaceId::new();
+    let space3 = brain_core::SpaceId::new();
+    let a_scope1 = brain_metadata::RowScope::new(ns_a, space1);
+    let a_scope2 = brain_metadata::RowScope::new(ns_a, space2);
+    let b_scope3 = brain_metadata::RowScope::new(ns_b, space3);
+
+    let a1 = put_entity_scoped(&metadata, a_scope1, "A-own", type_id);
+    let a2 = put_entity_scoped(&metadata, a_scope2, "A-sibling", type_id);
+    let b3 = put_entity_scoped(&metadata, b_scope3, "B-foreign", type_id);
+
+    let retriever = make_retriever_with_db(metadata);
+    // Caller authenticates as namespace A, space1.
+    let caller = a_scope1;
+
+    // --- Space-scoped (default) ------------------------------------------
+    let space_cfg = anchor_config(caller, false);
+    // Own space anchor resolves.
+    assert!(
+        retriever.retrieve(&star_anchor(a1), &space_cfg).is_ok(),
+        "own-space anchor must resolve when space-scoped"
+    );
+    // A sibling space in the SAME namespace is invisible when space-scoped —
+    // reported identically to an absent anchor.
+    assert!(
+        matches!(
+            retriever.retrieve(&star_anchor(a2), &space_cfg),
+            Err(GraphError::AnchorNotFound(_))
+        ),
+        "sibling-space anchor must NOT resolve when space-scoped"
+    );
+
+    // --- Namespace-wide ---------------------------------------------------
+    let ns_cfg = anchor_config(caller, true);
+    // Own space still resolves.
+    assert!(
+        retriever.retrieve(&star_anchor(a1), &ns_cfg).is_ok(),
+        "own-space anchor must resolve namespace-wide"
+    );
+    // A sibling space the caller owns now resolves — the space half relaxed.
+    assert!(
+        retriever.retrieve(&star_anchor(a2), &ns_cfg).is_ok(),
+        "sibling-space anchor MUST resolve namespace-wide"
+    );
+    // TENANT WALL: a foreign namespace's entity NEVER resolves, in EITHER
+    // mode — the namespace half is never relaxed. This is the leak gate.
+    assert!(
+        matches!(
+            retriever.retrieve(&star_anchor(b3), &space_cfg),
+            Err(GraphError::AnchorNotFound(_))
+        ),
+        "foreign-namespace anchor must never resolve (space-scoped)"
+    );
+    assert!(
+        matches!(
+            retriever.retrieve(&star_anchor(b3), &ns_cfg),
+            Err(GraphError::AnchorNotFound(_))
+        ),
+        "foreign-namespace anchor must NEVER resolve, even namespace-wide"
+    );
+}
+
+#[test]
+fn namespace_wide_walk_emits_sibling_space_never_foreign_namespace() {
+    // A walk anchored in the caller's own space reaches, over the unified
+    // (non-scope-keyed) edge table, both a sibling-space node of the same
+    // namespace and a foreign-namespace node. Namespace-wide must emit the
+    // former and never the latter.
+    let (_dir, metadata) = fresh_with_metadata();
+    let type_id = current_person_type(&metadata);
+
+    let ns_a = brain_core::NamespaceId::from(100);
+    let ns_b = brain_core::NamespaceId::from(200);
+    let space1 = brain_core::SpaceId::new();
+    let space2 = brain_core::SpaceId::new();
+    let space3 = brain_core::SpaceId::new();
+
+    let a1 = put_entity_scoped(
+        &metadata,
+        brain_metadata::RowScope::new(ns_a, space1),
+        "A1",
+        type_id,
+    );
+    let a2 = put_entity_scoped(
+        &metadata,
+        brain_metadata::RowScope::new(ns_a, space2),
+        "A2",
+        type_id,
+    );
+    let b3 = put_entity_scoped(
+        &metadata,
+        brain_metadata::RowScope::new(ns_b, space3),
+        "B3",
+        type_id,
+    );
+
+    // Edges from a1 to both a2 (sibling space, same ns) and b3 (foreign ns).
+    // The edge table is not scope-keyed, so both edges physically exist and
+    // the walk will traverse to both endpoints; the per-node scope re-check
+    // (`node_in_scope`) is the only thing keeping b3 out.
+    let rt = intern_relation_type(&metadata, "brain", "knows");
+    // Both edges are stamped under the caller's namespace scope, so the walk's
+    // sidecar currency check admits them; the endpoints, however, live in a
+    // sibling space (a2) and a foreign namespace (b3).
+    let caller = brain_metadata::RowScope::new(ns_a, space1);
+    let _e_a1_a2 = create_relation_scoped(&metadata, caller, rt, a1, a2);
+    let _e_a1_b3 = create_relation_scoped(&metadata, caller, rt, a1, b3);
+
+    let retriever = make_retriever_with_db(metadata);
+
+    let result = retriever
+        .retrieve(&star_anchor(a1), &anchor_config(caller, true))
+        .expect("namespace-wide walk from own-space anchor");
+
+    let mut sees_a2 = false;
+    let mut sees_b3 = false;
+    for item in &result {
+        if let RankedItemId::Entity(id) = item.id {
+            if id == a2 {
+                sees_a2 = true;
+            }
+            if id == b3 {
+                sees_b3 = true;
+            }
+        }
+    }
+    assert!(
+        sees_a2,
+        "namespace-wide walk must emit the sibling-space node"
+    );
+    assert!(
+        !sees_b3,
+        "TENANT WALL: namespace-wide walk must NEVER emit a foreign-namespace node"
+    );
+}

@@ -175,6 +175,10 @@ pub mod tombstone_reason {
     /// The reclamation GC worker selects only rows carrying this byte
     /// so plain tombstones and superseded rows stay put for audit.
     pub const RETRACT: u8 = 5;
+    /// Expired past the predicate's declared `retention` TTL. Physically
+    /// reclaimed after grace like `RETRACT` — an explicit retention policy
+    /// means the data is meant to be removed, not retained for audit.
+    pub const RETENTION_EXPIRED: u8 = 6;
 }
 
 // ---------------------------------------------------------------------------

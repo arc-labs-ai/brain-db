@@ -91,6 +91,15 @@ fn main() -> ExitCode {
     }
     .install();
 
+    // Same one-shot install for the precision-decision tuning from `[precision]`.
+    // Defaults are no-ops, so an uncalibrated deploy shapes answers exactly as
+    // before; a fitted calibration makes None reachable and Many minimal.
+    let _ = brain_core::PrecisionTuning {
+        commit_min_support: cfg.precision.commit_min_support,
+        many_min_support: cfg.precision.many_min_support,
+    }
+    .install();
+
     // Apply the configured formatter + level immediately, so the startup
     // logs below already honor `[monitoring.logging]`. OTel is attached
     // later, from inside the Tokio runtime (its exporter needs one).

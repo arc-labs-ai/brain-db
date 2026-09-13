@@ -30,6 +30,7 @@ pub mod handlers;
 pub mod index;
 pub mod memory_artifact;
 pub mod metrics;
+pub mod precision;
 pub mod state;
 #[doc(hidden)]
 pub mod test_support;
@@ -48,6 +49,9 @@ pub use brain_planner::PlannerContext;
 pub use context::{CrossEncoderSlot, OpsContext};
 pub use dispatch::{dispatch, DispatchOutcome, RequestCaller};
 pub use error::{ErrorCode, OpError};
+pub use handlers::recall::{
+    merge_namespace_partials, merge_recall_pools, MergedNamespaceRecall, NamespaceRecallPartial,
+};
 pub use handlers::subscribe::{
     parse_filter, EventBus, EventEnvelope, LsnAllocator, ParsedFilter, SimilarityMatch,
     SubscriptionHandle, SubscriptionRegistry, DEFAULT_EVENT_CHANNEL_CAPACITY,

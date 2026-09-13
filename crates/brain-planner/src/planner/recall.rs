@@ -171,6 +171,7 @@ mod tests {
 
     fn base_request() -> RecallRequest {
         RecallRequest {
+            scope: Default::default(),
             trace: false,
             cue_text: "hello".into(),
             subject_name: String::new(),

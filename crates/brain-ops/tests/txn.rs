@@ -155,6 +155,7 @@ fn forget_req(memory_id: u128, request_id: [u8; 16], txn: Option<[u8; 16]>) -> F
 
 fn recall_req(cue: &str, max_results: u32, txn: Option<[u8; 16]>) -> RecallRequest {
     RecallRequest {
+        scope: Default::default(),
         trace: false,
         cue_text: cue.into(),
         subject_name: String::new(),

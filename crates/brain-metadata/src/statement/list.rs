@@ -104,6 +104,130 @@ pub fn statement_history(
     Ok(out)
 }
 
+/// One page of a keyset-paginated supersession-chain history walk.
+#[derive(Debug)]
+pub struct StatementHistoryPage {
+    /// This page's chain entries, `version` ascending.
+    pub rows: Vec<Statement>,
+    /// True iff a further present entry exists past this page — exact, so a
+    /// short page never hides a full next one.
+    pub has_more: bool,
+    /// The `version` of the last row on this page — the keyset resume point
+    /// for the next request. `None` when the page is empty.
+    pub last_version: Option<u32>,
+    /// The full chain length (count of present entries across every version),
+    /// independent of the page window.
+    pub total: u32,
+    /// The resolved chain root — lets the caller mint a cursor bound to this
+    /// chain and reject one replayed against a different anchor.
+    pub chain_root: [u8; 16],
+}
+
+/// Paginated variant of [`statement_history`]: walk the supersession chain
+/// keyset-style, resuming strictly past `after_version` and returning at most
+/// `limit` entries.
+///
+/// The keyset is the chain's **immutable `version`** number (the 4th component
+/// of the `STATEMENT_CHAIN_TABLE` key), so the exhaustive-tiling contract holds
+/// under concurrent appends: following the cursor to exhaustion yields every
+/// present version exactly once. `has_more` is exact — it peeks one entry past
+/// the page. A present-but-undecodable chain row is corruption, not absence, and
+/// fails stop (invariant #7), exactly as [`statement_history`] does.
+pub fn statement_history_page(
+    rtxn: &ReadTransaction,
+    scope: RowScope,
+    anchor: StatementId,
+    after_version: Option<u32>,
+    limit: usize,
+) -> Result<StatementHistoryPage, StatementOpError> {
+    let chain_table = rtxn.open_table(STATEMENT_CHAIN_TABLE)?;
+    let anchor_bytes = anchor.to_bytes();
+    let is_chain_root = chain_table
+        .get(&(scope.namespace_id, scope.space_id_bytes, anchor_bytes, 1u32))?
+        .is_some();
+    let chain_root_bytes = if is_chain_root {
+        anchor_bytes
+    } else {
+        let s_table = rtxn.open_table(STATEMENTS_TABLE)?;
+        let row: Option<StatementMetadata> = s_table.get(&anchor_bytes)?.map(|g| g.value());
+        let Some(m) = row else {
+            return Err(StatementOpError::NotFound(anchor));
+        };
+        m.chain_root_bytes
+    };
+
+    let s_table = rtxn.open_table(STATEMENTS_TABLE)?;
+
+    // Full chain length: count present entries across every version. Cheap for
+    // a typical short chain; independent of the page window.
+    let mut total: u32 = 0;
+    {
+        let lo = (
+            scope.namespace_id,
+            scope.space_id_bytes,
+            chain_root_bytes,
+            0u32,
+        );
+        let hi = (
+            scope.namespace_id,
+            scope.space_id_bytes,
+            chain_root_bytes,
+            u32::MAX,
+        );
+        for entry in chain_table.range(lo..=hi)? {
+            let (_, v) = entry?;
+            if s_table.get(&v.value())?.is_some() {
+                total = total.saturating_add(1);
+            }
+        }
+    }
+
+    // Page walk: seek strictly past `after_version`.
+    let start = after_version.map_or(0u32, |v| v.saturating_add(1));
+    let lo = (
+        scope.namespace_id,
+        scope.space_id_bytes,
+        chain_root_bytes,
+        start,
+    );
+    let hi = (
+        scope.namespace_id,
+        scope.space_id_bytes,
+        chain_root_bytes,
+        u32::MAX,
+    );
+
+    let mut rows: Vec<Statement> = Vec::new();
+    let mut last_version: Option<u32> = None;
+    let mut has_more = false;
+    for entry in chain_table.range(lo..=hi)? {
+        let (k, v) = entry?;
+        let version = k.value().3;
+        let sid_bytes = v.value();
+        let Some(m) = s_table.get(&sid_bytes)?.map(|g| g.value()) else {
+            // Genuine absence (retracted / never materialized): skip.
+            continue;
+        };
+        if rows.len() == limit {
+            // A further present entry exists → the page is full and more remain.
+            has_more = true;
+            break;
+        }
+        // A PRESENT-but-undecodable row is corruption — fail stop (invariant #7).
+        let s = statement_from_metadata(&m).ok_or(StatementOpError::DecodeFailed)?;
+        rows.push(s);
+        last_version = Some(version);
+    }
+
+    Ok(StatementHistoryPage {
+        rows,
+        has_more,
+        last_version,
+        total,
+        chain_root: chain_root_bytes,
+    })
+}
+
 /// Surface contradicting active Facts for `(subject, predicate)`.
 /// Returns `Vec::new()` when no contradiction (zero or one distinct
 /// object value).
@@ -793,6 +917,77 @@ mod tests {
     /// cursor (which resumed including `is_current`) that relocated the row
     /// behind the cursor and it was silently gapped. Id-order resume keeps
     /// it in place.
+    #[test]
+    fn statement_history_page_tiles_the_chain_exactly() {
+        let (_dir, db) = open_db();
+        let subj = make_entity(&db, "subject");
+        let pred = intern_cumulative_pred(&db, "role");
+
+        // A 5-version supersession chain (one chain_root, versions 1..=5).
+        let root = create(&db, &fact(subj, pred, make_entity(&db, "obj0"), 0.9));
+        let mut latest = root;
+        for i in 1..5u64 {
+            let next = fact(subj, pred, make_entity(&db, &format!("obj{i}")), 0.9);
+            let wtxn = db.write_txn().unwrap();
+            latest = statement_supersede(
+                &wtxn,
+                test_scope(),
+                SessionId::DEFAULT,
+                latest,
+                &next,
+                T0 + i,
+            )
+            .unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        // Page at limit 2, following next_cursor (last_version) to exhaustion.
+        let mut versions: Vec<u32> = Vec::new();
+        let mut ids: Vec<[u8; 16]> = Vec::new();
+        let mut after: Option<u32> = None;
+        let mut pages = 0;
+        loop {
+            let rtxn = db.read_txn().unwrap();
+            let page = statement_history_page(&rtxn, test_scope(), root, after, 2).unwrap();
+            assert_eq!(
+                page.total, 5,
+                "total is the full chain length on every page"
+            );
+            assert_eq!(page.chain_root, root.to_bytes());
+            for s in &page.rows {
+                versions.push(s.version);
+                ids.push(s.id.to_bytes());
+            }
+            pages += 1;
+            assert!(pages <= 10, "cursor must terminate");
+            match (page.has_more, page.last_version) {
+                (true, Some(v)) => after = Some(v),
+                _ => break,
+            }
+        }
+
+        // Exhaustive tiling: versions 1..=5, ascending, each exactly once.
+        assert_eq!(versions, vec![1, 2, 3, 4, 5]);
+        let uniq: std::collections::BTreeSet<_> = ids.iter().collect();
+        assert_eq!(uniq.len(), ids.len(), "no duplicate across pages");
+        assert_eq!(pages, 3, "5 rows at limit 2 → 3 pages (2,2,1)");
+    }
+
+    #[test]
+    fn statement_history_page_resume_past_exhaustion_is_empty_not_error() {
+        let (_dir, db) = open_db();
+        let subj = make_entity(&db, "s");
+        let pred = intern_cumulative_pred(&db, "p");
+        let root = create(&db, &fact(subj, pred, make_entity(&db, "o"), 0.9));
+        // after_version past the only version → empty page, has_more false.
+        let rtxn = db.read_txn().unwrap();
+        let page = statement_history_page(&rtxn, test_scope(), root, Some(99), 10).unwrap();
+        assert!(page.rows.is_empty());
+        assert!(!page.has_more);
+        assert_eq!(page.last_version, None);
+        assert_eq!(page.total, 1);
+    }
+
     #[test]
     fn subject_history_page_survives_mid_page_supersession() {
         let (_dir, db) = open_db();

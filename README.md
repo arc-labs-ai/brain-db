@@ -157,11 +157,13 @@ Inside the container:
 
 ```bash
 just verify                                            # fmt + build + clippy + nextest + doctests
-export BRAIN__LLM__API_KEY=sk-...                      # REQUIRED — Brain refuses to boot without an LLM key
-cargo run --bin brain-server -- --config config/dev.toml   # the database
-curl -s http://127.0.0.1:9091/healthz                  # liveness (public)
+export BRAIN__LLM__API_KEY=sk-...                      # REQUIRED — live-validated at boot; the server refuses to start if it's missing OR invalid
+cargo run --bin brain-server -- --config config/dev.toml   # the database (dev.toml sets the ports + the [admin] token)
+curl -s http://127.0.0.1:9091/healthz                  # liveness (public, no auth)
 curl -s http://127.0.0.1:9091/readyz                   # readiness — 200 when all shards serve, 503 otherwise
-curl -s http://127.0.0.1:9092/v1/stats                 # admin via curl (loopback)
+curl -s http://127.0.0.1:9091/metrics | grep '^brain_' # metrics = the stats surface (public, no auth)
+# the admin listener (:9092, loopback) needs the bearer token from `[admin] token` in config/dev.toml:
+curl -s -H "Authorization: Bearer dev-admin-token" http://127.0.0.1:9092/v1/shards   # per-shard status
 ```
 
 **An LLM provider key is mandatory.** Write-time HyPE (hypothetical-question generation) is always-on and the write path (entity / statement / relation extraction) is built on it — there is no substrate-only mode. The server hard-fails at startup if `[llm] api_key` is empty; set `BRAIN__LLM__API_KEY` and point `[llm] model` at a provider you hold a key for. This is independent of the `[extractors.llm] enabled` tier flag: disabling that tier skips LLM-based extraction but does not remove the boot requirement.
@@ -192,6 +194,8 @@ The verbs that drive Brain. Full semantics are in [`spec/05_operations/`](spec/0
 | **LINK** / **UNLINK** | Manually assert / retract a typed edge between two memories. |
 | **SUBSCRIBE** | Stream events: memory created, statement created, extractor failed, schema updated, etc. |
 | **TXN_BEGIN** / **TXN_COMMIT** / **TXN_ABORT** | Group multiple operations into one atomic unit. |
+
+> The `brain` CLI below is the interactive client from the sibling [`brain-shell`](https://github.com/arc-labs-ai/brain-shell) repo — **this repo ships no client**. The examples illustrate the verbs; against `brain-server` directly you speak the §04 wire protocol (or use `brain-shell` / an SDK). They are not runnable from a checkout of this repo alone.
 
 One-shot mode (each invocation runs a single verb and exits):
 
@@ -316,26 +320,21 @@ Work that isn't done yet. Kept flat on purpose — no milestone tags, no version
 
 ### Outstanding work
 
-- **Acceptance suite on reference hardware.** The end-to-end harness lives in the `brain-eval` rig (`brain-eval acceptance --scale 1m` / `soak`) — latency, throughput, recall@K, system scenarios, restart-recovery. It runs; what's left is a quiet run on reference hardware (16-core x86_64, 64 GiB RAM, NVMe SSD) with the wall-time numbers captured against [`spec/19_benchmarks/02_performance_targets.md`](spec/19_benchmarks/02_performance_targets.md).
-- **Classifier inference latency on reference hardware.** The GLiNER forward pass (DeBERTa-v3 backbone → projection → label MLP → BiLSTM → markerV0 span head → einsum scoring → sigmoid decode) is implemented, validated against real weights, and dispatched live. On the dev box (aarch64, opt-level=2) it runs ~60–80 ms per short memory against a §11/01 p99 budget of 15 ms; because classification is enqueued off the ENCODE hot path this isn't a blocker, but the reference-hardware number (x86_64, opt-level=3 + LTO, optionally the `mkl` candle feature) hasn't been captured.
-- **Live LLM provider validation.** Anthropic and OpenAI clients are wired through a mock-client integration suite; a pass with real API keys and real cost accounting is still needed.
-- **Production-scale benches.** In-crate criterion benches run at 10K corpus scale in CI; the 1M-per-shard mixed-workload run is driven by `brain-eval` on reference hardware.
+**Reference-hardware performance verification is OPTIONAL / off the grid for v1.0** (owner decision, 2026-09-07). v1.0 locks on functional + operational correctness — hardware-independent, in CI — not on measured latency/throughput/storage numbers. The performance items below stay as engineering targets to capture *after* the lock; a miss is a tuning follow-up, never a v1.0 blocker. See [`spec/19_benchmarks/06_complete_acceptance.md`](spec/19_benchmarks/06_complete_acceptance.md).
+
+- **(post-v1, optional) Acceptance suite on reference hardware.** The end-to-end harness lives in the `brain-eval` rig (`brain-eval acceptance --scale 1m` / `soak`) — latency, throughput, recall@K, system scenarios, restart-recovery. It runs; what's deferred is a quiet run on reference hardware (16-core x86_64, 64 GiB RAM, NVMe SSD) with the wall-time numbers captured against [`spec/19_benchmarks/02_performance_targets.md`](spec/19_benchmarks/02_performance_targets.md).
+- **(post-v1, optional) Classifier inference latency on reference hardware.** The GLiNER forward pass (DeBERTa-v3 backbone → projection → label MLP → BiLSTM → markerV0 span head → einsum scoring → sigmoid decode) is implemented, validated against real weights, and dispatched live. On the dev box (aarch64, opt-level=2) it runs ~60–80 ms per short memory against a §11/01 p99 budget of 15 ms; because classification is enqueued off the ENCODE hot path this isn't a blocker, and the reference-hardware number (x86_64, opt-level=3 + LTO, optionally the `mkl` candle feature) is deferred.
+- **(post-v1, optional) Production-scale benches.** In-crate criterion benches run at 10K corpus scale in CI; the 1M-per-shard mixed-workload run is driven by `brain-eval` on reference hardware.
+- **Live LLM provider validation.** Anthropic and OpenAI clients are wired through a mock-client integration suite; a pass with real API keys and real cost accounting is still needed. (Independent of reference hardware — runs on any box with a valid key.)
 - **Spec consistency pass.** One more sweep to confirm every cross-reference resolves, numerical claims agree (latency targets, HNSW parameters, slot sizes, grace periods), and any remaining stub sections in §17–§19 are filled.
 - **Tutorial polish.** The end-to-end tutorial (blank deployment → working query) needs one "follow it on a fresh laptop" pass.
 
 ### Planned improvements
 
-- **Per-statement-kind retention policies.** Retention today is decay-based per-kind; explicit policies (e.g. per-namespace TTL) are planned.
-- **Per-row stale-extraction flag.** Stale (schema-version-behind) statements are counted via a metric today; a durable per-row flag needs a row-schema bump.
 - **Streaming retrieval query results.** `limit > 100` would stream across multiple `QueryResponse` frames — today's response is single-frame.
 - **Retrieval + transactional read-your-writes, richer lensing.** RECALL inside a transaction already overlays pending writes on committed data; deeper lens layering across statements + relations is planned.
-- **Multi-frame cursor pagination.** `ENTITY_LIST`, `STATEMENT_LIST`, `STATEMENT_HISTORY`, `RELATION_LIST_FROM` are single-frame snapshots today.
-- **Wire-protocol conformance corpus.** A language-agnostic round-trip corpus (recorded request/response frames with CBOR payloads) that any client implementation can replay to verify §04 conformance — Brain ships no first-party SDK, so this is the drift guard for third-party clients.
-- **`ADMIN_TANTIVY_REBUILD` wire op.** Hot tantivy rebuild from the admin CLI — today's rebuild is startup-only.
-- **Schema migration plan computation.** The `keep` / `re-extract` / `tombstone` action vocabulary is specified in [`spec/03_schema/05_versioning.md`](spec/03_schema/05_versioning.md); computation and execution are planned.
-- **Hot tantivy rebuild while the writer is running.** Today's rebuild requires a shard restart.
+- **Schema migration plan computation.** The `keep` / `re-extract` / `tombstone` action vocabulary is specified in [`spec/03_schema/05_versioning.md`](spec/03_schema/05_versioning.md); the worker sweeps and flags schema-version-behind rows today, but computing and executing the full per-row action plan is planned.
 - **Partial WAL replay on tantivy recovery.** Today's rebuild on `NeedsRebuild` starts from scratch; partial replay via indexer cursors is planned.
-- **Cross-shard retrieval result merging.** Retrieval today is per-shard; router-level fan-out and merge for cross-shard agents is planned.
 
 ### Larger architectural changes
 
@@ -365,10 +364,8 @@ These directions (offloading, storage-compute split, IVF+PQ, range sharding, dec
 - **Fine-grained access control is out of scope today.** Brain has authentication and shard-level authorization; per-memory ACLs, field-level security, and time-bounded permissions aren't built.
 - **Entity garbage collection tombstones but doesn't hard-reclaim.** `EntityGc` is a real per-shard worker, **off by default** (operator opt-in, daily, 30-day grace). Enabled, it computes the full inbound-reference count (active statements-by-subject + relations from/to + entity mentions), collects past-grace orphans under a read txn, re-checks each under the write txn, and tombstones the truly-orphaned with an audit row. Hard reclamation of the tombstoned rows rides the existing tombstone-grace flow; tombstone-reversal on a new inbound reference is the entity-ops layer's contract.
 - **Subscribe by similarity's initial snapshot is out of scope.** A `SUBSCRIBE` with a `similar_to` vector filter delivers live events whose memory is cosine-similar (≥ threshold) to a reference memory; the reference vector is resolved once at registration by re-embedding the reference's stored text, and the per-event cosine gate runs network-side. The `include_history` snapshot ignores `similar_to` (it applies the other filters only); a bad/tombstoned/out-of-space reference is rejected with `InvalidArgument`.
-- **No hot on-demand tantivy reindex.** The lexical index rebuilds automatically from authoritative redb at startup whenever `open` reports corruption or a schema mismatch (an operator can force this by removing the index dir and restarting). A live reindex-without-restart call needs the writer quiesced, since the rebuild swaps the index directory. The vector (HNSW) index does have an on-demand rebuild (`POST /v1/rebuild-ann`).
 - **Statement-level semantic retrieval is scoped to typed-graph reads.** The `StatementEmbed`-populated statement HNSW is searched (`SemanticScope::Both`) for typed-graph `QUERY` and entity-anchored `RECALL`, but plain (non-anchored) `RECALL` stays memory-only by design — its projector surfaces only memory hits, so statement candidates there would be pure overhead.
 - **Consolidation clusters by vector cosine over live redb vectors.** The consolidation worker clusters each recency bucket by vector cosine (`cluster_by_similarity`), resolving each candidate's write-time vector by id from the live redb artifact store (`get_artifact_vector`) — not the recovery-only mmap arena. A candidate whose stored vector can't be read (forgotten / never produced) is dropped fail-soft, never mis-clustered.
-- **Per-row stale-extraction flags aren't durable.** Stale (schema-version-behind) statements are counted via metrics only; a durable per-row flag needs a row-schema bump. Re-extraction itself is already handled by the schema-migration worker.
 - **Slot-version free-list reclamation isn't on the live path.** The `SlotAllocator` (free-list + version-bump-on-realloc) is implemented and exercised by recovery, but the writer mints slots via a `next_slot` atomic and live occupancy is read from redb — so the allocator's free-list reclamation isn't wired into the write path (its unit tests are `#[ignore]`'d). The slot version itself is still enforced via the `MemoryId` encoding; only physical slot *reuse* is deferred.
 
 None of the above are bugs — they're scope boundaries, listed so they're not mistaken for gaps.

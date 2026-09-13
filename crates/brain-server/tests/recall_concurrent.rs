@@ -159,6 +159,7 @@ async fn round_trip(
 
 fn recall_request(cue: &str, txn_id: Option<[u8; 16]>) -> RecallRequest {
     RecallRequest {
+        scope: Default::default(),
         trace: false,
         cue_text: cue.into(),
         subject_name: String::new(),

@@ -39,13 +39,13 @@
     "name": "req_recall",
     "opcode": "0x0021",
     "kind": "request",
-    "payload_len": 287
+    "payload_len": 299
   },
   {
     "name": "req_recall_act_as",
     "opcode": "0x0021",
     "kind": "request",
-    "payload_len": 335
+    "payload_len": 347
   },
   {
     "name": "req_forget",
@@ -717,7 +717,7 @@
     "name": "req_statement_history",
     "opcode": "0x0145",
     "kind": "request",
-    "payload_len": 48
+    "payload_len": 64
   },
   {
     "name": "req_statement_list",
@@ -747,7 +747,7 @@
     "name": "resp_statement_history",
     "opcode": "0x01C5",
     "kind": "response",
-    "payload_len": 1734
+    "payload_len": 1747
   },
   {
     "name": "req_schema_get",

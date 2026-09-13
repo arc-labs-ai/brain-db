@@ -140,6 +140,13 @@ pub struct PredicateDefinition {
     /// any prior active statement with the same `(subject, predicate)`
     /// before inserting the new row.
     pub is_stateful: bool,
+    /// Explicit time-to-live for statements of this predicate, in seconds.
+    /// `0` = no TTL (persist indefinitely, the default). When non-zero, the
+    /// reclaim worker soft-tombstones statements older than this (measured
+    /// per kind from `event_at` for Events, `valid_from` otherwise). Set from
+    /// the schema DSL `retention:` attribute at schema-apply time; lives only
+    /// on the persisted row, not on the projected `Predicate` value type.
+    pub retention_seconds: u64,
 }
 
 impl PredicateDefinition {
@@ -180,6 +187,10 @@ impl PredicateDefinition {
             origin_tag: origin.tag(),
             origin_payload: origin.payload(),
             is_stateful: p.is_stateful,
+            // Retention is a storage-only policy set separately at schema-apply
+            // via `predicate_set_retention`; a freshly-built row defaults to
+            // "no TTL" and the apply path stamps the declared value.
+            retention_seconds: 0,
         }
     }
 

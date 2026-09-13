@@ -377,6 +377,7 @@ fn recall_fills_buffer_then_boost_worker_applies() {
 
         // RECALL fills the buffer.
         let recall = RecallRequest {
+            scope: Default::default(),
             trace: false,
             cue_text: "alpha".into(),
             subject_name: String::new(),

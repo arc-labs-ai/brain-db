@@ -24,6 +24,7 @@ Request/response body schemas for every opcode in the `0x0120–0x012F` schema r
 | `0x0122` | `SCHEMA_LIST` | "SCHEMA_LIST" | implemented |
 | `0x0123` | `SCHEMA_VALIDATE` | "SCHEMA_VALIDATE" | implemented |
 | `0x0124` | `EXTRACTOR_LIST` | "EXTRACTOR_LIST" | implemented |
+| `0x0125` | `SCHEMA_DROP` | "SCHEMA_DROP" | implemented |
 | `0x0127` | `SCHEMA_REPLACE` | "SCHEMA_REPLACE" | implemented |
 
 Responses live at `0x01A0–0x01A7` (low byte with high bit set).
@@ -474,7 +475,7 @@ State machine:
 [strict schema (version N)] --SCHEMA_UPLOAD success--> [strict schema (version N+1)]
 ```
 
-There is no `SCHEMA_DROP` opcode currently. Removing a schema entirely requires operator action on the underlying redb file.
+`SCHEMA_DROP` (`0x0125`, response `0x01A5`, admin-only) narrows the active schema by removing one declared predicate or relation type, gated by an in-use safety check; like `SCHEMA_REPLACE` it is routed through `submit(Write)` so the drop is WAL-durable and replayed on recovery. `SCHEMA_REPLACE` (`0x0127`) remains the destructive whole-schema escape hatch. Neither requires touching the underlying redb file.
 
 ### Gate behavior
 

@@ -73,11 +73,11 @@ Triggers an immediate HNSW rebuild on the shard. Async; the call returns a job h
 
 ### GC
 
-Triggers immediate garbage collection — pruning expired idempotency entries, deleting eligible WAL segments, or reclaiming eligible slots. Administer via the admin HTTP API (`/v1/*` on the admin listener). (Operator action: force an immediate `idempotency` / `wal` / `slots` collection cycle rather than waiting for the scheduled worker. Route name TBD.)
+Triggers immediate garbage collection — pruning expired idempotency entries, deleting eligible WAL segments, or reclaiming eligible slots — rather than waiting for the scheduled worker. This is the generic worker run-now control plane: `POST /v1/workers/<name>/run-now` on the admin listener, where `<name>` is `idempotency_cleanup`, `wal_retention`, or `slot_reclamation`. (No dedicated GC route — the run-now action on the owning worker is the mechanism.)
 
 ### Vacuum
 
-Compacts the metadata store (redb); may take minutes for large stores. Administer via the admin HTTP API (`/v1/*` on the admin listener). (Operator action: compact the redb metadata file in place. Route name TBD.)
+Compacts the metadata store (redb); may take minutes for large stores. In-place redb compaction is **not exposed as a dedicated admin route today** (planned, post-v1); the practical reclamation path is a snapshot + restore cycle (`/v1/snapshots`). redb reclaims freed pages within its own file over time, so an explicit compaction route is a convenience, not a correctness requirement.
 
 ## 5. Snapshot operations
 

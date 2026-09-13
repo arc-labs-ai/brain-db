@@ -584,8 +584,9 @@ Tracked in [`.../00_overview/04_open_questions_archive.md`](../00_overview/04_op
 
 - Secondary indexes on `last_used_at_ns` (LLM cache) and `timestamp_ns` (audit table) for faster scans.
 - Touch-on-read for `last_used_at_ns` to make LLM cache LRU exact.
-- Per-statement-kind retention windows.
 - Watermark optimisation for stale extraction (skip re-flagging already-flagged rows).
+
+Per-statement-kind retention windows are **implemented** (no longer an open question): a predicate declares `retention: <duration>` in the schema DSL, and the `statement_reclaim` worker soft-tombstones expired statements (reason `RetentionExpired`) which then reclaim through the normal tombstone-grace flow.
 
 ## State-carrying workers
 

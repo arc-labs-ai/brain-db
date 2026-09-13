@@ -219,6 +219,7 @@ async fn recall_ids_as(
     act_as: Option<ActAs>,
 ) -> Vec<u128> {
     let req = RecallRequest {
+        scope: Default::default(),
         trace: false,
         cue_text: cue.into(),
         subject_name: String::new(),

@@ -102,6 +102,7 @@ fn main() {
 
     // ---- RECALL the just-encoded memory ----
     let recall = RecallRequest {
+        scope: Default::default(),
         trace: false,
         cue_text: "what color did the evening sky turn".into(),
         subject_name: String::new(),

@@ -659,6 +659,7 @@ mod tests {
     #[test]
     fn recall_round_trips() {
         round_trip(RequestBody::Recall(RecallRequest {
+            scope: Default::default(),
             cue_text: "what about budgets".into(),
             subject_name: "Alice".into(),
             max_results: 10,
@@ -999,6 +1000,7 @@ mod tests {
         assert_eq!(act_as_of(&encode), Some(&selector));
 
         let recall = RequestBody::Recall(RecallRequest {
+            scope: Default::default(),
             cue_text: "x".into(),
             subject_name: String::new(),
             max_results: 1,

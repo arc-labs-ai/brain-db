@@ -36,6 +36,9 @@ pub enum PredicateOpError {
         qname: String,
         existing_id: PredicateId,
     },
+
+    #[error("predicate {0:?} not found")]
+    NotFound(PredicateId),
 }
 
 // ---------------------------------------------------------------------------
@@ -227,6 +230,41 @@ pub fn predicate_get(
     let t = rtxn.open_table(PREDICATES_TABLE)?;
     let row: Option<PredicateDefinition> = t.get(&id.raw())?.map(|g| g.value());
     Ok(row.as_ref().map(PredicateDefinition::to_predicate))
+}
+
+/// Set (or clear, with `0`) the explicit retention TTL for a predicate, in
+/// seconds. Called from schema-apply after the predicate is interned — retention
+/// is a storage-only policy the projected `Predicate` value type doesn't carry,
+/// so it's stamped directly on the row here. Idempotent; a no-op when the value
+/// is already current. Errors if the predicate row doesn't exist.
+pub fn predicate_set_retention(
+    wtxn: &WriteTransaction,
+    id: PredicateId,
+    retention_seconds: u64,
+) -> Result<(), PredicateOpError> {
+    let mut t = wtxn.open_table(PREDICATES_TABLE)?;
+    let Some(mut row) = t.get(&id.raw())?.map(|g| g.value()) else {
+        return Err(PredicateOpError::NotFound(id));
+    };
+    if row.retention_seconds == retention_seconds {
+        return Ok(());
+    }
+    row.retention_seconds = retention_seconds;
+    t.insert(&id.raw(), &row)?;
+    Ok(())
+}
+
+/// The explicit retention TTL for a predicate, in seconds (`0` = none). Reads
+/// the persisted row directly, since [`predicate_get`]'s projected `Predicate`
+/// drops this storage-only field. Missing predicate ⇒ `0`.
+pub fn predicate_retention_seconds(
+    rtxn: &ReadTransaction,
+    id: PredicateId,
+) -> Result<u64, PredicateOpError> {
+    let t = rtxn.open_table(PREDICATES_TABLE)?;
+    Ok(t.get(&id.raw())?
+        .map(|g| g.value().retention_seconds)
+        .unwrap_or(0))
 }
 
 /// Look up a predicate by its namespaced qname. Identifier validation

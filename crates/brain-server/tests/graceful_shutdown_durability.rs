@@ -185,6 +185,7 @@ async fn encode(client: &mut TcpStream, stream_id: u32, text: &str) -> u128 {
 /// RECALL `cue` and return the memory_ids in the result set.
 async fn recall_ids(client: &mut TcpStream, stream_id: u32, cue: &str) -> Vec<u128> {
     let req = RecallRequest {
+        scope: Default::default(),
         trace: false,
         cue_text: cue.into(),
         subject_name: String::new(),

@@ -16,10 +16,12 @@ pub mod error;
 pub mod ids;
 pub mod migration;
 pub mod nodes;
+pub mod precision_config;
 pub mod resolution;
 pub mod retrieval_config;
 pub mod worker_state;
 
+pub use precision_config::{PrecisionTuning, MAX_SUPPORT};
 pub use retrieval_config::RetrievalTuning;
 
 pub use edges::{

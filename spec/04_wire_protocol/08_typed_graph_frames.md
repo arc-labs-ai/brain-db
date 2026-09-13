@@ -690,6 +690,8 @@ pub struct StatementRetractResponse {
 pub struct StatementHistoryRequest {
     pub anchor_id: WireUuid,           // either StatementId or chain_root
     pub include_tombstoned: bool,
+    pub limit: u32,                    // 1..=1000
+    pub cursor: Vec<u8>,               // opaque; empty on the first page
 }
 ```
 
@@ -702,15 +704,19 @@ pub struct StatementHistoryItem {
 
 pub struct StatementHistoryTail {
     pub chain_root: WireUuid,
-    pub total_versions: u32,
+    pub total_versions: u32,           // full chain length, not the page size
+    pub next_cursor: Vec<u8>,          // empty when the chain is exhausted
 }
 ```
 
-Returns the full chain in `version` order (ascending). Suppresses retracted statements regardless of `include_tombstoned`.
+Returns the chain in `version` order (ascending), a page at a time. Suppresses retracted statements regardless of `include_tombstoned`.
+
+Pagination is keyset (seek), keyed on the **immutable `version` number** of the chain — the cursor is the last version returned, and the next page scans strictly past it. Because `version` never mutates, the exhaustive-tiling contract holds: following `next_cursor` to exhaustion yields the union of the chain with each version exactly once, no gap and no duplicate, even when a new version is appended between page fetches. `total_versions` is the full chain length so a client can render progress; a filtered page (`include_tombstoned = false`) may return fewer than `limit` items while `next_cursor` remains non-empty. The cursor is opaque and encodes the `include_tombstoned` toggle; echoing a cursor back with a different toggle is rejected `STALE_CURSOR`, because the resumed page's filtered tiling would otherwise gap or duplicate.
 
 #### Errors
 
 - `STATEMENT_NOT_FOUND` — `anchor_id` doesn't exist.
+- `STALE_CURSOR` — the echoed cursor's `include_tombstoned` toggle differs from the request.
 
 ### STATEMENT_LIST (0x0146)
 

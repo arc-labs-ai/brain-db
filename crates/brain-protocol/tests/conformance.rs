@@ -1100,6 +1100,7 @@ fn corpus() -> Vec<Case> {
         &sample_encode_vector_direct(),
     ));
     let recall = RecallRequest {
+        scope: Default::default(),
         trace: true,
         cue_text: "what color is the sky".into(),
         subject_name: "sky".into(),
@@ -1123,6 +1124,7 @@ fn corpus() -> Vec<Case> {
         &recall,
     ));
     let recall_act_as = RecallRequest {
+        scope: Default::default(),
         trace: false,
         cue_text: "what color is the sky".into(),
         subject_name: "sky".into(),
@@ -2785,10 +2787,12 @@ fn corpus() -> Vec<Case> {
     let statement_history_req = StatementHistoryRequest {
         anchor_id: STMT_OLD_ID,
         include_tombstoned: true,
+        limit: 100,
+        cursor: Vec::new(),
     };
     cases.push(req_case(
         "req_statement_history",
-        RequestBody::StatementHistory(statement_history_req),
+        RequestBody::StatementHistory(statement_history_req.clone()),
         &statement_history_req,
     ));
 
@@ -2985,6 +2989,7 @@ fn corpus() -> Vec<Case> {
         ],
         chain_root: STMT_OLD_ID,
         total_versions: 3,
+        next_cursor: Vec::new(),
         is_final: true,
     };
     cases.push(resp_case(
