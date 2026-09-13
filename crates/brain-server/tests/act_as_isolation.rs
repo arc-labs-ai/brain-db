@@ -848,14 +848,27 @@ async fn txn_begun_with_act_as_commits_under_delegated_identity() {
     .await;
     txn_commit(&mut svc, 5, txn_id).await;
 
-    // The delegated identity sees the committed memory.
-    let delegated_ids = recall_ids_as(
-        &mut svc,
-        7,
-        "pager code secret",
-        Some(act_as("tenant_txn", "space-txn")),
-    )
-    .await;
+    // The delegated identity sees the committed memory. The txn commit makes the
+    // memory durable + semantically indexed synchronously, but the lexical
+    // (tantivy) lane is maintained asynchronously — and the stub embedder makes
+    // every semantic cosine 0.0, so under the test harness this recall is served
+    // entirely by the lexical lane. Poll until the async index catches up
+    // (fresh request_id per attempt, so RECALL idempotency never pins an early
+    // empty result) rather than racing the indexer with a single shot.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let delegated_ids = loop {
+        let ids = recall_ids_as(
+            &mut svc,
+            7,
+            "pager code secret",
+            Some(act_as("tenant_txn", "space-txn")),
+        )
+        .await;
+        if ids.contains(&mem) || std::time::Instant::now() >= deadline {
+            break ids;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    };
     assert!(
         delegated_ids.contains(&mem),
         "delegated identity's RECALL must find the txn-committed memory {mem}; got {delegated_ids:?}"
