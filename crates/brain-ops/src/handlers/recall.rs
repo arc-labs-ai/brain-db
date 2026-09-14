@@ -432,7 +432,7 @@ pub async fn recall_gather_namespace(
 ///   - **pool**: [`merge_recall_pools`] (RRF by within-shard rank, deduped, bounded);
 ///   - **HyPE**: union of the per-shard score maps (a memory is owned by exactly
 ///     one shard, so the keys are disjoint) — the answer-lead is now global;
-///   - **grounded**: the best-scoring [`GroundedOutcome::Answer`] across shards
+///   - **grounded**: the best-scoring `GroundedOutcome::Answer` across shards
 ///     (a namespace-wide subject typically resolves on one shard), preferring an
 ///     anchor-scoped answer on a near-tie — so a grounded commit fires even when
 ///     the subject's facts live on a shard other than the coordinator.

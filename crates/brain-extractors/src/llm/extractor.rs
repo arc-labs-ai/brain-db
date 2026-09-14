@@ -462,7 +462,7 @@ impl LlmExtractor {
     }
 
     /// Run the supersession judge over a pair of statements. Tier 2 of
-    /// the [`brain_metadata::statement::TieredSupersedeDecider`] ladder
+    /// the `brain_metadata::statement::TieredSupersedeDecider` ladder
     /// calls this when a candidate's cosine sits in the ambiguity band
     /// (typically `[0.82, 0.92)`). Returns `Supersedes` /
     /// `Contradicts` / `Coexists` per the prompt below.

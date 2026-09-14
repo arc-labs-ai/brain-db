@@ -615,7 +615,7 @@ pub fn rekey_predicate_index(
 /// Insert a statement's `statements_by_predicate` entry when it (re-)joins
 /// the live set — the FORGET-cascade revert path re-activating a row it
 /// tombstoned. Bucketed by `confidence`. Mirrors the create-path insert in
-/// [`insert_new_statement`] step 3. Idempotent: re-inserting the same key
+/// `insert_new_statement` step 3. Idempotent: re-inserting the same key
 /// is a redb overwrite of an identical value.
 pub fn add_to_predicate_index(
     wtxn: &WriteTransaction,
@@ -642,7 +642,7 @@ pub fn add_to_predicate_index(
 
 /// Flip a statement's `by_subject` index entry from non-current
 /// (`is_current = 0`) back to current (`1`). The inverse of
-/// [`flip_by_subject_to_noncurrent`], used by the FORGET-cascade revert
+/// `flip_by_subject_to_noncurrent`, used by the FORGET-cascade revert
 /// path when it un-tombstones a row.
 pub fn flip_by_subject_to_current(
     wtxn: &WriteTransaction,

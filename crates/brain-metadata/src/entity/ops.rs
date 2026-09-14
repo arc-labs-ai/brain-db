@@ -760,10 +760,10 @@ pub fn entity_iter_live_for_gc(
 /// order so the common case (a referenced entity) exits on the first
 /// hit:
 /// 1. active statements whose **subject** is the entity
-///    ([`STATEMENTS_BY_SUBJECT_TABLE`] range for the scope + entity);
-/// 2. relations **from** the entity ([`relation_list_from`]);
-/// 3. relations **to** the entity ([`relation_list_to`]);
-/// 4. entity **mentions** ([`ENTITY_MENTIONS_TABLE`] range).
+///    (`STATEMENTS_BY_SUBJECT_TABLE` range for the scope + entity);
+/// 2. relations **from** the entity (`relation_list_from`);
+/// 3. relations **to** the entity (`relation_list_to`);
+/// 4. entity **mentions** (`ENTITY_MENTIONS_TABLE` range).
 ///
 /// Anti-flap: this counts ANY present inbound row — active OR
 /// tombstoned-but-not-yet-reclaimed. A reclaimed row is already

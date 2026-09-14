@@ -13,7 +13,7 @@
 //! is an input here. See `spec/13_retrievers/07_precision_engine.md`.
 //!
 //! The stage is always-on (C0), but its thresholds
-//! ([`PrecisionTuning`](brain_core::PrecisionTuning)) default to no-ops, so an
+//! (`PrecisionTuning`) default to no-ops, so an
 //! uncalibrated deploy reproduces the pre-precision behaviour exactly. Everything
 //! here is pure (no `ctx`, no I/O) and unit-tested.
 

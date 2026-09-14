@@ -81,7 +81,7 @@ const MIN_SNAPSHOTS_KEPT: usize = 1;
 ///   - its age >= `max_age` (oldness rule), or
 ///   - it's outside the newest `max_count` (count rule),
 ///
-/// **and** it is not within the newest [`MIN_SNAPSHOTS_KEPT`] (the
+/// **and** it is not within the newest `MIN_SNAPSHOTS_KEPT` (the
 /// keep-floor always wins). The count/age combination is "either".
 #[must_use]
 pub fn decide_retention(

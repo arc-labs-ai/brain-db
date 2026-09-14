@@ -78,9 +78,9 @@ pub struct RetrievalExecutorContext {
     /// `acme/chatbot` can never anchor on or expand into `acme/research`'s
     /// or `globex`'s typed-graph rows.
     pub caller_space: brain_core::SpaceId,
-    /// Read-scope width for this request. [`ScopeMode::Space`] (the
+    /// Read-scope width for this request. `ScopeMode::Space` (the
     /// default) pins every scoped read to the caller's single
-    /// `(namespace, space)`. [`ScopeMode::Namespace`] widens the *space*
+    /// `(namespace, space)`. `ScopeMode::Namespace` widens the *space*
     /// half only — the read admits every space the caller owns within its
     /// own namespace (namespace-wide RECALL). The namespace wall is never
     /// relaxed by this: even namespace-wide, a read stays inside the

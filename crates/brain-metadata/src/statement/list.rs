@@ -542,7 +542,7 @@ fn statement_row_admits(
 /// position: it can neither be gapped (relocated behind the cursor) nor
 /// re-emitted. Every mutable, wire-visible predicate (`is_current`,
 /// confidence, kind, predicate, tombstone, time) is applied in-walk
-/// against the primary row via [`statement_row_admits`], so `has_more`
+/// against the primary row via `statement_row_admits`, so `has_more`
 /// and the returned `last` are exact.
 pub fn statement_list_page(
     rtxn: &ReadTransaction,

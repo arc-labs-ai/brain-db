@@ -300,7 +300,7 @@ pub struct RelationPage {
 }
 
 /// Keyset (seek) page over relations where `entity` is the `from`
-/// endpoint. See [`list_directional_page`].
+/// endpoint. See `list_directional_page`.
 pub fn relation_list_from_page(
     rtxn: &ReadTransaction,
     scope: RowScope,
@@ -323,7 +323,7 @@ pub fn relation_list_from_page(
 }
 
 /// Keyset (seek) page over relations where `entity` is the `to`
-/// endpoint. See [`list_directional_page`].
+/// endpoint. See `list_directional_page`.
 pub fn relation_list_to_page(
     rtxn: &ReadTransaction,
     scope: RowScope,

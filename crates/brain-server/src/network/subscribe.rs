@@ -302,7 +302,7 @@ struct SubscriptionState {
 /// connection would leak entries until it hit `StreamLimitExceeded`
 /// with zero live subscriptions.
 ///
-/// The reference is a [`Weak`] so a task that outlives its
+/// The reference is a [`Weak`](std::sync::Weak) so a task that outlives its
 /// (per-connection) registry does not resurrect the freed map: if the
 /// registry is gone, the whole `streams` map is gone and the drop is a
 /// no-op. Removing an already-absent key (the `cancel()` raced ahead)

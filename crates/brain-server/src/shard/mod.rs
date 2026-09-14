@@ -1585,7 +1585,7 @@ impl ShardHandle {
     /// Read one page of the historical audit tables. Backs the admin
     /// `GET /v1/audit` + `/v1/audit/export` routes. `limit` bounds the
     /// page; `cursor` resumes strictly after a prior page's last row.
-    /// The returned [`AuditPage::next`] is `Some` when more rows remain.
+    /// The returned `AuditPage::next` is `Some` when more rows remain.
     pub async fn audit_query(
         &self,
         selector: AuditSelector,
@@ -1751,7 +1751,7 @@ struct Shard {
     /// Concrete lexical retriever handle, kept alongside the
     /// `Arc<dyn LexicalRetriever>` in `ops` so the hot tantivy rebuild
     /// (`do_rebuild_tantivy`) can atomically swap its open-index bundle
-    /// via [`TantivyLexicalRetriever::swap_shard`] without disturbing the
+    /// via `TantivyLexicalRetriever::swap_shard` without disturbing the
     /// stable trait handle every reader holds.
     lexical_retriever: Arc<brain_index::TantivyLexicalRetriever>,
     /// Shard directory — root of the `memory_text.tantivy/` and
@@ -1873,7 +1873,7 @@ impl Shard {
     /// Read one page of the historical audit tables under a single redb
     /// read transaction. Walks the index matching `selector`, resuming
     /// strictly after `cursor`, and loads at most `limit` rows. Returns
-    /// [`AuditPage::next`] = `Some` iff at least one further row exists.
+    /// `AuditPage::next` = `Some` iff at least one further row exists.
     ///
     /// Runs on the shard executor (the sole owner of the `metadata.redb`
     /// handle). Deployment-wide operator surface — no tenant scoping.
