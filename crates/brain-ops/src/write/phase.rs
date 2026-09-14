@@ -172,6 +172,15 @@ pub enum Phase {
         declared_relation_types: Vec<String>,
         declared_entity_types: Vec<String>,
         created_at_unix_nanos: u64,
+        /// REPLACE mode: drop *all* declared predicates / relation types /
+        /// extractors in the namespace before the (additive) upload. `false`
+        /// for plain UPLOAD and targeted DROP.
+        replace_all: bool,
+        /// DROP mode: specific declared targets to remove before the upload,
+        /// as `(kind, local_name)` where `kind` matches
+        /// `brain_protocol::schema_drop_target` (0 = predicate,
+        /// 1 = relation_type). Empty for UPLOAD and REPLACE.
+        drops: Vec<(u8, String)>,
     },
 
     /// Write one edge row (forward + auto-mirror for symmetric kinds).
@@ -207,6 +216,15 @@ pub enum Phase {
         reason: u8,
         at_unix_nanos: u64,
     },
+
+    /// Un-tombstone a soft-forgotten memory — the reverse of a soft
+    /// `Tombstone(Memory)`. Re-sets ACTIVE, clears `tombstoned_at`,
+    /// re-inserts the timeline entry, and restores the dedup fingerprint.
+    /// The admin restore trigger builds this after validating the memory
+    /// is soft-forgotten and still within grace; the writer's post-commit
+    /// fan-out enqueues the FORGET-cascade revert so dependent statements
+    /// and relations are re-attached too.
+    RestoreMemory { id: MemoryId, at_unix_nanos: u64 },
 
     /// Supersede a versioned row by another. Statements and relations
     /// support this; memories don't (memories use Tombstone + a new
@@ -440,6 +458,11 @@ pub enum PhaseAck {
     UpsertedSchema {
         namespace: String,
         version: u32,
+        /// Count of declared rows the destructive delta removed before the
+        /// upload (REPLACE / DROP); `0` for a plain additive UPLOAD. Lets the
+        /// REPLACE handler report an accurate `dropped_count` without a
+        /// pre-submit re-scan.
+        dropped: u32,
     },
     Linked,
     Unlinked,
@@ -451,6 +474,13 @@ pub enum PhaseAck {
     Tombstoned {
         target: TombstoneTarget,
         tombstoned_at_unix_nanos: u64,
+    },
+    /// A soft-forgotten memory was un-tombstoned. `already_active` is true
+    /// on an idempotent no-op (the row was never tombstoned) — the apply
+    /// made no change.
+    MemoryRestored {
+        id: MemoryId,
+        already_active: bool,
     },
     Superseded(SupersedeTarget, SupersedeReplacementId),
     SalienceUpdated,
@@ -481,6 +511,10 @@ pub enum PhaseAck {
         /// (the audit log is keyed by `(timestamp, merge_id)`, not by
         /// survivor/merged, so reverse lookup is awkward).
         audit_id: MergeId,
+        /// Statements re-routed from the merged entity onto the survivor.
+        statements_rerouted: u32,
+        /// Relations re-routed from the merged entity onto the survivor.
+        relations_rerouted: u32,
     },
     /// A merge proposal was promoted: the underlying merge was applied
     /// and the proposal row stamped Approved (or AutoApplied for the
@@ -530,6 +564,7 @@ impl Phase {
             Self::Link { .. } => "link",
             Self::Unlink { .. } => "unlink",
             Self::Tombstone { .. } => "tombstone",
+            Self::RestoreMemory { .. } => "restore_memory",
             Self::Supersede { .. } => "supersede",
             Self::UpdateSalience { .. } => "update_salience",
             Self::UpdateKind { .. } => "update_kind",

@@ -227,6 +227,7 @@ async fn seed(fix: &Fixture) -> u128 {
 
 fn recall_req(txn_id: Option<[u8; 16]>) -> RecallRequest {
     RecallRequest {
+        scope: Default::default(),
         trace: false,
         cue_text: "meeting preferences".into(),
         subject_name: String::new(),
@@ -292,6 +293,7 @@ fn recall_p95_substrate_via_internal_entry_point() {
             TxnBeginRequest {
                 txn_id,
                 timeout_seconds: 60,
+                act_as: None,
             },
             [0u8; 16],
             &fix.ctx,

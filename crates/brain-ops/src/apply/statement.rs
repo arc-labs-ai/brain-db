@@ -123,6 +123,37 @@ fn stamp_implicit_predicate_flag(
     Ok(())
 }
 
+/// Tenant wall for a statement mutation. Loads the target row inside the
+/// wtxn and confirms it belongs to the caller's `(namespace, space)`
+/// scope; a row owned by another tenant (or a missing one) reads as
+/// NotFound — no existence leak. Mirrors the memory-layer wall in
+/// `apply_tombstone_memory`: the apply layer is the authoritative,
+/// atomic last line of defense, because a `StatementId` is an
+/// enumerable value and the mutators look rows up by global id alone.
+fn statement_scope_guard(
+    wtxn: &WriteTransaction,
+    id: StatementId,
+    write: &Write,
+) -> Result<(), ApplyError> {
+    let row: Option<StatementMetadata> = {
+        let t = wtxn
+            .open_table(STATEMENTS_TABLE)
+            .map_err(|e| ApplyError::Storage(format!("open statements: {e}")))?;
+        let got = t
+            .get(&id.to_bytes())
+            .map_err(|e| ApplyError::Storage(format!("statement lookup: {e}")))?;
+        got.map(|g| g.value())
+    };
+    let caller = brain_metadata::RowScope::new(write.namespace, write.space_id);
+    match row {
+        Some(m) if m.scope() == caller => Ok(()),
+        _ => Err(ApplyError::NotFound {
+            what: "statement",
+            detail: format!("{id:?}"),
+        }),
+    }
+}
+
 pub fn apply_supersede_statement(
     wtxn: &WriteTransaction,
     phase: &Phase,
@@ -145,6 +176,10 @@ pub fn apply_supersede_statement(
             "expected Supersede with Statement replacement",
         ));
     };
+    // Wall: the caller must own the row it supersedes. `statement_supersede`
+    // re-checks this too (defense in depth); guarding here keeps the write
+    // from touching any table when the target is foreign / absent.
+    statement_scope_guard(wtxn, *old_id, write)?;
     // Explicit STATEMENT_SUPERSEDE carries no session on the phase; the
     // replacement row lands in the default session (session grouping is
     // driven by the write-path UpsertStatement, not the supersede verb).
@@ -163,7 +198,7 @@ pub fn apply_supersede_statement(
 pub fn apply_tombstone_statement(
     wtxn: &WriteTransaction,
     phase: &Phase,
-    _write: &Write,
+    write: &Write,
 ) -> Result<PhaseAck, ApplyError> {
     let Phase::Tombstone {
         target,
@@ -176,6 +211,10 @@ pub fn apply_tombstone_statement(
     let TombstoneTarget::Statement(id) = target else {
         return Err(ApplyError::PhaseMisShape("expected Tombstone(Statement)"));
     };
+    // Wall: STATEMENT_TOMBSTONE / STATEMENT_RETRACT share this apply path
+    // and the metadata mutator looks the row up by global id, so the
+    // tenant check must happen here (mirroring the memory FORGET wall).
+    statement_scope_guard(wtxn, *id, write)?;
     let reason = TombstoneReason::from_u8(*reason).unwrap_or(TombstoneReason::UserRequest);
     statement_tombstone(wtxn, *id, reason, *at_unix_nanos)
         .map_err(|e| ApplyError::Metadata(format!("statement_tombstone: {e}")))?;
@@ -242,5 +281,236 @@ fn build_evidence_ref(phase_ref: &EvidenceRefPhase) -> EvidenceRef {
             EvidenceRef::inline(sv)
         }
         EvidenceRefPhase::Overflow(id) => EvidenceRef::Overflow(*id),
+    }
+}
+
+#[cfg(all(test, not(miri)))]
+mod tenant_wall_tests {
+    //! Cross-tenant write isolation for the statement apply path. A
+    //! caller in tenant B must not be able to tombstone / retract /
+    //! supersede a statement owned by tenant A; the mutation reads as
+    //! NotFound and A's row is left untouched.
+    use super::*;
+    use brain_core::{
+        Entity, EntityId, EntityType, EvidenceRef as CoreEvidenceRef, ExtractorId, PredicateId,
+        SessionId, StatementId, StatementKind, StatementObject, StatementValue, SubjectRef,
+    };
+    use brain_metadata::entity::ops::{entity_put, normalize_name};
+    use brain_metadata::schema::predicate::predicate_intern;
+    use brain_metadata::statement::{statement_create, statement_get};
+    use brain_metadata::{MetadataDb, RowScope};
+    use tempfile::TempDir;
+
+    use crate::write::{
+        Phase, SupersedeReplacement, SupersedeTarget, TombstoneTarget, Write, WriteId,
+    };
+
+    const NOW: u64 = 1_700_000_000_000_000_000;
+
+    fn scope_a() -> RowScope {
+        RowScope::from_bytes(1, [0xA1; 16])
+    }
+    fn scope_b() -> RowScope {
+        RowScope::from_bytes(2, [0xB2; 16])
+    }
+
+    fn open_db() -> (TempDir, MetadataDb) {
+        let dir = TempDir::new().unwrap();
+        let db = MetadataDb::open(dir.path().join("meta.redb")).unwrap();
+        (dir, db)
+    }
+
+    fn write_for(scope: RowScope, phase: Phase) -> Write {
+        Write::single(WriteId::new(), scope.space(), phase).with_namespace(scope.namespace())
+    }
+
+    fn make_entity(db: &MetadataDb, scope: RowScope, name: &str) -> EntityId {
+        let id = EntityId::new();
+        let e = Entity::new_active(
+            id,
+            EntityType::PERSON_ID,
+            name.into(),
+            normalize_name(name),
+            NOW,
+        );
+        let wtxn = db.write_txn().unwrap();
+        entity_put(&wtxn, scope, SessionId::DEFAULT, &e).unwrap();
+        wtxn.commit().unwrap();
+        id
+    }
+
+    fn intern_fact(db: &MetadataDb, name: &str) -> PredicateId {
+        let wtxn = db.write_txn().unwrap();
+        let id = predicate_intern(
+            &wtxn,
+            "test",
+            name,
+            Some(StatementKind::Fact),
+            2,
+            1,
+            "",
+            false,
+            NOW,
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+        id
+    }
+
+    fn fresh_fact(subject: EntityId, predicate: PredicateId, value: &str) -> brain_core::Statement {
+        brain_core::Statement::new_root(
+            StatementId::new(),
+            StatementKind::Fact,
+            SubjectRef::Entity(subject),
+            predicate,
+            StatementObject::Value(StatementValue::Text(value.into())),
+            0.9,
+            CoreEvidenceRef::default(),
+            ExtractorId::from(0),
+            NOW,
+            1,
+        )
+    }
+
+    /// Seed a current Fact owned by tenant A; returns its id.
+    fn seed_a(db: &MetadataDb) -> StatementId {
+        let subj = make_entity(db, scope_a(), "ada");
+        let pred = intern_fact(db, "knows");
+        let s = fresh_fact(subj, pred, "lovelace");
+        let wtxn = db.write_txn().unwrap();
+        statement_create(&wtxn, scope_a(), SessionId::DEFAULT, &s, NOW).unwrap();
+        wtxn.commit().unwrap();
+        s.id
+    }
+
+    fn tombstone_phase(id: StatementId) -> Phase {
+        Phase::Tombstone {
+            target: TombstoneTarget::Statement(id),
+            reason: brain_core::TombstoneReason::UserRequest.as_u8(),
+            at_unix_nanos: NOW + 1_000,
+        }
+    }
+
+    #[test]
+    fn cross_tenant_tombstone_denied_and_row_untouched() {
+        let (_dir, db) = open_db();
+        let id = seed_a(&db);
+
+        let wtxn = db.write_txn().unwrap();
+        let err = apply_tombstone_statement(
+            &wtxn,
+            &tombstone_phase(id),
+            &write_for(scope_b(), tombstone_phase(id)),
+        )
+        .expect_err("tenant B must not tombstone tenant A's statement");
+        assert!(matches!(
+            err,
+            ApplyError::NotFound {
+                what: "statement",
+                ..
+            }
+        ));
+        drop(wtxn);
+
+        let rtxn = db.read_txn().unwrap();
+        let got = statement_get(&rtxn, id).unwrap().expect("A's row present");
+        assert!(!got.tombstoned, "A's row must not be tombstoned");
+        assert!(
+            got.superseded_by.is_none(),
+            "A's row must not be superseded"
+        );
+    }
+
+    #[test]
+    fn cross_tenant_retract_denied_and_row_untouched() {
+        // Retract shares the tombstone apply path (Retract reason byte).
+        let (_dir, db) = open_db();
+        let id = seed_a(&db);
+        let phase = Phase::Tombstone {
+            target: TombstoneTarget::Statement(id),
+            reason: brain_core::TombstoneReason::Retract.as_u8(),
+            at_unix_nanos: NOW + 1_000,
+        };
+
+        let wtxn = db.write_txn().unwrap();
+        let err = apply_tombstone_statement(&wtxn, &phase, &write_for(scope_b(), phase.clone()))
+            .expect_err("tenant B must not retract tenant A's statement");
+        assert!(matches!(
+            err,
+            ApplyError::NotFound {
+                what: "statement",
+                ..
+            }
+        ));
+        drop(wtxn);
+
+        let rtxn = db.read_txn().unwrap();
+        let got = statement_get(&rtxn, id).unwrap().unwrap();
+        assert!(!got.tombstoned);
+    }
+
+    #[test]
+    fn cross_tenant_supersede_denied_no_row_in_victim_scope() {
+        let (_dir, db) = open_db();
+        // Old row owned by A; the B caller reuses A's subject/predicate so
+        // the only thing standing between B and a cross-tenant write is
+        // the wall.
+        let subj = make_entity(&db, scope_a(), "grace");
+        let pred = intern_fact(&db, "wrote");
+        let old = fresh_fact(subj, pred, "cobol");
+        {
+            let wtxn = db.write_txn().unwrap();
+            statement_create(&wtxn, scope_a(), SessionId::DEFAULT, &old, NOW).unwrap();
+            wtxn.commit().unwrap();
+        }
+        let replacement = fresh_fact(subj, pred, "flow-matic");
+        let new_id = replacement.id;
+        let phase = Phase::Supersede {
+            target: SupersedeTarget::Statement(old.id),
+            replacement: SupersedeReplacement::Statement(Box::new(replacement)),
+            at_unix_nanos: NOW + 1_000,
+        };
+
+        let wtxn = db.write_txn().unwrap();
+        let err = apply_supersede_statement(&wtxn, &phase, &write_for(scope_b(), phase.clone()))
+            .expect_err("tenant B must not supersede tenant A's statement");
+        assert!(matches!(
+            err,
+            ApplyError::NotFound {
+                what: "statement",
+                ..
+            }
+        ));
+        drop(wtxn);
+
+        let rtxn = db.read_txn().unwrap();
+        let old_got = statement_get(&rtxn, old.id).unwrap().unwrap();
+        assert!(
+            old_got.superseded_by.is_none() && !old_got.tombstoned,
+            "A's row must stay current, not superseded"
+        );
+        assert!(
+            statement_get(&rtxn, new_id).unwrap().is_none(),
+            "no B-authored replacement may land in A's scope"
+        );
+    }
+
+    #[test]
+    fn same_tenant_tombstone_succeeds() {
+        let (_dir, db) = open_db();
+        let id = seed_a(&db);
+
+        let wtxn = db.write_txn().unwrap();
+        apply_tombstone_statement(
+            &wtxn,
+            &tombstone_phase(id),
+            &write_for(scope_a(), tombstone_phase(id)),
+        )
+        .expect("same-tenant tombstone must succeed");
+        wtxn.commit().unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        let got = statement_get(&rtxn, id).unwrap().unwrap();
+        assert!(got.tombstoned, "same-tenant tombstone must apply");
     }
 }

@@ -65,7 +65,11 @@ fn validate_identifier(
             },
         });
     }
-    if s.len() > max {
+    // Bounded by Unicode code points, not bytes, so a multibyte name
+    // (作用于, wirkt_gegen) isn't clipped far below the stated char limit —
+    // matching the predicate-name validator. 64 code points is ≤ 256 bytes,
+    // so it stays within the wire identifier bound.
+    if s.chars().count() > max {
         return Err(RelationTypeOpError::InvalidIdentifier {
             reason: match label {
                 "namespace" => "namespace exceeds 32 chars",
@@ -457,6 +461,71 @@ pub fn relation_type_drop_schema_declared(
     Ok(count)
 }
 
+/// Resolve a relation_type id by `(namespace, name)` inside a write
+/// txn. The write-txn counterpart to [`relation_type_lookup_by_qname`],
+/// mirroring [`crate::schema::predicate::predicate_id_by_qname`]; lets a
+/// composing handler resolve the id and mutate in one transaction.
+pub fn relation_type_id_by_qname(
+    wtxn: &WriteTransaction,
+    namespace: &str,
+    name: &str,
+) -> Result<Option<RelationTypeId>, RelationTypeOpError> {
+    validate_namespace(namespace)?;
+    validate_name(name)?;
+    let q = qname(namespace, name);
+    let idx = wtxn.open_table(RELATION_TYPES_BY_QNAME_TABLE)?;
+    let found = idx
+        .get(q.as_str())?
+        .map(|g| RelationTypeId::from(g.value()));
+    Ok(found)
+}
+
+/// Drop a single schema-declared relation_type row identified by
+/// `(namespace, name)`. The scoped counterpart to
+/// [`relation_type_drop_schema_declared`], used by `SCHEMA_DROP` to
+/// narrow one declaration instead of wiping the namespace.
+///
+/// Returns `Some(id)` when a schema-declared relation_type with that
+/// qname existed and was removed, `None` otherwise. An
+/// implicit-from-write row sharing the qname is left untouched.
+pub fn relation_type_drop_one(
+    wtxn: &WriteTransaction,
+    namespace: &str,
+    name: &str,
+) -> Result<Option<RelationTypeId>, RelationTypeOpError> {
+    validate_namespace(namespace)?;
+    validate_name(name)?;
+
+    let q = qname(namespace, name);
+    let victim: Option<u32> = {
+        let idx = wtxn.open_table(RELATION_TYPES_BY_QNAME_TABLE)?;
+        let id = idx.get(q.as_str())?.map(|g| g.value());
+        drop(idx);
+        match id {
+            Some(id) => {
+                let t = wtxn.open_table(RELATION_TYPES_TABLE)?;
+                let row: Option<RelationTypeDefinition> = t.get(&id)?.map(|g| g.value());
+                match row {
+                    Some(r) if r.origin().is_schema_declared() => Some(id),
+                    _ => None,
+                }
+            }
+            None => None,
+        }
+    };
+    if let Some(id) = victim {
+        {
+            let mut t = wtxn.open_table(RELATION_TYPES_TABLE)?;
+            t.remove(&id)?;
+        }
+        {
+            let mut idx = wtxn.open_table(RELATION_TYPES_BY_QNAME_TABLE)?;
+            idx.remove(q.as_str())?;
+        }
+    }
+    Ok(victim.map(RelationTypeId::from))
+}
+
 // ---------------------------------------------------------------------------
 // Embeddings.
 // ---------------------------------------------------------------------------
@@ -495,7 +564,7 @@ pub fn relation_type_embedding_get(
     };
     let bytes = g.value();
     let mut out = Vec::with_capacity(bytes.len() / 4);
-    for chunk in bytes.chunks_exact(4) {
+    for chunk in bytes.as_chunks::<4>().0.iter() {
         out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }
     Ok(Some(out))

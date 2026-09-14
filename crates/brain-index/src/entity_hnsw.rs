@@ -244,27 +244,60 @@ impl EntityHnswIndex {
             }
         };
 
-        let fetch_k = k.saturating_mul(OVER_FACTOR).min(self.forward.len());
-        let neighbours: Vec<Neighbour> = self.inner.search(query.as_slice(), fetch_k, ef);
+        // Escalate the fetch width (and `ef`) when tombstone attrition
+        // starves the post-filter result set. A single fixed fetch can
+        // return fewer than `k` live neighbours if more than half of the
+        // top candidates were tombstoned by FORGET/consolidation before
+        // the next rebuild; widen until we have `k` live results or the
+        // graph is exhausted. Termination is guaranteed: `fetch_k` is
+        // capped at the node count and `ef` at `ef_search_max`.
+        let total_nodes = self.forward.len();
+        let mut ef = ef;
+        let mut fetch_multiplier = OVER_FACTOR;
         let mut out: Vec<(EntityId, f32)> = Vec::with_capacity(k);
-        for n in neighbours {
+        loop {
+            out.clear();
+            let fetch_k = k.saturating_mul(fetch_multiplier).min(total_nodes);
+            let neighbours: Vec<Neighbour> = self.inner.search(query.as_slice(), fetch_k, ef);
+            for n in neighbours {
+                if out.len() >= k {
+                    break;
+                }
+                let Ok(internal_id) = u32::try_from(n.d_id) else {
+                    continue;
+                };
+                if self.tombstones.is_set(internal_id) {
+                    continue;
+                }
+                let Some(Some(entity_id)) = self.forward.get(internal_id as usize) else {
+                    tracing::warn!(
+                        internal_id,
+                        "entity HNSW returned an internal id with no EntityId mapping; dropping"
+                    );
+                    continue;
+                };
+                out.push((*entity_id, 1.0 - n.distance));
+            }
+
             if out.len() >= k {
                 break;
             }
-            let Ok(internal_id) = u32::try_from(n.d_id) else {
-                continue;
-            };
-            if self.tombstones.is_set(internal_id) {
-                continue;
-            }
-            let Some(Some(entity_id)) = self.forward.get(internal_id as usize) else {
-                tracing::warn!(
-                    internal_id,
-                    "entity HNSW returned an internal id with no EntityId mapping; dropping"
+            let fetch_saturated = fetch_k >= total_nodes;
+            let ef_saturated = ef >= self.params.ef_search_max;
+            if fetch_saturated && ef_saturated {
+                tracing::debug!(
+                    requested_k = k,
+                    returned = out.len(),
+                    "entity HNSW search bailout exhausted; returning partial results"
                 );
-                continue;
-            };
-            out.push((*entity_id, 1.0 - n.distance));
+                break;
+            }
+            if !fetch_saturated {
+                fetch_multiplier = fetch_multiplier.saturating_mul(2);
+            }
+            if !ef_saturated {
+                ef = ef.saturating_mul(2).min(self.params.ef_search_max);
+            }
         }
         // hnsw_rs returns ascending by distance → descending by
         // similarity once we convert. Already in the right order;
@@ -363,6 +396,28 @@ impl EntityHnswIndex {
     }
 }
 
+/// Read-only entity vector search as the resolve handler (tier 3) needs it.
+///
+/// Abstracts the concrete per-shard [`EntityHnswIndex`] behind an object-safe
+/// trait so `brain-ops` can query the index without owning its lock or the
+/// `hnsw_rs` types. The query is a plain `&[f32]` (the caller's embedding, of
+/// [`VECTOR_DIM`]); implementations return `(entity, cosine)` pairs descending
+/// by score and yield an empty vec when the index is empty or the query is the
+/// wrong width — the resolver treats "no in-band hit" and "no index" the same
+/// (fall through to the create fallback).
+pub trait EntityVectorIndex: Send + Sync {
+    /// Top-`k` nearest live entities to `query` (cosine, descending).
+    fn search(&self, query: &[f32], k: usize) -> Vec<(EntityId, f32)>;
+
+    /// Insert `(entity_id, vector)` into the index unless the entity is already
+    /// present. Best-effort: a wrong-width vector or an insert error leaves the
+    /// entity durable but tier-3-unreachable until a rebuild (implementations
+    /// log and move on rather than failing the caller's write). Lets the write
+    /// path keep explicitly-created entities embedding-resolvable, matching the
+    /// extraction path which already stages entity vectors into the index.
+    fn insert(&self, entity_id: EntityId, vector: &[f32]);
+}
+
 // ---------------------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------------------
@@ -385,9 +440,30 @@ mod tests {
         v
     }
 
+    /// The query / anchor vector the widening tests probe with.
+    fn query() -> [f32; VECTOR_DIM] {
+        one_hot(0)
+    }
+
+    /// A vector in a tight cluster around [`query`]: a dominant query
+    /// component plus a unique perturbation of magnitude `mag` on dimension
+    /// `1 + seed`. Cosine to the query is ~1.0 and every such point occupies
+    /// a distinct location (no duplicate cluster to trap the traversal), so
+    /// the small graphs stay well-connected and HNSW returns them with
+    /// essentially full recall. `mag` sets the (small) distance from the
+    /// query: smaller = nearer. The tests never depend on HNSW surfacing
+    /// genuinely far nodes, which it does not guarantee on tiny graphs.
+    fn near_at(seed: usize, mag: f32) -> [f32; VECTOR_DIM] {
+        let mut v = zeros();
+        v[0] = 1.0;
+        v[1 + (seed % (VECTOR_DIM - 1))] = mag;
+        v
+    }
+
     // The params / insert / search / tombstone / rebuild matrix is covered
     // by the strictly-richer suite in `statement_hnsw.rs`. Only the
-    // entity-specific `is_tombstoned` round-trip lives here.
+    // entity-specific `is_tombstoned` round-trip and the search-widening
+    // escalation live here.
 
     #[test]
     fn is_tombstoned_round_trip() {
@@ -397,5 +473,92 @@ mod tests {
         assert!(!idx.is_tombstoned(id));
         idx.mark_tombstoned(id).unwrap();
         assert!(idx.is_tombstoned(id));
+    }
+
+    #[test]
+    fn search_widens_past_tombstone_attrition() {
+        // A dense hub of 24 tombstoned entities occupies the query's nearest
+        // ring — far more than the initial fetch window (k*OVER_FACTOR =
+        // 5*2 = 10) — so a single fixed fetch lands entirely on tombstoned
+        // neighbours and collapses to zero live results. A comfortable
+        // surplus of 12 live entities sits in a slightly farther ring of the
+        // same tight cluster (each ~cosine 1.0 to the query, all on distinct
+        // dimensions so the graph is densely connected and HNSW recalls them
+        // reliably). Escalation must widen the fetch past the tombstoned
+        // front until the k live results survive.
+        //
+        // Density is load-bearing: a large, well-connected cluster (as in the
+        // reliable statement-question widening test) lets the widened search
+        // reach the live ring; a sparse handful of points can leave the far
+        // ring unreachable on the approximate graph.
+        let mut idx = EntityHnswIndex::new(EntityHnswParams::default_v1()).unwrap();
+        let tombstoned: Vec<EntityId> = (0..24).map(|_| EntityId::new()).collect();
+        for (i, id) in tombstoned.iter().enumerate() {
+            idx.insert(*id, &near_at(i, 0.01)).unwrap();
+        }
+        let live: Vec<EntityId> = (0..12).map(|_| EntityId::new()).collect();
+        for (i, id) in live.iter().enumerate() {
+            idx.insert(*id, &near_at(30 + i, 0.02)).unwrap();
+        }
+        for id in &tombstoned {
+            idx.mark_tombstoned(*id).unwrap();
+        }
+
+        let r = idx.search(&query(), 5).unwrap();
+        assert_eq!(r.len(), 5, "escalation should still return k live results");
+        let got: Vec<EntityId> = r.iter().map(|(id, _)| *id).collect();
+        for id in &tombstoned {
+            assert!(!got.contains(id), "tombstoned id surfaced after widening");
+        }
+        for id in &got {
+            assert!(live.contains(id), "unexpected non-live entity in results");
+        }
+    }
+
+    #[test]
+    fn search_exhausts_cleanly_when_fewer_than_k_live() {
+        // Only 3 live of 6 total; search(k=5) can never reach k, so it must
+        // terminate cleanly (no infinite escalation loop) and return only live
+        // survivors — never fabricate up to k, never leak a tombstoned entry.
+        // The 3 live entities sit in a tight cluster around the query (cosine
+        // ~1.0) while the 3 tombstoned entities are orthogonal to it (cosine
+        // ~0, distinct far dimensions), so the live trio is unambiguously the
+        // query's nearest neighbourhood.
+        //
+        // The assertions bound the exhaustion behaviour — a non-empty subset
+        // of the live set, strictly fewer than k, with no tombstoned leak —
+        // rather than demanding exact full recall. Exactly how many of the
+        // few live points HNSW surfaces from a tiny graph is an approximate-
+        // recall property of the index itself (even ef widened to its maximum
+        // occasionally drops one node on a near-degenerate graph), not of the
+        // exhaustion/termination logic this test exists to pin down.
+        let mut idx = EntityHnswIndex::new(EntityHnswParams::default_v1()).unwrap();
+        let live: Vec<EntityId> = (0..3).map(|_| EntityId::new()).collect();
+        for (i, id) in live.iter().enumerate() {
+            idx.insert(*id, &near_at(i, 0.01)).unwrap();
+        }
+        let tombstoned: Vec<EntityId> = (0..3).map(|_| EntityId::new()).collect();
+        for (i, id) in tombstoned.iter().enumerate() {
+            idx.insert(*id, &one_hot(100 + i)).unwrap();
+            idx.mark_tombstoned(*id).unwrap();
+        }
+
+        let r = idx.search(&query(), 5).unwrap();
+        assert!(!r.is_empty(), "live survivors must remain reachable");
+        assert!(
+            r.len() <= live.len(),
+            "must not return more than the live count on exhaustion"
+        );
+        assert!(
+            r.len() < 5,
+            "cannot reach k when fewer than k live entries exist"
+        );
+        let got: Vec<EntityId> = r.iter().map(|(id, _)| *id).collect();
+        for id in &got {
+            assert!(live.contains(id), "returned id must be a live survivor");
+        }
+        for id in &tombstoned {
+            assert!(!got.contains(id), "tombstoned id must not surface");
+        }
     }
 }

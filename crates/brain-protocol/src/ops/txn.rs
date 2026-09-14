@@ -1,12 +1,21 @@
 //! TXN_BEGIN / TXN_COMMIT / TXN_ABORT requests.
 
 use crate::envelope::request::WireUuid;
+use crate::ops::memory::ActAs;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TxnBeginRequest {
     #[serde(with = "serde_bytes")]
     pub txn_id: WireUuid,
     pub timeout_seconds: u32,
+    /// Effective identity every write buffered in this transaction commits
+    /// as, on behalf of the authenticated connection principal. Delegation
+    /// is fixed at begin and applies to the whole txn: `TXN_COMMIT` carries
+    /// no `act_as` of its own — the commit runs under whatever identity the
+    /// begin established. `None` (the common case, and omitted on the wire)
+    /// means the txn commits as the connection's own key-bound identity.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

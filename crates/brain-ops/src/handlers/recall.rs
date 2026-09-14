@@ -14,6 +14,7 @@
 //! side before the merge.
 
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use brain_core::{EntityId, MemoryId, SessionId, Slot, SubjectRef};
 use brain_index::RankedItemId;
@@ -27,7 +28,7 @@ use brain_planner::retrieval::planner::{plan as retrieval_plan, PlanError};
 use brain_planner::retrieval::router::{
     QueryRequest as PlannerQueryRequest, Retriever, RetrieverSelection,
 };
-use brain_protocol::envelope::request::{MemoryKindWire, RecallRequest};
+use brain_protocol::envelope::request::{MemoryKindWire, RecallRequest, RecallScopeWire};
 use brain_protocol::envelope::response::{
     AnswerKindWire, MemoryResult, RankedItemKindWire, RecallResponseFrame, RecallTrace,
     RecallTraceCandidate, RecallTraceDroppedId, RecallTraceFilterChain, RecallTraceFusion,
@@ -41,6 +42,7 @@ use crate::grounded::{
     grounded_answer_walk, project_statement_slot, AnswerKind, GroundedAnswer, GroundedValue,
     SLOT_PROJECTION_STRONG_FLOOR,
 };
+use crate::metrics::{QueryOutcome, RetrieverKind};
 use crate::txn::BufferedEncode;
 
 /// Upper bound on the safety cap for returned items (`max_results`).
@@ -81,10 +83,60 @@ pub const MAX_RECALL_FILTER_ENTRIES: usize = 1024;
 /// of subjects at most.
 pub const MAX_SUBJECT_CANDIDATES: usize = 8;
 
+/// Upper bound on the number of DISTINCT surfaces mined from a cue that are
+/// handed to the (heavy) entity resolver. `MAX_SUBJECT_CANDIDATES` bounds the
+/// resolver's OUTPUT; this bounds its INVOCATIONS. Without it a cue-only RECALL
+/// (empty `subject_name`) calls `entity_resolve_scored` once per distinct token
+/// — a heavy trigram scan over every entity type — so a multi-megabyte cue of
+/// distinct non-resolving tokens (the wire cap is 16 MiB) would starve the
+/// single-writer shard core with resolver calls even though few or none
+/// resolve. Real cues name a handful of subjects; 32 is generous headroom while
+/// keeping the per-call resolver work strictly bounded.
+pub const MAX_CUE_SURFACES: usize = 32;
+
+/// Upper bound on how many whitespace tokens of the cue are SCANNED while
+/// mining surfaces. Bounds the token walk itself so a cue that is millions of
+/// copies of a handful of distinct tokens (which would never fill
+/// `MAX_CUE_SURFACES` and so never trip that cap) still can't force an O(cue)
+/// scan on the shard core. Far above any real cue length.
+pub const MAX_CUE_TOKENS_SCANNED: usize = 256;
+
+/// The read-scope width this request runs under, as the centralized
+/// [`brain_metadata::ScopeMode`] the `admits` predicate takes. `Space` (the
+/// default) pins reads to the caller's single `(namespace, space)`;
+/// `Namespace` widens the space half within the caller's own namespace.
+///
+/// While `handle_recall` still refuses `scope = Namespace` at the door (the
+/// cross-shard fan-out lands in a later phase), this is the single point
+/// that maps the wire scope onto the retrieval mode, so the whole read path
+/// is already threaded for when the gate lifts.
+fn recall_scope_mode(req: &RecallRequest) -> brain_metadata::ScopeMode {
+    match req.scope {
+        RecallScopeWire::Namespace => brain_metadata::ScopeMode::Namespace,
+        RecallScopeWire::Space => brain_metadata::ScopeMode::Space,
+    }
+}
+
 pub async fn handle_recall(
     mut req: RecallRequest,
     ctx: &OpsContext,
 ) -> Result<RecallResponseFrame, OpError> {
+    // Namespace-wide recall (scope = Namespace) requires cross-shard fan-out +
+    // global merge at the connection layer (spec §"Recall scope"). A single
+    // shard's handler cannot serve it — it would see only this shard's spaces —
+    // so it is refused here until that fan-out path lands. Single-space recall
+    // (the default) is unaffected. Lifts when the router-level fan-out is wired.
+    if matches!(req.scope, RecallScopeWire::Namespace) {
+        return Err(OpError::InvalidRequest(
+            "namespace-wide recall (scope=Namespace) is not yet supported".into(),
+        ));
+    }
+
+    // End-to-end wall clock for the query metric family. One `Instant`
+    // per recall (cheap), covering the whole read — fan-out, grounding
+    // overlay, membership shaping, and abstention — not just the
+    // executor's fan-out window. Recorded once, at each return point.
+    let recall_started = Instant::now();
     // Did the caller ask for a specific result count? `0` means "no count, use
     // the server default"; any non-zero value is an explicit caller cap. We
     // capture this BEFORE normalising `max_results` below, because the keyed
@@ -92,36 +144,7 @@ pub async fn handle_recall(
     // default window when the caller never asked for a count — and the
     // normalisation overwrites `0` with the default, erasing the distinction.
     let client_requested_count = req.max_results != 0;
-
-    // Normalise the safety cap. `0` means "server default"; anything
-    // above the hard ceiling is clamped (not rejected) — the cap is a
-    // bound, never the caller's intent. The answer's shape comes from
-    // the data, so there is no "zero results" request to honour here.
-    if req.max_results == 0 {
-        req.max_results = DEFAULT_RECALL_RESULTS;
-    }
-    if req.max_results > MAX_RECALL_RESULTS {
-        req.max_results = MAX_RECALL_RESULTS;
-    }
-    // A memory without its text is useless to the caller — recall always
-    // returns the remembered text. `include_text` is not a knob anyone
-    // wants set to false; force it on regardless of what the client sent.
-    // (The wire field is retained for now; a later lockstep pass drops it.)
-    req.include_text = true;
-    if let Some(ref ctxs) = req.session_filter {
-        if ctxs.len() > MAX_RECALL_FILTER_ENTRIES {
-            return Err(OpError::InvalidRequest(format!(
-                "recall: session_filter must have <= {MAX_RECALL_FILTER_ENTRIES} entries"
-            )));
-        }
-    }
-    if let Some(ref kinds) = req.kind_filter {
-        if kinds.len() > MAX_RECALL_FILTER_ENTRIES {
-            return Err(OpError::InvalidRequest(format!(
-                "recall: kind_filter must have <= {MAX_RECALL_FILTER_ENTRIES} entries"
-            )));
-        }
-    }
+    normalize_recall_request(&mut req)?;
 
     // Brain is a memory database: a recall returns one memory, an array of
     // memories, or none — never raw retrieval lanes. There is ONE unified read
@@ -139,59 +162,146 @@ pub async fn handle_recall(
     //      always-on without the subject-dump flooding that sinks recall.
     //   3. The answer's shape (Single / Many / None) follows the count.
 
+    // The read runs in two composable stages so namespace-wide RECALL reuses the
+    // EXACT same shaping as single-space RECALL (no second copy of the answer
+    // logic). `gather_recall` is the associative + typed-graph fan-out over the
+    // caller's read scope, producing a raw candidate pool; `shape_recall` turns a
+    // pool into the shaped answer (grounding overlay + membership + abstention).
+    // A single-space recall runs both here on one shard. A namespace-wide recall
+    // fans `gather_recall` out to every shard (`recall_gather_namespace`), merges
+    // the pools at the connection layer, and runs `shape_recall` once over the
+    // merged pool on the bound shard (`recall_shape_namespace`).
+    let gathered = gather_recall(&req, ctx).await?;
+    shape_recall(gathered, &req, ctx, client_requested_count, recall_started)
+}
+
+/// The raw candidate pool a single shard produced for a recall, plus the
+/// per-request shaping signals it computed locally (`grounded`, `hype_scores`).
+/// For namespace-wide recall the connection layer collects one of these per
+/// shard and merges all three signals ([`merge_recall_pools`] for the pool,
+/// plus the HyPE union and best-grounded pick) before a single global shaping
+/// pass — so a grounded commit and the HyPE answer-lead work ACROSS shards, not
+/// just on the coordinator.
+struct RecallGathered {
+    memories: Vec<MemoryResult>,
+    trace: Option<RecallTrace>,
+    metric_sample: RecallMetricSample,
+    cue_vec: Option<[f32; brain_embed::VECTOR_DIM]>,
+    anchor: Option<EntityId>,
+    /// The typed-graph grounded answer computed on this shard (over its own
+    /// spaces). `NoAnswer` when no cue vector, or no subject/predicate cleared
+    /// the match floor here.
+    grounded: GroundedOutcome,
+    /// HyPE answer-lead scores (memory_id → best question-bridge cosine) from
+    /// this shard's HyPE index. Empty when no cue vector.
+    hype_scores: HashMap<u128, f32>,
+}
+
+/// Stage 1 — the associative (semantic + lexical) + typed-graph fan-out over the
+/// caller's read scope, RRF-fused and reranked into a raw candidate pool. No
+/// membership shaping happens here, so the pool is safe to merge with other
+/// shards' pools before a single global shaping pass.
+async fn gather_recall(req: &RecallRequest, ctx: &OpsContext) -> Result<RecallGathered, OpError> {
     // Embed the cue once for the grounding overlay. A failed embed degrades to
     // the plain fan-out — grounding is an overlay, never a reason to fail the
     // read.
     let cue_vec = ctx.executor.embedder.embed(&req.cue_text).ok();
+    // The entity-graph traversal lane is anchored on the cue's resolved subject;
+    // `retrieve_memories` cue-conditions the graph candidates so the structural
+    // walk can't re-introduce the subject-dump flood.
+    let anchor = resolve_graph_anchor(req, ctx);
+    let (memories, trace, metric_sample) =
+        retrieve_memories(req, ctx, anchor, cue_vec.as_ref()).await?;
+    // Compute the grounding overlay + HyPE answer-lead HERE (per shard), not in
+    // `shape_recall`, so a namespace-wide fan-out can gather each shard's local
+    // signals and merge them — letting the grounded commit and the HyPE ordering
+    // reflect the whole namespace, not just the coordinator's spaces.
+    let (grounded, hype_scores) = compute_grounding(req, ctx, cue_vec.as_ref())?;
+    Ok(RecallGathered {
+        memories,
+        trace,
+        metric_sample,
+        cue_vec,
+        anchor,
+        grounded,
+        hype_scores,
+    })
+}
 
-    // Statement lanes are always searched inside `retrieve_memories` (cue-driven,
-    // never gated). The entity-graph traversal lane is ALSO always lit: we anchor
-    // it on the cue's resolved subject and `retrieve_memories` cue-conditions the
-    // graph candidates (scaling each by its cosine to the query), so the
-    // structural walk can't re-introduce the subject-dump flood. No flags: every
-    // read traverses everything the write built, ranked by relevance to the cue.
-    let anchor = resolve_graph_anchor(&req, ctx);
-    // `trace` is `Some` only when the caller opted in (`req.trace`); it carries
-    // the read pipeline's per-stage observability the executor already computed
-    // and otherwise discards. It rides through to the final frame untouched.
-    let (memories, trace) = retrieve_memories(&req, ctx, anchor, cue_vec.as_ref()).await?;
+/// Compute the typed-graph grounded answer + the HyPE answer-lead scores for a
+/// cue on THIS shard (over its own spaces). Factored out of the read stages so
+/// both the single-shard gather and any future re-computation share one
+/// definition. Returns `(NoAnswer, empty)` when there is no cue vector.
+fn compute_grounding(
+    req: &RecallRequest,
+    ctx: &OpsContext,
+    cue_vec: Option<&[f32; brain_embed::VECTOR_DIM]>,
+) -> Result<(GroundedOutcome, HashMap<u128, f32>), OpError> {
+    let Some(cue_vec) = cue_vec else {
+        return Ok((GroundedOutcome::NoAnswer, HashMap::new()));
+    };
+    let grounded = best_grounded_for_cue(req, ctx, cue_vec)?;
+    // HyPE questions are stored query-side (embed_query, BGE query prefix), so
+    // the cue must be embedded the SAME way for the answer-lead cosine to be
+    // in-distribution; fall back to the plain cue if the prefixed embed fails.
+    let hype_cue_vec = ctx
+        .executor
+        .embedder
+        .embed_query(&req.cue_text)
+        .unwrap_or(*cue_vec);
+    let hype_scores: HashMap<u128, f32> = ctx
+        .semantic_retriever
+        .hype_scores_for_query(&hype_cue_vec, RECALL_CANDIDATE_POOL as usize)
+        .into_iter()
+        .map(|(id, s)| (id.raw(), s))
+        .collect();
+    Ok((grounded, hype_scores))
+}
+
+/// Stage 2 — turn a candidate pool (this shard's, or the cross-shard merge)
+/// into the shaped answer: typed-graph grounding overlay, the membership set,
+/// and the two abstention gates. Cross-shard members degrade gracefully — the
+/// per-shard signals (`vector_for`, grounding, HyPE) simply miss for a member
+/// owned by another shard and fall back to the score already on the
+/// `MemoryResult`, so the merged answer is coherent without those refinements.
+fn shape_recall(
+    gathered: RecallGathered,
+    req: &RecallRequest,
+    ctx: &OpsContext,
+    client_requested_count: bool,
+    recall_started: Instant,
+) -> Result<RecallResponseFrame, OpError> {
+    let RecallGathered {
+        memories,
+        trace,
+        metric_sample,
+        cue_vec,
+        anchor,
+        grounded,
+        hype_scores,
+    } = gathered;
 
     let Some(cue_vec) = cue_vec else {
         // No cue embedding → no grounding overlay, so no committed shape; the
         // answer cardinality falls back to the member count.
-        return Ok(recall_frame(memories, None, trace));
+        let frame = recall_frame(memories, None, trace);
+        record_recall_metrics(ctx, recall_started, &metric_sample, frame.answer_kind);
+        return Ok(frame);
     };
 
-    let grounded = best_grounded_for_cue(&req, ctx, &cue_vec)?;
+    // `grounded` + `hype_scores` are supplied by the gather stage (single shard),
+    // or merged across shards for a namespace-wide read — shaping never
+    // recomputes them, so the grounded commit + HyPE ordering are global.
 
-    // Answer-lead signal via the HyPE question-bridge: one HNSW probe of the
-    // hypothetical-question pool with the cue yields, per memory, the best "does
-    // this memory ANSWER the cue?" cosine — the signal the passage↔cue cosine
-    // (topical adjacency) lacks. Computed ONCE here and threaded into both the
-    // membership ordering and the kind-presence abstention gate, so the two agree
-    // on which members genuinely answer.
-    let hype_scores: HashMap<u128, f32> = ctx
-        .semantic_retriever
-        .hype_scores_for_query(&cue_vec, RECALL_CANDIDATE_POOL as usize)
-        .into_iter()
-        .map(|(id, s)| (id.raw(), s))
-        .collect();
-
-    // MEMBERSHIP MODEL — recall is not a top-k pile, it is the SET of memories
-    // that belong to this cue. Two signals decide belonging and are UNIONed:
-    //   S_struct — the precise typed-graph answer: source memories of the
-    //              grounded values (Single → one, Set → its members).
-    //   S_sem    — the associative belonging set: the fan-out cut at its natural
-    //              score cliff (adaptive gap), never a fixed count.
-    // A memory in BOTH is the most-confirmed (both lanes agree) and ranks first.
-    // The answer's SHAPE is the grounded commit's shape when one fired (the
-    // committed value leads, episodic retained below), else it follows the set's
-    // cardinality: 0 → None, 1 → Single, N → Many. There is no caller-supplied
-    // count anywhere in this path.
+    // MEMBERSHIP MODEL — recall is the SET of memories that belong to this cue,
+    // unioning the typed-graph grounded answer (S_struct) with the associative
+    // fan-out cut at its natural score cliff (S_sem). The answer SHAPE is the
+    // grounded commit's shape when one fired, else it follows the set's
+    // cardinality: 0 → None, 1 → Single, N → Many.
     let (membership, committed_shape, any_belongs) = build_membership(
         memories,
         &grounded,
-        &req,
+        req,
         ctx,
         &cue_vec,
         anchor,
@@ -200,33 +310,379 @@ pub async fn handle_recall(
     );
 
     // ── ABSTENTION PIPELINE ─────────────────────────────────────────────────
-    // Two honest, structural abstention gates, both keyed on the cue having no
-    // real anchor for its answer. In-txn reads are exempt from BOTH: they are
-    // read-your-writes, and a pending write the caller just made is not topical
-    // noise — it carries no retrieval-lane confirmation only because it isn't
-    // committed/indexed yet, so abstaining it would break the guarantee.
+    // Two structural abstention gates keyed on the cue having no real anchor for
+    // its answer. In-txn reads are exempt from BOTH (read-your-writes: a pending
+    // write carries no retrieval-lane confirmation only because it isn't indexed
+    // yet, so abstaining it would break the guarantee).
     let membership = if req.txn_id.is_some() {
         membership
     } else {
-        // Both gates key on `any_belongs`: at least one surviving member carries a
-        // belonging signal BEYOND the raw passage cosine (strong HyPE / lexical /
-        // graph / grounded). They abstain (empty → None) only when NO member does
-        // and the grounded layer produced no answer. A lone semantic-cosine
-        // member never blocks abstention — under BGE compression a nonsense cue
-        // reaches the same low-0.6 cosine as a weak-but-real hit, so passage
-        // magnitude alone can't tell them apart; corroboration across an
-        // independent lane can. This keeps genuinely answerable cues (which
-        // corroborate across lanes, or match the HyPE question-bridge) while
-        // letting an unsupported adversarial/nonsense cue fall to None. The two
-        // gates keep their distinct anchor-state preconditions so each only acts
-        // in its own domain (no-anchor vs subject-resolved).
         // 1. No subject resolved at all.
         let membership = apply_anchor_abstention(membership, anchor, &grounded, any_belongs);
         // 2. Subject resolved but no fact of the matching KIND/role for it.
         apply_kind_presence_abstention(membership, anchor, &grounded, any_belongs)
     };
 
-    Ok(recall_frame(membership, committed_shape, trace))
+    let frame = recall_frame(membership, committed_shape, trace);
+    record_recall_metrics(ctx, recall_started, &metric_sample, frame.answer_kind);
+    Ok(frame)
+}
+
+/// Normalise a recall request in place: clamp the safety cap into
+/// `[DEFAULT, MAX]` (`0` = server default), force `include_text` on (a memory
+/// without its text is useless), and bound the filter list sizes. Shared by the
+/// single-space handler and the namespace-wide fan-out entry points so both
+/// apply identical bounds. Capture `client_requested_count = req.max_results
+/// != 0` BEFORE calling this — it overwrites a `0` cap.
+fn normalize_recall_request(req: &mut RecallRequest) -> Result<(), OpError> {
+    if req.max_results == 0 {
+        req.max_results = DEFAULT_RECALL_RESULTS;
+    }
+    if req.max_results > MAX_RECALL_RESULTS {
+        req.max_results = MAX_RECALL_RESULTS;
+    }
+    req.include_text = true;
+    if let Some(ref ctxs) = req.session_filter {
+        if ctxs.len() > MAX_RECALL_FILTER_ENTRIES {
+            return Err(OpError::InvalidRequest(format!(
+                "recall: session_filter must have <= {MAX_RECALL_FILTER_ENTRIES} entries"
+            )));
+        }
+    }
+    if let Some(ref kinds) = req.kind_filter {
+        if kinds.len() > MAX_RECALL_FILTER_ENTRIES {
+            return Err(OpError::InvalidRequest(format!(
+                "recall: kind_filter must have <= {MAX_RECALL_FILTER_ENTRIES} entries"
+            )));
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Namespace-wide fan-out (cross-shard) — Phase C.
+//
+// A namespace's spaces are spread across shards, so a namespace-wide RECALL
+// must run on EVERY shard and merge. The connection layer orchestrates it:
+//   1. `recall_gather_namespace` on each shard → that shard's raw candidate
+//      pool (its own spaces, widened by Phase B's namespace read scope).
+//   2. `merge_recall_pools` at the connection layer → one global pool (RRF by
+//      within-shard rank, deduped, bounded).
+//   3. `recall_shape_namespace` on the bound (coordinator) shard → the single
+//      global shaping pass over the merged pool, reusing the identical
+//      `shape_recall` used by single-space RECALL.
+// The per-shard gather never shapes, so no shard decides Single/Many/None over
+// a partial view; the shape is decided once, globally. The `handle_recall`
+// door still refuses `scope = Namespace` — a single shard cannot serve it — so
+// this path is only ever reached through the connection-layer fan-out.
+// ---------------------------------------------------------------------------
+
+/// RRF smoothing constant for the cross-shard merge. Matches the intra-shard
+/// fusion `k` so a rank-1 hit from one shard and a rank-1 hit from another are
+/// weighted identically.
+const CROSS_SHARD_RRF_K: f32 = 60.0;
+
+/// One shard's namespace-wide gather partial: its raw candidate pool plus the
+/// shaping signals it computed locally (the grounded answer over its spaces, its
+/// HyPE answer-lead scores, and the graph anchor it resolved). The connection
+/// layer collects one per shard and merges them ([`merge_namespace_partials`]);
+/// brain-server holds these opaquely and never inspects the fields.
+pub struct NamespaceRecallPartial {
+    memories: Vec<MemoryResult>,
+    grounded: GroundedOutcome,
+    hype_scores: HashMap<u128, f32>,
+    anchor: Option<EntityId>,
+}
+
+/// The merged cross-shard shaping inputs for a namespace-wide recall: the global
+/// candidate pool plus the winning grounded answer, unioned HyPE scores, and the
+/// anchor from the shard that produced the grounded answer. Fed to
+/// [`recall_shape_namespace`] for the single global shaping pass. Opaque to
+/// brain-server.
+pub struct MergedNamespaceRecall {
+    memories: Vec<MemoryResult>,
+    grounded: GroundedOutcome,
+    hype_scores: HashMap<u128, f32>,
+    anchor: Option<EntityId>,
+}
+
+/// Phase-C/D stage 1 (per shard): produce this shard's namespace-wide gather
+/// partial — its raw candidate pool AND the grounding/HyPE signals it computed
+/// over its own spaces. Normalises the request and forces the widened read
+/// scope, then runs the shared `gather_recall` (no shaping).
+pub async fn recall_gather_namespace(
+    mut req: RecallRequest,
+    ctx: &OpsContext,
+) -> Result<NamespaceRecallPartial, OpError> {
+    normalize_recall_request(&mut req)?;
+    // Force the widened read scope regardless of the wire value that reached
+    // this shard — this entry point IS the namespace fan-out.
+    req.scope = RecallScopeWire::Namespace;
+    let gathered = gather_recall(&req, ctx).await?;
+    Ok(NamespaceRecallPartial {
+        memories: gathered.memories,
+        grounded: gathered.grounded,
+        hype_scores: gathered.hype_scores,
+        anchor: gathered.anchor,
+    })
+}
+
+/// Merge every shard's namespace-wide gather partial into one set of global
+/// shaping inputs:
+///   - **pool**: [`merge_recall_pools`] (RRF by within-shard rank, deduped, bounded);
+///   - **HyPE**: union of the per-shard score maps (a memory is owned by exactly
+///     one shard, so the keys are disjoint) — the answer-lead is now global;
+///   - **grounded**: the best-scoring `GroundedOutcome::Answer` across shards
+///     (a namespace-wide subject typically resolves on one shard), preferring an
+///     anchor-scoped answer on a near-tie — so a grounded commit fires even when
+///     the subject's facts live on a shard other than the coordinator.
+///
+/// The anchor travels with the winning grounded answer's shard.
+pub fn merge_namespace_partials(partials: Vec<NamespaceRecallPartial>) -> MergedNamespaceRecall {
+    let mut pools: Vec<Vec<MemoryResult>> = Vec::with_capacity(partials.len());
+    let mut hype_scores: HashMap<u128, f32> = HashMap::new();
+    // Best grounded answer across shards, with the anchor from the same shard.
+    let mut best_grounded: GroundedOutcome = GroundedOutcome::NoAnswer;
+    let mut best_score = f32::NEG_INFINITY;
+    let mut best_anchor: Option<EntityId> = None;
+    // A Some anchor from any shard, used as a fallback when no shard grounded.
+    let mut fallback_anchor: Option<EntityId> = None;
+
+    for p in partials {
+        pools.push(p.memories);
+        for (id, s) in p.hype_scores {
+            // Disjoint keys across shards; `max` is a harmless tie-break if a
+            // memory ever appeared under two shards' HyPE maps.
+            hype_scores
+                .entry(id)
+                .and_modify(|cur| {
+                    if s > *cur {
+                        *cur = s;
+                    }
+                })
+                .or_insert(s);
+        }
+        if fallback_anchor.is_none() {
+            fallback_anchor = p.anchor;
+        }
+        if let GroundedOutcome::Answer(ref answer, anchor_scoped) = p.grounded {
+            let score = grounded_answer_score(answer);
+            // Prefer a strictly higher score; on a near-tie prefer an
+            // anchor-scoped answer (it is the one allowed to COMMIT the lead).
+            let take = score > best_score + GROUNDED_MERGE_TIE_EPS
+                || ((score - best_score).abs() <= GROUNDED_MERGE_TIE_EPS
+                    && anchor_scoped
+                    && !matches!(best_grounded, GroundedOutcome::Answer(_, true)));
+            if take {
+                best_score = score;
+                best_anchor = p.anchor;
+                best_grounded = p.grounded;
+            }
+        }
+    }
+
+    let anchor = if matches!(best_grounded, GroundedOutcome::Answer(..)) {
+        best_anchor
+    } else {
+        fallback_anchor
+    };
+    MergedNamespaceRecall {
+        memories: merge_recall_pools(pools),
+        grounded: best_grounded,
+        hype_scores,
+        anchor,
+    }
+}
+
+/// Phase-C/D stage 3 (coordinator shard): shape the MERGED cross-shard inputs
+/// into the final answer, reusing the identical `shape_recall` single-space
+/// RECALL uses. The cue vector is recomputed here (deterministic); the grounded
+/// answer, HyPE scores, and anchor come pre-merged from every shard, so the
+/// grounded commit + answer-lead reflect the whole namespace. Members owned by
+/// other shards still degrade gracefully in `shape_recall`'s per-member
+/// `vector_for` re-score (they fall back to the score on the `MemoryResult`).
+pub async fn recall_shape_namespace(
+    merged: MergedNamespaceRecall,
+    mut req: RecallRequest,
+    ctx: &OpsContext,
+) -> Result<RecallResponseFrame, OpError> {
+    let recall_started = Instant::now();
+    let client_requested_count = req.max_results != 0;
+    normalize_recall_request(&mut req)?;
+    req.scope = RecallScopeWire::Namespace;
+    let cue_vec = ctx.executor.embedder.embed(&req.cue_text).ok();
+    let gathered = RecallGathered {
+        memories: merged.memories,
+        // Per-shard trace/metrics don't compose across a fan-out; the merged
+        // answer records a minimal sample (namespace-wide observability is a
+        // follow-up).
+        trace: None,
+        metric_sample: RecallMetricSample::empty(),
+        cue_vec,
+        anchor: merged.anchor,
+        grounded: merged.grounded,
+        hype_scores: merged.hype_scores,
+    };
+    shape_recall(gathered, &req, ctx, client_requested_count, recall_started)
+}
+
+/// Near-tie epsilon for picking the best grounded answer across shards. Mirrors
+/// the intra-shard `TIE_EPS` used by `best_grounded_for_cue`.
+const GROUNDED_MERGE_TIE_EPS: f32 = 1e-4;
+
+/// The comparable score of a grounded answer — its top value's match cosine,
+/// the same key `best_grounded_for_cue` ranks candidates by within a shard.
+fn grounded_answer_score(answer: &GroundedAnswer) -> f32 {
+    answer.values.first().map(|v| v.match_score).unwrap_or(0.0)
+}
+
+/// Merge per-shard candidate pools into one global pool for namespace-wide
+/// recall. Each pool is that shard's fan-out result, best-first. A memory is
+/// owned by exactly one shard, so there are normally no cross-shard duplicates;
+/// this dedups defensively by id (keeping the higher RRF score) and orders the
+/// union by Reciprocal-Rank-Fusion over each hit's WITHIN-SHARD rank — the one
+/// cross-shard-comparable signal (raw fused scores are normalised per pool and
+/// are not comparable across shards). The result is truncated to the candidate
+/// pool budget so the downstream shaping pass stays bounded regardless of the
+/// shard count.
+///
+/// This ordering primarily bounds and assembles the pool; `shape_recall`
+/// re-scores members by cue cosine, so the exact merge order only decides the
+/// no-cue fast path and the truncation cut.
+pub fn merge_recall_pools(pools: Vec<Vec<MemoryResult>>) -> Vec<MemoryResult> {
+    let mut best: HashMap<u128, (MemoryResult, f32)> = HashMap::new();
+    for pool in pools {
+        for (rank0, m) in pool.into_iter().enumerate() {
+            let rrf = 1.0 / (CROSS_SHARD_RRF_K + (rank0 as f32) + 1.0);
+            match best.get_mut(&m.memory_id) {
+                Some((_, score)) => {
+                    // Same memory from two shards (should not happen — one owner
+                    // — but be defensive): keep the higher-ranked appearance.
+                    if rrf > *score {
+                        *score = rrf;
+                    }
+                }
+                None => {
+                    best.insert(m.memory_id, (m, rrf));
+                }
+            }
+        }
+    }
+    let mut merged: Vec<(MemoryResult, f32)> = best.into_values().collect();
+    // Descending RRF; ties broken on memory_id so the merge is deterministic
+    // across runs and shard-arrival order.
+    merged.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.memory_id.cmp(&b.0.memory_id))
+    });
+    merged.truncate(RECALL_CANDIDATE_POOL as usize);
+    merged.into_iter().map(|(m, _)| m).collect()
+}
+
+/// Lightweight always-on read-path stats the executor already MEASURED,
+/// extracted from `QueryMetadata` so the RECALL handler can RECORD them
+/// into the retriever / query metric families after the answer is
+/// shaped. Kept small (one `Vec` of at most three lanes, no per-item
+/// detail) so surfacing it up the call adds no hot-path allocation of
+/// consequence — the fan-out loop itself is untouched.
+struct RecallMetricSample {
+    /// One entry per retriever lane that was actually invoked (skipped
+    /// lanes are omitted — they never ran): `(kind, elapsed_ms,
+    /// candidates)`.
+    per_lane: Vec<(RetrieverKind, f64, u64)>,
+    /// The effective fusion `k` the engine fused at this execution.
+    effective_fusion_k: u32,
+    /// Whether the cross-encoder rerank stage actually reordered the
+    /// fused list (loaded and applied — not merely present).
+    rerank_invoked: bool,
+}
+
+impl RecallMetricSample {
+    /// A no-signal sample for the namespace-wide merged-shape path, where the
+    /// per-shard executor metadata does not compose across the fan-out. Records
+    /// the query outcome (latency + answer kind) with no per-lane detail.
+    fn empty() -> Self {
+        Self {
+            per_lane: Vec::new(),
+            effective_fusion_k: 0,
+            rerank_invoked: false,
+        }
+    }
+
+    /// Extract the always-on stats from the executor's returned
+    /// metadata. Populated on every recall (not gated on `trace_detail`)
+    /// — the per-lane latency / total / outcome vectors and the
+    /// `effective_fusion_k` / `rerank` fields are always filled.
+    fn from_metadata(meta: &QueryMetadata) -> Self {
+        let mut per_lane = Vec::with_capacity(meta.retriever_outcomes.len());
+        for outcome in &meta.retriever_outcomes {
+            // A skipped lane never ran, so it isn't an invocation.
+            if matches!(outcome.status, RetrieverStatus::Skipped(_)) {
+                continue;
+            }
+            let elapsed_ms = meta
+                .retriever_latencies_ms
+                .iter()
+                .find(|(r, _)| *r == outcome.retriever)
+                .map(|(_, ms)| *ms)
+                .unwrap_or(0.0);
+            let candidates = meta
+                .retriever_total_results
+                .iter()
+                .find(|(r, _)| *r == outcome.retriever)
+                .map(|(_, c)| *c as u64)
+                .unwrap_or(0);
+            per_lane.push((retriever_kind(outcome.retriever), elapsed_ms, candidates));
+        }
+        let rerank_invoked = matches!(meta.rerank, Some(RerankOutcome::Applied { .. }));
+        Self {
+            per_lane,
+            effective_fusion_k: meta.effective_fusion_k,
+            rerank_invoked,
+        }
+    }
+}
+
+/// Map the planner's retriever discriminant onto the metric-family
+/// label enum. Total — the planner has exactly these three lanes.
+fn retriever_kind(retriever: Retriever) -> RetrieverKind {
+    match retriever {
+        Retriever::Semantic => RetrieverKind::Semantic,
+        Retriever::Lexical => RetrieverKind::Lexical,
+        Retriever::Graph => RetrieverKind::Graph,
+    }
+}
+
+/// Map the wire answer shape onto the query-metric outcome label.
+fn query_outcome(answer_kind: AnswerKindWire) -> QueryOutcome {
+    match answer_kind {
+        AnswerKindWire::Single => QueryOutcome::Single,
+        AnswerKindWire::Many => QueryOutcome::Many,
+        AnswerKindWire::None => QueryOutcome::None,
+    }
+}
+
+/// Record the read-path metrics for one served recall. Runs on EVERY
+/// recall (both return paths), post-hoc: a handful of atomic adds plus
+/// a per-lane and two query histogram observes. No lock, no allocation
+/// beyond the already-built `per_lane` sample.
+fn record_recall_metrics(
+    ctx: &OpsContext,
+    started: Instant,
+    sample: &RecallMetricSample,
+    answer_kind: AnswerKindWire,
+) {
+    for &(kind, elapsed_ms, candidates) in &sample.per_lane {
+        ctx.retriever_metrics.record(kind, elapsed_ms, candidates);
+    }
+    let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
+    ctx.query_metrics.record(
+        latency_ms,
+        sample.effective_fusion_k,
+        sample.rerank_invoked,
+        query_outcome(answer_kind),
+    );
 }
 
 /// Honest abstention by structural anchor — unconditional, no flag/knob (FIX C).
@@ -374,6 +830,22 @@ const STRONG_SEMANTIC_SUPPORT: f32 = 0.6;
 /// calibrated against the read fixtures, full-eval sweep is the follow-up.
 const STRONG_HYPE_SUPPORT: f32 = 0.6;
 
+/// The cosine gap below which BGE-small cannot reliably distinguish two
+/// passages (or two cue↔hypothetical-question matches). BGE-small cosines are
+/// compressed, so a corpus of near-duplicate passages that differ only in one
+/// exact token scores within a hair on cosine (measured ~0.727–0.739 across a
+/// 50-way near-duplicate probe). Ordering such a set by that cosine alone is
+/// query-independent and strands the one document the cue's exact token
+/// matches. `order_by_answer_relevance` therefore quantises the two cosine-
+/// scale signals (HyPE answer-relevance, passage cosine) at this resolution:
+/// members within half a bucket of the best are treated as indistinguishable,
+/// and the RRF `fused_score` — which carries the lexical / graph evidence a
+/// cosine cannot — breaks the tie. A genuine cosine gap (larger than this)
+/// still decides, so a real topical / answer signal is never overridden by
+/// lexical coverage. Not per-corpus tuned: it is the model's discriminative
+/// floor, comfortably above the observed near-duplicate spread.
+const TOPICAL_COSINE_RESOLUTION: f32 = 0.05;
+
 /// Count the INDEPENDENT lanes that confirm a memory belongs to the cue — the
 /// ONE unifying corroboration signal the read path keys its belonging decisions
 /// on (FIX A/B/C). Each lane is a distinct, independently-computed source of
@@ -454,9 +926,92 @@ fn order_by_answer_relevance(
         return out;
     }
     let h = |m: &MemoryResult| hype.get(&m.memory_id).copied().unwrap_or(0.0);
-    // Flat / absent HyPE: no answer-relevance signal to discriminate the members,
-    // so keep the incoming (cosine / assembly) order — the lexical/paraphrase
-    // no-regression guarantee.
+    let c = |m: &MemoryResult| {
+        cos.get(&m.memory_id)
+            .copied()
+            .unwrap_or_else(|| m.similarity_score.max(0.0))
+    };
+    let f = |m: &MemoryResult| m.fused_score;
+
+    // ── EXACT-TOKEN LEAD ────────────────────────────────────────────────────
+    // A UNIQUE original-query lexical hit — exactly one member carries the cue's
+    // exact token — is a high-precision exact-match signal that neither cosine,
+    // HyPE, nor even the RRF fused_score reliably surfaces. On a dense near-
+    // duplicate corpus the one document carrying the cue's exact token scores
+    // within a hair of its neighbours on cosine (measured: 50 near-duplicates all
+    // at ~0.73), its HyPE is sub-floor noise, and the semantic-rank spread buries
+    // its small lexical bump in fused_score — yet it is the ONE document that
+    // answers the cue. Lead with it, then the RRF fused order, then cosine.
+    //
+    // Three guards confine this to the genuine exact-match case so diverse
+    // corpora never regress:
+    //   * UNIQUENESS — a low-specificity term matches many members (all tagged
+    //     Lexical), so `sole` is `None` and this path is skipped; PRF-expanded
+    //     lexical tags are already stripped from `contributing_retrievers`, so
+    //     only a genuine original-query match counts.
+    //   * NO STANDOUT ANSWER-LEAD — no member's HyPE clearly leads the rest. This
+    //     is measured as FLATNESS (top HyPE minus second-best HyPE below the
+    //     resolution), NOT magnitude: BGE-small cosines are so compressed that
+    //     even a random nonce cue scores ≥ the support floor against SOME
+    //     generated question, so an absolute floor would never engage. A genuine
+    //     answerable cue instead makes one member's answer-lead STAND OUT from
+    //     the pack; when it does, the standard answer-relevance ordering below
+    //     leads with that member instead.
+    //   * TOPICALLY COMPETITIVE — the unique hit's own passage cosine is within
+    //     BGE's discriminative resolution of the best member, so a real topical
+    //     answer that clearly out-cosines a stray one-word lexical coincidence
+    //     still wins (the coverage-bias guard), computed per-member rather than
+    //     on the whole set's spread (robust to a few low-cosine members).
+    let best_c = out.iter().map(&c).fold(f32::NEG_INFINITY, f32::max);
+    let (best_h, second_h) = {
+        let (mut b, mut s) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+        for m in &out {
+            let v = h(m);
+            if v > b {
+                s = b;
+                b = v;
+            } else if v > s {
+                s = v;
+            }
+        }
+        (b, s)
+    };
+    let answer_lead_stands_out = (best_h - second_h) >= TOPICAL_COSINE_RESOLUTION;
+    if !answer_lead_stands_out {
+        let lexical_members: Vec<u128> = out
+            .iter()
+            .filter(|m| {
+                m.contributing_retrievers
+                    .contains(&RetrieverNameWire::Lexical)
+            })
+            .map(|m| m.memory_id)
+            .collect();
+        if let [sole] = lexical_members.as_slice() {
+            let sole = *sole;
+            let sole_cos = out
+                .iter()
+                .find(|m| m.memory_id == sole)
+                .map(&c)
+                .unwrap_or(0.0);
+            if (best_c - sole_cos) < TOPICAL_COSINE_RESOLUTION {
+                out.sort_by(|a, b| {
+                    // The unique exact-token match (`true`) ranks first.
+                    (b.memory_id == sole)
+                        .cmp(&(a.memory_id == sole))
+                        .then_with(|| f(b).partial_cmp(&f(a)).unwrap_or(std::cmp::Ordering::Equal))
+                        .then_with(|| c(b).partial_cmp(&c(a)).unwrap_or(std::cmp::Ordering::Equal))
+                });
+                return out;
+            }
+        }
+        // No qualifying unique lexical hit — fall through to standard ordering.
+    }
+
+    // ── STANDARD ANSWER-RELEVANCE ORDERING ──────────────────────────────────
+    // Answer-relevance (HyPE) is the PRIMARY key, topical cosine the SECONDARY
+    // tiebreak. Flat / absent HyPE carries no answer-relevance signal, so the
+    // incoming (cosine / assembly) order is preserved verbatim — the
+    // lexical/paraphrase no-regression guarantee.
     let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
     for m in &out {
         let v = h(m);
@@ -466,11 +1021,6 @@ fn order_by_answer_relevance(
     if (hi - lo) <= f32::EPSILON {
         return out;
     }
-    let c = |m: &MemoryResult| {
-        cos.get(&m.memory_id)
-            .copied()
-            .unwrap_or_else(|| m.similarity_score.max(0.0))
-    };
     // Stable sort: equal (hype, cos) members keep their incoming relative order.
     out.sort_by(|a, b| {
         h(b).partial_cmp(&h(a))
@@ -896,20 +1446,26 @@ fn build_membership(
     // FIX B: `grounded_commit` now enforces corroboration internally (a lead
     // source must clear `SUPPORT_CORROBORATED`), so an uncorroborated grounded
     // value returns `None` here and falls through to `no_commit`.
-    let (mut out, committed_shape) = match grounded_commit(grounded, &support_of) {
-        // Honor the commit only when at least one lead memory is actually present
-        // in the visible set: a grounded source filtered out by the visibility
-        // pass (space/kind/context/tombstone) must not set a shape with no backing
-        // member. Otherwise fall through to plain answer-relevance ordering.
-        Some(lead) if lead.ids.iter().any(|id| placed.contains(id)) => {
-            let shape = lead.shape;
-            (
-                apply_grounded_commit(out, &lead, hype_scores, &cos_by_id),
-                Some(shape),
-            )
-        }
-        _ => no_commit(out),
-    };
+    let (mut out, committed_shape, committed_lead_count) =
+        match grounded_commit(grounded, &support_of) {
+            // Honor the commit only when at least one lead memory is actually present
+            // in the visible set: a grounded source filtered out by the visibility
+            // pass (space/kind/context/tombstone) must not set a shape with no backing
+            // member. Otherwise fall through to plain answer-relevance ordering.
+            Some(lead) if lead.ids.iter().any(|id| placed.contains(id)) => {
+                let shape = lead.shape;
+                let lead_n = lead.ids.iter().filter(|id| placed.contains(id)).count();
+                (
+                    apply_grounded_commit(out, &lead, hype_scores, &cos_by_id),
+                    Some(shape),
+                    lead_n,
+                )
+            }
+            _ => {
+                let (out, shape) = no_commit(out);
+                (out, shape, 0)
+            }
+        };
 
     // ── EXACT-PATH INTRINSIC CARDINALITY ───────────────────────────────────
     // Ablatable block (revert by deleting it and keeping the plain
@@ -972,6 +1528,69 @@ fn build_membership(
             || grounded_sources.contains(&id)
     };
     let any_belongs = out.iter().any(|m| belongs_of(m.memory_id));
+
+    // ── PRECISION DECISION ──────────────────────────────────────────────────
+    // Calibrated selective shaping over the assembled set: commit a Single/Many
+    // only when the lead is corroborated enough, else abstain with an honest None;
+    // keep a committed Many minimal. The confidence signal is the SAME cross-lane
+    // `support` the commit and abstention gates already use — the one signal that
+    // separates correct from wrong answers; retrieval score is deliberately not an
+    // input. Defaults are no-ops (commit_min_support = many_min_support = 0), so an
+    // uncalibrated deploy reproduces the prior shape and abstention exactly; a
+    // fitted `[precision]` calibration is what makes None reachable and Many tight.
+    //
+    // In-txn reads are EXEMPT — exactly as the caller's `any_belongs` abstention
+    // is. An in-txn read is read-your-writes: a write the caller just made isn't
+    // indexed yet, so it carries no cross-lane support and would be wrongly
+    // abstained. The precision decision therefore never runs on the txn path.
+    let (out, committed_shape) = if req.txn_id.is_some() {
+        (out, committed_shape)
+    } else {
+        let supports: Vec<u8> = out.iter().map(|m| support_of(m.memory_id)).collect();
+        let decision = crate::precision::decide(
+            &crate::precision::DecisionInput {
+                supports: &supports,
+                committed_shape,
+                committed_lead_count,
+            },
+            brain_core::PrecisionTuning::active(),
+        );
+        // Observability: emit the decision + every member's support (leads first) so
+        // a calibration can be fit from a single eval run's logs — no threshold
+        // sweep needed. This is the raw material for choosing the thresholds offline.
+        tracing::debug!(
+            target: "brain_ops::precision",
+            cue = %req.cue_text,
+            lead_support = supports.first().copied().unwrap_or(0),
+            shape = ?decision.shape,
+            lead_count = decision.lead_count,
+            abstained = decision.abstained,
+            members = out.len(),
+            support_hist = ?supports,
+            "recall: precision decision"
+        );
+        match decision.shape {
+            // Calibrated abstention: drop the set so `recall_frame` yields an
+            // explicit None. Only reachable when a `commit_min_support` is set.
+            AnswerKindWire::None => (Vec::new(), None),
+            shape => {
+                // Minimal-Many trim: for an UNCOMMITTED decision, drop the members
+                // below the committed lead set so a `Many` returns only its tight
+                // answer (fewer, higher-consensus memories). Guarded: grounded
+                // commits keep their full retained tail (their guardrail is that a
+                // wrong commit can only mis-order); and with the default
+                // many_min_support = 0 lead_count == out.len(), so nothing is
+                // dropped. Only fires when an operator calibrates a trim.
+                let out = if committed_shape.is_none() && decision.lead_count < out.len() {
+                    out.into_iter().take(decision.lead_count).collect()
+                } else {
+                    out
+                };
+                (out, Some(shape))
+            }
+        }
+    };
+    let any_belongs = any_belongs && !out.is_empty();
 
     (out, committed_shape, any_belongs)
 }
@@ -1080,6 +1699,17 @@ const MEMBERSHIP_REL_BAND: f32 = 0.85;
 /// path. Not a ranking knob and not caller intent — the adaptive gap decides the
 /// real set; this only caps a degenerate flat-distribution result so the
 /// response can't balloon.
+/// Whether a memory passes the `age_bound` filter. `age_bound` is an
+/// event-time lower bound: a memory passes iff its event time
+/// (`occurred_at`, falling back to `created_at` when unset) is at or after
+/// the bound. A `None` bound admits everything.
+fn passes_age_bound(bound: Option<u64>, occurred_at: Option<u64>, created_at: u64) -> bool {
+    match bound {
+        None => true,
+        Some(b) => occurred_at.unwrap_or(created_at) >= b,
+    }
+}
+
 fn membership_ceiling(req: &RecallRequest) -> u32 {
     let cap = if req.max_results == 0 {
         DEFAULT_RECALL_RESULTS
@@ -1223,6 +1853,36 @@ fn slot_hit_projectable(slot: Slot, subject: SubjectRef, anchors: &HashSet<Entit
     statement_subject_in_scope(subject, anchors)
 }
 
+/// Whether a statement id belongs to the caller's `(namespace, space)` scope.
+///
+/// The statement-question bridge index probed by the slot-projection path is
+/// shard-GLOBAL — it carries no tenant partition, so a probe with the caller's
+/// cue vector can match a question generated from ANY tenant's fact. Loading the
+/// hit's row via `statement_get` does NOT re-check scope (the `Statement` value
+/// carries no scope), so without this guard a foreign-space statement whose
+/// object/subject-slot question matched could project as a confident answer AND
+/// (worse) flip the abstention gates off (a spurious `Answer` disables both
+/// `apply_anchor_abstention` and `apply_kind_presence_abstention`). The
+/// predicate walk is immune because it reads scope-prefixed secondary indexes;
+/// this restores the same isolation for the global bridge probe by loading the
+/// primary row's stamped scope and comparing it to the caller's.
+///
+/// A missing row is out of scope (`false`) — never fabricate an answer.
+fn statement_in_caller_scope(
+    rtxn: &redb::ReadTransaction,
+    sid: brain_core::StatementId,
+    caller_scope: brain_metadata::RowScope,
+) -> Result<bool, OpError> {
+    use brain_metadata::tables::statement::STATEMENTS_TABLE;
+    let table = rtxn
+        .open_table(STATEMENTS_TABLE)
+        .map_err(|e| OpError::Internal(format!("slot-projection scope open: {e}")))?;
+    let row = table
+        .get(&sid.to_bytes())
+        .map_err(|e| OpError::Internal(format!("slot-projection scope get: {e}")))?;
+    Ok(matches!(row, Some(guard) if guard.value().scope() == caller_scope))
+}
+
 /// Build the cue-scoped OBJECT set for a `Slot::Object` slot-projection match
 /// (FIX A). The set is the DISTINCT objects of the statement-question bridge
 /// hits that (a) probe the Object slot, (b) clear the strong floor against THIS
@@ -1239,6 +1899,7 @@ fn cue_scoped_object_set(
     rtxn: &redb::ReadTransaction,
     hits: &[(brain_core::StatementId, Slot, f32)],
     anchors: &HashSet<EntityId>,
+    caller_scope: brain_metadata::RowScope,
 ) -> Result<Vec<GroundedValue>, OpError> {
     let mut values: Vec<GroundedValue> = Vec::new();
     for &(sid, slot, score) in hits {
@@ -1248,6 +1909,11 @@ fn cue_scoped_object_set(
             break;
         }
         if !matches!(slot, Slot::Object) {
+            continue;
+        }
+        // Tenant isolation for the GLOBAL bridge probe: drop any hit whose
+        // statement is not in the caller's scope before it can become a member.
+        if !statement_in_caller_scope(rtxn, sid, caller_scope)? {
             continue;
         }
         let Some(statement) = brain_metadata::statement_get(rtxn, sid)
@@ -1293,6 +1959,7 @@ fn slot_projection_grounded(
     ctx: &OpsContext,
     cue_vec: &[f32; brain_embed::VECTOR_DIM],
     anchors: &HashSet<EntityId>,
+    caller_scope: brain_metadata::RowScope,
     req: &RecallRequest,
 ) -> Result<Option<GroundedAnswer>, OpError> {
     let hits = ctx
@@ -1313,6 +1980,14 @@ fn slot_projection_grounded(
         // can clear it, so stop rather than scan the tail.
         if score < SLOT_PROJECTION_STRONG_FLOOR {
             break;
+        }
+        // Tenant isolation for the GLOBAL bridge probe: a hit whose statement is
+        // not in the caller's scope must never project — it would both leak a
+        // foreign fact AND, as a spurious `Answer`, disable the abstention gates
+        // (`apply_anchor_abstention` / `apply_kind_presence_abstention`). Checked
+        // BEFORE loading/projecting so a foreign row can produce nothing.
+        if !statement_in_caller_scope(rtxn, sid, caller_scope)? {
+            continue;
         }
         let Some(statement) = brain_metadata::statement_get(rtxn, sid)
             .map_err(|e| OpError::Internal(format!("slot projection statement_get: {e}")))?
@@ -1349,7 +2024,7 @@ fn slot_projection_grounded(
             // distinct object → Single. Time/Subject slots stay Single (a fact has
             // one event time / one subject).
             let answer = if matches!(slot, Slot::Object) {
-                let mut values = cue_scoped_object_set(rtxn, &hits, anchors)?;
+                let mut values = cue_scoped_object_set(rtxn, &hits, anchors, caller_scope)?;
                 // The chosen hit projected, so its object is always a member; keep
                 // it as the sole member if the scan somehow produced nothing.
                 if values.is_empty() {
@@ -1435,7 +2110,9 @@ fn best_grounded_for_cue(
     // projection about the anchor by construction; we keep it as a candidate but
     // do NOT return early, so a genuine multi-hop walk answer can override it
     // below (a shallow slot answer must not short-circuit a real chain).
-    let slot_answer = slot_projection_grounded(&rtxn, ctx, cue_vec, &anchors, req)?;
+    let caller_scope =
+        brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_space);
+    let slot_answer = slot_projection_grounded(&rtxn, ctx, cue_vec, &anchors, caller_scope, req)?;
 
     // Captured before the loop consumes `candidates`, for the decision trace.
     let candidate_count = candidates.len();
@@ -1562,15 +2239,20 @@ fn hydrate_memories_by_id(
 ) -> Result<Vec<MemoryResult>, OpError> {
     use brain_metadata::tables::memory::MEMORIES_TABLE as MEM_T;
 
-    // Strict per-space isolation: every row belongs to exactly one space, and
-    // the scope is the caller's own space derived from the key. There is no
-    // client-supplied space filter on the wire, so a key can never reach
-    // another space's data.
-    let space_scope: Option<HashSet<[u8; 16]>> = Some(
-        [<[u8; 16]>::from(ctx.executor.caller_space)]
-            .into_iter()
-            .collect(),
-    );
+    // Space scope of the structured projector. The namespace (tenant) wall is
+    // applied separately and unconditionally on every row below; this is only
+    // the inner space narrowing. Space-scoped recall pins the caller's own
+    // space; namespace-wide recall drops it (`None` = any space the caller
+    // owns within its namespace), so a namespace-wide answer spans the
+    // caller's spaces but never crosses the namespace wall.
+    let space_scope: Option<HashSet<[u8; 16]>> = match recall_scope_mode(req) {
+        brain_metadata::ScopeMode::Space => Some(
+            [<[u8; 16]>::from(ctx.executor.caller_space)]
+                .into_iter()
+                .collect(),
+        ),
+        brain_metadata::ScopeMode::Namespace => None,
+    };
     let kind_filter: Option<HashSet<MemoryKindWire>> = req
         .kind_filter
         .as_ref()
@@ -1635,10 +2317,12 @@ fn hydrate_memories_by_id(
         if row.salience < req.salience_floor {
             continue;
         }
-        if let Some(bound) = req.age_bound_unix_nanos {
-            if row.created_at_unix_nanos < bound {
-                continue;
-            }
+        if !passes_age_bound(
+            req.age_bound_unix_nanos,
+            row.occurred_at_unix_nanos,
+            row.created_at_unix_nanos,
+        ) {
+            continue;
         }
 
         let text = if let Some(texts) = texts_table.as_ref() {
@@ -1745,22 +2429,10 @@ fn subject_candidates_from_cue(
         &mut seen,
     );
 
-    // The surfaces to resolve against the canonical-name index.
-    let mut surfaces: Vec<String> = Vec::new();
-    let subject = req.subject_name.trim();
-    if subject.is_empty() {
-        // Mine surfaces from the cue when the client gave no subject.
-        surfaces.extend(capitalized_runs(&req.cue_text));
-        surfaces.extend(
-            req.cue_text
-                .split_whitespace()
-                .filter(|t| t.chars().count() >= 2)
-                .map(str::to_string),
-        );
-    } else {
-        // 2. Explicit subject still works.
-        surfaces.push(subject.to_string());
-    }
+    // The surfaces to resolve against the canonical-name index. DISTINCT and
+    // capped at `MAX_CUE_SURFACES` so the resolver (heavy per call) runs a
+    // bounded number of times regardless of cue length (see `mine_cue_surfaces`).
+    let surfaces = mine_cue_surfaces(&req.subject_name, &req.cue_text);
 
     for surface in surfaces {
         if out.len() >= MAX_SUBJECT_CANDIDATES {
@@ -1792,6 +2464,56 @@ fn subject_candidates_from_cue(
     Ok(out)
 }
 
+/// Mine the DISTINCT candidate surfaces to resolve against the canonical-name
+/// index, bounded so the (heavy) entity resolver runs a strictly bounded number
+/// of times regardless of cue length.
+///
+/// When the client passed an explicit `subject_name` it is the sole surface.
+/// Otherwise surfaces are mined from the cue: capitalized proper-noun runs
+/// first (the strongest anchors), then individual whitespace tokens of length
+/// ≥ 2 (CJK single-token names, lowercase entity names). Deduped, the token walk
+/// clamped to `MAX_CUE_TOKENS_SCANNED`, and the whole set capped at
+/// `MAX_CUE_SURFACES`. A normal-length cue is unaffected (it names far fewer than
+/// `MAX_CUE_SURFACES` distinct surfaces); a pathological multi-megabyte cue can
+/// no longer drive an unbounded number of resolver calls on the shard core.
+fn mine_cue_surfaces(subject_name: &str, cue_text: &str) -> Vec<String> {
+    let subject = subject_name.trim();
+    if !subject.is_empty() {
+        // Explicit subject still works — single surface, no mining.
+        return vec![subject.to_string()];
+    }
+
+    let mut surfaces: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    // Capitalized proper-noun runs first — the strongest anchors, so they get
+    // the scarce surface budget before generic tokens.
+    for run in capitalized_runs(cue_text) {
+        if surfaces.len() >= MAX_CUE_SURFACES {
+            return surfaces;
+        }
+        if seen.insert(run.clone()) {
+            surfaces.push(run);
+        }
+    }
+
+    // Then individual tokens, with the token walk itself clamped so a cue that
+    // is millions of copies of a few distinct tokens can't force an O(cue) scan.
+    for tok in cue_text.split_whitespace().take(MAX_CUE_TOKENS_SCANNED) {
+        if surfaces.len() >= MAX_CUE_SURFACES {
+            break;
+        }
+        if tok.chars().count() < 2 {
+            continue;
+        }
+        if seen.insert(tok.to_string()) {
+            surfaces.push(tok.to_string());
+        }
+    }
+
+    surfaces
+}
+
 /// Extract capitalized multi-word (or single-word) runs from the cue —
 /// Latin proper-noun surfaces like "NeuraCorp" or "Web Summit". A run is a
 /// maximal sequence of whitespace-split tokens whose first character is
@@ -1808,7 +2530,9 @@ fn capitalized_runs(cue: &str) -> Vec<String> {
             current.clear();
         }
     };
-    for raw in cue.split_whitespace() {
+    // Bound the token walk (see `MAX_CUE_TOKENS_SCANNED`) so a pathological
+    // multi-megabyte cue can't force an O(cue) scan on the shard core.
+    for raw in cue.split_whitespace().take(MAX_CUE_TOKENS_SCANNED) {
         // Trim leading/trailing punctuation and a trailing possessive so
         // the surface matches the stored canonical name.
         let trimmed = raw
@@ -1836,7 +2560,7 @@ async fn retrieve_memories(
     ctx: &OpsContext,
     entity_anchor: Option<EntityId>,
     cue_vec: Option<&[f32; brain_embed::VECTOR_DIM]>,
-) -> Result<(Vec<MemoryResult>, Option<RecallTrace>), OpError> {
+) -> Result<(Vec<MemoryResult>, Option<RecallTrace>, RecallMetricSample), OpError> {
     let planner_req = build_planner_request(req, ctx.executor.caller_space, entity_anchor);
 
     let plan = retrieval_plan(&planner_req).map_err(map_plan_error)?;
@@ -1847,6 +2571,7 @@ async fn retrieve_memories(
         metadata: ctx.executor.metadata.clone(),
         caller_namespace: ctx.executor.caller_namespace.raw(),
         caller_space: ctx.executor.caller_space,
+        scope_mode: recall_scope_mode(req),
         cross_encoder: ctx.cross_encoder.as_arc().cloned(),
         space_vectors: ctx.executor.space_vectors.clone(),
     };
@@ -1948,10 +2673,22 @@ async fn retrieve_memories(
     // observability; without `req.trace` we drop it exactly as before, so the
     // common path pays nothing. When asked, we hand it to the final frame.
     let trace = if req.trace {
-        Some(build_recall_trace(&result.metadata, ctx)?)
+        Some(build_recall_trace(
+            &result.metadata,
+            ctx,
+            recall_scope_mode(req),
+        )?)
     } else {
         None
     };
+
+    // Always-on read-path metric sample. Extracted from the same
+    // `result.metadata` the executor already produced (per-lane
+    // latency / totals / outcomes, effective fusion k, rerank flag) —
+    // populated on every recall, not just `req.trace`. The RECALL
+    // handler records it into the retriever / query metric families
+    // once the answer shape is known.
+    let metric_sample = RecallMetricSample::from_metadata(&result.metadata);
 
     let memory_results = project_memory_results(&result, req, ctx)?;
 
@@ -1980,7 +2717,7 @@ async fn retrieve_memories(
         ctx.access_buffer.record(MemoryId::from_raw(r.memory_id));
     }
 
-    Ok((memory_results, trace))
+    Ok((memory_results, trace, metric_sample))
 }
 
 /// Structure the executor's `QueryMetadata` into the wire `RecallTrace` the
@@ -1998,7 +2735,11 @@ async fn retrieve_memories(
 /// empty `Vec`s when the executor ran with `trace_detail = false`, so this
 /// degrades to the count-only shape automatically — it never has to guess
 /// which mode produced `meta`.
-fn build_recall_trace(meta: &QueryMetadata, ctx: &OpsContext) -> Result<RecallTrace, OpError> {
+fn build_recall_trace(
+    meta: &QueryMetadata,
+    ctx: &OpsContext,
+    mode: brain_metadata::ScopeMode,
+) -> Result<RecallTrace, OpError> {
     let latency_of = |r: Retriever| -> f64 {
         meta.retriever_latencies_ms
             .iter()
@@ -2029,7 +2770,16 @@ fn build_recall_trace(meta: &QueryMetadata, ctx: &OpsContext) -> Result<RecallTr
             _ => None,
         })
         .collect();
-    let candidate_texts = fetch_candidate_texts(&candidate_ids, ctx)?;
+    // Tenant wall for the diagnostic surface. The lexical / graph / statement-
+    // semantic lanes don't push the `(namespace, space)` scope down, so their
+    // pre-fusion candidate sets can carry foreign-tenant ids. The trace must not
+    // render another tenant's content: every candidate id is re-verified against
+    // the caller's scope BEFORE its text / label is fetched — a foreign or
+    // missing candidate surfaces as an opaque id with no content, mirroring the
+    // answer path's per-row `(namespace_id, space_id)` re-check.
+    let caller_scope =
+        brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_space);
+    let candidate_texts = fetch_candidate_texts(&candidate_ids, caller_scope, mode, ctx)?;
 
     // The graph lane surfaces typed items (entities / relations), not memories —
     // resolving those to display labels needs the metadata tables. Open one read
@@ -2066,7 +2816,13 @@ fn build_recall_trace(meta: &QueryMetadata, ctx: &OpsContext) -> Result<RecallTr
                     cands
                         .iter()
                         .map(|(id, score)| {
-                            candidate_from_ranked(typed_rtxn.as_ref(), id, *score, &candidate_texts)
+                            candidate_from_ranked(
+                                typed_rtxn.as_ref(),
+                                caller_scope,
+                                id,
+                                *score,
+                                &candidate_texts,
+                            )
                         })
                         .collect()
                 })
@@ -2219,22 +2975,30 @@ fn dropped_ids_wire(ids: &[RankedItemId]) -> Vec<RecallTraceDroppedId> {
 /// shown in the pipeline always matches the list.
 fn candidate_from_ranked(
     typed_rtxn: Option<&redb::ReadTransaction>,
+    caller_scope: brain_metadata::RowScope,
     id: &RankedItemId,
     score: f32,
     memory_texts: &HashMap<MemoryId, String>,
 ) -> RecallTraceCandidate {
     use brain_protocol::ops::memory::RecallCandidateKind;
     match id {
+        // Memory scope is enforced upstream: `fetch_candidate_texts` only
+        // populates `memory_texts` for in-scope rows, so a foreign / missing
+        // memory falls back to an empty (contentless) label here.
         RankedItemId::Memory(mid) => RecallTraceCandidate {
             item_id: mid.raw(),
             kind: RecallCandidateKind::Memory,
             text: memory_texts.get(mid).cloned().unwrap_or_default(),
             score,
         },
+        // Typed items are re-scoped here before their label is rendered: an
+        // out-of-scope (or missing) row yields an empty label, so a foreign
+        // tenant's entity name / relation / statement never reaches the trace.
         RankedItemId::Entity(eid) => RecallTraceCandidate {
             item_id: u128::from_be_bytes(eid.to_bytes()),
             kind: RecallCandidateKind::Entity,
             text: typed_rtxn
+                .filter(|r| entity_in_caller_scope(r, *eid, caller_scope))
                 .and_then(|r| brain_metadata::entity_get(r, *eid).ok().flatten())
                 .map(|e| e.canonical_name)
                 .unwrap_or_default(),
@@ -2244,6 +3008,7 @@ fn candidate_from_ranked(
             item_id: u128::from_be_bytes(rid.to_bytes()),
             kind: RecallCandidateKind::Relation,
             text: typed_rtxn
+                .filter(|r| relation_in_caller_scope(r, *rid, caller_scope))
                 .map(|r| render_relation_label(r, *rid))
                 .unwrap_or_default(),
             score,
@@ -2252,11 +3017,47 @@ fn candidate_from_ranked(
             item_id: u128::from_be_bytes(sid.to_bytes()),
             kind: RecallCandidateKind::Statement,
             text: typed_rtxn
+                .filter(|r| statement_in_caller_scope(r, *sid, caller_scope).unwrap_or(false))
                 .map(|r| render_statement_label(r, *sid))
                 .unwrap_or_default(),
             score,
         },
     }
+}
+
+/// Whether entity `eid`'s row belongs to the caller's `(namespace, space)`
+/// scope, read on the shared trace txn. Fail-closed: a missing row or read
+/// error denies, so a foreign / vanished entity never renders its canonical
+/// name into the trace. Mirrors [`statement_in_caller_scope`] for the graph
+/// lane's entity candidates.
+fn entity_in_caller_scope(
+    rtxn: &redb::ReadTransaction,
+    eid: EntityId,
+    caller_scope: brain_metadata::RowScope,
+) -> bool {
+    use brain_metadata::tables::entity::{EntityMetadata, ENTITIES_TABLE};
+    let Ok(t) = rtxn.open_table(ENTITIES_TABLE) else {
+        return false;
+    };
+    let row: Option<EntityMetadata> = t.get(&eid.to_bytes()).ok().flatten().map(|g| g.value());
+    matches!(row, Some(m) if m.scope() == caller_scope)
+}
+
+/// Whether relation `rid`'s sidecar row belongs to the caller's `(namespace,
+/// space)` scope, read on the shared trace txn. Fail-closed: a missing row or
+/// read error denies. Mirrors [`entity_in_caller_scope`] for the graph lane's
+/// relation candidates.
+fn relation_in_caller_scope(
+    rtxn: &redb::ReadTransaction,
+    rid: brain_core::RelationId,
+    caller_scope: brain_metadata::RowScope,
+) -> bool {
+    use brain_metadata::tables::relation::{RelationMetadata, RELATION_METADATA_TABLE};
+    let Ok(t) = rtxn.open_table(RELATION_METADATA_TABLE) else {
+        return false;
+    };
+    let row: Option<RelationMetadata> = t.get(&rid.to_bytes()).ok().flatten().map(|g| g.value());
+    matches!(row, Some(m) if m.scope() == caller_scope)
 }
 
 /// "From —namespace:name→ To" for a relation candidate; partial when a lookup
@@ -2327,6 +3128,8 @@ fn render_statement_label(rtxn: &redb::ReadTransaction, sid: brain_core::Stateme
 
 fn fetch_candidate_texts(
     ids: &HashSet<MemoryId>,
+    caller_scope: brain_metadata::RowScope,
+    mode: brain_metadata::ScopeMode,
     ctx: &OpsContext,
 ) -> Result<HashMap<MemoryId, String>, OpError> {
     if ids.is_empty() {
@@ -2340,9 +3143,32 @@ fn fetch_candidate_texts(
     let texts_table = rtxn
         .open_table(TEXTS_TABLE)
         .map_err(|e| OpError::Internal(format!("recall trace open TEXTS_TABLE: {e}")))?;
+    // The memory table carries each row's owner scope; the text table is keyed
+    // by global id with no scope, so text is fetched only after the row's
+    // `(namespace, space)` clears the caller's scope. A foreign / missing row
+    // is left out of the map entirely, so its trace candidate renders with no
+    // text — mirroring `project_memory_results`' per-row re-check.
+    let memories_table = rtxn
+        .open_table(MEMORIES_TABLE)
+        .map_err(|e| OpError::Internal(format!("recall trace open MEMORIES_TABLE: {e}")))?;
 
     let mut out = HashMap::with_capacity(ids.len());
     for &id in ids {
+        let in_scope = match memories_table.get(&id.to_be_bytes()) {
+            Ok(Some(guard)) => {
+                let row = guard.value();
+                caller_scope.admits(row.namespace_id, &row.space_id_bytes, mode)
+            }
+            Ok(None) => false,
+            Err(e) => {
+                return Err(OpError::Internal(format!(
+                    "recall trace MEMORIES_TABLE get: {e}"
+                )));
+            }
+        };
+        if !in_scope {
+            continue;
+        }
         let text = match texts_table.get(&id.to_be_bytes()) {
             Ok(Some(guard)) => std::str::from_utf8(guard.value())
                 .map(str::to_owned)
@@ -2372,12 +3198,10 @@ fn retriever_name_wire(r: Retriever) -> RetrieverNameWire {
     }
 }
 
-/// Env gate for autocut (`BRAIN_AUTOCUT`). Default OFF.
+/// Deploy-time gate for autocut (`[retrieval] autocut`). Default OFF.
+/// Sourced from the parsed config installed at boot.
 fn autocut_enabled() -> bool {
-    matches!(
-        std::env::var("BRAIN_AUTOCUT").ok().as_deref(),
-        Some("1" | "true" | "TRUE" | "on" | "ON")
-    )
+    brain_core::RetrievalTuning::active().autocut
 }
 
 /// Smallest count autocut will ever return when there is at least one hit —
@@ -2429,10 +3253,14 @@ fn overlay_txn_buffer(
     req: &RecallRequest,
     ctx: &OpsContext,
 ) -> Result<Vec<MemoryResult>, OpError> {
-    let _ = ctx.txn_store.validate_active(txn_id)?;
-    let (pending, tombstoned) = ctx.txn_store.with_buffer(txn_id, |buf| {
-        Ok::<_, OpError>((buf.encodes.clone(), buf.tombstoned.clone()))
-    })?;
+    let _ = ctx
+        .txn_store
+        .validate_active(txn_id, ctx.caller_connection_id)?;
+    let (pending, tombstoned) =
+        ctx.txn_store
+            .with_buffer(txn_id, ctx.caller_connection_id, |buf| {
+                Ok::<_, OpError>((buf.encodes.clone(), buf.tombstoned.clone()))
+            })?;
 
     // Drop tombstoned committed hits first — a tombstone in the
     // buffer wins over a committed row for in-txn reads.
@@ -2482,15 +3310,24 @@ fn overlay_txn_buffer(
         if p.salience_initial < req.salience_floor {
             continue;
         }
-        if let Some(bound) = req.age_bound_unix_nanos {
-            if p.created_at_unix_nanos < bound {
-                continue;
-            }
-        }
-        let score = cosine(&cue_vec, &p.vector);
-        if score < req.confidence_threshold {
+        if !passes_age_bound(
+            req.age_bound_unix_nanos,
+            p.occurred_at_unix_nanos,
+            p.created_at_unix_nanos,
+        ) {
             continue;
         }
+        // `confidence_threshold` is a SALIENCE floor on the committed path
+        // (brain-planner `filter_confidence` gates memory hits by
+        // `salience >= confidence_min`, deliberately — see the owner note there;
+        // the surfaced `confidence` field remains cosine). Apply the SAME
+        // semantic to buffered hits so read-your-writes is consistent: filter by
+        // the pending item's salience, never by cosine. A fresh buffered write
+        // has no decay, so `salience_initial` is its current salience.
+        if !pending_clears_confidence(p.salience_initial, req.confidence_threshold) {
+            continue;
+        }
+        let score = cosine(&cue_vec, &p.vector);
         merged.push(pending_to_memory_result(p, req, score));
     }
 
@@ -2505,6 +3342,21 @@ fn overlay_txn_buffer(
     // Candidate pool for membership, not the answer cap (applied downstream).
     merged.truncate(RECALL_CANDIDATE_POOL as usize);
     Ok(merged)
+}
+
+/// Whether a buffered (pending) hit clears the `confidence_threshold` gate,
+/// using the SAME semantic as the committed path.
+///
+/// On the committed path `confidence_threshold` becomes `FilterChain::confidence_min`
+/// and gates memory hits as a SALIENCE floor (`salience >= min`), NOT a cosine
+/// floor (intentional; the surfaced `confidence` field is cosine but the FILTER
+/// is salience). The overlay historically applied it as a cosine floor, so the
+/// one wire field filtered committed vs pending on different quantities and
+/// read-your-writes was inconsistent. This makes the pending gate salience-based
+/// too. A zero threshold admits everything (committed leaves `confidence_min`
+/// unset at `0.0`), which `salience >= 0.0` reproduces.
+fn pending_clears_confidence(salience: f32, confidence_threshold: f32) -> bool {
+    salience >= confidence_threshold
 }
 
 fn pending_to_memory_result(p: &BufferedEncode, req: &RecallRequest, score: f32) -> MemoryResult {
@@ -2855,11 +3707,20 @@ fn build_planner_request(
     caller_space: brain_core::SpaceId,
     entity_anchor: Option<EntityId>,
 ) -> PlannerQueryRequest {
-    // Strict per-space isolation: retrieval is always scoped to the calling
-    // space (from the key). Every row belongs to exactly one space, and there
-    // is no client-supplied space filter on the wire, so a key can never reach
-    // another space's memories.
-    let space_filter: Vec<brain_core::SpaceId> = vec![caller_space];
+    // Space scope of the front-gate prefilter. In the default (space-scoped)
+    // recall this pins retrieval to the calling space — every row belongs to
+    // exactly one space and there is no client-supplied space filter on the
+    // wire, so a key can never reach another space's memories. Under a
+    // namespace-wide recall the space filter is left EMPTY, which the
+    // retrievers read as "any space"; the namespace wall is enforced
+    // separately and unconditionally on every lane (semantic
+    // `namespace_id`, graph `admits`, and the projector post-filters), so
+    // an empty space filter widens across the caller's own spaces without
+    // ever crossing namespaces.
+    let space_filter: Vec<brain_core::SpaceId> = match recall_scope_mode(req) {
+        brain_metadata::ScopeMode::Space => vec![caller_space],
+        brain_metadata::ScopeMode::Namespace => Vec::new(),
+    };
 
     PlannerQueryRequest {
         text: Some(req.cue_text.clone()),
@@ -2990,18 +3851,25 @@ fn project_memory_results(
             continue;
         }
 
-        // Tenant wall — unconditional, defense-in-depth at the projector. The
-        // semantic (and per-space brute-force) lane scopes at the index, but the
-        // lexical and graph lanes do not push the `(namespace, space)` scope
-        // down, so a fused hit could otherwise carry a foreign-tenant OR
-        // foreign-space memory into the answer. Re-check the row's own owner
-        // scope here — both halves — so no lane can leak across the namespace or
-        // the space boundary (spec §20: space is a hard wall, and every
-        // id-keyed read re-verifies `(namespace_id, space_id)`).
-        if row.namespace_id != ctx.executor.caller_namespace.raw() {
-            continue;
-        }
-        if row.space_id_bytes != <[u8; 16]>::from(ctx.executor.caller_space) {
+        // Tenant wall — the authoritative, defense-in-depth scope gate at the
+        // projector. The semantic (and per-space brute-force) lane scopes at
+        // the index, but the lexical and graph lanes do NOT push the scope
+        // down (the tantivy query carries no namespace clause), so a fused hit
+        // could otherwise carry a foreign-tenant OR foreign-space memory into
+        // the answer. Re-check the row's own owner scope here via the one
+        // centralized `admits` predicate: the **namespace half is always
+        // enforced** (the tenant wall, never relaxed), while the space half is
+        // relaxed only under a namespace-wide recall — so a namespace-wide
+        // read spans the caller's own spaces yet can never cross namespaces,
+        // even though the lexical lane over-returns when its space filter is
+        // dropped. This projector is what makes that widening safe.
+        let caller_scope =
+            brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_space);
+        if !caller_scope.admits(
+            row.namespace_id,
+            &row.space_id_bytes,
+            recall_scope_mode(req),
+        ) {
             continue;
         }
 
@@ -3023,10 +3891,12 @@ fn project_memory_results(
         if row.salience < req.salience_floor {
             continue;
         }
-        if let Some(bound) = req.age_bound_unix_nanos {
-            if row.created_at_unix_nanos < bound {
-                continue;
-            }
+        if !passes_age_bound(
+            req.age_bound_unix_nanos,
+            row.occurred_at_unix_nanos,
+            row.created_at_unix_nanos,
+        ) {
+            continue;
         }
 
         let text = if let Some(texts) = texts_table.as_ref() {
@@ -3213,6 +4083,278 @@ mod tests {
     use super::*;
     use brain_planner::retrieval::router::Retriever;
 
+    /// Minimal `MemoryResult` for merge tests — only `memory_id` matters to the
+    /// cross-shard merge (it ranks by within-shard position, dedups by id).
+    fn mr_min(id: u128) -> MemoryResult {
+        MemoryResult {
+            memory_id: id,
+            text: String::new(),
+            similarity_score: 0.0,
+            confidence: 0.0,
+            salience: 0.0,
+            kind: MemoryKindWire::Semantic,
+            space_id: [0u8; 16],
+            session_id: 0,
+            created_at_unix_nanos: 0,
+            last_accessed_at_unix_nanos: 0,
+            edges: None,
+            graph: None,
+            contributing_retrievers: Vec::new(),
+            fused_score: 0.0,
+            rerank_score: None,
+            salience_initial: 0.0,
+            access_count: 0,
+            lsn: 0,
+            flags: 0,
+            consolidated_at_unix_nanos: None,
+            occurred_at_unix_nanos: None,
+            edges_out_count: 0,
+            edges_in_count: 0,
+        }
+    }
+
+    fn ids(pool: &[MemoryResult]) -> Vec<u128> {
+        pool.iter().map(|m| m.memory_id).collect()
+    }
+
+    #[test]
+    fn merge_pools_empty_is_empty() {
+        assert!(merge_recall_pools(Vec::new()).is_empty());
+        assert!(merge_recall_pools(vec![Vec::new(), Vec::new()]).is_empty());
+    }
+
+    #[test]
+    fn merge_pools_single_pool_preserves_order() {
+        let pool = vec![mr_min(10), mr_min(20), mr_min(30)];
+        assert_eq!(ids(&merge_recall_pools(vec![pool])), vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn merge_pools_interleaves_by_within_shard_rank() {
+        // Two shards. RRF by rank: both rank-1 hits outrank both rank-2 hits,
+        // etc. Within an equal rank, ties break on ascending memory_id.
+        let shard_a = vec![mr_min(1), mr_min(3), mr_min(5)];
+        let shard_b = vec![mr_min(2), mr_min(4)];
+        // rank1: {1,2} → 1,2 ; rank2: {3,4} → 3,4 ; rank3: {5} → 5
+        assert_eq!(
+            ids(&merge_recall_pools(vec![shard_a, shard_b])),
+            vec![1, 2, 3, 4, 5]
+        );
+    }
+
+    #[test]
+    fn merge_pools_dedups_by_id_keeping_best_rank() {
+        // A defensive case: the same memory appears in two pools at different
+        // ranks. It must appear ONCE, at its best (highest-RRF = lowest) rank.
+        let shard_a = vec![mr_min(1), mr_min(9)]; // 9 at rank 2
+        let shard_b = vec![mr_min(9), mr_min(2)]; // 9 at rank 1 (better)
+        let out = ids(&merge_recall_pools(vec![shard_a, shard_b]));
+        assert_eq!(out.iter().filter(|&&x| x == 9).count(), 1, "9 deduped");
+        // 9's best rank is 1 (from shard_b), tying with 1 (rank 1 shard_a) →
+        // ordered by id: 1, 9, then 2 (rank 2).
+        assert_eq!(out, vec![1, 9, 2]);
+    }
+
+    #[test]
+    fn merge_pools_truncates_to_candidate_budget() {
+        let big: Vec<MemoryResult> = (0..(RECALL_CANDIDATE_POOL as u128 + 50))
+            .map(mr_min)
+            .collect();
+        let out = merge_recall_pools(vec![big]);
+        assert_eq!(out.len(), RECALL_CANDIDATE_POOL as usize);
+    }
+
+    // ---- merge_namespace_partials (Phase D: cross-shard grounded + HyPE) ----
+
+    use brain_core::{StatementObject, StatementValue};
+
+    fn grounded(score: f32, anchor_scoped: bool) -> GroundedOutcome {
+        GroundedOutcome::Answer(
+            GroundedAnswer {
+                kind: crate::grounded::AnswerKind::Single,
+                values: vec![GroundedValue {
+                    predicate: "brain:x".into(),
+                    object: StatementObject::Value(StatementValue::Text("v".into())),
+                    confidence: 1.0,
+                    source_memory: None,
+                    match_score: score,
+                    recency: 0,
+                }],
+            },
+            anchor_scoped,
+        )
+    }
+
+    fn part(
+        memories: Vec<MemoryResult>,
+        grounded: GroundedOutcome,
+        hype: &[(u128, f32)],
+        anchor: Option<EntityId>,
+    ) -> NamespaceRecallPartial {
+        NamespaceRecallPartial {
+            memories,
+            grounded,
+            hype_scores: hype.iter().copied().collect(),
+            anchor,
+        }
+    }
+
+    #[test]
+    fn merge_partials_picks_highest_scoring_grounded_answer() {
+        let a1 = EntityId::new();
+        let a2 = EntityId::new();
+        let merged = merge_namespace_partials(vec![
+            part(vec![mr_min(1)], grounded(0.60, true), &[], Some(a1)),
+            part(vec![mr_min(2)], grounded(0.80, true), &[], Some(a2)),
+        ]);
+        match &merged.grounded {
+            GroundedOutcome::Answer(ans, _) => {
+                assert!(
+                    (grounded_answer_score(ans) - 0.80).abs() < 1e-6,
+                    "kept the 0.80 answer"
+                );
+            }
+            GroundedOutcome::NoAnswer => panic!("expected an Answer"),
+        }
+        assert_eq!(
+            merged.anchor,
+            Some(a2),
+            "anchor travels with the winning shard"
+        );
+    }
+
+    #[test]
+    fn merge_partials_prefers_anchor_scoped_on_tie() {
+        let a_scoped = EntityId::new();
+        let a_unscoped = EntityId::new();
+        // Unscoped answer arrives FIRST at an equal score; the anchor-scoped one
+        // must still win (only an anchor-scoped answer may commit the lead).
+        let merged = merge_namespace_partials(vec![
+            part(
+                vec![mr_min(1)],
+                grounded(0.70, false),
+                &[],
+                Some(a_unscoped),
+            ),
+            part(vec![mr_min(2)], grounded(0.70, true), &[], Some(a_scoped)),
+        ]);
+        match merged.grounded {
+            GroundedOutcome::Answer(_, anchor_scoped) => {
+                assert!(anchor_scoped, "anchor-scoped wins the tie")
+            }
+            GroundedOutcome::NoAnswer => panic!("expected an Answer"),
+        }
+        assert_eq!(merged.anchor, Some(a_scoped));
+    }
+
+    #[test]
+    fn merge_partials_unions_hype_scores_across_shards() {
+        let merged = merge_namespace_partials(vec![
+            part(
+                vec![mr_min(1)],
+                GroundedOutcome::NoAnswer,
+                &[(1, 0.5)],
+                None,
+            ),
+            part(
+                vec![mr_min(2)],
+                GroundedOutcome::NoAnswer,
+                &[(2, 0.9)],
+                None,
+            ),
+        ]);
+        assert_eq!(merged.hype_scores.get(&1), Some(&0.5));
+        assert_eq!(merged.hype_scores.get(&2), Some(&0.9));
+        assert_eq!(merged.hype_scores.len(), 2);
+    }
+
+    #[test]
+    fn merge_partials_no_grounded_uses_first_some_anchor() {
+        let a = EntityId::new();
+        let merged = merge_namespace_partials(vec![
+            part(vec![mr_min(1)], GroundedOutcome::NoAnswer, &[], None),
+            part(vec![mr_min(2)], GroundedOutcome::NoAnswer, &[], Some(a)),
+        ]);
+        assert!(matches!(merged.grounded, GroundedOutcome::NoAnswer));
+        assert_eq!(
+            merged.anchor,
+            Some(a),
+            "falls back to a resolved anchor when no shard grounded"
+        );
+        // Pools still merged across both shards.
+        assert_eq!(merged.memories.len(), 2);
+    }
+
+    // ---- merge_recall_pools property invariants (Phase E hardening) ----
+
+    mod merge_property {
+        use super::{mr_min, RECALL_CANDIDATE_POOL};
+        use crate::handlers::recall::merge_recall_pools;
+        use proptest::collection::vec as pvec;
+        use proptest::prelude::*;
+        use std::collections::HashSet;
+
+        proptest! {
+            #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
+
+            /// The cross-shard merge is a pure set-and-order operation. Whatever
+            /// the per-shard pools (any shard count, any sizes, overlapping ids
+            /// included), the merge must never fabricate an id, never duplicate
+            /// one, stay within the candidate budget, keep every id when the
+            /// union fits the budget, and be deterministic.
+            #[test]
+            fn merge_pools_invariants(
+                // Up to 8 shards, each up to 40 ids drawn from a small space so
+                // cross-pool id collisions actually occur and exercise dedup.
+                pools_ids in pvec(pvec(0u128..60, 0..40), 0..8),
+            ) {
+                let union: HashSet<u128> = pools_ids.iter().flatten().copied().collect();
+                let pools: Vec<Vec<_>> = pools_ids
+                    .iter()
+                    .map(|ids| ids.iter().map(|&id| mr_min(id)).collect())
+                    .collect();
+
+                let out = merge_recall_pools(pools.clone());
+                let out_ids: Vec<u128> = out.iter().map(|m| m.memory_id).collect();
+                let out_set: HashSet<u128> = out_ids.iter().copied().collect();
+
+                // No fabrication: every emitted id came from some input pool.
+                prop_assert!(out_set.is_subset(&union));
+                // No duplicates.
+                prop_assert_eq!(out_ids.len(), out_set.len(), "merge must dedup by id");
+                // Bounded by the candidate budget.
+                prop_assert!(out_ids.len() <= RECALL_CANDIDATE_POOL as usize);
+                // Completeness: when the whole union fits the budget, keep it all.
+                if union.len() <= RECALL_CANDIDATE_POOL as usize {
+                    prop_assert_eq!(out_set, union.clone());
+                }
+                // Deterministic across runs (same input → identical order).
+                let out2: Vec<u128> = merge_recall_pools(pools).iter().map(|m| m.memory_id).collect();
+                prop_assert_eq!(out_ids, out2);
+            }
+        }
+    }
+
+    #[test]
+    fn age_bound_none_admits_everything() {
+        assert!(passes_age_bound(None, Some(1), 2));
+        assert!(passes_age_bound(None, None, 0));
+    }
+
+    #[test]
+    fn age_bound_filters_on_event_time_not_ingest_time() {
+        let bound = Some(2025);
+        // Ingested in 2026 but the event occurred in 2020: excluded, because
+        // its event time (2020) is before the bound.
+        assert!(!passes_age_bound(bound, Some(2020), 2026));
+        // Back-filled 2026 event with an old created_at: included, because
+        // its event time (2026) is at/after the bound.
+        assert!(passes_age_bound(bound, Some(2026), 1990));
+        // No occurred_at: falls back to created_at.
+        assert!(!passes_age_bound(bound, None, 2020));
+        assert!(passes_age_bound(bound, None, 2025));
+    }
+
     #[test]
     fn memory_ids_wire_keeps_only_memory_variants() {
         let mem = MemoryId::from_raw(0x42);
@@ -3343,6 +4485,7 @@ mod tests {
     /// matters here; everything else is a benign zero/empty value.
     fn req_with_max(max_results: u32) -> RecallRequest {
         RecallRequest {
+            scope: Default::default(),
             cue_text: String::new(),
             subject_name: String::new(),
             max_results,
@@ -3447,6 +4590,15 @@ mod tests {
             occurred_at_unix_nanos: None,
             edges_out_count: 0,
             edges_in_count: 0,
+        }
+    }
+
+    /// Like [`mr`] but with an explicit RRF `fused_score` — for the ordering
+    /// tests that exercise the fused tiebreak within a cosine bucket.
+    fn mr_fused(id: u128, lanes: &[RetrieverNameWire], fused: f32) -> MemoryResult {
+        MemoryResult {
+            fused_score: fused,
+            ..mr(id, lanes)
         }
     }
 
@@ -3689,8 +4841,8 @@ mod tests {
     #[test]
     fn answer_relevance_flat_hype_falls_back_to_cosine_order() {
         // No HyPE signal (empty map) → no answer-relevance discrimination, so the
-        // incoming (cosine / assembly) order is preserved verbatim: the
-        // lexical/paraphrase no-regression guarantee.
+        // members order by topical cosine: distinct cosines (gaps well beyond one
+        // bucket) decide, so the highest-cosine member leads.
         let out = vec![mr(1, &[Semantic]), mr(2, &[Semantic]), mr(3, &[Semantic])];
         let cos: HashMap<u128, f32> = [(1u128, 0.90), (2u128, 0.70), (3u128, 0.40)]
             .into_iter()
@@ -3699,18 +4851,142 @@ mod tests {
         assert_eq!(
             got.iter().map(|m| m.memory_id).collect::<Vec<_>>(),
             vec![1, 2, 3],
-            "empty HyPE preserves the incoming order"
+            "empty HyPE → order by topical cosine when the gaps are real"
         );
 
-        // A present-but-FLAT HyPE (all equal) is equally non-discriminating → also
-        // preserves the incoming order, never re-sorts on cosine alone.
+        // A present-but-FLAT HyPE (all equal) is equally non-discriminating → the
+        // incoming (assembly) order is preserved verbatim (the lexical/paraphrase
+        // no-regression guarantee); this is NOT the exact-token regime (the cosine
+        // gap is real, so the flat-corpus path does not engage).
         let out = vec![mr(3, &[Semantic]), mr(1, &[Semantic])];
         let flat: HashMap<u128, f32> = [(3u128, 0.5), (1u128, 0.5)].into_iter().collect();
         let got = order_by_answer_relevance(out, &flat, &cos);
         assert_eq!(
             got.iter().map(|m| m.memory_id).collect::<Vec<_>>(),
             vec![3, 1],
-            "flat HyPE preserves the incoming order"
+            "flat HyPE + real cosine gap → incoming order preserved"
+        );
+    }
+
+    #[test]
+    fn answer_relevance_near_duplicate_cosine_defers_to_fused_lexical() {
+        // The exact-token regression at the unit level: three near-duplicate
+        // passages whose cosines sit within one bucket (0.727–0.739, BGE-small
+        // compression) and whose HyPE is flat. Pure-cosine ordering is query-
+        // independent and strands the exact-token match. Because all three tie on
+        // both the answer-relevance and topical-cosine buckets, the RRF
+        // `fused_score` — which carries the lexical rank-1 exact match — decides.
+        // Only id 2 was surfaced by the lexical lane (its nonce), so it leads even
+        // though it does NOT have the highest raw cosine.
+        let out = vec![
+            mr_fused(1, &[Semantic], 0.016),
+            mr_fused(2, &[Semantic, Lexical], 0.048),
+            mr_fused(3, &[Semantic], 0.015),
+        ];
+        let flat: HashMap<u128, f32> = [(1u128, 0.31), (2u128, 0.30), (3u128, 0.32)]
+            .into_iter()
+            .collect();
+        let cos: HashMap<u128, f32> = [(1u128, 0.739), (2u128, 0.727), (3u128, 0.733)]
+            .into_iter()
+            .collect();
+        let got = order_by_answer_relevance(out, &flat, &cos);
+        assert_eq!(
+            got[0].memory_id, 2,
+            "within a cosine bucket the exact lexical (fused) match must lead",
+        );
+    }
+
+    #[test]
+    fn answer_relevance_unique_lexical_leads_within_flat_bucket() {
+        // The exact-token known-answer case, faithful to the live measurement: a
+        // dense near-duplicate corpus where every member sits in one cosine bucket
+        // (~0.73) with flat HyPE, and the target's RRF `fused_score` is NOT the
+        // highest (the semantic-rank spread buries the small lexical bump). The
+        // target is the UNIQUE original-query lexical hit, so it must lead within
+        // the bucket even though a Semantic-only neighbour has a higher fused
+        // score.
+        let out = vec![
+            mr_fused(1, &[Semantic], 0.141),
+            mr_fused(2, &[Semantic], 0.118),
+            mr_fused(3, &[Semantic, Lexical], 0.108), // target, lower fused
+            mr_fused(4, &[Semantic], 0.107),
+        ];
+        let flat: HashMap<u128, f32> = [(1u128, 0.30), (2u128, 0.30), (3u128, 0.30), (4u128, 0.30)]
+            .into_iter()
+            .collect();
+        let cos: HashMap<u128, f32> = [
+            (1u128, 0.738),
+            (2u128, 0.735),
+            (3u128, 0.733),
+            (4u128, 0.735),
+        ]
+        .into_iter()
+        .collect();
+        let got = order_by_answer_relevance(out, &flat, &cos);
+        assert_eq!(
+            got[0].memory_id, 3,
+            "the unique exact-token lexical match leads within the flat cosine bucket",
+        );
+    }
+
+    #[test]
+    fn answer_relevance_non_unique_lexical_does_not_hijack() {
+        // Precision guard: when a low-specificity term matches MANY members (all
+        // tagged Lexical), the exact-match key is inert — no unique hit — so
+        // ordering falls back to fused_score within the bucket. id 1 (highest
+        // fused) leads; the several lexical hits do not collectively hijack.
+        let out = vec![
+            mr_fused(1, &[Semantic], 0.141),
+            mr_fused(2, &[Semantic, Lexical], 0.118),
+            mr_fused(3, &[Semantic, Lexical], 0.108),
+        ];
+        let flat: HashMap<u128, f32> = [(1u128, 0.30), (2u128, 0.30), (3u128, 0.30)]
+            .into_iter()
+            .collect();
+        let cos: HashMap<u128, f32> = [(1u128, 0.738), (2u128, 0.735), (3u128, 0.733)]
+            .into_iter()
+            .collect();
+        let got = order_by_answer_relevance(out, &flat, &cos);
+        assert_eq!(
+            got[0].memory_id, 1,
+            "non-unique lexical coverage must not hijack the lead over the top fused member",
+        );
+    }
+
+    #[test]
+    fn answer_relevance_unique_lexical_yields_to_real_cosine_gap() {
+        // The exact-match tiebreak sits BELOW the cosine bucket: a genuine topical
+        // gap (a better cosine bucket) still wins over a unique lexical hit in a
+        // worse bucket. id 1 (cos 0.80) leads over the unique-lexical id 2 (0.55).
+        let out = vec![
+            mr_fused(1, &[Semantic], 0.10),
+            mr_fused(2, &[Semantic, Lexical], 0.20),
+        ];
+        let cos: HashMap<u128, f32> = [(1u128, 0.80), (2u128, 0.55)].into_iter().collect();
+        let got = order_by_answer_relevance(out, &HashMap::new(), &cos);
+        assert_eq!(
+            got[0].memory_id, 1,
+            "a real cosine gap outranks a unique lexical hit in a worse bucket",
+        );
+    }
+
+    #[test]
+    fn answer_relevance_real_cosine_gap_beats_fused_coverage() {
+        // Guard against coverage bias: a genuine topical-cosine gap (larger than
+        // one bucket) must NOT be overridden by a lexical coverage hit. id 1 is the
+        // clear topical answer (cos 0.80); id 2 is a distractor a common term
+        // surfaced lexically (higher fused) but with a much lower cosine (0.55).
+        // The cosine bucket separates them, so id 1 leads — the lexical signal only
+        // breaks ties, it never overrides a real topical gap.
+        let out = vec![
+            mr_fused(1, &[Semantic], 0.016),
+            mr_fused(2, &[Semantic, Lexical], 0.048),
+        ];
+        let cos: HashMap<u128, f32> = [(1u128, 0.80), (2u128, 0.55)].into_iter().collect();
+        let got = order_by_answer_relevance(out, &HashMap::new(), &cos);
+        assert_eq!(
+            got[0].memory_id, 1,
+            "a real cosine gap wins over higher lexical-coverage fused_score",
         );
     }
 
@@ -4035,7 +5311,7 @@ mod tests {
             (s_soccer_dup.id, Slot::Object, 0.70),
             (s_chess.id, Slot::Object, 0.40),
         ];
-        let values = cue_scoped_object_set(&rtxn, &hits, &anchors).unwrap();
+        let values = cue_scoped_object_set(&rtxn, &hits, &anchors, scope).unwrap();
         let objs: Vec<String> = values
             .iter()
             .filter_map(|v| match &v.object {
@@ -4048,5 +5324,500 @@ mod tests {
             vec!["soccer".to_string(), "tennis".to_string()],
             "cross-predicate on-cue folds in; off-cue (below floor), wrong-subject, and duplicate excluded"
         );
+    }
+
+    // ── R1: bounded cue-token surface mining (resolver-invocation DoS) ──────
+
+    #[test]
+    fn mine_cue_surfaces_caps_pathological_cue() {
+        // A cue of many DISTINCT non-resolving tokens must not fan out into an
+        // unbounded number of resolver surfaces — each surface is one heavy
+        // `entity_resolve_scored` call on the shard core.
+        let cue: String = (0..10_000)
+            .map(|i| format!("tok{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let surfaces = mine_cue_surfaces("", &cue);
+        assert!(
+            surfaces.len() <= MAX_CUE_SURFACES,
+            "distinct-token cue mined {} surfaces, cap is {}",
+            surfaces.len(),
+            MAX_CUE_SURFACES
+        );
+    }
+
+    #[test]
+    fn mine_cue_surfaces_caps_repeated_token_cue() {
+        // A cue that is millions of copies of a few distinct tokens fills the
+        // dedup set slowly, so the surface cap alone wouldn't stop the scan; the
+        // token-scan clamp keeps it bounded regardless.
+        let cue = "alpha beta ".repeat(1_000_000);
+        let surfaces = mine_cue_surfaces("", &cue);
+        assert!(surfaces.len() <= MAX_CUE_SURFACES);
+        // Only two distinct tokens exist, so we resolve at most two surfaces.
+        assert!(surfaces.contains(&"alpha".to_string()));
+        assert!(surfaces.contains(&"beta".to_string()));
+        assert_eq!(surfaces.len(), 2);
+    }
+
+    #[test]
+    fn mine_cue_surfaces_keeps_normal_cue() {
+        // A realistic cue still yields its named subject as a surface, unchanged.
+        let surfaces = mine_cue_surfaces("", "who does Niraj report to");
+        assert!(
+            surfaces.contains(&"Niraj".to_string()),
+            "normal cue must still surface its named subject: {surfaces:?}"
+        );
+        // Explicit subject_name bypasses mining entirely.
+        assert_eq!(
+            mine_cue_surfaces("Niraj Georgian", "irrelevant cue text"),
+            vec!["Niraj Georgian".to_string()]
+        );
+    }
+
+    // ── R2: slot-projection tenant scoping (cross-space answer leak) ─────────
+
+    #[allow(clippy::type_complexity)]
+    fn scoped_statement_fixture() -> (
+        tempfile::TempDir,
+        brain_metadata::MetadataDb,
+        brain_metadata::RowScope, // scope A (caller)
+        brain_metadata::RowScope, // scope B (foreign)
+        brain_core::StatementId,  // A's statement
+        brain_core::StatementId,  // B's statement
+    ) {
+        use brain_core::{
+            Entity, EntityType, EvidenceRef, Statement, StatementKind, StatementObject,
+            StatementValue, SubjectRef,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db = brain_metadata::MetadataDb::open(dir.path().join("m.redb")).unwrap();
+        let scope_a =
+            brain_metadata::RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xA1; 16]);
+        let scope_b =
+            brain_metadata::RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xB2; 16]);
+        let subj_a = EntityId::new();
+        let subj_b = EntityId::new();
+        let wtxn = db.write_txn().unwrap();
+        for (scope, id, name) in [(scope_a, subj_a, "Alice"), (scope_b, subj_b, "Bob")] {
+            brain_metadata::entity::ops::entity_put(
+                &wtxn,
+                scope,
+                brain_core::SessionId::DEFAULT,
+                &Entity::new_active(id, EntityType::PERSON_ID, name.into(), name.into(), 1),
+            )
+            .unwrap();
+        }
+        let pid = brain_metadata::schema::predicate::predicate_intern_or_get(
+            &wtxn, "test", "plays", 0, 1,
+        )
+        .unwrap();
+        let mk = |subject: EntityId, obj: &str| {
+            Statement::new_root(
+                brain_core::StatementId::new(),
+                StatementKind::Fact,
+                SubjectRef::Entity(subject),
+                pid,
+                StatementObject::Value(StatementValue::Text(obj.into())),
+                0.9,
+                EvidenceRef::default(),
+                brain_core::ExtractorId::from(0),
+                1,
+                1,
+            )
+        };
+        let s_a = mk(subj_a, "soccer");
+        let s_b = mk(subj_b, "cricket");
+        let (id_a, id_b) = (s_a.id, s_b.id);
+        brain_metadata::statement::crud::statement_create(
+            &wtxn,
+            scope_a,
+            brain_core::SessionId::DEFAULT,
+            &s_a,
+            1,
+        )
+        .unwrap();
+        brain_metadata::statement::crud::statement_create(
+            &wtxn,
+            scope_b,
+            brain_core::SessionId::DEFAULT,
+            &s_b,
+            1,
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+        (dir, db, scope_a, scope_b, id_a, id_b)
+    }
+
+    #[test]
+    fn statement_in_caller_scope_drops_foreign_and_missing() {
+        let (_dir, db, scope_a, scope_b, id_a, id_b) = scoped_statement_fixture();
+        let rtxn = db.read_txn().unwrap();
+        assert!(statement_in_caller_scope(&rtxn, id_a, scope_a).unwrap());
+        assert!(!statement_in_caller_scope(&rtxn, id_b, scope_a).unwrap());
+        assert!(statement_in_caller_scope(&rtxn, id_b, scope_b).unwrap());
+        // A missing row is out of scope, never an answer source.
+        assert!(
+            !statement_in_caller_scope(&rtxn, brain_core::StatementId::new(), scope_a).unwrap()
+        );
+    }
+
+    #[test]
+    fn cue_scoped_object_set_drops_foreign_space_hit_with_empty_anchors() {
+        // The regression: with NO resolved subject (anchors empty) the old
+        // `slot_hit_projectable` let Object hits from ANY tenant through, so a
+        // space-B statement whose object-slot question matched a space-A caller's
+        // cue would project (and, upstream, disable abstention). The row-load
+        // scope check must drop the foreign hit while keeping the same-space one.
+        use brain_core::{StatementObject, StatementValue};
+        let (_dir, db, scope_a, _scope_b, id_a, id_b) = scoped_statement_fixture();
+        let rtxn = db.read_txn().unwrap();
+        let anchors: HashSet<EntityId> = HashSet::new(); // cue resolved no subject
+        let hits = vec![
+            (id_b, Slot::Object, 0.90), // foreign (space B), strongest
+            (id_a, Slot::Object, 0.80), // same space (A)
+        ];
+        let values = cue_scoped_object_set(&rtxn, &hits, &anchors, scope_a).unwrap();
+        let objs: Vec<String> = values
+            .iter()
+            .filter_map(|v| match &v.object {
+                StatementObject::Value(StatementValue::Text(t)) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            objs,
+            vec!["soccer".to_string()],
+            "foreign-space object must be dropped; same-space object still projects"
+        );
+    }
+
+    // ── T1: RECALL/QUERY trace cross-tenant leak wall ───────────────────────
+    //
+    // The answer path re-verifies `(namespace_id, space_id)` on every row, but
+    // the opt-in `trace = true` diagnostic surface renders candidate text /
+    // labels for the pre-fusion set of EVERY lane — and the lexical / graph /
+    // statement-semantic lanes don't push scope down. Without a per-candidate
+    // re-check, a caller in space A whose lanes surface space-B rows would read
+    // B's memory text, statement subject-predicate-object, entity canonical
+    // names, and relation labels inside its own trace. These pin the wall at the
+    // exact rendering boundary: a foreign / missing candidate renders as an
+    // opaque id with NO content, while same-space candidates render fully.
+
+    #[allow(clippy::type_complexity)]
+    fn scoped_trace_fixture() -> (
+        tempfile::TempDir,
+        brain_metadata::MetadataDb,
+        brain_metadata::RowScope, // scope A (caller)
+        brain_metadata::RowScope, // scope B (foreign)
+        EntityId,                 // A's entity (Alice)
+        EntityId,                 // B's entity (Bob)
+        brain_core::StatementId,  // A's statement
+        brain_core::StatementId,  // B's statement
+        brain_core::RelationId,   // A's relation
+        brain_core::RelationId,   // B's relation
+    ) {
+        use brain_core::{
+            Entity, EntityType, EvidenceRef, Relation, Statement, StatementKind, StatementObject,
+            StatementValue,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db = brain_metadata::MetadataDb::open(dir.path().join("m.redb")).unwrap();
+        // Distinct in BOTH halves of the scope so the test exercises the
+        // namespace wall and the space wall together.
+        let scope_a =
+            brain_metadata::RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xA1; 16]);
+        let scope_b = brain_metadata::RowScope::from_bytes(2, [0xB2; 16]);
+        let ent_a = EntityId::new();
+        let ent_b = EntityId::new();
+        let wtxn = db.write_txn().unwrap();
+        for (scope, id, name) in [(scope_a, ent_a, "Alice"), (scope_b, ent_b, "Bob")] {
+            brain_metadata::entity::ops::entity_put(
+                &wtxn,
+                scope,
+                brain_core::SessionId::DEFAULT,
+                &Entity::new_active(id, EntityType::PERSON_ID, name.into(), name.into(), 1),
+            )
+            .unwrap();
+        }
+        let pid = brain_metadata::schema::predicate::predicate_intern_or_get(
+            &wtxn, "test", "plays", 0, 1,
+        )
+        .unwrap();
+        let rtid = brain_metadata::relation::types::relation_type_intern_or_get(
+            &wtxn, "test", "knows", 0, 1,
+        )
+        .unwrap();
+        let mk_stmt = |subject: EntityId, obj: &str| {
+            Statement::new_root(
+                brain_core::StatementId::new(),
+                StatementKind::Fact,
+                brain_core::SubjectRef::Entity(subject),
+                pid,
+                StatementObject::Value(StatementValue::Text(obj.into())),
+                0.9,
+                EvidenceRef::default(),
+                brain_core::ExtractorId::from(0),
+                1,
+                1,
+            )
+        };
+        let s_a = mk_stmt(ent_a, "soccer");
+        let s_b = mk_stmt(ent_b, "cricket");
+        let (sid_a, sid_b) = (s_a.id, s_b.id);
+        for (scope, s) in [(scope_a, &s_a), (scope_b, &s_b)] {
+            brain_metadata::statement::crud::statement_create(
+                &wtxn,
+                scope,
+                brain_core::SessionId::DEFAULT,
+                s,
+                1,
+            )
+            .unwrap();
+        }
+        let mk_rel = |from: EntityId| {
+            Relation::new_root(
+                brain_core::RelationId::new(),
+                rtid,
+                from,
+                from, // self-edge keeps the fixture to one entity per scope
+                0.9,
+                Vec::new(),
+                brain_core::ExtractorId::from(0),
+                1,
+                false,
+            )
+        };
+        let r_a = mk_rel(ent_a);
+        let r_b = mk_rel(ent_b);
+        let (rid_a, rid_b) = (r_a.id, r_b.id);
+        for (scope, r) in [(scope_a, &r_a), (scope_b, &r_b)] {
+            brain_metadata::relation::ops::relation_create(
+                &wtxn,
+                scope,
+                brain_core::SessionId::DEFAULT,
+                r,
+                1,
+            )
+            .unwrap();
+        }
+        wtxn.commit().unwrap();
+        (
+            dir, db, scope_a, scope_b, ent_a, ent_b, sid_a, sid_b, rid_a, rid_b,
+        )
+    }
+
+    #[test]
+    fn entity_in_caller_scope_walls_foreign_and_missing() {
+        let (_dir, db, scope_a, scope_b, ent_a, ent_b, ..) = scoped_trace_fixture();
+        let rtxn = db.read_txn().unwrap();
+        assert!(entity_in_caller_scope(&rtxn, ent_a, scope_a));
+        assert!(!entity_in_caller_scope(&rtxn, ent_b, scope_a));
+        assert!(entity_in_caller_scope(&rtxn, ent_b, scope_b));
+        // A missing entity is out of scope — never renders a name.
+        assert!(!entity_in_caller_scope(&rtxn, EntityId::new(), scope_a));
+    }
+
+    #[test]
+    fn relation_in_caller_scope_walls_foreign_and_missing() {
+        let (_dir, db, scope_a, scope_b, .., rid_a, rid_b) = scoped_trace_fixture();
+        let rtxn = db.read_txn().unwrap();
+        assert!(relation_in_caller_scope(&rtxn, rid_a, scope_a));
+        assert!(!relation_in_caller_scope(&rtxn, rid_b, scope_a));
+        assert!(relation_in_caller_scope(&rtxn, rid_b, scope_b));
+        assert!(!relation_in_caller_scope(
+            &rtxn,
+            brain_core::RelationId::new(),
+            scope_a
+        ));
+    }
+
+    #[test]
+    fn candidate_from_ranked_walls_foreign_typed_items() {
+        let (_dir, db, scope_a, _scope_b, ent_a, ent_b, sid_a, sid_b, rid_a, rid_b) =
+            scoped_trace_fixture();
+        let rtxn = db.read_txn().unwrap();
+        let empty_texts: HashMap<MemoryId, String> = HashMap::new();
+        let render =
+            |id: RankedItemId| candidate_from_ranked(Some(&rtxn), scope_a, &id, 0.5, &empty_texts);
+
+        // Same-space typed items render their full label.
+        let c_ea = render(RankedItemId::Entity(ent_a));
+        assert_eq!(c_ea.text, "Alice", "same-space entity name must render");
+        let c_sa = render(RankedItemId::Statement(sid_a));
+        assert_eq!(
+            c_sa.text, "Alice test:plays soccer",
+            "same-space statement label must render"
+        );
+        let c_ra = render(RankedItemId::Relation(rid_a));
+        assert_eq!(
+            c_ra.text, "Alice —test:knows→ Alice",
+            "same-space relation label must render"
+        );
+
+        // Foreign-space typed items render as opaque ids with NO content: the
+        // id is preserved for observability, but B's name / label never leaks.
+        let c_eb = render(RankedItemId::Entity(ent_b));
+        assert_eq!(c_eb.item_id, u128::from_be_bytes(ent_b.to_bytes()));
+        assert!(
+            c_eb.text.is_empty(),
+            "foreign entity name must be walled, got {:?}",
+            c_eb.text
+        );
+        let c_sb = render(RankedItemId::Statement(sid_b));
+        assert_eq!(c_sb.item_id, u128::from_be_bytes(sid_b.to_bytes()));
+        assert!(
+            c_sb.text.is_empty(),
+            "foreign statement label must be walled, got {:?}",
+            c_sb.text
+        );
+        // Specifically: none of B's subject / object appears anywhere.
+        assert!(!c_sb.text.contains("Bob") && !c_sb.text.contains("cricket"));
+        let c_rb = render(RankedItemId::Relation(rid_b));
+        assert_eq!(c_rb.item_id, u128::from_be_bytes(rid_b.to_bytes()));
+        assert!(
+            c_rb.text.is_empty(),
+            "foreign relation label must be walled, got {:?}",
+            c_rb.text
+        );
+    }
+
+    #[test]
+    fn candidate_from_ranked_memory_renders_only_walled_map() {
+        // The memory scope wall lives in `fetch_candidate_texts` (which only
+        // populates the map for in-scope rows). At the render boundary a memory
+        // whose id is absent from the map (foreign, missing, or tombstoned since
+        // fusion) must therefore render with no text.
+        let mid_in = MemoryId::pack(1, 7, 1);
+        let mid_out = MemoryId::pack(1, 8, 1);
+        let mut texts: HashMap<MemoryId, String> = HashMap::new();
+        texts.insert(mid_in, "in-scope body".to_string());
+        let scope =
+            brain_metadata::RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xA1; 16]);
+
+        let c_in = candidate_from_ranked(None, scope, &RankedItemId::Memory(mid_in), 0.5, &texts);
+        assert_eq!(c_in.text, "in-scope body");
+        let c_out = candidate_from_ranked(None, scope, &RankedItemId::Memory(mid_out), 0.5, &texts);
+        assert_eq!(c_out.item_id, mid_out.raw());
+        assert!(
+            c_out.text.is_empty(),
+            "a memory absent from the walled map renders no text"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fetch_candidate_texts_walls_foreign_space_memory() {
+        use brain_core::{MemoryId, MemoryKind, NamespaceId, SessionId, SpaceId};
+        use brain_index::{IndexParams, SharedHnsw};
+        use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
+        use brain_metadata::tables::text::TEXTS_TABLE;
+        use brain_metadata::MetadataDb;
+        use brain_planner::{ExecutorContext, WriterHandle};
+        use std::sync::Arc;
+
+        struct ZeroDispatcher;
+        impl brain_embed::Dispatcher for ZeroDispatcher {
+            fn embed(
+                &self,
+                _text: &str,
+            ) -> Result<[f32; brain_embed::VECTOR_DIM], brain_embed::EmbedError> {
+                Ok([0.0; brain_embed::VECTOR_DIM])
+            }
+            fn embed_batch(
+                &self,
+                texts: &[&str],
+            ) -> Result<Vec<[f32; brain_embed::VECTOR_DIM]>, brain_embed::EmbedError> {
+                Ok(texts
+                    .iter()
+                    .map(|_| [0.0; brain_embed::VECTOR_DIM])
+                    .collect())
+            }
+            fn fingerprint(&self) -> [u8; 16] {
+                [0xAB; 16]
+            }
+        }
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let metadata: Arc<MetadataDb> =
+            Arc::new(MetadataDb::open(tempdir.path().join("metadata.redb")).unwrap());
+        let (shared, hnsw_writer) = SharedHnsw::new(IndexParams::default_v1()).unwrap();
+        let writer = Arc::new(crate::RealWriterHandle::new(metadata.clone(), hnsw_writer));
+        let executor = ExecutorContext::new(
+            Arc::new(ZeroDispatcher) as Arc<dyn brain_embed::Dispatcher>,
+            shared,
+            metadata.clone(),
+            writer as Arc<dyn WriterHandle>,
+        );
+        let ctx = crate::test_support::ops_context_for_tests(executor, tempdir.path());
+
+        // Scope A is the caller; scope B is a foreign space in a different
+        // namespace. Seed one memory + text row in each.
+        let space_a = SpaceId::from([0xA1; 16]);
+        let space_b = SpaceId::from([0xB2; 16]);
+        let mid_a = MemoryId::pack(1, 7, 1);
+        let mid_b = MemoryId::pack(1, 8, 1);
+        let wtxn = metadata.write_txn().unwrap();
+        {
+            let mut mt = wtxn.open_table(MEMORIES_TABLE).unwrap();
+            let mut tt = wtxn.open_table(TEXTS_TABLE).unwrap();
+            for (ns, space, mid, body) in [
+                (NamespaceId::SYSTEM, space_a, mid_a, "alice private note"),
+                (NamespaceId::from(2u32), space_b, mid_b, "bob private note"),
+            ] {
+                let m = MemoryMetadata::new_active(
+                    mid,
+                    ns,
+                    space,
+                    SessionId(0),
+                    mid.slot(),
+                    1,
+                    MemoryKind::Episodic,
+                    [0xAB; 16],
+                    0.5,
+                    body.len() as u32,
+                    1_700_000_000_000_000_000,
+                );
+                mt.insert(&mid.to_be_bytes(), &m).unwrap();
+                tt.insert(&mid.to_be_bytes(), body.as_bytes()).unwrap();
+            }
+        }
+        wtxn.commit().unwrap();
+
+        let scope_a = brain_metadata::RowScope::new(NamespaceId::SYSTEM, space_a);
+        let ids: HashSet<MemoryId> = [mid_a, mid_b].into_iter().collect();
+        let texts =
+            fetch_candidate_texts(&ids, scope_a, brain_metadata::ScopeMode::Space, &ctx).unwrap();
+
+        assert_eq!(
+            texts.get(&mid_a).map(String::as_str),
+            Some("alice private note"),
+            "same-space memory text must be present in the trace"
+        );
+        assert!(
+            !texts.contains_key(&mid_b),
+            "foreign-space memory must be walled out of the trace text map"
+        );
+        // Belt-and-suspenders: B's body never appears in any value.
+        assert!(texts.values().all(|t| !t.contains("bob")));
+    }
+
+    // ── R4: in-txn read-your-writes confidence semantics ────────────────────
+
+    #[test]
+    fn pending_confidence_gate_matches_committed_salience_semantics() {
+        // Committed path gates memory hits by `salience >= confidence_min`
+        // (brain-planner `filter_confidence`). The overlay must agree: filter
+        // pending hits by salience, never cosine.
+        //
+        // High salience, LOW cosine → committed KEEPS it (salience-based), so the
+        // overlay must keep it too. A cosine floor would have wrongly dropped it.
+        assert!(pending_clears_confidence(0.9, 0.5));
+        // Low salience, (any) cosine → committed DROPS it; overlay must drop it.
+        assert!(!pending_clears_confidence(0.3, 0.5));
+        // Exactly at the floor is kept (>=), matching committed.
+        assert!(pending_clears_confidence(0.5, 0.5));
+        // Zero threshold admits everything (committed leaves confidence_min unset).
+        assert!(pending_clears_confidence(0.0, 0.0));
     }
 }

@@ -20,4 +20,10 @@ pub enum WorkerError {
     /// helper guards).
     #[error("internal: {0}")]
     Internal(String),
+
+    /// A job asked the worker to perform an operation that has no
+    /// implementation yet. Surfaced (counted + logged by the scheduler)
+    /// rather than silently dropped so an unhandled job never vanishes.
+    #[error("unimplemented: {0}")]
+    Unimplemented(String),
 }

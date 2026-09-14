@@ -51,6 +51,7 @@
 
 pub mod adapters;
 pub mod llm_setup;
+pub mod rebuild;
 pub mod restore;
 pub mod snapshot_manifest;
 pub mod tantivy_recovery;
@@ -60,19 +61,19 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use brain_core::{ShardId, SlotVersion};
+use brain_core::{BackfillId, BackfillProgress, BackfillRequest, MemoryId, ShardId, SlotVersion};
 use brain_embed::{Dispatcher, VECTOR_DIM};
 use brain_index::entity_hnsw::{EntityHnswIndex, EntityHnswParams};
 use brain_index::hype_hnsw::HypeHnswIndex;
 use brain_index::statement_hnsw::{StatementHnswIndex, StatementHnswParams};
 use brain_index::statement_question_hnsw::StatementQuestionHnswIndex;
-use brain_index::{IndexParams, SharedHnsw};
+use brain_index::{IndexParams, PendingEntry, SharedHnsw};
 use brain_metadata::MetadataDb;
 use brain_ops::error::OpError;
 use brain_ops::subscribe::EventEnvelope;
 use brain_ops::{OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
-use brain_protocol::envelope::request::RequestBody;
+use brain_protocol::envelope::request::{ForgetMode, RequestBody};
 use brain_storage::arena::{
     AllocError, ArenaFile, ArenaOpenError, SlotAllocator, DEFAULT_INITIAL_CAPACITY_SLOTS,
 };
@@ -92,7 +93,8 @@ use brain_workers::{
 };
 
 use self::adapters::{
-    ArenaRebuildSource, ArenaSpaceVectorSource, ShardSnapshotSource, WalDirRetentionSource,
+    ArenaRebuildSource, ArenaSpaceVectorSource, RedbRebuildSource, ShardSnapshotSource,
+    WalDirRetentionSource,
 };
 use flume::{Receiver, Sender};
 use glommio::{ExecutorJoinHandle, LocalExecutorBuilder, Placement};
@@ -105,6 +107,19 @@ use tracing::{error, info, warn, Instrument as _};
 pub(crate) enum ShardRequest {
     /// Trivial round-trip. The shard replies with `()`.
     Ping { reply_tx: Sender<()> },
+    /// Resolve a memory's embedding vector by id, space-walled to
+    /// `space`. Used once at SUBSCRIBE registration to fetch the
+    /// reference vector for a `similar_to` filter — a one-time,
+    /// pure-data round-trip so the per-event filter never reaches into
+    /// shard state. The reply is `Some([f32; VECTOR_DIM])` for a live
+    /// memory owned by `space`, `None` when the memory is missing,
+    /// tombstoned, stale (slot-version mismatch), or belongs to another
+    /// space.
+    GetMemoryVector {
+        space: brain_core::SpaceId,
+        memory_id: brain_core::MemoryId,
+        reply_tx: Sender<Option<[f32; VECTOR_DIM]>>,
+    },
     /// Allocate a fresh slot. Returns `(slot_idx, slot_version)`.
     AllocSlot {
         reply_tx: Sender<Result<(u64, SlotVersion), ShardOpError>>,
@@ -127,6 +142,28 @@ pub(crate) enum ShardRequest {
         /// re-enters it via `.instrument()` so the `brain.encode` span nests
         /// under it even though span context is thread-local and does not
         /// follow the Tokio→Glommio hop on its own.
+        parent_span: tracing::Span,
+    },
+    /// Namespace-wide RECALL — Phase C stage 1 (per shard). Runs the associative
+    /// and typed-graph fan-out over THIS shard's spaces (widened to the caller's
+    /// whole namespace) and returns the raw candidate pool WITHOUT any
+    /// membership shaping, so the connection layer can merge every shard's pool
+    /// and shape once globally. Fanned out to all shards.
+    RecallGather {
+        req: Box<brain_protocol::ops::memory::RecallRequest>,
+        caller: brain_ops::RequestCaller,
+        reply_tx: Sender<Result<brain_ops::NamespaceRecallPartial, OpError>>,
+        parent_span: tracing::Span,
+    },
+    /// Namespace-wide RECALL — Phase C stage 3 (coordinator shard only). Shapes
+    /// the MERGED cross-shard inputs (pool + grounded + HyPE, merged by the
+    /// connection layer) into the final answer, reusing the identical
+    /// membership/abstention path single-space RECALL uses.
+    RecallShapeMerged {
+        merged: Box<brain_ops::MergedNamespaceRecall>,
+        req: Box<brain_protocol::ops::memory::RecallRequest>,
+        caller: brain_ops::RequestCaller,
+        reply_tx: Sender<Result<brain_protocol::ops::memory::RecallResponseFrame, OpError>>,
         parent_span: tracing::Span,
     },
     /// Append a pre-built record to the WAL. Returns the durable LSN.
@@ -156,8 +193,18 @@ pub(crate) enum ShardRequest {
         id: u64,
         reply_tx: Sender<Result<(), String>>,
     },
-    /// Trigger an immediate HNSW rebuild on this shard.
+    /// Trigger an immediate memory-HNSW rebuild on this shard. Retained
+    /// as the `/v1/rebuild-ann` back-compat path; equivalent to
+    /// `RebuildIndex { target: MemoryHnsw }`.
     RebuildHnsw {
+        reply_tx: Sender<Result<RebuildReport, String>>,
+    },
+    /// Rebuild a chosen derived index from authoritative redb state
+    /// (admin `POST /v1/rebuild?index=<target>`). Runs on the shard
+    /// executor and shares its implementation with the boot-recovery
+    /// path (`shard::rebuild`).
+    RebuildIndex {
+        target: rebuild::RebuildTarget,
         reply_tx: Sender<Result<RebuildReport, String>>,
     },
     /// Snapshot the HNSW index counts. Used by the admin `/metrics`
@@ -186,6 +233,28 @@ pub(crate) enum ShardRequest {
         selector: brain_protocol::BackfillSelector,
         reply_tx: Sender<Result<ExtractBackfillReport, String>>,
     },
+    /// Submit a resumable backfill run to this shard's `BackfillWorker`
+    /// (admin `POST /v1/backfill`). Distinct from `ExtractBackfill`,
+    /// which is a one-shot synchronous re-enqueue: this drives the
+    /// durable, checkpointed, cancellable worker. The `Err(String)`
+    /// reply is returned when the worker isn't provisioned on this
+    /// shard, surfaced to the HTTP layer as a 500.
+    BackfillSubmit {
+        request: BackfillRequest,
+        reply_tx: Sender<Result<BackfillId, String>>,
+    },
+    /// Flag the in-flight resumable backfill run matching `id` for
+    /// cancellation (admin `DELETE /v1/backfill/<id>`). Reply is
+    /// `Ok(true)` iff a matching run was flagged.
+    BackfillCancel {
+        id: BackfillId,
+        reply_tx: Sender<Result<bool, String>>,
+    },
+    /// Snapshot this shard's most-recent resumable backfill progress
+    /// (admin `GET /v1/backfill`).
+    BackfillProgressSnapshot {
+        reply_tx: Sender<Result<BackfillProgress, String>>,
+    },
     /// Auto-abort every Active txn owned by `connection_id`. Fanned out
     /// by the connection layer the moment a TCP/TLS connection drops
     /// before TXN_COMMIT. Reply carries the
@@ -194,6 +263,31 @@ pub(crate) enum ShardRequest {
     AbortOrphanedTxns {
         connection_id: [u8; 16],
         reply_tx: Sender<usize>,
+    },
+    /// Restore (un-tombstone) a soft-forgotten memory on this shard
+    /// (admin `POST /v1/memories/{id}/restore`). Validates the id + owning
+    /// namespace, rejects a hard-forgotten or past-grace memory, submits a
+    /// WAL-durable `Phase::RestoreMemory` through the shard writer, and
+    /// (via the writer's post-commit fan-out) enqueues the FORGET-cascade
+    /// revert. The admin handler fans this out to every shard; a non-owning
+    /// shard reports `NotFound`. The `Err(String)` reply is a real failure
+    /// (writer / metadata error), surfaced to HTTP as `500`.
+    RestoreMemory {
+        memory_id: brain_core::MemoryId,
+        namespace: String,
+        reply_tx: Sender<Result<brain_ops::AdminRestoreOutcome, String>>,
+    },
+    /// Query the historical audit tables (`GET /v1/audit`). Runs on the
+    /// shard executor, which owns the `metadata.redb` handle. Reads one
+    /// index page (`limit` rows, resuming after `cursor`) and returns
+    /// the decoded rows plus the cursor to continue from. Deployment-wide
+    /// operator surface — no tenant scoping (the admin token owns the
+    /// deployment).
+    AuditQuery {
+        selector: AuditSelector,
+        limit: usize,
+        cursor: Option<AuditCursor>,
+        reply_tx: Sender<Result<AuditPage, String>>,
     },
 }
 
@@ -285,6 +379,49 @@ pub struct RebuildReport {
     pub elapsed_ms: u64,
 }
 
+/// Which audit index an audit-log query walks. Pure data — crosses the
+/// Tokio↔Glommio channel unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuditSelector {
+    /// Extraction-audit rows for one memory (`EXTRACTOR_AUDIT_BY_MEMORY`).
+    Memory([u8; 16]),
+    /// Extraction-audit rows produced by one extractor
+    /// (`EXTRACTOR_AUDIT_BY_EXTRACTOR`).
+    Extractor(u32),
+    /// Extraction-audit rows whose `started_at_unix_nanos` falls in
+    /// `[since, until]` (`EXTRACTOR_AUDIT_BY_TIME`).
+    Time { since: u64, until: u64 },
+    /// Entity-resolution-audit rows whose `created_at_unix_nanos` falls in
+    /// `[since, until]`. The resolution table has no secondary index, so
+    /// the scan walks the primary key (UUIDv7 ≈ creation order) and
+    /// filters on the window.
+    Resolution { since: u64, until: u64 },
+}
+
+/// Opaque pagination position: the last index key returned in the prior
+/// page. `ts` is the leading key component for the `Time` selector; it is
+/// ignored for `Memory` / `Extractor` / `Resolution`, whose scans have a
+/// fixed (or absent) leading component and resume on `audit_id` alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuditCursor {
+    pub ts: u64,
+    pub audit_id: [u8; 16],
+}
+
+/// One page of audit rows plus the cursor to resume after the last row.
+/// `next` is `Some` iff at least one further row exists past this page.
+#[derive(Clone, Debug)]
+pub enum AuditPage {
+    Extraction {
+        rows: Vec<brain_metadata::tables::audit::ExtractionAudit>,
+        next: Option<AuditCursor>,
+    },
+    Resolution {
+        rows: Vec<brain_metadata::tables::audit::ResolutionAudit>,
+        next: Option<AuditCursor>,
+    },
+}
+
 // ---------------------------------------------------------------------------
 // Spawn config
 // ---------------------------------------------------------------------------
@@ -298,8 +435,10 @@ pub struct ShardSpawnConfig {
     pub pin_cpu: Option<usize>,
     /// Root data directory. Per-shard subdir is `<data_dir>/<shard_id>/`.
     pub data_dir: PathBuf,
-    /// Initial arena capacity in slots. The arena grows on demand via
-    /// `ArenaFile::grow_to` (not yet wired).
+    /// Initial arena capacity in slots. The arena is recovery-only (live
+    /// vectors live in redb), so it is populated during WAL replay, which
+    /// grows it on demand via `ArenaFile::grow_to` to fit the whole
+    /// recovered dataset regardless of this initial size.
     pub arena_initial_capacity_slots: u64,
     /// WAL configuration (group commit window, segment size limit, ...).
     pub wal_config: WalConfig,
@@ -694,6 +833,12 @@ pub enum ShardError {
     #[error("snapshot operation failed: {0}")]
     Snapshot(String),
 
+    #[error("backfill control failed: {0}")]
+    Backfill(String),
+
+    #[error("audit query failed: {0}")]
+    AuditQuery(String),
+
     #[error("failed to open arena: {0}")]
     ArenaOpen(#[from] ArenaOpenError),
 
@@ -839,9 +984,42 @@ pub struct ShardHandle {
     /// unconditional (drains an empty STATEMENTS table on substrate-
     /// only shards). `/metrics` exposition reads this directly.
     confidence_sweep_metrics: Arc<brain_ops::ConfidenceSweepMetrics>,
+    /// Read-path per-retriever metrics. Always wired — recall runs on
+    /// every shard. Shared by `Arc` with the shard's `OpsContext`, which
+    /// records into it after each `execute`; `/metrics` reads it here.
+    retriever_metrics: Arc<brain_ops::RetrieverMetrics>,
+    /// End-to-end RECALL (query) metrics. Same shared-by-`Arc` shape as
+    /// [`Self::retriever_metrics`].
+    query_metrics: Arc<brain_ops::QueryMetrics>,
 }
 
 impl ShardHandle {
+    /// Test-only constructor: builds a `ShardHandle` around a caller-owned
+    /// request channel so tests can observe the `ShardRequest`s the
+    /// connection layer sends (e.g. the disconnect-time orphan-txn sweep)
+    /// without spawning a real Glommio executor. The caller drains `tx`'s
+    /// receiver to count / reply to requests.
+    #[cfg(test)]
+    pub(crate) fn new_for_test(shard_id: ShardId, tx: Sender<ShardRequest>) -> Self {
+        let (_events_tx, events_rx) = flume::bounded::<EventEnvelope>(1);
+        Self {
+            shard_id,
+            tx,
+            events: events_rx,
+            wal_dir: std::path::PathBuf::new(),
+            shard_uuid: [0u8; 16],
+            auto_edge_metrics: None,
+            extractor_metrics: None,
+            temporal_edge_metrics: None,
+            causal_edge_metrics: None,
+            llm_cache_sweep_metrics: None,
+            statement_embed_metrics: Arc::new(brain_ops::StatementEmbedMetrics::new()),
+            confidence_sweep_metrics: Arc::new(brain_ops::ConfidenceSweepMetrics::new()),
+            retriever_metrics: Arc::new(brain_ops::RetrieverMetrics::new()),
+            query_metrics: Arc::new(brain_ops::QueryMetrics::new()),
+        }
+    }
+
     #[must_use]
     pub fn shard_id(&self) -> ShardId {
         self.shard_id
@@ -858,6 +1036,20 @@ impl ShardHandle {
     #[must_use]
     pub fn is_alive(&self) -> bool {
         !self.tx.is_disconnected()
+    }
+
+    /// Number of [`ShardRequest`]s queued on this shard's request
+    /// channel but not yet drained by the executor loop — the
+    /// dispatch-queue depth.
+    ///
+    /// Because the shard is single-writer (the executor drains the
+    /// channel serially), this is the count of requests waiting their
+    /// turn. It reads the flume channel length directly, without a
+    /// round-trip through the executor, so it is safe to call from the
+    /// admin (Tokio) side and cheap enough for a per-scrape gauge.
+    #[must_use]
+    pub fn queue_depth(&self) -> usize {
+        self.tx.len()
     }
 
     /// Read-only handle to the AutoEdgeWorker metric
@@ -913,6 +1105,21 @@ impl ShardHandle {
         self.confidence_sweep_metrics.clone()
     }
 
+    /// Read-only handle to the read-path per-retriever metric state.
+    /// Always wired — recall runs on every shard. `/metrics` exposition
+    /// reads this directly.
+    #[must_use]
+    pub fn retriever_metrics(&self) -> Arc<brain_ops::RetrieverMetrics> {
+        self.retriever_metrics.clone()
+    }
+
+    /// Read-only handle to the end-to-end RECALL (query) metric state.
+    /// Always wired. `/metrics` exposition reads this directly.
+    #[must_use]
+    pub fn query_metrics(&self) -> Arc<brain_ops::QueryMetrics> {
+        self.query_metrics.clone()
+    }
+
     /// Per-shard event feed. Cloning the Receiver shares the underlying
     /// queue (flume Receivers are SPMC-safe); the connection layer
     /// typically clones once and bridges into a tokio `broadcast`.
@@ -947,6 +1154,31 @@ impl ShardHandle {
             .await
             .map_err(|_| ShardError::ShardDisconnected)?;
         Ok(())
+    }
+
+    /// Resolve a memory's embedding vector by id, space-walled to
+    /// `space`. One-time round-trip used by SUBSCRIBE to fetch the
+    /// reference vector for a `similar_to` filter. Returns `Ok(None)`
+    /// when the memory is missing, tombstoned, stale, or owned by a
+    /// different space; `Err` only if the shard is unreachable.
+    pub async fn get_memory_vector(
+        &self,
+        space: brain_core::SpaceId,
+        memory_id: brain_core::MemoryId,
+    ) -> Result<Option<[f32; VECTOR_DIM]>, ShardError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.tx
+            .send_async(ShardRequest::GetMemoryVector {
+                space,
+                memory_id,
+                reply_tx,
+            })
+            .await
+            .map_err(|_| ShardError::ShardDisconnected)?;
+        reply_rx
+            .recv_async()
+            .await
+            .map_err(|_| ShardError::ShardDisconnected)
     }
 
     /// Ask the shard's allocator for a fresh slot. Returns the slot
@@ -1121,12 +1353,108 @@ impl ShardHandle {
             .map_err(ShardError::Snapshot)
     }
 
+    /// Restore (un-tombstone) a soft-forgotten memory on this shard.
+    /// Backs the admin `POST /v1/memories/{id}/restore` route. The admin
+    /// handler fans this out to every shard; a shard that doesn't own the
+    /// id reports [`brain_ops::AdminRestoreOutcome::NotFound`]. `Err` is a
+    /// real per-shard failure (writer / metadata error).
+    pub async fn restore_memory(
+        &self,
+        memory_id: brain_core::MemoryId,
+        namespace: String,
+    ) -> Result<brain_ops::AdminRestoreOutcome, ShardError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.tx
+            .send_async(ShardRequest::RestoreMemory {
+                memory_id,
+                namespace,
+                reply_tx,
+            })
+            .await
+            .map_err(|_| ShardError::ShardDisconnected)?;
+        reply_rx
+            .recv_async()
+            .await
+            .map_err(|_| ShardError::ShardDisconnected)?
+            .map_err(ShardError::Snapshot)
+    }
+
+    /// Submit a resumable backfill run to this shard's `BackfillWorker`
+    /// and return its id. Backs the admin `POST /v1/backfill` route.
+    /// Errors if the worker isn't provisioned on this shard.
+    pub async fn backfill_submit(
+        &self,
+        request: BackfillRequest,
+    ) -> Result<BackfillId, ShardError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.tx
+            .send_async(ShardRequest::BackfillSubmit { request, reply_tx })
+            .await
+            .map_err(|_| ShardError::ShardDisconnected)?;
+        reply_rx
+            .recv_async()
+            .await
+            .map_err(|_| ShardError::ShardDisconnected)?
+            .map_err(ShardError::Backfill)
+    }
+
+    /// Flag this shard's in-flight resumable backfill run matching `id`
+    /// for cancellation. Backs the admin `DELETE /v1/backfill/<id>`
+    /// route. Returns `true` iff a matching run was flagged.
+    pub async fn backfill_cancel(&self, id: BackfillId) -> Result<bool, ShardError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.tx
+            .send_async(ShardRequest::BackfillCancel { id, reply_tx })
+            .await
+            .map_err(|_| ShardError::ShardDisconnected)?;
+        reply_rx
+            .recv_async()
+            .await
+            .map_err(|_| ShardError::ShardDisconnected)?
+            .map_err(ShardError::Backfill)
+    }
+
+    /// Snapshot this shard's most-recent resumable backfill progress.
+    /// Backs the admin `GET /v1/backfill` route.
+    pub async fn backfill_progress(&self) -> Result<BackfillProgress, ShardError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.tx
+            .send_async(ShardRequest::BackfillProgressSnapshot { reply_tx })
+            .await
+            .map_err(|_| ShardError::ShardDisconnected)?;
+        reply_rx
+            .recv_async()
+            .await
+            .map_err(|_| ShardError::ShardDisconnected)?
+            .map_err(ShardError::Backfill)
+    }
+
     /// Trigger an immediate full HNSW rebuild. Returns the new
     /// entry count + elapsed time.
     pub async fn rebuild_hnsw(&self) -> Result<RebuildReport, ShardError> {
         let (reply_tx, reply_rx) = flume::bounded(1);
         self.tx
             .send_async(ShardRequest::RebuildHnsw { reply_tx })
+            .await
+            .map_err(|_| ShardError::ShardDisconnected)?;
+        reply_rx
+            .recv_async()
+            .await
+            .map_err(|_| ShardError::ShardDisconnected)?
+            .map_err(ShardError::Snapshot)
+    }
+
+    /// Rebuild a chosen derived index from authoritative redb state.
+    /// Backs the admin `POST /v1/rebuild?index=<target>` route. For
+    /// `RebuildTarget::All` the returned report aggregates the per-target
+    /// entry counts (sum) and total elapsed time.
+    pub(crate) async fn rebuild_index(
+        &self,
+        target: rebuild::RebuildTarget,
+    ) -> Result<RebuildReport, ShardError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.tx
+            .send_async(ShardRequest::RebuildIndex { target, reply_tx })
             .await
             .map_err(|_| ShardError::ShardDisconnected)?;
         reply_rx
@@ -1170,6 +1498,61 @@ impl ShardHandle {
             .map_err(DispatchError::Op)
     }
 
+    /// Namespace-wide RECALL — stage 1 on THIS shard: gather the raw candidate
+    /// pool over the shard's own spaces (widened to the caller's namespace),
+    /// without any membership shaping. The connection layer fans this out to
+    /// every shard and merges the pools before a single global shaping pass.
+    pub async fn recall_gather(
+        &self,
+        req: brain_protocol::ops::memory::RecallRequest,
+        caller: brain_ops::RequestCaller,
+        parent_span: tracing::Span,
+    ) -> Result<brain_ops::NamespaceRecallPartial, DispatchError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.tx
+            .send_async(ShardRequest::RecallGather {
+                req: Box::new(req),
+                caller,
+                reply_tx,
+                parent_span,
+            })
+            .await
+            .map_err(|_| DispatchError::ShardDisconnected)?;
+        reply_rx
+            .recv_async()
+            .await
+            .map_err(|_| DispatchError::ShardDisconnected)?
+            .map_err(DispatchError::Op)
+    }
+
+    /// Namespace-wide RECALL — stage 3 on the coordinator shard: shape the
+    /// merged cross-shard candidate pool into the final answer, reusing the
+    /// identical membership/abstention path single-space RECALL uses.
+    pub async fn recall_shape_merged(
+        &self,
+        merged: brain_ops::MergedNamespaceRecall,
+        req: brain_protocol::ops::memory::RecallRequest,
+        caller: brain_ops::RequestCaller,
+        parent_span: tracing::Span,
+    ) -> Result<brain_protocol::ops::memory::RecallResponseFrame, DispatchError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.tx
+            .send_async(ShardRequest::RecallShapeMerged {
+                merged: Box::new(merged),
+                req: Box::new(req),
+                caller,
+                reply_tx,
+                parent_span,
+            })
+            .await
+            .map_err(|_| DispatchError::ShardDisconnected)?;
+        reply_rx
+            .recv_async()
+            .await
+            .map_err(|_| DispatchError::ShardDisconnected)?
+            .map_err(DispatchError::Op)
+    }
+
     /// Auto-abort every Active txn this shard holds for the given
     /// wire session. The connection layer invokes this on every shard
     /// in the topology when a TCP/TLS connection drops before the
@@ -1197,6 +1580,33 @@ impl ShardHandle {
             .recv_async()
             .await
             .map_err(|_| DispatchError::ShardDisconnected)
+    }
+
+    /// Read one page of the historical audit tables. Backs the admin
+    /// `GET /v1/audit` + `/v1/audit/export` routes. `limit` bounds the
+    /// page; `cursor` resumes strictly after a prior page's last row.
+    /// The returned `AuditPage::next` is `Some` when more rows remain.
+    pub async fn audit_query(
+        &self,
+        selector: AuditSelector,
+        limit: usize,
+        cursor: Option<AuditCursor>,
+    ) -> Result<AuditPage, ShardError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.tx
+            .send_async(ShardRequest::AuditQuery {
+                selector,
+                limit,
+                cursor,
+                reply_tx,
+            })
+            .await
+            .map_err(|_| ShardError::ShardDisconnected)?;
+        reply_rx
+            .recv_async()
+            .await
+            .map_err(|_| ShardError::ShardDisconnected)?
+            .map_err(ShardError::AuditQuery)
     }
 }
 
@@ -1308,6 +1718,15 @@ struct Shard {
     /// The shared HNSW handle. `rebuild-ann` swaps a freshly-
     /// rebuilt index in via `SharedHnsw::swap()`.
     hnsw_shared: SharedHnsw,
+    /// Entity resolver HNSW. Same `Arc` the resolver + boot rebuild
+    /// hold, so an on-demand `RebuildIndex { EntityHnsw }` reinserts in
+    /// place and is immediately visible on the resolve path.
+    entity_hnsw: Arc<parking_lot::RwLock<EntityHnswIndex>>,
+    /// HyPE question pool. Same `Arc` the semantic retriever probes.
+    hype_hnsw: Arc<parking_lot::RwLock<HypeHnswIndex>>,
+    /// Per-statement question-bridge pool. Same `Arc` the retriever
+    /// probes on slot / temporal reads.
+    statement_question_hnsw: Arc<parking_lot::RwLock<StatementQuestionHnswIndex>>,
     /// The per-shard event-fanout task. Held (not detached) so the
     /// drain path can cancel it: it captures its own broadcast
     /// `EventBus` sender clone, so its `recv()` never observes
@@ -1329,6 +1748,66 @@ struct Shard {
     /// memory's text on disk and keyword-searchable.
     memory_text_task: Option<(flume::Sender<()>, glommio::Task<()>)>,
     statement_text_task: Option<(flume::Sender<()>, glommio::Task<()>)>,
+    /// Concrete lexical retriever handle, kept alongside the
+    /// `Arc<dyn LexicalRetriever>` in `ops` so the hot tantivy rebuild
+    /// (`do_rebuild_tantivy`) can atomically swap its open-index bundle
+    /// via `TantivyLexicalRetriever::swap_shard` without disturbing the
+    /// stable trait handle every reader holds.
+    lexical_retriever: Arc<brain_index::TantivyLexicalRetriever>,
+    /// Shard directory — root of the `memory_text.tantivy/` and
+    /// `statements.tantivy/` index directories the hot rebuild
+    /// reconstructs from authoritative redb and swaps in place.
+    tantivy_dir: std::path::PathBuf,
+    /// Control-plane senders to the two text indexers, used by the hot
+    /// rebuild to `Quiesce` (drop the writer, release the per-directory
+    /// lock) and `Resume` (rebuild the writer on the reopened index).
+    /// `None` when the corresponding indexer failed to spawn.
+    memory_text_control: Option<flume::Sender<brain_ops::index::text_indexer::IndexerControl>>,
+    statement_text_control: Option<flume::Sender<brain_ops::index::text_indexer::IndexerControl>>,
+}
+
+/// Load a page of `ExtractionAudit` rows from the primary audit table
+/// given an ascending iterator of candidate `audit_id`s (produced by
+/// walking one of the three extractor-audit indexes). Collects at most
+/// `limit` rows; when a further candidate exists past the page, the
+/// returned cursor points at the last row actually returned so the caller
+/// can resume strictly after it. Dangling index entries (no primary row)
+/// are skipped without consuming page budget.
+fn collect_extraction_page<I, T>(
+    audit_ids: I,
+    primary: &T,
+    limit: usize,
+) -> Result<
+    (
+        Vec<brain_metadata::tables::audit::ExtractionAudit>,
+        Option<AuditCursor>,
+    ),
+    String,
+>
+where
+    I: IntoIterator<Item = Result<[u8; 16], String>>,
+    T: redb::ReadableTable<[u8; 16], brain_metadata::tables::audit::ExtractionAudit>,
+{
+    let mut rows = Vec::new();
+    let mut last: Option<AuditCursor> = None;
+    let mut next = None;
+    for audit_id in audit_ids {
+        let audit_id = audit_id?;
+        if rows.len() >= limit {
+            // One candidate beyond the page → there is a next page.
+            next = last;
+            break;
+        }
+        if let Some(v) = primary.get(&audit_id).map_err(|e| format!("get: {e}"))? {
+            let row = v.value();
+            last = Some(AuditCursor {
+                ts: row.started_at_unix_nanos,
+                audit_id: row.audit_id_bytes,
+            });
+            rows.push(row);
+        }
+    }
+    Ok((rows, next))
 }
 
 impl Shard {
@@ -1348,6 +1827,178 @@ impl Shard {
             return 0;
         };
         table.len().unwrap_or(0)
+    }
+
+    /// Resolve a memory's full-precision embedding vector by id,
+    /// space-walled to `space`. Returns `None` when the row is missing,
+    /// tombstoned, belongs to another space, or has no stored text.
+    /// Never a silent cross-tenant read: the caller (SUBSCRIBE
+    /// similarity registration) rejects `None` with `InvalidRequest`.
+    ///
+    /// The vector is produced by re-embedding the memory's stored text
+    /// (`TEXTS_TABLE`) rather than reading the arena: the arena is
+    /// populated only by WAL recovery on shard restart, so a memory
+    /// encoded in the current run has no arena slot yet. The embedder is
+    /// deterministic, so re-embedding reproduces the exact vector indexed
+    /// at encode time.
+    fn memory_vector_for(
+        &self,
+        space: brain_core::SpaceId,
+        memory_id: brain_core::MemoryId,
+    ) -> Option<[f32; VECTOR_DIM]> {
+        use brain_metadata::tables::memory::MEMORIES_TABLE;
+        use brain_metadata::tables::text::TEXTS_TABLE;
+
+        let rtxn = self.ops.executor.metadata.read_txn().ok()?;
+        let table = rtxn.open_table(MEMORIES_TABLE).ok()?;
+        let row = table.get(memory_id.to_be_bytes()).ok().flatten()?.value();
+        // Space wall + liveness: a subscriber may only anchor similarity
+        // on a live memory its own (effective) space owns.
+        if !row.is_active() || row.space_id_bytes != space.0.into_bytes() {
+            return None;
+        }
+        // Resolve the reference vector by re-embedding the memory's stored
+        // text, NOT by reading the arena. The arena is populated only by
+        // WAL recovery on shard restart, so a memory encoded in the
+        // current run has no arena slot yet and would resolve to None —
+        // which silently rejected every same-run similarity subscription.
+        // The embedder is deterministic, so re-embedding the stored text
+        // reproduces the exact vector that was indexed at encode time.
+        let texts = rtxn.open_table(TEXTS_TABLE).ok()?;
+        let stored = texts.get(memory_id.to_be_bytes()).ok().flatten()?;
+        let text = std::str::from_utf8(stored.value()).ok()?;
+        self.ops.executor.embedder.embed(text).ok()
+    }
+
+    /// Read one page of the historical audit tables under a single redb
+    /// read transaction. Walks the index matching `selector`, resuming
+    /// strictly after `cursor`, and loads at most `limit` rows. Returns
+    /// `AuditPage::next` = `Some` iff at least one further row exists.
+    ///
+    /// Runs on the shard executor (the sole owner of the `metadata.redb`
+    /// handle). Deployment-wide operator surface — no tenant scoping.
+    fn run_audit_query(
+        &self,
+        selector: AuditSelector,
+        limit: usize,
+        cursor: Option<AuditCursor>,
+    ) -> Result<AuditPage, String> {
+        use brain_metadata::tables::audit::{
+            ENTITY_RESOLUTION_AUDIT_TABLE, EXTRACTOR_AUDIT_BY_EXTRACTOR_TABLE,
+            EXTRACTOR_AUDIT_BY_MEMORY_TABLE, EXTRACTOR_AUDIT_BY_TIME_TABLE, EXTRACTOR_AUDIT_TABLE,
+        };
+        use std::ops::Bound;
+
+        // A `limit` of 0 would loop forever below (never fills a page yet
+        // never terminates the "one-past" check); the handler caps it, but
+        // guard here too so the executor can never wedge.
+        let limit = limit.max(1);
+        let rtxn = self
+            .ops
+            .executor
+            .metadata
+            .read_txn()
+            .map_err(|e| format!("read txn: {e}"))?;
+
+        // Shared page-accumulation over an extractor-audit index: `entries`
+        // yields `(leading, audit_id)` in ascending key order; each hit is
+        // loaded from the primary table. `next` is set to the last row we
+        // actually returned when a further entry exists past the page.
+        match selector {
+            AuditSelector::Memory(mem) => {
+                let idx = rtxn
+                    .open_table(EXTRACTOR_AUDIT_BY_MEMORY_TABLE)
+                    .map_err(|e| format!("open by-memory index: {e}"))?;
+                let primary = rtxn
+                    .open_table(EXTRACTOR_AUDIT_TABLE)
+                    .map_err(|e| format!("open audit table: {e}"))?;
+                let lo = match cursor {
+                    Some(c) => Bound::Excluded((mem, c.audit_id)),
+                    None => Bound::Included((mem, [0u8; 16])),
+                };
+                let hi = Bound::Included((mem, [0xffu8; 16]));
+                let range = idx.range((lo, hi)).map_err(|e| format!("range: {e}"))?;
+                let (rows, next) = collect_extraction_page(
+                    range.map(|e| e.map(|(k, _)| k.value().1).map_err(|e| format!("row: {e}"))),
+                    &primary,
+                    limit,
+                )?;
+                Ok(AuditPage::Extraction { rows, next })
+            }
+            AuditSelector::Extractor(ext) => {
+                let idx = rtxn
+                    .open_table(EXTRACTOR_AUDIT_BY_EXTRACTOR_TABLE)
+                    .map_err(|e| format!("open by-extractor index: {e}"))?;
+                let primary = rtxn
+                    .open_table(EXTRACTOR_AUDIT_TABLE)
+                    .map_err(|e| format!("open audit table: {e}"))?;
+                let lo = match cursor {
+                    Some(c) => Bound::Excluded((ext, c.audit_id)),
+                    None => Bound::Included((ext, [0u8; 16])),
+                };
+                let hi = Bound::Included((ext, [0xffu8; 16]));
+                let range = idx.range((lo, hi)).map_err(|e| format!("range: {e}"))?;
+                let (rows, next) = collect_extraction_page(
+                    range.map(|e| e.map(|(k, _)| k.value().1).map_err(|e| format!("row: {e}"))),
+                    &primary,
+                    limit,
+                )?;
+                Ok(AuditPage::Extraction { rows, next })
+            }
+            AuditSelector::Time { since, until } => {
+                let idx = rtxn
+                    .open_table(EXTRACTOR_AUDIT_BY_TIME_TABLE)
+                    .map_err(|e| format!("open by-time index: {e}"))?;
+                let primary = rtxn
+                    .open_table(EXTRACTOR_AUDIT_TABLE)
+                    .map_err(|e| format!("open audit table: {e}"))?;
+                let lo = match cursor {
+                    Some(c) => Bound::Excluded((c.ts, c.audit_id)),
+                    None => Bound::Included((since, [0u8; 16])),
+                };
+                let hi = Bound::Included((until, [0xffu8; 16]));
+                let range = idx.range((lo, hi)).map_err(|e| format!("range: {e}"))?;
+                let (rows, next) = collect_extraction_page(
+                    range.map(|e| e.map(|(k, _)| k.value().1).map_err(|e| format!("row: {e}"))),
+                    &primary,
+                    limit,
+                )?;
+                Ok(AuditPage::Extraction { rows, next })
+            }
+            AuditSelector::Resolution { since, until } => {
+                let table = rtxn
+                    .open_table(ENTITY_RESOLUTION_AUDIT_TABLE)
+                    .map_err(|e| format!("open resolution table: {e}"))?;
+                let lo = match cursor {
+                    Some(c) => Bound::Excluded(c.audit_id),
+                    None => Bound::Included([0u8; 16]),
+                };
+                let hi = Bound::Included([0xffu8; 16]);
+                let mut rows = Vec::new();
+                let mut last: Option<AuditCursor> = None;
+                let mut next = None;
+                for entry in table.range((lo, hi)).map_err(|e| format!("range: {e}"))? {
+                    let (_k, v) = entry.map_err(|e| format!("row: {e}"))?;
+                    let row = v.value();
+                    // Primary-key scan is creation-ordered (UUIDv7) but the
+                    // window filter is applied in memory since no time index
+                    // exists for the resolution table.
+                    if row.created_at_unix_nanos < since || row.created_at_unix_nanos > until {
+                        continue;
+                    }
+                    if rows.len() >= limit {
+                        next = last;
+                        break;
+                    }
+                    last = Some(AuditCursor {
+                        ts: row.created_at_unix_nanos,
+                        audit_id: row.audit_id_bytes,
+                    });
+                    rows.push(row);
+                }
+                Ok(AuditPage::Resolution { rows, next })
+            }
+        }
     }
 
     /// Sample the shard's on-disk storage footprint for `/metrics`.
@@ -1391,6 +2042,411 @@ impl Shard {
             arena_slots_free,
         }
     }
+
+    /// Rebuild the memory HNSW from the authoritative redb vector
+    /// snapshot, folding in the pending buffer, and publish atomically
+    /// via `SharedHnsw::flush_with_rebuild` so a failed rebuild leaves
+    /// the prior index intact. Shared by the `RebuildHnsw` and
+    /// `RebuildIndex { MemoryHnsw }` handlers.
+    async fn do_rebuild_memory(&self) -> Result<RebuildReport, String> {
+        let start = std::time::Instant::now();
+        let vectors = self
+            .rebuild_source
+            .snapshot_vectors()
+            .await
+            .map_err(|e| format!("rebuild source: {e}"))?;
+        let params = self.hnsw_shared.params();
+        // Fold the redb snapshot together with the pending buffer and
+        // publish atomically. A raw `swap` would clear pending, discarding
+        // a live vector not yet folded into main — the sole home of a
+        // same-run encode between its ENCODE and the next flush.
+        let flush = self.hnsw_shared.flush_with_rebuild(move |pending| {
+            let combined = fold_pending_into(vectors, pending);
+            let (idx, _) = brain_index::rebuild::rebuild_impl(params, combined)?;
+            Ok(idx)
+        });
+        match flush {
+            Ok(report) => Ok(RebuildReport {
+                entries: report.main_len_after,
+                elapsed_ms: start.elapsed().as_millis() as u64,
+            }),
+            Err(e) => Err(format!("rebuild: {e:?}")),
+        }
+    }
+
+    /// Rebuild one derived index from authoritative redb state. The HNSW
+    /// helpers reinsert in place under the index's write lock, so the
+    /// rebuild is immediately visible on the serve path and a failure
+    /// leaves the prior index intact. `All` runs each HNSW target in turn
+    /// and returns an aggregate report (summed entries, total elapsed).
+    async fn do_rebuild_index(
+        &self,
+        target: rebuild::RebuildTarget,
+    ) -> Result<RebuildReport, String> {
+        use rebuild::RebuildTarget as T;
+        let metadata = &self.ops.executor.metadata;
+        let embedder = self.ops.executor.embedder.as_ref();
+        match target {
+            T::MemoryHnsw => self.do_rebuild_memory().await,
+            T::EntityHnsw => {
+                let start = std::time::Instant::now();
+                let entries = rebuild::rebuild_entity_hnsw(
+                    &self.entity_hnsw,
+                    metadata,
+                    embedder,
+                    self.shard_id,
+                )?;
+                Ok(RebuildReport {
+                    entries,
+                    elapsed_ms: start.elapsed().as_millis() as u64,
+                })
+            }
+            T::HypeHnsw => {
+                let start = std::time::Instant::now();
+                let entries = rebuild::rebuild_hype_hnsw(&self.hype_hnsw, metadata, self.shard_id)?;
+                Ok(RebuildReport {
+                    entries,
+                    elapsed_ms: start.elapsed().as_millis() as u64,
+                })
+            }
+            T::StatementQuestionHnsw => {
+                let start = std::time::Instant::now();
+                let entries = rebuild::rebuild_statement_question_hnsw(
+                    &self.statement_question_hnsw,
+                    metadata,
+                    self.shard_id,
+                )?;
+                Ok(RebuildReport {
+                    entries,
+                    elapsed_ms: start.elapsed().as_millis() as u64,
+                })
+            }
+            T::All => {
+                let start = std::time::Instant::now();
+                let mut entries = 0usize;
+                // Memory first (async snapshot), then the in-place HNSW
+                // rebuilds. Any failure short-circuits with the prior
+                // indexes intact (each target swaps atomically).
+                entries += self.do_rebuild_memory().await?.entries;
+                entries += rebuild::rebuild_entity_hnsw(
+                    &self.entity_hnsw,
+                    metadata,
+                    embedder,
+                    self.shard_id,
+                )?;
+                entries += rebuild::rebuild_hype_hnsw(&self.hype_hnsw, metadata, self.shard_id)?;
+                entries += rebuild::rebuild_statement_question_hnsw(
+                    &self.statement_question_hnsw,
+                    metadata,
+                    self.shard_id,
+                )?;
+                Ok(RebuildReport {
+                    entries,
+                    elapsed_ms: start.elapsed().as_millis() as u64,
+                })
+            }
+            // Tantivy rebuilds live via the quiesce → rebuild → swap dance.
+            T::TantivyMemory | T::TantivyStatement => self.do_rebuild_tantivy(target).await,
+        }
+    }
+
+    /// Hot-rebuild the two tantivy (lexical) indexes from authoritative
+    /// redb while the shard keeps serving, then live-swap the read side
+    /// and the indexer writers onto the rebuilt indexes.
+    ///
+    /// A tantivy index cannot be rebuilt in place: the running indexer
+    /// holds tantivy's exclusive per-directory writer lock, and the
+    /// retriever's cached readers are bound to the `Index` opened at spawn.
+    /// The dance below resolves both:
+    ///
+    /// 1. **Quiesce** both indexers — each drops its writer, releasing the
+    ///    lock; ops keep buffering on their channels.
+    /// 2. **Rebuild** both on-disk indexes from redb into `<live>.rebuild`
+    ///    and atomically rename them over `<live>` (the offline rebuild the
+    ///    boot path already uses; it is safe now that no writer holds the
+    ///    live lock).
+    /// 3. **Reopen** the shard from disk and **swap** the retriever's
+    ///    open-index bundle onto it in one atomic publish.
+    /// 4. **Resume** both indexers with fresh writers on the reopened
+    ///    index; their buffered ops re-drain idempotently.
+    ///
+    /// Both indexes are rebuilt regardless of the requested `target`: the
+    /// reopen + retriever swap are whole-shard, and reconstructing both
+    /// from redb keeps the swap atomic and lossless (a quiesced indexer
+    /// discards its uncommitted batch, which is only safe when that index
+    /// is itself reconstructed from the authoritative rows). At no instant
+    /// does a read observe a partial or stale-mixed index: the whole method
+    /// runs on the single-threaded shard main loop, so no read is dispatched
+    /// between quiesce and resume, and the retriever swap is atomic
+    /// (invariant #7).
+    async fn do_rebuild_tantivy(
+        &self,
+        target: rebuild::RebuildTarget,
+    ) -> Result<RebuildReport, String> {
+        let start = std::time::Instant::now();
+        let metadata = self.ops.executor.metadata.as_ref();
+
+        // The quiesce → rebuild → reopen/swap → resume orchestration lives in
+        // `drive_tantivy_rebuild`, which guarantees BOTH indexers are resumed
+        // on every exit path — including one whose own quiesce ack timed out
+        // while its drain loop had already dropped its writer and parked. A
+        // quiesced-but-never-resumed indexer is wedged forever and every later
+        // ENCODE/FORGET silently loses its lexical op (invariant #7). The
+        // middle closure runs synchronously between quiesce and resume.
+        let entries = drive_tantivy_rebuild(
+            self.memory_text_control.as_ref(),
+            self.statement_text_control.as_ref(),
+            |mem_quiesced, stmt_quiesced| {
+                // 2. Rebuild each on-disk index from authoritative redb, gated
+                //    on ITS OWN indexer having quiesced: an un-quiesced indexer
+                //    still holds the per-directory writer lock, so the on-disk
+                //    replace could not complete cleanly. Resume is still
+                //    guaranteed for both below regardless.
+                let rebuild_result: Result<u64, String> = (|| {
+                    let mem = if mem_quiesced {
+                        brain_ops::index::text_indexer::rebuild_memory_text(
+                            &self.tantivy_dir,
+                            metadata,
+                        )
+                        .map_err(|e| format!("memory text rebuild: {e}"))?
+                        .rows_processed
+                    } else {
+                        0
+                    };
+                    let stmt = if stmt_quiesced {
+                        brain_ops::index::text_indexer::rebuild_statements(
+                            &self.tantivy_dir,
+                            metadata,
+                        )
+                        .map_err(|e| format!("statement text rebuild: {e}"))?
+                        .rows_processed
+                    } else {
+                        0
+                    };
+                    Ok(mem + stmt)
+                })();
+
+                // 3. Reopen the shard from disk and swap the retriever's cached
+                //    readers onto it. `TantivyShard::open` reconciles any
+                //    interrupted swap, so even a mid-rebuild failure yields a
+                //    valid index (the completed rebuild or the restored prior
+                //    one). Capture — never swallow — the swap error: a failed
+                //    swap leaves the retriever bound to the pre-rebuild `Index`
+                //    whose segment files the completed on-disk rebuild has
+                //    already deleted, so reads would serve from unlinked
+                //    segments (stale / vanishing data), exactly what invariant
+                //    #7 forbids. A swap failure must therefore fail-stop.
+                let reopened = brain_index::TantivyShard::open(&self.tantivy_dir)
+                    .map_err(|e| format!("reopen tantivy after rebuild: {e}"));
+                let mut swap_err: Option<String> = None;
+                let (reopen_err, resume_handles) = match &reopened {
+                    Ok(startup) => {
+                        let new_shard = startup.shard.clone();
+                        if let Err(e) = self.lexical_retriever.swap_shard(new_shard.clone()) {
+                            tracing::error!(
+                                shard_id = self.shard_id,
+                                error = %e,
+                                "lexical retriever swap failed during tantivy rebuild",
+                            );
+                            swap_err = Some(format!("lexical retriever swap after rebuild: {e}"));
+                        }
+                        (
+                            None,
+                            Some((new_shard.memory_text.clone(), new_shard.statements.clone())),
+                        )
+                    }
+                    // Reopen failed: fall back to the pre-rebuild handles so the
+                    // indexers can still resume (writes keep flowing); the read
+                    // side keeps its prior bundle.
+                    Err(e) => (
+                        Some(e.clone()),
+                        self.ops
+                            .tantivy
+                            .as_ref()
+                            .map(|s| (s.memory_text.clone(), s.statements.clone())),
+                    ),
+                };
+
+                RebuildMiddle {
+                    rebuild_result,
+                    reopen_err,
+                    swap_err,
+                    resume_handles,
+                }
+            },
+        )
+        .await?;
+
+        tracing::info!(
+            shard_id = self.shard_id,
+            ?target,
+            entries,
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            "tantivy indexes rebuilt live and swapped",
+        );
+        Ok(RebuildReport {
+            entries: entries as usize,
+            elapsed_ms: start.elapsed().as_millis() as u64,
+        })
+    }
+}
+
+/// How long the hot rebuild waits for an indexer to acknowledge a control
+/// message before giving up. Generous: the ack rides the same
+/// single-threaded executor and is normally near-instant; the bound only
+/// guards against a dead/wedged indexer task.
+const INDEXER_CONTROL_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Middle phase of the hot tantivy rebuild, produced by the caller between
+/// quiesce and resume: the on-disk rebuild outcome plus the reopen/swap
+/// results and the handles to resume the indexers onto.
+#[cfg(target_os = "linux")]
+struct RebuildMiddle {
+    /// Rows reindexed across the (possibly-skipped) memory + statement
+    /// rebuilds, or the first rebuild error.
+    rebuild_result: Result<u64, String>,
+    /// Error reopening the shard from disk after the rebuild, if any.
+    reopen_err: Option<String>,
+    /// Error swapping the retriever onto the reopened index, if any.
+    swap_err: Option<String>,
+    /// Handles to resume both indexers onto — the reopened index, or the
+    /// pre-rebuild fallback. `None` only when no index is available at all.
+    resume_handles: Option<(brain_index::IndexHandle, brain_index::IndexHandle)>,
+}
+
+/// Drive the quiesce → rebuild → reopen/swap → resume dance for the two
+/// lexical indexers, returning the rows reindexed or the first fail-stop.
+///
+/// The ordering is invariant #7's load-bearing part: once an indexer receives
+/// `Quiesce` it drops its writer and parks, so a quiesced-but-never-resumed
+/// indexer is wedged forever and every later ENCODE/FORGET silently loses its
+/// lexical op. Therefore NOTHING between the first quiesce and the resume
+/// region may short-circuit — the bug this replaced `?`-returned on the FIRST
+/// quiesce, stranding an already-parked `memory_text` indexer whenever its ack
+/// timed out. Instead BOTH quiesce results are recorded (never `?`), `middle`
+/// runs synchronously to rebuild/reopen/swap, and BOTH indexers are resumed
+/// independently — even the one whose own quiesce ack failed (the `Quiesce`
+/// was still delivered; the indexer parked and is alive to be resumed). Only
+/// after both are resumed are the recorded failures surfaced, in dependency
+/// order, as fail-stop.
+#[cfg(target_os = "linux")]
+async fn drive_tantivy_rebuild<M>(
+    memory_control: Option<&flume::Sender<brain_ops::index::text_indexer::IndexerControl>>,
+    statement_control: Option<&flume::Sender<brain_ops::index::text_indexer::IndexerControl>>,
+    middle: M,
+) -> Result<u64, String>
+where
+    M: FnOnce(bool, bool) -> RebuildMiddle,
+{
+    // 1. Quiesce both indexers (release the per-directory writer locks).
+    //    Record — never `?` — BOTH quiesce results. An early return here would
+    //    strand an already-parked indexer with its writer dropped.
+    let mem_quiesce_err = quiesce_indexer(memory_control, "memory_text").await.err();
+    let stmt_quiesce_err = quiesce_indexer(statement_control, "statements").await.err();
+
+    // 2-3. Rebuild each on-disk index (gated on its own quiesce), reopen the
+    //       shard, and swap the retriever — all synchronous, no `?`.
+    let RebuildMiddle {
+        rebuild_result,
+        reopen_err,
+        swap_err,
+        resume_handles,
+    } = middle(mem_quiesce_err.is_none(), stmt_quiesce_err.is_none());
+
+    // 4. Resume BOTH indexers on the resolved handles, independently: a failed
+    //    first resume must never skip the second. This region runs on every
+    //    path above so no quiesced indexer is left parked.
+    let mut resume_err: Option<String> = None;
+    if let Some((mem_handle, stmt_handle)) = resume_handles {
+        if let Err(e) = resume_indexer(memory_control, mem_handle, "memory_text").await {
+            resume_err.get_or_insert(e);
+        }
+        if let Err(e) = resume_indexer(statement_control, stmt_handle, "statements").await {
+            resume_err.get_or_insert(e);
+        }
+    }
+
+    // Both indexers are resumed (or their revival failure recorded). Only now
+    // surface the first failure, in dependency order, as fail-stop.
+    if let Some(e) = mem_quiesce_err {
+        return Err(e);
+    }
+    if let Some(e) = stmt_quiesce_err {
+        return Err(e);
+    }
+    let entries = rebuild_result?;
+    if let Some(e) = reopen_err {
+        return Err(e);
+    }
+    if let Some(e) = swap_err {
+        return Err(e);
+    }
+    if let Some(e) = resume_err {
+        return Err(e);
+    }
+    Ok(entries)
+}
+
+/// Send `Quiesce` to an indexer (if it is running) and await its ack. The
+/// indexer drops its writer, releasing tantivy's per-directory lock, so the
+/// rebuild can replace the directory. A `None` control channel means the
+/// indexer never spawned — nothing holds the lock, so this is a no-op.
+#[cfg(target_os = "linux")]
+async fn quiesce_indexer(
+    control: Option<&flume::Sender<brain_ops::index::text_indexer::IndexerControl>>,
+    label: &str,
+) -> Result<(), String> {
+    let Some(control) = control else {
+        return Ok(());
+    };
+    let (ack_tx, ack_rx) = flume::bounded::<()>(1);
+    control
+        .send_async(brain_ops::index::text_indexer::IndexerControl::Quiesce { ack: ack_tx })
+        .await
+        .map_err(|_| format!("{label} indexer control channel closed (quiesce)"))?;
+    await_ack(&ack_rx, label, "quiesce").await
+}
+
+/// Send `Resume` with a fresh handle on the reopened index and await the
+/// ack. The indexer rebuilds its writer against `handle` and resumes
+/// draining. A `None` control channel is a no-op.
+#[cfg(target_os = "linux")]
+async fn resume_indexer(
+    control: Option<&flume::Sender<brain_ops::index::text_indexer::IndexerControl>>,
+    handle: brain_index::IndexHandle,
+    label: &str,
+) -> Result<(), String> {
+    let Some(control) = control else {
+        return Ok(());
+    };
+    let (ack_tx, ack_rx) = flume::bounded::<()>(1);
+    control
+        .send_async(brain_ops::index::text_indexer::IndexerControl::Resume {
+            handle,
+            ack: ack_tx,
+        })
+        .await
+        .map_err(|_| format!("{label} indexer control channel closed (resume)"))?;
+    await_ack(&ack_rx, label, "resume").await
+}
+
+/// Await a control ack with a bounded timeout so a dead indexer task can
+/// never wedge the rebuild indefinitely.
+#[cfg(target_os = "linux")]
+async fn await_ack(ack_rx: &flume::Receiver<()>, label: &str, phase: &str) -> Result<(), String> {
+    // `Err` = the deadline elapsed; `Ok(false)` = the ack sender was
+    // dropped (the indexer task died). Only `Ok(true)` is a real ack.
+    let res = glommio::timer::timeout(INDEXER_CONTROL_ACK_TIMEOUT, async {
+        Ok::<bool, glommio::GlommioError<()>>(ack_rx.recv_async().await.is_ok())
+    })
+    .await;
+    if matches!(res, Ok(true)) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{label} indexer {phase} ack timed out or task died"
+        ))
+    }
 }
 
 /// Register every background worker against `scheduler`, plugging in
@@ -1428,6 +2484,59 @@ fn register_phase8_workers(
     )?;
     scheduler.register(Arc::new(SnapshotWorker::new(snapshot_source)), ops)?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Fanout lag observability
+// ---------------------------------------------------------------------------
+
+/// Process-global count of shard-fanout events skipped because a broadcast
+/// subscriber lagged behind. A non-zero value means at least one live
+/// subscriber missed an LSN and must resync: the per-shard broadcast can no
+/// longer honour the "every event or an explicit resync signal" contract for
+/// that subscriber. Kept observable (never silently swallowed) so the gap is
+/// detectable; PromQL `rate()` over this surfaces sustained overload.
+static FANOUT_LAGGED_EVENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Record `skipped` fanout events lost to a lagging broadcast subscriber:
+/// bump the process-global counter and emit a warning. Called from the
+/// per-shard fanout task's `Lagged` arm instead of silently continuing, so a
+/// dropped event is always at least logged and counted.
+fn record_fanout_lag(shard_id: ShardId, skipped: u64) {
+    FANOUT_LAGGED_EVENTS.fetch_add(skipped, std::sync::atomic::Ordering::Relaxed);
+    warn!(
+        shard_id,
+        skipped,
+        "shard fanout lagged: broadcast subscriber dropped events; live subscribers see an LSN gap and must resync"
+    );
+}
+
+/// Read the process-global fanout-lag counter. Test/introspection hook.
+#[cfg(test)]
+fn fanout_lagged_events() -> u64 {
+    FANOUT_LAGGED_EVENTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Interpret the WAL-readiness signal the shard executor closure sends back
+/// after it opens (or fails to open) its WAL.
+///
+/// - `Ok(Ok(()))` — WAL open; the shard is building the rest of its stack.
+/// - `Ok(Err(e))` — WAL IO failure; the closure returned early. Surfaced as
+///   [`ShardError::WalInit`] so the spawn fails fast instead of serving a
+///   dead shard.
+/// - `Err(_)` — the sender was dropped before signalling: the executor
+///   thread exited or unwound (e.g. an earlier in-closure `.expect()`
+///   panicked) before reaching WAL init. Also a dead shard, so fail the spawn.
+fn interpret_wal_ready(
+    signal: Result<Result<(), WalError>, flume::RecvError>,
+) -> Result<(), ShardError> {
+    match signal {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => Err(ShardError::WalInit(err)),
+        Err(_) => Err(ShardError::Spawn(
+            "shard executor exited before WAL init completed".to_string(),
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1494,6 +2603,11 @@ pub fn spawn_shard(
                 .unwrap_or(false)
         });
     let next_lsn_after_recovery: u64;
+    // Physical byte length the active WAL segment must be truncated to
+    // before reopening for append — the tail recovery validated. Passed to
+    // `Wal::open_existing` so a crash-left torn tail or never-committed
+    // dangling-transaction prefix is dropped rather than appended past.
+    let recovered_tail_offset: u64;
     let allocator = if segments_present {
         let (report, alloc) = recover(&mut arena, &wal_dir, shard_uuid, &mut metadata_db)?;
         info!(
@@ -1502,12 +2616,16 @@ pub fn spawn_shard(
             records_skipped = report.records_skipped,
             records_discarded = report.records_discarded,
             next_lsn = report.next_lsn,
+            active_tail_offset = report.active_tail_offset,
+            active_segment_seq = ?report.active_segment_seq,
             "WAL recovery complete"
         );
         next_lsn_after_recovery = report.next_lsn;
+        recovered_tail_offset = report.active_tail_offset;
         alloc
     } else {
         next_lsn_after_recovery = 1;
+        recovered_tail_offset = 0;
         SlotAllocator::rebuild_from_arena(&arena)
     };
     let metadata: SharedMetadataDb = Arc::new(metadata_db);
@@ -1529,10 +2647,15 @@ pub fn spawn_shard(
     // indexer workers will write to. Constructing it here (outside the
     // closure) propagates the failure through `spawn_shard`'s `Result`
     // just like the open above.
-    let lexical_retriever: Arc<dyn brain_index::LexicalRetriever> = Arc::new(
+    // Keep the concrete retriever so the hot rebuild can call
+    // `swap_shard`; hand `OpsContext` the trait object cloned from it, so
+    // the read path and the rebuild path share one retriever instance.
+    let lexical_retriever_concrete: Arc<brain_index::TantivyLexicalRetriever> = Arc::new(
         brain_index::TantivyLexicalRetriever::new(tantivy_shard.clone())
             .map_err(|source| ShardError::LexicalRetrieverInitFailed { source })?,
     );
+    let lexical_retriever: Arc<dyn brain_index::LexicalRetriever> =
+        lexical_retriever_concrete.clone();
 
     // ---- 5. Spawn the Glommio executor + build the rest of the stack -----
     let (tx, rx) = flume::bounded::<ShardRequest>(cfg.channel_capacity);
@@ -1619,8 +2742,6 @@ pub fn spawn_shard(
     // `ShardError::ExtractorInitFailed` (hard spawn failure); a tier whose
     // dep (GLiNER model / LLM client) is absent materialises degraded and
     // emits `SkippedDisabled` audit rows rather than failing to spawn.
-    let tier_gate = brain_extractors::TierGate::all_enabled();
-    let tier_gate_for_closure = tier_gate;
     // The extraction pipeline (worker + queue drain) is always provisioned:
     // extraction is a non-configurable always-on capability.
     let extractor_pipeline_enabled = true;
@@ -1683,6 +2804,16 @@ pub fn spawn_shard(
     let confidence_sweep_metrics_for_handle: Arc<brain_ops::ConfidenceSweepMetrics> =
         Arc::new(brain_ops::ConfidenceSweepMetrics::new());
     let confidence_sweep_metrics_for_closure = confidence_sweep_metrics_for_handle.clone();
+    // Read-path metric families are unconditionally constructed: recall
+    // runs on every shard. One `Arc` is injected into the shard's
+    // `OpsContext` (the RECALL handler records into it) and the twin is
+    // stashed on `ShardHandle` for `/metrics` exposition.
+    let retriever_metrics_for_handle: Arc<brain_ops::RetrieverMetrics> =
+        Arc::new(brain_ops::RetrieverMetrics::new());
+    let retriever_metrics_for_closure = retriever_metrics_for_handle.clone();
+    let query_metrics_for_handle: Arc<brain_ops::QueryMetrics> =
+        Arc::new(brain_ops::QueryMetrics::new());
+    let query_metrics_for_closure = query_metrics_for_handle.clone();
     // Clone the process-wide dispatcher Arc into the executor closure.
     // The CachingDispatcher<CpuDispatcher> built once in main.rs is
     // shared across every shard so the BERT weights live in memory
@@ -1699,6 +2830,24 @@ pub fn spawn_shard(
     // The closure can no longer downgrade lexical retrieval to `None`.
     let tantivy_for_closure = tantivy_shard.clone();
     let lexical_retriever_for_closure = lexical_retriever.clone();
+    // Concrete retriever + shard dir, captured for the shard's hot
+    // tantivy rebuild (`do_rebuild_tantivy`).
+    let lexical_retriever_concrete_for_closure = lexical_retriever_concrete.clone();
+    let tantivy_dir_for_closure = dir.clone();
+    // WAL open/create runs *inside* the Glommio executor closure below —
+    // it needs the executor's io_uring reactor to `.await`, and it depends
+    // on `next_lsn_after_recovery` / `recovered_tail_offset` produced by the
+    // recovery pass above. That means it can't be hoisted outside the closure
+    // like the tantivy/rerank init. To keep a WAL IO failure (permissions,
+    // ENOSPC, an FS without O_DIRECT/io_uring support) from panicking the
+    // shard thread *after* `spawn` already returned `Ok` — which would leave
+    // `spawn_shard` reporting success while the shard is dead — the closure
+    // reports the outcome of WAL init back over this channel. `spawn_shard`
+    // blocks on it below and fails the spawn (fail-fast) instead of serving a
+    // dead shard. A `RecvError` (sender dropped) means the closure unwound
+    // before signalling — e.g. an earlier in-closure panic — which is also
+    // treated as a spawn failure.
+    let (wal_ready_tx, wal_ready_rx) = flume::bounded::<Result<(), WalError>>(1);
     let join_handle = LocalExecutorBuilder::new(placement)
         .name(&format!("brain-shard-{shard_id}"))
         .spawn(move || async move {
@@ -2030,11 +3179,8 @@ pub fn spawn_shard(
                 // Stash a clone for the worker's live rebuild path; the
                 // build below only borrows it.
                 extractor_rebuild_deps = materialize_deps.clone();
-                let (mut reg, errors) = brain_extractors::build_registry_with_gate(
-                    &defs,
-                    &materialize_deps,
-                    tier_gate_for_closure,
-                );
+                let (mut reg, errors) =
+                    brain_extractors::build_registry_from_definitions(&defs, &materialize_deps);
                 if !errors.is_empty() {
                     // An extractor tier that fails to materialise is a hard
                     // spawn failure, not a silent degrade: a shard serving
@@ -2076,6 +3222,14 @@ pub fn spawn_shard(
             // lexical indexes before the executor drops pending tasks.
             let mut __memory_text_task: Option<(flume::Sender<()>, glommio::Task<()>)> = None;
             let mut __statement_text_task: Option<(flume::Sender<()>, glommio::Task<()>)> = None;
+            // Control-plane senders for the hot tantivy rebuild. `Some`
+            // only when the matching indexer spawned.
+            let mut __memory_text_control: Option<
+                flume::Sender<brain_ops::index::text_indexer::IndexerControl>,
+            > = None;
+            let mut __statement_text_control: Option<
+                flume::Sender<brain_ops::index::text_indexer::IndexerControl>,
+            > = None;
             let (memory_text_dispatcher_for_ops, statement_text_dispatcher_for_ops) = {
                 let policy = brain_ops::index::text_indexer::CommitPolicy::new(
                     index_spawn_cfg.tantivy_commit_n.max(1),
@@ -2086,14 +3240,20 @@ pub fn spawn_shard(
                     let (dispatcher, receiver) =
                         brain_ops::index::text_indexer::MemoryTextDispatcher::default_channel();
                     let (stop_tx, stop_rx) = flume::bounded::<()>(1);
+                    // Control channel is unbounded-ish (cap 4): the rebuild
+                    // sends at most a Quiesce then a Resume at a time.
+                    let (control_tx, control_rx) =
+                        flume::bounded::<brain_ops::index::text_indexer::IndexerControl>(4);
                     match brain_ops::index::text_indexer::memory::spawn_memory_text_indexer_local(
                         tantivy_for_ops.memory_text.clone(),
                         receiver,
                         policy,
                         stop_rx,
+                        control_rx,
                     ) {
                         Ok(task) => {
                             __memory_text_task = Some((stop_tx, task));
+                            __memory_text_control = Some(control_tx);
                             Some(Arc::new(dispatcher))
                         }
                         Err(err) => {
@@ -2111,14 +3271,18 @@ pub fn spawn_shard(
                     let (dispatcher, receiver) =
                         brain_ops::index::text_indexer::StatementTextDispatcher::default_channel();
                     let (stop_tx, stop_rx) = flume::bounded::<()>(1);
+                    let (control_tx, control_rx) =
+                        flume::bounded::<brain_ops::index::text_indexer::IndexerControl>(4);
                     match brain_ops::index::text_indexer::statement::spawn_statement_text_indexer_local(
                         tantivy_for_ops.statements.clone(),
                         receiver,
                         policy,
                         stop_rx,
+                        control_rx,
                     ) {
                         Ok(task) => {
                             __statement_text_task = Some((stop_tx, task));
+                            __statement_text_control = Some(control_tx);
                             Some(Arc::new(dispatcher))
                         }
                         Err(err) => {
@@ -2135,10 +3299,21 @@ pub fn spawn_shard(
                 (memory_dispatcher, statement_dispatcher)
             };
 
+            // Per-shard redb-committed-LSN watermark. The writer advances
+            // it after each successful `wtxn.commit()`; the snapshot
+            // source reads the SAME handle for `CHECKPOINT_END.durable_lsn`
+            // (see `ShardSnapshotSource`). Seed it to the post-recovery
+            // committed tail: recovery replays every WAL record up to
+            // `next_lsn - 1` into redb and commits, so that LSN is durable
+            // in metadata at boot. A fresh shard seeds 0.
+            let redb_committed_watermark = brain_ops::RedbCommittedWatermark::new();
+            redb_committed_watermark.advance_to(next_lsn_after_recovery.saturating_sub(1));
+
             let mut real_writer = RealWriterHandle::new(metadata.clone(), hnsw_writer)
                 .with_shard_id(shard_id)
                 .with_event_bus(event_bus.clone())
-                .with_wal_sink(wal_sink);
+                .with_wal_sink(wal_sink)
+                .with_redb_committed_watermark(redb_committed_watermark.clone());
             // Seed the slot counter from the persisted high-water mark so a
             // restart on a non-empty shard never re-issues a live arena slot.
             // (The counter resets to 1 in-process; without this, restart-reuse
@@ -2197,6 +3372,17 @@ pub fn spawn_shard(
             // sound; the discipline is "drop the borrow before .await", and
             // `arena` isn't touched again before this point.
             let arena_cell = Rc::new(RefCell::new(arena));
+
+            // Construct the resumable BackfillWorker up front so the same
+            // `Arc` can be both threaded onto the executor context (giving
+            // the ADMIN_BACKFILL / ADMIN_BACKFILL_CANCEL dispatch path a
+            // submit/cancel handle) and registered in the scheduler below
+            // (which drives its checkpoint walk). It's a provisioned C2
+            // worker — `run_cycle` no-ops when no run is active — and not
+            // in the C0 always-on set, so it stays controllable.
+            let backfill_worker =
+                Arc::new(brain_workers::workers::backfill::BackfillWorker::new());
+
             let executor_ctx = ExecutorContext::new(
                 dispatcher.clone(),
                 hnsw_shared.clone(),
@@ -2205,7 +3391,10 @@ pub fn spawn_shard(
             )
             // Per-space brute-force retrieval lane: exact cosine scan of a
             // small single-space query's own arena vectors.
-            .with_space_vectors(Rc::new(ArenaSpaceVectorSource::new(arena_cell.clone())));
+            .with_space_vectors(Rc::new(ArenaSpaceVectorSource::new(arena_cell.clone())))
+            // Backfill control handle — same Arc registered in the
+            // scheduler below.
+            .with_backfill_handle(backfill_worker.clone());
 
             // The lexical retriever was constructed alongside the
             // tantivy open above and propagated in here pre-built.
@@ -2225,10 +3414,17 @@ pub fn spawn_shard(
                 .with_classifier_config(classifier_config)
                 .with_llm_cache(llm_cache_for_ops)
                 .with_tantivy(Some(tantivy_for_ops))
+                .with_entity_vector_index(std::sync::Arc::new(
+                    self::adapters::ShardEntityVectorIndex::new(entity_hnsw_for_shard.clone()),
+                ))
                 .with_memory_text_dispatcher(memory_text_dispatcher_for_ops)
                 .with_statement_text_dispatcher(statement_text_dispatcher_for_ops)
                 .with_cross_encoder(cross_encoder_for_closure)
-                .with_wal_sink(Some(wal_sink_for_ops)),
+                .with_wal_sink(Some(wal_sink_for_ops))
+                .with_recall_metrics(
+                    retriever_metrics_for_closure.clone(),
+                    query_metrics_for_closure.clone(),
+                ),
             );
 
             // Spawn the per-shard fanout task: drains the in-process
@@ -2239,9 +3435,12 @@ pub fn spawn_shard(
             //
             // `tokio::sync::broadcast::Receiver` is runtime-agnostic
             // (atomics + Waker, no tokio I/O); polling its `recv()`
-            // future inside Glommio is sound. `Lagged` is treated as
-            // a transient skip — slow subscribers see gaps, not
-            // crashes.
+            // future inside Glommio is sound. `Lagged` means this
+            // fanout receiver fell behind and the broadcast buffer
+            // overwrote events before we forwarded them: we can't
+            // recover the dropped envelopes, but we must not swallow
+            // the gap — `record_fanout_lag` counts + warns so a live
+            // subscriber's missing LSN is observable (resync required).
             let mut __fanout_task: Option<glommio::Task<()>> = None;
             {
                 let event_bus = ops.events.clone();
@@ -2257,27 +3456,46 @@ pub fn spawn_shard(
                                     break;
                                 }
                             }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                record_fanout_lag(shard_id, skipped);
+                                continue;
+                            }
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         }
                     }
                 }));
             }
 
-            // Open or create the WAL.
-            let wal = if segments_present {
+            // Open or create the WAL. A genuine IO failure here (bad perms,
+            // ENOSPC, an FS without O_DIRECT/io_uring support) must fail the
+            // spawn rather than panic this thread behind an already-returned
+            // `Ok` from `spawn`. Report the outcome over `wal_ready_tx`;
+            // `spawn_shard` blocks on the receiver and turns an `Err` into a
+            // spawn failure. On the error path we end the closure early so the
+            // executor thread exits cleanly instead of unwinding.
+            let wal_open_result = if segments_present {
                 Wal::open_existing(
                     &wal_dir_for_executor,
                     shard_uuid,
                     next_lsn_after_recovery,
+                    recovered_tail_offset,
                     wal_config,
                 )
                 .await
-                .expect("Wal::open_existing (post-recovery)")
             } else {
-                Wal::create_with_config(&wal_dir_for_executor, shard_uuid, wal_config)
-                    .await
-                    .expect("Wal::create_with_config")
+                Wal::create_with_config(&wal_dir_for_executor, shard_uuid, wal_config).await
+            };
+            let wal = match wal_open_result {
+                Ok(wal) => {
+                    // Best-effort: if the receiver is gone the spawn was
+                    // already abandoned, so there is nothing to serve.
+                    let _ = wal_ready_tx.send(Ok(()));
+                    wal
+                }
+                Err(err) => {
+                    let _ = wal_ready_tx.send(Err(err));
+                    return;
+                }
             };
 
             // Wrap the WAL in `Rc<RefCell<…>>` so adapters can share the
@@ -2317,11 +3535,25 @@ pub fn spawn_shard(
             });
 
             // Build real worker adapters.
+            //
+            // Two rebuild sources, by lifecycle phase:
+            //
+            // - `rebuild_source` (arena) feeds the *boot recovery* rebuild
+            //   below. On restart the arena is the freshly-WAL-replayed image
+            //   of every durable memory, so it is the authoritative substrate
+            //   here.
+            // - `redb_rebuild_source` feeds every *runtime* rebuild (the HNSW
+            //   maintenance worker + the admin `rebuild-ann` route). The arena
+            //   is never written by the live encode path, so a runtime rebuild
+            //   from it would silently drop every same-run memory; redb holds
+            //   the durable write-time vector for the complete live set.
             let rebuild_source: Arc<dyn RebuildSource<{ VECTOR_DIM }>> = Arc::new(
                 ArenaRebuildSource::<{ VECTOR_DIM }>::new(shard_id, arena_cell.clone()),
             );
+            let redb_rebuild_source: Arc<dyn RebuildSource<{ VECTOR_DIM }>> =
+                Arc::new(RedbRebuildSource::<{ VECTOR_DIM }>::new(metadata.clone()));
             // Keep a clone for the admin `rebuild-ann` route.
-            let rebuild_source_for_shard = rebuild_source.clone();
+            let rebuild_source_for_shard = redb_rebuild_source.clone();
 
             // Recovery step 6: restore the memory HNSW.
             // Try snapshot-load first; on any failure (missing, CRC /
@@ -2337,6 +3569,18 @@ pub fn spawn_shard(
                 ) {
                     Ok((loaded_idx, taken_at_lsn)) => {
                         let loaded_len = loaded_idx.len();
+                        // Capture the snapshot's memory ids BEFORE the swap
+                        // moves the index into the published main. Any of
+                        // these that redb marks inactive as of the recovered
+                        // tail is a memory FORGOTTEN after `taken_at_lsn`:
+                        // the snapshot still holds it active, so it must be
+                        // re-tombstoned below or it becomes a ghost node (a
+                        // live top-k slot diverging from redb indefinitely).
+                        let snapshot_ids: Vec<brain_core::MemoryId> = loaded_idx
+                            .id_map()
+                            .iter_forward()
+                            .map(|(bytes, _)| brain_core::MemoryId::from_be_bytes(bytes))
+                            .collect();
                         hnsw_shared.swap(loaded_idx);
                         // Tail-replay: any arena entry whose memory_id
                         // isn't in the loaded main is a write that
@@ -2366,6 +3610,30 @@ pub fn spawn_shard(
                                 error = ?e,
                                 "memory HNSW: tail-replay arena scan failed; loaded snapshot \
                                  alone may miss writes past taken_at_lsn"
+                            ),
+                        }
+                        // Post-snapshot FORGET reconciliation: re-apply every
+                        // delete that landed after `taken_at_lsn`. The arena
+                        // tail above only carries ACTIVE memories, so an
+                        // inactive redb row for a snapshot id is invisible to
+                        // it; tombstone those ids so the HNSW active set
+                        // converges to the redb active set.
+                        match reconcile_forgotten_memories(
+                            &hnsw_shared,
+                            &metadata,
+                            &snapshot_ids,
+                        ) {
+                            Ok(retombstoned) if retombstoned > 0 => info!(
+                                shard_id,
+                                retombstoned,
+                                "memory HNSW: re-applied post-snapshot FORGETs"
+                            ),
+                            Ok(_) => {}
+                            Err(e) => warn!(
+                                shard_id,
+                                error = %e,
+                                "memory HNSW: FORGET reconciliation failed; snapshot may \
+                                 retain ghost nodes"
                             ),
                         }
                         true
@@ -2443,143 +3711,38 @@ pub fn spawn_shard(
                 }
             }
 
-            // Recovery: rebuild the entity HNSW (resolver tier-3 embedding
-            // tie-break) from the metadata store. Like the memory HNSW it's
-            // in-RAM only and not persisted; without this the resolver loses
-            // its embedding tie-break after restart and over-creates
-            // duplicate entities until each surface is re-extracted.
-            //
-            // Prefer the durable vector written at entity-create time:
-            // a stored vector goes
-            // straight into the HNSW with no embedder call. Rows
-            // without a stored vector (pre-feature data, or a partial
-            // write) fall back to re-embedding the canonical name.
-            match metadata.read_txn() {
-                Ok(rtxn) => match brain_metadata::entity::ops::entity_iter_all_live_with_vectors(
-                    &rtxn,
-                ) {
-                    Ok(entities) if !entities.is_empty() => {
-                        let count = entities.len();
-                        let mut pairs: Vec<(brain_core::EntityId, [f32; VECTOR_DIM])> =
-                            Vec::with_capacity(count);
-                        let mut from_stored = 0usize;
-                        let mut from_reembed = 0usize;
-                        let mut embed_failures = 0usize;
-                        for (id, name, stored) in entities {
-                            if let Some(v) = stored {
-                                pairs.push((id, v));
-                                from_stored += 1;
-                            } else {
-                                match dispatcher.embed(&name) {
-                                    Ok(v) => {
-                                        pairs.push((id, v));
-                                        from_reembed += 1;
-                                    }
-                                    Err(_) => embed_failures += 1,
-                                }
-                            }
-                        }
-                        match entity_hnsw_for_shard.write().rebuild(pairs) {
-                            Ok(_) => info!(
-                                shard_id,
-                                rebuilt = count,
-                                from_stored,
-                                from_reembed,
-                                embed_failures,
-                                "entity HNSW rebuilt from metadata on startup"
-                            ),
-                            Err(e) => error!(
-                                shard_id,
-                                error = ?e,
-                                "entity HNSW startup rebuild failed; entity resolution degraded"
-                            ),
-                        }
-                    }
-                    Ok(_) => {
-                        info!(
-                            shard_id,
-                            "no entities to rebuild; entity HNSW starts empty"
-                        );
-                    }
-                    Err(e) => error!(
-                        shard_id,
-                        error = ?e,
-                        "entity HNSW startup rebuild: metadata scan failed"
-                    ),
-                },
-                Err(e) => error!(
+            // Recovery: rebuild the entity / HyPE / statement-question
+            // HNSW indexes from the authoritative redb tables. All three
+            // are in-RAM only (not persisted), so without this they start
+            // empty and the resolver + question-bridge reads degrade until
+            // each surface is re-extracted. Boot and the on-demand admin
+            // `RebuildIndex` route share one implementation in
+            // `shard::rebuild`; boot logs any failure and continues (a
+            // degraded index is better than refusing to start).
+            self::rebuild::log_boot_result(
+                shard_id,
+                "entity HNSW",
+                self::rebuild::rebuild_entity_hnsw(
+                    &entity_hnsw_for_shard,
+                    &metadata,
+                    dispatcher.as_ref(),
                     shard_id,
-                    error = ?e,
-                    "entity HNSW startup rebuild: read_txn failed"
                 ),
-            }
-
-            // HyPE pool rebuild: re-insert every persisted
-            // hypothetical-question vector into the in-RAM index. Unlike
-            // the entity index there is no re-embed fallback — the vectors
-            // are the durable source of truth, so a missing/empty table
-            // just means an empty pool (a fresh shard, or HyPE never
-            // generated). The open_table error on a never-written table is
-            // expected and logged at INFO, not ERROR.
-            match metadata.read_txn() {
-                Ok(rtxn) => match brain_metadata::hype_iter_all_vectors(&rtxn) {
-                    Ok(points) if !points.is_empty() => {
-                        let report = hype_hnsw_for_shard.write().rebuild(points);
-                        info!(
-                            shard_id,
-                            inserted = report.inserted,
-                            memories = report.memories,
-                            "HyPE HNSW rebuilt from metadata on startup"
-                        );
-                    }
-                    Ok(_) => info!(shard_id, "no HyPE vectors to rebuild; pool starts empty"),
-                    Err(e) => info!(
-                        shard_id,
-                        error = ?e,
-                        "HyPE pool empty or table absent; pool starts empty"
-                    ),
-                },
-                Err(e) => error!(
+            );
+            self::rebuild::log_boot_result(
+                shard_id,
+                "HyPE HNSW",
+                self::rebuild::rebuild_hype_hnsw(&hype_hnsw_for_shard, &metadata, shard_id),
+            );
+            self::rebuild::log_boot_result(
+                shard_id,
+                "statement question-bridge",
+                self::rebuild::rebuild_statement_question_hnsw(
+                    &statement_question_hnsw_for_shard,
+                    &metadata,
                     shard_id,
-                    error = ?e,
-                    "HyPE HNSW startup rebuild: read_txn failed"
                 ),
-            }
-
-            // Statement question-bridge rebuild: re-insert every persisted
-            // per-statement question vector. Same durable-source-of-truth
-            // model as the HyPE pool.
-            match metadata.read_txn() {
-                Ok(rtxn) => {
-                    match brain_metadata::statement_question::ops::statement_question_iter_all(
-                        &rtxn,
-                    ) {
-                        Ok(points) if !points.is_empty() => {
-                            let report = statement_question_hnsw_for_shard.write().rebuild(points);
-                            info!(
-                                shard_id,
-                                inserted = report.inserted,
-                                statements = report.statements,
-                                "statement question-bridge rebuilt from metadata on startup"
-                            );
-                        }
-                        Ok(_) => info!(
-                            shard_id,
-                            "no statement question vectors to rebuild; pool starts empty"
-                        ),
-                        Err(e) => info!(
-                            shard_id,
-                            error = ?e,
-                            "statement question-bridge empty or table absent; starts empty"
-                        ),
-                    }
-                }
-                Err(e) => error!(
-                    shard_id,
-                    error = ?e,
-                    "statement question-bridge startup rebuild: read_txn failed"
-                ),
-            }
+            );
 
             // Recovery: re-enqueue every live statement so the
             // StatementEmbedWorker repopulates the (in-RAM, non-persisted)
@@ -2630,6 +3793,7 @@ pub fn spawn_shard(
                 wal_cell.clone(),
                 metadata.clone(),
                 hnsw_shared.clone(),
+                redb_committed_watermark.clone(),
             ));
             // CacheEvictionSource stays Disabled* until a
             // real CachingDispatcher is wired per shard.
@@ -2641,13 +3805,23 @@ pub fn spawn_shard(
             register_phase8_workers(
                 &mut scheduler,
                 ops.clone(),
-                rebuild_source,
+                redb_rebuild_source,
                 wal_retention_source,
                 snapshot_source.clone(),
                 cache_eviction_source,
                 summarizer,
             )
             .expect("register Phase-8 workers");
+
+            // BackfillWorker — provisioned unconditionally (C2). It idles
+            // (run_cycle returns 0) until an ADMIN_BACKFILL submits a run
+            // via the handle threaded onto the executor context above; the
+            // scheduler then drives its checkpoint walk. Registering the
+            // same Arc means the dispatch handle and the running worker are
+            // one instance, so submit/cancel/progress see the live run.
+            scheduler
+                .register(backfill_worker.clone(), ops.clone())
+                .expect("register BackfillWorker");
 
             // LLM cache sweeper. Registered when enabled AND the shard
             // actually has an LLM cache — without a cache the worker is a
@@ -2849,6 +4023,34 @@ pub fn spawn_shard(
                     .expect("register AuditLogSweeper");
             }
 
+            // StaleExtractionDetector — counts statements whose
+            // `schema_version` trails the active schema and exposes the
+            // total via metrics so operators can see extraction drift after
+            // a narrowing SCHEMA_UPLOAD. On by default (read-only counting
+            // sweep, hourly cadence); its own `defaults_for` config carries
+            // the enabled flag, so the scheduler honours it. Without
+            // registration the stale-statement count is never emitted.
+            {
+                let worker =
+                    brain_workers::workers::stale_extraction_detector::StaleExtractionDetector::new();
+                scheduler
+                    .register(Arc::new(worker), ops.clone())
+                    .expect("register StaleExtractionDetector");
+            }
+
+            // EntityGcWorker — tombstones orphaned entities past a grace
+            // window (default 30d). Off by default: `EntityGcWorker::new()`
+            // ships disabled and its `defaults_for(EntityGc)` config carries
+            // `enabled = false`, so the scheduler leaves it idle until an
+            // operator opts in. Provisioned unconditionally so it *can* run
+            // when enabled; without registration it could never run at all.
+            {
+                let worker = brain_workers::workers::entity_gc::EntityGcWorker::new();
+                scheduler
+                    .register(Arc::new(worker), ops.clone())
+                    .expect("register EntityGcWorker");
+            }
+
             // AmbiguityResolverWorker — promotes / expires entries in the
             // entity-merge review queue using the per-shard entity HNSW +
             // embedder. Without it ambiguous resolutions accumulate and
@@ -2903,11 +4105,8 @@ pub fn spawn_shard(
                     });
                 // Give the worker the deps to rebuild the registry live when a
                 // SCHEMA_UPLOAD declares a new extractor — no restart needed.
-                // The tier gate is the same one the boot-time build used.
-                extractor_worker = extractor_worker.with_registry_rebuild_deps(
-                    extractor_rebuild_deps.clone(),
-                    tier_gate_for_closure,
-                );
+                extractor_worker = extractor_worker
+                    .with_registry_rebuild_deps(extractor_rebuild_deps.clone());
                 if let Some(d) = entity_disambiguator_for_worker.clone() {
                     extractor_worker = extractor_worker.with_entity_disambiguator(d);
                 }
@@ -3031,14 +4230,25 @@ pub fn spawn_shard(
                 snapshot_source,
                 rebuild_source: rebuild_source_for_shard,
                 hnsw_shared,
+                entity_hnsw: entity_hnsw_for_shard.clone(),
+                hype_hnsw: hype_hnsw_for_shard.clone(),
+                statement_question_hnsw: statement_question_hnsw_for_shard.clone(),
                 fanout_task: __fanout_task,
                 wal_drain_task: Some(__wal_drain_task),
                 memory_text_task: __memory_text_task,
                 statement_text_task: __statement_text_task,
+                lexical_retriever: lexical_retriever_concrete_for_closure,
+                tantivy_dir: tantivy_dir_for_closure,
+                memory_text_control: __memory_text_control,
+                statement_text_control: __statement_text_control,
             };
             shard_main_loop(shard, rx).await;
         })
         .map_err(|e| ShardError::Spawn(e.to_string()))?;
+    // Block until the shard signals its WAL is open (fail-fast readiness).
+    // A WAL IO failure, or the executor thread exiting before it signalled,
+    // fails the spawn here instead of leaving a dead shard serving requests.
+    interpret_wal_ready(wal_ready_rx.recv())?;
     let handle = ShardHandle {
         shard_id,
         tx,
@@ -3052,6 +4262,8 @@ pub fn spawn_shard(
         llm_cache_sweep_metrics: Some(llm_cache_sweep_metrics_for_handle),
         statement_embed_metrics: statement_embed_metrics_for_handle,
         confidence_sweep_metrics: confidence_sweep_metrics_for_handle,
+        retriever_metrics: retriever_metrics_for_handle,
+        query_metrics: query_metrics_for_handle,
     };
     let joiner = ShardJoiner {
         shard_id,
@@ -3081,6 +4293,19 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
                     warn!(
                         shard_id = shard.shard_id,
                         "Ping reply dropped (caller gone)"
+                    );
+                }
+            }
+            ShardRequest::GetMemoryVector {
+                space,
+                memory_id,
+                reply_tx,
+            } => {
+                let vector = shard.memory_vector_for(space, memory_id);
+                if reply_tx.send_async(vector).await.is_err() {
+                    warn!(
+                        shard_id = shard.shard_id,
+                        "GetMemoryVector reply dropped (caller gone)"
                     );
                 }
             }
@@ -3204,7 +4429,7 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
                 }
             }
             ShardRequest::ExtractBackfill { selector, reply_tx } => {
-                let out = run_extract_backfill(&shard, selector);
+                let out = run_extract_backfill(&shard, selector).await;
                 if reply_tx.send_async(out).await.is_err() {
                     warn!(
                         shard_id = shard.shard_id,
@@ -3212,29 +4437,76 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
                     );
                 }
             }
-            ShardRequest::RebuildHnsw { reply_tx } => {
-                let start = std::time::Instant::now();
-                let result = match shard.rebuild_source.snapshot_vectors().await {
-                    Ok(vectors) => {
-                        let params = shard.hnsw_shared.params();
-                        match brain_index::rebuild::rebuild_impl(params, vectors) {
-                            Ok((new_idx, _report)) => {
-                                let entries = new_idx.len();
-                                shard.hnsw_shared.swap(new_idx);
-                                Ok(RebuildReport {
-                                    entries,
-                                    elapsed_ms: start.elapsed().as_millis() as u64,
-                                })
-                            }
-                            Err(e) => Err(format!("rebuild: {e:?}")),
-                        }
-                    }
-                    Err(e) => Err(format!("rebuild source: {e}")),
+            ShardRequest::RestoreMemory {
+                memory_id,
+                namespace,
+                reply_tx,
+            } => {
+                let out = run_restore_memory(&shard, memory_id, &namespace).await;
+                if reply_tx.send_async(out).await.is_err() {
+                    warn!(
+                        shard_id = shard.shard_id,
+                        "RestoreMemory reply dropped (caller gone)"
+                    );
+                }
+            }
+            ShardRequest::BackfillSubmit { request, reply_tx } => {
+                // Reach the same per-shard worker handle the (now-rejected)
+                // wire op used to: the `Arc<dyn BackfillControl>` threaded
+                // onto the executor context at shard construction. `submit`
+                // is a synchronous `&self` push onto worker-owned state, so
+                // no borrow crosses the reply `.await`.
+                let out = match shard.ops.executor.backfill_handle.as_ref() {
+                    Some(handle) => Ok(handle.submit(request)),
+                    None => Err("backfill worker not provisioned on this shard".to_owned()),
                 };
+                if reply_tx.send_async(out).await.is_err() {
+                    warn!(
+                        shard_id = shard.shard_id,
+                        "BackfillSubmit reply dropped (caller gone)"
+                    );
+                }
+            }
+            ShardRequest::BackfillCancel { id, reply_tx } => {
+                let out = match shard.ops.executor.backfill_handle.as_ref() {
+                    Some(handle) => Ok(handle.cancel(id)),
+                    None => Err("backfill worker not provisioned on this shard".to_owned()),
+                };
+                if reply_tx.send_async(out).await.is_err() {
+                    warn!(
+                        shard_id = shard.shard_id,
+                        "BackfillCancel reply dropped (caller gone)"
+                    );
+                }
+            }
+            ShardRequest::BackfillProgressSnapshot { reply_tx } => {
+                let out = match shard.ops.executor.backfill_handle.as_ref() {
+                    Some(handle) => Ok(handle.progress()),
+                    None => Err("backfill worker not provisioned on this shard".to_owned()),
+                };
+                if reply_tx.send_async(out).await.is_err() {
+                    warn!(
+                        shard_id = shard.shard_id,
+                        "BackfillProgressSnapshot reply dropped (caller gone)"
+                    );
+                }
+            }
+            ShardRequest::RebuildHnsw { reply_tx } => {
+                let result = shard.do_rebuild_memory().await;
                 if reply_tx.send_async(result).await.is_err() {
                     warn!(
                         shard_id = shard.shard_id,
                         "RebuildHnsw reply dropped (caller gone)"
+                    );
+                }
+            }
+            ShardRequest::RebuildIndex { target, reply_tx } => {
+                let result = shard.do_rebuild_index(target).await;
+                if reply_tx.send_async(result).await.is_err() {
+                    warn!(
+                        shard_id = shard.shard_id,
+                        ?target,
+                        "RebuildIndex reply dropped (caller gone)"
                     );
                 }
             }
@@ -3255,6 +4527,20 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
                     warn!(
                         shard_id = shard.shard_id,
                         "AbortOrphanedTxns reply dropped (caller gone)"
+                    );
+                }
+            }
+            ShardRequest::AuditQuery {
+                selector,
+                limit,
+                cursor,
+                reply_tx,
+            } => {
+                let out = shard.run_audit_query(selector, limit, cursor);
+                if reply_tx.send_async(out).await.is_err() {
+                    warn!(
+                        shard_id = shard.shard_id,
+                        "AuditQuery reply dropped (caller gone)"
                     );
                 }
             }
@@ -3279,13 +4565,90 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
                 // `enter()` guard because the dispatch yields at `.await`
                 // points; a guard held across `.await` would mis-attribute
                 // spans from interleaved work.
+                // Peek for a direct (non-transactional) hard FORGET before
+                // moving `req` into dispatch. Hard forget promises the
+                // plaintext-derived embedding is "no longer recoverable from
+                // the file" immediately (invariant #6). The arena is the one
+                // at-rest home the apply layer can't reach — it holds only
+                // the redb wtxn, whereas the arena lives here on the shard —
+                // so we zero it at this boundary once the forget commits.
+                // Transactional forgets (`txn_id.is_some()`) are buffered and
+                // applied at COMMIT_TXN, and a rollback must not leave a
+                // zeroed slot, so they are covered by the recovery replay
+                // (which re-zeroes hard-forgotten slots) rather than here.
+                let hard_forget_id = match &*req {
+                    RequestBody::Forget(f) if f.mode == ForgetMode::Hard && f.txn_id.is_none() => {
+                        Some(MemoryId::from_raw(f.memory_id))
+                    }
+                    _ => None,
+                };
                 let out = brain_ops::dispatch::dispatch(*req, caller, &shard.ops)
+                    .instrument(parent_span)
+                    .await;
+                // Zero the arena slot only after a successful commit. FORGET
+                // is lenient (a missing/stale id is a no-op success) and
+                // `hard_forget_slot` is itself guarded on occupancy + slot
+                // version, so an over-eager call is a safe no-op: a same-run
+                // memory (never in the arena) and a slot since reclaimed by a
+                // newer memory (invariant #4) are both left untouched.
+                if let (Some(id), Ok(_)) = (hard_forget_id, &out) {
+                    let zeroed = {
+                        let mut arena = shard.arena.borrow_mut();
+                        arena.hard_forget_slot(id.slot(), id.version())
+                    };
+                    if zeroed {
+                        tracing::debug!(
+                            shard_id = shard.shard_id,
+                            memory_id = ?id,
+                            "hard forget: zeroed arena slot at rest"
+                        );
+                    }
+                }
+                if reply_tx.send_async(out).await.is_err() {
+                    warn!(
+                        shard_id = shard.shard_id,
+                        "DispatchOp reply dropped (caller gone)"
+                    );
+                }
+            }
+            ShardRequest::RecallGather {
+                req,
+                caller,
+                reply_tx,
+                parent_span,
+            } => {
+                // Namespace-wide RECALL, stage 1: this shard's raw candidate
+                // pool over its own spaces (widened to the caller's namespace).
+                // Runs entirely on the Glommio executor, same shape as
+                // DispatchOp; no shaping happens here.
+                let out = brain_ops::dispatch::dispatch_recall_gather(*req, caller, &shard.ops)
                     .instrument(parent_span)
                     .await;
                 if reply_tx.send_async(out).await.is_err() {
                     warn!(
                         shard_id = shard.shard_id,
-                        "DispatchOp reply dropped (caller gone)"
+                        "RecallGather reply dropped (caller gone)"
+                    );
+                }
+            }
+            ShardRequest::RecallShapeMerged {
+                merged,
+                req,
+                caller,
+                reply_tx,
+                parent_span,
+            } => {
+                // Namespace-wide RECALL, stage 3 (coordinator shard): shape the
+                // merged cross-shard pool into the final answer.
+                let out = brain_ops::dispatch::dispatch_recall_shape_merged(
+                    *merged, *req, caller, &shard.ops,
+                )
+                .instrument(parent_span)
+                .await;
+                if reply_tx.send_async(out).await.is_err() {
+                    warn!(
+                        shard_id = shard.shard_id,
+                        "RecallShapeMerged reply dropped (caller gone)"
                     );
                 }
             }
@@ -3364,27 +4727,6 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
             );
         }
     }
-    // Take the WAL out of its cell. The scheduler is already drained
-    // above, so any snapshot/retention adapter holding an `Rc` clone
-    // of `shard.wal` has finished its last future and dropped its
-    // borrow. `take()` is therefore safe.
-    let wal = shard.wal.borrow_mut().take();
-    if let Some(wal) = wal {
-        if let Err(e) = wal.shutdown().await {
-            warn!(
-                shard_id = shard.shard_id,
-                error = %e,
-                "wal shutdown failed"
-            );
-        }
-    }
-    if let Err(e) = shard.arena.borrow().msync_all() {
-        warn!(
-            shard_id = shard.shard_id,
-            error = %e,
-            "msync_all at shutdown failed"
-        );
-    }
     // Flush the lexical indexes before anything else is torn down.
     //
     // These are JOINED, not cancelled: their final `commit()` is durable
@@ -3427,17 +4769,51 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
         }
     }
 
-    // Cancel the detached per-shard helper tasks. Both capture their
-    // own channel-sender clone, so they never observe a closed channel
-    // and would otherwise stay runnable forever — a live task keeps the
-    // Glommio executor from terminating after this future returns, which
-    // hangs the shard's join. The WAL drain has already flushed above,
-    // so cancelling here loses no durable work.
+    // Cancel the detached per-shard helper tasks BEFORE reclaiming the WAL.
+    //
+    // `wal_drain_task` holds a *shared* `RefCell` borrow of `shard.wal`
+    // across its `wal.append_many(...).await`. It is an independently
+    // spawned Glommio task, not a scheduler-driven adapter, so draining the
+    // scheduler above does *not* guarantee it has dropped that borrow: on a
+    // single-threaded executor it can be parked mid-append (borrow live)
+    // when control returns here. If we called `shard.wal.borrow_mut()` while
+    // that shared borrow was outstanding, the `RefCell` would panic
+    // (`already borrowed`), aborting the shard thread mid-shutdown and
+    // skipping the WAL/arena flush below.
+    //
+    // `cancel().await` drops the task's future — releasing any live borrow —
+    // and joins it, so no shared borrow can be outstanding when we `take()`.
+    // The main loop has already exited (its channel is closed) and the
+    // scheduler is drained, so no new records can enqueue after this point.
+    // Only a not-yet-acked, still-in-flight append is abandoned; every acked
+    // write was fsynced before its LSN was returned, so WAL-before-ack holds
+    // and no durable work is lost. The fanout task touches no shared state
+    // but is cancelled here too so it can't keep the executor runnable.
     if let Some(t) = shard.wal_drain_task.take() {
         t.cancel().await;
     }
     if let Some(t) = shard.fanout_task.take() {
         t.cancel().await;
+    }
+    // Take the WAL out of its cell. The scheduler is drained and the WAL
+    // drain task is cancelled/joined above, so no `Rc` clone of `shard.wal`
+    // holds a live borrow. `take()` is therefore safe.
+    let wal = shard.wal.borrow_mut().take();
+    if let Some(wal) = wal {
+        if let Err(e) = wal.shutdown().await {
+            warn!(
+                shard_id = shard.shard_id,
+                error = %e,
+                "wal shutdown failed"
+            );
+        }
+    }
+    if let Err(e) = shard.arena.borrow().msync_all() {
+        warn!(
+            shard_id = shard.shard_id,
+            error = %e,
+            "msync_all at shutdown failed"
+        );
     }
     info!(
         shard_id = shard.shard_id,
@@ -3449,13 +4825,91 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
 // Extract-backfill helper
 // ---------------------------------------------------------------------------
 
+/// Merge a rebuild snapshot with the HNSW pending buffer, producing the
+/// complete `(MemoryId, vector)` set to feed a fresh index build. Pending
+/// entries shadow snapshot entries for the same id (latest vector wins) and
+/// new pending ids are appended; tombstoned pending entries are dropped. Used
+/// by the admin `rebuild-ann` path so a rebuild never loses a live vector that
+/// landed in pending after the snapshot read.
+fn fold_pending_into(
+    snapshot: Vec<(brain_core::MemoryId, [f32; VECTOR_DIM])>,
+    pending: &[PendingEntry],
+) -> Vec<(brain_core::MemoryId, [f32; VECTOR_DIM])> {
+    let mut combined = snapshot;
+    let ids: std::collections::HashSet<brain_core::MemoryId> =
+        combined.iter().map(|(id, _)| *id).collect();
+    for entry in pending {
+        if entry.tombstoned {
+            continue;
+        }
+        if ids.contains(&entry.memory_id) {
+            if let Some(slot) = combined.iter_mut().find(|(id, _)| *id == entry.memory_id) {
+                slot.1 = entry.vector;
+            }
+        } else {
+            combined.push((entry.memory_id, entry.vector));
+        }
+    }
+    combined
+}
+
+/// Rows examined between cooperative yields during a backfill table
+/// scan. A full `MEMORIES_TABLE` walk with per-row redb `get` + enqueue
+/// would otherwise hold the shard core for the whole scan, starving
+/// foreground RECALL/ENCODE on this shard. Yielding every N rows lets
+/// those interleave while keeping the per-yield bookkeeping negligible.
+const BACKFILL_YIELD_INTERVAL: usize = 256;
+
+/// Whether the scan should cooperatively yield after examining
+/// `rows_examined` rows. Yields on every `BACKFILL_YIELD_INTERVAL`-th
+/// row (never on row 0, so a tiny scan does no extra work).
+#[inline]
+fn backfill_should_yield(rows_examined: usize) -> bool {
+    rows_examined != 0 && rows_examined.is_multiple_of(BACKFILL_YIELD_INTERVAL)
+}
+
+/// Restore (un-tombstone) a soft-forgotten memory on this shard. Runs
+/// inside the shard executor. A non-owning shard (the id routes
+/// elsewhere) short-circuits to `NotFound` so the admin fan-out reports a
+/// clean miss rather than an error. The grace window matches the
+/// slot-reclamation worker's ([`brain_workers::workers::slot_reclaim::DEFAULT_FORGET_GRACE`]),
+/// so restore-eligibility and reclamation coincide.
+async fn run_restore_memory(
+    shard: &Shard,
+    memory_id: brain_core::MemoryId,
+    namespace: &str,
+) -> Result<brain_ops::AdminRestoreOutcome, String> {
+    // Cheap shard-belongs check: an id that routes elsewhere is a clean
+    // miss on this shard (the admin handler fans out to every shard).
+    if memory_id.shard() != shard.shard_id {
+        return Ok(brain_ops::AdminRestoreOutcome::NotFound);
+    }
+    let grace_nanos =
+        u64::try_from(brain_workers::workers::slot_reclaim::DEFAULT_FORGET_GRACE.as_nanos())
+            .unwrap_or(u64::MAX);
+    let now_unix_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    brain_ops::handle_admin_restore(
+        &shard.ops,
+        memory_id,
+        namespace,
+        grace_nanos,
+        now_unix_nanos,
+    )
+    .await
+    .map_err(|e| format!("restore: {e}"))
+}
+
 /// Walk the per-shard `memories` + `texts` redb tables and push each
 /// matching memory onto the `WriterHandle`'s extractor channel. Runs
-/// inside the shard executor; the metadata read txn is short-lived and
-/// dropped before each enqueue so the writer can take a separate
-/// `try_send`. No `.await` points — the whole sweep is synchronous
-/// against redb + the bounded flume queue.
-fn run_extract_backfill(
+/// inside the shard executor; the metadata read txn is held for the
+/// scan's duration (a stable snapshot) but the loop yields cooperatively
+/// every [`BACKFILL_YIELD_INTERVAL`] rows so foreground ops on this
+/// shard aren't starved by a large scan. Enqueue is still a non-blocking
+/// `try_send` against the bounded flume queue.
+async fn run_extract_backfill(
     shard: &Shard,
     selector: brain_protocol::BackfillSelector,
 ) -> Result<ExtractBackfillReport, String> {
@@ -3531,7 +4985,12 @@ fn run_extract_backfill(
         }
         BackfillSelector::Since { since_unix_nanos } => {
             let cutoff_nanos = since_unix_nanos;
+            let mut examined = 0usize;
             for entry in memories.iter().map_err(|e| format!("memories.iter: {e}"))? {
+                examined += 1;
+                if backfill_should_yield(examined) {
+                    glommio::executor().yield_if_needed().await;
+                }
                 let (k, v) = entry.map_err(|e| format!("memories.entry: {e}"))?;
                 let key = k.value();
                 let row = v.value();
@@ -3545,7 +5004,12 @@ fn run_extract_backfill(
             }
         }
         BackfillSelector::All => {
+            let mut examined = 0usize;
             for entry in memories.iter().map_err(|e| format!("memories.iter: {e}"))? {
+                examined += 1;
+                if backfill_should_yield(examined) {
+                    glommio::executor().yield_if_needed().await;
+                }
                 let (k, v) = entry.map_err(|e| format!("memories.entry: {e}"))?;
                 let key = k.value();
                 let row = v.value();
@@ -3608,6 +5072,46 @@ fn find_latest_snapshot_dir(root: &Path) -> Option<PathBuf> {
         }
     }
     best.map(|(_, p)| p)
+}
+
+/// Re-apply post-snapshot FORGETs to a freshly-loaded memory HNSW.
+///
+/// A snapshot captures the graph as of `taken_at_lsn`; a FORGET that landed
+/// afterward marks the memory inactive in redb but leaves the loaded main
+/// holding the node active — a ghost that occupies a top-k slot and diverges
+/// from redb until some later full rebuild fires. For every `snapshot_id`
+/// whose redb row is inactive (or entirely absent) this tombstones the node
+/// in `hnsw`, so after reconciliation the HNSW active set equals the redb
+/// active set for the memory index.
+///
+/// Returns the number of nodes re-tombstoned, or an error string when the
+/// redb read could not be set up (so the caller can warn rather than
+/// silently skip reconciliation). A per-row read error is treated as "leave
+/// as loaded" — fail-safe toward keeping a genuinely-live node.
+fn reconcile_forgotten_memories(
+    hnsw: &brain_index::SharedHnsw,
+    metadata: &brain_metadata::MetadataDb,
+    snapshot_ids: &[brain_core::MemoryId],
+) -> Result<usize, String> {
+    let rtxn = metadata.read_txn().map_err(|e| format!("read_txn: {e}"))?;
+    let table = rtxn
+        .open_table(brain_metadata::tables::memory::MEMORIES_TABLE)
+        .map_err(|e| format!("open MEMORIES_TABLE: {e}"))?;
+    let mut retombstoned = 0usize;
+    for mid in snapshot_ids {
+        let inactive = match table.get(mid.to_be_bytes()) {
+            Ok(Some(row)) => !row.value().is_active(),
+            // Row gone entirely → not active.
+            Ok(None) => true,
+            // Per-row read error → leave the node as loaded.
+            Err(_) => false,
+        };
+        if inactive && !hnsw.is_tombstoned(*mid) {
+            hnsw.tombstone_recovery(*mid);
+            retombstoned += 1;
+        }
+    }
+    Ok(retombstoned)
 }
 
 fn read_or_generate_uuid(path: &Path) -> Result<[u8; 16], ShardError> {
@@ -3678,6 +5182,79 @@ mod tests {
         Arc::new(TestStubDispatcher)
     }
 
+    #[test]
+    fn wal_ready_ok_yields_ok() {
+        assert!(interpret_wal_ready(Ok(Ok(()))).is_ok());
+    }
+
+    #[test]
+    fn queue_depth_tracks_undrained_requests() {
+        // The dispatch-queue depth reflects requests queued on the
+        // request channel but not yet drained by the executor. With no
+        // receiver draining, each send accumulates.
+        let (tx, rx) = flume::unbounded::<ShardRequest>();
+        let handle = ShardHandle::new_for_test(0, tx);
+        assert_eq!(handle.queue_depth(), 0);
+
+        let (reply_tx, _reply_rx) = flume::bounded(1);
+        handle
+            .tx
+            .send(ShardRequest::Ping { reply_tx })
+            .expect("send ping");
+        assert_eq!(handle.queue_depth(), 1);
+
+        let (reply_tx, _reply_rx) = flume::bounded(1);
+        handle
+            .tx
+            .send(ShardRequest::HnswSnapshot { reply_tx })
+            .expect("send snapshot");
+        assert_eq!(handle.queue_depth(), 2);
+
+        // Draining one request drops the depth.
+        let _ = rx.recv().expect("drain one");
+        assert_eq!(handle.queue_depth(), 1);
+    }
+
+    #[test]
+    fn backfill_yields_on_interval_boundaries_only() {
+        // Never yields on the first row (row 0 → 0 examined) or before a
+        // full interval elapses; yields on each interval boundary so a
+        // large scan can't monopolize the shard core.
+        assert!(!backfill_should_yield(0));
+        assert!(!backfill_should_yield(1));
+        assert!(!backfill_should_yield(BACKFILL_YIELD_INTERVAL - 1));
+        assert!(backfill_should_yield(BACKFILL_YIELD_INTERVAL));
+        assert!(backfill_should_yield(BACKFILL_YIELD_INTERVAL * 2));
+        assert!(!backfill_should_yield(BACKFILL_YIELD_INTERVAL + 1));
+
+        // A scan of `rows` yields floor(rows / interval) times.
+        let rows = BACKFILL_YIELD_INTERVAL * 3 + 7;
+        let yields = (1..=rows).filter(|n| backfill_should_yield(*n)).count();
+        assert_eq!(yields, 3);
+    }
+
+    #[test]
+    fn wal_ready_io_failure_fails_spawn() {
+        // A WAL open/create IO failure reported by the closure must surface
+        // as a spawn error, not a silently-dead serving shard.
+        let err = WalError::NoSegmentsFound {
+            dir: std::path::PathBuf::from("/nonexistent/wal"),
+        };
+        let out = interpret_wal_ready(Ok(Err(err)));
+        assert!(matches!(out, Err(ShardError::WalInit(_))));
+    }
+
+    #[test]
+    fn wal_ready_sender_dropped_fails_spawn() {
+        // If the executor thread exits before signalling (e.g. an earlier
+        // in-closure panic drops the sender), the spawn must still fail
+        // rather than proceed to build a handle over a dead shard.
+        let (tx, rx) = flume::bounded::<Result<(), WalError>>(1);
+        drop(tx);
+        let out = interpret_wal_ready(rx.recv());
+        assert!(matches!(out, Err(ShardError::Spawn(_))));
+    }
+
     /// Spawn config for tests that run without real model files. The
     /// stub dispatcher fakes embeddings; rerank is turned off because
     /// no cross-encoder weights exist in the test environment, and an
@@ -3686,6 +5263,153 @@ mod tests {
         let mut cfg = ShardSpawnConfig::new(dir, stub_dispatcher());
         cfg.rerank.enabled = false;
         cfg
+    }
+
+    #[test]
+    fn fanout_lag_is_counted_not_silently_swallowed() {
+        // The fanout task's `Lagged` arm routes through `record_fanout_lag`
+        // instead of a bare `continue`; a dropped event must always leave an
+        // observable trace (counter + warn). Assert on a delta because the
+        // counter is process-global and other tests may touch it in parallel.
+        let before = fanout_lagged_events();
+        record_fanout_lag(0, 3);
+        record_fanout_lag(0, 5);
+        let after = fanout_lagged_events();
+        assert_eq!(
+            after - before,
+            8,
+            "fanout lag must accumulate skipped-event counts, not be swallowed"
+        );
+    }
+
+    /// Regression: a delivered-but-unacked FIRST quiesce must NOT strand the
+    /// `memory_text` indexer. Before the fix `do_rebuild_tantivy` `?`-returned
+    /// on the first quiesce, skipping the whole resume region — so a
+    /// `memory_text` indexer that received `Quiesce` (dropped its writer,
+    /// parked) but whose ack never arrived was left parked forever, silently
+    /// losing every later ENCODE/FORGET lexical op (invariant #7). The drive
+    /// helper must instead resume BOTH indexers and only then surface the
+    /// quiesce failure as fail-stop.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn first_quiesce_failure_still_resumes_memory_text() {
+        use brain_ops::index::text_indexer::IndexerControl;
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        glommio::LocalExecutorBuilder::default()
+            .name("rebuild-quiesce-test")
+            .spawn(|| async move {
+                // Two control channels standing in for the two live indexers.
+                let (mem_tx, mem_rx) = flume::bounded::<IndexerControl>(4);
+                let (stmt_tx, stmt_rx) = flume::bounded::<IndexerControl>(4);
+
+                // memory_text fake: on `Quiesce` it records receipt and DROPS
+                // its ack without acking — modelling a delivered-but-timed-out
+                // quiesce (the drain loop parked with its writer dropped). It
+                // stays alive to receive `Resume`, proving it can be revived.
+                let mem_quiesced = Rc::new(Cell::new(false));
+                let mem_resumed = Rc::new(Cell::new(false));
+                let mem_task = {
+                    let mem_quiesced = mem_quiesced.clone();
+                    let mem_resumed = mem_resumed.clone();
+                    glommio::spawn_local(async move {
+                        while let Ok(ctl) = mem_rx.recv_async().await {
+                            match ctl {
+                                IndexerControl::Quiesce { ack } => {
+                                    mem_quiesced.set(true);
+                                    drop(ack); // parked; never acks
+                                }
+                                IndexerControl::Resume { ack, .. } => {
+                                    mem_resumed.set(true);
+                                    let _ = ack.send(());
+                                    break;
+                                }
+                            }
+                        }
+                    })
+                };
+
+                // statements fake: acks both quiesce and resume normally.
+                let stmt_resumed = Rc::new(Cell::new(false));
+                let stmt_task = {
+                    let stmt_resumed = stmt_resumed.clone();
+                    glommio::spawn_local(async move {
+                        while let Ok(ctl) = stmt_rx.recv_async().await {
+                            match ctl {
+                                IndexerControl::Quiesce { ack } => {
+                                    let _ = ack.send(());
+                                }
+                                IndexerControl::Resume { ack, .. } => {
+                                    stmt_resumed.set(true);
+                                    let _ = ack.send(());
+                                    break;
+                                }
+                            }
+                        }
+                    })
+                };
+
+                // Real handles to resume onto (a fresh empty on-disk shard).
+                let dir = TempDir::new().expect("tempdir");
+                let shard = brain_index::TantivyShard::open(dir.path())
+                    .expect("open tantivy shard")
+                    .shard;
+                let mem_handle = shard.memory_text.clone();
+                let stmt_handle = shard.statements.clone();
+
+                // Record which per-index rebuilds the middle was asked to run.
+                let mem_rebuild_run = Rc::new(Cell::new(false));
+                let stmt_rebuild_run = Rc::new(Cell::new(false));
+                let result = {
+                    let mem_rebuild_run = mem_rebuild_run.clone();
+                    let stmt_rebuild_run = stmt_rebuild_run.clone();
+                    drive_tantivy_rebuild(Some(&mem_tx), Some(&stmt_tx), move |mem_ok, stmt_ok| {
+                        mem_rebuild_run.set(mem_ok);
+                        stmt_rebuild_run.set(stmt_ok);
+                        RebuildMiddle {
+                            rebuild_result: Ok(0),
+                            reopen_err: None,
+                            swap_err: None,
+                            resume_handles: Some((mem_handle, stmt_handle)),
+                        }
+                    })
+                    .await
+                };
+
+                // The rebuild fail-stops (the first quiesce never acked)...
+                assert!(
+                    result.is_err(),
+                    "rebuild must fail-stop when the first quiesce ack does not arrive",
+                );
+                // ...yet memory_text is still RESUMED, not stranded parked...
+                assert!(
+                    mem_quiesced.get(),
+                    "memory_text quiesce must have been delivered",
+                );
+                assert!(
+                    mem_resumed.get(),
+                    "memory_text must be resumed even though its quiesce ack failed",
+                );
+                // ...and statements was quiesced + resumed normally.
+                assert!(stmt_resumed.get(), "statement indexer must be resumed");
+                // The memory-text on-disk rebuild was SKIPPED (its indexer
+                // never quiesced), while the statement rebuild was allowed.
+                assert!(
+                    !mem_rebuild_run.get(),
+                    "memory rebuild must be skipped when its indexer did not quiesce",
+                );
+                assert!(
+                    stmt_rebuild_run.get(),
+                    "statement rebuild must run when its indexer quiesced",
+                );
+
+                mem_task.await;
+                stmt_task.await;
+            })
+            .expect("spawn test executor")
+            .join()
+            .expect("join test executor");
     }
 
     #[test]
@@ -3805,5 +5529,86 @@ mod tests {
             paths.statements_tantivy().join("meta.json").exists(),
             "statements.tantivy/meta.json should exist after spawn (sub-task 22.1)"
         );
+    }
+
+    #[test]
+    fn reconcile_forgotten_tombstones_inactive_snapshot_nodes() {
+        // IDX1 convergence: a memory HNSW loaded from a snapshot holds M1..M3
+        // active; a post-snapshot FORGET marked M2 inactive in redb.
+        // Reconciliation must tombstone exactly M2 so the HNSW active set
+        // converges to the redb active set — M1/M3 stay live, no ghost.
+        use brain_core::{MemoryId, MemoryKind, NamespaceId, SessionId, SpaceId};
+        use brain_index::SharedHnsw;
+        use brain_metadata::tables::memory::{flags, MemoryMetadata, MEMORIES_TABLE};
+
+        fn space(b: u8) -> SpaceId {
+            let mut x = [0u8; 16];
+            x[15] = b;
+            x.into()
+        }
+        fn row(slot: u64) -> MemoryMetadata {
+            MemoryMetadata::new_active(
+                MemoryId::pack(1, slot, 1),
+                NamespaceId::SYSTEM,
+                space(slot as u8),
+                SessionId(1),
+                slot,
+                1,
+                MemoryKind::Episodic,
+                [0xAB; 16],
+                0.5,
+                10,
+                1_700_000_000_000_000_000,
+            )
+        }
+
+        let dir = TempDir::new().unwrap();
+        let md = brain_metadata::MetadataDb::open(dir.path().join("metadata.redb")).unwrap();
+
+        let m1 = MemoryId::pack(1, 1, 1);
+        let m2 = MemoryId::pack(1, 2, 1);
+        let m3 = MemoryId::pack(1, 3, 1);
+
+        let wtxn = md.write_txn().unwrap();
+        {
+            let mut t = wtxn.open_table(MEMORIES_TABLE).unwrap();
+            t.insert(&m1.to_be_bytes(), &row(1)).unwrap();
+            // M2: FORGOTTEN after the snapshot — ACTIVE flag cleared.
+            let mut r2 = row(2);
+            r2.set_flag(flags::ACTIVE, false);
+            assert!(r2.is_tombstoned());
+            t.insert(&m2.to_be_bytes(), &r2).unwrap();
+            t.insert(&m3.to_be_bytes(), &row(3)).unwrap();
+        }
+        wtxn.commit().unwrap();
+
+        // Simulate the loaded snapshot: all three active in the graph.
+        let idx = brain_index::HnswIndex::new(brain_index::params::IndexParams::default_v1())
+            .expect("HnswIndex::new");
+        let (hnsw, _writer) = SharedHnsw::from_index(idx);
+        for (i, mid) in [m1, m2, m3].iter().enumerate() {
+            let mut v = [0.0f32; VECTOR_DIM];
+            v[i] = 1.0;
+            hnsw.insert_recovery(*mid, &v);
+        }
+        assert!(hnsw.contains(m2), "M2 active before reconciliation");
+
+        let snapshot_ids = vec![m1, m2, m3];
+        let n = reconcile_forgotten_memories(&hnsw, &md, &snapshot_ids).unwrap();
+        assert_eq!(n, 1, "exactly M2 should be re-tombstoned");
+
+        assert!(
+            hnsw.is_tombstoned(m2),
+            "M2 must be tombstoned after reconcile"
+        );
+        assert!(!hnsw.contains(m2), "M2 must no longer be a live node");
+        assert!(hnsw.contains(m1), "M1 stays live");
+        assert!(hnsw.contains(m3), "M3 stays live");
+        assert!(!hnsw.is_tombstoned(m1));
+        assert!(!hnsw.is_tombstoned(m3));
+
+        // Idempotent: a second pass tombstones nothing more.
+        let n2 = reconcile_forgotten_memories(&hnsw, &md, &snapshot_ids).unwrap();
+        assert_eq!(n2, 0, "reconciliation is idempotent");
     }
 }

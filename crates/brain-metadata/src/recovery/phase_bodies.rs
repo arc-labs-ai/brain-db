@@ -76,7 +76,6 @@ pub type EntityCreateBody = EntityMetadata;
 /// stamps `IMPLICIT_PREDICATE`, mirroring the live apply path. `None`
 /// means the predicate in `meta` is authoritative (strict path).
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct StatementCreateBody {
     pub meta: StatementMetadata,
     pub predicate_intern_hint: Option<(String, String)>,
@@ -90,7 +89,6 @@ pub struct StatementCreateBody {
 /// post-update state inputs: the new canonical name, the full alias
 /// list, the opaque attributes blob, and the update timestamp.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct EntityUpdateBody {
     pub id: [u8; 16],
     pub canonical_name: String,
@@ -103,7 +101,6 @@ pub struct EntityUpdateBody {
 /// `EntityTombstone` (0x13) body. Mirrors the `entity_tombstone`
 /// helper's inputs.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct EntityTombstoneBody {
     pub id: [u8; 16],
     pub at_unix_nanos: u64,
@@ -114,7 +111,6 @@ pub struct EntityTombstoneBody {
 /// attributes are untouched (entity_rename applies the alias-trail policy
 /// itself, moving the old canonical into aliases).
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct EntityRenameBody {
     pub id: [u8; 16],
     pub new_canonical_name: String,
@@ -124,7 +120,6 @@ pub struct EntityRenameBody {
 /// `EntityUnmerge` (0x15) body. Mirrors `unmerge_entity`'s inputs.
 /// `actor_kind`: `0` = System (`actor_space` is `[0; 16]`), `1` = Space.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct EntityUnmergeBody {
     pub merged: [u8; 16],
     pub actor_kind: u8,
@@ -136,7 +131,6 @@ pub struct EntityUnmergeBody {
 /// inputs. `actor_kind` encodes `MergeActor`: `0` = `System` (and
 /// `actor_space` is `[0; 16]`), `1` = `Space(actor_space)`.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct EntityMergeBody {
     pub source: [u8; 16],
     pub target: [u8; 16],
@@ -155,7 +149,6 @@ pub struct EntityMergeBody {
 /// `StatementSupersede` (0x21) body. The new statement row plus the id
 /// of the statement it replaces and the supersession timestamp.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct StatementSupersedeBody {
     pub old_id: [u8; 16],
     pub new: StatementMetadata,
@@ -166,20 +159,29 @@ pub struct StatementSupersedeBody {
 /// reason byte (see `tables::statement::tombstone_reason`), and the
 /// tombstone timestamp.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct StatementTombstoneBody {
     pub id: [u8; 16],
     pub reason: u8,
     pub at_unix_nanos: u64,
 }
 
-/// `SchemaUpdate` (0x40) body. The schema DSL source text and its
-/// upload timestamp. Recovery re-parses, validates, and re-applies the
-/// declaration the same way the live `SCHEMA_UPLOAD` apply path does —
-/// storing the source rather than a pre-parsed form keeps replay
-/// authoritative against the parser that the running binary ships.
+/// One destructive drop target carried on a [`SchemaUpdateBody`] (SCHEMA_DROP).
+/// `kind` matches `brain_protocol::schema_drop_target` (0 = predicate,
+/// 1 = relation_type); `name` is the local (unqualified) target name.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
+pub struct SchemaDropTargetBody {
+    pub kind: u8,
+    pub name: String,
+}
+
+/// `SchemaUpdate` (0x40) body — the single WAL record behind every schema
+/// mutation (UPLOAD / REPLACE / DROP). The schema DSL source text and its
+/// upload timestamp, plus the destructive delta that REPLACE / DROP apply
+/// *before* the (additive) upload. Recovery re-parses, validates, applies the
+/// delta, then re-uploads the same way the live apply path does — storing the
+/// source rather than a pre-parsed form keeps replay authoritative against the
+/// parser that the running binary ships.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
 pub struct SchemaUpdateBody {
     /// Namespace + version this upload assigned. Carried so recovery can
     /// skip re-applying an already-present (namespace, version) — without
@@ -192,6 +194,13 @@ pub struct SchemaUpdateBody {
     /// `version` because replay reconstructs schema state in LSN order).
     pub blob: Vec<u8>,
     pub created_at_unix_nanos: u64,
+    /// REPLACE mode: drop *all* declared predicates / relation types /
+    /// extractors in the namespace before the upload (the destructive
+    /// escape hatch). `false` for plain UPLOAD and for targeted DROP.
+    pub replace_all: bool,
+    /// DROP mode: specific declared targets to remove before the upload.
+    /// Empty for UPLOAD and REPLACE.
+    pub drops: Vec<SchemaDropTargetBody>,
 }
 
 // ---------------------------------------------------------------------------
@@ -201,7 +210,6 @@ pub struct SchemaUpdateBody {
 /// `SpaceCreate` (0x60) body. Recovery replays via `registry::space_create`
 /// (idempotent).
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct SpaceCreateBody {
     pub namespace_id: u32,
     pub space_id: [u8; 16],
@@ -217,7 +225,6 @@ pub struct SpaceCreateBody {
 /// `registry::space_delete_registry` (idempotent — a re-replay of a deleted
 /// space is a no-op).
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct SpaceDeleteBody {
     pub namespace_id: u32,
     pub space_id: [u8; 16],
@@ -226,7 +233,6 @@ pub struct SpaceDeleteBody {
 /// `SessionCreate` (0x62) body. Recovery replays via
 /// `registry::session_create` (idempotent).
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct SessionCreateBody {
     pub namespace_id: u32,
     pub space_id: [u8; 16],
@@ -240,7 +246,6 @@ pub struct SessionCreateBody {
 /// handler chose for the memory cascade; the registry row removal is identical
 /// either way.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct SessionDeleteBody {
     pub namespace_id: u32,
     pub space_id: [u8; 16],
@@ -252,12 +257,6 @@ pub struct SessionDeleteBody {
 // Encode / decode.
 // ---------------------------------------------------------------------------
 
-/// rkyv scratch-space size for body serialization. Bodies are small
-/// (a row plus a handful of scalars); 1 KiB covers the common case
-/// without a heap fallback. rkyv grows the scratch on its own if a body
-/// (e.g. a large alias list or attributes blob) exceeds this.
-const SCRATCH: usize = 1024;
-
 /// Encode any typed-graph body. rkyv serialization of an owned, fully
 /// constructed value is infallible.
 macro_rules! body_codec {
@@ -265,7 +264,7 @@ macro_rules! body_codec {
         #[doc = concat!("Encode a [`", stringify!($ty), "`] to its WAL body bytes.")]
         #[must_use]
         pub fn $encode(body: &$ty) -> Vec<u8> {
-            rkyv::to_bytes::<_, SCRATCH>(body)
+            rkyv::to_bytes::<rkyv::rancor::Error>(body)
                 .expect("invariant: typed-graph body rkyv encode is infallible")
                 .into_vec()
         }
@@ -277,21 +276,19 @@ macro_rules! body_codec {
         /// Returns [`PhaseBodyError::Decode`] if the bytes fail
         /// rkyv `check_bytes` validation or the deserialize fails.
         pub fn $decode(bytes: &[u8]) -> Result<$ty, PhaseBodyError> {
-            use rkyv::Deserialize;
-            // rkyv's `check_archived_root` resolves the archived root from
-            // the *end* of the buffer and follows relative pointers that
-            // assume the buffer is aligned to the archive's alignment. The
-            // encode side returns an `AlignedVec`, but a WAL record body is
-            // a `&[u8]` slice at an arbitrary offset inside the larger
-            // record buffer — almost never aligned. Validating that slice
-            // directly trips "pointer out of bounds". Copy into an
-            // `AlignedVec` so the relative-pointer arithmetic is sound.
-            let mut aligned = rkyv::AlignedVec::with_capacity(bytes.len());
+            // `rkyv::access` resolves the archived root from the *end* of the
+            // buffer and follows relative pointers that assume the buffer is
+            // aligned to the archive's alignment. The encode side returns an
+            // `AlignedVec`, but a WAL record body is a `&[u8]` slice at an
+            // arbitrary offset inside the larger record buffer — almost never
+            // aligned. Validating that slice directly trips "pointer out of
+            // bounds". Copy into an `AlignedVec` so the relative-pointer
+            // arithmetic is sound.
+            let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(bytes.len());
             aligned.extend_from_slice(bytes);
-            let archived = rkyv::check_archived_root::<$ty>(&aligned)
+            let archived = rkyv::access::<rkyv::Archived<$ty>, rkyv::rancor::Error>(&aligned)
                 .map_err(|e| PhaseBodyError::Decode(e.to_string()))?;
-            archived
-                .deserialize(&mut rkyv::Infallible)
+            rkyv::deserialize::<$ty, rkyv::rancor::Error>(archived)
                 .map_err(|e| PhaseBodyError::Decode(format!("{e:?}")))
         }
     };
@@ -538,6 +535,8 @@ mod tests {
             version: 3,
             blob: b"entity Person { name: text }".to_vec(),
             created_at_unix_nanos: 1_700_000_000_000_000_777,
+            replace_all: false,
+            drops: Vec::new(),
         };
         let bytes = encode_schema_update(&body);
         let got = decode_schema_update(&bytes).unwrap();
@@ -618,6 +617,8 @@ mod tests {
             version: 3,
             blob: b"entity Person { name: text }".to_vec(),
             created_at_unix_nanos: 1_700_000_000_000_000_777,
+            replace_all: false,
+            drops: Vec::new(),
         };
         let bytes = encode_schema_update(&body);
         let got = decode_from_misaligned(&bytes, decode_schema_update);

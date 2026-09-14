@@ -119,6 +119,14 @@ fn seed_memory(
         meta.tombstoned_at_unix_nanos = tombstoned_at_unix_nanos;
         table.insert(id.to_be_bytes(), meta).unwrap();
     }
+    // Consolidation resolves candidate vectors from the redb artifact
+    // store. Give every seeded memory the same unit vector so memories in
+    // one context are cosine-1.0 and cluster together (session bucketing,
+    // not the vector, keeps different sessions apart).
+    brain_ops::memory_artifact::merge_memory_artifact(&wtxn, id.to_be_bytes(), |b| {
+        b.vector = unit_vec(0).to_vec();
+    })
+    .unwrap();
     wtxn.commit().unwrap();
     id
 }
@@ -610,6 +618,272 @@ fn second_cycle_is_idempotent() {
         assert_eq!(
             second, 0,
             "sources are stamped; second cycle finds no candidates"
+        );
+    });
+}
+
+// ===========================================================================
+// Similarity clustering in the cycle (4).
+// ===========================================================================
+
+/// Unit vector with all energy in `dim`. Two such vectors have cosine
+/// 1.0 when they share a dim and 0.0 when they don't.
+fn unit_vec(dim: usize) -> [f32; VECTOR_DIM] {
+    let mut v = [0.0f32; VECTOR_DIM];
+    v[dim] = 1.0;
+    v
+}
+
+/// Seed an Episodic memory as id `MemoryId::pack(0, slot, version)`.
+/// When `vector` is `Some`, its write-time embedding is written into the
+/// redb artifact bundle — the LIVE by-id vector store consolidation
+/// resolves from (the arena is recovery-only and empty in-run). `None`
+/// leaves the artifact absent, so `get_artifact_vector` returns `None`
+/// and the worker drops the candidate fail-soft.
+fn seed_packed(
+    metadata: &SharedMetadataDb,
+    slot: u64,
+    version: u32,
+    session_id: u64,
+    created_at_unix_nanos: u64,
+    vector: Option<[f32; VECTOR_DIM]>,
+) -> MemoryId {
+    let id = MemoryId::pack(0, slot, version);
+    let wtxn = metadata.write_txn().unwrap();
+    {
+        let mut table = wtxn.open_table(MEMORIES_TABLE).unwrap();
+        let meta = MemoryMetadata::new_active(
+            id,
+            brain_core::NamespaceId::SYSTEM,
+            SpaceId(Uuid::nil()),
+            SessionId(session_id),
+            slot,
+            version,
+            MemoryKind::Episodic,
+            [0; 16],
+            0.5,
+            16,
+            created_at_unix_nanos,
+        );
+        table.insert(id.to_be_bytes(), meta).unwrap();
+    }
+    if let Some(v) = vector {
+        brain_ops::memory_artifact::merge_memory_artifact(&wtxn, id.to_be_bytes(), |b| {
+            b.vector = v.to_vec();
+        })
+        .unwrap();
+    }
+    wtxn.commit().unwrap();
+    id
+}
+
+/// Seed an Episodic memory in an explicit `(namespace, space)`. Used by
+/// the tenant-isolation test: two spaces that share a `SessionId` and an
+/// identical vector must still land in separate clusters.
+#[allow(clippy::too_many_arguments)]
+fn seed_scoped(
+    metadata: &SharedMetadataDb,
+    slot: u64,
+    namespace: brain_core::NamespaceId,
+    space: SpaceId,
+    session_id: u64,
+    created_at_unix_nanos: u64,
+    vector: [f32; VECTOR_DIM],
+) -> MemoryId {
+    let id = MemoryId::pack(0, slot, 1);
+    let wtxn = metadata.write_txn().unwrap();
+    {
+        let mut table = wtxn.open_table(MEMORIES_TABLE).unwrap();
+        let meta = MemoryMetadata::new_active(
+            id,
+            namespace,
+            space,
+            SessionId(session_id),
+            slot,
+            1,
+            MemoryKind::Episodic,
+            [0; 16],
+            0.5,
+            16,
+            created_at_unix_nanos,
+        );
+        table.insert(id.to_be_bytes(), meta).unwrap();
+    }
+    brain_ops::memory_artifact::merge_memory_artifact(&wtxn, id.to_be_bytes(), |b| {
+        b.vector = vector.to_vec();
+    })
+    .unwrap();
+    wtxn.commit().unwrap();
+    id
+}
+
+fn count_consolidated(metadata: &SharedMetadataDb) -> usize {
+    let rtxn = metadata.read_txn().unwrap();
+    let table = rtxn.open_table(MEMORIES_TABLE).unwrap();
+    table
+        .iter()
+        .unwrap()
+        .filter(|e| {
+            let (_, v) = e.as_ref().unwrap();
+            v.value().kind().ok() == Some(MemoryKind::Consolidated)
+        })
+        .count()
+}
+
+#[test]
+fn two_dissimilar_subgroups_produce_two_consolidated() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let now = now_unix_nanos();
+        // Sub-group A: slots 1..=5 all point at dim 0.
+        for slot in 1..=5 {
+            seed_packed(&fix.metadata, slot, 1, 1, now, Some(unit_vec(0)));
+        }
+        // Sub-group B: slots 6..=10 all point at dim 100 (orthogonal
+        // to A → cross-group cosine 0.0 < 0.6).
+        for slot in 6..=10 {
+            seed_packed(&fix.metadata, slot, 1, 1, now, Some(unit_vec(100)));
+        }
+        let worker = ConsolidationWorker::new(Arc::new(EchoSummarizer))
+            .with_min_cluster_size(5)
+            .with_similarity_threshold(0.6);
+        let processed = run_cycle(&worker, fix.ctx.clone()).await.unwrap();
+        assert_eq!(processed, 2, "two dissimilar sub-groups → two clusters");
+        assert_eq!(count_consolidated(&fix.metadata), 2);
+    });
+}
+
+#[test]
+fn singleton_below_threshold_is_not_consolidated() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let now = now_unix_nanos();
+        // A cluster of 5 aligned memories (dim 0)…
+        let mut cluster_ids = Vec::new();
+        for slot in 1..=5 {
+            cluster_ids.push(seed_packed(
+                &fix.metadata,
+                slot,
+                1,
+                1,
+                now,
+                Some(unit_vec(0)),
+            ));
+        }
+        // …plus one orthogonal singleton (dim 200) that clears no pair.
+        let singleton = seed_packed(&fix.metadata, 6, 1, 1, now, Some(unit_vec(200)));
+
+        let worker = ConsolidationWorker::new(Arc::new(EchoSummarizer))
+            .with_min_cluster_size(5)
+            .with_similarity_threshold(0.6);
+        let processed = run_cycle(&worker, fix.ctx.clone()).await.unwrap();
+        assert_eq!(processed, 1, "only the size-5 cluster consolidates");
+        // The 5 aligned sources are stamped; the singleton is not.
+        for id in cluster_ids {
+            assert!(read_meta(&fix.metadata, id)
+                .unwrap()
+                .consolidated_at_unix_nanos
+                .is_some());
+        }
+        assert!(
+            read_meta(&fix.metadata, singleton)
+                .unwrap()
+                .consolidated_at_unix_nanos
+                .is_none(),
+            "the below-threshold singleton must not be consolidated"
+        );
+    });
+}
+
+#[test]
+fn missing_artifact_vector_candidates_are_dropped() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let now = now_unix_nanos();
+        // Six aligned memories (dim 0) — but slot 6 has no artifact
+        // vector, so `get_artifact_vector` returns None and that
+        // candidate is dropped. The remaining 5 still form one cluster.
+        let mut ids = Vec::new();
+        for slot in 1..=6 {
+            let v = if slot != 6 { Some(unit_vec(0)) } else { None };
+            ids.push(seed_packed(&fix.metadata, slot, 1, 1, now, v));
+        }
+        let missing = ids[5];
+
+        let worker = ConsolidationWorker::new(Arc::new(EchoSummarizer))
+            .with_min_cluster_size(5)
+            .with_similarity_threshold(0.6);
+        let processed = run_cycle(&worker, fix.ctx.clone()).await.unwrap();
+        assert_eq!(processed, 1, "the 5 resolvable candidates cluster");
+        assert_eq!(count_consolidated(&fix.metadata), 1);
+        // The dropped candidate is neither clustered nor stamped.
+        assert!(
+            read_meta(&fix.metadata, missing)
+                .unwrap()
+                .consolidated_at_unix_nanos
+                .is_none(),
+            "a candidate with no stored vector must be dropped, not mis-clustered"
+        );
+    });
+}
+
+#[test]
+fn two_spaces_sharing_session_are_not_clustered_and_summary_lands_in_source_space() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let now = now_unix_nanos();
+        // Two distinct spaces under the same namespace, BOTH using
+        // SessionId(1), and every memory carries the identical vector
+        // (unit_vec(0)) — so cosine is 1.0 across the whole set. Under the
+        // old session-only bucketing these ten would collapse into one
+        // cross-tenant cluster written to the NIL space. With full
+        // (namespace, space, session) bucketing they must form two
+        // separate clusters, each summarised into its own source space.
+        let ns = brain_core::NamespaceId::from(7);
+        let space_a = SpaceId::derive_from_string("tenant7", "space-a");
+        let space_b = SpaceId::derive_from_string("tenant7", "space-b");
+        assert_ne!(space_a, space_b);
+        for slot in 1..=5 {
+            seed_scoped(&fix.metadata, slot, ns, space_a, 1, now, unit_vec(0));
+        }
+        for slot in 6..=10 {
+            seed_scoped(&fix.metadata, slot, ns, space_b, 1, now, unit_vec(0));
+        }
+
+        let worker = ConsolidationWorker::new(Arc::new(EchoSummarizer))
+            .with_min_cluster_size(5)
+            .with_similarity_threshold(0.6);
+        let processed = run_cycle(&worker, fix.ctx.clone()).await.unwrap();
+        assert_eq!(
+            processed, 2,
+            "two spaces sharing a session must NOT be clustered together"
+        );
+
+        // Collect the consolidated rows and check where they landed.
+        let rtxn = fix.metadata.read_txn().unwrap();
+        let table = rtxn.open_table(MEMORIES_TABLE).unwrap();
+        let mut consolidated_spaces = std::collections::HashSet::new();
+        for entry in table.iter().unwrap() {
+            let (_, v) = entry.unwrap();
+            let m = v.value();
+            if m.kind().ok() == Some(MemoryKind::Consolidated) {
+                assert_ne!(
+                    m.space_id(),
+                    SpaceId::NIL,
+                    "consolidated memory must not land in the NIL space"
+                );
+                assert_eq!(
+                    m.namespace(),
+                    ns,
+                    "consolidated memory must inherit the source namespace"
+                );
+                consolidated_spaces.insert(m.space_id());
+            }
+        }
+        assert_eq!(
+            consolidated_spaces,
+            std::collections::HashSet::from([space_a, space_b]),
+            "each summary must land in its own source space, never mixed or NIL"
         );
     });
 }

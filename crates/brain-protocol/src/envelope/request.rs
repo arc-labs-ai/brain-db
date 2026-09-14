@@ -144,6 +144,7 @@ pub enum RequestBody {
     SchemaList(SchemaListRequest),
     SchemaValidate(SchemaValidateRequest),
     SchemaReplace(SchemaReplaceRequest),
+    SchemaDrop(SchemaDropRequest),
 
     // Extractor introspection (read-only).
     ExtractorList(ExtractorListRequest),
@@ -235,6 +236,7 @@ impl RequestBody {
             Self::SchemaList(_) => Opcode::SchemaListReq,
             Self::SchemaValidate(_) => Opcode::SchemaValidateReq,
             Self::SchemaReplace(_) => Opcode::SchemaReplaceReq,
+            Self::SchemaDrop(_) => Opcode::SchemaDropReq,
             Self::ExtractorList(_) => Opcode::ExtractorListReq,
             Self::QueryExplain(_) => Opcode::QueryExplainReq,
             Self::QueryTrace(_) => Opcode::QueryTraceReq,
@@ -322,6 +324,7 @@ impl RequestBody {
             Self::SchemaList(r) => to_cbor_bytes(r),
             Self::SchemaValidate(r) => to_cbor_bytes(r),
             Self::SchemaReplace(r) => to_cbor_bytes(r),
+            Self::SchemaDrop(r) => to_cbor_bytes(r),
             Self::ExtractorList(r) => to_cbor_bytes(r),
             Self::QueryExplain(r) => to_cbor_bytes(r),
             Self::QueryTrace(r) => to_cbor_bytes(r),
@@ -414,6 +417,7 @@ impl RequestBody {
             Opcode::SchemaListReq => Self::SchemaList(from_cbor_bytes(bytes)?),
             Opcode::SchemaValidateReq => Self::SchemaValidate(from_cbor_bytes(bytes)?),
             Opcode::SchemaReplaceReq => Self::SchemaReplace(from_cbor_bytes(bytes)?),
+            Opcode::SchemaDropReq => Self::SchemaDrop(from_cbor_bytes(bytes)?),
             Opcode::ExtractorListReq => Self::ExtractorList(from_cbor_bytes(bytes)?),
             Opcode::QueryExplainReq => Self::QueryExplain(from_cbor_bytes(bytes)?),
             Opcode::QueryTraceReq => Self::QueryTrace(from_cbor_bytes(bytes)?),
@@ -503,6 +507,12 @@ pub fn act_as_of(body: &RequestBody) -> Option<&ActAs> {
         RequestBody::SessionCreate(r) => r.act_as.as_ref(),
         RequestBody::SessionList(r) => r.act_as.as_ref(),
         RequestBody::SessionDelete(r) => r.act_as.as_ref(),
+        // Delegation is established once, at begin, and is fixed for the
+        // life of the txn: TXN_BEGIN carries the `act_as` and every write
+        // buffered under this txn commits as that identity. TXN_COMMIT /
+        // TXN_ABORT deliberately carry none — the commit runs under the
+        // identity the begin fixed, not a fresh selector on the commit.
+        RequestBody::TxnBegin(r) => r.act_as.as_ref(),
         // Exhaustive on purpose: no `_ => None`.
         //
         // Silently dropping an `act_as` is a tenancy violation that returns
@@ -519,7 +529,6 @@ pub fn act_as_of(body: &RequestBody) -> Option<&ActAs> {
         RequestBody::EncodeVectorDirect(_) => None,
         RequestBody::Unsubscribe(_) => None,
         RequestBody::GetCapabilities(_) => None,
-        RequestBody::TxnBegin(_) => None,
         RequestBody::TxnCommit(_) => None,
         RequestBody::TxnAbort(_) => None,
         RequestBody::CancelStream(_) => None,
@@ -555,6 +564,7 @@ pub fn act_as_of(body: &RequestBody) -> Option<&ActAs> {
         RequestBody::SchemaList(_) => None,
         RequestBody::SchemaValidate(_) => None,
         RequestBody::SchemaReplace(_) => None,
+        RequestBody::SchemaDrop(_) => None,
         RequestBody::ExtractorList(_) => None,
         RequestBody::QueryExplain(_) => None,
         RequestBody::QueryTrace(_) => None,
@@ -649,6 +659,7 @@ mod tests {
     #[test]
     fn recall_round_trips() {
         round_trip(RequestBody::Recall(RecallRequest {
+            scope: Default::default(),
             cue_text: "what about budgets".into(),
             subject_name: "Alice".into(),
             max_results: 10,
@@ -797,6 +808,16 @@ mod tests {
         round_trip(RequestBody::TxnBegin(TxnBeginRequest {
             txn_id: id,
             timeout_seconds: 60,
+            act_as: None,
+        }));
+        // A delegated begin must round-trip its `act_as` selector too.
+        round_trip(RequestBody::TxnBegin(TxnBeginRequest {
+            txn_id: id,
+            timeout_seconds: 60,
+            act_as: Some(crate::ops::memory::ActAs {
+                namespace: "acme".to_string(),
+                space_id: "support-bot:user123".to_string(),
+            }),
         }));
         round_trip(RequestBody::TxnCommit(TxnCommitRequest { txn_id: id }));
         round_trip(RequestBody::TxnAbort(TxnAbortRequest { txn_id: id }));
@@ -979,6 +1000,7 @@ mod tests {
         assert_eq!(act_as_of(&encode), Some(&selector));
 
         let recall = RequestBody::Recall(RecallRequest {
+            scope: Default::default(),
             cue_text: "x".into(),
             subject_name: String::new(),
             max_results: 1,
@@ -1199,6 +1221,15 @@ mod tests {
             act_as: Some(selector.clone()),
         });
         assert_eq!(act_as_of(&relation_list_to), Some(&selector));
+
+        // TXN_BEGIN carries the delegation for the whole transaction; the
+        // commit inherits it and carries none of its own.
+        let txn_begin = RequestBody::TxnBegin(TxnBeginRequest {
+            txn_id: sample_uuid(1),
+            timeout_seconds: 30,
+            act_as: Some(selector.clone()),
+        });
+        assert_eq!(act_as_of(&txn_begin), Some(&selector));
     }
 
     #[test]
@@ -1215,6 +1246,21 @@ mod tests {
             allow_duplicates: false,
         });
         assert!(act_as_of(&encode).is_none());
+
+        // A non-delegated begin carries no selector.
+        let txn_begin = RequestBody::TxnBegin(TxnBeginRequest {
+            txn_id: sample_uuid(1),
+            timeout_seconds: 30,
+            act_as: None,
+        });
+        assert!(act_as_of(&txn_begin).is_none());
+
+        // TXN_COMMIT never carries a selector of its own — the identity is
+        // fixed at begin.
+        let txn_commit = RequestBody::TxnCommit(TxnCommitRequest {
+            txn_id: sample_uuid(1),
+        });
+        assert!(act_as_of(&txn_commit).is_none());
 
         // Op that does not carry an `act_as` field at all.
         let ping = RequestBody::Ping(PingRequest {

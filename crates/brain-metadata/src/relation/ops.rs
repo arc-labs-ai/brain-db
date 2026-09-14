@@ -133,6 +133,36 @@ pub const DEFAULT_LIST_LIMIT: usize = 1_000;
 // Read paths.
 // ---------------------------------------------------------------------------
 
+/// Count non-tombstoned relation rows in `namespace_id` that key on
+/// `relation_type_id`, capped at `limit` (pass `usize::MAX` for an
+/// exact count). Used by `SCHEMA_DROP`'s in-use safety gate — dropping
+/// a relation_type that still has live relations requires the caller's
+/// explicit `force`.
+pub fn relation_live_count_by_type(
+    wtxn: &WriteTransaction,
+    namespace_id: u32,
+    relation_type_id: RelationTypeId,
+    limit: usize,
+) -> Result<usize, RelationOpError> {
+    if limit == 0 {
+        return Ok(0);
+    }
+    let want = relation_type_id.raw();
+    let t = wtxn.open_table(RELATION_METADATA_TABLE)?;
+    let mut count = 0usize;
+    for entry in t.iter()? {
+        let (_, v) = entry?;
+        let row: RelationMetadata = v.value();
+        if row.namespace_id == namespace_id && row.relation_type_id == want && row.tombstoned == 0 {
+            count += 1;
+            if count >= limit {
+                break;
+            }
+        }
+    }
+    Ok(count)
+}
+
 /// Fetch a relation by id. Returns `None` if absent.
 pub fn relation_get(
     rtxn: &ReadTransaction,
@@ -255,6 +285,170 @@ fn list_directional(
     Ok(out)
 }
 
+/// One page of a keyset-paginated directional relation listing.
+pub struct RelationPage {
+    /// The relations on this page, in edge-index scan order
+    /// (`(kind, other_endpoint, relation_id)` byte order).
+    pub rows: Vec<Relation>,
+    /// `true` when at least one more wire-visible relation exists past
+    /// the last row on this page.
+    pub has_more: bool,
+    /// Raw edge-table key of the last emitted row — the opaque resume
+    /// point the caller folds into the next cursor. `None` on an empty
+    /// page (nothing to resume after).
+    pub last_key: Option<Vec<u8>>,
+}
+
+/// Keyset (seek) page over relations where `entity` is the `from`
+/// endpoint. See `list_directional_page`.
+pub fn relation_list_from_page(
+    rtxn: &ReadTransaction,
+    scope: RowScope,
+    entity: EntityId,
+    filter: &RelationListFilter,
+    include_tombstoned: bool,
+    after_key: Option<&[u8]>,
+    limit: usize,
+) -> Result<RelationPage, RelationOpError> {
+    list_directional_page(
+        rtxn,
+        scope,
+        entity,
+        filter,
+        include_tombstoned,
+        after_key,
+        limit,
+        /* outgoing */ true,
+    )
+}
+
+/// Keyset (seek) page over relations where `entity` is the `to`
+/// endpoint. See `list_directional_page`.
+pub fn relation_list_to_page(
+    rtxn: &ReadTransaction,
+    scope: RowScope,
+    entity: EntityId,
+    filter: &RelationListFilter,
+    include_tombstoned: bool,
+    after_key: Option<&[u8]>,
+    limit: usize,
+) -> Result<RelationPage, RelationOpError> {
+    list_directional_page(
+        rtxn,
+        scope,
+        entity,
+        filter,
+        include_tombstoned,
+        after_key,
+        limit,
+        /* outgoing */ false,
+    )
+}
+
+/// Page directly from the edge index: range the anchor's contiguous
+/// keyspace, resume strictly past `after_key` when present, and apply
+/// every wire-visible predicate (scope wall, `current_only`,
+/// `include_tombstoned`, relation-type) *inside* the walk. Collects at
+/// most `limit` admitted rows, then peeks one further admitted row to
+/// set `has_more` — so a page is never short while a full next page
+/// exists, and rows past the former 1000-row window are reachable.
+///
+/// Unlike the whole-window [`list_directional`], cost is proportional to
+/// one page, not to (pages × window), and the returned `last_key` is the
+/// real edge-table key of the last row so the next seek is exact even
+/// under concurrent writes.
+#[allow(clippy::too_many_arguments)]
+fn list_directional_page(
+    rtxn: &ReadTransaction,
+    scope: RowScope,
+    entity: EntityId,
+    filter: &RelationListFilter,
+    include_tombstoned: bool,
+    after_key: Option<&[u8]>,
+    limit: usize,
+    outgoing: bool,
+) -> Result<RelationPage, RelationOpError> {
+    use std::ops::Bound;
+
+    let anchor = NodeRef::Entity(entity);
+    let kind_filter = filter.relation_type.map(EdgeKindRef::Typed);
+    let (prefix, hi) = edge::range_bounds(anchor, kind_filter);
+
+    let table = if outgoing {
+        rtxn.open_table(EDGES_TABLE)?
+    } else {
+        rtxn.open_table(EDGES_REVERSE_TABLE)?
+    };
+    let sidecar = rtxn.open_table(RELATION_METADATA_TABLE)?;
+
+    let lo_bound: Bound<&[u8]> = match after_key {
+        Some(k) => Bound::Excluded(k),
+        None => Bound::Included(prefix.as_slice()),
+    };
+    let hi_bound: Bound<&[u8]> = Bound::Included(hi.as_slice());
+
+    let mut rows = Vec::new();
+    let mut has_more = false;
+    let mut last_key: Option<Vec<u8>> = None;
+
+    for entry in table.range::<&[u8]>((lo_bound, hi_bound))? {
+        let (k, v) = entry?;
+        let raw = k.value();
+        let key = edge::EdgeKey::decode(raw)?;
+        // The range prefix already isolates the anchor; re-check
+        // defensively so a corrupt key can never surface a foreign row.
+        if key.from != anchor {
+            continue;
+        }
+        if let Some(want) = kind_filter {
+            if key.kind != want {
+                continue;
+            }
+        }
+        // Only typed edges are relations; ignore any substrate Builtin /
+        // Mentions edge that happens to anchor here.
+        if !matches!(key.kind, EdgeKindRef::Typed(_)) {
+            let _ = v;
+            continue;
+        }
+        let id = RelationId::from(key.disambiguator);
+        let Some(meta) = sidecar.get(&key.disambiguator)?.map(|g| g.value()) else {
+            continue;
+        };
+        // Unconditional scope wall — the shared edge table is not
+        // re-keyed by scope, so the sidecar is the authority.
+        if meta.namespace_id != scope.namespace_id || meta.space_id_bytes != scope.space_id_bytes {
+            continue;
+        }
+        if filter.current_only && !meta.is_current() {
+            continue;
+        }
+        if !include_tombstoned && meta.is_tombstoned() {
+            continue;
+        }
+        if let Some(want) = filter.relation_type {
+            if meta.relation_type_id != want.raw() {
+                continue;
+            }
+        }
+
+        // Admitted. If the page is already full, this row proves a next
+        // page exists — stop without emitting it.
+        if rows.len() == limit {
+            has_more = true;
+            break;
+        }
+        last_key = Some(raw.to_vec());
+        rows.push(relation_from_metadata(id, &meta));
+    }
+
+    Ok(RelationPage {
+        rows,
+        has_more,
+        last_key,
+    })
+}
+
 /// Returns ids of all relations that cite `memory_id` as evidence.
 pub fn relations_with_evidence(
     rtxn: &ReadTransaction,
@@ -358,6 +552,19 @@ pub fn relation_create(
         to_insert.to_entity = b;
     }
 
+    // Content dedup: a transient LLM failure makes the extractor worker
+    // re-run the whole pipeline and re-apply the already-committed
+    // pattern-tier rows. Cardinality supersession only fires on the sides
+    // a `single`/`One*` cardinality constrains, so a `ManyToMany` (or the
+    // unconstrained side of a `*ToMany`) tuple has nothing to catch a
+    // byte-identical repeat and would leak a duplicate `(from, type, to)`
+    // edge. Skip the insert and return the existing id — a no-op. Distinct
+    // Many tuples (different `from`/`to`) never match here, so legitimate
+    // multi-values are preserved.
+    if let Some(existing) = find_identical_active_relation(wtxn, scope, &to_insert)? {
+        return Ok(existing);
+    }
+
     let conflicting = find_cardinality_conflicts(wtxn, scope, &to_insert, cardinality)?;
     match conflicting.len() {
         0 => {
@@ -382,7 +589,7 @@ pub fn relation_create(
 /// Supersede `old_id` with `new_relation`.
 pub fn relation_supersede(
     wtxn: &WriteTransaction,
-    _scope: RowScope,
+    scope: RowScope,
     session: brain_core::SessionId,
     old_id: RelationId,
     new_relation: &Relation,
@@ -399,9 +606,15 @@ pub fn relation_supersede(
         let row = t.get(&old_id.to_bytes())?.map(|g| g.value());
         row.ok_or(RelationOpError::NotFound(old_id))?
     };
-    // The old row's owning scope is authoritative; the new row + evidence
-    // rows inherit it (a supersede can never re-home a relation).
-    let scope = old.scope();
+    // Tenant wall (authoritative). The old row's owning scope is adopted
+    // for the new row + evidence rows, so a caller from another tenant
+    // could otherwise re-home its replacement into the victim's scope.
+    // The caller must own `old`; a row owned by another tenant reads as
+    // NotFound (no existence leak). Past this guard the caller scope and
+    // the row's own scope are identical.
+    if scope != old.scope() {
+        return Err(RelationOpError::NotFound(old_id));
+    }
     if old.is_tombstoned() {
         return Err(RelationOpError::AlreadyTombstoned(old_id));
     }
@@ -641,6 +854,59 @@ fn find_cardinality_conflicts(
         )?;
     }
     Ok(found)
+}
+
+/// Find a byte-identical active relation for the exact `(from_entity,
+/// relation_type, to_entity)` tuple, regardless of cardinality.
+///
+/// Unlike [`find_cardinality_conflicts`], this matches on the full tuple
+/// (both endpoints), so it only ever fires on an exact repeat — never on a
+/// legitimately-distinct Many-cardinality edge that shares one endpoint.
+/// Used to make relation creation idempotent under extractor retries.
+fn find_identical_active_relation(
+    wtxn: &WriteTransaction,
+    scope: RowScope,
+    r: &Relation,
+) -> Result<Option<RelationId>, RelationOpError> {
+    let anchor = NodeRef::Entity(r.from_entity);
+    let target = NodeRef::Entity(r.to_entity);
+
+    let mut prefix = anchor.to_bytes().to_vec();
+    EdgeKindRef::Typed(r.relation_type).encode_into(&mut prefix);
+    let mut hi = prefix.clone();
+    hi.extend_from_slice(&[0xFF; 17 + 16]);
+
+    let table = wtxn.open_table(EDGES_TABLE)?;
+    let sidecar = wtxn.open_table(RELATION_METADATA_TABLE)?;
+    for entry in table.range::<&[u8]>(prefix.as_slice()..=hi.as_slice())? {
+        let (k, _) = entry?;
+        let key = edge::EdgeKey::decode(k.value())?;
+        if key.from != anchor {
+            continue;
+        }
+        if !matches!(key.kind, EdgeKindRef::Typed(rt) if rt == r.relation_type) {
+            continue;
+        }
+        if key.to != target {
+            continue;
+        }
+        let candidate = RelationId::from(key.disambiguator);
+        if candidate == r.id {
+            continue;
+        }
+        let Some(meta) = sidecar.get(&key.disambiguator)?.map(|g| g.value()) else {
+            continue;
+        };
+        // Same scope wall as the cardinality probe — a foreign-tenant edge
+        // surfaced by the shared table is not a duplicate of this one.
+        if meta.namespace_id != scope.namespace_id || meta.space_id_bytes != scope.space_id_bytes {
+            continue;
+        }
+        if meta.is_current() {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1466,13 +1732,17 @@ mod tests {
 
     #[test]
     fn many_to_many_no_supersession() {
+        // Two DISTINCT ManyToMany tuples that share the `from` endpoint but
+        // point at different `to` entities are genuine multi-values: both
+        // stay current, neither supersedes the other.
         let (_dir, mut db) = open_db();
         let a = make_entity(&mut db, "mm-a");
         let b = make_entity(&mut db, "mm-b");
+        let c = make_entity(&mut db, "mm-c");
         let t = intern_type(&mut db, "knows_mm", Cardinality::ManyToMany, false);
 
         let r1 = fresh_rel(t, a, b, false);
-        let r2 = fresh_rel(t, a, b, false);
+        let r2 = fresh_rel(t, a, c, false);
         let wtxn = db.write_txn().unwrap();
         relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &r1, 0).unwrap();
         relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &r2, 1).unwrap();
@@ -1483,6 +1753,85 @@ mod tests {
         let g2 = relation_get(&rtxn, r2.id).unwrap().unwrap();
         assert!(g1.superseded_by.is_none());
         assert!(g2.superseded_by.is_none());
+    }
+
+    #[test]
+    fn many_to_many_identical_reapply_is_noop() {
+        // A transient LLM failure makes the extractor worker re-run the whole
+        // pipeline, re-applying an already-committed pattern-tier ManyToMany
+        // relation with a freshly-minted RelationId. The exact same
+        // `(from, type, to)` tuple must NOT leak a second edge: the second
+        // create is a no-op returning the first row's id, and only one active
+        // row exists.
+        let (_dir, mut db) = open_db();
+        let a = make_entity(&mut db, "dup-a");
+        let b = make_entity(&mut db, "dup-b");
+        let t = intern_type(&mut db, "knows_dup", Cardinality::ManyToMany, false);
+
+        let r1 = fresh_rel(t, a, b, false);
+        let wtxn = db.write_txn().unwrap();
+        let id1 =
+            relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &r1, 0).unwrap();
+        wtxn.commit().unwrap();
+
+        // The retry: same tuple, different minted id.
+        let r2 = fresh_rel(t, a, b, false);
+        assert_ne!(r1.id, r2.id);
+        let wtxn = db.write_txn().unwrap();
+        let id2 =
+            relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &r2, 1).unwrap();
+        wtxn.commit().unwrap();
+
+        // No-op: the create returns the pre-existing id and never files r2.
+        assert_eq!(id2, id1);
+        let rtxn = db.read_txn().unwrap();
+        assert!(relation_get(&rtxn, r2.id).unwrap().is_none());
+
+        let filter = RelationListFilter {
+            current_only: true,
+            ..Default::default()
+        };
+        let current = relation_list_from(&rtxn, test_scope(), a, &filter).unwrap();
+        assert_eq!(
+            current.len(),
+            1,
+            "identical retry must not add a second edge"
+        );
+        assert_eq!(current[0].id, r1.id);
+    }
+
+    #[test]
+    fn distinct_many_tuples_coexist_after_dedup() {
+        // Dedup must never collapse legitimately-distinct Many values: three
+        // different `to` entities on a ManyToMany type all stay current.
+        let (_dir, mut db) = open_db();
+        let subj = make_entity(&mut db, "multi-subj");
+        let x = make_entity(&mut db, "multi-x");
+        let y = make_entity(&mut db, "multi-y");
+        let z = make_entity(&mut db, "multi-z");
+        let t = intern_type(&mut db, "linked_to", Cardinality::ManyToMany, false);
+
+        for (lsn, to) in [x, y, z].into_iter().enumerate() {
+            let r = fresh_rel(t, subj, to, false);
+            let wtxn = db.write_txn().unwrap();
+            relation_create(
+                &wtxn,
+                test_scope(),
+                brain_core::SessionId::DEFAULT,
+                &r,
+                lsn as u64,
+            )
+            .unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        let rtxn = db.read_txn().unwrap();
+        let filter = RelationListFilter {
+            current_only: true,
+            ..Default::default()
+        };
+        let current = relation_list_from(&rtxn, test_scope(), subj, &filter).unwrap();
+        assert_eq!(current.len(), 3);
     }
 
     #[test]
@@ -1692,5 +2041,44 @@ mod tests {
         let to_b = relation_list_to(&rtxn, test_scope(), b, &filter).unwrap();
         assert_eq!(to_b.len(), 1);
         assert_eq!(to_b[0].id, r.id);
+    }
+
+    #[test]
+    fn cross_scope_supersede_denied_no_row_in_victim_scope() {
+        // A caller in another tenant must not supersede a relation it does
+        // not own: NotFound, and no replacement row lands in the victim's
+        // scope (the W3 re-home defence).
+        let (_dir, mut db) = open_db();
+        let a = make_entity(&mut db, "xs-a");
+        let b = make_entity(&mut db, "xs-b");
+        let t = intern_type(&mut db, "xs_type", Cardinality::ManyToMany, false);
+        let old = fresh_rel(t, a, b, false);
+        let wtxn = db.write_txn().unwrap();
+        relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &old, 0).unwrap();
+        wtxn.commit().unwrap();
+
+        let other_scope = RowScope::from_bytes(999, [0xCD; 16]);
+        let new = fresh_rel(t, a, b, false);
+        let new_id = new.id;
+        let wtxn = db.write_txn().unwrap();
+        let err = relation_supersede(
+            &wtxn,
+            other_scope,
+            brain_core::SessionId::DEFAULT,
+            old.id,
+            &new,
+            1,
+        )
+        .expect_err("cross-scope supersede must be denied");
+        assert!(matches!(err, RelationOpError::NotFound(id) if id == old.id));
+        drop(wtxn);
+
+        let rtxn = db.read_txn().unwrap();
+        let old_got = relation_get(&rtxn, old.id).unwrap().unwrap();
+        assert!(old_got.superseded_by.is_none(), "victim row must be intact");
+        assert!(
+            relation_get(&rtxn, new_id).unwrap().is_none(),
+            "no replacement row may be stamped into the victim scope"
+        );
     }
 }

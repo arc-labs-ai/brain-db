@@ -16,6 +16,7 @@
 //! are cancelled (Glommio `Task::cancel`).
 
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -25,7 +26,7 @@ use brain_ops::OpsContext;
 use futures_lite::FutureExt;
 use glommio::timer::sleep;
 use glommio::Task;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::{WorkerConfig, WorkerKind};
 use crate::context::WorkerContext;
@@ -196,7 +197,15 @@ impl WorkerScheduler {
     ) -> Vec<(&'static str, WorkerKind, crate::metrics::MetricsSnapshot)> {
         self.handles
             .values()
-            .map(|h| (h.name, h.kind, h.metrics.snapshot()))
+            .map(|h| {
+                let mut snap = h.metrics.snapshot();
+                // `paused` lives in `WorkerControls`, not `WorkerMetrics`,
+                // so stamp it here where both are in scope. This is what
+                // lets the admin `GET /v1/workers` list report paused vs
+                // running.
+                snap.paused = h.controls.paused.load(Ordering::Relaxed);
+                (h.name, h.kind, snap)
+            })
             .collect()
     }
 
@@ -332,8 +341,39 @@ async fn worker_loop(
         let skip_this_cycle = first_iter && skip_first_tick;
         if cfg.enabled && !paused && !skip_this_cycle {
             let start = Instant::now();
-            match worker.run_cycle(&ctx).await {
-                Ok(processed) => {
+            // Isolate the cycle behind `catch_unwind`. A panic in
+            // `run_cycle` (an `expect`, a slice OOB, arithmetic overflow on a
+            // malformed row) would otherwise unwind the whole worker task:
+            // the feature would silently cease with no metric and no restart,
+            // and the panicked `Task` — held in `WorkerHandle` — would re-raise
+            // at shutdown join, aborting the rest of clean shutdown. Instead we
+            // treat a caught panic like an `Err` (bump `errors_total`, plus the
+            // distinct `panics_total`), log, and continue to the next tick. The
+            // `async` wrapper ensures a
+            // panic during future *construction* is caught too, not only one
+            // during polling.
+            //
+            // UNWIND-SAFETY: `AssertUnwindSafe` asserts the future's captured
+            // state is safe to observe after a panic. That holds here by the
+            // resilience model — a worker cycle is retried on its next tick, and
+            // its durable state is transactional: a panic mid-cycle drops any
+            // open redb write txn uncommitted (ACID rollback, no partial
+            // commit), and any in-memory index left inconsistent is rebuilt by
+            // its maintenance worker. A panicked-then-retried cycle is the
+            // intended failure mode, not a poisoning one.
+            let cycle = AssertUnwindSafe(async { worker.run_cycle(&ctx).await });
+            let outcome = futures_util::future::FutureExt::catch_unwind(cycle).await;
+            // `last_run` tracks the last *attempted* cycle, updated on
+            // every arm (Ok / Err / caught-panic). A worker that errors or
+            // panics every tick is still running — freezing `last_run` to
+            // the last success would make it read as dead. The
+            // errors_total / panics_total counters remain the failure
+            // signal.
+            metrics
+                .last_run_unix_secs
+                .store(now_unix_secs(), Ordering::Relaxed);
+            match outcome {
+                Ok(Ok(processed)) => {
                     metrics.cycles_total.fetch_add(1, Ordering::Relaxed);
                     metrics
                         .processed_total
@@ -343,14 +383,26 @@ async fn worker_loop(
                     metrics
                         .last_cycle_duration_ms
                         .store(duration_ms, Ordering::Relaxed);
-                    metrics
-                        .last_run_unix_secs
-                        .store(now_unix_secs(), Ordering::Relaxed);
                     debug!(worker = name, processed, duration_ms, "cycle complete");
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     metrics.errors_total.fetch_add(1, Ordering::Relaxed);
                     warn!(worker = name, error = %e, "worker cycle error");
+                }
+                Err(panic) => {
+                    // Caught panic: count it and survive to the next tick. The
+                    // scheduler task must never unwind, so shutdown's join can
+                    // never observe a worker-cycle panic. Bump both errors_total
+                    // (the "all failures" series) and the distinct panics_total
+                    // so a panic isn't hidden among ordinary Err cycles.
+                    metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                    metrics.panics_total.fetch_add(1, Ordering::Relaxed);
+                    let payload = panic_message(&panic);
+                    error!(
+                        worker = name,
+                        panic = %payload,
+                        "worker cycle panicked; isolated and continuing to next tick"
+                    );
                 }
             }
         }
@@ -370,6 +422,19 @@ async fn worker_loop(
         first_iter = false;
     }
     debug!(worker = name, "loop exiting");
+}
+
+/// Best-effort human-readable text for a caught panic payload. The
+/// standard library packages `panic!`/`expect` payloads as `&str` or
+/// `String`; anything else is reported opaquely.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
 }
 
 fn now_unix_secs() -> u64 {

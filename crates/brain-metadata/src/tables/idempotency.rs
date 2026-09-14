@@ -51,6 +51,7 @@ pub mod response_kind {
     pub const UPDATE_CONTEXT: u8 = 6;
     pub const TXN_BEGIN: u8 = 7;
     pub const TXN_COMMIT: u8 = 8;
+    pub const RESTORE: u8 = 9;
 }
 
 // ---------------------------------------------------------------------------
@@ -86,7 +87,6 @@ pub const DEFAULT_TTL_NANOS: u64 = 24 * 60 * 60 * 1_000_000_000;
 ///   `subscribe --start-lsn=lsn+1` recover the correct tail position
 ///   on retry.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct IdempotencyEntry {
     pub response_kind: u8,
     pub memory_id_bytes: Option<[u8; 16]>,
@@ -148,9 +148,9 @@ impl redb::Value for IdempotencyEntry {
     {
         // rkyv 0.7's validation includes alignment; redb returns bytes
         // at arbitrary alignment, so copy into an AlignedVec first.
-        let mut buf = rkyv::AlignedVec::with_capacity(data.len());
+        let mut buf = rkyv::util::AlignedVec::<16>::with_capacity(data.len());
         buf.extend_from_slice(data);
-        rkyv::from_bytes::<IdempotencyEntry>(&buf)
+        rkyv::from_bytes::<IdempotencyEntry, rkyv::rancor::Error>(&buf)
             .expect("IdempotencyEntry bytes failed rkyv validation; redb file is corrupt")
     }
 
@@ -159,7 +159,7 @@ impl redb::Value for IdempotencyEntry {
         Self: 'a,
         Self: 'b,
     {
-        rkyv::to_bytes::<_, 256>(value)
+        rkyv::to_bytes::<rkyv::rancor::Error>(value)
             .expect("IdempotencyEntry is rkyv-serializable")
             .into_vec()
     }

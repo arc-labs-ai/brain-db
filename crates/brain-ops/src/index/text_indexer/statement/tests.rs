@@ -36,9 +36,12 @@ fn spawn_drain(
 ) -> (StatementTextDispatcher, glommio::Task<()>) {
     let (dispatcher, rx) = StatementTextDispatcher::default_channel();
     let (stop_tx, stop_rx) = flume::bounded::<()>(1);
+    let (_control_tx, control_rx) = flume::bounded::<crate::index::text_indexer::IndexerControl>(1);
     let task = glommio::spawn_local(async move {
         let _stop_tx = stop_tx;
-        run_statement_text_indexer(handle, rx, policy, stop_rx).await;
+        // Held so the control channel never closes; see the memory test.
+        let _control_tx = _control_tx;
+        run_statement_text_indexer(handle, rx, policy, stop_rx, control_rx).await;
     });
     (dispatcher, task)
 }

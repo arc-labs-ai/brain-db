@@ -25,17 +25,21 @@ use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_extractors::resolver::{EmbeddingDeps, EntityDisambiguator, EMBED_RESOLVE_THRESHOLD};
 use brain_extractors::{
     EntityMention, ExtractedItem, ExtractionContext, ExtractionFuture, ExtractionResult, Extractor,
-    ExtractorRegistry,
+    ExtractorRegistry, StatementMention,
 };
 use brain_index::entity_hnsw::{EntityHnswIndex, EntityHnswParams};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_llm::client::{model_id_hash, LlmFuture};
 use brain_llm::{LlmClient, LlmRequest, LlmResponse};
+use brain_metadata::tables::audit::{
+    resolution_outcome, ResolutionAudit, ENTITY_RESOLUTION_AUDIT_TABLE,
+};
 use brain_metadata::MetadataDb;
 use brain_ops::{OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_workers::{ExtractorWorker, Worker, WorkerContext};
 use parking_lot::RwLock as PLRwLock;
+use redb::ReadableTable;
 use std::collections::HashMap;
 use std::sync::Mutex as StdMutex;
 
@@ -210,6 +214,88 @@ impl Extractor for SurfaceMentionStub {
     }
 }
 
+/// Marks a memory whose text drives a cross-type exact-reuse resolution: the
+/// stub emits a *statement* whose subject is a surface minted (as an entity of
+/// another type) by an earlier memory, but files NO entity mention for it this
+/// memory. That is the exact shape that sends `resolve_statement_subject` down
+/// the deterministic cross-type reuse branch.
+const CROSS_TYPE_STMT_MARKER: &str = "STMT";
+
+/// Extractor for the cross-type reuse test. On a memory whose text carries
+/// [`CROSS_TYPE_STMT_MARKER`] it emits two statements, both with subject
+/// [`BILLING_TEAM`] and NO entity mention for it — the first drives cross-type
+/// exact reuse, the second must hit the per-memory `entity_map` cache (writing
+/// no second audit row). On any other memory it behaves like the surface stub,
+/// filing an entity mention for each fixture surface present (so a prior memory
+/// can MINT the entity the statement later reuses).
+struct CrossTypeReuseStub {
+    id: ExtractorId,
+}
+
+impl Extractor for CrossTypeReuseStub {
+    fn id(&self) -> ExtractorId {
+        self.id
+    }
+    fn kind(&self) -> ExtractorKind {
+        ExtractorKind::Pattern
+    }
+    fn name(&self) -> &str {
+        "test:cross_type_reuse"
+    }
+    fn extractor_version(&self) -> u32 {
+        1
+    }
+    fn run<'a>(
+        &'a self,
+        _ctx: &'a ExtractionContext<'a>,
+        mem: &'a CoreMemory,
+    ) -> ExtractionFuture<'a> {
+        let id = self.id;
+        Box::pin(async move {
+            let text = mem.text.as_deref().unwrap_or_default();
+            if text.contains(CROSS_TYPE_STMT_MARKER) {
+                // Two statements, same subject, distinct literal objects: the
+                // first resolves the subject via cross-type reuse, the second
+                // must reuse the cached id without a second resolution audit.
+                let stmt = |object: &str| {
+                    ExtractedItem::StatementMention(StatementMention {
+                        kind: 1, // Fact
+                        subject_text: Some(BILLING_TEAM.to_string()),
+                        predicate_qname: "brain:related_to".to_string(),
+                        object_text: Some(object.to_string()),
+                        confidence: 0.9,
+                        extractor_id: id.raw(),
+                        extractor_version: 1,
+                        is_stateful: false,
+                        subject_is_memory: false,
+                        object_is_entity: false, // literal value — no object entity audit
+                        event_at_unix_nanos: None,
+                        subject_is_self: false,
+                        retract: false,
+                    })
+                };
+                return ExtractionResult::success(vec![stmt("invoicing"), stmt("billing")], 0, 0);
+            }
+            let items: Vec<ExtractedItem> = SURFACES
+                .iter()
+                .filter_map(|surface| {
+                    let start = text.find(surface)?;
+                    Some(ExtractedItem::EntityMention(EntityMention {
+                        entity_type_qname: ENTITY_TYPE_QNAME.to_string(),
+                        text: (*surface).to_string(),
+                        start,
+                        end: start + surface.len(),
+                        confidence: 0.9,
+                        extractor_id: id.raw(),
+                        extractor_version: 1,
+                    }))
+                })
+                .collect();
+            ExtractionResult::success(items, 0, 0)
+        })
+    }
+}
+
 struct Fixture {
     metadata: SharedMetadataDb,
     entity_hnsw: Arc<PLRwLock<EntityHnswIndex>>,
@@ -269,6 +355,13 @@ impl Fixture {
     fn hnsw_len(&self) -> usize {
         self.entity_hnsw.read().len()
     }
+
+    /// Every per-mention resolution audit row, in no particular order.
+    fn resolution_audit_rows(&self) -> Vec<ResolutionAudit> {
+        let rtxn = self.metadata.read_txn().unwrap();
+        let t = rtxn.open_table(ENTITY_RESOLUTION_AUDIT_TABLE).unwrap();
+        t.iter().unwrap().map(|r| r.unwrap().1.value()).collect()
+    }
 }
 
 fn build_fixture() -> Fixture {
@@ -276,6 +369,15 @@ fn build_fixture() -> Fixture {
 }
 
 fn build_fixture_with_embedder(embedder: Arc<dyn Dispatcher>) -> Fixture {
+    build_fixture_full(
+        embedder,
+        Arc::new(SurfaceMentionStub {
+            id: ExtractorId::from(4242),
+        }),
+    )
+}
+
+fn build_fixture_full(embedder: Arc<dyn Dispatcher>, extractor: Arc<dyn Extractor>) -> Fixture {
     let tempdir = tempfile::tempdir().unwrap();
     let metadata: SharedMetadataDb =
         Arc::new(MetadataDb::open(tempdir.path().join("metadata.redb")).unwrap());
@@ -289,9 +391,7 @@ fn build_fixture_with_embedder(embedder: Arc<dyn Dispatcher>) -> Fixture {
     );
 
     let mut registry = ExtractorRegistry::new();
-    registry.register(Arc::new(SurfaceMentionStub {
-        id: ExtractorId::from(4242),
-    }));
+    registry.register(extractor);
     let ops = Arc::new(
         brain_ops::test_support::ops_context_for_tests_owning_tempdir(executor)
             .with_extractor_registry(registry),
@@ -512,4 +612,167 @@ async fn real_embeddings_merge_the_paraphrase_and_keep_the_distinct_team() {
         vec![DIEGOS_TEAM.to_string(), BILLING_TEAM.to_string()],
         "real embeddings: the paraphrase folds in, the distinct team does not",
     );
+}
+
+// ---------------------------------------------------------------------------
+// Per-mention resolution audit — every mention→entity resolution on the
+// extractor apply path lands one row in ENTITY_RESOLUTION_AUDIT_TABLE, so a
+// derivation is queryable (the acceptance suite's "all derivations logged").
+// ---------------------------------------------------------------------------
+
+/// Minting a fresh entity for a mention writes one `CREATED` resolution row,
+/// carrying the surface, the new entity's id, and full (1.0) confidence.
+#[tokio::test(flavor = "current_thread")]
+async fn created_mention_writes_a_resolution_audit_row() {
+    let fixture = build_fixture();
+    encode(&fixture, 1, "the billing team owns invoicing").await;
+
+    let entities = fixture.live_entities();
+    assert_eq!(entities.len(), 1, "one entity minted: {entities:?}");
+    let minted = entities[0].0;
+
+    let rows = fixture.resolution_audit_rows();
+    assert_eq!(rows.len(), 1, "exactly one resolution row: {rows:?}");
+    let row = &rows[0];
+    assert_eq!(row.candidate_name, BILLING_TEAM);
+    assert_eq!(row.outcome, resolution_outcome::CREATED);
+    assert_eq!(row.resolved_entity(), Some(minted));
+    assert!(
+        (row.confidence - 1.0).abs() < f32::EPSILON,
+        "a created entity resolves at full confidence: {}",
+        row.confidence,
+    );
+}
+
+/// Re-resolving the same surface in a later memory hits the exact tier and
+/// APPENDS a second row (append-only history), rather than overwriting the
+/// first. Both rows point at the same entity.
+#[tokio::test(flavor = "current_thread")]
+async fn exact_reresolution_appends_a_row_preserving_history() {
+    let fixture = build_fixture();
+    encode(&fixture, 1, "the billing team owns invoicing").await;
+    encode(&fixture, 2, "the billing team fixed a bug").await;
+
+    let entities = fixture.live_entities();
+    assert_eq!(entities.len(), 1, "still one entity: {entities:?}");
+    let entity = entities[0].0;
+
+    let mut rows = fixture.resolution_audit_rows();
+    assert_eq!(rows.len(), 2, "two resolutions, two rows: {rows:?}");
+    for r in &rows {
+        assert_eq!(r.candidate_name, BILLING_TEAM);
+        assert_eq!(r.resolved_entity(), Some(entity));
+    }
+    // Order is audit-id (time) ordered on insert; sort by outcome to assert
+    // the pair {CREATED, TIER_1_EXACT} regardless of iteration order.
+    rows.sort_by_key(|r| r.outcome);
+    assert_eq!(rows[0].outcome, resolution_outcome::TIER_1_EXACT);
+    assert_eq!(rows[1].outcome, resolution_outcome::CREATED);
+}
+
+/// A paraphrase that clears the cosine threshold is confirmed by the wired
+/// disambiguator and folds onto the existing entity — logged as a `TIER_4_LLM`
+/// resolution carrying the disambiguator's own confidence (0.95), proving the
+/// real match score is threaded through to the audit rather than defaulted.
+#[tokio::test(flavor = "current_thread")]
+async fn paraphrase_logs_disambiguated_outcome_with_real_confidence() {
+    let fixture = build_fixture();
+    encode(&fixture, 1, "the billing team owns invoicing").await;
+    encode(
+        &fixture,
+        2,
+        "the billing platform team shipped the migration",
+    )
+    .await;
+
+    let entities = fixture.live_entities();
+    assert_eq!(entities.len(), 1, "paraphrase folds in: {entities:?}");
+    let entity = entities[0].0;
+
+    let rows = fixture.resolution_audit_rows();
+    assert_eq!(rows.len(), 2, "two resolutions, two rows: {rows:?}");
+
+    let created = rows
+        .iter()
+        .find(|r| r.outcome == resolution_outcome::CREATED)
+        .expect("the first surface mints an entity");
+    assert_eq!(created.candidate_name, BILLING_TEAM);
+    assert_eq!(created.resolved_entity(), Some(entity));
+
+    let folded = rows
+        .iter()
+        .find(|r| r.outcome == resolution_outcome::TIER_4_LLM)
+        .expect("the paraphrase is confirmed by the disambiguator");
+    assert_eq!(folded.candidate_name, BILLING_PLATFORM_TEAM);
+    assert_eq!(folded.resolved_entity(), Some(entity));
+    assert!(
+        (folded.confidence - 0.95).abs() < 1e-4,
+        "the disambiguator's confidence is threaded through: {}",
+        folded.confidence,
+    );
+}
+
+/// A statement subject that binds to an existing entity of a DIFFERENT type by
+/// exact canonical name (cross-type exact reuse) is a genuine mention→entity
+/// derivation, so it writes ONE `TIER_1_EXACT` resolution row at full (1.0)
+/// confidence pointing at the reused entity. A second statement reusing the same
+/// subject this memory hits the per-memory `entity_map` cache and writes NO
+/// further row — proving the reuse is logged exactly once, not double-counted,
+/// and the cache-hit path stays silent.
+#[tokio::test(flavor = "current_thread")]
+async fn cross_type_exact_reuse_writes_one_tier1_row() {
+    let fixture = build_fixture_full(
+        Arc::new(ScriptedEmbedder::new()),
+        Arc::new(CrossTypeReuseStub {
+            id: ExtractorId::from(4343),
+        }),
+    );
+
+    // Memory 1 mints "billing team" as an Organization entity (one CREATED row).
+    encode(&fixture, 1, "the billing team owns invoicing").await;
+    let entities = fixture.live_entities();
+    assert_eq!(entities.len(), 1, "one entity minted: {entities:?}");
+    let reused = entities[0].0;
+
+    // Memory 2 asserts two statements whose subject is that same surface,
+    // without re-filing it as an entity mention — the cross-type reuse shape.
+    encode(&fixture, 2, "STMT about the roster").await;
+
+    // The subject reused the existing entity rather than minting a second one.
+    assert_eq!(
+        fixture.live_entities().len(),
+        1,
+        "the statement subject reused the entity, minting none",
+    );
+
+    let rows = fixture.resolution_audit_rows();
+    // Exactly one TIER_1_EXACT row for the reused subject: the first statement
+    // logs the cross-type reuse; the second hits the entity_map cache and logs
+    // nothing (no double-log).
+    let reuse_rows: Vec<_> = rows
+        .iter()
+        .filter(|r| {
+            r.candidate_name == BILLING_TEAM && r.outcome == resolution_outcome::TIER_1_EXACT
+        })
+        .collect();
+    assert_eq!(
+        reuse_rows.len(),
+        1,
+        "cross-type reuse logs exactly one TIER_1_EXACT row: {rows:?}",
+    );
+    let row = reuse_rows[0];
+    assert_eq!(
+        row.resolved_entity(),
+        Some(reused),
+        "the reuse row points at the pre-existing entity",
+    );
+    assert!(
+        (row.confidence - 1.0).abs() < f32::EPSILON,
+        "a deterministic exact match resolves at full confidence: {}",
+        row.confidence,
+    );
+
+    // Only the mint (CREATED) and the single reuse (TIER_1_EXACT) — no cache-hit
+    // or self-routing path contributed a row.
+    assert_eq!(rows.len(), 2, "one mint + one reuse only: {rows:?}");
 }

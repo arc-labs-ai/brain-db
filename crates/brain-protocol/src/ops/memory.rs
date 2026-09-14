@@ -250,6 +250,21 @@ pub struct RecallRequest {
     /// key-bound identity.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub act_as: Option<ActAs>,
+    /// Scope of the recall: the caller's single `(namespace, space)` (default),
+    /// or every space in the caller's namespace — fanned out across shards and
+    /// merged. See `spec/05_operations/03_read_pipeline.md` §"Recall scope".
+    #[serde(default)]
+    pub scope: RecallScopeWire,
+}
+
+/// RECALL scope selector. `Space` (default) serves the caller's single space on
+/// its shard; `Namespace` spans every space in the caller's namespace via
+/// cross-shard fan-out + global merge. Never crosses namespaces.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum RecallScopeWire {
+    #[default]
+    Space,
+    Namespace,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]

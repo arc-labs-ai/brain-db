@@ -262,6 +262,7 @@ async fn encode_round_trip(
 /// a `RECALL_RESP` and returns the decoded frame.
 async fn recall(client: &mut TcpStream, stream_id: u32, cue: &str) -> RecallResponseFrame {
     let req = RecallRequest {
+        scope: Default::default(),
         trace: false,
         cue_text: cue.into(),
         // Empty subject: Brain resolves subject + relation from the cue

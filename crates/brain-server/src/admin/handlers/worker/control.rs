@@ -8,8 +8,9 @@ use std::sync::Arc;
 use brain_http::body::ResponseBody;
 use http::{Method, Request, Response, StatusCode};
 use hyper::body::Incoming;
+use tracing::warn;
 
-use crate::admin::handlers::worker::{KNOWN_ACTIONS, KNOWN_WORKERS};
+use crate::admin::handlers::worker::{classify_control, ControlDecision, KNOWN_ACTIONS};
 use crate::admin::util::{json_response, text_response};
 use crate::admin::AdminState;
 use crate::shard::WorkerAction;
@@ -35,11 +36,37 @@ pub async fn control(
     let name = parts.next().unwrap_or("").to_owned();
     let action_slug = parts.next().unwrap_or("");
 
-    if !KNOWN_WORKERS.contains(&name.as_str()) {
-        return Ok(text_response(
-            StatusCode::BAD_REQUEST,
-            &format!("unknown worker `{name}`\n"),
-        ));
+    // Derive the controllable set from the scheduler's live registration
+    // snapshot rather than a hand-maintained list, then apply the
+    // explicit C0 guard. This keeps every provisioned C2 worker
+    // controllable and every C0 always-on worker un-pausable, without
+    // either drifting as the worker set evolves.
+    let mut registered: Vec<&'static str> = Vec::new();
+    for shard in state.shards.iter() {
+        if let Ok(snaps) = shard.scheduler_snapshot().await {
+            for (n, _, _) in snaps {
+                if !registered.contains(&n) {
+                    registered.push(n);
+                }
+            }
+        }
+    }
+    match classify_control(&name, &registered) {
+        ControlDecision::Allow => {}
+        ControlDecision::RejectC0 => {
+            return Ok(text_response(
+                StatusCode::FORBIDDEN,
+                &format!(
+                    "worker `{name}` is C0 always-on and cannot be paused, resumed, or run on demand\n"
+                ),
+            ));
+        }
+        ControlDecision::Unknown => {
+            return Ok(text_response(
+                StatusCode::BAD_REQUEST,
+                &format!("unknown worker `{name}`\n"),
+            ));
+        }
     }
     let action = match action_slug {
         "stop" => WorkerAction::Pause,
@@ -70,27 +97,32 @@ pub async fn control(
                 // fatal. Surface as a partial-success.
                 errors.push(format!("shard {shard_idx}: worker not registered"));
             }
-            Err(e) => errors.push(format!("shard {shard_idx}: {e}")),
+            Err(e) => {
+                // Log the internal detail; keep only a generic marker on
+                // the wire so a shard error can't leak host internals.
+                warn!(shard = shard_idx, worker = %name, error = %e, "worker control failed");
+                errors.push(format!("shard {shard_idx}: control failed"));
+            }
         }
     }
 
     if applied == 0 {
-        let detail = errors.join("; ");
         return Ok(text_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("no shards applied the action: {detail}\n"),
+            "no shards applied the action\n",
         ));
     }
 
-    let body = format!(
-        "{{\"worker\":\"{name}\",\"action\":\"{action_slug}\",\"applied_shards\":{applied},\"errors\":[{}]}}\n",
-        errors
-            .iter()
-            .map(|e| format!("\"{e}\""))
-            .collect::<Vec<_>>()
-            .join(","),
-    );
-    Ok(json_response(StatusCode::OK, body))
+    // Build the JSON via serde so an error string containing `"`, `\`, or a
+    // newline can't break out of the response document.
+    let body = serde_json::json!({
+        "worker": name,
+        "action": action_slug,
+        "applied_shards": applied,
+        "errors": errors,
+    })
+    .to_string();
+    Ok(json_response(StatusCode::OK, format!("{body}\n")))
 }
 
 #[cfg(test)]
@@ -102,6 +134,28 @@ mod tests {
         assert!(KNOWN_ACTIONS.contains(&"stop"));
         assert!(KNOWN_ACTIONS.contains(&"start"));
         assert!(KNOWN_ACTIONS.contains(&"run-now"));
+    }
+
+    #[test]
+    fn error_strings_produce_valid_json() {
+        // A shard error containing a quote / backslash / newline must not
+        // break out of the JSON document. serde_json escapes it.
+        let errors = vec![
+            r#"shard 0: broke "everything""#.to_string(),
+            "shard 1: back\\slash\nnewline".to_string(),
+        ];
+        let body = serde_json::json!({
+            "worker": "de\"cay",
+            "action": "run-now",
+            "applied_shards": 2u64,
+            "errors": errors,
+        })
+        .to_string();
+        // Round-trips: the document is well-formed and preserves content.
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(parsed["applied_shards"], 2);
+        assert_eq!(parsed["errors"][0], r#"shard 0: broke "everything""#);
+        assert_eq!(parsed["worker"], "de\"cay");
     }
 
     #[test]

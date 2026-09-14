@@ -242,7 +242,13 @@ fn is_non_referential_span(text: &str) -> bool {
 /// span text and offset from the span start; a miss falls back to the
 /// whole span range.
 fn split_person_conjunction(m: EntityMention) -> Vec<EntityMention> {
-    if m.entity_type_qname.rsplit(':').next() != Some("Person") {
+    // First-colon split (`namespace:name`), consistent with every other qname
+    // parse site; `name` is colon-free so this equals the last segment.
+    let type_name = m
+        .entity_type_qname
+        .split_once(':')
+        .map_or(m.entity_type_qname.as_str(), |(_, n)| n);
+    if type_name != "Person" {
         return vec![m];
     }
     let parts: Vec<&str> = m

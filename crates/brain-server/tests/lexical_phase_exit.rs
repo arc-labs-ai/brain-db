@@ -280,3 +280,73 @@ async fn forget_removes_memory_from_lexical_index() {
 
     drop(data_dir);
 }
+
+/// The live tantivy rebuild preserves already-indexed data and resumes
+/// indexing new writes — the end-to-end invariant-#7 guarantee for a hot
+/// lexical rebuild.
+///
+/// 1. ENCODE a memory (its rows land in authoritative redb at ack).
+/// 2. Drive the shard's live rebuild (`ShardHandle::rebuild_index`) for a
+///    tantivy target — quiesce indexers, rebuild both lexical indexes from
+///    redb, reopen, swap the retriever, resume the indexers.
+/// 3. ENCODE a second memory AFTER the rebuild — proves the resumed
+///    indexer writes to the new index.
+/// 4. Stop and read the on-disk index: both memories are present.
+#[tokio::test(flavor = "current_thread")]
+async fn live_tantivy_rebuild_preserves_data_and_resumes_indexing() {
+    let data_dir = TempDir::new().expect("tmp");
+    let server = start_in(data_dir.path(), 1).await;
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
+    complete_handshake(&mut client, &server.token).await;
+
+    // 1. Pre-rebuild ENCODE. WaitMode::Ack ⇒ committed to redb, which is
+    //    what the rebuild reconstructs from.
+    let (_, body) = round_trip(
+        &mut client,
+        1,
+        encode_request("ticket ACME-1247 reproduces under load"),
+    )
+    .await;
+    let mem1 = match body {
+        ResponseBody::Encode(r) => brain_core::MemoryId::from(r.memory_id),
+        other => panic!("expected EncodeResp, got {other:?}"),
+    };
+
+    // 2. Live rebuild of the lexical indexes on shard 0.
+    server.handles[0]
+        .rebuild_index(shard::rebuild::RebuildTarget::TantivyMemory)
+        .await
+        .expect("live tantivy rebuild succeeds");
+
+    // 3. Post-rebuild ENCODE — must be indexed by the resumed indexer.
+    let (_, body2) = round_trip(
+        &mut client,
+        3,
+        encode_request("followup SPROCKET-9 diagnostic run"),
+    )
+    .await;
+    let mem2 = match body2 {
+        ResponseBody::Encode(r) => brain_core::MemoryId::from(r.memory_id),
+        other => panic!("expected EncodeResp, got {other:?}"),
+    };
+
+    // 4. Stop (flushes the resumed indexer) and read the on-disk index.
+    server.stop().await;
+
+    let acme = retrieve_memory_hits(&data_dir.path().join("0"), "acme-1247");
+    assert_eq!(
+        acme,
+        vec![RankedItemId::Memory(mem1)],
+        "pre-rebuild memory survives the live rebuild (rebuilt from redb)",
+    );
+    let sprocket = retrieve_memory_hits(&data_dir.path().join("0"), "sprocket-9");
+    assert_eq!(
+        sprocket,
+        vec![RankedItemId::Memory(mem2)],
+        "post-rebuild memory indexed by the resumed indexer",
+    );
+
+    drop(data_dir);
+}

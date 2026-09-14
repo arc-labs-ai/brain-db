@@ -116,6 +116,40 @@ async fn arena_first_spawn_creates_files() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rebuild_index_dispatches_each_target() {
+    use shard::rebuild::RebuildTarget;
+    let dir = TempDir::new().unwrap();
+    let (handle, joiner) =
+        spawn_shard(0, ShardSpawnConfig::new(dir.path(), stub())).expect("spawn");
+
+    // A fresh shard has empty derived indexes; every target rebuilds
+    // cleanly from authoritative (empty) redb, returning 0 entries.
+    for target in [
+        RebuildTarget::MemoryHnsw,
+        RebuildTarget::EntityHnsw,
+        RebuildTarget::HypeHnsw,
+        RebuildTarget::StatementQuestionHnsw,
+        RebuildTarget::All,
+    ] {
+        let report = handle
+            .rebuild_index(target)
+            .await
+            .unwrap_or_else(|e| panic!("rebuild {target:?} failed: {e:?}"));
+        assert_eq!(report.entries, 0, "empty shard, target {target:?}");
+    }
+
+    // The rebuild-ann alias resolves to the memory-HNSW target.
+    let report = handle.rebuild_hnsw().await.expect("rebuild-ann");
+    assert_eq!(report.entries, 0);
+
+    drop(handle);
+    tokio::task::spawn_blocking(move || joiner.join())
+        .await
+        .expect("blocking join")
+        .expect("join");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn arena_alloc_returns_sequential_indices() {
     let dir = TempDir::new().unwrap();
     let (handle, joiner) =

@@ -143,7 +143,7 @@ fn implemented_codes() -> BTreeSet<String> {
         return BTreeSet::new();
     };
     let body = &text[start..];
-    let end = body.find("\n}").map_or(body.len(), |i| i);
+    let end = body.find("\n}").unwrap_or(body.len());
     body[..end]
         .lines()
         .filter_map(|line| {

@@ -83,6 +83,7 @@ The server validates:
 
 ```rust
 struct RecallRequest {
+    scope: RecallScope,                      // Space (default) | Namespace; see §05/03 "Recall scope"
     cue_text: String,                        // the query
     cue_vector_offset: u32,                  // 0 if text-only
     cue_vector_dim: u16,                     // 0 if text-only; 384 if vector pre-supplied
@@ -108,6 +109,7 @@ graph, fused via RRF). The client cannot select between paths.
 
 Fields:
 
+- `scope` — `Space` (wire default) or `Namespace`. `Space` serves the request on the single shard the caller's `(namespace, space)` hashes to. `Namespace` fans the request out across every shard, widening each shard's scope filter from `(namespace, space)` to `namespace_id` only, and shapes once over the globally-merged pool — spanning every space in the caller's own namespace and never another tenant's. Reuses the `RECALL` permission. Full semantics in [`../05_operations/03_read_pipeline.md`](../05_operations/03_read_pipeline.md) §"Recall scope"; the cross-shard RRF merge is noted in [`../13_retrievers/01_rrf_fusion.md`](../13_retrievers/01_rrf_fusion.md).
 - `top_k` — max results returned. Default 10. Hard cap: 1000.
 - `confidence_threshold` — results with confidence below this are filtered out. Default: 0.0.
 - `context_filter` — restrict to specific contexts. None means search across all contexts the agent owns. Up to 16 context IDs allowed.

@@ -31,6 +31,10 @@ CLAUDE.md
 # is for working-set experiments only.
 /clients/
 
+# Local research scratch (prior-art notes, papers, OSS clones, prototype
+# experiments, forensics). Working-set only — never part of the shipped repo.
+/research/
+
 # Benchmarks
 /criterion/
 /perf.data

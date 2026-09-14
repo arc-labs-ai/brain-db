@@ -393,6 +393,55 @@ SchemaReplaceResponse {
 Parse / validate errors ride in `validation_errors` (mirroring the
 `SCHEMA_UPLOAD` response shape), not as `OpError`.
 
+## 9a. `SCHEMA_DROP` — targeted narrowing
+
+Where `SCHEMA_REPLACE` wipes a namespace's whole declared vocabulary,
+`SCHEMA_DROP` (`0x0125`) removes exactly **one** declared item — a predicate
+or a relation_type — and re-versions the narrowed document. Entity types are
+global (§1c) and never dropped.
+
+### Semantics
+
+1. Resolve the target in the active version's document by `(target_kind,
+   target_name)`. `target_kind`: `0 = predicate`, `1 = relation_type`.
+2. **Not-declared → no-op success.** No active version, or the target isn't in
+   the document, returns `dropped = false` with the version unchanged (mirrors
+   FORGET's leniency on an already-absent target). This is also what a *re-drop*
+   of an already-removed target returns.
+3. **In-use safety gate.** Count live (non-tombstoned) rows keyed on the target
+   (statements-by-predicate / relations-by-type). If any exist and `force` is
+   unset, reject with `Conflict` and mutate nothing; with `force`, drop it and
+   leave those rows as orphans.
+4. Remove the declared row from the typed-graph tables, narrow the document
+   (the removed item is dropped so the re-apply can't re-create it), re-validate,
+   and upload it as a new version — then a post-commit `OUTSIDE_ACTIVE_SCHEMA`
+   flag sweep re-marks statements on the dropped declaration stale.
+
+### Durability + idempotency
+
+`SCHEMA_DROP` flows through the unified `submit(Write)` path (a
+`Phase::UpsertSchema` carrying the narrowed document plus the drop delta), so
+the mutation is WAL-durable and replayed on recovery like every other write
+(see [`../08_storage/02_wal.md`](../08_storage/02_wal.md) §21) — the narrowed
+document rides the record as serde_json (it has no DSL source to re-parse).
+Idempotency is the spec-standard **safe retry**: a same-`request_id` replay of a
+completed drop is a no-op success (the target is already gone), not a byte-cached
+echo; a same-`request_id` different-params replay conflicts. Admin-only.
+
+### Response shape
+
+```rust
+SchemaDropResponse {
+    namespace:        String,
+    schema_version:   u32,   // narrowed version; unchanged on a no-op drop
+    target_kind:      u8,
+    target_name:      String,
+    dropped:          bool,  // false = nothing to drop (idempotent no-op)
+    live_rows:        u32,   // orphaned rows the drop left, when forced
+    validation_errors: Vec<SchemaValidationErrorWire>,
+}
+```
+
 ## 10. Open questions
 
 See [`.../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md). Notably:

@@ -43,7 +43,7 @@ use crate::framework::extractor::{
 };
 use crate::framework::item::{EntityMention, ExtractedItem, RelationMention, StatementMention};
 use crate::framework::trigger::{evaluate_trigger_on_encode, TriggerDecision};
-use crate::idempotency::hash_memory_text;
+use crate::idempotency::hash_prompt_context;
 
 const DEFAULT_CACHE_TTL_SECS: u64 = 7 * 24 * 60 * 60; // 7 days.
 
@@ -254,21 +254,13 @@ impl LlmExtractor {
         // existing predicates nearest THIS memory's text). A template
         // without a placeholder is left unchanged; an unfilled placeholder
         // renders empty.
-        let prompt = inner
-            .prompt
-            .replace(
-                "{DECLARED_ENTITY_TYPES}",
-                declared_entity_types.unwrap_or(""),
-            )
-            .replace("{CANDIDATE_PREDICATES}", candidate_predicates.unwrap_or(""))
-            .replace("{DECLARED_KINDS}", declared_kinds.unwrap_or(""))
-            // Complement to the deterministic apply-time date->fact join (which is
-            // the primary Time-slot mechanism): the anchor date helps the LLM
-            // classify actions as Event and set `event_at` for relative
-            // expressions ("last Saturday", "in June") the pattern extractor
-            // missed. Empty when the memory carries no usable timestamp — the
-            // prompt rule then harmlessly no-ops.
-            .replace("{ANCHOR_DATE}", anchor_date.unwrap_or(""));
+        let prompt = substitute_schema_placeholders(
+            &inner.prompt,
+            declared_entity_types,
+            candidate_predicates,
+            declared_kinds,
+            anchor_date,
+        );
         let (user_body, stats) = render_prompt_with_context(
             &prompt,
             memory_text,
@@ -296,6 +288,92 @@ impl LlmExtractor {
             timeout: inner.timeout,
         };
         (request, stats)
+    }
+
+    /// Render the exact user-message body that goes into the cache-key
+    /// hash: the same placeholder substitution + context render as
+    /// [`build_request`](Self::build_request), but with the wall-clock
+    /// anchor (`now`) pinned to `0`.
+    ///
+    /// The only wall-clock input to the render is the neighbor recency
+    /// hints (`T-Nh`); pinning `now` to `0` collapses them to a constant
+    /// so the body is stable across calls, while every content-bearing
+    /// input — memory text, prior entities, neighbor text + similarity,
+    /// summary, and the substituted schema/anchor blocks — still flows
+    /// into the body (and therefore the key). `memory_id` is used only
+    /// for diagnostics inside the render, never emitted into the body, so
+    /// two memories with identical text + context still share a key
+    /// (the intended cross-memory dedup).
+    #[allow(clippy::too_many_arguments)]
+    fn render_cache_body(
+        &self,
+        inner: &LlmExtractorInner,
+        memory_id: brain_core::MemoryId,
+        memory_text: &str,
+        prior_entities: &[&EntityMention],
+        extractor_context: Option<&ExtractorContext>,
+        declared_entity_types: Option<&str>,
+        candidate_predicates: Option<&str>,
+        declared_kinds: Option<&str>,
+        anchor_date: Option<&str>,
+    ) -> String {
+        let prompt = substitute_schema_placeholders(
+            &inner.prompt,
+            declared_entity_types,
+            candidate_predicates,
+            declared_kinds,
+            anchor_date,
+        );
+        let (body, _stats) = render_prompt_with_context(
+            &prompt,
+            memory_text,
+            prior_entities,
+            extractor_context,
+            0,
+            memory_id,
+        );
+        body
+    }
+
+    /// The cache-key input hash `run` uses for `mem` under `ctx`.
+    ///
+    /// Folds the owning tenant (`mem.space`), the active schema version,
+    /// and the fully materialized prompt-context body so that any change
+    /// that would change the model's output — text, anchor date, declared
+    /// types/kinds, candidate predicates, prior entities, bounded
+    /// neighbor/summary context — yields a distinct key, and no two
+    /// tenants ever share an entry. Exposed so callers (and tests) can
+    /// address the exact row the extractor reads and writes.
+    ///
+    /// The degraded (no client wired) path never touches the cache, but
+    /// still returns a tenant-isolated, deterministic hash over the
+    /// memory text so the function is total.
+    #[must_use]
+    pub fn cache_input_hash(&self, ctx: &ExtractionContext<'_>, mem: &Memory) -> [u8; 32] {
+        let text = mem.text.as_deref().unwrap_or("");
+        let space: [u8; 16] = mem.space.into();
+        let Some(inner) = self.inner.as_ref() else {
+            return hash_prompt_context(space, ctx.schema_version, text);
+        };
+        let prior_entities = collect_prior_entities(ctx, mem.id);
+        let extractor_context = ctx.extractor_context.and_then(|map| map.get(&mem.id));
+        let candidate_predicates = ctx
+            .candidate_predicates
+            .and_then(|map| map.get(&mem.id))
+            .map(String::as_str);
+        let anchor_date = anchor_date_iso(mem);
+        let body = self.render_cache_body(
+            inner,
+            mem.id,
+            text,
+            &prior_entities,
+            extractor_context,
+            ctx.declared_entity_types,
+            candidate_predicates,
+            ctx.declared_kinds,
+            anchor_date.as_deref(),
+        );
+        hash_prompt_context(space, ctx.schema_version, &body)
     }
 
     fn project_value(&self, parsed: &Value) -> Vec<ExtractedItem> {
@@ -384,7 +462,7 @@ impl LlmExtractor {
     }
 
     /// Run the supersession judge over a pair of statements. Tier 2 of
-    /// the [`brain_metadata::statement::TieredSupersedeDecider`] ladder
+    /// the `brain_metadata::statement::TieredSupersedeDecider` ladder
     /// calls this when a candidate's cosine sits in the ambiguity band
     /// (typically `[0.82, 0.92)`). Returns `Supersedes` /
     /// `Contradicts` / `Coexists` per the prompt below.
@@ -881,6 +959,36 @@ fn approx_tokens_of(s: &str) -> u64 {
 /// landed still see the memory text. `{PRIOR_ENTITIES}` is silently
 /// no-op when absent — when an operator's prompt doesn't anchor on
 /// prior tier output, the LLM falls back to its own extraction.
+/// Substitute the batch/per-memory schema blocks into the prompt
+/// template: declared entity types, candidate predicates, declared
+/// kinds, and the anchor date. Shared by [`LlmExtractor::build_request`]
+/// (for the live call) and [`LlmExtractor::render_cache_body`] (for the
+/// cache key) so the two can never drift — any block that reaches the
+/// model also reaches the key. A template missing a placeholder is left
+/// unchanged; an unfilled placeholder renders empty.
+///
+/// The anchor date is a complement to the deterministic apply-time
+/// date->fact join (the primary Time-slot mechanism): it helps the LLM
+/// classify actions as Event and set `event_at` for relative expressions
+/// ("last Saturday", "in June") the pattern extractor missed. Empty when
+/// the memory carries no usable timestamp — the prompt rule then no-ops.
+pub(super) fn substitute_schema_placeholders(
+    template: &str,
+    declared_entity_types: Option<&str>,
+    candidate_predicates: Option<&str>,
+    declared_kinds: Option<&str>,
+    anchor_date: Option<&str>,
+) -> String {
+    template
+        .replace(
+            "{DECLARED_ENTITY_TYPES}",
+            declared_entity_types.unwrap_or(""),
+        )
+        .replace("{CANDIDATE_PREDICATES}", candidate_predicates.unwrap_or(""))
+        .replace("{DECLARED_KINDS}", declared_kinds.unwrap_or(""))
+        .replace("{ANCHOR_DATE}", anchor_date.unwrap_or(""))
+}
+
 pub(super) fn render_prompt(
     template: &str,
     memory_text: &str,
@@ -1001,11 +1109,30 @@ fn read_str(v: &Value, key: &str) -> Option<String> {
     v.get(key).and_then(|x| x.as_str()).map(String::from)
 }
 
-fn read_conf(v: &Value) -> f32 {
+/// Confidence assigned to an item when the LLM omits the (required)
+/// `confidence` field. Deliberately low: an unstated confidence is low trust,
+/// so the operator's `confidence_threshold` (default 0.7) decides retention
+/// rather than the model getting the benefit of the doubt. It sits below
+/// `RETRACT_MIN_CONFIDENCE` (0.7, in the worker) so a defaulted confidence can
+/// never, on its own, drive a destructive retraction. Consistent with the
+/// other tiers, which assign fixed conservative confidences (pattern 0.7,
+/// temporal/classifier 0.6) rather than 1.0.
+const DEFAULT_MISSING_CONFIDENCE: f32 = 0.5;
+
+/// The LLM-emitted confidence when the model explicitly stated one, or `None`
+/// when the (required) field is absent. Callers that must not act on an
+/// unstated confidence (e.g. a destructive retraction) branch on the `None`.
+fn read_conf_explicit(v: &Value) -> Option<f32> {
     v.get("confidence")
         .and_then(Value::as_f64)
         .map(|f| f as f32)
-        .unwrap_or(1.0)
+}
+
+/// The item's confidence, falling back to the conservative
+/// [`DEFAULT_MISSING_CONFIDENCE`] when the model omits the field — never 1.0,
+/// which would grant an unstated confidence maximum trust.
+fn read_conf(v: &Value) -> f32 {
+    read_conf_explicit(v).unwrap_or(DEFAULT_MISSING_CONFIDENCE)
 }
 
 /// Whether the LLM marked the statement's object as a referenced entity (vs a
@@ -1084,6 +1211,16 @@ fn project_statement(
         .get("is_stateful")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let retract = read_retract(v);
+    // A retraction is destructive: it tombstones a stored fact. Require the
+    // model to have EXPLICITLY stated a confidence before we let it retire
+    // anything — an omitted confidence must never drive a tombstone on a
+    // default value the model never asserted. Drop the item rather than fall
+    // back to a positive assertion, which would mint a fact from a "no longer
+    // true" statement.
+    if retract && read_conf_explicit(v).is_none() {
+        return None;
+    }
     Some(ExtractedItem::StatementMention(StatementMention {
         kind,
         subject_text: read_str(v, "subject"),
@@ -1097,7 +1234,7 @@ fn project_statement(
         object_is_entity: read_object_is_entity(v),
         event_at_unix_nanos: read_event_at(v),
         subject_is_self: read_subject_is_self(v),
-        retract: read_retract(v),
+        retract,
     }))
 }
 
@@ -1121,6 +1258,14 @@ fn project_statement_open(
     let kind = read_str(v, "kind")
         .map(|s| kind_from_name(&s))
         .unwrap_or_else(|| brain_core::StatementKind::Fact.as_u8() + 1);
+    let retract = read_retract(v);
+    // A retraction is destructive: require an EXPLICIT confidence before we
+    // let it tombstone a stored fact (see `project_statement`). An omitted
+    // confidence drops the item rather than defaulting into a tombstone or a
+    // spurious positive assertion.
+    if retract && read_conf_explicit(v).is_none() {
+        return None;
+    }
     Some(ExtractedItem::StatementMention(StatementMention {
         kind,
         subject_text: read_str(v, "subject"),
@@ -1134,7 +1279,7 @@ fn project_statement_open(
         object_is_entity: read_object_is_entity(v),
         event_at_unix_nanos: read_event_at(v),
         subject_is_self: read_subject_is_self(v),
-        retract: read_retract(v),
+        retract,
     }))
 }
 
@@ -1237,7 +1382,14 @@ impl Extractor for LlmExtractor {
             };
             let inner = inner.clone();
             let text = mem.text.as_deref().unwrap_or("");
-            let input_hash = hash_memory_text(text);
+            // Cache key hashes the full materialized prompt context (text +
+            // anchor date + declared types/kinds + candidate predicates +
+            // prior entities + bounded neighbor/summary context), the active
+            // schema version, and the owning tenant (`mem.space`). Hashing
+            // only the text would serve a stale/wrong extraction whenever any
+            // of those changed — and would leak one tenant's extraction to
+            // another for byte-identical text.
+            let input_hash = self.cache_input_hash(ctx, mem);
             let model_id_hash = inner.client.model_id_hash();
             let extractor_id_raw = self.id.raw();
             let extractor_version = self.extractor_version;
@@ -1323,6 +1475,12 @@ impl Extractor for LlmExtractor {
             // real spend instead of zero.
             let mut cost_micro: u64 = 0;
 
+            // Total tokens this run consumes, summed across the first call
+            // and any schema-retry call — mirrors `cost_micro`. The cached
+            // row's `token_count` must reflect every token spent, else the
+            // per-extractor cost report undercounts retried extractions.
+            let mut total_tokens: u64 = 0;
+
             // ----- 3. First LLM call -------------------------------------------
             let resp1 = match inner.client.complete(request.clone()).await {
                 Ok(r) => r,
@@ -1332,6 +1490,9 @@ impl Extractor for LlmExtractor {
                 }
             };
             cost_micro = cost_micro.saturating_add(resp1.cost_micro_usd);
+            total_tokens = total_tokens
+                .saturating_add(resp1.tokens_in)
+                .saturating_add(resp1.tokens_out);
 
             // ----- 4. Validate + retry-once ------------------------------------
             let parsed = match inner.schema_compiled.as_ref() {
@@ -1357,15 +1518,23 @@ impl Extractor for LlmExtractor {
                         let resp2 = match inner.client.complete(request).await {
                             Ok(r) => r,
                             Err(e) => {
+                                // The first call already billed real provider
+                                // spend; carry it onto the failure so the
+                                // worker's per-cycle budget gate counts it
+                                // (both calls counted in cost_micro_usd).
                                 return ExtractionResult::failure(
                                     llm_error_reason(&e),
                                     started,
                                     started,
                                 )
+                                .with_cost(cost_micro)
                                 .with_failure_class(extraction_failure_class(&e));
                             }
                         };
                         cost_micro = cost_micro.saturating_add(resp2.cost_micro_usd);
+                        total_tokens = total_tokens
+                            .saturating_add(resp2.tokens_in)
+                            .saturating_add(resp2.tokens_out);
                         match validate_against(schema, &resp2.content) {
                             Ok(v) => v,
                             Err(_) => {
@@ -1373,11 +1542,17 @@ impl Extractor for LlmExtractor {
                                 // validation is a prompt/schema mismatch, not a
                                 // provider blip — retrying the same prompt won't
                                 // help, so it's permanent (terminal, no retry loop).
+                                // Both calls billed real spend; carry the summed
+                                // cost onto the failure so the worker's per-cycle
+                                // budget gate counts it (both calls counted
+                                // in cost_micro_usd) — else a malformed prompt
+                                // burns two API calls every cycle unbounded.
                                 return ExtractionResult::failure(
                                     "schema validation failed twice",
                                     started,
                                     started,
                                 )
+                                .with_cost(cost_micro)
                                 .with_failure_class(ExtractionFailureClass::Permanent);
                             }
                         }
@@ -1388,9 +1563,7 @@ impl Extractor for LlmExtractor {
             // ----- 5. Cache write ----------------------------------------------
             if let Some(cache) = inner.cache.as_ref() {
                 let blob = parsed.to_string().into_bytes();
-                let token_count = (resp1.tokens_in + resp1.tokens_out)
-                    .try_into()
-                    .unwrap_or(u32::MAX);
+                let token_count = total_tokens.try_into().unwrap_or(u32::MAX);
                 if let Err(e) = cache_put(
                     cache,
                     input_hash,

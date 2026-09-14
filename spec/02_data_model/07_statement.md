@@ -416,7 +416,7 @@ For chain_root = anchor_id_or_followed_chain_root:
         emit
 ```
 
-Returns the full chain ordered by `version` ascending. The wire-side shape is in [`../04_wire_protocol/08_typed_graph_frames.md`](../04_wire_protocol/08_typed_graph_frames.md) §8.
+Returns the chain ordered by `version` ascending, **keyset-paginated**: each call takes a `limit` and an opaque `cursor` (empty on the first page) and returns a page plus a `next_cursor`; the full chain is read by following the cursor to exhaustion. Pagination keys on the immutable `version`, so a page can neither gap nor duplicate a row across fetches. The wire-side shape is in [`../04_wire_protocol/08_typed_graph_frames.md`](../04_wire_protocol/08_typed_graph_frames.md) §8.
 
 #### Anchor flexibility
 

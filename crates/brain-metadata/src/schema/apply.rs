@@ -17,7 +17,9 @@ use brain_protocol::schema::{
 use redb::{ReadableTable, WriteTransaction};
 
 use super::kind::{kind_intern, KindOpError};
-use super::predicate::{predicate_intern, ObjectConstraint, PredicateOpError};
+use super::predicate::{
+    predicate_intern, predicate_set_retention, ObjectConstraint, PredicateOpError,
+};
 use crate::entity::types::{entity_type_intern, entity_type_lookup_by_name, EntityTypeOpError};
 use crate::extractor::ops::{extractor_intern, ExtractorOpError};
 use crate::relation::types::{relation_type_intern, RelationTypeOpError};
@@ -77,7 +79,7 @@ pub fn apply_schema_definitions(
                     object_type_byte: object_type_constraint_byte(&p.object),
                     entity_type_id: object_entity_type.map_or(0, EntityTypeId::raw),
                 };
-                predicate_intern(
+                let pred_id = predicate_intern(
                     wtxn,
                     namespace,
                     &p.name,
@@ -88,6 +90,9 @@ pub fn apply_schema_definitions(
                     p.resolved_stateful(),
                     now_unix_nanos,
                 )?;
+                // Stamp the declared retention TTL (or clear it, with 0, when the
+                // re-declaration drops `retention:`) onto the interned row.
+                predicate_set_retention(wtxn, pred_id, p.retention.map_or(0, |d| d.to_seconds()))?;
             }
             SchemaItem::RelationType(r) => {
                 let from = resolve_entity_type(wtxn, &r.from_type)?;

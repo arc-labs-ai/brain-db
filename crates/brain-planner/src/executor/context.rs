@@ -12,7 +12,9 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use brain_core::{EdgeKind, MemoryId, MemoryKind, SessionId};
+use brain_core::{
+    BackfillId, BackfillProgress, BackfillRequest, EdgeKind, MemoryId, MemoryKind, SessionId,
+};
 use brain_embed::{Dispatcher, VECTOR_DIM};
 use brain_index::{SharedHnsw, SpaceVectorSource};
 use brain_metadata::MetadataDb;
@@ -58,6 +60,29 @@ pub struct PendingMemorySnapshot {
     pub created_at_unix_nanos: u64,
 }
 
+/// Control handle onto the per-shard backfill worker.
+///
+/// `brain_workers::BackfillWorker` lives above this crate in the
+/// dependency graph, so the concrete worker can't be named here. The
+/// shard registers one worker in its scheduler and threads the *same*
+/// `Arc` onto the executor context as this trait object, giving the
+/// dispatch path (`ADMIN_BACKFILL` / `ADMIN_BACKFILL_CANCEL`) a way to
+/// submit and cancel resumable runs without a back-dependency on
+/// `brain-workers`.
+///
+/// The worker's `submit` / `cancel` / `progress` are all `&self` over
+/// interior state (single-writer-per-shard; no new lock on a hot
+/// path), so a shared `Arc` suffices — no `&mut` and no `Mutex` wrapper.
+pub trait BackfillControl {
+    /// Enqueue a backfill run; returns its id (the idempotency key).
+    fn submit(&self, request: BackfillRequest) -> BackfillId;
+    /// Flag the in-flight run matching `request_id` for cancellation.
+    /// Returns `true` if a matching run was flagged.
+    fn cancel(&self, request_id: BackfillId) -> bool;
+    /// Snapshot the most-recent run's progress.
+    fn progress(&self) -> BackfillProgress;
+}
+
 /// Executor-side context. Cheap to clone (every field is `Arc` or
 /// already cheap-clone like `SharedHnsw`).
 #[derive(Clone)]
@@ -101,6 +126,14 @@ pub struct ExecutorContext {
     /// `!Send` — already true of the whole dispatch path (`OpsContext`),
     /// so no new constraint. `Clone` still holds (`Rc: Clone`).
     pub space_vectors: Option<Rc<dyn SpaceVectorSource>>,
+    /// Per-shard backfill worker handle, wired at shard construction
+    /// from the registered `BackfillWorker` `Arc`. `None` on contexts
+    /// that didn't provision the worker (unit tests, non-shard callers);
+    /// the `ADMIN_BACKFILL` dispatch arm returns a clean "backfill worker
+    /// not provisioned" error rather than panicking in that case. Held
+    /// as `Arc<dyn BackfillControl>` (not the concrete type) to avoid a
+    /// back-dependency on `brain-workers`.
+    pub backfill_handle: Option<Arc<dyn BackfillControl>>,
 }
 
 impl ExecutorContext {
@@ -121,7 +154,16 @@ impl ExecutorContext {
             caller_namespace: brain_core::NamespaceId::SYSTEM,
             caller_space_string: String::new(),
             space_vectors: None,
+            backfill_handle: None,
         }
+    }
+
+    /// Wire the per-shard backfill worker handle. Called once at shard
+    /// construction with the same `Arc` registered in the scheduler.
+    #[must_use]
+    pub fn with_backfill_handle(mut self, handle: Arc<dyn BackfillControl>) -> Self {
+        self.backfill_handle = Some(handle);
+        self
     }
 
     /// Wire the per-shard by-slot vector source (the arena) for the
@@ -161,6 +203,32 @@ impl ExecutorContext {
     pub fn with_caller_space_string(mut self, space_string: String) -> Self {
         self.caller_space_string = space_string;
         self
+    }
+
+    /// Does memory `id` belong to the caller's `(namespace, space)`?
+    ///
+    /// The per-shard memory-edge graph and HNSW are keyed by id alone (tenant-
+    /// blind), so any traversal/recall path that seeds or projects a raw memory
+    /// id must re-verify its owner scope here — otherwise a caller could reach
+    /// another tenant's memory by id. Reads the owner scope from
+    /// `MEMORIES_TABLE` and compares BOTH halves. Fail-closed: a missing row or
+    /// any read error returns `false` (deny), never a wrong-tenant true.
+    #[must_use]
+    pub fn memory_in_caller_scope(&self, id: MemoryId) -> bool {
+        let Ok(rtxn) = self.metadata.read_txn() else {
+            return false;
+        };
+        let Ok(table) = rtxn.open_table(brain_metadata::tables::memory::MEMORIES_TABLE) else {
+            return false;
+        };
+        match table.get(&id.to_be_bytes()) {
+            Ok(Some(guard)) => {
+                let row = guard.value();
+                row.namespace_id == self.caller_namespace.raw()
+                    && row.space_id_bytes == <[u8; 16]>::from(self.caller_space)
+            }
+            _ => false,
+        }
     }
 }
 

@@ -131,6 +131,7 @@ impl MetadataSink for MetadataDb {
             WalPayload::RelationLink(p) => self.apply_relation_link(lsn, timestamp_ns, p),
             WalPayload::RelationSupersede(p) => self.apply_relation_supersede(lsn, timestamp_ns, p),
             WalPayload::RelationTombstone(p) => self.apply_relation_tombstone(lsn, p),
+            WalPayload::RestoreMemory(p) => self.apply_restore_memory(lsn, timestamp_ns, p),
         }
     }
 }
@@ -208,6 +209,8 @@ mod tests {
     use crate::tables::edge::{EDGES_REVERSE_TABLE, EDGES_TABLE};
     use crate::tables::idempotency::{response_kind, IDEMPOTENCY_TABLE};
     use crate::tables::memory::{flags, memory_kind_to_u8, MEMORIES_TABLE};
+    use crate::tables::memory_artifacts::MEMORY_ARTIFACTS_TABLE;
+    use crate::tables::memory_vector::MEMORY_VECTORS_TABLE;
     use crate::tables::model_fingerprint::MODEL_FINGERPRINTS_TABLE;
     use crate::tables::relation::{RELATION_BY_EVIDENCE_TABLE, RELATION_METADATA_TABLE};
     use crate::tables::slot_version::SLOT_VERSIONS_TABLE;
@@ -216,8 +219,8 @@ mod tests {
     use brain_storage::wal::payload::{
         CheckpointBeginPayload, CheckpointEndPayload, EdgePayload, EncodePayload, ForgetMode,
         ForgetPayload, ForgetReason, LinkPayload, MigrateEmbeddingPayload, ReclaimPayload,
-        SalienceReason, SalienceUpdate, TxnBeginPayload, UnlinkPayload, UpdateKindPayload,
-        UpdateSaliencePayload, UpdateSessionPayload, WalPayload,
+        RestorePayload, SalienceReason, SalienceUpdate, TxnBeginPayload, UnlinkPayload,
+        UpdateKindPayload, UpdateSaliencePayload, UpdateSessionPayload, WalPayload,
     };
     use std::path::PathBuf;
 
@@ -400,8 +403,85 @@ mod tests {
 
     // ---------- Forget ----------
 
+    fn forget_payload(id: MemoryId, byte: u8, mode: ForgetMode) -> ForgetPayload {
+        ForgetPayload {
+            memory_id: id,
+            request_id: rid(byte),
+            space_id: brain_core::SpaceId::default(),
+            mode,
+            reason: ForgetReason::ClientRequest,
+        }
+    }
+
+    fn restore_payload(id: MemoryId, byte: u8) -> RestorePayload {
+        RestorePayload {
+            memory_id: id,
+            request_id: rid(byte),
+            space_id: brain_core::SpaceId::default(),
+        }
+    }
+
+    /// RESTORE_MEMORY replay must reverse a soft FORGET: re-set ACTIVE and
+    /// clear tombstoned_at, honoring invariant #1 (the un-tombstone is WAL-
+    /// durable). Replaying the same record twice is a structural no-op
+    /// (idempotent recovery), and the record is never emitted for a
+    /// hard-forgotten memory.
     #[test]
-    fn forget_marks_memory_tombstoned() {
+    fn restore_replay_reactivates_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MetadataDb::open(db_path(&dir)).unwrap();
+        let enc = sample_encode(1, 1);
+        let id = enc.memory_id;
+        let key = id.to_be_bytes();
+        db.apply(1, TS, &WalPayload::Encode(enc)).unwrap();
+
+        // Soft forget, then restore.
+        db.apply(
+            2,
+            TS + 1,
+            &WalPayload::Forget(forget_payload(id, 2, ForgetMode::Soft)),
+        )
+        .unwrap();
+        db.apply(
+            3,
+            TS + 2,
+            &WalPayload::RestoreMemory(restore_payload(id, 3)),
+        )
+        .unwrap();
+
+        let check_active = |db: &MetadataDb| {
+            let rtxn = db.read_txn().unwrap();
+            let m = rtxn
+                .open_table(MEMORIES_TABLE)
+                .unwrap()
+                .get(&key)
+                .unwrap()
+                .unwrap()
+                .value();
+            assert_ne!(m.flags & flags::ACTIVE, 0, "restore must re-set ACTIVE");
+            assert_eq!(
+                m.tombstoned_at_unix_nanos, None,
+                "restore clears tombstoned_at"
+            );
+            assert_eq!(m.flags & flags::HARD_FORGOTTEN, 0);
+        };
+        check_active(&db);
+
+        // Idempotent replay: applying the restore again changes nothing.
+        db.apply(
+            3,
+            TS + 2,
+            &WalPayload::RestoreMemory(restore_payload(id, 3)),
+        )
+        .unwrap();
+        check_active(&db);
+    }
+
+    /// A restore against a hard-forgotten memory is a defensive no-op:
+    /// hard FORGET is irreversible (invariant #6). The record is never
+    /// emitted for one in production; recovery must not resurrect it.
+    #[test]
+    fn restore_replay_leaves_hard_forgotten_untouched() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MetadataDb::open(db_path(&dir)).unwrap();
         let enc = sample_encode(1, 1);
@@ -411,13 +491,14 @@ mod tests {
         db.apply(
             2,
             TS + 1,
-            &WalPayload::Forget(ForgetPayload {
-                memory_id: id,
-                request_id: rid(2),
-                space_id: brain_core::SpaceId::default(),
-                mode: ForgetMode::Soft,
-                reason: ForgetReason::ClientRequest,
-            }),
+            &WalPayload::Forget(forget_payload(id, 2, ForgetMode::Hard)),
+        )
+        .unwrap();
+
+        db.apply(
+            3,
+            TS + 2,
+            &WalPayload::RestoreMemory(restore_payload(id, 3)),
         )
         .unwrap();
 
@@ -429,8 +510,487 @@ mod tests {
             .unwrap()
             .unwrap()
             .value();
+        assert_eq!(m.flags & flags::ACTIVE, 0, "hard-forgotten stays inactive");
         assert_ne!(m.flags & flags::HARD_FORGOTTEN, 0);
-        assert_eq!(m.forgot_at_unix_nanos, Some(TS + 1));
+    }
+
+    /// Seed a MEMORY_ARTIFACTS + MEMORY_VECTORS row for `id`. Recovery's
+    /// `apply_encode` doesn't rebuild these derived tables, so we stand them
+    /// up directly to exercise the hard-forget purge path.
+    fn seed_artifact(db: &MetadataDb, id: MemoryId) {
+        let key = id.to_be_bytes();
+        let wtxn = db.write_txn().unwrap();
+        {
+            let mut a = wtxn.open_table(MEMORY_ARTIFACTS_TABLE).unwrap();
+            a.insert(&key, "{}").unwrap();
+        }
+        {
+            let mut v = wtxn.open_table(MEMORY_VECTORS_TABLE).unwrap();
+            v.insert(&key, [1u8, 2, 3, 4].as_slice()).unwrap();
+        }
+        wtxn.commit().unwrap();
+    }
+
+    /// Soft FORGET replay must converge on the live-apply end state:
+    /// ACTIVE cleared, tombstoned_at stamped, HARD_FORGOTTEN NOT set, and
+    /// the plaintext + artifact retained (reclamation purges those after
+    /// grace). The pre-fix bug left ACTIVE set (resurrecting the memory)
+    /// and never stamped tombstoned_at (blocking reclamation).
+    #[test]
+    fn soft_forget_deactivates_without_hard_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MetadataDb::open(db_path(&dir)).unwrap();
+        let enc = sample_encode(1, 1);
+        let id = enc.memory_id;
+        let key = id.to_be_bytes();
+        db.apply(1, TS, &WalPayload::Encode(enc)).unwrap();
+        seed_artifact(&db, id);
+
+        db.apply(
+            2,
+            TS + 1,
+            &WalPayload::Forget(forget_payload(id, 2, ForgetMode::Soft)),
+        )
+        .unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        let m = rtxn
+            .open_table(MEMORIES_TABLE)
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .unwrap()
+            .value();
+        assert_eq!(m.flags & flags::ACTIVE, 0, "soft forget must clear ACTIVE");
+        assert_eq!(m.tombstoned_at_unix_nanos, Some(TS + 1));
+        assert_eq!(
+            m.flags & flags::HARD_FORGOTTEN,
+            0,
+            "soft forget must NOT set HARD_FORGOTTEN"
+        );
+        assert_eq!(m.forgot_at_unix_nanos, None);
+
+        // Plaintext + artifact + vector retained until grace.
+        assert!(rtxn
+            .open_table(TEXTS_TABLE)
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .is_some());
+        assert!(rtxn
+            .open_table(MEMORY_ARTIFACTS_TABLE)
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .is_some());
+        assert!(rtxn
+            .open_table(MEMORY_VECTORS_TABLE)
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .is_some());
+    }
+
+    /// Hard FORGET replay: same deactivation as soft PLUS HARD_FORGOTTEN set
+    /// and the recoverable plaintext-derived data (text + artifact + vector)
+    /// purged, matching the live hard-forget apply and the arena replay.
+    #[test]
+    fn hard_forget_sets_flag_and_purges_recoverable_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MetadataDb::open(db_path(&dir)).unwrap();
+        let enc = sample_encode(1, 1);
+        let id = enc.memory_id;
+        let key = id.to_be_bytes();
+        db.apply(1, TS, &WalPayload::Encode(enc)).unwrap();
+        seed_artifact(&db, id);
+
+        db.apply(
+            2,
+            TS + 5,
+            &WalPayload::Forget(forget_payload(id, 2, ForgetMode::Hard)),
+        )
+        .unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        let m = rtxn
+            .open_table(MEMORIES_TABLE)
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .unwrap()
+            .value();
+        assert_eq!(m.flags & flags::ACTIVE, 0);
+        assert_ne!(m.flags & flags::HARD_FORGOTTEN, 0);
+        assert_eq!(m.tombstoned_at_unix_nanos, Some(TS + 5));
+        assert_eq!(m.forgot_at_unix_nanos, Some(TS + 5));
+
+        // Recoverable data purged now (privacy escape hatch).
+        assert!(rtxn
+            .open_table(TEXTS_TABLE)
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .is_none());
+        assert!(rtxn
+            .open_table(MEMORY_ARTIFACTS_TABLE)
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .is_none());
+        assert!(rtxn
+            .open_table(MEMORY_VECTORS_TABLE)
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .is_none());
+    }
+
+    /// FORGET replay is idempotent: applying the same record twice leaves
+    /// exactly the same row state as applying it once (recovery may replay
+    /// records already reflected in the checkpointed redb state).
+    #[test]
+    fn forget_replay_is_idempotent() {
+        for mode in [ForgetMode::Soft, ForgetMode::Hard] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut db = MetadataDb::open(db_path(&dir)).unwrap();
+            let enc = sample_encode(1, 1);
+            let id = enc.memory_id;
+            let key = id.to_be_bytes();
+            db.apply(1, TS, &WalPayload::Encode(enc)).unwrap();
+            seed_artifact(&db, id);
+
+            db.apply(2, TS + 7, &WalPayload::Forget(forget_payload(id, 2, mode)))
+                .unwrap();
+            let once = {
+                let rtxn = db.read_txn().unwrap();
+                rtxn.open_table(MEMORIES_TABLE)
+                    .unwrap()
+                    .get(&key)
+                    .unwrap()
+                    .unwrap()
+                    .value()
+            };
+
+            // Replay the identical record.
+            db.apply(2, TS + 7, &WalPayload::Forget(forget_payload(id, 2, mode)))
+                .unwrap();
+            let twice = {
+                let rtxn = db.read_txn().unwrap();
+                rtxn.open_table(MEMORIES_TABLE)
+                    .unwrap()
+                    .get(&key)
+                    .unwrap()
+                    .unwrap()
+                    .value()
+            };
+
+            assert_eq!(
+                once.flags, twice.flags,
+                "flags stable across replay ({mode:?})"
+            );
+            assert_eq!(
+                once.tombstoned_at_unix_nanos, twice.tombstoned_at_unix_nanos,
+                "tombstoned_at stable across replay ({mode:?})"
+            );
+            assert_eq!(
+                once.forgot_at_unix_nanos, twice.forgot_at_unix_nanos,
+                "forgot_at stable across replay ({mode:?})"
+            );
+        }
+    }
+
+    // ---------- Forget recovery convergence chaos ----------
+
+    /// Tiny deterministic PRNG (xorshift64*) so the chaos loop is
+    /// reproducible per seed with no external dependency. Seeded through a
+    /// fixed odd constant so seed 0 still yields a non-zero (never-stuck)
+    /// state.
+    struct ChaosRng(u64);
+    impl ChaosRng {
+        fn new(seed: u64) -> Self {
+            Self(seed ^ 0x9E37_79B9_7F4A_7C15)
+        }
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        /// Uniform-ish index in `0..n` (`n` small, modulo bias negligible).
+        fn below(&mut self, n: usize) -> usize {
+            (self.next_u64() % n as u64) as usize
+        }
+        fn coin(&mut self) -> bool {
+            self.next_u64() & 1 == 1
+        }
+    }
+
+    struct ForgetCase {
+        id: MemoryId,
+        hard: bool,
+        forget_lsn: u64,
+        forget_ts: u64,
+        forget_byte: u8,
+    }
+
+    fn text_present(db: &MetadataDb, id: MemoryId) -> bool {
+        let rtxn = db.read_txn().unwrap();
+        rtxn.open_table(TEXTS_TABLE)
+            .unwrap()
+            .get(&id.to_be_bytes())
+            .unwrap()
+            .is_some()
+    }
+
+    fn artifact_present(db: &MetadataDb, id: MemoryId) -> bool {
+        let rtxn = db.read_txn().unwrap();
+        rtxn.open_table(MEMORY_ARTIFACTS_TABLE)
+            .unwrap()
+            .get(&id.to_be_bytes())
+            .unwrap()
+            .is_some()
+    }
+
+    fn vector_present(db: &MetadataDb, id: MemoryId) -> bool {
+        let rtxn = db.read_txn().unwrap();
+        rtxn.open_table(MEMORY_VECTORS_TABLE)
+            .unwrap()
+            .get(&id.to_be_bytes())
+            .unwrap()
+            .is_some()
+    }
+
+    /// Assert the recovered end state converges on the live-tombstone
+    /// contract for every case in the set. The core invariant threaded
+    /// through every branch: a forgotten memory is NEVER active after
+    /// recovery (no resurrection).
+    fn assert_forget_convergence(db: &MetadataDb, cases: &[ForgetCase], seed: u64) {
+        for c in cases {
+            let rtxn = db.read_txn().unwrap();
+            let m = rtxn
+                .open_table(MEMORIES_TABLE)
+                .unwrap()
+                .get(&c.id.to_be_bytes())
+                .unwrap()
+                .unwrap_or_else(|| panic!("seed {seed}: memory {:?} vanished", c.id))
+                .value();
+            drop(rtxn);
+
+            // Core invariant — never resurrected, regardless of mode.
+            assert_eq!(
+                m.flags & flags::ACTIVE,
+                0,
+                "seed {seed}: forgotten memory {:?} is ACTIVE after recovery (resurrection)",
+                c.id,
+            );
+            assert_eq!(
+                m.tombstoned_at_unix_nanos,
+                Some(c.forget_ts),
+                "seed {seed}: tombstoned_at must be stamped for {:?}",
+                c.id,
+            );
+
+            if c.hard {
+                assert_ne!(
+                    m.flags & flags::HARD_FORGOTTEN,
+                    0,
+                    "seed {seed}: hard-forgotten {:?} missing HARD_FORGOTTEN",
+                    c.id,
+                );
+                assert_eq!(m.forgot_at_unix_nanos, Some(c.forget_ts));
+                assert!(
+                    !text_present(db, c.id),
+                    "seed {seed}: hard-forget must purge text for {:?}",
+                    c.id,
+                );
+                assert!(
+                    !artifact_present(db, c.id),
+                    "seed {seed}: hard-forget must purge artifact for {:?}",
+                    c.id,
+                );
+                assert!(
+                    !vector_present(db, c.id),
+                    "seed {seed}: hard-forget must purge vector for {:?}",
+                    c.id,
+                );
+            } else {
+                assert_eq!(
+                    m.flags & flags::HARD_FORGOTTEN,
+                    0,
+                    "seed {seed}: soft-forget must NOT set HARD_FORGOTTEN for {:?}",
+                    c.id,
+                );
+                assert_eq!(m.forgot_at_unix_nanos, None);
+                assert!(
+                    text_present(db, c.id),
+                    "seed {seed}: soft-forget must retain text for {:?}",
+                    c.id,
+                );
+                assert!(
+                    artifact_present(db, c.id),
+                    "seed {seed}: soft-forget must retain artifact for {:?}",
+                    c.id,
+                );
+                assert!(
+                    vector_present(db, c.id),
+                    "seed {seed}: soft-forget must retain vector for {:?}",
+                    c.id,
+                );
+            }
+        }
+    }
+
+    /// Chaos: over a randomized memory set with a random soft/hard mix,
+    /// simulate a crash BEFORE the next checkpoint (drop the db after the
+    /// ENCODEs are redb-committed but before any FORGET is), then let
+    /// recovery replay the FORGET WAL records — in a randomized order —
+    /// through `apply_forget`. Crash injection is the drop+reopen-same-redb
+    /// pattern: the first `MetadataDb` handle is dropped (simulating the
+    /// process dying) and a second handle reopens the same redb file, which
+    /// is where the FORGET records are replayed.
+    ///
+    /// Asserts, over 12 seeds: every soft-forgotten memory is INACTIVE (not
+    /// resurrected) with tombstoned_at set and text/vector retained; every
+    /// hard-forgotten memory is INACTIVE + HARD_FORGOTTEN with text/artifact/
+    /// vector purged; and replaying the identical FORGET records a second
+    /// time changes nothing (replay-idempotency). The one non-negotiable
+    /// invariant across all branches: a forgotten memory is never active
+    /// after recovery.
+    #[test]
+    fn forget_recovery_converges_and_never_resurrects_across_crash() {
+        for seed in 0u64..12 {
+            let mut rng = ChaosRng::new(seed);
+            let n = 6 + rng.below(7); // 6..=12 memories
+
+            let dir = tempfile::tempdir().unwrap();
+            let path = db_path(&dir);
+
+            // ---- Phase 1: pre-crash committed state. ENCODE each memory
+            // (redb-committed) + seed its derived artifact/vector rows, then
+            // drop the handle to simulate the process crashing before the
+            // next checkpoint captured any FORGET.
+            let mut cases: Vec<ForgetCase> = Vec::with_capacity(n);
+            {
+                let mut db = MetadataDb::open(&path).unwrap();
+                for i in 0..n {
+                    let slot = (i as u64) + 1;
+                    let byte = (i as u8) + 1;
+                    let enc = sample_encode(slot, byte);
+                    let id = enc.memory_id;
+                    db.apply((i as u64) + 1, TS + i as u64, &WalPayload::Encode(enc))
+                        .unwrap();
+                    seed_artifact(&db, id);
+                    cases.push(ForgetCase {
+                        id,
+                        hard: rng.coin(),
+                        // FORGET records are stamped after the ENCODE prefix.
+                        forget_lsn: (n as u64) + 1 + i as u64,
+                        forget_ts: TS + 1_000 + i as u64,
+                        // Offset well past the ENCODE request bytes so the
+                        // FORGET idempotency rows never clobber ENCODE rows.
+                        forget_byte: 100 + i as u8,
+                    });
+                }
+                // db dropped here → crash before checkpoint.
+            }
+
+            // Randomize FORGET replay order (Fisher-Yates) to prove the
+            // convergence is order-independent.
+            let mut order: Vec<usize> = (0..n).collect();
+            for i in (1..n).rev() {
+                let j = rng.below(i + 1);
+                order.swap(i, j);
+            }
+
+            // ---- Phase 2: recovery. Reopen the same redb file and replay
+            // the FORGET WAL records through the recovery sink.
+            let mut db = MetadataDb::open(&path).unwrap();
+            let replay = |db: &mut MetadataDb| {
+                for &idx in &order {
+                    let c = &cases[idx];
+                    let mode = if c.hard {
+                        ForgetMode::Hard
+                    } else {
+                        ForgetMode::Soft
+                    };
+                    db.apply(
+                        c.forget_lsn,
+                        c.forget_ts,
+                        &WalPayload::Forget(forget_payload(c.id, c.forget_byte, mode)),
+                    )
+                    .unwrap();
+                }
+            };
+
+            replay(&mut db);
+            assert_forget_convergence(&db, &cases, seed);
+
+            // ---- Replay-idempotency: applying the identical FORGET records
+            // a second time (as an interrupted-then-resumed recovery would)
+            // leaves the same converged state.
+            replay(&mut db);
+            assert_forget_convergence(&db, &cases, seed);
+        }
+    }
+
+    /// A soft FORGET followed by a hard FORGET of the same memory, replayed
+    /// across a crash, must converge on the hard end state (purged +
+    /// HARD_FORGOTTEN) and never resurrect. Guards the escalation ordering
+    /// the chaos test randomizes away.
+    #[test]
+    fn soft_then_hard_forget_recovery_converges_on_hard() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = db_path(&dir);
+        let enc = sample_encode(1, 1);
+        let id = enc.memory_id;
+        let key = id.to_be_bytes();
+        {
+            let mut db = MetadataDb::open(&path).unwrap();
+            db.apply(1, TS, &WalPayload::Encode(enc)).unwrap();
+            seed_artifact(&db, id);
+            // crash before checkpoint
+        }
+
+        let mut db = MetadataDb::open(&path).unwrap();
+        db.apply(
+            2,
+            TS + 1,
+            &WalPayload::Forget(forget_payload(id, 100, ForgetMode::Soft)),
+        )
+        .unwrap();
+        db.apply(
+            3,
+            TS + 2,
+            &WalPayload::Forget(forget_payload(id, 101, ForgetMode::Hard)),
+        )
+        .unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        let m = rtxn
+            .open_table(MEMORIES_TABLE)
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .unwrap()
+            .value();
+        assert_eq!(m.flags & flags::ACTIVE, 0, "must not resurrect");
+        assert_ne!(m.flags & flags::HARD_FORGOTTEN, 0);
+        assert_eq!(m.tombstoned_at_unix_nanos, Some(TS + 2));
+        assert_eq!(m.forgot_at_unix_nanos, Some(TS + 2));
+        assert!(rtxn
+            .open_table(TEXTS_TABLE)
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .is_none());
+        assert!(rtxn
+            .open_table(MEMORY_VECTORS_TABLE)
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .is_none());
     }
 
     // ---------- Link / Unlink ----------

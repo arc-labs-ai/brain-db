@@ -20,6 +20,12 @@ pub struct ForgetCascadeMetrics {
     relations_tombstoned: AtomicU64,
     relations_evidence_dropped: AtomicU64,
     edges_unlinked: AtomicU64,
+    // Revert-path counters (soft-FORGET reversal via the undo log).
+    revert_jobs_processed: AtomicU64,
+    revert_statements_reverted: AtomicU64,
+    revert_statements_untombstoned: AtomicU64,
+    revert_relations_reverted: AtomicU64,
+    revert_relations_untombstoned: AtomicU64,
 }
 
 impl ForgetCascadeMetrics {
@@ -37,6 +43,11 @@ impl ForgetCascadeMetrics {
             relations_tombstoned: AtomicU64::new(0),
             relations_evidence_dropped: AtomicU64::new(0),
             edges_unlinked: AtomicU64::new(0),
+            revert_jobs_processed: AtomicU64::new(0),
+            revert_statements_reverted: AtomicU64::new(0),
+            revert_statements_untombstoned: AtomicU64::new(0),
+            revert_relations_reverted: AtomicU64::new(0),
+            revert_relations_untombstoned: AtomicU64::new(0),
         }
     }
 
@@ -80,6 +91,31 @@ impl ForgetCascadeMetrics {
         self.edges_unlinked.fetch_add(n, Ordering::Relaxed);
     }
 
+    /// Bumped once per processed revert job after a successful commit.
+    pub fn add_revert_job_processed(&self) {
+        self.revert_jobs_processed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn add_revert_statements_reverted(&self, n: u64) {
+        self.revert_statements_reverted
+            .fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn add_revert_statements_untombstoned(&self, n: u64) {
+        self.revert_statements_untombstoned
+            .fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn add_revert_relations_reverted(&self, n: u64) {
+        self.revert_relations_reverted
+            .fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn add_revert_relations_untombstoned(&self, n: u64) {
+        self.revert_relations_untombstoned
+            .fetch_add(n, Ordering::Relaxed);
+    }
+
     #[must_use]
     pub fn snapshot(&self) -> ForgetCascadeMetricsSnapshot {
         ForgetCascadeMetricsSnapshot {
@@ -91,6 +127,15 @@ impl ForgetCascadeMetrics {
             relations_tombstoned: self.relations_tombstoned.load(Ordering::Relaxed),
             relations_evidence_dropped: self.relations_evidence_dropped.load(Ordering::Relaxed),
             edges_unlinked: self.edges_unlinked.load(Ordering::Relaxed),
+            revert_jobs_processed: self.revert_jobs_processed.load(Ordering::Relaxed),
+            revert_statements_reverted: self.revert_statements_reverted.load(Ordering::Relaxed),
+            revert_statements_untombstoned: self
+                .revert_statements_untombstoned
+                .load(Ordering::Relaxed),
+            revert_relations_reverted: self.revert_relations_reverted.load(Ordering::Relaxed),
+            revert_relations_untombstoned: self
+                .revert_relations_untombstoned
+                .load(Ordering::Relaxed),
         }
     }
 }
@@ -112,4 +157,9 @@ pub struct ForgetCascadeMetricsSnapshot {
     pub relations_tombstoned: u64,
     pub relations_evidence_dropped: u64,
     pub edges_unlinked: u64,
+    pub revert_jobs_processed: u64,
+    pub revert_statements_reverted: u64,
+    pub revert_statements_untombstoned: u64,
+    pub revert_relations_reverted: u64,
+    pub revert_relations_untombstoned: u64,
 }

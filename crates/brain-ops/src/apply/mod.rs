@@ -140,6 +140,7 @@ pub fn dispatch(
                 relation::apply_tombstone_relation(wtxn, phase, write)
             }
         },
+        Phase::RestoreMemory { .. } => memory::apply_restore_memory(wtxn, phase, write),
         Phase::Supersede { target, .. } => match target {
             crate::write::SupersedeTarget::Statement(_) => {
                 statement::apply_supersede_statement(wtxn, phase, write)

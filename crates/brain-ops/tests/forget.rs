@@ -114,6 +114,23 @@ fn unwrap_forget_resp(outcome: DispatchOutcome) -> ForgetResponse {
     }
 }
 
+fn seed_hype_vectors(fix: &Fixture, memory_id: u128, n: u8) {
+    let id = brain_core::MemoryId::from(memory_id);
+    let wtxn = fix.ctx.executor.metadata.write_txn().unwrap();
+    for i in 0..n {
+        let mut v = [0.0f32; VECTOR_DIM];
+        v[usize::from(i) % VECTOR_DIM] = 1.0;
+        brain_metadata::hype_vector_put(&wtxn, id, i, &v).unwrap();
+    }
+    wtxn.commit().unwrap();
+}
+
+fn has_hype_vectors(fix: &Fixture, memory_id: u128) -> bool {
+    let id = brain_core::MemoryId::from(memory_id);
+    let rtxn = fix.ctx.executor.metadata.read_txn().unwrap();
+    brain_metadata::hype_has_vectors(&rtxn, id).unwrap()
+}
+
 // ---------------------------------------------------------------------------
 // 1. Fresh forget.
 // ---------------------------------------------------------------------------
@@ -235,6 +252,78 @@ fn forget_idempotent_replay_returns_cached_response() {
         // wire shape can't distinguish a replay from a fresh result.)
         assert_eq!(first.was_already_forgotten, second.was_already_forgotten);
         assert_eq!(first.memory_id, second.memory_id);
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 6. FORGET removes the memory's HyPE question-vectors promptly, on the
+//    same policy as the lexical index (at tombstone time, Soft or Hard).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn forget_removes_hype_vectors() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        let memory_id = encode(&fix, [50; 16], "hype-owner").await;
+        // Simulate the HyPE worker having generated question-vectors.
+        seed_hype_vectors(&fix, memory_id, 3);
+        assert!(has_hype_vectors(&fix, memory_id));
+
+        let resp = unwrap_forget_resp(
+            dispatch(
+                RequestBody::Forget(forget_req(memory_id, [51; 16])),
+                brain_ops::RequestCaller::for_tests(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(!resp.was_already_forgotten);
+        assert!(
+            !has_hype_vectors(&fix, memory_id),
+            "FORGET must drop the memory's HyPE question-vectors"
+        );
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 7. A double-forget is a harmless no-op for the HyPE cleanup too — the
+//    second call finds no vectors and succeeds.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn double_forget_hype_cleanup_is_noop() {
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        let memory_id = encode(&fix, [60; 16], "hype-twice").await;
+        seed_hype_vectors(&fix, memory_id, 2);
+
+        // First FORGET drops the vectors.
+        let first = unwrap_forget_resp(
+            dispatch(
+                RequestBody::Forget(forget_req(memory_id, [61; 16])),
+                brain_ops::RequestCaller::for_tests(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(!first.was_already_forgotten);
+        assert!(!has_hype_vectors(&fix, memory_id));
+
+        // Second FORGET (fresh request_id) is AlreadyTombstoned; the HyPE
+        // delete never runs again, and there's nothing to remove anyway.
+        let second = unwrap_forget_resp(
+            dispatch(
+                RequestBody::Forget(forget_req(memory_id, [62; 16])),
+                brain_ops::RequestCaller::for_tests(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(second.was_already_forgotten);
+        assert!(!has_hype_vectors(&fix, memory_id));
     })
 }
 

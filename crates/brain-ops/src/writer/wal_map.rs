@@ -34,9 +34,9 @@ use brain_metadata::recovery::phase_bodies::{
     encode_entity_unmerge, encode_entity_update, encode_schema_update, encode_session_create,
     encode_session_delete, encode_space_create, encode_space_delete, encode_statement_create,
     encode_statement_supersede, encode_statement_tombstone, EntityMergeBody, EntityRenameBody,
-    EntityTombstoneBody, EntityUnmergeBody, EntityUpdateBody, SchemaUpdateBody, SessionCreateBody,
-    SessionDeleteBody, SpaceCreateBody, SpaceDeleteBody, StatementCreateBody,
-    StatementSupersedeBody, StatementTombstoneBody,
+    EntityTombstoneBody, EntityUnmergeBody, EntityUpdateBody, SchemaDropTargetBody,
+    SchemaUpdateBody, SessionCreateBody, SessionDeleteBody, SpaceCreateBody, SpaceDeleteBody,
+    StatementCreateBody, StatementSupersedeBody, StatementTombstoneBody,
 };
 use brain_metadata::tables::entity::EntityMetadata;
 use brain_metadata::tables::statement::metadata_from_statement;
@@ -203,6 +203,18 @@ pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> 
             }
         },
 
+        // Restore rides the first-class RestoreMemory payload — the mirror
+        // of Forget. Recovery re-activates the row, re-inserts the timeline
+        // entry, and restores the dedup fingerprint idempotently. The
+        // request_id carries the WriteId for idempotency replay.
+        Phase::RestoreMemory { id, .. } => Some(WalPayload::RestoreMemory(
+            brain_storage::wal::payload::RestorePayload {
+                memory_id: *id,
+                request_id: brain_core::RequestId(write.write_id.as_uuid()),
+                space_id: write.space_id,
+            },
+        )),
+
         Phase::UpdateSalience { id, new_salience } => {
             Some(WalPayload::UpdateSalience(UpdateSaliencePayload {
                 updates: vec![SalienceUpdate {
@@ -277,8 +289,8 @@ pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> 
 
         // Statement supersession rides the PhaseBody envelope; the new
         // statement is fully built (predicate resolved) so its row is
-        // carried inline. Relation supersession falls through to the
-        // None group below — not WAL-mapped yet.
+        // carried inline. (Relation supersession is WAL-mapped by its own
+        // first-class RelationSupersede arm below.)
         Phase::Supersede {
             target: SupersedeTarget::Statement(old_id),
             replacement: SupersedeReplacement::Statement(new_statement),
@@ -455,6 +467,8 @@ pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> 
             version,
             blob,
             created_at_unix_nanos,
+            replace_all,
+            drops,
             ..
         } => {
             let body = encode_schema_update(&SchemaUpdateBody {
@@ -462,6 +476,14 @@ pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> 
                 version: *version,
                 blob: blob.clone(),
                 created_at_unix_nanos: *created_at_unix_nanos,
+                replace_all: *replace_all,
+                drops: drops
+                    .iter()
+                    .map(|(kind, name)| SchemaDropTargetBody {
+                        kind: *kind,
+                        name: name.clone(),
+                    })
+                    .collect(),
             });
             Some(WalPayload::PhaseBody(PhaseBodyRecord::new(
                 WalRecordKind::SchemaUpdate,
@@ -701,6 +723,8 @@ mod tests {
             declared_relation_types: vec![],
             declared_entity_types: vec![],
             created_at_unix_nanos: 1_700_000_000_000,
+            replace_all: false,
+            drops: vec![],
         };
         let w = write_for(phase.clone());
         let WalPayload::PhaseBody(rec) = phase_to_wal_payload(&phase, &w).expect("should map")
@@ -938,6 +962,23 @@ mod tests {
         // The WAL's request_id field carries the WriteId.
         assert_eq!(fp.request_id.0, write_id.as_uuid());
         assert_eq!(fp.mode, brain_storage::wal::payload::ForgetMode::Soft);
+    }
+
+    #[test]
+    fn restore_memory_maps_to_restore_payload_with_write_id() {
+        let id = MemoryId::pack(0, 7, 0);
+        let phase = Phase::RestoreMemory {
+            id,
+            at_unix_nanos: 1_700_000_000_000,
+        };
+        let write_id = WriteId::new();
+        let w = Write::single(write_id, SpaceId::default(), phase.clone());
+        let WalPayload::RestoreMemory(rp) = phase_to_wal_payload(&phase, &w).unwrap() else {
+            panic!("expected RestoreMemory payload")
+        };
+        assert_eq!(rp.memory_id, id);
+        // The WAL's request_id field carries the WriteId for idempotency.
+        assert_eq!(rp.request_id.0, write_id.as_uuid());
     }
 
     #[test]

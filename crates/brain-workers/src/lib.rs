@@ -21,7 +21,6 @@
 
 pub mod config;
 pub mod context;
-pub mod env;
 pub mod error;
 pub mod metrics;
 pub mod scheduler;
@@ -31,7 +30,6 @@ pub mod workers;
 
 pub use config::{WorkerConfig, WorkerKind};
 pub use context::WorkerContext;
-pub use env::{parse_enabled, parse_interval_override, parse_positive_seconds};
 pub use error::WorkerError;
 pub use metrics::{MetricsSnapshot, WorkerMetrics};
 pub use scheduler::{WorkerHandle, WorkerScheduler};
@@ -73,7 +71,7 @@ pub use workers::consolidation::{
 pub use workers::counter_reconcile::CounterReconcileWorker;
 pub use workers::decay::{
     decayed_salience, half_life_days, DecayWorker, CONSOLIDATED_HALF_LIFE_DAYS,
-    EPISODIC_HALF_LIFE_DAYS, MIN_DELTA_FOR_WRITE, SEMANTIC_HALF_LIFE_DAYS,
+    EPISODIC_HALF_LIFE_DAYS, MIN_DELTA_FOR_WRITE, SALIENCE_FLOOR, SEMANTIC_HALF_LIFE_DAYS,
 };
 pub use workers::edge_scrub::EdgeScrubWorker;
 pub use workers::extractor::{

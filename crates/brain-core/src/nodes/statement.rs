@@ -310,6 +310,11 @@ pub enum TombstoneReason {
     /// The retract handler stamps this regardless of the caller's
     /// audit reason byte.
     Retract = 5,
+    /// Soft-tombstoned by the reclaim worker because the statement outlived
+    /// its predicate's declared `retention` TTL. Like `Retract`, it is
+    /// physically reclaimed after the tombstone grace (an explicit retention
+    /// policy means the data is meant to be removed, not kept for audit).
+    RetentionExpired = 6,
 }
 
 impl TombstoneReason {
@@ -326,6 +331,7 @@ impl TombstoneReason {
             3 => Self::SchemaInvalidation,
             4 => Self::ExtractorRetraction,
             5 => Self::Retract,
+            6 => Self::RetentionExpired,
             _ => return None,
         })
     }

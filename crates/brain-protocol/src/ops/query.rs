@@ -44,6 +44,10 @@ pub enum RetrieverSelectionWire {
 /// Per-query fusion override.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FusionConfigWire {
+    /// RRF constant. Applies to non-RRF fusion methods (e.g. relative-score);
+    /// for the default RRF path the executor derives an adaptive `k` from the
+    /// candidate-pool size and this value is superseded. QUERY_EXPLAIN /
+    /// QUERY_TRACE report the effective `k` actually used, not this nominal one.
     pub k: u32,
     pub semantic_weight: f32,
     pub lexical_weight: f32,

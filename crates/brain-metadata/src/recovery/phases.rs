@@ -25,13 +25,17 @@ use crate::entity::ops::{
     entity_get_inside_wtxn, entity_put, entity_rename, entity_tombstone, entity_update,
     normalize_name,
 };
+use crate::extractor::ops::extractor_drop_namespace;
 use crate::recovery::phase_bodies::{
     decode_entity_create, decode_entity_merge, decode_entity_rename, decode_entity_tombstone,
     decode_entity_unmerge, decode_entity_update, decode_schema_update, decode_session_create,
     decode_session_delete, decode_space_create, decode_space_delete, decode_statement_create,
     decode_statement_supersede, decode_statement_tombstone,
 };
-use crate::schema::predicate::predicate_intern_or_get;
+use crate::relation::types::{relation_type_drop_one, relation_type_drop_schema_declared};
+use crate::schema::predicate::{
+    predicate_drop_one, predicate_drop_schema_declared, predicate_intern_or_get,
+};
 use crate::schema::store::{schema_get, schema_upload};
 use crate::statement::{statement_create, statement_supersede, statement_tombstone};
 use crate::tables::statement::{
@@ -161,15 +165,58 @@ impl MetadataDb {
         if already {
             return self.bump_next_lsn(lsn);
         }
-        let source = std::str::from_utf8(&b.blob)
-            .map_err(|e| MetadataSinkError::Corruption(format!("schema blob not UTF-8: {e}")))?;
-        let parsed = parse_schema(source)
-            .map_err(|e| MetadataSinkError::Corruption(format!("schema re-parse: {e:?}")))?;
+        // Blob format mirrors the live apply path: UPLOAD / REPLACE carry DSL
+        // source text; targeted DROP (non-empty `drops`) carries the narrowed
+        // schema as serde_json. Both yield a `Schema` validated below.
+        let parsed = if b.drops.is_empty() {
+            let source = std::str::from_utf8(&b.blob).map_err(|e| {
+                MetadataSinkError::Corruption(format!("schema blob not UTF-8: {e}"))
+            })?;
+            parse_schema(source)
+                .map_err(|e| MetadataSinkError::Corruption(format!("schema re-parse: {e:?}")))?
+        } else {
+            serde_json::from_slice(&b.blob).map_err(|e| {
+                MetadataSinkError::Corruption(format!("schema drop blob not valid json: {e}"))
+            })?
+        };
         let validated = validate(&parsed).map_err(|errs| {
             MetadataSinkError::Corruption(format!("schema re-validate: {errs:?}"))
         })?;
         let wtxn = self.db.begin_write().map_err(transient)?;
         {
+            // Destructive delta (REPLACE / DROP) before the additive upload —
+            // the same order the live apply path uses, so replay converges on
+            // identical state. A plain UPLOAD carries an empty delta.
+            if b.replace_all {
+                predicate_drop_schema_declared(&wtxn, &b.namespace).map_err(|e| {
+                    MetadataSinkError::Corruption(format!("predicate drop-all: {e}"))
+                })?;
+                relation_type_drop_schema_declared(&wtxn, &b.namespace).map_err(|e| {
+                    MetadataSinkError::Corruption(format!("relation_type drop-all: {e}"))
+                })?;
+                extractor_drop_namespace(&wtxn, &b.namespace).map_err(|e| {
+                    MetadataSinkError::Corruption(format!("extractor drop-all: {e}"))
+                })?;
+            }
+            for drop in &b.drops {
+                match drop.kind {
+                    brain_protocol::schema_drop_target::PREDICATE => {
+                        predicate_drop_one(&wtxn, &b.namespace, &drop.name).map_err(|e| {
+                            MetadataSinkError::Corruption(format!("predicate drop: {e}"))
+                        })?;
+                    }
+                    brain_protocol::schema_drop_target::RELATION_TYPE => {
+                        relation_type_drop_one(&wtxn, &b.namespace, &drop.name).map_err(|e| {
+                            MetadataSinkError::Corruption(format!("relation_type drop: {e}"))
+                        })?;
+                    }
+                    other => {
+                        return Err(MetadataSinkError::Corruption(format!(
+                            "schema_update carried unknown drop kind {other}"
+                        )));
+                    }
+                }
+            }
             schema_upload(&wtxn, &validated, b.created_at_unix_nanos)
                 .map_err(|e| MetadataSinkError::Corruption(format!("schema_upload: {e}")))?;
             self.bump_next_lsn_in_txn(&wtxn, lsn)?;
@@ -806,6 +853,8 @@ mod tests {
             version: 1,
             blob: src.as_bytes().to_vec(),
             created_at_unix_nanos: NOW + 200,
+            replace_all: false,
+            drops: Vec::new(),
         });
         db.apply_schema_update(15, &body).unwrap();
         // Re-replay: skip-if-(namespace,version)-exists — must NOT mint v2.
@@ -813,6 +862,144 @@ mod tests {
 
         let rtxn = db.read_txn().unwrap();
         assert_eq!(schema_active(&rtxn, "acme").unwrap(), Some(1));
+    }
+
+    #[test]
+    fn schema_drop_and_replace_replay_reconstruct_final_state() {
+        use crate::recovery::phase_bodies::{
+            encode_schema_update, SchemaDropTargetBody, SchemaUpdateBody,
+        };
+        use crate::schema::predicate::predicate_lookup_by_qname;
+        use crate::schema::store::schema_active;
+        use brain_protocol::schema::{parse_schema, SchemaItem};
+
+        let dir = TempDir::new().unwrap();
+        let db = fresh_db(&dir);
+
+        // v1 — UPLOAD two predicates (DSL blob, additive).
+        let v1_src = "\
+namespace acme
+define predicate likes {
+    kind: Preference
+    object: Value<text>
+    stateful: true
+}
+define predicate dislikes {
+    kind: Preference
+    object: Value<text>
+    stateful: true
+}
+";
+        let v1 = encode_schema_update(&SchemaUpdateBody {
+            namespace: "acme".into(),
+            version: 1,
+            blob: v1_src.as_bytes().to_vec(),
+            created_at_unix_nanos: NOW,
+            replace_all: false,
+            drops: Vec::new(),
+        });
+        db.apply_schema_update(10, &v1).unwrap();
+        {
+            let rtxn = db.read_txn().unwrap();
+            assert_eq!(schema_active(&rtxn, "acme").unwrap(), Some(1));
+            assert!(predicate_lookup_by_qname(&rtxn, "acme", "likes")
+                .unwrap()
+                .is_some());
+            assert!(predicate_lookup_by_qname(&rtxn, "acme", "dislikes")
+                .unwrap()
+                .is_some());
+        }
+
+        // v2 — DROP predicate `likes`. The narrowed document (item removed,
+        // source cleared) rides the WAL body as serde_json; the `drops` delta
+        // removes the typed-graph row. This is exactly what the live handler
+        // submits.
+        let mut narrowed = parse_schema(v1_src).unwrap();
+        narrowed
+            .items
+            .retain(|it| !matches!(it, SchemaItem::Predicate(p) if p.name == "likes"));
+        narrowed.source = None;
+        let v2 = encode_schema_update(&SchemaUpdateBody {
+            namespace: "acme".into(),
+            version: 2,
+            blob: serde_json::to_vec(&narrowed).unwrap(),
+            created_at_unix_nanos: NOW + 1,
+            replace_all: false,
+            drops: vec![SchemaDropTargetBody {
+                kind: brain_protocol::schema_drop_target::PREDICATE,
+                name: "likes".into(),
+            }],
+        });
+        db.apply_schema_update(11, &v2).unwrap();
+        {
+            let rtxn = db.read_txn().unwrap();
+            assert_eq!(schema_active(&rtxn, "acme").unwrap(), Some(2));
+            assert!(
+                predicate_lookup_by_qname(&rtxn, "acme", "likes")
+                    .unwrap()
+                    .is_none(),
+                "dropped predicate must be gone after replay"
+            );
+            assert!(
+                predicate_lookup_by_qname(&rtxn, "acme", "dislikes")
+                    .unwrap()
+                    .is_some(),
+                "sibling predicate must survive a targeted drop"
+            );
+        }
+
+        // v3 — REPLACE the whole namespace (DSL blob + replace_all).
+        let v3_src = "\
+namespace acme
+define predicate admires {
+    kind: Preference
+    object: Value<text>
+    stateful: true
+}
+";
+        let v3 = encode_schema_update(&SchemaUpdateBody {
+            namespace: "acme".into(),
+            version: 3,
+            blob: v3_src.as_bytes().to_vec(),
+            created_at_unix_nanos: NOW + 2,
+            replace_all: true,
+            drops: Vec::new(),
+        });
+        db.apply_schema_update(12, &v3).unwrap();
+        {
+            let rtxn = db.read_txn().unwrap();
+            assert_eq!(schema_active(&rtxn, "acme").unwrap(), Some(3));
+            assert!(
+                predicate_lookup_by_qname(&rtxn, "acme", "admires")
+                    .unwrap()
+                    .is_some(),
+                "replacement predicate must be present"
+            );
+            assert!(
+                predicate_lookup_by_qname(&rtxn, "acme", "dislikes")
+                    .unwrap()
+                    .is_none(),
+                "replace_all must have dropped every prior declared predicate"
+            );
+        }
+
+        // Re-replay the whole sequence (crash after commit, before the LSN
+        // advanced): the skip-if-(namespace,version)-exists guard makes each
+        // replay a no-op, so the final state is unchanged.
+        for (lsn, body) in [(10u64, &v1), (11, &v2), (12, &v3)] {
+            db.apply_schema_update(lsn, body).unwrap();
+        }
+        let rtxn = db.read_txn().unwrap();
+        assert_eq!(schema_active(&rtxn, "acme").unwrap(), Some(3));
+        assert!(predicate_lookup_by_qname(&rtxn, "acme", "admires")
+            .unwrap()
+            .is_some());
+        assert!(predicate_lookup_by_qname(&rtxn, "acme", "likes")
+            .unwrap()
+            .is_none());
+        assert!(predicate_lookup_by_qname(&rtxn, "acme", "dislikes")
+            .unwrap()
+            .is_none());
     }
 
     // ----- statement create / tombstone ---------------------------------
@@ -880,6 +1067,94 @@ mod tests {
         let t = rtxn.open_table(STATEMENTS_TABLE).unwrap();
         let row = t.get(&sid.to_bytes()).unwrap().map(|g| g.value()).unwrap();
         assert!(row.flags & statement_flags::IMPLICIT_PREDICATE != 0);
+    }
+
+    #[test]
+    fn replay_maintains_new_statement_and_entity_indexes() {
+        // Coverage guard: WAL replay of an EntityCreate + StatementCreate
+        // into a FRESH redb (the apply_* path, NOT backfill-on-open) must
+        // maintain the additive id-ordered / by-type indexes exactly as the
+        // live CRUD path does. Backfill only covers pre-index DBs; the replay
+        // apply path is what re-populates them after a crash, so it must write
+        // these indexes itself.
+        use crate::recovery::phase_bodies::{encode_statement_create, StatementCreateBody};
+        use crate::statement::statement_get;
+        use crate::tables::entity::ENTITY_BY_TYPE_TABLE;
+        use crate::tables::statement::{
+            metadata_from_statement, STATEMENTS_BY_PREDICATE_ID_TABLE,
+            STATEMENTS_BY_SUBJECT_ID_TABLE,
+        };
+
+        let dir = TempDir::new().unwrap();
+        let db = fresh_db(&dir);
+        let scope = test_scope();
+
+        // 1. Replay the subject entity via the create apply path (not entity_put).
+        let subject_entity = person_entity("Replay Subject");
+        let subject_id = subject_entity.id;
+        let entity_body =
+            encode_entity_create(&EntityMetadata::from_entity(&subject_entity, scope));
+        db.apply_entity_create(30, &entity_body).unwrap();
+
+        // 2. Replay a schemaless statement about that subject.
+        let s = schemaless_statement(subject_id);
+        let sid = s.id;
+        let stmt_body = encode_statement_create(&StatementCreateBody {
+            meta: metadata_from_statement(&s, scope),
+            predicate_intern_hint: Some(("app".into(), "knows".into())),
+        });
+        db.apply_statement_create(31, &stmt_body).unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+
+        // The replayed statement's predicate was interned away from the
+        // PredicateId(0) placeholder; read it back to key the predicate index.
+        let got = statement_get(&rtxn, sid)
+            .unwrap()
+            .expect("statement present");
+        let predicate_id = got.predicate.raw();
+
+        // by_subject_id index row for the replayed statement.
+        let bysi = rtxn.open_table(STATEMENTS_BY_SUBJECT_ID_TABLE).unwrap();
+        assert!(
+            bysi.get(&(
+                scope.namespace_id,
+                scope.space_id_bytes,
+                subject_id.to_bytes(),
+                sid.to_bytes(),
+            ))
+            .unwrap()
+            .is_some(),
+            "replay must write STATEMENTS_BY_SUBJECT_ID_TABLE"
+        );
+
+        // by_predicate_id index row for the replayed statement.
+        let bypi = rtxn.open_table(STATEMENTS_BY_PREDICATE_ID_TABLE).unwrap();
+        assert!(
+            bypi.get(&(
+                scope.namespace_id,
+                scope.space_id_bytes,
+                predicate_id,
+                sid.to_bytes(),
+            ))
+            .unwrap()
+            .is_some(),
+            "replay must write STATEMENTS_BY_PREDICATE_ID_TABLE"
+        );
+
+        // by-(scope, type) listing index row for the replayed entity.
+        let byt = rtxn.open_table(ENTITY_BY_TYPE_TABLE).unwrap();
+        assert!(
+            byt.get(&(
+                scope.namespace_id,
+                scope.space_id_bytes,
+                EntityType::PERSON_ID.raw(),
+                subject_id.to_bytes(),
+            ))
+            .unwrap()
+            .is_some(),
+            "replay must write ENTITY_BY_TYPE_TABLE"
+        );
     }
 
     #[test]

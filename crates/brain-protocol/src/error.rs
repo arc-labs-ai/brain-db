@@ -214,13 +214,14 @@ pub enum ErrorCode {
     /// (subject, predicate). Resolution: client picks `STATEMENT_SUPERSEDE`
     /// or leaves both active.
     StatementContradictsExisting,
-    /// `QUERY` / `QUERY_TEXT` exceeded its wall-time budget.
+    /// A retrieval read (`RECALL`, or a `QUERY_EXPLAIN` / `QUERY_TRACE`
+    /// plan probe) exceeded its wall-time budget.
     QueryTimeout,
-    /// `QUERY` exceeded its declared cost budget (top_k × retrievers ×
-    /// per-hit cost).
+    /// A retrieval read exceeded its declared cost budget (top_k ×
+    /// retrievers × per-hit cost).
     QueryOverBudget,
-    /// Extractor governance op (`EXTRACTOR_DISABLE` / `_ENABLE`) refused —
-    /// extractor is disabled by the operator or unreachable.
+    /// The extractor tier is disabled or unreachable — surfaced when a
+    /// governance or introspection op cannot be served.
     ExtractorDisabled,
     /// LLM extractor's per-call cost budget exceeded.
     ExtractorBudgetExceeded,

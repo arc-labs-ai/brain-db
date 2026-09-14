@@ -142,6 +142,7 @@ fn build_fixture(
         metadata,
         caller_namespace: brain_core::NamespaceId::SYSTEM.raw(),
         caller_space: brain_core::SpaceId::default(),
+        scope_mode: brain_metadata::ScopeMode::Space,
         cross_encoder: None,
         space_vectors: None,
     };

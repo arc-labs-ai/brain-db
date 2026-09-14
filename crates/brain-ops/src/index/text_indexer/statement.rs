@@ -3,6 +3,7 @@
 //! Hooks the statement create / supersede / tombstone / retract
 //! post-commit pipelines into `statements.tantivy/`.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -115,11 +116,13 @@ pub fn spawn_statement_text_indexer_local(
     rx: Receiver<StatementTextOp>,
     policy: CommitPolicy,
     shutdown: Receiver<()>,
+    control: Receiver<super::IndexerControl>,
 ) -> Result<glommio::Task<()>, IndexerError> {
     let writer = build_writer(&handle)?;
     let fields = StatementFields::resolve(&handle)?;
+    let commit_gen = handle.commit_generation_counter();
     Ok(glommio::spawn_local(async move {
-        run_loop(writer, fields, rx, policy, shutdown).await;
+        run_loop(writer, fields, commit_gen, rx, policy, shutdown, control).await;
     }))
 }
 
@@ -132,6 +135,7 @@ pub async fn run_statement_text_indexer(
     rx: Receiver<StatementTextOp>,
     policy: CommitPolicy,
     shutdown: Receiver<()>,
+    control: Receiver<super::IndexerControl>,
 ) {
     let writer = match build_writer(&handle) {
         Ok(w) => w,
@@ -147,7 +151,8 @@ pub async fn run_statement_text_indexer(
             return;
         }
     };
-    run_loop(writer, fields, rx, policy, shutdown).await;
+    let commit_gen = handle.commit_generation_counter();
+    run_loop(writer, fields, commit_gen, rx, policy, shutdown, control).await;
 }
 
 fn build_writer(handle: &IndexHandle) -> Result<IndexWriter, IndexerError> {
@@ -165,12 +170,16 @@ enum NextOp<T> {
     /// matching variant in [`super::memory`] for why a signal is used
     /// rather than waiting for the op channel to close.
     Shutdown,
+    /// The shard's live-rebuild dance sent a control message. See the
+    /// matching variant in [`super::memory`].
+    Control(super::IndexerControl),
 }
 
 #[cfg(target_os = "linux")]
 async fn wait_next<T: 'static>(
     rx: &Receiver<T>,
     shutdown: &Receiver<()>,
+    control: &Receiver<super::IndexerControl>,
     remaining: Duration,
 ) -> NextOp<T> {
     use futures_lite::FutureExt;
@@ -184,20 +193,33 @@ async fn wait_next<T: 'static>(
         let _ = shutdown.recv_async().await;
         NextOp::Shutdown
     };
+    let ctrl = async {
+        match control.recv_async().await {
+            Ok(msg) => NextOp::Control(msg),
+            // Control channel closed: keep serving ops; fall through to a
+            // benign deadline so the select never resolves here.
+            Err(_) => {
+                glommio::timer::sleep(remaining).await;
+                NextOp::DeadlineHit
+            }
+        }
+    };
     let timer = async {
         glommio::timer::sleep(remaining).await;
         NextOp::DeadlineHit
     };
-    recv.or(stop).or(timer).await
+    recv.or(stop).or(ctrl).or(timer).await
 }
 
 #[cfg(target_os = "linux")]
 async fn run_loop(
     mut writer: IndexWriter,
     fields: StatementFields,
+    mut commit_gen: Arc<AtomicU64>,
     rx: Receiver<StatementTextOp>,
     policy: CommitPolicy,
     shutdown: Receiver<()>,
+    control: Receiver<super::IndexerControl>,
 ) {
     let mut batch: usize = 0;
     let mut last_commit = Instant::now();
@@ -206,7 +228,7 @@ async fn run_loop(
         let deadline = last_commit + policy.interval;
         let remaining = deadline.saturating_duration_since(Instant::now());
 
-        match wait_next(&rx, &shutdown, remaining).await {
+        match wait_next(&rx, &shutdown, &control, remaining).await {
             NextOp::Op(op) => {
                 if let Err(err) = apply_op(&mut writer, &fields, &op) {
                     warn!(
@@ -218,7 +240,7 @@ async fn run_loop(
                     batch += 1;
                 }
                 if batch >= policy.n_writes {
-                    if commit_with_retry(&mut writer).is_err() {
+                    if commit_with_retry(&mut writer, &commit_gen).is_err() {
                         return;
                     }
                     batch = 0;
@@ -240,18 +262,43 @@ async fn run_loop(
                     }
                 }
                 if batch > 0 {
-                    let _ = commit_with_retry(&mut writer);
+                    let _ = commit_with_retry(&mut writer, &commit_gen);
                 }
                 return;
             }
             NextOp::DeadlineHit => {
                 if batch > 0 {
-                    if commit_with_retry(&mut writer).is_err() {
+                    if commit_with_retry(&mut writer, &commit_gen).is_err() {
                         return;
                     }
                     batch = 0;
                 }
                 last_commit = Instant::now();
+            }
+            NextOp::Control(super::IndexerControl::Quiesce { ack }) => {
+                // Release the live-dir writer lock so the shard's rebuild
+                // dance can replace the on-disk index. See the matching arm
+                // in [`super::memory`] for why the uncommitted batch is
+                // discarded rather than flushed.
+                drop(writer);
+                batch = 0;
+                let _ = ack.send_async(()).await;
+                match super::wait_while_paused(&control, &shutdown).await {
+                    Some((w, gen)) => {
+                        writer = w;
+                        // Adopt the reopened index's counter so post-resume
+                        // commits bump the generation the swapped-in retriever
+                        // now watches.
+                        commit_gen = gen;
+                        last_commit = Instant::now();
+                    }
+                    None => return,
+                }
+            }
+            NextOp::Control(super::IndexerControl::Resume { ack, .. }) => {
+                // Resume with no preceding Quiesce: writer already live. Ack
+                // so the orchestrator does not block.
+                let _ = ack.send_async(()).await;
             }
         }
     }
@@ -318,9 +365,12 @@ pub fn confidence_bucket(confidence: f32) -> u64 {
     ))
 }
 
-fn commit_with_retry(writer: &mut IndexWriter) -> Result<(), ()> {
+fn commit_with_retry(writer: &mut IndexWriter, commit_gen: &AtomicU64) -> Result<(), ()> {
     match attempt_commit(writer) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            commit_gen.fetch_add(1, Ordering::Release);
+            Ok(())
+        }
         Err(first) => {
             warn!(
                 target: "brain_ops::text_indexer",
@@ -328,7 +378,10 @@ fn commit_with_retry(writer: &mut IndexWriter) -> Result<(), ()> {
                 "statement text indexer commit failed; retrying",
             );
             match attempt_commit(writer) {
-                Ok(()) => Ok(()),
+                Ok(()) => {
+                    commit_gen.fetch_add(1, Ordering::Release);
+                    Ok(())
+                }
                 Err(second) => {
                     error!(
                         target: "brain_ops::text_indexer",

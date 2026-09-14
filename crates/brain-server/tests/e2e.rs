@@ -195,6 +195,7 @@ async fn encode_round_trip(
 
 async fn recall_round_trip(client: &mut TcpStream, stream_id: u32, cue: &str) -> u16 {
     let req = RecallRequest {
+        scope: Default::default(),
         trace: false,
         cue_text: cue.into(),
         subject_name: String::new(),

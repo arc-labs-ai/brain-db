@@ -1,13 +1,16 @@
 //! Unit tests for the per-shard tantivy handle.
 
 use std::fs;
+use std::path::Path;
 
 use tantivy::schema::FieldType;
+use tantivy::{Index, TantivyDocument};
 use tempfile::TempDir;
 
 use super::{
-    memory_text_schema, schema_payload_json, statements_schema, BrainSchemaPayload, IndexStatus,
-    LexicalScope, RebuildReason, TantivyShard, BRAIN_SCHEMA_VERSION,
+    build_analyzer, memory_text_schema, schema_payload_json, statements_schema, BrainSchemaPayload,
+    IndexStatus, LexicalScope, RebuildReason, TantivyShard, BRAIN_SCHEMA_VERSION,
+    BRAIN_TOKENIZER_NAME, OLD_SUFFIX, REBUILD_SUFFIX,
 };
 
 // ---------------------------------------------------------------------------
@@ -179,4 +182,207 @@ fn schema_payload_json_round_trips() {
     let s = schema_payload_json();
     let parsed: BrainSchemaPayload = serde_json::from_str(&s).expect("parse");
     assert_eq!(parsed.brain_schema_version, BRAIN_SCHEMA_VERSION);
+}
+
+// ---------------------------------------------------------------------------
+// Crash-safe rebuild swap. The rebuild worker replaces the live index with
+// two non-atomic renames (live→`.old`, then `.rebuild`→live). A crash in
+// that window leaves the live dir absent with the completed replacement in
+// `.rebuild`. `open()` must finish the swap, not create a fresh empty index.
+// ---------------------------------------------------------------------------
+
+/// Build a fully-committed memory-text index at `dir` holding one doc whose
+/// `text` field contains `marker`. Stamps the brain schema payload so it
+/// reads as a *completed* index (the swap-recovery completeness check).
+fn build_completed_memory_index(dir: &Path, marker: &str) {
+    fs::create_dir_all(dir).expect("mkdir index dir");
+    let index = Index::create_in_dir(dir, memory_text_schema()).expect("create index");
+    index
+        .tokenizers()
+        .register(BRAIN_TOKENIZER_NAME, build_analyzer());
+    let mut writer = index
+        .writer_with_num_threads(1, 15_000_000)
+        .expect("writer");
+    let text_field = index.schema().get_field("text").expect("text field");
+    let mut doc = TantivyDocument::default();
+    doc.add_text(text_field, marker);
+    writer.add_document(doc).expect("add doc");
+    let mut prepared = writer.prepare_commit().expect("prepare");
+    prepared.set_payload(&schema_payload_json());
+    prepared.commit().expect("commit");
+    drop(writer);
+    drop(index);
+}
+
+fn num_docs(index: &Index) -> u64 {
+    let reader = index.reader().expect("reader");
+    reader.searcher().num_docs()
+}
+
+#[test]
+fn open_completes_interrupted_swap_from_rebuild_dir() {
+    let dir = TempDir::new().expect("tempdir");
+    let live = dir.path().join("memory_text.tantivy");
+    let rebuild = dir
+        .path()
+        .join(format!("memory_text.tantivy{REBUILD_SUFFIX}"));
+
+    // Simulate a crash after live→`.old` succeeded but before
+    // `.rebuild`→live: live is absent, the completed new index sits in
+    // `.rebuild`. (No `.old` here — the prior data is irrelevant once the
+    // newer complete rebuild exists.)
+    build_completed_memory_index(&rebuild, "recovered payments doc");
+    assert!(
+        !live.exists(),
+        "live must be absent to model the crash window"
+    );
+
+    let startup = TantivyShard::open(dir.path()).expect("open");
+
+    // The promoted index must be Ready AND carry the rebuilt doc — never a
+    // fresh-empty one (invariant #7).
+    assert!(matches!(startup.memory_status, IndexStatus::Ready));
+    assert_eq!(
+        num_docs(&startup.shard.memory_text.index),
+        1,
+        "the completed rebuild must be promoted, not replaced by an empty index",
+    );
+    assert!(live.exists(), "live dir must exist after promotion");
+    assert!(
+        !rebuild.exists(),
+        "the .rebuild scratch dir must be cleaned up"
+    );
+}
+
+#[test]
+fn open_restores_from_old_dir_when_rebuild_absent() {
+    let dir = TempDir::new().expect("tempdir");
+    let live = dir.path().join("memory_text.tantivy");
+    let old = dir.path().join(format!("memory_text.tantivy{OLD_SUFFIX}"));
+
+    // Simulate a crash after live→`.old` but before a complete `.rebuild`
+    // existed (the new index never finished committing). The only complete
+    // index is the prior data in `.old`; open must restore it.
+    build_completed_memory_index(&old, "prior data doc");
+    assert!(!live.exists());
+
+    let startup = TantivyShard::open(dir.path()).expect("open");
+
+    assert!(matches!(startup.memory_status, IndexStatus::Ready));
+    assert_eq!(
+        num_docs(&startup.shard.memory_text.index),
+        1,
+        "the prior .old index must be restored, not dropped for an empty one",
+    );
+    assert!(live.exists());
+    assert!(
+        !old.exists(),
+        "the .old dir must be cleaned up after restore"
+    );
+}
+
+#[test]
+fn open_prefers_rebuild_over_old_and_cleans_both() {
+    let dir = TempDir::new().expect("tempdir");
+    let live = dir.path().join("memory_text.tantivy");
+    let rebuild = dir
+        .path()
+        .join(format!("memory_text.tantivy{REBUILD_SUFFIX}"));
+    let old = dir.path().join(format!("memory_text.tantivy{OLD_SUFFIX}"));
+
+    // Both siblings complete: the crash landed after live→`.old` and after
+    // `.rebuild` finished committing but before `.rebuild`→live. The newest
+    // complete index (`.rebuild`) wins; both scratch dirs are cleaned up.
+    build_completed_memory_index(&old, "stale doc one two three");
+    build_completed_memory_index(&rebuild, "fresh doc alpha beta gamma");
+    assert!(!live.exists());
+
+    let startup = TantivyShard::open(dir.path()).expect("open");
+    assert!(matches!(startup.memory_status, IndexStatus::Ready));
+    assert_eq!(num_docs(&startup.shard.memory_text.index), 1);
+    assert!(live.exists());
+    assert!(!rebuild.exists());
+    assert!(!old.exists());
+
+    // Confirm it's the rebuild's content, not the old's.
+    let index = &startup.shard.memory_text.index;
+    index
+        .tokenizers()
+        .register(BRAIN_TOKENIZER_NAME, build_analyzer());
+    let text = index.schema().get_field("text").expect("text");
+    let reader = index.reader().expect("reader");
+    let searcher = reader.searcher();
+    let qp = tantivy::query::QueryParser::for_index(index, vec![text]);
+    let q = qp.parse_query("alpha").expect("parse");
+    let hits = searcher
+        .search(
+            &q,
+            &tantivy::collector::TopDocs::with_limit(10).order_by_score(),
+        )
+        .expect("search");
+    assert_eq!(hits.len(), 1, "promoted index must be the .rebuild content");
+}
+
+#[test]
+fn open_ignores_incomplete_rebuild_and_creates_fresh() {
+    let dir = TempDir::new().expect("tempdir");
+    let live = dir.path().join("memory_text.tantivy");
+    let rebuild = dir
+        .path()
+        .join(format!("memory_text.tantivy{REBUILD_SUFFIX}"));
+
+    // A `.rebuild` created but never finally committed: tantivy wrote a
+    // meta.json at creation but no brain payload. This is an in-progress
+    // rebuild, not a completed one — it must NOT be promoted.
+    fs::create_dir_all(&rebuild).expect("mkdir rebuild");
+    let index = Index::create_in_dir(&rebuild, memory_text_schema()).expect("create");
+    drop(index);
+    assert!(rebuild.join("meta.json").exists());
+    assert!(!live.exists());
+
+    let startup = TantivyShard::open(dir.path()).expect("open");
+    // Fresh empty live index (Ready), and the half-built rebuild is gone.
+    assert!(matches!(startup.memory_status, IndexStatus::Ready));
+    assert_eq!(num_docs(&startup.shard.memory_text.index), 0);
+    assert!(live.exists());
+    assert!(!rebuild.exists());
+}
+
+// ---------------------------------------------------------------------------
+// Commit-generation counter — the signal the retriever uses to skip redundant
+// reloads. The indexer bumps it after each commit; a clone (the indexer holds
+// one, the retriever reads the shard's) must share the same value.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn commit_generation_starts_at_zero_and_is_shared_across_clones() {
+    let dir = TempDir::new().expect("tempdir");
+    let shard = TantivyShard::open(dir.path()).expect("open").shard;
+
+    assert_eq!(shard.memory_text.commit_generation(), 0, "starts at 0");
+    assert_eq!(shard.statements.commit_generation(), 0, "starts at 0");
+
+    // The indexer works through a clone of the handle; the retriever reads the
+    // shard's own handle. A bump on the clone must be visible on the original.
+    let indexer_handle = shard.memory_text.clone();
+    indexer_handle.bump_commit_generation();
+    assert_eq!(indexer_handle.commit_generation(), 1);
+    assert_eq!(
+        shard.memory_text.commit_generation(),
+        1,
+        "clones share one counter",
+    );
+
+    // Each index scope carries its own counter — a memory commit must not
+    // make the statements reader think it needs to reload.
+    assert_eq!(
+        shard.statements.commit_generation(),
+        0,
+        "per-scope counters are independent",
+    );
+
+    // The bare counter handle the drain loop keeps bumps the same value.
+    let counter = indexer_handle.commit_generation_counter();
+    counter.fetch_add(1, std::sync::atomic::Ordering::Release);
+    assert_eq!(shard.memory_text.commit_generation(), 2);
 }

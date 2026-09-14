@@ -235,7 +235,10 @@ fn validate_name(s: &str) -> Result<(), ExtractorOpError> {
             reason: "name must be non-empty",
         });
     }
-    if s.len() > NAME_MAX_LEN {
+    // Code points, not bytes — matches the predicate/relation-type name
+    // validators so a multibyte name isn't clipped below the stated char
+    // limit. 64 code points is ≤ 256 bytes, within the wire identifier bound.
+    if s.chars().count() > NAME_MAX_LEN {
         return Err(ExtractorOpError::InvalidIdentifier {
             reason: "name exceeds 64-char limit",
         });

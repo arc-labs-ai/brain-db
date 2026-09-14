@@ -16,12 +16,11 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use brain_http::body::ResponseBody;
+use brain_http::body::{read_to_bytes, ResponseBody, MAX_BODY_BYTES};
 use brain_metadata::api_keys::bits;
 use bytes::Bytes;
 use http::{Method, Request, Response, StatusCode};
-use http_body_util::BodyExt as _;
-use hyper::body::Incoming;
+use hyper::body::{Body, Incoming};
 use serde::{Deserialize, Serialize};
 
 use crate::admin::util::{json_response, text_response};
@@ -148,9 +147,11 @@ async fn mint(
     req: Request<Incoming>,
     state: Arc<AdminState>,
 ) -> brain_http::Result<Response<ResponseBody>> {
-    let body = match collect_body(req).await {
+    // Bounded read: an unbounded `collect()` here would let a malicious
+    // multi-GB body OOM-kill the whole process (shards + admin share it).
+    let body = match read_bounded_body(req.into_body()).await {
         Ok(b) => b,
-        Err(msg) => return Ok(text_response(StatusCode::BAD_REQUEST, &msg)),
+        Err(e) => return Ok(map_body_error(e)),
     };
     let parsed: MintBody = match serde_json::from_slice(&body) {
         Ok(b) => b,
@@ -319,12 +320,26 @@ async fn revoke(
 // Helpers
 // ---------------------------------------------------------------------------
 
-async fn collect_body(req: Request<Incoming>) -> Result<Bytes, String> {
-    req.into_body()
-        .collect()
-        .await
-        .map(|c| c.to_bytes())
-        .map_err(|e| format!("body read failed: {e}\n"))
+/// Read a request body into memory, bounded by [`MAX_BODY_BYTES`]. Routing
+/// every body-reading admin handler through this guard keeps an unbounded
+/// `collect()` from OOM-killing the shared process. Map the error to a
+/// client response with [`map_body_error`].
+async fn read_bounded_body<B>(body: B) -> brain_http::Result<Bytes>
+where
+    B: Body<Data = Bytes>,
+    B::Error: Into<brain_http::Error>,
+{
+    read_to_bytes(body, MAX_BODY_BYTES).await
+}
+
+fn map_body_error(e: brain_http::Error) -> Response<ResponseBody> {
+    match e {
+        brain_http::Error::BodyTooLarge { limit, .. } => text_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            &format!("request body exceeds {limit} bytes\n"),
+        ),
+        _ => text_response(StatusCode::BAD_REQUEST, "failed to read request body\n"),
+    }
 }
 
 fn parse_16(s: &str) -> Result<[u8; 16], String> {
@@ -364,4 +379,57 @@ fn hex16(bytes: &[u8; 16]) -> String {
         let _ = write!(&mut s, "{b:02x}");
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    use hyper::body::{Frame, SizeHint};
+
+    /// A body that lies about being enormous but yields no data. Proves the
+    /// bounded reader rejects on the size-hint cheap path — before buffering
+    /// a single byte — so a hostile `Content-Length` can't OOM the process.
+    struct HugeBody;
+
+    impl Body for HugeBody {
+        type Data = Bytes;
+        type Error = brain_http::Error;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            // Must never be polled: rejection happens before any read.
+            panic!("invariant: oversize body must be rejected before buffering");
+        }
+
+        fn size_hint(&self) -> SizeHint {
+            let mut sh = SizeHint::new();
+            sh.set_upper(u64::MAX);
+            sh
+        }
+    }
+
+    #[tokio::test]
+    async fn oversize_body_rejected_without_buffering() {
+        let err = read_bounded_body(HugeBody)
+            .await
+            .expect_err("oversize body must be rejected");
+        // Rejected via the size-hint cheap path — HugeBody::poll_frame would
+        // have panicked had the reader tried to buffer.
+        assert!(matches!(err, brain_http::Error::BodyTooLarge { .. }));
+        // And the client-facing mapping is a 413.
+        assert_eq!(map_body_error(err).status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn body_at_limit_is_accepted() {
+        use http_body_util::Full;
+        let body = Full::new(Bytes::from(vec![0u8; 64]));
+        let bytes = read_bounded_body(body).await.expect("small body accepted");
+        assert_eq!(bytes.len(), 64);
+    }
 }

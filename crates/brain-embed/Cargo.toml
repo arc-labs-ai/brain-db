@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+publish.workspace = true
 description = "Built-in embedding service (BGE-small) for Brain."
 
 [dependencies]

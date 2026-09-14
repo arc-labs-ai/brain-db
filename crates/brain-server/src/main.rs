@@ -78,6 +78,28 @@ fn main() -> ExitCode {
         }
     };
 
+    // Install the process-wide retrieval tuning from the parsed `[retrieval]`
+    // section before any shard or read path runs. This replaces the former
+    // bespoke `BRAIN_*` env reads at the fusion / retriever / RECALL call
+    // sites; the generic `BRAIN__RETRIEVAL__*` override already applied during
+    // `Config::load`, so TOML is the single source of truth.
+    let _ = brain_core::RetrievalTuning {
+        fusion_method: cfg.retrieval.fusion_method.clone(),
+        hype_rrf: cfg.retrieval.hype_rrf,
+        ef_occupancy_scaling: cfg.retrieval.ef_occupancy_scaling,
+        autocut: cfg.retrieval.autocut,
+    }
+    .install();
+
+    // Same one-shot install for the precision-decision tuning from `[precision]`.
+    // Defaults are no-ops, so an uncalibrated deploy shapes answers exactly as
+    // before; a fitted calibration makes None reachable and Many minimal.
+    let _ = brain_core::PrecisionTuning {
+        commit_min_support: cfg.precision.commit_min_support,
+        many_min_support: cfg.precision.many_min_support,
+    }
+    .install();
+
     // Apply the configured formatter + level immediately, so the startup
     // logs below already honor `[monitoring.logging]`. OTel is attached
     // later, from inside the Tokio runtime (its exporter needs one).
@@ -114,7 +136,7 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        linux_main::run(cfg, dispatcher, log_handle)
+        linux_main::run(cfg, dispatcher, log_handle, args.config)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -212,6 +234,7 @@ mod linux_main {
         cfg: Config,
         dispatcher: Arc<dyn brain_embed::Dispatcher>,
         log_handle: crate::logging::LoggingHandle,
+        config_path: std::path::PathBuf,
     ) -> ExitCode {
         // Build the configured Summarizer (default
         // `DisabledSummarizer`). Construction happens once and the
@@ -360,13 +383,19 @@ mod linux_main {
             //   - admin   → `/v1/*`                  on `admin_addr` (loopback default)
             // Both share the same ShutdownSignal so a single ctrl-c brings
             // them down together.
-            let admin_state = Arc::new(crate::admin::AdminState::new(
-                topology.shards.clone(),
-                connection_metrics.clone(),
-                Arc::new(cfg.clone()),
-                request_metrics.clone(),
-                topology.auth_store.clone(),
-            ));
+            let admin_state = Arc::new(
+                crate::admin::AdminState::new(
+                    topology.shards.clone(),
+                    connection_metrics.clone(),
+                    Arc::new(cfg.clone()),
+                    request_metrics.clone(),
+                    topology.auth_store.clone(),
+                )
+                .with_reload(config_path, {
+                    let h = log_handle.clone();
+                    Arc::new(move |level: &str| h.set_level(level))
+                }),
+            );
 
             let public = crate::admin::AdminServer::public(
                 cfg.server.metrics_addr,
@@ -388,7 +417,7 @@ mod linux_main {
             // minting data-plane keys, so it must be gated by an operator
             // secret. Without one configured, refuse to start it rather than
             // expose an unauthenticated mint endpoint.
-            if cfg.admin.token.as_deref().unwrap_or("").is_empty() {
+            if !cfg.admin.has_token() {
                 tracing::error!(
                     hint = "set [admin] token or BRAIN__ADMIN__TOKEN",
                     "admin secret not configured: the admin HTTP listener mints \

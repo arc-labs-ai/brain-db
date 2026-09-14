@@ -156,6 +156,16 @@ pub struct SemanticFilters {
     /// kind / created_at), so checking context costs nothing extra and
     /// stays bounded by HNSW visits — sublinear in the corpus size.
     pub session_ids: Vec<u64>,
+    /// Whether tombstoned (soft-forgotten) rows may surface in the vector
+    /// lane. A soft-FORGET flips a row's `ACTIVE` flag but leaves its HNSW
+    /// node in place until the next index rebuild, so without this gate the
+    /// HNSW would fill its top-k with tombstoned candidates and the live
+    /// matches sitting just below them in the `ef` window would never enter
+    /// the fused set — a silent recall-completeness loss. `false` (the
+    /// RECALL default) excludes tombstoned at the source, matching the
+    /// graph and lexical lanes; `true` is the admin/debug path that wants
+    /// tombstoned rows returned.
+    pub include_tombstoned: bool,
 }
 
 /// HNSW search config + post-search cuts.

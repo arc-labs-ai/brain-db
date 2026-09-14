@@ -69,6 +69,8 @@ pub async fn format(snap: &Snapshot<'_>) -> String {
     emit_temporal_edge_metrics(&mut s, snap.shards);
     emit_causal_edge_metrics(&mut s, snap.shards);
     emit_statement_embed_metrics(&mut s, snap.shards);
+    emit_retriever_metrics(&mut s, snap.shards);
+    emit_query_metrics(&mut s, snap.shards);
     emit_tracing_metrics(&mut s);
 
     s
@@ -332,7 +334,25 @@ async fn emit_worker_counters(out: &mut String, shards: &[ShardHandle]) {
     emit_header(
         out,
         "brain_worker_last_run_unixtime",
-        "Unix-time of the worker's last cycle.",
+        "Unix-time of the worker's last attempted cycle (success, error, or caught panic).",
+        "gauge",
+    );
+    emit_header(
+        out,
+        "brain_worker_panics_total",
+        "Worker cycles that panicked (a subset of errors_total). Nonzero is worth alerting on.",
+        "counter",
+    );
+    emit_header(
+        out,
+        "brain_worker_pending_work",
+        "Worker's last-observed estimate of outstanding work items.",
+        "gauge",
+    );
+    emit_header(
+        out,
+        "brain_worker_cycle_duration_ms",
+        "Duration of the worker's most recent successful cycle, in milliseconds.",
         "gauge",
     );
 
@@ -362,6 +382,21 @@ async fn emit_worker_counters(out: &mut String, shards: &[ShardHandle]) {
                         out,
                         "brain_worker_last_run_unixtime{{shard=\"{shard_id}\",worker=\"{name}\"}} {}",
                         snap.last_run_unix_secs
+                    );
+                    let _ = writeln!(
+                        out,
+                        "brain_worker_panics_total{{shard=\"{shard_id}\",worker=\"{name}\"}} {}",
+                        snap.panics_total
+                    );
+                    let _ = writeln!(
+                        out,
+                        "brain_worker_pending_work{{shard=\"{shard_id}\",worker=\"{name}\"}} {}",
+                        snap.pending_work_estimate
+                    );
+                    let _ = writeln!(
+                        out,
+                        "brain_worker_cycle_duration_ms{{shard=\"{shard_id}\",worker=\"{name}\"}} {}",
+                        snap.last_cycle_duration_ms
                     );
                 }
             }
@@ -870,6 +905,144 @@ fn emit_statement_embed_metrics(out: &mut String, shards: &[ShardHandle]) {
             &inner,
             &snap.batch_duration_seconds,
         );
+    }
+}
+
+/// Per-shard read-path retriever metric family. Labeled by
+/// `retriever = semantic | lexical | graph` (a bounded enum — no
+/// unbounded cardinality). Same dispatch shape as
+/// [`emit_statement_embed_metrics`]; recorded by the RECALL handler
+/// after each `execute`.
+fn emit_retriever_metrics(out: &mut String, shards: &[ShardHandle]) {
+    emit_header(
+        out,
+        "brain_retriever_invocations_total",
+        "Times each retriever lane was invoked while serving a recall.",
+        "counter",
+    );
+    for shard in shards {
+        let snap = shard.retriever_metrics().snapshot();
+        for (idx, retriever) in brain_ops::RETRIEVER_LABELS.iter().enumerate() {
+            let labels = format!(
+                "{{shard=\"{}\",retriever=\"{retriever}\"}}",
+                shard.shard_id()
+            );
+            let _ = writeln!(
+                out,
+                "brain_retriever_invocations_total{labels} {}",
+                snap.invocations_total[idx]
+            );
+        }
+    }
+
+    emit_header(
+        out,
+        "brain_retriever_candidates_total",
+        "Candidates each retriever lane returned across served recalls.",
+        "counter",
+    );
+    for shard in shards {
+        let snap = shard.retriever_metrics().snapshot();
+        for (idx, retriever) in brain_ops::RETRIEVER_LABELS.iter().enumerate() {
+            let labels = format!(
+                "{{shard=\"{}\",retriever=\"{retriever}\"}}",
+                shard.shard_id()
+            );
+            let _ = writeln!(
+                out,
+                "brain_retriever_candidates_total{labels} {}",
+                snap.candidates_total[idx]
+            );
+        }
+    }
+
+    emit_header(
+        out,
+        "brain_retriever_latency_ms",
+        "Per-retriever lane wall-clock latency histogram (milliseconds).",
+        "histogram",
+    );
+    for shard in shards {
+        let snap = shard.retriever_metrics().snapshot();
+        for (idx, retriever) in brain_ops::RETRIEVER_LABELS.iter().enumerate() {
+            let inner = format!("shard=\"{}\",retriever=\"{retriever}\"", shard.shard_id());
+            emit_worker_histogram(
+                out,
+                "brain_retriever_latency_ms",
+                &inner,
+                &snap.latency_ms[idx],
+            );
+        }
+    }
+}
+
+/// Per-shard end-to-end RECALL (query) metric family. `outcome_total`
+/// is labeled by `outcome = single | many | none` (a bounded enum).
+/// Same dispatch shape as [`emit_statement_embed_metrics`].
+fn emit_query_metrics(out: &mut String, shards: &[ShardHandle]) {
+    emit_header(out, "brain_query_total", "Recalls served.", "counter");
+    for shard in shards {
+        let snap = shard.query_metrics().snapshot();
+        let labels = format!("{{shard=\"{}\"}}", shard.shard_id());
+        let _ = writeln!(out, "brain_query_total{labels} {}", snap.total);
+    }
+
+    emit_header(
+        out,
+        "brain_query_rerank_invoked_total",
+        "Recalls where the cross-encoder rerank stage reordered the fused list.",
+        "counter",
+    );
+    for shard in shards {
+        let snap = shard.query_metrics().snapshot();
+        let labels = format!("{{shard=\"{}\"}}", shard.shard_id());
+        let _ = writeln!(
+            out,
+            "brain_query_rerank_invoked_total{labels} {}",
+            snap.rerank_invoked_total
+        );
+    }
+
+    emit_header(
+        out,
+        "brain_query_outcome_total",
+        "Served recalls by answer shape (single / many / none).",
+        "counter",
+    );
+    for shard in shards {
+        let snap = shard.query_metrics().snapshot();
+        for (idx, outcome) in brain_ops::QUERY_OUTCOME_LABELS.iter().enumerate() {
+            let labels = format!("{{shard=\"{}\",outcome=\"{outcome}\"}}", shard.shard_id());
+            let _ = writeln!(
+                out,
+                "brain_query_outcome_total{labels} {}",
+                snap.outcome_total[idx]
+            );
+        }
+    }
+
+    emit_header(
+        out,
+        "brain_query_latency_ms",
+        "End-to-end recall latency histogram (milliseconds).",
+        "histogram",
+    );
+    for shard in shards {
+        let snap = shard.query_metrics().snapshot();
+        let inner = format!("shard=\"{}\"", shard.shard_id());
+        emit_worker_histogram(out, "brain_query_latency_ms", &inner, &snap.latency_ms);
+    }
+
+    emit_header(
+        out,
+        "brain_query_fusion_k",
+        "Effective adaptive fusion-k the engine fused at, per served recall (histogram).",
+        "histogram",
+    );
+    for shard in shards {
+        let snap = shard.query_metrics().snapshot();
+        let inner = format!("shard=\"{}\"", shard.shard_id());
+        emit_worker_histogram(out, "brain_query_fusion_k", &inner, &snap.fusion_k);
     }
 }
 

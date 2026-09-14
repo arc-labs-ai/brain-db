@@ -73,6 +73,7 @@ pub(crate) async fn emit_graph_event(
             stage_outcome: None,
             stage_payload: None,
             space_id,
+            vector: None,
         };
         let _ = ctx.events.publish(envelope);
         return;
@@ -92,6 +93,7 @@ pub(crate) async fn emit_graph_event(
         stage_outcome: None,
         stage_payload: None,
         space_id,
+        vector: None,
     })
     .await;
 }

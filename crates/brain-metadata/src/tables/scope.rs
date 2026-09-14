@@ -16,6 +16,25 @@
 
 use brain_core::{NamespaceId, SpaceId};
 
+/// How widely a scope admits rows on the read path.
+///
+/// The namespace is always the tenant wall — no mode ever relaxes it.
+/// The *space* check is what varies: a single-space read pins one space,
+/// a namespace-wide read spans every space the caller owns within its
+/// own namespace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ScopeMode {
+    /// A row is admitted only when BOTH its namespace and its space match
+    /// the caller's scope. The default — the wall every write, forget,
+    /// and single-space read enforces.
+    #[default]
+    Space,
+    /// Read-only widening: a row is admitted when its namespace matches;
+    /// the space check is dropped so the caller sees every space it owns
+    /// within its own namespace. NEVER crosses namespaces.
+    Namespace,
+}
+
 /// The `(namespace_id, space_id)` ownership key for a typed-graph row.
 ///
 /// Stored as byte representations (`u32` + `[u8; 16]`) so it composes
@@ -62,6 +81,35 @@ impl RowScope {
     pub fn space(&self) -> SpaceId {
         SpaceId::from(self.space_id_bytes)
     }
+
+    /// Does a row owned by `(row_namespace_id, row_space_id_bytes)` belong
+    /// to this scope under `mode`?
+    ///
+    /// This is the single centralized scope predicate for the read path.
+    /// The namespace check is **unconditional** — it is the tenant wall
+    /// and holds in every mode, so a namespace-wide read can never return
+    /// another tenant's rows. Only the space check is relaxed, and only
+    /// under [`ScopeMode::Namespace`].
+    ///
+    /// Write, forget, and mutation paths do NOT use this — they call the
+    /// strict `(namespace, space)` equality directly, because a widened
+    /// scope must never affect where a row is written or removed.
+    #[must_use]
+    pub fn admits(
+        &self,
+        row_namespace_id: u32,
+        row_space_id_bytes: &[u8; 16],
+        mode: ScopeMode,
+    ) -> bool {
+        // Tenant wall — never relaxed.
+        if row_namespace_id != self.namespace_id {
+            return false;
+        }
+        match mode {
+            ScopeMode::Space => row_space_id_bytes == &self.space_id_bytes,
+            ScopeMode::Namespace => true,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -84,5 +132,48 @@ mod tests {
         let s = RowScope::new(NamespaceId::SYSTEM, SpaceId::NIL);
         assert_eq!(s.namespace_id, 0);
         assert!(s.namespace().is_system());
+    }
+
+    #[test]
+    fn admits_space_mode_pins_both_walls() {
+        let own_space = SpaceId::new();
+        let other_space = SpaceId::new();
+        let s = RowScope::new(NamespaceId::from(7), own_space);
+
+        // same namespace + same space → admitted
+        assert!(s.admits(7, &<[u8; 16]>::from(own_space), ScopeMode::Space));
+        // same namespace, different space → rejected in Space mode
+        assert!(!s.admits(7, &<[u8; 16]>::from(other_space), ScopeMode::Space));
+        // different namespace → rejected regardless of space
+        assert!(!s.admits(8, &<[u8; 16]>::from(own_space), ScopeMode::Space));
+    }
+
+    #[test]
+    fn admits_namespace_mode_relaxes_space_but_not_namespace() {
+        let own_space = SpaceId::new();
+        let sibling_space = SpaceId::new();
+        let s = RowScope::new(NamespaceId::from(7), own_space);
+
+        // same namespace, own space → admitted
+        assert!(s.admits(7, &<[u8; 16]>::from(own_space), ScopeMode::Namespace));
+        // same namespace, a DIFFERENT space the caller owns → admitted
+        assert!(s.admits(7, &<[u8; 16]>::from(sibling_space), ScopeMode::Namespace));
+        // TENANT WALL: different namespace → rejected even namespace-wide
+        assert!(!s.admits(8, &<[u8; 16]>::from(sibling_space), ScopeMode::Namespace));
+        assert!(!s.admits(8, &<[u8; 16]>::from(own_space), ScopeMode::Namespace));
+    }
+
+    #[test]
+    fn admits_never_crosses_namespaces_in_any_mode() {
+        let space = SpaceId::new();
+        let s = RowScope::new(NamespaceId::from(1), space);
+        for mode in [ScopeMode::Space, ScopeMode::Namespace] {
+            for foreign_ns in [0u32, 2, 3, u32::MAX] {
+                assert!(
+                    !s.admits(foreign_ns, &<[u8; 16]>::from(space), mode),
+                    "namespace {foreign_ns} leaked in mode {mode:?}"
+                );
+            }
+        }
     }
 }

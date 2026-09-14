@@ -41,14 +41,17 @@ pub use api_keys::{
 };
 pub use audit::ops::{
     audit_by_extractor, audit_by_memory, audit_get, audit_recent, audit_recent_failures,
-    audit_write, AuditOpError,
+    audit_write, resolution_audit_write, AuditOpError,
 };
 pub use db::{MetadataDb, MetadataDbError};
 pub use entity::ops::{
-    entity_add_alias, entity_get, entity_list_by_type, entity_lookup_by_alias,
+    backfill_entity_by_type_index, entity_add_alias, entity_get, entity_get_inside_wtxn,
+    entity_get_resolved, entity_get_resolved_with_chain, entity_inbound_reference_count,
+    entity_iter_live_for_gc, entity_list_by_type, entity_list_by_type_page, entity_lookup_by_alias,
     entity_lookup_by_canonical_name, entity_put, entity_remove_alias, entity_rename,
     entity_resolve_canonical_all_types, entity_resolve_canonical_all_types_wtxn,
-    entity_resolve_scored, entity_tombstone, entity_update, normalize_name, EntityOpError,
+    entity_resolve_scored, entity_tombstone, entity_update, normalize_name, EntityGcCandidate,
+    EntityListFilter, EntityListPage, EntityOpError, MERGE_REDIRECT_MAX_HOPS,
     READ_RESOLVE_TRIGRAM_FLOOR,
 };
 pub use entity::review::{
@@ -84,9 +87,9 @@ pub use registry::{
     SpaceListEntry,
 };
 pub use relation::ops::{
-    relation_create, relation_get, relation_history, relation_list_from, relation_list_to,
-    relation_supersede, relation_tombstone, relations_with_evidence, RelationListFilter,
-    RelationOpError,
+    relation_create, relation_get, relation_history, relation_list_from, relation_list_from_page,
+    relation_list_to, relation_list_to_page, relation_supersede, relation_tombstone,
+    relations_with_evidence, RelationListFilter, RelationOpError, RelationPage,
 };
 pub use relation::traversal::{
     traverse, TraversalConfig, TraversalDirection, TraversalPath, TraversalStep,
@@ -102,19 +105,22 @@ pub use schema::kind::{
 };
 pub use schema::predicate::{
     predicate_embedding_get, predicate_embedding_put, predicate_get, predicate_intern,
-    predicate_list, predicate_lookup_by_qname, predicate_review_list, predicate_review_record,
-    render_declared_predicates_block, PredicateOpError,
+    predicate_list, predicate_lookup_by_qname, predicate_retention_seconds, predicate_review_list,
+    predicate_review_record, predicate_set_retention, render_declared_predicates_block,
+    PredicateOpError,
 };
 pub use schema::store::{
     schema_active, schema_active_row, schema_get, schema_list, schema_namespaces, schema_upload,
     SchemaStoreError,
 };
 pub use statement::{
-    allocate_evidence_overflow, evidence_overflow_load, pack_evidence_entries, pack_evidence_ids,
-    read_evidence_entries_w, read_evidence_ids, read_evidence_ids_w, reclaim_evidence_overflow,
-    statement_create, statement_get, statement_history, statement_list, statement_retract,
-    statement_supersede, statement_tombstone, statements_contradicting, StatementListFilter,
-    StatementOpError, DEFAULT_LIST_LIMIT,
+    allocate_evidence_overflow, backfill_statement_id_indexes, evidence_overflow_load,
+    pack_evidence_entries, pack_evidence_ids, read_evidence_entries_w, read_evidence_ids,
+    read_evidence_ids_w, reclaim_evidence_overflow, statement_create, statement_get,
+    statement_history, statement_history_page, statement_list, statement_list_page,
+    statement_retract, statement_supersede, statement_tombstone, statements_contradicting,
+    StatementHistoryPage, StatementListCursor, StatementListFilter, StatementOpError,
+    StatementPage, StatementPageExtra, DEFAULT_LIST_LIMIT,
 };
 pub use system_schema::{seed_system_schema, SystemSchemaError, SYSTEM_SCHEMA_SOURCE};
 pub use tables::extractor_audit::{
@@ -131,4 +137,4 @@ pub use tables::memory::{
 pub use tables::schema_version::{
     SchemaVersionRow, SCHEMA_ACTIVE_VERSIONS_TABLE, SCHEMA_VERSIONS_TABLE, VALIDATOR_VERSION,
 };
-pub use tables::scope::RowScope;
+pub use tables::scope::{RowScope, ScopeMode};

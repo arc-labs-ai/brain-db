@@ -50,21 +50,26 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::workers::hype::{HypeGenOutcome, HypeGenerator};
 use brain_core::{
-    EntityId, ExtractorId, Memory as CoreMemory, MemoryId, MemoryKind, Salience, SessionId, SpaceId,
+    AuditId, EntityId, ExtractorId, Memory as CoreMemory, MemoryId, MemoryKind, Salience,
+    SessionId, SpaceId,
 };
 use brain_core::{StatementKind, StatementObject, StatementValue, SubjectRef};
 use brain_extractors::{
-    build_registry_with_gate,
+    build_registry_from_definitions,
     resolver::{
         resolve_or_create_with_deps, Disambiguation, EmbeddingDeps, EntityDisambiguator,
         PendingVerdict, PrecomputedVerdicts, ResolutionTier, ResolverError, StagedEntityVectors,
     },
     EntityMention, ExtractedItem, ExtractionContext, ExtractionFailureClass, ExtractionResult,
     ExtractionStatus, Extractor, ExtractorContext, ExtractorRegistry, MaterializeDeps,
-    StatementMention, TemporalExtractor, TierGate, TriggerDecision, SYSTEM_NAMESPACE,
+    StatementMention, TemporalExtractor, TriggerDecision, SYSTEM_NAMESPACE,
 };
+use brain_metadata::audit_write;
 use brain_metadata::relation::types::relation_type_intern_or_get;
 use brain_metadata::schema::predicate::predicate_intern_or_get;
+use brain_metadata::tables::audit::{
+    extraction_status, resolution_outcome, ExtractionAudit, ResolutionAudit,
+};
 use brain_metadata::tables::edge::{
     self, derived_by, origin, zero_disambiguator, EdgeData, EDGES_REVERSE_TABLE, EDGES_TABLE,
 };
@@ -74,7 +79,9 @@ use brain_metadata::tables::extractor_audit::{
 };
 use brain_metadata::tables::predicate::{PREDICATES_TABLE, PREDICATE_EMBEDDINGS_TABLE};
 use brain_metadata::tables::relation::RELATION_TYPE_EMBEDDINGS_TABLE;
-use brain_metadata::{hype_has_vectors, pipeline_has_extracted};
+use brain_metadata::{
+    entity_get_inside_wtxn, hype_has_vectors, pipeline_has_extracted, resolution_audit_write,
+};
 use brain_ops::apply::encode_helpers::{
     fetch_extractor_context, ExtractorContextFetchConfig, DEFAULT_EXTRACTOR_CONTEXT_TOP_M,
 };
@@ -158,6 +165,18 @@ pub const DEFAULT_EXTRACTOR_HYPE_REFRESH_PER_CYCLE: usize = 8;
 /// and going higher adds latency without throughput gains. Bigger
 /// hosts can lift this via `[workers.extractor] batch_size`.
 pub const DEFAULT_EXTRACTOR_BATCH_SIZE: usize = 8;
+
+/// How many rows `load_pending_batch` over-drains per `want`: it scans up
+/// to `want * FACTOR` front rows (bounded by [`EXTRACTION_QUEUE_MAX_SCAN`])
+/// to page past a front window stuck in transient-failure backoff, so a
+/// due row deeper in the queue is still found and processed this cycle
+/// instead of being starved behind the backing-off front.
+const EXTRACTION_QUEUE_OVERDRAIN_FACTOR: usize = 8;
+
+/// Hard ceiling on rows scanned per `load_pending_batch` call so the
+/// over-drain stays bounded even when `want` is large and the whole front
+/// of the queue is backing off.
+const EXTRACTION_QUEUE_MAX_SCAN: usize = 1024;
 
 impl Default for ExtractorKnobs {
     fn default() -> Self {
@@ -262,8 +281,6 @@ pub struct RegistryRebuildDeps {
     /// upload can add entity types), so the value carried here is only
     /// the startup fallback for that one field.
     pub deps: MaterializeDeps,
-    /// Deploy-time `extractors.{pattern,classifier,llm}.enabled` gate.
-    pub gate: TierGate,
 }
 
 impl ExtractorWorker {
@@ -294,8 +311,8 @@ impl ExtractorWorker {
     /// registry refreshes live. Tests and substrate deployments that
     /// don't exercise schema-driven extractor changes leave it unset.
     #[must_use]
-    pub fn with_registry_rebuild_deps(mut self, deps: MaterializeDeps, gate: TierGate) -> Self {
-        self.rebuild_deps = Some(RegistryRebuildDeps { deps, gate });
+    pub fn with_registry_rebuild_deps(mut self, deps: MaterializeDeps) -> Self {
+        self.rebuild_deps = Some(RegistryRebuildDeps { deps });
         self
     }
 
@@ -623,7 +640,7 @@ async fn do_extractor_cycle(
 /// row doesn't rebuild every cycle; a fresh upload re-flips it.
 ///
 /// No lock is held across an `.await`: the whole rebuild is synchronous
-/// (redb reads + `build_registry_with_gate`), and the write-lock swap is
+/// (redb reads + `build_registry_from_definitions`), and the write-lock swap is
 /// a single move. Single-writer-per-shard means the handler that sets
 /// the flag and this consumer never run concurrently.
 fn maybe_rebuild_registry(worker: &ExtractorWorker, ctx: &WorkerContext) {
@@ -668,7 +685,7 @@ fn maybe_rebuild_registry(worker: &ExtractorWorker, ctx: &WorkerContext) {
 
     let mut deps = rebuild.deps.clone();
     deps.entity_type_qnames = Arc::new(entity_types);
-    let (mut reg, errors) = build_registry_with_gate(&defs, &deps, rebuild.gate);
+    let (mut reg, errors) = build_registry_from_definitions(&defs, &deps);
     if !errors.is_empty() {
         // A genuinely-broken definition (bad JSON blob, unknown kind).
         // Operator LLM misconfigurations register as degraded extractors,
@@ -723,11 +740,28 @@ fn load_pending_batch(ctx: &WorkerContext, limit: usize) -> Result<Vec<MemoryId>
     // failures are reported "due" here and handled by the idempotency gate in
     // `drain_batch` (AlreadyExtracted → queue row removed). First-time and
     // succeeded-then-requeued ids are always due.
+    //
+    // The over-drain is what prevents head-of-line blocking: the queue is
+    // keyed by MemoryId, so a full front window of `limit` rows stuck in
+    // backoff (e.g. the oldest rows that reliably time out, widening their
+    // backoff) would otherwise yield zero due rows and stall every newer
+    // due row behind them. We page past the front, scanning up to a bounded
+    // multiple of `limit` rows, and return the first `limit` DUE rows found
+    // — bounding the total scan per cycle while never starving deeper rows.
     let now = now_unix_nanos();
-    let pending = brain_metadata::extraction_queue_drain(&rtxn, limit)
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let scan_cap = limit
+        .saturating_mul(EXTRACTION_QUEUE_OVERDRAIN_FACTOR)
+        .min(EXTRACTION_QUEUE_MAX_SCAN);
+    let pending = brain_metadata::extraction_queue_drain(&rtxn, scan_cap)
         .map_err(|e| format!("extraction_queue_drain: {e}"))?;
-    let mut due = Vec::with_capacity(pending.len());
+    let mut due = Vec::with_capacity(limit.min(pending.len()));
     for (id, _) in pending {
+        if due.len() >= limit {
+            break;
+        }
         match brain_metadata::pipeline_extraction_retry_due(&rtxn, id, now) {
             Ok(true) => due.push(id),
             Ok(false) => {} // backing off — leave queued, retry when due
@@ -823,6 +857,88 @@ enum StageDecision {
 /// `run_batch` call (amortising the GLiNER forward pass). Pattern +
 /// LLM tiers run per-memory because pattern is fast and LLM
 /// per-memory accounting drives the budget gate.
+/// Row-derived facts about one queued memory, read once per micro-batch.
+///
+/// Carries the event/write timestamps (so the temporal extractor can
+/// anchor relative dates to the real event time), the owning namespace
+/// and space (so the LLM tier scopes extractor selection AND keys its
+/// response cache by the memory's real space), the session, and the real
+/// stored kind (so a trigger `where memory.kind = ...` evaluates against
+/// the stored kind). A row miss omits the id; callers fall back to
+/// anonymous defaults — never a drop.
+struct RowFacts {
+    created_ns: u64,
+    occurred: Option<u64>,
+    namespace_id: u32,
+    space: SpaceId,
+    session_id: SessionId,
+    kind: MemoryKind,
+}
+
+/// Read each live memory's [`RowFacts`] in a single read txn. Ids whose
+/// row is absent (forgotten before extraction ran) are omitted.
+fn load_row_facts(
+    ctx: &WorkerContext,
+    live: &[(usize, MemoryId, Arc<str>)],
+) -> HashMap<MemoryId, RowFacts> {
+    use brain_metadata::tables::memory::MEMORIES_TABLE;
+    let mut m = HashMap::with_capacity(live.len());
+    if let Ok(rtxn) = ctx.ops.executor.metadata.read_txn() {
+        if let Ok(t) = rtxn.open_table(MEMORIES_TABLE) {
+            for (_, mid, _) in live {
+                if let Ok(Some(g)) = t.get(&mid.to_be_bytes()) {
+                    let row = g.value();
+                    m.insert(
+                        *mid,
+                        RowFacts {
+                            created_ns: row.created_at_unix_nanos,
+                            occurred: row.occurred_at_unix_nanos,
+                            namespace_id: row.namespace_id,
+                            space: row.space_id(),
+                            session_id: SessionId::from(row.session_id),
+                            kind: row.kind().unwrap_or(MemoryKind::Episodic),
+                        },
+                    );
+                }
+            }
+        }
+    }
+    m
+}
+
+/// Build the [`CoreMemory`] the extraction tiers see for each live row.
+///
+/// Threads each memory's REAL `(space, session)` from its row facts so
+/// the LLM tier's response-cache key is stable across cycles for the same
+/// `(text, space)`. Minting a fresh space per call would make the key
+/// change every cycle, so the per-shard LLM cache would never hit and the
+/// always-on tier's cost/latency control would be defeated. A row miss
+/// falls back to the anonymous defaults, never a drop.
+fn build_extraction_core_memories(
+    live: &[(usize, MemoryId, Arc<str>)],
+    row_facts: &HashMap<MemoryId, RowFacts>,
+) -> Vec<CoreMemory> {
+    live.iter()
+        .map(|(_, mid, text)| {
+            let (created_ns, occurred, space, session_id, kind) = row_facts
+                .get(mid)
+                .map(|f| (f.created_ns, f.occurred, f.space, f.session_id, f.kind))
+                .unwrap_or((0, None, SpaceId::NIL, SessionId(0), MemoryKind::Episodic));
+            CoreMemory {
+                id: *mid,
+                space,
+                session_id,
+                kind,
+                salience: Salience::default(),
+                text: Some(text.to_string()),
+                created_at_unix_ms: created_ns / 1_000_000,
+                last_accessed_at_unix_ms: 0,
+                occurred_at_unix_nanos: occurred,
+            }
+        })
+        .collect()
+}
+
 async fn drain_batch(
     worker: &ExtractorWorker,
     ctx: &WorkerContext,
@@ -905,56 +1021,8 @@ async fn drain_batch(
     // `where memory.kind = ...` evaluates against the stored kind, not a
     // hardcoded one). A row miss falls back to zero timestamps, the system
     // namespace, and Episodic — never drops the memory.
-    struct RowFacts {
-        created_ns: u64,
-        occurred: Option<u64>,
-        namespace_id: u32,
-        kind: MemoryKind,
-    }
-    let row_facts: HashMap<MemoryId, RowFacts> = {
-        use brain_metadata::tables::memory::MEMORIES_TABLE;
-        let mut m = HashMap::with_capacity(live.len());
-        if let Ok(rtxn) = ctx.ops.executor.metadata.read_txn() {
-            if let Ok(t) = rtxn.open_table(MEMORIES_TABLE) {
-                for (_, mid, _) in &live {
-                    if let Ok(Some(g)) = t.get(&mid.to_be_bytes()) {
-                        let row = g.value();
-                        m.insert(
-                            *mid,
-                            RowFacts {
-                                created_ns: row.created_at_unix_nanos,
-                                occurred: row.occurred_at_unix_nanos,
-                                namespace_id: row.namespace_id,
-                                kind: row.kind().unwrap_or(MemoryKind::Episodic),
-                            },
-                        );
-                    }
-                }
-            }
-        }
-        m
-    };
-
-    let live_mems: Vec<CoreMemory> = live
-        .iter()
-        .map(|(_, mid, text)| {
-            let (created_ns, occurred, kind) = row_facts
-                .get(mid)
-                .map(|f| (f.created_ns, f.occurred, f.kind))
-                .unwrap_or((0, None, MemoryKind::Episodic));
-            CoreMemory {
-                id: *mid,
-                space: SpaceId::new(),
-                session_id: SessionId(0),
-                kind,
-                salience: Salience::default(),
-                text: Some(text.to_string()),
-                created_at_unix_ms: created_ns / 1_000_000,
-                last_accessed_at_unix_ms: 0,
-                occurred_at_unix_nanos: occurred,
-            }
-        })
-        .collect();
+    let row_facts = load_row_facts(ctx, &live);
+    let live_mems: Vec<CoreMemory> = build_extraction_core_memories(&live, &row_facts);
 
     // Resolve each live memory's owning namespace to its name so the LLM
     // tier can scope selection: a namespace's own enabled LLM extractor
@@ -1097,8 +1165,8 @@ async fn drain_batch(
             _ => None,
         };
 
-    // Extraction and HyPE are independent, unordered async stages (spec
-    // §05/17a). `build_neighborhood` resolves the entities a memory mentions
+    // Extraction and HyPE are independent, unordered async stages.
+    // `build_neighborhood` resolves the entities a memory mentions
     // against the *persisted* registry, not this batch's just-written graph,
     // so HyPE needs only the memory text — it does not depend on extraction's
     // output. Run the two LLM round-trips CONCURRENTLY instead of
@@ -1185,7 +1253,7 @@ async fn run_hype_pass(worker: &ExtractorWorker, ctx: &WorkerContext, items: &[E
         return;
     };
     let cycle_budget = worker.knobs.llm_budget_per_cycle_micro_usd;
-    // Per-memory HyPE generation is independent (spec §05/17a): fan the LLM
+    // Per-memory HyPE generation is independent: fan the LLM
     // calls out concurrently so a whole micro-batch costs ~one round-trip
     // instead of N serial ones. Every future runs on this single glommio task
     // and interleaves only at await points — the network round-trips overlap
@@ -1686,7 +1754,11 @@ fn build_neighborhood(ctx: &WorkerContext, scope: brain_metadata::RowScope, text
 /// phrase ("brain:works_at" -> "works at") so the HyPE prompt reads naturally.
 /// This is prompt rendering only — not a matching heuristic.
 fn humanize_qname(qname: &str) -> String {
-    let name = qname.split(':').next_back().unwrap_or(qname);
+    // First-colon split (`namespace:rest`), consistent with every other qname
+    // parse site — a qname is `namespace:name` where `name` is a colon-free
+    // identifier, so this equals last-segment for well-formed input and is
+    // consistent (not divergent) for anything malformed.
+    let name = qname.split_once(':').map_or(qname, |(_, n)| n);
     name.replace('_', " ")
 }
 
@@ -1806,12 +1878,34 @@ async fn fetch_extractor_context_for_batch(
     out
 }
 
+/// Per-call audit facts for one tier of a pipeline run: which extractor
+/// produced the tier's recorded outcome, its version, the precise
+/// [`extraction_status`] byte, and any non-success reason. Captured
+/// alongside the coarse `tier_status` byte so `run_apply_body` can emit
+/// one historical [`ExtractionAudit`] row per extractor that actually ran
+/// (or was skipped) — `None` means the tier was absent (no extractor
+/// present), which produces no audit row.
+#[derive(Clone)]
+struct TierAudit {
+    extractor_id: u32,
+    extractor_version: u32,
+    /// One of [`extraction_status`] bytes; == `ExtractionStatus::as_u8()`.
+    status: u8,
+    /// `result.status_reason`; empty on Success.
+    reason: String,
+}
+
 /// Aggregate of one pipeline run across all enabled extractors.
 struct PipelineOutcome {
     items: Vec<ExtractedItem>,
     pattern: u8,
     classifier: u8,
     llm: u8,
+    /// Per-call audit facts for the extractor whose outcome each tier's
+    /// status byte reflects. `None` when the tier was absent.
+    pattern_audit: Option<TierAudit>,
+    classifier_audit: Option<TierAudit>,
+    llm_audit: Option<TierAudit>,
     failure_reason: Option<String>,
     /// Set when the LLM tier failed: whether the failure is transient
     /// (retry with backoff) or permanent (terminate). Drives the worker's
@@ -1856,6 +1950,9 @@ async fn run_pipeline_batch(
             pattern: tier_status::ABSENT,
             classifier: tier_status::ABSENT,
             llm: tier_status::ABSENT,
+            pattern_audit: None,
+            classifier_audit: None,
+            llm_audit: None,
             failure_reason: None,
             llm_failure_class: ExtractionFailureClass::Unclassified,
             llm_cost_micro_usd: 0,
@@ -1934,8 +2031,22 @@ async fn run_pipeline_batch(
         // Cycle-budget gate: skip the LLM tier across the whole batch
         // when prior cycles have eaten the budget. Pattern + classifier
         // already ran so cheap-tier output still lands under load.
+        // Attribute the skip to the first configured LLM extractor so the
+        // per-call audit records a SkippedBudget row rather than dropping
+        // the tier silently.
+        let llm_ident = llm_exts
+            .first()
+            .map(|e| (e.id().raw(), e.extractor_version()));
         for o in &mut outcomes {
             o.llm = tier_status::SKIPPED;
+            if let Some((extractor_id, extractor_version)) = llm_ident {
+                o.llm_audit = Some(TierAudit {
+                    extractor_id,
+                    extractor_version,
+                    status: extraction_status::SKIPPED_BUDGET,
+                    reason: "cycle LLM budget exhausted".to_string(),
+                });
+            }
         }
     } else {
         // Bounded inferential context per memory: top-10 similar
@@ -1996,10 +2107,19 @@ async fn run_tier_into(
     tier_kind: brain_core::ExtractorKind,
 ) {
     for extractor in tier_exts {
+        let ext_id = extractor.id().raw();
+        let ext_version = extractor.extractor_version();
         let results = extractor.run_batch(ctx, mems).await;
         debug_assert_eq!(results.len(), mems.len());
         for (i, result) in results.into_iter().enumerate() {
-            fold_tier_result(&mut outcomes[i], result, tier_kind, mems[i].id);
+            fold_tier_result(
+                &mut outcomes[i],
+                result,
+                tier_kind,
+                mems[i].id,
+                ext_id,
+                ext_version,
+            );
         }
     }
 }
@@ -2016,13 +2136,52 @@ fn fold_tier_result(
     result: ExtractionResult,
     tier_kind: brain_core::ExtractorKind,
     memory_id: MemoryId,
+    ext_id: u32,
+    ext_version: u32,
 ) {
     use brain_core::ExtractorKind;
     let outcome_byte = tier_outcome_for(&result);
+    // Two extractors can share one tier. Combine rather than overwrite so a
+    // later extractor's SKIP never erases an earlier extractor's real outcome
+    // (A=RAN + B=SkippedFilter must record RAN, not SKIPPED). Mirrors the LLM
+    // runner's ABSENT→SKIP guard; among two real outcomes the later wins, so
+    // RAN-vs-FAILED ordering (and the LLM retry decision it feeds) is
+    // unchanged.
+    let current = match tier_kind {
+        ExtractorKind::Pattern => slot.pattern,
+        ExtractorKind::Classifier => slot.classifier,
+        ExtractorKind::Llm => slot.llm,
+    };
+    // Whether the incoming outcome wins the combine — recomputed with the
+    // exact predicate `combine_tier_status` uses, so the captured per-call
+    // audit always describes the extractor whose byte we record.
+    let took_incoming = {
+        let cur_real = matches!(current, tier_status::RAN | tier_status::FAILED);
+        let inc_real = matches!(outcome_byte, tier_status::RAN | tier_status::FAILED);
+        !(cur_real && !inc_real)
+    };
+    let combined = combine_tier_status(current, outcome_byte);
     match tier_kind {
-        ExtractorKind::Pattern => slot.pattern = outcome_byte,
-        ExtractorKind::Classifier => slot.classifier = outcome_byte,
-        ExtractorKind::Llm => slot.llm = outcome_byte,
+        ExtractorKind::Pattern => slot.pattern = combined,
+        ExtractorKind::Classifier => slot.classifier = combined,
+        ExtractorKind::Llm => slot.llm = combined,
+    }
+    if took_incoming {
+        // Precise status byte for the historical audit row: `as_u8()`
+        // is byte-equal to `extraction_status::*` (Success=1 … Disabled=6),
+        // so a SkippedFilter / SkippedDuplicate keeps its exact reason
+        // rather than collapsing to the coarse tier byte.
+        let tier_audit = TierAudit {
+            extractor_id: ext_id,
+            extractor_version: ext_version,
+            status: result.status.as_u8(),
+            reason: result.status_reason.clone(),
+        };
+        match tier_kind {
+            ExtractorKind::Pattern => slot.pattern_audit = Some(tier_audit),
+            ExtractorKind::Classifier => slot.classifier_audit = Some(tier_audit),
+            ExtractorKind::Llm => slot.llm_audit = Some(tier_audit),
+        }
     }
     // Real provider cost flows from the LLM extractor's result into the
     // per-memory outcome, which the caller sums into the per-cycle spend
@@ -2114,6 +2273,8 @@ async fn run_llm_tier_into(
 
     for ext in llm_exts {
         let ext_ns = ext.namespace();
+        let ext_id = ext.id().raw();
+        let ext_version = ext.extractor_version();
         // Build this extractor's sub-batch: the memories it is effective
         // for (namespace rule) AND whose ENCODE trigger fires. Running a
         // per-extractor sub-batch preserves the concurrent-fan-out of
@@ -2141,6 +2302,12 @@ async fn run_llm_tier_into(
                     // a RAN with a SKIPPED).
                     if outcomes[i].llm == tier_status::ABSENT {
                         outcomes[i].llm = tier_status::SKIPPED;
+                        outcomes[i].llm_audit = Some(TierAudit {
+                            extractor_id: ext_id,
+                            extractor_version: ext_version,
+                            status: extraction_status::SKIPPED_FILTER,
+                            reason: "encode trigger where-clause did not match".to_string(),
+                        });
                     }
                     tracing::debug!(
                         target: "brain_debug::extractor",
@@ -2164,7 +2331,14 @@ async fn run_llm_tier_into(
         debug_assert_eq!(results.len(), sub_mems.len());
         for (k, result) in results.into_iter().enumerate() {
             let i = sub_idx[k];
-            fold_tier_result(&mut outcomes[i], result, ExtractorKind::Llm, mems[i].id);
+            fold_tier_result(
+                &mut outcomes[i],
+                result,
+                ExtractorKind::Llm,
+                mems[i].id,
+                ext_id,
+                ext_version,
+            );
         }
     }
 }
@@ -2332,6 +2506,21 @@ fn tier_outcome_for(result: &ExtractionResult) -> u8 {
     }
 }
 
+/// Fold a later extractor's tier outcome into the tier's running status byte
+/// when two extractors share one tier. A real outcome (`RAN` / `FAILED`) must
+/// never be clobbered by a `SKIP` (or the initial `ABSENT`); among two real
+/// outcomes the later one wins, preserving the pre-existing RAN-vs-FAILED
+/// behavior the LLM retry path depends on.
+fn combine_tier_status(current: u8, incoming: u8) -> u8 {
+    let current_is_real = matches!(current, tier_status::RAN | tier_status::FAILED);
+    let incoming_is_real = matches!(incoming, tier_status::RAN | tier_status::FAILED);
+    if current_is_real && !incoming_is_real {
+        current
+    } else {
+        incoming
+    }
+}
+
 /// Summary of a successful `apply_outcome` commit. The cycle uses it
 /// to populate the `StageCompleted` SUBSCRIBE event so clients
 /// know exactly how many entities / statements / relations landed.
@@ -2375,6 +2564,95 @@ const RETRACT_MIN_CONFIDENCE: f32 = 0.7;
 /// memory's anchor carries a wall-clock time-of-day, so the anchor-vs-event
 /// comparison is done at whole-day granularity (`nanos / NANOS_PER_DAY`).
 const NANOS_PER_DAY: u64 = 86_400_000_000_000;
+
+/// BLAKE3 of the memory's source text, read from `TEXTS_TABLE` inside the
+/// open extraction `wtxn`. Feeds `ExtractionAudit::input_hash` so an
+/// operator can tell whether a re-extraction ran over edited text. Returns
+/// the all-zero hash when the text row is missing (shouldn't happen for a
+/// queued memory) rather than failing the audit.
+fn memory_text_hash(wtxn: &redb::WriteTransaction, memory_id: MemoryId) -> [u8; 32] {
+    use brain_metadata::tables::text::TEXTS_TABLE;
+    wtxn.open_table(TEXTS_TABLE)
+        .ok()
+        .and_then(|t| {
+            t.get(&memory_id.to_be_bytes())
+                .ok()
+                .flatten()
+                .map(|g| *blake3::hash(g.value()).as_bytes())
+        })
+        .unwrap_or([0u8; 32])
+}
+
+/// Emit one historical [`ExtractionAudit`] row per extractor tier that ran
+/// (or was skipped) for `memory_id`, into `EXTRACTOR_AUDIT_TABLE` + its
+/// three secondary indexes, inside the caller's extraction `wtxn` so the
+/// audit rows and the extracted graph commit atomically. A tier that was
+/// absent (no extractor present) yields no row — we never audit a call that
+/// didn't happen.
+///
+/// Best-effort observability: a write error is logged and skipped, never
+/// propagated, so a redb hiccup in the audit log can't fail the durable
+/// extraction it describes (matching how the post-commit fan-outs treat
+/// their own failures).
+fn emit_per_call_extraction_audit(
+    wtxn: &redb::WriteTransaction,
+    memory_id: MemoryId,
+    outcome: &PipelineOutcome,
+    now: u64,
+    input_hash: [u8; 32],
+) {
+    // Only the LLM tier carries provider cost; pattern + classifier are free.
+    let tiers = [
+        (&outcome.pattern_audit, 0u64),
+        (&outcome.classifier_audit, 0u64),
+        (&outcome.llm_audit, outcome.llm_cost_micro_usd),
+    ];
+    for (tier_audit, cost_micro_usd) in tiers {
+        let Some(t) = tier_audit else { continue };
+        // `schema_version` is 1: the pipeline runs every tier at
+        // `ExtractionContext { schema_version: 1, .. }`. `outputs` is left
+        // empty — per-tier attribution of committed entity/statement/relation
+        // ids is not tracked at this site (the surface-dedup collapses across
+        // tiers); the aggregate counts live on the per-memory
+        // `extractor_pipeline_audit` state row.
+        let mut row = if t.status == extraction_status::SUCCESS {
+            ExtractionAudit::success(
+                AuditId::new(),
+                memory_id,
+                t.extractor_id,
+                t.extractor_version,
+                1,
+                now,
+                now,
+                Vec::new(),
+                input_hash,
+            )
+        } else {
+            ExtractionAudit::non_success(
+                AuditId::new(),
+                memory_id,
+                t.extractor_id,
+                t.extractor_version,
+                1,
+                now,
+                now,
+                t.status,
+                t.reason.clone(),
+                input_hash,
+            )
+        };
+        row.cost_micro_usd = cost_micro_usd;
+        if let Err(e) = audit_write(wtxn, &row) {
+            warn!(
+                target: "brain_workers::extractor",
+                memory_id = ?memory_id,
+                extractor_id = t.extractor_id,
+                error = %e,
+                "per-call extraction audit write failed (best-effort; extraction unaffected)",
+            );
+        }
+    }
+}
 
 async fn apply_outcome(
     worker: &ExtractorWorker,
@@ -2743,7 +3021,7 @@ fn run_apply_body(
     }
     for key in &surface_order {
         let em = best_by_surface[key];
-        let (entity_id, tier) = resolve_entity_mention(
+        let (entity_id, tier, confidence) = resolve_entity_mention(
             &wtxn,
             source_scope,
             em,
@@ -2752,6 +3030,26 @@ fn run_apply_body(
             &mut staged,
             disambiguation,
         )?;
+        // Log this mention→entity resolution as a derivation. Emitted here,
+        // after per-surface dedup, so a surface that several tiers proposed is
+        // resolved — and audited — exactly once. The entity_type_id is read
+        // back from the resolved row inside the txn so the audit records the
+        // referent's actual type (cross-type resolution can differ from the
+        // mention's hinted type). Best-effort, append-only; see
+        // `emit_resolution_audit`.
+        let resolved_type_id = entity_get_inside_wtxn(&wtxn, entity_id)
+            .ok()
+            .flatten()
+            .map_or(0, |e| e.entity_type.raw());
+        emit_resolution_audit(
+            &wtxn,
+            &em.text,
+            resolved_type_id,
+            entity_id,
+            tier,
+            confidence,
+            now,
+        );
         // Stage journal (S8 entity resolution). The resolver's own logs
         // never carry `memory_id`, so a resolve verdict couldn't be tied
         // back to the encode that triggered it. Log it here, where
@@ -3134,7 +3432,7 @@ fn run_apply_body(
                         "apply: statement kind/time",
                     );
 
-                    // Axis-faithful entity-object routing (spec §02 data model).
+                    // Axis-faithful entity-object routing per the data model.
                     // `StatementObject::Entity` is a first-class statement object:
                     // `manages`, `is_a`, `met_with`, `traveled_to` are entity-object
                     // *statements*, read from the subject. Only a `kind=Relation`
@@ -3393,15 +3691,21 @@ fn run_apply_body(
     // accumulator drives the cross-memory budget gate separately.
     let (status_byte, reason) = decide_status(outcome, counts);
     let attempts = prior_attempts.saturating_add(1);
-    // A retryable failure is specifically the LLM tier failing (statements are
-    // LLM-only and a failed call wrote zero, so re-running can't duplicate
-    // them) with a transient cause. A TRANSIENT failure (timeout / rate-limit /
-    // 5xx) keeps the memory queued and is retried with backoff until it
-    // succeeds — a passing provider outage must never permanently strip a
-    // memory's grounding. A PERMANENT failure (bad key, no balance, malformed)
-    // is terminal at once: retrying can't help and only hides the problem.
-    // Pattern/classifier-only failures are never retried (their rows already
-    // committed; a re-run would duplicate).
+    // A retryable failure is specifically the LLM tier failing with a
+    // transient cause. A TRANSIENT failure (timeout / rate-limit / 5xx) keeps
+    // the memory queued and is retried with backoff until it succeeds — a
+    // passing provider outage must never permanently strip a memory's
+    // grounding. A PERMANENT failure (bad key, no balance, malformed) is
+    // terminal at once: retrying can't help and only hides the problem.
+    //
+    // A retry re-runs the whole pipeline, so the already-committed
+    // pattern/classifier-tier rows are re-applied. That is safe because
+    // relation/statement creation is content-idempotent at the apply layer:
+    // `relation_create` / `statement_create` no-op on a byte-identical active
+    // tuple rather than minting a duplicate (a user-declared pattern Relation
+    // with `Many` cardinality has no cardinality conflict to catch the repeat,
+    // so the content-dedup is what prevents the leak). Distinct multi-values
+    // still coexist; only exact re-applications collapse.
     let llm_failed = outcome.llm == brain_metadata::tier_status::FAILED;
     let failure_class_byte = match outcome.llm_failure_class {
         ExtractionFailureClass::Transient => brain_metadata::failure_class::TRANSIENT,
@@ -3437,6 +3741,15 @@ fn run_apply_body(
     .with_failure_class(failure_class_byte);
     record_extracted(&wtxn, &audit)
         .map_err(|e| ApplyError::Audit(format!("record_extracted: {e}")))?;
+
+    // Per-call historical audit: one `ExtractionAudit` row per tier that
+    // ran (or was skipped), written into THIS txn so the audit rows and the
+    // extracted graph commit atomically (no extra fsync). Append-only —
+    // each row mints a fresh UUIDv7 id, so a re-extraction adds rows rather
+    // than overwriting. Best-effort inside the helper: a write error is
+    // logged, never propagated, so the audit log can't fail the extraction.
+    let input_hash = memory_text_hash(&wtxn, memory_id);
+    emit_per_call_extraction_audit(&wtxn, memory_id, outcome, now, input_hash);
 
     // Hand the uncommitted txn back to the orchestrator, which commits
     // (or, for a plan pass that discovered ambiguity, rolls back) and then
@@ -3519,6 +3832,7 @@ async fn publish_extracted_graph(
         stage_outcome: Some(outcome),
         stage_payload: Some(payload),
         space_id,
+        vector: None,
     };
     ctx.ops.publish_stage_event(envelope).await;
 }
@@ -3564,6 +3878,7 @@ async fn publish_hype_completed(
         stage_outcome: Some(stage_outcome),
         stage_payload: Some(payload),
         space_id,
+        vector: None,
     };
     ctx.ops.publish_stage_event(envelope).await;
 }
@@ -3607,7 +3922,7 @@ fn resolve_entity_mention(
     embed_deps: Option<&EmbeddingDeps>,
     staged: &mut StagedEntityVectors,
     disambiguation: &mut Disambiguation<'_>,
-) -> Result<(EntityId, ResolutionTier), ApplyError> {
+) -> Result<(EntityId, ResolutionTier, f32), ApplyError> {
     let res = resolve_or_create_with_deps(
         wtxn,
         scope,
@@ -3620,7 +3935,7 @@ fn resolve_entity_mention(
         disambiguation,
     )
     .map_err(ApplyError::from)?;
-    Ok((res.entity_id, res.tier))
+    Ok((res.entity_id, res.tier, res.confidence))
 }
 
 fn resolution_tier_to_metric(tier: ResolutionTier) -> ResolverOutcome {
@@ -3632,6 +3947,92 @@ fn resolution_tier_to_metric(tier: ResolutionTier) -> ResolverOutcome {
         ResolutionTier::Disambiguated => ResolverOutcome::Disambiguated,
         ResolutionTier::Created => ResolverOutcome::Create,
     }
+}
+
+/// Map a resolver tier to the durable `resolution_outcome` byte written on a
+/// per-mention resolution audit row. `Alias` maps to `TIER_1_EXACT`: an alias
+/// hit (including the trigram-fuzzy and coref tiers, which alias the surface
+/// onto the matched entity) is an exact match against the alias index, so it
+/// belongs with the tier-1 exact-identity bucket. The resolver always resolves
+/// or mints an entity at this site, so the `AMBIGUOUS` / `NOT_RESOLVED`
+/// outcomes never arise here — they exist for callers that can abstain.
+fn resolution_tier_to_outcome(tier: ResolutionTier) -> u8 {
+    match tier {
+        ResolutionTier::Exact | ResolutionTier::Alias => resolution_outcome::TIER_1_EXACT,
+        ResolutionTier::Fuzzy => resolution_outcome::TIER_2_FUZZY,
+        ResolutionTier::Embedding => resolution_outcome::TIER_3_EMBEDDING,
+        ResolutionTier::Disambiguated => resolution_outcome::TIER_4_LLM,
+        ResolutionTier::Created => resolution_outcome::CREATED,
+    }
+}
+
+/// Append one per-mention resolution audit row inside the extraction write txn
+/// (no extra fsync — it rides the existing commit). A mention→entity
+/// resolution is a derivation, so the acceptance suite's "all derivations
+/// logged" line requires it to be queryable via `GET /v1/audit?by=resolution`.
+///
+/// Best-effort: a write failure is logged and swallowed, never failing the
+/// extraction — matching the extraction-audit emission and the sibling
+/// post-commit fan-outs. The row is append-only (a fresh `AuditId` per call),
+/// so re-extracting the same memory adds rows rather than overwriting, which
+/// preserves the resolution history.
+fn emit_resolution_audit(
+    wtxn: &redb::WriteTransaction,
+    candidate_name: &str,
+    entity_type_id: u32,
+    resolved: EntityId,
+    tier: ResolutionTier,
+    confidence: f32,
+    now: u64,
+) {
+    let mut audit = ResolutionAudit::new(
+        AuditId::new(),
+        candidate_name.to_string(),
+        entity_type_id,
+        resolution_tier_to_outcome(tier),
+        confidence,
+        now,
+    );
+    audit.resolved_entity_bytes = Some(resolved.to_bytes());
+    if let Err(e) = resolution_audit_write(wtxn, &audit) {
+        warn!(
+            target: "brain_workers::extractor",
+            surface = %candidate_name,
+            error = %e,
+            "resolution audit write failed; skipping (extraction unaffected)",
+        );
+    }
+}
+
+/// Append one resolution audit row for a cross-type exact-reuse resolution:
+/// a coined subject / relation endpoint that bound to an existing entity of a
+/// different type because exactly one entity carries this exact canonical name
+/// (see [`reuse_cross_type_exact`]). That reuse IS a mention→entity derivation
+/// even though it never passed through the tiered resolver, so "all derivations
+/// logged" requires a row. It is a deterministic exact-name match, so the
+/// outcome is `TIER_1_EXACT` at confidence 1.0. The `entity_type_id` is read
+/// back from the reused entity (its real type, not the coined generic), exactly
+/// as the sibling `emit_resolution_audit` call sites do. Best-effort: a failure
+/// is swallowed, never failing the extraction.
+fn emit_cross_type_reuse_audit(
+    wtxn: &redb::WriteTransaction,
+    candidate_name: &str,
+    reused: EntityId,
+    now: u64,
+) {
+    let resolved_type_id = entity_get_inside_wtxn(wtxn, reused)
+        .ok()
+        .flatten()
+        .map_or(0, |e| e.entity_type.raw());
+    emit_resolution_audit(
+        wtxn,
+        candidate_name,
+        resolved_type_id,
+        reused,
+        ResolutionTier::Exact,
+        1.0,
+        now,
+    );
 }
 
 /// Link `memory_id --Mentions--> entity_id`, annotated with the surface form
@@ -3824,12 +4225,34 @@ const CANDIDATE_PREDICATE_K: usize = 20;
 /// `is_declared` is intentionally ignored: BOTH declared and open-vocab
 /// existing predicates are valid reuse targets — the goal is convergence on
 /// whatever name already exists, not schema enforcement.
+/// Epsilon grid for candidate-cosine ranking. Cosines within one step are
+/// treated as tied so float noise doesn't reshuffle the block across cycles.
+const CANDIDATE_TIE_EPS: f32 = 1e-6;
+
+/// Total-order comparator for candidate ranking: higher cosine first (quantized
+/// to [`CANDIDATE_TIE_EPS`] so sub-epsilon noise collapses to one bucket), ties
+/// broken by the older (lower) predicate id.
+///
+/// This MUST be a total order. The previous form was an epsilon *band*
+/// (`|a-b| <= eps ? by-id : by-score`), which is non-transitive — `a ~ b` and
+/// `b ~ c` yet `a !~ c` — so `slice::sort_by` panics with "comparison function
+/// does not correctly implement a total order" and takes the shard down.
+/// Quantizing both scores to the same integer grid restores transitivity.
+/// NaN cannot reach here: callers filter to `sim > 0.0` first.
+fn candidate_cmp(
+    a: (f32, brain_core::PredicateId),
+    b: (f32, brain_core::PredicateId),
+) -> std::cmp::Ordering {
+    let qa = (a.0 / CANDIDATE_TIE_EPS).round() as i64;
+    let qb = (b.0 / CANDIDATE_TIE_EPS).round() as i64;
+    qb.cmp(&qa).then_with(|| a.1.cmp(&b.1))
+}
+
 fn select_candidate_predicates(
     query: &[f32],
     candidates: &[brain_metadata::schema::predicate::PredicateConsolidationCandidate],
     k: usize,
 ) -> Vec<String> {
-    const TIE_EPS: f32 = 1e-6;
     let mut scored: Vec<(f32, brain_core::PredicateId, &str)> = candidates
         .iter()
         .filter(|(_, name, _, _)| !name.starts_with("behavior_"))
@@ -3842,15 +4265,7 @@ fn select_candidate_predicates(
             }
         })
         .collect();
-    scored.sort_by(|a, b| {
-        // Higher cosine first; within an epsilon the older (lower) id wins so
-        // the block is deterministic across cycles.
-        if (a.0 - b.0).abs() <= TIE_EPS {
-            a.1.cmp(&b.1)
-        } else {
-            b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
-        }
-    });
+    scored.sort_by(|a, b| candidate_cmp((a.0, a.1), (b.0, b.1)));
     scored
         .into_iter()
         .take(k)
@@ -4732,6 +5147,13 @@ fn resolve_statement_subject(
         // Concept doesn't permanently split from a correctly-typed entity
         // ("aspirin" the Drug). 0 or >1 matches fall through to the normal
         // type-scoped mint.
+        //
+        // This reuse is a genuine mention→entity derivation (the surface bound
+        // to an existing entity across a type boundary), so log it: an exact
+        // canonical-name match, hence TIER_1_EXACT at full (1.0) confidence.
+        // It runs only on an entity_map miss and then caches `id`, so a repeat
+        // surface this memory hits the cache branch above and never double-logs.
+        emit_cross_type_reuse_audit(wtxn, text, id, now);
         entity_map.insert(text.to_string(), id);
         id
     } else {
@@ -4747,6 +5169,25 @@ fn resolve_statement_subject(
             disambiguation,
         )
         .map_err(ApplyError::from)?;
+        // Coined-subject resolution is a mention→entity derivation not covered
+        // by the pass-1 entity-mention loop (this surface was never filed as an
+        // EntityMention), so log it here. The other unlogged branches above are
+        // an entity_map cache hit (already audited when first resolved) and a
+        // self-entity routing (deterministic, not a tier decision); the
+        // cross-type exact-reuse branch logs its own TIER_1_EXACT row inline.
+        let resolved_type_id = entity_get_inside_wtxn(wtxn, res.entity_id)
+            .ok()
+            .flatten()
+            .map_or(0, |e| e.entity_type.raw());
+        emit_resolution_audit(
+            wtxn,
+            text,
+            resolved_type_id,
+            res.entity_id,
+            res.tier,
+            res.confidence,
+            now,
+        );
         entity_map.insert(text.to_string(), res.entity_id);
         res.entity_id
     };
@@ -4848,6 +5289,12 @@ fn resolve_relation_endpoint(
     } else if !statement_subject_mintable(text) {
         return Ok(None);
     } else if let Some(id) = reuse_cross_type_exact(wtxn, scope, text)? {
+        // Cross-type exact reuse of an existing entity for this endpoint is a
+        // deterministic exact canonical-name match across a type boundary — a
+        // real mention→entity derivation, logged as TIER_1_EXACT at full (1.0)
+        // confidence (same rationale as `resolve_statement_subject`). Cached
+        // straight after, so a repeat surface hits the cache branch, not here.
+        emit_cross_type_reuse_audit(wtxn, text, id, now);
         entity_map.insert(text.to_string(), id);
         id
     } else {
@@ -4863,6 +5310,22 @@ fn resolve_relation_endpoint(
             disambiguation,
         )
         .map_err(ApplyError::from)?;
+        // A relation / statement-object endpoint resolved through the gauntlet
+        // is a mention→entity derivation; log it (same rationale and branch
+        // exclusions as `resolve_statement_subject`).
+        let resolved_type_id = entity_get_inside_wtxn(wtxn, res.entity_id)
+            .ok()
+            .flatten()
+            .map_or(0, |e| e.entity_type.raw());
+        emit_resolution_audit(
+            wtxn,
+            text,
+            resolved_type_id,
+            res.entity_id,
+            res.tier,
+            res.confidence,
+            now,
+        );
         entity_map.insert(text.to_string(), res.entity_id);
         res.entity_id
     };
@@ -4924,6 +5387,43 @@ enum ApplyError {
 
 #[cfg(test)]
 mod tests {
+    /// `candidate_cmp` must be a TOTAL order: `slice::sort_by` panics on any
+    /// comparator that isn't ("comparison function does not correctly implement
+    /// a total order"), which previously crashed the whole shard. The prior
+    /// epsilon-*band* form is non-transitive, so an epsilon-chain of scores
+    /// (each neighbour within TIE_EPS, endpoints far apart) trips the panic.
+    /// This builds such a chain, shuffles it, and sorts — it must not panic and
+    /// must come out consistently ordered.
+    #[test]
+    fn candidate_cmp_is_a_total_order_on_an_epsilon_chain() {
+        // 200 scores stepping by 0.6 * TIE_EPS: each adjacent pair is within
+        // one epsilon (a "tie"), but far-apart pairs are many epsilons apart.
+        let step = super::CANDIDATE_TIE_EPS * 0.6;
+        let mut v: Vec<(f32, PredicateId)> = (0..200u32)
+            .map(|i| (0.5 + i as f32 * step, PredicateId::from(200 - i)))
+            .collect();
+        // Interleave so the input isn't already sorted (forces real comparisons).
+        v.rotate_left(97);
+        for i in (0..v.len()).step_by(3) {
+            if i + 1 < v.len() {
+                v.swap(i, i + 1);
+            }
+        }
+        // Under the old band comparator this panics; with the quantized total
+        // order it sorts cleanly.
+        v.sort_by(|a, b| super::candidate_cmp(*a, *b));
+
+        // Sanity: non-increasing on the quantized score, ties by ascending id.
+        for w in v.windows(2) {
+            let qa = (w[0].0 / super::CANDIDATE_TIE_EPS).round() as i64;
+            let qb = (w[1].0 / super::CANDIDATE_TIE_EPS).round() as i64;
+            assert!(qa >= qb, "quantized score must be non-increasing");
+            if qa == qb {
+                assert!(w[0].1 <= w[1].1, "within a bucket, id must ascend");
+            }
+        }
+    }
+
     fn __ts() -> brain_metadata::RowScope {
         brain_metadata::RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xA1; 16])
     }
@@ -5189,10 +5689,105 @@ mod tests {
             pattern,
             classifier,
             llm,
+            pattern_audit: None,
+            classifier_audit: None,
+            llm_audit: None,
             failure_reason: None,
             llm_failure_class: ExtractionFailureClass::Unclassified,
             llm_cost_micro_usd: 0,
         }
+    }
+
+    /// Two extractors in one tier: the first succeeds (and yields an item),
+    /// the second skips on its where-clause. The tier byte must record the
+    /// real outcome (RAN), not be clobbered to SKIPPED by the later extractor,
+    /// and the successful extractor's items must be merged (not lost).
+    #[test]
+    fn fold_two_extractors_one_tier_success_then_skip_keeps_success() {
+        use brain_core::ExtractorKind;
+        let mem_id = MemoryId::pack(0, 1, 0);
+        let mut slot = outcome(
+            tier_status::ABSENT,
+            tier_status::ABSENT,
+            tier_status::ABSENT,
+        );
+
+        let item = ExtractedItem::EntityMention(EntityMention {
+            entity_type_qname: "brain:Person".into(),
+            text: "Alice".into(),
+            start: 0,
+            end: 5,
+            confidence: 0.9,
+            extractor_id: 1,
+            extractor_version: 1,
+        });
+        // Extractor A: success with one item.
+        fold_tier_result(
+            &mut slot,
+            ExtractionResult::success(vec![item], 0, 0),
+            ExtractorKind::Pattern,
+            mem_id,
+            1,
+            1,
+        );
+        assert_eq!(slot.pattern, tier_status::RAN);
+
+        // Extractor B in the SAME tier: filtered out by its where-clause.
+        fold_tier_result(
+            &mut slot,
+            ExtractionResult::skipped(ExtractionStatus::SkippedFilter, "where-clause", 0),
+            ExtractorKind::Pattern,
+            mem_id,
+            1,
+            1,
+        );
+
+        assert_eq!(
+            slot.pattern,
+            tier_status::RAN,
+            "a later SKIP must not clobber an earlier real outcome"
+        );
+        assert_eq!(
+            slot.items.len(),
+            1,
+            "the successful extractor's item is preserved"
+        );
+    }
+
+    /// The reverse order (skip first, success second) must also land on RAN.
+    #[test]
+    fn fold_two_extractors_one_tier_skip_then_success_keeps_success() {
+        use brain_core::ExtractorKind;
+        let mem_id = MemoryId::pack(0, 1, 0);
+        let mut slot = outcome(
+            tier_status::ABSENT,
+            tier_status::ABSENT,
+            tier_status::ABSENT,
+        );
+
+        fold_tier_result(
+            &mut slot,
+            ExtractionResult::skipped(ExtractionStatus::SkippedFilter, "where-clause", 0),
+            ExtractorKind::Classifier,
+            mem_id,
+            1,
+            1,
+        );
+        assert_eq!(slot.classifier, tier_status::SKIPPED);
+
+        fold_tier_result(
+            &mut slot,
+            ExtractionResult::success(Vec::new(), 0, 0),
+            ExtractorKind::Classifier,
+            mem_id,
+            1,
+            1,
+        );
+        assert_eq!(
+            slot.classifier,
+            tier_status::RAN,
+            "a real outcome upgrades a prior SKIP"
+        );
     }
 
     /// Reproduces the user-visible regression: pattern produces 1
@@ -5686,6 +6281,9 @@ mod tests {
                 pattern: tier_status::ABSENT,
                 classifier: tier_status::ABSENT,
                 llm: tier_status::ABSENT,
+                pattern_audit: None,
+                classifier_audit: None,
+                llm_audit: None,
                 failure_reason: None,
                 llm_failure_class: ExtractionFailureClass::Unclassified,
                 llm_cost_micro_usd: 0,
@@ -5901,6 +6499,9 @@ mod tests {
             pattern: tier_status::ABSENT,
             classifier: tier_status::ABSENT,
             llm: tier_status::RAN,
+            pattern_audit: None,
+            classifier_audit: None,
+            llm_audit: None,
             failure_reason: None,
             llm_failure_class: ExtractionFailureClass::Unclassified,
             llm_cost_micro_usd: 0,
@@ -6170,6 +6771,9 @@ mod tests {
             pattern: tier_status::ABSENT,
             classifier: tier_status::ABSENT,
             llm: tier_status::RAN,
+            pattern_audit: None,
+            classifier_audit: None,
+            llm_audit: None,
             failure_reason: None,
             llm_failure_class: ExtractionFailureClass::Unclassified,
             llm_cost_micro_usd: 0,
@@ -6402,6 +7006,9 @@ mod tests {
             pattern: tier_status::ABSENT,
             classifier: tier_status::ABSENT,
             llm: tier_status::RAN,
+            pattern_audit: None,
+            classifier_audit: None,
+            llm_audit: None,
             failure_reason: None,
             llm_failure_class: ExtractionFailureClass::Unclassified,
             llm_cost_micro_usd: 0,
@@ -6671,6 +7278,9 @@ mod tests {
             pattern: tier_status::RAN,
             classifier: tier_status::RAN,
             llm: tier_status::RAN,
+            pattern_audit: None,
+            classifier_audit: None,
+            llm_audit: None,
             failure_reason: None,
             llm_failure_class: ExtractionFailureClass::Unclassified,
             llm_cost_micro_usd: 0,
@@ -6866,6 +7476,9 @@ mod tests {
             pattern: tier_status::RAN,
             classifier: tier_status::RAN,
             llm: tier_status::RAN,
+            pattern_audit: None,
+            classifier_audit: None,
+            llm_audit: None,
             failure_reason: None,
             llm_failure_class: ExtractionFailureClass::Unclassified,
             llm_cost_micro_usd: 0,
@@ -7015,6 +7628,9 @@ mod tests {
             pattern: tier_status::ABSENT,
             classifier: tier_status::ABSENT,
             llm: tier_status::RAN,
+            pattern_audit: None,
+            classifier_audit: None,
+            llm_audit: None,
             failure_reason: None,
             llm_failure_class: ExtractionFailureClass::Unclassified,
             llm_cost_micro_usd: 0,
@@ -7469,6 +8085,9 @@ mod tests {
             pattern: tier_status::RAN,
             classifier: tier_status::ABSENT,
             llm: tier_status::RAN,
+            pattern_audit: None,
+            classifier_audit: None,
+            llm_audit: None,
             failure_reason: None,
             llm_failure_class: ExtractionFailureClass::Unclassified,
             llm_cost_micro_usd: 0,
@@ -7521,6 +8140,110 @@ mod tests {
             "expected exactly one statement for brain:{name}"
         );
         v.into_iter().next().unwrap()
+    }
+
+    /// Per-call extraction audit: applying an outcome writes one
+    /// `ExtractionAudit` row per tier that ran (absent tiers write none),
+    /// each reachable through the by-memory / by-extractor / by-time
+    /// indexes, and a re-apply ADDS rows rather than overwriting (history
+    /// preserved — the whole point of the append-only UUIDv7 log).
+    #[test]
+    fn apply_emits_per_call_extraction_audit_rows() {
+        use brain_metadata::{audit_by_extractor, audit_by_memory, audit_recent};
+
+        let (worker, ctx, metadata) = __join_env();
+        let memory_id = brain_core::MemoryId::pack(0, 7, 1);
+        __seed_memory_row(&metadata, memory_id, __ts());
+
+        // A pattern tier and an LLM tier both ran, attributed to distinct
+        // extractor ids; the classifier tier is absent (no extractor).
+        let mut outcome = __outcome(vec![
+            __alice(),
+            __entity_stmt("brain:likes", "coffee", false, StatementKind::Fact, None),
+        ]);
+        outcome.pattern_audit = Some(TierAudit {
+            extractor_id: 11,
+            extractor_version: 1,
+            status: extraction_status::SUCCESS,
+            reason: String::new(),
+        });
+        outcome.classifier_audit = None;
+        outcome.llm_audit = Some(TierAudit {
+            extractor_id: 22,
+            extractor_version: 3,
+            status: extraction_status::SUCCESS,
+            reason: String::new(),
+        });
+        outcome.llm_cost_micro_usd = 500;
+
+        futures_lite::future::block_on(apply_outcome(&worker, &ctx, memory_id, &outcome))
+            .expect("apply_outcome");
+
+        {
+            let rtxn = metadata.read_txn().unwrap();
+            // Two tiers ran → two rows, reachable by-memory.
+            let by_mem = audit_by_memory(&rtxn, memory_id, 100).unwrap();
+            assert_eq!(by_mem.len(), 2, "one audit row per tier that ran");
+            // by-extractor isolates each tier's extractor.
+            assert_eq!(audit_by_extractor(&rtxn, 11, 100).unwrap().len(), 1);
+            let llm_rows = audit_by_extractor(&rtxn, 22, 100).unwrap();
+            assert_eq!(llm_rows.len(), 1);
+            assert_eq!(llm_rows[0].cost_micro_usd, 500, "LLM cost attributed");
+            // The absent classifier tier wrote nothing.
+            assert!(audit_by_extractor(&rtxn, 33, 100).unwrap().is_empty());
+            // by-time returns both.
+            assert_eq!(audit_recent(&rtxn, 0, 100).unwrap().len(), 2);
+        }
+
+        // A SECOND apply ADDS new rows (append-only history), never overwrites.
+        futures_lite::future::block_on(apply_outcome(&worker, &ctx, memory_id, &outcome))
+            .expect("apply_outcome re-run");
+        {
+            let rtxn = metadata.read_txn().unwrap();
+            assert_eq!(
+                audit_by_memory(&rtxn, memory_id, 100).unwrap().len(),
+                4,
+                "re-extraction ADDS rows; never overwrites",
+            );
+        }
+    }
+
+    /// A failed tier records a Failure row carrying its reason; a
+    /// budget-skipped LLM tier records a SkippedBudget row.
+    #[test]
+    fn apply_emits_failure_and_skip_audit_rows() {
+        use brain_metadata::audit_by_extractor;
+
+        let (worker, ctx, metadata) = __join_env();
+        let memory_id = brain_core::MemoryId::pack(0, 8, 1);
+        __seed_memory_row(&metadata, memory_id, __ts());
+
+        let mut outcome = __outcome(vec![__alice()]);
+        outcome.pattern_audit = Some(TierAudit {
+            extractor_id: 44,
+            extractor_version: 1,
+            status: extraction_status::FAILURE,
+            reason: "boom".to_string(),
+        });
+        outcome.classifier_audit = None;
+        outcome.llm_audit = Some(TierAudit {
+            extractor_id: 55,
+            extractor_version: 1,
+            status: extraction_status::SKIPPED_BUDGET,
+            reason: "cycle LLM budget exhausted".to_string(),
+        });
+
+        futures_lite::future::block_on(apply_outcome(&worker, &ctx, memory_id, &outcome))
+            .expect("apply_outcome");
+
+        let rtxn = metadata.read_txn().unwrap();
+        let failed = audit_by_extractor(&rtxn, 44, 10).unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].status, extraction_status::FAILURE);
+        assert_eq!(failed[0].status_reason, "boom");
+        let skipped = audit_by_extractor(&rtxn, 55, 10).unwrap();
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].status, extraction_status::SKIPPED_BUDGET);
     }
 
     const D1: u64 = 1_684_540_800_000_000_000; // 2023-05-20
@@ -7892,6 +8615,161 @@ mod tests {
             "action stays an Event; ambiguous dates just aren't stamped",
         );
     }
+
+    // ----- Extraction CoreMemory space threading + queue over-drain. -----
+
+    /// Minimal worker fixture: a temp metadata db (seeds the brain: system
+    /// schema) wired into an ops context, plus the metadata handle and the
+    /// tempdir the metadata db lives in (kept alive by the caller).
+    #[allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send by design
+    fn __worker_fixture() -> (
+        crate::context::WorkerContext,
+        brain_planner::SharedMetadataDb,
+        tempfile::TempDir,
+    ) {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
+        use brain_index::{IndexParams, SharedHnsw};
+        use brain_metadata::MetadataDb;
+        use brain_ops::RealWriterHandle;
+        use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
+
+        use crate::context::WorkerContext;
+
+        struct ZeroDispatcher;
+        impl Dispatcher for ZeroDispatcher {
+            fn embed(&self, _t: &str) -> Result<[f32; VECTOR_DIM], EmbedError> {
+                Ok([0.0; VECTOR_DIM])
+            }
+            fn embed_batch(&self, t: &[&str]) -> Result<Vec<[f32; VECTOR_DIM]>, EmbedError> {
+                Ok(vec![[0.0; VECTOR_DIM]; t.len()])
+            }
+            fn fingerprint(&self) -> [u8; 16] {
+                [0xCD; 16]
+            }
+        }
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let metadata: SharedMetadataDb =
+            Arc::new(MetadataDb::open(tempdir.path().join("md.redb")).unwrap());
+        let (shared, hnsw_writer) = SharedHnsw::new(IndexParams::default_v1()).unwrap();
+        let writer = Arc::new(RealWriterHandle::new(metadata.clone(), hnsw_writer));
+        let executor = ExecutorContext::new(
+            Arc::new(ZeroDispatcher) as Arc<dyn Dispatcher>,
+            shared,
+            metadata.clone(),
+            writer as Arc<dyn WriterHandle>,
+        );
+        let ops = Arc::new(brain_ops::test_support::ops_context_for_tests_owning_tempdir(executor));
+        let ctx = WorkerContext {
+            ops,
+            shutdown: Arc::new(AtomicBool::new(false)),
+        };
+        (ctx, metadata, tempdir)
+    }
+
+    #[test]
+    fn extraction_core_memory_carries_real_space_for_stable_cache_key() {
+        use brain_core::{MemoryId, NamespaceId, SessionId, SpaceId};
+        use std::sync::Arc;
+
+        let (ctx, metadata, _tempdir) = __worker_fixture();
+
+        // Seed a memory row owning a known, non-NIL space.
+        let ns = NamespaceId::from(9);
+        let space = SpaceId::derive_from_string("tenant9", "space-x");
+        assert_ne!(space, SpaceId::NIL);
+        let mid = MemoryId::pack(0, 42, 1);
+        __seed_memory_row(&metadata, mid, brain_metadata::RowScope::new(ns, space));
+
+        let live: Vec<(usize, MemoryId, Arc<str>)> = vec![(0, mid, Arc::from("hello world"))];
+        let facts = load_row_facts(&ctx, &live);
+        let mems = build_extraction_core_memories(&live, &facts);
+        assert_eq!(mems.len(), 1);
+        assert_eq!(
+            mems[0].space, space,
+            "CoreMemory must carry the memory's REAL space (the LLM cache key folds it), \
+             not a freshly-minted per-call SpaceId"
+        );
+        assert_eq!(mems[0].session_id, SessionId(0));
+
+        // The old bug minted a fresh SpaceId every call, so two builds of the
+        // same id diverged and the response cache never hit across cycles.
+        // With the fix the space is stable, so the cache-key input is stable.
+        let mems2 = build_extraction_core_memories(&live, &facts);
+        assert_eq!(
+            mems[0].space, mems2[0].space,
+            "the extraction CoreMemory space must be stable across cycles"
+        );
+        assert_eq!(
+            <[u8; 16]>::from(mems[0].space),
+            <[u8; 16]>::from(space),
+            "the exact 16 bytes the LLM cache key folds must match the stored space"
+        );
+    }
+
+    #[test]
+    fn load_pending_batch_pages_past_backing_off_front_rows() {
+        use brain_core::MemoryId;
+        use brain_metadata::{
+            extraction_queue_enqueue, failure_class, pipeline_record_extracted, pipeline_status,
+            tier_status, ExtractorItemCounts, ExtractorPipelineAuditEntry,
+        };
+
+        let (ctx, metadata, _tempdir) = __worker_fixture();
+
+        // shard=0 keeps `slot` in the high bytes, so the queue's MemoryId
+        // byte order is slot order: the low-slot front rows come first, the
+        // high-slot due row last.
+        let front: Vec<MemoryId> = (1..=4).map(|s| MemoryId::pack(0, s, 1)).collect();
+        let due_id = MemoryId::pack(0, 100, 1);
+
+        let now = now_unix_nanos();
+        {
+            let wtxn = metadata.write_txn().unwrap();
+            for id in &front {
+                extraction_queue_enqueue(&wtxn, *id, now).unwrap();
+                // A retryable transient LLM failure with a high attempt count:
+                // its exponential backoff (capped at 1h) has NOT elapsed, so
+                // the row is queued-but-not-due this cycle.
+                let entry = ExtractorPipelineAuditEntry::new(
+                    *id,
+                    now,
+                    pipeline_status::FAILURE,
+                    String::new(),
+                    tier_status::SKIPPED,
+                    tier_status::SKIPPED,
+                    tier_status::FAILED,
+                    ExtractorItemCounts::zero(),
+                    0,
+                )
+                .with_attempts(20)
+                .with_failure_class(failure_class::TRANSIENT);
+                pipeline_record_extracted(&wtxn, &entry).unwrap();
+            }
+            // A newer row deeper in the queue with no audit row → due now.
+            extraction_queue_enqueue(&wtxn, due_id, now).unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        // `want` is smaller than the backing-off front window: draining exactly
+        // `want` (the old behaviour) would return only front rows, filter them
+        // all out, and make zero progress. The over-drain must page past them
+        // and surface the due row this cycle.
+        let due = load_pending_batch(&ctx, 2).unwrap();
+        assert!(
+            due.contains(&due_id),
+            "a due row behind a backing-off front window must be found this cycle"
+        );
+        for id in &front {
+            assert!(
+                !due.contains(id),
+                "backing-off front rows must not be returned as due"
+            );
+        }
+    }
 }
 
 /// Live registry-refresh on SCHEMA_UPLOAD: a newly-declared extractor
@@ -7903,7 +8781,7 @@ mod registry_refresh_tests {
     use std::sync::Arc;
 
     use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
-    use brain_extractors::{MaterializeDeps, TierGate};
+    use brain_extractors::MaterializeDeps;
     use brain_index::{IndexParams, SharedHnsw};
     use brain_metadata::MetadataDb;
     use brain_ops::RealWriterHandle;
@@ -7949,8 +8827,8 @@ mod registry_refresh_tests {
         // Worker wired with rebuild deps (no classifier model / LLM router
         // needed for a pattern extractor).
         let (_tx, rx) = flume::unbounded();
-        let worker = ExtractorWorker::new(rx)
-            .with_registry_rebuild_deps(MaterializeDeps::default(), TierGate::all_enabled());
+        let worker =
+            ExtractorWorker::new(rx).with_registry_rebuild_deps(MaterializeDeps::default());
 
         // Boot-time registry is empty (nothing declared yet).
         assert_eq!(
@@ -8026,8 +8904,8 @@ mod registry_refresh_tests {
             shutdown: Arc::new(AtomicBool::new(false)),
         };
         let (_tx, rx) = flume::unbounded();
-        let worker = ExtractorWorker::new(rx)
-            .with_registry_rebuild_deps(MaterializeDeps::default(), TierGate::all_enabled());
+        let worker =
+            ExtractorWorker::new(rx).with_registry_rebuild_deps(MaterializeDeps::default());
 
         // Persist an extractor but leave the flag unset: rebuild must not run,
         // so the (empty) boot-time registry stays untouched.

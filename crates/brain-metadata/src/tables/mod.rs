@@ -14,11 +14,13 @@ pub mod extraction_queue;
 pub mod extractor;
 pub mod extractor_audit;
 pub mod fingerprint;
+pub mod forget_undo;
 pub mod hype;
 pub mod idempotency;
 pub mod kind;
 pub mod memory;
 pub mod memory_artifacts;
+pub mod memory_vector;
 pub mod merge;
 pub mod merge_review_queue;
 pub mod model_fingerprint;
@@ -62,9 +64,9 @@ macro_rules! impl_redb_rkyv_value {
             where
                 Self: 'a,
             {
-                let mut buf = ::rkyv::AlignedVec::with_capacity(data.len());
+                let mut buf = ::rkyv::util::AlignedVec::<16>::with_capacity(data.len());
                 buf.extend_from_slice(data);
-                ::rkyv::from_bytes::<$ty>(&buf).expect(concat!(
+                ::rkyv::from_bytes::<$ty, ::rkyv::rancor::Error>(&buf).expect(concat!(
                     stringify!($ty),
                     " bytes failed rkyv validation; redb file is corrupt"
                 ))
@@ -75,7 +77,7 @@ macro_rules! impl_redb_rkyv_value {
                 Self: 'a,
                 Self: 'b,
             {
-                ::rkyv::to_bytes::<_, 256>(value)
+                ::rkyv::to_bytes::<::rkyv::rancor::Error>(value)
                     .expect(concat!(stringify!($ty), " is rkyv-serializable"))
                     .into_vec()
             }
@@ -104,7 +106,7 @@ pub fn materialize_all_tables(wtxn: &::redb::WriteTransaction) -> Result<(), ::r
     use contradiction::STATEMENT_CONTRADICTION_AUDIT_TABLE;
     use edge::{EDGES_REVERSE_TABLE, EDGES_TABLE};
     use entity::{
-        ENTITIES_TABLE, ENTITY_ALIASES_TABLE, ENTITY_BY_CANONICAL_NAME_TABLE,
+        ENTITIES_TABLE, ENTITY_ALIASES_TABLE, ENTITY_BY_CANONICAL_NAME_TABLE, ENTITY_BY_TYPE_TABLE,
         ENTITY_MENTIONS_TABLE, ENTITY_TRIGRAMS_TABLE, ENTITY_VECTORS_TABLE,
     };
     use entity_type::ENTITY_TYPES_TABLE;
@@ -112,6 +114,7 @@ pub fn materialize_all_tables(wtxn: &::redb::WriteTransaction) -> Result<(), ::r
     use extractor::{EXTRACTORS_BY_QNAME_TABLE, EXTRACTORS_TABLE};
     use extractor_audit::EXTRACTOR_PIPELINE_AUDIT_TABLE;
     use fingerprint::FINGERPRINTS_TABLE;
+    use forget_undo::FORGET_UNDO_LOG_TABLE;
     use idempotency::IDEMPOTENCY_TABLE;
     use kind::{KINDS_BY_BYTE_TABLE, KINDS_TABLE};
     use memory::{MEMORIES_BY_SPACE_TIMELINE_TABLE, MEMORIES_TABLE};
@@ -131,9 +134,9 @@ pub fn materialize_all_tables(wtxn: &::redb::WriteTransaction) -> Result<(), ::r
     use space::SPACES_TABLE;
     use statement::{
         EVIDENCE_OVERFLOW_TABLE, STATEMENTS_BY_EVENT_TIME_TABLE, STATEMENTS_BY_EVIDENCE_TABLE,
-        STATEMENTS_BY_OBJECT_ENTITY_TABLE, STATEMENTS_BY_PREDICATE_TABLE,
-        STATEMENTS_BY_SUBJECT_TABLE, STATEMENTS_TABLE, STATEMENT_CHAIN_TABLE,
-        STATEMENT_EMBED_QUEUE_TABLE,
+        STATEMENTS_BY_OBJECT_ENTITY_TABLE, STATEMENTS_BY_PREDICATE_ID_TABLE,
+        STATEMENTS_BY_PREDICATE_TABLE, STATEMENTS_BY_SUBJECT_ID_TABLE, STATEMENTS_BY_SUBJECT_TABLE,
+        STATEMENTS_TABLE, STATEMENT_CHAIN_TABLE, STATEMENT_EMBED_QUEUE_TABLE,
     };
     use statement_question::STATEMENT_QUESTION_VECTORS_TABLE;
     use text::TEXTS_TABLE;
@@ -157,12 +160,14 @@ pub fn materialize_all_tables(wtxn: &::redb::WriteTransaction) -> Result<(), ::r
     let _ = wtxn.open_table(ENTITY_ALIASES_TABLE)?;
     let _ = wtxn.open_table(ENTITY_TRIGRAMS_TABLE)?;
     let _ = wtxn.open_table(ENTITY_MENTIONS_TABLE)?;
+    let _ = wtxn.open_table(ENTITY_BY_TYPE_TABLE)?;
     let _ = wtxn.open_table(ENTITY_VECTORS_TABLE)?;
     let _ = wtxn.open_table(EXTRACTION_QUEUE_TABLE)?;
     let _ = wtxn.open_table(EXTRACTORS_TABLE)?;
     let _ = wtxn.open_table(EXTRACTORS_BY_QNAME_TABLE)?;
     let _ = wtxn.open_table(EXTRACTOR_PIPELINE_AUDIT_TABLE)?;
     let _ = wtxn.open_table(FINGERPRINTS_TABLE)?;
+    let _ = wtxn.open_table(FORGET_UNDO_LOG_TABLE)?;
     let _ = wtxn.open_table(IDEMPOTENCY_TABLE)?;
     let _ = wtxn.open_table(KINDS_TABLE)?;
     let _ = wtxn.open_table(KINDS_BY_BYTE_TABLE)?;
@@ -189,7 +194,9 @@ pub fn materialize_all_tables(wtxn: &::redb::WriteTransaction) -> Result<(), ::r
     let _ = wtxn.open_table(SLOT_VERSIONS_TABLE)?;
     let _ = wtxn.open_table(STATEMENTS_TABLE)?;
     let _ = wtxn.open_table(STATEMENTS_BY_SUBJECT_TABLE)?;
+    let _ = wtxn.open_table(STATEMENTS_BY_SUBJECT_ID_TABLE)?;
     let _ = wtxn.open_table(STATEMENTS_BY_PREDICATE_TABLE)?;
+    let _ = wtxn.open_table(STATEMENTS_BY_PREDICATE_ID_TABLE)?;
     let _ = wtxn.open_table(STATEMENTS_BY_OBJECT_ENTITY_TABLE)?;
     let _ = wtxn.open_table(STATEMENTS_BY_EVENT_TIME_TABLE)?;
     let _ = wtxn.open_table(STATEMENTS_BY_EVIDENCE_TABLE)?;

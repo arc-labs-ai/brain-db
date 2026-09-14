@@ -7,6 +7,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -31,6 +32,14 @@ pub const BRAIN_SCHEMA_VERSION: u32 = 1;
 
 const STATEMENTS_DIR: &str = "statements.tantivy";
 const MEMORY_TEXT_DIR: &str = "memory_text.tantivy";
+
+/// Suffix for the scratch directory the rebuild worker builds the new
+/// index into before the atomic swap (`<live>.rebuild`). Public so the
+/// rebuild worker and the crash-recovery path agree on one spelling.
+pub const REBUILD_SUFFIX: &str = ".rebuild";
+/// Suffix for the previous live index, renamed aside during the swap
+/// (`<live>.old`) so a crash mid-swap can fall back to it.
+pub const OLD_SUFFIX: &str = ".old";
 
 /// Scope tag carried alongside each [`IndexHandle`] so retrievers
 /// can dispatch without an extra lookup.
@@ -59,16 +68,59 @@ impl LexicalScope {
 /// cheap and shares the same underlying tokenizer / directory
 /// references — required for the indexer worker
 /// and the retriever to hold independent handles.
+///
+/// `commit_generation` is a monotonic counter the indexer bumps after every
+/// successful tantivy commit; because it is an `Arc`, every clone of a handle
+/// shares the same counter. The retriever reads it to decide whether the
+/// writer has committed since its last `IndexReader::reload()` — reloading
+/// only when the generation advanced instead of on every query, while still
+/// serving every committed write (read-your-commits, invariant #7).
 #[derive(Clone)]
 pub struct IndexHandle {
     pub index: Index,
     pub scope: LexicalScope,
+    commit_generation: Arc<AtomicU64>,
+}
+
+impl IndexHandle {
+    /// Build a handle with a fresh commit-generation counter (starts at 0).
+    #[must_use]
+    pub fn new(index: Index, scope: LexicalScope) -> Self {
+        Self {
+            index,
+            scope,
+            commit_generation: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Current commit generation. Advances by one on every successful commit
+    /// against this index (see [`bump_commit_generation`](Self::bump_commit_generation)).
+    #[must_use]
+    pub fn commit_generation(&self) -> u64 {
+        self.commit_generation.load(Ordering::Acquire)
+    }
+
+    /// A shared reference to this handle's commit-generation counter, so the
+    /// indexer's drain loop can bump it without holding the whole handle.
+    #[must_use]
+    pub fn commit_generation_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.commit_generation)
+    }
+
+    /// Record that a commit has landed: advance the generation so readers
+    /// sharing this counter know to reload. `Release` pairs with the
+    /// retriever's `Acquire` read so the committed segments are visible once
+    /// the new generation is.
+    pub fn bump_commit_generation(&self) {
+        self.commit_generation.fetch_add(1, Ordering::Release);
+    }
 }
 
 impl std::fmt::Debug for IndexHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IndexHandle")
             .field("scope", &self.scope)
+            .field("commit_generation", &self.commit_generation())
             .finish()
     }
 }
@@ -207,14 +259,8 @@ impl TantivyShard {
             .register(BRAIN_TOKENIZER_NAME, build_analyzer());
 
         let shard = Arc::new(TantivyShard {
-            memory_text: IndexHandle {
-                index: memory_index,
-                scope: LexicalScope::MemoryText,
-            },
-            statements: IndexHandle {
-                index: statements_index,
-                scope: LexicalScope::StatementText,
-            },
+            memory_text: IndexHandle::new(memory_index, LexicalScope::MemoryText),
+            statements: IndexHandle::new(statements_index, LexicalScope::StatementText),
         });
 
         Ok(TantivyShardStartup {
@@ -235,6 +281,20 @@ fn open_or_create(
     schema: Schema,
 ) -> Result<(Index, IndexStatus), TantivyShardError> {
     let dir = shard_dir.join(scope.dir_name());
+
+    // Crash recovery: the rebuild worker swaps a freshly-built index over
+    // the live directory with two non-atomic renames (live→`.old`, then
+    // `.rebuild`→live). A crash between them leaves the live directory
+    // absent while a complete replacement sits in `.rebuild` (or the prior
+    // data in `.old`). Reconcile *before* the create-or-open decision below,
+    // otherwise this open would mistake the missing live dir for a fresh
+    // shard and create an empty index — silently discarding the completed
+    // rebuild (invariant #7). This is a no-op unless a leftover swap dir is
+    // present.
+    recover_interrupted_swap(&dir).map_err(|source| TantivyShardError::Mkdir {
+        path: dir.clone(),
+        source,
+    })?;
 
     fs::create_dir_all(&dir).map_err(|source| TantivyShardError::Mkdir {
         path: dir.clone(),
@@ -273,6 +333,94 @@ fn open_or_create(
             ))
         }
     }
+}
+
+/// Complete or roll back an interrupted rebuild swap for a single
+/// index directory.
+///
+/// The rebuild worker replaces `live` with two non-atomic renames:
+/// `live`→`<live>.old`, then `<live>.rebuild`→`live`, then it removes
+/// `<live>.old`. A crash anywhere in that sequence can leave the `live`
+/// directory missing (or present-but-empty) with the real data stranded
+/// in a sibling. This resolves that state deterministically to the
+/// newest *complete* index:
+///
+/// - If `live` is not a completed index and `<live>.rebuild` is complete,
+///   promote `.rebuild` → `live` (the swap had reached the point where the
+///   new index was fully committed).
+/// - Else if `live` is not complete and `<live>.old` is complete, restore
+///   `.old` → `live` (the swap failed before the new index committed).
+/// - Any leftover `.rebuild` / `.old` directories are removed afterward.
+///
+/// "Complete" means the directory opens as a tantivy index *and* carries a
+/// stamped brain schema-version payload — an in-progress rebuild has a
+/// `meta.json` (tantivy writes one at creation) but no payload until its
+/// final commit, so a half-built rebuild is never mistaken for a finished
+/// one. A no-op when neither sibling exists.
+fn recover_interrupted_swap(live: &Path) -> std::io::Result<()> {
+    let rebuild = path_with_suffix(live, REBUILD_SUFFIX);
+    let old = path_with_suffix(live, OLD_SUFFIX);
+
+    // Nothing to reconcile unless a swap sibling is lying around.
+    if !rebuild.exists() && !old.exists() {
+        return Ok(());
+    }
+
+    if !is_completed_index(live) {
+        if is_completed_index(&rebuild) {
+            promote_swap_dir(&rebuild, live)?;
+        } else if is_completed_index(&old) {
+            promote_swap_dir(&old, live)?;
+        }
+    }
+
+    // Clean up whatever remains so a later run starts from a clean slate.
+    if rebuild.exists() {
+        fs::remove_dir_all(&rebuild)?;
+    }
+    if old.exists() {
+        fs::remove_dir_all(&old)?;
+    }
+    Ok(())
+}
+
+/// Move `src` onto `live`, replacing any incomplete `live` directory.
+fn promote_swap_dir(src: &Path, live: &Path) -> std::io::Result<()> {
+    if live.exists() {
+        fs::remove_dir_all(live)?;
+    }
+    fs::rename(src, live)
+}
+
+/// Append `suffix` to a path's final component (e.g. `foo` → `foo.rebuild`).
+fn path_with_suffix(p: &Path, suffix: &str) -> PathBuf {
+    let mut buf = p.as_os_str().to_owned();
+    buf.push(suffix);
+    PathBuf::from(buf)
+}
+
+/// True iff `dir` is a fully-committed brain index: it opens as a tantivy
+/// index and its `meta.json` carries our stamped schema-version payload.
+/// A freshly-created-but-never-committed index (no payload) reads as
+/// incomplete, which is exactly what keeps a half-built `.rebuild` from
+/// being promoted over live data.
+fn is_completed_index(dir: &Path) -> bool {
+    if !dir.join("meta.json").exists() {
+        return false;
+    }
+    let Ok(index) = Index::open_in_dir(dir) else {
+        return false;
+    };
+    let Ok(meta) = index.load_metas() else {
+        return false;
+    };
+    let Some(raw) = meta.payload.as_ref() else {
+        return false;
+    };
+    matches!(
+        serde_json::from_str::<BrainSchemaPayload>(raw),
+        Ok(payload) if payload.brain_schema_version == BRAIN_SCHEMA_VERSION
+    )
 }
 
 /// Inspect a freshly opened `Index`'s metadata payload for our schema

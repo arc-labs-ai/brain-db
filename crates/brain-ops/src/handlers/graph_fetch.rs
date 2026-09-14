@@ -46,12 +46,14 @@ use brain_core::{
     EdgeKind, EdgeKindRef, EntityId, MemoryId, NodeRef, StatementId, StatementObject,
     StatementValue, SubjectRef,
 };
-use brain_metadata::entity::ops::entity_get;
 use brain_metadata::relation::types::relation_type_get;
 use brain_metadata::schema::predicate::predicate_get;
 use brain_metadata::statement::statement_get;
 use brain_metadata::tables::edge::{walk_incoming, walk_outgoing};
+use brain_metadata::tables::entity::ENTITIES_TABLE;
 use brain_metadata::tables::entity_type::ENTITY_TYPES_TABLE;
+use brain_metadata::tables::memory::MEMORIES_TABLE;
+use brain_metadata::tables::relation::RELATION_METADATA_TABLE;
 use brain_metadata::tables::statement::STATEMENTS_BY_SUBJECT_TABLE;
 use brain_metadata::tables::text::TEXTS_TABLE;
 use brain_metadata::RowScope;
@@ -127,14 +129,15 @@ pub fn handle_graph_fetch(
         ));
     }
 
+    let scope = RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_space);
+
     let flags = req_flags(&req);
     let after_key: Option<StmtKey> = if req.cursor.is_empty() {
         None
     } else {
-        Some(decode_cursor(&req.cursor, flags)?)
+        Some(decode_cursor(&req.cursor, flags, scope)?)
     };
 
-    let scope = RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_space);
     let rtxn = ctx
         .executor
         .metadata
@@ -159,15 +162,20 @@ pub fn handle_graph_fetch(
         [0xffu8; 16],
     );
     let lower = match &after_key {
-        // Resume strictly after the last key returned.
-        Some(k) => std::ops::Bound::Excluded(*k),
-        None => std::ops::Bound::Included(lo_key),
+        // Resume strictly after the last key returned — but never below the
+        // caller's own floor. `decode_cursor` already rejects an out-of-tenant
+        // cursor; clamping the effective lower bound to `max(decoded, lo_key)`
+        // is defence in depth so a decoded key that somehow sorts below the
+        // caller's scope can never widen the scan onto a neighbour's rows.
+        Some(k) if *k > lo_key => std::ops::Bound::Excluded(*k),
+        _ => std::ops::Bound::Included(lo_key),
     };
     let range = by_subject
         .range((lower, std::ops::Bound::Included(hi_key)))
         .map_err(|e| OpError::Internal(format!("statement range: {e}")))?;
 
     let mut builder = GraphBuilder::new(
+        scope,
         req.include_statements,
         req.include_memories,
         req.include_memory_edges,
@@ -183,7 +191,14 @@ pub fn handle_graph_fetch(
         }
         let (k, v) = entry.map_err(|e| OpError::Internal(format!("statement row: {e}")))?;
         let key = k.value();
-        let (_ns, _ag, _subj, _kind, _pred, is_current, _sid_bytes) = key;
+        let (row_ns, row_ag, _subj, _kind, _pred, is_current, _sid_bytes) = key;
+        // Tenant wall (defence in depth): the range is already bounded to the
+        // caller's `(ns, space)`, but never trust a row's scope implicitly — a
+        // forged cursor that widened the lower bound must not leak a neighbour's
+        // statement text/values here. Skip any row outside the caller's scope.
+        if row_ns != ns || row_ag != ag {
+            continue;
+        }
         // Only current (non-superseded) statements form the live graph.
         if is_current == 0 {
             continue;
@@ -284,6 +299,12 @@ pub fn handle_graph_fetch(
 /// Accumulates the page's nodes + edges with per-page dedup so a node/edge
 /// reached twice within one page is emitted once.
 struct GraphBuilder {
+    /// The caller's tenant scope. Every node/edge emitted must belong to
+    /// it: the shared entity / relation-sidecar / memory tables are flat
+    /// keyspaces, so a write in another tenant can attach a relation or
+    /// mention to one of the caller's ids. This scope is the wall that
+    /// keeps the foreign endpoint out of the export.
+    scope: RowScope,
     include_statements: bool,
     include_memories: bool,
     include_memory_edges: bool,
@@ -303,8 +324,14 @@ struct GraphBuilder {
 }
 
 impl GraphBuilder {
-    fn new(include_statements: bool, include_memories: bool, include_memory_edges: bool) -> Self {
+    fn new(
+        scope: RowScope,
+        include_statements: bool,
+        include_memories: bool,
+        include_memory_edges: bool,
+    ) -> Self {
         Self {
+            scope,
             include_statements,
             include_memories,
             include_memory_edges,
@@ -337,31 +364,72 @@ impl GraphBuilder {
     }
 
     /// Emit an entity node (deduped) and record it as a walk seed.
+    ///
+    /// Tenant wall: the primary entity table is a flat keyspace shared
+    /// across tenants, and an entity can be reached as a statement object
+    /// or relation far-endpoint written by another tenant. Load the
+    /// primary row and skip the id entirely — no seed, no node — unless its
+    /// owning `(namespace, space)` is the caller's.
     fn emit_entity(&mut self, rtxn: &redb::ReadTransaction, eid: EntityId) -> Result<(), OpError> {
+        let entities = rtxn
+            .open_table(ENTITIES_TABLE)
+            .map_err(|e| OpError::Internal(format!("open entities: {e}")))?;
+        let Some(meta) = entities
+            .get(&eid.to_bytes())
+            .map_err(|e| OpError::Internal(format!("entity_get: {e}")))?
+            .map(|g| g.value())
+        else {
+            return Ok(());
+        };
+        if meta.namespace_id != self.scope.namespace_id
+            || meta.space_id_bytes != self.scope.space_id_bytes
+        {
+            return Ok(());
+        }
         if self.seen_entity_seeds.insert(eid.to_bytes()) {
             self.entities_this_page.push(eid);
         }
         if self.seen_nodes.contains(&eid.to_bytes()) {
             return Ok(());
         }
-        let Some(ent) =
-            entity_get(rtxn, eid).map_err(|e| OpError::Internal(format!("entity_get: {e}")))?
-        else {
-            return Ok(());
-        };
         let type_qname = rtxn
             .open_table(ENTITY_TYPES_TABLE)
             .ok()
-            .and_then(|t| t.get(&ent.entity_type.raw()).ok().flatten())
+            .and_then(|t| t.get(&meta.entity_type_id).ok().flatten())
             .map(|g| g.value().name)
             .unwrap_or_default();
         self.emit_node(GraphNode {
             id: eid.to_bytes(),
             kind: NODE_ENTITY,
-            label: ent.canonical_name,
+            label: meta.canonical_name,
             type_qname,
         });
         Ok(())
+    }
+
+    /// Whether `mem_id` belongs to the caller's tenant. The mention /
+    /// memory-edge tables are shared keyspaces, so a foreign tenant can
+    /// attach a `Mentions` or memory↔memory edge onto one of the caller's
+    /// ids; the primary memory row carries the owning scope and is the
+    /// authority. A missing row is treated as out-of-scope (nothing to
+    /// emit).
+    fn memory_in_scope(
+        &self,
+        rtxn: &redb::ReadTransaction,
+        mem_id: MemoryId,
+    ) -> Result<bool, OpError> {
+        let t = rtxn
+            .open_table(MEMORIES_TABLE)
+            .map_err(|e| OpError::Internal(format!("open memories: {e}")))?;
+        let Some(meta) = t
+            .get(&mem_id.to_be_bytes())
+            .map_err(|e| OpError::Internal(format!("memory_get: {e}")))?
+            .map(|g| g.value())
+        else {
+            return Ok(false);
+        };
+        Ok(meta.namespace_id == self.scope.namespace_id
+            && meta.space_id_bytes == self.scope.space_id_bytes)
     }
 
     /// Walk the typed relations incident to `eid` (both directions), emitting
@@ -373,6 +441,9 @@ impl GraphBuilder {
         rtxn: &redb::ReadTransaction,
         eid: EntityId,
     ) -> Result<(), OpError> {
+        let sidecar = rtxn
+            .open_table(RELATION_METADATA_TABLE)
+            .map_err(|e| OpError::Internal(format!("open relation metadata: {e}")))?;
         let mut walked = 0usize;
         for outgoing in [true, false] {
             let rows = if outgoing {
@@ -381,7 +452,7 @@ impl GraphBuilder {
                 walk_incoming(rtxn, NodeRef::Entity(eid), None)
             }
             .map_err(|e| OpError::Internal(format!("walk relation: {e}")))?;
-            for (kind, other, _disamb, _data) in rows {
+            for (kind, other, disamb, _data) in rows {
                 if walked >= MAX_EDGES_PER_ENTITY {
                     return Ok(());
                 }
@@ -391,6 +462,23 @@ impl GraphBuilder {
                 let NodeRef::Entity(other_id) = other else {
                     continue;
                 };
+                // Tenant wall: the shared edge table is not scope-keyed, so
+                // the walk can surface a relation another tenant created
+                // incident to this entity. The sidecar (keyed by the
+                // relation's disambiguator) carries the owning scope and is
+                // the authority that filters it out.
+                let Some(meta) = sidecar
+                    .get(&disamb)
+                    .map_err(|e| OpError::Internal(format!("relation sidecar: {e}")))?
+                    .map(|g| g.value())
+                else {
+                    continue;
+                };
+                if meta.namespace_id != self.scope.namespace_id
+                    || meta.space_id_bytes != self.scope.space_id_bytes
+                {
+                    continue;
+                }
                 let Some(rt) = relation_type_get(rtxn, rt_id)
                     .map_err(|e| OpError::Internal(format!("relation_type_get: {e}")))?
                 else {
@@ -432,6 +520,12 @@ impl GraphBuilder {
             let NodeRef::Memory(mem_id) = from else {
                 continue;
             };
+            // Tenant wall: a foreign tenant can mention one of the caller's
+            // entities. Skip the memory (node, seed, and edge) unless it
+            // belongs to the caller's scope.
+            if !self.memory_in_scope(rtxn, mem_id)? {
+                continue;
+            }
             let mem_bytes = mem_id.to_be_bytes();
             self.emit_memory_node(texts.as_ref(), mem_id);
             // Only mentioned memories seed the memory-edge walk.
@@ -495,6 +589,12 @@ impl GraphBuilder {
                 let NodeRef::Memory(other_id) = other else {
                     continue;
                 };
+                // Tenant wall: the far endpoint may be a memory another
+                // tenant linked to this one. Skip it (node and edge) unless
+                // it belongs to the caller's scope.
+                if !self.memory_in_scope(rtxn, other_id)? {
+                    continue;
+                }
                 let (from, to) = memory_edge_endpoints(edge_kind, mem_id, other_id, outgoing);
                 walked += 1;
                 self.emit_memory_node(texts.as_ref(), other_id);
@@ -620,12 +720,29 @@ fn encode_cursor(flags: u8, key: &StmtKey) -> Vec<u8> {
     out
 }
 
-fn decode_cursor(cursor: &[u8], flags: u8) -> Result<StmtKey, OpError> {
+/// Decode a continuation token minted by [`encode_cursor`], verifying it names
+/// the caller's own `scope`. The `StmtKey` embeds `(namespace, space)` as its
+/// leading fields, so a cursor is bound to a tenant: one whose scope differs
+/// from the caller's is rejected rather than used as the scan lower bound.
+///
+/// Without this a forged cursor carrying `ns=0/space=0` would set the scan
+/// floor below the caller's range and walk statements belonging to tenants
+/// sorting beneath it — a cross-tenant read. The version/flags checks stay:
+/// a cursor that survives them but points at another tenant is rejected as
+/// out-of-tenant, not silently honoured.
+fn decode_cursor(cursor: &[u8], flags: u8, scope: RowScope) -> Result<StmtKey, OpError> {
     let stale = || OpError::InvalidRequest("stale_cursor: layer toggles changed".into());
     if cursor.len() != CURSOR_LEN || cursor[0] != CURSOR_VERSION || cursor[1] != flags {
         return Err(stale());
     }
-    bytes_to_key(&cursor[2..]).ok_or_else(stale)
+    let key = bytes_to_key(&cursor[2..]).ok_or_else(stale)?;
+    let (ns, ag, ..) = key;
+    if ns != scope.namespace_id || ag != scope.space_id_bytes {
+        return Err(OpError::InvalidRequest(
+            "cursor does not belong to the caller's tenant".into(),
+        ));
+    }
+    Ok(key)
 }
 
 #[cfg(test)]
@@ -635,6 +752,12 @@ mod tests {
 
     fn key() -> StmtKey {
         (7, [1u8; 16], [0xABu8; 16], 3, 0x00C0_FFEE, 1, [0x42u8; 16])
+    }
+
+    /// The scope whose `(namespace, space)` matches [`key`], so a cursor built
+    /// from `key()` is in-tenant for this caller.
+    fn caller_scope() -> RowScope {
+        RowScope::from_bytes(7, [1u8; 16])
     }
 
     #[test]
@@ -650,7 +773,7 @@ mod tests {
         let flags = FLAG_STATEMENTS | FLAG_MEMORIES;
         let cur = encode_cursor(flags, &key());
         assert_eq!(cur.len(), CURSOR_LEN);
-        assert_eq!(decode_cursor(&cur, flags).unwrap(), key());
+        assert_eq!(decode_cursor(&cur, flags, caller_scope()).unwrap(), key());
     }
 
     #[test]
@@ -658,16 +781,51 @@ mod tests {
         // A cursor minted with statements+memories must not resume a request
         // that dropped a layer — the derived result set would differ.
         let cur = encode_cursor(FLAG_STATEMENTS | FLAG_MEMORIES, &key());
-        assert!(decode_cursor(&cur, FLAG_STATEMENTS).is_err());
-        assert!(decode_cursor(&cur, 0).is_err());
+        assert!(decode_cursor(&cur, FLAG_STATEMENTS, caller_scope()).is_err());
+        assert!(decode_cursor(&cur, 0, caller_scope()).is_err());
     }
 
     #[test]
     fn cursor_rejects_wrong_version_and_length() {
         let mut cur = encode_cursor(0, &key());
-        assert!(decode_cursor(&cur[..CURSOR_LEN - 1], 0).is_err());
+        assert!(decode_cursor(&cur[..CURSOR_LEN - 1], 0, caller_scope()).is_err());
         cur[0] = CURSOR_VERSION.wrapping_add(1);
-        assert!(decode_cursor(&cur, 0).is_err());
+        assert!(decode_cursor(&cur, 0, caller_scope()).is_err());
+    }
+
+    /// A cursor is bound to the tenant that minted it. Replaying one against a
+    /// different caller — a different namespace, or a different space in the
+    /// same namespace — must be rejected, not honoured as a scan lower bound.
+    #[test]
+    fn cursor_rejects_wrong_tenant() {
+        let cur = encode_cursor(0, &key());
+        // Same layout, in-tenant → accepted.
+        assert_eq!(decode_cursor(&cur, 0, caller_scope()).unwrap(), key());
+        // Foreign namespace.
+        let other_ns = RowScope::from_bytes(8, [1u8; 16]);
+        assert!(decode_cursor(&cur, 0, other_ns).is_err());
+        // Same namespace, foreign space.
+        let other_space = RowScope::from_bytes(7, [2u8; 16]);
+        assert!(decode_cursor(&cur, 0, other_space).is_err());
+    }
+
+    /// The specific leak path: a forged cursor claiming the reserved
+    /// `ns=0/space=0` scope (which sorts below every real tenant) must be
+    /// rejected for any real caller, so it can never become a scan floor that
+    /// walks a neighbour's statements. This is the failure branch the
+    /// length/version/flags checks let through before the tenant bind.
+    #[test]
+    fn forged_zero_scope_cursor_rejected_for_real_caller() {
+        // A well-formed cursor (correct len, version, flags) whose embedded
+        // key names the reserved zero scope rather than the caller's.
+        let forged_key: StmtKey = (0, [0u8; 16], [0u8; 16], 0, 0, 1, [0u8; 16]);
+        let cur = encode_cursor(0, &forged_key);
+        assert_eq!(cur.len(), CURSOR_LEN);
+        assert_eq!(cur[0], CURSOR_VERSION);
+        assert_eq!(cur[1], 0);
+        // Rejected loudly for a real tenant rather than used as the floor.
+        let err = decode_cursor(&cur, 0, caller_scope()).unwrap_err();
+        assert!(matches!(err, OpError::InvalidRequest(_)));
     }
 
     #[test]
@@ -714,11 +872,11 @@ mod tests {
     fn cursor_rejects_memory_edge_toggle_mid_scroll() {
         let with = FLAG_MEMORIES | FLAG_MEMORY_EDGES;
         let cur = encode_cursor(with, &key());
-        assert_eq!(decode_cursor(&cur, with).unwrap(), key());
-        assert!(decode_cursor(&cur, FLAG_MEMORIES).is_err());
+        assert_eq!(decode_cursor(&cur, with, caller_scope()).unwrap(), key());
+        assert!(decode_cursor(&cur, FLAG_MEMORIES, caller_scope()).is_err());
 
         let without = encode_cursor(FLAG_MEMORIES, &key());
-        assert!(decode_cursor(&without, with).is_err());
+        assert!(decode_cursor(&without, with, caller_scope()).is_err());
     }
 
     /// Every builtin kind must map to its own wire byte, and none may

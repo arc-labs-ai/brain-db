@@ -78,16 +78,16 @@ use brain_protocol::{
     RelationSupersedeRequest, RelationSupersedeResponse, RelationTombstoneRequest,
     RelationTombstoneResponse, RelationTraverseRequest, RelationTraverseResponseFrame,
     RelationView, RequestBody, ResolutionOutcomeWire, ResponseBody, RetrieverNameWire,
-    SchemaGetRequest, SchemaGetResponse, SchemaListItemWire, SchemaListRequest,
-    SchemaListResponseFrame, SchemaReplaceRequest, SchemaReplaceResponse, SchemaUploadRequest,
-    SchemaUploadResponse, SchemaValidateRequest, SchemaValidateResponse, SchemaValidationErrorWire,
-    ServerPingResponse, SessionCreateRequest, SessionCreateResponse, SessionDeleteRequest,
-    SessionDeleteResponse, SessionListRequest, SessionListResponse, SessionView, SimilarityFilter,
-    SpaceCreateRequest, SpaceCreateResponse, SpaceDeleteRequest, SpaceDeleteResponse,
-    SpaceListRequest, SpaceListResponse, SpaceView, StageKind, StatementCreateRequest,
-    StatementCreateResponse, StatementGetRequest, StatementGetResponse, StatementHistoryRequest,
-    StatementHistoryResponseFrame, StatementKindWire, StatementListRequest,
-    StatementListResponseFrame, StatementObjectWire, StatementRetractRequest,
+    SchemaDropRequest, SchemaDropResponse, SchemaGetRequest, SchemaGetResponse, SchemaListItemWire,
+    SchemaListRequest, SchemaListResponseFrame, SchemaReplaceRequest, SchemaReplaceResponse,
+    SchemaUploadRequest, SchemaUploadResponse, SchemaValidateRequest, SchemaValidateResponse,
+    SchemaValidationErrorWire, ServerPingResponse, SessionCreateRequest, SessionCreateResponse,
+    SessionDeleteRequest, SessionDeleteResponse, SessionListRequest, SessionListResponse,
+    SessionView, SimilarityFilter, SpaceCreateRequest, SpaceCreateResponse, SpaceDeleteRequest,
+    SpaceDeleteResponse, SpaceListRequest, SpaceListResponse, SpaceView, StageKind,
+    StatementCreateRequest, StatementCreateResponse, StatementGetRequest, StatementGetResponse,
+    StatementHistoryRequest, StatementHistoryResponseFrame, StatementKindWire,
+    StatementListRequest, StatementListResponseFrame, StatementObjectWire, StatementRetractRequest,
     StatementRetractResponse, StatementSupersedeRequest, StatementSupersedeResponse,
     StatementTombstoneRequest, StatementTombstoneResponse, StatementValueWire, StatementView,
     SubscribeRequest, SubscriptionEvent, SubscriptionFilter, TransitionKind, TraversalPathWire,
@@ -570,6 +570,7 @@ fn sample_entity_view() -> EntityView {
 fn sample_entity_get() -> EntityGetResponse {
     EntityGetResponse {
         entity: sample_entity_view(),
+        resolved_from: vec![[7u8; 16], [8u8; 16]],
     }
 }
 
@@ -1099,6 +1100,7 @@ fn corpus() -> Vec<Case> {
         &sample_encode_vector_direct(),
     ));
     let recall = RecallRequest {
+        scope: Default::default(),
         trace: true,
         cue_text: "what color is the sky".into(),
         subject_name: "sky".into(),
@@ -1122,6 +1124,7 @@ fn corpus() -> Vec<Case> {
         &recall,
     ));
     let recall_act_as = RecallRequest {
+        scope: Default::default(),
         trace: false,
         cue_text: "what color is the sky".into(),
         subject_name: "sky".into(),
@@ -2349,6 +2352,10 @@ fn corpus() -> Vec<Case> {
     };
     let entity_get_merged_resp = EntityGetResponse {
         entity: entity_merged_away,
+        // The returned view is the merged-away record itself (entity_id ==
+        // the requested id, still carrying merged_into), so no redirect hop
+        // was walked to reach it — the chain is empty.
+        resolved_from: Vec::new(),
     };
     cases.push(resp_case(
         "resp_entity_get_merged",
@@ -2780,10 +2787,12 @@ fn corpus() -> Vec<Case> {
     let statement_history_req = StatementHistoryRequest {
         anchor_id: STMT_OLD_ID,
         include_tombstoned: true,
+        limit: 100,
+        cursor: Vec::new(),
     };
     cases.push(req_case(
         "req_statement_history",
-        RequestBody::StatementHistory(statement_history_req),
+        RequestBody::StatementHistory(statement_history_req.clone()),
         &statement_history_req,
     ));
 
@@ -2980,6 +2989,7 @@ fn corpus() -> Vec<Case> {
         ],
         chain_root: STMT_OLD_ID,
         total_versions: 3,
+        next_cursor: Vec::new(),
         is_final: true,
     };
     cases.push(resp_case(
@@ -3058,6 +3068,22 @@ fn corpus() -> Vec<Case> {
         "req_schema_replace",
         RequestBody::SchemaReplace(schema_replace_req.clone()),
         &schema_replace_req,
+    ));
+    // Surgical single-declaration narrow. `target_kind` is 1
+    // (relation_type) — deliberately not the 0 (predicate) default — so a
+    // fixture that hard-codes the discriminant is visible, and `force` is
+    // `true` to pin the confirmation flag in a non-default state.
+    let schema_drop_req = SchemaDropRequest {
+        namespace: "org".into(),
+        target_kind: 1,
+        target_name: "mentors".into(),
+        force: true,
+        request_id: RID,
+    };
+    cases.push(req_case(
+        "req_schema_drop",
+        RequestBody::SchemaDrop(schema_drop_req.clone()),
+        &schema_drop_req,
     ));
 
     // ---- Schema responses ----
@@ -3146,6 +3172,24 @@ fn corpus() -> Vec<Case> {
         ResponseBody::SchemaReplace(schema_replace_resp.clone()),
         &schema_replace_resp,
     ));
+    // `dropped` (true) and `live_rows` (5, non-zero) are the fields unique
+    // to DROP — a force-drop that left five rows orphaned. `target_kind`
+    // (1) / `target_name` echo the request; `schema_version` (4) is the
+    // new active version after the narrow.
+    let schema_drop_resp = SchemaDropResponse {
+        namespace: "org".into(),
+        schema_version: 4,
+        target_kind: 1,
+        target_name: "mentors".into(),
+        dropped: true,
+        live_rows: 5,
+        validation_errors: Vec::new(),
+    };
+    cases.push(resp_case(
+        "resp_schema_drop",
+        ResponseBody::SchemaDrop(schema_drop_resp.clone()),
+        &schema_drop_resp,
+    ));
 
     // ---- Transaction requests ----
     //
@@ -3156,10 +3200,11 @@ fn corpus() -> Vec<Case> {
     let txn_begin_req = TxnBeginRequest {
         txn_id: TXN_ID,
         timeout_seconds: 45,
+        act_as: None,
     };
     cases.push(req_case(
         "req_txn_begin",
-        RequestBody::TxnBegin(txn_begin_req),
+        RequestBody::TxnBegin(txn_begin_req.clone()),
         &txn_begin_req,
     ));
     // COMMIT and ABORT are byte-identical single-field maps; the opcode is the
@@ -3431,6 +3476,8 @@ fn required_families() -> Vec<(&'static str, Opcode)> {
         ("graph.relation_create_resp", Opcode::RelationCreateResp),
         ("schema.upload", Opcode::SchemaUploadReq),
         ("schema.upload_resp", Opcode::SchemaUploadResp),
+        ("schema.drop", Opcode::SchemaDropReq),
+        ("schema.drop_resp", Opcode::SchemaDropResp),
         ("procedural.materialize", Opcode::MaterializeProceduralReq),
         (
             "procedural.materialize_resp",

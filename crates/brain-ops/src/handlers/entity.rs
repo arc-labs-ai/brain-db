@@ -14,10 +14,14 @@
 //! These handlers do **not** touch the entity HNSW or emit
 //! subscription events. Both wire in later.
 
+use std::sync::Arc;
+
 use brain_core::{Entity, EntityAttributes, EntityId, EntityTypeId, RequestId};
+use brain_index::EntityVectorIndex;
 use brain_metadata::entity::merge::MergeActor;
 use brain_metadata::entity::ops::{
-    entity_get, entity_list_by_type, entity_lookup_by_alias, entity_lookup_by_canonical_name,
+    entity_get, entity_get_resolved_with_chain, entity_list_by_type_page, entity_lookup_by_alias,
+    entity_lookup_by_canonical_name, EntityListFilter,
 };
 use brain_metadata::entity::trigram::{
     candidates_for_query, extract_trigrams, jaccard, trigrams_of_components,
@@ -42,6 +46,23 @@ use crate::write::{Phase, PhaseAck, TombstoneTarget, Write, WriteId};
 // Default grace window for ENTITY_MERGE — 7 days.
 const DEFAULT_MERGE_GRACE_SECS: u64 = 7 * 24 * 60 * 60;
 
+/// Resolver tier-3 (embedding) tunables: search the entity HNSW for the top-5
+/// nearest and resolve to a unique candidate whose cosine clears 0.78.
+const EMBEDDING_TOP_K: usize = 5;
+const EMBEDDING_THRESHOLD: f32 = 0.78;
+
+/// Lexical corroboration floor for a tier-3 embedding hit. Raw name embeddings
+/// are noisy — two unrelated short names ("Zelda", "Alice") sit close enough in
+/// BGE space to clear the cosine floor, which would silently alias distinct
+/// entities. Neither signal alone is trusted: an embedding hit only resolves if
+/// the candidate also shares this much trigram-Jaccard with the matched entity's
+/// name/aliases. That admits misspellings and variants (moderate overlap on both
+/// axes) while rejecting semantically-near-but-lexically-disjoint names (which
+/// score ~0 here and fall through to NotFound / create-fallback). The floor sits
+/// well below tier-2's standalone 0.85 bar because it is corroboration, not a
+/// standalone match.
+const EMBEDDING_LEXICAL_CORROBORATION: f32 = 0.3;
+
 /// Whether `id`'s primary row belongs to the caller's `(namespace,
 /// space)` scope. The brain-core [`Entity`] returned by `entity_get`
 /// drops the scope (brain-core has no slot for it), so the tenant wall
@@ -64,6 +85,21 @@ fn entity_id_in_caller_scope(ctx: &OpsContext, id: EntityId) -> bool {
         }
         None => false,
     }
+}
+
+/// Read an entity's `(namespace_id, space_id_bytes, entity_type_id)` in a
+/// single lookup against a caller-provided read txn. Used by the resolver's
+/// tier-3 scope+type filter so it can screen many HNSW hits under one txn
+/// (rather than opening one per hit). Returns `None` on a missing row or read
+/// error — the caller treats that as fail-closed and drops the candidate.
+fn entity_scope_and_type(
+    rtxn: &redb::ReadTransaction,
+    id: EntityId,
+) -> Option<(u32, [u8; 16], u32)> {
+    use brain_metadata::tables::entity::{EntityMetadata, ENTITIES_TABLE};
+    let t = rtxn.open_table(ENTITIES_TABLE).ok()?;
+    let m: EntityMetadata = t.get(&id.to_bytes()).ok().flatten().map(|g| g.value())?;
+    Some((m.namespace_id, m.space_id_bytes, m.entity_type_id))
 }
 
 /// Upper bound on the alias count of a single entity. Otherwise bounded
@@ -130,6 +166,10 @@ pub async fn handle_entity_create(
         }
     };
 
+    // Embed + index the new entity so tier-3 resolution can find it without
+    // waiting for a rebuild (best-effort; the entity is already durable).
+    index_entity_embedding(ctx, created_id, &req.canonical_name);
+
     // Emit ENTITY_CREATED event post-commit.
     emit_graph_event(
         ctx,
@@ -157,15 +197,18 @@ pub async fn handle_entity_get(
     ctx: &OpsContext,
 ) -> Result<EntityGetResponse, OpError> {
     let id = EntityId::from(req.entity_id);
-    let entity = {
+    let resolved = {
         let rtxn = ctx
             .executor
             .metadata
             .read_txn()
             .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
-        entity_get(&rtxn, id).map_err(OpError::from)?
+        // Follow the `merged_into` redirect: a GET on a merged entity's id
+        // returns the surviving entity (multi-hop chains collapsed), plus the
+        // audit trail of redirect hops walked to reach it.
+        entity_get_resolved_with_chain(&rtxn, id).map_err(OpError::from)?
     };
-    let entity = entity.ok_or_else(|| OpError::NotFound {
+    let (entity, chain) = resolved.ok_or_else(|| OpError::NotFound {
         what: "entity",
         detail: format!("{id:?}"),
     })?;
@@ -182,6 +225,7 @@ pub async fn handle_entity_get(
     }
     Ok(EntityGetResponse {
         entity: entity_to_view(&entity),
+        resolved_from: chain.into_iter().map(|e| e.to_bytes()).collect(),
     })
 }
 
@@ -205,6 +249,15 @@ pub async fn handle_entity_update(
     }
     let id = EntityId::from(req.entity_id);
     let now = crate::txn::now_unix_nanos_pub();
+
+    // Tenant wall (early): a foreign / absent id reads as NotFound before
+    // the write is built. The apply-layer wall re-checks atomically.
+    if !entity_id_in_caller_scope(ctx, id) {
+        return Err(OpError::NotFound {
+            what: "entity",
+            detail: format!("{id:?}"),
+        });
+    }
 
     let real_writer = downcast_writer_pub(ctx)?;
     let write_id =
@@ -273,6 +326,15 @@ pub async fn handle_entity_rename(
     let id = EntityId::from(req.entity_id);
     let now = crate::txn::now_unix_nanos_pub();
 
+    // Tenant wall (early): a foreign / absent id reads as NotFound before
+    // the write is built. The apply-layer wall re-checks atomically.
+    if !entity_id_in_caller_scope(ctx, id) {
+        return Err(OpError::NotFound {
+            what: "entity",
+            detail: format!("{id:?}"),
+        });
+    }
+
     let real_writer = downcast_writer_pub(ctx)?;
     let write_id =
         WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
@@ -333,6 +395,16 @@ pub async fn handle_entity_merge(
     let merged = EntityId::from(req.merged);
     let now = crate::txn::now_unix_nanos_pub();
 
+    // Tenant wall (early): the caller must own both endpoints. A foreign /
+    // absent endpoint reads as NotFound before the write is built. The
+    // apply-layer wall re-checks both atomically.
+    if !entity_id_in_caller_scope(ctx, survivor) || !entity_id_in_caller_scope(ctx, merged) {
+        return Err(OpError::NotFound {
+            what: "entity",
+            detail: format!("survivor={survivor:?} merged={merged:?}"),
+        });
+    }
+
     let real_writer = downcast_writer_pub(ctx)?;
     let write_id =
         WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
@@ -357,8 +429,13 @@ pub async fn handle_entity_merge(
         .with_namespace(ctx.executor.caller_namespace)
         .with_request_hash(request_hash);
     let ack = real_writer.submit(write).await.map_err(map_writer_err)?;
-    let audit_id = match ack.single_phase() {
-        PhaseAck::EntityMerged { audit_id, .. } => *audit_id,
+    let (audit_id, statements_rerouted, relations_rerouted) = match ack.single_phase() {
+        PhaseAck::EntityMerged {
+            audit_id,
+            statements_rerouted,
+            relations_rerouted,
+            ..
+        } => (*audit_id, *statements_rerouted, *relations_rerouted),
         other => {
             return Err(OpError::Internal(format!(
                 "unexpected phase ack for ENTITY_MERGE: {other:?}"
@@ -375,8 +452,8 @@ pub async fn handle_entity_merge(
             merged: req.merged,
             audit_id: audit_id.to_bytes(),
             confidence: req.confidence,
-            statements_rerouted: 0,
-            relations_rerouted: 0,
+            statements_rerouted,
+            relations_rerouted,
         }),
         now,
     )
@@ -398,6 +475,15 @@ pub async fn handle_entity_unmerge(
 ) -> Result<EntityUnmergeResponse, OpError> {
     let merged = EntityId::from(req.merged_entity);
     let now = crate::txn::now_unix_nanos_pub();
+
+    // Tenant wall (early): a foreign / absent id reads as NotFound before
+    // the write is built. The apply-layer wall re-checks atomically.
+    if !entity_id_in_caller_scope(ctx, merged) {
+        return Err(OpError::NotFound {
+            what: "entity",
+            detail: format!("{merged:?}"),
+        });
+    }
 
     let real_writer = downcast_writer_pub(ctx)?;
     let write_id =
@@ -463,21 +549,16 @@ pub async fn handle_entity_tombstone(
         WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_entity_tombstone_request(&req, id);
 
-    // Pre-check existence so we return NotFound at the handler edge
-    // before the writer accepts a phase whose apply would surface the
-    // same error from inside the wtxn.
-    {
-        let rtxn = ctx
-            .executor
-            .metadata
-            .read_txn()
-            .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
-        if entity_get(&rtxn, id).map_err(OpError::from)?.is_none() {
-            return Err(OpError::NotFound {
-                what: "entity",
-                detail: format!("{id:?}"),
-            });
-        }
+    // Pre-check existence AND ownership so we return NotFound at the
+    // handler edge before the writer accepts a phase whose apply would
+    // surface the same error. Scope-aware: an entity owned by another
+    // tenant is indistinguishable from a missing one (no existence leak).
+    // The apply-layer wall re-checks atomically.
+    if !entity_id_in_caller_scope(ctx, id) {
+        return Err(OpError::NotFound {
+            what: "entity",
+            detail: format!("{id:?}"),
+        });
     }
 
     let phase = Phase::Tombstone {
@@ -647,63 +728,63 @@ pub async fn handle_entity_list(
             "entity_type_id filter is required in v1.0 ENTITY_LIST".into(),
         ));
     }
-    if !req.cursor.is_empty() {
-        return Err(OpError::InvalidRequest(
-            "ENTITY_LIST cursor pagination lands in phase 16.7.6".into(),
-        ));
-    }
+    let scope =
+        brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_space);
+    let resume_after = crate::handlers::cursor::decode_opt(scope, &req.cursor)?;
     let type_id = EntityTypeId(req.entity_type_id);
-    let name_prefix_norm = if req.name_prefix.is_empty() {
-        None
-    } else {
-        Some(brain_metadata::entity::ops::normalize_name(
-            &req.name_prefix,
-        ))
+    let filter = EntityListFilter {
+        include_tombstoned: req.include_tombstoned,
+        include_merged: req.include_merged,
+        mention_count_min: req.mention_count_min,
+        name_prefix_norm: if req.name_prefix.is_empty() {
+            None
+        } else {
+            Some(brain_metadata::entity::ops::normalize_name(
+                &req.name_prefix,
+            ))
+        },
     };
-    let entities = {
+
+    // Keyset page directly off the (scope, type) index: the walk applies
+    // every wire filter and resumes strictly past the cursor id, so a page
+    // costs one page — not the whole (scope, type) bucket re-scanned per
+    // request. Ascending EntityId order matches the cursor's resume order.
+    let page = {
         let rtxn = ctx
             .executor
             .metadata
             .read_txn()
             .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
-        entity_list_by_type(
+        entity_list_by_type_page(
             &rtxn,
-            brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_space),
+            scope,
             type_id,
+            &filter,
+            resume_after,
+            req.limit as usize,
         )
         .map_err(OpError::from)?
     };
 
-    let mut items: Vec<EntityListItem> = entities
-        .into_iter()
-        .filter(|e| {
-            if !req.include_tombstoned && e.flags & 1 != 0 {
-                return false;
-            }
-            if !req.include_merged && e.is_merged() {
-                return false;
-            }
-            if e.mention_count < req.mention_count_min {
-                return false;
-            }
-            if let Some(prefix) = &name_prefix_norm {
-                if !e.normalized_name.starts_with(prefix.as_str()) {
-                    return false;
-                }
-            }
-            true
-        })
-        .take(req.limit as usize)
+    let next_cursor = if page.has_more {
+        page.last_id
+            .map(|id| crate::handlers::cursor::encode(scope, id))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    let items: Vec<EntityListItem> = page
+        .rows
+        .iter()
         .map(|e| EntityListItem {
-            entity: entity_to_view(&e),
+            entity: entity_to_view(e),
         })
         .collect();
-
     let cumulative_count = items.len() as u32;
-    // Single-frame snapshot; streamed batches land later.
     let frame = EntityListResponseFrame {
-        items: std::mem::take(&mut items),
-        next_cursor: Vec::new(),
+        items,
+        next_cursor,
         cumulative_count,
         is_final: true,
     };
@@ -711,15 +792,16 @@ pub async fn handle_entity_list(
 }
 
 // ---------------------------------------------------------------------------
-// ENTITY_RESOLVE (tiers 1+2 only — tier 3 / 4 deferred until
-// the entity HNSW + LLM backends are wired into the shard runtime)
+// ENTITY_RESOLVE — tiers 1 (exact/alias), 2 (trigram fuzzy), 3 (embedding
+// HNSW tie-break), and 5 (create fallback under allow_create). Tier 4 (LLM
+// disambiguation) is the extraction resolver's, not this wire path's.
 // ---------------------------------------------------------------------------
 //
-// Wire ENTITY_RESOLVE is a read operation: it returns the wire's richer
-// outcome surface (Resolved | Ambiguous | NotFound) without mutating state.
-// The writer-side `Phase::Resolve` is intentionally separate — it serves
-// the extractor pipeline's resolve-or-create primitive (always succeeds,
-// auto-aliases the surface form into the matched entity).
+// Wire ENTITY_RESOLVE returns the wire outcome surface (Resolved | Ambiguous |
+// Created | NotFound). It is read-only except tier 5, which mints a new entity
+// via a Phase::UpsertEntity write when allow_create is set and no tier matched.
+// The extractor pipeline runs its own resolve-or-create primitive
+// (resolve_or_create_with_deps) separately.
 
 pub async fn handle_entity_resolve(
     req: EntityResolveRequest,
@@ -859,19 +941,26 @@ pub async fn handle_entity_resolve(
         });
     }
 
-    // No match at tiers 1+2. Tier 3 (embedding) requires the entity HNSW
-    // wired through ExecutorContext (deferred). Tier 5 (create) only
-    // fires if allow_create=true.
+    // No match at tiers 1+2. Tier 3 (embedding HNSW tie-break) resolves when
+    // the candidate embedding lands a unique entity above threshold; multiple
+    // in-band hits are Ambiguous. Skipped when no entity vector index is wired
+    // (tests) — then we fall straight through to the create fallback.
+    if let Some(index) = ctx.entity_vector_index.as_ref() {
+        if let Some(resp) = resolve_via_embedding(ctx, &req, index).await? {
+            return Ok(resp);
+        }
+    }
+
+    // Tier 5 — create fallback. Per spec the resolver auto-creates a new entity
+    // on a clean no-match and returns `Created`. The wire's `allow_create=false`
+    // lets a caller opt out of creation, in which case we report `NotFound`.
     if req.allow_create {
-        // Stub — defer create-fallback to the caller.
-        // Returning NotFound here so clients explicitly call
-        // ENTITY_CREATE if they want creation; auto-create lands when
-        // the resolver's tier 5 wires statement extraction.
+        let created = create_fallback_entity(ctx, &req).await?;
         return Ok(EntityResolveResponse {
-            outcome: ResolutionOutcomeWire::NotFound,
-            tier: 0,
-            confidence: 0.0,
-            resolved_entity: [0; 16],
+            outcome: ResolutionOutcomeWire::Created,
+            tier: 5,
+            confidence: 1.0,
+            resolved_entity: created.to_bytes(),
             candidate_ids: Vec::new(),
             audit_id: [0; 16],
         });
@@ -884,6 +973,161 @@ pub async fn handle_entity_resolve(
         candidate_ids: Vec::new(),
         audit_id: [0; 16],
     })
+}
+
+/// Tier-5 create fallback: mint a new entity for the unresolved candidate and
+/// return its id. Mirrors [`handle_entity_create`]'s write-submit path so the
+/// resolver's auto-create is durable and idempotent by `request_id`.
+async fn create_fallback_entity(
+    ctx: &OpsContext,
+    req: &EntityResolveRequest,
+) -> Result<EntityId, OpError> {
+    let now = crate::txn::now_unix_nanos_pub();
+    let id = EntityId::new();
+    let entity_type = EntityTypeId(req.entity_type_hint);
+    let normalized = normalize_name(&req.candidate_name);
+
+    let real_writer = downcast_writer_pub(ctx)?;
+    let write_id =
+        WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
+    let phase = Phase::UpsertEntity {
+        id,
+        ty: entity_type,
+        session: brain_core::SessionId::from(0u64),
+        canonical: req.candidate_name.clone(),
+        normalized,
+        aliases: Vec::new(),
+        attributes: EntityAttributes::from(Vec::new()),
+        created_at_unix_nanos: now,
+    };
+    let write = Write::single(write_id, ctx.executor.caller_space, phase)
+        .with_namespace(ctx.executor.caller_namespace);
+    let ack = real_writer.submit(write).await.map_err(map_writer_err)?;
+    match ack.single_phase() {
+        PhaseAck::UpsertedEntity(eid) => {
+            let eid = *eid;
+            // Index the fresh entity so an immediate tier-3 re-resolve finds it.
+            index_entity_embedding(ctx, eid, &req.candidate_name);
+            Ok(eid)
+        }
+        other => Err(OpError::Internal(format!(
+            "unexpected phase ack for resolver create-fallback: {other:?}"
+        ))),
+    }
+}
+
+/// Best-effort: embed the entity's canonical name and insert it into the
+/// per-shard entity vector index, so tier-3 (embedding) resolution can reach an
+/// explicitly-created entity without waiting for a rebuild. Mirrors the
+/// extraction path, which stages entity vectors into the same index; the stored
+/// vector is the name embedding, matching the rebuild path. A missing index
+/// (tests) or an embed error is a no-op — the entity is already durable, just
+/// tier-3-unreachable until a rebuild.
+fn index_entity_embedding(ctx: &OpsContext, entity_id: EntityId, canonical_name: &str) {
+    let Some(index) = ctx.entity_vector_index.as_ref() else {
+        return;
+    };
+    match ctx.executor.embedder.embed(canonical_name) {
+        Ok(vector) => index.insert(entity_id, &vector),
+        Err(e) => tracing::warn!(
+            target: "brain_ops::write_trace",
+            ?entity_id,
+            error = %e,
+            "entity embed for tier-3 index failed; entity durable but tier-3-unreachable until rebuild",
+        ),
+    }
+}
+
+/// Tier-3 embedding tie-break: embed `candidate + context_snippet`, search the
+/// per-shard entity vector index, and resolve to the unique candidate above
+/// `EMBEDDING_THRESHOLD`. Multiple in-band hits are `Ambiguous`; zero returns
+/// `None` so the caller falls through to the create fallback.
+async fn resolve_via_embedding(
+    ctx: &OpsContext,
+    req: &EntityResolveRequest,
+    index: &Arc<dyn EntityVectorIndex>,
+) -> Result<Option<EntityResolveResponse>, OpError> {
+    // Spec: embed "candidate + first ~100 chars of context".
+    let ctx_snippet: String = req.resolution_context.chars().take(100).collect();
+    let to_embed = if ctx_snippet.is_empty() {
+        req.candidate_name.clone()
+    } else {
+        format!("{} {}", req.candidate_name, ctx_snippet)
+    };
+    let vector = ctx
+        .executor
+        .embedder
+        .embed(&to_embed)
+        .map_err(|e| OpError::Internal(format!("resolver embed: {e}")))?;
+
+    // The per-shard entity HNSW mixes every tenant's entities and types, so a
+    // raw hit may belong to another `(namespace, space)` or a different entity
+    // type. Over-fetch, then filter every hit through the caller's scope wall
+    // AND the entity-type hint under a SINGLE read txn — the tenant wall is
+    // unconditional (resolution is per-(namespace, agent)), and the type hint
+    // stops a Person lookup aliasing onto a same-scope Organization neighbour.
+    // Mirrors the extraction resolver's embedding-tier filter.
+    let hits = index.search(&vector, EMBEDDING_TOP_K * 4);
+    let caller_ns = ctx.executor.caller_namespace.raw();
+    let caller_space = <[u8; 16]>::from(ctx.executor.caller_space);
+    let type_hint = req.entity_type_hint; // 0 == no hint (accept any type)
+    let candidate_norm = normalize_name(&req.candidate_name);
+    let candidate_trigrams = extract_trigrams(&candidate_norm);
+    let rtxn = ctx
+        .executor
+        .metadata
+        .read_txn()
+        .map_err(|e| OpError::Internal(format!("resolver read_txn: {e}")))?;
+    let mut in_band: Vec<(EntityId, f32)> = Vec::with_capacity(EMBEDDING_TOP_K);
+    for (id, score) in hits {
+        if score < EMBEDDING_THRESHOLD {
+            continue;
+        }
+        let Some((ns, space, ty)) = entity_scope_and_type(&rtxn, id) else {
+            continue; // missing row → fail-closed (drop)
+        };
+        let scope_ok = ns == caller_ns && space == caller_space;
+        let type_ok = type_hint == 0 || ty == type_hint;
+        if !(scope_ok && type_ok) {
+            continue;
+        }
+        // Lexical corroboration: a raw-embedding hit alone aliases unrelated
+        // short names, so require the candidate to also share trigrams with the
+        // matched entity's surface forms. Missing row → fail-closed (drop).
+        let Some(cand_entity) = entity_get(&rtxn, id).map_err(OpError::from)? else {
+            continue;
+        };
+        let cand_trigrams =
+            trigrams_of_components(&cand_entity.canonical_name, &cand_entity.aliases);
+        if jaccard(&candidate_trigrams, &cand_trigrams) < EMBEDDING_LEXICAL_CORROBORATION {
+            continue;
+        }
+        in_band.push((id, score));
+        if in_band.len() == EMBEDDING_TOP_K {
+            break;
+        }
+    }
+    drop(rtxn);
+
+    match in_band.as_slice() {
+        [] => Ok(None),
+        [(id, score)] => Ok(Some(EntityResolveResponse {
+            outcome: ResolutionOutcomeWire::Resolved,
+            tier: 3,
+            confidence: *score,
+            resolved_entity: id.to_bytes(),
+            candidate_ids: Vec::new(),
+            audit_id: [0; 16],
+        })),
+        many => Ok(Some(EntityResolveResponse {
+            outcome: ResolutionOutcomeWire::Ambiguous,
+            tier: 3,
+            confidence: many[0].1,
+            resolved_entity: [0; 16],
+            candidate_ids: many.iter().map(|(id, _)| id.to_bytes()).collect(),
+            audit_id: [0; 16],
+        })),
+    }
 }
 
 // ---------------------------------------------------------------------------

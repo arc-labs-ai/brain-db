@@ -594,6 +594,7 @@ async fn recall_returns_single_frame_eos_in_v1() {
     complete_handshake(&mut client, &server.mint(space_id)).await;
 
     let recall = RecallRequest {
+        scope: Default::default(),
         trace: false,
         cue_text: "anything".into(),
         subject_name: String::new(),

@@ -6,15 +6,21 @@
 
 use redb::{ReadableTable, WriteTransaction};
 
-use brain_core::{StatementKind, StatementObject};
+use brain_core::{StatementId, StatementKind, StatementObject, TombstoneReason};
 
 use crate::statement::evidence::reclaim_evidence_overflow;
+use crate::statement::statement_tombstone;
 use crate::statement::StatementOpError;
-use crate::tables::audit::EXTRACTOR_AUDIT_TABLE;
+use crate::tables::audit::{
+    ENTITY_RESOLUTION_AUDIT_TABLE, EXTRACTOR_AUDIT_BY_EXTRACTOR_TABLE,
+    EXTRACTOR_AUDIT_BY_MEMORY_TABLE, EXTRACTOR_AUDIT_BY_TIME_TABLE, EXTRACTOR_AUDIT_TABLE,
+};
+use crate::tables::predicate::PREDICATES_TABLE;
 use crate::tables::statement::{
     confidence_bucket, statement_from_metadata, tombstone_reason, StatementMetadata,
     STATEMENTS_BY_EVENT_TIME_TABLE, STATEMENTS_BY_EVIDENCE_TABLE,
-    STATEMENTS_BY_OBJECT_ENTITY_TABLE, STATEMENTS_BY_PREDICATE_TABLE, STATEMENTS_BY_SUBJECT_TABLE,
+    STATEMENTS_BY_OBJECT_ENTITY_TABLE, STATEMENTS_BY_PREDICATE_ID_TABLE,
+    STATEMENTS_BY_PREDICATE_TABLE, STATEMENTS_BY_SUBJECT_ID_TABLE, STATEMENTS_BY_SUBJECT_TABLE,
     STATEMENTS_TABLE, STATEMENT_CHAIN_TABLE,
 };
 
@@ -92,12 +98,31 @@ pub fn sweep_superseded_statements(
 
     if dry_run {
         summary.dry_run_would_delete = victims.len() as u64;
-    } else {
-        let mut t = wtxn.open_table(STATEMENTS_TABLE)?;
-        for key in &victims {
-            t.remove(key)?;
-            summary.deleted += 1;
-        }
+        return Ok(summary);
+    }
+
+    // Phase 2: re-read each victim under the same write txn and tear it
+    // down through `reclaim_one`, which strips EVERY secondary index
+    // (by_subject both bits + the id-ordered twin, by_predicate + its
+    // id-ordered twin, by_object_entity, by_evidence, evidence_overflow)
+    // and honours the dense-chain invariant. A superseded victim always
+    // carries `superseded_by_bytes`, so it is mid-chain by definition and
+    // `reclaim_one` correctly KEEPS its chain entry (removing it would
+    // punch a hole in the dense 1..=N range). A bare primary `remove`
+    // here would orphan all of those secondary rows.
+    for key in &victims {
+        let row = {
+            let t = wtxn.open_table(STATEMENTS_TABLE)?;
+            let guard = t.get(key)?;
+            guard.map(|g| g.value())
+        };
+        let Some(row) = row else {
+            // Vanished between scan and now (another writer / replay).
+            summary.skipped += 1;
+            continue;
+        };
+        reclaim_one(wtxn, &row)?;
+        summary.deleted += 1;
     }
     Ok(summary)
 }
@@ -209,11 +234,107 @@ pub fn reclaim_retracted_statements(
 }
 
 /// True iff a row is a retract past its grace cutoff.
+/// Time anchor a retention TTL is measured from, per kind: `event_at` for
+/// Events, `valid_from` for Facts/Preferences, falling back to the always-present
+/// arrival timestamp (`extracted_at`) when the kind-specific anchor is unset.
+fn retention_anchor(row: &StatementMetadata) -> u64 {
+    let by_kind = match StatementKind::from_u8(row.kind) {
+        StatementKind::Event => row.event_at_unix_nanos,
+        _ => row.valid_from_unix_nanos,
+    };
+    by_kind.unwrap_or(row.extracted_at_unix_nanos)
+}
+
+/// Soft-tombstone current statements that have outlived their predicate's
+/// declared `retention` TTL (reason [`TombstoneReason::RetentionExpired`]), so
+/// the standard grace→reclaim flow ([`reclaim_retracted_statements`]) then
+/// physically removes them. Two-phase like the reclaim: collect victim ids under
+/// an immutable bounded scan (`batch_cap`), then re-check + tombstone each in the
+/// same write txn. Per-predicate retention is cached so a hot predicate costs one
+/// lookup. A predicate with `retention_seconds == 0` (the default) is skipped —
+/// so this is a no-op until a schema declares `retention`. `dry_run` counts
+/// without mutating.
+pub fn sweep_expired_by_retention(
+    wtxn: &WriteTransaction,
+    now_unix_nanos: u64,
+    batch_cap: usize,
+    dry_run: bool,
+) -> Result<SweepSummary, StatementOpError> {
+    use std::collections::HashMap;
+    let mut summary = SweepSummary::default();
+
+    let victims: Vec<[u8; 16]> = {
+        let stmts = wtxn.open_table(STATEMENTS_TABLE)?;
+        let preds = wtxn.open_table(PREDICATES_TABLE)?;
+        let mut retention_cache: HashMap<u32, u64> = HashMap::new();
+        let mut out = Vec::new();
+        for entry in stmts.iter()? {
+            let (_, v) = entry?;
+            let row = v.value();
+            summary.scanned += 1;
+            // Only the live set — current (not superseded), not already tombstoned.
+            if row.is_tombstoned() || row.is_current != 1 {
+                continue;
+            }
+            let ttl_secs = match retention_cache.get(&row.predicate_id) {
+                Some(&t) => t,
+                None => {
+                    let t = preds
+                        .get(&row.predicate_id)?
+                        .map_or(0, |g| g.value().retention_seconds);
+                    retention_cache.insert(row.predicate_id, t);
+                    t
+                }
+            };
+            if ttl_secs == 0 {
+                continue;
+            }
+            let ttl_ns = ttl_secs.saturating_mul(1_000_000_000);
+            let age_ns = now_unix_nanos.saturating_sub(retention_anchor(&row));
+            if age_ns <= ttl_ns {
+                continue;
+            }
+            out.push(row.statement_id_bytes);
+            if out.len() == batch_cap {
+                break;
+            }
+        }
+        out
+    };
+
+    if dry_run {
+        summary.dry_run_would_delete = victims.len() as u64;
+        return Ok(summary);
+    }
+
+    for key in &victims {
+        // `statement_tombstone` re-reads the row and handles all index/audit
+        // bookkeeping; a row that vanished or was tombstoned between scan and now
+        // is a benign skip (idempotent under replay / concurrent writers).
+        match statement_tombstone(
+            wtxn,
+            StatementId::from_bytes(*key),
+            TombstoneReason::RetentionExpired,
+            now_unix_nanos,
+        ) {
+            Ok(()) => summary.deleted += 1,
+            Err(StatementOpError::NotFound(_)) => summary.skipped += 1,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(summary)
+}
+
 fn is_reclaimable(row: &StatementMetadata, cutoff_ns: u64) -> bool {
     if !row.is_tombstoned() {
         return false;
     }
-    if row.tombstone_reason != tombstone_reason::RETRACT {
+    // Rows the operator/policy asked to REMOVE (vs. plain tombstones and
+    // superseded rows, which are kept for audit): explicit retract, or expiry
+    // past a declared retention TTL.
+    if row.tombstone_reason != tombstone_reason::RETRACT
+        && row.tombstone_reason != tombstone_reason::RETENTION_EXPIRED
+    {
         return false;
     }
     match row.tombstoned_at_unix_nanos {
@@ -264,6 +385,9 @@ fn reclaim_one(wtxn: &WriteTransaction, row: &StatementMetadata) -> Result<(), S
             1u8,
             id_bytes,
         ))?;
+        // Immutable id-ordered pagination twin.
+        let mut t = wtxn.open_table(STATEMENTS_BY_SUBJECT_ID_TABLE)?;
+        t.remove(&(ns, ag, row.subject_entity_bytes, id_bytes))?;
     }
 
     // 3. by_predicate.
@@ -277,6 +401,9 @@ fn reclaim_one(wtxn: &WriteTransaction, row: &StatementMetadata) -> Result<(), S
             confidence_bucket(row.confidence),
             id_bytes,
         ))?;
+        // Immutable id-ordered pagination twin.
+        let mut t = wtxn.open_table(STATEMENTS_BY_PREDICATE_ID_TABLE)?;
+        t.remove(&(ns, ag, row.predicate_id, id_bytes))?;
     }
 
     // 4. by_object_entity — only when the object is an Entity.
@@ -348,10 +475,17 @@ fn overflow_memory_ids(
 // Audit log sweeper.
 // ---------------------------------------------------------------------------
 
-/// Hard-delete audit rows older than `retention_seconds`. Merge/Unmerge
-/// audit rows are exempt (kept forever) — the audit table stores
-/// extraction events only, so the merge-exemption is a no-op until
-/// merge audits land on this table.
+/// Hard-delete historical audit rows older than `retention_seconds` from
+/// both audit logs — `EXTRACTOR_AUDIT_TABLE` (per-call extraction audit)
+/// and `ENTITY_RESOLUTION_AUDIT_TABLE` (entity-resolution audit) — with a
+/// 90 d default. `MERGE_LOG_TABLE` is kept forever and never touched here.
+///
+/// For each expired extraction-audit row the primary row AND its three
+/// secondary index entries (`by_memory` / `by_extractor` / `by_time`) are
+/// removed together in the same txn, so a sweep never leaves a dangling
+/// index row pointing at a deleted primary. `batch_cap` bounds the number
+/// of primary rows deleted per invocation *per table* (index deletes ride
+/// along and don't count against the cap).
 pub fn sweep_audit_log(
     wtxn: &WriteTransaction,
     retention_seconds: u64,
@@ -365,7 +499,16 @@ pub fn sweep_audit_log(
     }
     let cutoff_ns = now_unix_nanos.saturating_sub(retention_seconds * 1_000_000_000);
 
-    let victims: Vec<[u8; 16]> = {
+    // Phase 1 — collect expired extraction-audit victims. Capture the index
+    // coordinates (memory_id, extractor_id, started_at) alongside the primary
+    // key so phase 2 can strip every index entry without re-reading the row.
+    struct ExtractionVictim {
+        audit_id: [u8; 16],
+        memory_id: [u8; 16],
+        extractor_id: u32,
+        started_at: u64,
+    }
+    let extraction_victims: Vec<ExtractionVictim> = {
         let table = wtxn.open_table(EXTRACTOR_AUDIT_TABLE)?;
         let mut out = Vec::new();
         for entry in table.iter()? {
@@ -373,6 +516,31 @@ pub fn sweep_audit_log(
             let row = v.value();
             summary.scanned += 1;
             if row.started_at_unix_nanos > cutoff_ns {
+                continue;
+            }
+            out.push(ExtractionVictim {
+                audit_id: k.value(),
+                memory_id: row.memory_id_bytes,
+                extractor_id: row.extractor_id,
+                started_at: row.started_at_unix_nanos,
+            });
+            if out.len() == batch_cap {
+                break;
+            }
+        }
+        out
+    };
+
+    // Phase 1b — collect expired resolution-audit victims (primary-only table;
+    // keyed by created_at).
+    let resolution_victims: Vec<[u8; 16]> = {
+        let table = wtxn.open_table(ENTITY_RESOLUTION_AUDIT_TABLE)?;
+        let mut out = Vec::new();
+        for entry in table.iter()? {
+            let (k, v) = entry?;
+            let row = v.value();
+            summary.scanned += 1;
+            if row.created_at_unix_nanos > cutoff_ns {
                 continue;
             }
             out.push(k.value());
@@ -384,14 +552,35 @@ pub fn sweep_audit_log(
     };
 
     if dry_run {
-        summary.dry_run_would_delete = victims.len() as u64;
-    } else {
-        let mut t = wtxn.open_table(EXTRACTOR_AUDIT_TABLE)?;
-        for key in &victims {
+        summary.dry_run_would_delete = (extraction_victims.len() + resolution_victims.len()) as u64;
+        return Ok(summary);
+    }
+
+    // Phase 2 — delete each extraction-audit primary row together with its
+    // three index entries, all in this txn.
+    {
+        let mut primary = wtxn.open_table(EXTRACTOR_AUDIT_TABLE)?;
+        let mut by_memory = wtxn.open_table(EXTRACTOR_AUDIT_BY_MEMORY_TABLE)?;
+        let mut by_extractor = wtxn.open_table(EXTRACTOR_AUDIT_BY_EXTRACTOR_TABLE)?;
+        let mut by_time = wtxn.open_table(EXTRACTOR_AUDIT_BY_TIME_TABLE)?;
+        for victim in &extraction_victims {
+            primary.remove(&victim.audit_id)?;
+            by_memory.remove(&(victim.memory_id, victim.audit_id))?;
+            by_extractor.remove(&(victim.extractor_id, victim.audit_id))?;
+            by_time.remove(&(victim.started_at, victim.audit_id))?;
+            summary.deleted += 1;
+        }
+    }
+
+    // Phase 2b — delete expired resolution-audit rows (no secondary indexes).
+    {
+        let mut t = wtxn.open_table(ENTITY_RESOLUTION_AUDIT_TABLE)?;
+        for key in &resolution_victims {
             t.remove(key)?;
             summary.deleted += 1;
         }
     }
+
     Ok(summary)
 }
 
@@ -443,7 +632,7 @@ pub fn scan_stale_statements(
 mod reclaim_tests {
     use super::*;
     use crate::entity::ops::{entity_put, normalize_name};
-    use crate::schema::predicate::predicate_intern;
+    use crate::schema::predicate::{predicate_intern, predicate_set_retention};
     use crate::statement::crud::{statement_create, statement_get};
     use crate::statement::tombstone::{statement_retract, statement_tombstone};
     use brain_core::{
@@ -553,6 +742,89 @@ mod reclaim_tests {
         assert_eq!(summary.deleted, 1);
         let rtxn = db.read_txn().unwrap();
         assert!(statement_get(&rtxn, id).unwrap().is_none());
+    }
+
+    const TEN_DAYS_SECS: u64 = 10 * 24 * 60 * 60;
+    const DAY_NS: u64 = 24 * 60 * 60 * 1_000_000_000;
+
+    /// Intern a Fact predicate and stamp a retention TTL on it.
+    fn intern_fact_with_retention(
+        db: &mut crate::MetadataDb,
+        name: &str,
+        ttl_secs: u64,
+    ) -> PredicateId {
+        let p = intern_fact(db, name, false);
+        let wtxn = db.write_txn().unwrap();
+        predicate_set_retention(&wtxn, p, ttl_secs).unwrap();
+        wtxn.commit().unwrap();
+        p
+    }
+
+    /// Create one live Fact at `T0` under a retention-bearing predicate.
+    fn live_fact(db: &mut crate::MetadataDb, tag: &str, ttl_secs: u64) -> brain_core::StatementId {
+        let subj = make_entity(db, &format!("subj-{tag}"));
+        let obj = make_entity(db, &format!("obj-{tag}"));
+        let p = intern_fact_with_retention(db, tag, ttl_secs);
+        let s = fresh_fact(subj, p, obj);
+        let wtxn = db.write_txn().unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &s, T0).unwrap();
+        wtxn.commit().unwrap();
+        s.id
+    }
+
+    #[test]
+    fn retention_ttl_not_elapsed_is_kept() {
+        let (_d, mut db) = open_db();
+        let id = live_fact(&mut db, "ret_keep", TEN_DAYS_SECS);
+        // 5 days < 10-day TTL → not expired.
+        let now = T0 + 5 * DAY_NS;
+        let wtxn = db.write_txn().unwrap();
+        let s = sweep_expired_by_retention(&wtxn, now, 256, false).unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(s.deleted, 0, "within TTL, nothing is tombstoned");
+        let rtxn = db.read_txn().unwrap();
+        assert!(statement_get(&rtxn, id).unwrap().is_some());
+    }
+
+    #[test]
+    fn retention_ttl_expired_soft_tombstones_then_reclaims_past_grace() {
+        let (_d, mut db) = open_db();
+        let id = live_fact(&mut db, "ret_exp", TEN_DAYS_SECS);
+        // 11 days > 10-day TTL → expired: the sweep soft-tombstones it.
+        let expire_at = T0 + 11 * DAY_NS;
+        let wtxn = db.write_txn().unwrap();
+        let s = sweep_expired_by_retention(&wtxn, expire_at, 256, false).unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(s.deleted, 1, "past TTL, the live statement is tombstoned");
+
+        // A second sweep is idempotent — the row is already tombstoned.
+        let wtxn = db.write_txn().unwrap();
+        let again = sweep_expired_by_retention(&wtxn, expire_at, 256, false).unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(again.deleted, 0, "already-tombstoned rows are not re-swept");
+
+        // The retention tombstone rides the standard grace → hard-reclaim path.
+        let reclaim_at = expire_at + GRACE;
+        let wtxn = db.write_txn().unwrap();
+        let r = reclaim_retracted_statements(&wtxn, GRACE, reclaim_at, 256, false).unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(r.deleted, 1, "RetentionExpired row is reclaimed past grace");
+        let rtxn = db.read_txn().unwrap();
+        assert!(statement_get(&rtxn, id).unwrap().is_none());
+    }
+
+    #[test]
+    fn no_retention_declared_is_a_noop() {
+        let (_d, mut db) = open_db();
+        // TTL 0 = no policy (the default).
+        let id = live_fact(&mut db, "ret_none", 0);
+        let now = T0 + 100 * DAY_NS;
+        let wtxn = db.write_txn().unwrap();
+        let s = sweep_expired_by_retention(&wtxn, now, 256, false).unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(s.deleted, 0, "a predicate without retention is never swept");
+        let rtxn = db.read_txn().unwrap();
+        assert!(statement_get(&rtxn, id).unwrap().is_some());
     }
 
     #[test]
@@ -813,5 +1085,468 @@ mod reclaim_tests {
         assert_eq!(summary.scanned, 0);
         let rtxn = db.read_txn().unwrap();
         assert!(statement_get(&rtxn, id).unwrap().is_some());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests — superseded-statement retention sweep.
+// ---------------------------------------------------------------------------
+
+#[cfg(all(test, not(miri)))]
+mod supersession_sweep_tests {
+    use super::*;
+    use crate::entity::ops::{entity_put, normalize_name};
+    use crate::schema::predicate::predicate_intern;
+    use crate::statement::crud::{statement_create, statement_get};
+    use crate::tables::scope::RowScope;
+    use brain_core::{
+        Entity, EntityId, EntityType, EvidenceEntry, EvidenceRef, ExtractorId, MemoryId,
+        PredicateId, Statement, StatementObject, SubjectRef, INLINE_EVIDENCE_CAP,
+    };
+    use smallvec::SmallVec;
+
+    const T0: u64 = 1_700_000_000_000_000_000;
+    const RETENTION_NS: u64 = 30 * 24 * 60 * 60 * 1_000_000_000;
+    const RETENTION_SECONDS: u64 = 30 * 24 * 60 * 60;
+
+    fn test_scope() -> RowScope {
+        RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xAB; 16])
+    }
+
+    fn open_db() -> (tempfile::TempDir, crate::MetadataDb) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::MetadataDb::open(dir.path().join("md.redb")).unwrap();
+        (dir, db)
+    }
+
+    fn make_entity(db: &mut crate::MetadataDb, name: &str) -> EntityId {
+        let id = EntityId::new();
+        let e = Entity::new_active(
+            id,
+            EntityType::PERSON_ID,
+            name.to_string(),
+            normalize_name(name),
+            T0,
+        );
+        let wtxn = db.write_txn().unwrap();
+        entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
+        wtxn.commit().unwrap();
+        id
+    }
+
+    fn intern_stateful_fact(db: &mut crate::MetadataDb, name: &str) -> PredicateId {
+        let wtxn = db.write_txn().unwrap();
+        let id = predicate_intern(
+            &wtxn,
+            "test",
+            name,
+            Some(StatementKind::Fact),
+            1, // object: Entity
+            1,
+            "",
+            true, // stateful → auto-supersedes prior fact
+            T0,
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+        id
+    }
+
+    fn fact_with_evidence(
+        subject: EntityId,
+        predicate: PredicateId,
+        object: EntityId,
+        mem: MemoryId,
+    ) -> Statement {
+        let mut s = Statement::new_root(
+            brain_core::StatementId::new(),
+            StatementKind::Fact,
+            SubjectRef::Entity(subject),
+            predicate,
+            StatementObject::Entity(object),
+            0.9,
+            EvidenceRef::default(),
+            ExtractorId::from(0),
+            T0,
+            1,
+        );
+        let mut sv = SmallVec::<[EvidenceEntry; INLINE_EVIDENCE_CAP]>::new();
+        sv.push(EvidenceEntry::from_parts(
+            mem,
+            0.8,
+            T0,
+            ExtractorId::from(0),
+        ));
+        s.evidence = EvidenceRef::Inline(Box::new(sv));
+        s
+    }
+
+    /// Regression: sweeping a superseded statement must strip every
+    /// secondary index, not just the primary row. Before the fix the bare
+    /// primary `remove` orphaned by_subject (both bits + id-twin),
+    /// by_predicate id-twin, by_object_entity, and by_evidence.
+    #[test]
+    fn sweep_strips_all_secondary_indexes_no_orphans() {
+        let (_d, mut db) = open_db();
+        let subj = make_entity(&mut db, "subj-sweep");
+        let o1 = make_entity(&mut db, "o1-sweep");
+        let o2 = make_entity(&mut db, "o2-sweep");
+        let p = intern_stateful_fact(&mut db, "p_sweep");
+        let mem = MemoryId::pack(7, brain_core::SessionId::DEFAULT.into(), 0);
+        let f1 = fact_with_evidence(subj, p, o1, mem);
+        let f2 = fact_with_evidence(subj, p, o2, mem);
+
+        let wtxn = db.write_txn().unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &f1, T0).unwrap();
+        wtxn.commit().unwrap();
+        // f2 auto-supersedes f1 (stateful predicate): f1 gets
+        // superseded_by set and valid_to = f2.extracted_at (T0).
+        let wtxn = db.write_txn().unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &f2, T0).unwrap();
+        wtxn.commit().unwrap();
+
+        // Sweep past retention: cutoff = now - retention = T0, so f1's
+        // valid_to (T0) qualifies.
+        let now = T0 + RETENTION_NS;
+        let wtxn = db.write_txn().unwrap();
+        let summary =
+            sweep_superseded_statements(&wtxn, RETENTION_SECONDS, now, 256, false).unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(summary.deleted, 1, "only the superseded f1 is swept");
+
+        let rtxn = db.read_txn().unwrap();
+        let sc = test_scope();
+        let f1_id = f1.id.to_bytes();
+
+        // Primary row gone; f2 (the live tail) survives.
+        assert!(statement_get(&rtxn, f1.id).unwrap().is_none());
+        assert!(statement_get(&rtxn, f2.id).unwrap().is_some());
+
+        // by_subject: no orphan for f1 under either current-bit.
+        let bys = rtxn.open_table(STATEMENTS_BY_SUBJECT_TABLE).unwrap();
+        for bit in [0u8, 1u8] {
+            assert!(
+                bys.get(&(
+                    sc.namespace_id,
+                    sc.space_id_bytes,
+                    subj.to_bytes(),
+                    StatementKind::Fact.as_u8(),
+                    p.raw(),
+                    bit,
+                    f1_id,
+                ))
+                .unwrap()
+                .is_none(),
+                "by_subject bit={bit} orphan for swept id"
+            );
+        }
+        // by_subject id-ordered twin.
+        let bys_id = rtxn.open_table(STATEMENTS_BY_SUBJECT_ID_TABLE).unwrap();
+        assert!(
+            bys_id
+                .get(&(sc.namespace_id, sc.space_id_bytes, subj.to_bytes(), f1_id))
+                .unwrap()
+                .is_none(),
+            "by_subject_id twin orphan for swept id"
+        );
+        // by_predicate id-ordered twin.
+        let byp_id = rtxn.open_table(STATEMENTS_BY_PREDICATE_ID_TABLE).unwrap();
+        assert!(
+            byp_id
+                .get(&(sc.namespace_id, sc.space_id_bytes, p.raw(), f1_id))
+                .unwrap()
+                .is_none(),
+            "by_predicate_id twin orphan for swept id"
+        );
+        // by_object_entity.
+        let byo = rtxn.open_table(STATEMENTS_BY_OBJECT_ENTITY_TABLE).unwrap();
+        assert!(
+            byo.get(&(
+                sc.namespace_id,
+                sc.space_id_bytes,
+                o1.to_bytes(),
+                StatementKind::Fact.as_u8(),
+                f1_id,
+            ))
+            .unwrap()
+            .is_none(),
+            "by_object_entity orphan for swept id"
+        );
+        // by_evidence.
+        let bye = rtxn.open_table(STATEMENTS_BY_EVIDENCE_TABLE).unwrap();
+        assert!(
+            bye.get(&(sc.namespace_id, sc.space_id_bytes, mem.to_be_bytes(), f1_id,))
+                .unwrap()
+                .is_none(),
+            "by_evidence orphan for swept id"
+        );
+        // Dense-chain invariant: f1 is mid-chain (superseded), so its
+        // chain entry (version 1) is KEPT as a tombstone.
+        let chain = rtxn.open_table(STATEMENT_CHAIN_TABLE).unwrap();
+        assert!(
+            chain
+                .get(&(
+                    sc.namespace_id,
+                    sc.space_id_bytes,
+                    f1.chain_root.to_bytes(),
+                    1u32,
+                ))
+                .unwrap()
+                .is_some(),
+            "mid-chain entry must survive the sweep to keep 1..=N dense"
+        );
+    }
+
+    /// `retention_seconds == 0` disables the sweep entirely.
+    #[test]
+    fn sweep_disabled_is_noop() {
+        let (_d, mut db) = open_db();
+        let subj = make_entity(&mut db, "subj-noop");
+        let o1 = make_entity(&mut db, "o1-noop");
+        let o2 = make_entity(&mut db, "o2-noop");
+        let p = intern_stateful_fact(&mut db, "p_noop");
+        let mem = MemoryId::pack(9, brain_core::SessionId::DEFAULT.into(), 0);
+        let f1 = fact_with_evidence(subj, p, o1, mem);
+        let f2 = fact_with_evidence(subj, p, o2, mem);
+        let wtxn = db.write_txn().unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &f1, T0).unwrap();
+        wtxn.commit().unwrap();
+        let wtxn = db.write_txn().unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &f2, T0).unwrap();
+        wtxn.commit().unwrap();
+
+        let wtxn = db.write_txn().unwrap();
+        let summary =
+            sweep_superseded_statements(&wtxn, 0, T0 + RETENTION_NS * 100, 256, false).unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(summary.deleted, 0);
+        assert_eq!(summary.scanned, 0);
+        let rtxn = db.read_txn().unwrap();
+        assert!(statement_get(&rtxn, f1.id).unwrap().is_some());
+    }
+
+    /// A dry run counts victims without mutating any table.
+    #[test]
+    fn sweep_dry_run_counts_without_mutating() {
+        let (_d, mut db) = open_db();
+        let subj = make_entity(&mut db, "subj-dry");
+        let o1 = make_entity(&mut db, "o1-dry");
+        let o2 = make_entity(&mut db, "o2-dry");
+        let p = intern_stateful_fact(&mut db, "p_dry");
+        let mem = MemoryId::pack(11, brain_core::SessionId::DEFAULT.into(), 0);
+        let f1 = fact_with_evidence(subj, p, o1, mem);
+        let f2 = fact_with_evidence(subj, p, o2, mem);
+        let wtxn = db.write_txn().unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &f1, T0).unwrap();
+        wtxn.commit().unwrap();
+        let wtxn = db.write_txn().unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &f2, T0).unwrap();
+        wtxn.commit().unwrap();
+
+        let now = T0 + RETENTION_NS;
+        let wtxn = db.write_txn().unwrap();
+        let summary =
+            sweep_superseded_statements(&wtxn, RETENTION_SECONDS, now, 256, true).unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(summary.dry_run_would_delete, 1);
+        assert_eq!(summary.deleted, 0);
+        let rtxn = db.read_txn().unwrap();
+        assert!(
+            statement_get(&rtxn, f1.id).unwrap().is_some(),
+            "dry run must not delete"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests — audit-log retention sweep.
+// ---------------------------------------------------------------------------
+
+#[cfg(all(test, not(miri)))]
+mod audit_sweep_tests {
+    use super::*;
+    use crate::audit::ops::{audit_write, resolution_audit_write};
+    use crate::tables::audit::{
+        output_kind, resolution_outcome, ExtractionAudit, OutputRef, ResolutionAudit,
+    };
+    use brain_core::{AuditId, EntityId, MemoryId};
+
+    const RETENTION_90D_SECONDS: u64 = 90 * 24 * 60 * 60;
+    const DAY_NANOS: u64 = 24 * 60 * 60 * 1_000_000_000;
+    /// A "now" far enough from the epoch that "100 days ago" doesn't underflow.
+    const NOW: u64 = 1_000 * DAY_NANOS;
+
+    fn open_db() -> (tempfile::TempDir, crate::MetadataDb) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::MetadataDb::open(dir.path().join("md.redb")).unwrap();
+        (dir, db)
+    }
+
+    fn extraction_row(memory: MemoryId, extractor_id: u32, started_at: u64) -> ExtractionAudit {
+        ExtractionAudit::success(
+            AuditId::new(),
+            memory,
+            extractor_id,
+            1,
+            1,
+            started_at,
+            started_at + 100,
+            vec![OutputRef {
+                kind: output_kind::ENTITY,
+                id: [1u8; 16],
+            }],
+            [0u8; 32],
+        )
+    }
+
+    /// An extraction-audit row older than 90 d is swept along with all three
+    /// of its index entries; a fresh row (and its index entries) survive.
+    #[test]
+    fn sweep_removes_expired_extraction_rows_and_all_index_entries() {
+        let (_d, db) = open_db();
+        let mem_old = MemoryId::pack(0, 1, 1);
+        let mem_fresh = MemoryId::pack(0, 2, 1);
+        let old = extraction_row(mem_old, 7, NOW - 100 * DAY_NANOS);
+        let fresh = extraction_row(mem_fresh, 8, NOW - DAY_NANOS);
+        let old_id = old.audit_id_bytes;
+        let fresh_id = fresh.audit_id_bytes;
+
+        {
+            let wtxn = db.write_txn().unwrap();
+            audit_write(&wtxn, &old).unwrap();
+            audit_write(&wtxn, &fresh).unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        {
+            let wtxn = db.write_txn().unwrap();
+            let summary = sweep_audit_log(&wtxn, RETENTION_90D_SECONDS, NOW, 256, false).unwrap();
+            wtxn.commit().unwrap();
+            assert_eq!(summary.deleted, 1, "only the >90d extraction row is swept");
+        }
+
+        let rtxn = db.read_txn().unwrap();
+        // Primary: old gone, fresh survives.
+        let primary = rtxn.open_table(EXTRACTOR_AUDIT_TABLE).unwrap();
+        assert!(primary.get(&old_id).unwrap().is_none());
+        assert!(primary.get(&fresh_id).unwrap().is_some());
+        // by_memory: no dangling entry for the old row; fresh entry present.
+        let by_mem = rtxn.open_table(EXTRACTOR_AUDIT_BY_MEMORY_TABLE).unwrap();
+        assert!(by_mem
+            .get(&(mem_old.to_be_bytes(), old_id))
+            .unwrap()
+            .is_none());
+        assert!(by_mem
+            .get(&(mem_fresh.to_be_bytes(), fresh_id))
+            .unwrap()
+            .is_some());
+        // by_extractor: old (extractor 7) gone; fresh (extractor 8) present.
+        let by_ext = rtxn.open_table(EXTRACTOR_AUDIT_BY_EXTRACTOR_TABLE).unwrap();
+        assert!(by_ext.get(&(7u32, old_id)).unwrap().is_none());
+        assert!(by_ext.get(&(8u32, fresh_id)).unwrap().is_some());
+        // by_time: old started_at key gone; fresh present.
+        let by_time = rtxn.open_table(EXTRACTOR_AUDIT_BY_TIME_TABLE).unwrap();
+        assert!(by_time
+            .get(&(NOW - 100 * DAY_NANOS, old_id))
+            .unwrap()
+            .is_none());
+        assert!(by_time.get(&(NOW - DAY_NANOS, fresh_id)).unwrap().is_some());
+    }
+
+    /// The resolution-audit table is swept on the same 90 d cutoff.
+    #[test]
+    fn sweep_removes_expired_resolution_rows() {
+        let (_d, db) = open_db();
+        let mut old = ResolutionAudit::new(
+            AuditId::new(),
+            "Priya".into(),
+            1,
+            resolution_outcome::TIER_2_FUZZY,
+            0.8,
+            NOW - 100 * DAY_NANOS,
+        );
+        old.resolved_entity_bytes = Some(EntityId::new().to_bytes());
+        let fresh = ResolutionAudit::new(
+            AuditId::new(),
+            "Dana".into(),
+            1,
+            resolution_outcome::TIER_1_EXACT,
+            1.0,
+            NOW - DAY_NANOS,
+        );
+        let old_id = old.audit_id_bytes;
+        let fresh_id = fresh.audit_id_bytes;
+
+        {
+            let wtxn = db.write_txn().unwrap();
+            resolution_audit_write(&wtxn, &old).unwrap();
+            resolution_audit_write(&wtxn, &fresh).unwrap();
+            wtxn.commit().unwrap();
+        }
+        {
+            let wtxn = db.write_txn().unwrap();
+            let summary = sweep_audit_log(&wtxn, RETENTION_90D_SECONDS, NOW, 256, false).unwrap();
+            wtxn.commit().unwrap();
+            assert_eq!(summary.deleted, 1, "only the >90d resolution row is swept");
+        }
+
+        let rtxn = db.read_txn().unwrap();
+        let t = rtxn.open_table(ENTITY_RESOLUTION_AUDIT_TABLE).unwrap();
+        assert!(t.get(&old_id).unwrap().is_none());
+        assert!(t.get(&fresh_id).unwrap().is_some());
+    }
+
+    /// A dry run counts victims across both tables without mutating either.
+    #[test]
+    fn sweep_dry_run_counts_without_deleting() {
+        let (_d, db) = open_db();
+        let old_ext = extraction_row(MemoryId::pack(0, 3, 1), 9, NOW - 100 * DAY_NANOS);
+        let old_res = ResolutionAudit::new(
+            AuditId::new(),
+            "Eve".into(),
+            1,
+            resolution_outcome::TIER_1_EXACT,
+            1.0,
+            NOW - 100 * DAY_NANOS,
+        );
+        let ext_id = old_ext.audit_id_bytes;
+        {
+            let wtxn = db.write_txn().unwrap();
+            audit_write(&wtxn, &old_ext).unwrap();
+            resolution_audit_write(&wtxn, &old_res).unwrap();
+            wtxn.commit().unwrap();
+        }
+        let wtxn = db.write_txn().unwrap();
+        let summary = sweep_audit_log(&wtxn, RETENTION_90D_SECONDS, NOW, 256, true).unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(summary.dry_run_would_delete, 2);
+        assert_eq!(summary.deleted, 0);
+        let rtxn = db.read_txn().unwrap();
+        let primary = rtxn.open_table(EXTRACTOR_AUDIT_TABLE).unwrap();
+        assert!(
+            primary.get(&ext_id).unwrap().is_some(),
+            "dry run keeps rows"
+        );
+    }
+
+    /// `retention_seconds == 0` disables the sweep entirely.
+    #[test]
+    fn sweep_disabled_is_noop() {
+        let (_d, db) = open_db();
+        let row = extraction_row(MemoryId::pack(0, 4, 1), 1, NOW - 100 * DAY_NANOS);
+        let id = row.audit_id_bytes;
+        {
+            let wtxn = db.write_txn().unwrap();
+            audit_write(&wtxn, &row).unwrap();
+            wtxn.commit().unwrap();
+        }
+        let wtxn = db.write_txn().unwrap();
+        let summary = sweep_audit_log(&wtxn, 0, NOW, 256, false).unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(summary.deleted, 0);
+        assert_eq!(summary.scanned, 0);
+        let rtxn = db.read_txn().unwrap();
+        let primary = rtxn.open_table(EXTRACTOR_AUDIT_TABLE).unwrap();
+        assert!(primary.get(&id).unwrap().is_some());
     }
 }

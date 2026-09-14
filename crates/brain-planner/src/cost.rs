@@ -51,7 +51,7 @@ pub(crate) const CROSS_SHARD_MERGE_MS: f32 = 0.05;
 pub(crate) const CROSS_SHARD_PER_SHARD_SERIALISATION_MS: f32 = 0.1;
 
 // REASON's VSA analogical-fit nudge (`executor::analogical`). Per
-// spec §7's order-of-magnitude estimate: ~10 µs for the bind/unbind
+// Order-of-magnitude estimate: ~10 µs for the bind/unbind
 // pair that builds a triple's HRR vector, plus ~5 ms for the
 // `Codebook::cleanup` argmax cosine-rank over the call's filler
 // vocabulary. One lookup per surviving evidence item.

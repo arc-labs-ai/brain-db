@@ -27,7 +27,8 @@ pub mod tombstone;
 // sub-modules.
 pub use contradiction::{contradiction_audit_list_pending, contradiction_audit_record};
 pub use crud::{
-    allocate_evidence_overflow, evidence_overflow_load, rekey_predicate_index,
+    add_to_predicate_index, allocate_evidence_overflow, backfill_statement_id_indexes,
+    evidence_overflow_load, flip_by_subject_to_current, rekey_predicate_index,
     remove_from_predicate_index, statement_create, statement_get,
 };
 pub use embed_queue::{
@@ -39,13 +40,13 @@ pub use evidence::{
     read_evidence_ids_w, reclaim_evidence_overflow,
 };
 pub use list::{
-    statement_history, statement_list, statements_citing_memory, statements_contradicting,
-    StatementListFilter, DEFAULT_LIST_LIMIT,
+    statement_history, statement_history_page, statement_list, statement_list_page,
+    statements_citing_memory, statements_contradicting, StatementHistoryPage, StatementListCursor,
+    StatementListFilter, StatementPage, StatementPageExtra, DEFAULT_LIST_LIMIT,
 };
 pub use supersede::{
-    statement_create_with_decision, statement_supersede, JudgeError, JudgeFuture, JudgeVerdict,
-    StatementJudge, StatementSimilarityCandidate, StatementSimilaritySource, SupersedeDecision,
-    TieredSupersedeDecider, TieredThresholds,
+    statement_supersede, JudgeError, JudgeFuture, JudgeVerdict, StatementJudge,
+    StatementSimilarityCandidate, StatementSimilaritySource,
 };
 pub use tombstone::{statement_retract, statement_tombstone};
 

@@ -37,7 +37,6 @@ pub fn space_range_bounds(namespace_id: u32) -> ([u8; 20], [u8; 20]) {
 /// Per-space registry row. The `(namespace_id, space_id)` scope lives in
 /// the table key, not the value.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct SpaceMetadata {
     /// Human-readable structured space string the wire selector carried
     /// (e.g. `"support-bot:user123"`). The 16-byte storage `space_id` is
@@ -88,9 +87,9 @@ impl redb::Value for SpaceMetadata {
     where
         Self: 'a,
     {
-        let mut buf = rkyv::AlignedVec::with_capacity(data.len());
+        let mut buf = rkyv::util::AlignedVec::<16>::with_capacity(data.len());
         buf.extend_from_slice(data);
-        rkyv::from_bytes::<SpaceMetadata>(&buf)
+        rkyv::from_bytes::<SpaceMetadata, rkyv::rancor::Error>(&buf)
             .expect("SpaceMetadata bytes failed rkyv validation; redb file is corrupt")
     }
 
@@ -99,7 +98,7 @@ impl redb::Value for SpaceMetadata {
         Self: 'a,
         Self: 'b,
     {
-        rkyv::to_bytes::<_, 256>(value)
+        rkyv::to_bytes::<rkyv::rancor::Error>(value)
             .expect("SpaceMetadata is rkyv-serializable")
             .into_vec()
     }

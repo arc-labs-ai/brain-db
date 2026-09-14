@@ -243,7 +243,7 @@ impl PendingBuffer {
 /// A full-precision vector buffered until the next flush rebuild folds
 /// it into the main HNSW. The `vector` field is kept verbatim so
 /// pending search uses exact cosine.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PendingEntry {
     pub memory_id: MemoryId,
     pub vector: [f32; VECTOR_DIM],
@@ -455,6 +455,35 @@ impl SharedHnsw {
         }
     }
 
+    /// Recovery-only: mark `memory_id` tombstoned directly in the
+    /// pending overlay, bypassing the [`Writer`].
+    ///
+    /// The mirror of [`Self::insert_recovery`] for the snapshot-load →
+    /// tail-reconciliation path. A snapshot captures the memory HNSW at
+    /// `taken_at_lsn`; a `FORGET` that landed *after* the snapshot marks
+    /// the memory inactive in redb but leaves the loaded main graph
+    /// holding the node active. Without re-applying that delete the node
+    /// becomes a ghost — an active top-k slot that diverges from redb
+    /// indefinitely (the tombstone-ratio rebuild trigger may never fire
+    /// on a freshly-loaded snapshot). Calling this for every memory whose
+    /// redb row is inactive/tombstoned as of the recovered tail makes the
+    /// HNSW active set converge to the redb active set.
+    ///
+    /// Boot is single-threaded, so bypassing the writer is safe.
+    /// Production tombstone paths must go through
+    /// [`Writer::mark_tombstoned`].
+    pub fn tombstone_recovery(&self, memory_id: MemoryId) {
+        let mut pending = self.pending.write();
+        pending.tombstoned.insert(memory_id);
+        if let Some(slot) = pending
+            .entries
+            .iter_mut()
+            .find(|e| e.memory_id == memory_id)
+        {
+            slot.tombstoned = true;
+        }
+    }
+
     /// Atomically replace the published main with `new_index` and
     /// clear pending. Used for bootstrap and snapshot-load paths
     /// where main was rebuilt from a source of truth that already
@@ -492,9 +521,39 @@ impl SharedHnsw {
         });
         self.main.store(new_epoch);
 
-        let flushed: HashSet<MemoryId> = snapshot.iter().map(|e| e.memory_id).collect();
-        pending.entries.retain(|e| !flushed.contains(&e.memory_id));
-        pending.tombstoned.retain(|id| !flushed.contains(id));
+        // Reconcile pending against exactly what was folded into the new
+        // main — by *identity*, not by id. The build closure ran with no
+        // lock held (snapshot cloned above, write-lock re-acquired here),
+        // so a re-insert (updated vector) or a fresh tombstone for an id in
+        // the snapshot may have landed during the build. Retaining by id
+        // would drop that newer pending entry while the freshly-published
+        // main still carries the *old* snapshot vector — losing the update
+        // from both tiers. Retaining by identity keeps any entry that no
+        // longer byte-matches its folded snapshot version.
+        //
+        // (Not reachable under today's single-threaded Glommio model — the
+        // build is synchronous with no `.await`, so no foreground insert
+        // interleaves — but hardened so it stays correct if that changes.)
+        use std::collections::HashMap;
+        let folded: HashMap<MemoryId, &PendingEntry> =
+            snapshot.iter().map(|e| (e.memory_id, e)).collect();
+        pending.entries.retain(|e| {
+            folded
+                .get(&e.memory_id)
+                .is_none_or(|folded_e| *folded_e != e)
+        });
+        // Drop only tombstone-overlay ids whose folded snapshot entry was
+        // itself tombstoned (build already excluded them from main). A
+        // tombstone that arrived after the snapshot for an id folded as
+        // active is preserved by the entries retain above.
+        let folded_tombstones: HashSet<MemoryId> = snapshot
+            .iter()
+            .filter(|e| e.tombstoned)
+            .map(|e| e.memory_id)
+            .collect();
+        pending
+            .tombstoned
+            .retain(|id| !folded_tombstones.contains(id));
 
         Ok(FlushReport {
             entries_flushed: snapshot_count,
@@ -723,6 +782,79 @@ mod tests {
         assert_eq!(reader.pending_len(), 0);
         assert!(reader.contains(mid(1)));
         assert!(reader.contains(mid(2)));
+    }
+
+    #[test]
+    fn tombstone_recovery_hides_snapshot_memory() {
+        // Simulate IDX1: a memory folded into the loaded main (an active
+        // snapshot node) that a post-snapshot FORGET marked inactive in
+        // redb. The recovery reconciliation must re-apply the delete so the
+        // node stops surfacing.
+        let (reader, mut writer) = build_shared();
+        let v = unit_at_angle(0.0);
+        writer.insert(mid(5), &v).unwrap();
+        reader
+            .flush_with_rebuild(|snapshot| {
+                let mut idx = HnswIndex::new(IndexParams::default_v1()).unwrap();
+                for e in snapshot {
+                    idx.insert(e.memory_id, &e.vector).unwrap();
+                }
+                Ok(idx)
+            })
+            .unwrap();
+        assert!(reader.contains(mid(5)), "memory should be active in main");
+
+        reader.tombstone_recovery(mid(5));
+        assert!(reader.is_tombstoned(mid(5)));
+        assert!(!reader.contains(mid(5)));
+        let results = reader.search_active(&v, 5, None);
+        assert!(
+            results.iter().all(|(id, _)| *id != mid(5)),
+            "ghost node still surfaced after recovery tombstone"
+        );
+    }
+
+    #[test]
+    fn flush_preserves_reinsert_during_build_window() {
+        // IDX4: a re-insert (updated vector) for a snapshot id lands during
+        // the lock-free build window. Identity-based retain must keep the
+        // newer pending entry rather than dropping it (which would leave the
+        // old snapshot vector in main and lose the update from both tiers).
+        let (reader, mut writer) = build_shared();
+        let v_old = unit_at_angle(0.0);
+        writer.insert(mid(1), &v_old).unwrap();
+        let v_new = unit_at_angle(1.0);
+        let reader2 = reader.clone();
+
+        reader
+            .flush_with_rebuild(|snapshot| {
+                let mut idx = HnswIndex::new(IndexParams::default_v1()).unwrap();
+                for e in snapshot {
+                    if !e.tombstoned {
+                        idx.insert(e.memory_id, &e.vector).unwrap();
+                    }
+                }
+                // Interleaved re-insert during the build window (no lock held).
+                reader2.insert_recovery(mid(1), &v_new);
+                Ok(idx)
+            })
+            .unwrap();
+
+        assert_eq!(
+            reader.pending_len(),
+            1,
+            "updated re-insert must survive the flush reconciliation"
+        );
+        // Querying the NEW vector must score ~1.0: the pending entry (v_new)
+        // wins on collision. If the entry had been dropped, main's v_old
+        // would score cos(0,1) ≈ 0.54 instead.
+        let results = reader.search_active(&v_new, 1, None);
+        assert_eq!(results[0].0, mid(1));
+        assert!(
+            (results[0].1 - 1.0).abs() < 1e-5,
+            "new vector must win, got {}",
+            results[0].1
+        );
     }
 
     #[test]

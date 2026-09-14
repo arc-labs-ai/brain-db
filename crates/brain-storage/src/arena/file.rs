@@ -255,6 +255,9 @@ impl ArenaFile {
             return Err(ArenaOpenError::FallocateFailed(io::Error::last_os_error()));
         }
 
+        // SAFETY: `fd` is valid (owned by `file`, kept alive past the mmap) and
+        // `file_size` is exactly the length just grown via fallocate above, so
+        // the mapping covers only backed pages.
         let base = unsafe { mmap_rw(fd, file_size)? };
         apply_madvise(base, file_size);
 
@@ -321,6 +324,9 @@ impl ArenaFile {
         })?;
 
         let fd = file.as_raw_fd();
+        // SAFETY: `fd` is valid (owned by `file`, kept alive past the mmap) and
+        // `file_size` is the existing file's length, so the mapping covers only
+        // backed pages.
         let base = unsafe { mmap_rw(fd, file_size)? };
         apply_madvise(base, file_size);
 
@@ -493,6 +499,49 @@ impl ArenaFile {
             let ptr = self.base.as_ptr().add(off) as *mut Slot;
             &mut *ptr
         }
+    }
+
+    /// Zero a hard-forgotten memory's vector-at-rest, live (no restart).
+    ///
+    /// Hard FORGET promises the plaintext-derived embedding is "no longer
+    /// recoverable from the file". Because the arena is populated only by
+    /// WAL recovery — the live encode path never writes it — a memory that
+    /// was encoded in a *prior* run and re-materialized into the arena on
+    /// this run's startup keeps its 384-float embedding in the mmap'd file
+    /// until the next restart, which may never come. Zeroing it here closes
+    /// that gap immediately rather than deferring to the recovery replay
+    /// (which mirrors this in `recovery::mark_slot_tombstoned`).
+    ///
+    /// Two guards matter on the live path and are absent from the recovery
+    /// path:
+    ///
+    /// - **Occupancy.** A memory encoded in the *current* run has no arena
+    ///   slot yet, so its `slot()` index is either out of range or points
+    ///   at an unrelated slot. Only an occupied slot is touched — a same-run
+    ///   hard forget is a no-op here (its at-rest homes are redb + tantivy,
+    ///   purged elsewhere).
+    /// - **Slot version (invariant #4).** If a newer memory has reclaimed
+    ///   this slot index, its `slot_version` won't match `expected_version`;
+    ///   zeroing would destroy live data, so the mismatch is a no-op.
+    ///
+    /// Returns `true` if the slot was actually zeroed, `false` for any
+    /// no-op (out of range, free, or version mismatch). Idempotent: a
+    /// second call on an already-zeroed slot re-zeros (still `true`).
+    pub fn hard_forget_slot(&mut self, slot_idx: u64, expected_version: u32) -> bool {
+        if slot_idx >= self.capacity_slots {
+            return false;
+        }
+        let slot = self.slot_mut(slot_idx);
+        if !slot.is_occupied() || slot.metadata.slot_version != expected_version {
+            return false;
+        }
+        slot.vector.fill(0.0);
+        slot.set_flag(
+            crate::arena::slot::flags::TOMBSTONED | crate::arena::slot::flags::HARD_FORGOTTEN,
+            true,
+        );
+        slot.refresh_crc();
+        true
     }
 
     /// Grow the arena to (at least) `new_capacity_slots`.
@@ -854,6 +903,95 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let arena = open_fresh(&dir, 16);
         let _ = arena.slot(16);
+    }
+
+    // ---- Live hard-forget zeroing ----------------------------------------
+
+    /// Populate slot `idx` as an occupied memory at `version` with a
+    /// recognizable non-zero embedding, mirroring what WAL recovery lays
+    /// down for a prior-run memory.
+    fn occupy_slot(arena: &mut ArenaFile, idx: u64, version: u32) {
+        let s = arena.slot_mut(idx);
+        s.metadata.slot_version = version;
+        s.metadata.flags = flags::OCCUPIED;
+        s.metadata.embedding_model_fp_short = [0xCD; 16];
+        for (i, x) in s.vector.iter_mut().enumerate() {
+            *x = (i as f32) * 0.25 + 1.0; // all non-zero
+        }
+        s.refresh_crc();
+    }
+
+    #[test]
+    fn hard_forget_zeroes_occupied_matching_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut arena = open_fresh(&dir, 16);
+        occupy_slot(&mut arena, 5, 3);
+
+        let zeroed = arena.hard_forget_slot(5, 3);
+        assert!(zeroed, "occupied slot at matching version must be zeroed");
+
+        let s = arena.slot(5);
+        assert!(s.vector.iter().all(|&x| x == 0.0), "vector must be zeroed");
+        assert!(s.is_hard_forgotten(), "HARD_FORGOTTEN flag must be set");
+        assert!(s.is_tombstoned(), "TOMBSTONED flag must be set");
+        assert!(s.is_valid(), "CRC must be refreshed after zeroing");
+    }
+
+    #[test]
+    fn hard_forget_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("arena.bin");
+        {
+            let mut arena = ArenaFile::open(&path, uuid(1), 16).unwrap();
+            occupy_slot(&mut arena, 2, 9);
+            assert!(arena.hard_forget_slot(2, 9));
+        }
+        // The zeroing must be durable across unmap + remap — not merely a
+        // live in-memory scrub.
+        let arena = ArenaFile::open(&path, uuid(1), 16).unwrap();
+        let s = arena.slot(2);
+        assert!(s.vector.iter().all(|&x| x == 0.0));
+        assert!(s.is_hard_forgotten());
+        assert!(s.is_valid());
+    }
+
+    #[test]
+    fn hard_forget_version_mismatch_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut arena = open_fresh(&dir, 16);
+        occupy_slot(&mut arena, 5, 7); // slot now holds version 7
+
+        // A stale FORGET for version 3 (a newer memory reclaimed the slot)
+        // must not touch the live data — invariant #4.
+        let zeroed = arena.hard_forget_slot(5, 3);
+        assert!(!zeroed, "version mismatch must be a no-op");
+
+        let s = arena.slot(5);
+        assert!(s.is_occupied());
+        assert!(!s.is_hard_forgotten());
+        assert!(
+            s.vector.iter().any(|&x| x != 0.0),
+            "live vector must be untouched on version mismatch"
+        );
+    }
+
+    #[test]
+    fn hard_forget_free_slot_is_noop() {
+        // A same-run memory has no arena slot: its slot() index resolves to
+        // a free slot, which must not be mutated.
+        let dir = tempfile::tempdir().unwrap();
+        let mut arena = open_fresh(&dir, 16);
+        assert!(!arena.hard_forget_slot(4, 0));
+        assert!(!arena.slot(4).is_occupied());
+    }
+
+    #[test]
+    fn hard_forget_out_of_range_is_noop() {
+        // A same-run memory's slot() index can exceed arena capacity; that
+        // must be a no-op, not a panic.
+        let dir = tempfile::tempdir().unwrap();
+        let mut arena = open_fresh(&dir, 16);
+        assert!(!arena.hard_forget_slot(9999, 0));
     }
 
     // ---- Grow ------------------------------------------------------------

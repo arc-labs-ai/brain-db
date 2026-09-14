@@ -21,7 +21,8 @@ use brain_ops::{OpsContext, RealWriterHandle};
 use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_workers::{
     decayed_salience, half_life_days, DecayWorker, Worker, WorkerConfig, WorkerContext, WorkerKind,
-    WorkerScheduler, CONSOLIDATED_HALF_LIFE_DAYS, EPISODIC_HALF_LIFE_DAYS, SEMANTIC_HALF_LIFE_DAYS,
+    WorkerScheduler, CONSOLIDATED_HALF_LIFE_DAYS, EPISODIC_HALF_LIFE_DAYS, SALIENCE_FLOOR,
+    SEMANTIC_HALF_LIFE_DAYS,
 };
 use uuid::Uuid;
 
@@ -161,11 +162,41 @@ fn age_zero_is_identity() {
 }
 
 #[test]
-fn extreme_age_clamps_above_zero_no_nan() {
+fn extreme_age_rests_at_floor_no_nan() {
     let s = decayed_salience(1.0, 10_000 * NANOS_PER_DAY, MemoryKind::Episodic);
-    assert!(s.is_finite() && s >= 0.0, "got {s}");
-    // 10000 / 30 ≈ 333 half-lives; well past f32 precision.
-    assert!(s < 1e-10, "ought to be effectively zero, got {s}");
+    assert!(s.is_finite(), "got {s}");
+    // 10000 / 30 ≈ 333 half-lives: the closed form is effectively zero,
+    // but decay never lowers salience below the floor.
+    assert!((s - SALIENCE_FLOOR).abs() < 1e-6, "expected floor, got {s}");
+}
+
+#[test]
+fn decay_never_drops_below_floor() {
+    // A very old memory decays toward zero but rests at the floor,
+    // never below — decay stops at the floor rather than at 0.0, so
+    // decay alone can never auto-erase a memory.
+    for kind in [
+        MemoryKind::Episodic,
+        MemoryKind::Semantic,
+        MemoryKind::Consolidated,
+    ] {
+        let s = decayed_salience(0.9, 100_000 * NANOS_PER_DAY, kind);
+        assert!(s >= SALIENCE_FLOOR, "{kind:?} fell below floor: {s}");
+        assert!(
+            (s - SALIENCE_FLOOR).abs() < 1e-6,
+            "{kind:?} not at floor: {s}"
+        );
+    }
+}
+
+#[test]
+fn decay_does_not_raise_below_floor_memory_to_floor() {
+    // A memory created below the floor is left where it is, not lifted up
+    // to the floor — decay is monotone non-increasing.
+    let below = SALIENCE_FLOOR / 2.0;
+    let s = decayed_salience(below, 10_000 * NANOS_PER_DAY, MemoryKind::Episodic);
+    assert!(s <= below + 1e-6, "raised a below-floor memory: {s}");
+    assert!(s >= 0.0 && s.is_finite(), "got {s}");
 }
 
 #[test]

@@ -8,16 +8,20 @@
 
 #![cfg(target_os = "linux")]
 
+use std::io::{Read as _, Write as _};
+use std::net::TcpStream as StdTcpStream;
+use std::time::Duration;
+
 use brain_protocol::codec::opcode::Opcode;
 use brain_protocol::connection::handshake::{
     AuthCredentials, AuthMethod, AuthPayload, HelloCapabilities, HelloPayload,
 };
-use brain_protocol::envelope::request::RequestBody;
+use brain_protocol::envelope::request::{EncodeRequest, RequestBody};
 use brain_protocol::envelope::response::ResponseBody;
-use brain_protocol::ExtractorListRequest;
-use brain_protocol::Frame;
+use brain_protocol::{ExtractorListRequest, Frame, WaitMode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use uuid::Uuid;
 
 #[allow(dead_code)]
 #[path = "../src/admin/mod.rs"]
@@ -144,9 +148,102 @@ async fn round_trip(
     (resp_opcode, body)
 }
 
+/// Encode `text`, blocking until the async derivation (extraction) completes
+/// (`WaitMode::Derived`), so the resolution-audit rows are durable by the time
+/// the call returns.
+async fn encode_and_wait(client: &mut TcpStream, stream_id: u32, text: &str) {
+    let req = EncodeRequest {
+        text: text.into(),
+        session_id: 1,
+        request_id: *Uuid::now_v7().as_bytes(),
+        txn_id: None,
+        occurred_at_unix_nanos: None,
+        act_as: None,
+        wait: WaitMode::Derived,
+        allow_duplicates: false,
+    };
+    let (opcode, _body) = round_trip(client, stream_id, RequestBody::Encode(req)).await;
+    assert_eq!(opcode, Opcode::EncodeResp.as_u16(), "encode should ack");
+}
+
+/// Blocking GET against the admin listener with the test operator secret.
+/// Runs under `spawn_blocking` at the call site.
+fn http_get_authed(admin_addr: &str, path: &str) -> (u16, String) {
+    let mut stream = StdTcpStream::connect_timeout(
+        &admin_addr.parse().expect("admin addr"),
+        Duration::from_secs(5),
+    )
+    .expect("connect admin");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: {admin_addr}\r\n\
+         Authorization: Bearer test-admin-token\r\n\
+         Connection: close\r\nAccept: */*\r\n\r\n",
+    );
+    stream.write_all(req.as_bytes()).unwrap();
+    stream.flush().unwrap();
+    let mut raw = Vec::with_capacity(1024);
+    stream.read_to_end(&mut raw).unwrap();
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("response delimiter");
+    let head = std::str::from_utf8(&raw[..split]).unwrap();
+    let status: u16 = head
+        .lines()
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap();
+    let body = String::from_utf8_lossy(&raw[split + 4..]).to_string();
+    (status, body)
+}
+
 // ---------------------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------------------
+
+/// End-to-end: an ENCODE runs the always-on pattern extractor, which files
+/// entity mentions that the apply path resolves — and each resolution now lands
+/// a per-mention audit row. Prove the whole derivation→log→query chain by
+/// reading the rows back through the admin `GET /v1/audit?by=resolution` route.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn encode_extraction_emits_queryable_resolution_audit() {
+    let server = start(1).await;
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
+    complete_handshake(&mut client, &server.token).await;
+
+    // Proper nouns the model-free pattern tier lifts as entity mentions.
+    encode_and_wait(&mut client, 1, "Alice Johnson works at Acme Corporation").await;
+
+    let admin_addr = server.admin_addr.to_string();
+    let (code, body) = tokio::task::spawn_blocking(move || {
+        http_get_authed(&admin_addr, "/v1/audit?by=resolution")
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(code, 200, "body:\n{body}");
+    assert!(
+        body.contains("\"kind\":\"resolution\""),
+        "resolution rows expected; body:\n{body}",
+    );
+    // At least one proper-noun mention resolved into a durable, queryable
+    // derivation row.
+    assert!(
+        body.contains("\"resolved_entity\"") || body.contains("Acme") || body.contains("Alice"),
+        "a resolved mention should appear; body:\n{body}",
+    );
+
+    server.stop().await;
+}
 
 #[tokio::test(flavor = "current_thread")]
 async fn extractor_list_returns_seeded_builtins() {

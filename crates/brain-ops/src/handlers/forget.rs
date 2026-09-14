@@ -81,9 +81,30 @@ pub async fn handle_forget(
     if matches!(outcome, ForgetOutcome::Tombstoned) {
         if let Some(dispatcher) = ctx.memory_text_dispatcher.as_ref() {
             dispatcher
-                .dispatch(MemoryTextOp::Forget { id: memory_id })
+                .dispatch(MemoryTextOp::Forget {
+                    id: memory_id,
+                    hard: matches!(req.mode, ForgetMode::Hard),
+                })
                 .await;
         }
+
+        // Drop the memory's HyPE question-vectors on the same policy as
+        // the lexical index above: at forget time, for both Soft and Hard
+        // modes. Leaving them behind would let the semantic lane keep
+        // probing hypothetical-question hits that resolve to a
+        // tombstoned/gone memory — wasted probe budget and worse
+        // tombstone-suppression during the grace window. The durable redb
+        // rows are the source of truth the in-RAM HyPE HNSW is rebuilt
+        // from at boot, so removing them here retires the memory from HyPE
+        // on the next rebuild; the slot-reclaim worker re-runs the same
+        // (idempotent) delete at grace as a backstop. Best-effort — a
+        // redb hiccup here never fails the lenient FORGET, and the reclaim
+        // backstop guarantees eventual removal.
+        //
+        // The memory's HNSW node is tombstoned by the writer's
+        // Tombstone(Memory) side-effect when the Write below commits, so
+        // the semantic lane already excludes it — nothing to do here.
+        delete_hype_vectors(ctx, memory_id);
 
         // Only submit a Write when the memory actually exists active.
         // AlreadyTombstoned + MemoryNotFound are wire-level no-ops.
@@ -111,6 +132,54 @@ pub async fn handle_forget(
     })
 }
 
+/// Remove every HyPE question-vector row owned by `memory_id` in a
+/// dedicated write transaction. Idempotent: `hype_vectors_delete_memory`
+/// returns 0 when the memory owns none, so a double-forget (or the
+/// slot-reclaim backstop) is a harmless no-op. Best-effort: a redb error
+/// is logged, not propagated — FORGET is lenient and the reclaim worker
+/// re-runs this at grace.
+pub(crate) fn delete_hype_vectors(ctx: &OpsContext, memory_id: MemoryId) {
+    let wtxn = match ctx.executor.metadata.write_txn() {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::warn!(
+                target: "brain_ops::forget",
+                memory_id = ?memory_id,
+                error = %e,
+                "forget: HyPE vector delete write_txn failed; leaving rows for reclaim",
+            );
+            return;
+        }
+    };
+    match brain_metadata::hype_vectors_delete_memory(&wtxn, memory_id) {
+        Ok(removed) => {
+            if let Err(e) = wtxn.commit() {
+                tracing::warn!(
+                    target: "brain_ops::forget",
+                    memory_id = ?memory_id,
+                    error = %e,
+                    "forget: HyPE vector delete commit failed; leaving rows for reclaim",
+                );
+            } else if removed > 0 {
+                tracing::debug!(
+                    target: "brain_ops::forget",
+                    memory_id = ?memory_id,
+                    removed,
+                    "forget: removed HyPE question-vectors",
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "brain_ops::forget",
+                memory_id = ?memory_id,
+                error = %e,
+                "forget: HyPE vector delete failed; leaving rows for reclaim",
+            );
+        }
+    }
+}
+
 fn hex_short(bytes: &[u8; 16]) -> String {
     let mut s = String::with_capacity(8);
     for b in &bytes[..4] {
@@ -136,6 +205,16 @@ fn peek_forget_outcome(ctx: &OpsContext, id: MemoryId) -> Result<ForgetOutcome, 
         return Ok(ForgetOutcome::MemoryNotFound);
     };
     let row = guard.value();
+    // Tenant wall — mirror the read paths: a memory owned by another
+    // `(namespace, space)` is indistinguishable from a missing one to this
+    // caller. FORGET is lenient, so a foreign id reads as MemoryNotFound (a
+    // no-op success), never leaking that the id exists in another tenant. The
+    // apply layer re-checks inside the write txn as the authoritative guard.
+    if row.namespace_id != ctx.executor.caller_namespace.raw()
+        || row.space_id_bytes != <[u8; 16]>::from(ctx.executor.caller_space)
+    {
+        return Ok(ForgetOutcome::MemoryNotFound);
+    }
     if row.flags & brain_metadata::tables::memory::flags::ACTIVE == 0 {
         Ok(ForgetOutcome::AlreadyTombstoned)
     } else {
@@ -163,7 +242,9 @@ async fn handle_forget_in_txn(
     let plan = plan_forget_inner(&req, &ctx.planner_ctx)?;
     let _ = plan;
 
-    let _ = ctx.txn_store.validate_active(txn_id)?;
+    let _ = ctx
+        .txn_store
+        .validate_active(txn_id, ctx.caller_connection_id)?;
 
     let memory_id = MemoryId::from(req.memory_id);
     let request_hash = hash_forget_request(&ForgetOp {
@@ -174,23 +255,25 @@ async fn handle_forget_in_txn(
     });
 
     // Replay check.
-    let cached = ctx.txn_store.with_buffer(txn_id, |buf| {
-        if let Some(prior_hash) = buf.request_hashes.get(&req.request_id) {
-            if prior_hash != &request_hash {
-                return Err(OpError::Conflict(
-                    "forget in-txn request_id replay with different params".into(),
-                ));
+    let cached = ctx
+        .txn_store
+        .with_buffer(txn_id, ctx.caller_connection_id, |buf| {
+            if let Some(prior_hash) = buf.request_hashes.get(&req.request_id) {
+                if prior_hash != &request_hash {
+                    return Err(OpError::Conflict(
+                        "forget in-txn request_id replay with different params".into(),
+                    ));
+                }
+                if let Some(BufferedReplay::Forget {
+                    memory_id: cached_mid,
+                    outcome,
+                }) = buf.request_id_cache.get(&req.request_id)
+                {
+                    return Ok(Some((*cached_mid, *outcome)));
+                }
             }
-            if let Some(BufferedReplay::Forget {
-                memory_id: cached_mid,
-                outcome,
-            }) = buf.request_id_cache.get(&req.request_id)
-            {
-                return Ok(Some((*cached_mid, *outcome)));
-            }
-        }
-        Ok(None)
-    })?;
+            Ok(None)
+        })?;
     if let Some((cached_mid, outcome)) = cached {
         return Ok(ForgetResponse {
             memory_id: cached_mid.raw(),
@@ -205,7 +288,9 @@ async fn handle_forget_in_txn(
     // Reject the 1001st op now — replay-cache hits still replay, but
     // a fresh FORGET against a full buffer fails fast.
     ctx.txn_store
-        .with_buffer(txn_id, |buf| buf.check_capacity_for_push())?;
+        .with_buffer(txn_id, ctx.caller_connection_id, |buf| {
+            buf.check_capacity_for_push()
+        })?;
 
     // Decide the outcome at preview time: look up the memory in
     // committed state OR pending in-buffer.
@@ -220,14 +305,27 @@ async fn handle_forget_in_txn(
                 .map_err(|e| {
                     OpError::ExecError(brain_planner::ExecError::MetadataReadFailed(e.to_string()))
                 })?;
-            table.get(memory_id.to_be_bytes()).ok().flatten().is_some()
+            // Scope the existence probe: a foreign-tenant id reads as absent so
+            // this in-txn preview can't be a cross-tenant existence oracle (the
+            // forget itself is scope-walled at apply time; this closes the probe).
+            table
+                .get(memory_id.to_be_bytes())
+                .ok()
+                .flatten()
+                .map(|g| g.value())
+                .is_some_and(|row| {
+                    row.namespace_id == ctx.executor.caller_namespace.raw()
+                        && row.space_id_bytes == <[u8; 16]>::from(ctx.executor.caller_space)
+                })
         };
 
-        let (pending, tombstoned) = ctx.txn_store.with_buffer(txn_id, |buf| {
-            let pending = buf.encodes.iter().any(|e| e.memory_id == memory_id);
-            let tombstoned = buf.tombstoned.contains(&memory_id);
-            Ok((pending, tombstoned))
-        })?;
+        let (pending, tombstoned) =
+            ctx.txn_store
+                .with_buffer(txn_id, ctx.caller_connection_id, |buf| {
+                    let pending = buf.encodes.iter().any(|e| e.memory_id == memory_id);
+                    let tombstoned = buf.tombstoned.contains(&memory_id);
+                    Ok((pending, tombstoned))
+                })?;
 
         if tombstoned {
             ForgetOutcome::AlreadyTombstoned
@@ -246,18 +344,19 @@ async fn handle_forget_in_txn(
         created_at_unix_nanos: crate::txn::now_unix_nanos_pub(),
         space_id: ctx.executor.caller_space,
     };
-    ctx.txn_store.with_buffer(txn_id, |buf| {
-        buf.forgets.push(buffered);
-        if matches!(outcome, ForgetOutcome::Tombstoned) {
-            buf.tombstoned.insert(memory_id);
-        }
-        buf.request_hashes.insert(req.request_id, request_hash);
-        buf.request_id_cache.insert(
-            req.request_id,
-            BufferedReplay::Forget { memory_id, outcome },
-        );
-        Ok(())
-    })?;
+    ctx.txn_store
+        .with_buffer(txn_id, ctx.caller_connection_id, |buf| {
+            buf.forgets.push(buffered);
+            if matches!(outcome, ForgetOutcome::Tombstoned) {
+                buf.tombstoned.insert(memory_id);
+            }
+            buf.request_hashes.insert(req.request_id, request_hash);
+            buf.request_id_cache.insert(
+                req.request_id,
+                BufferedReplay::Forget { memory_id, outcome },
+            );
+            Ok(())
+        })?;
 
     Ok(ForgetResponse {
         memory_id: req.memory_id,

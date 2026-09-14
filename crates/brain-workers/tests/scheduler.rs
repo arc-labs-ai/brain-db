@@ -466,6 +466,188 @@ fn scheduler_rejects_duplicate_worker_names() {
 }
 
 // ===========================================================================
+// Panic isolation (1 test).
+// ===========================================================================
+
+#[test]
+fn panic_in_run_cycle_is_isolated_and_shutdown_stays_clean() {
+    // A worker whose `run_cycle` panics every tick must NOT (a) kill its own
+    // task — it must survive and tick again, (b) affect other workers, or
+    // (c) poison `shutdown()` (the stored task's panic must never re-raise at
+    // join). A caught panic is counted like an error (`errors_total`).
+    //
+    // NOTE: relies on the unwinding panic strategy (dev/test default). The
+    // release profile sets `panic = "abort"`, under which `catch_unwind`
+    // cannot intercept and the process aborts instead — a fail-stop, not a
+    // silent cessation.
+    glommio_run(|| async {
+        let (ops, _td) = make_ops_context();
+        let mut sched = WorkerScheduler::new();
+
+        // Panicking worker: panics on every cycle.
+        let panic_body: CycleBody = Arc::new(|_ctx| {
+            Box::pin(async {
+                panic!("invariant: injected worker-cycle panic");
+                #[allow(unreachable_code)]
+                Ok(0)
+            })
+        });
+        sched
+            .register(
+                Arc::new(TestWorker::new(
+                    "forget_cascade",
+                    WorkerKind::ForgetCascade,
+                    fast_config(),
+                    panic_body,
+                )),
+                ops.clone(),
+            )
+            .unwrap();
+
+        // Healthy worker registered alongside it.
+        let healthy_body: CycleBody = Arc::new(|_ctx| Box::pin(async { Ok(1) }));
+        sched
+            .register(
+                Arc::new(TestWorker::new(
+                    "decay",
+                    WorkerKind::Decay,
+                    fast_config(),
+                    healthy_body,
+                )),
+                ops,
+            )
+            .unwrap();
+
+        let panic_metrics = sched.metrics("forget_cascade").unwrap();
+        let healthy_metrics = sched.metrics("decay").unwrap();
+
+        // The panicking worker must survive its own panic and tick again:
+        // errors_total >= 2 proves the task was not killed by the first panic.
+        // The healthy worker keeps ticking independently.
+        let ok = wait_until(1000, || {
+            panic_metrics.errors_total.load(Ordering::Relaxed) >= 2
+                && healthy_metrics.cycles_total.load(Ordering::Relaxed) >= 2
+        })
+        .await;
+
+        // Shutdown must complete cleanly and NOT propagate the stored panic.
+        let shutdown = sched.shutdown().await;
+
+        assert!(
+            ok,
+            "panicking worker must survive (errors_total={}, need >=2) and healthy \
+             worker must keep ticking (cycles_total={}, need >=2)",
+            panic_metrics.errors_total.load(Ordering::Relaxed),
+            healthy_metrics.cycles_total.load(Ordering::Relaxed),
+        );
+        assert!(
+            shutdown.is_ok(),
+            "shutdown must not propagate a worker-cycle panic"
+        );
+        // A caught panic is counted, never a successful cycle.
+        assert_eq!(
+            panic_metrics.cycles_total.load(Ordering::Relaxed),
+            0,
+            "panicking cycles must not count as successful cycles"
+        );
+        // Panics are also tracked distinctly, so a silently-ceasing-turned-
+        // isolated worker is visible in its own series (not just errors_total).
+        assert!(
+            panic_metrics.panics_total.load(Ordering::Relaxed) >= 2,
+            "each isolated panic must bump panics_total (got {})",
+            panic_metrics.panics_total.load(Ordering::Relaxed),
+        );
+        // A logical Err worker never bumps panics_total.
+        assert_eq!(
+            healthy_metrics.panics_total.load(Ordering::Relaxed),
+            0,
+            "a healthy worker must never register a panic"
+        );
+    });
+}
+
+#[test]
+fn erroring_worker_advances_last_run() {
+    // `last_run` tracks the last *attempted* cycle, not the last success.
+    // A worker that returns `Err` every tick is still alive; its
+    // `last_run_unix_secs` must advance past the default 0 so operators
+    // don't read it as a dead worker.
+    glommio_run(|| async {
+        let (ops, _td) = make_ops_context();
+        let mut sched = WorkerScheduler::new();
+        let body: CycleBody =
+            Arc::new(|_ctx| Box::pin(async { Err(WorkerError::Ops("always fails".into())) }));
+        sched
+            .register(
+                Arc::new(TestWorker::new(
+                    "edge_scrub",
+                    WorkerKind::EdgeScrub,
+                    fast_config(),
+                    body,
+                )),
+                ops,
+            )
+            .unwrap();
+        let metrics = sched.metrics("edge_scrub").unwrap();
+        let ok = wait_until(1000, || {
+            metrics.errors_total.load(Ordering::Relaxed) >= 1
+                && metrics.last_run_unix_secs.load(Ordering::Relaxed) > 0
+        })
+        .await;
+        sched.shutdown().await.unwrap();
+        assert!(
+            ok,
+            "erroring worker must bump errors_total (got {}) AND advance last_run (got {})",
+            metrics.errors_total.load(Ordering::Relaxed),
+            metrics.last_run_unix_secs.load(Ordering::Relaxed),
+        );
+        // cycles_total stays 0 — an erroring cycle is not a success.
+        assert_eq!(metrics.cycles_total.load(Ordering::Relaxed), 0);
+    });
+}
+
+#[test]
+fn metrics_snapshot_reports_paused_state() {
+    // The scheduler's snapshot must carry each worker's live pause state
+    // so the admin `GET /v1/workers` list can report paused vs running.
+    glommio_run(|| async {
+        let (ops, _td) = make_ops_context();
+        let mut sched = WorkerScheduler::new();
+        let body: CycleBody = Arc::new(|_| Box::pin(async { Ok(1) }));
+        sched
+            .register(
+                Arc::new(TestWorker::new(
+                    "decay",
+                    WorkerKind::Decay,
+                    fast_config(),
+                    body,
+                )),
+                ops,
+            )
+            .unwrap();
+
+        // Running worker: snapshot reports paused=false.
+        let snap = sched.metrics_snapshot();
+        let (_, _, m) = snap.iter().find(|(n, _, _)| *n == "decay").unwrap();
+        assert!(!m.paused, "a running worker must snapshot paused=false");
+
+        // After pause, the snapshot flips to paused=true.
+        assert!(sched.pause("decay"));
+        let snap = sched.metrics_snapshot();
+        let (_, _, m) = snap.iter().find(|(n, _, _)| *n == "decay").unwrap();
+        assert!(m.paused, "a paused worker must snapshot paused=true");
+
+        // Resume flips it back.
+        assert!(sched.resume("decay"));
+        let snap = sched.metrics_snapshot();
+        let (_, _, m) = snap.iter().find(|(n, _, _)| *n == "decay").unwrap();
+        assert!(!m.paused, "a resumed worker must snapshot paused=false");
+
+        sched.shutdown().await.unwrap();
+    });
+}
+
+// ===========================================================================
 // Multi-worker (1 test).
 // ===========================================================================
 
