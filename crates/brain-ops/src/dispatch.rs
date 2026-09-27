@@ -300,7 +300,7 @@ pub async fn dispatch(
         // call this at session warm-up.
         // -----------------------------------------------------------
         RequestBody::GetCapabilities(r) => {
-            crate::handlers::capabilities::handle_get_capabilities(r, ctx)
+            crate::handlers::capabilities::handle_get_capabilities(r, ctx, &caller.namespace)
                 .await
                 .map(|b| single(ResponseBody::GetCapabilities(b)))
         }
@@ -946,6 +946,7 @@ mod tests {
         let req = RequestBody::SchemaGet(SchemaGetRequest {
             namespace: "acme".into(),
             version: 0,
+            act_as: None,
         });
         let err = enforce_namespace(&caller, &req).unwrap_err();
         assert!(matches!(err, OpError::Unauthorized(_)));
@@ -953,6 +954,7 @@ mod tests {
         let req = RequestBody::SchemaGet(SchemaGetRequest {
             namespace: "brain".into(),
             version: 0,
+            act_as: None,
         });
         assert!(enforce_namespace(&caller, &req).is_ok());
     }
@@ -964,6 +966,7 @@ mod tests {
             namespace: "anywhere".into(),
             limit: 0,
             cursor: Vec::new(),
+            act_as: None,
         });
         assert!(enforce_namespace(&caller, &req).is_ok());
     }

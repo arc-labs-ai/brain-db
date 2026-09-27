@@ -4,6 +4,7 @@
 //! changes are made in place.
 
 use crate::envelope::request::WireUuid;
+use crate::ops::memory::ActAs;
 
 /// `SCHEMA_UPLOAD` (`0x0120`).
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -18,6 +19,13 @@ pub struct SchemaUploadRequest {
     pub allow_breaking: bool,
     #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
+    /// Optional effective identity (`act_as`), on behalf of the
+    /// authenticated connection principal. When present the op runs as
+    /// that `(namespace, space)` — every namespace check below binds to
+    /// the effective namespace. `None` (omitted on the wire) means the
+    /// connection's own key-bound identity. See [`ActAs`].
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
 }
 
 /// `SCHEMA_GET` (`0x0121`). `version == 0` → active version.
@@ -25,6 +33,13 @@ pub struct SchemaUploadRequest {
 pub struct SchemaGetRequest {
     pub namespace: String,
     pub version: u32,
+    /// Optional effective identity (`act_as`), on behalf of the
+    /// authenticated connection principal. When present the op runs as
+    /// that `(namespace, space)` — every namespace check below binds to
+    /// the effective namespace. `None` (omitted on the wire) means the
+    /// connection's own key-bound identity. See [`ActAs`].
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
 }
 
 /// `SCHEMA_LIST` (`0x0122`). `limit == 0` → unlimited (v1 caps
@@ -34,12 +49,26 @@ pub struct SchemaListRequest {
     pub namespace: String,
     pub limit: u32,
     pub cursor: Vec<u8>,
+    /// Optional effective identity (`act_as`), on behalf of the
+    /// authenticated connection principal. When present the op runs as
+    /// that `(namespace, space)` — every namespace check below binds to
+    /// the effective namespace. `None` (omitted on the wire) means the
+    /// connection's own key-bound identity. See [`ActAs`].
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
 }
 
 /// `SCHEMA_VALIDATE` (`0x0123`). Dry-run; never touches storage.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SchemaValidateRequest {
     pub schema_document: String,
+    /// Optional effective identity (`act_as`), on behalf of the
+    /// authenticated connection principal. When present the op runs as
+    /// that `(namespace, space)` — every namespace check below binds to
+    /// the effective namespace. `None` (omitted on the wire) means the
+    /// connection's own key-bound identity. See [`ActAs`].
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
 }
 
 /// `SCHEMA_REPLACE` (`0x0127`). Destructive counterpart to
@@ -64,6 +93,13 @@ pub struct SchemaReplaceRequest {
     pub force_drop_existing: bool,
     #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
+    /// Optional effective identity (`act_as`), on behalf of the
+    /// authenticated connection principal. When present the op runs as
+    /// that `(namespace, space)` — every namespace check below binds to
+    /// the effective namespace. `None` (omitted on the wire) means the
+    /// connection's own key-bound identity. See [`ActAs`].
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
 }
 
 /// Target kind for a `SCHEMA_DROP` request.
@@ -108,6 +144,13 @@ pub struct SchemaDropRequest {
     pub force: bool,
     #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
+    /// Optional effective identity (`act_as`), on behalf of the
+    /// authenticated connection principal. When present the op runs as
+    /// that `(namespace, space)` — every namespace check below binds to
+    /// the effective namespace. `None` (omitted on the wire) means the
+    /// connection's own key-bound identity. See [`ActAs`].
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
 }
 
 // ============================================================

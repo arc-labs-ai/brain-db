@@ -36,7 +36,7 @@ use serde_json::Value;
 
 use super::cache::{cache_get, cache_put};
 use super::pricing::{estimate_cost, CostBudget, Pricing};
-use super::validation::validate_against;
+use super::validation::{looks_like_json, strip_code_fences, validate_against};
 use crate::framework::extractor::{
     ExtractionContext, ExtractionFailureClass, ExtractionFuture, ExtractionResult,
     ExtractionStatus, Extractor, ExtractorContext, NeighborMemory,
@@ -399,6 +399,15 @@ impl LlmExtractor {
                         {
                             if item.confidence() >= self.confidence_threshold {
                                 out.push(item);
+                                // The model's type for the statement's
+                                // endpoints — the only tier that types an
+                                // entity from the whole memory and the
+                                // namespace's schema.
+                                out.extend(typed_endpoint_mentions(
+                                    v,
+                                    self.id.raw(),
+                                    self.extractor_version,
+                                ));
                             }
                         }
                     }
@@ -1169,6 +1178,53 @@ fn read_event_at(v: &Value) -> Option<u64> {
     read_str(v, "event_at").and_then(|s| crate::pattern::temporal::parse_event_date(&s))
 }
 
+/// Typed entity mentions for a statement's subject / object, from the
+/// model's `subject_type` / `object_type`. Without these the LLM tier could
+/// not type an entity at all — every entity it contributed was minted as the
+/// generic type, so only the span classifier ever assigned real types. The
+/// subject is skipped when it is the speaker (`subject_is_self`); the object
+/// only counts when it names an entity. A bare type name is qualified as
+/// `brain:<Name>`, the label form every entity type is offered under.
+pub(crate) fn typed_endpoint_mentions(
+    v: &Value,
+    extractor_id: u32,
+    extractor_version: u32,
+) -> Vec<ExtractedItem> {
+    let qualify = |t: String| {
+        let t = t.trim().to_string();
+        if t.is_empty() {
+            None
+        } else if t.contains(':') {
+            Some(t)
+        } else {
+            Some(format!("brain:{t}"))
+        }
+    };
+    let mut out = Vec::new();
+    let mut push = |text: Option<String>, ty: Option<String>| {
+        if let (Some(text), Some(ty)) = (text, ty.and_then(qualify)) {
+            if !crate::resolver::is_temporal_expression_surface(&text) {
+                out.push(ExtractedItem::EntityMention(EntityMention {
+                    entity_type_qname: ty,
+                    text,
+                    start: 0,
+                    end: 0,
+                    confidence: read_conf(v),
+                    extractor_id,
+                    extractor_version,
+                }));
+            }
+        }
+    };
+    if !read_subject_is_self(v) {
+        push(read_str(v, "subject"), read_str(v, "subject_type"));
+    }
+    if read_object_is_entity(v) {
+        push(read_str(v, "object"), read_str(v, "object_type"));
+    }
+    out
+}
+
 fn project_entity(
     v: &Value,
     entity_type: &str,
@@ -1496,8 +1552,24 @@ impl Extractor for LlmExtractor {
 
             // ----- 4. Validate + retry-once ------------------------------------
             let parsed = match inner.schema_compiled.as_ref() {
-                None => match serde_json::from_str::<Value>(&resp1.content) {
+                None => match serde_json::from_str::<Value>(strip_code_fences(&resp1.content)) {
                     Ok(v) => v,
+                    // An evident JSON attempt that fails to parse (truncated,
+                    // unbalanced) is malformed output. Never fall through to
+                    // the plain-text projection below: that would mint the raw
+                    // fragment (`{"subject": "Mirror"},{`) as an entity NAME.
+                    Err(e) if looks_like_json(&resp1.content) => {
+                        return ExtractionResult::failure(
+                            format!("response is malformed JSON: {e}"),
+                            started,
+                            started,
+                        )
+                        .with_cost(cost_micro)
+                        .with_failure_class(ExtractionFailureClass::Permanent);
+                    }
+                    // A deliberate plain-text answer (e.g. an entity-target
+                    // extractor replying with a bare name) keeps the legacy
+                    // string projection.
                     Err(_) => Value::String(resp1.content.clone()),
                 },
                 Some(schema) => match validate_against(schema, &resp1.content) {

@@ -237,6 +237,54 @@ fn cycle_writes_followed_by_link_through_unified_path() {
     });
 }
 
+/// Regression: the edge write must carry the memories' real space. The
+/// write used to be stamped `SpaceId::default()`, and `apply_link`'s tenant
+/// wall drops a Memory endpoint outside `write.space_id` — silently — so every
+/// FollowedBy edge for a real tenant vanished (PLAN then found no path over a
+/// session chain). The test above uses the nil space, which IS the default,
+/// which is how this went unnoticed.
+#[test]
+fn cycle_persists_followed_by_edge_for_a_real_tenant_space() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let space = SpaceId::new();
+        assert_ne!(space, SpaceId::default());
+        let session_id = SessionId(1);
+
+        let t0 = now_unix_nanos();
+        let t1 = t0 + 1_000_000_000;
+        let _m0 = seed_memory(&fix, 1, space, session_id, t0).await;
+        let m1 = seed_memory(&fix, 2, space, session_id, t1).await;
+        fix.sender
+            .try_send((m1, space, session_id, t1, [0.0_f32; VECTOR_DIM]))
+            .expect("enqueue");
+
+        let worker = TemporalEdgeWorker::new(fix.receiver.clone()).with_knobs(TemporalEdgeKnobs {
+            window_seconds: 300,
+            weight_min: 0.1,
+            cross_session: false,
+            topical_threshold: 0.4,
+        });
+        let wctx = WorkerContext {
+            ops: fix.ctx.clone(),
+            shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        worker.run_cycle(&wctx).await.unwrap();
+
+        let rtxn = fix.metadata.read_txn().unwrap();
+        let t = rtxn.open_table(EDGES_TABLE).unwrap();
+        let persisted = t
+            .iter()
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().1.value().origin == edge_origin::AUTO_DERIVED)
+            .count();
+        assert_eq!(
+            persisted, 1,
+            "the FollowedBy edge must survive the tenant wall for a non-default space"
+        );
+    });
+}
+
 /// The `StageCompleted{TemporalEdge}` envelope carries the enqueue's real
 /// owning `space_id` — not `SpaceId::default()` — so an space-scoped
 /// SUBSCRIBE filter (`filter.spaces: [space]`) actually matches the

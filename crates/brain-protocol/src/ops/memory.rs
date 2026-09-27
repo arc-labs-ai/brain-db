@@ -27,6 +27,25 @@ pub struct ActAs {
     /// never parsed for sub-scopes. An empty string selects the
     /// connection's key-bound space (single-space keys, zero ceremony).
     pub space_id: String,
+    /// Extra permission bits the delegating principal grants this one
+    /// delegated op, on top of the fixed `STANDARD_SPACE` mask the
+    /// effective identity always receives. Only the delegable bits —
+    /// `SCHEMA_UPLOAD` (`1 << 4`) and `ADMIN` (`1 << 5`) — may be set, and
+    /// only ones the connection principal itself holds; anything else is
+    /// rejected with `ActAsDenied` (a delegator can never grant more than
+    /// it has). `0` (the default) means "no extra rights" — exactly the
+    /// pre-`grant` behaviour.
+    ///
+    /// Wire: omitted from the CBOR map when `0` and defaulted to `0` when
+    /// absent, so a selector without a grant encodes byte-identically to
+    /// the two-field form and old peers interoperate unchanged.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub grant: u32,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if passes `&T`.
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 
 /// `ENCODE_REQ` body. Expresses client *intent* only: the text to
@@ -1582,6 +1601,7 @@ mod memory_list_tests {
         req.act_as = Some(ActAs {
             namespace: "acme".into(),
             space_id: "acme:space".into(),
+            grant: 0,
         });
         req.cursor = Vec::new();
         let body = RequestBody::MemoryList(req);

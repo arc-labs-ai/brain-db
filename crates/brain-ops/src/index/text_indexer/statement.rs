@@ -30,6 +30,8 @@ pub enum StatementTextOp {
         kind: StatementKind,
         confidence: f32,
         extracted_at_unix_ms: u64,
+        /// The statement row's space — the lexical tenancy wall.
+        space_id: [u8; 16],
     },
     Delete {
         id: StatementId,
@@ -85,6 +87,7 @@ struct StatementFields {
     kind: Field,
     confidence_bucket: Field,
     extracted_at: Field,
+    space_id: Field,
 }
 
 impl StatementFields {
@@ -104,6 +107,7 @@ impl StatementFields {
             kind: get("kind")?,
             confidence_bucket: get("confidence_bucket")?,
             extracted_at: get("extracted_at")?,
+            space_id: get("space_id")?,
         })
     }
 }
@@ -324,6 +328,7 @@ fn apply_op(
         kind,
         confidence,
         extracted_at_unix_ms,
+        space_id,
         ..
     } = op
     {
@@ -336,6 +341,7 @@ fn apply_op(
         doc.add_u64(fields.kind, kind_to_u64(*kind));
         doc.add_u64(fields.confidence_bucket, confidence_bucket(*confidence));
         doc.add_u64(fields.extracted_at, *extracted_at_unix_ms);
+        doc.add_bytes(fields.space_id, space_id);
         writer.add_document(doc)?;
     }
     Ok(())
@@ -432,6 +438,15 @@ pub fn upsert_op_from_statement(
 
     let object_text = object_text_for_index(&statement.object, &rtxn);
 
+    // The core `Statement` carries no scope; its stored row does. A row that
+    // is not there yet is not indexable — never index into a guessed space.
+    let space_id = {
+        use brain_metadata::tables::statement::STATEMENTS_TABLE;
+        let table = rtxn.open_table(STATEMENTS_TABLE).ok()?;
+        let row = table.get(&statement.id.to_bytes()).ok()??;
+        row.value().space_id_bytes
+    };
+
     Some(StatementTextOp::Upsert {
         id: statement.id,
         subject_canonical_name: subject.canonical_name,
@@ -441,6 +456,7 @@ pub fn upsert_op_from_statement(
         kind: statement.kind,
         confidence: statement.confidence,
         extracted_at_unix_ms: statement.extracted_at_unix_nanos / 1_000_000,
+        space_id,
     })
 }
 

@@ -92,6 +92,7 @@ fn dispatch_upsert_then_query_returns_hit() {
                 kind: StatementKind::Fact,
                 confidence: 0.85,
                 extracted_at_unix_ms: 1_700_000_000_000,
+                space_id: [0u8; 16],
             })
             .await;
 
@@ -135,6 +136,7 @@ fn delete_removes_doc() {
                 kind: StatementKind::Fact,
                 confidence: 0.6,
                 extracted_at_unix_ms: 0,
+                space_id: [0u8; 16],
             })
             .await;
         dispatcher.dispatch(StatementTextOp::Delete { id }).await;
@@ -165,6 +167,7 @@ fn supersede_pattern_delete_then_upsert() {
                 kind: StatementKind::Preference,
                 confidence: 0.7,
                 extracted_at_unix_ms: 0,
+                space_id: [0u8; 16],
             })
             .await;
         dispatcher
@@ -180,6 +183,7 @@ fn supersede_pattern_delete_then_upsert() {
                 kind: StatementKind::Preference,
                 confidence: 0.9,
                 extracted_at_unix_ms: 1_000,
+                space_id: [0u8; 16],
             })
             .await;
         drop(dispatcher);
@@ -213,6 +217,7 @@ fn commit_by_time_flushes_below_n() {
                 kind: StatementKind::Fact,
                 confidence: 0.5,
                 extracted_at_unix_ms: 0,
+                space_id: [0u8; 16],
             })
             .await;
 
@@ -245,6 +250,7 @@ fn upsert_round_trips_metadata_fields() {
                 kind: StatementKind::Event,
                 confidence: 0.65,
                 extracted_at_unix_ms: 1_700_000_000_000,
+                space_id: [0u8; 16],
             })
             .await;
         drop(dispatcher);

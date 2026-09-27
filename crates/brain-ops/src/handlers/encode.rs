@@ -565,10 +565,12 @@ fn stage_detail_from_env(env: &crate::subscribe::EventEnvelope) -> String {
 /// entity in this write is a literal value (e.g. "manages **the billing
 /// platform team**") — it gets a synthetic `"literal"` node (deduped by id
 /// within this call) instead of the all-zero placeholder, so the rendered
-/// graph carries the real value. A relation endpoint beyond the enrichment
-/// cap still falls back to the zero id — relations are always entity-to-
-/// entity by schema, so an unresolved endpoint there is a cap miss, not a
-/// literal. The synthetic id comes from the shared
+/// graph carries the real value. An edge whose entity endpoint does not
+/// resolve to a node (a subject beyond the enrichment cap, or a relation
+/// endpoint this write did not mention) is skipped rather than rendered
+/// against the all-zero id — a nil endpoint is a dangling edge, mirroring
+/// [`enrichment_to_graph_counted`](crate::memory_artifact::enrichment_to_graph_counted).
+/// The synthetic id comes from the shared
 /// [`literal_node_id`](crate::memory_artifact::literal_node_id), so this live
 /// trace and the durable `MEMORY_INSPECT` bundle agree on one id per fact.
 fn encode_artifacts_to_graph(artifacts: &EncodeTraceArtifacts) -> EncodeStageGraph {
@@ -597,7 +599,14 @@ fn encode_artifacts_to_graph(artifacts: &EncodeTraceArtifacts) -> EncodeStageGra
     let mut seen_literals: std::collections::HashSet<[u8; 16]> = std::collections::HashSet::new();
     let mut edges: Vec<EncodeGraphEdge> = Vec::new();
     for s in &artifacts.statements {
-        let source = lookup(&s.subject_name).unwrap_or([0u8; 16]);
+        let Some(source) = lookup(&s.subject_name) else {
+            tracing::debug!(
+                subject = %s.subject_name,
+                predicate = %s.predicate,
+                "encode trace: statement subject not among this write's entities; edge skipped",
+            );
+            continue;
+        };
         let target = match lookup(&s.object_name) {
             Some(id) => id,
             None => {
@@ -623,9 +632,18 @@ fn encode_artifacts_to_graph(artifacts: &EncodeTraceArtifacts) -> EncodeStageGra
         });
     }
     for r in &artifacts.relations {
+        let (Some(source), Some(target)) = (lookup(&r.source_name), lookup(&r.target_name)) else {
+            tracing::debug!(
+                source = %r.source_name,
+                predicate = %r.predicate,
+                target = %r.target_name,
+                "encode trace: relation endpoint not among this write's entities; edge skipped",
+            );
+            continue;
+        };
         edges.push(EncodeGraphEdge {
-            source: lookup(&r.source_name).unwrap_or([0u8; 16]),
-            target: lookup(&r.target_name).unwrap_or([0u8; 16]),
+            source,
+            target,
             predicate: r.predicate.clone(),
             kind: "relation".to_string(),
             confidence: 1.0,
@@ -1094,6 +1112,42 @@ mod tests {
                 matched_memory_id: None,
             },
         }
+    }
+
+    #[test]
+    fn relation_with_unmentioned_endpoint_is_skipped_never_nil() {
+        let mut artifacts = literal_object_artifacts();
+        artifacts.relations = vec![
+            brain_protocol::envelope::response::EncodeTraceRelation {
+                source_name: "space:da6ce18abcb75e7bacc022e44956b287".into(),
+                predicate: "brain:works_at".into(),
+                target_name: "Priya".into(),
+            },
+            brain_protocol::envelope::response::EncodeTraceRelation {
+                source_name: "Priya".into(),
+                predicate: "brain:knows".into(),
+                target_name: "Priya".into(),
+            },
+        ];
+        let graph = encode_artifacts_to_graph(&artifacts);
+        let relations: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == "relation")
+            .collect();
+        assert_eq!(
+            relations.len(),
+            1,
+            "only the fully-resolved relation survives"
+        );
+        assert!(
+            graph
+                .edges
+                .iter()
+                .all(|e| e.source != [0u8; 16] && e.target != [0u8; 16]),
+            "no edge may point at the nil id: {:?}",
+            graph.edges
+        );
     }
 
     #[test]

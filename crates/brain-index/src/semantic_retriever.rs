@@ -245,11 +245,6 @@ pub fn validate_filters_for_scope(
             }
         }
         SemanticScope::Statement => {
-            if !filters.space_ids.is_empty() {
-                return Err(SemanticError::QueryParseFailed(
-                    "space_id filter applies only to Memory / Both".into(),
-                ));
-            }
             if filters.memory_kind.is_some() {
                 return Err(SemanticError::QueryParseFailed(
                     "memory_kind filter applies only to Memory / Both".into(),

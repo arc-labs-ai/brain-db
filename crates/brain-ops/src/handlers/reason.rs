@@ -5,10 +5,10 @@
 //! per-step frames plus a terminal summary) into a sequence of wire
 //! `ReasonResponseFrame`s.
 //!
-//! **v1 scope:** the executor always produces exactly one inference
-//! step — the aggregate of all supporting + contradicting evidence —
-//! so the typical stream is one mid-stream frame + one terminal
-//! frame. An empty inference stream (no base resolved) collapses to a
+//! The executor emits the aggregate verdict on the observation (all
+//! supporting + contradicting evidence) as step 0, followed by zero or
+//! more claims drawn outward from the typed graph — one mid-stream frame
+//! per step, then one terminal frame. An empty inference stream (no base resolved) collapses to a
 //! single terminal frame. The wire framing is multi-frame-ready: a
 //! future iteration that walks supporting and contradicting passes
 //! independently can emit a step per pass without touching the
@@ -104,9 +104,12 @@ fn step_to_wire(step: InferenceStep, claim: &str) -> ReasonResponseFrame {
         .map(|e| e.memory_id.into())
         .collect();
 
+    // Derived steps (and a `ByText` aggregate step) carry their own
+    // claim; a `ByMemoryId` aggregate step has none and keeps the
+    // request-level claim (empty — documented v1 gap).
     let inference = WireInferenceStep {
         step_index: step.step_index,
-        claim: claim.to_owned(),
+        claim: step.claim.unwrap_or_else(|| claim.to_owned()),
         supporting_memories,
         contradicting_memories,
         confidence: step.confidence,

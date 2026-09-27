@@ -79,6 +79,33 @@ fn write_statement(
     confidence: f32,
     extracted_at_ms: u64,
 ) {
+    write_statement_in(
+        shard,
+        [0u8; 16],
+        id,
+        subject_name,
+        predicate_name,
+        predicate_id,
+        object_text,
+        kind,
+        confidence,
+        extracted_at_ms,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_statement_in(
+    shard: &TantivyShard,
+    space: [u8; 16],
+    id: StatementId,
+    subject_name: &str,
+    predicate_name: &str,
+    predicate_id: u32,
+    object_text: &str,
+    kind: StatementKind,
+    confidence: f32,
+    extracted_at_ms: u64,
+) {
     let schema = shard.statements.index.schema();
     let id_field = schema.get_field("statement_id").unwrap();
     let subj_field = schema.get_field("subject_name").unwrap();
@@ -88,6 +115,7 @@ fn write_statement(
     let kind_field = schema.get_field("kind").unwrap();
     let bucket_field = schema.get_field("confidence_bucket").unwrap();
     let extracted_field = schema.get_field("extracted_at").unwrap();
+    let space_field = schema.get_field("space_id").unwrap();
 
     // Mirrors the canonical bucket formula (floor(c*10).clamp(0,10),
     // 0..=10) used by brain-metadata + the brain-ops tantivy writer.
@@ -107,6 +135,7 @@ fn write_statement(
     doc.add_u64(kind_field, u64::from(kind.as_u8()));
     doc.add_u64(bucket_field, bucket);
     doc.add_u64(extracted_field, extracted_at_ms);
+    doc.add_bytes(space_field, &space);
     writer.add_document(doc).expect("add doc");
     writer.commit().expect("commit");
     // Mirror the production indexer: advance the commit generation so the
@@ -513,14 +542,30 @@ fn confidence_bucket_range_filter() {
 }
 
 #[test]
-fn space_id_filter_on_statement_scope_errors() {
-    let (_dir, _shard, retriever) = fresh();
-    let err = retriever
+fn space_id_filter_walls_statement_hits() {
+    let (_dir, shard, retriever) = fresh();
+    let mine = SpaceId::new();
+    let theirs = SpaceId::new();
+    for (space, id) in [(mine, 1u8), (theirs, 2u8)] {
+        write_statement_in(
+            &shard,
+            space.into(),
+            StatementId::from([id; 16]),
+            "Diego",
+            "joined",
+            1,
+            "billing team",
+            StatementKind::Fact,
+            0.9,
+            0,
+        );
+    }
+    let result = retriever
         .retrieve(
             &LexicalQuery {
-                terms: vec!["x".into()],
+                terms: vec!["billing".into()],
                 filters: LexicalFilters {
-                    space_ids: vec![SpaceId::new()],
+                    space_ids: vec![mine],
                     ..Default::default()
                 },
                 ..Default::default()
@@ -528,8 +573,12 @@ fn space_id_filter_on_statement_scope_errors() {
             LexicalScope::StatementText,
             &LexicalRetrieverConfig::default(),
         )
-        .expect_err("must reject wrong-scope filter");
-    assert!(matches!(err, LexicalError::QueryParseFailed(_)));
+        .expect("retrieve");
+    assert_eq!(result.len(), 1, "the other space's statement is walled off");
+    assert_eq!(
+        result[0].id,
+        RankedItemId::Statement(StatementId::from([1u8; 16]))
+    );
 }
 
 #[test]

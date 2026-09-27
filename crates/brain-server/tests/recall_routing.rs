@@ -301,6 +301,7 @@ async fn recall_after_schema_upload_uses_retrieval_path() {
             dry_run: false,
             allow_breaking: false,
             request_id: *uuid::Uuid::now_v7().as_bytes(),
+            act_as: None,
         }),
     )
     .await;
@@ -331,6 +332,7 @@ async fn recall_inside_txn_returns_committed_pipeline_hits() {
             dry_run: false,
             allow_breaking: false,
             request_id: *uuid::Uuid::now_v7().as_bytes(),
+            act_as: None,
         }),
     )
     .await;

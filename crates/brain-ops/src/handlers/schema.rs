@@ -27,7 +27,7 @@ use brain_metadata::schema::store::{schema_active, schema_get, schema_list, Sche
 use brain_metadata::system_schema::SYSTEM_SCHEMA_NAMESPACE;
 use brain_planner::WriterError;
 use brain_protocol::envelope::response::EventType;
-use brain_protocol::schema::{parse_schema, validate, ParseError, ValidationError};
+use brain_protocol::schema::{parse_schema, validate_located, ParseError, ValidationError};
 use brain_protocol::schema::{
     CardinalityAst, ExtractorKindAst, SchemaItem, StatementKindAst, ValidatedSchema,
 };
@@ -63,7 +63,7 @@ pub async fn handle_schema_upload(
     };
 
     // 2. Validate.
-    let validated = match validate(&schema) {
+    let validated = match validate_located(&req.schema_document, &schema) {
         Ok(v) => v,
         Err(errs) => {
             return Ok(SchemaUploadResponse {
@@ -92,11 +92,26 @@ pub async fn handle_schema_upload(
         )));
     }
 
-    // 3. Dry-run → don't persist.
+    // 3. Associative-merge pre-flight against current state. For each
+    //    declared item, classify as Insert / Idempotent / Conflict.
+    //    Conflict aborts the upload before any commit; if every item is
+    //    Idempotent we return the current active version without
+    //    bumping (re-upload of an unchanged schema is a no-op so
+    //    operators can safely re-apply the same DSL).
+    //
+    //    Runs BEFORE the dry-run exit: a dry run must predict the real
+    //    upload, conflicts included. It used to return early here and
+    //    report a conflicting document as an accepted next version.
+    let merge_summary = classify_schema_merge(ctx, &validated)?;
+
+    // 4. Dry-run → don't persist. An all-idempotent document would not
+    //    bump the version, so report the current one.
     if req.dry_run {
-        let would_be = current_active(ctx, &namespace)?
-            .unwrap_or(0)
-            .saturating_add(1);
+        let current = current_active(ctx, &namespace)?;
+        let would_be = match (merge_summary.all_idempotent, current) {
+            (true, Some(version)) => version,
+            _ => current.unwrap_or(0).saturating_add(1),
+        };
         return Ok(SchemaUploadResponse {
             namespace,
             schema_version: would_be,
@@ -106,13 +121,6 @@ pub async fn handle_schema_upload(
         });
     }
 
-    // 4. Associative-merge pre-flight against current state. For each
-    //    declared item, classify as Insert / Idempotent / Conflict.
-    //    Conflict aborts the upload before any commit; if every item is
-    //    Idempotent we return the current active version without
-    //    bumping (re-upload of an unchanged schema is a no-op so
-    //    operators can safely re-apply the same DSL).
-    let merge_summary = classify_schema_merge(ctx, &validated)?;
     if let (true, Some(version)) = (merge_summary.all_idempotent, merge_summary.current_version) {
         return Ok(SchemaUploadResponse {
             namespace,
@@ -344,7 +352,7 @@ pub async fn handle_schema_validate(
         }
     };
 
-    match validate(&schema) {
+    match validate_located(&req.schema_document, &schema) {
         Ok(v) => {
             let namespace = v.as_schema().namespace.clone();
             // Tenant binding, mirroring SCHEMA_UPLOAD: a caller may only
@@ -834,7 +842,7 @@ mod tests {
         /// read path has rows to (not) find.
         fn seed_schema(metadata: &SharedMetadataDb, doc: &str) {
             let parsed = parse_schema(doc).unwrap();
-            let validated = validate(&parsed).unwrap();
+            let validated = brain_protocol::schema::validate(&parsed).unwrap();
             let wtxn = metadata.write_txn().unwrap();
             schema_upload(&wtxn, &validated, 1).unwrap();
             wtxn.commit().unwrap();
@@ -846,6 +854,7 @@ mod tests {
                 allow_breaking: false,
                 dry_run: false,
                 request_id: [1u8; 16],
+                act_as: None,
             }
         }
 
@@ -858,6 +867,47 @@ mod tests {
             assert!(resp.validation_errors.is_empty());
             assert_eq!(resp.namespace, "acme");
             assert!(resp.schema_version >= 1);
+        }
+
+        /// A dry run must predict the real upload. It used to exit before the
+        /// merge pre-flight and report a conflicting document as an accepted
+        /// next version, which the real upload then refused.
+        #[tokio::test]
+        async fn dry_run_reports_the_same_conflict_the_upload_would() {
+            let (_dir, ctx, _md) = build_ctx_for("acme");
+            handle_schema_upload(upload_req(ACME_V1), &ctx)
+                .await
+                .expect("v1");
+            // Same predicate, flipped `stateful` — a declared-constraint change.
+            let changed = "namespace acme\ndefine predicate prefers { kind: Preference object: Value<text> stateful: true }\n";
+            let dry = SchemaUploadRequest {
+                dry_run: true,
+                ..upload_req(changed)
+            };
+            let err = handle_schema_upload(dry, &ctx)
+                .await
+                .expect_err("dry run must surface the conflict");
+            assert!(
+                matches!(err, OpError::SchemaConflict { .. }),
+                "expected SchemaConflict, got {err:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn dry_run_of_an_unchanged_schema_reports_the_current_version() {
+            let (_dir, ctx, _md) = build_ctx_for("acme");
+            let v1 = handle_schema_upload(upload_req(ACME_V1), &ctx)
+                .await
+                .expect("v1");
+            let dry = SchemaUploadRequest {
+                dry_run: true,
+                ..upload_req(ACME_V1)
+            };
+            let resp = handle_schema_upload(dry, &ctx).await.expect("dry run");
+            assert_eq!(
+                resp.schema_version, v1.schema_version,
+                "no bump for a no-op"
+            );
         }
 
         #[tokio::test]
@@ -890,6 +940,7 @@ mod tests {
                 SchemaGetRequest {
                     namespace: "other".into(),
                     version: 0,
+                    act_as: None,
                 },
                 &ctx,
             )
@@ -902,6 +953,7 @@ mod tests {
                 SchemaGetRequest {
                     namespace: "never_existed".into(),
                     version: 0,
+                    act_as: None,
                 },
                 &ctx,
             )
@@ -920,6 +972,7 @@ mod tests {
                     namespace: "other".into(),
                     limit: 0,
                     cursor: Vec::new(),
+                    act_as: None,
                 },
                 &ctx,
             )
@@ -938,6 +991,7 @@ mod tests {
                 SchemaGetRequest {
                     namespace: "acme".into(),
                     version: 0,
+                    act_as: None,
                 },
                 &ctx,
             )
@@ -950,6 +1004,7 @@ mod tests {
                     namespace: "acme".into(),
                     limit: 0,
                     cursor: Vec::new(),
+                    act_as: None,
                 },
                 &ctx,
             )
@@ -967,6 +1022,7 @@ mod tests {
                 SchemaGetRequest {
                     namespace: SYSTEM_SCHEMA_NAMESPACE.into(),
                     version: 0,
+                    act_as: None,
                 },
                 &ctx,
             )
@@ -979,6 +1035,7 @@ mod tests {
                     namespace: SYSTEM_SCHEMA_NAMESPACE.into(),
                     limit: 0,
                     cursor: Vec::new(),
+                    act_as: None,
                 },
                 &ctx,
             )
@@ -997,6 +1054,7 @@ mod tests {
             let err = handle_schema_validate(
                 SchemaValidateRequest {
                     schema_document: OTHER_V1.into(),
+                    act_as: None,
                 },
                 &ctx,
             )
@@ -1014,6 +1072,7 @@ mod tests {
             let resp = handle_schema_validate(
                 SchemaValidateRequest {
                     schema_document: ACME_V1.into(),
+                    act_as: None,
                 },
                 &ctx,
             )

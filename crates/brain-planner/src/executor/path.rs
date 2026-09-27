@@ -91,8 +91,14 @@ pub async fn execute_path(
 ) -> Result<PathResult, ExecError> {
     // 1. Resolve endpoints. ByMemoryId is direct; ByText runs a
     //    small ANN search; ByVector isn't wired yet.
-    let starts = resolve_endpoint(&plan.start, ctx)?;
-    let goals = resolve_endpoint(&plan.goal, ctx)?;
+    //    Each side resolves to a ranked candidate list; the two lists are
+    //    then made disjoint (see `disjoint_endpoints`) so the start and goal
+    //    anchors never collapse onto each other just because the ANN
+    //    neighbourhoods of two different cues overlap.
+    let (starts, goals) = disjoint_endpoints(
+        resolve_endpoint(&plan.start, ctx)?,
+        resolve_endpoint(&plan.goal, ctx)?,
+    );
 
     if starts.is_empty() || goals.is_empty() {
         return Ok(PathResult {
@@ -158,10 +164,79 @@ pub async fn execute_path(
 // Endpoint resolution.
 // ---------------------------------------------------------------------------
 
+/// Split the two ranked endpoint candidate lists into disjoint seed sets.
+///
+/// `ByText` endpoints anchor on the top-K ANN hits for their cue. In a small
+/// (or topically tight) space those neighbourhoods overlap heavily — with two
+/// memories total, BOTH memories are in the start set AND the goal set. The
+/// BFS used to treat every overlapping id as a trivial `start == goal`
+/// meeting point and emit one single-node path per overlap: the reported
+/// symptom of a PLAN returning the goal memory and the start memory as two
+/// "paths" of one step each (`step_index` 0, `Initial`, distance 0), in
+/// score order rather than start → goal order.
+///
+/// Rules (each list is ranked best-first; its head is that side's anchor):
+///
+/// * If both anchors are the same memory, the endpoints genuinely resolve to
+///   one memory — that id stays on both sides and the BFS reports the
+///   one-node `start == goal` path. This is by design (e.g. PLAN from a
+///   memory to a cue that best matches that same memory).
+/// * Otherwise every id appears on exactly one side. A side's anchor is never
+///   given away; any other shared id goes to the side it scored higher on
+///   (ties to the start side).
+///
+/// `ByMemoryId` endpoints resolve to a single pinned id, which is by
+/// definition that side's anchor.
+fn disjoint_endpoints(
+    starts: Vec<(MemoryId, f32)>,
+    goals: Vec<(MemoryId, f32)>,
+) -> (HashSet<MemoryId>, HashSet<MemoryId>) {
+    let start_anchor = starts.first().map(|(id, _)| *id);
+    let goal_anchor = goals.first().map(|(id, _)| *id);
+    if start_anchor.is_some() && start_anchor == goal_anchor {
+        // Same best memory on both sides: a genuine start == goal plan.
+        let only: HashSet<MemoryId> = start_anchor.into_iter().collect();
+        return (only.clone(), only);
+    }
+    let goal_scores: HashMap<MemoryId, f32> = goals.iter().copied().collect();
+    let start_scores: HashMap<MemoryId, f32> = starts.iter().copied().collect();
+    // An id shared by both lists belongs to the start side when it is the
+    // start anchor, never when it is the goal anchor, and otherwise when it
+    // scored at least as high against the start cue.
+    let belongs_to_start = |id: MemoryId| -> bool {
+        if Some(id) == start_anchor {
+            return true;
+        }
+        if Some(id) == goal_anchor {
+            return false;
+        }
+        match (start_scores.get(&id), goal_scores.get(&id)) {
+            (Some(s), Some(g)) => s >= g,
+            (Some(_), None) => true,
+            _ => false,
+        }
+    };
+    let start_set = starts
+        .iter()
+        .map(|(id, _)| *id)
+        .filter(|id| !goal_scores.contains_key(id) || belongs_to_start(*id))
+        .collect();
+    let goal_set = goals
+        .iter()
+        .map(|(id, _)| *id)
+        .filter(|id| !start_scores.contains_key(id) || !belongs_to_start(*id))
+        .collect();
+    (start_set, goal_set)
+}
+
+/// Resolve one endpoint to its ranked candidate list, best first.
+/// `ByMemoryId` yields the single pinned id (score `1.0`); `ByText` yields
+/// the in-scope ANN hits with their cosine scores, in the index's
+/// descending order.
 fn resolve_endpoint(
     state: &PlanState,
     ctx: &ExecutorContext,
-) -> Result<HashSet<MemoryId>, ExecError> {
+) -> Result<Vec<(MemoryId, f32)>, ExecError> {
     match state {
         PlanState::ByMemoryId(raw) => {
             let id = MemoryId::from(*raw);
@@ -171,7 +246,7 @@ fn resolve_endpoint(
             // `NoPathFound`. Matches `search_active`'s silent-filter
             // behavior for ByText endpoints.
             if ctx.index.is_tombstoned(id) {
-                return Ok(HashSet::new());
+                return Ok(Vec::new());
             }
             // Tenant wall: the caller must not seed a traversal with another
             // tenant's memory id. The per-shard edge graph is tenant-blind at
@@ -180,11 +255,9 @@ fn resolve_endpoint(
             // empty endpoint — indistinguishable from tombstoned, so it leaks
             // nothing (not even existence).
             if !ctx.memory_in_caller_scope(id) {
-                return Ok(HashSet::new());
+                return Ok(Vec::new());
             }
-            let mut s = HashSet::with_capacity(1);
-            s.insert(id);
-            Ok(s)
+            Ok(vec![(id, 1.0)])
         }
         PlanState::ByText(text) => {
             // Caller-supplied query text (PLAN endpoint resolution) —
@@ -196,13 +269,10 @@ fn resolve_endpoint(
             // The shard HNSW is tenant-blind; keep only the caller's own
             // memories as endpoints so a text seed can't anchor on a
             // foreign-tenant memory.
-            let mut out = HashSet::new();
-            for (id, _) in hits {
-                if ctx.memory_in_caller_scope(id) {
-                    out.insert(id);
-                }
-            }
-            Ok(out)
+            Ok(hits
+                .into_iter()
+                .filter(|(id, _)| ctx.memory_in_caller_scope(*id))
+                .collect())
         }
         PlanState::ByVector { .. } => Err(ExecError::Unsupported(
             "PLAN endpoint ByVector — wire vector window not yet exposed to the executor",
@@ -433,7 +503,15 @@ fn run_bidirectional_bfs(
                 queue.push_back(next);
                 nodes_explored += 1;
 
-                if other_visited.contains_key(&next) {
+                // A meeting point is only a valid path when the stitched
+                // chain fits the caller's step budget. Each side is
+                // individually capped at `max_depth`, so without this
+                // combined check a path of up to `2 × max_depth` hops
+                // could be returned for a `max_steps = max_depth` request.
+                let within_budget = other_visited
+                    .get(&next)
+                    .is_some_and(|other| crumb.depth + 1 + other.depth <= max_depth);
+                if within_budget {
                     // Every meeting point beyond `max_paths` is
                     // silently dropped from `meeting_points` (and thus
                     // from `paths`) exactly as before — `included`
@@ -913,5 +991,73 @@ fn neighbour_alignment_scores(
 }
 
 // ---------------------------------------------------------------------------
-// Tests live in `crates/brain-planner/tests/path_executor.rs`.
+// Tests. Endpoint-splitting unit tests below; the end-to-end PLAN pipeline is
+// covered by `crates/brain-ops/tests/plan.rs`.
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(n: u128) -> MemoryId {
+        MemoryId::from(n)
+    }
+
+    fn set(ids: &[u128]) -> HashSet<MemoryId> {
+        ids.iter().map(|n| id(*n)).collect()
+    }
+
+    /// Regression: two memories, both in each cue's top-K. Before the fix
+    /// both ids were in BOTH seed sets, so the BFS emitted two one-node
+    /// "start == goal" paths (goal memory first, both `step_index` 0).
+    /// Now each anchor stays on its own side.
+    #[test]
+    fn overlapping_text_neighbourhoods_split_by_anchor() {
+        let start = vec![(id(1), 0.93), (id(2), 0.41)];
+        let goal = vec![(id(2), 0.95), (id(1), 0.44)];
+        let (s, g) = disjoint_endpoints(start, goal);
+        assert_eq!(s, set(&[1]));
+        assert_eq!(g, set(&[2]));
+        assert!(s.is_disjoint(&g));
+    }
+
+    /// Non-anchor ids shared by both sides go to the side they scored
+    /// higher on; ties go to the start side.
+    #[test]
+    fn shared_non_anchor_ids_go_to_the_better_side() {
+        let start = vec![(id(1), 0.9), (id(3), 0.7), (id(4), 0.5)];
+        let goal = vec![(id(2), 0.9), (id(3), 0.6), (id(4), 0.5), (id(5), 0.4)];
+        let (s, g) = disjoint_endpoints(start, goal);
+        assert_eq!(s, set(&[1, 3, 4]));
+        assert_eq!(g, set(&[2, 5]));
+    }
+
+    /// Same best memory for both cues: by design a one-node start == goal
+    /// plan, so that id (and only that id) seeds both sides.
+    #[test]
+    fn identical_anchors_resolve_to_a_single_shared_memory() {
+        let start = vec![(id(7), 0.99), (id(8), 0.5)];
+        let goal = vec![(id(7), 0.97), (id(9), 0.5)];
+        let (s, g) = disjoint_endpoints(start, goal);
+        assert_eq!(s, set(&[7]));
+        assert_eq!(g, set(&[7]));
+    }
+
+    /// A pinned `ByMemoryId` endpoint is its side's anchor and is never
+    /// given away to a `ByText` side that merely contains it.
+    #[test]
+    fn pinned_memory_id_keeps_its_side() {
+        let start = vec![(id(1), 1.0)];
+        let goal = vec![(id(2), 0.8), (id(1), 0.99)];
+        let (s, g) = disjoint_endpoints(start, goal);
+        assert_eq!(s, set(&[1]));
+        assert_eq!(g, set(&[2]));
+    }
+
+    #[test]
+    fn empty_side_stays_empty() {
+        let (s, g) = disjoint_endpoints(Vec::new(), vec![(id(2), 0.8)]);
+        assert!(s.is_empty());
+        assert_eq!(g, set(&[2]));
+    }
+}

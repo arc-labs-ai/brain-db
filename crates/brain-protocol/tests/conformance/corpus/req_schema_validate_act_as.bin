@@ -1,0 +1,3 @@
+¢oschema_documentxEnamespace org
+define relation_type mentors { from Person to Person }
+fact_as¢inamespacecorghspace_idssupport-bot:user123

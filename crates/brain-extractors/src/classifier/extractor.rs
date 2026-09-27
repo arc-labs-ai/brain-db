@@ -7,8 +7,8 @@ use brain_core::ExtractorId;
 use brain_core::{ExtractorKind, Memory};
 use brain_protocol::schema::ExtractorTarget;
 
+use super::gliner_label;
 use super::model::{ClassifiedSpan, ClassifierModel};
-use super::simple_label;
 use crate::framework::extractor::{
     ExtractionContext, ExtractionFuture, ExtractionResult, ExtractionStatus, Extractor,
 };
@@ -100,7 +100,7 @@ impl ClassifierExtractor {
         let mut seen = std::collections::HashSet::new();
         let mut collision = false;
         for q in labels.iter() {
-            if !seen.insert(simple_label(q.as_str())) {
+            if !seen.insert(gliner_label(q.as_str())) {
                 collision = true;
                 break;
             }
@@ -118,13 +118,10 @@ impl ClassifierExtractor {
                 .collect();
             (simples, map)
         } else {
-            let simples: Vec<String> = labels
-                .iter()
-                .map(|q| simple_label(q.as_str()).to_string())
-                .collect();
+            let simples: Vec<String> = labels.iter().map(|q| gliner_label(q.as_str())).collect();
             let map: HashMap<String, String> = labels
                 .iter()
-                .map(|q| (simple_label(q.as_str()).to_string(), q.clone()))
+                .map(|q| (gliner_label(q.as_str()), q.clone()))
                 .collect();
             (simples, map)
         }

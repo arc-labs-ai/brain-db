@@ -96,7 +96,7 @@ pub async fn handle_schema_drop(
     // 3a. Load the active schema document. No active version → nothing is
     //     declared, so the target cannot be dropped: a no-op success,
     //     mirroring FORGET's leniency on an already-absent target.
-    let (current_version, mut schema): (u32, Schema) = {
+    let (current_version, mut schema, prior_text): (u32, Schema, Option<String>) = {
         let rtxn = ctx
             .executor
             .metadata
@@ -109,7 +109,7 @@ pub async fn handle_schema_drop(
         };
         let schema: Schema = serde_json::from_slice(&active_row.source)
             .map_err(|e| OpError::Internal(format!("decode stored schema document: {e}")))?;
-        (active_row.version, schema)
+        (active_row.version, schema, active_row.source_text.clone())
     };
 
     // 3b. Find the declared item in the document (the authority for "what is
@@ -176,7 +176,7 @@ pub async fn handle_schema_drop(
     };
     if live_rows > 0 && !req.force {
         return Err(OpError::Conflict(format!(
-            "schema_drop: {} {:?} still has live rows in namespace {namespace:?}; \
+            "schema_drop: {} {:?} still has {live_rows} live rows in namespace {namespace:?}; \
              set force to drop it and leave those rows as orphans",
             target_kind_label(target_kind),
             target_name
@@ -184,14 +184,18 @@ pub async fn handle_schema_drop(
     }
 
     // 4. Narrow the document and route the drop through submit(Write). The
-    //    narrowed document (item removed, DSL source cleared) is carried as
-    //    serde_json — it has no DSL text to re-parse — and the `drops` delta
+    //    narrowed document (item removed) is carried as serde_json, and the
+    //    `drops` delta
     //    tells apply which typed-graph table row to remove. Live apply and WAL
     //    recovery reconstruct identical narrowed state; submit also supplies
     //    the WriteId idempotency replay and the post-commit flag sweep this
     //    handler used to hand-roll.
     schema.items.remove(item_idx);
-    schema.source = None;
+    // Keep the version readable: the prior DSL text with the dropped block
+    // cut out, kept only if it re-parses to exactly the narrowed document.
+    // It used to be cleared, so every drop left a version with no source
+    // text (a blank document to anyone reading or editing it).
+    schema.source = narrowed_source(prior_text.as_deref(), &schema, target_kind, target_name);
     let validated = validate(&schema).map_err(|errs| {
         OpError::Internal(format!(
             "schema_drop: narrowed document failed re-validation: {} error(s)",
@@ -283,6 +287,149 @@ fn hash_schema_drop_request(req: &SchemaDropRequest) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
+/// The prior DSL `text` with the `define <kind> <name> { … }` block (and the
+/// comment lines attached directly above it) removed — `Some` only when that
+/// text re-parses to exactly `narrowed`, so the stored text can never
+/// disagree with the stored document. `None` falls back to no source text.
+fn narrowed_source(
+    text: Option<&str>,
+    narrowed: &Schema,
+    target_kind: u8,
+    name: &str,
+) -> Option<String> {
+    let keyword = match target_kind {
+        schema_drop_target::PREDICATE => "predicate",
+        schema_drop_target::RELATION_TYPE => "relation_type",
+        _ => return None,
+    };
+    let cut = remove_definition(text?, keyword, name)?;
+    let reparsed = brain_protocol::schema::parse_schema(&cut).ok()?;
+    (reparsed.namespace == narrowed.namespace && reparsed.items == narrowed.items).then_some(cut)
+}
+
+/// Cut `define <keyword> <name> { … }` out of `text`: brace-balanced,
+/// skipping braces inside `"…"` / `"""…"""` strings and `#` comments. Also
+/// removes the comment lines directly above the block and one of the blank
+/// lines it leaves behind.
+fn remove_definition(text: &str, keyword: &str, name: &str) -> Option<String> {
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let is_header = |l: &str| {
+        let mut w = l
+            .split(|c: char| c.is_whitespace() || c == '{')
+            .filter(|w| !w.is_empty());
+        w.next() == Some("define") && w.next() == Some(keyword) && w.next() == Some(name)
+    };
+    let start_line = lines.iter().position(|l| is_header(l))?;
+    let offset = |line: usize| lines[..line].iter().map(|l| l.len()).sum::<usize>();
+
+    // Scan from the header for the matching close brace.
+    let bytes = text.as_bytes();
+    let mut i = offset(start_line);
+    let mut depth = 0usize;
+    let mut opened = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'#' => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'"' if text[i..].starts_with("\"\"\"") => {
+                i += text[i + 3..].find("\"\"\"")? + 6;
+                continue;
+            }
+            b'"' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+            }
+            b'{' => {
+                depth += 1;
+                opened = true;
+            }
+            b'}' if opened => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if !opened || depth != 0 || i >= bytes.len() {
+        return None;
+    }
+    // End of the line holding the close brace.
+    let end = text[i..].find('\n').map_or(text.len(), |n| i + n + 1);
+    let end_line = lines
+        .iter()
+        .scan(0usize, |acc, l| {
+            *acc += l.len();
+            Some(*acc)
+        })
+        .position(|acc| acc >= end)?
+        + 1;
+
+    // Attached comments directly above.
+    let mut first = start_line;
+    while first > 0 && lines[first - 1].trim_start().starts_with('#') {
+        first -= 1;
+    }
+    // Drop one of the two blank lines the cut would leave adjacent.
+    let mut last = end_line;
+    let blank = |l: &str| l.trim().is_empty();
+    if last < lines.len() && blank(lines[last]) && (first == 0 || blank(lines[first - 1])) {
+        last += 1;
+    }
+    let mut out = String::with_capacity(text.len());
+    for (n, l) in lines.iter().enumerate() {
+        if n < first || n >= last {
+            out.push_str(l);
+        }
+    }
+    Some(out)
+}
+#[cfg(test)]
+mod narrow_text_tests {
+    use super::*;
+
+    const DOC: &str = "namespace acme\n\n# Likes.\n# Two lines.\ndefine predicate prefers {\n    kind: Preference\n    object: Value<text>\n    description: \"a { brace } in a string\" # and } in a comment\n}\n\ndefine predicate dislikes {\n    kind: Preference\n    object: Value<text>\n}\n";
+
+    #[test]
+    fn cuts_the_block_its_comments_and_one_blank_line() {
+        let out = remove_definition(DOC, "predicate", "prefers").unwrap();
+        assert_eq!(
+            out,
+            "namespace acme\n\ndefine predicate dislikes {\n    kind: Preference\n    object: Value<text>\n}\n"
+        );
+    }
+
+    #[test]
+    fn leaves_other_definitions_and_ignores_prefix_names() {
+        assert!(remove_definition(DOC, "predicate", "pref").is_none());
+        let out = remove_definition(DOC, "predicate", "dislikes").unwrap();
+        assert!(out.contains("define predicate prefers"));
+        assert!(!out.contains("dislikes"));
+    }
+
+    #[test]
+    fn narrowed_source_only_when_it_reparses_to_the_narrowed_document() {
+        let mut schema = brain_protocol::schema::parse_schema(DOC).unwrap();
+        schema
+            .items
+            .retain(|i| !matches!(i, SchemaItem::Predicate(p) if p.name == "prefers"));
+        schema.source = None;
+        let text = narrowed_source(Some(DOC), &schema, schema_drop_target::PREDICATE, "prefers")
+            .expect("text kept");
+        assert!(!text.contains("prefers"));
+        // No prior text → nothing to keep.
+        assert!(narrowed_source(None, &schema, schema_drop_target::PREDICATE, "prefers").is_none());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -364,6 +511,7 @@ mod tests {
             target_name: name.into(),
             force,
             request_id: rid,
+            act_as: None,
         }
     }
 

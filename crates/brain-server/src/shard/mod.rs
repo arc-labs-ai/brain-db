@@ -231,6 +231,10 @@ pub(crate) enum ShardRequest {
     /// worker on a populated shard.
     ExtractBackfill {
         selector: brain_protocol::BackfillSelector,
+        /// Tenant scope for a `Memory(id)` selector: when `Some`, the
+        /// memory is only re-enqueued if it belongs to this namespace.
+        /// Always `None` for the global `Since` / `All` forms.
+        namespace: Option<String>,
         reply_tx: Sender<Result<ExtractBackfillReport, String>>,
     },
     /// Submit a resumable backfill run to this shard's `BackfillWorker`
@@ -302,6 +306,12 @@ pub struct ExtractBackfillReport {
     /// text row, tombstoned, or (for `Memory(id)`) not found on this
     /// shard.
     pub skipped: u64,
+    /// Namespace-scoped `Memory(id)` only: `1` when the owning shard found
+    /// the memory AND it belongs to the requested namespace (whether it was
+    /// then enqueued or skipped), else `0`. A fan-out summing to `0` means
+    /// "no such memory in this namespace" — the admin handler's `404`.
+    /// Always `0` for unscoped selectors.
+    pub namespace_matched: u64,
 }
 
 /// Action verbs for [`ShardRequest::WorkerControl`].
@@ -1337,13 +1347,22 @@ impl ShardHandle {
     /// shard is the contract — the admin handler fans the call out to
     /// every shard, and only the shard that owns the id will report a
     /// hit.
+    ///
+    /// `namespace = Some(ns)` scopes a `Memory(id)` selector to one tenant:
+    /// a memory owned by another namespace (or an unknown namespace) is
+    /// treated as absent and reported with `namespace_matched = 0`.
     pub async fn extract_backfill(
         &self,
         selector: brain_protocol::BackfillSelector,
+        namespace: Option<String>,
     ) -> Result<ExtractBackfillReport, ShardError> {
         let (reply_tx, reply_rx) = flume::bounded(1);
         self.tx
-            .send_async(ShardRequest::ExtractBackfill { selector, reply_tx })
+            .send_async(ShardRequest::ExtractBackfill {
+                selector,
+                namespace,
+                reply_tx,
+            })
             .await
             .map_err(|_| ShardError::ShardDisconnected)?;
         reply_rx
@@ -4428,8 +4447,12 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
                     );
                 }
             }
-            ShardRequest::ExtractBackfill { selector, reply_tx } => {
-                let out = run_extract_backfill(&shard, selector).await;
+            ShardRequest::ExtractBackfill {
+                selector,
+                namespace,
+                reply_tx,
+            } => {
+                let out = run_extract_backfill(&shard, selector, namespace.as_deref()).await;
                 if reply_tx.send_async(out).await.is_err() {
                     warn!(
                         shard_id = shard.shard_id,
@@ -4909,9 +4932,17 @@ async fn run_restore_memory(
 /// every [`BACKFILL_YIELD_INTERVAL`] rows so foreground ops on this
 /// shard aren't starved by a large scan. Enqueue is still a non-blocking
 /// `try_send` against the bounded flume queue.
+///
+/// `namespace` (only meaningful with `Memory(id)`; the admin handler never
+/// sends it with `Since` / `All`) is a tenant wall: the memory is only
+/// considered when its row's `namespace_id` is that namespace's interned id.
+/// A foreign or unknown namespace reads as "not found" — no enqueue, no
+/// skip, `namespace_matched = 0` — exactly like
+/// `POST /v1/memories/{id}/restore?namespace=`.
 async fn run_extract_backfill(
     shard: &Shard,
     selector: brain_protocol::BackfillSelector,
+    namespace: Option<&str>,
 ) -> Result<ExtractBackfillReport, String> {
     use brain_core::MemoryId;
     use brain_metadata::tables::memory::MEMORIES_TABLE;
@@ -4972,6 +5003,9 @@ async fn run_extract_backfill(
         Ok(())
     };
 
+    // Set by the namespace-scoped `Memory(id)` arm; copied onto the report
+    // after the match (`try_one` holds the report mutably until then).
+    let mut namespace_matched = 0u64;
     match selector {
         BackfillSelector::Memory(wire_id) => {
             let memory_id: MemoryId = wire_id.into();
@@ -4980,6 +5014,22 @@ async fn run_extract_backfill(
             // shard; only the owning shard reports a hit.
             if memory_id.shard() != shard.shard_id {
                 return Ok(report);
+            }
+            if let Some(ns) = namespace {
+                // Tenant wall. Resolve the named namespace and compare it to
+                // the row's owner; anything else is indistinguishable from a
+                // missing memory.
+                let resolved = brain_metadata::namespace::namespace_lookup_by_name(&rtxn, ns)
+                    .map_err(|e| format!("namespace lookup: {e}"))?;
+                let owner = memories
+                    .get(&memory_id.to_be_bytes())
+                    .map_err(|e| format!("memories.get: {e}"))?
+                    .map(|g| g.value().namespace_id);
+                match (resolved, owner) {
+                    (Some(ns_id), Some(owner)) if owner == ns_id.raw() => {}
+                    _ => return Ok(report),
+                }
+                namespace_matched = 1;
             }
             try_one(memory_id.to_be_bytes())?;
         }
@@ -5021,6 +5071,7 @@ async fn run_extract_backfill(
         }
     }
 
+    report.namespace_matched = namespace_matched;
     Ok(report)
 }
 

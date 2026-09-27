@@ -332,6 +332,7 @@ fn sample_encode_act_as() -> EncodeRequest {
         act_as: Some(ActAs {
             namespace: "tenant-acme".into(),
             space_id: SPACE_STR.into(),
+            grant: 0,
         }),
         wait: brain_protocol::WaitMode::Ack,
         allow_duplicates: false,
@@ -1143,6 +1144,7 @@ fn corpus() -> Vec<Case> {
         act_as: Some(ActAs {
             namespace: "tenant-acme".into(),
             space_id: SPACE_STR.into(),
+            grant: 0,
         }),
     };
     cases.push(req_case(
@@ -1170,6 +1172,7 @@ fn corpus() -> Vec<Case> {
         act_as: Some(ActAs {
             namespace: "tenant-acme".into(),
             space_id: SPACE_STR.into(),
+            grant: 0,
         }),
     };
     cases.push(req_case(
@@ -1200,6 +1203,7 @@ fn corpus() -> Vec<Case> {
         act_as: Some(ActAs {
             namespace: "tenant-acme".into(),
             space_id: SPACE_STR.into(),
+            grant: 0,
         }),
     };
     cases.push(req_case(
@@ -1221,6 +1225,7 @@ fn corpus() -> Vec<Case> {
         act_as: Some(ActAs {
             namespace: "tenant-acme".into(),
             space_id: SPACE_STR.into(),
+            grant: 0,
         }),
     };
     cases.push(req_case(
@@ -1256,6 +1261,7 @@ fn corpus() -> Vec<Case> {
         act_as: Some(ActAs {
             namespace: "tenant-acme".into(),
             space_id: SPACE_STR.into(),
+            grant: 0,
         }),
     };
     cases.push(req_case(
@@ -1278,6 +1284,7 @@ fn corpus() -> Vec<Case> {
         dry_run: false,
         allow_breaking: false,
         request_id: RID,
+        act_as: None,
     };
     cases.push(req_case(
         "req_schema_upload",
@@ -2050,6 +2057,7 @@ fn corpus() -> Vec<Case> {
         act_as: Some(ActAs {
             namespace: "tenant-acme".into(),
             space_id: SPACE_STR.into(),
+            grant: 0,
         }),
     };
     cases.push(req_case(
@@ -2147,6 +2155,7 @@ fn corpus() -> Vec<Case> {
         act_as: Some(ActAs {
             namespace: "tenant-acme".into(),
             space_id: SPACE_STR.into(),
+            grant: 0,
         }),
     };
     cases.push(req_case(
@@ -2181,6 +2190,7 @@ fn corpus() -> Vec<Case> {
         act_as: Some(ActAs {
             namespace: "tenant-acme".into(),
             space_id: SPACE_STR.into(),
+            grant: 0,
         }),
     };
     cases.push(req_case(
@@ -2383,6 +2393,7 @@ fn corpus() -> Vec<Case> {
     let graph_act_as = ActAs {
         namespace: "tenant-acme".into(),
         space_id: SPACE_STR.into(),
+        grant: 0,
     };
 
     // =====================================================================
@@ -3023,6 +3034,7 @@ fn corpus() -> Vec<Case> {
     let schema_get_req = SchemaGetRequest {
         namespace: "org".into(),
         version: 3,
+        act_as: None,
     };
     cases.push(req_case(
         "req_schema_get",
@@ -3036,6 +3048,7 @@ fn corpus() -> Vec<Case> {
         namespace: "org".into(),
         limit: 25,
         cursor: vec![0x9a, 0x02, 0x00, 0x00, 0x03],
+        act_as: None,
     };
     cases.push(req_case(
         "req_schema_list",
@@ -3047,6 +3060,7 @@ fn corpus() -> Vec<Case> {
     let schema_validate_req = SchemaValidateRequest {
         schema_document: "namespace org\ndefine relation_type mentors { from Person to Person }\n"
             .into(),
+        act_as: None,
     };
     cases.push(req_case(
         "req_schema_validate",
@@ -3063,6 +3077,7 @@ fn corpus() -> Vec<Case> {
                 .into(),
         force_drop_existing: true,
         request_id: RID,
+        act_as: None,
     };
     cases.push(req_case(
         "req_schema_replace",
@@ -3079,11 +3094,85 @@ fn corpus() -> Vec<Case> {
         target_name: "mentors".into(),
         force: true,
         request_id: RID,
+        act_as: None,
     };
     cases.push(req_case(
         "req_schema_drop",
         RequestBody::SchemaDrop(schema_drop_req.clone()),
         &schema_drop_req,
+    ));
+
+    // ---- Delegated schema requests (`act_as` + `grant`) ----
+    //
+    // A shared-pool gateway runs schema ops as the tenant. `act_as` is the
+    // last key of each map and is omitted when `None`, so the non-delegated
+    // fixtures above are byte-identical to their pre-`act_as` form. `grant`
+    // is the third, optional key of the `act_as` map (omitted when 0): the
+    // read-shaped verbs pin its absence, the mutating verbs pin the delegable
+    // bits — SCHEMA_UPLOAD (16) for UPLOAD, ADMIN (32) for REPLACE / DROP.
+    let tenant = |grant: u32| {
+        Some(ActAs {
+            namespace: "org".into(),
+            space_id: SPACE_STR.into(),
+            grant,
+        })
+    };
+    let schema_get_act_as = SchemaGetRequest {
+        act_as: tenant(0),
+        ..schema_get_req.clone()
+    };
+    cases.push(req_case(
+        "req_schema_get_act_as",
+        RequestBody::SchemaGet(schema_get_act_as.clone()),
+        &schema_get_act_as,
+    ));
+    let schema_list_act_as = SchemaListRequest {
+        act_as: tenant(0),
+        ..schema_list_req.clone()
+    };
+    cases.push(req_case(
+        "req_schema_list_act_as",
+        RequestBody::SchemaList(schema_list_act_as.clone()),
+        &schema_list_act_as,
+    ));
+    let schema_validate_act_as = SchemaValidateRequest {
+        act_as: tenant(0),
+        ..schema_validate_req.clone()
+    };
+    cases.push(req_case(
+        "req_schema_validate_act_as",
+        RequestBody::SchemaValidate(schema_validate_act_as.clone()),
+        &schema_validate_act_as,
+    ));
+    let schema_upload_act_as = SchemaUploadRequest {
+        schema_document: "namespace org\ndefine entity_type Person\n".into(),
+        dry_run: false,
+        allow_breaking: false,
+        request_id: RID,
+        act_as: tenant(1 << 4),
+    };
+    cases.push(req_case(
+        "req_schema_upload_act_as_grant",
+        RequestBody::SchemaUpload(schema_upload_act_as.clone()),
+        &schema_upload_act_as,
+    ));
+    let schema_replace_act_as = SchemaReplaceRequest {
+        act_as: tenant(1 << 5),
+        ..schema_replace_req.clone()
+    };
+    cases.push(req_case(
+        "req_schema_replace_act_as_grant",
+        RequestBody::SchemaReplace(schema_replace_act_as.clone()),
+        &schema_replace_act_as,
+    ));
+    let schema_drop_act_as = SchemaDropRequest {
+        act_as: tenant(1 << 5),
+        ..schema_drop_req.clone()
+    };
+    cases.push(req_case(
+        "req_schema_drop_act_as_grant",
+        RequestBody::SchemaDrop(schema_drop_act_as.clone()),
+        &schema_drop_act_as,
     ));
 
     // ---- Schema responses ----
@@ -3252,6 +3341,7 @@ fn corpus() -> Vec<Case> {
         act_as: Some(ActAs {
             namespace: "tenant-acme".into(),
             space_id: SPACE_STR.into(),
+            grant: 0,
         }),
     };
     cases.push(req_case(
@@ -3329,11 +3419,26 @@ fn corpus() -> Vec<Case> {
     // Structurally empty request — the payload is an empty CBOR map, NOT a
     // zero-length body or a CBOR null. That distinction is exactly what an
     // SDK gets wrong when it "optimizes away" a fieldless request.
-    let get_capabilities_req = GetCapabilitiesRequest {};
+    let get_capabilities_req = GetCapabilitiesRequest { act_as: None };
     cases.push(req_case(
         "req_get_capabilities",
-        RequestBody::GetCapabilities(get_capabilities_req),
+        RequestBody::GetCapabilities(get_capabilities_req.clone()),
         &get_capabilities_req,
+    ));
+    // Delegated capabilities: the formerly fieldless map now carries one
+    // optional key. `grant` is 0 and therefore omitted — the nested `act_as`
+    // map is the same two-key shape every other op carries.
+    let get_capabilities_act_as = GetCapabilitiesRequest {
+        act_as: Some(ActAs {
+            namespace: "tenant-acme".into(),
+            space_id: SPACE_STR.into(),
+            grant: 0,
+        }),
+    };
+    cases.push(req_case(
+        "req_get_capabilities_act_as",
+        RequestBody::GetCapabilities(get_capabilities_act_as.clone()),
+        &get_capabilities_act_as,
     ));
 
     // ---- LINK / UNLINK requests ----
@@ -3354,6 +3459,7 @@ fn corpus() -> Vec<Case> {
         act_as: Some(ActAs {
             namespace: "tenant-acme".into(),
             space_id: SPACE_STR.into(),
+            grant: 0,
         }),
     };
     cases.push(req_case(
@@ -3373,6 +3479,7 @@ fn corpus() -> Vec<Case> {
         act_as: Some(ActAs {
             namespace: "tenant-acme".into(),
             space_id: SPACE_STR.into(),
+            grant: 0,
         }),
     };
     cases.push(req_case(

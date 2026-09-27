@@ -12,6 +12,16 @@
 //! Exactly one of the three forms must be present; the handler returns
 //! `400 Bad Request` otherwise.
 //!
+//! The single-memory form takes an optional tenant scope,
+//! `?memory=<id>&namespace=<name>` (the same `namespace` param
+//! `POST /v1/memories/{id}/restore` takes): the memory is re-enqueued only
+//! if it belongs to that namespace, and a memory that is absent, owned by
+//! another namespace, or under a never-interned namespace answers
+//! `404 Not Found` — indistinguishable, so a tenant-scoped caller can't
+//! probe other tenants' ids. Without `namespace` the form is global, as
+//! before. `namespace` with `?since` / `?all` is a `400`: those stay
+//! operator-global.
+//!
 //! The handler fans the request out to every configured shard (the
 //! memory-by-id form short-circuits on shards that don't own the id),
 //! sums the per-shard `enqueued` + `skipped` counts, and replies
@@ -51,17 +61,26 @@ pub async fn handle(
         Ok(s) => s,
         Err(msg) => return Ok(text_response(StatusCode::BAD_REQUEST, &format!("{msg}\n"))),
     };
+    let namespace = match parse_namespace_scope(&query_str, &selector) {
+        Ok(ns) => ns,
+        Err(msg) => return Ok(text_response(StatusCode::BAD_REQUEST, &format!("{msg}\n"))),
+    };
 
     let mut enqueued: u64 = 0;
     let mut skipped: u64 = 0;
+    let mut namespace_matched: u64 = 0;
     let mut succeeded: usize = 0;
     let mut shard_errors: Vec<String> = Vec::new();
     for (idx, shard) in state.shards.iter().enumerate() {
-        match shard.extract_backfill(selector.clone()).await {
+        match shard
+            .extract_backfill(selector.clone(), namespace.clone())
+            .await
+        {
             Ok(report) => {
                 succeeded += 1;
                 enqueued = enqueued.saturating_add(report.enqueued);
                 skipped = skipped.saturating_add(report.skipped);
+                namespace_matched = namespace_matched.saturating_add(report.namespace_matched);
             }
             Err(e) => {
                 warn!(shard = idx, error = %e, "extract_backfill failed");
@@ -76,6 +95,17 @@ pub async fn handle(
         return Ok(text_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "extraction backfill failed\n",
+        ));
+    }
+
+    // Tenant-scoped single memory that no shard matched: absent, foreign, or
+    // an unknown namespace — all one `404`. Only claimed on a clean fan-out;
+    // if a shard errored it may have been the owner, so the partial-failure
+    // path below reports that instead of a possibly-wrong 404.
+    if namespace.is_some() && namespace_matched == 0 && shard_errors.is_empty() {
+        return Ok(text_response(
+            StatusCode::NOT_FOUND,
+            "no such memory in this namespace\n",
         ));
     }
 
@@ -186,9 +216,50 @@ fn parse_selector(query: &str) -> Result<BackfillSelector, String> {
     Ok(BackfillSelector::All)
 }
 
+/// Pull the optional `namespace=<name>` tenant scope. Only the single-memory
+/// selector may be scoped; an empty value, or a scope on `?since` / `?all`,
+/// is a `400`.
+fn parse_namespace_scope(
+    query: &str,
+    selector: &BackfillSelector,
+) -> Result<Option<String>, String> {
+    let Some(ns) = query
+        .split('&')
+        .filter(|s| !s.is_empty())
+        .find_map(|kv| kv.strip_prefix("namespace="))
+    else {
+        return Ok(None);
+    };
+    if ns.is_empty() {
+        return Err("empty namespace; pass ?namespace=<name> or omit it".into());
+    }
+    if !matches!(selector, BackfillSelector::Memory(_)) {
+        return Err("namespace scoping is only supported with ?memory=<id>".into());
+    }
+    Ok(Some(ns.to_owned()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn namespace_scope_only_with_memory_selector() {
+        let mem = BackfillSelector::Memory(7);
+        assert_eq!(parse_namespace_scope("memory=7", &mem).unwrap(), None);
+        assert_eq!(
+            parse_namespace_scope("memory=7&namespace=acme", &mem).unwrap(),
+            Some("acme".to_owned())
+        );
+        assert!(parse_namespace_scope("memory=7&namespace=", &mem).is_err());
+        assert!(parse_namespace_scope("all&namespace=acme", &BackfillSelector::All).is_err());
+        let since = BackfillSelector::Since {
+            since_unix_nanos: 0,
+        };
+        assert!(parse_namespace_scope("since=0&namespace=acme", &since).is_err());
+        // `namespace` is not itself a selector.
+        assert!(parse_selector("namespace=acme").is_err());
+    }
 
     #[test]
     fn parse_selector_memory() {

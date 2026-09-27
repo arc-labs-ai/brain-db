@@ -28,7 +28,10 @@ pub use tokenizer::{build_analyzer, BrainTokenizer, BRAIN_TOKENIZER_NAME};
 ///
 /// Bumped whenever any field in the schemas defined by [`memory_text_schema`]
 /// or [`statements_schema`] changes shape. Mismatch on open → `NeedsRebuild`.
-pub const BRAIN_SCHEMA_VERSION: u32 = 1;
+///
+/// v2: `statements.tantivy/` gained `space_id`, so the statement lane can
+/// rank inside the caller's space the way the memory lane does.
+pub const BRAIN_SCHEMA_VERSION: u32 = 2;
 
 const STATEMENTS_DIR: &str = "statements.tantivy";
 const MEMORY_TEXT_DIR: &str = "memory_text.tantivy";
@@ -221,6 +224,10 @@ pub fn statements_schema() -> Schema {
     sb.add_u64_field("kind", INDEXED);
     sb.add_u64_field("confidence_bucket", INDEXED | FAST);
     sb.add_u64_field("extracted_at", INDEXED | FAST);
+    // 16-byte space UUID of the statement's row — the same tenancy wall as
+    // `memory_text`'s `space_id`. Without it BM25 ranks every space on the
+    // shard together and foreign statements take the caller's top-k slots.
+    sb.add_bytes_field("space_id", INDEXED | STORED);
     sb.build()
 }
 

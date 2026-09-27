@@ -1101,6 +1101,12 @@ fn invoke_semantic(
         ..SemanticFilters::default()
     };
     apply_pre_filter_to_semantic(&planned.pre_filter, &mut filters);
+    // Space wall: a single-space read stays in the caller's space whatever
+    // the planner chose as its pre-filter. Namespace-wide reads leave it
+    // open (the namespace wall above still holds).
+    if filters.space_ids.is_empty() && ctx.scope_mode == brain_metadata::ScopeMode::Space {
+        filters.space_ids = vec![ctx.caller_space];
+    }
     // Tombstone gate: mirror the request's include_tombstoned into the vector
     // lane. A soft-forgotten row's HNSW node lingers until the next rebuild,
     // so without this the HNSW top-k fills with tombstoned candidates the
@@ -1733,17 +1739,26 @@ fn invoke_lexical(
         .map_err(|e| RetrieverInvocationError::Failure(e.to_string()))?;
 
     // Typed-graph QUERY also searches the statement-text index. The
-    // StatementText scope rejects the memory-only filters (space_id,
-    // memory_kind, created_at_ms), so build a statement-scoped filter
-    // carrying only the predicate / statement-kind pre-filter and the
-    // shared context scope. The two corpora return disjoint id variants
-    // (Memory vs Statement), so fusion merges them without collision.
+    // StatementText scope rejects the memory-only filters (memory_kind,
+    // created_at_ms), so build a statement-scoped filter carrying the
+    // space wall, the predicate / statement-kind pre-filter and the shared
+    // context scope. The two corpora return disjoint id variants (Memory vs
+    // Statement), so fusion merges them without collision.
     if include_statements {
         let mut stmt_filters = LexicalFilters {
             session_ids: req.session_filter.clone(),
             ..Default::default()
         };
         apply_pre_filter_to_lexical_statement(&planned.pre_filter, &mut stmt_filters);
+        // A single-space read ranks inside the caller's space whatever the
+        // planner chose as its pre-filter; foreign statements would
+        // otherwise fill top-k and only be dropped (unlabelled) afterwards.
+        // Namespace-wide reads leave it open, like the semantic lane.
+        if stmt_filters.space_ids.is_empty()
+            && ctx.scope_mode == brain_metadata::ScopeMode::Space
+        {
+            stmt_filters.space_ids = vec![ctx.caller_space];
+        }
         let stmt_query = LexicalQuery {
             terms: query.terms.clone(),
             phrase_clauses: Vec::new(),
@@ -1758,19 +1773,20 @@ fn invoke_lexical(
     Ok(hits)
 }
 
-/// Project a pre-filter onto the statement-text lexical scope. Only the
-/// statement-relevant predicates carry over; the memory-only filters
-/// (space_id / memory_kind / created_at_ms) would be rejected by the
+/// Project a pre-filter onto the statement-text lexical scope. The space
+/// wall and the statement-relevant predicates carry over; the memory-only
+/// filters (memory_kind / created_at_ms) would be rejected by the
 /// StatementText scope, so they are dropped here.
 fn apply_pre_filter_to_lexical_statement(pre: &Option<PreFilter>, filters: &mut LexicalFilters) {
     let Some(pf) = pre else {
         return;
     };
     match pf {
+        PreFilter::SpaceIds(ids) => filters.space_ids = ids.clone(),
         PreFilter::StatementKind(ks) => filters.statement_kind = ks.first().copied(),
         PreFilter::PredicateId(ps) => filters.predicate_id = ps.first().map(|p| p.raw()),
         // Memory-only pre-filters don't apply to the statement corpus.
-        PreFilter::SpaceIds(_) | PreFilter::MemoryKind(_) | PreFilter::Temporal(_) => {}
+        PreFilter::MemoryKind(_) | PreFilter::Temporal(_) => {}
     }
 }
 

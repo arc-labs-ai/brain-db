@@ -122,10 +122,11 @@ pub struct PredicateDef {
 
 impl PredicateDef {
     /// Resolve the `stateful` flag against its kind-derived default.
-    /// Preference predicates default to stateful (each new preference
-    /// supersedes the prior one); Fact and Event default to cumulative.
-    /// `Any` is treated as Fact-like — no auto-supersession unless the
-    /// author opts in explicitly.
+    /// Only the single-valued kinds (Attribute, Directive) default to
+    /// stateful — a newer value supersedes the prior one. Fact, Event and
+    /// Preference default to cumulative (one can like many things), so a
+    /// single-valued preference such as "the framework to use" must declare
+    /// `stateful: true` to supersede. `Any` is treated as Fact-like.
     #[must_use]
     pub fn resolved_stateful(&self) -> bool {
         self.stateful.unwrap_or(match self.kind {

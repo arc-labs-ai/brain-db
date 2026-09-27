@@ -196,22 +196,26 @@ pub fn merge_hype_questions(
 ///
 /// Best-effort: a read or merge failure returns `Err` for the caller to log,
 /// never blocks the durable graph write (which already committed).
+///
+/// Returns the number of graph edges skipped because an entity endpoint did
+/// not resolve to a node (see [`enrichment_to_graph_counted`]) — they are never
+/// persisted against the nil id; the caller counts them.
 pub fn merge_graph_from_committed(
     metadata: &MetadataDb,
     memory_id: MemoryId,
-) -> Result<(), String> {
-    let graph = {
+) -> Result<usize, String> {
+    let (graph, unresolved) = {
         let rtxn = metadata
             .read_txn()
             .map_err(|e| format!("graph merge read_txn: {e}"))?;
         let Some(scope) = memory_scope(&rtxn, memory_id)? else {
             // Memory row gone (e.g. hard-forgotten between commit and merge):
             // nothing to enrich, and the bundle was purged with the row.
-            return Ok(());
+            return Ok(0);
         };
         let enr = crate::handlers::recall::fetch_enrichment_for(&[memory_id], scope, None, &rtxn)
             .map_err(|e| format!("graph enrichment: {e}"))?;
-        enrichment_to_graph(enr.into_iter().next())
+        enrichment_to_graph_counted(enr.into_iter().next())
     };
 
     let wtxn = metadata
@@ -228,7 +232,7 @@ pub fn merge_graph_from_committed(
     })?;
     wtxn.commit()
         .map_err(|e| format!("graph merge commit: {e}"))?;
-    Ok(())
+    Ok(unresolved)
 }
 
 /// Merge derived memory↔memory edges (`SimilarTo` from `auto_edge`,
@@ -505,15 +509,30 @@ pub(crate) fn literal_node_id(source: &[u8; 16], predicate: &str, literal_text: 
 /// value (e.g. "favorite color is **blue**") — it gets a synthetic
 /// `"literal"` node (deduped by id within this call) carrying the real text,
 /// so the bundle's edge points at a real node instead of the all-zero
-/// placeholder. A relation endpoint still falls back to the zero id —
-/// relations are entity-to-entity by schema, so an unresolved endpoint there
-/// is an enrichment-cap miss, not a literal.
+/// placeholder.
+///
+/// An edge whose entity endpoint does not resolve to a node (a statement
+/// subject beyond the entity cap; a relation endpoint that is not an entity
+/// this memory mentions — the enrichment walks ALL relations incident to a
+/// mentioned entity, including ones another memory wrote, e.g. the space
+/// self-entity's `works_at`) is SKIPPED, never emitted against the nil id:
+/// a persisted edge to `00000000-…` is a dangling edge no reader can render.
+#[cfg(test)]
 pub(crate) fn enrichment_to_graph(
     enr: Option<brain_protocol::envelope::response::GraphEnrichment>,
 ) -> EncodeStageGraph {
+    enrichment_to_graph_counted(enr).0
+}
+
+/// [`enrichment_to_graph`] plus the number of edges skipped because an
+/// entity endpoint did not resolve to a node.
+pub(crate) fn enrichment_to_graph_counted(
+    enr: Option<brain_protocol::envelope::response::GraphEnrichment>,
+) -> (EncodeStageGraph, usize) {
     let Some(enr) = enr else {
-        return EncodeStageGraph::default();
+        return (EncodeStageGraph::default(), 0);
     };
+    let mut unresolved = 0usize;
 
     let mut nodes: Vec<EncodeGraphNode> = enr
         .entities
@@ -539,7 +558,10 @@ pub(crate) fn enrichment_to_graph(
     // Statements (subject → object via predicate); a non-entity object is a
     // literal value and gets its own synthetic node.
     for s in &enr.statements {
-        let source = lookup(&s.subject_name).unwrap_or([0u8; 16]);
+        let Some(source) = lookup(&s.subject_name) else {
+            unresolved += 1;
+            continue;
+        };
         let target = match lookup(&s.object_label) {
             Some(id) => id,
             None => {
@@ -566,9 +588,13 @@ pub(crate) fn enrichment_to_graph(
     }
     // Typed relations (from → to via relation-type predicate).
     for r in &enr.relations {
+        let (Some(source), Some(target)) = (lookup(&r.from_name), lookup(&r.to_name)) else {
+            unresolved += 1;
+            continue;
+        };
         edges.push(EncodeGraphEdge {
-            source: lookup(&r.from_name).unwrap_or([0u8; 16]),
-            target: lookup(&r.to_name).unwrap_or([0u8; 16]),
+            source,
+            target,
             predicate: r.predicate.clone(),
             kind: "relation".to_string(),
             confidence: 1.0,
@@ -577,7 +603,7 @@ pub(crate) fn enrichment_to_graph(
         });
     }
 
-    EncodeStageGraph { nodes, edges }
+    (EncodeStageGraph { nodes, edges }, unresolved)
 }
 
 /// Build the sync [`EncodeStageRecord`] from the fields in hand at apply time.
@@ -610,7 +636,7 @@ pub fn sync_record(
 mod tests {
     use super::*;
     use brain_protocol::envelope::response::{
-        EncodeStageArtifact, EnrichedEntity, EnrichedStatement, GraphEnrichment,
+        EncodeStageArtifact, EnrichedEntity, EnrichedRelation, EnrichedStatement, GraphEnrichment,
     };
     use tempfile::TempDir;
 
@@ -1066,6 +1092,78 @@ mod tests {
         );
         assert_eq!(graph.edges[0].target, [3u8; 16]);
         assert_eq!(graph.nodes.len(), 2, "no duplicate node minted");
+    }
+
+    #[test]
+    fn relation_with_unresolved_endpoint_is_skipped_never_nil() {
+        // "Northwind" is mentioned; the relation's other endpoint (e.g. the
+        // space self-entity, written by ANOTHER memory) is not a node here.
+        let enr = GraphEnrichment {
+            entities: vec![EnrichedEntity {
+                id: [4u8; 16],
+                name: "Northwind".into(),
+                type_qname: "Organization".into(),
+            }],
+            statements: vec![EnrichedStatement {
+                id: [5u8; 16],
+                subject_name: "someone beyond the entity cap".into(),
+                predicate: "brain:role".into(),
+                object_label: "lead".into(),
+                confidence: 0.9,
+                event_at_unix_nanos: None,
+            }],
+            relations: vec![
+                EnrichedRelation {
+                    from_name: "space:da6ce18abcb75e7bacc022e44956b287".into(),
+                    predicate: "brain:works_at".into(),
+                    to_name: "Northwind".into(),
+                },
+                EnrichedRelation {
+                    from_name: "Northwind".into(),
+                    predicate: "brain:joined".into(),
+                    to_name: "Nobody Mentioned".into(),
+                },
+            ],
+        };
+        let (graph, unresolved) = enrichment_to_graph_counted(Some(enr));
+        assert_eq!(unresolved, 3, "two relations + one statement skipped");
+        assert!(graph.edges.is_empty(), "{:?}", graph.edges);
+        assert!(
+            graph
+                .edges
+                .iter()
+                .all(|e| e.source != [0u8; 16] && e.target != [0u8; 16]),
+            "no edge may point at the nil id"
+        );
+    }
+
+    #[test]
+    fn relation_with_both_endpoints_mentioned_is_kept() {
+        let enr = GraphEnrichment {
+            entities: vec![
+                EnrichedEntity {
+                    id: priya_id(),
+                    name: "Priya".into(),
+                    type_qname: "brain:person".into(),
+                },
+                EnrichedEntity {
+                    id: [4u8; 16],
+                    name: "Northwind".into(),
+                    type_qname: "Organization".into(),
+                },
+            ],
+            statements: Vec::new(),
+            relations: vec![EnrichedRelation {
+                from_name: "Priya".into(),
+                predicate: "brain:works_at".into(),
+                to_name: "Northwind".into(),
+            }],
+        };
+        let (graph, unresolved) = enrichment_to_graph_counted(Some(enr));
+        assert_eq!(unresolved, 0);
+        assert_eq!(graph.edges.len(), 1);
+        assert_eq!(graph.edges[0].source, priya_id());
+        assert_eq!(graph.edges[0].target, [4u8; 16]);
     }
 
     #[test]

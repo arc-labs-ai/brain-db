@@ -268,6 +268,9 @@ fn iterate_statements(
     let extracted_at_field = schema
         .get_field("extracted_at")
         .map_err(|e| RebuildError::Metadata(format!("extracted_at: {e}")))?;
+    let space_id_field = schema
+        .get_field("space_id")
+        .map_err(|e| RebuildError::Metadata(format!("space_id: {e}")))?;
 
     let rtxn = metadata
         .read_txn()
@@ -351,6 +354,7 @@ fn iterate_statements(
             )),
         );
         doc.add_u64(extracted_at_field, stmt.extracted_at_unix_nanos / 1_000_000);
+        doc.add_bytes(space_id_field, &stmt.space_id_bytes);
         writer.add_document(doc)?;
 
         count += 1;
