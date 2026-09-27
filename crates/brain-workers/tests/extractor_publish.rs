@@ -429,7 +429,7 @@ async fn seeded_pattern_extractor_persists_entities_end_to_end() {
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires BRAIN_NER_MODEL_PATH pointing at a GLiNER pickle directory"]
 async fn shard_registry_with_real_gliner_persists_entities() {
-    use brain_extractors::{ClassifierConfig, GlinerClassifier, MaterializeDeps, TierGate};
+    use brain_extractors::{ClassifierConfig, GlinerClassifier, MaterializeDeps};
     use redb::ReadableTable;
     use std::path::PathBuf;
 
@@ -471,8 +471,7 @@ async fn shard_registry_with_real_gliner_persists_entities() {
         model_router: None,
         llm_cache: None,
     };
-    let (registry, errors) =
-        brain_extractors::build_registry_with_gate(&defs, &deps, TierGate::all_enabled());
+    let (registry, errors) = brain_extractors::build_registry_from_definitions(&defs, &deps);
     assert!(errors.is_empty(), "registry build errors: {errors:?}");
     assert_eq!(
         registry.iter_enabled().count(),

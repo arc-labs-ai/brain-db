@@ -162,6 +162,7 @@ fn encode_req(request_id: [u8; 16], text: &str) -> EncodeRequest {
 
 fn recall_req(cue: &str) -> RecallRequest {
     RecallRequest {
+        scope: Default::default(),
         trace: false,
         cue_text: cue.into(),
         subject_name: String::new(),

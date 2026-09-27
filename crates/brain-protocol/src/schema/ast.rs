@@ -109,14 +109,24 @@ pub struct PredicateDef {
     pub stateful: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Explicit time-to-live for statements of this predicate. When set, a
+    /// statement older than this (measured per kind from `event_at` for
+    /// Events, `valid_from` for Facts/Preferences) is soft-tombstoned by the
+    /// reclaim worker, then hard-reclaimed on the standard tombstone grace.
+    /// `None` (the default) keeps statements indefinitely — subject only to
+    /// confidence decay, supersession, and explicit FORGET/RETRACT. Distinct
+    /// from decay, which dims confidence but never removes a row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<DurationAst>,
 }
 
 impl PredicateDef {
     /// Resolve the `stateful` flag against its kind-derived default.
-    /// Preference predicates default to stateful (each new preference
-    /// supersedes the prior one); Fact and Event default to cumulative.
-    /// `Any` is treated as Fact-like — no auto-supersession unless the
-    /// author opts in explicitly.
+    /// Only the single-valued kinds (Attribute, Directive) default to
+    /// stateful — a newer value supersedes the prior one. Fact, Event and
+    /// Preference default to cumulative (one can like many things), so a
+    /// single-valued preference such as "the framework to use" must declare
+    /// `stateful: true` to supersede. `Any` is treated as Fact-like.
     #[must_use]
     pub fn resolved_stateful(&self) -> bool {
         self.stateful.unwrap_or(match self.kind {
@@ -330,6 +340,20 @@ pub enum DurationUnit {
     Days,
 }
 
+impl DurationAst {
+    /// Total seconds this duration represents (saturating).
+    #[must_use]
+    pub fn to_seconds(self) -> u64 {
+        let mult = match self.unit {
+            DurationUnit::Seconds => 1,
+            DurationUnit::Minutes => 60,
+            DurationUnit::Hours => 3_600,
+            DurationUnit::Days => 86_400,
+        };
+        self.amount.saturating_mul(mult)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct CostExpr {
     pub amount: f64,
@@ -428,6 +452,7 @@ mod tests {
                     },
                     stateful: None,
                     description: None,
+                    retention: None,
                 }),
                 SchemaItem::Predicate(PredicateDef {
                     name: "prefers".into(),
@@ -437,6 +462,7 @@ mod tests {
                     },
                     stateful: None,
                     description: None,
+                    retention: None,
                 }),
                 SchemaItem::RelationType(RelationTypeDef {
                     name: "reports_to".into(),

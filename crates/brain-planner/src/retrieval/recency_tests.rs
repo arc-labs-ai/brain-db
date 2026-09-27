@@ -166,6 +166,48 @@ fn zero_weight_is_a_noop() {
 }
 
 #[test]
+fn boost_scales_with_the_fusion_k() {
+    // The recency term is one top-rank vote: `weight · (1 / (k + 1)) · decay`.
+    // RRF fuses at the adaptive k (15/30 for small pools), not the plan's
+    // default k=60, so the executor must pass the SAME k `fuse()` used. At a
+    // fresh event (decay ≈ 1) the boost is `weight / (k + 1)`, so a smaller
+    // adaptive k yields a proportionally LARGER boost — the bug this guards
+    // against sized the term to k=60 and made it ~4x too weak.
+    let (_dir, metadata) = fresh();
+    let now = 1_900_000_000 * 1_000_000_000_u64;
+
+    let id = MemoryId::pack(0, 1, 0);
+    put_memory(&metadata, id, Some(now), now); // fresh ⇒ decay ≈ 1
+
+    // Adaptive k for a small candidate pool.
+    let mut items = vec![fused(id, 0.0)];
+    apply_recency_boost(&mut items, &metadata, now, 0.5, 15).expect("boost");
+    let expected_k15 = 0.5 * (1.0 / 16.0);
+    assert!(
+        (items[0].fused_score - expected_k15).abs() < 1e-9,
+        "boost must use the passed (adaptive) k=15 scale, 1/(15+1); got {}",
+        items[0].fused_score,
+    );
+
+    // Same memory, the plan's default k=60: the boost is ~4x smaller.
+    let mut items_k60 = vec![fused(id, 0.0)];
+    apply_recency_boost(&mut items_k60, &metadata, now, 0.5, 60).expect("boost");
+    let expected_k60 = 0.5 * (1.0 / 61.0);
+    assert!(
+        (items_k60[0].fused_score - expected_k60).abs() < 1e-9,
+        "k=60 boost is 1/(60+1); got {}",
+        items_k60[0].fused_score,
+    );
+    assert!(
+        items[0].fused_score > items_k60[0].fused_score * 3.0,
+        "the adaptive-k boost must be materially larger than the k=60 boost: \
+         k15={} vs k60={}",
+        items[0].fused_score,
+        items_k60[0].fused_score,
+    );
+}
+
+#[test]
 fn future_dated_event_saturates_at_full_freshness() {
     let (_dir, metadata) = fresh();
     let now = 1_900_000_000 * 1_000_000_000_u64;

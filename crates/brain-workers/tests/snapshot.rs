@@ -178,6 +178,32 @@ fn count_and_age_combined() {
     assert_eq!(ids, vec![3, 4, 5]);
 }
 
+#[test]
+fn keep_floor_retains_newest_even_when_all_past_max_age() {
+    let now = now_unix_nanos();
+    // Every snapshot is far older than max_age (30d). Without the
+    // keep-floor this would delete ALL of them, leaving nothing to
+    // restore from (invariant #7 — the only backup path).
+    let s = [
+        snap(1, now - 40 * DAY_NS),
+        snap(2, now - 50 * DAY_NS),
+        snap(3, now - 60 * DAY_NS),
+    ];
+    let policy = RetentionPolicy {
+        max_count: 7,
+        max_age: Duration::from_secs(30 * 24 * 3600),
+    };
+    let r = decide_retention(&s, now, policy);
+    let mut ids: Vec<u64> = r.into_iter().map(|i| i.0).collect();
+    ids.sort();
+    // Newest (id 1, 40d) is kept by the floor; the older two are dropped.
+    assert_eq!(
+        ids,
+        vec![2, 3],
+        "keep-floor never deletes the newest snapshot"
+    );
+}
+
 // ===========================================================================
 // Stub sources.
 // ===========================================================================

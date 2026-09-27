@@ -67,7 +67,6 @@ pub const LLM_RESPONSE_TTL_TABLE: TableDefinition<'static, LlmTtlKey, ()> =
 /// schema-validated output type. The framing layer here doesn't peek
 /// inside.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct LlmResponse {
     /// rkyv-encoded typed response. The LLM extractor defines the shape.
     pub response_blob: Vec<u8>,
@@ -255,9 +254,15 @@ pub fn sweep_expired(db: &mut LlmCacheDb, now_unix_secs: u64) -> Result<usize, L
             // The main-table key is (hash, extractor_id, extractor_version,
             // model_id). A single input hash may match multiple rows if
             // the same input has been cached under different extractor /
-            // version / model triples. Range-scan the hash-prefix to
-            // find them, collect, then remove — never delete while a
-            // borrow on the table iterator is alive.
+            // version / model triples. Range-scan the hash-prefix to find
+            // them, collect, then remove — never delete while a borrow on
+            // the table iterator is alive.
+            //
+            // Each candidate row carries its own authoritative expiry. A
+            // row is deleted only when *its* expiry is `<= now`: re-caching
+            // the same key with a later TTL overwrites the row (extending
+            // its expiry) but leaves the earlier TTL hint behind, so this
+            // stale hint must not evict a row that is now live again.
             let lo_key = (*hash, 0u32, 0u32, 0u64);
             let hi_key = (*hash, u32::MAX, u32::MAX, u64::MAX);
             let mut main_keys: Vec<LlmCacheKey> = Vec::new();
@@ -265,7 +270,13 @@ pub fn sweep_expired(db: &mut LlmCacheDb, now_unix_secs: u64) -> Result<usize, L
                 Ok(iter) => {
                     for entry in iter {
                         match entry {
-                            Ok((k, _)) => main_keys.push(k.value()),
+                            Ok((k, v)) => {
+                                let row_expiry_secs =
+                                    v.value().expires_at_unix_nanos / 1_000_000_000;
+                                if row_expiry_secs <= now_unix_secs {
+                                    main_keys.push(k.value());
+                                }
+                            }
                             Err(e) => tracing::debug!(
                                 target: "brain_metadata::llm_cache",
                                 error = %e,
@@ -437,10 +448,16 @@ mod tests {
     }
 
     fn put_with_ttl(db: &mut LlmCacheDb, key: LlmCacheKey, expiry_secs: u64, resp: &LlmResponse) {
+        // Keep the stored row's authoritative expiry consistent with the
+        // TTL-index key. `sweep_expired` deletes a row only when the row's
+        // own expiry is `<= now`, so the two must agree for the sweep to
+        // observe the intended expiry.
+        let mut resp = resp.clone();
+        resp.expires_at_unix_nanos = expiry_secs.saturating_mul(1_000_000_000);
         let wtxn = db.write_txn().unwrap();
         {
             let mut t = wtxn.open_table(LLM_RESPONSES_TABLE).unwrap();
-            t.insert(&key, resp).unwrap();
+            t.insert(&key, &resp).unwrap();
         }
         {
             let mut ttl = wtxn.open_table(LLM_RESPONSE_TTL_TABLE).unwrap();
@@ -551,7 +568,10 @@ mod tests {
         // delete every main-table row matching that hash.
         let dir = tempfile::tempdir().unwrap();
         let mut db = LlmCacheDb::open(cache_path(&dir)).unwrap();
-        let resp = sample_response();
+        // All three rows share both the input hash and the same expiry
+        // (50s), consistent with the single TTL hint below.
+        let mut resp = sample_response();
+        resp.expires_at_unix_nanos = 50 * 1_000_000_000;
         let hash = [0x55u8; 32];
 
         let wtxn = db.write_txn().unwrap();
@@ -571,6 +591,55 @@ mod tests {
         let removed = sweep_expired(&mut db, 100).unwrap();
         assert_eq!(removed, 1, "one TTL row removed");
         assert_eq!(count_main(&db), 0, "all three main rows removed");
+    }
+
+    #[test]
+    fn sweep_retains_live_sibling_with_same_hash_different_expiry() {
+        // WK5 regression. Re-caching the same key with a longer TTL
+        // overwrites the single main row (extending its expiry) but leaves
+        // the earlier TTL hint in place — the TTL table now holds two rows
+        // for one hash at different expiry seconds. Sweeping at a time
+        // between the two expiries must drop only the stale hint and keep
+        // the still-live row readable.
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = LlmCacheDb::open(cache_path(&dir)).unwrap();
+        let hash = [0x77u8; 32];
+        let key = (hash, 1u32, 1u32, 0u64);
+
+        // First put: expiry at 100s, token_count 111.
+        let mut resp1 = sample_response();
+        resp1.token_count = 111;
+        put_with_ttl(&mut db, key, 100, &resp1);
+
+        // Re-put same key: expiry extended to 300s, token_count 222. The
+        // main row is overwritten; the TTL table now has (100, hash) and
+        // (300, hash).
+        let mut resp2 = sample_response();
+        resp2.token_count = 222;
+        put_with_ttl(&mut db, key, 300, &resp2);
+
+        assert_eq!(count_main(&db), 1, "one main row after re-put");
+        assert_eq!(count_ttl(&db), 2, "two TTL hints for one hash");
+
+        // Sweep at 200: (100, hash) is stale, (300, hash) is still live.
+        let removed = sweep_expired(&mut db, 200).unwrap();
+        assert_eq!(removed, 1, "only the stale TTL hint is removed");
+        assert_eq!(count_ttl(&db), 1, "live TTL hint retained");
+        assert_eq!(count_main(&db), 1, "live main row retained");
+
+        // The retained row is the extended re-put, still readable.
+        let rtxn = db.read_txn().unwrap();
+        let main = rtxn.open_table(LLM_RESPONSES_TABLE).unwrap();
+        let got = main.get(&key).unwrap().expect("live row still readable");
+        assert_eq!(got.value().token_count, 222);
+
+        // Sweeping past the live expiry finally evicts the row.
+        drop(main);
+        drop(rtxn);
+        let removed2 = sweep_expired(&mut db, 400).unwrap();
+        assert_eq!(removed2, 1, "live hint now expired");
+        assert_eq!(count_main(&db), 0, "no dangling main row");
+        assert_eq!(count_ttl(&db), 0, "no dangling TTL hint");
     }
 
     #[test]

@@ -13,7 +13,7 @@
 //! confirmed by loading each primary row rather than re-scanning the
 //! index.
 
-use brain_core::{AuditId, EntityId, PredicateId, StatementId, StatementObject};
+use brain_core::{AuditId, EntityId, PredicateId, StatementId};
 use redb::{ReadableTable, WriteTransaction};
 
 use crate::tables::contradiction::{
@@ -88,7 +88,7 @@ pub fn contradiction_audit_list_pending(
                 continue;
             }
             let mut live_ids: Vec<[u8; 16]> = Vec::new();
-            let mut distinct_objects: Vec<StatementObject> = Vec::new();
+            let mut live_stmts: Vec<brain_core::Statement> = Vec::new();
             for id in &row.contradicting_statement_ids {
                 let Some(m): Option<StatementMetadata> = st.get(id)?.map(|g| g.value()) else {
                     continue;
@@ -100,12 +100,18 @@ pub fn contradiction_audit_list_pending(
                     continue;
                 };
                 live_ids.push(*id);
-                if !distinct_objects.contains(&s.object) {
-                    distinct_objects.push(s.object);
-                }
+                live_stmts.push(s);
             }
             row.contradicting_statement_ids = live_ids;
-            if distinct_objects.len() >= 2 {
+            // Still a live contradiction iff some pair of live Facts
+            // disagrees on `object` AND has overlapping validity intervals.
+            // Sequential facts (non-overlapping intervals) do not contradict.
+            let still_contradicts = live_stmts.iter().enumerate().any(|(i, a)| {
+                live_stmts[i + 1..].iter().any(|b| {
+                    a.object != b.object && crate::statement::crud::fact_intervals_overlap(a, b)
+                })
+            });
+            if still_contradicts {
                 live.push(row.clone());
                 rewrites.push((key, row));
                 if live.len() >= limit {
@@ -136,8 +142,8 @@ mod tests {
     use crate::statement::tombstone::statement_tombstone;
     use crate::tables::scope::RowScope;
     use brain_core::{
-        Entity, EntityType, EvidenceRef, Statement, StatementKind, StatementValue, SubjectRef,
-        TombstoneReason,
+        Entity, EntityType, EvidenceRef, Statement, StatementKind, StatementObject, StatementValue,
+        SubjectRef, TombstoneReason,
     };
     use brain_core::{ExtractorId, PredicateId};
 

@@ -30,8 +30,9 @@ use brain_core::{Entity, EntityId, EntityTypeId};
 use redb::{ReadTransaction, ReadableTable, WriteTransaction};
 
 use crate::tables::entity::{
-    flags, EntityMetadata, ENTITIES_TABLE, ENTITY_ALIASES_TABLE, ENTITY_BY_CANONICAL_NAME_TABLE,
-    ENTITY_VECTORS_TABLE, ENTITY_VECTOR_BYTES,
+    flags, ByTypeKey, EntityMetadata, ENTITIES_TABLE, ENTITY_ALIASES_TABLE,
+    ENTITY_BY_CANONICAL_NAME_TABLE, ENTITY_BY_TYPE_TABLE, ENTITY_VECTORS_TABLE,
+    ENTITY_VECTOR_BYTES,
 };
 use crate::tables::entity_type::ENTITY_TYPES_TABLE;
 use crate::tables::scope::RowScope;
@@ -51,6 +52,11 @@ pub enum EntityOpError {
 
     #[error("entity {0:?} not found")]
     NotFound(EntityId),
+
+    /// The `merged_into` redirect chain starting at this entity exceeded
+    /// [`MERGE_REDIRECT_MAX_HOPS`] — a corrupted cycle. Fail-stop.
+    #[error("entity {0:?} merge-redirect chain exceeds the hop cap (cycle?)")]
+    MergeRedirectCycle(EntityId),
 
     #[error("entity type {0:?} is not registered")]
     UnknownEntityType(EntityTypeId),
@@ -130,10 +136,82 @@ fn strip_leading_determiner(s: &str) -> &str {
 // ---------------------------------------------------------------------------
 
 /// Fetch an entity by id. Returns `None` if the row doesn't exist.
+///
+/// This is the RAW lookup: a merged entity is returned as-is (with
+/// `merged_into = Some(survivor)`). Callers that want reads to transparently
+/// follow the merge redirect use [`entity_get_resolved`].
 pub fn entity_get(rtxn: &ReadTransaction, id: EntityId) -> Result<Option<Entity>, EntityOpError> {
     let t = rtxn.open_table(ENTITIES_TABLE)?;
     let row: Option<EntityMetadata> = t.get(&id.to_bytes())?.map(|g| g.value());
     Ok(row.as_ref().map(Entity::from))
+}
+
+/// Hop cap for [`entity_get_resolved`]'s merge-chain walk. A merge chain
+/// (`A → B → C → …`) is bounded in practice by the number of merges, but
+/// the walk defends against a malformed cycle by stopping here.
+pub const MERGE_REDIRECT_MAX_HOPS: usize = 16;
+
+/// Fetch an entity by id, transparently following the `merged_into`
+/// redirect to the surviving entity.
+///
+/// After `merge_entity(survivor, merged)`, a read through `merged`'s id
+/// must return the survivor (the merged row is a redirect, not a live
+/// entity). Multi-hop chains (`A → B → C`) are collapsed at read time:
+/// this walks `merged_into` until it reaches a live row and returns that.
+///
+/// Returns `Ok(None)` if the starting id has no row. Returns
+/// [`EntityOpError::MergeRedirectCycle`] if the chain exceeds
+/// [`MERGE_REDIRECT_MAX_HOPS`] (a corrupted cycle) — fail-stop rather than
+/// loop forever or silently return a mid-chain node.
+pub fn entity_get_resolved(
+    rtxn: &ReadTransaction,
+    id: EntityId,
+) -> Result<Option<Entity>, EntityOpError> {
+    // One walk; the chain is discarded here. Callers that need the audit
+    // trail of redirect hops use [`entity_get_resolved_with_chain`].
+    Ok(entity_get_resolved_with_chain(rtxn, id)?.map(|(entity, _chain)| entity))
+}
+
+/// Fetch an entity by id, following the `merged_into` redirect to the
+/// surviving entity, and additionally return the **chain of redirect hops**
+/// traversed to get there — the audit trail the §Multi-hop merge spec
+/// requires (`entity_get(A)` on `A → B → C` returns `C`'s row "with an audit
+/// trail showing both merges").
+///
+/// The returned `Vec<EntityId>` lists the redirect ids walked through, in
+/// order, **excluding** the final survivor:
+///
+/// - live id (no merge): `[]` — the row is returned directly.
+/// - `A → B` (get A): `[A]`.
+/// - `A → B → C` (get A): `[A, B]`.
+///
+/// So the vec is exactly the set of ids that were redirected away; the
+/// survivor's own id is the returned [`Entity`]'s `id`, not in the chain.
+///
+/// Returns `Ok(None)` if the starting id has no row. Returns
+/// [`EntityOpError::MergeRedirectCycle`] if the chain exceeds
+/// [`MERGE_REDIRECT_MAX_HOPS`] (a corrupted cycle) — fail-stop rather than
+/// loop forever or silently return a mid-chain node.
+pub fn entity_get_resolved_with_chain(
+    rtxn: &ReadTransaction,
+    id: EntityId,
+) -> Result<Option<(Entity, Vec<EntityId>)>, EntityOpError> {
+    let t = rtxn.open_table(ENTITIES_TABLE)?;
+    let mut current = id;
+    let mut chain: Vec<EntityId> = Vec::new();
+    for _ in 0..=MERGE_REDIRECT_MAX_HOPS {
+        let Some(row) = t.get(&current.to_bytes())?.map(|g| g.value()) else {
+            return Ok(None);
+        };
+        match row.merged_into() {
+            None => return Ok(Some((Entity::from(&row), chain))),
+            Some(next) => {
+                chain.push(current);
+                current = next;
+            }
+        }
+    }
+    Err(EntityOpError::MergeRedirectCycle(id))
 }
 
 /// Tier-1 exact-match resolver lookup. Returns `Some(EntityId)` if a
@@ -413,31 +491,211 @@ pub fn entity_lookup_by_alias(
     Ok(out)
 }
 
-/// Scan all entities of a given type. O(N) over the primary table;
-/// caller bears the cost. Paginated/filtered variants (`name_prefix`,
-/// `mention_count_min`) can be layered on later; this is the simplest
-/// form.
+/// List every entity of a given `(scope, type)`, in ascending EntityId
+/// order.
+///
+/// Range-scans the [`ENTITY_BY_TYPE_TABLE`] index over the contiguous
+/// `(namespace, space, type)` prefix and point-gets each primary row —
+/// so the cost is proportional to this one tenant's entities of this
+/// type, never the whole cross-tenant primary table. Tombstoned and
+/// merged rows are included (they remain in the index); callers that
+/// want them filtered do so themselves. For paginated wire listings use
+/// [`entity_list_by_type_page`], which applies the wire filters and an
+/// early break inside the walk.
 pub fn entity_list_by_type(
     rtxn: &ReadTransaction,
     scope: RowScope,
     type_id: EntityTypeId,
 ) -> Result<Vec<Entity>, EntityOpError> {
-    let t = rtxn.open_table(ENTITIES_TABLE)?;
+    let idx = rtxn.open_table(ENTITY_BY_TYPE_TABLE)?;
+    let primary = rtxn.open_table(ENTITIES_TABLE)?;
+    let lo: ByTypeKey = (
+        scope.namespace_id,
+        scope.space_id_bytes,
+        type_id.raw(),
+        [0u8; 16],
+    );
+    let hi: ByTypeKey = (
+        scope.namespace_id,
+        scope.space_id_bytes,
+        type_id.raw(),
+        [0xFFu8; 16],
+    );
     let mut out = Vec::new();
-    for entry in t.iter()? {
-        let (_, v) = entry?;
-        let m = v.value();
-        // Tenant wall (unconditional): a list never crosses the caller's
-        // `(namespace, space)`. The primary table is a flat keyspace
-        // shared across tenants, so the scope check is what isolates it.
-        if m.namespace_id == scope.namespace_id
-            && m.space_id_bytes == scope.space_id_bytes
-            && m.entity_type_id == type_id.raw()
+    for entry in idx.range(lo..=hi)? {
+        let (k, _) = entry?;
+        let (k_ns, k_space, k_type, k_id) = k.value();
+        // Defensive: the range prefix already isolates this
+        // `(scope, type)`, but re-check so a corrupt key can never
+        // surface a foreign row.
+        if k_ns != scope.namespace_id || k_space != scope.space_id_bytes || k_type != type_id.raw()
         {
-            out.push((&m).into());
+            continue;
+        }
+        if let Some(g) = primary.get(&k_id)? {
+            out.push((&g.value()).into());
         }
     }
     Ok(out)
+}
+
+/// Wire-filter predicates for a paginated `(scope, type)` listing,
+/// applied INSIDE the index walk so a page costs one page — not the
+/// whole `(scope, type)` bucket re-scanned per page.
+#[derive(Debug, Clone, Default)]
+pub struct EntityListFilter {
+    /// Keep tombstoned rows when `true` (default: drop them).
+    pub include_tombstoned: bool,
+    /// Keep merged (redirect) rows when `true` (default: drop them).
+    pub include_merged: bool,
+    /// Drop rows whose `mention_count` is below this floor.
+    pub mention_count_min: u32,
+    /// Already-normalized name prefix; `None` = no prefix filter.
+    pub name_prefix_norm: Option<String>,
+}
+
+/// One keyset page of a `(scope, type)` entity listing.
+pub struct EntityListPage {
+    /// The admitted rows, in ascending EntityId order.
+    pub rows: Vec<Entity>,
+    /// `true` when at least one more admitted row exists past the last
+    /// row on this page.
+    pub has_more: bool,
+    /// EntityId of the last emitted row — the resume point the caller
+    /// folds into the next cursor. `None` on an empty page.
+    pub last_id: Option<[u8; 16]>,
+}
+
+/// Keyset (seek) page over entities of a `(scope, type)`.
+///
+/// Range-scans the [`ENTITY_BY_TYPE_TABLE`] index from strictly after
+/// `after_id` (when present) to the end of the `(scope, type)` prefix,
+/// point-gets each primary row, applies every wire filter inside the
+/// walk, collects at most `limit` admitted rows, then admits one more to
+/// set `has_more` without emitting it. Cost is proportional to one page,
+/// not to (pages × bucket) as a re-materialize-and-slice loop would be.
+///
+/// Ascending EntityId order matches the wire cursor's resume contract, so
+/// every row is emitted on exactly one page with no overlap or gap while
+/// the underlying rows are unchanged.
+pub fn entity_list_by_type_page(
+    rtxn: &ReadTransaction,
+    scope: RowScope,
+    type_id: EntityTypeId,
+    filter: &EntityListFilter,
+    after_id: Option<[u8; 16]>,
+    limit: usize,
+) -> Result<EntityListPage, EntityOpError> {
+    let idx = rtxn.open_table(ENTITY_BY_TYPE_TABLE)?;
+    let primary = rtxn.open_table(ENTITIES_TABLE)?;
+    let lo: ByTypeKey = (
+        scope.namespace_id,
+        scope.space_id_bytes,
+        type_id.raw(),
+        after_id.unwrap_or([0u8; 16]),
+    );
+    let hi: ByTypeKey = (
+        scope.namespace_id,
+        scope.space_id_bytes,
+        type_id.raw(),
+        [0xFFu8; 16],
+    );
+
+    let mut rows = Vec::new();
+    let mut has_more = false;
+    let mut last_id: Option<[u8; 16]> = None;
+
+    for entry in idx.range(lo..=hi)? {
+        let (k, _) = entry?;
+        let (k_ns, k_space, k_type, k_id) = k.value();
+        if k_ns != scope.namespace_id || k_space != scope.space_id_bytes || k_type != type_id.raw()
+        {
+            continue;
+        }
+        // Resume strictly after the cursor id (the inclusive range starts
+        // AT `after_id`, so skip that exact row).
+        if let Some(a) = after_id {
+            if k_id <= a {
+                continue;
+            }
+        }
+        let Some(g) = primary.get(&k_id)? else {
+            continue;
+        };
+        let m = g.value();
+        if !filter.include_tombstoned && m.flags & flags::TOMBSTONED != 0 {
+            continue;
+        }
+        if !filter.include_merged && m.merged_into_bytes.is_some() {
+            continue;
+        }
+        if m.mention_count < filter.mention_count_min {
+            continue;
+        }
+        if let Some(prefix) = &filter.name_prefix_norm {
+            if !m.normalized_name.starts_with(prefix.as_str()) {
+                continue;
+            }
+        }
+
+        // Admitted. A full page plus this row proves a next page exists —
+        // stop without emitting it.
+        if rows.len() == limit {
+            has_more = true;
+            break;
+        }
+        last_id = Some(k_id);
+        rows.push((&m).into());
+    }
+
+    Ok(EntityListPage {
+        rows,
+        has_more,
+        last_id,
+    })
+}
+
+/// One-time construction of the [`ENTITY_BY_TYPE_TABLE`] listing index
+/// from the authoritative primary rows, for a DB written before the index
+/// existed. Idempotent: a no-op once the index holds any row (entities are
+/// never physically deleted, so a non-empty index is never stale-missing).
+/// Returns the number of rows indexed.
+///
+/// The index is derived data — like the in-RAM HNSW rebuilt from the
+/// primary rows at boot — so reconstructing it is index construction, not
+/// a format migration. Runs inside the caller's open-time write txn.
+/// Uses redb-native errors to match [`crate::tables::materialize_all_tables`].
+pub fn backfill_entity_by_type_index(wtxn: &WriteTransaction) -> Result<usize, redb::Error> {
+    // Already populated → the common (already-migrated) boot. Skip.
+    {
+        let idx = wtxn.open_table(ENTITY_BY_TYPE_TABLE)?;
+        if idx.iter()?.next().is_some() {
+            return Ok(0);
+        }
+    }
+    // Collect the keys first so the primary read iterator is dropped
+    // before the index is opened for write (borrow discipline).
+    let keys: Vec<ByTypeKey> = {
+        let primary = wtxn.open_table(ENTITIES_TABLE)?;
+        let mut ks = Vec::new();
+        for entry in primary.iter()? {
+            let (_, v) = entry?;
+            let m = v.value();
+            ks.push((
+                m.namespace_id,
+                m.space_id_bytes,
+                m.entity_type_id,
+                m.entity_id_bytes,
+            ));
+        }
+        ks
+    };
+    let n = keys.len();
+    let mut idx = wtxn.open_table(ENTITY_BY_TYPE_TABLE)?;
+    for k in keys {
+        idx.insert(&k, &())?;
+    }
+    Ok(n)
 }
 
 /// Scan every live (non-tombstoned) entity, returning
@@ -463,6 +721,110 @@ pub fn entity_iter_all_live(
         out.push((EntityId::from(k.value()), m.canonical_name));
     }
     Ok(out)
+}
+
+/// One live entity as the entity-GC sweeper needs it:
+/// `(EntityId, owning scope, created_at_unix_nanos)`. The scope +
+/// created-at are the columns the sweeper tests for grace-window +
+/// inbound-reference eligibility without re-opening the primary row.
+pub type EntityGcCandidate = (EntityId, RowScope, u64);
+
+/// Scan every live (non-tombstoned) entity, yielding the columns the
+/// entity-GC sweeper needs to test eligibility. O(N) over the primary
+/// table; the sweeper runs daily and off by default, so the full scan
+/// is acceptable (mirrors [`entity_iter_all_live`]).
+pub fn entity_iter_live_for_gc(
+    rtxn: &ReadTransaction,
+) -> Result<Vec<EntityGcCandidate>, EntityOpError> {
+    let t = rtxn.open_table(ENTITIES_TABLE)?;
+    let mut out = Vec::new();
+    for entry in t.iter()? {
+        let (_, v) = entry?;
+        let m = v.value();
+        if m.flags & flags::TOMBSTONED != 0 {
+            continue;
+        }
+        out.push((
+            m.entity_id(),
+            RowScope::from_bytes(m.namespace_id, m.space_id_bytes),
+            m.created_at_unix_nanos,
+        ));
+    }
+    Ok(out)
+}
+
+/// Count inbound references to `entity_id` within `scope`, returning as
+/// soon as the running sum exceeds zero.
+///
+/// Inbound references are summed across four sources, in cheapest-first
+/// order so the common case (a referenced entity) exits on the first
+/// hit:
+/// 1. active statements whose **subject** is the entity
+///    (`STATEMENTS_BY_SUBJECT_TABLE` range for the scope + entity);
+/// 2. relations **from** the entity (`relation_list_from`);
+/// 3. relations **to** the entity (`relation_list_to`);
+/// 4. entity **mentions** (`ENTITY_MENTIONS_TABLE` range).
+///
+/// Anti-flap: this counts ANY present inbound row — active OR
+/// tombstoned-but-not-yet-reclaimed. A reclaimed row is already
+/// physically gone, so `== 0` means the entity is truly orphaned and safe
+/// to tombstone; a row that is tombstoned-within-grace still counts,
+/// because it may yet be reverted and pointing at a GC'd entity would
+/// orphan it. The return value is therefore a lower bound on the true
+/// reference count — exact only when it is `0`, which is all the caller
+/// needs (eligibility is `== 0`).
+///
+/// The `scope` prefix bounds every range to one `(namespace, space)`, so
+/// the count can never observe another tenant's rows.
+pub fn entity_inbound_reference_count(
+    rtxn: &ReadTransaction,
+    scope: RowScope,
+    entity_id: EntityId,
+) -> Result<u64, crate::relation::ops::RelationOpError> {
+    use crate::relation::ops::{relation_list_from, relation_list_to, RelationListFilter};
+    use crate::tables::entity::ENTITY_MENTIONS_TABLE;
+    use crate::tables::statement::STATEMENTS_BY_SUBJECT_TABLE;
+
+    let ns = scope.namespace_id;
+    let sp = scope.space_id_bytes;
+    let eid = entity_id.to_bytes();
+
+    // 1. Statements where subject == entity. The subject-anchored index
+    // key is `(ns, space, subject, kind, predicate_id, is_current,
+    // statement_id)`; range the whole `(kind, predicate, is_current,
+    // statement)` suffix for this scope + subject and stop on the first
+    // present row.
+    {
+        let t = rtxn.open_table(STATEMENTS_BY_SUBJECT_TABLE)?;
+        let lo = (ns, sp, eid, 0u8, 0u32, 0u8, [0u8; 16]);
+        let hi = (ns, sp, eid, u8::MAX, u32::MAX, 1u8, [0xffu8; 16]);
+        if t.range(lo..=hi)?.next().is_some() {
+            return Ok(1);
+        }
+    }
+
+    // 2 + 3. Relations from / to the entity, via the unified edge table.
+    // The default filter keeps `current_only = false`, so tombstoned-
+    // within-grace relations still count (anti-flap).
+    let filter = RelationListFilter::default();
+    if !relation_list_from(rtxn, scope, entity_id, &filter)?.is_empty() {
+        return Ok(1);
+    }
+    if !relation_list_to(rtxn, scope, entity_id, &filter)?.is_empty() {
+        return Ok(1);
+    }
+
+    // 4. Entity mentions. Key: `(ns, space, entity, memory)`.
+    {
+        let t = rtxn.open_table(ENTITY_MENTIONS_TABLE)?;
+        let lo = (ns, sp, eid, [0u8; 16]);
+        let hi = (ns, sp, eid, [0xffu8; 16]);
+        if t.range(lo..=hi)?.next().is_some() {
+            return Ok(1);
+        }
+    }
+
+    Ok(0)
 }
 
 /// Little-endian byte image of an entity vector. Safe, no-unsafe
@@ -628,6 +990,21 @@ pub fn entity_put(
         )?;
     }
 
+    // By-(scope, type) listing index — the capped ENTITY_LIST walk
+    // range-scans this instead of the cross-tenant primary table.
+    {
+        let mut t = wtxn.open_table(ENTITY_BY_TYPE_TABLE)?;
+        t.insert(
+            &(
+                scope.namespace_id,
+                scope.space_id_bytes,
+                entity.entity_type.raw(),
+                m.entity_id_bytes,
+            ),
+            &(),
+        )?;
+    }
+
     // Alias index — one row per alias, normalized.
     if !entity.aliases.is_empty() {
         let mut t = wtxn.open_table(ENTITY_ALIASES_TABLE)?;
@@ -697,6 +1074,13 @@ pub fn entity_update(
     let normalized_old = normalize_name(&current.canonical_name);
     let normalized_new = normalize_name(&next.canonical_name);
     let canonical_changed = normalized_old != normalized_new;
+    // A type change re-buckets every secondary-index row. All of the
+    // secondary indexes (canonical-name, alias, trigram) key on the
+    // entity's type_id, so a type change alone — even with an unchanged
+    // name and alias set — strands their rows under the OLD type_id. When
+    // the type changes we must re-key the canonical-name row and fully
+    // re-index the alias + trigram sets, not just apply the string delta.
+    let type_changed = current.entity_type_id != next.entity_type.raw();
 
     if canonical_changed {
         // Old canonical_name moves into aliases. The constructor
@@ -707,8 +1091,13 @@ pub fn entity_update(
             next.aliases.push(current.canonical_name.clone());
         }
         next.embedding_version = current.embedding_version + 1;
+    }
 
-        // Update canonical-name index.
+    // Re-key the canonical-name index whenever the canonical name OR the
+    // entity type changed. The row is keyed on (scope, type_id, name), so
+    // a type change alone would otherwise leave the row under the old
+    // type_id and make lookups under the new type miss.
+    if canonical_changed || type_changed {
         let mut t = wtxn.open_table(ENTITY_BY_CANONICAL_NAME_TABLE)?;
         t.remove(&(
             scope.namespace_id,
@@ -742,28 +1131,67 @@ pub fn entity_update(
         )?;
     }
 
-    // Alias delta. Compare on normalized forms.
+    // By-(scope, type) listing index follows a type change. Scope is
+    // immutable, so only a type change moves the row between type buckets;
+    // the trailing EntityId is unchanged.
+    if type_changed {
+        let mut t = wtxn.open_table(ENTITY_BY_TYPE_TABLE)?;
+        t.remove(&(
+            scope.namespace_id,
+            scope.space_id_bytes,
+            current.entity_type_id,
+            current.entity_id_bytes,
+        ))?;
+        t.insert(
+            &(
+                scope.namespace_id,
+                scope.space_id_bytes,
+                next.entity_type.raw(),
+                next.id.to_bytes(),
+            ),
+            &(),
+        )?;
+    }
+
+    // Alias index. Compare on normalized forms. When the type changed
+    // every alias row must move type buckets, so we drop the FULL old set
+    // (under the old type_id) and insert the FULL new set (under the new
+    // type_id); a string delta would leave unchanged aliases stranded
+    // under the old type. When the type is unchanged, apply the delta.
     let old_norms: HashSet<String> = current.aliases.iter().map(|a| normalize_name(a)).collect();
     let new_norms: HashSet<String> = next.aliases.iter().map(|a| normalize_name(a)).collect();
 
     {
+        // On a type change, remove the full old set and insert the full
+        // new set so every alias row moves type buckets; otherwise apply
+        // the string delta between the two sets.
+        let removed: Vec<&String> = if type_changed {
+            old_norms.iter().collect()
+        } else {
+            old_norms.difference(&new_norms).collect()
+        };
+        let added: Vec<&String> = if type_changed {
+            new_norms.iter().collect()
+        } else {
+            new_norms.difference(&old_norms).collect()
+        };
         let mut t = wtxn.open_table(ENTITY_ALIASES_TABLE)?;
-        for removed in old_norms.difference(&new_norms) {
+        for r in removed {
             t.remove(&(
                 scope.namespace_id,
                 scope.space_id_bytes,
                 current.entity_type_id,
-                removed.as_str(),
+                r.as_str(),
                 current.entity_id_bytes,
             ))?;
         }
-        for added in new_norms.difference(&old_norms) {
+        for a in added {
             t.insert(
                 &(
                     scope.namespace_id,
                     scope.space_id_bytes,
                     next.entity_type.raw(),
-                    added.as_str(),
+                    a.as_str(),
                     next.id.to_bytes(),
                 ),
                 &(),
@@ -771,18 +1199,28 @@ pub fn entity_update(
         }
     }
 
-    // Trigram delta. The entity's old trigram set is
-    // derived from current.canonical_name + current.aliases; the new
-    // set from next.canonical_name + next.aliases. Remove `old - new`,
-    // add `new - old`.
+    // Trigram index. The entity's old trigram set is derived from
+    // current.canonical_name + current.aliases; the new set from
+    // next.canonical_name + next.aliases. When the type changed, every
+    // trigram row moves type buckets, so drop the FULL old set (under the
+    // old type) and add the FULL new set (under the new type). When the
+    // type is unchanged, apply the delta: remove `old - new`, add
+    // `new - old`.
     let old_trigrams =
         crate::entity::trigram::trigrams_of_components(&current.canonical_name, &current.aliases);
     let new_trigrams =
         crate::entity::trigram::trigrams_of_components(&next.canonical_name, &next.aliases);
-    let to_remove: std::collections::HashSet<[u8; 3]> =
-        old_trigrams.difference(&new_trigrams).copied().collect();
-    let to_add: std::collections::HashSet<[u8; 3]> =
-        new_trigrams.difference(&old_trigrams).copied().collect();
+    let (to_remove, to_add): (
+        std::collections::HashSet<[u8; 3]>,
+        std::collections::HashSet<[u8; 3]>,
+    ) = if type_changed {
+        (old_trigrams.clone(), new_trigrams.clone())
+    } else {
+        (
+            old_trigrams.difference(&new_trigrams).copied().collect(),
+            new_trigrams.difference(&old_trigrams).copied().collect(),
+        )
+    };
     crate::entity::trigram::remove_entity_trigrams(
         wtxn,
         scope,
@@ -912,6 +1350,11 @@ pub fn entity_tombstone(
             &trigrams,
         )?;
     }
+    // The by-(scope, type) listing index is deliberately NOT torn down:
+    // the primary row persists for audit/unmerge, and ENTITY_LIST supports
+    // `include_tombstoned`, so the row must remain range-scannable. The
+    // tombstone flag on the primary row is what the listing filters on.
+
     // Update primary row with tombstone flag + timestamp.
     let mut next = current;
     next.flags |= flags::TOMBSTONED;
@@ -1092,6 +1535,84 @@ mod tests {
         let rtxn = db.read_txn().unwrap();
         let got = entity_get(&rtxn, id).unwrap().expect("present");
         assert_eq!(got, e);
+    }
+
+    // ----- entity_get_resolved_with_chain (merge audit trail) ------------
+
+    #[test]
+    fn get_resolved_with_chain_returns_redirect_hops() {
+        // A → B → C. get_resolved_with_chain(A) returns C plus the redirect
+        // trail [A, B] (the survivor C's id is NOT in the chain).
+        let dir = TempDir::new().unwrap();
+        let db = fresh_db(&dir);
+        let mut a = person_entity("ChainA");
+        let mut b = person_entity("ChainB");
+        let c = person_entity("ChainC");
+        a.merged_into = Some(b.id);
+        b.merged_into = Some(c.id);
+        let (aid, bid, cid) = (a.id, b.id, c.id);
+
+        let wtxn = db.write_txn().unwrap();
+        for e in [&a, &b, &c] {
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, e).unwrap();
+        }
+        wtxn.commit().unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        let (survivor, chain) = entity_get_resolved_with_chain(&rtxn, aid)
+            .unwrap()
+            .expect("present");
+        assert_eq!(survivor.id, cid);
+        assert_eq!(chain, vec![aid, bid]);
+
+        // get on the mid-chain id B yields [B].
+        let (survivor_b, chain_b) = entity_get_resolved_with_chain(&rtxn, bid)
+            .unwrap()
+            .expect("present");
+        assert_eq!(survivor_b.id, cid);
+        assert_eq!(chain_b, vec![bid]);
+    }
+
+    #[test]
+    fn get_resolved_with_chain_empty_for_live_entity() {
+        let dir = TempDir::new().unwrap();
+        let db = fresh_db(&dir);
+        let e = person_entity("LiveOne");
+        let id = e.id;
+        let wtxn = db.write_txn().unwrap();
+        entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
+        wtxn.commit().unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        let (survivor, chain) = entity_get_resolved_with_chain(&rtxn, id)
+            .unwrap()
+            .expect("present");
+        assert_eq!(survivor.id, id);
+        assert!(chain.is_empty());
+    }
+
+    #[test]
+    fn get_resolved_with_chain_detects_cycle() {
+        // A malformed cycle A → B → A must fail-stop rather than loop.
+        let dir = TempDir::new().unwrap();
+        let db = fresh_db(&dir);
+        let mut a = person_entity("CycleA");
+        let mut b = person_entity("CycleB");
+        a.merged_into = Some(b.id);
+        b.merged_into = Some(a.id);
+        let aid = a.id;
+
+        let wtxn = db.write_txn().unwrap();
+        for e in [&a, &b] {
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, e).unwrap();
+        }
+        wtxn.commit().unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        match entity_get_resolved_with_chain(&rtxn, aid) {
+            Err(EntityOpError::MergeRedirectCycle(id)) => assert_eq!(id, aid),
+            other => panic!("expected MergeRedirectCycle, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1606,6 +2127,364 @@ mod tests {
         assert_eq!(projects[0].canonical_name, "ProjectOne");
     }
 
+    /// The `(scope, type)` index range must never surface another tenant's
+    /// entity of the same type. Before the index existed the list scanned
+    /// the shared primary table and filtered by scope in code; the index
+    /// prefix must give the same isolation by construction.
+    #[test]
+    fn list_by_type_is_scope_walled() {
+        let dir = TempDir::new().unwrap();
+        let db = fresh_db(&dir);
+        let scope_a = test_scope();
+        let scope_b = RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xCD; 16]);
+
+        let a = person_entity("Alice");
+        let b = person_entity("Bob");
+        {
+            let wtxn = db.write_txn().unwrap();
+            entity_put(&wtxn, scope_a, brain_core::SessionId::DEFAULT, &a).unwrap();
+            entity_put(&wtxn, scope_b, brain_core::SessionId::DEFAULT, &b).unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        let rtxn = db.read_txn().unwrap();
+        let in_a = entity_list_by_type(&rtxn, scope_a, EntityType::PERSON_ID).unwrap();
+        assert_eq!(in_a.len(), 1);
+        assert_eq!(in_a[0].canonical_name, "Alice");
+        let in_b = entity_list_by_type(&rtxn, scope_b, EntityType::PERSON_ID).unwrap();
+        assert_eq!(in_b.len(), 1);
+        assert_eq!(in_b[0].canonical_name, "Bob");
+    }
+
+    /// A DB written before the by-type index existed has primary rows but
+    /// an empty index. Range-scanning that empty index returns nothing —
+    /// the exact stale-index failure this fix must close. `backfill_*`
+    /// reconstructs the index from the authoritative primary rows, and is
+    /// idempotent once populated.
+    #[test]
+    fn backfill_reconstructs_index_for_pre_index_rows() {
+        use redb::ReadableDatabase;
+        let dir = TempDir::new().unwrap();
+        // Bare redb DB with tables materialized but nothing seeded, so the
+        // index is genuinely empty.
+        let db = crate::tables::fresh_db(&dir);
+        let scope = test_scope();
+
+        // Simulate a pre-index write: insert straight into the primary
+        // table WITHOUT touching the index (the old entity_put shape).
+        let alice = person_entity("Alice");
+        let bob = person_entity("Bob");
+        {
+            let wtxn = db.begin_write().unwrap();
+            {
+                let mut t = wtxn.open_table(ENTITIES_TABLE).unwrap();
+                for e in [&alice, &bob] {
+                    let m = EntityMetadata::from_entity(e, scope);
+                    t.insert(&m.entity_id_bytes, &m).unwrap();
+                }
+            }
+            wtxn.commit().unwrap();
+        }
+
+        // Stale index → wrong (empty) result.
+        {
+            let rtxn = db.begin_read().unwrap();
+            let stale = entity_list_by_type(&rtxn, scope, EntityType::PERSON_ID).unwrap();
+            assert!(
+                stale.is_empty(),
+                "pre-backfill index is empty, so the list is (wrongly) empty"
+            );
+        }
+
+        // Backfill from the primary rows.
+        let indexed = {
+            let wtxn = db.begin_write().unwrap();
+            let n = backfill_entity_by_type_index(&wtxn).unwrap();
+            wtxn.commit().unwrap();
+            n
+        };
+        assert_eq!(indexed, 2);
+
+        // Now the list is correct.
+        {
+            let rtxn = db.begin_read().unwrap();
+            let healed = entity_list_by_type(&rtxn, scope, EntityType::PERSON_ID).unwrap();
+            assert_eq!(healed.len(), 2);
+        }
+
+        // Idempotent: a second backfill is a no-op (index already populated).
+        {
+            let wtxn = db.begin_write().unwrap();
+            let n = backfill_entity_by_type_index(&wtxn).unwrap();
+            wtxn.commit().unwrap();
+            assert_eq!(n, 0);
+        }
+    }
+
+    /// Changing an entity's type must move its index row between type
+    /// buckets: it disappears from the old type's list and appears under
+    /// the new one. A missed migration here would leave a stale row that
+    /// lists the entity under a type it no longer has.
+    #[test]
+    fn entity_update_type_change_migrates_index() {
+        let dir = TempDir::new().unwrap();
+        let db = fresh_db(&dir);
+
+        // Register a second type to move into.
+        {
+            use crate::tables::entity_type::{EntityTypeDefinition, ENTITY_TYPES_TABLE};
+            let wtxn = db.write_txn().unwrap();
+            {
+                let mut t = wtxn.open_table(ENTITY_TYPES_TABLE).unwrap();
+                let row =
+                    EntityTypeDefinition::new(EntityTypeId(7), "Project".into(), Vec::new(), NOW);
+                t.insert(&7u32, &row).unwrap();
+            }
+            wtxn.commit().unwrap();
+        }
+
+        let e = person_entity("Chameleon");
+        let id = e.id;
+        {
+            let wtxn = db.write_txn().unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
+            wtxn.commit().unwrap();
+        }
+        {
+            let wtxn = db.write_txn().unwrap();
+            let mut next: Entity = e.clone();
+            next.entity_type = EntityTypeId(7);
+            entity_update(&wtxn, &next, LATER).unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        let rtxn = db.read_txn().unwrap();
+        let persons = entity_list_by_type(&rtxn, test_scope(), EntityType::PERSON_ID).unwrap();
+        assert!(
+            persons.iter().all(|p| p.id != id),
+            "entity must leave its old type bucket"
+        );
+        let projects = entity_list_by_type(&rtxn, test_scope(), EntityTypeId(7)).unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].id, id);
+    }
+
+    /// A type change with an UNCHANGED canonical name and alias set must
+    /// still re-key every resolver index — canonical-name, alias, and
+    /// trigram all key on the entity's type_id, so a type change alone
+    /// strands their rows under the old type_id. Before the fix the
+    /// canonical/alias/trigram re-key ran only when the name string
+    /// changed, leaving stale rows that resolved under the OLD type and
+    /// nothing under the NEW one. This exercises exactly that path: retype
+    /// with identical name/aliases and assert every lookup follows.
+    #[test]
+    fn entity_update_type_change_rekeys_name_alias_trigram_indexes() {
+        use crate::entity::trigram::{extract_trigrams, lookup_candidates_by_trigram};
+
+        let dir = TempDir::new().unwrap();
+        let db = fresh_db(&dir);
+
+        // Register a second type to move into.
+        {
+            use crate::tables::entity_type::{EntityTypeDefinition, ENTITY_TYPES_TABLE};
+            let wtxn = db.write_txn().unwrap();
+            {
+                let mut t = wtxn.open_table(ENTITY_TYPES_TABLE).unwrap();
+                let row =
+                    EntityTypeDefinition::new(EntityTypeId(7), "Project".into(), Vec::new(), NOW);
+                t.insert(&7u32, &row).unwrap();
+            }
+            wtxn.commit().unwrap();
+        }
+
+        let mut e = person_entity("Chameleon");
+        e.aliases.push("Cham Leon".into());
+        let id = e.id;
+        {
+            let wtxn = db.write_txn().unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        // Retype only — canonical name and aliases are byte-identical.
+        {
+            let wtxn = db.write_txn().unwrap();
+            let mut next: Entity = e.clone();
+            next.entity_type = EntityTypeId(7);
+            entity_update(&wtxn, &next, LATER).unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        let rtxn = db.read_txn().unwrap();
+        let scope = test_scope();
+
+        // Canonical-name index follows the type.
+        assert_eq!(
+            entity_lookup_by_canonical_name(&rtxn, scope, EntityTypeId(7), "Chameleon").unwrap(),
+            Some(id),
+            "canonical-name resolves under the new type"
+        );
+        assert_eq!(
+            entity_lookup_by_canonical_name(&rtxn, scope, EntityType::PERSON_ID, "Chameleon")
+                .unwrap(),
+            None,
+            "canonical-name must not remain under the old type"
+        );
+
+        // Alias index follows the type.
+        assert_eq!(
+            entity_lookup_by_alias(&rtxn, scope, EntityTypeId(7), "Cham Leon").unwrap(),
+            vec![id],
+            "alias resolves under the new type"
+        );
+        assert!(
+            entity_lookup_by_alias(&rtxn, scope, EntityType::PERSON_ID, "Cham Leon")
+                .unwrap()
+                .is_empty(),
+            "alias must not remain under the old type"
+        );
+
+        // Trigram index follows the type: every trigram of the canonical
+        // name and the alias resolves under the new type and none under the
+        // old one.
+        for tg in extract_trigrams("chameleon")
+            .into_iter()
+            .chain(extract_trigrams("cham leon"))
+        {
+            let under_new =
+                lookup_candidates_by_trigram(&rtxn, scope, EntityTypeId(7), tg).unwrap();
+            assert!(
+                under_new.contains(&id),
+                "trigram {tg:?} must resolve under the new type"
+            );
+            let under_old =
+                lookup_candidates_by_trigram(&rtxn, scope, EntityType::PERSON_ID, tg).unwrap();
+            assert!(
+                !under_old.contains(&id),
+                "trigram {tg:?} must not remain under the old type"
+            );
+        }
+    }
+
+    /// Tombstoning must NOT tear the row out of the by-type index — unlike
+    /// the resolver indexes. The row stays range-scannable so
+    /// `include_tombstoned` can surface it; the tombstone flag on the
+    /// primary row is what the page filter honors.
+    #[test]
+    fn tombstoned_rows_stay_indexed_and_filter_honored() {
+        let dir = TempDir::new().unwrap();
+        let db = fresh_db(&dir);
+
+        let alice = person_entity("Alice");
+        let bob = person_entity("Bob");
+        let bob_id = bob.id;
+        {
+            let wtxn = db.write_txn().unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &alice).unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &bob).unwrap();
+            wtxn.commit().unwrap();
+        }
+        {
+            let wtxn = db.write_txn().unwrap();
+            entity_tombstone(&wtxn, bob_id, LATER).unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        let rtxn = db.read_txn().unwrap();
+        // Raw list keeps the tombstoned row in the index.
+        let raw = entity_list_by_type(&rtxn, test_scope(), EntityType::PERSON_ID).unwrap();
+        assert_eq!(raw.len(), 2);
+
+        // Page filter drops it by default...
+        let default_filter = EntityListFilter::default();
+        let hidden = entity_list_by_type_page(
+            &rtxn,
+            test_scope(),
+            EntityType::PERSON_ID,
+            &default_filter,
+            None,
+            10,
+        )
+        .unwrap();
+        assert_eq!(hidden.rows.len(), 1);
+        assert!(hidden.rows.iter().all(|e| e.id != bob_id));
+
+        // ...and surfaces it when asked.
+        let show_filter = EntityListFilter {
+            include_tombstoned: true,
+            ..Default::default()
+        };
+        let shown = entity_list_by_type_page(
+            &rtxn,
+            test_scope(),
+            EntityType::PERSON_ID,
+            &show_filter,
+            None,
+            10,
+        )
+        .unwrap();
+        assert_eq!(shown.rows.len(), 2);
+        assert!(shown.rows.iter().any(|e| e.id == bob_id));
+    }
+
+    /// Keyset paging over the index must cover every row exactly once,
+    /// with no overlap or gap, and report `has_more` accurately — the
+    /// per-page cost the fix delivers instead of re-scanning the bucket.
+    #[test]
+    fn list_page_keyset_no_overlap_or_gap() {
+        let dir = TempDir::new().unwrap();
+        let db = fresh_db(&dir);
+
+        let mut ids = std::collections::HashSet::new();
+        {
+            let wtxn = db.write_txn().unwrap();
+            for i in 0..5 {
+                let e = person_entity(&format!("Person{i}"));
+                ids.insert(e.id);
+                entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
+            }
+            wtxn.commit().unwrap();
+        }
+
+        let rtxn = db.read_txn().unwrap();
+        let filter = EntityListFilter::default();
+        let mut seen: Vec<[u8; 16]> = Vec::new();
+        let mut after: Option<[u8; 16]> = None;
+        let mut pages = 0;
+        loop {
+            let page = entity_list_by_type_page(
+                &rtxn,
+                test_scope(),
+                EntityType::PERSON_ID,
+                &filter,
+                after,
+                2,
+            )
+            .unwrap();
+            for e in &page.rows {
+                seen.push(e.id.to_bytes());
+            }
+            pages += 1;
+            assert!(pages <= 10, "pagination must terminate");
+            if !page.has_more {
+                assert!(page.rows.len() <= 2);
+                break;
+            }
+            assert_eq!(page.rows.len(), 2, "a non-final page fills the limit");
+            after = page.last_id;
+            assert!(after.is_some());
+        }
+
+        // Every id seen exactly once, and all five covered.
+        let unique: std::collections::HashSet<_> = seen.iter().collect();
+        assert_eq!(unique.len(), seen.len(), "no row emitted on two pages");
+        assert_eq!(seen.len(), 5, "every row covered, no gap");
+        // Ascending id order across the whole walk.
+        let mut sorted = seen.clone();
+        sorted.sort();
+        assert_eq!(seen, sorted, "index walk is ascending EntityId order");
+    }
+
     #[test]
     fn iter_all_live_returns_live_skips_tombstoned() {
         let dir = TempDir::new().unwrap();
@@ -1861,6 +2740,198 @@ mod tests {
         assert!(
             vec_for_without.is_none(),
             "absent vector must surface as None so caller re-embeds"
+        );
+    }
+
+    // ----- entity_inbound_reference_count --------------------------------
+
+    fn put_person(db: &MetadataDb, name: &str) -> EntityId {
+        let e = person_entity(name);
+        let id = e.id;
+        let wtxn = db.write_txn().unwrap();
+        entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
+        wtxn.commit().unwrap();
+        id
+    }
+
+    /// Intern a Fact predicate with an Entity object.
+    fn intern_fact_pred(db: &MetadataDb, name: &str) -> brain_core::PredicateId {
+        use crate::schema::predicate::predicate_intern;
+        let wtxn = db.write_txn().unwrap();
+        let id = predicate_intern(
+            &wtxn,
+            "test",
+            name,
+            Some(brain_core::StatementKind::Fact),
+            1, // object: Entity
+            1,
+            "",
+            false,
+            NOW,
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+        id
+    }
+
+    #[test]
+    fn inbound_count_zero_for_isolated_entity() {
+        let dir = TempDir::new().unwrap();
+        let db = fresh_db(&dir);
+        let id = put_person(&db, "Isolated Ivy");
+        let rtxn = db.read_txn().unwrap();
+        let n = entity_inbound_reference_count(&rtxn, test_scope(), id).unwrap();
+        assert_eq!(n, 0, "an entity with no inbound rows is orphaned");
+    }
+
+    #[test]
+    fn inbound_count_positive_for_subject_statement() {
+        use crate::statement::crud::statement_create;
+        use brain_core::{
+            EvidenceRef, ExtractorId, Statement, StatementKind, StatementObject, SubjectRef,
+        };
+        let dir = TempDir::new().unwrap();
+        let db = fresh_db(&dir);
+        let subj = put_person(&db, "Subject Sam");
+        let obj = put_person(&db, "Object Olly");
+        let pred = intern_fact_pred(&db, "likes");
+        let s = Statement::new_root(
+            brain_core::StatementId::new(),
+            StatementKind::Fact,
+            SubjectRef::Entity(subj),
+            pred,
+            StatementObject::Entity(obj),
+            0.9,
+            EvidenceRef::default(),
+            ExtractorId::from(0),
+            NOW,
+            1,
+        );
+        {
+            let wtxn = db.write_txn().unwrap();
+            statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &s, NOW).unwrap();
+            wtxn.commit().unwrap();
+        }
+        let rtxn = db.read_txn().unwrap();
+        // subj is referenced (subject of a statement); obj is not (the
+        // subject index keys on subject only).
+        assert!(entity_inbound_reference_count(&rtxn, test_scope(), subj).unwrap() > 0);
+        assert_eq!(
+            entity_inbound_reference_count(&rtxn, test_scope(), obj).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn inbound_count_positive_for_relation_from_and_to() {
+        use crate::relation::ops::relation_create;
+        use crate::relation::types::relation_type_intern;
+        use brain_core::{Cardinality, ExtractorId, Relation, RelationId};
+        let dir = TempDir::new().unwrap();
+        let db = fresh_db(&dir);
+        let from = put_person(&db, "From Fran");
+        let to = put_person(&db, "To Tom");
+        let rel_type = {
+            let wtxn = db.write_txn().unwrap();
+            let id = relation_type_intern(
+                &wtxn,
+                "test",
+                "knows",
+                None,
+                None,
+                Cardinality::ManyToMany,
+                false,
+                1,
+                "",
+                NOW,
+            )
+            .unwrap();
+            wtxn.commit().unwrap();
+            id
+        };
+        let r = Relation::new_root(
+            RelationId::new(),
+            rel_type,
+            from,
+            to,
+            0.9,
+            vec![],
+            ExtractorId::from(0),
+            NOW,
+            false,
+        );
+        {
+            let wtxn = db.write_txn().unwrap();
+            relation_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &r, 0).unwrap();
+            wtxn.commit().unwrap();
+        }
+        let rtxn = db.read_txn().unwrap();
+        // Both endpoints are referenced: `from` via relation_list_from,
+        // `to` via relation_list_to.
+        assert!(entity_inbound_reference_count(&rtxn, test_scope(), from).unwrap() > 0);
+        assert!(entity_inbound_reference_count(&rtxn, test_scope(), to).unwrap() > 0);
+    }
+
+    #[test]
+    fn inbound_count_positive_for_mention() {
+        use crate::tables::entity::{mention_context, MentionMetadata, ENTITY_MENTIONS_TABLE};
+        use brain_core::MemoryId;
+        let dir = TempDir::new().unwrap();
+        let db = fresh_db(&dir);
+        let id = put_person(&db, "Mentioned Mia");
+        let mem = MemoryId::pack(1, 100, 1);
+        let s = test_scope();
+        {
+            let wtxn = db.write_txn().unwrap();
+            {
+                let mut t = wtxn.open_table(ENTITY_MENTIONS_TABLE).unwrap();
+                let key = (
+                    s.namespace_id,
+                    s.space_id_bytes,
+                    id.to_bytes(),
+                    mem.to_be_bytes(),
+                );
+                let m = MentionMetadata::new(NOW, mention_context::IN_TEXT, 0.9);
+                t.insert(&key, &m).unwrap();
+            }
+            wtxn.commit().unwrap();
+        }
+        let rtxn = db.read_txn().unwrap();
+        assert!(entity_inbound_reference_count(&rtxn, test_scope(), id).unwrap() > 0);
+    }
+
+    #[test]
+    fn inbound_count_isolates_by_scope() {
+        // A mention in a DIFFERENT scope must not count toward the
+        // entity's inbound references in the caller's scope.
+        use crate::tables::entity::{mention_context, MentionMetadata, ENTITY_MENTIONS_TABLE};
+        use brain_core::MemoryId;
+        let dir = TempDir::new().unwrap();
+        let db = fresh_db(&dir);
+        let id = put_person(&db, "Scoped Sue");
+        let other = RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xCD; 16]);
+        let mem = MemoryId::pack(2, 200, 1);
+        {
+            let wtxn = db.write_txn().unwrap();
+            {
+                let mut t = wtxn.open_table(ENTITY_MENTIONS_TABLE).unwrap();
+                let key = (
+                    other.namespace_id,
+                    other.space_id_bytes,
+                    id.to_bytes(),
+                    mem.to_be_bytes(),
+                );
+                let m = MentionMetadata::new(NOW, mention_context::IN_TEXT, 0.9);
+                t.insert(&key, &m).unwrap();
+            }
+            wtxn.commit().unwrap();
+        }
+        let rtxn = db.read_txn().unwrap();
+        // Counted in `other`, not in `test_scope`.
+        assert!(entity_inbound_reference_count(&rtxn, other, id).unwrap() > 0);
+        assert_eq!(
+            entity_inbound_reference_count(&rtxn, test_scope(), id).unwrap(),
+            0
         );
     }
 }

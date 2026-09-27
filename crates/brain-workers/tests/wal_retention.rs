@@ -134,6 +134,32 @@ fn last_lsn_equal_to_cutoff_is_kept() {
     );
 }
 
+#[test]
+fn straddling_segment_and_active_segment_are_kept() {
+    // seg 1: entirely below the cutoff → deletable.
+    // seg 2: straddles the cutoff (first < cutoff <= last) → its
+    //        post-cutoff records live only in the WAL, so it must stay.
+    // seg 3: active (highest id) → never deleted.
+    // cutoff = durable_lsn = 500.
+    let segs = [seg(1, 0, 399), seg(2, 400, 899), seg(3, 900, 1200)];
+    let r = decide_deletions(&segs, CheckpointDesc { durable_lsn: 500 }, 0);
+    assert_eq!(
+        r,
+        vec![1],
+        "only the fully-below-cutoff, non-active segment is deletable"
+    );
+}
+
+#[test]
+fn active_segment_never_deleted_even_when_below_cutoff() {
+    // A lone segment is both active and fully below the cutoff; the
+    // active-segment guard must still keep it (it's the live append
+    // target for post-checkpoint records).
+    let segs = [seg(7, 0, 100)];
+    let r = decide_deletions(&segs, CheckpointDesc { durable_lsn: 1000 }, 0);
+    assert!(r.is_empty(), "the sole (active) segment is never deletable");
+}
+
 // ===========================================================================
 // Stub sources.
 // ===========================================================================

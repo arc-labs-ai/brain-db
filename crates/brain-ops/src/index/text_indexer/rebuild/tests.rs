@@ -327,3 +327,75 @@ fn rebuild_creates_payload_for_reopen() {
 fn __ts() -> brain_metadata::RowScope {
     brain_metadata::RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xA1; 16])
 }
+
+// ---------------------------------------------------------------------------
+// Confidence bucketing parity: the rebuild must bucket identically to the
+// live indexer (both delegate to the canonical
+// `brain_metadata::tables::statement::confidence_bucket`, 0..=10). A
+// confidence-1.0 statement must land in bucket 10 in the rebuilt index, so
+// a `confidence_bucket: 10` lexical filter matches it — not bucket 9 as the
+// old divergent `.min(9)` produced.
+fn count_bucket_hits(index: &Index, bucket: u64) -> usize {
+    use tantivy::query::TermQuery;
+    use tantivy::schema::IndexRecordOption;
+    use tantivy::Term;
+
+    let field = index
+        .schema()
+        .get_field("confidence_bucket")
+        .expect("confidence_bucket field");
+    let reader = index.reader().expect("reader");
+    reader.reload().expect("reload");
+    let searcher = reader.searcher();
+    let term = Term::from_field_u64(field, bucket);
+    let query = TermQuery::new(term, IndexRecordOption::Basic);
+    searcher
+        .search(&query, &tantivy::collector::Count)
+        .expect("search")
+}
+
+#[test]
+fn rebuild_confidence_one_lands_in_bucket_ten_matching_live() {
+    // Canonical + live indexer bucketing agree at the 1.0 boundary.
+    assert_eq!(
+        brain_metadata::tables::statement::confidence_bucket(1.0),
+        10,
+        "canonical bucketing puts confidence 1.0 in bucket 10",
+    );
+    assert_eq!(
+        crate::index::text_indexer::statement::confidence_bucket(1.0),
+        10,
+        "live indexer must bucket confidence 1.0 as 10",
+    );
+
+    let dir = TempDir::new().expect("tempdir");
+    let mut metadata = fresh_metadata(dir.path());
+
+    let type_id = ensure_person_type(&mut metadata);
+    let carol = put_entity(&mut metadata, "Carol", type_id);
+    let predicate = intern_predicate(&mut metadata, "brain", "speaks");
+    let _ = create_statement(
+        &mut metadata,
+        carol,
+        predicate,
+        StatementObject::Value(StatementValue::Text("Certain".into())),
+        StatementKind::Fact,
+        1.0,
+    );
+
+    let report = rebuild_statements(dir.path(), &metadata).expect("rebuild");
+    assert_eq!(report.rows_processed, 1);
+
+    let startup = TantivyShard::open(dir.path()).expect("open");
+    let index = &startup.shard.statements.index;
+    assert_eq!(
+        count_bucket_hits(index, 10),
+        1,
+        "rebuild must place confidence 1.0 in bucket 10, matching the live indexer",
+    );
+    assert_eq!(
+        count_bucket_hits(index, 9),
+        0,
+        "confidence 1.0 must NOT land in bucket 9 (the old divergent behaviour)",
+    );
+}

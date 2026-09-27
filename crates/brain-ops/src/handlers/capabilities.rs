@@ -19,10 +19,15 @@
 //!   the client the capability is mute, even though the operator
 //!   opted in — useful diagnostic surface for "API key missing"
 //!   style misconfigurations.
-//! * `schema_namespaces` — every namespace with an active schema
-//!   version on the shard. Excludes empty-string entries defensively
-//!   (the system schema is normally `brain`; user schemas have
-//!   non-empty names).
+//! * `schema_namespaces` — the namespaces with an active schema version
+//!   on the shard, filtered to the caller's OWN (effective) namespace, so
+//!   the result is `[]` or `[caller_namespace]`. A shared shard hosts many
+//!   tenants; listing every tenant that has declared schema would leak the
+//!   tenant roster to any authenticated caller. Under `act_as` the caller
+//!   is the effective (delegated) identity, so a gateway sees exactly the
+//!   tenant it is acting for. Excludes the always-on `brain` system
+//!   namespace (as the wire doc has always promised — it was previously
+//!   listed) and empty-string entries.
 //! * `vector_dim` — the embedder's output dimensionality (currently
 //!   384 for BGE-small). Hard-coded to the substrate constant so the
 //!   wire response stays accurate even when the dispatcher is a
@@ -30,6 +35,7 @@
 
 use brain_core::ExtractorKind;
 use brain_metadata::schema::store::schema_namespaces;
+use brain_metadata::system_schema::SYSTEM_SCHEMA_NAMESPACE;
 use brain_protocol::envelope::response::{
     Capabilities, GetCapabilitiesRequest, GetCapabilitiesResponse,
 };
@@ -43,17 +49,25 @@ use crate::error::OpError;
 /// substrate contract and shouldn't change underneath us.
 const VECTOR_DIM_U16: u16 = 384;
 
+/// `caller_namespace` is the AUTH-bound (or, under `act_as`, effective)
+/// namespace from the `RequestCaller`. An empty string is the test-only
+/// "no namespace lock" caller (`RequestCaller::for_tests`); it sees the
+/// unfiltered list, matching `RequestCaller::require_namespace`. Production
+/// callers always carry a non-empty namespace.
 pub async fn handle_get_capabilities(
     _req: GetCapabilitiesRequest,
     ctx: &OpsContext,
+    caller_namespace: &str,
 ) -> Result<GetCapabilitiesResponse, OpError> {
     let rerank = matches!(ctx.cross_encoder, CrossEncoderSlot::Enabled(_));
 
     // Snapshot the registry under one read lock — three booleans
     // out, no need to hold the lock for the I/O steps below.
+    // Extraction is always-on (C0): the bits report whether an extractor of
+    // each tier is present (and, for LLM, actually wired). There is no per-tier
+    // enable/disable gate.
     let (pattern_extractor, classifier_extractor, llm_extractor) = {
         let registry = ctx.extractor_registry.read();
-        let gate = registry.tier_gate();
         let mut pattern = false;
         let mut classifier = false;
         let mut llm = false;
@@ -71,11 +85,7 @@ pub async fn handle_get_capabilities(
                 }
             }
         }
-        (
-            pattern && gate.pattern.is_enabled(),
-            classifier && gate.classifier.is_enabled(),
-            llm && gate.llm.is_enabled(),
-        )
+        (pattern, classifier, llm)
     };
 
     // Per-shard schema namespaces. A failure here downgrades to "no
@@ -88,7 +98,11 @@ pub async fn handle_get_capabilities(
             .read_txn()
             .map_err(|e| OpError::Internal(format!("metadata read_txn: {e}")))?;
         match schema_namespaces(&rtxn) {
-            Ok(list) => list.into_iter().filter(|n| !n.is_empty()).collect(),
+            Ok(list) => list
+                .into_iter()
+                .filter(|n| !n.is_empty() && n != SYSTEM_SCHEMA_NAMESPACE)
+                .filter(|n| caller_namespace.is_empty() || n == caller_namespace)
+                .collect(),
             Err(err) => {
                 tracing::warn!(
                     target: "brain_ops::capabilities",

@@ -20,8 +20,19 @@
 //!    score is at or above [`EMBED_RESOLVE_THRESHOLD`], add the
 //!    surface form as an alias and return that EntityId. This catches
 //!    paraphrases trigrams miss (e.g. "Stripe Inc." vs
-//!    "Stripe Payments").
-//! 5. **Create** — mint a fresh UUIDv7 EntityId, intern the type if
+//!    "Stripe Payments"). A candidate that lands in the lower,
+//!    ambiguous partial-match band is not aliased outright — it goes
+//!    to the disambiguator (tier 5) for a second opinion.
+//! 5. **Disambiguate (second opinion)** — when the embedding probe
+//!    lands a candidate in the ambiguous partial-match band, ask the
+//!    pluggable disambiguator whether it is the same entity. The
+//!    backend is LLM-driven today (via [`brain_llm::LlmClient`];
+//!    heuristics or a classifier could slot in later). A confirmed
+//!    match aliases the surface form and returns
+//!    ([`ResolutionTier::Disambiguated`]); an explicit rejection, or an
+//!    uncertain / absent disambiguator, falls through to create. This
+//!    tier is live today, not planned.
+//! 6. **Create** — mint a fresh UUIDv7 EntityId, intern the type if
 //!    needed, embed the canonical name (when an HNSW is wired), write
 //!    the entity row + the durable vector row, and STAGE the HNSW
 //!    insert in a [`StagedEntityVectors`] the caller flushes after its
@@ -33,17 +44,17 @@
 //!
 //! Determinism comes from the lookup contract: given the same DB
 //! state + same surface form, the resolver always returns the same
-//! EntityId. Tier-5 creates use UUIDv7 (time + random), so two
+//! EntityId. Tier-6 creates use UUIDv7 (time + random), so two
 //! independent resolves of the same brand-new surface form against
 //! the same DB produce different IDs only if both observe a
-//! tier-1/2/3/4 miss — which is the intended split-brain semantics
+//! tier-1/2/3/4/5 miss — which is the intended split-brain semantics
 //! for two simultaneous extractions.
 //!
 //! The embedding threshold defaults to 0.78 cosine, carried on
 //! [`EmbeddingDeps::embed_threshold`]; the shard ferries
 //! `[extractors.resolver] embed_threshold` there. Callers that have no
-//! HNSW or no embedder pass `None` for either and the tier silently
-//! skips — the gauntlet still flows through tier-1/2/3/5 unchanged.
+//! HNSW or no embedder pass `None` for either and tiers 4–5 silently
+//! skip — the gauntlet still flows through tier-1/2/3/6 unchanged.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -160,10 +171,19 @@ pub enum ResolutionTier {
 }
 
 /// Successful resolution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Resolution {
     pub entity_id: EntityId,
     pub tier: ResolutionTier,
+    /// The resolver's confidence in this match, in `[0.0, 1.0]`. The
+    /// deterministic identity tiers (exact / alias / coref / created)
+    /// carry `1.0`; the score-based tiers surface their real match
+    /// score — trigram Jaccard for fuzzy, cosine for embedding, and the
+    /// disambiguator's own confidence for a confirmed ambiguous-band
+    /// match. Consumed by the per-mention resolution audit so a logged
+    /// derivation records how strong the match was, not just which tier
+    /// fired.
+    pub confidence: f32,
 }
 
 /// Errors the resolver can surface to the worker. Most are storage-level;
@@ -971,6 +991,7 @@ pub fn resolve_or_create_with_deps(
         return Ok(Resolution {
             entity_id: id,
             tier: ResolutionTier::Exact,
+            confidence: 1.0,
         });
     }
 
@@ -985,6 +1006,7 @@ pub fn resolve_or_create_with_deps(
         return Ok(Resolution {
             entity_id: id,
             tier: ResolutionTier::Alias,
+            confidence: 1.0,
         });
     }
 
@@ -1007,6 +1029,7 @@ pub fn resolve_or_create_with_deps(
             return Ok(Resolution {
                 entity_id: id,
                 tier: ResolutionTier::Exact,
+                confidence: 1.0,
             });
         }
     }
@@ -1014,7 +1037,18 @@ pub fn resolve_or_create_with_deps(
     // Tier 3a — trigram fuzzy lookup. Candidates whose Jaccard against
     // the query is above `DEFAULT_FUZZY_THRESHOLD` get the surface
     // form added as an alias and are returned as the match.
-    let candidate_ids = trigram_candidates_wtxn(wtxn, scope, type_id, &normalized)?;
+    let mut candidate_ids = trigram_candidates_wtxn(wtxn, scope, type_id, &normalized)?;
+    // Numbers in a name are identifiers: `eval-0916` and `eval-0917`,
+    // `env-v1` and `env-v2` are distinct however close their trigrams. No
+    // string tier below may merge across differing digit runs.
+    let mut kept = HashSet::with_capacity(candidate_ids.len());
+    for cid in candidate_ids {
+        let canonical = read_entity_canonical(wtxn, cid)?.unwrap_or_default();
+        if digit_runs_compatible(&normalized, &normalize_name(&canonical)) {
+            kept.insert(cid);
+        }
+    }
+    candidate_ids = kept;
     if !candidate_ids.is_empty() {
         let query_tgs = trigrams::extract_trigrams(&normalized);
         if !query_tgs.is_empty() {
@@ -1033,13 +1067,14 @@ pub fn resolve_or_create_with_deps(
                     _ => best = Some((cid, score)),
                 }
             }
-            if let Some((cid, _)) = best {
+            if let Some((cid, score)) = best {
                 // The surface form is now associated with this entity;
                 // re-runs of the same string hit tier 2 directly.
                 entity_add_alias(wtxn, cid, surface_form.to_string(), now_unix_nanos)?;
                 return Ok(Resolution {
                     entity_id: cid,
                     tier: ResolutionTier::Alias,
+                    confidence: score,
                 });
             }
         }
@@ -1087,6 +1122,7 @@ pub fn resolve_or_create_with_deps(
                     return Ok(Resolution {
                         entity_id: cid,
                         tier: ResolutionTier::Alias,
+                        confidence: 1.0,
                     });
                 }
             }
@@ -1148,6 +1184,7 @@ pub fn resolve_or_create_with_deps(
                     return Ok(Resolution {
                         entity_id: cid,
                         tier: ResolutionTier::Alias,
+                        confidence: 1.0,
                     });
                 }
             }
@@ -1214,6 +1251,7 @@ pub fn resolve_or_create_with_deps(
                             return Ok(Resolution {
                                 entity_id: cid,
                                 tier: ResolutionTier::Alias,
+                                confidence: 1.0,
                             });
                         }
                     }
@@ -1234,7 +1272,22 @@ pub fn resolve_or_create_with_deps(
     let mut partial_match: Option<(EntityId, f32)> = None;
     if let Some(deps) = embed_deps {
         match tier_embedding(deps, staged, scope, type_id, surface_form, wtxn) {
-            Ok(EmbeddingProbe::AutoAlias { entity_id, .. }) => {
+            Ok(EmbeddingProbe::AutoAlias { entity_id, .. })
+                if !digit_runs_compatible(
+                    &normalized,
+                    &normalize_name(&read_entity_canonical(wtxn, entity_id)?.unwrap_or_default()),
+                ) =>
+            {
+                // A close vector across differing identifiers ("run 41" vs
+                // "run 42") is not the same entity — mint a distinct one.
+                tracing::debug!(
+                    target: "brain_extractors::resolver",
+                    ?entity_id,
+                    surface_form,
+                    "embedding auto-alias skipped: digit runs differ",
+                );
+            }
+            Ok(EmbeddingProbe::AutoAlias { entity_id, score }) => {
                 // A high cosine alone is not proof of identity: two
                 // distinct same-type entities ("Japan" vs "Tokyo", both
                 // Places) can sit above the auto-alias threshold and the
@@ -1274,6 +1327,7 @@ pub fn resolve_or_create_with_deps(
                         return Ok(Resolution {
                             entity_id: entity,
                             tier: ResolutionTier::Disambiguated,
+                            confidence,
                         });
                     }
                     // No disambiguator, or it declined to commit either
@@ -1290,6 +1344,7 @@ pub fn resolve_or_create_with_deps(
                         return Ok(Resolution {
                             entity_id,
                             tier: ResolutionTier::Embedding,
+                            confidence: score,
                         });
                     }
                 }
@@ -1335,6 +1390,7 @@ pub fn resolve_or_create_with_deps(
                 return Ok(Resolution {
                     entity_id: entity,
                     tier: ResolutionTier::Disambiguated,
+                    confidence,
                 });
             }
             MatchVerdict::Rejected => {
@@ -1449,6 +1505,7 @@ pub fn resolve_or_create_with_deps(
     Ok(Resolution {
         entity_id: new_id,
         tier: ResolutionTier::Created,
+        confidence: 1.0,
     })
 }
 
@@ -1489,12 +1546,19 @@ fn tier_embedding(
         .embedder
         .embed(surface_form)
         .map_err(|e| format!("embedder failed: {e}"))?;
+    // Over-fetch: the per-shard entity HNSW mixes tenants + types, and the
+    // scope+type filter below runs AFTER the search. Fetching only
+    // EMBED_RESOLVE_TOP_K would let a same-tenant alias ranked just past the
+    // top-k be starved out by foreign/wrong-type neighbours (→ a missed alias
+    // → entity fragmentation). Pull a wider pool so the filter has same-scope
+    // candidates to keep. Bounded by the entity HNSW's ef_search (64).
+    let pool = EMBED_RESOLVE_TOP_K * 4;
     let mut hits = {
         let hnsw = deps.hnsw.read();
         if hnsw.is_empty() {
             Vec::new()
         } else {
-            hnsw.search(&vector, EMBED_RESOLVE_TOP_K)
+            hnsw.search(&vector, pool)
                 .map_err(|e| format!("hnsw search failed: {e}"))?
         }
     };
@@ -1503,11 +1567,11 @@ fn tier_embedding(
     // `wtxn`, so they're legitimate candidates for a later surface in the
     // same memory. Scan them alongside the index hits and re-sort.
     if !staged.is_empty() {
-        hits.extend(staged.probe(&vector, EMBED_RESOLVE_TOP_K));
+        hits.extend(staged.probe(&vector, pool));
         hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         let mut seen = HashSet::with_capacity(hits.len());
         hits.retain(|(id, _)| seen.insert(*id));
-        hits.truncate(EMBED_RESOLVE_TOP_K);
+        hits.truncate(pool);
     }
     if hits.is_empty() {
         return Ok(EmbeddingProbe::None);
@@ -1567,6 +1631,20 @@ fn read_entity_type_and_scope(
 
 /// Read just the `canonical_name` for `id` inside an existing write txn.
 /// Used by the partial-name coref tier to compare token sets.
+/// Whether two normalized names carry the same digit runs (in order). Names
+/// whose numbers differ — including one numbered and one not — are distinct
+/// identifiers and must never be auto-merged; over-splitting is recoverable
+/// (the ambiguity workers can merge later), a false merge silently corrupts
+/// every fact attached to both.
+fn digit_runs_compatible(a: &str, b: &str) -> bool {
+    fn runs(s: &str) -> Vec<&str> {
+        s.split(|c: char| !c.is_ascii_digit())
+            .filter(|r| !r.is_empty())
+            .collect()
+    }
+    runs(a) == runs(b)
+}
+
 fn read_entity_canonical(
     wtxn: &WriteTransaction,
     id: EntityId,
@@ -1794,6 +1872,72 @@ mod tests {
 
     fn db(dir: &TempDir) -> MetadataDb {
         MetadataDb::open(dir.path().join("metadata.redb")).expect("open")
+    }
+
+    #[test]
+    fn digit_runs_must_match_to_merge() {
+        assert!(digit_runs_compatible("stripe inc", "stripe payments"));
+        assert!(digit_runs_compatible("eval 0917", "eval-0917 run"));
+        assert!(!digit_runs_compatible("eval 0916", "eval 0917"));
+        assert!(!digit_runs_compatible(
+            "linear sandbox 8004",
+            "linear sandbox 8003"
+        ));
+        assert!(!digit_runs_compatible(
+            "linear sandbox",
+            "linear sandbox 8004"
+        ));
+        assert!(!digit_runs_compatible("env v1", "env v2"));
+    }
+
+    #[test]
+    fn fuzzy_tier_never_merges_names_that_differ_only_in_digits() {
+        let dir = TempDir::new().unwrap();
+        let db = db(&dir);
+        let wtxn = db.write_txn().unwrap();
+        let first = resolve_or_create(
+            &wtxn,
+            test_scope(),
+            "linear-sandbox-8003",
+            "brain:Concept",
+            0.9,
+            1,
+        )
+        .unwrap();
+        let second = resolve_or_create(
+            &wtxn,
+            test_scope(),
+            "linear-sandbox-8004",
+            "brain:Concept",
+            0.9,
+            2,
+        )
+        .unwrap();
+        assert_ne!(
+            first.entity_id, second.entity_id,
+            "distinct identifiers must not merge"
+        );
+        assert_eq!(second.tier, ResolutionTier::Created);
+        // A real near-duplicate (no digits involved) still merges.
+        let a = resolve_or_create(
+            &wtxn,
+            test_scope(),
+            "Northwind Labs",
+            "brain:Organization",
+            0.9,
+            3,
+        )
+        .unwrap();
+        let b = resolve_or_create(
+            &wtxn,
+            test_scope(),
+            "Northwind Labs.",
+            "brain:Organization",
+            0.9,
+            4,
+        )
+        .unwrap();
+        assert_eq!(a.entity_id, b.entity_id);
     }
 
     #[test]

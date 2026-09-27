@@ -12,6 +12,16 @@
 //! Exactly one of the three forms must be present; the handler returns
 //! `400 Bad Request` otherwise.
 //!
+//! The single-memory form takes an optional tenant scope,
+//! `?memory=<id>&namespace=<name>` (the same `namespace` param
+//! `POST /v1/memories/{id}/restore` takes): the memory is re-enqueued only
+//! if it belongs to that namespace, and a memory that is absent, owned by
+//! another namespace, or under a never-interned namespace answers
+//! `404 Not Found` — indistinguishable, so a tenant-scoped caller can't
+//! probe other tenants' ids. Without `namespace` the form is global, as
+//! before. `namespace` with `?since` / `?all` is a `400`: those stay
+//! operator-global.
+//!
 //! The handler fans the request out to every configured shard (the
 //! memory-by-id form short-circuits on shards that don't own the id),
 //! sums the per-shard `enqueued` + `skipped` counts, and replies
@@ -22,6 +32,14 @@
 //!
 //! The CLI prints this verbatim in JSON mode and renders a small KV
 //! table otherwise.
+//!
+//! Fan-out is partial-tolerant. A backfill that some shards accept and
+//! others reject is a *partial success*, not a silent one: the response
+//! carries a top-level `"errors":[…]` array of the per-shard failures and
+//! its status is `207 Multi-Status`, so an operator can see the skipped
+//! shards rather than reading `200 OK` over a half-applied run. The route
+//! only fails outright with `500` when *every* shard errored; a clean
+//! all-shards fan-out stays `200 OK` with no `errors` key.
 
 use std::sync::Arc;
 
@@ -43,15 +61,26 @@ pub async fn handle(
         Ok(s) => s,
         Err(msg) => return Ok(text_response(StatusCode::BAD_REQUEST, &format!("{msg}\n"))),
     };
+    let namespace = match parse_namespace_scope(&query_str, &selector) {
+        Ok(ns) => ns,
+        Err(msg) => return Ok(text_response(StatusCode::BAD_REQUEST, &format!("{msg}\n"))),
+    };
 
     let mut enqueued: u64 = 0;
     let mut skipped: u64 = 0;
+    let mut namespace_matched: u64 = 0;
+    let mut succeeded: usize = 0;
     let mut shard_errors: Vec<String> = Vec::new();
     for (idx, shard) in state.shards.iter().enumerate() {
-        match shard.extract_backfill(selector.clone()).await {
+        match shard
+            .extract_backfill(selector.clone(), namespace.clone())
+            .await
+        {
             Ok(report) => {
+                succeeded += 1;
                 enqueued = enqueued.saturating_add(report.enqueued);
                 skipped = skipped.saturating_add(report.skipped);
+                namespace_matched = namespace_matched.saturating_add(report.namespace_matched);
             }
             Err(e) => {
                 warn!(shard = idx, error = %e, "extract_backfill failed");
@@ -60,18 +89,86 @@ pub async fn handle(
         }
     }
 
-    if !shard_errors.is_empty() && enqueued == 0 && skipped == 0 {
+    if succeeded == 0 {
+        // No shard accepted the backfill. Per-shard detail already logged;
+        // keep it off the wire.
         return Ok(text_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("backfill failed: {}\n", shard_errors.join("; ")),
+            "extraction backfill failed\n",
         ));
     }
 
-    let body = format!(
-        "{{\"enqueued\":{enqueued},\"skipped\":{skipped},\"shards\":{n}}}\n",
-        n = state.shards.len(),
-    );
-    Ok(json_response(StatusCode::OK, body))
+    // Tenant-scoped single memory that no shard matched: absent, foreign, or
+    // an unknown namespace — all one `404`. Only claimed on a clean fan-out;
+    // if a shard errored it may have been the owner, so the partial-failure
+    // path below reports that instead of a possibly-wrong 404.
+    if namespace.is_some() && namespace_matched == 0 && shard_errors.is_empty() {
+        return Ok(text_response(
+            StatusCode::NOT_FOUND,
+            "no such memory in this namespace\n",
+        ));
+    }
+
+    // At least one shard accepted. A clean fan-out is `200 OK`; a partial
+    // one (some shards rejected the backfill) is `207 Multi-Status` carrying
+    // the per-shard failures, so the operator sees the skipped shards.
+    let status = if shard_errors.is_empty() {
+        StatusCode::OK
+    } else {
+        StatusCode::MULTI_STATUS
+    };
+    let body = backfill_body_json(enqueued, skipped, state.shards.len(), &shard_errors);
+    Ok(json_response(status, body))
+}
+
+/// Render the full backfill response body: the summed `enqueued` +
+/// `skipped` counts, the shard count, and — only when the fan-out was
+/// partial — a top-level `"errors"` array of the shards whose backfill was
+/// rejected. A clean all-shards fan-out renders no `errors` key.
+fn backfill_body_json(
+    enqueued: u64,
+    skipped: u64,
+    shard_count: usize,
+    shard_errors: &[String],
+) -> String {
+    let mut body =
+        format!("{{\"enqueued\":{enqueued},\"skipped\":{skipped},\"shards\":{shard_count}");
+    if !shard_errors.is_empty() {
+        body.push_str(",\"errors\":");
+        body.push_str(&errors_array_json(shard_errors));
+    }
+    body.push_str("}\n");
+    body
+}
+
+/// Render `["shard i: …", …]`, JSON-escaping each message so an error's
+/// `Display` can never break out of the string and corrupt the document.
+fn errors_array_json(errors: &[String]) -> String {
+    let items: Vec<String> = errors.iter().map(|e| json_string(e)).collect();
+    format!("[{}]", items.join(","))
+}
+
+/// Minimal JSON string escaping (the two mandatory escapes plus control
+/// characters). Kept local so per-shard error text is always emitted safely.
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                use std::fmt::Write as _;
+                write!(&mut out, "\\u{:04x}", c as u32).expect("string write into String");
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Pull exactly one selector spec out of the query string. The three
@@ -119,9 +216,50 @@ fn parse_selector(query: &str) -> Result<BackfillSelector, String> {
     Ok(BackfillSelector::All)
 }
 
+/// Pull the optional `namespace=<name>` tenant scope. Only the single-memory
+/// selector may be scoped; an empty value, or a scope on `?since` / `?all`,
+/// is a `400`.
+fn parse_namespace_scope(
+    query: &str,
+    selector: &BackfillSelector,
+) -> Result<Option<String>, String> {
+    let Some(ns) = query
+        .split('&')
+        .filter(|s| !s.is_empty())
+        .find_map(|kv| kv.strip_prefix("namespace="))
+    else {
+        return Ok(None);
+    };
+    if ns.is_empty() {
+        return Err("empty namespace; pass ?namespace=<name> or omit it".into());
+    }
+    if !matches!(selector, BackfillSelector::Memory(_)) {
+        return Err("namespace scoping is only supported with ?memory=<id>".into());
+    }
+    Ok(Some(ns.to_owned()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn namespace_scope_only_with_memory_selector() {
+        let mem = BackfillSelector::Memory(7);
+        assert_eq!(parse_namespace_scope("memory=7", &mem).unwrap(), None);
+        assert_eq!(
+            parse_namespace_scope("memory=7&namespace=acme", &mem).unwrap(),
+            Some("acme".to_owned())
+        );
+        assert!(parse_namespace_scope("memory=7&namespace=", &mem).is_err());
+        assert!(parse_namespace_scope("all&namespace=acme", &BackfillSelector::All).is_err());
+        let since = BackfillSelector::Since {
+            since_unix_nanos: 0,
+        };
+        assert!(parse_namespace_scope("since=0&namespace=acme", &since).is_err());
+        // `namespace` is not itself a selector.
+        assert!(parse_selector("namespace=acme").is_err());
+    }
 
     #[test]
     fn parse_selector_memory() {
@@ -159,5 +297,48 @@ mod tests {
     fn parse_selector_rejects_garbage_numbers() {
         assert!(parse_selector("memory=abc").is_err());
         assert!(parse_selector("since=xx").is_err());
+    }
+
+    #[test]
+    fn backfill_body_surfaces_partial_shard_errors() {
+        // The specific defect: a fan-out that some shards accept and one
+        // rejects must NOT render as a clean success. The rejected shard's
+        // message has to appear in a top-level "errors" array so the
+        // handler can return 207 instead of a silent 200.
+        let shard_errors = vec!["shard 1: worker mailbox closed".to_owned()];
+        let body = backfill_body_json(9, 2, 2, &shard_errors);
+
+        assert!(body.contains("\"enqueued\":9"), "{body}");
+        assert!(body.contains("\"skipped\":2"), "{body}");
+        assert!(body.contains("\"shards\":2"), "{body}");
+        // The rejected shard is surfaced, not swallowed.
+        assert!(
+            body.contains("\"errors\":[\"shard 1: worker mailbox closed\"]"),
+            "partial failure must surface the rejected shard: {body}"
+        );
+    }
+
+    #[test]
+    fn backfill_body_errors_are_json_escaped() {
+        // A raw error Display carrying a quote or backslash must not break
+        // out of the JSON string.
+        let shard_errors = vec!["shard 1: bad \"key\"\\path".to_owned()];
+        let body = backfill_body_json(0, 0, 2, &shard_errors);
+        assert!(
+            body.contains(r#"["shard 1: bad \"key\"\\path"]"#),
+            "error text must be JSON-escaped: {body}"
+        );
+    }
+
+    #[test]
+    fn backfill_body_omits_errors_key_when_clean() {
+        // A clean all-shards fan-out stays a plain success body — no errors
+        // key, so 200 OK stays semantically accurate.
+        let body = backfill_body_json(5, 1, 3, &[]);
+        assert!(
+            !body.contains("\"errors\""),
+            "no errors key when clean: {body}"
+        );
+        assert!(body.contains("\"shards\":3"), "{body}");
     }
 }

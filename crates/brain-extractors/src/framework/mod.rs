@@ -15,5 +15,5 @@ pub use extractor::{
 };
 pub use item::{EntityMention, ExtractedItem, RelationMention, StatementMention};
 pub use options::ExtractorRunOptions;
-pub use registry::{ExtractorRegistry, TierGate, TierState};
+pub use registry::ExtractorRegistry;
 pub use trigger::{evaluate_trigger_on_encode, TriggerDecision};

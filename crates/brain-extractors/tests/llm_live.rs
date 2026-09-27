@@ -43,8 +43,7 @@ use std::time::Duration;
 
 use brain_core::{ExtractorId, Memory, MemoryId, MemoryKind, Salience, SessionId, SpaceId};
 use brain_extractors::{
-    hash_memory_text, ExtractedItem, ExtractionContext, ExtractionStatus, Extractor,
-    ExtractorRegistry, LlmExtractor,
+    ExtractedItem, ExtractionContext, ExtractionStatus, Extractor, ExtractorRegistry, LlmExtractor,
 };
 use brain_llm::client::{model_id_hash, LlmClient};
 use brain_llm::AnthropicClient;
@@ -259,7 +258,7 @@ async fn live_anthropic_cache_short_circuits_second_call() {
     // hash) and capture the `created_at` so we can verify it doesn't
     // move on the second call.
     let key = (
-        hash_memory_text(INPUT_TEXT),
+        ext.cache_input_hash(&ctx(&reg), &mem),
         EXT_ID_RAW,
         EXT_VERSION,
         model_id_hash(MODEL),

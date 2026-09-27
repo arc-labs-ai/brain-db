@@ -57,6 +57,7 @@ predicate_def    := "define" ws "predicate" ws qualified_identifier ws? "{" ws?
                        "kind:" ws? statement_kind ws?
                        "object:" ws? object_type ws?
                        ("description:" ws? string_literal ws?)?
+                       ("retention:" ws? duration_literal ws?)?
                     "}"
 
 statement_kind   := "Fact" | "Preference" | "Event"
@@ -67,6 +68,17 @@ object_type      := "Value" ws? "<" ws? attr_type ws? ">"
                   | "Statement"
                   | "Any"     # falls back to Value<text> at storage level
 ```
+
+`retention` (optional) is an explicit time-to-live for statements of this predicate — distinct
+from confidence decay, which only dims a statement's confidence and never removes it. When set, a
+statement whose age exceeds the duration is soft-tombstoned by the reclamation worker (then hard-
+reclaimed on the standard tombstone grace, so the removal is auditable and recoverable within the
+grace window). Age is measured per kind from the statement's own time anchor — `event_at` for
+Events, `valid_from` for Facts and Preferences. Omitting `retention` keeps the prior behaviour:
+statements persist indefinitely (subject only to decay, supersession, and explicit FORGET/RETRACT).
+`duration_literal` is the same `<amount><unit>` form used elsewhere in the grammar (e.g. `90d`,
+`24h`); units are `s`/`m`/`h`/`d`. Retention is a per-predicate (hence per-namespace, per-domain)
+policy declared in the tenant's uploaded schema — Brain seeds none.
 
 ## Relation types
 

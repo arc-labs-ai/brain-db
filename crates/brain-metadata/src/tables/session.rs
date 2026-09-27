@@ -81,7 +81,6 @@ pub fn session_scope_range_bounds(namespace_id: u32, space_id: [u8; 16]) -> ([u8
 /// Per-session registry row. The `(namespace, space, session_id)` scope
 /// lives in the table key, not the value.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct SessionMetadata {
     pub created_at_unix_nanos: u64,
     pub last_active_unix_nanos: u64,
@@ -116,9 +115,9 @@ impl redb::Value for SessionMetadata {
     where
         Self: 'a,
     {
-        let mut buf = rkyv::AlignedVec::with_capacity(data.len());
+        let mut buf = rkyv::util::AlignedVec::<16>::with_capacity(data.len());
         buf.extend_from_slice(data);
-        rkyv::from_bytes::<SessionMetadata>(&buf)
+        rkyv::from_bytes::<SessionMetadata, rkyv::rancor::Error>(&buf)
             .expect("SessionMetadata bytes failed rkyv validation; redb file is corrupt")
     }
 
@@ -127,7 +126,7 @@ impl redb::Value for SessionMetadata {
         Self: 'a,
         Self: 'b,
     {
-        rkyv::to_bytes::<_, 256>(value)
+        rkyv::to_bytes::<rkyv::rancor::Error>(value)
             .expect("SessionMetadata is rkyv-serializable")
             .into_vec()
     }

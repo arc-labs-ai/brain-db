@@ -48,6 +48,9 @@ pub enum SystemSchemaError {
     #[error("namespace registry: {0}")]
     Namespace(#[from] crate::namespace::NamespaceOpError),
 
+    #[error("system extractor upgrade: {0}")]
+    ExtractorUpgrade(#[from] crate::extractor::ops::ExtractorOpError),
+
     /// A stored `brain:` definition diverges from the embedded
     /// schema during reconciliation. Surfaced so an operator-edited
     /// `schema.brain` that breaks a prior definition (entity type,
@@ -129,7 +132,43 @@ fn reconcile_system_schema(
     schema_version: u32,
     now_unix_nanos: u64,
 ) -> Result<(), SystemSchemaError> {
+    upgrade_system_extractors(wtxn, validated, schema_version)?;
     apply_schema_definitions(wtxn, validated, schema_version, now_unix_nanos)?;
+    Ok(())
+}
+
+/// Bring the built-in `brain:` extractor rows up to the compiled definitions.
+///
+/// The system extractors (e.g. the LLM tier's prompt and output schema) are
+/// code, not operator data: nobody can edit the reserved `brain` namespace —
+/// user uploads to it are rejected. But the runtime extractors are
+/// materialised from these stored rows, so without this a changed built-in
+/// definition could never reach an existing database, and the strict
+/// divergence check below would even refuse to open it. Rows are replaced in
+/// place (same id), so audit rows and mention provenance keep resolving.
+fn upgrade_system_extractors(
+    wtxn: &WriteTransaction,
+    validated: &ValidatedSchema,
+    schema_version: u32,
+) -> Result<(), SystemSchemaError> {
+    use brain_protocol::schema::SchemaItem;
+    let schema = validated.as_schema();
+    for item in &schema.items {
+        let SchemaItem::Extractor(e) = item else {
+            continue;
+        };
+        let blob = serde_json::to_vec(e)
+            .map_err(|err| SchemaApplyError::ExtractorEncode(err.to_string()))?;
+        let kind = crate::schema::apply::map_extractor_kind(e.kind);
+        crate::extractor::ops::extractor_replace_system_definition(
+            wtxn,
+            &schema.namespace,
+            &e.name,
+            kind,
+            schema_version,
+            blob,
+        )?;
+    }
     Ok(())
 }
 
@@ -433,25 +472,26 @@ mod tests {
         );
     }
 
-    /// A diverged extractor row (same qname, different
-    /// definition_blob) raises a `Reconcile` error instead of
-    /// silently overwriting. Bumping the schema version via a
-    /// real `SCHEMA_UPLOAD` is the recovery path; reconciliation
-    /// refuses to make that decision unilaterally.
+    /// A diverged BUILT-IN extractor row (same qname, different
+    /// definition_blob) is restored to the compiled definition on reopen, in
+    /// place (same id). System extractors are code: the runtime is built from
+    /// these rows, and the reserved `brain` namespace cannot be uploaded to,
+    /// so refusing (the old contract) left a changed built-in prompt unable
+    /// to ever reach an existing database.
     #[test]
-    fn reconciliation_propagates_diverged_definition() {
+    fn reconciliation_restores_a_diverged_system_extractor_in_place() {
         use crate::tables::extractor::{ExtractorDefinition, EXTRACTORS_TABLE};
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.redb");
-        {
+        let compiled = {
             let db = Database::create(&path).unwrap();
             seed_system_schema(&db).unwrap();
-
-            // Overwrite `entity_mentions` (id 1) with a tampered
-            // definition_blob. The qname index still points at id 1
-            // so the intern's idempotency probe will fetch this row
-            // and observe the divergence.
+            let compiled = {
+                let rtxn = db.begin_read().unwrap();
+                let t = rtxn.open_table(EXTRACTORS_TABLE).unwrap();
+                t.get(&1u32).unwrap().unwrap().value()
+            };
             let wtxn = db.begin_write().unwrap();
             {
                 let mut t = wtxn.open_table(EXTRACTORS_TABLE).unwrap();
@@ -467,18 +507,34 @@ mod tests {
                 t.insert(&1u32, &tampered).unwrap();
             }
             wtxn.commit().unwrap();
-        }
+            compiled
+        };
 
         let db = Database::open(&path).unwrap();
-        let err = seed_system_schema(&db).expect_err("diverged definition must surface");
-        match err {
-            SystemSchemaError::Reconcile(SchemaApplyError::Extractor(
-                ExtractorOpError::AlreadyExists { qname, .. },
-            )) => {
-                assert_eq!(qname, "brain:entity_mentions");
-            }
-            other => panic!("expected Reconcile/AlreadyExists, got {other:?}"),
-        }
+        seed_system_schema(&db).expect("a diverged built-in is upgraded, not refused");
+        let rtxn = db.begin_read().unwrap();
+        let t = rtxn.open_table(EXTRACTORS_TABLE).unwrap();
+        let row = t.get(&1u32).unwrap().unwrap().value();
+        assert_eq!(row.definition_blob, compiled.definition_blob);
+        assert_eq!(row.extractor_id, 1, "replaced in place");
+    }
+
+    #[test]
+    fn user_extractors_are_never_replaced_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::create(dir.path().join("t.redb")).unwrap();
+        seed_system_schema(&db).unwrap();
+        let wtxn = db.begin_write().unwrap();
+        let err = crate::extractor::ops::extractor_replace_system_definition(
+            &wtxn,
+            "acme",
+            "x",
+            brain_core::ExtractorKind::Pattern,
+            1,
+            Vec::new(),
+        )
+        .expect_err("user namespace");
+        assert!(matches!(err, ExtractorOpError::NotSystemNamespace(_)));
     }
 
     /// Regression for the `entities=0` extraction bug: a DB seeded

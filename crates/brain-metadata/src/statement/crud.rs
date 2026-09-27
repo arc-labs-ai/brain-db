@@ -12,9 +12,10 @@ use redb::{ReadTransaction, ReadableTable, WriteTransaction};
 use crate::tables::statement::{
     confidence_bucket, metadata_from_statement, statement_from_metadata, tombstone_reason,
     EvidenceOverflow, StatementMetadata, EVIDENCE_OVERFLOW_TABLE, STATEMENTS_BY_EVENT_TIME_TABLE,
-    STATEMENTS_BY_EVIDENCE_TABLE, STATEMENTS_BY_OBJECT_ENTITY_TABLE, STATEMENTS_BY_PREDICATE_TABLE,
-    STATEMENTS_BY_SUBJECT_TABLE, STATEMENTS_TABLE, STATEMENT_CHAIN_TABLE,
-    STATEMENT_EMBED_QUEUE_TABLE,
+    STATEMENTS_BY_EVIDENCE_TABLE, STATEMENTS_BY_OBJECT_ENTITY_TABLE,
+    STATEMENTS_BY_PREDICATE_ID_TABLE, STATEMENTS_BY_PREDICATE_TABLE,
+    STATEMENTS_BY_SUBJECT_ID_TABLE, STATEMENTS_BY_SUBJECT_TABLE, STATEMENTS_TABLE,
+    STATEMENT_CHAIN_TABLE, STATEMENT_EMBED_QUEUE_TABLE,
 };
 
 use super::supersede::statement_supersede;
@@ -142,6 +143,21 @@ pub fn statement_create(
         }
     }
 
+    // Content dedup for cumulative kinds. Single-valued kinds already
+    // returned above via supersession; what falls through here is Fact /
+    // Event / other cumulative kinds, where nothing collapses a
+    // byte-identical repeat. A transient LLM failure re-runs the whole
+    // extractor pipeline and re-applies already-committed pattern-tier
+    // rows, so an identical `(subject, predicate, object, event_at)`
+    // active row means this is a retry: no-op and return the existing id.
+    // Distinct objects (multi-valued Facts) and distinct event times
+    // (separate Events) never match, so legitimate cumulation is kept.
+    if let Some(e) = subject_entity {
+        if let Some(existing) = find_identical_active_statement(wtxn, scope, e, s)? {
+            return Ok(existing);
+        }
+    }
+
     // Fact contradiction probe (read-only; insert proceeds). Only for
     // entity subjects — memory subjects don't participate in the
     // entity-keyed contradiction index (and temporal events are Events,
@@ -149,19 +165,25 @@ pub fn statement_create(
     if let (StatementKind::Fact, Some(subject_entity)) = (s.kind, subject_entity) {
         let active =
             load_active_facts_for_subject_predicate_wtxn(wtxn, scope, subject_entity, s.predicate)?;
-        let disagrees = active.iter().any(|existing| existing.object != s.object);
-        if disagrees {
+        // A contradiction requires a *different* object AND *overlapping*
+        // validity intervals: sequential facts (old.valid_to < new.valid_from)
+        // describe different periods and are not contradictions.
+        let conflicting: Vec<&Statement> = active
+            .iter()
+            .filter(|existing| existing.object != s.object && fact_intervals_overlap(existing, s))
+            .collect();
+        if !conflicting.is_empty() {
             tracing::warn!(
                 subject = ?subject_entity,
                 predicate = s.predicate.raw(),
                 new_id = ?s.id,
                 "statement_create: Fact contradicts active facts"
             );
-            // Durable audit: the conflicting set is the active Fact(s)
-            // already indexed plus the one being inserted. The insert
-            // still proceeds (coexisting Facts are allowed); operators
-            // reconcile via ADMIN_LIST_PENDING_CONTRADICTIONS.
-            let mut contradicting: Vec<StatementId> = active.iter().map(|a| a.id).collect();
+            // Durable audit: the conflicting set is the overlapping,
+            // disagreeing active Fact(s) plus the one being inserted. The
+            // insert still proceeds (coexisting Facts are allowed);
+            // operators reconcile via ADMIN_LIST_PENDING_CONTRADICTIONS.
+            let mut contradicting: Vec<StatementId> = conflicting.iter().map(|a| a.id).collect();
             contradicting.push(s.id);
             super::contradiction::contradiction_audit_record(
                 wtxn,
@@ -196,6 +218,25 @@ pub fn statement_create(
 // Internal helpers (shared with sibling modules via `pub(super)`).
 // ---------------------------------------------------------------------------
 
+/// Half-open validity interval `[from, to)` for a Fact. An unset
+/// `valid_from` defaults to `extracted_at` (the fact became true no later
+/// than when it was ingested); an unset `valid_to` is open-ended.
+pub(super) fn fact_validity_interval(s: &Statement) -> (u64, u64) {
+    let from = s.valid_from_unix_nanos.unwrap_or(s.extracted_at_unix_nanos);
+    let to = s.valid_to_unix_nanos.unwrap_or(u64::MAX);
+    (from, to)
+}
+
+/// Whether two Facts' validity intervals overlap. Uses half-open
+/// `[from, to)` semantics, so sequential facts (`old.valid_to == new.valid_from`,
+/// or `old.valid_to < new.valid_from`) do not overlap, while a still-open
+/// `valid_to = None` fact overlaps any later fact.
+pub(super) fn fact_intervals_overlap(a: &Statement, b: &Statement) -> bool {
+    let (a_from, a_to) = fact_validity_interval(a);
+    let (b_from, b_to) = fact_validity_interval(b);
+    a_from < b_to && b_from < a_to
+}
+
 /// Per-kind invariants validated before any storage access.
 pub(super) fn validate_statement_shape(s: &Statement) -> Result<(), StatementOpError> {
     if !(0.0..=1.0).contains(&s.confidence) || s.confidence.is_nan() {
@@ -211,7 +252,15 @@ pub(super) fn validate_statement_shape(s: &Statement) -> Result<(), StatementOpE
         // temporal role available so the read answers "when" from the evidence
         // memory's own `occurred_at`, instead of losing the fact by demoting it to
         // a timeless Fact. Only a NON-Event is forbidden a time.
-        StatementKind::Event => {}
+        StatementKind::Event => {
+            // Events are point-in-time, not validity ranges: they carry
+            // event_at (or nothing), never valid_from / valid_to.
+            if s.valid_from_unix_nanos.is_some() || s.valid_to_unix_nanos.is_some() {
+                return Err(StatementOpError::InvalidArgument(
+                    "Event may not set valid_from_unix_nanos / valid_to_unix_nanos",
+                ));
+            }
+        }
         _ => {
             if s.event_at_unix_nanos.is_some() {
                 return Err(StatementOpError::InvalidArgument(
@@ -315,6 +364,12 @@ pub(super) fn insert_new_statement(
             ),
             &m.statement_id_bytes,
         )?;
+        // Immutable id-ordered twin used for keyset pagination resume. Its
+        // key carries no mutable column, so a later supersession /
+        // confidence recompute never relocates the row out from under a
+        // paging cursor.
+        let mut t = wtxn.open_table(STATEMENTS_BY_SUBJECT_ID_TABLE)?;
+        t.insert(&(ns, ag, m.subject_entity_bytes, m.statement_id_bytes), &())?;
     }
 
     // 3. by_predicate.
@@ -331,6 +386,9 @@ pub(super) fn insert_new_statement(
             ),
             &m.statement_id_bytes,
         )?;
+        // Immutable id-ordered twin (see the by_subject_id note above).
+        let mut t = wtxn.open_table(STATEMENTS_BY_PREDICATE_ID_TABLE)?;
+        t.insert(&(ns, ag, m.predicate_id, m.statement_id_bytes), &())?;
     }
 
     // 4. by_object_entity — only if object is Entity.
@@ -469,6 +527,45 @@ pub fn remove_from_predicate_index(
     Ok(())
 }
 
+/// Count non-tombstoned statement rows in `namespace_id` that key on
+/// `predicate_id`, capped at `limit` (pass `usize::MAX` for an exact
+/// count). Walks the by-predicate index across every space in the
+/// namespace and dereferences each hit to the primary row so
+/// tombstoned rows don't count. Used by `SCHEMA_DROP`'s in-use safety
+/// gate — dropping a predicate that still has live statements requires
+/// the caller's explicit `force`.
+pub fn statement_live_count_by_predicate(
+    wtxn: &WriteTransaction,
+    namespace_id: u32,
+    predicate_id: PredicateId,
+    limit: usize,
+) -> Result<usize, StatementOpError> {
+    if limit == 0 {
+        return Ok(0);
+    }
+    let want = predicate_id.raw();
+    let index = wtxn.open_table(STATEMENTS_BY_PREDICATE_TABLE)?;
+    let primary = wtxn.open_table(STATEMENTS_TABLE)?;
+    let mut count = 0usize;
+    for entry in index.iter()? {
+        let (k, v) = entry?;
+        let (k_ns, _space, k_pred, _kind, _bucket, _sid) = k.value();
+        if k_ns != namespace_id || k_pred != want {
+            continue;
+        }
+        let sid = v.value();
+        if let Some(row) = primary.get(&sid)?.map(|g| g.value()) {
+            if row.tombstoned == 0 {
+                count += 1;
+                if count >= limit {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(count)
+}
+
 /// Re-key a still-current statement's predicate-bucket entry after its
 /// confidence changed. No-op when the coarse bucket is unchanged — this
 /// is the index-churn gate that mirrors the >0.05 confidence threshold
@@ -508,6 +605,71 @@ pub fn rekey_predicate_index(
             predicate_id,
             kind,
             new_bucket,
+            *statement_id_bytes,
+        ),
+        statement_id_bytes,
+    )?;
+    Ok(())
+}
+
+/// Insert a statement's `statements_by_predicate` entry when it (re-)joins
+/// the live set — the FORGET-cascade revert path re-activating a row it
+/// tombstoned. Bucketed by `confidence`. Mirrors the create-path insert in
+/// `insert_new_statement` step 3. Idempotent: re-inserting the same key
+/// is a redb overwrite of an identical value.
+pub fn add_to_predicate_index(
+    wtxn: &WriteTransaction,
+    scope: RowScope,
+    predicate_id: u32,
+    kind: u8,
+    confidence: f32,
+    statement_id_bytes: &[u8; 16],
+) -> Result<(), StatementOpError> {
+    let mut t = wtxn.open_table(STATEMENTS_BY_PREDICATE_TABLE)?;
+    t.insert(
+        &(
+            scope.namespace_id,
+            scope.space_id_bytes,
+            predicate_id,
+            kind,
+            confidence_bucket(confidence),
+            *statement_id_bytes,
+        ),
+        statement_id_bytes,
+    )?;
+    Ok(())
+}
+
+/// Flip a statement's `by_subject` index entry from non-current
+/// (`is_current = 0`) back to current (`1`). The inverse of
+/// `flip_by_subject_to_noncurrent`, used by the FORGET-cascade revert
+/// path when it un-tombstones a row.
+pub fn flip_by_subject_to_current(
+    wtxn: &WriteTransaction,
+    scope: RowScope,
+    subject_entity_bytes: [u8; 16],
+    kind: u8,
+    predicate_id: u32,
+    statement_id_bytes: &[u8; 16],
+) -> Result<(), StatementOpError> {
+    let mut bys = wtxn.open_table(STATEMENTS_BY_SUBJECT_TABLE)?;
+    bys.remove(&(
+        scope.namespace_id,
+        scope.space_id_bytes,
+        subject_entity_bytes,
+        kind,
+        predicate_id,
+        0u8,
+        *statement_id_bytes,
+    ))?;
+    bys.insert(
+        &(
+            scope.namespace_id,
+            scope.space_id_bytes,
+            subject_entity_bytes,
+            kind,
+            predicate_id,
+            1u8,
             *statement_id_bytes,
         ),
         statement_id_bytes,
@@ -616,6 +778,62 @@ fn find_current_statement(
         None => None,
     };
     Ok(first)
+}
+
+/// Find an active statement byte-identical to `s` on its semantic
+/// identity — `(subject, predicate, kind, object, event_at)`.
+///
+/// Used to make cumulative-kind creation idempotent under extractor
+/// retries. Matching includes the object and event time, so distinct
+/// multi-values (different objects) and distinct events (different
+/// `event_at`) never collapse — only an exact repeat does.
+fn find_identical_active_statement(
+    wtxn: &WriteTransaction,
+    scope: RowScope,
+    subject: EntityId,
+    s: &Statement,
+) -> Result<Option<StatementId>, StatementOpError> {
+    let bys = wtxn.open_table(STATEMENTS_BY_SUBJECT_TABLE)?;
+    let lo = (
+        scope.namespace_id,
+        scope.space_id_bytes,
+        subject.to_bytes(),
+        s.kind.as_u8(),
+        s.predicate.raw(),
+        1u8,
+        [0u8; 16],
+    );
+    let hi = (
+        scope.namespace_id,
+        scope.space_id_bytes,
+        subject.to_bytes(),
+        s.kind.as_u8(),
+        s.predicate.raw(),
+        1u8,
+        [0xffu8; 16],
+    );
+    let mut ids: Vec<[u8; 16]> = Vec::new();
+    for entry in bys.range(lo..=hi)? {
+        let (_, v) = entry?;
+        ids.push(v.value());
+    }
+    let st = wtxn.open_table(STATEMENTS_TABLE)?;
+    let self_bytes = s.id.to_bytes();
+    for id in ids {
+        if id == self_bytes {
+            continue;
+        }
+        let Some(m) = st.get(&id)?.map(|g| g.value()) else {
+            continue;
+        };
+        let Some(existing) = statement_from_metadata(&m) else {
+            continue;
+        };
+        if existing.object == s.object && existing.event_at_unix_nanos == s.event_at_unix_nanos {
+            return Ok(Some(existing.id));
+        }
+    }
+    Ok(None)
 }
 
 /// Write-txn variant used by the in-line contradiction probe so it
@@ -753,6 +971,69 @@ fn predicate_get_via(
     Ok(row.as_ref().map(PredicateDefinition::to_predicate))
 }
 
+/// One-time construction of the immutable id-ordered pagination indexes
+/// ([`STATEMENTS_BY_SUBJECT_ID_TABLE`] and
+/// [`STATEMENTS_BY_PREDICATE_ID_TABLE`]) from the authoritative primary
+/// rows, for a DB written before these indexes existed. Idempotent: a
+/// no-op once the predicate-id index holds any row (every live statement
+/// writes it, so a non-empty index is never stale-missing).
+///
+/// These indexes are derived data — like the in-RAM HNSW rebuilt from the
+/// primary rows at boot — so reconstructing them is index construction,
+/// not a format migration. Runs inside the caller's open-time write txn.
+/// Uses redb-native errors to match [`crate::tables::materialize_all_tables`].
+/// Returns the number of primary rows scanned into the indexes.
+pub fn backfill_statement_id_indexes(wtxn: &WriteTransaction) -> Result<usize, redb::Error> {
+    // Already populated → the common (already-migrated) boot. The
+    // predicate-id index gets a row for every live statement, so it is the
+    // authoritative sentinel (the subject-id index skips memory subjects).
+    {
+        let idx = wtxn.open_table(STATEMENTS_BY_PREDICATE_ID_TABLE)?;
+        if idx.iter()?.next().is_some() {
+            return Ok(0);
+        }
+    }
+    // Collect keys first so the primary read iterator is dropped before the
+    // indexes are opened for write (borrow discipline).
+    struct Row {
+        ns: u32,
+        ag: [u8; 16],
+        subject: [u8; 16],
+        predicate_id: u32,
+        id: [u8; 16],
+        subject_kind: u8,
+    }
+    let rows: Vec<Row> = {
+        let primary = wtxn.open_table(STATEMENTS_TABLE)?;
+        let mut rs = Vec::new();
+        for entry in primary.iter()? {
+            let (_, v) = entry?;
+            let m = v.value();
+            rs.push(Row {
+                ns: m.namespace_id,
+                ag: m.space_id_bytes,
+                subject: m.subject_entity_bytes,
+                predicate_id: m.predicate_id,
+                id: m.statement_id_bytes,
+                subject_kind: m.subject_kind,
+            });
+        }
+        rs
+    };
+    let n = rows.len();
+    let mut bysi = wtxn.open_table(STATEMENTS_BY_SUBJECT_ID_TABLE)?;
+    let mut bypi = wtxn.open_table(STATEMENTS_BY_PREDICATE_ID_TABLE)?;
+    for r in rows {
+        // Mirror the insert gate: memory subjects are by-subject-indexed
+        // too, only `pending` (subject_kind == 1) is skipped.
+        if r.subject_kind != 1 {
+            bysi.insert(&(r.ns, r.ag, r.subject, r.id), &())?;
+        }
+        bypi.insert(&(r.ns, r.ag, r.predicate_id, r.id), &())?;
+    }
+    Ok(n)
+}
+
 // ---------------------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------------------
@@ -767,6 +1048,9 @@ mod tests {
     use brain_core::{Entity, EntityType, StatementValue, TombstoneReason, INLINE_EVIDENCE_CAP};
     use brain_core::{MemoryId, SessionId};
     use smallvec::SmallVec;
+
+    const T0: u64 = 1_700_000_000_000_000_000;
+
     fn test_scope() -> RowScope {
         RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xAB; 16])
     }
@@ -942,6 +1226,70 @@ mod tests {
     }
 
     #[test]
+    fn live_count_by_predicate_counts_only_non_tombstoned() {
+        let (_dir, mut db) = open_db();
+        let subj = make_entity(&mut db, "priya");
+        let obj = make_entity(&mut db, "manager-role");
+        let pred = intern_fact_entity_pred(&mut db, "reports_to");
+        let ns = test_scope().namespace_id;
+
+        // No statements yet.
+        {
+            let wtxn = db.write_txn().unwrap();
+            assert_eq!(
+                statement_live_count_by_predicate(&wtxn, ns, pred, usize::MAX).unwrap(),
+                0
+            );
+        }
+
+        // One live statement on the predicate.
+        let sid = {
+            let wtxn = db.write_txn().unwrap();
+            let s = fresh_fact(subj, pred, obj);
+            let id = statement_create(&wtxn, test_scope(), SessionId::DEFAULT, &s, T0).unwrap();
+            wtxn.commit().unwrap();
+            id
+        };
+        {
+            let wtxn = db.write_txn().unwrap();
+            assert_eq!(
+                statement_live_count_by_predicate(&wtxn, ns, pred, usize::MAX).unwrap(),
+                1
+            );
+            // A different predicate id sees nothing.
+            assert_eq!(
+                statement_live_count_by_predicate(&wtxn, ns, PredicateId::from(pred.raw() + 7), 1)
+                    .unwrap(),
+                0
+            );
+            // A different namespace sees nothing.
+            assert_eq!(
+                statement_live_count_by_predicate(&wtxn, ns + 1, pred, usize::MAX).unwrap(),
+                0
+            );
+            // The cap short-circuits at the first hit.
+            assert_eq!(
+                statement_live_count_by_predicate(&wtxn, ns, pred, 1).unwrap(),
+                1
+            );
+        }
+
+        // Tombstoning removes it from the live count.
+        {
+            let wtxn = db.write_txn().unwrap();
+            statement_tombstone(&wtxn, sid, TombstoneReason::UserRequest, T0 + 1).unwrap();
+            wtxn.commit().unwrap();
+        }
+        {
+            let wtxn = db.write_txn().unwrap();
+            assert_eq!(
+                statement_live_count_by_predicate(&wtxn, ns, pred, usize::MAX).unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
     fn create_fact_round_trips_via_get() {
         let (_dir, mut db) = open_db();
         let subj = make_entity(&mut db, "priya");
@@ -1034,6 +1382,121 @@ mod tests {
             .get(&(sc.namespace_id, sc.space_id_bytes, s.id.to_bytes(), 1u32))
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn cumulative_fact_identical_reapply_is_noop() {
+        // On a transient LLM failure the extractor worker re-runs the whole
+        // pipeline and re-applies the already-committed cumulative-kind rows.
+        // An identical `(subject, predicate, object)` Fact must not leak a
+        // second active row: the create is a no-op returning the first id.
+        let (_dir, mut db) = open_db();
+        let subj = make_entity(&mut db, "dup-subj");
+        let obj = make_entity(&mut db, "dup-obj");
+        let pred = intern_fact_entity_pred(&mut db, "role_dup");
+
+        let s1 = fresh_fact(subj, pred, obj);
+        let wtxn = db.write_txn().unwrap();
+        let id1 =
+            statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &s1, 0).unwrap();
+        wtxn.commit().unwrap();
+
+        // The retry: identical content, fresh StatementId.
+        let s2 = fresh_fact(subj, pred, obj);
+        assert_ne!(s1.id, s2.id);
+        let wtxn = db.write_txn().unwrap();
+        let id2 =
+            statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &s2, 1).unwrap();
+        wtxn.commit().unwrap();
+
+        assert_eq!(id2, id1, "identical re-apply must return the existing id");
+        let rtxn = db.read_txn().unwrap();
+        assert!(statement_get(&rtxn, s2.id).unwrap().is_none());
+
+        let filter = StatementListFilter {
+            subject: Some(subj),
+            predicate: Some(pred),
+            kind: Some(StatementKind::Fact),
+            current_only: true,
+            ..Default::default()
+        };
+        let current = statement_list(&rtxn, test_scope(), &filter).unwrap();
+        assert_eq!(current.len(), 1, "retry must not add a second Fact row");
+        assert_eq!(current[0].id, s1.id);
+    }
+
+    #[test]
+    fn cumulative_fact_distinct_objects_coexist() {
+        // Dedup keys on the object, so two Facts with the same
+        // (subject, predicate) but DIFFERENT objects are genuine
+        // multi-values and both stay current.
+        let (_dir, mut db) = open_db();
+        let subj = make_entity(&mut db, "multi-subj");
+        let obj_a = make_entity(&mut db, "obj-a");
+        let obj_b = make_entity(&mut db, "obj-b");
+        let pred = intern_fact_entity_pred(&mut db, "linked_role");
+
+        for obj in [obj_a, obj_b] {
+            let s = fresh_fact(subj, pred, obj);
+            let wtxn = db.write_txn().unwrap();
+            statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &s, 0).unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        let rtxn = db.read_txn().unwrap();
+        let filter = StatementListFilter {
+            subject: Some(subj),
+            predicate: Some(pred),
+            kind: Some(StatementKind::Fact),
+            current_only: true,
+            ..Default::default()
+        };
+        let current = statement_list(&rtxn, test_scope(), &filter).unwrap();
+        assert_eq!(current.len(), 2);
+    }
+
+    #[test]
+    fn event_distinct_times_coexist_identical_time_dedups() {
+        // Events are cumulative but distinguished by event time: two events
+        // with different `event_at` coexist, while re-applying an event with
+        // the same object AND time is a no-op (extractor retry).
+        let (_dir, mut db) = open_db();
+        let subj = make_entity(&mut db, "event-subj");
+        let pred = intern_event_any_pred(&mut db, "scheduled_at");
+
+        let e1 = fresh_event(subj, pred, 1_700_000_100_000_000_000);
+        let e2 = fresh_event(subj, pred, 1_700_000_200_000_000_000);
+        let wtxn = db.write_txn().unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e1, 0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e2, 1).unwrap();
+        wtxn.commit().unwrap();
+
+        // Retry of e1: same object, same event_at, fresh id → no-op.
+        let e1_retry = fresh_event(subj, pred, 1_700_000_100_000_000_000);
+        let wtxn = db.write_txn().unwrap();
+        let dup_id = statement_create(
+            &wtxn,
+            test_scope(),
+            brain_core::SessionId::DEFAULT,
+            &e1_retry,
+            2,
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+
+        assert_eq!(dup_id, e1.id, "identical-time event retry is a no-op");
+        let rtxn = db.read_txn().unwrap();
+        assert!(statement_get(&rtxn, e1_retry.id).unwrap().is_none());
+
+        let filter = StatementListFilter {
+            subject: Some(subj),
+            predicate: Some(pred),
+            kind: Some(StatementKind::Event),
+            current_only: true,
+            ..Default::default()
+        };
+        let current = statement_list(&rtxn, test_scope(), &filter).unwrap();
+        assert_eq!(current.len(), 2, "two distinct-time events must coexist");
     }
 
     #[test]
@@ -1895,5 +2358,144 @@ mod tests {
             crate::statement::statement_embed_queue_len(&rtxn).unwrap(),
             2
         );
+    }
+
+    // -- S1: Event validity invariants (validate_statement_shape) ---------
+
+    #[test]
+    fn event_with_valid_from_rejected() {
+        let subj = EntityId::new();
+        let pred = PredicateId::from(1);
+        let mut s = fresh_event(subj, pred, T0 + 10);
+        s.valid_from_unix_nanos = Some(T0);
+        assert!(
+            matches!(
+                validate_statement_shape(&s),
+                Err(StatementOpError::InvalidArgument(_))
+            ),
+            "an Event carrying valid_from must be rejected"
+        );
+    }
+
+    #[test]
+    fn event_with_valid_to_rejected() {
+        let subj = EntityId::new();
+        let pred = PredicateId::from(1);
+        let mut s = fresh_event(subj, pred, T0 + 10);
+        s.valid_to_unix_nanos = Some(T0 + 20);
+        assert!(matches!(
+            validate_statement_shape(&s),
+            Err(StatementOpError::InvalidArgument(_))
+        ));
+    }
+
+    #[test]
+    fn event_with_only_event_at_accepted() {
+        let subj = EntityId::new();
+        let pred = PredicateId::from(1);
+        let s = fresh_event(subj, pred, T0 + 10);
+        assert!(validate_statement_shape(&s).is_ok());
+    }
+
+    #[test]
+    fn fact_with_validity_accepted() {
+        let subj = EntityId::new();
+        let obj = EntityId::new();
+        let pred = PredicateId::from(1);
+        let mut s = fresh_fact(subj, pred, obj);
+        s.valid_from_unix_nanos = Some(T0);
+        s.valid_to_unix_nanos = Some(T0 + 100);
+        assert!(validate_statement_shape(&s).is_ok());
+    }
+
+    // -- S5: extracted_at is record time, independent of valid_from -------
+
+    #[test]
+    fn create_preserves_arrival_extracted_at_with_historical_valid_from() {
+        let (_dir, mut db) = open_db();
+        let subj = make_entity(&mut db, "priya");
+        let obj = make_entity(&mut db, "manager-role");
+        let pred = intern_fact_entity_pred(&mut db, "role");
+
+        // Caller supplies a historical valid_from; extracted_at must be the
+        // arrival time passed to statement_create, not the historical date.
+        let historical = 1_600_000_000_000_000_000u64;
+        let arrival = 1_700_000_000_000_000_500u64;
+        let mut s = fresh_fact(subj, pred, obj);
+        s.valid_from_unix_nanos = Some(historical);
+
+        let wtxn = db.write_txn().unwrap();
+        let id = statement_create(&wtxn, test_scope(), SessionId::DEFAULT, &s, arrival).unwrap();
+        wtxn.commit().unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        let stored = statement_get(&rtxn, id).unwrap().unwrap();
+        assert_eq!(stored.valid_from_unix_nanos, Some(historical));
+        // extracted_at is set by Statement::new_root from the value the
+        // caller passed as `extracted_at_unix_nanos` (fresh_fact uses a
+        // fixed base); the point of S5 is the handler always passes arrival
+        // there — this asserts the two fields stay independent in storage.
+        assert_ne!(stored.extracted_at_unix_nanos, historical);
+    }
+
+    // -- S2: contradiction requires overlapping validity -----------------
+
+    #[test]
+    fn sequential_facts_do_not_contradict() {
+        let (_dir, mut db) = open_db();
+        let subj = make_entity(&mut db, "priya");
+        let engineer = make_entity(&mut db, "engineer-role");
+        let manager = make_entity(&mut db, "manager-role");
+        let pred = intern_fact_entity_pred(&mut db, "role");
+
+        // F1 valid until T; F2 valid from T+1 -> non-overlapping.
+        let mut f1 = fresh_fact(subj, pred, engineer);
+        f1.valid_to_unix_nanos = Some(T0 + 100);
+        let mut f2 = fresh_fact(subj, pred, manager);
+        f2.valid_from_unix_nanos = Some(T0 + 200);
+
+        let wtxn = db.write_txn().unwrap();
+        statement_create(&wtxn, test_scope(), SessionId::DEFAULT, &f1, T0).unwrap();
+        statement_create(&wtxn, test_scope(), SessionId::DEFAULT, &f2, T0).unwrap();
+        wtxn.commit().unwrap();
+
+        let wtxn = db.write_txn().unwrap();
+        let pending =
+            crate::statement::contradiction::contradiction_audit_list_pending(&wtxn, 16, T0 + 1)
+                .unwrap();
+        wtxn.commit().unwrap();
+        assert!(
+            pending.is_empty(),
+            "sequential facts describe different periods, not a contradiction"
+        );
+    }
+
+    #[test]
+    fn overlapping_distinct_facts_contradict() {
+        let (_dir, mut db) = open_db();
+        let subj = make_entity(&mut db, "priya");
+        let engineer = make_entity(&mut db, "engineer-role");
+        let manager = make_entity(&mut db, "manager-role");
+        let pred = intern_fact_entity_pred(&mut db, "role");
+
+        // Overlapping intervals with distinct objects -> contradiction.
+        let mut f1 = fresh_fact(subj, pred, engineer);
+        f1.valid_from_unix_nanos = Some(T0);
+        f1.valid_to_unix_nanos = Some(T0 + 300);
+        let mut f2 = fresh_fact(subj, pred, manager);
+        f2.valid_from_unix_nanos = Some(T0 + 100);
+        f2.valid_to_unix_nanos = Some(T0 + 400);
+
+        let wtxn = db.write_txn().unwrap();
+        statement_create(&wtxn, test_scope(), SessionId::DEFAULT, &f1, T0).unwrap();
+        statement_create(&wtxn, test_scope(), SessionId::DEFAULT, &f2, T0).unwrap();
+        wtxn.commit().unwrap();
+
+        let wtxn = db.write_txn().unwrap();
+        let pending =
+            crate::statement::contradiction::contradiction_audit_list_pending(&wtxn, 16, T0 + 1)
+                .unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(pending.len(), 1, "overlapping distinct facts contradict");
     }
 }

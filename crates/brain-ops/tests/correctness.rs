@@ -128,6 +128,7 @@ async fn encode(fix: &Fixture, rid: [u8; 16], text: &str) -> u128 {
 
 async fn recall(fix: &Fixture, cue: &str, max_results: u32) -> RecallResponseFrame {
     let req = RecallRequest {
+        scope: Default::default(),
         trace: false,
         cue_text: cue.into(),
         subject_name: String::new(),

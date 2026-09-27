@@ -82,7 +82,6 @@ pub mod proposal_tier {
 /// `candidate_entity` — the candidate is canonical because it pre-dated
 /// the source.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct MergeReviewProposal {
     pub proposal_id: [u8; 16],
     pub source_entity: [u8; 16],

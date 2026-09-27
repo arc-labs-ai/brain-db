@@ -44,6 +44,38 @@ a fixed top-K window. The relevance band (not a count) decides which memories
 belong to the answer; `max_results` is only a safety ceiling on how many members
 are returned, never the criterion that shapes the answer.
 
+### Recall scope — space (default) vs namespace-wide
+
+RECALL carries a `scope` selector:
+
+```rust
+enum RecallScope { Space, Namespace }   // wire default: Space
+```
+
+- **`Space`** (default, unchanged): the request is served by the single shard the
+  caller's `(namespace, space)` hashes to (`shard_for_space`), and the pipeline
+  above runs once on that shard.
+- **`Namespace`**: the request spans **every space in the caller's own namespace**.
+  Because a namespace's spaces hash across shards (shared-nothing shards, each with
+  its own indexes), the connection layer **fans the RECALL out to all shards in
+  parallel**; each shard runs the retrieval pipeline with its scope filter widened
+  from `(namespace, space)` to `namespace_id` only (all spaces it holds), and
+  returns **raw scored candidates** (per-lane scores, not yet shaped). The router
+  then **globally merges** the per-shard pools (RRF), and the membership / precision
+  shaping runs **once over the merged pool** — so `Single`/`Many`/`None` and the
+  precision decision are computed globally, not per shard.
+
+Authorization reuses the existing `RECALL` permission: a key that may RECALL may
+request `scope = Namespace`. **Tenant-isolation invariant (non-negotiable):** a
+namespace-wide RECALL returns only rows of the caller's own `namespace_id`. Each
+shard's filter pins `namespace_id`, and the router never merges across namespaces —
+`scope = Namespace` can never surface another tenant's data. `act_as` still selects
+the effective identity; the namespace-wide span is over the *effective* namespace.
+
+`max_results` remains a global safety ceiling on the merged answer; each shard is
+additionally bounded to a per-shard top-K during fan-out so the merge cost stays
+proportional to one shard's work, not the whole corpus.
+
 ### MEMORY_LIST — enumeration, not search
 
 `MEMORY_LIST` (`0x0027`) is a distinct read *kind*: a non-ranked, paginated
@@ -349,8 +381,8 @@ lists in its own layer; the DB returns the answer.
 
 For agents whose data spans multiple shards (rare), RECALL fans out:
 
-- Each shard runs its sub-recall in parallel.
-- Results are merged by score.
+- Each shard runs its sub-recall in parallel, returning raw scored candidates (not shaped).
+- The router merges the per-shard pools with **global RRF** over each hit's within-shard rank (see the "Recall scope — space vs namespace-wide" section above and [`../13_retrievers/01_rrf_fusion.md`](../13_retrievers/01_rrf_fusion.md)).
 
 The membership answer is computed over the merged global candidate pool.
 

@@ -26,7 +26,6 @@ pub const NAMESPACE_BY_NAME_TABLE: TableDefinition<'static, &'static str, u32> =
     TableDefinition::new("namespace_by_name");
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct NamespaceDefinition {
     pub namespace_id: u32,
     pub name: String,

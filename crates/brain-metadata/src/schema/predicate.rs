@@ -36,6 +36,9 @@ pub enum PredicateOpError {
         qname: String,
         existing_id: PredicateId,
     },
+
+    #[error("predicate {0:?} not found")]
+    NotFound(PredicateId),
 }
 
 // ---------------------------------------------------------------------------
@@ -229,6 +232,41 @@ pub fn predicate_get(
     Ok(row.as_ref().map(PredicateDefinition::to_predicate))
 }
 
+/// Set (or clear, with `0`) the explicit retention TTL for a predicate, in
+/// seconds. Called from schema-apply after the predicate is interned — retention
+/// is a storage-only policy the projected `Predicate` value type doesn't carry,
+/// so it's stamped directly on the row here. Idempotent; a no-op when the value
+/// is already current. Errors if the predicate row doesn't exist.
+pub fn predicate_set_retention(
+    wtxn: &WriteTransaction,
+    id: PredicateId,
+    retention_seconds: u64,
+) -> Result<(), PredicateOpError> {
+    let mut t = wtxn.open_table(PREDICATES_TABLE)?;
+    let Some(mut row) = t.get(&id.raw())?.map(|g| g.value()) else {
+        return Err(PredicateOpError::NotFound(id));
+    };
+    if row.retention_seconds == retention_seconds {
+        return Ok(());
+    }
+    row.retention_seconds = retention_seconds;
+    t.insert(&id.raw(), &row)?;
+    Ok(())
+}
+
+/// The explicit retention TTL for a predicate, in seconds (`0` = none). Reads
+/// the persisted row directly, since [`predicate_get`]'s projected `Predicate`
+/// drops this storage-only field. Missing predicate ⇒ `0`.
+pub fn predicate_retention_seconds(
+    rtxn: &ReadTransaction,
+    id: PredicateId,
+) -> Result<u64, PredicateOpError> {
+    let t = rtxn.open_table(PREDICATES_TABLE)?;
+    Ok(t.get(&id.raw())?
+        .map(|g| g.value().retention_seconds)
+        .unwrap_or(0))
+}
+
 /// Look up a predicate by its namespaced qname. Identifier validation
 /// is enforced — invalid namespace/name produces
 /// [`PredicateOpError::InvalidIdentifier`] instead of `Ok(None)`.
@@ -391,7 +429,7 @@ pub fn predicate_embedding_get(
     };
     let bytes = g.value();
     let mut out = Vec::with_capacity(bytes.len() / 4);
-    for chunk in bytes.chunks_exact(4) {
+    for chunk in bytes.as_chunks::<4>().0.iter() {
         out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }
     Ok(Some(out))
@@ -840,7 +878,7 @@ pub fn predicate_consolidation_candidates_rtxn(
 /// The embedding is stored as little-endian `f32`s.
 fn decode_candidate(row: &PredicateDefinition, bytes: &[u8]) -> PredicateConsolidationCandidate {
     let mut vec = Vec::with_capacity(bytes.len() / 4);
-    for chunk in bytes.chunks_exact(4) {
+    for chunk in bytes.as_chunks::<4>().0.iter() {
         vec.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }
     (
@@ -892,6 +930,56 @@ pub fn predicate_drop_schema_declared(
         }
     }
     Ok(count)
+}
+
+/// Drop a single schema-declared predicate row identified by
+/// `(namespace, name)`. The scoped counterpart to
+/// [`predicate_drop_schema_declared`]: `SCHEMA_DROP` narrows one
+/// declaration instead of wiping the whole namespace.
+///
+/// Returns `Some(id)` when a schema-declared predicate with that qname
+/// existed and was removed, `None` when no schema-declared predicate
+/// with that qname exists. An implicit-from-write row sharing the qname
+/// is deliberately left untouched — the declared vocabulary is the only
+/// thing `SCHEMA_DROP` narrows, and an open-vocab row is not part of it.
+/// The embedding row is left in place (a harmless orphan), matching
+/// [`predicate_drop_schema_declared`].
+pub fn predicate_drop_one(
+    wtxn: &WriteTransaction,
+    namespace: &str,
+    name: &str,
+) -> Result<Option<PredicateId>, PredicateOpError> {
+    validate_namespace(namespace)?;
+    validate_name(name)?;
+
+    let q = qname(namespace, name);
+    let victim: Option<u32> = {
+        let idx = wtxn.open_table(PREDICATES_BY_QNAME_TABLE)?;
+        let id = idx.get(q.as_str())?.map(|g| g.value());
+        drop(idx);
+        match id {
+            Some(id) => {
+                let t = wtxn.open_table(PREDICATES_TABLE)?;
+                let row: Option<PredicateDefinition> = t.get(&id)?.map(|g| g.value());
+                match row {
+                    Some(r) if r.origin().is_schema_declared() => Some(id),
+                    _ => None,
+                }
+            }
+            None => None,
+        }
+    };
+    if let Some(id) = victim {
+        {
+            let mut t = wtxn.open_table(PREDICATES_TABLE)?;
+            t.remove(&id)?;
+        }
+        {
+            let mut idx = wtxn.open_table(PREDICATES_BY_QNAME_TABLE)?;
+            idx.remove(q.as_str())?;
+        }
+    }
+    Ok(victim.map(PredicateId::from))
 }
 
 // ---------------------------------------------------------------------------

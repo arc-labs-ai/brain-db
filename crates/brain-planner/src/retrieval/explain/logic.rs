@@ -17,19 +17,32 @@ use std::fmt::Write;
 
 use crate::retrieval::executor::{QueryMetadata, RetrieverStatus};
 use crate::retrieval::filters::{FilterChain, FilterChainStats};
+use crate::retrieval::fusion::FusionMethod;
 use crate::retrieval::planner::{PreFilter, QueryPlan, RetrieverConfig};
 use crate::retrieval::router::{OverrideKind, Retriever};
 
 /// Render a `QueryPlan` as a human-readable EXPLAIN report.
+///
+/// EXPLAIN does not execute, so for RRF the effective smoothing constant
+/// (derived adaptively from the candidate-pool size at execution) is not
+/// yet known; the fusion line reports `k=adaptive`. TRACE, which executes,
+/// renders the concrete effective k via [`render_trace`].
 #[must_use]
 pub fn render_plan(plan: &QueryPlan) -> String {
+    render_plan_inner(plan, None)
+}
+
+/// Shared plan renderer. `effective_k` is the RRF constant execution
+/// actually used (from [`QueryMetadata::effective_fusion_k`]); `None`
+/// means the plan-only EXPLAIN path where no execution has happened.
+fn render_plan_inner(plan: &QueryPlan, effective_k: Option<u32>) -> String {
     let mut s = String::new();
     let _ = writeln!(s, "QUERY: <see request text in calling layer>");
     let _ = writeln!(s, "PLAN:");
     render_routing(&mut s, plan);
     render_pre_filters(&mut s, plan);
     render_retrievers(&mut s, plan);
-    render_fusion(&mut s, plan);
+    render_fusion(&mut s, plan, effective_k);
     render_post_filters(&mut s, &plan.post_filters);
     let _ = writeln!(s, "  LIMIT: {}", plan.limit);
     let _ = writeln!(s, "  ESTIMATED COST: {:.1}ms", plan.estimated_cost_ms);
@@ -37,9 +50,13 @@ pub fn render_plan(plan: &QueryPlan) -> String {
 }
 
 /// Render plan + execution metadata as a TRACE report.
+///
+/// The fusion line reports the effective k the engine fused at
+/// ([`QueryMetadata::effective_fusion_k`]), so EXPLAIN/TRACE and execution
+/// agree rather than always printing the plan's nominal k.
 #[must_use]
 pub fn render_trace(plan: &QueryPlan, metadata: &QueryMetadata) -> String {
-    let mut s = render_plan(plan);
+    let mut s = render_plan_inner(plan, Some(metadata.effective_fusion_k));
     let _ = writeln!(s, "EXECUTION:");
     render_per_retriever(&mut s, metadata);
     render_filter_stats(&mut s, &metadata.filter_stats);
@@ -163,12 +180,26 @@ fn render_retrievers(s: &mut String, plan: &QueryPlan) {
     }
 }
 
-fn render_fusion(s: &mut String, plan: &QueryPlan) {
+fn render_fusion(s: &mut String, plan: &QueryPlan, effective_k: Option<u32>) {
     let w = &plan.fusion.weights;
+    // Report the k execution actually fused at. When known (TRACE), that is
+    // the recorded effective k. When unknown (plan-only EXPLAIN): RRF picks
+    // k adaptively from the pool size at run time, so no static value is
+    // truthful — print `adaptive`; non-RRF methods do use `plan.fusion.k`.
+    let k_display = match effective_k {
+        Some(k) => k.to_string(),
+        None => {
+            if plan.fusion.method == FusionMethod::Rrf {
+                "adaptive".to_string()
+            } else {
+                plan.fusion.k.to_string()
+            }
+        }
+    };
     let _ = writeln!(
         s,
-        "  FUSION: RRF(k={}, weights={{sem={:.2}, lex={:.2}, gr={:.2}}})",
-        plan.fusion.k, w.semantic, w.lexical, w.graph,
+        "  FUSION: RRF(k={k_display}, weights={{sem={:.2}, lex={:.2}, gr={:.2}}})",
+        w.semantic, w.lexical, w.graph,
     );
 }
 

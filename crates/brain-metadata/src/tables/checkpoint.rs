@@ -48,7 +48,6 @@ pub const CHECKPOINTS_TABLE: TableDefinition<'static, u64, CheckpointMeta> =
 /// [`crate::tables::memory::MemoryMetadata`]); the `Meta` suffix
 /// preserves that pattern without colliding.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct CheckpointMeta {
     /// Mirrors the table key. Monotonic across checkpoint attempts;
     /// the writer task assigns these (see
@@ -113,9 +112,9 @@ impl redb::Value for CheckpointMeta {
     {
         // rkyv 0.7's validation includes alignment; redb returns bytes
         // at arbitrary alignment, so copy into an AlignedVec first.
-        let mut buf = rkyv::AlignedVec::with_capacity(data.len());
+        let mut buf = rkyv::util::AlignedVec::<16>::with_capacity(data.len());
         buf.extend_from_slice(data);
-        rkyv::from_bytes::<CheckpointMeta>(&buf)
+        rkyv::from_bytes::<CheckpointMeta, rkyv::rancor::Error>(&buf)
             .expect("CheckpointMeta bytes failed rkyv validation; redb file is corrupt")
     }
 
@@ -124,7 +123,7 @@ impl redb::Value for CheckpointMeta {
         Self: 'a,
         Self: 'b,
     {
-        rkyv::to_bytes::<_, 256>(value)
+        rkyv::to_bytes::<rkyv::rancor::Error>(value)
             .expect("CheckpointMeta is rkyv-serializable")
             .into_vec()
     }

@@ -11,11 +11,14 @@ on:
 permissions:
   contents: read
 
-# Cancel a stale run when a newer commit lands on the same branch/PR —
-# no point finishing a CI run for a diff that's already superseded.
+# Cancel a stale PR run when a newer commit lands — no point finishing CI for a
+# diff that's already superseded. Pushes to the release branches (main, dev) are
+# NOT cancelled: a rapid burst of pushes during release prep would otherwise kill
+# each in-flight run before it finishes, so CI never reaches green even though
+# nothing is broken. Those runs must complete.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -27,8 +30,12 @@ env:
 jobs:
   build-and-test:
     name: Build & test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 45
+    env:
+      # Use the Ubuntu 26 compatibility compiler only for C sources; assembly
+      # sources must not receive the Linux header injection.
+      CC: ${{ github.workspace }}/.github/scripts/cc-ubuntu26
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-rust
@@ -72,7 +79,7 @@ jobs:
 
   miri:
     name: Miri (storage layer)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     env:
       # The byte-logic tests miri DOES run (slot/payload) use proptest, which
@@ -81,6 +88,7 @@ jobs:
       # checks UB. The mmap/WAL modules miri genuinely can't model stay gated
       # behind #[cfg(all(test, not(miri)))].
       MIRIFLAGS: -Zmiri-disable-isolation
+      CC: ${{ github.workspace }}/.github/scripts/cc-ubuntu26
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-rust
@@ -96,7 +104,7 @@ jobs:
 
   audit:
     name: cargo audit
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6

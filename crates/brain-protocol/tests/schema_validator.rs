@@ -60,6 +60,7 @@ fn duplicate_predicate_fails() {
             },
             stateful: None,
             description: None,
+            retention: None,
         })
     };
     let s = s_with_items(vec![p(), p()]);
@@ -91,6 +92,7 @@ fn preference_entity_object_mismatches() {
         },
         stateful: None,
         description: None,
+        retention: None,
     });
     let s = s_with_items(vec![person_entity(), p]);
     assert_has_code(&s, ValidationErrorCode::PredicateKindObjectMismatch);
@@ -104,6 +106,7 @@ fn event_statement_object_mismatches() {
         object: ObjectTypeDecl::Statement,
         stateful: None,
         description: None,
+        retention: None,
     });
     let s = s_with_items(vec![p]);
     assert_has_code(&s, ValidationErrorCode::PredicateKindObjectMismatch);

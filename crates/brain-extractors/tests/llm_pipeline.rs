@@ -19,8 +19,7 @@ use std::time::Duration;
 use brain_core::{ExtractorId, Memory, MemoryId, MemoryKind, Salience, SessionId, SpaceId};
 use brain_extractors::{
     framework::extractor::{ExtractionContext, ExtractionStatus, Extractor},
-    hash_memory_text, CostBudget, ExtractedItem, ExtractionResult, ExtractorRegistry, LlmExtractor,
-    Pricing,
+    CostBudget, ExtractedItem, ExtractionResult, ExtractorRegistry, LlmExtractor, Pricing,
 };
 use brain_llm::client::{model_id_hash, LlmFuture};
 use brain_llm::{LlmClient, LlmError, LlmMessage, LlmRequest, LlmResponse, LlmRole};
@@ -98,17 +97,29 @@ fn target() -> ExtractorTarget {
     }
 }
 
+// A fixed tenant so that identical text maps to one cache key across
+// calls (the cache key now folds in `space`). Tests that exercise
+// cross-tenant isolation pass their own distinct spaces via
+// `memory_in`.
+fn fixed_space() -> SpaceId {
+    SpaceId::derive_from_string("acme", "pipeline-tests")
+}
+
 fn memory(text: &str) -> Memory {
+    memory_in(text, fixed_space(), None)
+}
+
+fn memory_in(text: &str, space: SpaceId, occurred_at_unix_nanos: Option<u64>) -> Memory {
     Memory {
         id: MemoryId::pack(0, 1, 0),
-        space: SpaceId::new(),
+        space,
         session_id: SessionId(0),
         kind: MemoryKind::Episodic,
         salience: Salience::default(),
         text: Some(text.into()),
         created_at_unix_ms: 0,
         last_accessed_at_unix_ms: 0,
-        occurred_at_unix_nanos: None,
+        occurred_at_unix_nanos,
     }
 }
 
@@ -221,9 +232,11 @@ fn cache_row_invalidation_re_arms_call() {
     let _ = block_on(ext.run(&ctx(&reg), &mem));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-    // Manually evict the cache row.
+    // Manually evict the cache row. The input hash folds the full
+    // prompt context + tenant, so ask the extractor for the exact key
+    // it wrote rather than reconstructing it from the text alone.
     let key = (
-        hash_memory_text("Alice met Bob"),
+        ext.cache_input_hash(&ctx(&reg), &mem),
         EXT_ID_RAW,
         EXT_VERSION,
         model_id_hash("claude-haiku-4-5"),
@@ -273,6 +286,61 @@ fn schema_validation_retry_completes_in_two_calls() {
     assert_eq!(r.status, ExtractionStatus::Success);
     assert_eq!(r.items.len(), 1);
     assert_eq!(calls.load(Ordering::SeqCst), 2, "retried exactly once");
+}
+
+#[test]
+fn retry_cached_token_count_sums_both_calls() {
+    // WK6: when a schema-retry occurs, the cached row's `token_count`
+    // must reflect tokens from *both* the first call and the retry, not
+    // just the first — the value feeds per-extractor cost reporting.
+    let dir = tempfile::tempdir().unwrap();
+    let cache = open_cache_in(dir.path());
+
+    let schema = serde_json::json!({
+        "type": "array",
+        "items": {
+            "type": "object",
+            "required": ["name"],
+            "properties": {"name": {"type": "string"}},
+        },
+    });
+    // First response fails schema validation (bare string), second passes.
+    // ok_response splits `tokens` evenly across in/out.
+    let client = Arc::new(ScriptedClient::new(
+        "claude-haiku-4-5",
+        vec![
+            Ok(ok_response("[\"bare string\"]", 50)),
+            Ok(ok_response("[{\"name\":\"Alice\"}]", 80)),
+        ],
+    ));
+    let calls = client.calls.clone();
+    let ext = build_extractor(client, Some(cache.clone()), Some(schema), None, 0.0);
+    let reg = ExtractorRegistry::new();
+    let mem = memory("Alice");
+
+    let r = block_on(ext.run(&ctx(&reg), &mem));
+    assert_eq!(r.status, ExtractionStatus::Success);
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "retried exactly once");
+
+    // Inspect the cached row's token_count: 50 (first) + 80 (retry) = 130.
+    let key = (
+        ext.cache_input_hash(&ctx(&reg), &mem),
+        EXT_ID_RAW,
+        EXT_VERSION,
+        model_id_hash("claude-haiku-4-5"),
+    );
+    let db = cache.lock();
+    let rtxn = db.read_txn().unwrap();
+    let t = rtxn.open_table(LLM_RESPONSES_TABLE).unwrap();
+    let row = t
+        .get(&key)
+        .unwrap()
+        .expect("cached row present after retry");
+    assert_eq!(
+        row.value().token_count,
+        130,
+        "cached token_count must include both the first call and the retry"
+    );
 }
 
 #[test]
@@ -382,6 +450,213 @@ fn response_blob_in_cache_persists_across_extractor_rebuilds() {
         calls_b.load(Ordering::SeqCst),
         0,
         "extractor B should reuse A's cache row"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Cache-key correctness: the key must fold in everything that changes
+// the model's output, plus the owning tenant. A wrong-context or
+// cross-tenant HIT must be impossible.
+// ---------------------------------------------------------------------------
+
+fn ctx_full<'a>(
+    reg: &'a ExtractorRegistry,
+    schema_version: u32,
+    declared_entity_types: Option<&'a str>,
+) -> ExtractionContext<'a> {
+    ExtractionContext {
+        declared_entity_types,
+        candidate_predicates: None,
+        declared_kinds: None,
+        entity_type_labels: None,
+        schema_version,
+        now_unix_nanos: 100,
+        registry: reg,
+        prior_tier_items: None,
+        extractor_context: None,
+    }
+}
+
+fn build_extractor_prompt(
+    client: Arc<dyn LlmClient>,
+    cache: Option<Arc<Mutex<LlmCacheDb>>>,
+    prompt: &str,
+) -> LlmExtractor {
+    LlmExtractor::build(
+        ExtractorId::from(EXT_ID_RAW),
+        "acme:llm_pipeline_test".into(),
+        target(),
+        EXT_VERSION,
+        client,
+        cache,
+        prompt.into(),
+        None,
+        None,
+        None,
+        0.0,
+        None,
+        Duration::from_secs(60),
+    )
+}
+
+const ANCHOR_2020: u64 = 1_600_000_000_000_000_000;
+const ANCHOR_2023: u64 = 1_700_000_000_000_000_000;
+
+#[test]
+fn cache_key_is_stable_for_identical_context() {
+    let client = Arc::new(ScriptedClient::new("claude-haiku-4-5", vec![]));
+    let ext = build_extractor(client, None, None, None, 0.0);
+    let reg = ExtractorRegistry::new();
+    let mem = memory("Alice met Bob");
+    let k1 = ext.cache_input_hash(&ctx(&reg), &mem);
+    let k2 = ext.cache_input_hash(&ctx(&reg), &mem);
+    assert_eq!(k1, k2, "identical text + context + tenant must share a key");
+}
+
+#[test]
+fn cache_key_folds_anchor_date() {
+    // Same text, different occurred_at → different anchor date in the
+    // prompt → distinct key, so "next Friday" can't resolve to the
+    // first memory's date.
+    let client = Arc::new(ScriptedClient::new("claude-haiku-4-5", vec![]));
+    let ext = build_extractor_prompt(client, None, "Extract. Anchor: {ANCHOR_DATE}\n{TEXT}");
+    let reg = ExtractorRegistry::new();
+    let space = fixed_space();
+    let m2020 = memory_in("Let's meet next Friday", space, Some(ANCHOR_2020));
+    let m2023 = memory_in("Let's meet next Friday", space, Some(ANCHOR_2023));
+    assert_ne!(
+        ext.cache_input_hash(&ctx(&reg), &m2020),
+        ext.cache_input_hash(&ctx(&reg), &m2023),
+        "different anchor dates must not share a cache entry",
+    );
+}
+
+#[test]
+fn cache_key_folds_schema_version() {
+    // A SCHEMA_UPLOAD bumps the active schema version; the same text
+    // must then re-extract rather than serve the pre-upload response.
+    let client = Arc::new(ScriptedClient::new("claude-haiku-4-5", vec![]));
+    let ext = build_extractor(client, None, None, None, 0.0);
+    let reg = ExtractorRegistry::new();
+    let mem = memory("Alice met Bob");
+    assert_ne!(
+        ext.cache_input_hash(&ctx_full(&reg, 1, None), &mem),
+        ext.cache_input_hash(&ctx_full(&reg, 2, None), &mem),
+        "different schema versions must not share a cache entry",
+    );
+}
+
+#[test]
+fn cache_key_folds_declared_entity_types() {
+    // A schema change that adds a declared type reaches the prompt via
+    // {DECLARED_ENTITY_TYPES}; the key must change so the new type gets
+    // a fresh extraction.
+    let client = Arc::new(ScriptedClient::new("claude-haiku-4-5", vec![]));
+    let ext = build_extractor_prompt(
+        client,
+        None,
+        "Extract. Types:\n{DECLARED_ENTITY_TYPES}\n{TEXT}",
+    );
+    let reg = ExtractorRegistry::new();
+    let mem = memory("Alice met Bob");
+    assert_ne!(
+        ext.cache_input_hash(&ctx_full(&reg, 1, Some("- brain:Person")), &mem),
+        ext.cache_input_hash(
+            &ctx_full(&reg, 1, Some("- brain:Person\n- brain:Org")),
+            &mem
+        ),
+        "different declared entity types must not share a cache entry",
+    );
+}
+
+#[test]
+fn cache_key_folds_tenant() {
+    // Byte-identical text in two tenants must never share an entry.
+    let client = Arc::new(ScriptedClient::new("claude-haiku-4-5", vec![]));
+    let ext = build_extractor(client, None, None, None, 0.0);
+    let reg = ExtractorRegistry::new();
+    let mem_a = memory_in(
+        "shared text",
+        SpaceId::derive_from_string("tenant_a", "s"),
+        None,
+    );
+    let mem_b = memory_in(
+        "shared text",
+        SpaceId::derive_from_string("tenant_b", "s"),
+        None,
+    );
+    assert_ne!(
+        ext.cache_input_hash(&ctx(&reg), &mem_a),
+        ext.cache_input_hash(&ctx(&reg), &mem_b),
+        "two tenants must not share a cache entry for identical text",
+    );
+}
+
+#[test]
+fn cache_miss_across_tenants_re_invokes_client() {
+    // End-to-end: tenant A populates, tenant B's identical text must
+    // miss and drive a fresh call rather than reading A's row.
+    let dir = tempfile::tempdir().unwrap();
+    let cache = open_cache_in(dir.path());
+    let client = Arc::new(ScriptedClient::new(
+        "claude-haiku-4-5",
+        vec![
+            Ok(ok_response("[\"A\"]", 50)),
+            Ok(ok_response("[\"B\"]", 50)),
+        ],
+    ));
+    let calls = client.calls.clone();
+    let ext = build_extractor(client, Some(cache), None, None, 0.0);
+    let reg = ExtractorRegistry::new();
+
+    let mem_a = memory_in(
+        "shared text",
+        SpaceId::derive_from_string("tenant_a", "s"),
+        None,
+    );
+    let mem_b = memory_in(
+        "shared text",
+        SpaceId::derive_from_string("tenant_b", "s"),
+        None,
+    );
+
+    let _ = block_on(ext.run(&ctx(&reg), &mem_a));
+    let _ = block_on(ext.run(&ctx(&reg), &mem_b));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "tenant B must not read tenant A's cached extraction",
+    );
+}
+
+#[test]
+fn cache_miss_across_anchor_dates_re_invokes_client() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = open_cache_in(dir.path());
+    let client = Arc::new(ScriptedClient::new(
+        "claude-haiku-4-5",
+        vec![
+            Ok(ok_response("[\"first\"]", 50)),
+            Ok(ok_response("[\"second\"]", 50)),
+        ],
+    ));
+    let calls = client.calls.clone();
+    let ext = build_extractor_prompt(
+        client,
+        Some(cache),
+        "Extract. Anchor: {ANCHOR_DATE}\n{TEXT}",
+    );
+    let reg = ExtractorRegistry::new();
+    let space = fixed_space();
+    let m2020 = memory_in("Let's meet next Friday", space, Some(ANCHOR_2020));
+    let m2023 = memory_in("Let's meet next Friday", space, Some(ANCHOR_2023));
+
+    let _ = block_on(ext.run(&ctx(&reg), &m2020));
+    let _ = block_on(ext.run(&ctx(&reg), &m2023));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "a different anchor date must re-extract, not serve the stale date",
     );
 }
 

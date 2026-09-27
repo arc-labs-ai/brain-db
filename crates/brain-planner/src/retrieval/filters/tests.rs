@@ -768,6 +768,171 @@ fn as_of_filter_in_chain_drops_invalidated_statement() {
     assert_eq!(only, vec![RankedItemId::Statement(p1_id)]);
 }
 
+#[test]
+fn as_of_returns_superseded_row_without_include_superseded() {
+    // Spec 02_data_model/09_composition.md: as_of returns rows whose
+    // record window contains the instant, even if since superseded.
+    // Fact role=Engineer at t1; supersede to role=Manager at t2;
+    // as_of=t1.5 must return Engineer (not empty) — the supersession
+    // filter must not drop it first — while as_of unset returns only
+    // Manager.
+    let (_dir, mut metadata) = fresh();
+    let type_id = ensure_person_type(&mut metadata);
+    let priya = put_entity(&mut metadata, "Priya", type_id);
+    let pred = intern_predicate(&mut metadata, "test", "role");
+
+    let mut engineer = Statement::new_root(
+        StatementId::new(),
+        StatementKind::Fact,
+        SubjectRef::Entity(priya),
+        pred,
+        StatementObject::Value(StatementValue::Text("Engineer".into())),
+        0.9,
+        EvidenceRef::default(),
+        ExtractorId::from(0),
+        1_000, // extracted_at (t1)
+        1,
+    );
+    engineer.is_stateful = true;
+    let wtxn = metadata.write_txn().unwrap();
+    let engineer_id = brain_metadata::statement::statement_create(
+        &wtxn,
+        __ts(),
+        brain_core::SessionId::DEFAULT,
+        &engineer,
+        1_000,
+    )
+    .unwrap();
+    wtxn.commit().unwrap();
+
+    let mut manager = Statement::new_root(
+        StatementId::new(),
+        StatementKind::Fact,
+        SubjectRef::Entity(priya),
+        pred,
+        StatementObject::Value(StatementValue::Text("Manager".into())),
+        0.9,
+        EvidenceRef::default(),
+        ExtractorId::from(0),
+        2_000, // extracted_at (t2)
+        1,
+    );
+    manager.is_stateful = true;
+    let wtxn = metadata.write_txn().unwrap();
+    let manager_id = brain_metadata::statement::statement_supersede(
+        &wtxn,
+        __ts(),
+        brain_core::SessionId::DEFAULT,
+        engineer_id,
+        &manager,
+        2_000, // supersession stamps engineer.record_invalidated_at = 2_000
+    )
+    .unwrap();
+    wtxn.commit().unwrap();
+
+    // as_of = t1.5 (1_500): the Engineer row was current then; it must
+    // survive the supersession filter (no include_superseded) and be
+    // the only row the as-of interval selects.
+    let items = vec![
+        fused(RankedItemId::Statement(engineer_id), 1),
+        fused(RankedItemId::Statement(manager_id), 2),
+    ];
+    let chain = FilterChain {
+        as_of_record_time_unix_nanos: Some(1_500),
+        ..Default::default()
+    };
+    let (out, _stats) = apply_filter_chain(items, &chain, &metadata, 0, false).expect("ok");
+    let ids: Vec<_> = out.iter().map(|f| f.id).collect();
+    assert_eq!(
+        ids,
+        vec![RankedItemId::Statement(engineer_id)],
+        "as_of=t1.5 must return the superseded Engineer row"
+    );
+
+    // as_of unset: current-state retrieval drops the superseded Engineer
+    // row and returns only Manager.
+    let items = vec![
+        fused(RankedItemId::Statement(engineer_id), 1),
+        fused(RankedItemId::Statement(manager_id), 2),
+    ];
+    let chain = FilterChain::default();
+    let (out, _stats) = apply_filter_chain(items, &chain, &metadata, 0, false).expect("ok");
+    let ids: Vec<_> = out.iter().map(|f| f.id).collect();
+    assert_eq!(
+        ids,
+        vec![RankedItemId::Statement(manager_id)],
+        "current state must return only the Manager row"
+    );
+}
+
+#[test]
+fn fact_unset_valid_from_defaults_to_extracted_at_not_epoch() {
+    // Spec 02_data_model/07_statement.md: valid_from defaults to
+    // extracted_at when unset. A Fact extracted in ~2027 with no
+    // valid_from has validity window [extracted_at, ∞), so a time filter
+    // over [2008, 2014] must NOT match it. With the epoch-0 bug the
+    // window was [0, ∞) and it falsely matched.
+    let (_dir, mut metadata) = fresh();
+    let type_id = ensure_person_type(&mut metadata);
+    let alice = put_entity(&mut metadata, "Alice", type_id);
+    let pred = intern_predicate(&mut metadata, "test", "born_in");
+
+    // extracted_at ≈ 2027-01 (ms → nanos).
+    let extracted_ms: u64 = 1_800_000_000_000;
+    let mut fact = Statement::new_root(
+        StatementId::new(),
+        StatementKind::Fact,
+        SubjectRef::Entity(alice),
+        pred,
+        StatementObject::Value(StatementValue::Text("Paris".into())),
+        0.9,
+        EvidenceRef::default(),
+        ExtractorId::from(0),
+        extracted_ms.saturating_mul(1_000_000),
+        1,
+    );
+    fact.valid_from_unix_nanos = None;
+    fact.valid_to_unix_nanos = None;
+    let wtxn = metadata.write_txn().unwrap();
+    let fact_id = brain_metadata::statement::statement_create(
+        &wtxn,
+        __ts(),
+        brain_core::SessionId::DEFAULT,
+        &fact,
+        extracted_ms.saturating_mul(1_000_000),
+    )
+    .unwrap();
+    wtxn.commit().unwrap();
+
+    // Time filter [2008, 2014] (ms) — well before the extraction.
+    let items = vec![fused(RankedItemId::Statement(fact_id), 1)];
+    let chain = FilterChain {
+        time_filter: Some(TimeRange {
+            from_unix_ms: Some(1_200_000_000_000),
+            to_unix_ms: Some(1_400_000_000_000),
+        }),
+        ..Default::default()
+    };
+    let (out, stats) = apply_filter_chain(items, &chain, &metadata, 0, false).expect("ok");
+    assert_eq!(
+        stats.after_temporal, 0,
+        "window [extracted, ∞) must not overlap the past filter"
+    );
+    assert!(out.is_empty());
+
+    // Sanity: a filter covering the extraction instant still matches.
+    let items = vec![fused(RankedItemId::Statement(fact_id), 1)];
+    let chain = FilterChain {
+        time_filter: Some(TimeRange {
+            from_unix_ms: Some(extracted_ms - 1),
+            to_unix_ms: None,
+        }),
+        ..Default::default()
+    };
+    let (out, _stats) = apply_filter_chain(items, &chain, &metadata, 0, false).expect("ok");
+    assert_eq!(out.len(), 1);
+}
+
 fn __ts() -> brain_metadata::RowScope {
     brain_metadata::RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xA1; 16])
 }

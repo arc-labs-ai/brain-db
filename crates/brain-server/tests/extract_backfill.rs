@@ -406,3 +406,81 @@ async fn backfill_rejects_conflicting_selectors_400() {
 
     server.stop().await;
 }
+
+/// `?memory=<id>&namespace=<name>` re-enqueues the memory only when it
+/// belongs to that namespace. A memory owned by another tenant, or a
+/// never-interned namespace, is an indistinguishable `404`; a scope on the
+/// global `?all` form is a `400`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn backfill_memory_id_is_tenant_scoped_by_namespace() {
+    let data_dir = TempDir::new().expect("tmp");
+    let server = start_in(data_dir.path(), 1).await;
+
+    // Default harness key → namespace "test".
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
+    handshake(&mut client, &server.token).await;
+    let mine = encode_one(&mut client, 1, "tenant test memory").await;
+    let mine = u128::from_be_bytes(mine.to_be_bytes());
+
+    // A second tenant ("other") on the same shard, so its namespace is
+    // interned and it owns a memory of its own.
+    let other_token = server.mint(
+        "other",
+        *Uuid::now_v7().as_bytes(),
+        brain_metadata::api_keys::bits::STANDARD_SPACE,
+    );
+    let mut other = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect other");
+    handshake(&mut other, &other_token).await;
+    let theirs = encode_one(&mut other, 1, "tenant other memory").await;
+    let theirs = u128::from_be_bytes(theirs.to_be_bytes());
+
+    let post = |path: String| {
+        let admin_addr = server.admin_addr.to_string();
+        tokio::task::spawn_blocking(move || http_post_no_body(&admin_addr, &path))
+    };
+
+    // Own namespace: touches exactly the one row.
+    let (status, body) = post(format!("/v1/extract/backfill?memory={mine}&namespace=test"))
+        .await
+        .unwrap();
+    assert_eq!(status, 200, "body = {body}");
+    let report: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(
+        report["enqueued"].as_u64().unwrap() + report["skipped"].as_u64().unwrap(),
+        1,
+        "body = {body}"
+    );
+
+    // Another tenant's memory, a foreign namespace for my memory, a
+    // never-interned namespace, and a nonexistent id: all 404.
+    for path in [
+        format!("/v1/extract/backfill?memory={theirs}&namespace=test"),
+        format!("/v1/extract/backfill?memory={mine}&namespace=other"),
+        format!("/v1/extract/backfill?memory={mine}&namespace=never-seen"),
+        format!(
+            "/v1/extract/backfill?memory={}&namespace=test",
+            mine.wrapping_add(1 << 60)
+        ),
+    ] {
+        let (status, body) = post(path.clone()).await.unwrap();
+        assert_eq!(status, 404, "{path}: body = {body}");
+    }
+
+    // The unscoped form is unchanged: still global.
+    let (status, body) = post(format!("/v1/extract/backfill?memory={theirs}"))
+        .await
+        .unwrap();
+    assert_eq!(status, 200, "body = {body}");
+
+    // Scoping the global forms is refused.
+    let (status, body) = post("/v1/extract/backfill?all&namespace=test".into())
+        .await
+        .unwrap();
+    assert_eq!(status, 400, "body = {body}");
+
+    server.stop().await;
+}

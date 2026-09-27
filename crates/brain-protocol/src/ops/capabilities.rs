@@ -11,12 +11,22 @@
 //! the same way `PING` / `BYE` are — capability bits don't reveal
 //! sensitive state, and clients need them at session warm-up.
 
-/// Empty request — capabilities are server-side state; the client has
-/// nothing to send. Kept as a struct (rather than a unit type) so the
-/// encoding stays consistent with every other request body and
-/// the envelope's `decode` arm doesn't special-case empty bytes.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct GetCapabilitiesRequest {}
+/// Capabilities are server-side state; the only thing a client may send
+/// is an optional effective-identity selector. Kept as a struct (rather
+/// than a unit type) so the encoding stays consistent with every other
+/// request body and the envelope's `decode` arm doesn't special-case
+/// empty bytes. With `act_as` absent the body is the empty CBOR map
+/// (`0xA0`), byte-identical to the historical field-less request.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GetCapabilitiesRequest {
+    /// Optional effective identity (`act_as`) the snapshot is computed
+    /// for, on behalf of the authenticated connection principal. The only
+    /// identity-derived field is `schema_namespaces`, which is filtered to
+    /// the effective caller's own namespace. `None` (omitted on the wire)
+    /// means the connection's own key-bound identity.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<crate::ops::memory::ActAs>,
+}
 
 /// Capability snapshot returned by the server. Each field corresponds
 /// to one server-side opt-in or runtime parameter the client may need
@@ -40,11 +50,12 @@ pub struct Capabilities {
     /// True when the pattern extractor tier is enabled (always
     /// available unless the operator explicitly opted out).
     pub pattern_extractor: bool,
-    /// User schema namespaces currently active on the shard (excludes
-    /// the always-on `brain` system namespace). Empty list means no
-    /// user schema is declared. Clients use this to surface
-    /// schema-gated UI choices ("which namespace do you want to
-    /// query?").
+    /// User schema namespaces active on the shard, filtered to the
+    /// (effective) caller's own namespace — a caller never learns which
+    /// other tenants have declared schema. So this is either empty (no
+    /// user schema declared for the caller's namespace) or exactly
+    /// `[caller_namespace]`. Excludes the always-on `brain` system
+    /// namespace.
     pub schema_namespaces: Vec<String>,
     /// Embedding vector dimensionality the shard's embedder produces.
     /// clients that drive `EncodeVectorDirect` need this to validate

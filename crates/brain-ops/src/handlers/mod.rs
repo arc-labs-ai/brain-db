@@ -4,6 +4,7 @@
 
 pub mod admin;
 pub mod capabilities;
+pub mod cursor;
 pub mod encode;
 pub mod encode_vector_direct;
 pub mod entity;
@@ -21,7 +22,9 @@ pub mod reason;
 pub mod recall;
 pub mod registry_cascade;
 pub mod relation;
+pub mod restore;
 pub mod schema;
+pub mod schema_drop;
 pub mod schema_replace;
 pub mod session;
 pub mod space;

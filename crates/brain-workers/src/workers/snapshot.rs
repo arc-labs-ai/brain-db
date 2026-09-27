@@ -1,8 +1,10 @@
 //! Snapshot worker.
 //!
 //! Periodic snapshot trigger with retention policy. This worker is
-//! **off by default** — many deployments prefer external backup
-//! tooling, and the built-in snapshot worker is a convenience.
+//! **on by default** (hourly): a periodic snapshot bounds the WAL
+//! replay the next restart has to do. Deployments that prefer external
+//! backup tooling disable it via `[workers.snapshot].enabled = false`
+//! (or leave the source `DisabledSnapshotSource`).
 //!
 //! ## v1 status
 //!
@@ -10,7 +12,7 @@
 //! driven by the real `ShardSnapshotSource` in brain-server), giving a
 //! fast memory-index cold-start. What is NOT yet wired is full-shard
 //! snapshot orchestration — the arena + metadata-redb + WAL-tail reflink
-//! bundle and its `manifest.json` (see spec/08_storage/06_snapshots.md),
+//! bundle and its `manifest.json`,
 //! and therefore the checkpoint-then-copy sequencing.
 //!
 //! The worker ships the **shape + retention policy** as a pluggable seam
@@ -66,12 +68,21 @@ impl Default for RetentionPolicy {
 // Pure retention logic.
 // ---------------------------------------------------------------------------
 
+/// Absolute floor on retained snapshots: retention never deletes the
+/// newest `MIN_SNAPSHOTS_KEPT` snapshots, even when they are older than
+/// `max_age`. Without this floor a long-idle shard whose every snapshot
+/// has aged past `max_age` would delete *all* of them, leaving nothing
+/// to restore from (invariant #7 — this is the only backup path). Must
+/// be >= 1.
+const MIN_SNAPSHOTS_KEPT: usize = 1;
+
 /// Return ids of snapshots to delete given the current set + policy.
 /// A snapshot is deletable if **either**:
 ///   - its age >= `max_age` (oldness rule), or
-///   - it's outside the newest `max_count` (count rule).
+///   - it's outside the newest `max_count` (count rule),
 ///
-/// The combination is unspecified; v1 uses "either".
+/// **and** it is not within the newest `MIN_SNAPSHOTS_KEPT` (the
+/// keep-floor always wins). The count/age combination is "either".
 #[must_use]
 pub fn decide_retention(
     snapshots: &[SnapshotDesc],
@@ -89,6 +100,11 @@ pub fn decide_retention(
 
     let mut out = Vec::new();
     for (idx, snap) in by_age.iter().enumerate() {
+        // Keep-floor: never delete the newest N. Guarantees at least one
+        // restorable backup always survives.
+        if idx < MIN_SNAPSHOTS_KEPT {
+            continue;
+        }
         let age = now_unix_nanos.saturating_sub(snap.taken_at_unix_nanos);
         let too_old = age >= max_age_nanos;
         let excess = idx >= policy.max_count;
@@ -158,7 +174,7 @@ impl SnapshotWorker {
     #[must_use]
     pub fn new(source: Arc<dyn SnapshotSource>) -> Self {
         Self {
-            // WorkerKind::Snapshot defaults enabled=false.2.
+            // WorkerKind::Snapshot defaults enabled=true (hourly).
             config: WorkerConfig::defaults_for(WorkerKind::Snapshot),
             retention: RetentionPolicy::default(),
             source,

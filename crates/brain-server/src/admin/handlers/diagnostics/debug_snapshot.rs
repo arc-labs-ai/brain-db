@@ -1,8 +1,14 @@
 //! `GET /v1/diagnostics/debug-snapshot?shard=N` — partial snapshot of
 //! per-shard runtime state.
 //!
-//! v1 populates worker statuses from `scheduler_snapshot()` and flags
-//! the remaining spec'd fields in `deferred[]`.
+//! v1 populates:
+//! - `workers` from `scheduler_snapshot()`,
+//! - `pending_requests` from the shard's dispatch-queue depth
+//!   (`ShardHandle::queue_depth`), and
+//! - `in_memory_state_summary` from `hnsw_snapshot()` + `storage_stats()`.
+//!
+//! The remaining spec'd fields (`active_tasks`, `recent_errors`) are
+//! flagged in `deferred[]` — see the module doc for why.
 
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -47,7 +53,52 @@ pub async fn debug_snapshot(
         }
         write!(&mut body, "\"{field}\"").expect("string write");
     }
-    body.push_str("],\"workers\":[");
+    body.push(']');
+
+    // pending_requests: dispatch-queue depth (requests queued on the
+    // shard's request channel, not yet drained by the executor).
+    write!(&mut body, ",\"pending_requests\":{}", shard.queue_depth()).expect("string write");
+
+    // in_memory_state_summary: HNSW node/tombstone counts + arena / WAL /
+    // metadata footprint. Both reads round-trip through the executor; on
+    // failure (shard disconnected mid-scrape) we emit `null` and warn,
+    // rather than fail the whole snapshot.
+    body.push_str(",\"in_memory_state_summary\":");
+    let hnsw = shard.hnsw_snapshot().await;
+    let storage = shard.storage_stats().await;
+    match (hnsw, storage) {
+        (Ok(h), Ok(s)) => {
+            write!(
+                &mut body,
+                "{{\"hnsw\":{{\"node_count\":{hn},\"tombstone_count\":{ht}}},\
+                 \"arena\":{{\"capacity_bytes\":{ac},\"used_bytes\":{au},\
+                 \"slots_used\":{asu},\"slots_free\":{asf}}},\
+                 \"wal\":{{\"size_bytes\":{ws},\"segments\":{wg}}},\
+                 \"metadata\":{{\"size_bytes\":{ms}}}}}",
+                hn = h.node_count,
+                ht = h.tombstone_count,
+                ac = s.arena_capacity_bytes,
+                au = s.arena_used_bytes,
+                asu = s.arena_slots_used,
+                asf = s.arena_slots_free,
+                ws = s.wal_size_bytes,
+                wg = s.wal_segments,
+                ms = s.metadata_size_bytes,
+            )
+            .expect("string write");
+        }
+        (hnsw_res, storage_res) => {
+            if let Err(e) = hnsw_res {
+                warn!(shard = shard_id, error = %e, "hnsw_snapshot failed");
+            }
+            if let Err(e) = storage_res {
+                warn!(shard = shard_id, error = %e, "storage_stats failed");
+            }
+            body.push_str("null");
+        }
+    }
+
+    body.push_str(",\"workers\":[");
 
     match shard.scheduler_snapshot().await {
         Ok(mut snaps) => {

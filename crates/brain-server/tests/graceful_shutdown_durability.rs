@@ -185,6 +185,7 @@ async fn encode(client: &mut TcpStream, stream_id: u32, text: &str) -> u128 {
 /// RECALL `cue` and return the memory_ids in the result set.
 async fn recall_ids(client: &mut TcpStream, stream_id: u32, cue: &str) -> Vec<u128> {
     let req = RecallRequest {
+        scope: Default::default(),
         trace: false,
         cue_text: cue.into(),
         subject_name: String::new(),
@@ -244,7 +245,13 @@ async fn recall_ids_until_contains(
     cue: &str,
     wanted: u128,
 ) -> Vec<u128> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    // 90s, not 3s: the loop returns the instant `wanted` surfaces (50ms poll),
+    // so this ceiling only bites the worst case — the async post-restart lexical
+    // reindex catching up under heavy CPU contention (the full workspace suite
+    // sharing cores). The write's durability is already proven synchronously by
+    // recovery (redb + arena repopulate before the shard serves); this only
+    // waits out the index rebuild rather than flaking when the box is saturated.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
     loop {
         let ids = recall_ids(client, stream_id, cue).await;
         if ids.contains(&wanted) || std::time::Instant::now() >= deadline {
@@ -396,6 +403,126 @@ async fn graceful_shutdown_with_no_writes_restarts_clean() {
             got.is_empty(),
             "expected empty recall on a fresh dir, got {got:?}"
         );
+        drop(client);
+        server.stop().await;
+    }
+}
+
+/// Fire a burst of ENCODEs and shut the server down while writes are still
+/// draining, then restart and prove the acknowledged ones survived.
+///
+/// This targets the shutdown-time `RefCell` borrow race: the per-shard WAL
+/// drain task holds a shared borrow of `shard.wal` across its
+/// `append_many().await`, and the shutdown path takes the WAL out of the same
+/// cell with `borrow_mut()`. If the drain task can be parked mid-append when
+/// `borrow_mut()` runs, the cell double-borrows and panics — aborting the
+/// shard thread mid-shutdown and skipping the WAL/arena flush. By pipelining
+/// many encodes and reading back only the first few acks before stopping, the
+/// drain task is maximally likely to be in-flight at `stop()`. A clean
+/// `stop()` (no panic, no hang) plus recovery of every acknowledged id proves
+/// the shutdown ordering cancels the drain task before reclaiming the WAL and
+/// still flushes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn burst_encode_then_graceful_shutdown_does_not_panic_and_flushes() {
+    let dir = TempDir::new().expect("tmp");
+    let space_id = *uuid::Uuid::now_v7().as_bytes();
+
+    // How many to pipeline vs. how many acks to read before stopping. The
+    // unread tail stays in flight through the drain task at shutdown.
+    const BURST: u32 = 16;
+    const ACKED_BEFORE_STOP: u32 = 4;
+
+    let mut durable_ids = Vec::new();
+    {
+        let server = start_in(dir.path(), 1).await;
+        let mut client = TcpStream::connect(server.data_plane_addr)
+            .await
+            .expect("connect 1");
+        handshake(
+            &mut client,
+            &server.mint("test", space_id, brain_metadata::api_keys::bits::FULL),
+        )
+        .await;
+
+        // Pipeline the whole burst without waiting for acks: back-to-back
+        // frames on odd client stream ids.
+        for i in 0..BURST {
+            let text = format!("burst drain memory number {i} sentinel phrase zebra{i}");
+            let req = EncodeRequest {
+                text,
+                session_id: 0,
+                request_id: *uuid::Uuid::now_v7().as_bytes(),
+                txn_id: None,
+                occurred_at_unix_nanos: None,
+                act_as: None,
+                wait: brain_protocol::WaitMode::Ack,
+                allow_duplicates: true,
+            };
+            send_frame(
+                &mut client,
+                Frame::new(
+                    Opcode::EncodeReq.as_u16(),
+                    FLAG_EOS,
+                    1 + i * 2,
+                    RequestBody::Encode(req).encode(),
+                ),
+            )
+            .await;
+        }
+
+        // Read only the first few acks: those are fsynced-durable by contract.
+        for _ in 0..ACKED_BEFORE_STOP {
+            let resp = read_one_frame(&mut client).await;
+            assert_eq!(
+                resp.header.opcode_u16(),
+                Opcode::EncodeResp.as_u16(),
+                "burst encode must ack with EncodeResp"
+            );
+            if let ResponseBody::Encode(r) = ResponseBody::decode(
+                Opcode::from_u16(resp.header.opcode_u16()).expect("known opcode"),
+                &resp.payload,
+            )
+            .expect("decode resp")
+            {
+                durable_ids.push(r.memory_id);
+            }
+        }
+        drop(client);
+
+        // Stop immediately — the unread tail is still draining. This must
+        // return (no panic-induced hang) within the drain budget.
+        server.stop().await;
+    }
+
+    assert_eq!(
+        durable_ids.len(),
+        ACKED_BEFORE_STOP as usize,
+        "expected {ACKED_BEFORE_STOP} acknowledged writes before shutdown"
+    );
+
+    // Restart on the same dir; every acknowledged write must be recoverable —
+    // proving the shutdown flushed the WAL/arena rather than aborting on a
+    // borrow panic.
+    {
+        let server = start_in(dir.path(), 1).await;
+        let mut client = TcpStream::connect(server.data_plane_addr)
+            .await
+            .expect("connect 2");
+        handshake(
+            &mut client,
+            &server.mint("test", space_id, brain_metadata::api_keys::bits::FULL),
+        )
+        .await;
+
+        for (i, id) in durable_ids.iter().enumerate() {
+            let cue = format!("burst drain memory number {i} sentinel zebra{i}");
+            let got = recall_ids_until_contains(&mut client, 1 + (i as u32) * 2, &cue, *id).await;
+            assert!(
+                got.contains(id),
+                "DATA LOSS: acknowledged burst write {id} was not recoverable after \
+                 graceful shutdown; recall for \"{cue}\" returned {got:?}"
+            );
+        }
         drop(client);
         server.stop().await;
     }

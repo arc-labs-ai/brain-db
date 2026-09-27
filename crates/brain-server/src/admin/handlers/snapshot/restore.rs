@@ -164,13 +164,82 @@ pub async fn handle(
 }
 
 fn restore_error_response(e: RestoreError) -> Response<ResponseBody> {
-    let status = match e {
-        RestoreError::Manifest { .. } => StatusCode::NOT_FOUND,
-        RestoreError::ShardUuidMismatch { .. } | RestoreError::Integrity { .. } => {
-            StatusCode::UNPROCESSABLE_ENTITY
-        }
-        RestoreError::Place { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+    // Map each variant to a status + client-safe message. The error's own
+    // `Display` carries host internals (filesystem paths, redb detail), so
+    // it is logged server-side but never echoed to the client.
+    let (status, client_msg) = match &e {
+        RestoreError::Manifest { .. } => (
+            StatusCode::NOT_FOUND,
+            "snapshot manifest missing or unreadable",
+        ),
+        RestoreError::ShardUuidMismatch { .. } => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "snapshot does not belong to the target shard",
+        ),
+        RestoreError::Integrity { .. } => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "snapshot failed integrity verification",
+        ),
+        RestoreError::Place { .. } => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "restore failed while placing snapshot files",
+        ),
     };
     warn!(error = %e, "snapshot restore failed");
-    text_response(status, &format!("{e}\n"))
+    text_response(status, &format!("{client_msg}\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http_body_util::BodyExt as _;
+
+    async fn body_string(resp: Response<ResponseBody>) -> String {
+        let bytes = resp
+            .into_body()
+            .collect()
+            .await
+            .expect("collect body")
+            .to_bytes();
+        String::from_utf8(bytes.to_vec()).expect("utf8")
+    }
+
+    #[tokio::test]
+    async fn manifest_error_does_not_leak_filesystem_path() {
+        // The Manifest variant carries an absolute PathBuf; its Display
+        // would leak the host data-dir layout to the client.
+        let secret_path = PathBuf::from("/srv/brain/data/shard-0/snapshots/000/manifest.json");
+        let e = RestoreError::Manifest {
+            path: secret_path.clone(),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"),
+        };
+        let resp = restore_error_response(e);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = body_string(resp).await;
+        assert!(
+            !body.contains("/srv/brain/data"),
+            "response leaked a filesystem path: {body}"
+        );
+        assert!(
+            !body.contains("no such file"),
+            "response leaked the io error detail: {body}"
+        );
+        assert!(
+            body.contains("snapshot manifest"),
+            "unexpected body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn place_error_does_not_leak_internal_detail() {
+        let e = RestoreError::Place {
+            file: "arena.bin".into(),
+            source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "EACCES /root/x"),
+        };
+        let resp = restore_error_response(e);
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = body_string(resp).await;
+        assert!(!body.contains("/root/x"), "leaked path: {body}");
+        assert!(!body.contains("EACCES"), "leaked io detail: {body}");
+    }
 }

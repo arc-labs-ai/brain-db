@@ -41,7 +41,8 @@ pub mod tombstones;
 pub use arena_reader::{null_arena_reader, ArenaReader, NullArenaReader};
 
 pub use entity_hnsw::{
-    EntityHnswError, EntityHnswIndex, EntityHnswParams, RebuildReport as EntityRebuildReport,
+    EntityHnswError, EntityHnswIndex, EntityHnswParams, EntityVectorIndex,
+    RebuildReport as EntityRebuildReport,
 };
 pub use graph_retriever::{
     proximity_score, validate_depth as validate_graph_depth, Direction, GraphAnchor, GraphError,
@@ -81,5 +82,6 @@ pub use tantivy_shard::{
     LexicalRetriever, LexicalRetrieverConfig, LexicalScope, RankedItem, RankedItemId,
     RebuildReason as TantivyRebuildReason, TantivyLexicalRetriever, TantivyShard,
     TantivyShardError, TantivyShardStartup, BRAIN_SCHEMA_VERSION, BRAIN_TOKENIZER_NAME,
+    OLD_SUFFIX as TANTIVY_OLD_SUFFIX, REBUILD_SUFFIX as TANTIVY_REBUILD_SUFFIX,
 };
 pub use tombstones::TombstoneBitmap;

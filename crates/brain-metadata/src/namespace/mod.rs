@@ -57,6 +57,16 @@ pub fn namespace_name(
     Ok(hit.map(|v| v.value().name))
 }
 
+/// Write-transaction counterpart to [`namespace_name`].
+pub fn namespace_name_wtxn(
+    wtxn: &WriteTransaction,
+    id: NamespaceId,
+) -> Result<Option<String>, NamespaceOpError> {
+    let t = wtxn.open_table(NAMESPACES_TABLE)?;
+    let hit = t.get(&id.raw())?;
+    Ok(hit.map(|v| v.value().name))
+}
+
 /// Intern a namespace by name, returning its stable id. Idempotent: a
 /// name already present returns its existing id. The reserved `brain`
 /// system namespace always resolves to [`NamespaceId::SYSTEM`]. User

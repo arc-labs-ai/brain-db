@@ -97,7 +97,6 @@ pub mod derived_by {
 
 /// Per-edge metadata stored in both the forward and reverse tables.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct EdgeData {
     pub weight: f32,
     pub origin: u8,
@@ -131,9 +130,9 @@ impl redb::Value for EdgeData {
     where
         Self: 'a,
     {
-        let mut buf = rkyv::AlignedVec::with_capacity(data.len());
+        let mut buf = rkyv::util::AlignedVec::<16>::with_capacity(data.len());
         buf.extend_from_slice(data);
-        rkyv::from_bytes::<EdgeData>(&buf)
+        rkyv::from_bytes::<EdgeData, rkyv::rancor::Error>(&buf)
             .expect("EdgeData bytes failed rkyv validation; redb file is corrupt")
     }
 
@@ -142,7 +141,7 @@ impl redb::Value for EdgeData {
         Self: 'a,
         Self: 'b,
     {
-        rkyv::to_bytes::<_, 256>(value)
+        rkyv::to_bytes::<rkyv::rancor::Error>(value)
             .expect("EdgeData is rkyv-serializable")
             .into_vec()
     }
@@ -448,12 +447,18 @@ pub fn walk_incoming(
     range_scan(&t, to, kind_filter)
 }
 
-fn range_scan(
-    table: &ReadOnlyTable<&'static [u8], EdgeData>,
-    anchor: NodeRef,
-    kind_filter: Option<EdgeKindRef>,
-) -> Result<Vec<EdgeRow>, EdgeOpError> {
-    let (lo, hi) = match kind_filter {
+/// Inclusive `(lower_prefix, upper)` byte bounds for a scan of every
+/// edge anchored at `anchor`, optionally narrowed to a single `kind`.
+///
+/// The lower bound is the raw anchor (or anchor+kind) prefix; the upper
+/// bound saturates the remaining `(to, disambiguator)` suffix with
+/// `0xFF` so an inclusive range covers every row under the prefix.
+/// Exposed so a keyset-paginated walk can seek strictly past a resume
+/// key (`Bound::Excluded(after_key)`) while keeping the same upper
+/// bound — see `relation::ops::list_directional_page`.
+#[must_use]
+pub fn range_bounds(anchor: NodeRef, kind_filter: Option<EdgeKindRef>) -> (Vec<u8>, Vec<u8>) {
+    match kind_filter {
         Some(k) => {
             let prefix = EdgeKey::from_kind_prefix(anchor, k);
             let mut hi = prefix.clone();
@@ -470,7 +475,15 @@ fn range_scan(
             );
             (prefix, hi)
         }
-    };
+    }
+}
+
+fn range_scan(
+    table: &ReadOnlyTable<&'static [u8], EdgeData>,
+    anchor: NodeRef,
+    kind_filter: Option<EdgeKindRef>,
+) -> Result<Vec<EdgeRow>, EdgeOpError> {
+    let (lo, hi) = range_bounds(anchor, kind_filter);
 
     let mut out = Vec::new();
     for entry in table.range::<&[u8]>(lo.as_slice()..=hi.as_slice())? {

@@ -37,6 +37,7 @@ mod util;
 
 use std::io;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -83,7 +84,24 @@ pub struct AdminState {
     /// Scope-bound API key store (W2.5). Mint / revoke / list endpoints
     /// read and write through this handle.
     pub auth_store: Arc<AuthStore>,
+    /// Path to the config file this server booted from. `Some` in
+    /// production (wired from the `--config` arg); `None` in the test
+    /// harness, which constructs [`Config::for_tests`] with no file
+    /// behind it. `POST /v1/config/reload` needs this to re-read the
+    /// file; without it the endpoint reports that reload is unavailable.
+    pub config_path: Option<PathBuf>,
+    /// Applies a new log level to the live tracing subscriber, returning
+    /// whether the reload took effect. Wraps the logging reload handle so
+    /// `admin` stays decoupled from the tracing internals (and test crates
+    /// that mount only `admin` need not mount `logging`). `Some` in
+    /// production; `None` in the test harness.
+    pub apply_log_level: Option<ApplyLogLevel>,
 }
+
+/// Callback that applies a log level to the running subscriber. `Send +
+/// Sync` because [`AdminState`] is shared across the Tokio connection
+/// layer and the admin server.
+pub type ApplyLogLevel = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 impl AdminState {
     pub fn new(
@@ -106,7 +124,23 @@ impl AdminState {
             config,
             request_metrics,
             auth_store,
+            config_path: None,
+            apply_log_level: None,
         }
+    }
+
+    /// Wire the live-config-reload dependencies: the path the config was
+    /// loaded from and a callback that applies a log level to the running
+    /// subscriber. Production calls this immediately after [`Self::new`];
+    /// the test harness leaves both unset, so `POST /v1/config/reload`
+    /// reports reload unavailable there rather than acting on a
+    /// non-existent file.
+    #[must_use]
+    #[allow(dead_code)] // called from main.rs; test crates construct via `new` only.
+    pub fn with_reload(mut self, config_path: PathBuf, apply_log_level: ApplyLogLevel) -> Self {
+        self.config_path = Some(config_path);
+        self.apply_log_level = Some(apply_log_level);
+        self
     }
 
     /// Borrow-only view consumed by `crate::metrics::format::format`.

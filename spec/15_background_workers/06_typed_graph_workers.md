@@ -584,8 +584,9 @@ Tracked in [`.../00_overview/04_open_questions_archive.md`](../00_overview/04_op
 
 - Secondary indexes on `last_used_at_ns` (LLM cache) and `timestamp_ns` (audit table) for faster scans.
 - Touch-on-read for `last_used_at_ns` to make LLM cache LRU exact.
-- Per-statement-kind retention windows.
 - Watermark optimisation for stale extraction (skip re-flagging already-flagged rows).
+
+Per-statement-kind retention windows are **implemented** (no longer an open question): a predicate declares `retention: <duration>` in the schema DSL, and the `statement_reclaim` worker soft-tombstones expired statements (reason `RetentionExpired`) which then reclaim through the normal tombstone-grace flow.
 
 ## State-carrying workers
 
@@ -772,23 +773,29 @@ pub struct ForgetCascadeJob {
                               memory_id ‖ record_id, now)
 3. Open a write txn (batched, ≤ 256 records per txn).
 4. For each record in the batch:
-     a. Drop `memory_id` from `evidence`.
-     b. Recompute `confidence` per ../10_metadata/00_purpose.md.
-     c. If evidence.is_empty():
+     a. If the FORGET is soft, journal a ForgetUndoRecord to
+        forget_undo_log capturing the stripped evidence entry
+        and the row's prior confidence / is_current /
+        tombstone_reason / overflow id (hard FORGET journals
+        nothing — it is irreversible).
+     b. Drop `memory_id` from `evidence`.
+     c. Recompute `confidence` per ../10_metadata/00_purpose.md.
+     d. If evidence.is_empty():
           - confidence >= threshold:
               mark `stale_evidence` flag; keep row.
           - else:
               tombstone with reason=SourceMemoryForgotten;
               audit row.
-     d. mark_completed in the same wtxn.
+     e. mark_completed in the same wtxn.
 5. Commit. If more than 256 dependents remain, enqueue a
    continuation job for the leftover.
 ```
 
 #### Soft vs hard cascade
 
-- **Soft FORGET** (Brain's default with a grace window): the cascade marks dependent rows with the same grace expiry. If the FORGET is reverted within grace, the cascade receives a `CascadeKind::Revert` job and rolls back the pending-tombstone flag on each affected row.
-- **Hard FORGET**: the cascade hard-tombstones immediately.
+- **Soft FORGET** (Brain's default with a grace window): the `Apply` cascade mutates dependent rows immediately but additively journals each mutation to `forget_undo_log` (see step 4a above and [`../10_metadata/00_purpose.md`](../10_metadata/00_purpose.md) — the additive undo log). If the FORGET is reverted within grace, the worker receives a `CascadeKind::Revert` job and replays the undo log: it re-attaches evidence, re-adds the reverse-index row, recomputes confidence, and un-tombstones each row still carrying reason `SourceMemoryForgotten`, deleting each consumed undo row in the same txn so a re-run is a structural no-op.
+- **Hard FORGET**: the cascade hard-tombstones immediately and writes no undo records — it is irreversible.
+- **Post-grace**: once the grace window passes, slot reclamation reaps the forgotten memory's undo rows, so a soft FORGET becomes irreversible after grace too.
 
 #### Confidence threshold
 

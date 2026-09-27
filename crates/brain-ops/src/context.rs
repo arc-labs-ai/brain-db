@@ -16,13 +16,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use brain_extractors::{ClassifierConfig, ExtractorRegistry};
-use brain_index::{GraphRetriever, LexicalRetriever, SemanticRetriever, TantivyShard};
+use brain_index::{
+    EntityVectorIndex, GraphRetriever, LexicalRetriever, SemanticRetriever, TantivyShard,
+};
 use brain_metadata::LlmCacheDb;
 use brain_planner::{ExecutorContext, PlannerContext};
 use brain_rerank::RerankService;
 use parking_lot::{Mutex, RwLock};
 
 use crate::index::text_indexer::{MemoryTextDispatcher, StatementTextDispatcher};
+use crate::metrics::{QueryMetrics, RetrieverMetrics};
 use crate::state::access_buffer::AccessBuffer;
 use crate::subscribe::{EventBus, EventEnvelope, SubscriptionRegistry};
 use crate::txn::TxnStore;
@@ -96,6 +99,14 @@ pub struct OpsContext {
     /// Inner executor context — embedder, index, metadata, writer.
     /// Handlers borrow this to call brain-planner's `execute_*`.
     pub executor: ExecutorContext,
+    /// Wire-level session that issued **this request**, stamped
+    /// per-request by `brain-ops::dispatch` from the authenticated
+    /// caller. Transaction handlers compare it against the opener's
+    /// `TxnEntry::connection_id` so only the connection that opened a
+    /// txn can read its pending writes, buffer into it, or commit/abort
+    /// it. All-zero means "no session" (in-process test path); a txn
+    /// opened without a session imposes no ownership binding.
+    pub caller_connection_id: [u8; 16],
     /// Planner-side config + budgets. Defaults are fine for v1; the
     /// builder is here so the server can override budgets at startup.
     pub planner_ctx: PlannerContext,
@@ -173,6 +184,11 @@ pub struct OpsContext {
     /// the moment the shard spawns; the retriever just dispatches
     /// into it.
     pub graph_retriever: Arc<dyn GraphRetriever>,
+    /// Per-shard entity vector index for the resolver's tier-3 embedding
+    /// tie-break. `None` until the shard-spawn path wires it via
+    /// [`OpsContext::with_entity_vector_index`]; when absent the resolver
+    /// skips tier 3 and falls through to the create fallback.
+    pub entity_vector_index: Option<Arc<dyn EntityVectorIndex>>,
     /// Per-shard cross-encoder (W2.2 rerank pass). Shared across
     /// shards because the model is read-only and CPU-heavy.
     ///
@@ -203,6 +219,18 @@ pub struct OpsContext {
     /// commit and WAL append loses the matching subscribe event for
     /// that op, not the underlying typed-graph data.
     pub wal_sink: Option<Arc<dyn WalSink>>,
+    /// Per-shard read-path retriever metric family. Shared by `Arc`
+    /// with `brain-server`'s `/metrics` exposition. The RECALL handler
+    /// records per-lane invocations / candidates / latency here after
+    /// `execute` returns — the hot fan-out loop is untouched. Always
+    /// present (recall runs on every shard); tests get a fresh zeroed
+    /// instance.
+    pub retriever_metrics: Arc<RetrieverMetrics>,
+    /// Per-shard end-to-end RECALL metric family. Same shared-by-`Arc`
+    /// shape as [`Self::retriever_metrics`]; recorded once per served
+    /// recall with the end-to-end latency, effective fusion `k`, rerank
+    /// flag, and answer shape.
+    pub query_metrics: Arc<QueryMetrics>,
 }
 
 impl OpsContext {
@@ -221,6 +249,7 @@ impl OpsContext {
         let subscriptions = Arc::new(SubscriptionRegistry::new(events.clone()));
         Self {
             executor,
+            caller_connection_id: [0u8; 16],
             planner_ctx: PlannerContext::default(),
             txn_store: Arc::new(TxnStore::new()),
             events,
@@ -238,9 +267,21 @@ impl OpsContext {
             lexical_retriever,
             semantic_retriever,
             graph_retriever,
+            entity_vector_index: None,
             cross_encoder: CrossEncoderSlot::Disabled,
             wal_sink: None,
+            retriever_metrics: Arc::new(RetrieverMetrics::new()),
+            query_metrics: Arc::new(QueryMetrics::new()),
         }
+    }
+
+    /// Wire the per-shard entity vector index for the resolver's tier-3
+    /// embedding tie-break. The shard-spawn path calls this with an adapter
+    /// over its `EntityHnswIndex`; left unset (tests), tier 3 is skipped.
+    #[must_use]
+    pub fn with_entity_vector_index(mut self, index: Arc<dyn EntityVectorIndex>) -> Self {
+        self.entity_vector_index = Some(index);
+        self
     }
 
     /// Override the bounded poll window for the one-shot subscribe
@@ -270,6 +311,17 @@ impl OpsContext {
     #[must_use]
     pub fn with_txn_store(mut self, store: Arc<TxnStore>) -> Self {
         self.txn_store = store;
+        self
+    }
+
+    /// Stamp the per-request wire-level session id. Called by
+    /// `brain-ops::dispatch` from the authenticated caller so the
+    /// transaction handlers can enforce connection ownership on every
+    /// in-txn op. Tests set it directly to simulate distinct
+    /// connections.
+    #[must_use]
+    pub fn with_caller_connection_id(mut self, connection_id: [u8; 16]) -> Self {
+        self.caller_connection_id = connection_id;
         self
     }
 
@@ -393,6 +445,22 @@ impl OpsContext {
     #[must_use]
     pub fn with_wal_sink(mut self, sink: Option<Arc<dyn WalSink>>) -> Self {
         self.wal_sink = sink;
+        self
+    }
+
+    /// Install the shared read-path metric families. The server calls
+    /// this once at shard startup with the same `Arc`s it stashes on
+    /// the `ShardHandle`, so the RECALL handler and `/metrics`
+    /// exposition observe one counter set. Tests that don't care keep
+    /// the fresh zeroed instances from [`Self::new`].
+    #[must_use]
+    pub fn with_recall_metrics(
+        mut self,
+        retriever_metrics: Arc<RetrieverMetrics>,
+        query_metrics: Arc<QueryMetrics>,
+    ) -> Self {
+        self.retriever_metrics = retriever_metrics;
+        self.query_metrics = query_metrics;
         self
     }
 

@@ -63,7 +63,11 @@ pub(super) async fn tombstone_space_memories(
             let (k, _) = entry.map_err(|e| OpError::Internal(format!("timeline row: {e}")))?;
             let key = k.value();
             if let Some(want) = session_filter {
-                let session = u64::from_be_bytes(key[28..36].try_into().unwrap());
+                let session = u64::from_be_bytes(
+                    key[28..36]
+                        .try_into()
+                        .expect("invariant: 8-byte session slice from a fixed-width key"),
+                );
                 if session != want {
                     continue;
                 }

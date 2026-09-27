@@ -8,9 +8,9 @@ use brain_core::{AuditId, MemoryId};
 use redb::{ReadTransaction, WriteTransaction};
 
 use crate::tables::audit::{
-    extraction_status, ExtractionAudit, EXTRACTOR_AUDIT_BY_EXTRACTOR_TABLE,
-    EXTRACTOR_AUDIT_BY_MEMORY_TABLE, EXTRACTOR_AUDIT_BY_TIME_TABLE, EXTRACTOR_AUDIT_TABLE,
-    OUTPUTS_CAP,
+    extraction_status, ExtractionAudit, ResolutionAudit, ENTITY_RESOLUTION_AUDIT_TABLE,
+    EXTRACTOR_AUDIT_BY_EXTRACTOR_TABLE, EXTRACTOR_AUDIT_BY_MEMORY_TABLE,
+    EXTRACTOR_AUDIT_BY_TIME_TABLE, EXTRACTOR_AUDIT_TABLE, OUTPUTS_CAP,
 };
 
 #[derive(thiserror::Error, Debug)]
@@ -60,6 +60,23 @@ pub fn audit_write(wtxn: &WriteTransaction, audit: &ExtractionAudit) -> Result<(
         let mut t = wtxn.open_table(EXTRACTOR_AUDIT_BY_TIME_TABLE)?;
         t.insert(&(audit.started_at_unix_nanos, key), &())?;
     }
+    Ok(())
+}
+
+/// Write one entity-resolution audit row into
+/// [`ENTITY_RESOLUTION_AUDIT_TABLE`]. The key is the row's UUIDv7
+/// `audit_id`, which keeps the table time-ordered.
+///
+/// Caller commits the same `wtxn` that performed the audited mutation
+/// (e.g. the entity tombstone) so the audit and the state change land
+/// atomically. This is the entity-lifecycle counterpart to
+/// [`audit_write`] (which targets the extraction log).
+pub fn resolution_audit_write(
+    wtxn: &WriteTransaction,
+    audit: &ResolutionAudit,
+) -> Result<(), AuditOpError> {
+    let mut t = wtxn.open_table(ENTITY_RESOLUTION_AUDIT_TABLE)?;
+    t.insert(&audit.audit_id_bytes, audit)?;
     Ok(())
 }
 

@@ -98,6 +98,24 @@ pub struct ForgetPayload {
     pub reason: ForgetReason,
 }
 
+/// RESTORE_MEMORY WAL record — the mirror of [`ForgetPayload`] for a
+/// soft-forget revert. Re-activates a soft-tombstoned memory: recovery
+/// clears the ACTIVE-cleared flag, drops `tombstoned_at`, re-inserts the
+/// timeline entry, and restores the dedup fingerprint. A hard-forgotten
+/// memory is never the subject of one of these (hard forget is
+/// irreversible), so recovery treats a restore against a hard-forgotten
+/// row as a defensive no-op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestorePayload {
+    pub memory_id: MemoryId,
+    /// The WriteId of the restore, carried for idempotency-cache replay
+    /// (both share the UUIDv7 16-byte layout, like [`ForgetPayload`]).
+    pub request_id: RequestId,
+    /// Space the restore ran under — the same tenant-routing role the
+    /// field plays on [`ForgetPayload`].
+    pub space_id: SpaceId,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ForgetMode {
@@ -376,6 +394,9 @@ pub enum WalPayload {
     RelationSupersede(RelationSupersedePayload),
     /// Typed-relation tombstone.
     RelationTombstone(RelationTombstonePayload),
+    /// Un-tombstone a soft-forgotten memory (FORGET soft-cascade revert).
+    /// First-class typed payload, the mirror of [`Self::Forget`].
+    RestoreMemory(RestorePayload),
     /// opaque-body record carried as an opaque body. Used for the
     /// entity / statement / schema / audit kinds whose typed body
     /// schemas are layered above; the framing layer transports them
@@ -406,6 +427,7 @@ impl WalPayload {
             Self::RelationLink(_) => WalRecordKind::RelationCreate,
             Self::RelationSupersede(_) => WalRecordKind::RelationSupersede,
             Self::RelationTombstone(_) => WalRecordKind::RelationTombstone,
+            Self::RestoreMemory(_) => WalRecordKind::RestoreMemory,
             Self::PhaseBody(r) => r.kind,
         }
     }
@@ -433,6 +455,7 @@ impl WalPayload {
             Self::RelationLink(p) => encode_relation_link(p, &mut out),
             Self::RelationSupersede(p) => encode_relation_supersede(p, &mut out),
             Self::RelationTombstone(p) => encode_relation_tombstone(p, &mut out),
+            Self::RestoreMemory(p) => encode_restore(p, &mut out),
             Self::PhaseBody(r) => {
                 // Layout: space_id (16 B) || opaque body.
                 put_uuid_bytes(&mut out, r.space_id.into());
@@ -480,6 +503,7 @@ impl WalPayload {
             WalRecordKind::RelationTombstone => {
                 Self::RelationTombstone(decode_relation_tombstone(&mut r)?)
             }
+            WalRecordKind::RestoreMemory => Self::RestoreMemory(decode_restore(&mut r)?),
             // Remaining typed-graph kinds keep the opaque body. Their
             // typed schemas land in later phases; the framing layer
             // transports them unchanged. We early-return so the
@@ -942,6 +966,20 @@ fn decode_forget(r: &mut Reader<'_>) -> Result<ForgetPayload, WalPayloadError> {
         space_id: r.array16()?.into(),
         mode: forget_mode_from_u8(r.u8()?)?,
         reason: forget_reason_from_u8(r.u8()?)?,
+    })
+}
+
+fn encode_restore(p: &RestorePayload, out: &mut Vec<u8>) {
+    put_memory_id(out, p.memory_id);
+    put_uuid_bytes(out, p.request_id.into());
+    put_uuid_bytes(out, p.space_id.into());
+}
+
+fn decode_restore(r: &mut Reader<'_>) -> Result<RestorePayload, WalPayloadError> {
+    Ok(RestorePayload {
+        memory_id: r.memory_id()?,
+        request_id: r.array16()?.into(),
+        space_id: r.array16()?.into(),
     })
 }
 
@@ -2250,6 +2288,29 @@ mod tests {
                 assert_eq!(p.reason, ForgetReason::ClientRequest);
             }
             other => panic!("expected Forget, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn restore_payload_round_trips() {
+        // The un-tombstone WAL record must survive a full
+        // encode_to_bytes → decode round-trip: recovery keys the
+        // idempotency replay off request_id and routes the re-activation
+        // by space_id, so both must reproduce byte-for-byte.
+        let space = aid(0x71);
+        let payload = WalPayload::RestoreMemory(RestorePayload {
+            memory_id: mid(123),
+            request_id: rid(9),
+            space_id: space,
+        });
+        let bytes = payload.encode_to_bytes();
+        match WalPayload::decode(WalRecordKind::RestoreMemory, &bytes).unwrap() {
+            WalPayload::RestoreMemory(p) => {
+                assert_eq!(p.memory_id, mid(123));
+                assert_eq!(p.request_id, rid(9));
+                assert_eq!(p.space_id, space);
+            }
+            other => panic!("expected RestoreMemory, got {other:?}"),
         }
     }
 }

@@ -260,6 +260,98 @@ fn env_override_byte_size_string_parses() {
     assert_eq!(cfg.shard.arena_capacity_bytes, 2u64 << 30);
 }
 
+#[test]
+fn env_numeric_looking_secret_stays_string() {
+    // A pure-digit admin token / API key must be accepted verbatim as a
+    // string, not re-typed to an integer (which would fail deserialization
+    // and make the server refuse to boot with a confusing "config
+    // validation error").
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_tmp(&dir, MINIMAL_CONFIG);
+    let mut env = HashMap::new();
+    env.insert("BRAIN__ADMIN__TOKEN".into(), "48291057".into());
+    env.insert("BRAIN__LLM__API_KEY".into(), "99999".into());
+    let cfg = Config::load_with_env(&path, &env).expect("digit secrets must load as strings");
+    assert_eq!(cfg.admin.token.as_deref(), Some("48291057"));
+    assert_eq!(cfg.llm.api_key.as_deref(), Some("99999"));
+}
+
+#[test]
+fn env_bool_looking_secret_stays_string() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_tmp(&dir, MINIMAL_CONFIG);
+    let mut env = HashMap::new();
+    env.insert("BRAIN__ADMIN__TOKEN".into(), "true".into());
+    let cfg = Config::load_with_env(&path, &env).expect("bool-looking secret must load as string");
+    assert_eq!(cfg.admin.token.as_deref(), Some("true"));
+}
+
+#[test]
+fn env_numeric_field_still_accepts_numeric_override() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_tmp(&dir, MINIMAL_CONFIG);
+    let mut env = HashMap::new();
+    env.insert("BRAIN__STORAGE__SHARD_COUNT".into(), "8".into());
+    let cfg = Config::load_with_env(&path, &env).unwrap();
+    assert_eq!(cfg.storage.shard_count, 8);
+}
+
+#[test]
+fn env_wrong_typed_numeric_field_still_errors() {
+    // A non-numeric value for a genuinely numeric field must still fail
+    // fast — the string-preserving fix only covers string-typed targets.
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_tmp(&dir, MINIMAL_CONFIG);
+    let mut env = HashMap::new();
+    env.insert("BRAIN__STORAGE__SHARD_COUNT".into(), "notanumber".into());
+    let err = Config::load_with_env(&path, &env)
+        .expect_err("a string for a numeric field must fail deserialization");
+    assert!(matches!(err, ConfigError::Validate { .. }), "got: {err:?}");
+}
+
+#[test]
+fn validate_post_rejects_zero_worker_interval() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_tmp(&dir, MINIMAL_CONFIG);
+    let mut env = HashMap::new();
+    env.insert("BRAIN__WORKERS__AUTO_EDGE__INTERVAL_MS".into(), "0".into());
+    let err = Config::load_with_env(&path, &env).expect_err("interval_ms = 0 must be rejected");
+    assert!(
+        matches!(err, ConfigError::Invariant(ref m) if m.contains("interval_ms")),
+        "got: {err:?}"
+    );
+}
+
+#[test]
+fn validate_post_rejects_zero_channel_capacity() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_tmp(&dir, MINIMAL_CONFIG);
+    let mut env = HashMap::new();
+    env.insert(
+        "BRAIN__WORKERS__EXTRACTOR__CHANNEL_CAPACITY".into(),
+        "0".into(),
+    );
+    let err =
+        Config::load_with_env(&path, &env).expect_err("channel_capacity = 0 must be rejected");
+    assert!(
+        matches!(err, ConfigError::Invariant(ref m) if m.contains("channel_capacity")),
+        "got: {err:?}"
+    );
+}
+
+#[test]
+fn validate_post_rejects_zero_optional_cadence() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_tmp(&dir, MINIMAL_CONFIG);
+    let mut env = HashMap::new();
+    env.insert("BRAIN__WORKERS__DECAY_INTERVAL_SEC".into(), "0".into());
+    let err = Config::load_with_env(&path, &env).expect_err("decay_interval_sec = 0 must reject");
+    assert!(
+        matches!(err, ConfigError::Invariant(ref m) if m.contains("decay_interval_sec")),
+        "got: {err:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 12. Defaults
 // ---------------------------------------------------------------------------

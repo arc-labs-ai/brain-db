@@ -30,6 +30,7 @@ pub mod handlers;
 pub mod index;
 pub mod memory_artifact;
 pub mod metrics;
+pub mod precision;
 pub mod state;
 #[doc(hidden)]
 pub mod test_support;
@@ -38,18 +39,22 @@ pub mod writer;
 
 // Module-level re-exports so external callers (brain-server, brain-planner)
 // can write `brain_ops::encode::*` rather than `brain_ops::handlers::encode::*`.
+pub use handlers::restore::{handle_admin_restore, AdminRestoreOutcome};
 pub use handlers::{
     encode, encode_vector_direct, entity, extractor_admin, forget, link, plan, query, reason,
-    recall, relation, schema, statement, subscribe, txn,
+    recall, relation, restore, schema, statement, subscribe, txn,
 };
 
 pub use brain_planner::PlannerContext;
 pub use context::{CrossEncoderSlot, OpsContext};
 pub use dispatch::{dispatch, DispatchOutcome, RequestCaller};
 pub use error::{ErrorCode, OpError};
+pub use handlers::recall::{
+    merge_namespace_partials, merge_recall_pools, MergedNamespaceRecall, NamespaceRecallPartial,
+};
 pub use handlers::subscribe::{
-    parse_filter, EventBus, EventEnvelope, LsnAllocator, ParsedFilter, SubscriptionHandle,
-    SubscriptionRegistry, DEFAULT_EVENT_CHANNEL_CAPACITY,
+    parse_filter, EventBus, EventEnvelope, LsnAllocator, ParsedFilter, SimilarityMatch,
+    SubscriptionHandle, SubscriptionRegistry, DEFAULT_EVENT_CHANNEL_CAPACITY,
 };
 pub use handlers::txn::{TxnId, TxnState, TxnStore};
 pub use metrics::{
@@ -58,12 +63,14 @@ pub use metrics::{
     CausalSkipReason, ConfidenceSweepMetrics, ConfidenceSweepMetricsSnapshot, ExtractorItemKind,
     ExtractorMetrics, ExtractorMetricsSnapshot, ForgetCascadeMetrics, ForgetCascadeMetricsSnapshot,
     IdempotencyOutcome, LlmCacheMetrics, LlmCacheMetricsSnapshot, LlmCacheModelCounts,
-    LlmCacheSweepMetrics, LlmCacheSweepMetricsSnapshot, PerPhaseSnapshot, ResolverOutcome,
-    SchemaMigrationMetrics, SchemaMigrationMetricsSnapshot, StatementEmbedMetrics,
-    StatementEmbedMetricsSnapshot, SubmitOutcome, TemporalEdgeMetrics, TemporalEdgeMetricsSnapshot,
-    TemporalSkipReason, TierKind, TierStatus, WorkerBucketSnapshot, WorkerHistogram,
-    WorkerHistogramSnapshot, WriterMetrics, WriterMetricsSnapshot, ITEM_KIND_LABELS,
-    RESOLVER_OUTCOME_LABELS, TIER_LABELS, TIER_STATUS_LABELS,
+    LlmCacheSweepMetrics, LlmCacheSweepMetricsSnapshot, PerPhaseSnapshot, QueryMetrics,
+    QueryMetricsSnapshot, QueryOutcome, ResolverOutcome, RetrieverKind, RetrieverMetrics,
+    RetrieverMetricsSnapshot, SchemaMigrationMetrics, SchemaMigrationMetricsSnapshot,
+    StatementEmbedMetrics, StatementEmbedMetricsSnapshot, SubmitOutcome, TemporalEdgeMetrics,
+    TemporalEdgeMetricsSnapshot, TemporalSkipReason, TierKind, TierStatus, WorkerBucketSnapshot,
+    WorkerHistogram, WorkerHistogramSnapshot, WriterMetrics, WriterMetricsSnapshot,
+    ITEM_KIND_LABELS, QUERY_OUTCOME_LABELS, RESOLVER_OUTCOME_LABELS, RETRIEVER_LABELS, TIER_LABELS,
+    TIER_STATUS_LABELS,
 };
 pub use state::access_buffer::{AccessBuffer, DEFAULT_ACCESS_BUFFER_CAPACITY};
 pub use write::{
@@ -72,7 +79,8 @@ pub use write::{
 };
 pub use writer::{
     AutoEdgeEnqueue, CausalEdgeEnqueue, ExtractorEnqueue, ForgetCascadeJob, ForgetCascadeKind,
-    ForgetCascadeMode, RealWriterHandle, SchemaFlagSweepJob, TemporalEdgeEnqueue,
+    ForgetCascadeMode, RealWriterHandle, RedbCommittedWatermark, SchemaFlagSweepJob,
+    TemporalEdgeEnqueue,
 };
 
 #[cfg(test)]
@@ -302,10 +310,11 @@ mod tests {
             }
 
             // Backfill control is part of the same HTTP-only admin plane
-            // (`POST /v1/extract/backfill`); the wire opcode must reject the
-            // same way — NOT dangle on `NotYetImplemented`. Pinned explicitly
-            // so a future split of the shared match arm can't silently
-            // regress it back to "coming later".
+            // (the resumable worker is driven from `/v1/backfill`); the wire
+            // opcode must reject the same way — NOT dangle on
+            // `NotYetImplemented`, and NOT drive the worker over the wire.
+            // Pinned explicitly so a future split of the shared match arm
+            // can't silently regress it.
             let backfill = brain_protocol::envelope::request::RequestBody::AdminBackfill(
                 brain_protocol::envelope::request::AdminBackfillRequest {
                     scope: brain_protocol::envelope::request::BackfillScope::All,

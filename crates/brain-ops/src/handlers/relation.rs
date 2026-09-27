@@ -21,7 +21,8 @@
 use brain_core::Relation;
 use brain_core::{Cardinality, EntityId, RelationId, RelationTypeId, RequestId};
 use brain_metadata::relation::ops::{
-    relation_get, relation_list_from, relation_list_to, RelationListFilter, RelationOpError,
+    relation_get, relation_list_from_page, relation_list_to_page, RelationListFilter,
+    RelationOpError,
 };
 use brain_metadata::relation::traversal::{
     traverse, TraversalConfig, TraversalDirection, MAX_DEPTH,
@@ -353,10 +354,18 @@ pub async fn handle_relation_supersede(
         rt
     };
 
-    // Pre-submit existence check so a missing `old_relation_id` keeps
-    // its `NotFound { what: "relation", .. }` wire shape — submit-path
-    // failures collapse to `WriterError::Internal`.
-    peek_relation_exists(ctx, old_id)?;
+    // Pre-submit existence + ownership check so a missing OR foreign
+    // `old_relation_id` keeps its `NotFound { what: "relation", .. }`
+    // wire shape (submit-path failures collapse to
+    // `WriterError::Internal`). Scope-aware: another tenant's relation is
+    // indistinguishable from a missing one. The apply-layer wall
+    // re-checks atomically.
+    if !relation_id_in_caller_scope(ctx, old_id) {
+        return Err(OpError::NotFound {
+            what: "relation",
+            detail: format!("{old_id:?}"),
+        });
+    }
 
     let new_relation = build_relation_from_create(&req.new_relation, &rt, now)?;
 
@@ -432,10 +441,17 @@ pub async fn handle_relation_tombstone(
     let id = RelationId::from(req.relation_id);
     let now = crate::txn::now_unix_nanos_pub();
 
-    // Pre-submit existence check — submit-path failures collapse into
-    // WriterError::Internal, so peek first to keep the missing-id
-    // case structured as OpError::NotFound.
-    peek_relation_exists(ctx, id)?;
+    // Pre-submit existence + ownership check — submit-path failures
+    // collapse into WriterError::Internal, so check first to keep the
+    // missing-id case structured as OpError::NotFound. Scope-aware:
+    // another tenant's relation is indistinguishable from a missing one.
+    // The apply-layer wall re-checks atomically.
+    if !relation_id_in_caller_scope(ctx, id) {
+        return Err(OpError::NotFound {
+            what: "relation",
+            detail: format!("{id:?}"),
+        });
+    }
 
     let real_writer = downcast_writer_pub(ctx)?;
     let write_id =
@@ -491,7 +507,7 @@ pub async fn handle_relation_list_from(
     req: RelationListFromRequest,
     ctx: &OpsContext,
 ) -> Result<RelationListFromResponseFrame, OpError> {
-    let (items, count) = run_list(
+    let (items, count, next_cursor) = run_list(
         ctx,
         EntityId::from(req.from_entity),
         &req.relation_type_filter,
@@ -503,7 +519,7 @@ pub async fn handle_relation_list_from(
     )?;
     Ok(RelationListFromResponseFrame {
         items,
-        next_cursor: Vec::new(),
+        next_cursor,
         cumulative_count: count,
         is_final: true,
     })
@@ -513,7 +529,7 @@ pub async fn handle_relation_list_to(
     req: RelationListToRequest,
     ctx: &OpsContext,
 ) -> Result<RelationListToResponseFrame, OpError> {
-    let (items, count) = run_list(
+    let (items, count, next_cursor) = run_list(
         ctx,
         EntityId::from(req.to_entity),
         &req.relation_type_filter,
@@ -525,7 +541,7 @@ pub async fn handle_relation_list_to(
     )?;
     Ok(RelationListToResponseFrame {
         items,
-        next_cursor: Vec::new(),
+        next_cursor,
         cumulative_count: count,
         is_final: true,
     })
@@ -541,15 +557,19 @@ fn run_list(
     limit: u32,
     cursor: &[u8],
     from_side: bool,
-) -> Result<(Vec<RelationView>, u32), OpError> {
+) -> Result<(Vec<RelationView>, u32, Vec<u8>), OpError> {
     if limit == 0 || limit > LIST_LIMIT_MAX {
         return Err(OpError::InvalidRequest("limit must be in 1..=1000".into()));
     }
-    if !cursor.is_empty() {
-        return Err(OpError::InvalidRequest(
-            "RELATION_LIST cursor pagination lands in phase 23".into(),
-        ));
-    }
+    let scope =
+        brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_space);
+    let filter_sig = relation_list_filter_signature(
+        type_filter,
+        include_superseded,
+        include_tombstoned,
+        from_side,
+    );
+    let resume_key = decode_relation_cursor(cursor, scope, &filter_sig)?;
 
     let rtxn = ctx
         .executor
@@ -577,7 +597,7 @@ fn run_list(
                         version,
                     });
                 }
-                return Ok((Vec::new(), 0));
+                return Ok((Vec::new(), 0, Vec::new()));
             }
         }
     };
@@ -585,27 +605,121 @@ fn run_list(
     let filter = RelationListFilter {
         relation_type,
         current_only: !include_superseded && !include_tombstoned,
-        limit: limit as usize,
+        // The page fn takes its page size as an explicit argument; the
+        // struct field is unused on this path.
+        limit: 0,
     };
-    let scope =
-        brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_space);
-    let mut rows = if from_side {
-        relation_list_from(&rtxn, scope, entity, &filter).map_err(map_relation_op_error)?
+
+    // Page directly from the edge index: seek strictly past the cursor,
+    // apply tombstone / current filters in the walk, and return one page
+    // plus whether more remain. No 1000-row window, so relations past
+    // 1000 are reachable and each page costs one page's worth of scan.
+    let page = if from_side {
+        relation_list_from_page(
+            &rtxn,
+            scope,
+            entity,
+            &filter,
+            include_tombstoned,
+            resume_key.as_deref(),
+            limit as usize,
+        )
     } else {
-        relation_list_to(&rtxn, scope, entity, &filter).map_err(map_relation_op_error)?
-    };
-
-    // Wire-level filters not pushed into list_*.
-    if !include_tombstoned {
-        rows.retain(|r| !r.tombstoned);
+        relation_list_to_page(
+            &rtxn,
+            scope,
+            entity,
+            &filter,
+            include_tombstoned,
+            resume_key.as_deref(),
+            limit as usize,
+        )
     }
+    .map_err(map_relation_op_error)?;
 
-    let mut out = Vec::with_capacity(rows.len());
-    for r in &rows {
+    let mut out = Vec::with_capacity(page.rows.len());
+    for r in &page.rows {
         out.push(project_view(&rtxn, r)?);
     }
     let count = out.len() as u32;
-    Ok((out, count))
+    let next_cursor = match (page.has_more, page.last_key) {
+        (true, Some(k)) => encode_relation_cursor(scope, &filter_sig, &k),
+        _ => Vec::new(),
+    };
+    Ok((out, count, next_cursor))
+}
+
+// ---------------------------------------------------------------------------
+// RELATION_LIST_{FROM,TO} keyset-pagination cursor.
+//
+// Opaque bytes on the wire (a `bytes` field — the manifest is unchanged
+// and no SDK parses it). Carries the owning scope (tenant reject), a
+// signature of the query filters + direction (a mid-pagination change or
+// a from/to mixup fails closed), and the raw edge-table key of the last
+// row so the next page seeks strictly past it in-store.
+// ---------------------------------------------------------------------------
+
+const RELATION_CURSOR_VERSION: u8 = 2;
+/// `version(1) + namespace_id(4) + space_id(16) + filter_sig(8)` then the
+/// variable-length raw edge key.
+const RELATION_CURSOR_HEADER: usize = 1 + 4 + 16 + 8;
+
+fn relation_list_filter_signature(
+    type_filter: &str,
+    include_superseded: bool,
+    include_tombstoned: bool,
+    from_side: bool,
+) -> [u8; 8] {
+    let mut h = blake3::Hasher::new();
+    h.update(&(type_filter.len() as u32).to_le_bytes());
+    h.update(type_filter.as_bytes());
+    h.update(&[
+        u8::from(include_superseded),
+        u8::from(include_tombstoned),
+        u8::from(from_side),
+    ]);
+    let full = h.finalize();
+    let mut out = [0u8; 8];
+    out.copy_from_slice(&full.as_bytes()[..8]);
+    out
+}
+
+fn encode_relation_cursor(scope: brain_metadata::RowScope, sig: &[u8; 8], key: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(RELATION_CURSOR_HEADER + key.len());
+    out.push(RELATION_CURSOR_VERSION);
+    out.extend_from_slice(&scope.namespace_id.to_le_bytes());
+    out.extend_from_slice(&scope.space_id_bytes);
+    out.extend_from_slice(sig);
+    out.extend_from_slice(key);
+    out
+}
+
+fn decode_relation_cursor(
+    cursor: &[u8],
+    scope: brain_metadata::RowScope,
+    sig: &[u8; 8],
+) -> Result<Option<Vec<u8>>, OpError> {
+    if cursor.is_empty() {
+        return Ok(None);
+    }
+    // The raw edge key is always non-empty, so a valid cursor is strictly
+    // longer than the header.
+    if cursor.len() <= RELATION_CURSOR_HEADER || cursor[0] != RELATION_CURSOR_VERSION {
+        return Err(OpError::InvalidRequest("malformed cursor".into()));
+    }
+    let mut ns = [0u8; 4];
+    ns.copy_from_slice(&cursor[1..5]);
+    if u32::from_le_bytes(ns) != scope.namespace_id || cursor[5..21] != scope.space_id_bytes {
+        return Err(OpError::InvalidRequest(
+            "cursor does not belong to the caller's tenant".into(),
+        ));
+    }
+    if cursor[21..29] != *sig {
+        return Err(OpError::InvalidRequest(
+            "stale_cursor: filters changed between pages".into(),
+        ));
+    }
+    Ok(Some(cursor[RELATION_CURSOR_HEADER..].to_vec()))
 }
 
 // ---------------------------------------------------------------------------
@@ -733,7 +847,7 @@ fn validate_qname(q: &str) -> Result<(), OpError> {
     }
     if q.len() > QNAME_MAX {
         return Err(OpError::InvalidRequest(format!(
-            "relation_type qname exceeds {QNAME_MAX} chars"
+            "relation_type qname exceeds {QNAME_MAX} bytes"
         )));
     }
     if !q.contains(':') {
@@ -934,29 +1048,6 @@ fn rt_active_for_schema_rtxn(
         }
     }
     Ok(out)
-}
-
-/// Confirm the relation row exists. Returns `OpError::NotFound` with
-/// the stable `what: "relation"` discriminant when the id has never
-/// been written. Used pre-submit so a missing relation keeps its
-/// wire-level NotFound shape instead of collapsing into Internal via
-/// WriterError.
-fn peek_relation_exists(ctx: &OpsContext, id: RelationId) -> Result<(), OpError> {
-    let rtxn = ctx
-        .executor
-        .metadata
-        .read_txn()
-        .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
-    if relation_get(&rtxn, id)
-        .map_err(map_relation_op_error)?
-        .is_none()
-    {
-        return Err(OpError::NotFound {
-            what: "relation",
-            detail: format!("{id:?}"),
-        });
-    }
-    Ok(())
 }
 
 /// BLAKE3 over the canonical RELATION_CREATE request fields. Excludes

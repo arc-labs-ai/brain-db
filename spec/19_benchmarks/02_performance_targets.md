@@ -1,5 +1,9 @@
 # 19.02 Performance Targets
 
+> **v1.0 status — advisory, not a lock gate (owner decision, 2026-09-07).** Reference-hardware performance verification is **optional / off the grid for v1.0** — see [`06_complete_acceptance.md`](06_complete_acceptance.md) §"Performance acceptance". The numbers here are engineering targets to measure post-lock, not v1.0 lock criteria.
+>
+> **Reconciliation note.** The per-operation numbers in this file are **being reconciled** against [`../01_architecture/05_hardware_and_targets.md`](../01_architecture/05_hardware_and_targets.md) §7 and [`06_complete_acceptance.md`](06_complete_acceptance.md), which agree with each other (and split targets by CPU / GPU / `ENCODE_VECTOR_DIRECT` path). Where a number in §2 below disagrees with those two — FORGET/PLAN/REASON/STATEMENT_CREATE/RELATION_CREATE/entity-resolve latency, and the throughput lines — **treat §01/05 + §19/06 as authoritative** until this file's tables are refreshed (post-v1 tuning task). This file states single-number, older targets; the CPU/GPU-split figures supersede them.
+
 > **TL;DR.** Brain v1.0 performance gates: latency (per-operation p50/p95/p99 targets), throughput (per-shard sustained ops/s), and resource budgets (CPU, RAM, disk per shard / per node). All measured by the benchmark suite on reference hardware (16-core x86_64, 64 GiB RAM, NVMe SSD) at the 1M-memory primary scale.
 
 ## Latency Targets
@@ -92,7 +96,7 @@ TRAVERSE numbers assume default `max_branching_factor = 1000` per [`../13_retrie
 
 ### 2.5 typed graph — deferred targets
 
-- **ENTITY_RESOLVE (tier 3 — embedding HNSW)** lands when the entity HNSW is wired into the resolver. Target placeholder per the phase-16 doc: p50 ≤ 5 ms at 100K, ≤ 50 ms at 1M. Final numbers set here.
+- **ENTITY_RESOLVE (tier 3 — embedding HNSW)** is wired into the resolver (embed-on-create + top-k entity-HNSW search under a scope+type filter); what remains is the reference-hardware measurement, like every other §19.02 target. Target per the phase-16 doc: p50 ≤ 5 ms at 100K, ≤ 50 ms at 1M — final numbers captured on reference hardware.
 - **ENTITY_RESOLVE (tier 4 — LLM)** lands here with the LLM extractor. Latency is gated by the model + cache hit-rate; target is "tail under 1 s with cache warm, queued under 5 s cold."
 - **Statement HNSW semantic search** — gated on the embedding worker populating the HNSW. Brain writes / reads the table inline; the semantic-search target lands with the worker.
 - **Cross-shard RELATION_TRAVERSE** — gated on the query router. Brain ships same-shard only.

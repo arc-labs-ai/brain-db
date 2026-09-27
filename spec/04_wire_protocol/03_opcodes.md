@@ -153,9 +153,12 @@ The low byte's high bit selects direction within this namespace, mirroring the s
 | 0x0122 | `SCHEMA_LIST` | (none) | list of versions with timestamps |
 | 0x0123 | `SCHEMA_VALIDATE` | schema document | validation_errors (without commit) |
 | 0x0124 | `EXTRACTOR_LIST` | (none) | active extractors (read-only introspection) |
+| 0x0125 | `SCHEMA_DROP` | target_kind (0 = predicate, 1 = relation_type) + target_name + `force` | namespace, schema_version, target_kind, target_name, dropped, live_rows, validation_errors |
 | 0x0127 | `SCHEMA_REPLACE` | schema document + `force_drop_existing: true` | namespace, schema_version, dropped_count, validation_errors |
 
 `SCHEMA_REPLACE` (request `0x0127`, response `0x01A7`) is the destructive counterpart to the additive-merge `SCHEMA_UPLOAD`. It tombstones every schema-declared predicate, relation_type, and extractor row in the target namespace and re-runs the apply path against a clean slate inside a single redb wtxn. Entity types are **not** dropped (they are global in v1; see [`../03_schema/05_versioning.md`](../03_schema/05_versioning.md) §1c). Admin-only; the handler rejects the call unless `force_drop_existing` is exactly `true`. See [`../03_schema/05_versioning.md`](../03_schema/05_versioning.md) §9.
+
+`SCHEMA_DROP` (request `0x0125`, response `0x01A5`) is the *targeted* narrowing: it removes one declared predicate or relation_type from a namespace and re-versions the narrowed document, versus `SCHEMA_REPLACE`, which wipes the whole namespace. Entity types are global and never dropped. An in-use safety gate rejects the drop (`Conflict`) when live (non-tombstoned) rows are still keyed on the target unless `force` is set. Re-dropping an already-absent target is a lenient no-op success (`dropped = false`, version unchanged), matching FORGET's idempotency. Admin-only. Like `SCHEMA_UPLOAD` / `SCHEMA_REPLACE`, it flows through the unified `submit(Write)` path so the mutation is WAL-durable and replayed on recovery (see [`../08_storage/02_wal.md`](../08_storage/02_wal.md) §21). See [`../03_schema/05_versioning.md`](../03_schema/05_versioning.md) §9a.
 
 ### 2.2 Entity operations (0x0130–0x013F)
 
@@ -180,7 +183,7 @@ The low byte's high bit selects direction within this namespace, mirroring the s
 | 0x0142 | `STATEMENT_SUPERSEDE` | old_id, new_statement | new StatementId |
 | 0x0143 | `STATEMENT_TOMBSTONE` | StatementId, reason | confirmation |
 | 0x0144 | `STATEMENT_RETRACT` | StatementId | confirmation |
-| 0x0145 | `STATEMENT_HISTORY` | StatementId or chain_root | full chain |
+| 0x0145 | `STATEMENT_HISTORY` | StatementId or chain_root, limit, cursor | page of versions + next_cursor (keyset) |
 | 0x0146 | `STATEMENT_LIST` | filter (subject, predicate, kind, time, confidence) | StatementIds |
 
 ### 2.4 Relation operations (0x0150–0x015F)

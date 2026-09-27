@@ -301,6 +301,10 @@ impl From<brain_metadata::schema::predicate::PredicateOpError> for OpError {
             E::AlreadyExists { qname, existing_id } => OpError::Conflict(format!(
                 "predicate {qname:?} already exists with id {existing_id:?}"
             )),
+            E::NotFound(id) => OpError::NotFound {
+                what: "predicate",
+                detail: format!("{id:?}"),
+            },
             E::Storage(e) => OpError::Internal(format!("redb storage: {e}")),
             E::Table(e) => OpError::Internal(format!("redb table: {e}")),
         }
@@ -382,6 +386,9 @@ impl From<brain_metadata::entity::ops::EntityOpError> for OpError {
             E::Storage(e) => OpError::Internal(format!("redb storage: {e}")),
             E::Table(e) => OpError::Internal(format!("redb table: {e}")),
             E::TrigramOp(e) => OpError::Internal(format!("trigram op: {e}")),
+            E::MergeRedirectCycle(id) => {
+                OpError::Internal(format!("entity {id:?} merge-redirect chain is a cycle"))
+            }
         }
     }
 }

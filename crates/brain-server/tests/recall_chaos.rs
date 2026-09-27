@@ -173,6 +173,7 @@ async fn seed_fixture(client: &mut TcpStream) {
 
 fn recall_request() -> RecallRequest {
     RecallRequest {
+        scope: Default::default(),
         trace: false,
         cue_text: "meeting preferences".into(),
         subject_name: String::new(),
