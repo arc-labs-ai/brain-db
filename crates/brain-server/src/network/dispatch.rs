@@ -35,7 +35,9 @@ use brain_protocol::connection::handshake::{
 };
 use brain_protocol::error::ErrorCode;
 
-use crate::auth::{derive_scope_from_handshake, hex32, AuthError, AuthStore, RequestScope};
+use crate::auth::{
+    act_as_grant_violation, derive_scope_from_handshake, hex32, AuthError, AuthStore, RequestScope,
+};
 use brain_protocol::codec::opcode::Opcode;
 use brain_protocol::envelope::request::RequestBody;
 use brain_protocol::envelope::response::{
@@ -1179,6 +1181,16 @@ fn check_act_as(
             "act_as: target namespace is not in the principal's may_act allowlist",
         ));
     }
+    // R4 extension — explicit delegated grant. A delegated op normally runs
+    // under the fixed STANDARD_SPACE mask; `act_as.grant` lets the trusted
+    // delegator add SCHEMA_UPLOAD / ADMIN for this one op. Hard-reject (never
+    // silently mask) a grant that names a non-delegable bit or one the
+    // delegator does not itself hold: a caller asking for rights it can't
+    // have gets a clear ActAsDenied rather than a confusing downstream
+    // PermissionDenied.
+    if let Some(message) = act_as_grant_violation(scope.permissions, a.grant) {
+        return Err((ErrorCode::ActAsDenied, message));
+    }
     Ok(())
 }
 
@@ -1800,6 +1812,7 @@ mod tests {
         let act_as = brain_protocol::ActAs {
             namespace: namespace.to_owned(),
             space_id: space_sel,
+            grant: 0,
         };
 
         // TXN_BEGIN with act_as → routes to the target space's shard and

@@ -1,0 +1,27 @@
+{
+  "schema_document": "namespace org\ndefine entity_type Person { attributes { joined_at: timestamp } }\n",
+  "force_drop_existing": true,
+  "request_id": [
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17
+  ],
+  "act_as": {
+    "namespace": "org",
+    "space_id": "support-bot:user123",
+    "grant": 32
+  }
+}

@@ -54,7 +54,7 @@
 //!   superseded the original edge persists. Tracked as a known v1
 //!   limitation; edge_scrub can be extended later.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -282,6 +282,9 @@ async fn do_causal_edge_cycle(
     let whitelist = worker.resolved.get().expect("resolved set populated above");
 
     let mut pairs: Vec<(MemoryId, MemoryId, f32)> = Vec::new();
+    // Owning space of each effect memory, from its statement's row: the
+    // edge write must carry the tenant's space (see the submit below).
+    let mut spaces: HashMap<MemoryId, SpaceId> = HashMap::new();
     let mut processed = 0usize;
     while processed < cfg.batch_size {
         if started.elapsed() >= cfg.max_runtime {
@@ -321,8 +324,14 @@ async fn do_causal_edge_cycle(
                 .inc_skip(CausalSkipReason::NonCausalPredicate);
             continue;
         }
-        let outcome =
-            collect_pairs_for_statement(ctx, statement_id, whitelist, &worker.knobs, &mut pairs)?;
+        let outcome = collect_pairs_for_statement(
+            ctx,
+            statement_id,
+            whitelist,
+            &worker.knobs,
+            &mut pairs,
+            &mut spaces,
+        )?;
         if let Some(skip) = outcome {
             worker.metrics.inc_skip(skip);
         }
@@ -332,22 +341,15 @@ async fn do_causal_edge_cycle(
         0usize
     } else {
         let created_at = now_unix_nanos_causal();
-        let phases: Vec<Phase> = pairs
-            .iter()
-            .map(|(cause, effect, weight)| Phase::Link {
-                from: NodeRef::Memory(*cause),
-                to: NodeRef::Memory(*effect),
-                kind: EdgeKindRef::Builtin(EdgeKind::Caused),
-                weight: *weight,
-                origin: origin::AUTO_DERIVED,
-                derived_by: derived_by::CAUSAL_WORKER,
-                disambiguator: zero_disambiguator(),
-                created_at_unix_nanos: created_at,
-            })
-            .collect();
-        let request_hash = hash_causal_batch(&pairs);
-        let write = Write::from_phases(WriteId::new(), SpaceId::default(), phases)
-            .with_request_hash(request_hash);
+        // One Write per owning space. `apply_link`'s tenant wall drops any
+        // Memory endpoint whose row is not in `write.space_id`, so stamping
+        // `SpaceId::default()` here silently discarded every Caused edge for
+        // real (non-default-space) tenants.
+        let mut by_space: HashMap<SpaceId, Vec<(MemoryId, MemoryId, f32)>> = HashMap::new();
+        for pair in &pairs {
+            let space = spaces.get(&pair.1).copied().unwrap_or_default();
+            by_space.entry(space).or_default().push(*pair);
+        }
         let real_writer = ctx
             .ops
             .executor
@@ -357,10 +359,28 @@ async fn do_causal_edge_cycle(
             .ok_or_else(|| {
                 WorkerError::Ops("causal_edge: unified path requires RealWriterHandle".into())
             })?;
-        real_writer
-            .submit(write)
-            .await
-            .map_err(|e| WorkerError::Ops(format!("submit: {e:?}")))?;
+        for (space, links) in by_space {
+            let phases: Vec<Phase> = links
+                .iter()
+                .map(|(cause, effect, weight)| Phase::Link {
+                    from: NodeRef::Memory(*cause),
+                    to: NodeRef::Memory(*effect),
+                    kind: EdgeKindRef::Builtin(EdgeKind::Caused),
+                    weight: *weight,
+                    origin: origin::AUTO_DERIVED,
+                    derived_by: derived_by::CAUSAL_WORKER,
+                    disambiguator: zero_disambiguator(),
+                    created_at_unix_nanos: created_at,
+                })
+                .collect();
+            let request_hash = hash_causal_batch(&links);
+            let write =
+                Write::from_phases(WriteId::new(), space, phases).with_request_hash(request_hash);
+            real_writer
+                .submit(write)
+                .await
+                .map_err(|e| WorkerError::Ops(format!("submit: {e:?}")))?;
+        }
         pairs.len()
     };
     worker.metrics.add_edges_written(written as u64);
@@ -382,6 +402,7 @@ fn collect_pairs_for_statement(
     whitelist: &HashSet<PredicateId>,
     knobs: &CausalEdgeKnobs,
     pairs: &mut Vec<(MemoryId, MemoryId, f32)>,
+    spaces: &mut HashMap<MemoryId, SpaceId>,
 ) -> Result<Option<CausalSkipReason>, WorkerError> {
     let metadata = ctx.ops.executor.metadata.clone();
     let rtxn = metadata
@@ -413,6 +434,20 @@ fn collect_pairs_for_statement(
     )?;
     if effect_memories.is_empty() {
         return Ok(Some(CausalSkipReason::NoEvidence));
+    }
+    // Each effect memory's owning space, read from its own row — the tenant
+    // wall `apply_link` enforces compares endpoints against exactly this, so
+    // the edge write must be stamped with it.
+    {
+        use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
+        if let Ok(t) = rtxn.open_table(MEMORIES_TABLE) {
+            for em in &effect_memories {
+                if let Ok(Some(g)) = t.get(&em.to_be_bytes()) {
+                    let m: MemoryMetadata = g.value();
+                    spaces.insert(*em, SpaceId(uuid::Uuid::from_bytes(m.space_id_bytes)));
+                }
+            }
+        }
     }
 
     // Direction: "Outage caused_by Deploy" means Deploy caused Outage.

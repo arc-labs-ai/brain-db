@@ -39,10 +39,10 @@ pub use context::PlannerContext;
 pub use error::PlanError;
 pub use executor::{
     execute_path, execute_path_stream, execute_reason, execute_reason_stream, execute_recall,
-    BackfillControl, EdgeOutcome, EncodeOp, EncodeOpEdge, EncodeResult, EvidenceItem, ExecError,
-    ExecutorContext, ForgetOp, ForgetOutcome, ForgetResult, InferenceKind, InferenceStep,
-    InferenceStream, InferenceStreamTerminal, LinkOp, Path, PathFrame, PathResult, PathStream,
-    PathStreamTerminal, PendingMemorySnapshot, PlanExecutionMetadata, PlanStatus,
+    BackfillControl, DerivedInference, EdgeOutcome, EncodeOp, EncodeOpEdge, EncodeResult,
+    EvidenceItem, ExecError, ExecutorContext, ForgetOp, ForgetOutcome, ForgetResult, InferenceKind,
+    InferenceStep, InferenceStream, InferenceStreamTerminal, LinkOp, Path, PathFrame, PathResult,
+    PathStream, PathStreamTerminal, PendingMemorySnapshot, PlanExecutionMetadata, PlanStatus,
     PlanTraceDirection, PlanTraceMeetingPoint, PlanTraceNode, ReasonResult, ReasonStatus,
     ReasonTrace, ReasonTraceBase, ReasonTraceCandidate, ReasonTraceCentroid,
     ReasonTraceEdgeCandidate, ReasonTraceScoreBreakdown, ReasonTraceTrim, ReasonTraceWalk,

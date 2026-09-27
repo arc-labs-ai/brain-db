@@ -1037,7 +1037,18 @@ pub fn resolve_or_create_with_deps(
     // Tier 3a — trigram fuzzy lookup. Candidates whose Jaccard against
     // the query is above `DEFAULT_FUZZY_THRESHOLD` get the surface
     // form added as an alias and are returned as the match.
-    let candidate_ids = trigram_candidates_wtxn(wtxn, scope, type_id, &normalized)?;
+    let mut candidate_ids = trigram_candidates_wtxn(wtxn, scope, type_id, &normalized)?;
+    // Numbers in a name are identifiers: `eval-0916` and `eval-0917`,
+    // `env-v1` and `env-v2` are distinct however close their trigrams. No
+    // string tier below may merge across differing digit runs.
+    let mut kept = HashSet::with_capacity(candidate_ids.len());
+    for cid in candidate_ids {
+        let canonical = read_entity_canonical(wtxn, cid)?.unwrap_or_default();
+        if digit_runs_compatible(&normalized, &normalize_name(&canonical)) {
+            kept.insert(cid);
+        }
+    }
+    candidate_ids = kept;
     if !candidate_ids.is_empty() {
         let query_tgs = trigrams::extract_trigrams(&normalized);
         if !query_tgs.is_empty() {
@@ -1261,6 +1272,21 @@ pub fn resolve_or_create_with_deps(
     let mut partial_match: Option<(EntityId, f32)> = None;
     if let Some(deps) = embed_deps {
         match tier_embedding(deps, staged, scope, type_id, surface_form, wtxn) {
+            Ok(EmbeddingProbe::AutoAlias { entity_id, .. })
+                if !digit_runs_compatible(
+                    &normalized,
+                    &normalize_name(&read_entity_canonical(wtxn, entity_id)?.unwrap_or_default()),
+                ) =>
+            {
+                // A close vector across differing identifiers ("run 41" vs
+                // "run 42") is not the same entity — mint a distinct one.
+                tracing::debug!(
+                    target: "brain_extractors::resolver",
+                    ?entity_id,
+                    surface_form,
+                    "embedding auto-alias skipped: digit runs differ",
+                );
+            }
             Ok(EmbeddingProbe::AutoAlias { entity_id, score }) => {
                 // A high cosine alone is not proof of identity: two
                 // distinct same-type entities ("Japan" vs "Tokyo", both
@@ -1605,6 +1631,20 @@ fn read_entity_type_and_scope(
 
 /// Read just the `canonical_name` for `id` inside an existing write txn.
 /// Used by the partial-name coref tier to compare token sets.
+/// Whether two normalized names carry the same digit runs (in order). Names
+/// whose numbers differ — including one numbered and one not — are distinct
+/// identifiers and must never be auto-merged; over-splitting is recoverable
+/// (the ambiguity workers can merge later), a false merge silently corrupts
+/// every fact attached to both.
+fn digit_runs_compatible(a: &str, b: &str) -> bool {
+    fn runs(s: &str) -> Vec<&str> {
+        s.split(|c: char| !c.is_ascii_digit())
+            .filter(|r| !r.is_empty())
+            .collect()
+    }
+    runs(a) == runs(b)
+}
+
 fn read_entity_canonical(
     wtxn: &WriteTransaction,
     id: EntityId,
@@ -1832,6 +1872,72 @@ mod tests {
 
     fn db(dir: &TempDir) -> MetadataDb {
         MetadataDb::open(dir.path().join("metadata.redb")).expect("open")
+    }
+
+    #[test]
+    fn digit_runs_must_match_to_merge() {
+        assert!(digit_runs_compatible("stripe inc", "stripe payments"));
+        assert!(digit_runs_compatible("eval 0917", "eval-0917 run"));
+        assert!(!digit_runs_compatible("eval 0916", "eval 0917"));
+        assert!(!digit_runs_compatible(
+            "linear sandbox 8004",
+            "linear sandbox 8003"
+        ));
+        assert!(!digit_runs_compatible(
+            "linear sandbox",
+            "linear sandbox 8004"
+        ));
+        assert!(!digit_runs_compatible("env v1", "env v2"));
+    }
+
+    #[test]
+    fn fuzzy_tier_never_merges_names_that_differ_only_in_digits() {
+        let dir = TempDir::new().unwrap();
+        let db = db(&dir);
+        let wtxn = db.write_txn().unwrap();
+        let first = resolve_or_create(
+            &wtxn,
+            test_scope(),
+            "linear-sandbox-8003",
+            "brain:Concept",
+            0.9,
+            1,
+        )
+        .unwrap();
+        let second = resolve_or_create(
+            &wtxn,
+            test_scope(),
+            "linear-sandbox-8004",
+            "brain:Concept",
+            0.9,
+            2,
+        )
+        .unwrap();
+        assert_ne!(
+            first.entity_id, second.entity_id,
+            "distinct identifiers must not merge"
+        );
+        assert_eq!(second.tier, ResolutionTier::Created);
+        // A real near-duplicate (no digits involved) still merges.
+        let a = resolve_or_create(
+            &wtxn,
+            test_scope(),
+            "Northwind Labs",
+            "brain:Organization",
+            0.9,
+            3,
+        )
+        .unwrap();
+        let b = resolve_or_create(
+            &wtxn,
+            test_scope(),
+            "Northwind Labs.",
+            "brain:Organization",
+            0.9,
+            4,
+        )
+        .unwrap();
+        assert_eq!(a.entity_id, b.entity_id);
     }
 
     #[test]

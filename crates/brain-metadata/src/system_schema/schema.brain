@@ -212,7 +212,7 @@ define extractor llm_predicate {
     model: "gpt-4o-mini"
     prompt: """You extract durable, factual knowledge from one memory at a time as clean subject–predicate–object triples for a memory database. Extract only genuine, lasting facts, preferences, and relationships about the entities — NOT conversational filler, greetings, reactions, or in-the-moment feelings.
 
-The active schema declares these entity types — use them when classifying an entity:
+The active schema declares these entity types — use them when classifying an entity (set `subject_type` / `object_type`, below):
 {DECLARED_ENTITY_TYPES}
 
 PREDICATES ARE OPEN. Capture the real relation as a short snake_case predicate taken from the text — do NOT restrict yourself to a fixed list, and NEVER omit a genuine fact just because no predefined predicate fits. Emit each predicate as `brain:<snake_case>` (e.g. "works at" -> `brain:works_at`, "is allergic to" -> `brain:allergic_to`).
@@ -240,11 +240,11 @@ Choosing the kind — go by the fact's SHAPE, not its topic:
 Output STRICT JSON matching this shape, and nothing else:
 {
   "statements": [
-    { "subject": "Alice Wong", "predicate": "brain:works_at", "object": "Acme Corp", "object_is_entity": true, "kind": "Relation", "confidence": 0.92 },
-    { "subject": "Eve Adams", "predicate": "brain:favorite_color", "object": "blue", "object_is_entity": false, "kind": "Attribute", "confidence": 0.88 },
-    { "subject": "Frank Brown", "predicate": "brain:traveled_to", "object": "Paris", "object_is_entity": true, "kind": "Event", "event_at": "2020-01-15", "confidence": 0.9 },
-    { "subject": "I", "predicate": "brain:prefers", "object": "dark roast coffee", "object_is_entity": false, "subject_is_self": true, "kind": "Preference", "confidence": 0.95 },
-    { "subject": "Priya", "predicate": "brain:works_at", "object": "Google", "object_is_entity": true, "kind": "Relation", "retract": true, "confidence": 0.9 }
+    { "subject": "Alice Wong", "subject_type": "brain:Person", "predicate": "brain:works_at", "object": "Acme Corp", "object_type": "brain:Organization", "object_is_entity": true, "kind": "Relation", "confidence": 0.92 },
+    { "subject": "Eve Adams", "subject_type": "brain:Person", "predicate": "brain:favorite_color", "object": "blue", "object_type": null, "object_is_entity": false, "kind": "Attribute", "confidence": 0.88 },
+    { "subject": "Frank Brown", "subject_type": "brain:Person", "predicate": "brain:traveled_to", "object": "Paris", "object_type": "brain:Place", "object_is_entity": true, "kind": "Event", "event_at": "2020-01-15", "confidence": 0.9 },
+    { "subject": "I", "subject_type": null, "predicate": "brain:prefers", "object": "dark roast coffee", "object_type": null, "object_is_entity": false, "subject_is_self": true, "kind": "Preference", "confidence": 0.95 },
+    { "subject": "Priya", "subject_type": "brain:Person", "predicate": "brain:works_at", "object": "Google", "object_type": "brain:Organization", "object_is_entity": true, "kind": "Relation", "retract": true, "confidence": 0.9 }
   ]
 }
 
@@ -255,6 +255,7 @@ Rules:
 - Locations are RELATIONS to a place, not prose. When the fact states where an entity is (lives, works, is based) or where an event happened, emit it as a Relation whose object is the place itself, with `object_is_entity: true` (e.g. predicate "brain:lives_in" object "Paris", predicate "brain:located_in" object "Paris") — never bury the place inside a longer value so "where" can be answered as the object of that relation.
 - Objects must be SPECIFIC. The object must name a particular thing. If the only object you can form is a generic placeholder or a bare category rather than a specific named thing, drop the triple — a vague object is worse than no triple.
 - `object_is_entity`: set true when the object names a thing (a person, organization, place, product, concept — something that could have its own facts), e.g. "Acme Corp", "Paris", "aspirin"; set false when the object is a literal value, e.g. "blue", "42", "Senior Engineer". When unsure, prefer false.
+- `subject_type` / `object_type`: the entity type of the subject / object, chosen from the declared entity types listed at the top. Pick the MOST SPECIFIC type that fits, and prefer a type the namespace itself declares over a generic built-in one (a sandboxed environment is its declared environment type, not a Concept; a software framework or tool is not a Person). Use `brain:Concept` only when nothing more specific fits. `object_type` is null when the object is a value (`object_is_entity: false`); `subject_type` is null when `subject_is_self` is true.
 - `event_at`: for Event-kind statements ONLY, the date it happened as an ISO date string ("YYYY-MM-DD", or just "YYYY" if only the year is known). This memory was recorded on {ANCHOR_DATE}. Set `event_at` to when the event actually happened — resolve relative expressions (yesterday, last week, last Saturday, in June) against {ANCHOR_DATE}, and attach the date only to the specific event it modifies, never to unrelated facts in the same text. Omit it for non-Events and when no date is stated or resolvable — do NOT invent one.
 - `subject_is_self`: set true when the subject is the speaker / author of this memory referring to THEMSELVES — first person in ANY language ("I", "me", "my", "yo", "私", "ich", "moi", …). Keep the original surface in `subject`; the system attributes the fact to the writing agent. Set false (or omit) for everyone else, including the person the author is addressing ("you").
 - Negation & change: when the text says a fact NO LONGER holds ("not at Google anymore", "no longer drinks coffee", "used to live in Paris but moved"), emit that former fact as a triple marked `"retract": true` (subject, predicate, and the OLD object — e.g. works_at Google with retract:true) so the database retires the prior record. If a NEW current value is also stated ("now works at OpenAI"), emit it too as a normal triple (no retract). A plain statement with no `retract` key is a normal current assertion; only set `retract` when the text explicitly denies/ends a fact.
@@ -280,9 +281,9 @@ Input text:
                     "type": "object",
                     "additionalProperties": false,
                     "required": [
-                        "subject", "predicate", "object", "object_is_entity",
-                        "kind", "confidence", "event_at", "subject_is_self",
-                        "retract", "is_stateful"
+                        "subject", "subject_type", "predicate", "object",
+                        "object_type", "object_is_entity", "kind", "confidence",
+                        "event_at", "subject_is_self", "retract", "is_stateful"
                     ],
                     "properties": {
                         "subject": {
@@ -303,6 +304,14 @@ Input text:
                         "object_is_entity": {
                             "type": "boolean",
                             "description": "A deliberate choice for every triple; never guessed. true when the object names a thing that could carry its own facts (a person, organization, place, product, concept). false when the object is a literal value — job titles, roles and ranks (senior engineer, staff architect) are values, as are colors, numbers, and free text. When unsure, false."
+                        },
+                        "subject_type": {
+                            "type": ["string", "null"],
+                            "description": "The subject's entity type from the declared list (e.g. brain:Person) — the most specific that fits. null when subject_is_self."
+                        },
+                        "object_type": {
+                            "type": ["string", "null"],
+                            "description": "The object's entity type from the declared list — the most specific that fits. null when the object is a value."
                         },
                         "kind": {"type": ["string", "null"], "minLength": 1},
                         "confidence": {"type": ["number", "null"], "minimum": 0, "maximum": 1},

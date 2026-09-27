@@ -100,6 +100,10 @@ pub use relation::types::{
     relation_type_intern, relation_type_list, relation_type_lookup_by_qname, RelationTypeOpError,
 };
 pub use schema::apply::{apply_schema_definitions, SchemaApplyError};
+pub use schema::declared::{
+    declared_vocabulary, declared_vocabulary_wtxn, entity_type_labels_for_namespaces,
+    render_entity_type_labels_block, DeclaredVocabulary,
+};
 pub use schema::kind::{
     kind_behavior, kind_intern, kind_list, render_declared_kinds_block, KindOpError,
 };

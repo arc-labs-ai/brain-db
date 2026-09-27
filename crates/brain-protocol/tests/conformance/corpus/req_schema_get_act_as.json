@@ -1,0 +1,8 @@
+{
+  "namespace": "org",
+  "version": 3,
+  "act_as": {
+    "namespace": "org",
+    "space_id": "support-bot:user123"
+  }
+}

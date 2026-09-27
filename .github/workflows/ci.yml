@@ -30,8 +30,12 @@ env:
 jobs:
   build-and-test:
     name: Build & test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 45
+    env:
+      # Use the Ubuntu 26 compatibility compiler only for C sources; assembly
+      # sources must not receive the Linux header injection.
+      CC: ${{ github.workspace }}/.github/scripts/cc-ubuntu26
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-rust
@@ -75,7 +79,7 @@ jobs:
 
   miri:
     name: Miri (storage layer)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     env:
       # The byte-logic tests miri DOES run (slot/payload) use proptest, which
@@ -84,6 +88,7 @@ jobs:
       # checks UB. The mmap/WAL modules miri genuinely can't model stay gated
       # behind #[cfg(all(test, not(miri)))].
       MIRIFLAGS: -Zmiri-disable-isolation
+      CC: ${{ github.workspace }}/.github/scripts/cc-ubuntu26
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-rust
@@ -99,7 +104,7 @@ jobs:
 
   audit:
     name: cargo audit
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6

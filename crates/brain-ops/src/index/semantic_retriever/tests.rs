@@ -1088,3 +1088,140 @@ fn vector_for_returns_none_when_neither_artifact_nor_text_present() {
         "no by-id vector and no text ⇒ None",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Statement lane tenant wall.
+// ---------------------------------------------------------------------------
+
+/// Seed three statements that embed identically — mine, a sibling space's in
+/// my namespace, and a foreign namespace's — and return the retriever plus
+/// their ids. Only the metadata rows tell them apart, which is exactly what
+/// the statement lane must read.
+fn statement_wall_fixture() -> (
+    TempDir,
+    BrainSemanticRetriever,
+    brain_core::NamespaceId,
+    SpaceId,
+    [brain_core::StatementId; 3],
+) {
+    use brain_core::{
+        Entity, EntityId, EntityType, EvidenceRef, Statement, StatementKind, StatementObject,
+        StatementValue, SubjectRef,
+    };
+    use brain_index::statement_hnsw::{StatementHnswIndex, StatementHnswParams};
+    use parking_lot::RwLock;
+
+    let (dir, metadata) = fresh_metadata();
+    let my_ns = brain_core::NamespaceId::from(7u32);
+    let foreign_ns = brain_core::NamespaceId::from(9u32);
+    let my_space = SpaceId::from([0xA1; 16]);
+    let scopes = [
+        brain_metadata::RowScope::from_bytes(my_ns.raw(), my_space.into()),
+        brain_metadata::RowScope::from_bytes(my_ns.raw(), [0xB2; 16]),
+        brain_metadata::RowScope::from_bytes(foreign_ns.raw(), my_space.into()),
+    ];
+
+    let wtxn = metadata.write_txn().unwrap();
+    let pid =
+        brain_metadata::schema::predicate::predicate_intern_or_get(&wtxn, "test", "joined", 0, 1)
+            .unwrap();
+    let mut ids = Vec::new();
+    for scope in scopes {
+        let subject = EntityId::new();
+        brain_metadata::entity::ops::entity_put(
+            &wtxn,
+            scope,
+            SessionId::DEFAULT,
+            &Entity::new_active(
+                subject,
+                EntityType::PERSON_ID,
+                "Diego".into(),
+                "Diego".into(),
+                1,
+            ),
+        )
+        .unwrap();
+        let st = Statement::new_root(
+            brain_core::StatementId::new(),
+            StatementKind::Fact,
+            SubjectRef::Entity(subject),
+            pid,
+            StatementObject::Value(StatementValue::Text("billing team".into())),
+            0.9,
+            EvidenceRef::default(),
+            brain_core::ExtractorId::from(0),
+            1,
+            1,
+        );
+        brain_metadata::statement::crud::statement_create(&wtxn, scope, SessionId::DEFAULT, &st, 1)
+            .unwrap();
+        ids.push(st.id);
+    }
+    wtxn.commit().unwrap();
+
+    let mut index = StatementHnswIndex::new(StatementHnswParams::default_v1()).unwrap();
+    for id in &ids {
+        index.insert(*id, &one_hot(0)).unwrap();
+    }
+    let (reader, _writer) = SharedHnsw::new(IndexParams::default_v1()).expect("SharedHnsw::new");
+    let embedder: Arc<dyn Dispatcher> = Arc::new(FixedDispatcher {
+        vector: one_hot(0),
+        fingerprint: [0u8; 16],
+    });
+    let retriever = BrainSemanticRetriever::new(
+        embedder,
+        reader,
+        Some(Arc::new(RwLock::new(index))),
+        Arc::new(metadata),
+    );
+    (dir, retriever, my_ns, my_space, [ids[0], ids[1], ids[2]])
+}
+
+fn statement_hits(
+    retriever: &BrainSemanticRetriever,
+    namespace: brain_core::NamespaceId,
+    space_ids: Vec<SpaceId>,
+) -> Vec<brain_core::StatementId> {
+    let cfg = SemanticRetrieverConfig {
+        top_k: 10,
+        similarity_threshold: 0.0,
+        filters: SemanticFiltersConfigSlot(SemanticFilters {
+            namespace_id: namespace.raw(),
+            space_ids,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    retriever
+        .retrieve(
+            &SemanticQuery::Vector(Box::new(one_hot(0))),
+            SemanticScope::Statement,
+            &cfg,
+            None,
+        )
+        .expect("retrieve")
+        .into_iter()
+        .map(|r| match r.id {
+            RankedItemId::Statement(id) => id,
+            other => panic!("statement lane returned {other:?}"),
+        })
+        .collect()
+}
+
+#[test]
+fn statement_lane_keeps_only_the_callers_space() {
+    let (_dir, retriever, ns, space, [mine, _sibling, _foreign]) = statement_wall_fixture();
+    assert_eq!(statement_hits(&retriever, ns, vec![space]), vec![mine]);
+}
+
+#[test]
+fn statement_lane_namespace_wide_never_crosses_namespaces() {
+    let (_dir, retriever, ns, _space, [mine, sibling, foreign]) = statement_wall_fixture();
+    let hits = statement_hits(&retriever, ns, Vec::new());
+    assert_eq!(hits.len(), 2, "both of my namespace's spaces: {hits:?}");
+    assert!(hits.contains(&mine) && hits.contains(&sibling));
+    assert!(
+        !hits.contains(&foreign),
+        "a foreign namespace never surfaces"
+    );
+}

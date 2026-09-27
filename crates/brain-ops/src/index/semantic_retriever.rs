@@ -31,6 +31,7 @@ use brain_metadata::tables::memory::{
     space_timeline_prefix_space, MemoryMetadata, MEMORIES_BY_SPACE_TIMELINE_TABLE, MEMORIES_TABLE,
     SPACE_TIMELINE_KEY_LEN,
 };
+use brain_metadata::tables::statement::STATEMENTS_TABLE;
 use brain_metadata::MetadataDb;
 use parking_lot::RwLock;
 
@@ -462,7 +463,7 @@ impl BrainSemanticRetriever {
         &self,
         vector: &[f32; SEMANTIC_VECTOR_DIM],
         config: &SemanticRetrieverConfig,
-        _filters: &SemanticFilters,
+        filters: &SemanticFilters,
     ) -> Result<Vec<RankedItem>, SemanticError> {
         let Some(handle) = self.statement_index.as_ref() else {
             // Statement HNSW corpus may be empty in
@@ -470,12 +471,44 @@ impl BrainSemanticRetriever {
             // empty result, not an error.
             return Ok(Vec::new());
         };
+        // Tenant wall, as the memory lane applies it: the statement HNSW is
+        // shared by every tenant on the shard and has no filtered search, so
+        // over-fetch and keep only live rows in the caller's namespace (and
+        // space, when one is set). Without this a foreign tenant's statements
+        // fill top-k; they were dropped later, but only after crowding out
+        // the caller's own candidates.
+        let fetch = config
+            .top_k
+            .saturating_mul(4)
+            .clamp(config.top_k, SEMANTIC_EF_SEARCH_MAX);
+        let ef = config.ef_search.max(fetch).min(SEMANTIC_EF_SEARCH_MAX);
+        let rtxn = self
+            .metadata
+            .read_txn()
+            .map_err(|e| SemanticError::Internal(format!("read_txn: {e}")))?;
+        let table = rtxn
+            .open_table(STATEMENTS_TABLE)
+            .map_err(|e| SemanticError::Internal(format!("open STATEMENTS_TABLE: {e}")))?;
+        let space_filter: HashSet<[u8; 16]> =
+            filters.space_ids.iter().map(|a| (*a).into()).collect();
+        let passes = |id: brain_core::StatementId| -> bool {
+            let Some(row) = table.get(&id.to_bytes()).ok().flatten() else {
+                return false;
+            };
+            let row = row.value();
+            row.namespace_id == filters.namespace_id
+                && (filters.include_tombstoned || row.tombstoned == 0)
+                && (space_filter.is_empty() || space_filter.contains(&row.space_id_bytes))
+        };
+
         let guard = handle.read();
-        let hits = guard
-            .search_with_ef(vector, config.top_k, Some(config.ef_search))
-            .map_err(|e| SemanticError::Internal(format!("statement search: {e}")))?;
-        // v1 has no statement metadata-side filter push-down.
-        // Post-search filters would land here if/when needed.
+        let hits: Vec<(brain_core::StatementId, f32)> = guard
+            .search_with_ef(vector, fetch, Some(ef))
+            .map_err(|e| SemanticError::Internal(format!("statement search: {e}")))?
+            .into_iter()
+            .filter(|(id, _)| passes(*id))
+            .take(config.top_k)
+            .collect();
         let mut direct = project_statement_hits(hits, config.similarity_threshold);
 
         // Question-bridge union: probe the templated-question pool with the
@@ -492,7 +525,7 @@ impl BrainSemanticRetriever {
             // (500) = the planner cap, so it never errors.
             let raw = bridge
                 .read()
-                .search_with_ef(vector, config.top_k, Some(config.ef_search))
+                .search_with_ef(vector, fetch, Some(ef))
                 .unwrap_or_default();
             // Retrieval boosting only needs "which statement is relevant", not
             // which slot — the slot is consumed by the separate slot-projection
@@ -500,6 +533,7 @@ impl BrainSemanticRetriever {
             // recall-additive statement union. Drop the slot here.
             let raw: Vec<(brain_core::StatementId, f32)> = raw
                 .into_iter()
+                .filter(|(id, _slot, _)| passes(*id))
                 .map(|(id, _slot, score)| (id, score))
                 .collect();
             merge_statement_hits(&mut direct, raw, config.similarity_threshold, config.top_k);

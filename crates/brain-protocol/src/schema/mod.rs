@@ -5,6 +5,7 @@
 //! - 19.4 — Static validator (next).
 
 pub mod ast;
+pub mod locate;
 pub mod ops;
 pub mod parse_error;
 pub mod parser;
@@ -17,6 +18,7 @@ pub use ast::{
     ObjectKindAst, ObjectTypeDecl, PredicateDef, RelationTypeDef, ResolverConfig, Schema,
     SchemaItem, StatementKindAst, TemporalModelAst, TriggerExpr,
 };
+pub use locate::{locate_spans, validate_located};
 pub use parse_error::ParseError;
 pub use parser::parse_schema;
 pub use validator::{

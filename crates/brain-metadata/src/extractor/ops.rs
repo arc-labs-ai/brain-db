@@ -30,6 +30,9 @@ pub enum ExtractorOpError {
 
     #[error("extractor not found: id {id:?}")]
     NotFound { id: ExtractorId },
+
+    #[error("only the system namespace's extractors are upgraded in place, not {0:?}")]
+    NotSystemNamespace(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -119,6 +122,53 @@ pub fn extractor_intern(
         idx.insert(&q.as_str(), &next_id_raw)?;
     }
     Ok(ExtractorId::from(next_id_raw))
+}
+
+/// Replace a SYSTEM-namespace extractor's stored definition in place when
+/// it differs from `definition_blob` (same id). A no-op when the row is
+/// absent (the normal intern registers it) or already identical. Refuses any
+/// namespace but the reserved system one: user extractors keep the strict
+/// refuse-on-divergence rule of [`extractor_intern`].
+///
+/// # Errors
+/// [`ExtractorOpError::Storage`]-class failures from redb, or
+/// `NotSystemNamespace` for a user namespace.
+pub fn extractor_replace_system_definition(
+    wtxn: &WriteTransaction,
+    namespace: &str,
+    name: &str,
+    kind: ExtractorKind,
+    schema_version: u32,
+    definition_blob: Vec<u8>,
+) -> Result<bool, ExtractorOpError> {
+    if namespace != crate::system_schema::SYSTEM_SCHEMA_NAMESPACE {
+        return Err(ExtractorOpError::NotSystemNamespace(namespace.to_string()));
+    }
+    let q = format!("{namespace}:{name}");
+    let id_raw = {
+        let idx = wtxn.open_table(EXTRACTORS_BY_QNAME_TABLE)?;
+        let got = idx.get(q.as_str())?.map(|g| g.value());
+        got
+    };
+    let Some(id_raw) = id_raw else {
+        return Ok(false);
+    };
+    let mut t = wtxn.open_table(EXTRACTORS_TABLE)?;
+    let current = t.get(&id_raw)?.map(|g| g.value());
+    let Some(mut row) = current else {
+        return Ok(false);
+    };
+    if row.kind == kind.as_u8()
+        && row.schema_version == schema_version
+        && row.definition_blob == definition_blob
+    {
+        return Ok(false);
+    }
+    row.kind = kind.as_u8();
+    row.schema_version = schema_version;
+    row.definition_blob = definition_blob;
+    t.insert(&id_raw, &row)?;
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------

@@ -12,6 +12,7 @@ pub mod path;
 pub mod reason;
 pub mod recall;
 pub mod result;
+pub mod stance;
 pub mod writer;
 
 pub use context::{
@@ -22,12 +23,12 @@ pub use path::{execute_path, execute_path_stream};
 pub use reason::{execute_reason, execute_reason_stream};
 pub use recall::execute_recall;
 pub use result::{
-    EncodeResult, EvidenceItem, ForgetResult, InferenceKind, InferenceStep, InferenceStream,
-    InferenceStreamTerminal, Path, PathFrame, PathResult, PathStream, PathStreamTerminal,
-    PlanExecutionMetadata, PlanStatus, PlanTraceDirection, PlanTraceMeetingPoint, PlanTraceNode,
-    ReasonResult, ReasonStatus, ReasonTrace, ReasonTraceBase, ReasonTraceCandidate,
-    ReasonTraceCentroid, ReasonTraceEdgeCandidate, ReasonTraceScoreBreakdown, ReasonTraceTrim,
-    ReasonTraceWalk, RecallHit, RecallResult,
+    DerivedInference, EncodeResult, EvidenceItem, ForgetResult, InferenceKind, InferenceStep,
+    InferenceStream, InferenceStreamTerminal, Path, PathFrame, PathResult, PathStream,
+    PathStreamTerminal, PlanExecutionMetadata, PlanStatus, PlanTraceDirection,
+    PlanTraceMeetingPoint, PlanTraceNode, ReasonResult, ReasonStatus, ReasonTrace, ReasonTraceBase,
+    ReasonTraceCandidate, ReasonTraceCentroid, ReasonTraceEdgeCandidate, ReasonTraceScoreBreakdown,
+    ReasonTraceTrim, ReasonTraceWalk, RecallHit, RecallResult,
 };
 pub use writer::{
     EdgeOutcome, EncodeOp, EncodeOpEdge, ForgetOp, ForgetOutcome, LinkOp, UnlinkOp, WriterError,

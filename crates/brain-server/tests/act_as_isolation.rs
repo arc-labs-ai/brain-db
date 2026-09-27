@@ -256,6 +256,7 @@ fn act_as(namespace: &str, space: &str) -> ActAs {
     ActAs {
         namespace: namespace.to_string(),
         space_id: space.to_string(),
+        grant: 0,
     }
 }
 
@@ -919,6 +920,264 @@ async fn txn_begin_act_as_without_grant_is_denied() {
         ),
         other => panic!("expected Error body, got {other:?}"),
     }
+
+    server.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Delegated capabilities + schema ops (`act_as` + `grant`)
+// ---------------------------------------------------------------------------
+
+fn act_as_granting(namespace: &str, space: &str, grant: u32) -> ActAs {
+    ActAs {
+        grant,
+        ..act_as(namespace, space)
+    }
+}
+
+fn expect_error(opcode: u16, body: &ResponseBody, code: ErrorCodeWire, what: &str) {
+    assert_eq!(
+        opcode,
+        Opcode::Error.as_u16(),
+        "{what}: expected an Error frame, got 0x{opcode:04x}: {body:?}"
+    );
+    match body {
+        ResponseBody::Error(e) => assert_eq!(
+            e.code, code,
+            "{what}: expected {code:?}, got {:?}: {}",
+            e.code, e.message
+        ),
+        other => panic!("{what}: expected Error body, got {other:?}"),
+    }
+}
+
+async fn schema_upload_as(
+    client: &mut TcpStream,
+    stream_id: u32,
+    doc: &str,
+    act_as: Option<ActAs>,
+) -> (u16, ResponseBody) {
+    use brain_protocol::SchemaUploadRequest;
+    round_trip(
+        client,
+        stream_id,
+        RequestBody::SchemaUpload(SchemaUploadRequest {
+            schema_document: doc.into(),
+            dry_run: false,
+            allow_breaking: false,
+            request_id: *uuid::Uuid::now_v7().as_bytes(),
+            act_as,
+        }),
+    )
+    .await
+}
+
+async fn capabilities_as(
+    client: &mut TcpStream,
+    stream_id: u32,
+    act_as: Option<ActAs>,
+) -> Vec<String> {
+    use brain_protocol::envelope::response::GetCapabilitiesRequest;
+    let (opcode, body) = round_trip(
+        client,
+        stream_id,
+        RequestBody::GetCapabilities(GetCapabilitiesRequest { act_as }),
+    )
+    .await;
+    match body {
+        ResponseBody::GetCapabilities(r) => {
+            let mut v = r.capabilities.schema_namespaces;
+            v.sort();
+            v
+        }
+        other => panic!("capabilities failed: opcode=0x{opcode:04x} body={other:?}"),
+    }
+}
+
+/// The shared-pool gateway runs schema ops and capability discovery AS the
+/// tenant: a delegated SCHEMA_UPLOAD (with an explicit `SCHEMA_UPLOAD`
+/// grant) lands in the tenant's namespace, SCHEMA_GET binds to the effective
+/// namespace (a foreign one is refused), a delegated upload WITHOUT a grant
+/// keeps the historical STANDARD_SPACE rights and is refused, and
+/// GET_CAPABILITIES lists only the effective caller's own namespace.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn act_as_schema_ops_and_capabilities_run_as_tenant() {
+    use brain_metadata::api_keys::bits;
+    use brain_protocol::SchemaGetRequest;
+
+    let server = start(1).await;
+    let svc_space = *uuid::Uuid::now_v7().as_bytes();
+    let svc_token = server.mint_with_may_act(
+        "svc",
+        svc_space,
+        bits::ACT_AS | bits::STANDARD_SPACE | bits::SCHEMA_UPLOAD,
+        vec!["*".to_string()],
+    );
+    let mut svc = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect svc");
+    handshake_as(&mut svc, &svc_token).await;
+
+    let su = bits::SCHEMA_UPLOAD;
+    let doc_a =
+        "namespace tenant_a\ndefine predicate prefers { kind: Preference object: Value<text> }\n";
+    let doc_b =
+        "namespace tenant_b\ndefine predicate dislikes { kind: Preference object: Value<text> }\n";
+
+    // No grant → STANDARD_SPACE → no SCHEMA_UPLOAD: refused, as before.
+    let (op, body) =
+        schema_upload_as(&mut svc, 1, doc_a, Some(act_as("tenant_a", "space-a"))).await;
+    expect_error(
+        op,
+        &body,
+        ErrorCodeWire::PermissionDenied,
+        "upload w/o grant",
+    );
+
+    // Granted: each tenant's upload lands in its own namespace.
+    for (i, (ns, space, doc)) in [
+        ("tenant_a", "space-a", doc_a),
+        ("tenant_b", "space-b", doc_b),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (op, body) = schema_upload_as(
+            &mut svc,
+            3 + 2 * i as u32,
+            doc,
+            Some(act_as_granting(ns, space, su)),
+        )
+        .await;
+        match body {
+            ResponseBody::SchemaUpload(r) if op == Opcode::SchemaUploadResp.as_u16() => {
+                assert!(r.validation_errors.is_empty(), "{:?}", r.validation_errors);
+                assert_eq!(r.namespace, ns);
+                assert!(r.schema_version >= 1);
+            }
+            other => panic!("granted upload for {ns} failed: 0x{op:04x} {other:?}"),
+        }
+    }
+
+    // Cross-tenant write: acting as tenant_a with tenant_b's DSL.
+    let (op, body) = schema_upload_as(
+        &mut svc,
+        7,
+        doc_b,
+        Some(act_as_granting("tenant_a", "space-a", su)),
+    )
+    .await;
+    expect_error(
+        op,
+        &body,
+        ErrorCodeWire::PermissionDenied,
+        "cross-tenant upload",
+    );
+
+    // SCHEMA_GET binds to the effective namespace.
+    let get = |namespace: &str| {
+        RequestBody::SchemaGet(SchemaGetRequest {
+            namespace: namespace.into(),
+            version: 0,
+            act_as: Some(act_as("tenant_a", "space-a")),
+        })
+    };
+    let (op, body) = round_trip(&mut svc, 9, get("tenant_a")).await;
+    match body {
+        ResponseBody::SchemaGet(r) if op == Opcode::SchemaGetResp.as_u16() => {
+            assert_eq!(r.namespace, "tenant_a");
+        }
+        other => panic!("own-namespace get failed: 0x{op:04x} {other:?}"),
+    }
+    let (op, body) = round_trip(&mut svc, 11, get("tenant_b")).await;
+    expect_error(
+        op,
+        &body,
+        ErrorCodeWire::PermissionDenied,
+        "cross-tenant get",
+    );
+
+    // Capabilities: each effective caller sees only its own namespace; the
+    // gateway's own identity ("svc", no schema) sees none of the tenants.
+    assert_eq!(
+        capabilities_as(&mut svc, 13, Some(act_as("tenant_a", "space-a"))).await,
+        ["tenant_a"]
+    );
+    assert_eq!(
+        capabilities_as(&mut svc, 15, Some(act_as("tenant_b", "space-b"))).await,
+        ["tenant_b"]
+    );
+    assert!(capabilities_as(&mut svc, 17, None).await.is_empty());
+
+    server.stop().await;
+}
+
+/// A delegator can never grant more than it holds: a grant naming a bit the
+/// principal lacks (ADMIN here), or a non-delegable bit (ACT_AS), is
+/// hard-rejected with `ActAsDenied` before any work runs — on the normal
+/// dispatch path and on SUBSCRIBE's separate branch alike (both call
+/// `check_act_as`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn act_as_grant_beyond_delegator_is_denied() {
+    use brain_metadata::api_keys::bits;
+    use brain_protocol::SchemaReplaceRequest;
+
+    let server = start(1).await;
+    let svc_space = *uuid::Uuid::now_v7().as_bytes();
+    // Holds SCHEMA_UPLOAD but NOT ADMIN.
+    let svc_token = server.mint_with_may_act(
+        "svc",
+        svc_space,
+        bits::ACT_AS | bits::STANDARD_SPACE | bits::SCHEMA_UPLOAD,
+        vec!["*".to_string()],
+    );
+    let mut svc = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect svc");
+    handshake_as(&mut svc, &svc_token).await;
+
+    let replace = RequestBody::SchemaReplace(SchemaReplaceRequest {
+        schema_document: "namespace tenant_a\ndefine predicate prefers { kind: Preference object: Value<text> }\n".into(),
+        force_drop_existing: true,
+        request_id: *uuid::Uuid::now_v7().as_bytes(),
+        act_as: Some(act_as_granting("tenant_a", "space-a", bits::ADMIN)),
+    });
+    let (op, body) = round_trip(&mut svc, 1, replace).await;
+    expect_error(
+        op,
+        &body,
+        ErrorCodeWire::ActAsDenied,
+        "ADMIN grant w/o ADMIN",
+    );
+
+    // ACT_AS is never delegable, even by a principal that holds it.
+    let (op, body) = schema_upload_as(
+        &mut svc,
+        3,
+        "namespace tenant_a\n",
+        Some(act_as_granting("tenant_a", "space-a", bits::ACT_AS)),
+    )
+    .await;
+    expect_error(op, &body, ErrorCodeWire::ActAsDenied, "ACT_AS grant");
+
+    // The same bound applies to non-schema ops carrying a grant.
+    let req = EncodeRequest {
+        text: "never written".into(),
+        session_id: 0,
+        request_id: *uuid::Uuid::now_v7().as_bytes(),
+        txn_id: None,
+        occurred_at_unix_nanos: None,
+        act_as: Some(act_as_granting("tenant_a", "space-a", bits::ADMIN)),
+        wait: brain_protocol::WaitMode::Ack,
+        allow_duplicates: false,
+    };
+    let (op, body) = round_trip(&mut svc, 5, RequestBody::Encode(req)).await;
+    expect_error(
+        op,
+        &body,
+        ErrorCodeWire::ActAsDenied,
+        "ADMIN grant on encode",
+    );
 
     server.stop().await;
 }

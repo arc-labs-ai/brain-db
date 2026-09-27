@@ -65,6 +65,7 @@ fn statements_schema_matches_spec() {
         ("kind", "u64"),
         ("confidence_bucket", "u64"),
         ("extracted_at", "u64"),
+        ("space_id", "bytes"),
     ];
 
     let actual: Vec<(String, &'static str)> = schema

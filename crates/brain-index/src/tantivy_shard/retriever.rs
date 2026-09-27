@@ -274,11 +274,6 @@ fn validate_filters_for_scope(
             }
         }
         LexicalScope::StatementText => {
-            if !filters.space_ids.is_empty() {
-                return Err(LexicalError::QueryParseFailed(
-                    "space_id filter applies only to MemoryText scope".into(),
-                ));
-            }
             if filters.memory_kind.is_some() {
                 return Err(LexicalError::QueryParseFailed(
                     "memory_kind filter applies only to MemoryText".into(),
@@ -328,29 +323,29 @@ fn build_query(
 
     // ----- Filters ----------------------------------------------------------
     let f = &query.filters;
+    // Both corpora carry `space_id`: `space_id IN [..]` = OR-group of
+    // TermQuery, wrapped as a single MUST so the BM25 scoring stays inside
+    // the requested space universe.
+    if !f.space_ids.is_empty() {
+        let field = schema
+            .get_field("space_id")
+            .map_err(|e| LexicalError::Internal(format!("space_id field: {e}")))?;
+        let inner: Vec<(Occur, Box<dyn tantivy::query::Query>)> = f
+            .space_ids
+            .iter()
+            .map(|space| -> (Occur, Box<dyn tantivy::query::Query>) {
+                let bytes: [u8; 16] = (*space).into();
+                let term = Term::from_field_bytes(field, &bytes);
+                (
+                    Occur::Should,
+                    Box::new(TermQuery::new(term, IndexRecordOption::Basic)),
+                )
+            })
+            .collect();
+        clauses.push((Occur::Must, Box::new(BooleanQuery::new(inner))));
+    }
     match scope {
         LexicalScope::MemoryText => {
-            if !f.space_ids.is_empty() {
-                let field = schema
-                    .get_field("space_id")
-                    .map_err(|e| LexicalError::Internal(format!("space_id field: {e}")))?;
-                // `space_id IN [..]` = OR-group of TermQuery, wrapped as
-                // a single MUST so the BM25 scoring stays inside the
-                // requested space universe.
-                let inner: Vec<(Occur, Box<dyn tantivy::query::Query>)> = f
-                    .space_ids
-                    .iter()
-                    .map(|space| -> (Occur, Box<dyn tantivy::query::Query>) {
-                        let bytes: [u8; 16] = (*space).into();
-                        let term = Term::from_field_bytes(field, &bytes);
-                        (
-                            Occur::Should,
-                            Box::new(TermQuery::new(term, IndexRecordOption::Basic)),
-                        )
-                    })
-                    .collect();
-                clauses.push((Occur::Must, Box::new(BooleanQuery::new(inner))));
-            }
             if let Some(kind) = f.memory_kind {
                 let field = schema
                     .get_field("kind")

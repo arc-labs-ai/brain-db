@@ -162,6 +162,7 @@ fn txn_begun_with_act_as_commits_under_delegated_identity() {
                     act_as: Some(ActAs {
                         namespace: "acme".into(),
                         space_id: "acme:main".into(),
+                        grant: 0,
                     }),
                 }),
                 caller("acme", ACME_SPACE),

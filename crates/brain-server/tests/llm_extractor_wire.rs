@@ -164,6 +164,7 @@ fn upload_request(source: &str) -> RequestBody {
         dry_run: false,
         allow_breaking: false,
         request_id: *uuid::Uuid::now_v7().as_bytes(),
+        act_as: None,
     })
 }
 

@@ -12,7 +12,15 @@
 //! The space is addressed by its 16-byte `SpaceId` (a UUID) in the path
 //! and its owning namespace in the `?namespace=<name>` query param — the
 //! same `(namespace, space)` pair the wire path resolves from the caller's
-//! API key. A space's whole footprint is homed on one shard
+//! API key.
+//!
+//! `?by=external` reads the path id as the *external* space id instead — the
+//! string a control plane sends as `act_as.space_id` — and derives the
+//! storage id from it exactly as ingress does
+//! ([`brain_core::SpaceId::derive_from_string`]). Without it, passing the
+//! external id addresses a space that does not exist. A delete that matches
+//! nothing on any shard is a `404` (with that hint), never a `200` reading
+//! `"deleted":false`. A space's whole footprint is homed on one shard
 //! (`hash_space_to_shard`), but the delete fans out to every shard the way
 //! `POST /v1/extract/backfill` does: non-owning shards find nothing and
 //! report zero, which keeps the handler correct under routing overrides
@@ -73,8 +81,8 @@ async fn delete(req: Request<Incoming>, state: Arc<AdminState>) -> Response<Resp
     if id_str.is_empty() {
         return text_response(StatusCode::BAD_REQUEST, "missing space id in path\n");
     }
-    let space_id = match Uuid::parse_str(&id_str) {
-        Ok(u) => brain_core::SpaceId(u),
+    let path_uuid = match Uuid::parse_str(&id_str) {
+        Ok(u) => u,
         Err(e) => {
             return text_response(
                 StatusCode::BAD_REQUEST,
@@ -82,11 +90,13 @@ async fn delete(req: Request<Incoming>, state: Arc<AdminState>) -> Response<Resp
             )
         }
     };
+    let query = req.uri().query().unwrap_or("");
+    let external = query_param(query, "by").as_deref() == Some("external");
 
     // The owning namespace is the outer half of the (namespace, space)
     // scope key; the wire path takes it from the caller's key, so the admin
     // plane must name it explicitly.
-    let namespace = match namespace_param(req.uri().query().unwrap_or("")) {
+    let namespace = match namespace_param(query) {
         Some(ns) if !ns.is_empty() => ns,
         _ => {
             return text_response(
@@ -96,15 +106,27 @@ async fn delete(req: Request<Incoming>, state: Arc<AdminState>) -> Response<Resp
         }
     };
 
+    // An external id is the string ingress hashes: its canonical hyphenated
+    // form, exactly what `Uuid::to_string` renders (so a simple-form path id
+    // still lands on the same space).
+    let external_string = external.then(|| path_uuid.to_string());
+    let space_id = match &external_string {
+        Some(s) => brain_core::SpaceId::derive_from_string(&namespace, s),
+        None => brain_core::SpaceId(path_uuid),
+    };
+
     // Drive the same SPACE_DELETE the wire path drives, as an operator
     // acting with FULL permissions on the target (namespace, space).
-    let caller = RequestCaller::from_scope(
+    let mut caller = RequestCaller::from_scope(
         space_id,
         [0u8; 16],
         [0u8; 16],
         namespace.clone(),
         perm_bits::FULL,
     );
+    if let Some(s) = external_string {
+        caller = caller.with_space_string(s);
+    }
     let request = SpaceDeleteRequest {
         request_id: *Uuid::now_v7().as_bytes(),
         act_as: None,
@@ -145,6 +167,19 @@ async fn delete(req: Request<Incoming>, state: Arc<AdminState>) -> Response<Resp
             StatusCode::INTERNAL_SERVER_ERROR,
             "space cascade delete failed\n",
         );
+    }
+
+    if shard_errors.is_empty() && !existed && memories_forgotten == 0 {
+        // Nothing under (namespace, space) on any shard. Usually the id is
+        // the external one without `?by=external`, or the wrong namespace —
+        // say so instead of a 200 that reads like a completed delete.
+        let hint = if external {
+            "no such space in this namespace\n"
+        } else {
+            "no such space in this namespace; if this is the control plane's \
+             space id, add ?by=external\n"
+        };
+        return text_response(StatusCode::NOT_FOUND, hint);
     }
 
     // The cascade applied somewhere (existed or forgot rows on at least one
@@ -228,10 +263,15 @@ fn json_string(s: &str) -> String {
 /// Pull the `namespace=<name>` value out of a query string. Returns the
 /// first match, percent-decoding untouched (namespaces are ASCII names).
 fn namespace_param(query: &str) -> Option<String> {
+    query_param(query, "namespace")
+}
+
+/// The first `name=<value>` in a query string, undecoded.
+fn query_param(query: &str, name: &str) -> Option<String> {
     query
         .split('&')
         .filter(|s| !s.is_empty())
-        .find_map(|kv| kv.strip_prefix("namespace="))
+        .find_map(|kv| kv.strip_prefix(name)?.strip_prefix('='))
         .map(ToOwned::to_owned)
 }
 
@@ -245,6 +285,30 @@ mod tests {
         assert_eq!(
             namespace_param("foo=1&namespace=acme&bar=2"),
             Some("acme".to_owned())
+        );
+    }
+
+    #[test]
+    fn query_param_matches_whole_names_only() {
+        assert_eq!(
+            query_param("by=external", "by"),
+            Some("external".to_owned())
+        );
+        assert_eq!(query_param("bypass=1&by=x", "by"), Some("x".to_owned()));
+        assert_eq!(query_param("bypass=1", "by"), None);
+    }
+
+    #[test]
+    fn external_ids_derive_the_ingress_storage_id() {
+        // The admin plane and ingress must hash the same string, or an
+        // external delete silently targets an empty space.
+        let external = Uuid::parse_str("01a0dd98-7d23-7232-9306-8d15515a1790").unwrap();
+        let simple = Uuid::parse_str("01a0dd987d23723293068d15515a1790").unwrap();
+        assert_eq!(external.to_string(), simple.to_string());
+        assert_eq!(
+            brain_core::SpaceId::derive_from_string("mirror", &external.to_string()).0,
+            Uuid::parse_str("dbaf7598-61db-5dba-890b-7f2fced26bd1").unwrap(),
+            "matches the storage id the purge of this space actually used"
         );
     }
 

@@ -106,8 +106,12 @@ impl RequestScope {
     /// The op runs as the target `(namespace, space_id)`, not the
     /// connection principal's own identity. Effective permissions are the
     /// fixed `STANDARD_SPACE` mask — never the principal's bits, and never
-    /// `ADMIN` / `ACT_AS` — because Brain has no per-space permission
-    /// store to consult for the impersonated identity. The principal's
+    /// `ACT_AS` — because Brain has no per-space permission store to
+    /// consult for the impersonated identity. The one widening is an
+    /// explicit, per-request `act_as.grant` (see [`delegated_permissions`]):
+    /// the trusted delegator may add `SCHEMA_UPLOAD` / `ADMIN` for a tenant
+    /// whose role it has decided allows it, but only bits it holds itself.
+    /// The principal's
     /// `org_id` / `user_id` are retained for the audit trail (the acting
     /// party is never erased; see RFC 8693 delegation), and the wire
     /// `connection_id` rides along so the connection-drop sweep still finds
@@ -138,11 +142,42 @@ impl RequestScope {
             self.org_id,
             self.user_id,
             act_as.namespace.clone(),
-            bits::STANDARD_SPACE,
+            delegated_permissions(self.permissions, act_as.grant),
         )
         .with_session_id(connection_id)
         .with_space_string(act_as.space_id.clone())
     }
+}
+
+/// Effective permission mask for a delegated (`act_as`) op.
+///
+/// `STANDARD_SPACE | (grant & delegator & DELEGABLE)`: the fixed standard
+/// mask, plus any delegable bit (`SCHEMA_UPLOAD`, `ADMIN`) that the request
+/// asked for AND the delegating principal itself holds. A delegator can
+/// therefore never hand out more than it has, `ACT_AS` is never inheritable
+/// (it is not in `DELEGABLE`), and `grant == 0` reproduces the historical
+/// fixed-`STANDARD_SPACE` behaviour exactly.
+///
+/// The dispatch layer (`check_act_as`) already hard-rejects a grant that
+/// names a non-delegable bit or one the delegator lacks, so in production
+/// the masking here is belt-and-braces: it keeps this constructor safe even
+/// if a future call site skips that check.
+#[must_use]
+pub fn delegated_permissions(delegator_permissions: u32, grant: u32) -> u32 {
+    bits::STANDARD_SPACE | (grant & delegator_permissions & bits::DELEGABLE)
+}
+
+/// Why an `act_as.grant` is refused. `None` means the grant is acceptable
+/// (including the common `grant == 0`).
+#[must_use]
+pub fn act_as_grant_violation(delegator_permissions: u32, grant: u32) -> Option<&'static str> {
+    if grant & !bits::DELEGABLE != 0 {
+        return Some("act_as: grant names a permission bit that cannot be delegated");
+    }
+    if grant & !delegator_permissions != 0 {
+        return Some("act_as: grant exceeds the connection principal's own permissions");
+    }
+    None
 }
 
 /// Auth-time failure modes. Each maps to a specific wire error.
@@ -551,6 +586,81 @@ mod tests {
         let payload = auth_token(minted.secret_bytes);
         let scope = derive_scope_from_handshake(&payload, &store).unwrap();
         assert_eq!(scope.space_id, SpaceId(uuid::Uuid::from_bytes(key_space)));
+    }
+
+    fn delegator(permissions: u32) -> RequestScope {
+        RequestScope {
+            space_id: SpaceId(uuid::Uuid::from_bytes(space(9))),
+            org_id: [0u8; 16],
+            user_id: [0u8; 16],
+            namespace: "svc".into(),
+            permissions,
+            may_act: vec!["*".into()],
+            key_hash: [0u8; 32],
+        }
+    }
+
+    fn selector(grant: u32) -> brain_protocol::ActAs {
+        brain_protocol::ActAs {
+            namespace: "acme".into(),
+            space_id: "acme:u1".into(),
+            grant,
+        }
+    }
+
+    /// No grant → exactly the historical fixed STANDARD_SPACE mask, however
+    /// powerful the delegator is.
+    #[test]
+    fn delegated_caller_without_grant_is_standard_space() {
+        let full = delegator(bits::FULL | bits::ACT_AS);
+        let caller = full.to_effective_caller(&selector(0), [0u8; 16]);
+        assert_eq!(caller.permissions, bits::STANDARD_SPACE);
+        assert_eq!(caller.namespace, "acme");
+        assert_eq!(
+            delegated_permissions(bits::FULL | bits::ACT_AS, 0),
+            bits::STANDARD_SPACE
+        );
+        assert_eq!(act_as_grant_violation(bits::FULL | bits::ACT_AS, 0), None);
+    }
+
+    /// A granted delegable bit the delegator holds is added.
+    #[test]
+    fn delegated_caller_gains_granted_bits_the_delegator_holds() {
+        let svc =
+            delegator(bits::ACT_AS | bits::STANDARD_SPACE | bits::SCHEMA_UPLOAD | bits::ADMIN);
+        let su = svc.to_effective_caller(&selector(bits::SCHEMA_UPLOAD), [0u8; 16]);
+        assert_eq!(su.permissions, bits::STANDARD_SPACE | bits::SCHEMA_UPLOAD);
+        let both = svc.to_effective_caller(&selector(bits::DELEGABLE), [0u8; 16]);
+        assert_eq!(both.permissions, bits::STANDARD_SPACE | bits::DELEGABLE);
+        assert_eq!(
+            act_as_grant_violation(svc.permissions, bits::DELEGABLE),
+            None
+        );
+    }
+
+    /// A delegator without a bit cannot grant it: the dispatch check rejects
+    /// it, and the constructor masks it off even if that check were skipped.
+    #[test]
+    fn delegator_cannot_grant_a_bit_it_lacks() {
+        let svc = delegator(bits::ACT_AS | bits::STANDARD_SPACE | bits::SCHEMA_UPLOAD);
+        assert!(act_as_grant_violation(svc.permissions, bits::ADMIN).is_some());
+        let caller = svc.to_effective_caller(&selector(bits::ADMIN), [0u8; 16]);
+        assert_eq!(caller.permissions & bits::ADMIN, 0);
+        assert_eq!(caller.permissions, bits::STANDARD_SPACE);
+    }
+
+    /// ACT_AS (and any other non-delegable bit) is never inheritable.
+    #[test]
+    fn non_delegable_bits_are_rejected_and_masked() {
+        let svc = delegator(bits::FULL | bits::ACT_AS);
+        for bad in [bits::ACT_AS, 1 << 7, 1 << 31] {
+            assert!(
+                act_as_grant_violation(svc.permissions, bad).is_some(),
+                "{bad:#x}"
+            );
+            let caller = svc.to_effective_caller(&selector(bad), [0u8; 16]);
+            assert_eq!(caller.permissions, bits::STANDARD_SPACE, "{bad:#x}");
+        }
     }
 
     #[test]

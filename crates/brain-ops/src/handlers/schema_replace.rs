@@ -21,7 +21,7 @@
 //! a typo in a client can't accidentally wipe a deployment's schema.
 
 use brain_core::RequestId;
-use brain_protocol::schema::{parse_schema, validate};
+use brain_protocol::schema::{parse_schema, validate_located};
 use brain_protocol::{SchemaReplaceRequest, SchemaReplaceResponse};
 
 use crate::context::OpsContext;
@@ -77,7 +77,7 @@ pub async fn handle_schema_replace(
             });
         }
     };
-    let validated = match validate(&parsed) {
+    let validated = match validate_located(&req.schema_document, &parsed) {
         Ok(v) => v,
         Err(errs) => {
             return Ok(SchemaReplaceResponse {
@@ -295,7 +295,7 @@ mod tests {
     /// rows to drop.
     fn seed_schema(metadata: &SharedMetadataDb, doc: &str) {
         let parsed = parse_schema(doc).unwrap();
-        let validated = validate(&parsed).unwrap();
+        let validated = brain_protocol::schema::validate(&parsed).unwrap();
         let wtxn = metadata.write_txn().unwrap();
         schema_upload(&wtxn, &validated, 1).unwrap();
         wtxn.commit().unwrap();
@@ -306,6 +306,7 @@ mod tests {
             schema_document: doc.into(),
             force_drop_existing: true,
             request_id: rid,
+            act_as: None,
         }
     }
 

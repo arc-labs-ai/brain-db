@@ -393,22 +393,15 @@ async fn do_temporal_edge_cycle(
     let written = if to_link.is_empty() {
         0
     } else {
-        let phases: Vec<Phase> = to_link
-            .iter()
-            .map(|(from, to, weight)| Phase::Link {
-                from: NodeRef::Memory(*from),
-                to: NodeRef::Memory(*to),
-                kind: EdgeKindRef::Builtin(EdgeKind::FollowedBy),
-                weight: *weight,
-                origin: origin::AUTO_DERIVED,
-                derived_by: derived_by::TEMPORAL_WORKER,
-                disambiguator: zero_disambiguator(),
-                created_at_unix_nanos: created_at,
-            })
-            .collect();
-        let request_hash = hash_temporal_batch(&to_link);
-        let write = Write::from_phases(WriteId::new(), SpaceId::default(), phases)
-            .with_request_hash(request_hash);
+        // One Write per owning space. `apply_link`'s tenant wall drops any
+        // Memory endpoint whose row is not in `write.space_id`, so stamping
+        // `SpaceId::default()` here silently discarded every FollowedBy
+        // edge for real (non-default-space) tenants.
+        let mut by_space: HashMap<SpaceId, Vec<(MemoryId, MemoryId, f32)>> = HashMap::new();
+        for link in &to_link {
+            let space = source_spaces.get(&link.1).copied().unwrap_or_default();
+            by_space.entry(space).or_default().push(*link);
+        }
         let real_writer = ctx
             .ops
             .executor
@@ -418,10 +411,28 @@ async fn do_temporal_edge_cycle(
             .ok_or_else(|| {
                 WorkerError::Ops("temporal_edge: unified path requires RealWriterHandle".into())
             })?;
-        real_writer
-            .submit(write)
-            .await
-            .map_err(|e| WorkerError::Ops(format!("submit: {e:?}")))?;
+        for (space, links) in by_space {
+            let phases: Vec<Phase> = links
+                .iter()
+                .map(|(from, to, weight)| Phase::Link {
+                    from: NodeRef::Memory(*from),
+                    to: NodeRef::Memory(*to),
+                    kind: EdgeKindRef::Builtin(EdgeKind::FollowedBy),
+                    weight: *weight,
+                    origin: origin::AUTO_DERIVED,
+                    derived_by: derived_by::TEMPORAL_WORKER,
+                    disambiguator: zero_disambiguator(),
+                    created_at_unix_nanos: created_at,
+                })
+                .collect();
+            let request_hash = hash_temporal_batch(&links);
+            let write =
+                Write::from_phases(WriteId::new(), space, phases).with_request_hash(request_hash);
+            real_writer
+                .submit(write)
+                .await
+                .map_err(|e| WorkerError::Ops(format!("submit: {e:?}")))?;
+        }
         to_link.len()
     };
 

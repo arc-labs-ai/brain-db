@@ -575,3 +575,21 @@ fn real_inference_returns_brain_qnames_for_alice() {
         .iter()
         .any(|s| s.label == "brain:Place" && s.text.contains("Paris")));
 }
+
+#[test]
+fn gliner_label_splits_camel_case_and_leaves_single_words() {
+    use super::gliner_label;
+    let cases = [
+        ("brain:CloneEnv", "Clone Env"),
+        ("brain:AgentPolicy", "Agent Policy"),
+        ("brain:EvalRun", "Eval Run"),
+        ("brain:TargetApp", "Target App"),
+        ("brain:Person", "Person"),
+        ("brain:Organization", "Organization"),
+        ("acme:Http2Server", "Http2 Server"),
+        ("brain:snake_case", "snake case"),
+    ];
+    for (q, want) in cases {
+        assert_eq!(gliner_label(q), want, "input={q:?}");
+    }
+}

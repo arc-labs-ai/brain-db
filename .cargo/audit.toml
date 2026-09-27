@@ -1,0 +1,6 @@
+# Glommio 0.9.0 currently depends on lockfree 0.5.1, which depends on
+# owned-alloc 0.2.0. RUSTSEC-2026-0291 has no fixed release. Keep this
+# exception narrow and revisit it when Glommio or lockfree removes the
+# dependency.
+[advisories]
+ignore = ["RUSTSEC-2026-0291"]

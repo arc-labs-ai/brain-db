@@ -780,6 +780,42 @@
     "payload_len": 83
   },
   {
+    "name": "req_schema_get_act_as",
+    "opcode": "0x0121",
+    "kind": "request",
+    "payload_len": 75
+  },
+  {
+    "name": "req_schema_list_act_as",
+    "opcode": "0x0122",
+    "kind": "request",
+    "payload_len": 88
+  },
+  {
+    "name": "req_schema_validate_act_as",
+    "opcode": "0x0123",
+    "kind": "request",
+    "payload_len": 139
+  },
+  {
+    "name": "req_schema_upload_act_as_grant",
+    "opcode": "0x0120",
+    "kind": "request",
+    "payload_len": 170
+  },
+  {
+    "name": "req_schema_replace_act_as_grant",
+    "opcode": "0x0127",
+    "kind": "request",
+    "payload_len": 207
+  },
+  {
+    "name": "req_schema_drop_act_as_grant",
+    "opcode": "0x0125",
+    "kind": "request",
+    "payload_len": 142
+  },
+  {
     "name": "resp_schema_get",
     "opcode": "0x01A1",
     "kind": "response",
@@ -874,6 +910,12 @@
     "opcode": "0x0032",
     "kind": "request",
     "payload_len": 1
+  },
+  {
+    "name": "req_get_capabilities_act_as",
+    "opcode": "0x0032",
+    "kind": "request",
+    "payload_len": 60
   },
   {
     "name": "req_link",

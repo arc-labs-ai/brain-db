@@ -222,6 +222,48 @@ fn success_no_schema_parses_json_array() {
 }
 
 #[test]
+fn no_schema_malformed_json_fails_instead_of_minting_fragment_entity() {
+    // A truncated / unbalanced JSON body used to fall through to the
+    // plain-text projection and become ONE entity named with the raw
+    // fragment. It must now be a (permanent) failure with no items.
+    let client = Arc::new(MockClient::new(
+        "claude-haiku-4-5",
+        vec![Ok(ok_response("[{\"name\":\"Mirror\"},{", 50))],
+    ));
+    let ext = build_ext(client, None, None, None);
+    let reg = ExtractorRegistry::new();
+    let r = futures_lite::future::block_on(ext.run(&ctx(&reg), &memory("Mirror")));
+    assert_eq!(r.status, ExtractionStatus::Failure);
+    assert!(
+        r.status_reason.contains("malformed JSON"),
+        "{}",
+        r.status_reason
+    );
+    assert!(r.items.is_empty(), "no fragment entity: {:?}", r.items);
+}
+
+#[test]
+fn no_schema_fenced_json_is_unwrapped() {
+    let client = Arc::new(MockClient::new(
+        "claude-haiku-4-5",
+        vec![Ok(ok_response("```json\n[\"Alice\",\"Bob\"]\n```", 50))],
+    ));
+    let ext = build_ext(client, None, None, None);
+    let reg = ExtractorRegistry::new();
+    let r = futures_lite::future::block_on(ext.run(&ctx(&reg), &memory("Alice met Bob")));
+    assert_eq!(r.status, ExtractionStatus::Success);
+    let names: Vec<&str> = r
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            ExtractedItem::EntityMention(m) => Some(m.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(names, vec!["Alice", "Bob"]);
+}
+
+#[test]
 fn confidence_below_threshold_filtered() {
     let body = "[{\"name\":\"Alice\",\"confidence\":0.9}, \
                {\"name\":\"X\",\"confidence\":0.1}]";
@@ -1301,7 +1343,8 @@ fn system_schema_missing_object_fails_validation_then_retry_recovers() {
     ]}"#;
     // Second response (the retry): model corrects itself.
     let good = r#"{"statements": [
-        {"subject": "Priya", "predicate": "brain:manages", "object": "the billing platform team",
+        {"subject": "Priya", "subject_type": "brain:Person", "predicate": "brain:manages",
+         "object": "the billing platform team", "object_type": null,
          "object_is_entity": false, "kind": "Relation", "confidence": 0.9, "event_at": null,
          "subject_is_self": false, "retract": false, "is_stateful": false}
     ]}"#;
@@ -1322,12 +1365,22 @@ fn system_schema_missing_object_fails_validation_then_retry_recovers() {
         "missing object must trigger exactly one retry call"
     );
     assert_eq!(r.status, ExtractionStatus::Success);
-    assert_eq!(r.items.len(), 1);
+    // The statement, plus the subject's typed mention (the object is a value).
+    assert_eq!(r.items.len(), 2);
     match &r.items[0] {
         ExtractedItem::StatementMention(m) => {
             assert_eq!(m.object_text.as_deref(), Some("the billing platform team"));
         }
         other => panic!("expected statement mention, got {other:?}"),
+    }
+    match &r.items[1] {
+        ExtractedItem::EntityMention(m) => {
+            assert_eq!(
+                (m.text.as_str(), m.entity_type_qname.as_str()),
+                ("Priya", "brain:Person")
+            );
+        }
+        other => panic!("expected entity mention, got {other:?}"),
     }
 }
 
@@ -1513,4 +1566,49 @@ fn retract_with_explicit_high_confidence_survives() {
         }
         other => panic!("expected statement mention, got {other:?}"),
     }
+}
+
+#[test]
+fn typed_endpoints_become_entity_mentions() {
+    use crate::framework::{EntityMention, ExtractedItem};
+    let v = serde_json::json!({
+        "subject": "linear-sandbox", "subject_type": "brain:CloneEnv",
+        "predicate": "mirror:clones", "object": "Linear", "object_type": "TargetApp",
+        "object_is_entity": true, "subject_is_self": false, "confidence": 0.9
+    });
+    let items = super::extractor::typed_endpoint_mentions(&v, 3, 1);
+    let got: Vec<(String, String)> = items
+        .iter()
+        .map(|i| match i {
+            ExtractedItem::EntityMention(EntityMention {
+                text,
+                entity_type_qname,
+                ..
+            }) => (text.clone(), entity_type_qname.clone()),
+            other => panic!("unexpected {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("linear-sandbox".to_string(), "brain:CloneEnv".to_string()),
+            ("Linear".to_string(), "brain:TargetApp".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn typed_endpoints_skip_self_values_and_missing_types() {
+    let v = serde_json::json!({
+        "subject": "I", "subject_type": "brain:Person", "subject_is_self": true,
+        "predicate": "brain:prefers", "object": "dark roast", "object_type": "brain:Concept",
+        "object_is_entity": false, "confidence": 0.9
+    });
+    assert!(super::extractor::typed_endpoint_mentions(&v, 3, 1).is_empty());
+    let untyped = serde_json::json!({
+        "subject": "Ann", "predicate": "brain:works_at", "object": "Acme",
+        "object_is_entity": true, "subject_type": null, "object_type": "",
+        "confidence": 0.9
+    });
+    assert!(super::extractor::typed_endpoint_mentions(&untyped, 3, 1).is_empty());
 }
