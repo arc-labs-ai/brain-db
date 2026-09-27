@@ -290,7 +290,10 @@ mod tests {
 
     #[test]
     fn query_param_matches_whole_names_only() {
-        assert_eq!(query_param("by=external", "by"), Some("external".to_owned()));
+        assert_eq!(
+            query_param("by=external", "by"),
+            Some("external".to_owned())
+        );
         assert_eq!(query_param("bypass=1&by=x", "by"), Some("x".to_owned()));
         assert_eq!(query_param("bypass=1", "by"), None);
     }

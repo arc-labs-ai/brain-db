@@ -1754,9 +1754,7 @@ fn invoke_lexical(
         // planner chose as its pre-filter; foreign statements would
         // otherwise fill top-k and only be dropped (unlabelled) afterwards.
         // Namespace-wide reads leave it open, like the semantic lane.
-        if stmt_filters.space_ids.is_empty()
-            && ctx.scope_mode == brain_metadata::ScopeMode::Space
-        {
+        if stmt_filters.space_ids.is_empty() && ctx.scope_mode == brain_metadata::ScopeMode::Space {
             stmt_filters.space_ids = vec![ctx.caller_space];
         }
         let stmt_query = LexicalQuery {

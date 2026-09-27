@@ -1132,7 +1132,13 @@ fn statement_wall_fixture() -> (
             &wtxn,
             scope,
             SessionId::DEFAULT,
-            &Entity::new_active(subject, EntityType::PERSON_ID, "Diego".into(), "Diego".into(), 1),
+            &Entity::new_active(
+                subject,
+                EntityType::PERSON_ID,
+                "Diego".into(),
+                "Diego".into(),
+                1,
+            ),
         )
         .unwrap();
         let st = Statement::new_root(
@@ -1214,5 +1220,8 @@ fn statement_lane_namespace_wide_never_crosses_namespaces() {
     let hits = statement_hits(&retriever, ns, Vec::new());
     assert_eq!(hits.len(), 2, "both of my namespace's spaces: {hits:?}");
     assert!(hits.contains(&mine) && hits.contains(&sibling));
-    assert!(!hits.contains(&foreign), "a foreign namespace never surfaces");
+    assert!(
+        !hits.contains(&foreign),
+        "a foreign namespace never surfaces"
+    );
 }
