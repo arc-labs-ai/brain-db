@@ -11,6 +11,61 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Deserializer, Serialize};
 
+// The worker implementation is Linux-only because it runs on Glommio. Keep
+// the configuration defaults available on other hosts so the portable config
+// parser and CLI can still be checked and used there.
+#[cfg(target_os = "linux")]
+mod worker_defaults {
+    pub use brain_extractors::classifier::DEFAULT_GLINER_THRESHOLD as GLINER_THRESHOLD;
+    pub use brain_extractors::resolver::EMBED_RESOLVE_THRESHOLD;
+    pub use brain_ops::index::text_indexer::DEFAULT_COMMIT_MS as TEXT_INDEX_COMMIT_MS;
+    pub use brain_ops::index::text_indexer::DEFAULT_COMMIT_N as TEXT_INDEX_COMMIT_N;
+    pub use brain_workers::workers::ambiguity_resolver::DEFAULT_INTERVAL_SECS as AMBIGUITY_RESOLVER_INTERVAL_SECS;
+    pub use brain_workers::workers::confidence_sweep::DEFAULT_INTERVAL_SECS as CONFIDENCE_SWEEP_INTERVAL_SECS;
+    pub use brain_workers::workers::llm_cache_sweeper::DEFAULT_INTERVAL_SECS as LLM_CACHE_SWEEP_INTERVAL_SECS;
+    pub use brain_workers::workers::statement_reclaim::{
+        DEFAULT_GRACE_SECONDS as STATEMENT_RECLAIM_GRACE_SECONDS,
+        DEFAULT_PERIOD_SECONDS as STATEMENT_RECLAIM_PERIOD_SECONDS,
+    };
+    pub use brain_workers::workers::supersession_sweeper::DEFAULT_PERIOD_SECONDS as SUPERSESSION_PERIOD_SECONDS;
+    pub use brain_workers::{
+        DEFAULT_AUTO_EDGE_SIMILARITY_THRESHOLD as AUTO_EDGE_SIMILARITY_THRESHOLD,
+        DEFAULT_EXTRACTOR_BATCH_SIZE as EXTRACTOR_BATCH_SIZE,
+        DEFAULT_MAX_CAUSE_MEMORIES as MAX_CAUSE_MEMORIES,
+        DEFAULT_MAX_EFFECT_MEMORIES as MAX_EFFECT_MEMORIES,
+        DEFAULT_MAX_RELATED_STATEMENTS as MAX_RELATED_STATEMENTS,
+        DEFAULT_TEMPORAL_EDGE_TOPICAL_THRESHOLD as TEMPORAL_EDGE_TOPICAL_THRESHOLD,
+        DEFAULT_WHITELIST_QNAMES as WHITELIST_QNAMES,
+    };
+}
+
+#[cfg(not(target_os = "linux"))]
+mod worker_defaults {
+    pub const GLINER_THRESHOLD: f32 = 0.5;
+    pub const EMBED_RESOLVE_THRESHOLD: f32 = 0.78;
+    pub const TEXT_INDEX_COMMIT_MS: u64 = 1000;
+    pub const TEXT_INDEX_COMMIT_N: usize = 256;
+    pub const AMBIGUITY_RESOLVER_INTERVAL_SECS: u64 = 3600;
+    pub const CONFIDENCE_SWEEP_INTERVAL_SECS: u64 = 3600;
+    pub const LLM_CACHE_SWEEP_INTERVAL_SECS: u64 = 3600;
+    pub const STATEMENT_RECLAIM_GRACE_SECONDS: u64 = 30 * 24 * 60 * 60;
+    pub const STATEMENT_RECLAIM_PERIOD_SECONDS: u64 = 86_400;
+    pub const SUPERSESSION_PERIOD_SECONDS: u64 = 86_400;
+    pub const AUTO_EDGE_SIMILARITY_THRESHOLD: f32 = 0.85;
+    pub const EXTRACTOR_BATCH_SIZE: usize = 8;
+    pub const MAX_CAUSE_MEMORIES: usize = 3;
+    pub const MAX_EFFECT_MEMORIES: usize = 3;
+    pub const MAX_RELATED_STATEMENTS: usize = 5;
+    pub const TEMPORAL_EDGE_TOPICAL_THRESHOLD: f32 = 0.4;
+    pub const WHITELIST_QNAMES: &[(&str, &str)] = &[
+        ("brain", "caused_by"),
+        ("brain", "triggered"),
+        ("brain", "led_to"),
+        ("brain", "resulted_in"),
+        ("brain", "because_of"),
+    ];
+}
+
 // ----------------------------------------------------------------------------
 // Top-level Config
 // ----------------------------------------------------------------------------
@@ -287,7 +342,7 @@ impl Default for ClassifierExtractorConfig {
 }
 
 fn default_classifier_threshold() -> f32 {
-    brain_extractors::classifier::DEFAULT_GLINER_THRESHOLD
+    worker_defaults::GLINER_THRESHOLD
 }
 
 /// `[extractors.resolver]` TOML sub-section. Entity-resolution
@@ -311,7 +366,7 @@ impl Default for ResolverExtractorConfig {
 }
 
 fn default_resolver_embed_threshold() -> f32 {
-    brain_extractors::resolver::EMBED_RESOLVE_THRESHOLD
+    worker_defaults::EMBED_RESOLVE_THRESHOLD
 }
 
 /// `[extractors.hype]` TOML sub-section. Write-time hypothetical-
@@ -446,7 +501,7 @@ fn default_supersession_retention_seconds() -> u64 {
     0
 }
 fn default_supersession_period_seconds() -> u64 {
-    brain_workers::workers::supersession_sweeper::DEFAULT_PERIOD_SECONDS
+    worker_defaults::SUPERSESSION_PERIOD_SECONDS
 }
 
 /// `[workers.statement_reclaim]` TOML section. Controls the retracted-
@@ -485,10 +540,10 @@ fn default_statement_reclaim_enabled() -> bool {
     false
 }
 fn default_statement_reclaim_grace_seconds() -> u64 {
-    brain_workers::workers::statement_reclaim::DEFAULT_GRACE_SECONDS
+    worker_defaults::STATEMENT_RECLAIM_GRACE_SECONDS
 }
 fn default_statement_reclaim_period_seconds() -> u64 {
-    brain_workers::workers::statement_reclaim::DEFAULT_PERIOD_SECONDS
+    worker_defaults::STATEMENT_RECLAIM_PERIOD_SECONDS
 }
 
 /// `[workers.ambiguity_resolver]` TOML section. Controls the entity
@@ -517,7 +572,7 @@ impl Default for AmbiguityResolverWorkerConfig {
 }
 
 fn default_ambiguity_resolver_interval_secs() -> u64 {
-    brain_workers::workers::ambiguity_resolver::DEFAULT_INTERVAL_SECS
+    worker_defaults::AMBIGUITY_RESOLVER_INTERVAL_SECS
 }
 
 /// `[workers.confidence_sweep]` TOML section. Controls the Statement
@@ -544,7 +599,7 @@ impl Default for ConfidenceSweepWorkerConfig {
 }
 
 fn default_confidence_sweep_interval_secs() -> u64 {
-    brain_workers::workers::confidence_sweep::DEFAULT_INTERVAL_SECS
+    worker_defaults::CONFIDENCE_SWEEP_INTERVAL_SECS
 }
 
 /// Shared default for low-cost maintenance workers that are on unless an
@@ -577,7 +632,7 @@ impl Default for LlmCacheSweepWorkerConfig {
 }
 
 fn default_llm_cache_sweep_interval_secs() -> u64 {
-    brain_workers::workers::llm_cache_sweeper::DEFAULT_INTERVAL_SECS
+    worker_defaults::LLM_CACHE_SWEEP_INTERVAL_SECS
 }
 
 /// `[index]` TOML section. Index-pipeline tuning. Currently the tantivy
@@ -606,10 +661,10 @@ impl Default for IndexConfig {
 }
 
 fn default_tantivy_commit_n() -> usize {
-    brain_ops::index::text_indexer::DEFAULT_COMMIT_N
+    worker_defaults::TEXT_INDEX_COMMIT_N
 }
 fn default_tantivy_commit_ms() -> u64 {
-    brain_ops::index::text_indexer::DEFAULT_COMMIT_MS
+    worker_defaults::TEXT_INDEX_COMMIT_MS
 }
 
 /// `[retrieval]` TOML section. Deploy-time read-path tuning that was
@@ -734,7 +789,7 @@ fn default_auto_edge_similarity_threshold() -> f32 {
     // false SimilarTo edges and hub clutter. Operators override via
     // `BRAIN__WORKERS__AUTO_EDGE__SIMILARITY_THRESHOLD` (the generic
     // env-override path) or directly in TOML.
-    brain_workers::DEFAULT_AUTO_EDGE_SIMILARITY_THRESHOLD
+    worker_defaults::AUTO_EDGE_SIMILARITY_THRESHOLD
 }
 fn default_auto_edge_top_k() -> usize {
     5
@@ -825,7 +880,7 @@ fn default_temporal_edge_cross_session() -> bool {
     false
 }
 fn default_temporal_edge_topical_threshold() -> f32 {
-    brain_workers::DEFAULT_TEMPORAL_EDGE_TOPICAL_THRESHOLD
+    worker_defaults::TEMPORAL_EDGE_TOPICAL_THRESHOLD
 }
 
 /// `[workers.causal_edge]` TOML section. Controls extractor-driven
@@ -901,19 +956,19 @@ fn default_causal_edge_min_confidence() -> f32 {
     0.6
 }
 fn default_causal_edge_whitelist() -> Vec<String> {
-    brain_workers::DEFAULT_WHITELIST_QNAMES
+    worker_defaults::WHITELIST_QNAMES
         .iter()
         .map(|(ns, name)| format!("{ns}:{name}"))
         .collect()
 }
 fn default_causal_edge_max_effect_memories() -> usize {
-    brain_workers::DEFAULT_MAX_EFFECT_MEMORIES
+    worker_defaults::MAX_EFFECT_MEMORIES
 }
 fn default_causal_edge_max_cause_memories() -> usize {
-    brain_workers::DEFAULT_MAX_CAUSE_MEMORIES
+    worker_defaults::MAX_CAUSE_MEMORIES
 }
 fn default_causal_edge_max_related_statements() -> usize {
-    brain_workers::DEFAULT_MAX_RELATED_STATEMENTS
+    worker_defaults::MAX_RELATED_STATEMENTS
 }
 fn default_causal_edge_channel_capacity() -> usize {
     1024
@@ -982,7 +1037,7 @@ fn default_extractor_skip_audited() -> bool {
     true
 }
 fn default_extractor_batch_size() -> usize {
-    brain_workers::DEFAULT_EXTRACTOR_BATCH_SIZE
+    worker_defaults::EXTRACTOR_BATCH_SIZE
 }
 
 /// `[monitoring]` TOML section. Groups logging and distributed-tracing

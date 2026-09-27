@@ -28,7 +28,7 @@ env:
 jobs:
   perf:
     name: Acceptance benches (relation_traverse + recall)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v6

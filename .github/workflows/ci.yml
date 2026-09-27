@@ -30,7 +30,7 @@ env:
 jobs:
   build-and-test:
     name: Build & test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
@@ -75,7 +75,7 @@ jobs:
 
   miri:
     name: Miri (storage layer)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     env:
       # The byte-logic tests miri DOES run (slot/payload) use proptest, which
@@ -99,7 +99,7 @@ jobs:
 
   audit:
     name: cargo audit
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6

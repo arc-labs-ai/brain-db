@@ -198,8 +198,8 @@ pub fn merge_hype_questions(
 /// never blocks the durable graph write (which already committed).
 ///
 /// Returns the number of graph edges skipped because an entity endpoint did
-/// not resolve to a node (see [`enrichment_to_graph_counted`]) — they are never
-/// persisted against the nil id; the caller counts them.
+/// not resolve to a node — they are never persisted against the nil id; the
+/// caller counts them.
 pub fn merge_graph_from_committed(
     metadata: &MetadataDb,
     memory_id: MemoryId,
