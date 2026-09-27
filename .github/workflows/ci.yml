@@ -32,6 +32,10 @@ jobs:
     name: Build & test
     runs-on: ubuntu-26.04
     timeout-minutes: 45
+    env:
+      # Glommio 0.9.0's bundled liburing header uses struct open_how without
+      # including its header. Ubuntu 26.04 no longer exposes it transitively.
+      CFLAGS: "-include linux/openat2.h"
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-rust
@@ -84,6 +88,9 @@ jobs:
       # checks UB. The mmap/WAL modules miri genuinely can't model stay gated
       # behind #[cfg(all(test, not(miri)))].
       MIRIFLAGS: -Zmiri-disable-isolation
+      # Glommio 0.9.0's bundled liburing header needs this include on Ubuntu
+      # 26.04, where linux/fs.h no longer exposes struct open_how transitively.
+      CFLAGS: "-include linux/openat2.h"
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-rust
