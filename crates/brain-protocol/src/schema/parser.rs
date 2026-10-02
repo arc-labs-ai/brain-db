@@ -15,7 +15,7 @@ use crate::schema::ast::{
     ConditionValue, CostExpr, CostUnit, DurationAst, DurationUnit, EntityTypeDef, ExtractorDef,
     ExtractorField, ExtractorKindAst, ExtractorTarget, KindCardinalityAst, KindDef, LiteralValue,
     ObjectKindAst, ObjectTypeDecl, PredicateDef, RelationTypeDef, ResolverConfig, Schema,
-    SchemaItem, StatementKindAst, TemporalModelAst, TriggerExpr,
+    SchemaItem, StatementKindAst, SubjectTypeDecl, TemporalModelAst, TriggerExpr,
 };
 use crate::schema::parse_error::ParseError;
 
@@ -419,6 +419,7 @@ fn parse_predicate_def(pair: Pair<'_, Rule>) -> Result<PredicateDef, ParseError>
     let line_col = pair.line_col();
     let mut name = String::new();
     let mut kind: Option<StatementKindAst> = None;
+    let mut subject: Option<SubjectTypeDecl> = None;
     let mut object: Option<ObjectTypeDecl> = None;
     let mut stateful: Option<bool> = None;
     let mut description: Option<String> = None;
@@ -433,6 +434,13 @@ fn parse_predicate_def(pair: Pair<'_, Rule>) -> Result<PredicateDef, ParseError>
                     .find(|p| p.as_rule() == Rule::statement_kind)
                     .expect("kind field always has statement_kind child");
                 kind = Some(parse_statement_kind(kind_pair.as_str()));
+            }
+            Rule::predicate_subject_field => {
+                let sub_pair = child
+                    .into_inner()
+                    .find(|p| p.as_rule() == Rule::subject_type)
+                    .expect("subject field always has subject_type child");
+                subject = Some(parse_subject_type(sub_pair));
             }
             Rule::predicate_object_field => {
                 let obj_pair = child
@@ -480,6 +488,7 @@ fn parse_predicate_def(pair: Pair<'_, Rule>) -> Result<PredicateDef, ParseError>
     Ok(PredicateDef {
         name,
         kind,
+        subject,
         object,
         stateful,
         description,
@@ -594,6 +603,27 @@ fn parse_kind_def(pair: Pair<'_, Rule>) -> Result<KindDef, ParseError> {
         polarity,
         hint,
     })
+}
+
+/// `subject: Entity<T>` / `subject: Any`. Absent is handled by the caller
+/// (a `None` subject means any), so this only sees an explicit declaration.
+fn parse_subject_type(pair: Pair<'_, Rule>) -> SubjectTypeDecl {
+    let inner = pair
+        .into_inner()
+        .next()
+        .expect("subject_type always has one child");
+    match inner.as_rule() {
+        Rule::subject_type_entity => {
+            let entity_type = inner
+                .into_inner()
+                .find(|p| p.as_rule() == Rule::identifier)
+                .map(|p| p.as_str().to_string())
+                .expect("Entity<...> always carries an identifier");
+            SubjectTypeDecl::Entity { entity_type }
+        }
+        Rule::subject_type_any => SubjectTypeDecl::Any,
+        other => unreachable!("subject_type produced {other:?}"),
+    }
 }
 
 fn parse_object_type(pair: Pair<'_, Rule>) -> ObjectTypeDecl {
@@ -1761,5 +1791,112 @@ mod tests {
                 .expect("cache_ttl present");
             assert_eq!(d.unit, unit);
         }
+    }
+
+    // ── predicate subject domain ────────────────────────────────────────
+
+    fn only_predicate(src: &str) -> PredicateDef {
+        let schema = parse_schema(src).expect("parse");
+        schema
+            .items
+            .iter()
+            .find_map(|i| match i {
+                SchemaItem::Predicate(p) => Some(p.clone()),
+                _ => None,
+            })
+            .expect("a predicate")
+    }
+
+    #[test]
+    fn subject_entity_narrows_the_predicate_to_one_type() {
+        let p = only_predicate(
+            "namespace m
+             define entity_type Builder { attributes {} }
+             define predicate prefers_fidelity {
+                 kind: Preference
+                 subject: Entity<Builder>
+                 object: Value<text>
+             }",
+        );
+        assert_eq!(
+            p.subject,
+            Some(SubjectTypeDecl::Entity {
+                entity_type: "Builder".into()
+            })
+        );
+    }
+
+    #[test]
+    fn an_omitted_subject_is_none_not_any() {
+        // `None` and `Any` both mean "any subject", but they must stay
+        // distinguishable: `None` is a schema that predates the field,
+        // `Any` is an author who considered it and declined. Collapsing
+        // them would erase that, and `skip_serializing_if` would start
+        // emitting a field the author never wrote.
+        let p = only_predicate(
+            "namespace m
+             define predicate clone_status { kind: Fact object: Value<text> }",
+        );
+        assert_eq!(p.subject, None);
+    }
+
+    #[test]
+    fn subject_any_is_parsed_explicitly() {
+        let p = only_predicate(
+            "namespace m
+             define predicate clone_status {
+                 kind: Fact
+                 subject: Any
+                 object: Value<text>
+             }",
+        );
+        assert_eq!(p.subject, Some(SubjectTypeDecl::Any));
+    }
+
+    #[test]
+    fn subject_and_object_are_independent() {
+        // The bug this field fixes: a predicate could pin its object and
+        // never its subject. Both must be expressible at once.
+        let p = only_predicate(
+            "namespace m
+             define entity_type Builder { attributes {} }
+             define entity_type CloneEnv { attributes {} }
+             define predicate requested {
+                 kind: Fact
+                 subject: Entity<Builder>
+                 object: Entity<CloneEnv>
+             }",
+        );
+        assert_eq!(
+            p.subject,
+            Some(SubjectTypeDecl::Entity {
+                entity_type: "Builder".into()
+            })
+        );
+        assert_eq!(
+            p.object,
+            ObjectTypeDecl::Entity {
+                entity_type: "CloneEnv".into()
+            }
+        );
+    }
+
+    #[test]
+    fn field_order_does_not_matter() {
+        let p = only_predicate(
+            "namespace m
+             define entity_type Builder { attributes {} }
+             define predicate prefers_fidelity {
+                 object: Value<text>
+                 subject: Entity<Builder>
+                 kind: Preference
+             }",
+        );
+        assert_eq!(
+            p.subject,
+            Some(SubjectTypeDecl::Entity {
+                entity_type: "Builder".into()
+            })
+        );
     }
 }

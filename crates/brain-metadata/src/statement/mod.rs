@@ -93,6 +93,15 @@ pub enum StatementOpError {
         actual: EntityTypeId,
     },
 
+    #[error(
+        "subject entity {entity:?} has entity type {actual:?} but predicate requires {expected:?}"
+    )]
+    SubjectEntityTypeMismatch {
+        entity: EntityId,
+        expected: EntityTypeId,
+        actual: EntityTypeId,
+    },
+
     #[error("invalid argument: {0}")]
     InvalidArgument(&'static str),
 

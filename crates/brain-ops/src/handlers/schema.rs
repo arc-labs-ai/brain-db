@@ -16,7 +16,7 @@
 //! `schema_version = 0`.
 
 use brain_core::{Cardinality, RequestId, StatementKind};
-use brain_metadata::entity::types::entity_type_lookup_by_name_rtxn;
+use brain_metadata::entity::types::entity_type_lookup_rtxn;
 use brain_metadata::extractor::ops::extractor_lookup_by_qname;
 use brain_metadata::relation::types::relation_type_lookup_by_qname;
 // One encoding of an object declaration, shared with the apply path, so
@@ -29,7 +29,8 @@ use brain_planner::WriterError;
 use brain_protocol::envelope::response::EventType;
 use brain_protocol::schema::{parse_schema, validate_located, ParseError, ValidationError};
 use brain_protocol::schema::{
-    CardinalityAst, ExtractorKindAst, SchemaItem, StatementKindAst, ValidatedSchema,
+    CardinalityAst, ExtractorKindAst, SchemaItem, StatementKindAst, SubjectTypeDecl,
+    ValidatedSchema,
 };
 use brain_protocol::{
     GraphEventPayload, SchemaGetRequest, SchemaGetResponse, SchemaListItemWire, SchemaListRequest,
@@ -539,6 +540,19 @@ struct MergeSummary {
 /// all-or-nothing under the associative-merge contract: a single
 /// conflict reverts the whole upload, the previous active version
 /// remains live.
+/// Pre-flight entity-type lookup for a namespace that may not be
+/// registered yet. `None` namespace → no rows of its own; fall back to the
+/// shared system namespace so built-ins still classify as existing.
+fn lookup_entity_type(
+    rtxn: &redb::ReadTransaction,
+    namespace_id: Option<brain_core::NamespaceId>,
+    name: &str,
+) -> Result<Option<brain_metadata::tables::entity_type::EntityTypeDefinition>, OpError> {
+    let ns = namespace_id.unwrap_or(brain_core::NamespaceId::SYSTEM).raw();
+    entity_type_lookup_rtxn(rtxn, ns, name)
+        .map_err(|err| OpError::Internal(format!("entity_type lookup: {err}")))
+}
+
 fn classify_schema_merge(
     ctx: &OpsContext,
     validated: &ValidatedSchema,
@@ -554,11 +568,19 @@ fn classify_schema_merge(
 
     let current_version = schema_active(&rtxn, namespace).map_err(map_schema_store_error)?;
 
+    // Entity types are scoped per tenant, so the pre-flight must classify
+    // against THIS namespace's registry. An unregistered namespace (a
+    // first-ever upload) has no rows of its own, and `0` would mean the
+    // system namespace — so a miss reads as "nothing declared here yet",
+    // which is exactly right for a first upload.
+    let namespace_id = brain_metadata::namespace::namespace_lookup_by_name(&rtxn, namespace)
+        .map_err(|e| OpError::Internal(format!("namespace lookup: {e}")))?;
+
     let mut all_idempotent = true;
     for item in &schema.items {
         match item {
             SchemaItem::EntityType(e) => {
-                let existing = entity_type_lookup_by_name_rtxn(&rtxn, &e.name)
+                let existing = lookup_entity_type(&rtxn, namespace_id, &e.name)
                     .map_err(|err| OpError::Internal(format!("entity_type lookup: {err}")))?;
                 match existing {
                     None => all_idempotent = false,
@@ -591,18 +613,37 @@ fn classify_schema_merge(
                         // resolves to `0` there too, so the comparison
                         // stays exact.
                         let new_object_entity_type = match declared_object_entity_type(&p.object) {
-                            Some(name) => entity_type_lookup_by_name_rtxn(&rtxn, name)
+                            Some(name) => lookup_entity_type(&rtxn, namespace_id, name)
                                 .map_err(|err| {
                                     OpError::Internal(format!("entity_type lookup: {err}"))
                                 })?
                                 .map_or(0, |d| d.id().raw()),
                             None => 0,
                         };
+                        // Same resolution for the declared subject domain.
+                        // Must be compared here or the two layers disagree:
+                        // this pre-flight would classify an added `subject:`
+                        // as "unchanged" and store nothing, while
+                        // `predicate_intern` counts it as a differing
+                        // constraint and refuses. The upload then answered
+                        // `200 backward_compatible` for a document it had
+                        // silently discarded.
+                        let new_subject_entity_type = match &p.subject {
+                            Some(SubjectTypeDecl::Entity { entity_type }) => {
+                                lookup_entity_type(&rtxn, namespace_id, entity_type)
+                                    .map_err(|err| {
+                                        OpError::Internal(format!("entity_type lookup: {err}"))
+                                    })?
+                                    .map_or(0, |d| d.id().raw())
+                            }
+                            Some(SubjectTypeDecl::Any) | None => 0,
+                        };
                         let new_description = p.description.as_deref().unwrap_or("");
                         let new_stateful = p.resolved_stateful();
                         if row.kind_constraint != new_kind
                             || row.object_type_constraint_byte != new_object
                             || row.object_entity_type_id != new_object_entity_type
+                            || row.subject_entity_type_id != new_subject_entity_type
                             || row.description != new_description
                             || row.is_stateful != new_stateful
                         {
@@ -623,6 +664,12 @@ fn classify_schema_merge(
                                 diff.push(format!(
                                     "object entity_type: stored={} new={}",
                                     row.object_entity_type_id, new_object_entity_type
+                                ));
+                            }
+                            if row.subject_entity_type_id != new_subject_entity_type {
+                                diff.push(format!(
+                                    "subject entity_type: stored={} new={}",
+                                    row.subject_entity_type_id, new_subject_entity_type
                                 ));
                             }
                             if row.description != new_description {
@@ -867,6 +914,83 @@ mod tests {
             assert!(resp.validation_errors.is_empty());
             assert_eq!(resp.namespace, "acme");
             assert!(resp.schema_version >= 1);
+        }
+
+        const ACME_TYPED_V1: &str = "namespace acme\n\
+            define entity_type Builder { attributes {} }\n\
+            define entity_type CloneEnv { attributes {} }\n\
+            define predicate prefers { kind: Preference object: Value<text> }\n";
+
+        /// Adding `subject:` to an existing predicate is a declared-constraint
+        /// change and must be refused like any other.
+        ///
+        /// It was not compared in the merge pre-flight, so the upload
+        /// classified the document as idempotent, stored nothing, and
+        /// answered `200 backward_compatible` — while `predicate_intern`
+        /// counted the same change as a conflict. The operator saw success
+        /// and got a schema that had not moved.
+        #[tokio::test]
+        async fn adding_a_subject_to_an_existing_predicate_is_a_conflict() {
+            let (_dir, ctx, _md) = build_ctx_for("acme");
+            handle_schema_upload(upload_req(ACME_TYPED_V1), &ctx)
+                .await
+                .expect("v1");
+
+            let narrowed = "namespace acme\n\
+                define entity_type Builder { attributes {} }\n\
+                define entity_type CloneEnv { attributes {} }\n\
+                define predicate prefers { kind: Preference subject: Entity<Builder> \
+                 object: Value<text> }\n";
+            let err = handle_schema_upload(upload_req(narrowed), &ctx)
+                .await
+                .expect_err("a narrowed subject must not be accepted silently");
+            match err {
+                OpError::SchemaConflict { conflict, name, .. } => {
+                    assert_eq!(name, "prefers");
+                    assert!(
+                        conflict.contains("subject entity_type"),
+                        "the conflict must name the subject, not something else: {conflict}",
+                    );
+                }
+                other => panic!("expected SchemaConflict, got {other:?}"),
+            }
+        }
+
+        /// Changing WHICH type the subject is pinned to is also a conflict —
+        /// not just going from unset to set.
+        #[tokio::test]
+        async fn repinning_a_subject_to_another_type_is_a_conflict() {
+            let (_dir, ctx, _md) = build_ctx_for("acme");
+            let with_builder = "namespace acme\n\
+                define entity_type Builder { attributes {} }\n\
+                define entity_type CloneEnv { attributes {} }\n\
+                define predicate prefers { kind: Preference subject: Entity<Builder> \
+                 object: Value<text> }\n";
+            handle_schema_upload(upload_req(with_builder), &ctx)
+                .await
+                .expect("v1");
+
+            let repinned = with_builder.replace("Entity<Builder>", "Entity<CloneEnv>");
+            let err = handle_schema_upload(upload_req(&repinned), &ctx)
+                .await
+                .expect_err("re-pinning must be refused");
+            assert!(matches!(err, OpError::SchemaConflict { .. }), "{err:?}");
+        }
+
+        /// Re-uploading the SAME subject must stay idempotent — the new
+        /// comparison must not turn every unchanged re-upload into a
+        /// conflict.
+        #[tokio::test]
+        async fn re_uploading_an_unchanged_subject_is_idempotent() {
+            let (_dir, ctx, _md) = build_ctx_for("acme");
+            let doc = "namespace acme\n\
+                define entity_type Builder { attributes {} }\n\
+                define predicate prefers { kind: Preference subject: Entity<Builder> \
+                 object: Value<text> }\n";
+            handle_schema_upload(upload_req(doc), &ctx).await.expect("v1");
+            handle_schema_upload(upload_req(doc), &ctx)
+                .await
+                .expect("an unchanged re-upload must still succeed");
         }
 
         /// A dry run must predict the real upload. It used to exit before the

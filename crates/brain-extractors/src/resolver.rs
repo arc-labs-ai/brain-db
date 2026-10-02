@@ -73,7 +73,7 @@ use brain_metadata::entity::ops::{
 use brain_metadata::entity::review::{enqueue_merge_proposal, MergeReviewError};
 use brain_metadata::entity::trigram::TrigramOpError;
 use brain_metadata::entity::types::{
-    entity_type_intern, entity_type_lookup_by_name, EntityTypeOpError,
+    entity_type_intern, entity_type_lookup, EntityTypeOpError,
 };
 use brain_metadata::tables::entity::{
     EntityMetadata, ENTITIES_TABLE, ENTITY_ALIASES_TABLE, ENTITY_BY_CANONICAL_NAME_TABLE,
@@ -384,14 +384,25 @@ fn is_iso_date_token(tok: &str) -> bool {
 /// so the common case never enters intern).
 fn resolve_entity_type(
     wtxn: &WriteTransaction,
+    namespace_id: u32,
     qname: &str,
     now_unix_nanos: u64,
 ) -> Result<EntityTypeId, ResolverError> {
     let name = qname_to_type_name(qname);
-    if let Some(def) = entity_type_lookup_by_name(wtxn, name)? {
+    // Resolve within the caller's tenant first, falling back to the shared
+    // built-ins. A type minted here belongs to the caller's namespace, not
+    // to everyone: two tenants whose corpora both coin `Builder` get two
+    // rows, and neither can make the other's schema upload fail.
+    if let Some(def) = entity_type_lookup(wtxn, namespace_id, name)? {
         return Ok(def.id());
     }
-    Ok(entity_type_intern(wtxn, name, Vec::new(), now_unix_nanos)?)
+    Ok(entity_type_intern(
+        wtxn,
+        namespace_id,
+        name,
+        Vec::new(),
+        now_unix_nanos,
+    )?)
 }
 
 /// Fetch the trigram set for `entity_id`'s canonical_name + aliases.
@@ -984,7 +995,7 @@ pub fn resolve_or_create_with_deps(
     if normalized.is_empty() {
         return Err(ResolverError::EmptyNormalizedName);
     }
-    let type_id = resolve_entity_type(wtxn, entity_type_qname, now_unix_nanos)?;
+    let type_id = resolve_entity_type(wtxn, scope.namespace_id, entity_type_qname, now_unix_nanos)?;
 
     // Tier 1 — exact canonical-name lookup.
     if let Some(id) = lookup_canonical_wtxn(wtxn, scope, type_id, &normalized)? {
@@ -2691,7 +2702,7 @@ mod tests {
         // The new type lives in the registry now.
         let d = d;
         let wtxn = d.write_txn().unwrap();
-        let def = entity_type_lookup_by_name(&wtxn, "Organization").unwrap();
+        let def = entity_type_lookup(&wtxn, brain_core::NamespaceId::SYSTEM.raw(), "Organization").unwrap();
         assert!(def.is_some());
         wtxn.commit().unwrap();
     }
@@ -2961,7 +2972,7 @@ mod tests {
         // Intern an Organization type so we can seed a cross-type entity.
         let org_type_id = {
             let wtxn = d.write_txn().unwrap();
-            let id = entity_type_intern(&wtxn, "Organization", Vec::new(), NOW).unwrap();
+            let id = entity_type_intern(&wtxn, brain_core::NamespaceId::SYSTEM.raw(), "Organization", Vec::new(), NOW).unwrap();
             wtxn.commit().unwrap();
             id
         };

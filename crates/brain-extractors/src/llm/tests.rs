@@ -78,6 +78,7 @@ impl LlmClient for MockClient {
 
 fn ok_response(json: &str, tokens: u64) -> LlmResponse {
     LlmResponse {
+        truncated: false,
         content: json.into(),
         tokens_in: tokens / 2,
         tokens_out: tokens / 2,
@@ -782,6 +783,7 @@ fn extractor_with_mock(mock: Arc<MockClient>) -> LlmExtractor {
         0.0,
         None,
         Duration::from_secs(60),
+        None,
     )
 }
 
@@ -898,6 +900,7 @@ fn judge_supersedes_budget_blocks_call() {
             per_call_micro_usd: 1,
         }),
         Duration::from_secs(60),
+        None,
     );
     let tmp = tempfile::tempdir().unwrap();
     let md = open_md(&tmp);

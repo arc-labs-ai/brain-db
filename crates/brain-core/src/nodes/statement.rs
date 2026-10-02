@@ -555,6 +555,16 @@ pub struct Predicate {
     /// (a bare `Entity` declaration, or an object variant other than
     /// `Entity`).
     pub object_entity_type_id: u32,
+    /// The `EntityTypeId` this predicate's SUBJECT must have, from a
+    /// declared `subject: Entity<SomeType>`. `0` = any subject (the
+    /// default, and what every schema written before the `subject` field
+    /// existed means).
+    ///
+    /// The object side could always be narrowed; the subject side could
+    /// not. So a schema could say "prefers_fidelity carries a text value"
+    /// but not "…and it belongs to a Builder", and nothing stopped the
+    /// predicate landing on whatever entity the extractor guessed.
+    pub subject_entity_type_id: u32,
     pub schema_version: u32,
     pub description: String,
     /// When true, a new statement with the same `(subject, predicate)`
@@ -733,6 +743,7 @@ mod tests {
     #[test]
     fn predicate_canonical_form() {
         let p = Predicate {
+            subject_entity_type_id: 0,
             id: PredicateId::from(7),
             namespace: "brain".into(),
             name: "is_a".into(),

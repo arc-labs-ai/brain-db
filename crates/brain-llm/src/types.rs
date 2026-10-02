@@ -173,6 +173,18 @@ pub struct LlmResponse {
     /// `"claude-haiku-4-5-20240307"`). Used downstream for drift
     /// detection.
     pub model_version: String,
+    /// The provider stopped because the output hit `max_tokens`, not
+    /// because the model finished (OpenAI `finish_reason == "length"`,
+    /// Anthropic `stop_reason == "max_tokens"`).
+    ///
+    /// Worth its own field because a truncated response is not a bad
+    /// response — it is an incomplete one, and the two need opposite
+    /// handling. Structured output cut mid-token parses as malformed
+    /// JSON, so without this a truncation is indistinguishable from a
+    /// model that cannot follow the schema: the caller retries the same
+    /// prompt, hits the same ceiling, gets the same bytes, and reports a
+    /// schema problem for what is really a budget problem.
+    pub truncated: bool,
 }
 
 #[cfg(test)]

@@ -336,6 +336,11 @@ impl From<brain_metadata::statement::StatementOpError> for OpError {
             // violated — the client can fix it by pointing at an
             // entity of the declared type.
             e @ E::ObjectEntityTypeMismatch { .. } => OpError::InvalidRequest(e.to_string()),
+            // Same, on the subject side: the predicate declares
+            // `subject: Entity<Type>` and the write hung it off a
+            // different kind of thing. Client-fixable, so InvalidRequest
+            // rather than a server fault.
+            e @ E::SubjectEntityTypeMismatch { .. } => OpError::InvalidRequest(e.to_string()),
             E::InvalidArgument(s) => OpError::InvalidRequest(s.to_string()),
             E::AlreadySuperseded(id, by) => {
                 OpError::Conflict(format!("statement {id:?} already superseded by {by:?}"))

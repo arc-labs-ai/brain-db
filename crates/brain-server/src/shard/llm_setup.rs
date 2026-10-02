@@ -160,6 +160,9 @@ pub struct LlmDeps {
     /// client without re-resolving credentials. `None` mirrors
     /// `disambiguator`: no provider key was resolvable.
     pub primary_client: Option<Arc<dyn LlmClient>>,
+    /// `[extractors.llm] max_tokens` — the LLM tier's output-token
+    /// ceiling. `None` leaves the extractor on its own default.
+    pub max_tokens: Option<u32>,
     pub primary_model: String,
 }
 
@@ -184,6 +187,7 @@ impl LlmDeps {
             entity_type_qnames,
             model_router: self.router,
             llm_cache: self.cache,
+            llm_max_tokens: self.max_tokens,
         }
     }
 }
@@ -209,6 +213,7 @@ pub fn build_llm_deps(shard_dir: &Path, llm_cfg: &LlmSpawnConfig) -> LlmDeps {
         disambiguator,
         primary_client,
         primary_model,
+        max_tokens: llm_cfg.extractor_max_tokens,
     }
 }
 
@@ -473,6 +478,7 @@ mod tests {
     fn into_materialize_deps_threads_router_cache_and_labels() {
         let dir = tempfile::tempdir().unwrap();
         let deps = LlmDeps {
+            max_tokens: None,
             router: None,
             cache: open_cache(dir.path()),
             disambiguator: None,
@@ -535,6 +541,7 @@ mod tests {
 
         let labels = Arc::new(vec!["brain:Person".to_string()]);
         let deps_a = LlmDeps {
+            max_tokens: None,
             router: None,
             cache: Some(Arc::clone(&cache_arc)),
             disambiguator: None,
@@ -543,6 +550,7 @@ mod tests {
         }
         .into_materialize_deps(None, labels.clone());
         let deps_b = LlmDeps {
+            max_tokens: None,
             router: None,
             cache: Some(Arc::clone(&cache_arc)),
             disambiguator: None,

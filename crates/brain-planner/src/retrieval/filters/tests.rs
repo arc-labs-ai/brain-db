@@ -38,7 +38,7 @@ fn fresh() -> (TempDir, MetadataDb) {
 
 fn ensure_person_type(metadata: &mut MetadataDb) -> EntityTypeId {
     let wtxn = metadata.write_txn().expect("wtxn");
-    let id = entity_type_intern(&wtxn, PERSON_TYPE, Vec::new(), 0).expect("type");
+    let id = entity_type_intern(&wtxn, brain_core::NamespaceId::SYSTEM.raw(), PERSON_TYPE, Vec::new(), 0).expect("type");
     wtxn.commit().expect("commit");
     id
 }

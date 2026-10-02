@@ -1244,6 +1244,7 @@ mod tests {
                 type_qname: artifacts.entities[0].type_qname.clone(),
             }],
             statements: vec![EnrichedStatement {
+                object_entity_id: None,
                 id: s.id,
                 subject_name: s.subject_name.clone(),
                 predicate: s.predicate.clone(),

@@ -110,6 +110,13 @@ pub struct OpsContext {
     /// Planner-side config + budgets. Defaults are fine for v1; the
     /// builder is here so the server can override budgets at startup.
     pub planner_ctx: PlannerContext,
+    /// How many shards this deployment runs.
+    ///
+    /// A handler only ever sees its own shard's data, so this is what
+    /// lets a per-shard answer say whether it is the WHOLE answer:
+    /// `SPACE_LIST` is complete at `1` and partial above it. Defaults to
+    /// `1`; the shard-spawn path overrides it with the real count.
+    pub shard_count: usize,
     /// Per-shard transaction registry.
     pub txn_store: Arc<TxnStore>,
     /// Per-shard change-feed bus. Cross-shard fan-out is the
@@ -251,6 +258,7 @@ impl OpsContext {
             executor,
             caller_connection_id: [0u8; 16],
             planner_ctx: PlannerContext::default(),
+            shard_count: 1,
             txn_store: Arc::new(TxnStore::new()),
             events,
             subscriptions,
@@ -273,6 +281,21 @@ impl OpsContext {
             retriever_metrics: Arc::new(RetrieverMetrics::new()),
             query_metrics: Arc::new(QueryMetrics::new()),
         }
+    }
+
+    /// Record the deployment's shard count. Set once by the shard-spawn
+    /// path. `0` is coerced to `1`: a listing is never "complete across
+    /// zero shards", and the value is only ever compared against 1.
+    #[must_use]
+    pub fn with_shard_count(mut self, count: usize) -> Self {
+        self.shard_count = count.max(1);
+        self
+    }
+
+    /// Whether a single-shard answer covers the whole deployment.
+    #[must_use]
+    pub fn single_shard_deployment(&self) -> bool {
+        single_shard_deployment(self.shard_count)
     }
 
     /// Wire the per-shard entity vector index for the resolver's tier-3
@@ -604,4 +627,36 @@ impl OpsContext {
 
 fn now_unix_nanos_ctx() -> u64 {
     crate::clock::now_unix_nanos()
+}
+
+/// Whether a listing produced by one shard covers the whole deployment.
+///
+/// The rule behind `SPACE_LIST.cross_shard_complete`. A free function so
+/// it is stated once and testable without standing up an `OpsContext`.
+/// `0` reads as `1`: a misconfigured shard count must not make every
+/// listing claim completeness across nothing.
+#[must_use]
+pub fn single_shard_deployment(shard_count: usize) -> bool {
+    shard_count.max(1) <= 1
+}
+
+#[cfg(test)]
+mod shard_count_tests {
+    use super::single_shard_deployment;
+
+    /// This must be a real function of the deployment, not a constant — a
+    /// flag that never changes teaches every caller to ignore it, which is
+    /// how the hardcoded `false` managed to be both wrong on single-shard
+    /// deployments and useless on multi-shard ones.
+    #[test]
+    fn one_shard_is_complete_and_more_than_one_is_not() {
+        assert!(single_shard_deployment(1));
+        assert!(!single_shard_deployment(2));
+        assert!(!single_shard_deployment(64));
+    }
+
+    #[test]
+    fn zero_shards_reads_as_one() {
+        assert!(single_shard_deployment(0));
+    }
 }

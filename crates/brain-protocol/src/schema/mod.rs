@@ -16,7 +16,7 @@ pub use ast::{
     ConditionValue, CostExpr, CostUnit, DurationAst, DurationUnit, EntityTypeDef, ExtractorDef,
     ExtractorField, ExtractorKindAst, ExtractorTarget, KindCardinalityAst, KindDef, LiteralValue,
     ObjectKindAst, ObjectTypeDecl, PredicateDef, RelationTypeDef, ResolverConfig, Schema,
-    SchemaItem, StatementKindAst, TemporalModelAst, TriggerExpr,
+    SchemaItem, StatementKindAst, SubjectTypeDecl, TemporalModelAst, TriggerExpr,
 };
 pub use locate::{locate_spans, validate_located};
 pub use parse_error::ParseError;

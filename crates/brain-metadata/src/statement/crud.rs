@@ -304,6 +304,28 @@ fn validate_against_predicate(
             ));
         }
     }
+    // A declared `subject: Entity<Type>` domain pins which kind of thing
+    // may carry this predicate. `0` = undeclared, which is every schema
+    // written before the field existed, so this check is inert unless a
+    // schema opts in.
+    //
+    // Only an Entity subject is checked. A `Memory` or `Pending` subject
+    // has no entity type to compare, and rejecting those would break the
+    // extractor's normal two-phase write (pending subject now, resolved
+    // entity later) for every predicate that declares a domain.
+    if p.subject_entity_type_id != 0 {
+        if let SubjectRef::Entity(eid) = s.subject {
+            let actual =
+                entity_type_of(wtxn, eid)?.ok_or(StatementOpError::UnknownSubject(eid))?;
+            if actual.raw() != p.subject_entity_type_id {
+                return Err(StatementOpError::SubjectEntityTypeMismatch {
+                    entity: eid,
+                    expected: EntityTypeId::from(p.subject_entity_type_id),
+                    actual,
+                });
+            }
+        }
+    }
     // A declared `object: Entity<Type>` range narrows the variant check
     // to one entity type. `0` means the declaration was a bare `Entity`
     // (or another variant entirely) and admits any type.
@@ -2497,5 +2519,97 @@ mod tests {
                 .unwrap();
         wtxn.commit().unwrap();
         assert_eq!(pending.len(), 1, "overlapping distinct facts contradict");
+    }
+
+    // ── declared subject domain ─────────────────────────────────────────
+
+    /// Intern a Fact predicate declaring `subject: Entity<entity_type>`
+    /// and an unconstrained object.
+    fn intern_subject_typed_pred(
+        db: &mut crate::MetadataDb,
+        name: &str,
+        subject_entity_type: brain_core::EntityTypeId,
+    ) -> PredicateId {
+        use crate::schema::predicate::ObjectConstraint;
+        let wtxn = db.write_txn().unwrap();
+        let id = crate::schema::predicate::predicate_intern_with_subject(
+            &wtxn,
+            "test",
+            name,
+            Some(StatementKind::Fact),
+            ObjectConstraint::ANY,
+            subject_entity_type.raw(),
+            /* schema_version */ 1,
+            "",
+            false,
+            1_700_000_000_000_000_000,
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+        id
+    }
+
+    #[test]
+    fn declared_subject_entity_type_accepts_conforming_subject() {
+        let (_dir, mut db) = open_db();
+        let org_subject = make_entity_typed(&mut db, "an-org", ORGANIZATION_ID);
+        let object = make_entity(&mut db, "some-object");
+        let pred = intern_subject_typed_pred(&mut db, "org_only_pred", ORGANIZATION_ID);
+
+        let s = fresh_fact(org_subject, pred, object);
+        let wtxn = db.write_txn().unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &s, 0).unwrap();
+        wtxn.commit().unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        assert!(statement_get(&rtxn, s.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn declared_subject_entity_type_rejects_wrong_type() {
+        // The real defect this closes: `prefers_fidelity` is a thing a
+        // BUILDER wants, and nothing stopped it being written against the
+        // environment instead. `object` could never express that.
+        let (_dir, mut db) = open_db();
+        let person_subject = make_entity(&mut db, "a-person");
+        let object = make_entity(&mut db, "some-object-2");
+        let pred = intern_subject_typed_pred(&mut db, "org_only_pred_2", ORGANIZATION_ID);
+
+        let s = fresh_fact(person_subject, pred, object);
+        let wtxn = db.write_txn().unwrap();
+        let err = statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &s, 0)
+            .expect_err("a wrong-typed subject must be refused");
+        match err {
+            StatementOpError::SubjectEntityTypeMismatch {
+                expected, actual, ..
+            } => {
+                assert_eq!(expected, ORGANIZATION_ID);
+                assert_ne!(actual, ORGANIZATION_ID);
+            }
+            other => panic!("expected SubjectEntityTypeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_undeclared_subject_domain_admits_any_subject() {
+        // Every schema written before the `subject` field means `0` here.
+        // If this check fired on `0` it would reject essentially every
+        // existing write.
+        let (_dir, mut db) = open_db();
+        let person_subject = make_entity(&mut db, "any-person");
+        let object = make_entity(&mut db, "some-object-3");
+        let pred = intern_subject_typed_pred(
+            &mut db,
+            "unconstrained_pred",
+            brain_core::EntityTypeId(0),
+        );
+
+        let s = fresh_fact(person_subject, pred, object);
+        let wtxn = db.write_txn().unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &s, 0).unwrap();
+        wtxn.commit().unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        assert!(statement_get(&rtxn, s.id).unwrap().is_some());
     }
 }

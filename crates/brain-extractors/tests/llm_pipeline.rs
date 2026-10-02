@@ -74,6 +74,7 @@ impl LlmClient for ScriptedClient {
 
 fn ok_response(content: &str, tokens: u64) -> LlmResponse {
     LlmResponse {
+        truncated: false,
         content: content.into(),
         tokens_in: tokens / 2,
         tokens_out: tokens / 2,
@@ -159,6 +160,7 @@ fn build_extractor(
         threshold,
         budget,
         Duration::from_secs(60),
+        None,
     )
 }
 
@@ -496,6 +498,7 @@ fn build_extractor_prompt(
         0.0,
         None,
         Duration::from_secs(60),
+        None,
     )
 }
 

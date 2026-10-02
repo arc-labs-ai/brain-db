@@ -1238,6 +1238,22 @@ pub struct EnrichedStatement {
     /// Stringified object — entity canonical name for entity objects,
     /// formatted scalar for literal objects.
     pub object_label: String,
+    /// The object's entity id when the object IS an entity; `None` for a
+    /// literal value.
+    ///
+    /// [`Self::object_label`] alone cannot answer "is this an entity?" — it
+    /// stringifies both cases — so a consumer had to guess by matching the
+    /// label against known entity names. That guess is wrong exactly when a
+    /// literal's text happens to equal an entity's name: a stored
+    /// `clone_status = "trello-clone-v7"` text value was drawn as an edge
+    /// pointing at the `trello-clone-v7` entity, inventing a
+    /// self-referential link the store never held. It also picked
+    /// arbitrarily between two entities sharing a canonical name.
+    ///
+    /// Optional on the wire so an older peer that omits it still decodes;
+    /// absent means "no entity object", which is the safe reading.
+    #[serde(default, with = "crate::codec::cbor::opt_byte_array16")]
+    pub object_entity_id: Option<[u8; 16]>,
     pub confidence: f32,
     /// When the statement's EVENT happened, in unix nanos — the reified
     /// Time slot of an Event-kind statement. `None` for a statement with

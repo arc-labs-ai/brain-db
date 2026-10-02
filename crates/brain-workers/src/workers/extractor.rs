@@ -3092,11 +3092,30 @@ async fn apply_outcome(
     // Merge the freshly-committed typed graph into this memory's durable
     // write-artifact bundle (MEMORY_INSPECT), reading it back through the same
     // enrichment resolver RECALL uses. Post-commit only, so the read sees the
-    // rows we just wrote. Gated on non-empty extraction so a memory that
-    // produced no graph costs no extra transaction; the sync bundle already
-    // holds vector + record. Best-effort: a failure is logged, never fatal —
+    // rows we just wrote. Best-effort: a failure is logged, never fatal —
     // the durable graph itself already committed.
-    if counts.entities + counts.statements + counts.relations > 0 {
+    //
+    // Gated on non-empty extraction so a memory that produced no graph costs
+    // no extra transaction; the sync bundle already holds vector + record.
+    //
+    // The zero-count case is NOT unconditionally skippable, though. On a
+    // RE-extraction the bundle already holds the previous run's edges, and
+    // "extraction produced nothing" is precisely when those edges are stale
+    // and must go: `merge_graph_from_committed` replaces the extractor-owned
+    // edges with the committed set, so merging on an empty result is what
+    // clears them. Skipping it left a memory serving a stale graph that
+    // re-running extraction could never repair — the operator's only
+    // remaining move was to delete and re-encode the memory.
+    //
+    // So: merge when there is something to write, or when there is something
+    // stale to clear. The extra read only happens on the zero-count path.
+    let extracted_something = counts.entities + counts.statements + counts.relations > 0;
+    let has_stale_graph = !extracted_something
+        && brain_ops::memory_artifact::artifact_holds_extractor_graph(
+            ctx.ops.executor.metadata.as_ref(),
+            memory_id,
+        );
+    if extracted_something || has_stale_graph {
         let metadata = ctx.ops.executor.metadata.as_ref();
         match brain_ops::memory_artifact::merge_graph_from_committed(metadata, memory_id) {
             Ok(0) => {}
@@ -3636,7 +3655,35 @@ fn run_apply_body(
                     // embedding consolidation onto a `brain:` synonym.
                     let declared_pid =
                         declared_predicate_in_namespace(&wtxn, declared_vocab, name)?;
-                    let (pid, pred_ns) = match resolve_extracted_predicate(
+                    // The relation type this local name resolves to, looked up
+                    // before the predicate so we can tell whether a predicate is
+                    // needed at all.
+                    let declared_rt =
+                        declared_relation_type_in_namespace(&wtxn, declared_vocab, name)?;
+                    // A name the namespace declares ONLY as a relation type,
+                    // carrying an entity object, is headed for the relations
+                    // table — the routing decision below turns it into a
+                    // `StatementKind::Relation` and `continue`s before any
+                    // statement is written.
+                    //
+                    // Interning a predicate for it anyway minted a permanent
+                    // `ImplicitFromWrite` row that nothing ever referenced: the
+                    // relation store held the fact, and the predicate registry
+                    // grew a duplicate of a name the schema had already declared
+                    // on the other axis.
+                    //
+                    // `object_is_entity` is the LLM's per-triple judgment and is
+                    // only a PREDICTION of how the object will resolve — a
+                    // surface that fails to resolve to an entity falls back to a
+                    // text value, which does need a predicate. So this defers the
+                    // mint rather than skipping it, and the fallback below mints
+                    // on the way past.
+                    let predicate_deferred =
+                        declared_pid.is_none() && declared_rt.is_some() && sm.object_is_entity;
+                    let resolved_predicate = if predicate_deferred {
+                        None
+                    } else {
+                        Some(match resolve_extracted_predicate(
                         &wtxn,
                         embed_deps,
                         &worker.metrics,
@@ -3657,13 +3704,8 @@ fn run_apply_body(
                             );
                             continue;
                         }
+                    })
                     };
-                    // The relation type this local name resolves to when the
-                    // triple turns out to be an entity↔entity link (or a
-                    // retraction of one). Looked up once; interned lazily.
-                    let declared_rt =
-                        declared_relation_type_in_namespace(&wtxn, declared_vocab, name)?;
-                    let used_qname = (pred_ns.to_string(), name.to_string());
 
                     // Object axis: the predicate's declared object constraint
                     // (Entity→mint / Value→text) wins; else the LLM's per-object
@@ -3681,7 +3723,7 @@ fn run_apply_body(
                         source_scope,
                         memory_id,
                         sm,
-                        pid,
+                        resolved_predicate.map(|(pid, _)| pid),
                         &mut entity_map,
                         &mut mentioned,
                         embed_deps,
@@ -3698,13 +3740,71 @@ fn run_apply_body(
                         );
                         continue;
                     };
+                    // The deferred mint, settled now that the object is known.
+                    //
+                    // Predicted-relation and it IS an entity → no predicate is
+                    // needed: the routing below writes a relation and `continue`s
+                    // before `statement_create`. Predicted-relation but the
+                    // surface did not resolve to an entity → this is an ordinary
+                    // value statement after all, so mint the predicate here.
+                    let routes_to_relation =
+                        predicate_deferred && matches!(object, StatementObject::Entity(_));
+                    let (pid, pred_ns) = match resolved_predicate {
+                        Some(resolved) => resolved,
+                        None if routes_to_relation => {
+                            // Placeholder: every read of it below degrades to the
+                            // same default an un-constrained predicate gives, and
+                            // the relation branch `continue`s before any write
+                            // that would persist it.
+                            (brain_core::PredicateId::from(0), mem_ns.as_str())
+                        }
+                        None => match resolve_extracted_predicate(
+                            &wtxn,
+                            embed_deps,
+                            &worker.metrics,
+                            declared_pid,
+                            &mem_ns,
+                            ns,
+                            name,
+                            now,
+                        ) {
+                            Ok(resolved) => resolved,
+                            Err(e) => {
+                                worker.metrics.inc_apply_dropped("predicate_invalid");
+                                warn!(
+                                    memory_id = ?memory_id,
+                                    predicate = %sm.predicate_qname,
+                                    error = %e,
+                                    "statement: predicate intern failed; skipping triple",
+                                );
+                                continue;
+                            }
+                        },
+                    };
+                    let used_qname = (pred_ns.to_string(), name.to_string());
+
                     // A declared `Value<number>` / `Value<bool>` predicate stores
                     // a typed value, not the LLM's text rendering of it.
                     let object = if declared_pid.is_some() {
-                        coerce_declared_value(
+                        match coerce_declared_value(
                             object,
                             declared_vocab.and_then(|v| v.predicate(name)),
-                        )
+                        ) {
+                            Some(o) => o,
+                            None => {
+                                worker
+                                    .metrics
+                                    .inc_apply_dropped("declared_value_type_mismatch");
+                                debug!(
+                                    memory_id = ?memory_id,
+                                    predicate = %sm.predicate_qname,
+                                    object = ?sm.object_text,
+                                    "statement: object violates the predicate's declared \
+                                     value type; skipping triple",
+                                );
+                                continue;
+                            }
+                        }
                     } else {
                         object
                     };
@@ -3835,9 +3935,10 @@ fn run_apply_body(
                     // RELATION TYPE (and not as a predicate) is an entity↔entity
                     // link by schema: when the object resolved to an entity,
                     // route it to the typed edge whatever kind the LLM guessed.
-                    if declared_pid.is_none()
-                        && declared_rt.is_some()
-                        && matches!(object, StatementObject::Entity(_))
+                    if routes_to_relation
+                        || (declared_pid.is_none()
+                            && declared_rt.is_some()
+                            && matches!(object, StatementObject::Entity(_)))
                     {
                         kind = StatementKind::Relation;
                     }
@@ -3958,9 +4059,11 @@ fn run_apply_body(
                             }
                             Err(e) => {
                                 worker.metrics.inc_apply_dropped("create_rejected");
+                                let rule = describe_endpoint_violation(&wtxn, &e);
                                 warn!(
                                     memory_id = ?memory_id,
                                     predicate = %sm.predicate_qname,
+                                    rule = %rule,
                                     error = %e,
                                     "relation_create rejected for entity link; skipping triple",
                                 );
@@ -4023,8 +4126,15 @@ fn run_apply_body(
                         }
                         Err(e) => {
                             worker.metrics.inc_apply_dropped("create_rejected");
+                            let rule = describe_statement_violation(&wtxn, &e);
                             warn!(
                                 memory_id = ?memory_id,
+                                // The predicate was missing entirely, so the
+                                // log said a triple was dropped without saying
+                                // which one — unactionable on a memory that
+                                // produced a dozen.
+                                predicate = %sm.predicate_qname,
+                                rule = %rule,
                                 error = %e,
                                 "statement_create rejected; skipping triple",
                             );
@@ -5131,26 +5241,94 @@ fn resolve_extracted_relation_type<'a>(
 fn coerce_declared_value(
     object: StatementObject,
     declared: Option<&brain_protocol::schema::PredicateDef>,
-) -> StatementObject {
+) -> Option<StatementObject> {
     use brain_protocol::schema::{AttrType, ObjectTypeDecl};
     let Some(ObjectTypeDecl::Value { value_type }) = declared.map(|p| &p.object) else {
-        return object;
+        return Some(object);
     };
     let StatementObject::Value(StatementValue::Text(text)) = &object else {
-        return object;
+        return Some(object);
     };
     let t = text.trim();
     match value_type {
         AttrType::Number => match t.parse::<f64>() {
-            Ok(f) if f.is_finite() => StatementObject::Value(StatementValue::Float(f)),
-            _ => object,
+            Ok(f) if f.is_finite() => Some(StatementObject::Value(StatementValue::Float(f))),
+            // Declared `Value<number>`, and the tier produced something that
+            // is not a number. Returning the text unchanged stored a row that
+            // contradicts the schema the operator wrote: a numeric filter over
+            // the predicate then silently skips it, and `episode_budget =
+            // "medium"` reads as a fact when it is a misparse. `None` = reject.
+            _ => None,
         },
         AttrType::Bool => match t.to_ascii_lowercase().as_str() {
-            "true" | "yes" => StatementObject::Value(StatementValue::Bool(true)),
-            "false" | "no" => StatementObject::Value(StatementValue::Bool(false)),
-            _ => object,
+            "true" | "yes" => Some(StatementObject::Value(StatementValue::Bool(true))),
+            "false" | "no" => Some(StatementObject::Value(StatementValue::Bool(false))),
+            _ => None,
         },
-        _ => object,
+        // Text / date / the rest: no coercion defined, so nothing to violate.
+        _ => Some(object),
+    }
+}
+
+/// Render an entity type id as its declared name, falling back to the raw
+/// id when the row is missing. Never fails the caller: this is log text.
+fn type_name(wtxn: &redb::WriteTransaction, id: brain_core::EntityTypeId) -> String {
+    match brain_metadata::entity_type_name_by_id(wtxn, id) {
+        Ok(Some(name)) => name,
+        _ => format!("EntityTypeId({})", id.raw()),
+    }
+}
+
+/// Restate a relation endpoint violation as the schema rule it broke.
+///
+/// The underlying error is precise but unreadable — `requires
+/// EntityTypeId(9) but entity ... is EntityTypeId(8)` makes an operator go
+/// look up two ids to learn that `to:` wanted a CloneEnv and got a
+/// TargetApp. Empty string for any other error, so the caller's `error`
+/// field stays the sole detail in cases this does not improve.
+fn describe_endpoint_violation(
+    wtxn: &redb::WriteTransaction,
+    e: &brain_metadata::relation::ops::RelationOpError,
+) -> String {
+    use brain_metadata::relation::ops::RelationOpError as E;
+    match e {
+        E::EndpointTypeViolation {
+            side,
+            expected,
+            actual,
+            ..
+        } => format!(
+            "{side} must be {} but got {}",
+            type_name(wtxn, *expected),
+            type_name(wtxn, *actual)
+        ),
+        _ => String::new(),
+    }
+}
+
+/// The statement-side counterpart: restate a declared subject/object domain
+/// violation in type names rather than ids.
+fn describe_statement_violation(
+    wtxn: &redb::WriteTransaction,
+    e: &brain_metadata::statement::StatementOpError,
+) -> String {
+    use brain_metadata::statement::StatementOpError as E;
+    match e {
+        E::SubjectEntityTypeMismatch {
+            expected, actual, ..
+        } => format!(
+            "subject must be {} but got {}",
+            type_name(wtxn, *expected),
+            type_name(wtxn, *actual)
+        ),
+        E::ObjectEntityTypeMismatch {
+            expected, actual, ..
+        } => format!(
+            "object must be {} but got {}",
+            type_name(wtxn, *expected),
+            type_name(wtxn, *actual)
+        ),
+        _ => String::new(),
     }
 }
 
@@ -5230,7 +5408,12 @@ fn resolve_statement_object(
     scope: brain_metadata::RowScope,
     memory_id: MemoryId,
     sm: &StatementMention,
-    pid: brain_core::PredicateId,
+    // The predicate this triple resolved to, when one has been interned.
+    // `None` when the mint was deferred because the triple looks headed
+    // for the relations table — there is no declared constraint to read in
+    // that case, so the axis falls to the mention's own flag, which is
+    // exactly what an un-constrained predicate would have produced.
+    pid: Option<brain_core::PredicateId>,
     entity_map: &mut HashMap<String, EntityId>,
     mentioned: &mut HashSet<EntityId>,
     embed_deps: Option<&EmbeddingDeps>,
@@ -5253,7 +5436,11 @@ fn resolve_statement_object(
     // about it. Consulting the map first let that incidental hit silently
     // override both the explicit flag and a schema-declared `Value` constraint,
     // binding literals as entity objects.
-    let want_entity = match predicate_declared_object_constraint_in_write_txn(wtxn, pid)? {
+    let declared_object_constraint = match pid {
+        Some(pid) => predicate_declared_object_constraint_in_write_txn(wtxn, pid)?,
+        None => None,
+    };
+    let want_entity = match declared_object_constraint {
         Some(1) => true,
         Some(2) => false,
         _ => sm.object_is_entity,
@@ -9732,6 +9919,186 @@ mod tests {
     /// `mirror:` vocabulary — with the declared kind (Fact, over the LLM's
     /// Attribute guess), the declared `Value<number>` object type, and the
     /// declared relation type — and never coin the `brain:` twins.
+    #[test]
+    fn a_declared_value_object_stays_a_literal_even_when_it_names_an_entity() {
+        // `blocked_by` declares `object: Value<text>`, so its object is a
+        // literal whatever the tier guessed. The case that breaks it is an
+        // object whose TEXT happens to match an entity the same memory
+        // mentioned: the tier sets `object_is_entity`, and if the declared
+        // constraint does not win, the statement binds to that entity instead
+        // of storing the words — producing a self-referential edge like
+        // `trello-clone-v7 -(clone_status)-> trello-clone-v7` rather than the
+        // status value.
+        use brain_core::{MemoryId, StatementKind};
+
+        let (worker, ctx, metadata) = __join_env();
+        let scope = __upload_schema_scope(&metadata, __MIRROR_SCHEMA, "mirror");
+        let memory_id = MemoryId::pack(0, 1, 31);
+        __seed_memory_row(&metadata, memory_id, scope);
+
+        let outcome = __outcome(vec![
+            __alice(),
+            // Object text == the mentioned entity's name, tier says entity.
+            __entity_stmt("brain:blocked_by", "Alice", true, StatementKind::Fact, None),
+        ]);
+        futures_lite::future::block_on(apply_outcome(&worker, &ctx, memory_id, &outcome))
+            .expect("apply_outcome");
+
+        let rtxn = metadata.read_txn().unwrap();
+        let alice = __alice_in(&rtxn, scope);
+        let rows = __statements_for(&rtxn, scope, alice, "mirror", "blocked_by");
+        assert_eq!(rows.len(), 1, "the statement must persist");
+        assert_eq!(
+            rows[0].object,
+            StatementObject::Value(StatementValue::Text("Alice".into())),
+            "a declared Value<text> object must stay a literal, not bind to the entity",
+        );
+    }
+
+    #[test]
+    fn a_declared_relation_type_does_not_also_mint_a_predicate() {
+        // A name the namespace declares ONLY as a relation type, emitted as a
+        // statement triple with an entity object, is written to the relations
+        // table. It used to ALSO mint an `ImplicitFromWrite` predicate of the
+        // same name that nothing ever referenced — a duplicate of a name the
+        // schema had already declared on the other axis, which then showed up
+        // in the operator's promotion shortlist.
+        use brain_core::{MemoryId, StatementKind};
+
+        let (worker, ctx, metadata) = __join_env();
+        let scope = __upload_schema_scope(&metadata, __MIRROR_SCHEMA, "mirror");
+        let memory_id = MemoryId::pack(0, 1, 21);
+        __seed_memory_row(&metadata, memory_id, scope);
+
+        let outcome = __outcome(vec![
+            __alice(),
+            __entity_stmt("brain:clones", "Linear", true, StatementKind::Fact, None),
+        ]);
+        futures_lite::future::block_on(apply_outcome(&worker, &ctx, memory_id, &outcome))
+            .expect("apply_outcome");
+
+        let rtxn = metadata.read_txn().unwrap();
+        // The edge landed.
+        let rt = brain_metadata::relation_type_lookup_by_qname(&rtxn, "mirror", "clones")
+            .unwrap()
+            .expect("mirror:clones declared");
+        let alice = __alice_in(&rtxn, scope);
+        let edges = brain_metadata::relation::ops::relation_list_from(
+            &rtxn,
+            scope,
+            alice,
+            &brain_metadata::relation::ops::RelationListFilter {
+                relation_type: Some(rt.id),
+                current_only: true,
+                limit: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(edges.len(), 1, "the triple must persist as a relation");
+
+        // And no predicate twin was minted on either namespace spelling.
+        for ns in ["mirror", "brain"] {
+            assert!(
+                brain_metadata::predicate_lookup_by_qname(&rtxn, ns, "clones")
+                    .unwrap()
+                    .is_none(),
+                "{ns}:clones must not be minted as a predicate",
+            );
+        }
+    }
+
+    #[test]
+    fn a_declared_relation_type_with_an_unresolvable_object_still_gets_a_predicate() {
+        // The deferred mint is predicated on the LLM's `object_is_entity`
+        // flag, which is a prediction. When the surface does not resolve to an
+        // entity the triple is an ordinary value statement after all, and it
+        // must still get a predicate rather than being silently lost.
+        use brain_core::{MemoryId, StatementKind};
+
+        let (worker, ctx, metadata) = __join_env();
+        let scope = __upload_schema_scope(&metadata, __MIRROR_SCHEMA, "mirror");
+        let memory_id = MemoryId::pack(0, 1, 22);
+        __seed_memory_row(&metadata, memory_id, scope);
+
+        // `object_is_entity: false` → the earlier guard drops a declared
+        // relation type carrying a value object, so use the entity axis with a
+        // surface no entity mention backs.
+        let outcome = __outcome(vec![
+            __alice(),
+            __entity_stmt(
+                "brain:clones",
+                "a product nobody mentioned",
+                true,
+                StatementKind::Fact,
+                None,
+            ),
+        ]);
+        futures_lite::future::block_on(apply_outcome(&worker, &ctx, memory_id, &outcome))
+            .expect("apply_outcome");
+
+        let rtxn = metadata.read_txn().unwrap();
+        // Whichever axis it landed on, the triple was not dropped on the floor.
+        let alice = __alice_in(&rtxn, scope);
+        let as_statement = __statements_for(&rtxn, scope, alice, "mirror", "clones");
+        let rt = brain_metadata::relation_type_lookup_by_qname(&rtxn, "mirror", "clones")
+            .unwrap()
+            .expect("declared");
+        let as_relation = brain_metadata::relation::ops::relation_list_from(
+            &rtxn,
+            scope,
+            alice,
+            &brain_metadata::relation::ops::RelationListFilter {
+                relation_type: Some(rt.id),
+                current_only: true,
+                limit: 0,
+            },
+        )
+        .unwrap();
+        assert!(
+            as_statement.len() + as_relation.len() == 1,
+            "the triple must persist exactly once, on one axis or the other",
+        );
+    }
+
+    #[test]
+    fn a_value_that_violates_a_declared_number_type_is_refused() {
+        // `success_rate` is declared `object: Value<number>`. A tier that
+        // hands it "medium" used to have that stored verbatim as text, so a
+        // numeric read over the predicate silently skipped the row and the
+        // typed graph held a fact contradicting its own schema.
+        use brain_core::{MemoryId, StatementKind};
+
+        let (worker, ctx, metadata) = __join_env();
+        let scope = __upload_schema_scope(&metadata, __MIRROR_SCHEMA, "mirror");
+        let memory_id = MemoryId::pack(0, 1, 23);
+        __seed_memory_row(&metadata, memory_id, scope);
+
+        let outcome = __outcome(vec![
+            __alice(),
+            __entity_stmt(
+                "brain:success_rate",
+                "medium",
+                false,
+                StatementKind::Fact,
+                None,
+            ),
+            // A coercible sibling, so the test distinguishes "rejected the bad
+            // one" from "rejected everything".
+            __entity_stmt("brain:success_rate", "0.62", false, StatementKind::Fact, None),
+        ]);
+        futures_lite::future::block_on(apply_outcome(&worker, &ctx, memory_id, &outcome))
+            .expect("apply_outcome");
+
+        let rtxn = metadata.read_txn().unwrap();
+        let alice = __alice_in(&rtxn, scope);
+        let rows = __statements_for(&rtxn, scope, alice, "mirror", "success_rate");
+        assert_eq!(rows.len(), 1, "only the numeric value may persist");
+        assert_eq!(
+            rows[0].object,
+            StatementObject::Value(StatementValue::Float(0.62)),
+        );
+    }
+
     #[test]
     fn apply_resolves_declared_vocabulary_of_memory_namespace() {
         use brain_core::{MemoryId, StatementKind};

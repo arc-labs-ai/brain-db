@@ -23,7 +23,7 @@ use hyper::body::Incoming;
 
 use crate::admin::handlers::{
     api_keys, audit, backfill, config, diagnostics, extract, healthz, memory, metrics, readyz,
-    rebuild, shard, snapshot, space, worker,
+    rebuild, schema, shard, snapshot, space, worker,
 };
 use crate::admin::AdminState;
 
@@ -166,6 +166,15 @@ fn attach_v1_routes(r: Router<Incoming>, state: Arc<AdminState>) -> Router<Incom
         "/v1/workers/",
         state.clone(),
         worker::control,
+    );
+
+    // ──────── /v1/schema ───────────────────────────────────────────────
+    let r = with_state(
+        r,
+        Method::GET,
+        "/v1/schema/review",
+        state.clone(),
+        schema::review,
     );
 
     // ──────── /v1/config ───────────────────────────────────────────────

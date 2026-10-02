@@ -35,6 +35,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
 
+use brain_core::MemoryId;
 use brain_metadata::schema::predicate::predicates_active_for_schema;
 use brain_ops::{SchemaFlagSweepJob, SchemaMigrationMetrics};
 
@@ -46,18 +47,28 @@ use crate::worker::Worker;
 pub const WORKER_ID: &str = "schema_migration";
 
 /// Outcome of one flag-sweep against the namespace's `STATEMENTS_TABLE`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SweepStats {
     /// Rows that gained the `OUTSIDE_ACTIVE_SCHEMA` bit on this pass.
     pub rows_flagged: usize,
     /// Rows that lost the bit on this pass (predicate re-introduced).
     pub rows_cleared: usize,
+    /// Distinct source memories behind the newly-flagged rows, from each
+    /// statement's evidence. These are the memories whose extraction
+    /// predates the new vocabulary — the exact set a re-extraction would
+    /// need to touch, and the number an operator needs before deciding to
+    /// pay for one. Collected during the sweep's existing scan, so it
+    /// costs no extra pass.
+    pub stale_memories: Vec<[u8; 16]>,
 }
 
 pub struct SchemaMigrationWorker {
     config: WorkerConfig,
     queue: flume::Receiver<SchemaFlagSweepJob>,
     metrics: Arc<SchemaMigrationMetrics>,
+    /// Mirrors `[workers.extractor] reextract_on_schema_change`. See
+    /// [`Self::with_reextract_on_schema_change`].
+    reextract_on_schema_change: bool,
 }
 
 impl SchemaMigrationWorker {
@@ -72,7 +83,21 @@ impl SchemaMigrationWorker {
             config: WorkerConfig::defaults_for(WorkerKind::SchemaMigration),
             queue,
             metrics: Arc::new(SchemaMigrationMetrics::new()),
+            reextract_on_schema_change: false,
         }
+    }
+
+    /// Enqueue the memories behind newly-flagged statements for
+    /// re-extraction after each sweep.
+    ///
+    /// Off by default because re-extraction is one LLM call per memory and
+    /// a single schema upload can cover a whole corpus. With it off the
+    /// sweep still reports the affected count so an operator can run the
+    /// same work through `POST /v1/extract/backfill` on purpose.
+    #[must_use]
+    pub fn with_reextract_on_schema_change(mut self, on: bool) -> Self {
+        self.reextract_on_schema_change = on;
+        self
     }
 
     #[must_use]
@@ -135,9 +160,11 @@ impl SchemaMigrationWorker {
                         new_version = job.new_version,
                         rows_flagged = stats.rows_flagged,
                         rows_cleared = stats.rows_cleared,
+                        stale_memories = stats.stale_memories.len(),
                         duration_seconds = elapsed,
                         "schema flag-sweep complete",
                     );
+                    self.settle_stale_memories(ctx, &job.namespace, job.new_version, &stats);
                 }
                 Err(e) => {
                     self.metrics.inc_error();
@@ -157,6 +184,74 @@ impl SchemaMigrationWorker {
             processed += 1;
         }
         Ok(processed)
+    }
+
+    /// Decide what happens to the memories the sweep found outside the new
+    /// schema: re-extract them, or just say how many there are.
+    ///
+    /// This is the step whose absence made the schema-migration worker's own
+    /// module doc wrong. The stale-extraction detector said "the
+    /// schema-migration worker is the side that re-extracts"; it only ever
+    /// flipped an advisory flag bit, so uploading a schema never re-aligned
+    /// a single existing memory and nothing said so.
+    fn settle_stale_memories(
+        &self,
+        ctx: &WorkerContext,
+        namespace: &str,
+        new_version: u32,
+        stats: &SweepStats,
+    ) {
+        if stats.stale_memories.is_empty() {
+            return;
+        }
+        if !self.reextract_on_schema_change {
+            // The operator's cue. Not a warning: staying flagged is the
+            // configured behaviour, not a fault.
+            tracing::info!(
+                target: "brain_workers::schema_migration",
+                namespace = %namespace,
+                new_version,
+                stale_memories = stats.stale_memories.len(),
+                "memories carry statements outside the new schema; \
+                 re-extraction is off (workers.extractor.reextract_on_schema_change). \
+                 Run POST /v1/extract/backfill to re-align them",
+            );
+            return;
+        }
+
+        let metadata = ctx.ops.executor.metadata.as_ref();
+        let writer = ctx.ops.executor.writer.as_ref();
+        let mut enqueued = 0usize;
+        let mut skipped = 0usize;
+        for id_bytes in &stats.stale_memories {
+            if ctx.is_shutdown() {
+                break;
+            }
+            match memory_text_for_reextraction(metadata, *id_bytes) {
+                Some(text) => {
+                    if writer.enqueue_for_extraction(MemoryId::from_be_bytes(*id_bytes), &text) {
+                        enqueued += 1;
+                    } else {
+                        // Channel full or unwired. The statement keeps its
+                        // flag, so the next upload (or the admin backfill)
+                        // picks it up — never re-queued here, which would
+                        // spin against a full channel.
+                        skipped += 1;
+                    }
+                }
+                // Tombstoned, hard-forgotten, or text row gone: there is
+                // nothing left to re-extract from.
+                None => skipped += 1,
+            }
+        }
+        tracing::info!(
+            target: "brain_workers::schema_migration",
+            namespace = %namespace,
+            new_version,
+            enqueued,
+            skipped,
+            "re-extraction enqueued for memories outside the new schema",
+        );
     }
 
     fn run_flag_sweep(
@@ -194,6 +289,31 @@ impl SchemaMigrationWorker {
 
         Ok(stats)
     }
+}
+
+/// Resolve a memory's text for re-extraction, or `None` when there is
+/// nothing to re-extract from.
+///
+/// Applies the same skip rules as the admin `EXTRACT_BACKFILL` path — an
+/// inactive or hard-forgotten memory, a missing text row, or non-UTF-8
+/// bytes are all "skip", never an error. Re-extraction is best-effort
+/// maintenance; one unreadable row must not abort the batch.
+fn memory_text_for_reextraction(
+    metadata: &brain_metadata::MetadataDb,
+    memory_id_bytes: [u8; 16],
+) -> Option<String> {
+    use brain_metadata::tables::memory::MEMORIES_TABLE;
+    use brain_metadata::tables::text::TEXTS_TABLE;
+
+    let rtxn = metadata.read_txn().ok()?;
+    let memories = rtxn.open_table(MEMORIES_TABLE).ok()?;
+    let row = memories.get(&memory_id_bytes).ok()??.value();
+    if !row.is_active() || row.is_hard_forgotten() {
+        return None;
+    }
+    let texts = rtxn.open_table(TEXTS_TABLE).ok()?;
+    let guard = texts.get(&memory_id_bytes).ok()??;
+    std::str::from_utf8(guard.value()).ok().map(str::to_owned)
 }
 
 /// One-pass flag-sweep over `namespace`'s statements. Flips the
@@ -243,6 +363,12 @@ fn sweep_and_count(
     // gained / lost split as we go.
     let mut rows_flagged = 0usize;
     let mut rows_cleared = 0usize;
+    // Distinct, insertion-ordered: one memory usually backs several
+    // newly-flagged statements, and re-extracting it once re-derives all of
+    // them. A set would lose the order the scan found them in, which is the
+    // closest thing we have to "oldest first" for a bounded backfill.
+    let mut stale_memories: Vec<[u8; 16]> = Vec::new();
+    let mut seen_memories: HashSet<[u8; 16]> = HashSet::new();
     let updates: Vec<([u8; 16], StatementMetadata)> = {
         let t = wtxn
             .open_table(STATEMENTS_TABLE)
@@ -268,6 +394,17 @@ fn sweep_and_count(
             if should_flag {
                 new_row.set_flag(statement_flags::OUTSIDE_ACTIVE_SCHEMA);
                 rows_flagged += 1;
+                // Evidence is how a statement points back at the memory it
+                // was extracted from; there is no direct source-memory
+                // column. A statement with no evidence (hand-written via
+                // STATEMENT_CREATE rather than extracted) contributes
+                // nothing, which is right: re-extraction cannot reproduce a
+                // row no memory ever produced.
+                for ev in &new_row.evidence_inline {
+                    if seen_memories.insert(ev.memory_id_bytes) {
+                        stale_memories.push(ev.memory_id_bytes);
+                    }
+                }
             } else {
                 new_row.clear_flag(statement_flags::OUTSIDE_ACTIVE_SCHEMA);
                 rows_cleared += 1;
@@ -290,6 +427,7 @@ fn sweep_and_count(
     Ok(SweepStats {
         rows_flagged,
         rows_cleared,
+        stale_memories,
     })
 }
 
@@ -694,5 +832,228 @@ mod tests {
             "replay sweep must not double-count flagged rows",
         );
         assert_eq!(snap2.sweeps_completed_total, 2);
+    }
+
+    // ── re-extraction after a schema change ─────────────────────────────
+
+    /// Run the sweep directly so the test can read `SweepStats`, which the
+    /// worker loop consumes and does not expose.
+    fn sweep(fx: &Fixture, namespace: &str, version: u32) -> SweepStats {
+        fx.worker
+            .run_flag_sweep(
+                &fx.ctx,
+                &SchemaFlagSweepJob {
+                    namespace: namespace.into(),
+                    new_version: version,
+                    enqueued_at_unix_nanos: NOW,
+                },
+            )
+            .expect("sweep")
+    }
+
+    #[test]
+    fn sweep_reports_the_memory_behind_a_newly_flagged_row() {
+        // The whole point of the re-extraction path: knowing WHICH memories
+        // to replay. A flag bit alone never told anyone that.
+        let fx = build_fixture();
+        let subject = put_subject(&fx.metadata, SpaceId::default());
+        write_statement(&fx.metadata, subject, "acme", "ghost");
+        let v = upload_schema(&fx.metadata, &schema_with_predicates("acme", &["prefers"]));
+
+        let stats = sweep(&fx, "acme", v);
+        assert_eq!(stats.rows_flagged, 1);
+        assert_eq!(
+            stats.stale_memories,
+            vec![MemoryId::pack(1, SessionId::DEFAULT.into(), 0).to_be_bytes()],
+            "the evidence memory must be reported so it can be re-extracted",
+        );
+    }
+
+    #[test]
+    fn an_already_flagged_row_is_not_reported_a_second_time() {
+        // `stale_memories` tracks the flag TRANSITION, not the flagged set.
+        // Reporting on every sweep would re-enqueue the same memories on
+        // each upload and re-spend the LLM budget for no new information.
+        let fx = build_fixture();
+        let subject = put_subject(&fx.metadata, SpaceId::default());
+        write_statement(&fx.metadata, subject, "acme", "ghost");
+        let v = upload_schema(&fx.metadata, &schema_with_predicates("acme", &["prefers"]));
+
+        assert_eq!(sweep(&fx, "acme", v).stale_memories.len(), 1);
+        let second = sweep(&fx, "acme", v);
+        assert_eq!(second.rows_flagged, 0);
+        assert!(second.stale_memories.is_empty());
+    }
+
+    #[test]
+    fn one_memory_behind_several_flagged_rows_is_reported_once() {
+        // Re-extracting a memory re-derives every statement it produced, so
+        // the same id three times would be three identical LLM calls.
+        let fx = build_fixture();
+        let subject = put_subject(&fx.metadata, SpaceId::default());
+        for name in ["ghost_a", "ghost_b", "ghost_c"] {
+            write_statement(&fx.metadata, subject, "acme", name);
+        }
+        let v = upload_schema(&fx.metadata, &schema_with_predicates("acme", &["prefers"]));
+
+        let stats = sweep(&fx, "acme", v);
+        assert_eq!(stats.rows_flagged, 3);
+        assert_eq!(stats.stale_memories.len(), 1);
+    }
+
+    #[test]
+    fn clearing_a_flag_reports_no_stale_memory() {
+        // A predicate coming BACK into the schema needs no re-extraction —
+        // the rows were already correct and were only mis-flagged.
+        let fx = build_fixture();
+        let subject = put_subject(&fx.metadata, SpaceId::default());
+        write_statement(&fx.metadata, subject, "acme", "ghost");
+        let v1 = upload_schema(&fx.metadata, &schema_with_predicates("acme", &["prefers"]));
+        assert_eq!(sweep(&fx, "acme", v1).rows_flagged, 1);
+
+        let v2 = upload_schema(
+            &fx.metadata,
+            &schema_with_predicates("acme", &["prefers", "ghost"]),
+        );
+        let stats = sweep(&fx, "acme", v2);
+        assert_eq!(stats.rows_cleared, 1);
+        assert!(stats.stale_memories.is_empty());
+    }
+
+    #[test]
+    fn re_extraction_is_off_unless_configured() {
+        // The default must stay off: enabling it spends real money per
+        // memory, and a default nobody chose is the wrong way to find that
+        // out. If this flips, it should be a deliberate edit that fails
+        // here first.
+        let fx = build_fixture();
+        assert!(!fx.worker.reextract_on_schema_change);
+    }
+
+    /// Put the memory row + text that `memory_text_for_reextraction`
+    /// requires, for the id `write_statement` stamps into evidence.
+    fn put_memory_with_text(metadata: &SharedMetadataDb, id: MemoryId, text: &str) {
+        use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
+        use brain_metadata::tables::text::TEXTS_TABLE;
+        let wtxn = metadata.write_txn().unwrap();
+        {
+            let mut t = wtxn.open_table(MEMORIES_TABLE).unwrap();
+            let row = MemoryMetadata::new_active(
+                id,
+                brain_core::NamespaceId::SYSTEM,
+                SpaceId::default(),
+                SessionId::DEFAULT,
+                0,
+                0,
+                brain_core::MemoryKind::Episodic,
+                [0x55; 16],
+                0.5,
+                text.len() as u32,
+                NOW,
+            );
+            t.insert(&id.to_be_bytes(), &row).unwrap();
+        }
+        {
+            let mut t = wtxn.open_table(TEXTS_TABLE).unwrap();
+            t.insert(&id.to_be_bytes(), text.as_bytes()).unwrap();
+        }
+        wtxn.commit().unwrap();
+    }
+
+    /// A fixture whose writer has a real extractor channel, so the test can
+    /// observe what re-extraction actually enqueues.
+    fn fixture_with_extractor_channel(
+        reextract: bool,
+    ) -> (Fixture, flume::Receiver<brain_ops::ExtractorEnqueue>) {
+        let tempdir = tempfile::tempdir().unwrap();
+        let metadata: SharedMetadataDb =
+            Arc::new(MetadataDb::open(tempdir.path().join("metadata.redb")).unwrap());
+        let (shared, hnsw_writer) = SharedHnsw::new(IndexParams::default_v1()).unwrap();
+
+        let (ex_tx, ex_rx) = flume::unbounded::<brain_ops::ExtractorEnqueue>();
+        let mut writer = RealWriterHandle::new(metadata.clone(), hnsw_writer);
+        writer.set_extractor_sender(ex_tx);
+
+        let (tx, rx) = flume::unbounded::<SchemaFlagSweepJob>();
+        let worker = SchemaMigrationWorker::new(rx)
+            .with_metrics(Arc::new(SchemaMigrationMetrics::new()))
+            .with_reextract_on_schema_change(reextract);
+
+        let executor = ExecutorContext::new(
+            Arc::new(MockDispatcher) as Arc<dyn Dispatcher>,
+            shared,
+            metadata.clone(),
+            Arc::new(writer) as Arc<dyn WriterHandle>,
+        );
+        let ops = Arc::new(brain_ops::test_support::ops_context_for_tests_owning_tempdir(executor));
+        let ctx = WorkerContext {
+            ops,
+            shutdown: Arc::new(AtomicBool::new(false)),
+        };
+        (
+            Fixture {
+                worker,
+                ctx,
+                metadata,
+                tx,
+                _tempdir: tempdir,
+            },
+            ex_rx,
+        )
+    }
+
+    fn stage_one_stale_memory(fx: &Fixture) -> u32 {
+        let subject = put_subject(&fx.metadata, SpaceId::default());
+        write_statement(&fx.metadata, subject, "acme", "ghost");
+        put_memory_with_text(
+            &fx.metadata,
+            MemoryId::pack(1, SessionId::DEFAULT.into(), 0),
+            "Priya prefers Playwright.",
+        );
+        upload_schema(&fx.metadata, &schema_with_predicates("acme", &["prefers"]))
+    }
+
+    #[test]
+    fn enabling_reextract_enqueues_the_stale_memory() {
+        let (fx, ex_rx) = fixture_with_extractor_channel(true);
+        let v = stage_one_stale_memory(&fx);
+        fx.tx
+            .send(SchemaFlagSweepJob {
+                namespace: "acme".into(),
+                new_version: v,
+                enqueued_at_unix_nanos: NOW,
+            })
+            .unwrap();
+        assert_eq!(drive_once(&fx.worker, &fx.ctx), 1);
+
+        let queued: Vec<_> = ex_rx.drain().collect();
+        assert_eq!(queued.len(), 1, "the stale memory must be re-extracted");
+        assert_eq!(
+            queued[0].0,
+            MemoryId::pack(1, SessionId::DEFAULT.into(), 0)
+        );
+        assert_eq!(&*queued[0].1, "Priya prefers Playwright.");
+    }
+
+    #[test]
+    fn the_default_sweeps_but_enqueues_nothing() {
+        // Identical setup, flag off: the flag bit still moves (observability
+        // is never withheld) and not one LLM call is scheduled.
+        let (fx, ex_rx) = fixture_with_extractor_channel(false);
+        let v = stage_one_stale_memory(&fx);
+        fx.tx
+            .send(SchemaFlagSweepJob {
+                namespace: "acme".into(),
+                new_version: v,
+                enqueued_at_unix_nanos: NOW,
+            })
+            .unwrap();
+        assert_eq!(drive_once(&fx.worker, &fx.ctx), 1);
+
+        assert_eq!(fx.worker.metrics().snapshot().rows_flagged_total, 1);
+        assert!(
+            ex_rx.drain().next().is_none(),
+            "re-extraction must not run unless it was asked for",
+        );
     }
 }

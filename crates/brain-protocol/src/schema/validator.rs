@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use crate::schema::ast::{
     AttrType, AttributeDecl, CardinalityAst, ExtractorDef, ExtractorField, ExtractorKindAst,
     ExtractorTarget, KindDef, LiteralValue, ObjectTypeDecl, PredicateDef, RelationTypeDef, Schema,
-    SchemaItem, StatementKindAst,
+    SchemaItem, StatementKindAst, SubjectTypeDecl,
 };
 
 // ---------------------------------------------------------------------------
@@ -399,6 +399,22 @@ fn check_predicate(pred: &PredicateDef, entity_names: &[&str], errors: &mut Vali
                 code: ValidationErrorCode::UnresolvedTypeRef,
                 message: format!(
                     "predicate {:?}: object Entity<{:?}> is not a declared entity_type",
+                    pred.name, entity_type
+                ),
+                source_span: None,
+            });
+        }
+    }
+
+    // Same resolution for the subject domain. A subject naming an
+    // undeclared type is the mistake this field exists to prevent, so it
+    // must fail at upload rather than silently admit every subject.
+    if let Some(SubjectTypeDecl::Entity { entity_type }) = &pred.subject {
+        if !resolves_to_entity(entity_type, entity_names) {
+            errors.push(ValidationError {
+                code: ValidationErrorCode::UnresolvedTypeRef,
+                message: format!(
+                    "predicate {:?}: subject Entity<{:?}> is not a declared entity_type",
                     pred.name, entity_type
                 ),
                 source_span: None,
@@ -794,6 +810,7 @@ mod tests {
     fn overlong_predicate_name_rejected() {
         let mut s = base_schema();
         s.items.push(SchemaItem::Predicate(PredicateDef {
+            subject: None,
             name: "p".repeat(TYPE_NAME_MAX_LEN + 1),
             kind: StatementKindAst::Fact,
             object: ObjectTypeDecl::Any,
@@ -811,6 +828,7 @@ mod tests {
     fn empty_type_name_rejected() {
         let mut s = base_schema();
         s.items.push(SchemaItem::Predicate(PredicateDef {
+            subject: None,
             name: String::new(),
             kind: StatementKindAst::Fact,
             object: ObjectTypeDecl::Any,
@@ -828,6 +846,7 @@ mod tests {
     fn normal_type_name_accepted() {
         let mut s = base_schema();
         s.items.push(SchemaItem::Predicate(PredicateDef {
+            subject: None,
             name: "works_at".into(),
             kind: StatementKindAst::Fact,
             object: ObjectTypeDecl::Any,
@@ -864,5 +883,49 @@ mod tests {
                 variants: vec!["red".into(), "blue".into()]
             }
         ));
+    }
+
+    #[test]
+    fn subject_naming_an_undeclared_entity_type_is_rejected() {
+        // A typo'd subject that validated cleanly would be worse than no
+        // subject at all: the upload would report success and the
+        // predicate would silently accept every subject, which is exactly
+        // the behaviour the author was trying to stop.
+        let mut s = base_schema();
+        s.items.push(SchemaItem::Predicate(PredicateDef {
+            subject: Some(SubjectTypeDecl::Entity {
+                entity_type: "NoSuchType".into(),
+            }),
+            name: "prefers_fidelity".into(),
+            kind: StatementKindAst::Preference,
+            object: ObjectTypeDecl::Any,
+            stateful: None,
+            description: None,
+            retention: None,
+        }));
+        let errs = validate(&s).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.code
+                == ValidationErrorCode::UnresolvedTypeRef
+                && e.message.contains("subject")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn subject_any_and_an_omitted_subject_both_validate() {
+        for subject in [None, Some(SubjectTypeDecl::Any)] {
+            let mut s = base_schema();
+            s.items.push(SchemaItem::Predicate(PredicateDef {
+                subject,
+                name: "clone_status".into(),
+                kind: StatementKindAst::Fact,
+                object: ObjectTypeDecl::Any,
+                stateful: None,
+                description: None,
+                retention: None,
+            }));
+            assert!(validate(&s).is_ok());
+        }
     }
 }
