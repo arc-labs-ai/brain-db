@@ -5265,7 +5265,23 @@ fn coerce_declared_value(
             "false" | "no" => Some(StatementObject::Value(StatementValue::Bool(false))),
             _ => None,
         },
-        // Text / date / the rest: no coercion defined, so nothing to violate.
+        // A declared variant set is a closed vocabulary — the whole point of
+        // writing `enum [draft, building, ready, failed, archived]` instead
+        // of `text`. Letting anything through made the declaration
+        // decorative: a tier that answered `clone_status = "slack-clone-v1"`
+        // (the environment's own name, not a status) stored it as a fact,
+        // and a reader filtering on `ready` silently skipped the row.
+        //
+        // Matching is case-insensitive and normalises to the DECLARED
+        // spelling, so "Ready" stores as "ready". That is coercion in the
+        // same spirit as "yes" -> true above: the model's casing is not a
+        // semantic difference, but two spellings of one status would split
+        // every aggregate over it.
+        AttrType::Enum { variants } => variants
+            .iter()
+            .find(|v| v.eq_ignore_ascii_case(t))
+            .map(|v| StatementObject::Value(StatementValue::Text(v.clone()))),
+        // Text / date / ref: no closed vocabulary to violate.
         _ => Some(object),
     }
 }
@@ -9797,6 +9813,10 @@ mod tests {
             kind: Fact
             object: Value<text>
         }
+        define predicate clone_status {
+            kind: Fact
+            object: Value<enum [draft, building, ready, failed, archived]>
+        }
         define relation_type clones {
             from: Any
             to: Any
@@ -9919,6 +9939,74 @@ mod tests {
     /// `mirror:` vocabulary — with the declared kind (Fact, over the LLM's
     /// Attribute guess), the declared `Value<number>` object type, and the
     /// declared relation type — and never coin the `brain:` twins.
+    #[test]
+    fn a_value_outside_a_declared_enum_is_refused() {
+        // `clone_status` declares a lifecycle, not free text. A tier that
+        // answered with the environment's own name — the live failure was
+        // `clone_status = "slack-clone-v1"` — used to store it verbatim, so
+        // a reader filtering on `ready` silently skipped the row and the
+        // declaration was decorative.
+        use brain_core::{MemoryId, StatementKind};
+
+        let (worker, ctx, metadata) = __join_env();
+        let scope = __upload_schema_scope(&metadata, __MIRROR_SCHEMA, "mirror");
+        let memory_id = MemoryId::pack(0, 1, 41);
+        __seed_memory_row(&metadata, memory_id, scope);
+
+        let outcome = __outcome(vec![
+            __alice(),
+            __entity_stmt("brain:clone_status", "ready", false, StatementKind::Fact, None),
+            __entity_stmt(
+                "brain:clone_status",
+                "slack-clone-v1",
+                false,
+                StatementKind::Fact,
+                None,
+            ),
+        ]);
+        futures_lite::future::block_on(apply_outcome(&worker, &ctx, memory_id, &outcome))
+            .expect("apply_outcome");
+
+        let rtxn = metadata.read_txn().unwrap();
+        let alice = __alice_in(&rtxn, scope);
+        let rows = __statements_for(&rtxn, scope, alice, "mirror", "clone_status");
+        assert_eq!(rows.len(), 1, "only the declared variant may persist");
+        assert_eq!(
+            rows[0].object,
+            StatementObject::Value(StatementValue::Text("ready".into())),
+        );
+    }
+
+    #[test]
+    fn enum_matching_normalises_to_the_declared_spelling() {
+        // "Ready" and "ready" are one status. Storing both would split every
+        // aggregate over the predicate, so the declared spelling wins —
+        // coercion in the same spirit as "yes" -> true.
+        use brain_core::{MemoryId, StatementKind};
+
+        let (worker, ctx, metadata) = __join_env();
+        let scope = __upload_schema_scope(&metadata, __MIRROR_SCHEMA, "mirror");
+        let memory_id = MemoryId::pack(0, 1, 42);
+        __seed_memory_row(&metadata, memory_id, scope);
+
+        let outcome = __outcome(vec![
+            __alice(),
+            __entity_stmt("brain:clone_status", "ReAdY", false, StatementKind::Fact, None),
+        ]);
+        futures_lite::future::block_on(apply_outcome(&worker, &ctx, memory_id, &outcome))
+            .expect("apply_outcome");
+
+        let rtxn = metadata.read_txn().unwrap();
+        let alice = __alice_in(&rtxn, scope);
+        let rows = __statements_for(&rtxn, scope, alice, "mirror", "clone_status");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].object,
+            StatementObject::Value(StatementValue::Text("ready".into())),
+            "must store the DECLARED spelling, not the tier's casing",
+        );
+    }
+
     #[test]
     fn a_declared_value_object_stays_a_literal_even_when_it_names_an_entity() {
         // `blocked_by` declares `object: Value<text>`, so its object is a

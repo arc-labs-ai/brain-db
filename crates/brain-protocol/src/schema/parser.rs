@@ -1899,4 +1899,73 @@ mod tests {
             })
         );
     }
+
+    // ── enum-valued predicate objects ───────────────────────────────────
+
+    #[test]
+    fn a_predicate_object_may_declare_a_closed_variant_set() {
+        // `clone_status` is a lifecycle, not free text. The DSL already had
+        // `enum [...]` for entity attributes and `object: Value<attr_type>`
+        // accepts the same grammar, so this parses — what was missing was
+        // the store honouring it.
+        let p = only_predicate(
+            "namespace m
+             define predicate clone_status {
+                 kind: Fact
+                 object: Value<enum [draft, building, ready, failed, archived]>
+             }",
+        );
+        match p.object {
+            ObjectTypeDecl::Value {
+                value_type: AttrType::Enum { variants },
+            } => assert_eq!(
+                variants,
+                vec!["draft", "building", "ready", "failed", "archived"]
+            ),
+            other => panic!("expected an enum-valued object, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_enum_object_coexists_with_a_subject_domain() {
+        // The two narrowings are independent and must compose: this is the
+        // shape the mirror schema wants for `clone_status`.
+        let p = only_predicate(
+            "namespace m
+             define entity_type CloneEnv { attributes {} }
+             define predicate clone_status {
+                 kind: Fact
+                 subject: Entity<CloneEnv>
+                 object: Value<enum [draft, ready]>
+             }",
+        );
+        assert_eq!(
+            p.subject,
+            Some(SubjectTypeDecl::Entity {
+                entity_type: "CloneEnv".into()
+            })
+        );
+        assert!(matches!(
+            p.object,
+            ObjectTypeDecl::Value {
+                value_type: AttrType::Enum { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn a_single_variant_enum_is_still_an_enum() {
+        // Degenerate but legal: a one-value vocabulary pins the object to a
+        // constant, and must not silently parse as plain text.
+        let p = only_predicate(
+            "namespace m
+             define predicate pinned { kind: Fact object: Value<enum [only]> }",
+        );
+        assert!(matches!(
+            p.object,
+            ObjectTypeDecl::Value {
+                value_type: AttrType::Enum { .. }
+            }
+        ));
+    }
 }
