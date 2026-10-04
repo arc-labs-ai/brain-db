@@ -30,6 +30,7 @@ use brain_metadata::schema::store::{
 use brain_metadata::system_schema::SYSTEM_SCHEMA_NAMESPACE;
 use brain_planner::WriterError;
 use brain_protocol::envelope::response::EventType;
+use brain_protocol::schema::render::render_schema_verified;
 use brain_protocol::schema::{
     parse_schema, validate_located_with, validate_namespace, DeclaredContext, ParseError,
     ValidationError,
@@ -289,10 +290,23 @@ pub async fn handle_schema_get(
             detail: format!("namespace={:?} version={resolved_version}", req.namespace),
         })?;
 
+    // `source_text` is the single document uploaded for this version. Since
+    // UPLOAD became additive, that document is only a fragment of what the
+    // version actually declares — the merged AST in `source` is the schema —
+    // so the document handed back is rendered from the AST, which is also
+    // what makes `schema get` output re-uploadable. Falls back to the stored
+    // text if the AST holds something the DSL cannot express.
+    let schema_document =
+        serde_json::from_slice::<brain_protocol::schema::ast::Schema>(&row.source)
+            .ok()
+            .and_then(|s| render_schema_verified(&s))
+            .or(row.source_text)
+            .unwrap_or_default();
+
     Ok(SchemaGetResponse {
         namespace: row.namespace,
         schema_version: row.version,
-        schema_document: row.source_text.unwrap_or_default(),
+        schema_document,
         source_blob: row.source,
         uploaded_at_unix_nanos: row.uploaded_at_unix_nanos,
         validator_version: row.validator_version,
