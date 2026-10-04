@@ -62,6 +62,34 @@ use parking_lot::RwLock;
 
 use crate::config::{WorkerConfig, WorkerKind};
 use crate::context::WorkerContext;
+
+/// Run the embedder off the shard's reactor thread.
+///
+/// Workers are `glommio::spawn_local` tasks, so they share the shard's single
+/// reactor thread, and `embed_batch` is a synchronous candle forward pass —
+/// uninterruptible CPU work with no `.await` in it. Running it inline blocked
+/// every other task on the shard for the length of the batch: a trace of
+/// STATEMENT_CREATE showed writes stalling 16.4-16.6 s at a time, matching
+/// this worker's `cycle_duration_ms` to within ~100 ms, and overshooting the
+/// 5 s `max_runtime` ceiling because that bound can only be checked between
+/// batches.
+///
+/// Handing the forward pass to glommio's blocking pool keeps the reactor free
+/// while it runs. The texts are copied because the pool needs `'static`; that
+/// is a few KB against a multi-second matmul.
+async fn embed_batch_off_reactor(
+    embedder: &Arc<dyn Dispatcher>,
+    texts: Vec<String>,
+) -> Result<Vec<[f32; brain_embed::VECTOR_DIM]>, brain_embed::EmbedError> {
+    let embedder = Arc::clone(embedder);
+    glommio::executor()
+        .spawn_blocking(move || {
+            let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+            embedder.embed_batch(&refs)
+        })
+        .await
+}
+
 use crate::error::WorkerError;
 use crate::worker::Worker;
 
@@ -253,8 +281,8 @@ impl StatementEmbedWorker {
             if ctx.is_shutdown() {
                 break;
             }
-            let texts: Vec<&str> = slice.iter().map(|(_, t)| t.as_str()).collect();
-            let vectors = match self.embedder.embed_batch(&texts) {
+            let texts: Vec<String> = slice.iter().map(|(_, t)| t.clone()).collect();
+            let vectors = match embed_batch_off_reactor(&self.embedder, texts).await {
                 Ok(v) => v,
                 Err(e) => {
                     if let Some(m) = &self.metrics {
@@ -326,7 +354,7 @@ impl StatementEmbedWorker {
         //    fails the tick — the bridge is read-time enrichment, not the
         //    durable statement embed.
         if self.question_bridge.is_some() {
-            if let Err(e) = self.embed_question_bridge(&pending, ctx) {
+            if let Err(e) = self.embed_question_bridge(&pending, ctx).await {
                 tracing::warn!(
                     target: "brain_workers::statement_embed",
                     error = %e,
@@ -349,7 +377,7 @@ impl StatementEmbedWorker {
     /// vectors. Inserts the vectors into the bridge HNSW and persists them to
     /// the `statement_question_vectors` table so a restart rebuilds without
     /// re-embedding.
-    fn embed_question_bridge(
+    async fn embed_question_bridge(
         &self,
         pending: &[StatementId],
         ctx: &WorkerContext,
@@ -401,9 +429,10 @@ impl StatementEmbedWorker {
             if ctx.is_shutdown() {
                 break;
             }
-            let refs: Vec<&str> = questions.iter().map(|(_, q)| q.as_str()).collect();
-            let vectors = match self.embedder.embed_batch(&refs) {
-                Ok(v) if v.len() == refs.len() => v,
+            let owned: Vec<String> = questions.iter().map(|(_, q)| q.clone()).collect();
+            let want = owned.len();
+            let vectors = match embed_batch_off_reactor(&self.embedder, owned).await {
+                Ok(v) if v.len() == want => v,
                 Ok(_) => continue,
                 Err(e) => {
                     tracing::debug!(
@@ -643,6 +672,20 @@ fn uuid_hex(bytes: &[u8; 16]) -> String {
 #[cfg(all(test, not(miri)))]
 #[allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send
 mod tests {
+    /// Drive a cycle the way the shard does — inside a glommio executor.
+    ///
+    /// The worker is a `spawn_local` task in production, and its embed
+    /// offload asks the executor for a blocking pool. Driving `tick` on a
+    /// bare `block_on` leaves glommio's scoped thread-local unset, so the
+    /// offload panics; running the cycle on a real executor is both what
+    /// fixes that and what makes these tests exercise the path that ships.
+    fn on_shard<T>(fut: impl std::future::Future<Output = T>) -> T {
+        glommio::LocalExecutorBuilder::new(glommio::Placement::Unbound)
+            .make()
+            .expect("local executor for worker cycle")
+            .run(fut)
+    }
+
     fn __ts() -> brain_metadata::RowScope {
         brain_metadata::RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xA1; 16])
     }
@@ -1083,7 +1126,7 @@ mod tests {
         let worker =
             StatementEmbedWorker::new(fx.metadata.clone(), fx.hnsw.clone(), fx.dispatcher.clone());
 
-        let processed = futures_lite::future::block_on(worker.tick(&fx.worker_ctx)).unwrap();
+        let processed = on_shard(worker.tick(&fx.worker_ctx)).unwrap();
         assert_eq!(processed, 5);
         for id in &ids {
             assert!(
@@ -1111,7 +1154,7 @@ mod tests {
 
         let worker =
             StatementEmbedWorker::new(fx.metadata.clone(), fx.hnsw.clone(), fx.dispatcher.clone());
-        let processed = futures_lite::future::block_on(worker.tick(&fx.worker_ctx)).unwrap();
+        let processed = on_shard(worker.tick(&fx.worker_ctx)).unwrap();
         assert_eq!(processed, 1);
         assert!(fx.hnsw.read().contains(active));
         assert!(!fx.hnsw.read().contains(dead));
@@ -1132,7 +1175,7 @@ mod tests {
                     max_per_tick: 7,
                 });
 
-        let processed = futures_lite::future::block_on(worker.tick(&fx.worker_ctx)).unwrap();
+        let processed = on_shard(worker.tick(&fx.worker_ctx)).unwrap();
         assert_eq!(processed, 7, "max_per_tick honoured");
         assert_eq!(queue_len(&fx.metadata), 13);
         assert_eq!(fx.hnsw.read().len(), 7);
@@ -1145,12 +1188,12 @@ mod tests {
         let worker =
             StatementEmbedWorker::new(fx.metadata.clone(), fx.hnsw.clone(), fx.dispatcher.clone());
 
-        let first = futures_lite::future::block_on(worker.tick(&fx.worker_ctx)).unwrap();
+        let first = on_shard(worker.tick(&fx.worker_ctx)).unwrap();
         assert_eq!(first, 1);
         assert_eq!(fx.hnsw.read().len(), 1);
 
         // Re-run: queue drained, nothing to embed. Idempotent.
-        let second = futures_lite::future::block_on(worker.tick(&fx.worker_ctx)).unwrap();
+        let second = on_shard(worker.tick(&fx.worker_ctx)).unwrap();
         assert_eq!(second, 0);
         assert_eq!(fx.hnsw.read().len(), 1, "no duplicate inserts");
     }
@@ -1169,7 +1212,7 @@ mod tests {
             Arc::new(FailingDispatcher),
         )
         .with_metrics(metrics.clone());
-        let processed = futures_lite::future::block_on(worker.tick(&fx.worker_ctx)).unwrap();
+        let processed = on_shard(worker.tick(&fx.worker_ctx)).unwrap();
         assert_eq!(processed, 0, "no rows embedded");
         assert_eq!(queue_len(&fx.metadata), 2, "queue preserved");
         let s = metrics.snapshot();
