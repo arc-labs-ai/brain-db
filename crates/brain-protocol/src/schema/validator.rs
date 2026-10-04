@@ -88,11 +88,39 @@ const ANY_TYPE_LITERAL: &str = "Any";
 // Entry point.
 // ---------------------------------------------------------------------------
 
+/// Type names that are already declared *outside* the document being
+/// validated, and which its references may therefore resolve against.
+///
+/// SCHEMA_UPLOAD is additive — it merges into the namespace's active schema
+/// rather than standing alone — so a document may legitimately name a type an
+/// earlier upload (or the system `brain` schema) declared. Validating the
+/// document in isolation rejected exactly that, which is why an incremental
+/// document failed with "is not a declared entity_type" for a type the server
+/// demonstrably had, `Person` included. Callers that validate a standalone
+/// document pass [`DeclaredContext::default`] and get the old behaviour.
+#[derive(Debug, Default, Clone)]
+pub struct DeclaredContext {
+    /// Entity-type names already declared for the target namespace.
+    pub entity_types: Vec<String>,
+    /// Relation-type names already declared for the target namespace.
+    pub relation_types: Vec<String>,
+}
+
 /// Validate a schema. Returns all errors at once; an `Err` always
 /// carries at least one element. Successful validation produces a
 /// `ValidatedSchema` carrying the input.
 pub fn validate(schema: &Schema) -> Result<ValidatedSchema, ValidationErrors> {
-    validate_inner(schema, ValidatorMode::User)
+    validate_with(schema, &DeclaredContext::default())
+}
+
+/// [`validate`], resolving type references against `ctx` in addition to the
+/// document's own declarations. Every other check stays document-local, so
+/// errors still point at the uploaded text.
+pub fn validate_with(
+    schema: &Schema,
+    ctx: &DeclaredContext,
+) -> Result<ValidatedSchema, ValidationErrors> {
+    validate_inner(schema, ValidatorMode::User, ctx)
 }
 
 /// Validate the **system schema** — same rules as [`validate`]
@@ -103,7 +131,7 @@ pub fn validate(schema: &Schema) -> Result<ValidatedSchema, ValidationErrors> {
 /// `system_schema` module). User uploads of `namespace brain`
 /// must continue to be rejected by [`validate`].
 pub fn validate_system_schema(schema: &Schema) -> Result<ValidatedSchema, ValidationErrors> {
-    validate_inner(schema, ValidatorMode::System)
+    validate_inner(schema, ValidatorMode::System, &DeclaredContext::default())
 }
 
 #[derive(Clone, Copy)]
@@ -115,14 +143,23 @@ enum ValidatorMode {
 fn validate_inner(
     schema: &Schema,
     mode: ValidatorMode,
+    ctx: &DeclaredContext,
 ) -> Result<ValidatedSchema, ValidationErrors> {
     let mut errors: ValidationErrors = Vec::new();
 
     check_namespace(schema, &mut errors, mode);
     check_duplicates(schema, &mut errors);
 
-    let entity_names = collect_entity_names(schema);
-    let relation_names = collect_relation_names(schema);
+    // A reference resolves against this document's declarations plus anything
+    // the namespace already has (see [`DeclaredContext`]).
+    let entity_names: Vec<&str> = collect_entity_names(schema)
+        .into_iter()
+        .chain(ctx.entity_types.iter().map(String::as_str))
+        .collect();
+    let relation_names: Vec<&str> = collect_relation_names(schema)
+        .into_iter()
+        .chain(ctx.relation_types.iter().map(String::as_str))
+        .collect();
 
     for item in &schema.items {
         match item {
@@ -150,6 +187,24 @@ fn validate_inner(
 // ---------------------------------------------------------------------------
 // Namespace.
 // ---------------------------------------------------------------------------
+
+/// Run only the `namespace` declaration's own checks.
+///
+/// A caller that must bind a request to its tenant *before* validating the
+/// rest of the document (because the rest now consults persisted state for
+/// that namespace) still needs a reserved or malformed namespace to surface as
+/// a validation error rather than an authorization failure — `namespace brain`
+/// is a mistake in the document, not an attempt to write someone else's
+/// schema.
+pub fn validate_namespace(schema: &Schema) -> Result<(), ValidationErrors> {
+    let mut errors: ValidationErrors = Vec::new();
+    check_namespace(schema, &mut errors, ValidatorMode::User);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
 
 fn check_namespace(schema: &Schema, errors: &mut ValidationErrors, mode: ValidatorMode) {
     if schema.namespace.is_empty() {
@@ -905,9 +960,9 @@ mod tests {
         }));
         let errs = validate(&s).unwrap_err();
         assert!(
-            errs.iter().any(|e| e.code
-                == ValidationErrorCode::UnresolvedTypeRef
-                && e.message.contains("subject")),
+            errs.iter()
+                .any(|e| e.code == ValidationErrorCode::UnresolvedTypeRef
+                    && e.message.contains("subject")),
             "{errs:?}"
         );
     }

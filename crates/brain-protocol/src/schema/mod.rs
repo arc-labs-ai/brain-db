@@ -18,10 +18,10 @@ pub use ast::{
     ObjectKindAst, ObjectTypeDecl, PredicateDef, RelationTypeDef, ResolverConfig, Schema,
     SchemaItem, StatementKindAst, SubjectTypeDecl, TemporalModelAst, TriggerExpr,
 };
-pub use locate::{locate_spans, validate_located};
+pub use locate::{locate_spans, validate_located, validate_located_with};
 pub use parse_error::ParseError;
 pub use parser::parse_schema;
 pub use validator::{
-    validate, validate_system_schema, SourceSpan, ValidatedSchema, ValidationError,
-    ValidationErrorCode, ValidationErrors,
+    validate, validate_namespace, validate_system_schema, validate_with, DeclaredContext,
+    SourceSpan, ValidatedSchema, ValidationError, ValidationErrorCode, ValidationErrors,
 };

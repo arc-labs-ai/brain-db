@@ -12,7 +12,9 @@
 //! reworded message fails loudly here instead of silently losing its span.
 
 use super::ast::Schema;
-use super::validator::{validate, SourceSpan, ValidatedSchema, ValidationErrors};
+use super::validator::{
+    validate_with, DeclaredContext, SourceSpan, ValidatedSchema, ValidationErrors,
+};
 
 /// [`validate`], with each error's `source_span` resolved against `source` (the
 /// text `schema` was parsed from) when the validator left it empty.
@@ -23,7 +25,18 @@ pub fn validate_located(
     source: &str,
     schema: &Schema,
 ) -> Result<ValidatedSchema, ValidationErrors> {
-    validate(schema).map_err(|mut errors| {
+    validate_located_with(source, schema, &DeclaredContext::default())
+}
+
+/// [`validate_located`], resolving type references against `ctx` as well as
+/// the document's own declarations. Spans still point into `source`, because
+/// every error is about the uploaded document.
+pub fn validate_located_with(
+    source: &str,
+    schema: &Schema,
+    ctx: &DeclaredContext,
+) -> Result<ValidatedSchema, ValidationErrors> {
+    validate_with(schema, ctx).map_err(|mut errors| {
         locate_spans(source, &mut errors);
         errors
     })

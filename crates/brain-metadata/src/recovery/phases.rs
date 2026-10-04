@@ -36,12 +36,14 @@ use crate::relation::types::{relation_type_drop_one, relation_type_drop_schema_d
 use crate::schema::predicate::{
     predicate_drop_one, predicate_drop_schema_declared, predicate_intern_or_get,
 };
-use crate::schema::store::{schema_get, schema_upload};
+use crate::schema::store::{
+    declared_context_wtxn, schema_get, schema_upload_with_mode, SourceMode,
+};
 use crate::statement::{statement_create, statement_supersede, statement_tombstone};
 use crate::tables::statement::{
     statement_flags, statement_from_metadata, StatementMetadata, STATEMENTS_TABLE,
 };
-use brain_protocol::schema::{parse_schema, validate};
+use brain_protocol::schema::{parse_schema, validate_with, DeclaredContext};
 
 use super::transient;
 
@@ -179,10 +181,27 @@ impl MetadataDb {
                 MetadataSinkError::Corruption(format!("schema drop blob not valid json: {e}"))
             })?
         };
-        let validated = validate(&parsed).map_err(|errs| {
+        let wtxn = self.db.begin_write().map_err(transient)?;
+        // Mirror the live apply path: a destructive phase (REPLACE / DROP)
+        // carries the whole new schema and validates standalone, while a plain
+        // UPLOAD is additive and re-validates against the schema it merges
+        // into. Resolved from this same wtxn so replay sees exactly the state
+        // the original write did.
+        let destructive = b.replace_all || !b.drops.is_empty();
+        let mode = if destructive {
+            SourceMode::Replace
+        } else {
+            SourceMode::Merge
+        };
+        let declared = if destructive {
+            DeclaredContext::default()
+        } else {
+            declared_context_wtxn(&wtxn, &b.namespace)
+                .map_err(|e| MetadataSinkError::Corruption(format!("declared context: {e}")))?
+        };
+        let validated = validate_with(&parsed, &declared).map_err(|errs| {
             MetadataSinkError::Corruption(format!("schema re-validate: {errs:?}"))
         })?;
-        let wtxn = self.db.begin_write().map_err(transient)?;
         {
             // Destructive delta (REPLACE / DROP) before the additive upload —
             // the same order the live apply path uses, so replay converges on
@@ -217,7 +236,7 @@ impl MetadataDb {
                     }
                 }
             }
-            schema_upload(&wtxn, &validated, b.created_at_unix_nanos)
+            schema_upload_with_mode(&wtxn, &validated, b.created_at_unix_nanos, mode)
                 .map_err(|e| MetadataSinkError::Corruption(format!("schema_upload: {e}")))?;
             self.bump_next_lsn_in_txn(&wtxn, lsn)?;
         }
