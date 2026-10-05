@@ -1028,10 +1028,7 @@ mod tests {
 
         let queued: Vec<_> = ex_rx.drain().collect();
         assert_eq!(queued.len(), 1, "the stale memory must be re-extracted");
-        assert_eq!(
-            queued[0].0,
-            MemoryId::pack(1, SessionId::DEFAULT.into(), 0)
-        );
+        assert_eq!(queued[0].0, MemoryId::pack(1, SessionId::DEFAULT.into(), 0));
         assert_eq!(&*queued[0].1, "Priya prefers Playwright.");
     }
 

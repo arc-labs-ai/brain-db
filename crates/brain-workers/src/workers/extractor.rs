@@ -3683,28 +3683,30 @@ fn run_apply_body(
                     let resolved_predicate = if predicate_deferred {
                         None
                     } else {
-                        Some(match resolve_extracted_predicate(
-                        &wtxn,
-                        embed_deps,
-                        &worker.metrics,
-                        declared_pid,
-                        &mem_ns,
-                        ns,
-                        name,
-                        now,
-                    ) {
-                        Ok(resolved) => resolved,
-                        Err(e) => {
-                            worker.metrics.inc_apply_dropped("predicate_invalid");
-                            warn!(
-                                memory_id = ?memory_id,
-                                predicate = %sm.predicate_qname,
-                                error = %e,
-                                "statement: predicate intern failed; skipping triple",
-                            );
-                            continue;
-                        }
-                    })
+                        Some(
+                            match resolve_extracted_predicate(
+                                &wtxn,
+                                embed_deps,
+                                &worker.metrics,
+                                declared_pid,
+                                &mem_ns,
+                                ns,
+                                name,
+                                now,
+                            ) {
+                                Ok(resolved) => resolved,
+                                Err(e) => {
+                                    worker.metrics.inc_apply_dropped("predicate_invalid");
+                                    warn!(
+                                        memory_id = ?memory_id,
+                                        predicate = %sm.predicate_qname,
+                                        error = %e,
+                                        "statement: predicate intern failed; skipping triple",
+                                    );
+                                    continue;
+                                }
+                            },
+                        )
                     };
 
                     // Object axis: the predicate's declared object constraint
@@ -9955,7 +9957,13 @@ mod tests {
 
         let outcome = __outcome(vec![
             __alice(),
-            __entity_stmt("brain:clone_status", "ready", false, StatementKind::Fact, None),
+            __entity_stmt(
+                "brain:clone_status",
+                "ready",
+                false,
+                StatementKind::Fact,
+                None,
+            ),
             __entity_stmt(
                 "brain:clone_status",
                 "slack-clone-v1",
@@ -9991,7 +9999,13 @@ mod tests {
 
         let outcome = __outcome(vec![
             __alice(),
-            __entity_stmt("brain:clone_status", "ReAdY", false, StatementKind::Fact, None),
+            __entity_stmt(
+                "brain:clone_status",
+                "ReAdY",
+                false,
+                StatementKind::Fact,
+                None,
+            ),
         ]);
         futures_lite::future::block_on(apply_outcome(&worker, &ctx, memory_id, &outcome))
             .expect("apply_outcome");
@@ -10172,7 +10186,13 @@ mod tests {
             ),
             // A coercible sibling, so the test distinguishes "rejected the bad
             // one" from "rejected everything".
-            __entity_stmt("brain:success_rate", "0.62", false, StatementKind::Fact, None),
+            __entity_stmt(
+                "brain:success_rate",
+                "0.62",
+                false,
+                StatementKind::Fact,
+                None,
+            ),
         ]);
         futures_lite::future::block_on(apply_outcome(&worker, &ctx, memory_id, &outcome))
             .expect("apply_outcome");
