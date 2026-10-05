@@ -39,6 +39,12 @@ pub enum PredicateOpError {
 
     #[error("predicate {0:?} not found")]
     NotFound(PredicateId),
+
+    /// A neighbouring subsystem a predicate operation had to consult
+    /// failed — the namespace registry or the statement index during
+    /// orphan reclamation. Carries that error's message.
+    #[error("dependency failed: {0}")]
+    Dependency(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -443,10 +449,7 @@ pub fn predicate_embedding_get(
 /// `SchemaOrigin::ImplicitFromWrite`), so presence alone would filter the
 /// entire queue away. Only an explicit declaration disqualifies a
 /// candidate.
-fn qname_is_declared(
-    rtxn: &ReadTransaction,
-    qname: &str,
-) -> Result<bool, PredicateOpError> {
+fn qname_is_declared(rtxn: &ReadTransaction, qname: &str) -> Result<bool, PredicateOpError> {
     use crate::tables::relation_type::RELATION_TYPES_BY_QNAME_TABLE;
 
     if let Ok(idx) = rtxn.open_table(RELATION_TYPES_BY_QNAME_TABLE) {
@@ -1131,6 +1134,123 @@ pub fn predicate_drop_one(
 }
 
 // ---------------------------------------------------------------------------
+// Orphaned-predicate reclamation.
+//
+// Brain's predicate vocabulary is open: a name the corpus uses but no schema
+// declares is interned on demand (`SchemaOrigin::ImplicitFromWrite`). Nothing
+// ever removed those rows, while the statements that justified them do get
+// removed — `statement_reclaim` hard-deletes retracted and retention-expired
+// rows, FORGET cascades delete more. The predicate that was coined for them
+// outlives its last user, keeping a `PREDICATES_TABLE` row, a qname-index
+// entry, possibly an embedding, and a review-queue entry naming vocabulary
+// the corpus no longer contains.
+//
+// A declared predicate is never a candidate, however unused: the schema is
+// the statement of intent, and dropping it belongs to SCHEMA_DROP.
+// ---------------------------------------------------------------------------
+
+/// What one reclamation pass did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PredicateReclaimSummary {
+    /// Coined predicates examined (past grace, not schema-declared).
+    pub examined: usize,
+    /// Coined predicates dropped because no live statement used them.
+    pub reclaimed: usize,
+    /// Coined predicates left alone because a live statement still uses them.
+    pub still_referenced: usize,
+}
+
+/// Drop coined predicates that no live statement references.
+///
+/// `grace_nanos` protects a name that was just coined: interning happens in
+/// the same write as the statement, but a crash between them — or a row
+/// tombstoned immediately — would otherwise let the next pass reap a
+/// predicate the corpus is actively minting. `limit` bounds how many
+/// predicates one pass may reclaim so a worker cycle stays short.
+///
+/// `dry_run` reports what would be reclaimed without deleting anything —
+/// the same escape hatch [`crate::extractor::sweep::reclaim_retracted_statements`]
+/// offers, and worth having before trusting a GC with vocabulary.
+pub fn predicate_reclaim_orphans(
+    wtxn: &WriteTransaction,
+    now_unix_nanos: u64,
+    grace_nanos: u64,
+    limit: usize,
+    dry_run: bool,
+) -> Result<PredicateReclaimSummary, PredicateOpError> {
+    let mut summary = PredicateReclaimSummary::default();
+    if limit == 0 {
+        return Ok(summary);
+    }
+
+    // Pass 1 — collect candidates, then close the table before the
+    // statement-index reads and the deletes below.
+    let mut candidates: Vec<(u32, String, String)> = Vec::new();
+    {
+        let t = wtxn.open_table(PREDICATES_TABLE)?;
+        for entry in t.iter()? {
+            let (k, v) = entry?;
+            let row = v.value();
+            if row.origin().is_schema_declared() {
+                continue;
+            }
+            if now_unix_nanos.saturating_sub(row.created_at_unix_nanos) < grace_nanos {
+                continue;
+            }
+            candidates.push((k.value(), row.namespace.clone(), row.name.clone()));
+        }
+    }
+
+    // Pass 2 — keep only those with no live statement.
+    let mut victims: Vec<(u32, String)> = Vec::new();
+    for (id, namespace, name) in candidates {
+        if victims.len() >= limit {
+            break;
+        }
+        summary.examined += 1;
+        // Deliberately namespace-agnostic: a statement's `namespace_id` need
+        // not match the namespace its predicate was coined under, so scoping
+        // this to the predicate's own namespace would miss live references
+        // and delete a row something still points at.
+        let live =
+            crate::statement::crud::statement_any_live_by_predicate(wtxn, PredicateId::from(id))
+                .map_err(|e| PredicateOpError::Dependency(format!("live statement probe: {e}")))?;
+        if live {
+            summary.still_referenced += 1;
+            continue;
+        }
+        victims.push((id, qname(&namespace, &name)));
+    }
+
+    // Pass 3 — delete the row and everything keyed off it.
+    summary.reclaimed = victims.len();
+    if dry_run {
+        return Ok(summary);
+    }
+    for (id, q) in &victims {
+        {
+            let mut t = wtxn.open_table(PREDICATES_TABLE)?;
+            t.remove(id)?;
+        }
+        {
+            let mut idx = wtxn.open_table(PREDICATES_BY_QNAME_TABLE)?;
+            idx.remove(q.as_str())?;
+        }
+        {
+            let mut emb = wtxn.open_table(PREDICATE_EMBEDDINGS_TABLE)?;
+            emb.remove(id)?;
+        }
+        {
+            // The review queue is a shortlist of names worth promoting into a
+            // schema; a name with nothing left to promote does not belong on it.
+            let mut rq = wtxn.open_table(crate::tables::predicate::PREDICATE_REVIEW_QUEUE_TABLE)?;
+            rq.remove(q.as_str())?;
+        }
+    }
+    Ok(summary)
+}
+
+// ---------------------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------------------
 
@@ -1792,5 +1912,146 @@ mod tests {
                 ("brain:zeta".to_string(), 1),
             ]
         );
+    }
+}
+
+#[cfg(all(test, not(miri)))]
+mod predicate_gc_tests {
+    use super::*;
+    use crate::tables::fresh_db;
+    use redb::ReadableDatabase;
+
+    const DAY: u64 = 24 * 60 * 60 * 1_000_000_000;
+    const GRACE: u64 = 7 * DAY;
+
+    fn db() -> (tempfile::TempDir, redb::Database) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(&dir);
+        (dir, db)
+    }
+
+    /// Coin a predicate (`ImplicitFromWrite`) created `age_nanos` ago.
+    fn coin(db: &redb::Database, name: &str, created_at: u64) -> PredicateId {
+        let wtxn = db.begin_write().unwrap();
+        let id = predicate_intern_or_get(&wtxn, "brain", name, 1, created_at).unwrap();
+        wtxn.commit().unwrap();
+        id
+    }
+
+    fn exists(db: &redb::Database, name: &str) -> bool {
+        let rtxn = db.begin_read().unwrap();
+        let idx = rtxn.open_table(PREDICATES_BY_QNAME_TABLE).unwrap();
+        idx.get(qname("brain", name).as_str()).unwrap().is_some()
+    }
+
+    fn reclaim(db: &redb::Database, now: u64, limit: usize) -> PredicateReclaimSummary {
+        let wtxn = db.begin_write().unwrap();
+        let s = predicate_reclaim_orphans(&wtxn, now, GRACE, limit, false).unwrap();
+        wtxn.commit().unwrap();
+        s
+    }
+
+    /// The leak this closes: a coined name whose statements are gone.
+    #[test]
+    fn an_unreferenced_coined_predicate_is_reclaimed() {
+        let (_d, db) = db();
+        coin(&db, "agreed_to_lead", 0);
+        assert!(exists(&db, "agreed_to_lead"));
+
+        let s = reclaim(&db, 30 * DAY, 100);
+        assert_eq!(s.reclaimed, 1);
+        assert_eq!(s.still_referenced, 0);
+        assert!(!exists(&db, "agreed_to_lead"), "orphaned name is gone");
+    }
+
+    /// A declared predicate is intent, not residue — never a candidate,
+    /// however unused. Dropping it belongs to SCHEMA_DROP.
+    #[test]
+    fn a_schema_declared_predicate_is_never_reclaimed() {
+        let (_d, db) = db();
+        {
+            let wtxn = db.begin_write().unwrap();
+            predicate_intern(&wtxn, "acme", "manages", None, 1, 1, "", false, 0).unwrap();
+            wtxn.commit().unwrap();
+        }
+        let s = reclaim(&db, 365 * DAY, 100);
+        assert_eq!(s.reclaimed, 0, "declared vocabulary is untouched");
+        let rtxn = db.begin_read().unwrap();
+        let idx = rtxn.open_table(PREDICATES_BY_QNAME_TABLE).unwrap();
+        assert!(idx
+            .get(qname("acme", "manages").as_str())
+            .unwrap()
+            .is_some());
+    }
+
+    /// Interning happens in the same write as the statement; a freshly
+    /// coined name must survive until the grace window closes.
+    #[test]
+    fn a_freshly_coined_predicate_is_inside_the_grace_window() {
+        let (_d, db) = db();
+        coin(&db, "just_minted", 10 * DAY);
+
+        let s = reclaim(&db, 10 * DAY + 1, 100);
+        assert_eq!(s.examined, 0, "inside grace, not even examined");
+        assert!(exists(&db, "just_minted"));
+
+        let s = reclaim(&db, 10 * DAY + GRACE + 1, 100);
+        assert_eq!(s.reclaimed, 1, "past grace it is reclaimable");
+    }
+
+    /// The review queue is a shortlist of names worth promoting into a
+    /// schema; a reclaimed name has nothing left to promote.
+    #[test]
+    fn reclaiming_clears_the_review_queue_entry() {
+        let (_d, db) = db();
+        coin(&db, "queued_name", 0);
+        {
+            let rtxn = db.begin_read().unwrap();
+            let q = predicate_review_list(&rtxn).unwrap();
+            assert!(
+                q.iter().any(|(n, _)| n == "brain:queued_name"),
+                "coining enqueues it for review"
+            );
+        }
+        reclaim(&db, 30 * DAY, 100);
+        let rtxn = db.begin_read().unwrap();
+        let q = predicate_review_list(&rtxn).unwrap();
+        assert!(
+            !q.iter().any(|(n, _)| n == "brain:queued_name"),
+            "and reclaiming dequeues it"
+        );
+    }
+
+    /// Report-only must report and delete nothing.
+    #[test]
+    fn a_dry_run_reports_without_deleting() {
+        let (_d, db) = db();
+        coin(&db, "preview_me", 0);
+
+        let s = {
+            let wtxn = db.begin_write().unwrap();
+            let s = predicate_reclaim_orphans(&wtxn, 30 * DAY, GRACE, 100, true).unwrap();
+            wtxn.commit().unwrap();
+            s
+        };
+        assert_eq!(s.reclaimed, 1, "reports what it would reclaim");
+        assert!(exists(&db, "preview_me"), "but the row is still there");
+
+        let s = reclaim(&db, 30 * DAY, 100);
+        assert_eq!(s.reclaimed, 1, "a real pass then removes it");
+        assert!(!exists(&db, "preview_me"));
+    }
+
+    /// One pass must stay bounded so a worker cycle stays short.
+    #[test]
+    fn a_pass_reclaims_at_most_its_limit() {
+        let (_d, db) = db();
+        for i in 0..5 {
+            coin(&db, &format!("spare_{i}"), 0);
+        }
+        let s = reclaim(&db, 30 * DAY, 2);
+        assert_eq!(s.reclaimed, 2, "limit honoured");
+        let s = reclaim(&db, 30 * DAY, 100);
+        assert_eq!(s.reclaimed, 3, "the rest go on the next pass");
     }
 }

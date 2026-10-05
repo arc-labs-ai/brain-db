@@ -473,6 +473,8 @@ pub struct WorkersConfig {
     /// retract grace window. Off by default. Section may be omitted.
     #[serde(default)]
     pub statement_reclaim: StatementReclaimWorkerConfig,
+    #[serde(default)]
+    pub predicate_gc: PredicateGcWorkerConfig,
     /// Entity merge-review-queue sweeper cadence. Section may be
     /// omitted; the field defaults.
     #[serde(default)]
@@ -540,6 +542,53 @@ fn default_supersession_retention_seconds() -> u64 {
 }
 fn default_supersession_period_seconds() -> u64 {
     worker_defaults::SUPERSESSION_PERIOD_SECONDS
+}
+
+/// `[workers.predicate_gc]` TOML section. Controls reclamation of coined
+/// (`ImplicitFromWrite`) predicates that no live statement references. Off by
+/// default: the review queue is a shortlist of names worth promoting into a
+/// schema, so an operator may prefer coined vocabulary to accumulate.
+/// Schema-declared predicates are never touched.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PredicateGcWorkerConfig {
+    /// Master switch. `false` (default) leaves the worker unregistered.
+    #[serde(default = "default_predicate_gc_enabled")]
+    pub enabled: bool,
+    /// Grace window in seconds measured from the predicate's intern time,
+    /// covering the gap between coining a name and its statement landing.
+    /// Defaults to 7 days.
+    #[serde(default = "default_predicate_gc_grace_seconds")]
+    pub grace_seconds: u64,
+    /// Sweep cadence in seconds. Defaults to 1 day.
+    #[serde(default = "default_predicate_gc_period_seconds")]
+    pub period_seconds: u64,
+    /// Report-only. `true` logs what each cycle would reclaim and deletes
+    /// nothing — the way to see the shape of a deployment's coined
+    /// vocabulary before trusting a GC with it.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+impl Default for PredicateGcWorkerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_predicate_gc_enabled(),
+            grace_seconds: default_predicate_gc_grace_seconds(),
+            period_seconds: default_predicate_gc_period_seconds(),
+            dry_run: false,
+        }
+    }
+}
+
+fn default_predicate_gc_enabled() -> bool {
+    false
+}
+fn default_predicate_gc_grace_seconds() -> u64 {
+    brain_workers::workers::predicate_gc::DEFAULT_GRACE_SECONDS
+}
+fn default_predicate_gc_period_seconds() -> u64 {
+    brain_workers::workers::predicate_gc::DEFAULT_PERIOD_SECONDS
 }
 
 /// `[workers.statement_reclaim]` TOML section. Controls the retracted-

@@ -485,6 +485,7 @@ pub struct ShardSpawnConfig {
     pub causal_edge: CausalEdgeSpawnConfig,
     /// Retracted-statement GC worker knobs. Off by default.
     pub statement_reclaim: StatementReclaimSpawnConfig,
+    pub predicate_gc: PredicateGcSpawnConfig,
     /// Superseded-statement GC worker knobs. Off by default.
     pub supersession_sweeper: SupersessionSweeperSpawnConfig,
     /// Entity merge-review-queue sweeper cadence.
@@ -697,6 +698,27 @@ impl Default for StatementReclaimSpawnConfig {
     }
 }
 
+/// Knobs ferried from `Config.workers.predicate_gc` into the shard spawn
+/// path. Coined-predicate GC is off by default.
+#[derive(Clone, Copy, Debug)]
+pub struct PredicateGcSpawnConfig {
+    pub enabled: bool,
+    pub grace_seconds: u64,
+    pub period_seconds: u64,
+    pub dry_run: bool,
+}
+
+impl Default for PredicateGcSpawnConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            grace_seconds: brain_workers::workers::predicate_gc::DEFAULT_GRACE_SECONDS,
+            period_seconds: brain_workers::workers::predicate_gc::DEFAULT_PERIOD_SECONDS,
+            dry_run: false,
+        }
+    }
+}
+
 /// Knobs ferried from `Config.workers.supersession_sweeper` into the
 /// spawn path. The superseded-statement GC worker is off by default
 /// (`retention_seconds == 0`): superseded rows are filtered from every
@@ -831,6 +853,7 @@ impl ShardSpawnConfig {
             temporal_edge: TemporalEdgeSpawnConfig::default(),
             causal_edge: CausalEdgeSpawnConfig::default(),
             statement_reclaim: StatementReclaimSpawnConfig::default(),
+            predicate_gc: PredicateGcSpawnConfig::default(),
             supersession_sweeper: SupersessionSweeperSpawnConfig::default(),
             ambiguity_resolver: AmbiguityResolverSpawnConfig::default(),
             confidence_sweep: ConfidenceSweepSpawnConfig::default(),
@@ -2732,6 +2755,7 @@ pub fn spawn_shard(
     let temporal_edge_spawn_cfg_for_closure = cfg.temporal_edge.clone();
     let causal_edge_spawn_cfg_for_closure = cfg.causal_edge.clone();
     let statement_reclaim_spawn_cfg = cfg.statement_reclaim;
+    let predicate_gc_spawn_cfg = cfg.predicate_gc;
     let supersession_sweeper_spawn_cfg = cfg.supersession_sweeper;
     let ambiguity_resolver_spawn_cfg = cfg.ambiguity_resolver;
     let confidence_sweep_spawn_cfg = cfg.confidence_sweep;
@@ -3954,6 +3978,24 @@ pub fn spawn_shard(
                 scheduler
                     .register(Arc::new(worker), ops.clone())
                     .expect("register StatementReclaimWorker");
+            }
+
+            // PredicateGcWorker — reclaims coined (ImplicitFromWrite)
+            // predicates once no live statement references them. Off by
+            // default (`[workers.predicate_gc] enabled = false`); a disabled
+            // worker is simply not registered, like every other optional one.
+            // Schema-declared predicates are never candidates — undeclaring
+            // those is SCHEMA_DROP's job. Closes the vocabulary side of the
+            // reclaim story, after statements are hard-reclaimed above.
+            if predicate_gc_spawn_cfg.enabled {
+                let worker = brain_workers::workers::predicate_gc::PredicateGcWorker::new()
+                    .set_enabled(true)
+                    .with_grace_seconds(predicate_gc_spawn_cfg.grace_seconds)
+                    .with_period_seconds(predicate_gc_spawn_cfg.period_seconds)
+                    .with_dry_run(predicate_gc_spawn_cfg.dry_run);
+                scheduler
+                    .register(Arc::new(worker), ops.clone())
+                    .expect("register PredicateGcWorker");
             }
 
             // SupersessionSweeper — physically reclaims superseded

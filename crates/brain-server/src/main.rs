@@ -171,9 +171,9 @@ mod linux_main {
     use crate::shard::{
         spawn_shard, AmbiguityResolverSpawnConfig, AutoEdgeSpawnConfig, CausalEdgeSpawnConfig,
         ConfidenceSweepSpawnConfig, ExtractorSpawnConfig, ExtractorTuningSpawnConfig,
-        IndexSpawnConfig, LlmCacheSweepSpawnConfig, RerankSpawnConfig, ShardHandle, ShardJoiner,
-        ShardSpawnConfig, StatementReclaimSpawnConfig, SupersessionSweeperSpawnConfig,
-        TemporalEdgeSpawnConfig,
+        IndexSpawnConfig, LlmCacheSweepSpawnConfig, PredicateGcSpawnConfig, RerankSpawnConfig,
+        ShardHandle, ShardJoiner, ShardSpawnConfig, StatementReclaimSpawnConfig,
+        SupersessionSweeperSpawnConfig, TemporalEdgeSpawnConfig,
     };
 
     /// Errors surfaced by [`build_dispatcher`]. Hand-rolled `Display`
@@ -639,6 +639,12 @@ mod linux_main {
             };
             // Ferry the per-worker cadence / gate knobs that previously
             // only had bespoke `BRAIN_*` env vars.
+            spawn_cfg.predicate_gc = PredicateGcSpawnConfig {
+                enabled: cfg.workers.predicate_gc.enabled,
+                grace_seconds: cfg.workers.predicate_gc.grace_seconds,
+                period_seconds: cfg.workers.predicate_gc.period_seconds,
+                dry_run: cfg.workers.predicate_gc.dry_run,
+            };
             spawn_cfg.statement_reclaim = StatementReclaimSpawnConfig {
                 enabled: cfg.workers.statement_reclaim.enabled,
                 grace_seconds: cfg.workers.statement_reclaim.grace_seconds,

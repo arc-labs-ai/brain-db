@@ -307,6 +307,9 @@ impl From<brain_metadata::schema::predicate::PredicateOpError> for OpError {
             },
             E::Storage(e) => OpError::Internal(format!("redb storage: {e}")),
             E::Table(e) => OpError::Internal(format!("redb table: {e}")),
+            // A neighbouring subsystem failed underneath a predicate op; the
+            // caller did nothing wrong, so this is ours, not theirs.
+            E::Dependency(detail) => OpError::Internal(format!("predicate dependency: {detail}")),
         }
     }
 }
