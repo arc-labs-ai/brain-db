@@ -179,7 +179,14 @@ fn build(spec: &GraphSpec) -> (MetadataDb, tempfile::TempDir, BuiltGraph) {
     // A second, non-seeded entity type so the strategy can vary types.
     let org_ty: EntityTypeId = {
         let wtxn = db.write_txn().unwrap();
-        let id = entity_type_intern(&wtxn, brain_core::NamespaceId::SYSTEM.raw(), "Org", Vec::new(), NOW).unwrap();
+        let id = entity_type_intern(
+            &wtxn,
+            brain_core::NamespaceId::SYSTEM.raw(),
+            "Org",
+            Vec::new(),
+            NOW,
+        )
+        .unwrap();
         wtxn.commit().unwrap();
         id
     };

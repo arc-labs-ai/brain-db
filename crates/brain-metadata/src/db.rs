@@ -331,7 +331,11 @@ mod tests {
             let wtxn = db.begin_write().unwrap();
             {
                 let mut t = wtxn.open_table(ENTITY_TYPES_TABLE).unwrap();
-                let row = EntityTypeDefinition::new(brain_core::EntityTypeId(42), brain_core::NamespaceId::SYSTEM.raw(), "UserCustomNoun".into(), Vec::new(),
+                let row = EntityTypeDefinition::new(
+                    brain_core::EntityTypeId(42),
+                    brain_core::NamespaceId::SYSTEM.raw(),
+                    "UserCustomNoun".into(),
+                    Vec::new(),
                     1_700_000_000_000_000_000,
                 );
                 t.insert(&42u32, &row).unwrap();

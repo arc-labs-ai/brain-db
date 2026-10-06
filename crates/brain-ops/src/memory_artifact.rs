@@ -568,8 +568,7 @@ fn prune_dangling_edges(bundle: &mut EncodeStageArtifact) {
     let Some(graph) = bundle.graph.as_mut() else {
         return;
     };
-    let known: std::collections::HashSet<[u8; 16]> =
-        graph.nodes.iter().map(|n| n.id).collect();
+    let known: std::collections::HashSet<[u8; 16]> = graph.nodes.iter().map(|n| n.id).collect();
     graph
         .edges
         .retain(|e| known.contains(&e.source) && known.contains(&e.target));
@@ -1447,7 +1446,10 @@ mod tests {
 
         let g = read_bundle(&db, id).unwrap().graph.unwrap();
         assert_eq!(
-            g.edges.iter().map(|e| e.predicate.as_str()).collect::<Vec<_>>(),
+            g.edges
+                .iter()
+                .map(|e| e.predicate.as_str())
+                .collect::<Vec<_>>(),
             vec!["brain:prefers"],
             "only the edge whose endpoints are both nodes survives"
         );
@@ -1564,8 +1566,14 @@ mod tests {
         let (_dir, db) = open_db();
         let id = [4u8; 16];
         let wtxn = db.write_txn().unwrap();
-        put_sync_artifact(&wtxn, id, vec![0.1], sync_record(id, 1, 0.5, 100, 0, 1, 4), vec![])
-            .unwrap();
+        put_sync_artifact(
+            &wtxn,
+            id,
+            vec![0.1],
+            sync_record(id, 1, 0.5, 100, 0, 1, 4),
+            vec![],
+        )
+        .unwrap();
         wtxn.commit().unwrap();
         assert!(!artifact_holds_extractor_graph(
             &db,

@@ -21,7 +21,5 @@ pub mod validation;
 #[cfg(test)]
 mod tests;
 
-pub use extractor::{
-    BuildRequestStats, LlmExtractor, LlmExtractorInner, DEFAULT_LLM_MAX_TOKENS,
-};
+pub use extractor::{BuildRequestStats, LlmExtractor, LlmExtractorInner, DEFAULT_LLM_MAX_TOKENS};
 pub use pricing::{estimate_cost, CostBudget, Pricing};

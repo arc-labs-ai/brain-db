@@ -153,8 +153,14 @@ fn seed_causal_statement(
     let now = now_unix_nanos();
     // 1. Entity type for the subject (any type works; the resolver only
     //    requires existence).
-    let entity_type: EntityTypeId =
-        entity_type_intern(&wtxn, brain_core::NamespaceId::SYSTEM.raw(), "Thing", Vec::new(), now).expect("entity_type_intern");
+    let entity_type: EntityTypeId = entity_type_intern(
+        &wtxn,
+        brain_core::NamespaceId::SYSTEM.raw(),
+        "Thing",
+        Vec::new(),
+        now,
+    )
+    .expect("entity_type_intern");
     // 2. Subject entity (the statement asserts something about it).
     let subject_entity = EntityId::new();
     let entity = brain_core::Entity::new_active(

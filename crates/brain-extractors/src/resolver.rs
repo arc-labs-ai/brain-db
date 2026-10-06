@@ -72,9 +72,7 @@ use brain_metadata::entity::ops::{
 };
 use brain_metadata::entity::review::{enqueue_merge_proposal, MergeReviewError};
 use brain_metadata::entity::trigram::TrigramOpError;
-use brain_metadata::entity::types::{
-    entity_type_intern, entity_type_lookup, EntityTypeOpError,
-};
+use brain_metadata::entity::types::{entity_type_intern, entity_type_lookup, EntityTypeOpError};
 use brain_metadata::tables::entity::{
     EntityMetadata, ENTITIES_TABLE, ENTITY_ALIASES_TABLE, ENTITY_BY_CANONICAL_NAME_TABLE,
     ENTITY_TRIGRAMS_TABLE,
@@ -2702,7 +2700,8 @@ mod tests {
         // The new type lives in the registry now.
         let d = d;
         let wtxn = d.write_txn().unwrap();
-        let def = entity_type_lookup(&wtxn, brain_core::NamespaceId::SYSTEM.raw(), "Organization").unwrap();
+        let def = entity_type_lookup(&wtxn, brain_core::NamespaceId::SYSTEM.raw(), "Organization")
+            .unwrap();
         assert!(def.is_some());
         wtxn.commit().unwrap();
     }
@@ -2972,7 +2971,14 @@ mod tests {
         // Intern an Organization type so we can seed a cross-type entity.
         let org_type_id = {
             let wtxn = d.write_txn().unwrap();
-            let id = entity_type_intern(&wtxn, brain_core::NamespaceId::SYSTEM.raw(), "Organization", Vec::new(), NOW).unwrap();
+            let id = entity_type_intern(
+                &wtxn,
+                brain_core::NamespaceId::SYSTEM.raw(),
+                "Organization",
+                Vec::new(),
+                NOW,
+            )
+            .unwrap();
             wtxn.commit().unwrap();
             id
         };

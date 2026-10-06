@@ -19,8 +19,7 @@ use redb::{ReadableTable, WriteTransaction};
 
 use super::kind::{kind_intern, KindOpError};
 use super::predicate::{
-    predicate_intern_with_subject, predicate_set_retention, ObjectConstraint,
-    PredicateOpError,
+    predicate_intern_with_subject, predicate_set_retention, ObjectConstraint, PredicateOpError,
 };
 use crate::entity::types::{entity_type_intern, entity_type_lookup, EntityTypeOpError};
 use crate::extractor::ops::{extractor_intern, ExtractorOpError};
@@ -96,7 +95,8 @@ pub fn apply_schema_definitions(
                 // the object side.
                 let subject_entity_type_id = match &p.subject {
                     Some(SubjectTypeDecl::Entity { entity_type }) => {
-                        resolve_entity_type(wtxn, namespace_id, entity_type)?.map_or(0, EntityTypeId::raw)
+                        resolve_entity_type(wtxn, namespace_id, entity_type)?
+                            .map_or(0, EntityTypeId::raw)
                     }
                     Some(SubjectTypeDecl::Any) | None => 0,
                 };

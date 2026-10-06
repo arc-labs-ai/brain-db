@@ -267,9 +267,30 @@ mod tests {
         {
             let wtxn = db.begin_write().unwrap();
             // Intern out of lexical order so the sort is exercised.
-            entity_type_intern(&wtxn, brain_core::NamespaceId::SYSTEM.raw(), "Person", Vec::new(), NOW).unwrap();
-            entity_type_intern(&wtxn, brain_core::NamespaceId::SYSTEM.raw(), "Drug", Vec::new(), NOW).unwrap();
-            entity_type_intern(&wtxn, brain_core::NamespaceId::SYSTEM.raw(), "Organization", Vec::new(), NOW).unwrap();
+            entity_type_intern(
+                &wtxn,
+                brain_core::NamespaceId::SYSTEM.raw(),
+                "Person",
+                Vec::new(),
+                NOW,
+            )
+            .unwrap();
+            entity_type_intern(
+                &wtxn,
+                brain_core::NamespaceId::SYSTEM.raw(),
+                "Drug",
+                Vec::new(),
+                NOW,
+            )
+            .unwrap();
+            entity_type_intern(
+                &wtxn,
+                brain_core::NamespaceId::SYSTEM.raw(),
+                "Organization",
+                Vec::new(),
+                NOW,
+            )
+            .unwrap();
             wtxn.commit().unwrap();
         }
         let rtxn = db.begin_read().unwrap();
@@ -327,11 +348,17 @@ mod tests {
 
         let wtxn = db.begin_write().unwrap();
         assert_eq!(
-            entity_type_lookup(&wtxn, ACME, "Builder").unwrap().unwrap().schema_blob,
+            entity_type_lookup(&wtxn, ACME, "Builder")
+                .unwrap()
+                .unwrap()
+                .schema_blob,
             vec![1]
         );
         assert_eq!(
-            entity_type_lookup(&wtxn, GLOBEX, "Builder").unwrap().unwrap().schema_blob,
+            entity_type_lookup(&wtxn, GLOBEX, "Builder")
+                .unwrap()
+                .unwrap()
+                .schema_blob,
             vec![2, 2]
         );
     }
@@ -343,7 +370,10 @@ mod tests {
         let first = entity_type_intern(&wtxn, ACME, "Builder", vec![1], NOW).unwrap();
         let again = entity_type_intern(&wtxn, ACME, "Builder", vec![1], NOW).unwrap();
         wtxn.commit().unwrap();
-        assert_eq!(first, again, "re-uploading an unchanged schema must not mint");
+        assert_eq!(
+            first, again,
+            "re-uploading an unchanged schema must not mint"
+        );
     }
 
     #[test]
@@ -356,7 +386,10 @@ mod tests {
         let wtxn = db.begin_write().unwrap();
         entity_type_intern(&wtxn, ACME, "Builder", vec![1], NOW).unwrap();
         let err = entity_type_intern(&wtxn, ACME, "Builder", vec![9], NOW).unwrap_err();
-        assert!(matches!(err, EntityTypeOpError::AlreadyExists { .. }), "{err:?}");
+        assert!(
+            matches!(err, EntityTypeOpError::AlreadyExists { .. }),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -369,7 +402,10 @@ mod tests {
         let wtxn = db.begin_write().unwrap();
         for ns in [ACME, GLOBEX] {
             assert_eq!(
-                entity_type_lookup(&wtxn, ns, "Person").unwrap().unwrap().id(),
+                entity_type_lookup(&wtxn, ns, "Person")
+                    .unwrap()
+                    .unwrap()
+                    .id(),
                 person,
                 "a tenant that declared nothing still sees the built-ins",
             );
@@ -390,11 +426,17 @@ mod tests {
 
         let wtxn = db.begin_write().unwrap();
         assert_eq!(
-            entity_type_lookup(&wtxn, ACME, "Person").unwrap().unwrap().id(),
+            entity_type_lookup(&wtxn, ACME, "Person")
+                .unwrap()
+                .unwrap()
+                .id(),
             own
         );
         assert_eq!(
-            entity_type_lookup(&wtxn, GLOBEX, "Person").unwrap().unwrap().id(),
+            entity_type_lookup(&wtxn, GLOBEX, "Person")
+                .unwrap()
+                .unwrap()
+                .id(),
             builtin
         );
     }
@@ -411,10 +453,17 @@ mod tests {
 
         let rtxn = db.begin_read().unwrap();
         assert_eq!(
-            entity_type_lookup_rtxn(&rtxn, ACME, "Builder").unwrap().unwrap().id(),
+            entity_type_lookup_rtxn(&rtxn, ACME, "Builder")
+                .unwrap()
+                .unwrap()
+                .id(),
             own
         );
-        assert!(entity_type_lookup_rtxn(&rtxn, GLOBEX, "Builder").unwrap().is_none());
-        assert!(entity_type_lookup_rtxn(&rtxn, GLOBEX, "Person").unwrap().is_some());
+        assert!(entity_type_lookup_rtxn(&rtxn, GLOBEX, "Builder")
+            .unwrap()
+            .is_none());
+        assert!(entity_type_lookup_rtxn(&rtxn, GLOBEX, "Person")
+            .unwrap()
+            .is_some());
     }
 }
