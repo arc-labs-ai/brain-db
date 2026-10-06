@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.2.0](https://github.com/arc-labs-ai/brain-db/compare/v0.1.0...v0.2.0) (2026-10-06)
+
+
+### Features
+
+* **docker:** bundle the GLiNER classifier so extraction isn't silently degraded ([56a8771](https://github.com/arc-labs-ai/brain-db/commit/56a8771c4dcb64c47bc76a5fdbc72b716513428d))
+
+
+### Bug Fixes
+
+* **ci:** label the published images so they trace back to a commit ([17b7f83](https://github.com/arc-labs-ai/brain-db/commit/17b7f8335767f271ab86f8e4faa818a52146f35c))
+* **ci:** repair the release pipeline and stop duplicate CI runs ([7860393](https://github.com/arc-labs-ai/brain-db/commit/786039328c58e12a155b0476464f5257f3261064))
+* **ci:** stop the release workflow silently dropping the image coordinates ([edc6684](https://github.com/arc-labs-ai/brain-db/commit/edc66840202950be712301ce743aa98c92d1229a))
+* **docker:** bundle the embedding model so the image can actually start ([d50add3](https://github.com/arc-labs-ai/brain-db/commit/d50add342b0618c432a9cc2262f74a92e8e4c1b7))
+
 ## 0.1.0 (2026-10-06)
 
 
