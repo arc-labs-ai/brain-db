@@ -313,6 +313,44 @@ pub struct ExtractorsConfig {
     /// Write-time HyPE (hypothetical-question) generation tuning.
     #[serde(default)]
     pub hype: HypeExtractorConfig,
+    /// LLM tier tuning.
+    #[serde(default)]
+    pub llm: LlmExtractorConfig,
+}
+
+/// `[extractors.llm]` TOML sub-section. The LLM tier's tuning. The tier
+/// is always-on (no gate) — this only sizes its calls.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LlmExtractorConfig {
+    /// Output-token ceiling for one extraction call.
+    ///
+    /// The tier asks for the whole typed graph of a memory as a single
+    /// JSON document, so the ceiling scales with how much the memory
+    /// says, not how long it is. Hitting it truncates the JSON mid-token,
+    /// which reads downstream as malformed output rather than as a budget
+    /// problem — the provider's `finish_reason` is what tells the two
+    /// apart, and the extractor now reports truncation by name.
+    ///
+    /// Was 1024, which a single dense paragraph could exceed: eight
+    /// entities with their statements and relations runs past it, and the
+    /// memory then landed with entities but zero statements and zero
+    /// relations. 4096 fits the dense case with headroom; raise it if
+    /// `response truncated at max_tokens` appears in the extractor log.
+    #[serde(default = "default_llm_max_tokens")]
+    pub max_tokens: u32,
+}
+
+impl Default for LlmExtractorConfig {
+    fn default() -> Self {
+        Self {
+            max_tokens: default_llm_max_tokens(),
+        }
+    }
+}
+
+fn default_llm_max_tokens() -> u32 {
+    4096
 }
 
 /// `[extractors.classifier]` TOML sub-section. The classifier tier's
@@ -435,6 +473,8 @@ pub struct WorkersConfig {
     /// retract grace window. Off by default. Section may be omitted.
     #[serde(default)]
     pub statement_reclaim: StatementReclaimWorkerConfig,
+    #[serde(default)]
+    pub predicate_gc: PredicateGcWorkerConfig,
     /// Entity merge-review-queue sweeper cadence. Section may be
     /// omitted; the field defaults.
     #[serde(default)]
@@ -502,6 +542,53 @@ fn default_supersession_retention_seconds() -> u64 {
 }
 fn default_supersession_period_seconds() -> u64 {
     worker_defaults::SUPERSESSION_PERIOD_SECONDS
+}
+
+/// `[workers.predicate_gc]` TOML section. Controls reclamation of coined
+/// (`ImplicitFromWrite`) predicates that no live statement references. Off by
+/// default: the review queue is a shortlist of names worth promoting into a
+/// schema, so an operator may prefer coined vocabulary to accumulate.
+/// Schema-declared predicates are never touched.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PredicateGcWorkerConfig {
+    /// Master switch. `false` (default) leaves the worker unregistered.
+    #[serde(default = "default_predicate_gc_enabled")]
+    pub enabled: bool,
+    /// Grace window in seconds measured from the predicate's intern time,
+    /// covering the gap between coining a name and its statement landing.
+    /// Defaults to 7 days.
+    #[serde(default = "default_predicate_gc_grace_seconds")]
+    pub grace_seconds: u64,
+    /// Sweep cadence in seconds. Defaults to 1 day.
+    #[serde(default = "default_predicate_gc_period_seconds")]
+    pub period_seconds: u64,
+    /// Report-only. `true` logs what each cycle would reclaim and deletes
+    /// nothing — the way to see the shape of a deployment's coined
+    /// vocabulary before trusting a GC with it.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+impl Default for PredicateGcWorkerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_predicate_gc_enabled(),
+            grace_seconds: default_predicate_gc_grace_seconds(),
+            period_seconds: default_predicate_gc_period_seconds(),
+            dry_run: false,
+        }
+    }
+}
+
+fn default_predicate_gc_enabled() -> bool {
+    false
+}
+fn default_predicate_gc_grace_seconds() -> u64 {
+    brain_workers::workers::predicate_gc::DEFAULT_GRACE_SECONDS
+}
+fn default_predicate_gc_period_seconds() -> u64 {
+    brain_workers::workers::predicate_gc::DEFAULT_PERIOD_SECONDS
 }
 
 /// `[workers.statement_reclaim]` TOML section. Controls the retracted-
@@ -1006,6 +1093,26 @@ pub struct ExtractorWorkerConfig {
     /// per-memory cost down by ~4-5x on a CPU host.
     #[serde(default = "default_extractor_batch_size")]
     pub batch_size: usize,
+    /// Re-extract a namespace's already-committed memories when a new
+    /// schema version is uploaded for it.
+    ///
+    /// **Default `false`, and that default is deliberate.** Re-extraction
+    /// costs one LLM call per affected memory, so a single `SCHEMA_UPLOAD`
+    /// on a large corpus can turn into thousands of paid calls with no
+    /// operator in the loop. With this off, the schema-migration worker
+    /// still does its flag sweep and now REPORTS how many memories fell
+    /// outside the new schema, so the operator can trigger the same work
+    /// deliberately via `POST /v1/extract/backfill`.
+    ///
+    /// Turning it on makes a namespace self-healing: upload a schema and
+    /// its corpus re-aligns to the new vocabulary without a second step.
+    /// Choose it when schema churn is rare and the corpus is small.
+    ///
+    /// Either way, re-extraction is bounded by the extractor's own
+    /// `channel_capacity` and per-cycle `llm_budget_per_cycle_micro_usd` —
+    /// enabling this cannot outrun those ceilings, it only fills them.
+    #[serde(default = "default_reextract_on_schema_change")]
+    pub reextract_on_schema_change: bool,
 }
 
 impl Default for ExtractorWorkerConfig {
@@ -1017,6 +1124,7 @@ impl Default for ExtractorWorkerConfig {
             channel_capacity: default_extractor_channel_capacity(),
             skip_already_extracted: default_extractor_skip_audited(),
             batch_size: default_extractor_batch_size(),
+            reextract_on_schema_change: default_reextract_on_schema_change(),
         }
     }
 }
@@ -1038,6 +1146,10 @@ fn default_extractor_skip_audited() -> bool {
 }
 fn default_extractor_batch_size() -> usize {
     worker_defaults::EXTRACTOR_BATCH_SIZE
+}
+/// Off. Spending money on the operator's behalf is not a default.
+fn default_reextract_on_schema_change() -> bool {
+    false
 }
 
 /// `[monitoring]` TOML section. Groups logging and distributed-tracing

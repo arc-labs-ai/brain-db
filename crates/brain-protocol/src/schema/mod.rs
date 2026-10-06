@@ -9,6 +9,7 @@ pub mod locate;
 pub mod ops;
 pub mod parse_error;
 pub mod parser;
+pub mod render;
 pub mod validator;
 
 pub use ast::{
@@ -16,12 +17,13 @@ pub use ast::{
     ConditionValue, CostExpr, CostUnit, DurationAst, DurationUnit, EntityTypeDef, ExtractorDef,
     ExtractorField, ExtractorKindAst, ExtractorTarget, KindCardinalityAst, KindDef, LiteralValue,
     ObjectKindAst, ObjectTypeDecl, PredicateDef, RelationTypeDef, ResolverConfig, Schema,
-    SchemaItem, StatementKindAst, TemporalModelAst, TriggerExpr,
+    SchemaItem, StatementKindAst, SubjectTypeDecl, TemporalModelAst, TriggerExpr,
 };
-pub use locate::{locate_spans, validate_located};
+pub use locate::{locate_spans, validate_located, validate_located_with};
 pub use parse_error::ParseError;
 pub use parser::parse_schema;
+pub use render::{render_schema, render_schema_verified};
 pub use validator::{
-    validate, validate_system_schema, SourceSpan, ValidatedSchema, ValidationError,
-    ValidationErrorCode, ValidationErrors,
+    validate, validate_namespace, validate_system_schema, validate_with, DeclaredContext,
+    SourceSpan, ValidatedSchema, ValidationError, ValidationErrorCode, ValidationErrors,
 };

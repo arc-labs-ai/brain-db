@@ -92,6 +92,7 @@ pub enum IndexerError {
 
 /// Resolved schema fields, looked up once at worker construction
 /// time so the hot path is allocation-free.
+#[derive(Clone, Copy)]
 struct MemoryFields {
     memory_id: Field,
     text: Field,
@@ -263,7 +264,7 @@ async fn run_loop(
     shutdown: Receiver<()>,
     control: Receiver<super::IndexerControl>,
 ) {
-    let mut batch: usize = 0;
+    let mut pending: Vec<MemoryTextOp> = Vec::new();
     let mut last_commit = Instant::now();
 
     loop {
@@ -273,30 +274,26 @@ async fn run_loop(
         match wait_next(&rx, &shutdown, &control, remaining).await {
             NextOp::Op(op) => {
                 let is_hard_forget = matches!(op, MemoryTextOp::Forget { hard: true, .. });
-                if let Err(err) = apply_op(&mut writer, &fields, &op) {
-                    warn!(
-                        target: "brain_ops::text_indexer",
-                        error = %err,
-                        "memory text indexer write failed; skipping op",
-                    );
-                } else {
-                    batch += 1;
-                }
-                if is_hard_forget {
-                    // Hard forget: don't wait for the batch/interval — commit
-                    // the delete and force-merge so the memory's plaintext is
-                    // physically evicted from the on-disk segments now, not on
-                    // some incidental future merge (invariant #6).
-                    if purge_hard_forget(&mut writer, &commit_gen).await.is_err() {
+                pending.push(op);
+                // Hard forget: don't wait for the batch/interval — commit the
+                // delete and force-merge so the memory's plaintext is
+                // physically evicted from the on-disk segments now, not on
+                // some incidental future merge (invariant #6).
+                if is_hard_forget || pending.len() >= policy.n_writes {
+                    let (w, ok) = flush_off_reactor(
+                        writer,
+                        fields,
+                        std::mem::take(&mut pending),
+                        &commit_gen,
+                    )
+                    .await;
+                    writer = w;
+                    if !ok {
                         return;
                     }
-                    batch = 0;
-                    last_commit = Instant::now();
-                } else if batch >= policy.n_writes {
-                    if commit_with_retry(&mut writer, &commit_gen).is_err() {
-                        return;
+                    if is_hard_forget {
+                        purge_merged_deletes(&mut writer).await;
                     }
-                    batch = 0;
                     last_commit = Instant::now();
                 }
             }
@@ -307,27 +304,26 @@ async fn run_loop(
                 // it — a FORGET's lexical delete is typically the last
                 // op enqueued and would otherwise be the one lost.
                 while let Ok(op) = rx.try_recv() {
-                    if let Err(err) = apply_op(&mut writer, &fields, &op) {
-                        warn!(
-                            target: "brain_ops::text_indexer",
-                            error = %err,
-                            "memory text indexer write failed during drain; skipping op",
-                        );
-                    } else {
-                        batch += 1;
-                    }
+                    pending.push(op);
                 }
-                if batch > 0 {
-                    let _ = commit_with_retry(&mut writer, &commit_gen);
+                if !pending.is_empty() {
+                    let _ = flush_off_reactor(writer, fields, pending, &commit_gen).await;
                 }
                 return;
             }
             NextOp::DeadlineHit => {
-                if batch > 0 {
-                    if commit_with_retry(&mut writer, &commit_gen).is_err() {
+                if !pending.is_empty() {
+                    let (w, ok) = flush_off_reactor(
+                        writer,
+                        fields,
+                        std::mem::take(&mut pending),
+                        &commit_gen,
+                    )
+                    .await;
+                    writer = w;
+                    if !ok {
                         return;
                     }
-                    batch = 0;
                 }
                 last_commit = Instant::now();
             }
@@ -341,7 +337,7 @@ async fn run_loop(
                 // would only write into the directory about to be renamed
                 // away.
                 drop(writer);
-                batch = 0;
+                pending.clear();
                 let _ = ack.send_async(()).await;
                 // Park until Resume hands us a writer on the reopened index
                 // (or teardown). `rx` keeps buffering ops meanwhile.
@@ -484,9 +480,37 @@ fn attempt_commit(writer: &mut IndexWriter) -> Result<(), TantivyError> {
 /// merge still reclaims the bytes. Only a failed commit terminates the
 /// drain loop (`Err(())`), matching [`commit_with_retry`].
 #[cfg(target_os = "linux")]
-async fn purge_hard_forget(writer: &mut IndexWriter, commit_gen: &AtomicU64) -> Result<(), ()> {
-    commit_with_retry(writer, commit_gen)?;
+/// Apply `ops` and group-commit, entirely off the shard's reactor thread.
+/// See the twin in [`super::statement`] for why: every `IndexWriter` call
+/// blocks on tantivy's own threads, and doing that from inside the glommio
+/// executor turned a ~27 ms batch-plus-commit into a ~72 s shard-wide stall.
+#[cfg(target_os = "linux")]
+async fn flush_off_reactor(
+    writer: IndexWriter,
+    fields: MemoryFields,
+    ops: Vec<MemoryTextOp>,
+    commit_gen: &Arc<AtomicU64>,
+) -> (IndexWriter, bool) {
+    let gen = Arc::clone(commit_gen);
+    glommio::executor()
+        .spawn_blocking(move || {
+            let mut writer = writer;
+            for op in &ops {
+                if let Err(err) = apply_op(&mut writer, &fields, op) {
+                    warn!(
+                        target: "brain_ops::text_indexer",
+                        error = %err,
+                        "memory text indexer write failed; skipping op",
+                    );
+                }
+            }
+            let ok = commit_with_retry(&mut writer, &gen).is_ok();
+            (writer, ok)
+        })
+        .await
+}
 
+async fn purge_merged_deletes(writer: &mut IndexWriter) {
     let with_deletes: Vec<SegmentId> = match writer.index().searchable_segment_metas() {
         Ok(metas) => metas
             .iter()
@@ -499,7 +523,7 @@ async fn purge_hard_forget(writer: &mut IndexWriter, commit_gen: &AtomicU64) -> 
                 error = %err,
                 "hard forget: could not read segment metas for purge; bytes evicted on next merge",
             );
-            return Ok(());
+            return;
         }
     };
 
@@ -507,7 +531,7 @@ async fn purge_hard_forget(writer: &mut IndexWriter, commit_gen: &AtomicU64) -> 
         // No segment retained the deleted doc (e.g. it was added and
         // deleted before ever being committed to a segment) — nothing to
         // compact.
-        return Ok(());
+        return;
     }
 
     if let Err(err) = writer.merge(&with_deletes).await {
@@ -516,7 +540,7 @@ async fn purge_hard_forget(writer: &mut IndexWriter, commit_gen: &AtomicU64) -> 
             error = %err,
             "hard forget: force-merge failed; bytes evicted on next merge",
         );
-        return Ok(());
+        return;
     }
 
     if let Err(err) = writer.garbage_collect_files().await {
@@ -526,8 +550,6 @@ async fn purge_hard_forget(writer: &mut IndexWriter, commit_gen: &AtomicU64) -> 
             "hard forget: garbage collect failed; superseded segment files linger until next GC",
         );
     }
-
-    Ok(())
 }
 
 /// Convenience: hold both the dispatcher and the receiver until

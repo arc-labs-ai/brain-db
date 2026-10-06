@@ -25,7 +25,14 @@ const PERSON_TYPE: &str = "brain:Person";
 
 fn ensure_person_type(metadata: &MetadataDb) -> EntityTypeId {
     let wtxn = metadata.write_txn().expect("wtxn");
-    let id = entity_type_intern(&wtxn, PERSON_TYPE, Vec::new(), 0).expect("type intern");
+    let id = entity_type_intern(
+        &wtxn,
+        brain_core::NamespaceId::SYSTEM.raw(),
+        PERSON_TYPE,
+        Vec::new(),
+        0,
+    )
+    .expect("type intern");
     wtxn.commit().expect("commit");
     id
 }
@@ -98,7 +105,14 @@ fn current_person_type(metadata: &Arc<MetadataDb>) -> EntityTypeId {
     // Person type was already interned by fresh_with_metadata;
     // re-call intern to get its id back.
     let wtxn = metadata.write_txn().expect("wtxn");
-    let id = entity_type_intern(&wtxn, PERSON_TYPE, Vec::new(), 0).expect("intern");
+    let id = entity_type_intern(
+        &wtxn,
+        brain_core::NamespaceId::SYSTEM.raw(),
+        PERSON_TYPE,
+        Vec::new(),
+        0,
+    )
+    .expect("intern");
     wtxn.commit().expect("commit");
     id
 }

@@ -35,7 +35,14 @@ fn fresh_metadata(dir: &Path) -> MetadataDb {
 /// Intern a Person entity type if absent; return its id.
 fn ensure_person_type(metadata: &mut MetadataDb) -> EntityTypeId {
     let wtxn = metadata.write_txn().expect("wtxn");
-    let id = entity_type_intern(&wtxn, PERSON_TYPE, Vec::new(), 0).expect("type intern");
+    let id = entity_type_intern(
+        &wtxn,
+        brain_core::NamespaceId::SYSTEM.raw(),
+        PERSON_TYPE,
+        Vec::new(),
+        0,
+    )
+    .expect("type intern");
     wtxn.commit().expect("commit");
     id
 }

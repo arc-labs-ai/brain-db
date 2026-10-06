@@ -16,8 +16,8 @@
 use brain_metadata::extractor::ops::extractor_drop_namespace;
 use brain_metadata::relation::types::{relation_type_drop_one, relation_type_drop_schema_declared};
 use brain_metadata::schema::predicate::{predicate_drop_one, predicate_drop_schema_declared};
-use brain_metadata::schema::store::schema_upload;
-use brain_protocol::schema::{parse_schema, validate};
+use brain_metadata::schema::store::{declared_context_wtxn, schema_upload_with_mode, SourceMode};
+use brain_protocol::schema::{parse_schema, validate_with, DeclaredContext};
 use brain_protocol::schema_drop_target;
 use redb::WriteTransaction;
 
@@ -69,7 +69,25 @@ pub fn apply_upsert_schema(
             ))
         })?
     };
-    let validated = validate(&parsed).map_err(|errs| {
+    // A destructive phase (REPLACE / DROP) carries the namespace's whole new
+    // schema and overwrites the stored source, so it validates standalone. A
+    // plain UPLOAD is additive: it may reference types the active schema
+    // already declares, so it re-validates against the same merge target the
+    // handler used — otherwise WAL replay would reject a document the server
+    // accepted.
+    let destructive = *replace_all || !drops.is_empty();
+    let mode = if destructive {
+        SourceMode::Replace
+    } else {
+        SourceMode::Merge
+    };
+    let ctx = if destructive {
+        DeclaredContext::default()
+    } else {
+        declared_context_wtxn(wtxn, &parsed.namespace)
+            .map_err(|e| ApplyError::Metadata(format!("declared context: {e}")))?
+    };
+    let validated = validate_with(&parsed, &ctx).map_err(|errs| {
         ApplyError::Invariant(format!("UpsertSchema re-validate failed: {errs:?}"))
     })?;
 
@@ -80,7 +98,7 @@ pub fn apply_upsert_schema(
     // identical state. UPLOAD carries an empty delta and skips both branches.
     let dropped = apply_schema_delta(wtxn, &namespace, *replace_all, drops)?;
 
-    let version = schema_upload(wtxn, &validated, *created_at_unix_nanos)
+    let version = schema_upload_with_mode(wtxn, &validated, *created_at_unix_nanos, mode)
         .map_err(|e| ApplyError::Metadata(format!("schema_upload: {e}")))?;
 
     Ok(PhaseAck::UpsertedSchema {

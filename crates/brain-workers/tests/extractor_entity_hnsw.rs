@@ -146,6 +146,7 @@ impl LlmClient for AlwaysYesLlm {
     fn complete<'a>(&'a self, _request: LlmRequest) -> LlmFuture<'a> {
         Box::pin(async {
             Ok(LlmResponse {
+                truncated: false,
                 content: "YES 0.95".to_string(),
                 tokens_in: 8,
                 tokens_out: 4,

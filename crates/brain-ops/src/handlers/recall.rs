@@ -991,7 +991,7 @@ fn order_by_answer_relevance(
             let sole_cos = out
                 .iter()
                 .find(|m| m.memory_id == sole)
-                .map(&c)
+                .map(c)
                 .unwrap_or(0.0);
             if (best_c - sole_cos) < TOPICAL_COSINE_RESOLUTION {
                 out.sort_by(|a, b| {
@@ -3593,11 +3593,18 @@ pub(crate) fn fetch_enrichment_for(
                         format!("statement:{:x?}", sid.to_bytes())
                     }
                 };
+                // The object's identity, not just its rendering. A literal
+                // stays `None` even when its text equals an entity's name.
+                let object_entity_id = match &stmt.object {
+                    brain_core::StatementObject::Entity(eid) => Some(eid.to_bytes()),
+                    _ => None,
+                };
                 enriched_statements.push(EnrichedStatement {
                     id: stmt.id.to_bytes(),
                     subject_name,
                     predicate,
                     object_label,
+                    object_entity_id,
                     confidence: stmt.confidence,
                     event_at_unix_nanos: stmt.event_at_unix_nanos,
                 });

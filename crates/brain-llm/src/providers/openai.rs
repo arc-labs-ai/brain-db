@@ -287,6 +287,12 @@ struct OpenAIResponseBody {
 #[derive(Deserialize, Debug)]
 struct OpenAIChoice {
     message: OpenAIChoiceMessage,
+    /// `"stop"` on a clean finish, `"length"` when the output hit
+    /// `max_tokens`. Absent on some proxies, so it defaults to `None`
+    /// and an unknown reason is treated as NOT truncated — a false
+    /// "truncated" would mask a real schema failure.
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -315,6 +321,12 @@ fn decode_openai_response(payload: OpenAIResponseBody) -> Result<LlmResponse, Ll
         });
     }
 
+    let truncated = payload
+        .choices
+        .first()
+        .and_then(|c| c.finish_reason.as_deref())
+        == Some("length");
+
     let cost_micro_usd = payload.usage.prompt_tokens * PRICE_INPUT_PER_TOKEN_DEFAULT
         + payload.usage.completion_tokens * PRICE_OUTPUT_PER_TOKEN_DEFAULT;
 
@@ -328,6 +340,7 @@ fn decode_openai_response(payload: OpenAIResponseBody) -> Result<LlmResponse, Ll
         cache_read_input_tokens: 0,
         cost_micro_usd,
         model_version: payload.model,
+        truncated,
     })
 }
 
@@ -455,6 +468,7 @@ mod tests {
         let payload = OpenAIResponseBody {
             model: "gpt-4o-mini-2024-07-18".into(),
             choices: vec![OpenAIChoice {
+                finish_reason: None,
                 message: OpenAIChoiceMessage {
                     content: Some("the answer".into()),
                 },
@@ -492,6 +506,7 @@ mod tests {
         let payload = OpenAIResponseBody {
             model: "m".into(),
             choices: vec![OpenAIChoice {
+                finish_reason: None,
                 message: OpenAIChoiceMessage { content: None },
             }],
             usage: OpenAIUsage {
@@ -508,6 +523,7 @@ mod tests {
         let payload = OpenAIResponseBody {
             model: "m".into(),
             choices: vec![OpenAIChoice {
+                finish_reason: None,
                 message: OpenAIChoiceMessage {
                     content: Some(String::new()),
                 },
@@ -542,5 +558,50 @@ mod tests {
     fn parse_retry_after_absent_returns_zero() {
         let headers = reqwest::header::HeaderMap::new();
         assert_eq!(parse_retry_after(&headers), 0);
+    }
+
+    // ── truncation detection ────────────────────────────────────────────
+
+    fn body_with_finish(reason: Option<&str>) -> OpenAIResponseBody {
+        OpenAIResponseBody {
+            model: "gpt-4o-mini".into(),
+            choices: vec![OpenAIChoice {
+                message: OpenAIChoiceMessage {
+                    content: Some("{\"a\":1}".into()),
+                },
+                finish_reason: reason.map(str::to_string),
+            }],
+            usage: OpenAIUsage {
+                prompt_tokens: 10,
+                completion_tokens: 20,
+            },
+        }
+    }
+
+    #[test]
+    fn finish_reason_length_marks_the_response_truncated() {
+        // The signal that tells a budget problem from a schema problem.
+        // Without it, output cut mid-JSON is indistinguishable from a
+        // model that cannot follow the schema, and the caller burns a
+        // second identical call to learn nothing.
+        let r = decode_openai_response(body_with_finish(Some("length"))).unwrap();
+        assert!(r.truncated);
+    }
+
+    #[test]
+    fn a_clean_stop_is_not_truncated() {
+        let r = decode_openai_response(body_with_finish(Some("stop"))).unwrap();
+        assert!(!r.truncated);
+    }
+
+    #[test]
+    fn an_absent_or_unknown_finish_reason_is_not_truncated() {
+        // Fail toward "not truncated": a false positive would swallow a
+        // real schema failure behind a misleading budget message, and some
+        // proxies omit the field entirely.
+        for reason in [None, Some("content_filter"), Some("tool_calls")] {
+            let r = decode_openai_response(body_with_finish(reason)).unwrap();
+            assert!(!r.truncated, "{reason:?} must not read as truncated");
+        }
     }
 }

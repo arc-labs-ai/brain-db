@@ -4,8 +4,21 @@
 //! `schema_version` is behind the current schema. v1 does NOT
 //! write a per-row flag (that's a `StatementRow.flags` bump, post-
 //! v1); instead, the worker logs the count + exposes it via
-//! metrics. The schema-migration worker is the side that
-//! re-extracts.
+//! metrics.
+//!
+//! ## What re-extracts, and when
+//!
+//! Nothing here. This worker only counts.
+//!
+//! Re-extraction happens in the schema-migration worker, and only when
+//! `[workers.extractor] reextract_on_schema_change` is on — it is off by
+//! default because re-extraction is one LLM call per memory. With it off,
+//! that worker logs how many memories fell outside the new schema and the
+//! operator re-aligns them with `POST /v1/extract/backfill`.
+//!
+//! (This paragraph used to read "the schema-migration worker is the side
+//! that re-extracts". That worker only flipped an advisory flag bit, so
+//! the answer to "what re-extracts?" was: nothing, silently.)
 //!
 //! ## v1 scope cuts
 //!
@@ -13,9 +26,13 @@
 //!   schema bump). Operators query stale count via the
 //!   `sweeper_swept_total{worker="stale_extraction_detector"}`
 //!   metric.
-//! - Per-namespace schema version lookup is approximated as
-//!   "max schema_version across all `SCHEMA_ACTIVE_VERSIONS_TABLE`
-//!   rows"; per-(memory, namespace) precise lookup is post-v1.
+//! - The current schema version is the MAX across every namespace's
+//!   `SCHEMA_ACTIVE_VERSIONS_TABLE` row, not this namespace's own. On a
+//!   multi-tenant shard that over-counts: one tenant uploading their 9th
+//!   schema makes every other tenant's v1-era rows read as stale. The
+//!   count is an operator hint, never a correctness input — nothing gates
+//!   on it — but read it as an upper bound, not a total. A precise
+//!   per-(memory, namespace) lookup is post-v1.
 
 use std::future::Future;
 use std::pin::Pin;

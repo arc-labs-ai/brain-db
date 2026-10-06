@@ -242,7 +242,14 @@ mod tests {
         let to = {
             // Distinct entity_type so we exercise interning.
             let wtxn = db.write_txn().unwrap();
-            let org_type = entity_type_intern(&wtxn, "Organization", Vec::new(), NOW).unwrap();
+            let org_type = entity_type_intern(
+                &wtxn,
+                brain_core::NamespaceId::SYSTEM.raw(),
+                "Organization",
+                Vec::new(),
+                NOW,
+            )
+            .unwrap();
             let e = brain_core::Entity::new_active(
                 EntityId::new(),
                 org_type,

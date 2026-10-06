@@ -104,7 +104,14 @@ fn recover_rebuilds_statements_with_join() {
     // Set up entity + predicate + statement.
     let type_id: EntityTypeId = {
         let wtxn = metadata.write_txn().expect("wtxn");
-        let id = entity_type_intern(&wtxn, "brain:Person", Vec::new(), 0).expect("type intern");
+        let id = entity_type_intern(
+            &wtxn,
+            brain_core::NamespaceId::SYSTEM.raw(),
+            "brain:Person",
+            Vec::new(),
+            0,
+        )
+        .expect("type intern");
         wtxn.commit().expect("commit");
         id
     };

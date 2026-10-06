@@ -63,8 +63,8 @@ pub use entity::trigram::{
     lookup_candidates_by_trigram, remove_entity_trigrams, trigrams_of_entity, TrigramOpError,
 };
 pub use entity::types::{
-    entity_type_intern, entity_type_label_qnames, entity_type_lookup_by_name,
-    render_declared_entity_types_block, EntityTypeOpError,
+    entity_type_intern, entity_type_label_qnames, entity_type_lookup, entity_type_lookup_rtxn,
+    entity_type_name_by_id, render_declared_entity_types_block, EntityTypeOpError,
 };
 pub use extraction::queue::{
     extraction_queue_drain, extraction_queue_enqueue, extraction_queue_len,
@@ -109,9 +109,9 @@ pub use schema::kind::{
 };
 pub use schema::predicate::{
     predicate_embedding_get, predicate_embedding_put, predicate_get, predicate_intern,
-    predicate_list, predicate_lookup_by_qname, predicate_retention_seconds, predicate_review_list,
-    predicate_review_record, predicate_set_retention, render_declared_predicates_block,
-    PredicateOpError,
+    predicate_intern_with_subject, predicate_list, predicate_lookup_by_qname,
+    predicate_retention_seconds, predicate_review_list, predicate_review_record,
+    predicate_set_retention, render_declared_predicates_block, PredicateOpError,
 };
 pub use schema::store::{
     schema_active, schema_active_row, schema_get, schema_list, schema_namespaces, schema_upload,

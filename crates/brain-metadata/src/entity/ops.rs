@@ -2099,8 +2099,13 @@ mod tests {
             let wtxn = db.write_txn().unwrap();
             {
                 let mut t = wtxn.open_table(ENTITY_TYPES_TABLE).unwrap();
-                let row =
-                    EntityTypeDefinition::new(EntityTypeId(7), "Project".into(), Vec::new(), NOW);
+                let row = EntityTypeDefinition::new(
+                    EntityTypeId(7),
+                    brain_core::NamespaceId::SYSTEM.raw(),
+                    "Project".into(),
+                    Vec::new(),
+                    NOW,
+                );
                 t.insert(&7u32, &row).unwrap();
             }
             wtxn.commit().unwrap();
@@ -2236,8 +2241,13 @@ mod tests {
             let wtxn = db.write_txn().unwrap();
             {
                 let mut t = wtxn.open_table(ENTITY_TYPES_TABLE).unwrap();
-                let row =
-                    EntityTypeDefinition::new(EntityTypeId(7), "Project".into(), Vec::new(), NOW);
+                let row = EntityTypeDefinition::new(
+                    EntityTypeId(7),
+                    brain_core::NamespaceId::SYSTEM.raw(),
+                    "Project".into(),
+                    Vec::new(),
+                    NOW,
+                );
                 t.insert(&7u32, &row).unwrap();
             }
             wtxn.commit().unwrap();
@@ -2290,8 +2300,13 @@ mod tests {
             let wtxn = db.write_txn().unwrap();
             {
                 let mut t = wtxn.open_table(ENTITY_TYPES_TABLE).unwrap();
-                let row =
-                    EntityTypeDefinition::new(EntityTypeId(7), "Project".into(), Vec::new(), NOW);
+                let row = EntityTypeDefinition::new(
+                    EntityTypeId(7),
+                    brain_core::NamespaceId::SYSTEM.raw(),
+                    "Project".into(),
+                    Vec::new(),
+                    NOW,
+                );
                 t.insert(&7u32, &row).unwrap();
             }
             wtxn.commit().unwrap();

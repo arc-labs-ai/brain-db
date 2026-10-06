@@ -48,6 +48,10 @@ pub struct MaterializeDeps {
     pub entity_type_qnames: Arc<Vec<String>>,
     pub model_router: Option<Arc<ModelRouter>>,
     pub llm_cache: Option<Arc<Mutex<LlmCacheDb>>>,
+    /// Output-token ceiling for one LLM extraction call
+    /// (`[extractors.llm] max_tokens`). `None` uses
+    /// [`crate::llm::DEFAULT_LLM_MAX_TOKENS`].
+    pub llm_max_tokens: Option<u32>,
 }
 
 /// Materialise a pattern extractor from a persisted row. Decodes
@@ -268,6 +272,7 @@ fn materialize_llm_extractor_core(
         threshold,
         cost_budget,
         cache_ttl,
+        deps.llm_max_tokens,
     );
     Ok(extractor)
 }
@@ -677,6 +682,7 @@ mod tests {
             "brain:Project".to_string(),
         ]);
         let deps = MaterializeDeps {
+            llm_max_tokens: None,
             classifier_model: Some(Arc::new(DummyModel)),
             entity_type_qnames: labels.clone(),
             model_router: None,
@@ -863,6 +869,7 @@ mod tests {
         );
         let r = row(7, ExtractorKind::Llm, blob);
         let deps = MaterializeDeps {
+            llm_max_tokens: None,
             classifier_model: None,
             model_router: Some(anthropic_router()),
             llm_cache: None,
@@ -924,6 +931,7 @@ mod tests {
         );
         let r = row(1, ExtractorKind::Llm, blob);
         let deps = MaterializeDeps {
+            llm_max_tokens: None,
             classifier_model: None,
             model_router: Some(anthropic_router()),
             llm_cache: None,
@@ -945,6 +953,7 @@ mod tests {
         );
         let r = row(1, ExtractorKind::Llm, blob);
         let deps = MaterializeDeps {
+            llm_max_tokens: None,
             classifier_model: None,
             model_router: Some(anthropic_router()),
             llm_cache: None,
@@ -959,6 +968,7 @@ mod tests {
         let blob = llm_ast("p", vec![ExtractorField::Model("claude-haiku-4-5".into())]);
         let r = row(1, ExtractorKind::Llm, blob);
         let deps = MaterializeDeps {
+            llm_max_tokens: None,
             classifier_model: None,
             model_router: Some(anthropic_router()),
             llm_cache: None,
@@ -973,6 +983,7 @@ mod tests {
         let blob = llm_ast("p", vec![ExtractorField::Prompt("x".into())]);
         let r = row(1, ExtractorKind::Llm, blob);
         let deps = MaterializeDeps {
+            llm_max_tokens: None,
             classifier_model: None,
             model_router: Some(anthropic_router()),
             llm_cache: None,
@@ -995,6 +1006,7 @@ mod tests {
         );
         let r = row(1, ExtractorKind::Llm, blob);
         let deps = MaterializeDeps {
+            llm_max_tokens: None,
             classifier_model: None,
             model_router: Some(anthropic_router()),
             llm_cache: None,
@@ -1019,6 +1031,7 @@ mod tests {
         );
         let r = row(1, ExtractorKind::Llm, blob);
         let deps = MaterializeDeps {
+            llm_max_tokens: None,
             classifier_model: None,
             model_router: Some(anthropic_router()),
             llm_cache: None,
@@ -1073,6 +1086,7 @@ mod tests {
             ),
         );
         let deps = MaterializeDeps {
+            llm_max_tokens: None,
             classifier_model: None,
             model_router: Some(anthropic_router()),
             llm_cache: None,

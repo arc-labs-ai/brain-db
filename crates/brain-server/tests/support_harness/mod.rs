@@ -183,6 +183,7 @@ pub async fn start_full_pipeline_in(
     start_in_with(data_dir, 1, move |dd| {
         let mut cfg = ShardSpawnConfig::new(dd, dispatcher.clone());
         cfg.llm = LlmSpawnConfig {
+            extractor_max_tokens: None,
             api_key: api_key.clone(),
             model: None,
         };

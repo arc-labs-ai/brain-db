@@ -104,6 +104,18 @@ pub struct LlmExtractorInner {
     pub timeout: Duration,
 }
 
+/// Output-token ceiling for one LLM extraction call when the operator
+/// sets none.
+///
+/// Was 1024. The tier asks for a memory's whole typed graph as one JSON
+/// document, so the ceiling scales with how much the memory SAYS, not how
+/// long it is — and a single dense paragraph (eight entities with their
+/// statements and relations) runs past 1024. The JSON was then cut
+/// mid-token and read downstream as malformed output, so the memory
+/// landed with entities but zero statements and zero relations, reported
+/// as "schema validation failed twice".
+pub const DEFAULT_LLM_MAX_TOKENS: u32 = 4096;
+
 impl LlmExtractor {
     /// Fully-wired extractor.
     #[allow(clippy::too_many_arguments)]
@@ -162,6 +174,7 @@ impl LlmExtractor {
         confidence_threshold: f32,
         cost_budget: Option<CostBudget>,
         cache_ttl: Duration,
+        max_tokens: Option<u32>,
     ) -> Self {
         let pricing = Pricing::for_model(client.model());
         Self::new(
@@ -180,7 +193,7 @@ impl LlmExtractor {
                 response_schema,
                 schema_compiled,
                 pricing,
-                max_tokens: 1024,
+                max_tokens: max_tokens.unwrap_or(DEFAULT_LLM_MAX_TOKENS),
                 temperature: 0.0,
                 timeout: Duration::from_secs(30),
             },
@@ -1574,6 +1587,27 @@ impl Extractor for LlmExtractor {
                 },
                 Some(schema) => match validate_against(schema, &resp1.content) {
                     Ok(v) => v,
+                    // The output was cut off at `max_tokens`. Retrying is
+                    // pointless and not free: the prompt is unchanged, so
+                    // the model regenerates the same prefix and stops at
+                    // the same ceiling, and the operator pays twice to be
+                    // told "schema validation failed twice" about a
+                    // response that never had a schema problem. Fail once,
+                    // and name the budget.
+                    Err(_) if resp1.truncated => {
+                        return ExtractionResult::failure(
+                            format!(
+                                "response truncated at max_tokens={} \
+                                 (raise [extractors.llm] max_tokens, or the memory is \
+                                 too dense to extract in one call)",
+                                inner.max_tokens
+                            ),
+                            started,
+                            started,
+                        )
+                        .with_cost(cost_micro)
+                        .with_failure_class(ExtractionFailureClass::Permanent);
+                    }
                     Err(err1) => {
                         // Retry with the validation error in the prompt.
                         request.messages.push(brain_llm::LlmMessage {
@@ -1609,7 +1643,22 @@ impl Extractor for LlmExtractor {
                             .saturating_add(resp2.tokens_out);
                         match validate_against(schema, &resp2.content) {
                             Ok(v) => v,
-                            Err(_) => {
+                            // The retry ran long even though the first
+                            // attempt did not: same ceiling, same verdict.
+                            Err(_) if resp2.truncated => {
+                                return ExtractionResult::failure(
+                                    format!(
+                                        "retry truncated at max_tokens={} \
+                                         (first attempt failed validation: {err1})",
+                                        inner.max_tokens
+                                    ),
+                                    started,
+                                    started,
+                                )
+                                .with_cost(cost_micro)
+                                .with_failure_class(ExtractionFailureClass::Permanent);
+                            }
+                            Err(err2) => {
                                 // Two valid round-trips that both failed schema
                                 // validation is a prompt/schema mismatch, not a
                                 // provider blip — retrying the same prompt won't
@@ -1619,8 +1668,21 @@ impl Extractor for LlmExtractor {
                                 // budget gate counts it (both calls counted
                                 // in cost_micro_usd) — else a malformed prompt
                                 // burns two API calls every cycle unbounded.
+                                // Name BOTH errors. `schema validation failed
+                                // twice` alone is unactionable: it says the
+                                // model disagreed with the compiled schema but
+                                // not on what, so an operator cannot tell a
+                                // wrong prompt from a wrong schema without
+                                // attaching a debugger to a production worker.
+                                // Both attempts are reported because they often
+                                // differ — the retry carries err1 in its prompt,
+                                // so a *changed* err2 means the model moved and
+                                // an *identical* one means it did not.
                                 return ExtractionResult::failure(
-                                    "schema validation failed twice",
+                                    format!(
+                                        "schema validation failed twice \
+                                         (attempt 1: {err1}; attempt 2: {err2})"
+                                    ),
                                     started,
                                     started,
                                 )

@@ -171,9 +171,9 @@ mod linux_main {
     use crate::shard::{
         spawn_shard, AmbiguityResolverSpawnConfig, AutoEdgeSpawnConfig, CausalEdgeSpawnConfig,
         ConfidenceSweepSpawnConfig, ExtractorSpawnConfig, ExtractorTuningSpawnConfig,
-        IndexSpawnConfig, LlmCacheSweepSpawnConfig, RerankSpawnConfig, ShardHandle, ShardJoiner,
-        ShardSpawnConfig, StatementReclaimSpawnConfig, SupersessionSweeperSpawnConfig,
-        TemporalEdgeSpawnConfig,
+        IndexSpawnConfig, LlmCacheSweepSpawnConfig, PredicateGcSpawnConfig, RerankSpawnConfig,
+        ShardHandle, ShardJoiner, ShardSpawnConfig, StatementReclaimSpawnConfig,
+        SupersessionSweeperSpawnConfig, TemporalEdgeSpawnConfig,
     };
 
     /// Errors surfaced by [`build_dispatcher`]. Hand-rolled `Display`
@@ -260,6 +260,9 @@ mod linux_main {
             let llm_cfg = crate::shard::LlmSpawnConfig {
                 api_key: cfg.llm.api_key.clone(),
                 model: cfg.llm.model.clone(),
+                // Preflight only checks the credential; the ceiling is
+                // irrelevant to it.
+                extractor_max_tokens: None,
             };
             match preflight_llm_auth(&llm_cfg) {
                 LlmPreflight::Ok => {
@@ -540,6 +543,7 @@ mod linux_main {
             spawn_cfg.llm = crate::shard::LlmSpawnConfig {
                 api_key: cfg.llm.api_key.clone(),
                 model: cfg.llm.model.clone(),
+                extractor_max_tokens: Some(cfg.extractors.llm.max_tokens),
             };
             // Ferry the operator's `[workers.auto_edge]`
             // overrides into the per-shard spawn config so the
@@ -568,6 +572,7 @@ mod linux_main {
                 channel_capacity: cfg.workers.extractor.channel_capacity,
                 skip_already_extracted: cfg.workers.extractor.skip_already_extracted,
                 batch_size: cfg.workers.extractor.batch_size,
+                reextract_on_schema_change: cfg.workers.extractor.reextract_on_schema_change,
             };
             // Ferry the operator's `[workers.temporal_edge]`
             // overrides into the per-shard spawn config.
@@ -634,6 +639,12 @@ mod linux_main {
             };
             // Ferry the per-worker cadence / gate knobs that previously
             // only had bespoke `BRAIN_*` env vars.
+            spawn_cfg.predicate_gc = PredicateGcSpawnConfig {
+                enabled: cfg.workers.predicate_gc.enabled,
+                grace_seconds: cfg.workers.predicate_gc.grace_seconds,
+                period_seconds: cfg.workers.predicate_gc.period_seconds,
+                dry_run: cfg.workers.predicate_gc.dry_run,
+            };
             spawn_cfg.statement_reclaim = StatementReclaimSpawnConfig {
                 enabled: cfg.workers.statement_reclaim.enabled,
                 grace_seconds: cfg.workers.statement_reclaim.grace_seconds,
@@ -665,6 +676,10 @@ mod linux_main {
                 classifier_threshold: cfg.extractors.classifier.threshold,
                 hype_num_questions: cfg.extractors.hype.num_questions,
             };
+            // The deployment's shard count. A shard reads only its own
+            // data, so handlers need this to say whether a per-shard answer
+            // is the whole answer (`SPACE_LIST.cross_shard_complete`).
+            spawn_cfg.total_shards = cfg.storage.shard_count;
             // Ferry the tantivy commit cadence.
             spawn_cfg.index = IndexSpawnConfig {
                 tantivy_commit_n: cfg.index.tantivy_commit_n,

@@ -218,6 +218,12 @@ pub(crate) enum ShardRequest {
     StorageStats {
         reply_tx: Sender<StorageStatsSnapshot>,
     },
+    /// Snapshot the predicate review queue — the qnames this shard's
+    /// corpus coined that no schema declared, with sighting counts.
+    /// Read-only operator diagnostic; not on any hot path.
+    PredicateReview {
+        reply_tx: Sender<Vec<(String, u64)>>,
+    },
     /// Pause / resume / run-now a single background worker.
     /// Replies with `true` iff the named worker exists.
     WorkerControl {
@@ -443,6 +449,11 @@ pub enum AuditPage {
 pub struct ShardSpawnConfig {
     pub channel_capacity: usize,
     pub pin_cpu: Option<usize>,
+    /// How many shards this deployment runs in total (`[storage]
+    /// shard_count`). A shard only ever reads its own data, so handlers
+    /// need this to say whether their answer covers the deployment —
+    /// `SPACE_LIST`'s `cross_shard_complete`. Defaults to 1.
+    pub total_shards: usize,
     /// Root data directory. Per-shard subdir is `<data_dir>/<shard_id>/`.
     pub data_dir: PathBuf,
     /// Initial arena capacity in slots. The arena is recovery-only (live
@@ -474,6 +485,7 @@ pub struct ShardSpawnConfig {
     pub causal_edge: CausalEdgeSpawnConfig,
     /// Retracted-statement GC worker knobs. Off by default.
     pub statement_reclaim: StatementReclaimSpawnConfig,
+    pub predicate_gc: PredicateGcSpawnConfig,
     /// Superseded-statement GC worker knobs. Off by default.
     pub supersession_sweeper: SupersessionSweeperSpawnConfig,
     /// Entity merge-review-queue sweeper cadence.
@@ -515,6 +527,9 @@ pub struct ShardSpawnConfig {
 pub struct LlmSpawnConfig {
     pub api_key: Option<String>,
     pub model: Option<String>,
+    /// `[extractors.llm] max_tokens`. `None` leaves the LLM extractor on
+    /// its own default.
+    pub extractor_max_tokens: Option<u32>,
 }
 
 /// Knobs ferried from `Config.rerank` into the spawn path.
@@ -571,6 +586,11 @@ pub struct ExtractorSpawnConfig {
     /// Memories the extractor worker batches into one classifier
     /// forward pass per cycle iteration.
     pub batch_size: usize,
+    /// Re-extract a namespace's existing memories after a SCHEMA_UPLOAD.
+    /// Read by the SchemaMigrationWorker, not the extractor worker — it
+    /// lives under `[workers.extractor]` because it governs extractor
+    /// spend, which is the only thing about it an operator has to weigh.
+    pub reextract_on_schema_change: bool,
 }
 
 impl Default for ExtractorSpawnConfig {
@@ -582,6 +602,7 @@ impl Default for ExtractorSpawnConfig {
             channel_capacity: 1024,
             skip_already_extracted: true,
             batch_size: brain_workers::DEFAULT_EXTRACTOR_BATCH_SIZE,
+            reextract_on_schema_change: false,
         }
     }
 }
@@ -673,6 +694,27 @@ impl Default for StatementReclaimSpawnConfig {
             enabled: false,
             grace_seconds: brain_workers::workers::statement_reclaim::DEFAULT_GRACE_SECONDS,
             period_seconds: brain_workers::workers::statement_reclaim::DEFAULT_PERIOD_SECONDS,
+        }
+    }
+}
+
+/// Knobs ferried from `Config.workers.predicate_gc` into the shard spawn
+/// path. Coined-predicate GC is off by default.
+#[derive(Clone, Copy, Debug)]
+pub struct PredicateGcSpawnConfig {
+    pub enabled: bool,
+    pub grace_seconds: u64,
+    pub period_seconds: u64,
+    pub dry_run: bool,
+}
+
+impl Default for PredicateGcSpawnConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            grace_seconds: brain_workers::workers::predicate_gc::DEFAULT_GRACE_SECONDS,
+            period_seconds: brain_workers::workers::predicate_gc::DEFAULT_PERIOD_SECONDS,
+            dry_run: false,
         }
     }
 }
@@ -801,6 +843,7 @@ impl ShardSpawnConfig {
         Self {
             channel_capacity: 1024,
             pin_cpu: None,
+            total_shards: 1,
             data_dir: data_dir.into(),
             arena_initial_capacity_slots: DEFAULT_INITIAL_CAPACITY_SLOTS,
             wal_config: WalConfig::default(),
@@ -810,6 +853,7 @@ impl ShardSpawnConfig {
             temporal_edge: TemporalEdgeSpawnConfig::default(),
             causal_edge: CausalEdgeSpawnConfig::default(),
             statement_reclaim: StatementReclaimSpawnConfig::default(),
+            predicate_gc: PredicateGcSpawnConfig::default(),
             supersession_sweeper: SupersessionSweeperSpawnConfig::default(),
             ambiguity_resolver: AmbiguityResolverSpawnConfig::default(),
             confidence_sweep: ConfidenceSweepSpawnConfig::default(),
@@ -1305,6 +1349,23 @@ impl ShardHandle {
         let (reply_tx, reply_rx) = flume::bounded(1);
         self.tx
             .send_async(ShardRequest::StorageStats { reply_tx })
+            .await
+            .map_err(|_| ShardError::ShardDisconnected)?;
+        reply_rx
+            .recv_async()
+            .await
+            .map_err(|_| ShardError::ShardDisconnected)
+    }
+
+    /// Snapshot this shard's predicate review queue: `(qname, count)`
+    /// pairs, descending by count. These are predicates the extractor
+    /// coined because no schema declared them — the statements are
+    /// committed and queryable (Brain's vocabulary is open), so this is a
+    /// promotion shortlist, not an error log.
+    pub async fn predicate_review(&self) -> Result<Vec<(String, u64)>, ShardError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.tx
+            .send_async(ShardRequest::PredicateReview { reply_tx })
             .await
             .map_err(|_| ShardError::ShardDisconnected)?;
         reply_rx
@@ -2688,11 +2749,13 @@ pub fn spawn_shard(
     };
     let wal_config = cfg.wal_config;
     let summarizer = cfg.summarizer;
+    let total_shards_for_ops = cfg.total_shards;
     let auto_edge_spawn_cfg_for_closure = cfg.auto_edge.clone();
     let extractor_spawn_cfg_for_closure = cfg.extractor.clone();
     let temporal_edge_spawn_cfg_for_closure = cfg.temporal_edge.clone();
     let causal_edge_spawn_cfg_for_closure = cfg.causal_edge.clone();
     let statement_reclaim_spawn_cfg = cfg.statement_reclaim;
+    let predicate_gc_spawn_cfg = cfg.predicate_gc;
     let supersession_sweeper_spawn_cfg = cfg.supersession_sweeper;
     let ambiguity_resolver_spawn_cfg = cfg.ambiguity_resolver;
     let confidence_sweep_spawn_cfg = cfg.confidence_sweep;
@@ -3443,7 +3506,8 @@ pub fn spawn_shard(
                 .with_recall_metrics(
                     retriever_metrics_for_closure.clone(),
                     query_metrics_for_closure.clone(),
-                ),
+                )
+                .with_shard_count(total_shards_for_ops),
             );
 
             // Spawn the per-shard fanout task: drains the in-process
@@ -3916,6 +3980,24 @@ pub fn spawn_shard(
                     .expect("register StatementReclaimWorker");
             }
 
+            // PredicateGcWorker — reclaims coined (ImplicitFromWrite)
+            // predicates once no live statement references them. Off by
+            // default (`[workers.predicate_gc] enabled = false`); a disabled
+            // worker is simply not registered, like every other optional one.
+            // Schema-declared predicates are never candidates — undeclaring
+            // those is SCHEMA_DROP's job. Closes the vocabulary side of the
+            // reclaim story, after statements are hard-reclaimed above.
+            if predicate_gc_spawn_cfg.enabled {
+                let worker = brain_workers::workers::predicate_gc::PredicateGcWorker::new()
+                    .set_enabled(true)
+                    .with_grace_seconds(predicate_gc_spawn_cfg.grace_seconds)
+                    .with_period_seconds(predicate_gc_spawn_cfg.period_seconds)
+                    .with_dry_run(predicate_gc_spawn_cfg.dry_run);
+                scheduler
+                    .register(Arc::new(worker), ops.clone())
+                    .expect("register PredicateGcWorker");
+            }
+
             // SupersessionSweeper — physically reclaims superseded
             // statement rows after the configured retention window. Off
             // by default and gated on `[workers.supersession_sweeper]
@@ -4022,11 +4104,20 @@ pub fn spawn_shard(
             // narrowing SCHEMA_UPLOAD. Without it the OUTSIDE_ACTIVE_SCHEMA
             // flag never updates and ADMIN_LIST_STALE_STATEMENTS goes blind.
             // Shares the metrics Arc handed to the writer above.
+            //
+            // It also decides what happens to the memories behind those
+            // rows: with `reextract_on_schema_change` it enqueues them for
+            // re-extraction, and without it reports how many there are so
+            // the operator can run `POST /v1/extract/backfill` deliberately.
+            // Flagging alone never re-aligned a memory to a new schema.
             {
                 let worker = brain_workers::workers::schema_migration::SchemaMigrationWorker::new(
                     schema_flag_sweep_receiver,
                 )
-                .with_metrics(schema_migration_metrics.clone());
+                .with_metrics(schema_migration_metrics.clone())
+                .with_reextract_on_schema_change(
+                    extractor_spawn_cfg.reextract_on_schema_change,
+                );
                 scheduler
                     .register(Arc::new(worker), ops.clone())
                     .expect("register SchemaMigrationWorker");
@@ -4424,6 +4515,31 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>) {
                     warn!(
                         shard_id = shard.shard_id,
                         "StorageStats reply dropped (caller gone)"
+                    );
+                }
+            }
+            ShardRequest::PredicateReview { reply_tx } => {
+                let queue = shard
+                    .ops
+                    .executor
+                    .metadata
+                    .read_txn()
+                    .map_err(|e| e.to_string())
+                    .and_then(|rtxn| {
+                        brain_metadata::predicate_review_list(&rtxn).map_err(|e| e.to_string())
+                    })
+                    .unwrap_or_else(|e| {
+                        warn!(
+                            shard_id = shard.shard_id,
+                            error = %e,
+                            "predicate review queue read failed"
+                        );
+                        Vec::new()
+                    });
+                if reply_tx.send_async(queue).await.is_err() {
+                    warn!(
+                        shard_id = shard.shard_id,
+                        "PredicateReview reply dropped (caller gone)"
                     );
                 }
             }

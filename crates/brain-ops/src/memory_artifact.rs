@@ -73,6 +73,7 @@ where
         .and_then(|g| serde_json::from_str::<EncodeStageArtifact>(g.value()).ok())
         .unwrap_or_default();
     f(&mut bundle);
+    prune_dangling_edges(&mut bundle);
     let json = serde_json::to_string(&bundle).map_err(|e| format!("artifact serialize: {e}"))?;
     table
         .insert(&memory_id, json.as_str())
@@ -409,6 +410,35 @@ pub fn read_memory_artifact(
         .and_then(|g| serde_json::from_str::<EncodeStageArtifact>(g.value()).ok()))
 }
 
+/// Whether this memory's bundle still holds extractor-owned graph edges
+/// (`statement` / `relation`).
+///
+/// Exists for one caller: the extractor's post-commit merge gate. That gate
+/// skips the merge when extraction produced nothing, which is right for a
+/// memory that never had a graph — but wrong for a RE-extraction, where the
+/// bundle holds the PREVIOUS run's edges and "produced nothing" is exactly
+/// the case that must clear them. Without this check a memory whose
+/// re-extraction fails keeps serving its stale graph to `MEMORY_INSPECT`
+/// forever, and re-running extraction can never repair it.
+///
+/// Read-only and cheap: one point lookup on the bundle, taken only on the
+/// zero-count path, so the common "nothing extracted, nothing there before"
+/// case still costs no write txn.
+#[must_use]
+pub fn artifact_holds_extractor_graph(metadata: &MetadataDb, memory_id: MemoryId) -> bool {
+    match read_memory_artifact(metadata, memory_id) {
+        Ok(Some(bundle)) => bundle.graph.is_some_and(|g| {
+            g.edges
+                .iter()
+                .any(|e| EXTRACTOR_EDGE_KINDS.contains(&e.kind.as_str()))
+        }),
+        // Absent bundle → nothing to clear. A read error is reported as
+        // "nothing there": the merge is best-effort and the caller logs, so
+        // guessing `true` would only add a doomed write txn.
+        _ => false,
+    }
+}
+
 /// Read just a memory's stored write-time embedding vector by id, under a
 /// caller-provided read txn. Returns `None` when the row is absent or the
 /// stored vector isn't the expected dimension.
@@ -517,6 +547,33 @@ pub(crate) fn literal_node_id(source: &[u8; 16], predicate: &str, literal_text: 
 /// mentioned entity, including ones another memory wrote, e.g. the space
 /// self-entity's `works_at`) is SKIPPED, never emitted against the nil id:
 /// a persisted edge to `00000000-…` is a dangling edge no reader can render.
+/// Drop graph edges whose endpoints are not nodes of the bundle.
+///
+/// Enforced HERE, at the single write boundary, rather than in each producer:
+/// every path that touches a bundle goes through `merge_memory_artifact`, so
+/// the invariant "a persisted edge names two nodes of this bundle" holds no
+/// matter which worker wrote last — and an old bundle is repaired the next
+/// time anything touches it.
+///
+/// The producers already skip an edge they cannot resolve. What they cannot do
+/// is fix a bundle written before they learned to: `merge_graph_from_committed`
+/// only runs when extraction produced something, and extraction produces
+/// nothing when a tier is down (no LLM key, say), so a re-extract of an
+/// already-extracted memory leaves the old edges in place. On a real corpus
+/// that surfaced in MEMORY_INSPECT as
+/// `00000000-0000-0000-0000-000000000000 -brain:works_at-> Priya Sharma`:
+/// a relation that reads correctly from the typed-graph tables and is
+/// unrenderable here, because the reader has no node to name.
+fn prune_dangling_edges(bundle: &mut EncodeStageArtifact) {
+    let Some(graph) = bundle.graph.as_mut() else {
+        return;
+    };
+    let known: std::collections::HashSet<[u8; 16]> = graph.nodes.iter().map(|n| n.id).collect();
+    graph
+        .edges
+        .retain(|e| known.contains(&e.source) && known.contains(&e.target));
+}
+
 #[cfg(test)]
 pub(crate) fn enrichment_to_graph(
     enr: Option<brain_protocol::envelope::response::GraphEnrichment>,
@@ -562,7 +619,34 @@ pub(crate) fn enrichment_to_graph_counted(
             unresolved += 1;
             continue;
         };
-        let target = match lookup(&s.object_label) {
+        // Entity-ness comes from the statement, never from the label. A
+        // literal whose text happens to equal an entity's canonical name is
+        // still a literal: matching by name drew `clone_status =
+        // "trello-clone-v7"` as an edge INTO the trello-clone-v7 entity,
+        // showing a self-referential link the store never held. It also
+        // picked arbitrarily between same-named entities.
+        //
+        // An entity object whose node is not in this enrichment gets one
+        // minted from the id + label, rather than being left to dangle and
+        // swept away by `prune_dangling_edges` — a rendering gap must not
+        // silently delete a statement the store holds.
+        // No name fallback: `None` means "not an entity", and falling back
+        // to a name match would reinstate the exact bug — a literal whose
+        // text equals an entity's name would resolve to that entity again.
+        // There is no older-peer case to protect: this enrichment is built
+        // in-process by `fetch_enrichment_for`, not read off the wire.
+        let entity_target = s.object_entity_id;
+        if let Some(id) = entity_target {
+            if !nodes.iter().any(|n| n.id == id) {
+                nodes.push(EncodeGraphNode {
+                    id,
+                    name: s.object_label.clone(),
+                    kind: "entity".to_string(),
+                    type_qname: String::new(),
+                });
+            }
+        }
+        let target = match entity_target {
             Some(id) => id,
             None => {
                 let lit_id = literal_node_id(&source, &s.predicate, &s.object_label);
@@ -880,12 +964,27 @@ mod tests {
             bundle.graph = Some(replace_owned_edges(
                 existing,
                 &EXTRACTOR_EDGE_KINDS,
-                vec![EncodeGraphNode {
-                    id: other,
-                    name: "Acme Corp".to_string(),
-                    kind: "entity".to_string(),
-                    type_qname: "brain:Org".to_string(),
-                }],
+                // BOTH endpoints are nodes. A real producer never emits an
+                // edge naming a node it does not also add — `enrichment_to_
+                // graph_counted` takes its endpoints from the entity set (or
+                // a synthetic literal node it pushes), and `merge_edge_links`
+                // adds a node per endpoint. The write boundary now enforces
+                // that, so a fixture that skipped the source node was
+                // asserting on a shape no producer emits.
+                vec![
+                    EncodeGraphNode {
+                        id: mid,
+                        name: "m".to_string(),
+                        kind: "memory".to_string(),
+                        type_qname: String::new(),
+                    },
+                    EncodeGraphNode {
+                        id: other,
+                        name: "Acme Corp".to_string(),
+                        kind: "entity".to_string(),
+                        type_qname: "brain:Org".to_string(),
+                    },
+                ],
                 vec![EncodeGraphEdge {
                     source: mid,
                     target: other,
@@ -978,6 +1077,7 @@ mod tests {
                 type_qname: "brain:person".into(),
             }],
             statements: vec![EnrichedStatement {
+                object_entity_id: None,
                 id: [2u8; 16],
                 subject_name: "Priya".into(),
                 predicate: "favorite_color".into(),
@@ -987,6 +1087,121 @@ mod tests {
             }],
             relations: Vec::new(),
         }
+    }
+
+    /// The live failure: `clone_status = "trello-clone-v7"` is a TEXT value
+    /// whose content equals the subject entity's own name.
+    fn literal_colliding_with_entity_name() -> GraphEnrichment {
+        GraphEnrichment {
+            entities: vec![EnrichedEntity {
+                id: priya_id(),
+                name: "trello-clone-v7".into(),
+                type_qname: "CloneEnv".into(),
+            }],
+            statements: vec![EnrichedStatement {
+                id: [3u8; 16],
+                subject_name: "trello-clone-v7".into(),
+                predicate: "mirror:clone_status".into(),
+                // Stored as Value(Text(...)) — hence no entity id.
+                object_label: "trello-clone-v7".into(),
+                object_entity_id: None,
+                confidence: 0.92,
+                event_at_unix_nanos: None,
+            }],
+            relations: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_literal_whose_text_matches_an_entity_name_is_not_drawn_as_an_edge_to_it() {
+        // Matching the object by NAME invented a self-referential edge for a
+        // plain text value, so MEMORY_INSPECT showed a link the store never
+        // held. Entity-ness now comes from the statement's object id.
+        let graph = enrichment_to_graph(Some(literal_colliding_with_entity_name()));
+
+        let edge = &graph.edges[0];
+        assert_ne!(
+            edge.target, edge.source,
+            "a text value must not resolve to the subject entity"
+        );
+        let target = graph
+            .nodes
+            .iter()
+            .find(|n| n.id == edge.target)
+            .expect("target node present");
+        assert_eq!(target.kind, "literal");
+        assert_eq!(target.name, "trello-clone-v7");
+    }
+
+    #[test]
+    fn an_entity_object_is_wired_by_id_not_by_label() {
+        // The converse: a real entity object must still produce an entity
+        // edge — and by id, so two entities sharing a canonical name cannot
+        // be confused for one another.
+        let other = [9u8; 16];
+        let enr = GraphEnrichment {
+            entities: vec![
+                EnrichedEntity {
+                    id: priya_id(),
+                    name: "Priya".into(),
+                    type_qname: "brain:person".into(),
+                },
+                EnrichedEntity {
+                    id: other,
+                    name: "Acme".into(),
+                    type_qname: "brain:organization".into(),
+                },
+            ],
+            statements: vec![EnrichedStatement {
+                id: [4u8; 16],
+                subject_name: "Priya".into(),
+                predicate: "works_at".into(),
+                object_label: "Acme".into(),
+                object_entity_id: Some(other),
+                confidence: 0.9,
+                event_at_unix_nanos: None,
+            }],
+            relations: Vec::new(),
+        };
+        let graph = enrichment_to_graph(Some(enr));
+        assert_eq!(graph.edges[0].target, other);
+        assert!(
+            graph.nodes.iter().all(|n| n.kind != "literal"),
+            "an entity object must not synthesize a literal node"
+        );
+    }
+
+    #[test]
+    fn an_entity_object_missing_from_the_enrichment_still_renders() {
+        // The edge must not be left dangling for `prune_dangling_edges` to
+        // sweep away — a rendering gap must never delete a stored statement.
+        let absent = [7u8; 16];
+        let enr = GraphEnrichment {
+            entities: vec![EnrichedEntity {
+                id: priya_id(),
+                name: "Priya".into(),
+                type_qname: "brain:person".into(),
+            }],
+            statements: vec![EnrichedStatement {
+                id: [5u8; 16],
+                subject_name: "Priya".into(),
+                predicate: "works_at".into(),
+                object_label: "Offstage Ltd".into(),
+                object_entity_id: Some(absent),
+                confidence: 0.9,
+                event_at_unix_nanos: None,
+            }],
+            relations: Vec::new(),
+        };
+        let graph = enrichment_to_graph(Some(enr));
+        assert_eq!(graph.edges.len(), 1);
+        let target = graph
+            .nodes
+            .iter()
+            .find(|n| n.id == absent)
+            .expect("a node must be minted for the off-enrichment entity");
+        assert_eq!(target.kind, "entity");
+        assert_eq!(target.name, "Offstage Ltd");
     }
 
     #[test]
@@ -1075,6 +1290,9 @@ mod tests {
                 },
             ],
             statements: vec![EnrichedStatement {
+                // This fixture models an ENTITY object, so it carries that
+                // object's id. Leaving it `None` would describe a literal.
+                object_entity_id: Some([3u8; 16]),
                 id: [2u8; 16],
                 subject_name: "Priya".into(),
                 predicate: "role".into(),
@@ -1105,6 +1323,7 @@ mod tests {
                 type_qname: "Organization".into(),
             }],
             statements: vec![EnrichedStatement {
+                object_entity_id: None,
                 id: [5u8; 16],
                 subject_name: "someone beyond the entity cap".into(),
                 predicate: "brain:role".into(),
@@ -1180,5 +1399,273 @@ mod tests {
             rtxn.open_table(MEMORY_ARTIFACTS_TABLE).is_err(),
             "empty link set must not create the artifacts table"
         );
+    }
+
+    /// A bundle must never keep an edge naming a node it does not hold.
+    ///
+    /// Captured from a real corpus: MEMORY_INSPECT served
+    /// `00000000-…-000000000000 -brain:works_at-> Priya Sharma`. The relation
+    /// itself was intact in the typed-graph tables; only this snapshot was
+    /// wrong, and no reader could render it.
+    #[test]
+    fn dangling_edges_are_dropped_when_the_bundle_is_written() {
+        let (_dir, db) = open_db();
+        let id = [9u8; 16];
+        let priya = [1u8; 16];
+        let updates = [2u8; 16];
+        let nil = [0u8; 16];
+
+        let node = |i: [u8; 16], name: &str| EncodeGraphNode {
+            id: i,
+            name: name.to_string(),
+            kind: "entity".to_string(),
+            type_qname: String::new(),
+        };
+        let edge = |s: [u8; 16], t: [u8; 16], p: &str| EncodeGraphEdge {
+            source: s,
+            target: t,
+            predicate: p.to_string(),
+            kind: "relation".to_string(),
+            confidence: 1.0,
+            event_at_unix_nanos: None,
+        };
+
+        let wtxn = db.write_txn().unwrap();
+        merge_memory_artifact(&wtxn, id, |b| {
+            b.graph = Some(EncodeStageGraph {
+                nodes: vec![node(priya, "Priya Sharma"), node(updates, "async updates")],
+                edges: vec![
+                    edge(priya, updates, "brain:prefers"),
+                    edge(priya, nil, "brain:works_at"),
+                    edge(nil, priya, "brain:reports_to"),
+                ],
+            });
+        })
+        .unwrap();
+        wtxn.commit().unwrap();
+
+        let g = read_bundle(&db, id).unwrap().graph.unwrap();
+        assert_eq!(
+            g.edges
+                .iter()
+                .map(|e| e.predicate.as_str())
+                .collect::<Vec<_>>(),
+            vec!["brain:prefers"],
+            "only the edge whose endpoints are both nodes survives"
+        );
+        // The nodes are untouched: pruning is about edges, not about
+        // forgetting what the memory mentioned.
+        assert_eq!(g.nodes.len(), 2);
+    }
+
+    /// The repair is retroactive: a bundle written before the invariant
+    /// existed is cleaned the next time anything touches it, which is what
+    /// makes this fix reach memories nobody will ever re-extract.
+    #[test]
+    fn an_already_stale_bundle_is_repaired_by_an_unrelated_write() {
+        let (_dir, db) = open_db();
+        let id = [11u8; 16];
+        let a = [3u8; 16];
+        let nil = [0u8; 16];
+
+        // Simulate the old writer: put a dangling edge in directly.
+        let wtxn = db.write_txn().unwrap();
+        {
+            let mut table = wtxn.open_table(MEMORY_ARTIFACTS_TABLE).unwrap();
+            let bundle = EncodeStageArtifact {
+                graph: Some(EncodeStageGraph {
+                    nodes: vec![EncodeGraphNode {
+                        id: a,
+                        name: "A".into(),
+                        kind: "entity".into(),
+                        type_qname: String::new(),
+                    }],
+                    edges: vec![EncodeGraphEdge {
+                        source: a,
+                        target: nil,
+                        predicate: "brain:works_at".into(),
+                        kind: "relation".into(),
+                        confidence: 1.0,
+                        event_at_unix_nanos: None,
+                    }],
+                }),
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&bundle).unwrap();
+            table.insert(&id, json.as_str()).unwrap();
+        }
+        wtxn.commit().unwrap();
+        assert_eq!(read_bundle(&db, id).unwrap().graph.unwrap().edges.len(), 1);
+
+        // Any later write — here one that only sets HyPE — repairs it.
+        let wtxn = db.write_txn().unwrap();
+        merge_memory_artifact(&wtxn, id, |b| {
+            b.hype_questions = vec!["what does A do?".into()];
+        })
+        .unwrap();
+        wtxn.commit().unwrap();
+
+        let after = read_bundle(&db, id).unwrap();
+        assert!(after.graph.unwrap().edges.is_empty(), "stale edge pruned");
+        assert_eq!(after.hype_questions.len(), 1, "the actual write landed");
+    }
+
+    #[test]
+    fn a_bundle_with_no_graph_is_left_alone() {
+        let (_dir, db) = open_db();
+        let id = [13u8; 16];
+        let wtxn = db.write_txn().unwrap();
+        merge_memory_artifact(&wtxn, id, |b| {
+            b.hype_questions = vec!["q".into()];
+        })
+        .unwrap();
+        wtxn.commit().unwrap();
+        assert!(read_bundle(&db, id).unwrap().graph.is_none());
+    }
+
+    // ── stale-graph detection (the extractor's merge gate) ──────────────
+
+    fn edge_of_kind(kind: &str) -> EncodeGraphEdge {
+        EncodeGraphEdge {
+            source: [1u8; 16],
+            target: [2u8; 16],
+            predicate: "brain:prefers".to_string(),
+            kind: kind.to_string(),
+            confidence: 1.0,
+            event_at_unix_nanos: None,
+        }
+    }
+
+    /// The two endpoints `edge_of_kind` references. They must be present:
+    /// `merge_memory_artifact` prunes edges whose endpoints aren't nodes, so
+    /// a fixture that omits them stores an empty edge list and every
+    /// assertion below would pass or fail for the wrong reason.
+    fn edge_endpoints() -> Vec<EncodeGraphNode> {
+        [[1u8; 16], [2u8; 16]]
+            .into_iter()
+            .map(|id| EncodeGraphNode {
+                id,
+                name: "n".to_string(),
+                kind: "entity".to_string(),
+                type_qname: String::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn no_bundle_means_nothing_stale_to_clear() {
+        let (_dir, db) = open_db();
+        assert!(!artifact_holds_extractor_graph(
+            &db,
+            MemoryId::from_be_bytes([3u8; 16])
+        ));
+    }
+
+    #[test]
+    fn a_bundle_with_no_graph_holds_nothing_stale() {
+        let (_dir, db) = open_db();
+        let id = [4u8; 16];
+        let wtxn = db.write_txn().unwrap();
+        put_sync_artifact(
+            &wtxn,
+            id,
+            vec![0.1],
+            sync_record(id, 1, 0.5, 100, 0, 1, 4),
+            vec![],
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+        assert!(!artifact_holds_extractor_graph(
+            &db,
+            MemoryId::from_be_bytes(id)
+        ));
+    }
+
+    #[test]
+    fn statement_and_relation_edges_are_the_extractor_owned_ones() {
+        for kind in EXTRACTOR_EDGE_KINDS {
+            let (_dir, db) = open_db();
+            let id = [5u8; 16];
+            let wtxn = db.write_txn().unwrap();
+            merge_memory_artifact(&wtxn, id, |b| {
+                b.graph = Some(EncodeStageGraph {
+                    nodes: edge_endpoints(),
+                    edges: vec![edge_of_kind(kind)],
+                });
+            })
+            .unwrap();
+            wtxn.commit().unwrap();
+            assert!(
+                artifact_holds_extractor_graph(&db, MemoryId::from_be_bytes(id)),
+                "{kind} edges must count as extractor-owned"
+            );
+        }
+    }
+
+    #[test]
+    fn memory_to_memory_edges_are_not_stale_extraction() {
+        // `similar_to` / `followed_by` are written by the auto-edge and
+        // temporal workers, not the extractor. A memory carrying only those
+        // has nothing for a re-extraction to clear, so the gate must still
+        // skip the write txn — otherwise every derived-edge memory pays for
+        // a no-op merge on every failed extraction cycle.
+        let (_dir, db) = open_db();
+        let id = [6u8; 16];
+        let wtxn = db.write_txn().unwrap();
+        merge_memory_artifact(&wtxn, id, |b| {
+            b.graph = Some(EncodeStageGraph {
+                nodes: edge_endpoints(),
+                edges: vec![edge_of_kind("similar_to"), edge_of_kind("followed_by")],
+            });
+        })
+        .unwrap();
+        wtxn.commit().unwrap();
+        assert!(!artifact_holds_extractor_graph(
+            &db,
+            MemoryId::from_be_bytes(id)
+        ));
+    }
+
+    #[test]
+    fn an_empty_merge_clears_stale_extractor_edges_but_keeps_derived_ones() {
+        // The behaviour the gate fix depends on: re-merging with an empty
+        // committed graph removes the extractor's edges and leaves the
+        // memory↔memory edges alone.
+        let (_dir, db) = open_db();
+        let id = [8u8; 16];
+        let wtxn = db.write_txn().unwrap();
+        merge_memory_artifact(&wtxn, id, |b| {
+            b.graph = Some(EncodeStageGraph {
+                nodes: edge_endpoints(),
+                edges: vec![
+                    edge_of_kind("statement"),
+                    edge_of_kind("relation"),
+                    edge_of_kind("similar_to"),
+                ],
+            });
+        })
+        .unwrap();
+        wtxn.commit().unwrap();
+
+        let wtxn = db.write_txn().unwrap();
+        merge_memory_artifact(&wtxn, id, |b| {
+            let existing = b.graph.take().unwrap_or_default();
+            b.graph = Some(replace_owned_edges(
+                existing,
+                &EXTRACTOR_EDGE_KINDS,
+                vec![],
+                vec![],
+            ));
+        })
+        .unwrap();
+        wtxn.commit().unwrap();
+
+        let g = read_bundle(&db, id).unwrap().graph.unwrap();
+        let kinds: Vec<&str> = g.edges.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(kinds, vec!["similar_to"]);
+        assert!(!artifact_holds_extractor_graph(
+            &db,
+            MemoryId::from_be_bytes(id)
+        ));
     }
 }

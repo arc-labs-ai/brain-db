@@ -466,6 +466,7 @@ async fn shard_registry_with_real_gliner_persists_entities() {
     let model = GlinerClassifier::load(&ClassifierConfig::with_model_path(model_path))
         .expect("load gliner");
     let deps = MaterializeDeps {
+        llm_max_tokens: None,
         classifier_model: Some(Arc::new(model)),
         entity_type_qnames: Arc::new(entity_type_qnames),
         model_router: None,
@@ -731,6 +732,7 @@ impl LlmClient for FakeHypeLlmClient {
         let cost_micro_usd = self.cost_micro_usd;
         Box::pin(async move {
             Ok(LlmResponse {
+                truncated: false,
                 content,
                 tokens_in: 10,
                 tokens_out: 20,

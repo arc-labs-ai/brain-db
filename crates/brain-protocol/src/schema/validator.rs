@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use crate::schema::ast::{
     AttrType, AttributeDecl, CardinalityAst, ExtractorDef, ExtractorField, ExtractorKindAst,
     ExtractorTarget, KindDef, LiteralValue, ObjectTypeDecl, PredicateDef, RelationTypeDef, Schema,
-    SchemaItem, StatementKindAst,
+    SchemaItem, StatementKindAst, SubjectTypeDecl,
 };
 
 // ---------------------------------------------------------------------------
@@ -88,11 +88,39 @@ const ANY_TYPE_LITERAL: &str = "Any";
 // Entry point.
 // ---------------------------------------------------------------------------
 
+/// Type names that are already declared *outside* the document being
+/// validated, and which its references may therefore resolve against.
+///
+/// SCHEMA_UPLOAD is additive — it merges into the namespace's active schema
+/// rather than standing alone — so a document may legitimately name a type an
+/// earlier upload (or the system `brain` schema) declared. Validating the
+/// document in isolation rejected exactly that, which is why an incremental
+/// document failed with "is not a declared entity_type" for a type the server
+/// demonstrably had, `Person` included. Callers that validate a standalone
+/// document pass [`DeclaredContext::default`] and get the old behaviour.
+#[derive(Debug, Default, Clone)]
+pub struct DeclaredContext {
+    /// Entity-type names already declared for the target namespace.
+    pub entity_types: Vec<String>,
+    /// Relation-type names already declared for the target namespace.
+    pub relation_types: Vec<String>,
+}
+
 /// Validate a schema. Returns all errors at once; an `Err` always
 /// carries at least one element. Successful validation produces a
 /// `ValidatedSchema` carrying the input.
 pub fn validate(schema: &Schema) -> Result<ValidatedSchema, ValidationErrors> {
-    validate_inner(schema, ValidatorMode::User)
+    validate_with(schema, &DeclaredContext::default())
+}
+
+/// [`validate`], resolving type references against `ctx` in addition to the
+/// document's own declarations. Every other check stays document-local, so
+/// errors still point at the uploaded text.
+pub fn validate_with(
+    schema: &Schema,
+    ctx: &DeclaredContext,
+) -> Result<ValidatedSchema, ValidationErrors> {
+    validate_inner(schema, ValidatorMode::User, ctx)
 }
 
 /// Validate the **system schema** — same rules as [`validate`]
@@ -103,7 +131,7 @@ pub fn validate(schema: &Schema) -> Result<ValidatedSchema, ValidationErrors> {
 /// `system_schema` module). User uploads of `namespace brain`
 /// must continue to be rejected by [`validate`].
 pub fn validate_system_schema(schema: &Schema) -> Result<ValidatedSchema, ValidationErrors> {
-    validate_inner(schema, ValidatorMode::System)
+    validate_inner(schema, ValidatorMode::System, &DeclaredContext::default())
 }
 
 #[derive(Clone, Copy)]
@@ -115,14 +143,23 @@ enum ValidatorMode {
 fn validate_inner(
     schema: &Schema,
     mode: ValidatorMode,
+    ctx: &DeclaredContext,
 ) -> Result<ValidatedSchema, ValidationErrors> {
     let mut errors: ValidationErrors = Vec::new();
 
     check_namespace(schema, &mut errors, mode);
     check_duplicates(schema, &mut errors);
 
-    let entity_names = collect_entity_names(schema);
-    let relation_names = collect_relation_names(schema);
+    // A reference resolves against this document's declarations plus anything
+    // the namespace already has (see [`DeclaredContext`]).
+    let entity_names: Vec<&str> = collect_entity_names(schema)
+        .into_iter()
+        .chain(ctx.entity_types.iter().map(String::as_str))
+        .collect();
+    let relation_names: Vec<&str> = collect_relation_names(schema)
+        .into_iter()
+        .chain(ctx.relation_types.iter().map(String::as_str))
+        .collect();
 
     for item in &schema.items {
         match item {
@@ -150,6 +187,24 @@ fn validate_inner(
 // ---------------------------------------------------------------------------
 // Namespace.
 // ---------------------------------------------------------------------------
+
+/// Run only the `namespace` declaration's own checks.
+///
+/// A caller that must bind a request to its tenant *before* validating the
+/// rest of the document (because the rest now consults persisted state for
+/// that namespace) still needs a reserved or malformed namespace to surface as
+/// a validation error rather than an authorization failure — `namespace brain`
+/// is a mistake in the document, not an attempt to write someone else's
+/// schema.
+pub fn validate_namespace(schema: &Schema) -> Result<(), ValidationErrors> {
+    let mut errors: ValidationErrors = Vec::new();
+    check_namespace(schema, &mut errors, ValidatorMode::User);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
 
 fn check_namespace(schema: &Schema, errors: &mut ValidationErrors, mode: ValidatorMode) {
     if schema.namespace.is_empty() {
@@ -399,6 +454,22 @@ fn check_predicate(pred: &PredicateDef, entity_names: &[&str], errors: &mut Vali
                 code: ValidationErrorCode::UnresolvedTypeRef,
                 message: format!(
                     "predicate {:?}: object Entity<{:?}> is not a declared entity_type",
+                    pred.name, entity_type
+                ),
+                source_span: None,
+            });
+        }
+    }
+
+    // Same resolution for the subject domain. A subject naming an
+    // undeclared type is the mistake this field exists to prevent, so it
+    // must fail at upload rather than silently admit every subject.
+    if let Some(SubjectTypeDecl::Entity { entity_type }) = &pred.subject {
+        if !resolves_to_entity(entity_type, entity_names) {
+            errors.push(ValidationError {
+                code: ValidationErrorCode::UnresolvedTypeRef,
+                message: format!(
+                    "predicate {:?}: subject Entity<{:?}> is not a declared entity_type",
                     pred.name, entity_type
                 ),
                 source_span: None,
@@ -794,6 +865,7 @@ mod tests {
     fn overlong_predicate_name_rejected() {
         let mut s = base_schema();
         s.items.push(SchemaItem::Predicate(PredicateDef {
+            subject: None,
             name: "p".repeat(TYPE_NAME_MAX_LEN + 1),
             kind: StatementKindAst::Fact,
             object: ObjectTypeDecl::Any,
@@ -811,6 +883,7 @@ mod tests {
     fn empty_type_name_rejected() {
         let mut s = base_schema();
         s.items.push(SchemaItem::Predicate(PredicateDef {
+            subject: None,
             name: String::new(),
             kind: StatementKindAst::Fact,
             object: ObjectTypeDecl::Any,
@@ -828,6 +901,7 @@ mod tests {
     fn normal_type_name_accepted() {
         let mut s = base_schema();
         s.items.push(SchemaItem::Predicate(PredicateDef {
+            subject: None,
             name: "works_at".into(),
             kind: StatementKindAst::Fact,
             object: ObjectTypeDecl::Any,
@@ -864,5 +938,49 @@ mod tests {
                 variants: vec!["red".into(), "blue".into()]
             }
         ));
+    }
+
+    #[test]
+    fn subject_naming_an_undeclared_entity_type_is_rejected() {
+        // A typo'd subject that validated cleanly would be worse than no
+        // subject at all: the upload would report success and the
+        // predicate would silently accept every subject, which is exactly
+        // the behaviour the author was trying to stop.
+        let mut s = base_schema();
+        s.items.push(SchemaItem::Predicate(PredicateDef {
+            subject: Some(SubjectTypeDecl::Entity {
+                entity_type: "NoSuchType".into(),
+            }),
+            name: "prefers_fidelity".into(),
+            kind: StatementKindAst::Preference,
+            object: ObjectTypeDecl::Any,
+            stateful: None,
+            description: None,
+            retention: None,
+        }));
+        let errs = validate(&s).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.code == ValidationErrorCode::UnresolvedTypeRef
+                    && e.message.contains("subject")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn subject_any_and_an_omitted_subject_both_validate() {
+        for subject in [None, Some(SubjectTypeDecl::Any)] {
+            let mut s = base_schema();
+            s.items.push(SchemaItem::Predicate(PredicateDef {
+                subject,
+                name: "clone_status".into(),
+                kind: StatementKindAst::Fact,
+                object: ObjectTypeDecl::Any,
+                stateful: None,
+                description: None,
+                retention: None,
+            }));
+            assert!(validate(&s).is_ok());
+        }
     }
 }

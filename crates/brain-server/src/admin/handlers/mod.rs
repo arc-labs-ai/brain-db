@@ -19,6 +19,7 @@ pub mod memory;
 pub mod metrics;
 pub mod readyz;
 pub mod rebuild;
+pub mod schema;
 pub mod shard;
 pub mod snapshot;
 pub mod space;

@@ -304,6 +304,27 @@ fn validate_against_predicate(
             ));
         }
     }
+    // A declared `subject: Entity<Type>` domain pins which kind of thing
+    // may carry this predicate. `0` = undeclared, which is every schema
+    // written before the field existed, so this check is inert unless a
+    // schema opts in.
+    //
+    // Only an Entity subject is checked. A `Memory` or `Pending` subject
+    // has no entity type to compare, and rejecting those would break the
+    // extractor's normal two-phase write (pending subject now, resolved
+    // entity later) for every predicate that declares a domain.
+    if p.subject_entity_type_id != 0 {
+        if let SubjectRef::Entity(eid) = s.subject {
+            let actual = entity_type_of(wtxn, eid)?.ok_or(StatementOpError::UnknownSubject(eid))?;
+            if actual.raw() != p.subject_entity_type_id {
+                return Err(StatementOpError::SubjectEntityTypeMismatch {
+                    entity: eid,
+                    expected: EntityTypeId::from(p.subject_entity_type_id),
+                    actual,
+                });
+            }
+        }
+    }
     // A declared `object: Entity<Type>` range narrows the variant check
     // to one entity type. `0` means the declaration was a bare `Entity`
     // (or another variant entirely) and admits any type.
@@ -564,6 +585,41 @@ pub fn statement_live_count_by_predicate(
         }
     }
     Ok(count)
+}
+
+/// Whether ANY live statement, in any namespace or space, uses
+/// `predicate_id`.
+///
+/// [`statement_live_count_by_predicate`] filters by namespace because its
+/// caller (SCHEMA_DROP) is answering a tenant-scoped question. Predicate GC
+/// is not: it is deciding whether a row can be deleted outright, and a row
+/// deleted while anything still points at it orphans that statement's
+/// predicate reference. Resolving the predicate's namespace *name* to an id
+/// is not a safe substitute — a statement's `namespace_id` need not match the
+/// namespace its predicate was coined under, and an unregistered name would
+/// read as "no statements" and green-light the delete.
+///
+/// Stops at the first hit: the question is existence, not population.
+pub fn statement_any_live_by_predicate(
+    wtxn: &WriteTransaction,
+    predicate_id: PredicateId,
+) -> Result<bool, StatementOpError> {
+    let want = predicate_id.raw();
+    let index = wtxn.open_table(STATEMENTS_BY_PREDICATE_TABLE)?;
+    let primary = wtxn.open_table(STATEMENTS_TABLE)?;
+    for entry in index.iter()? {
+        let (k, v) = entry?;
+        let (_ns, _space, k_pred, _kind, _bucket, _sid) = k.value();
+        if k_pred != want {
+            continue;
+        }
+        if let Some(row) = primary.get(&v.value())?.map(|g| g.value()) {
+            if row.tombstoned == 0 {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// Re-key a still-current statement's predicate-bucket entry after its
@@ -2497,5 +2553,145 @@ mod tests {
                 .unwrap();
         wtxn.commit().unwrap();
         assert_eq!(pending.len(), 1, "overlapping distinct facts contradict");
+    }
+
+    // ── declared subject domain ─────────────────────────────────────────
+
+    /// Intern a Fact predicate declaring `subject: Entity<entity_type>`
+    /// and an unconstrained object.
+    fn intern_subject_typed_pred(
+        db: &mut crate::MetadataDb,
+        name: &str,
+        subject_entity_type: brain_core::EntityTypeId,
+    ) -> PredicateId {
+        use crate::schema::predicate::ObjectConstraint;
+        let wtxn = db.write_txn().unwrap();
+        let id = crate::schema::predicate::predicate_intern_with_subject(
+            &wtxn,
+            "test",
+            name,
+            Some(StatementKind::Fact),
+            ObjectConstraint::ANY,
+            subject_entity_type.raw(),
+            /* schema_version */ 1,
+            "",
+            false,
+            1_700_000_000_000_000_000,
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+        id
+    }
+
+    #[test]
+    fn declared_subject_entity_type_accepts_conforming_subject() {
+        let (_dir, mut db) = open_db();
+        let org_subject = make_entity_typed(&mut db, "an-org", ORGANIZATION_ID);
+        let object = make_entity(&mut db, "some-object");
+        let pred = intern_subject_typed_pred(&mut db, "org_only_pred", ORGANIZATION_ID);
+
+        let s = fresh_fact(org_subject, pred, object);
+        let wtxn = db.write_txn().unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &s, 0).unwrap();
+        wtxn.commit().unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        assert!(statement_get(&rtxn, s.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn declared_subject_entity_type_rejects_wrong_type() {
+        // The real defect this closes: `prefers_fidelity` is a thing a
+        // BUILDER wants, and nothing stopped it being written against the
+        // environment instead. `object` could never express that.
+        let (_dir, mut db) = open_db();
+        let person_subject = make_entity(&mut db, "a-person");
+        let object = make_entity(&mut db, "some-object-2");
+        let pred = intern_subject_typed_pred(&mut db, "org_only_pred_2", ORGANIZATION_ID);
+
+        let s = fresh_fact(person_subject, pred, object);
+        let wtxn = db.write_txn().unwrap();
+        let err = statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &s, 0)
+            .expect_err("a wrong-typed subject must be refused");
+        match err {
+            StatementOpError::SubjectEntityTypeMismatch {
+                expected, actual, ..
+            } => {
+                assert_eq!(expected, ORGANIZATION_ID);
+                assert_ne!(actual, ORGANIZATION_ID);
+            }
+            other => panic!("expected SubjectEntityTypeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_undeclared_subject_domain_admits_any_subject() {
+        // Every schema written before the `subject` field means `0` here.
+        // If this check fired on `0` it would reject essentially every
+        // existing write.
+        let (_dir, mut db) = open_db();
+        let person_subject = make_entity(&mut db, "any-person");
+        let object = make_entity(&mut db, "some-object-3");
+        let pred =
+            intern_subject_typed_pred(&mut db, "unconstrained_pred", brain_core::EntityTypeId(0));
+
+        let s = fresh_fact(person_subject, pred, object);
+        let wtxn = db.write_txn().unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &s, 0).unwrap();
+        wtxn.commit().unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        assert!(statement_get(&rtxn, s.id).unwrap().is_some());
+    }
+
+    /// The safety property of predicate GC: a coined predicate that a live
+    /// statement still uses must survive. Lives here because this module owns
+    /// the fixtures that can create a real statement; the reclaim itself is in
+    /// `schema::predicate`.
+    #[test]
+    fn predicate_gc_spares_a_coined_predicate_that_statements_still_use() {
+        use crate::schema::predicate::predicate_reclaim_orphans;
+        use crate::tables::predicate::PREDICATES_BY_QNAME_TABLE;
+
+        const DAY: u64 = 24 * 60 * 60 * 1_000_000_000;
+        let (_dir, mut db) = open_db();
+        let subj = make_entity(&mut db, "priya");
+        let obj = make_entity(&mut db, "ada");
+
+        // Coin it the way a write does, not via the declared path.
+        let pred = {
+            let wtxn = db.write_txn().unwrap();
+            let id =
+                crate::schema::predicate::predicate_intern_or_get(&wtxn, "test", "mentors", 1, 0)
+                    .unwrap();
+            wtxn.commit().unwrap();
+            id
+        };
+        {
+            let wtxn = db.write_txn().unwrap();
+            let s = fresh_fact(subj, pred, obj);
+            statement_create(&wtxn, test_scope(), SessionId::DEFAULT, &s, T0).unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        // Well past grace, but still referenced.
+        let summary = {
+            let wtxn = db.write_txn().unwrap();
+            let s = predicate_reclaim_orphans(&wtxn, 365 * DAY, 7 * DAY, 100, false).unwrap();
+            wtxn.commit().unwrap();
+            s
+        };
+        assert_eq!(
+            summary.reclaimed, 0,
+            "a referenced predicate is never dropped"
+        );
+        assert_eq!(summary.still_referenced, 1);
+
+        let rtxn = db.read_txn().unwrap();
+        let idx = rtxn.open_table(PREDICATES_BY_QNAME_TABLE).unwrap();
+        assert!(
+            idx.get("test:mentors").unwrap().is_some(),
+            "the predicate row survives"
+        );
     }
 }

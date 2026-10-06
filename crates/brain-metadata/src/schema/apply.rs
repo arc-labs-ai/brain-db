@@ -12,15 +12,16 @@ use brain_core::{
     Cardinality, EntityTypeId, ExtractorKind, KindCardinality, PredicateId, TemporalModel,
 };
 use brain_protocol::schema::{
-    CardinalityAst, ExtractorKindAst, ObjectTypeDecl, SchemaItem, StatementKindAst, ValidatedSchema,
+    CardinalityAst, ExtractorKindAst, ObjectTypeDecl, SchemaItem, StatementKindAst,
+    SubjectTypeDecl, ValidatedSchema,
 };
 use redb::{ReadableTable, WriteTransaction};
 
 use super::kind::{kind_intern, KindOpError};
 use super::predicate::{
-    predicate_intern, predicate_set_retention, ObjectConstraint, PredicateOpError,
+    predicate_intern_with_subject, predicate_set_retention, ObjectConstraint, PredicateOpError,
 };
-use crate::entity::types::{entity_type_intern, entity_type_lookup_by_name, EntityTypeOpError};
+use crate::entity::types::{entity_type_intern, entity_type_lookup, EntityTypeOpError};
 use crate::extractor::ops::{extractor_intern, ExtractorOpError};
 use crate::relation::types::{relation_type_intern, RelationTypeOpError};
 use crate::tables::predicate::{PredicateDefinition, PREDICATES_TABLE};
@@ -56,13 +57,20 @@ pub fn apply_schema_definitions(
 ) -> Result<(), SchemaApplyError> {
     let schema = validated.as_schema();
     let namespace = schema.namespace.as_str();
+    // Entity types are scoped by the owning tenant, so resolve the
+    // schema's namespace to its id once. `namespace_intern_or_get` is the
+    // same call the write path uses, so a first-ever upload for a
+    // namespace registers it here rather than failing to resolve.
+    let namespace_id = crate::namespace::namespace_intern_or_get(wtxn, namespace, now_unix_nanos)
+        .map_err(|e| SchemaApplyError::ExtractorEncode(format!("namespace resolve: {e}")))?
+        .raw();
 
     for item in &schema.items {
         match item {
             SchemaItem::EntityType(e) => {
                 // `schema_blob` left empty — typed accessors will own
                 // the encoding.
-                entity_type_intern(wtxn, &e.name, Vec::new(), now_unix_nanos)?;
+                entity_type_intern(wtxn, namespace_id, &e.name, Vec::new(), now_unix_nanos)?;
             }
             SchemaItem::Predicate(p) => {
                 // A declared `Entity<Type>` range is carried through to
@@ -72,19 +80,33 @@ pub fn apply_schema_definitions(
                 // upload, matching `resolve_entity_type`'s leniency on
                 // the relation path.
                 let object_entity_type = match declared_object_entity_type(&p.object) {
-                    Some(name) => resolve_entity_type(wtxn, name)?,
+                    Some(name) => resolve_entity_type(wtxn, namespace_id, name)?,
                     None => None,
                 };
                 let object_constraint = ObjectConstraint {
                     object_type_byte: object_type_constraint_byte(&p.object),
                     entity_type_id: object_entity_type.map_or(0, EntityTypeId::raw),
                 };
-                let pred_id = predicate_intern(
+                // Same treatment for the declared subject domain. The
+                // validator already refused an undeclared type name at
+                // upload, so an unresolvable name here means the type row
+                // is missing rather than the schema being wrong — degrade
+                // to "any subject" instead of failing the upload, matching
+                // the object side.
+                let subject_entity_type_id = match &p.subject {
+                    Some(SubjectTypeDecl::Entity { entity_type }) => {
+                        resolve_entity_type(wtxn, namespace_id, entity_type)?
+                            .map_or(0, EntityTypeId::raw)
+                    }
+                    Some(SubjectTypeDecl::Any) | None => 0,
+                };
+                let pred_id = predicate_intern_with_subject(
                     wtxn,
                     namespace,
                     &p.name,
                     map_statement_kind(p.kind),
                     object_constraint,
+                    subject_entity_type_id,
                     schema_version,
                     p.description.as_deref().unwrap_or(""),
                     p.resolved_stateful(),
@@ -95,8 +117,8 @@ pub fn apply_schema_definitions(
                 predicate_set_retention(wtxn, pred_id, p.retention.map_or(0, |d| d.to_seconds()))?;
             }
             SchemaItem::RelationType(r) => {
-                let from = resolve_entity_type(wtxn, &r.from_type)?;
-                let to = resolve_entity_type(wtxn, &r.to_type)?;
+                let from = resolve_entity_type(wtxn, namespace_id, &r.from_type)?;
+                let to = resolve_entity_type(wtxn, namespace_id, &r.to_type)?;
                 relation_type_intern(
                     wtxn,
                     namespace,
@@ -297,12 +319,13 @@ pub(crate) fn map_extractor_kind(k: ExtractorKindAst) -> ExtractorKind {
 /// constraint" semantics for unknown / Any targets.
 fn resolve_entity_type(
     wtxn: &WriteTransaction,
+    namespace_id: u32,
     name: &str,
 ) -> Result<Option<EntityTypeId>, EntityTypeOpError> {
     if name == "Any" {
         return Ok(None);
     }
-    Ok(entity_type_lookup_by_name(wtxn, name)?.map(|d| d.id()))
+    Ok(entity_type_lookup(wtxn, namespace_id, name)?.map(|d| d.id()))
 }
 
 // ---------------------------------------------------------------------------
@@ -387,7 +410,14 @@ mod tests {
         }
 
         let rtxn = db.begin_read().unwrap();
-        let org_id = crate::entity::types::entity_type_lookup_by_name_rtxn(&rtxn, "Organization")
+        // The schema declares `namespace acme`, so its entity types belong
+        // to acme — not to the shared system namespace. Looking in SYSTEM
+        // used to work only because the registry was one global space.
+        let acme = crate::namespace::namespace_lookup_by_name(&rtxn, "acme")
+            .unwrap()
+            .expect("acme registered by apply")
+            .raw();
+        let org_id = crate::entity::types::entity_type_lookup_rtxn(&rtxn, acme, "Organization")
             .unwrap()
             .expect("Organization interned")
             .id();

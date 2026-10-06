@@ -144,6 +144,10 @@ fn build_extractor(
         // a couple of hundred input tokens.
         None,
         Duration::from_secs(7 * 24 * 60 * 60),
+        // Default ceiling (DEFAULT_LLM_MAX_TOKENS). The live model needs room
+        // for a full JSON object; too low truncates the response and the
+        // extractor reports a permanent failure rather than a parse error.
+        None,
     )
 }
 

@@ -78,6 +78,7 @@ pub enum IndexerError {
     Writer(#[from] TantivyError),
 }
 
+#[derive(Clone, Copy)]
 struct StatementFields {
     statement_id: Field,
     subject_name: Field,
@@ -225,7 +226,7 @@ async fn run_loop(
     shutdown: Receiver<()>,
     control: Receiver<super::IndexerControl>,
 ) {
-    let mut batch: usize = 0;
+    let mut pending: Vec<StatementTextOp> = Vec::new();
     let mut last_commit = Instant::now();
 
     loop {
@@ -234,20 +235,19 @@ async fn run_loop(
 
         match wait_next(&rx, &shutdown, &control, remaining).await {
             NextOp::Op(op) => {
-                if let Err(err) = apply_op(&mut writer, &fields, &op) {
-                    warn!(
-                        target: "brain_ops::text_indexer",
-                        error = %err,
-                        "statement text indexer write failed; skipping op",
-                    );
-                } else {
-                    batch += 1;
-                }
-                if batch >= policy.n_writes {
-                    if commit_with_retry(&mut writer, &commit_gen).is_err() {
+                pending.push(op);
+                if pending.len() >= policy.n_writes {
+                    let (w, ok) = flush_off_reactor(
+                        writer,
+                        fields,
+                        std::mem::take(&mut pending),
+                        &commit_gen,
+                    )
+                    .await;
+                    writer = w;
+                    if !ok {
                         return;
                     }
-                    batch = 0;
                     last_commit = Instant::now();
                 }
             }
@@ -255,27 +255,26 @@ async fn run_loop(
                 // Drain what is still queued before the final commit —
                 // see the matching arm in [`super::memory`].
                 while let Ok(op) = rx.try_recv() {
-                    if let Err(err) = apply_op(&mut writer, &fields, &op) {
-                        warn!(
-                            target: "brain_ops::text_indexer",
-                            error = %err,
-                            "statement text indexer write failed during drain; skipping op",
-                        );
-                    } else {
-                        batch += 1;
-                    }
+                    pending.push(op);
                 }
-                if batch > 0 {
-                    let _ = commit_with_retry(&mut writer, &commit_gen);
+                if !pending.is_empty() {
+                    let _ = flush_off_reactor(writer, fields, pending, &commit_gen).await;
                 }
                 return;
             }
             NextOp::DeadlineHit => {
-                if batch > 0 {
-                    if commit_with_retry(&mut writer, &commit_gen).is_err() {
+                if !pending.is_empty() {
+                    let (w, ok) = flush_off_reactor(
+                        writer,
+                        fields,
+                        std::mem::take(&mut pending),
+                        &commit_gen,
+                    )
+                    .await;
+                    writer = w;
+                    if !ok {
                         return;
                     }
-                    batch = 0;
                 }
                 last_commit = Instant::now();
             }
@@ -285,7 +284,7 @@ async fn run_loop(
                 // in [`super::memory`] for why the uncommitted batch is
                 // discarded rather than flushed.
                 drop(writer);
-                batch = 0;
+                pending.clear();
                 let _ = ack.send_async(()).await;
                 match super::wait_while_paused(&control, &shutdown).await {
                     Some((w, gen)) => {
@@ -306,6 +305,48 @@ async fn run_loop(
             }
         }
     }
+}
+
+/// Apply `ops` and group-commit, entirely off the shard's reactor thread.
+///
+/// Every `IndexWriter` call is blocking: `add_document` hands the document to
+/// tantivy's own indexing thread and `commit` waits on it, both parking on a
+/// futex. Running them from inside the glommio executor blocks the shard's
+/// single reactor thread, and the wait degrades catastrophically — a 256-doc
+/// batch plus commit measured ~27 ms on an ordinary thread but ~72 s on the
+/// reactor. While the shard was stuck the indexer stopped draining, its
+/// bounded op channel filled, and the foreground STATEMENT_CREATE blocked on
+/// the backpressure send until clients hit their request timeout.
+///
+/// So the loop buffers ops (cheap, async) and hands the whole batch to
+/// glommio's blocking pool once per commit cycle — at most one hop per
+/// `n_writes` ops or per commit interval, which the ~27 ms real cost makes
+/// negligible. Returns the writer so the caller keeps ownership across the
+/// hop, and `false` when the commit failed twice (shard-fatal).
+#[cfg(target_os = "linux")]
+async fn flush_off_reactor(
+    writer: IndexWriter,
+    fields: StatementFields,
+    ops: Vec<StatementTextOp>,
+    commit_gen: &Arc<AtomicU64>,
+) -> (IndexWriter, bool) {
+    let gen = Arc::clone(commit_gen);
+    glommio::executor()
+        .spawn_blocking(move || {
+            let mut writer = writer;
+            for op in &ops {
+                if let Err(err) = apply_op(&mut writer, &fields, op) {
+                    warn!(
+                        target: "brain_ops::text_indexer",
+                        error = %err,
+                        "statement text indexer write failed; skipping op",
+                    );
+                }
+            }
+            let ok = commit_with_retry(&mut writer, &gen).is_ok();
+            (writer, ok)
+        })
+        .await
 }
 
 fn apply_op(
