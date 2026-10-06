@@ -70,6 +70,21 @@ ARG EMBED_MODEL_REPO=BAAI/bge-small-en-v1.5
 ARG EMBED_MODEL_REV=main
 ARG EMBED_MODEL_DIR=/models/bge-small-en-v1.5
 
+# GLiNER is the classifier tier of the extractor pipeline. Unlike the embedder
+# it degrades rather than failing: a missing model leaves the tier unloaded and
+# the server starts anyway, so its absence is silent. Bundling it means the
+# stock image extracts with correct span boundaries instead of quietly running
+# a weaker pipeline. The weights are GLiNER's own; the tokenizer, backbone
+# config and SPM come from the DeBERTa-v3-small the model was trained on.
+ARG NER_MODEL_REPO=urchade/gliner_small-v2.1
+# Not microsoft/deberta-v3-small: that repo ships only spm.model +
+# tokenizer_config.json, and the `tokenizers` crate needs a JSON tokenizer.
+# microsoft/.../tokenizer.json is a 404. onnx-community mirrors the same
+# tokenizer in the fast JSON form, which is what bootstrap-model.sh uses.
+ARG NER_TOKENIZER_REPO=onnx-community/deberta-v3-small
+ARG NER_MODEL_REV=main
+ARG NER_MODEL_DIR=/models/gliner-small-v2.1
+
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
@@ -84,6 +99,59 @@ RUN set -eux; \
     size="$(stat -c%s "${EMBED_MODEL_DIR}/model.safetensors")"; \
     test "$size" -gt 10000000 || { echo "weights too small: ${size} bytes" >&2; exit 1; }; \
     head -c4 "${EMBED_MODEL_DIR}/config.json" | grep -q '{' || { echo "config.json is not JSON" >&2; exit 1; }
+
+RUN apt-get update && apt-get install -y --no-install-recommends python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+    mkdir -p "$NER_MODEL_DIR"; \
+    ner="https://huggingface.co/${NER_MODEL_REPO}/resolve/${NER_MODEL_REV}"; \
+    tok="https://huggingface.co/${NER_TOKENIZER_REPO}/resolve/${NER_MODEL_REV}"; \
+    for f in pytorch_model.bin gliner_config.json; do \
+        curl -fsSL --retry 5 --retry-delay 2 -o "${NER_MODEL_DIR}/${f}" "${ner}/${f}"; \
+    done; \
+    for f in tokenizer.json config.json spm.model; do \
+        curl -fsSL --retry 5 --retry-delay 2 -o "${NER_MODEL_DIR}/${f}" "${tok}/${f}"; \
+    done; \
+    size="$(stat -c%s "${NER_MODEL_DIR}/pytorch_model.bin")"; \
+    test "$size" -gt 10000000 || { echo "NER weights too small: ${size} bytes" >&2; exit 1; }; \
+    head -c4 "${NER_MODEL_DIR}/gliner_config.json" | grep -q '{' || { echo "gliner_config.json is not JSON" >&2; exit 1; }
+
+# The <<ENT>> / <<SEP>> marker tokens must exist IN tokenizer.json. The loader
+# resolves them with token_to_id and fails with MissingToken if absent — it
+# does not add them (classifier/gliner/mod.rs:631). <<ENT>> is the per-label
+# pool position the head reads when computing label embeddings, so without the
+# patch the classifier cannot load at all. This mirrors patch_gliner_tokenizer
+# in .devcontainer/bootstrap-model.sh, including its refusal to clobber an id
+# that is already taken by different content.
+RUN python3 - "${NER_MODEL_DIR}/tokenizer.json" <<'PATCH'
+import json, sys
+path = sys.argv[1]
+with open(path, encoding="utf-8") as f:
+    tok = json.load(f)
+REQUIRED = [(128001, "<<ENT>>"), (128002, "<<SEP>>")]
+added = tok.setdefault("added_tokens", [])
+by_id = {a["id"]: a for a in added}
+for tid, content in REQUIRED:
+    if tid in by_id:
+        if by_id[tid]["content"] != content:
+            sys.exit(f"id={tid} taken by {by_id[tid]['content']!r}; refusing to clobber")
+        continue
+    clash = next((a for a in added if a["content"] == content), None)
+    if clash is not None:
+        sys.exit(f"{content!r} already at id={clash['id']}, expected {tid}")
+    added.append({"id": tid, "content": content, "single_word": False,
+                  "lstrip": False, "rstrip": False, "normalized": True,
+                  "special": False})
+added.sort(key=lambda a: a["id"])
+tok["added_tokens"] = added
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(tok, f, ensure_ascii=False)
+    f.write("\n")
+ids = {a["content"]: a["id"] for a in added}
+assert ids.get("<<ENT>>") == 128001 and ids.get("<<SEP>>") == 128002, ids
+print("patched tokenizer.json:", {k: v for k, v in ids.items() if k.startswith("<<")})
+PATCH
 
 # Runtime
 # ----------------------------------------------------------------------------

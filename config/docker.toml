@@ -137,3 +137,16 @@ channel_capacity                         = 1024
 # Consolidation worker is a no-op until an LLM backend is wired.
 # Set to openai / ollama at build time to enable summarization.
 backend = "disabled"
+
+# Extractor pipeline — per-tier tuning. Extraction itself is always-on;
+# there is no per-tier on/off gate.
+[extractors.classifier]
+# The GLiNER NER model ships inside the image. Set explicitly rather than
+# left to XDG auto-discovery: with HOME=/var/lib/brain and XDG_DATA_HOME
+# unset, discovery resolves to /var/lib/brain/.local/share/brain/models/,
+# a path nothing mounts and no operator would guess. Leaving it implicit is
+# what left the classifier tier silently unloaded in v0.1.0.
+#
+# Point this at your own directory to use a different GLiNER build; it must
+# contain pytorch_model.bin, gliner_config.json, tokenizer.json, config.json.
+model_path = "/opt/brain/models/gliner-small-v2.1"
