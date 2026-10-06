@@ -1,8 +1,16 @@
 name: CI
 
+# `push` fires for main only. dev is deliberately NOT a push trigger: while a
+# dev -> main release PR is open, dev is that PR's head, so every merge into
+# dev raised TWO runs of this workflow on one SHA — a `push:dev` run and a
+# `pull_request:dev` run — which doubled CI cost and made the PR check list
+# show each job twice (the loser cancelled by the concurrency group, rendered
+# as a red x beside its green twin). Work reaching dev is already gated by the
+# feature -> dev PR that merged it and by the standing dev -> main PR, both of
+# which run under `pull_request` on the same commit.
 on:
   push:
-    branches: [main, dev]
+    branches: [main]
   pull_request:
     branches: [main, dev]
 

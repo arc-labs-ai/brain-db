@@ -38,7 +38,16 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
+      # The token matters. Events raised with the default GITHUB_TOKEN do not
+      # start workflow runs (GitHub's recursion guard), so a v* tag pushed
+      # under it never reached docker-publish.yml — v0.1.0 was tagged and
+      # released on 2026-10-06 and no image was ever built. A PAT makes the
+      # tag push an ordinary user event, which does trigger docker-publish.
+      # Falls back to GITHUB_TOKEN so this workflow still manages the Release
+      # PR if the secret is absent — but then the tag will NOT build an image
+      # and you must run docker-publish.yml by hand.
       - uses: googleapis/release-please-action@v5
         with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
