@@ -166,6 +166,20 @@ impl ClassifierExtractor {
             if crate::resolver::is_temporal_expression_surface(&span.text) {
                 continue;
             }
+            // Drop a span that merely restates its own type. Labels are
+            // handed to GLiNER as natural language (`AgentPolicy` →
+            // "Agent Policy"), so a sentence that names the type out loud —
+            // "the agent policy CheckoutBot" — gets the type words tagged
+            // alongside the instance. That produced an `AgentPolicy` entity
+            // literally named "agent policy" and an `EvalRun` named
+            // "EvalRun", sitting beside the real CheckoutBot and
+            // EvalRun-42. They are invisible to endpoint validation,
+            // because a node that echoes its type carries exactly the type
+            // the relation expects, so `evaluated` happily pointed at the
+            // generic "EvalRun" instead of the run in the text.
+            if is_label_echo(&span.text, &span.label) {
+                continue;
+            }
             if let Some(item) = self.project(span) {
                 match item {
                     // GLiNER frequently tags conjoined names ("Alice and
@@ -444,6 +458,24 @@ impl Extractor for ClassifierExtractor {
             out
         })
     }
+}
+
+/// Whether `text` says nothing more than the type it was tagged as.
+///
+/// Compared on alphanumerics only, case-folded, so "agent policy",
+/// "Agent Policy" and "AgentPolicy" all collapse onto the label
+/// `mirror:AgentPolicy`. An instance that merely extends the type name
+/// ("EvalRun-42") keeps its extra characters and survives.
+pub(crate) fn is_label_echo(text: &str, label_qname: &str) -> bool {
+    fn squash(s: &str) -> String {
+        s.chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect()
+    }
+    let simple = super::simple_label(label_qname);
+    let t = squash(text);
+    !t.is_empty() && t == squash(simple)
 }
 
 #[cfg(test)]
