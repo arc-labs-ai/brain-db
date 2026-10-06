@@ -5,7 +5,7 @@ clone this repo to run Brain — you pull a released image and point an SDK at i
 The same image is what powers our own hosted launch and the playground, so what
 you run is exactly what we run.
 
-- **Image:** `ghcr.io/arc-labs-ai/brain`
+- **Image:** `ghcr.io/arc-labs-ai/brain-db`
 - **Arches:** `linux/amd64`, `linux/arm64`
 - **Tags:** `X.Y.Z` (immutable release), `X.Y` (latest patch of a minor),
   `latest` (latest release). Pin `X.Y.Z` — or a digest — in production.
@@ -48,7 +48,7 @@ docker run -d --name brain \
   -e BRAIN__ADMIN__TOKEN="$(openssl rand -hex 32)" \
   -v brain-data:/var/lib/brain/data \
   -v brain-models:/var/lib/brain/models \
-  ghcr.io/arc-labs-ai/brain:latest
+  ghcr.io/arc-labs-ai/brain-db:latest
 
 # Liveness:
 curl -fsS http://localhost:9091/healthz

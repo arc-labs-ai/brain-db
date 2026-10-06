@@ -28,6 +28,17 @@ on:
   push:
     tags:
       - "v*"
+  # Escape hatch. A tag pushed by release-please under the default
+  # GITHUB_TOKEN does not raise a workflow-starting event, so the tag -> image
+  # chain can silently not happen (it didn't for v0.1.0). This lets a
+  # maintainer build and publish any existing version tag by hand without
+  # deleting and re-pushing it.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing version tag to build and publish (e.g. v0.1.0)"
+        required: true
+        type: string
 
 # `packages: write` lets the job's GITHUB_TOKEN push to GHCR; `contents:
 # write` lets the merge job create the GitHub Release for the tag.
@@ -39,14 +50,14 @@ permissions:
 # usually isn't one), but group by ref so two accidental pushes of the same
 # tag can't race each other.
 concurrency:
-  group: docker-publish-${{ github.ref }}
+  group: docker-publish-${{ inputs.tag || github.ref }}
   cancel-in-progress: false
 
 # Lowercased owner keeps GHCR happy (ghcr.io rejects uppercase path
 # segments); arc-labs-ai is already lowercase, so a bare interpolation is
 # fine here.
 env:
-  IMAGE: ghcr.io/${{ github.repository_owner }}/brain
+  IMAGE: ghcr.io/${{ github.repository_owner }}/brain-db
   # Run JavaScript actions (docker/login-action et al.) on Node 24 rather
   # than the deprecated Node 20, silencing the per-step deprecation warning.
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -66,6 +77,11 @@ jobs:
             runner: ubuntu-26.04-arm
     steps:
       - uses: actions/checkout@v6
+        with:
+          # On a tag push this is already the tag; on a manual dispatch
+          # github.ref is the branch the hatch was fired from, so the tag the
+          # operator named is what must be built.
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Derive platform tag pair
         run: |
@@ -124,9 +140,13 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE }}
+          # `value=` pins what semver parses. On a tag push github.ref_name is
+          # already `vX.Y.Z`; on a manual dispatch it would be the branch the
+          # hatch was fired from, which parses to no version at all and would
+          # publish an image tagged only `latest`.
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{version}},value=${{ inputs.tag || github.ref_name }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ inputs.tag || github.ref_name }}
             type=raw,value=latest
 
       - name: Set up Docker Buildx
@@ -173,6 +193,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
           generate_release_notes: true
           body: |
             ## Container image

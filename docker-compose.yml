@@ -8,7 +8,7 @@
 #
 # Pin a real version in production — `latest` is a moving target. Better
 # still, pin the digest from the GitHub Release (immutable):
-#   image: ghcr.io/arc-labs-ai/brain@sha256:...
+#   image: ghcr.io/arc-labs-ai/brain-db@sha256:...
 #
 # The in-image config lives at /etc/brain/config.toml; override single
 # fields with BRAIN__SECTION__FIELD env vars (see .env.example), or bind-
@@ -16,7 +16,7 @@
 
 services:
   brain:
-    image: ghcr.io/arc-labs-ai/brain:${BRAIN_VERSION:-latest}
+    image: ghcr.io/arc-labs-ai/brain-db:${BRAIN_VERSION:-latest}
     # io_uring (Glommio, thread-per-core) needs the io_uring syscalls the
     # default Docker seccomp profile blocks. Unconfined is the documented
     # requirement; a custom profile allowing io_uring_* works too.
