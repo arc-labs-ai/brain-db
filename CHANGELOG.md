@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/arc-labs-ai/brain-db/compare/v0.1.0...v0.1.1) (2026-10-06)
+
+
+### Bug Fixes
+
+* **ci:** repair the release pipeline and stop duplicate CI runs ([7860393](https://github.com/arc-labs-ai/brain-db/commit/786039328c58e12a155b0476464f5257f3261064))
+
 ## 0.1.0 (2026-10-06)
 
 
