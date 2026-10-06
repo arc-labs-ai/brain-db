@@ -42,11 +42,11 @@ A CBOR `null` is avoided for optional `WireUuid` fields. Where a struct field ca
 | `0x0131` | `ENTITY_GET` | "ENTITY_GET" | implemented  |
 | `0x0132` | `ENTITY_UPDATE` | "ENTITY_UPDATE" | implemented  |
 | `0x0133` | `ENTITY_RENAME` | "ENTITY_RENAME" | implemented  |
-| `0x0134` | `ENTITY_MERGE` | "ENTITY_MERGE" | spec-only |
-| `0x0135` | `ENTITY_UNMERGE` | "ENTITY_UNMERGE" | spec-only |
-| `0x0136` | `ENTITY_RESOLVE` | "ENTITY_RESOLVE" | spec-only |
-| `0x0137` | `ENTITY_LIST` | "ENTITY_LIST" | spec-only |
-| `0x0138` | `ENTITY_TOMBSTONE` | "ENTITY_TOMBSTONE" | spec-only |
+| `0x0134` | `ENTITY_MERGE` | "ENTITY_MERGE" | implemented |
+| `0x0135` | `ENTITY_UNMERGE` | "ENTITY_UNMERGE" | implemented |
+| `0x0136` | `ENTITY_RESOLVE` | "ENTITY_RESOLVE" | implemented |
+| `0x0137` | `ENTITY_LIST` | "ENTITY_LIST" | implemented |
+| `0x0138` | `ENTITY_TOMBSTONE` | "ENTITY_TOMBSTONE" | implemented |
 
 Responses occupy `0x01B0–0x01B8` (same low byte with high bit set, matching Brain's `0x2N → 0xAN` convention; see [`./03_opcodes.md`](./03_opcodes.md) §3).
 
@@ -210,7 +210,7 @@ pub struct EntityRenameResponse {
 - `DUPLICATE_CANONICAL_NAME` — `new_canonical_name` collides under the same type.
 - `INVALID_ARGUMENT` — empty name, name too long, or `move_to_alias=false` (currently unsupported).
 
-### ENTITY_MERGE (0x0134) — spec-only
+### ENTITY_MERGE (0x0134)
 
 #### Request body — `EntityMergeRequest`
 
@@ -246,7 +246,7 @@ pub struct EntityMergeResponse {
 - Cross-type merges (Person ↔ Organization): forbidden by default, or allowed with attribute drop?
 - Should the grace period be returned absolute (unix nanos) or relative (seconds)? Currently relative.
 
-### ENTITY_UNMERGE (0x0135) — spec-only
+### ENTITY_UNMERGE (0x0135)
 
 #### Request body — `EntityUnmergeRequest`
 
@@ -274,7 +274,7 @@ pub struct EntityUnmergeResponse {
 - `ENTITY_NOT_FOUND` — `merged_entity` doesn't exist or was never merged.
 - `ENTITY_MERGE_CONFLICT` — grace period expired, or `survivor` has been merged further since.
 
-### ENTITY_RESOLVE (0x0136) — spec-only
+### ENTITY_RESOLVE (0x0136)
 
 Exposes the entity resolver over the wire so clients can run resolution without re-implementing the tier ladder.
 
@@ -315,7 +315,7 @@ pub enum ResolutionOutcome {
 - `INVALID_ARGUMENT` — empty `candidate_name`, oversized `context`.
 - `SCHEMA_NOT_DECLARED` (substrate `0x21` for now; §03-specific code possible) — if no schema declared (resolver currently requires the entity_type registry seeded).
 
-### ENTITY_LIST (0x0137) — spec-only
+### ENTITY_LIST (0x0137)
 
 Paginated scan over the entity table. Cheap for small deployments; the query router is the better path for production-sized graphs.
 
@@ -354,7 +354,7 @@ The frame layout mirrors substrate `RECALL_RESP` — see [`./06_streaming.md`](.
 
 - `INVALID_ARGUMENT` — `limit` > 1000, malformed cursor.
 
-### ENTITY_TOMBSTONE (0x0138) — spec-only
+### ENTITY_TOMBSTONE (0x0138)
 
 #### Request body — `EntityTombstoneRequest`
 
@@ -424,7 +424,7 @@ For every opcode in this section that carries a `request_id`, Brain's idempotenc
 
 ### Entity-frames implementation note
 
-The wire shapes for `ENTITY_CREATE` through `ENTITY_RENAME` are implemented with round-trip CBOR conformance tests in the `brain-protocol` crate. The shapes for `ENTITY_MERGE` through `ENTITY_TOMBSTONE` are **spec-only**; their Rust counterparts may be refined during implementation. Refinements must update this file before code lands.
+All entity wire shapes (`ENTITY_CREATE` through `ENTITY_TOMBSTONE`) are implemented with round-trip CBOR conformance tests in the `brain-protocol` crate and dispatched to live handlers in `brain-ops`. Refinements to any shape must update this file before code lands.
 
 ## Statement frames
 
@@ -434,13 +434,13 @@ Request/response body schemas for every opcode in the `0x0140–0x014F` statemen
 
 | Opcode | Name | Section | Status |
 |---|---|---|---|
-| `0x0140` | `STATEMENT_CREATE` | "STATEMENT_CREATE" | spec-only |
-| `0x0141` | `STATEMENT_GET` | "STATEMENT_GET" | spec-only |
-| `0x0142` | `STATEMENT_SUPERSEDE` | "STATEMENT_SUPERSEDE" | spec-only |
-| `0x0143` | `STATEMENT_TOMBSTONE` | "STATEMENT_TOMBSTONE" | spec-only |
-| `0x0144` | `STATEMENT_RETRACT` | "STATEMENT_RETRACT" | spec-only |
-| `0x0145` | `STATEMENT_HISTORY` | "STATEMENT_HISTORY" | spec-only |
-| `0x0146` | `STATEMENT_LIST` | "STATEMENT_LIST" | spec-only |
+| `0x0140` | `STATEMENT_CREATE` | "STATEMENT_CREATE" | implemented |
+| `0x0141` | `STATEMENT_GET` | "STATEMENT_GET" | implemented |
+| `0x0142` | `STATEMENT_SUPERSEDE` | "STATEMENT_SUPERSEDE" | implemented |
+| `0x0143` | `STATEMENT_TOMBSTONE` | "STATEMENT_TOMBSTONE" | implemented |
+| `0x0144` | `STATEMENT_RETRACT` | "STATEMENT_RETRACT" | implemented |
+| `0x0145` | `STATEMENT_HISTORY` | "STATEMENT_HISTORY" | implemented |
+| `0x0146` | `STATEMENT_LIST` | "STATEMENT_LIST" | implemented |
 
 Responses live at `0x01C0–0x01C6`.
 
@@ -690,6 +690,8 @@ pub struct StatementRetractResponse {
 pub struct StatementHistoryRequest {
     pub anchor_id: WireUuid,           // either StatementId or chain_root
     pub include_tombstoned: bool,
+    pub limit: u32,                    // 1..=1000
+    pub cursor: Vec<u8>,               // opaque; empty on the first page
 }
 ```
 
@@ -702,15 +704,19 @@ pub struct StatementHistoryItem {
 
 pub struct StatementHistoryTail {
     pub chain_root: WireUuid,
-    pub total_versions: u32,
+    pub total_versions: u32,           // full chain length, not the page size
+    pub next_cursor: Vec<u8>,          // empty when the chain is exhausted
 }
 ```
 
-Returns the full chain in `version` order (ascending). Suppresses retracted statements regardless of `include_tombstoned`.
+Returns the chain in `version` order (ascending), a page at a time. Suppresses retracted statements regardless of `include_tombstoned`.
+
+Pagination is keyset (seek), keyed on the **immutable `version` number** of the chain — the cursor is the last version returned, and the next page scans strictly past it. Because `version` never mutates, the exhaustive-tiling contract holds: following `next_cursor` to exhaustion yields the union of the chain with each version exactly once, no gap and no duplicate, even when a new version is appended between page fetches. `total_versions` is the full chain length so a client can render progress; a filtered page (`include_tombstoned = false`) may return fewer than `limit` items while `next_cursor` remains non-empty. The cursor is opaque and encodes the `include_tombstoned` toggle; echoing a cursor back with a different toggle is rejected `STALE_CURSOR`, because the resumed page's filtered tiling would otherwise gap or duplicate.
 
 #### Errors
 
 - `STATEMENT_NOT_FOUND` — `anchor_id` doesn't exist.
+- `STALE_CURSOR` — the echoed cursor's `include_tombstoned` toggle differs from the request.
 
 ### STATEMENT_LIST (0x0146)
 
@@ -765,13 +771,13 @@ Request/response body schemas for opcodes `0x0150–0x0156` (relation operations
 
 | Opcode | Name | Section | Status |
 |---|---|---|---|
-| `0x0150` | `RELATION_CREATE` | "RELATION_CREATE" | spec-only |
-| `0x0151` | `RELATION_GET` | "RELATION_GET" | spec-only |
-| `0x0152` | `RELATION_SUPERSEDE` | "RELATION_SUPERSEDE" | spec-only |
-| `0x0153` | `RELATION_TOMBSTONE` | "RELATION_TOMBSTONE" | spec-only |
-| `0x0154` | `RELATION_LIST_FROM` | "RELATION_LIST_FROM" | spec-only |
-| `0x0155` | `RELATION_LIST_TO` | "RELATION_LIST_TO" | spec-only |
-| `0x0156` | `RELATION_TRAVERSE` | "RELATION_TRAVERSE" | spec-only |
+| `0x0150` | `RELATION_CREATE` | "RELATION_CREATE" | implemented |
+| `0x0151` | `RELATION_GET` | "RELATION_GET" | implemented |
+| `0x0152` | `RELATION_SUPERSEDE` | "RELATION_SUPERSEDE" | implemented |
+| `0x0153` | `RELATION_TOMBSTONE` | "RELATION_TOMBSTONE" | implemented |
+| `0x0154` | `RELATION_LIST_FROM` | "RELATION_LIST_FROM" | implemented |
+| `0x0155` | `RELATION_LIST_TO` | "RELATION_LIST_TO" | implemented |
+| `0x0156` | `RELATION_TRAVERSE` | "RELATION_TRAVERSE" | implemented |
 
 Responses live at `0x01D0–0x01D6`.
 

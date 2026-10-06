@@ -429,7 +429,7 @@ async fn seeded_pattern_extractor_persists_entities_end_to_end() {
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires BRAIN_NER_MODEL_PATH pointing at a GLiNER pickle directory"]
 async fn shard_registry_with_real_gliner_persists_entities() {
-    use brain_extractors::{ClassifierConfig, GlinerClassifier, MaterializeDeps, TierGate};
+    use brain_extractors::{ClassifierConfig, GlinerClassifier, MaterializeDeps};
     use redb::ReadableTable;
     use std::path::PathBuf;
 
@@ -466,13 +466,13 @@ async fn shard_registry_with_real_gliner_persists_entities() {
     let model = GlinerClassifier::load(&ClassifierConfig::with_model_path(model_path))
         .expect("load gliner");
     let deps = MaterializeDeps {
+        llm_max_tokens: None,
         classifier_model: Some(Arc::new(model)),
         entity_type_qnames: Arc::new(entity_type_qnames),
         model_router: None,
         llm_cache: None,
     };
-    let (registry, errors) =
-        brain_extractors::build_registry_with_gate(&defs, &deps, TierGate::all_enabled());
+    let (registry, errors) = brain_extractors::build_registry_from_definitions(&defs, &deps);
     assert!(errors.is_empty(), "registry build errors: {errors:?}");
     assert_eq!(
         registry.iter_enabled().count(),
@@ -732,6 +732,7 @@ impl LlmClient for FakeHypeLlmClient {
         let cost_micro_usd = self.cost_micro_usd;
         Box::pin(async move {
             Ok(LlmResponse {
+                truncated: false,
                 content,
                 tokens_in: 10,
                 tokens_out: 20,

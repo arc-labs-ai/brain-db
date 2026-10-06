@@ -86,7 +86,20 @@ pub fn rerank_top_n(
     if candidates.is_empty() || scores.is_empty() {
         return fused;
     }
-    debug_assert_eq!(scores.len(), candidates.len());
+    // Contract: `scores[i]` scores `candidates[i]`, so the slices must be
+    // equal length. A mismatch (e.g. a short score vector) would otherwise
+    // silently leave trailing candidates unscored (rer_norm = 0) and
+    // mis-rank the result. Degrade safely instead: log and skip rerank,
+    // preserving the RRF ordering rather than partially applying the model.
+    if scores.len() != candidates.len() {
+        tracing::warn!(
+            target: "brain_planner::rerank",
+            scores = scores.len(),
+            candidates = candidates.len(),
+            "rerank score/candidate length mismatch; skipping rerank (RRF order preserved)",
+        );
+        return fused;
+    }
 
     // Build an id → score map for the rerank window.
     let mut scored: std::collections::HashMap<RankedItemId, f32> =
@@ -237,6 +250,27 @@ mod tests {
         assert_eq!(out[1].rerank_score, Some(0.9));
         assert_eq!(out[2].rerank_score, None);
         assert_eq!(out[3].rerank_score, None);
+    }
+
+    #[test]
+    fn length_mismatch_skips_rerank_no_partial_scoring() {
+        // Contract violation: fewer scores than candidates. In release this
+        // must degrade to RRF-only order (no partial scoring), not silently
+        // leave trailing candidates unscored and mis-rank. The result is the
+        // input `fused` unchanged, and no item carries a rerank_score.
+        let fused = vec![fused_item(1, 0.040), fused_item(2, 0.037)];
+        let candidates = [candidate(1), candidate(2)];
+        let scores = [0.9_f32]; // short by one
+
+        let out = rerank_top_n(&scores, fused.clone(), &candidates);
+
+        assert_eq!(out.len(), fused.len());
+        assert_eq!(out[0].id, fused[0].id);
+        assert_eq!(out[1].id, fused[1].id);
+        assert!(
+            out.iter().all(|f| f.rerank_score.is_none()),
+            "no candidate should be scored when the contract is violated"
+        );
     }
 
     #[test]

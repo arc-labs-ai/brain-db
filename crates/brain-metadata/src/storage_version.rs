@@ -40,7 +40,22 @@ use redb::{Database, ReadableDatabase, TableDefinition};
 /// (reified slot-filling): the stored value width changed from 1536 to
 /// 1537 bytes, so a v2 file's rows are not readable under the v3 fixed-size
 /// value type. No migration tool — pre-user, fresh-start on bump.
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+///
+/// v4 scopes entity types by tenant and gives predicates a subject domain:
+///
+/// - `EntityTypeDefinition` gains `namespace_id`, plus a new
+///   `entity_types_by_scope` index keyed `(namespace_id, name)`. The
+///   registry used to be keyed on bare `name` globally, so two tenants
+///   declaring the same type name either shared one definition or the
+///   second tenant's `SCHEMA_UPLOAD` failed over a name they never wrote.
+/// - `PredicateDefinition` gains `subject_entity_type_id`, backing
+///   `subject: Entity<T>` in the schema DSL. A predicate could constrain
+///   its object but not its subject, so nothing stopped a predicate
+///   landing on the wrong kind of entity.
+///
+/// Both change the rkyv row layout, and the new index has no rows in an
+/// older file. No migration tool — pre-user, fresh-start on bump.
+pub const CURRENT_SCHEMA_VERSION: u32 = 4;
 
 /// Singleton key inside [`SCHEMA_META_TABLE`].
 pub const SCHEMA_VERSION_KEY: &str = "schema_version";
@@ -135,7 +150,30 @@ pub fn open_or_init_schema(db: &Database) -> Result<u32, SchemaError> {
         }
     }
     crate::tables::materialize_all_tables(&wtxn)?;
+    // Build the by-(scope, type) entity listing index from the primary
+    // rows if a pre-index DB is being opened. Idempotent — a no-op once
+    // the index holds any row. Derived data, rebuilt like the in-RAM
+    // indexes, so it is index construction, not a format migration.
+    let backfilled = crate::entity::ops::backfill_entity_by_type_index(&wtxn)?;
+    // Build the immutable id-ordered statement pagination indexes from the
+    // primary rows if a pre-index DB is being opened. Idempotent — a no-op
+    // once the index holds any row. Derived data, rebuilt like the in-RAM
+    // indexes, so it is index construction, not a format migration.
+    let statement_ids_backfilled = crate::statement::backfill_statement_id_indexes(&wtxn)?;
     wtxn.commit()?;
+
+    if backfilled > 0 {
+        tracing::info!(
+            entities_indexed = backfilled,
+            "backfilled entity_by_type listing index for pre-index DB"
+        );
+    }
+    if statement_ids_backfilled > 0 {
+        tracing::info!(
+            statements_indexed = statement_ids_backfilled,
+            "backfilled statement id-ordered pagination indexes for pre-index DB"
+        );
+    }
 
     if fresh {
         tracing::info!(
@@ -244,7 +282,7 @@ mod tests {
             SchemaError::SchemaTooOld { found, current } => {
                 assert_eq!(found, 1);
                 assert_eq!(current, CURRENT_SCHEMA_VERSION);
-                assert_eq!(current, 3);
+                assert_eq!(current, 4);
             }
             other => panic!("expected SchemaTooOld, got {other:?}"),
         }

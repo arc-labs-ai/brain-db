@@ -1,0 +1,29 @@
+{
+  "namespace": "org",
+  "target_kind": 1,
+  "target_name": "mentors",
+  "force": true,
+  "request_id": [
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17
+  ],
+  "act_as": {
+    "namespace": "org",
+    "space_id": "support-bot:user123",
+    "grant": 32
+  }
+}

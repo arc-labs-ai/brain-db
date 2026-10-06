@@ -78,6 +78,7 @@ impl LlmClient for MockClient {
 
 fn ok_response(json: &str, tokens: u64) -> LlmResponse {
     LlmResponse {
+        truncated: false,
         content: json.into(),
         tokens_in: tokens / 2,
         tokens_out: tokens / 2,
@@ -219,6 +220,48 @@ fn success_no_schema_parses_json_array() {
         }
         other => panic!("expected entity, got {other:?}"),
     }
+}
+
+#[test]
+fn no_schema_malformed_json_fails_instead_of_minting_fragment_entity() {
+    // A truncated / unbalanced JSON body used to fall through to the
+    // plain-text projection and become ONE entity named with the raw
+    // fragment. It must now be a (permanent) failure with no items.
+    let client = Arc::new(MockClient::new(
+        "claude-haiku-4-5",
+        vec![Ok(ok_response("[{\"name\":\"Mirror\"},{", 50))],
+    ));
+    let ext = build_ext(client, None, None, None);
+    let reg = ExtractorRegistry::new();
+    let r = futures_lite::future::block_on(ext.run(&ctx(&reg), &memory("Mirror")));
+    assert_eq!(r.status, ExtractionStatus::Failure);
+    assert!(
+        r.status_reason.contains("malformed JSON"),
+        "{}",
+        r.status_reason
+    );
+    assert!(r.items.is_empty(), "no fragment entity: {:?}", r.items);
+}
+
+#[test]
+fn no_schema_fenced_json_is_unwrapped() {
+    let client = Arc::new(MockClient::new(
+        "claude-haiku-4-5",
+        vec![Ok(ok_response("```json\n[\"Alice\",\"Bob\"]\n```", 50))],
+    ));
+    let ext = build_ext(client, None, None, None);
+    let reg = ExtractorRegistry::new();
+    let r = futures_lite::future::block_on(ext.run(&ctx(&reg), &memory("Alice met Bob")));
+    assert_eq!(r.status, ExtractionStatus::Success);
+    let names: Vec<&str> = r
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            ExtractedItem::EntityMention(m) => Some(m.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(names, vec!["Alice", "Bob"]);
 }
 
 #[test]
@@ -740,6 +783,7 @@ fn extractor_with_mock(mock: Arc<MockClient>) -> LlmExtractor {
         0.0,
         None,
         Duration::from_secs(60),
+        None,
     )
 }
 
@@ -856,6 +900,7 @@ fn judge_supersedes_budget_blocks_call() {
             per_call_micro_usd: 1,
         }),
         Duration::from_secs(60),
+        None,
     );
     let tmp = tempfile::tempdir().unwrap();
     let md = open_md(&tmp);
@@ -1301,7 +1346,8 @@ fn system_schema_missing_object_fails_validation_then_retry_recovers() {
     ]}"#;
     // Second response (the retry): model corrects itself.
     let good = r#"{"statements": [
-        {"subject": "Priya", "predicate": "brain:manages", "object": "the billing platform team",
+        {"subject": "Priya", "subject_type": "brain:Person", "predicate": "brain:manages",
+         "object": "the billing platform team", "object_type": null,
          "object_is_entity": false, "kind": "Relation", "confidence": 0.9, "event_at": null,
          "subject_is_self": false, "retract": false, "is_stateful": false}
     ]}"#;
@@ -1322,12 +1368,22 @@ fn system_schema_missing_object_fails_validation_then_retry_recovers() {
         "missing object must trigger exactly one retry call"
     );
     assert_eq!(r.status, ExtractionStatus::Success);
-    assert_eq!(r.items.len(), 1);
+    // The statement, plus the subject's typed mention (the object is a value).
+    assert_eq!(r.items.len(), 2);
     match &r.items[0] {
         ExtractedItem::StatementMention(m) => {
             assert_eq!(m.object_text.as_deref(), Some("the billing platform team"));
         }
         other => panic!("expected statement mention, got {other:?}"),
+    }
+    match &r.items[1] {
+        ExtractedItem::EntityMention(m) => {
+            assert_eq!(
+                (m.text.as_str(), m.entity_type_qname.as_str()),
+                ("Priya", "brain:Person")
+            );
+        }
+        other => panic!("expected entity mention, got {other:?}"),
     }
 }
 
@@ -1369,4 +1425,193 @@ fn system_schema_missing_object_twice_drops_cleanly_never_fabricates() {
         r.items.is_empty(),
         "a twice-invalid response must yield zero items, never a fabricated empty-object statement"
     );
+}
+
+// ----- E1: failed extractions must carry their real provider spend. -----
+
+#[test]
+fn schema_validation_failed_twice_reports_full_cost() {
+    let schema = system_llm_predicate_schema();
+    // Both calls omit "object" → schema fails twice → terminal Failure. Each
+    // `ok_response(_, 100)` bills tokens*2 = 200 µ$, so the two calls that
+    // actually hit the provider spent 400 µ$ total. The failure MUST report
+    // that spend so the worker's per-cycle budget gate counts it — else a
+    // malformed prompt burns two API calls forever.
+    let bad = r#"{"statements": [
+        {"subject": "Priya", "predicate": "brain:manages", "kind": "Relation",
+         "confidence": 0.9, "object_is_entity": false, "event_at": null,
+         "subject_is_self": false, "retract": false, "is_stateful": false}
+    ]}"#;
+    let client = Arc::new(MockClient::new(
+        "gpt-4o-mini",
+        vec![Ok(ok_response(bad, 100)), Ok(ok_response(bad, 100))],
+    ));
+    let ext = build_ext_with_target(client, schema, ExtractorTarget::EntityOrStatement);
+    let reg = ExtractorRegistry::new();
+    let r = futures_lite::future::block_on(ext.run(
+        &ctx(&reg),
+        &memory("Priya manages the billing platform team."),
+    ));
+    assert_eq!(r.status, ExtractionStatus::Failure);
+    assert_eq!(
+        r.cost_micro_usd, 400,
+        "both calls' real spend must ride the failure, not default to 0"
+    );
+}
+
+#[test]
+fn retry_transport_error_reports_first_call_cost() {
+    let schema = system_llm_predicate_schema();
+    // First call reaches the provider (bills 200 µ$) but fails schema; the
+    // retry errors at transport. The first call's spend already happened, so
+    // the failure must carry 200 µ$ — not 0.
+    let bad = r#"{"statements": [
+        {"subject": "Priya", "predicate": "brain:manages", "kind": "Relation",
+         "confidence": 0.9, "object_is_entity": false, "event_at": null,
+         "subject_is_self": false, "retract": false, "is_stateful": false}
+    ]}"#;
+    let client = Arc::new(MockClient::new(
+        "gpt-4o-mini",
+        vec![
+            Ok(ok_response(bad, 100)),
+            Err(LlmError::ProviderError {
+                status: 503,
+                message: "upstream down".into(),
+            }),
+        ],
+    ));
+    let ext = build_ext_with_target(client, schema, ExtractorTarget::EntityOrStatement);
+    let reg = ExtractorRegistry::new();
+    let r = futures_lite::future::block_on(ext.run(
+        &ctx(&reg),
+        &memory("Priya manages the billing platform team."),
+    ));
+    assert_eq!(r.status, ExtractionStatus::Failure);
+    assert_eq!(
+        r.cost_micro_usd, 200,
+        "the first call already billed real spend; it must ride the failure"
+    );
+}
+
+// ----- E2: missing confidence is conservative; retracts need explicit conf. --
+
+#[test]
+fn missing_confidence_uses_conservative_default_not_max() {
+    // No "confidence" field on the emitted statement. It must NOT default to
+    // 1.0; it gets the conservative 0.5 default, which sits below the 0.7
+    // retract floor so an unstated confidence can never drive a tombstone.
+    let body = r#"{"statements":[{"subject":"Alice","predicate":"brain:likes","object":"tea"}]}"#;
+    let client = Arc::new(MockClient::new(
+        "claude-haiku-4-5",
+        vec![Ok(ok_response(body, 50))],
+    ));
+    // build_ext sets confidence_threshold = 0.5, so the 0.5 default is retained.
+    let ext = build_ext(client, None, None, None);
+    let reg = ExtractorRegistry::new();
+    let r = futures_lite::future::block_on(ext.run(&ctx(&reg), &memory("Alice likes tea")));
+    assert_eq!(r.status, ExtractionStatus::Success);
+    assert_eq!(r.items.len(), 1);
+    match &r.items[0] {
+        ExtractedItem::StatementMention(m) => {
+            assert!(
+                m.confidence < 1.0,
+                "missing confidence must not default to max"
+            );
+            assert!(
+                (m.confidence - 0.5).abs() < f32::EPSILON,
+                "conservative default should be 0.5, got {}",
+                m.confidence
+            );
+            assert!(m.confidence < 0.7, "must sit below the retract floor");
+        }
+        other => panic!("expected statement mention, got {other:?}"),
+    }
+}
+
+#[test]
+fn retract_without_confidence_is_dropped_never_tombstones() {
+    // A retraction with NO stated confidence must be dropped entirely — never
+    // fall back to a default that fires a destructive tombstone, and never
+    // become a spurious positive assertion.
+    let body = r#"{"statements":[{"subject":"Bob","predicate":"brain:works_at","object":"Google","retract":true}]}"#;
+    let client = Arc::new(MockClient::new(
+        "claude-haiku-4-5",
+        vec![Ok(ok_response(body, 50))],
+    ));
+    let ext = build_ext(client, None, None, None);
+    let reg = ExtractorRegistry::new();
+    let r = futures_lite::future::block_on(ext.run(&ctx(&reg), &memory("Bob no longer at Google")));
+    assert_eq!(r.status, ExtractionStatus::Success);
+    assert!(
+        r.items.is_empty(),
+        "a retract with no explicit confidence must be dropped, never emit a mention"
+    );
+}
+
+#[test]
+fn retract_with_explicit_high_confidence_survives() {
+    // An explicit, high confidence on a retraction still produces the retract
+    // mention so a real negation can retire a stored fact.
+    let body = r#"{"statements":[{"subject":"Bob","predicate":"brain:works_at","object":"Google","retract":true,"confidence":0.9}]}"#;
+    let client = Arc::new(MockClient::new(
+        "claude-haiku-4-5",
+        vec![Ok(ok_response(body, 50))],
+    ));
+    let ext = build_ext(client, None, None, None);
+    let reg = ExtractorRegistry::new();
+    let r = futures_lite::future::block_on(ext.run(&ctx(&reg), &memory("Bob no longer at Google")));
+    assert_eq!(r.status, ExtractionStatus::Success);
+    assert_eq!(r.items.len(), 1);
+    match &r.items[0] {
+        ExtractedItem::StatementMention(m) => {
+            assert!(m.retract, "retract flag must survive");
+            assert!((m.confidence - 0.9).abs() < f32::EPSILON);
+        }
+        other => panic!("expected statement mention, got {other:?}"),
+    }
+}
+
+#[test]
+fn typed_endpoints_become_entity_mentions() {
+    use crate::framework::{EntityMention, ExtractedItem};
+    let v = serde_json::json!({
+        "subject": "linear-sandbox", "subject_type": "brain:CloneEnv",
+        "predicate": "mirror:clones", "object": "Linear", "object_type": "TargetApp",
+        "object_is_entity": true, "subject_is_self": false, "confidence": 0.9
+    });
+    let items = super::extractor::typed_endpoint_mentions(&v, 3, 1);
+    let got: Vec<(String, String)> = items
+        .iter()
+        .map(|i| match i {
+            ExtractedItem::EntityMention(EntityMention {
+                text,
+                entity_type_qname,
+                ..
+            }) => (text.clone(), entity_type_qname.clone()),
+            other => panic!("unexpected {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("linear-sandbox".to_string(), "brain:CloneEnv".to_string()),
+            ("Linear".to_string(), "brain:TargetApp".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn typed_endpoints_skip_self_values_and_missing_types() {
+    let v = serde_json::json!({
+        "subject": "I", "subject_type": "brain:Person", "subject_is_self": true,
+        "predicate": "brain:prefers", "object": "dark roast", "object_type": "brain:Concept",
+        "object_is_entity": false, "confidence": 0.9
+    });
+    assert!(super::extractor::typed_endpoint_mentions(&v, 3, 1).is_empty());
+    let untyped = serde_json::json!({
+        "subject": "Ann", "predicate": "brain:works_at", "object": "Acme",
+        "object_is_entity": true, "subject_type": null, "object_type": "",
+        "confidence": 0.9
+    });
+    assert!(super::extractor::typed_endpoint_mentions(&untyped, 3, 1).is_empty());
 }

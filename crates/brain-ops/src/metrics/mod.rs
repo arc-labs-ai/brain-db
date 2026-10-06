@@ -29,6 +29,8 @@ pub mod forget_cascade;
 pub mod histograms;
 pub mod llm;
 pub mod llm_cache;
+pub mod query;
+pub mod retriever;
 pub mod schema_migration;
 pub mod statement_embed;
 pub mod temporal_edge;
@@ -50,6 +52,14 @@ pub use histograms::{
 };
 pub use llm::{LlmCacheMetrics, LlmCacheMetricsSnapshot, LlmCacheModelCounts};
 pub use llm_cache::{LlmCacheSweepMetrics, LlmCacheSweepMetricsSnapshot};
+pub use query::{
+    QueryMetrics, QueryMetricsSnapshot, QueryOutcome, QUERY_FUSION_K_BUCKETS,
+    QUERY_LATENCY_MS_BUCKETS, QUERY_OUTCOME_LABELS,
+};
+pub use retriever::{
+    RetrieverKind, RetrieverMetrics, RetrieverMetricsSnapshot, RETRIEVER_LABELS,
+    RETRIEVER_LATENCY_MS_BUCKETS,
+};
 pub use schema_migration::{SchemaMigrationMetrics, SchemaMigrationMetricsSnapshot};
 pub use statement_embed::{StatementEmbedMetrics, StatementEmbedMetricsSnapshot};
 pub use temporal_edge::{TemporalEdgeMetrics, TemporalEdgeMetricsSnapshot, TemporalSkipReason};

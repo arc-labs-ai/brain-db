@@ -100,6 +100,7 @@ async fn encode_one(ctx: &OpsContext, rid: u32, text: &str) {
 
 async fn recall_one(ctx: &OpsContext, cue: &str) -> usize {
     let req = RecallRequest {
+        scope: Default::default(),
         trace: false,
         cue_text: cue.into(),
         subject_name: String::new(),

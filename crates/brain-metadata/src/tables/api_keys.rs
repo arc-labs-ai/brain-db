@@ -50,13 +50,20 @@ pub mod permissions {
     pub const READ_WRITE: u32 = ENCODE | RECALL | FORGET | LINK | SCHEMA_UPLOAD;
     /// Full powers including admin.
     pub const FULL: u32 = ENCODE | RECALL | FORGET | LINK | SCHEMA_UPLOAD | ADMIN;
+
+    /// Bits a delegating (`ACT_AS`) principal may add to a delegated op via
+    /// `act_as.grant`, on top of the fixed [`STANDARD_SPACE`] mask the
+    /// effective identity always gets. Deliberately excludes [`ACT_AS`]
+    /// (a delegated op can never itself delegate) and every bit already in
+    /// `STANDARD_SPACE`. A grant is further bounded by what the delegator
+    /// itself holds: `effective = STANDARD_SPACE | (grant & delegator & DELEGABLE)`.
+    pub const DELEGABLE: u32 = SCHEMA_UPLOAD | ADMIN;
 }
 
 /// One row in [`API_KEYS_TABLE`]. The plaintext secret never lives
 /// here; `key_hash` is the BLAKE3 of the secret bytes that the holder
 /// presents on AUTH.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq, Eq)]
-#[archive(check_bytes)]
 pub struct ApiKeyRow {
     /// BLAKE3 of the raw secret. Also the primary key — duplicated in
     /// the value so range scans don't need a join.

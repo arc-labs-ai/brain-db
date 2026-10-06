@@ -22,6 +22,7 @@
 use std::collections::HashSet;
 
 use crate::retrieval::fusion::FusedItem;
+use crate::retrieval::rerank::RERANK_ALPHA;
 
 /// MMR trade-off for list intent: 0.5 balances relevance against
 /// novelty. Higher → more relevance-faithful (less spread); lower →
@@ -62,10 +63,25 @@ fn jaccard(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
 ///
 /// `token_sets[i]` is the token set for `items[i]` (empty = no text /
 /// treated as maximally novel — non-memory hits never look redundant).
-/// Relevance is each item's effective score (rerank score when present,
-/// else fused score), min-max normalized across the window so it shares
-/// the `[0, 1]` scale of the Jaccard redundancy term. Items outside the
-/// window are left untouched after the reordered head.
+///
+/// Relevance is the **same blended ranking key the rerank stage used** —
+/// `normalize(fused_score) + RERANK_ALPHA · normalize(rerank_logit)` — not
+/// the raw cross-encoder logit. Using the raw logit would make MMR's first
+/// pick `argmax(raw_logit)`, which can flip the order the rerank stage's
+/// α-bound deliberately protected (a strongly-fused answer surviving a
+/// noisy logit) and mis-scale non-reranked statement/entity hits (tiny
+/// `fused_score`) against reranked memory hits (raw logit — different
+/// units). Recomputing the blend here reproduces the rerank stage's key
+/// exactly: the min/max normalization spans the **whole** `items` slice
+/// (which is the same set the rerank stage saw — the caller truncates to
+/// `top_k` only *after* diversity), so MMR's `argmax(rel)` agrees with the
+/// incoming blended rank-0. When no item was reranked (encoder disabled),
+/// every `rerank_score` is `None`, the rerank term is 0, and relevance
+/// collapses to normalized `fused_score` (the prior fallback behaviour).
+///
+/// The blend is then min-max normalized across the window so it shares the
+/// `[0, 1]` scale of the Jaccard redundancy term. Items outside the window
+/// are left untouched after the reordered head.
 ///
 /// A non-positive `lambda` or a window of ≤ 2 is a no-op (nothing to
 /// diversify).
@@ -75,11 +91,45 @@ pub fn mmr_reorder(items: &mut Vec<FusedItem>, token_sets: &[HashSet<String>], l
         return;
     }
 
-    // Effective relevance per windowed item, min-max normalized.
+    // Reproduce the rerank stage's blended key so MMR ranks by the value
+    // the incoming order was actually sorted by. Both min/max passes span
+    // the full `items` slice — identical to the range the rerank stage
+    // normalized over (it saw this same, un-truncated set) — so the blend
+    // computed here equals the rerank key and MMR's argmax is the incoming
+    // rank-0 item.
+    let (fus_min, fus_max) = items
+        .iter()
+        .map(|it| it.fused_score)
+        .filter(|s| s.is_finite())
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), s| {
+            (lo.min(s), hi.max(s))
+        });
+    let fus_range = (fus_max - fus_min).max(f64::EPSILON);
+    let (rer_min, rer_max) = items
+        .iter()
+        .filter_map(|it| it.rerank_score)
+        .filter(|s| s.is_finite())
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), s| {
+            (lo.min(s), hi.max(s))
+        });
+    let rer_range = (rer_max - rer_min).max(f32::EPSILON);
+
+    // Blended relevance per windowed item, then min-max normalized.
     let rel_raw: Vec<f64> = items
         .iter()
         .take(window)
-        .map(|it| it.rerank_score.map_or(it.fused_score, f64::from))
+        .map(|it| {
+            let fus_norm = if it.fused_score.is_finite() {
+                ((it.fused_score - fus_min) / fus_range).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let rer_norm = match it.rerank_score {
+                Some(s) if s.is_finite() => f64::from(((s - rer_min) / rer_range).clamp(0.0, 1.0)),
+                _ => 0.0,
+            };
+            fus_norm + RERANK_ALPHA * rer_norm
+        })
         .collect();
     let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
     for &r in &rel_raw {

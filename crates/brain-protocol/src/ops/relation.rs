@@ -437,7 +437,11 @@ mod tests {
             from_entity: sample_uuid(11),
             to_entity: sample_uuid(12),
             properties_blob: Vec::new(),
-            evidence: EvidenceRefWire::Inline(vec![[5u8; 16]]),
+            // A well-formed MemoryId: the reserved low-32-bits (bytes
+            // 12..16) must be zero, since decode normalizes them.
+            evidence: EvidenceRefWire::Inline(vec![[
+                5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 0, 0, 0, 0,
+            ]]),
             extractor_id: 0,
             extracted_at_unix_nanos: 1_700_000_000_000_000_000,
             confidence: 0.9,

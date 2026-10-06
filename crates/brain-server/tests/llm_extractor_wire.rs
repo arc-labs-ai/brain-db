@@ -164,13 +164,16 @@ fn upload_request(source: &str) -> RequestBody {
         dry_run: false,
         allow_breaking: false,
         request_id: *uuid::Uuid::now_v7().as_bytes(),
+        act_as: None,
     })
 }
 
 // User schema declaring an LLM extractor. `cost_budget` and
 // `cache_*` left off so the materializer takes the no-router
 // degraded path (CI has no `BRAIN__LLM__API_KEY`).
-const ACME_LLM_SCHEMA: &str = "namespace acme\n\
+// The caller's own namespace ("test", the default token's namespace) — a caller
+// may only upload schema for its own namespace (tenant binding).
+const USER_LLM_SCHEMA: &str = "namespace test\n\
                                define extractor llm_prefs {\n\
                                kind: llm\n\
                                target: statement Preference\n\
@@ -194,13 +197,13 @@ async fn schema_upload_registers_llm_extractor_in_list() {
     complete_handshake(&mut client, &server.token).await;
 
     // 1. SCHEMA_UPLOAD parses + persists the user namespace.
-    let (opcode, body) = round_trip(&mut client, 1, upload_request(ACME_LLM_SCHEMA)).await;
+    let (opcode, body) = round_trip(&mut client, 1, upload_request(USER_LLM_SCHEMA)).await;
     assert_eq!(opcode, Opcode::SchemaUploadResp.as_u16());
     let upload_resp = match body {
         ResponseBody::SchemaUpload(r) => r,
         other => panic!("expected SchemaUploadResp, got {other:?}"),
     };
-    assert_eq!(upload_resp.namespace, "acme");
+    assert_eq!(upload_resp.namespace, "test");
     assert_eq!(upload_resp.schema_version, 1);
     assert!(
         upload_resp.validation_errors.is_empty(),
@@ -225,7 +228,7 @@ async fn schema_upload_registers_llm_extractor_in_list() {
     let llm_row = list
         .items
         .iter()
-        .find(|i| i.namespace == "acme" && i.name == "llm_prefs")
+        .find(|i| i.namespace == "test" && i.name == "llm_prefs")
         .expect("acme:llm_prefs registered");
     assert_eq!(llm_row.kind, 2, "kind byte 2 == llm");
 

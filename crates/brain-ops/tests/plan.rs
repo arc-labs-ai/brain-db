@@ -418,3 +418,162 @@ fn plan_trace_true_populates_explored_and_meeting_points() {
         assert!(!meet.text.is_empty());
     })
 }
+
+// ---------------------------------------------------------------------------
+// 8. Regression: ByText endpoints whose ANN neighbourhoods overlap.
+//
+// Live repro: a space holding just two memories, PLAN start "Priya is based
+// in Bangalore" → goal "Priya leads the EU office in Lisbon". Both memories
+// sit in the top-K of BOTH cues, so both used to seed both BFS sides; the
+// executor then reported each as a trivial start == goal "path" — two frames
+// of one step each (step_index 0, Initial, distance 0), goal memory first.
+// With the endpoints split by anchor the plan is the single real path
+// start → goal, numbered from the start.
+// ---------------------------------------------------------------------------
+
+/// Keyword-driven embedder: each city gets its own axis plus a small shared
+/// component, so the two memories are mildly similar (both land in each
+/// cue's top-K) but each cue's nearest memory is its own.
+struct CityDispatcher;
+
+impl Dispatcher for CityDispatcher {
+    fn embed(&self, text: &str) -> Result<[f32; VECTOR_DIM], EmbedError> {
+        let mut v = [0.0f32; VECTOR_DIM];
+        if text.contains("Bangalore") {
+            v[0] = 1.0;
+        } else if text.contains("Lisbon") {
+            v[1] = 1.0;
+        } else {
+            v[3] = 1.0;
+        }
+        v[2] = 0.3;
+        Ok(v)
+    }
+    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<[f32; VECTOR_DIM]>, EmbedError> {
+        texts.iter().map(|t| self.embed(t)).collect()
+    }
+    fn fingerprint(&self) -> [u8; 16] {
+        [0xC1; 16]
+    }
+}
+
+#[test]
+fn plan_by_text_overlapping_endpoints_returns_start_to_goal_path() {
+    use brain_protocol::envelope::response::EncodeResponse;
+    use brain_protocol::EncodeRequest;
+
+    run_in_glommio(|| async {
+        let tempdir = tempfile::tempdir().unwrap();
+        let metadata: SharedMetadataDb =
+            Arc::new(MetadataDb::open(tempdir.path().join("metadata.redb")).unwrap());
+        let (shared, hnsw_writer) = SharedHnsw::new(IndexParams::default_v1()).unwrap();
+        let writer = Arc::new(RealWriterHandle::new(metadata.clone(), hnsw_writer));
+        let executor = ExecutorContext::new(
+            Arc::new(CityDispatcher) as Arc<dyn Dispatcher>,
+            shared,
+            metadata,
+            writer as Arc<dyn WriterHandle>,
+        );
+        let ctx = brain_ops::test_support::ops_context_for_tests(executor, tempdir.path());
+
+        let mut ids = Vec::new();
+        for (i, text) in [
+            "Priya is based in Bangalore",
+            "Priya leads the EU office in Lisbon",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let out = dispatch(
+                RequestBody::Encode(EncodeRequest {
+                    text: (*text).into(),
+                    session_id: 1,
+                    request_id: [0x40 + i as u8; 16],
+                    txn_id: None,
+                    occurred_at_unix_nanos: None,
+                    act_as: None,
+                    wait: brain_protocol::WaitMode::Ack,
+                    allow_duplicates: true,
+                }),
+                brain_ops::RequestCaller::for_tests(),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            match out {
+                DispatchOutcome::Single(ResponseBody::Encode(EncodeResponse {
+                    memory_id, ..
+                })) => ids.push(memory_id),
+                other => panic!("expected Encode, got {other:?}"),
+            }
+        }
+        let (bangalore, lisbon) = (ids[0], ids[1]);
+        assert_ne!(bangalore, lisbon);
+
+        // The causal hop the plan should find: Bangalore → Lisbon.
+        dispatch(
+            RequestBody::Link(LinkRequest {
+                source: bangalore,
+                target: lisbon,
+                kind: EdgeKindWire::from(EdgeKind::Caused),
+                weight: 1.0,
+                request_id: [0x5E; 16],
+                txn_id: None,
+                act_as: None,
+            }),
+            brain_ops::RequestCaller::for_tests(),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let req = PlanRequest {
+            start: PlanState::ByText("Priya is based in Bangalore".into()),
+            goal: PlanState::ByText("Priya leads the EU office in Lisbon".into()),
+            budget: PlanBudget {
+                max_steps: 4,
+                max_wall_time_ms: 1000,
+                max_branches_explored: 256,
+            },
+            strategy_hint: None,
+            session_filter: None,
+            request_id: None,
+            txn_id: None,
+            trace: false,
+            act_as: None,
+        };
+        let frames = unwrap_plan_stream(
+            dispatch(
+                RequestBody::Plan(req),
+                brain_ops::RequestCaller::for_tests(),
+                &ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        let paths: Vec<_> = frames.iter().filter(|f| !f.is_final).collect();
+        let terminal = frames.last().expect("terminal frame");
+        assert!(terminal.is_final);
+        assert_eq!(terminal.plan_status, Some(WirePlanStatus::GoalReached));
+
+        // No degenerate one-node "paths": the endpoints resolved to
+        // different memories, so every path must span start → goal.
+        for p in &paths {
+            assert!(
+                p.steps.len() >= 2,
+                "one-node path means start/goal collapsed: {:?}",
+                p.steps
+            );
+        }
+        let best = &paths.first().expect("at least one path").steps;
+        assert_eq!(best.len(), 2);
+        assert_eq!(best[0].memory_id, bangalore, "path starts at the start");
+        assert_eq!(best[1].memory_id, lisbon, "path ends at the goal");
+        assert_eq!(best[0].step_index, 0);
+        assert_eq!(best[1].step_index, 1);
+        assert_eq!(best[0].transition_kind, TransitionKind::Initial);
+        assert_ne!(best[1].transition_kind, TransitionKind::Initial);
+        assert_eq!(best[0].estimated_distance_to_goal, 1.0);
+        assert_eq!(best[1].estimated_distance_to_goal, 0.0);
+    })
+}

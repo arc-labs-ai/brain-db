@@ -87,15 +87,24 @@ predicate_def = {
 
 predicate_field = _{
       predicate_kind_field
+    | predicate_subject_field
     | predicate_object_field
     | predicate_stateful_field
     | predicate_description_field
+    | predicate_retention_field
 }
 
 predicate_kind_field        = { "kind" ~ ":" ~ statement_kind }
+// Which entity type may carry this predicate. Optional; omitted means
+// `Any`, which is how every pre-existing schema behaves. A predicate could
+// already constrain its OBJECT but not its SUBJECT, so a schema could say
+// "prefers_fidelity takes a text value" and not "…and it belongs to a
+// Builder" — nothing stopped it landing on a CloneEnv.
+predicate_subject_field     = { "subject" ~ ":" ~ subject_type }
 predicate_object_field      = { "object" ~ ":" ~ object_type }
 predicate_stateful_field    = { "stateful" ~ ":" ~ bool_literal }
 predicate_description_field = { "description" ~ ":" ~ string_literal }
+predicate_retention_field   = { "retention" ~ ":" ~ duration_literal }
 
 statement_kind = @{ "Fact" | "Preference" | "Event" | "Attribute" | "Relation" | "Directive" | "Any" }
 
@@ -135,6 +144,16 @@ object_type = {
     | object_type_statement
     | object_type_any
 }
+
+// Subjects are entities, so the only meaningful narrowing is to one
+// entity type. `Any` is the explicit spelling of the default.
+subject_type = {
+      subject_type_entity
+    | subject_type_any
+}
+
+subject_type_entity = { "Entity" ~ "<" ~ identifier ~ ">" }
+subject_type_any    = @{ "Any" }
 
 object_type_value     = { "Value" ~ "<" ~ attr_type ~ ">" }
 object_type_entity    = { "Entity" ~ "<" ~ identifier ~ ">" }

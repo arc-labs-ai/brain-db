@@ -39,11 +39,12 @@ use super::analogical::{self, EvidenceTriple};
 use super::context::ExecutorContext;
 use super::error::ExecError;
 use super::result::{
-    EvidenceItem, InferenceKind, InferenceStep, InferenceStream, InferenceStreamTerminal,
-    ReasonResult, ReasonStatus, ReasonTrace, ReasonTraceBase, ReasonTraceCandidate,
-    ReasonTraceCentroid, ReasonTraceEdgeCandidate, ReasonTraceScoreBreakdown, ReasonTraceTrim,
-    ReasonTraceWalk,
+    DerivedInference, EvidenceItem, InferenceKind, InferenceStep, InferenceStream,
+    InferenceStreamTerminal, ReasonResult, ReasonStatus, ReasonTrace, ReasonTraceBase,
+    ReasonTraceCandidate, ReasonTraceCentroid, ReasonTraceEdgeCandidate, ReasonTraceScoreBreakdown,
+    ReasonTraceTrim, ReasonTraceWalk,
 };
+use super::stance;
 
 /// Absolute-confidence shift (post-nudge vs. evidence-only) above
 /// which a step is tagged `InferenceKind::AnalogicalInference` instead
@@ -84,12 +85,26 @@ pub async fn execute_reason_stream(
     if !result.base_memories.is_empty() {
         steps.push(InferenceStep {
             step_index: 0,
-            base_memories: result.base_memories,
+            claim: result.claim,
+            base_memories: result.base_memories.clone(),
             supporting: result.supporting,
             contradicting: result.contradicting,
             confidence,
             inference_kind,
         });
+        // Claims drawn outward from the typed graph, one step each, after
+        // the aggregate verdict on the observation.
+        for (i, d) in result.derived.into_iter().enumerate() {
+            steps.push(InferenceStep {
+                step_index: u32::try_from(i + 1).unwrap_or(u32::MAX),
+                claim: Some(d.claim),
+                base_memories: result.base_memories.clone(),
+                supporting: d.supporting,
+                contradicting: d.contradicting,
+                confidence: d.confidence,
+                inference_kind: d.inference_kind,
+            });
+        }
     }
     let steps_emitted = u32::try_from(steps.len()).unwrap_or(u32::MAX);
     Ok(InferenceStream {
@@ -122,6 +137,8 @@ pub async fn execute_reason(
                 ..ReasonTrace::default()
             }),
             inference_kind: InferenceKind::EvidenceAccumulation,
+            claim: observation_claim(&plan.observation),
+            derived: Vec::new(),
         });
     }
 
@@ -148,8 +165,93 @@ pub async fn execute_reason(
         .copied()
         .collect();
 
+    // Direct-similarity items at distance 0.
+    //
+    // `ByMemoryId`: the observation memory itself is the (only) base item
+    // and trivially supports itself.
+    //
+    // `ByText`: the base set is the observation's ANN neighbourhood, and
+    // similarity is not agreement — a newer "the blocker is fixed" record
+    // is as close to "X is blocked" as the record that says so. Each hit
+    // is classified against the observation (`stance::stance_pass`):
+    // supporting hits stay supporting, opposing hits become contradicting
+    // evidence, off-topic / state-silent hits are dropped, and whichever
+    // side is older than the newest opposing record is damped.
+    let now = now_unix_nanos();
+    let scope = RowScope::new(ctx.caller_namespace, ctx.caller_space);
+    let observation_profile = observation_profile(&plan.observation, ctx);
+    let mut stance_contradicting: Vec<EvidenceItem> = Vec::new();
+    let mut direct_supporting: Vec<EvidenceItem> = Vec::new();
+    let mut direct_trace: Vec<ReasonTraceScoreBreakdown> = Vec::new();
+    match &plan.observation {
+        ObservationInput::ByMemoryId(_) => {
+            for (&id, &sim) in &base_scores {
+                push_direct(
+                    &mut direct_supporting,
+                    &mut direct_trace,
+                    id,
+                    sim,
+                    1.0,
+                    trace,
+                );
+            }
+        }
+        ObservationInput::ByText(_) => {
+            let ranked: Vec<(MemoryId, f32)> = base_memories
+                .iter()
+                .filter_map(|id| base_scores.get(id).map(|s| (*id, *s)))
+                .collect();
+            let rtxn = ctx
+                .metadata
+                .read_txn()
+                .map_err(|e| ExecError::MetadataReadFailed(e.to_string()))?;
+            let (sup, con) = stance::stance_pass(&rtxn, scope, &observation_profile, &ranked, now);
+            for item in sup {
+                let sim = base_scores
+                    .get(&item.memory_id)
+                    .copied()
+                    .unwrap_or(item.score);
+                let damp = if sim > 0.0 { item.score / sim } else { 1.0 };
+                push_direct(
+                    &mut direct_supporting,
+                    &mut direct_trace,
+                    item.memory_id,
+                    sim,
+                    damp,
+                    trace,
+                );
+            }
+            for item in con {
+                let sim = base_scores
+                    .get(&item.memory_id)
+                    .copied()
+                    .unwrap_or(item.score);
+                let damp = if sim > 0.0 { item.score / sim } else { 1.0 };
+                push_direct(
+                    &mut stance_contradicting,
+                    &mut direct_trace,
+                    item.memory_id,
+                    sim,
+                    damp,
+                    trace,
+                );
+            }
+        }
+    }
+
+    // The outward walks start from the base memories that actually
+    // support the observation: for `ByText` a Supports edge out of a
+    // refuting memory supports the refutation, not the observation.
+    let walk_base: HashMap<MemoryId, f32> = match &plan.observation {
+        ObservationInput::ByMemoryId(_) => base_scores.clone(),
+        ObservationInput::ByText(_) => direct_supporting
+            .iter()
+            .filter_map(|e| base_scores.get(&e.memory_id).map(|s| (e.memory_id, *s)))
+            .collect(),
+    };
+
     let (mut supporting, supports_walk_trace, mut scoring_trace) = walk_outward(
-        &base_scores,
+        &walk_base,
         &supports_kinds,
         plan.supports_traversal.max_depth,
         max_inferences,
@@ -160,31 +262,13 @@ pub async fn execute_reason(
         trace,
     )?;
 
-    // Direct-similarity supporting items: every base memory is a
-    // supporting item at distance 0.
-    for (&id, &sim) in &base_scores {
-        supporting.push(EvidenceItem {
-            memory_id: id,
-            score: sim,
-            edge_path: Vec::new(),
-            edge_weights: Vec::new(),
-            distance: 0,
-        });
-        if trace {
-            scoring_trace.push(ReasonTraceScoreBreakdown {
-                memory_id: id,
-                base_similarity: sim,
-                decay: 1.0,
-                weight_product: 1.0,
-                alignment: 1.0,
-                analogical_fit: 1.0,
-                final_score: sim,
-            });
-        }
+    supporting.extend(direct_supporting);
+    if trace {
+        scoring_trace.extend(direct_trace);
     }
 
-    let (contradicting, contradicts_walk_trace, contradicting_scoring_trace) = walk_outward(
-        &base_scores,
+    let (mut contradicting, contradicts_walk_trace, contradicting_scoring_trace) = walk_outward(
+        &walk_base,
         &contradicts_kinds,
         plan.contradicts_traversal.max_depth,
         max_inferences,
@@ -196,6 +280,11 @@ pub async fn execute_reason(
     )?;
     if trace {
         scoring_trace.extend(contradicting_scoring_trace);
+    }
+    for item in stance_contradicting {
+        if !contradicting.iter().any(|e| e.memory_id == item.memory_id) {
+            contradicting.push(item);
+        }
     }
 
     // 3+4. Apply confidence floor + trim.
@@ -214,19 +303,13 @@ pub async fn execute_reason(
     // to decide the "which kind wins" tag; the analogical-fit pass
     // that follows can only re-rank these same survivors, never
     // resurrect anything the floor already cut.
-    let sum_s0: f32 = supporting.iter().map(|e| e.score).sum();
-    let sum_c0: f32 = contradicting.iter().map(|e| e.score).sum();
-    let confidence_evidence_only = if sum_s0 + sum_c0 <= 0.0 {
-        0.0
-    } else {
-        (sum_s0 - sum_c0) / (sum_s0 + sum_c0)
-    };
+    let confidence_evidence_only =
+        aggregate_confidence(&plan.observation, &supporting, &contradicting);
 
     // VSA analogical-inference nudge (bounded re-rank only — see
     // `executor::analogical`). One fresh, deterministically seeded
     // `Codebook` per call, dropped at the end of this function; never
     // a shared/global mutable singleton.
-    let scope = RowScope::new(ctx.caller_namespace, ctx.caller_space);
     let analogical_rtxn = ctx.metadata.read_txn().ok();
     let observation_triple: Option<EvidenceTriple> =
         analogical_rtxn
@@ -277,13 +360,7 @@ pub async fn execute_reason(
     });
 
     // 5. Aggregate.
-    let sum_s: f32 = supporting.iter().map(|e| e.score).sum();
-    let sum_c: f32 = contradicting.iter().map(|e| e.score).sum();
-    let confidence = if sum_s + sum_c <= 0.0 {
-        0.0
-    } else {
-        (sum_s - sum_c) / (sum_s + sum_c)
-    };
+    let confidence = aggregate_confidence(&plan.observation, &supporting, &contradicting);
 
     // Which kind wins: tag the step `AnalogicalInference` only when the
     // nudge moved the aggregate confidence materially away from its
@@ -312,6 +389,22 @@ pub async fn execute_reason(
         centroid: centroid_trace,
     });
 
+    // Claims drawn outward from the typed graph around the evidence. The
+    // aggregate step above spends one of `max_inferences`.
+    let derived = if started.elapsed().as_millis() as u64 > wall_ms {
+        Vec::new()
+    } else {
+        derive_inferences(
+            ctx,
+            scope,
+            &observation_profile,
+            &supporting,
+            &contradicting,
+            now,
+            max_inferences.saturating_sub(1),
+        )
+    };
+
     Ok(ReasonResult {
         base_memories,
         supporting,
@@ -320,7 +413,178 @@ pub async fn execute_reason(
         status,
         trace: reason_trace,
         inference_kind,
+        claim: observation_claim(&plan.observation),
+        derived,
     })
+}
+
+/// `balance = (sum_s - sum_c) / (sum_s + sum_c)` (`0` when both are
+/// empty). A `ByText` verdict is only as certain as its strongest
+/// evidence — an uncontested 0.7-cosine neighbour is not proof — so the
+/// balance is scaled by the best item score. `ByMemoryId` keeps the
+/// plain balance (the observation memory is itself a stored record at
+/// score 1.0).
+fn aggregate_confidence(
+    observation: &ObservationInput,
+    supporting: &[EvidenceItem],
+    contradicting: &[EvidenceItem],
+) -> f32 {
+    let sum_s: f32 = supporting.iter().map(|e| e.score).sum();
+    let sum_c: f32 = contradicting.iter().map(|e| e.score).sum();
+    if sum_s + sum_c <= 0.0 {
+        return 0.0;
+    }
+    let balance = (sum_s - sum_c) / (sum_s + sum_c);
+    match observation {
+        ObservationInput::ByText(_) => {
+            let strength = supporting
+                .iter()
+                .chain(contradicting.iter())
+                .map(|e| e.score)
+                .fold(0.0_f32, f32::max)
+                .clamp(0.0, 1.0);
+            balance * strength
+        }
+        ObservationInput::ByMemoryId(_) => balance,
+    }
+}
+
+/// The claim the aggregate step evaluates: the observation text for
+/// `ByText`, `None` for `ByMemoryId`.
+fn observation_claim(observation: &ObservationInput) -> Option<String> {
+    match observation {
+        ObservationInput::ByText(t) => Some(t.clone()),
+        ObservationInput::ByMemoryId(_) => None,
+    }
+}
+
+/// Stance profile of the observation: its own text for `ByText`, the
+/// stored memory text for `ByMemoryId` (empty profile when missing).
+fn observation_profile(observation: &ObservationInput, ctx: &ExecutorContext) -> stance::Profile {
+    match observation {
+        ObservationInput::ByText(t) => stance::Profile::of(t),
+        ObservationInput::ByMemoryId(raw) => {
+            let text = ctx
+                .metadata
+                .read_txn()
+                .ok()
+                .and_then(|rtxn| stance::memory_text(&rtxn, MemoryId::from(*raw)))
+                .unwrap_or_default();
+            stance::Profile::of(&text)
+        }
+    }
+}
+
+/// Push one distance-0 evidence item (score = `sim × damp`) plus its
+/// score breakdown. `damp` is the stance pass's recency / supersession
+/// multiplier, recorded as the breakdown's `weight_product` (no edges are
+/// traversed at distance 0, so that slot is otherwise always `1.0`).
+fn push_direct(
+    out: &mut Vec<EvidenceItem>,
+    scoring_trace: &mut Vec<ReasonTraceScoreBreakdown>,
+    id: MemoryId,
+    sim: f32,
+    damp: f32,
+    trace: bool,
+) {
+    let score = sim * damp;
+    out.push(EvidenceItem {
+        memory_id: id,
+        score,
+        edge_path: Vec::new(),
+        edge_weights: Vec::new(),
+        distance: 0,
+    });
+    if trace {
+        scoring_trace.push(ReasonTraceScoreBreakdown {
+            memory_id: id,
+            base_similarity: sim,
+            decay: 1.0,
+            weight_product: damp,
+            alignment: 1.0,
+            analogical_fit: 1.0,
+            final_score: score,
+        });
+    }
+}
+
+/// Draw up to `max_claims` claims outward from the statements of the
+/// final supporting + contradicting evidence (see
+/// `stance::derive_claims`). Best-effort: a read failure yields no
+/// derived claims, never an error.
+fn derive_inferences(
+    ctx: &ExecutorContext,
+    scope: RowScope,
+    observation: &stance::Profile,
+    supporting: &[EvidenceItem],
+    contradicting: &[EvidenceItem],
+    now: u64,
+    max_claims: usize,
+) -> Vec<DerivedInference> {
+    if max_claims == 0 {
+        return Vec::new();
+    }
+    let Ok(rtxn) = ctx.metadata.read_txn() else {
+        return Vec::new();
+    };
+    let mut seeds: Vec<MemoryId> = Vec::new();
+    let mut stanced: Vec<stance::StancedItem> = Vec::new();
+    for item in supporting.iter().chain(contradicting.iter()) {
+        if seeds.contains(&item.memory_id) {
+            continue;
+        }
+        seeds.push(item.memory_id);
+        let (Some(text), Some(time)) = (
+            stance::memory_text(&rtxn, item.memory_id),
+            stance::memory_time(&rtxn, scope, item.memory_id),
+        ) else {
+            continue;
+        };
+        let profile = stance::Profile::of(&text);
+        stanced.push(stance::StancedItem {
+            memory_id: item.memory_id,
+            score: item.score,
+            stance: stance::Stance::Unrelated,
+            time,
+            polarity: profile.polarity,
+            tokens: profile.tokens,
+        });
+    }
+    let sources = stance::ClaimSources {
+        observation,
+        seed_memories: &seeds,
+        stanced: &stanced,
+        now,
+        max_claims,
+    };
+    let to_items = |v: Vec<(MemoryId, f32)>| -> Vec<EvidenceItem> {
+        v.into_iter()
+            .map(|(memory_id, score)| EvidenceItem {
+                memory_id,
+                score,
+                edge_path: Vec::new(),
+                edge_weights: Vec::new(),
+                distance: 0,
+            })
+            .collect()
+    };
+    stance::derive_claims(&rtxn, scope, &sources)
+        .into_iter()
+        .map(|c| DerivedInference {
+            claim: c.claim,
+            supporting: to_items(c.supporting),
+            contradicting: to_items(c.contradicting),
+            confidence: c.confidence,
+            inference_kind: InferenceKind::EvidenceAccumulation,
+        })
+        .collect()
+}
+
+fn now_unix_nanos() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -341,6 +605,12 @@ fn resolve_base(plan: &ReasonPlan, ctx: &ExecutorContext, trace: bool) -> Resolv
             // BFS short-circuits to an empty result set, matching
             // `search_active`'s silent-filter for ByText seeds.
             if ctx.index.is_tombstoned(id) {
+                return Ok((HashMap::new(), Vec::new(), ReasonTraceBase::default()));
+            }
+            // Tenant wall: a foreign-tenant seed id would let REASON aggregate
+            // over another tenant's subgraph. Out-of-scope (or missing) → empty
+            // base, indistinguishable from tombstoned (leaks nothing).
+            if !ctx.memory_in_caller_scope(id) {
                 return Ok((HashMap::new(), Vec::new(), ReasonTraceBase::default()));
             }
             let mut map = HashMap::with_capacity(1);
@@ -368,7 +638,14 @@ fn resolve_base(plan: &ReasonPlan, ctx: &ExecutorContext, trace: bool) -> Resolv
                 .max_supporting
                 .saturating_add(plan.aggregation.max_contradicting)
                 .max(1);
-            let hits = ctx.index.search_active(&vector, k, Some(BASE_RECALL_EF));
+            let hits: Vec<(MemoryId, f32)> = ctx
+                .index
+                .search_active(&vector, k, Some(BASE_RECALL_EF))
+                .into_iter()
+                // The shard HNSW is tenant-blind; keep only the caller's own
+                // memories as base candidates.
+                .filter(|(id, _)| ctx.memory_in_caller_scope(*id))
+                .collect();
             let base_trace = if trace {
                 let ids: Vec<MemoryId> = hits.iter().map(|(id, _)| *id).collect();
                 let texts = fetch_trace_texts(&ids, ctx);

@@ -7,8 +7,8 @@ use brain_core::ExtractorId;
 use brain_core::{ExtractorKind, Memory};
 use brain_protocol::schema::ExtractorTarget;
 
+use super::gliner_label;
 use super::model::{ClassifiedSpan, ClassifierModel};
-use super::simple_label;
 use crate::framework::extractor::{
     ExtractionContext, ExtractionFuture, ExtractionResult, ExtractionStatus, Extractor,
 };
@@ -100,7 +100,7 @@ impl ClassifierExtractor {
         let mut seen = std::collections::HashSet::new();
         let mut collision = false;
         for q in labels.iter() {
-            if !seen.insert(simple_label(q.as_str())) {
+            if !seen.insert(gliner_label(q.as_str())) {
                 collision = true;
                 break;
             }
@@ -118,13 +118,10 @@ impl ClassifierExtractor {
                 .collect();
             (simples, map)
         } else {
-            let simples: Vec<String> = labels
-                .iter()
-                .map(|q| simple_label(q.as_str()).to_string())
-                .collect();
+            let simples: Vec<String> = labels.iter().map(|q| gliner_label(q.as_str())).collect();
             let map: HashMap<String, String> = labels
                 .iter()
-                .map(|q| (simple_label(q.as_str()).to_string(), q.clone()))
+                .map(|q| (gliner_label(q.as_str()), q.clone()))
                 .collect();
             (simples, map)
         }
@@ -167,6 +164,20 @@ impl ClassifierExtractor {
             // tags as entities: a date/relative-time phrase names no
             // referent, so it must not become a Person / entity node.
             if crate::resolver::is_temporal_expression_surface(&span.text) {
+                continue;
+            }
+            // Drop a span that merely restates its own type. Labels are
+            // handed to GLiNER as natural language (`AgentPolicy` →
+            // "Agent Policy"), so a sentence that names the type out loud —
+            // "the agent policy CheckoutBot" — gets the type words tagged
+            // alongside the instance. That produced an `AgentPolicy` entity
+            // literally named "agent policy" and an `EvalRun` named
+            // "EvalRun", sitting beside the real CheckoutBot and
+            // EvalRun-42. They are invisible to endpoint validation,
+            // because a node that echoes its type carries exactly the type
+            // the relation expects, so `evaluated` happily pointed at the
+            // generic "EvalRun" instead of the run in the text.
+            if is_label_echo(&span.text, &span.label) {
                 continue;
             }
             if let Some(item) = self.project(span) {
@@ -242,7 +253,13 @@ fn is_non_referential_span(text: &str) -> bool {
 /// span text and offset from the span start; a miss falls back to the
 /// whole span range.
 fn split_person_conjunction(m: EntityMention) -> Vec<EntityMention> {
-    if m.entity_type_qname.rsplit(':').next() != Some("Person") {
+    // First-colon split (`namespace:name`), consistent with every other qname
+    // parse site; `name` is colon-free so this equals the last segment.
+    let type_name = m
+        .entity_type_qname
+        .split_once(':')
+        .map_or(m.entity_type_qname.as_str(), |(_, n)| n);
+    if type_name != "Person" {
         return vec![m];
     }
     let parts: Vec<&str> = m
@@ -441,6 +458,24 @@ impl Extractor for ClassifierExtractor {
             out
         })
     }
+}
+
+/// Whether `text` says nothing more than the type it was tagged as.
+///
+/// Compared on alphanumerics only, case-folded, so "agent policy",
+/// "Agent Policy" and "AgentPolicy" all collapse onto the label
+/// `mirror:AgentPolicy`. An instance that merely extends the type name
+/// ("EvalRun-42") keeps its extra characters and survives.
+pub(crate) fn is_label_echo(text: &str, label_qname: &str) -> bool {
+    fn squash(s: &str) -> String {
+        s.chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect()
+    }
+    let simple = super::simple_label(label_qname);
+    let t = squash(text);
+    !t.is_empty() && t == squash(simple)
 }
 
 #[cfg(test)]

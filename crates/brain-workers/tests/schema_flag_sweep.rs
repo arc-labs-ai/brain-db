@@ -161,6 +161,8 @@ fn submit_upload(writer: &RealWriterHandle, source: &str) {
         declared_relation_types: Vec::new(),
         declared_entity_types: Vec::new(),
         created_at_unix_nanos: NOW,
+        replace_all: false,
+        drops: Vec::new(),
     };
     let write = Write::single(WriteId::new(), SpaceId::default(), phase);
     let rt = tokio::runtime::Builder::new_current_thread()

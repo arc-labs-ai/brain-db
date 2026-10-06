@@ -12,11 +12,12 @@
 //!
 //! Migration-time compatibility checks are out of scope.
 
-use brain_protocol::schema::ValidatedSchema;
+use brain_protocol::schema::{DeclaredContext, Schema, SchemaItem, ValidatedSchema};
 use redb::{ReadTransaction, ReadableTable, WriteTransaction};
 
 use super::apply::{apply_schema_definitions, SchemaApplyError};
 use super::predicate::PredicateOpError;
+use crate::system_schema::SYSTEM_SCHEMA_NAMESPACE;
 use crate::tables::schema_version::{
     SchemaVersionRow, SCHEMA_ACTIVE_VERSIONS_TABLE, SCHEMA_VERSIONS_TABLE, VALIDATOR_VERSION,
 };
@@ -53,6 +54,197 @@ pub enum SchemaStoreError {
 // Writes.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Additive-merge support.
+//
+// SCHEMA_UPLOAD is additive: it merges into the namespace's active schema and
+// never replaces it. The DEFINITIONS always behaved that way (they fan out
+// into the entity_type / predicate / relation_type intern tables), but the
+// stored SOURCE did not — it was overwritten by whatever document was last
+// uploaded. The two then disagreed, with user-visible consequences: a
+// document declaring one type narrowed the namespace's recorded vocabulary to
+// that single type, and because the merge pre-flight classifies against the
+// interned definitions it then reported a re-upload of the full schema as
+// idempotent and never rewrote the source, so the narrowing could not be
+// undone. The source is also what says which tenant OWNS a type
+// (`declared.rs`), so narrowing it silently un-claimed that tenant's private
+// vocabulary.
+//
+// The stored source is therefore now the union of the active source and the
+// uploaded document. SCHEMA_REPLACE and SCHEMA_DROP still overwrite it: their
+// whole purpose is to narrow, and DROP hands us the already-narrowed schema.
+// ---------------------------------------------------------------------------
+
+/// How a write relates to the namespace's stored schema source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceMode {
+    /// Plain `SCHEMA_UPLOAD`: store the union of the active source and the
+    /// uploaded document.
+    Merge,
+    /// `SCHEMA_REPLACE` / `SCHEMA_DROP`: the document *is* the new source.
+    Replace,
+}
+
+/// Identity of a declaration within a schema document: two items collide
+/// only when they are the same kind with the same name.
+fn item_key(item: &SchemaItem) -> (u8, &str) {
+    match item {
+        SchemaItem::EntityType(e) => (0, e.name.as_str()),
+        SchemaItem::Predicate(p) => (1, p.name.as_str()),
+        SchemaItem::RelationType(r) => (2, r.name.as_str()),
+        SchemaItem::Extractor(x) => (3, x.name.as_str()),
+        SchemaItem::Kind(k) => (4, k.name.as_str()),
+    }
+}
+
+/// Union of `active` and `incoming`, preserving `active`'s order and letting
+/// `incoming` win on a same-kind/same-name collision. A conflicting
+/// redefinition is already rejected by the upload pre-flight, so "wins" here
+/// only ever resolves an identical re-declaration.
+fn merge_schema_items(active: &Schema, incoming: &Schema) -> Vec<SchemaItem> {
+    let incoming_keys: std::collections::HashSet<(u8, String)> = incoming
+        .items
+        .iter()
+        .map(|i| {
+            let (k, n) = item_key(i);
+            (k, n.to_string())
+        })
+        .collect();
+    let mut out: Vec<SchemaItem> = active
+        .items
+        .iter()
+        .filter(|i| {
+            let (k, n) = item_key(i);
+            !incoming_keys.contains(&(k, n.to_string()))
+        })
+        .cloned()
+        .collect();
+    out.extend(incoming.items.iter().cloned());
+    out
+}
+
+/// Whether `namespace`'s active source already declares every item in
+/// `schema`.
+///
+/// The upload pre-flight classifies a document against the INTERNED
+/// definitions, so a document can be entirely "idempotent" while the stored
+/// source is missing those declarations — which is how a narrowed source
+/// became unrecoverable: re-uploading the full schema was classified as a
+/// no-op and never rewrote the source. Gating the no-op on this check as well
+/// means a re-upload heals the source instead of being skipped, while an
+/// unchanged re-upload still costs nothing.
+pub fn active_source_covers(
+    rtxn: &ReadTransaction,
+    namespace: &str,
+    schema: &Schema,
+) -> Result<bool, SchemaStoreError> {
+    let Some(active) = active_schema_ast(rtxn, namespace)? else {
+        return Ok(schema.items.is_empty());
+    };
+    let have: std::collections::HashSet<(u8, String)> = active
+        .items
+        .iter()
+        .map(|i| {
+            let (k, n) = item_key(i);
+            (k, n.to_string())
+        })
+        .collect();
+    Ok(schema.items.iter().all(|i| {
+        let (k, n) = item_key(i);
+        have.contains(&(k, n.to_string()))
+    }))
+}
+
+/// Decode the active schema AST for `namespace`, or `None` when it has no
+/// active version or the row fails to decode.
+pub fn active_schema_ast(
+    rtxn: &ReadTransaction,
+    namespace: &str,
+) -> Result<Option<Schema>, SchemaStoreError> {
+    Ok(schema_active_row(rtxn, namespace)?.and_then(|row| decode_source(namespace, &row)))
+}
+
+/// Write-transaction counterpart to [`active_schema_ast`], for the apply and
+/// recovery paths that read inside their own wtxn.
+pub fn active_schema_ast_wtxn(
+    wtxn: &WriteTransaction,
+    namespace: &str,
+) -> Result<Option<Schema>, SchemaStoreError> {
+    let version = {
+        let active = wtxn.open_table(SCHEMA_ACTIVE_VERSIONS_TABLE)?;
+        let v = active.get(&namespace)?.map(|g| g.value());
+        v
+    };
+    let Some(version) = version else {
+        return Ok(None);
+    };
+    let row = {
+        let versions = wtxn.open_table(SCHEMA_VERSIONS_TABLE)?;
+        let r = versions.get(&(namespace, version))?.map(|g| g.value());
+        r
+    };
+    Ok(row.and_then(|row| decode_source(namespace, &row)))
+}
+
+fn decode_source(namespace: &str, row: &SchemaVersionRow) -> Option<Schema> {
+    match serde_json::from_slice::<Schema>(&row.source) {
+        // The row is keyed by namespace; never hand back an AST claiming
+        // another one.
+        Ok(schema) if schema.namespace == namespace => Some(schema),
+        Ok(_) => None,
+        Err(e) => {
+            tracing::warn!(
+                target: "brain_metadata::schema",
+                namespace,
+                version = row.version,
+                error = %e,
+                "active schema source failed to decode; treating namespace as undeclared",
+            );
+            None
+        }
+    }
+}
+
+/// Type names an additive upload to `namespace` may reference without
+/// re-declaring: the namespace's own active schema plus the system `brain`
+/// schema.
+pub fn declared_context_wtxn(
+    wtxn: &WriteTransaction,
+    namespace: &str,
+) -> Result<DeclaredContext, SchemaStoreError> {
+    let mut ctx = DeclaredContext::default();
+    for ns in [namespace, SYSTEM_SCHEMA_NAMESPACE] {
+        if let Some(schema) = active_schema_ast_wtxn(wtxn, ns)? {
+            collect_into(&schema, &mut ctx);
+        }
+    }
+    Ok(ctx)
+}
+
+/// Read-transaction counterpart to [`declared_context_wtxn`].
+pub fn declared_context(
+    rtxn: &ReadTransaction,
+    namespace: &str,
+) -> Result<DeclaredContext, SchemaStoreError> {
+    let mut ctx = DeclaredContext::default();
+    for ns in [namespace, SYSTEM_SCHEMA_NAMESPACE] {
+        if let Some(schema) = active_schema_ast(rtxn, ns)? {
+            collect_into(&schema, &mut ctx);
+        }
+    }
+    Ok(ctx)
+}
+
+fn collect_into(schema: &Schema, ctx: &mut DeclaredContext) {
+    for item in &schema.items {
+        match item {
+            SchemaItem::EntityType(e) => ctx.entity_types.push(e.name.clone()),
+            SchemaItem::RelationType(r) => ctx.relation_types.push(r.name.clone()),
+            _ => {}
+        }
+    }
+}
+
 /// Persist a validated schema as a new version of its namespace.
 ///
 /// - Reads the namespace's current active version, increments by 1.
@@ -70,11 +262,38 @@ pub fn schema_upload(
     validated: &ValidatedSchema,
     now_unix_nanos: u64,
 ) -> Result<u32, SchemaStoreError> {
+    schema_upload_with_mode(wtxn, validated, now_unix_nanos, SourceMode::Merge)
+}
+
+/// [`schema_upload`] with an explicit [`SourceMode`]. `Merge` is the additive
+/// `SCHEMA_UPLOAD` contract; `Replace` is for `SCHEMA_REPLACE` and
+/// `SCHEMA_DROP`, which deliberately narrow the namespace.
+pub fn schema_upload_with_mode(
+    wtxn: &WriteTransaction,
+    validated: &ValidatedSchema,
+    now_unix_nanos: u64,
+    mode: SourceMode,
+) -> Result<u32, SchemaStoreError> {
     let schema = validated.as_schema();
     let namespace = schema.namespace.clone();
     let new_version = next_version_in(wtxn, &namespace)?;
 
-    let source = serde_json::to_vec(schema).map_err(|e| SchemaStoreError::Encode(e.to_string()))?;
+    // What gets PERSISTED is the merged document; what gets APPLIED below is
+    // the uploaded one. Applying the merge too would re-intern every
+    // already-declared item on every upload for no gain.
+    let stored: Schema = match mode {
+        SourceMode::Replace => schema.clone(),
+        SourceMode::Merge => match active_schema_ast_wtxn(wtxn, &namespace)? {
+            Some(active) => Schema {
+                items: merge_schema_items(&active, schema),
+                ..schema.clone()
+            },
+            None => schema.clone(),
+        },
+    };
+
+    let source =
+        serde_json::to_vec(&stored).map_err(|e| SchemaStoreError::Encode(e.to_string()))?;
     let row = SchemaVersionRow {
         namespace: namespace.clone(),
         version: new_version,
@@ -506,5 +725,179 @@ mod tests {
         // Source is JSON; decode round-trips.
         let decoded: brain_protocol::schema::Schema = serde_json::from_slice(&row.source).unwrap();
         assert_eq!(decoded.namespace, "acme");
+    }
+}
+
+#[cfg(all(test, not(miri)))]
+mod additive_merge_tests {
+    use super::*;
+    use brain_protocol::schema::{parse_schema, validate, validate_with};
+    use redb::{Database, ReadableDatabase};
+
+    fn open_db(dir: &tempfile::TempDir) -> Database {
+        let db = Database::create(dir.path().join("merge.redb")).unwrap();
+        let wtxn = db.begin_write().unwrap();
+        crate::tables::materialize_all_tables(&wtxn).unwrap();
+        wtxn.commit().unwrap();
+        db
+    }
+
+    fn validated(src: &str) -> ValidatedSchema {
+        let schema = parse_schema(src).expect("parse");
+        validate(&schema).expect("validate")
+    }
+
+    fn upload(db: &Database, v: &ValidatedSchema, mode: SourceMode) -> u32 {
+        let wtxn = db.begin_write().unwrap();
+        let ver = schema_upload_with_mode(&wtxn, v, 1, mode).expect("upload");
+        wtxn.commit().unwrap();
+        ver
+    }
+
+    fn stored_item_names(db: &Database, namespace: &str) -> Vec<String> {
+        let rtxn = db.begin_read().unwrap();
+        let schema = active_schema_ast(&rtxn, namespace)
+            .expect("read")
+            .expect("active schema");
+        let mut names: Vec<String> = schema
+            .items
+            .iter()
+            .map(|i| item_key(i).1.to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn two_types() -> ValidatedSchema {
+        validated(
+            "
+            namespace acme
+            define entity_type Person { attributes {} }
+            define entity_type Org { attributes {} }
+            ",
+        )
+    }
+
+    fn one_other_type() -> ValidatedSchema {
+        validated(
+            "
+            namespace acme
+            define entity_type Widget { attributes {} }
+            ",
+        )
+    }
+
+    /// The defect: uploading a narrow document replaced the stored source, so
+    /// the namespace silently stopped declaring the types it had declared.
+    #[test]
+    fn a_narrow_upload_keeps_the_types_an_earlier_upload_declared() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_db(&dir);
+
+        upload(&db, &two_types(), SourceMode::Merge);
+        assert_eq!(stored_item_names(&db, "acme"), vec!["Org", "Person"]);
+
+        upload(&db, &one_other_type(), SourceMode::Merge);
+        assert_eq!(
+            stored_item_names(&db, "acme"),
+            vec!["Org", "Person", "Widget"],
+            "UPLOAD is additive: a later document must not drop earlier declarations"
+        );
+    }
+
+    /// REPLACE and DROP exist to narrow, so they must NOT merge.
+    #[test]
+    fn replace_mode_overwrites_the_stored_source() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_db(&dir);
+
+        upload(&db, &two_types(), SourceMode::Merge);
+        upload(&db, &one_other_type(), SourceMode::Replace);
+        assert_eq!(
+            stored_item_names(&db, "acme"),
+            vec!["Widget"],
+            "REPLACE / DROP carry the whole new schema and overwrite the source"
+        );
+    }
+
+    /// Re-applying the same DSL must stay free — the no-op short-circuit the
+    /// merge gate depends on.
+    #[test]
+    fn an_unchanged_re_upload_is_already_covered_by_the_source() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_db(&dir);
+        upload(&db, &two_types(), SourceMode::Merge);
+
+        let rtxn = db.begin_read().unwrap();
+        assert!(
+            active_source_covers(&rtxn, "acme", two_types().as_schema()).unwrap(),
+            "an unchanged re-upload is a true no-op"
+        );
+        assert!(
+            !active_source_covers(&rtxn, "acme", one_other_type().as_schema()).unwrap(),
+            "a document carrying a new declaration is not covered"
+        );
+    }
+
+    /// A source narrowed before the fix must heal rather than stay stuck: the
+    /// old no-op test looked only at interned definitions, so re-uploading the
+    /// full schema was skipped and the narrowing was permanent.
+    #[test]
+    fn a_narrowed_source_is_not_reported_as_covering_the_full_schema() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_db(&dir);
+
+        upload(&db, &two_types(), SourceMode::Merge);
+        upload(&db, &one_other_type(), SourceMode::Replace); // narrow it
+
+        let rtxn = db.begin_read().unwrap();
+        assert!(
+            !active_source_covers(&rtxn, "acme", two_types().as_schema()).unwrap(),
+            "the full schema is NOT covered by the narrowed source, so re-uploading it writes"
+        );
+    }
+
+    /// The validator half: a document may name a type the namespace already
+    /// declares. Validated standalone this is an UnresolvedTypeRef.
+    #[test]
+    fn an_incremental_document_resolves_against_the_active_schema() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_db(&dir);
+        upload(&db, &two_types(), SourceMode::Merge);
+
+        let incremental = parse_schema(
+            "
+            namespace acme
+            define predicate works_at { kind: Fact subject: Entity<Person> object: Entity<Org> }
+            ",
+        )
+        .expect("parse");
+
+        assert!(
+            validate(&incremental).is_err(),
+            "standalone validation cannot see Person/Org — the behaviour being fixed"
+        );
+
+        let rtxn = db.begin_read().unwrap();
+        let ctx = declared_context(&rtxn, "acme").expect("context");
+        assert!(
+            validate_with(&incremental, &ctx).is_ok(),
+            "validated against the schema it merges into, the reference resolves"
+        );
+    }
+
+    /// The context must not leak another tenant's vocabulary.
+    #[test]
+    fn the_merge_context_is_scoped_to_its_own_namespace() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_db(&dir);
+        upload(&db, &two_types(), SourceMode::Merge);
+
+        let rtxn = db.begin_read().unwrap();
+        let other = declared_context(&rtxn, "crm").expect("context");
+        assert!(
+            !other.entity_types.iter().any(|n| n == "Person"),
+            "acme's declarations must not be visible to crm"
+        );
     }
 }

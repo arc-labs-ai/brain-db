@@ -1,0 +1,7 @@
+{
+  "schema_document": "namespace org\ndefine relation_type mentors { from Person to Person }\n",
+  "act_as": {
+    "namespace": "org",
+    "space_id": "support-bot:user123"
+  }
+}

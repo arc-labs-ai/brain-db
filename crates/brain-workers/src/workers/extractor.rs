@@ -50,21 +50,26 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::workers::hype::{HypeGenOutcome, HypeGenerator};
 use brain_core::{
-    EntityId, ExtractorId, Memory as CoreMemory, MemoryId, MemoryKind, Salience, SessionId, SpaceId,
+    AuditId, EntityId, ExtractorId, Memory as CoreMemory, MemoryId, MemoryKind, Salience,
+    SessionId, SpaceId,
 };
 use brain_core::{StatementKind, StatementObject, StatementValue, SubjectRef};
 use brain_extractors::{
-    build_registry_with_gate,
+    build_registry_from_definitions,
     resolver::{
         resolve_or_create_with_deps, Disambiguation, EmbeddingDeps, EntityDisambiguator,
         PendingVerdict, PrecomputedVerdicts, ResolutionTier, ResolverError, StagedEntityVectors,
     },
     EntityMention, ExtractedItem, ExtractionContext, ExtractionFailureClass, ExtractionResult,
     ExtractionStatus, Extractor, ExtractorContext, ExtractorRegistry, MaterializeDeps,
-    StatementMention, TemporalExtractor, TierGate, TriggerDecision, SYSTEM_NAMESPACE,
+    StatementMention, TemporalExtractor, TriggerDecision, SYSTEM_NAMESPACE,
 };
+use brain_metadata::audit_write;
 use brain_metadata::relation::types::relation_type_intern_or_get;
 use brain_metadata::schema::predicate::predicate_intern_or_get;
+use brain_metadata::tables::audit::{
+    extraction_status, resolution_outcome, ExtractionAudit, ResolutionAudit,
+};
 use brain_metadata::tables::edge::{
     self, derived_by, origin, zero_disambiguator, EdgeData, EDGES_REVERSE_TABLE, EDGES_TABLE,
 };
@@ -74,7 +79,9 @@ use brain_metadata::tables::extractor_audit::{
 };
 use brain_metadata::tables::predicate::{PREDICATES_TABLE, PREDICATE_EMBEDDINGS_TABLE};
 use brain_metadata::tables::relation::RELATION_TYPE_EMBEDDINGS_TABLE;
-use brain_metadata::{hype_has_vectors, pipeline_has_extracted};
+use brain_metadata::{
+    entity_get_inside_wtxn, hype_has_vectors, pipeline_has_extracted, resolution_audit_write,
+};
 use brain_ops::apply::encode_helpers::{
     fetch_extractor_context, ExtractorContextFetchConfig, DEFAULT_EXTRACTOR_CONTEXT_TOP_M,
 };
@@ -158,6 +165,18 @@ pub const DEFAULT_EXTRACTOR_HYPE_REFRESH_PER_CYCLE: usize = 8;
 /// and going higher adds latency without throughput gains. Bigger
 /// hosts can lift this via `[workers.extractor] batch_size`.
 pub const DEFAULT_EXTRACTOR_BATCH_SIZE: usize = 8;
+
+/// How many rows `load_pending_batch` over-drains per `want`: it scans up
+/// to `want * FACTOR` front rows (bounded by [`EXTRACTION_QUEUE_MAX_SCAN`])
+/// to page past a front window stuck in transient-failure backoff, so a
+/// due row deeper in the queue is still found and processed this cycle
+/// instead of being starved behind the backing-off front.
+const EXTRACTION_QUEUE_OVERDRAIN_FACTOR: usize = 8;
+
+/// Hard ceiling on rows scanned per `load_pending_batch` call so the
+/// over-drain stays bounded even when `want` is large and the whole front
+/// of the queue is backing off.
+const EXTRACTION_QUEUE_MAX_SCAN: usize = 1024;
 
 impl Default for ExtractorKnobs {
     fn default() -> Self {
@@ -262,8 +281,6 @@ pub struct RegistryRebuildDeps {
     /// upload can add entity types), so the value carried here is only
     /// the startup fallback for that one field.
     pub deps: MaterializeDeps,
-    /// Deploy-time `extractors.{pattern,classifier,llm}.enabled` gate.
-    pub gate: TierGate,
 }
 
 impl ExtractorWorker {
@@ -294,8 +311,8 @@ impl ExtractorWorker {
     /// registry refreshes live. Tests and substrate deployments that
     /// don't exercise schema-driven extractor changes leave it unset.
     #[must_use]
-    pub fn with_registry_rebuild_deps(mut self, deps: MaterializeDeps, gate: TierGate) -> Self {
-        self.rebuild_deps = Some(RegistryRebuildDeps { deps, gate });
+    pub fn with_registry_rebuild_deps(mut self, deps: MaterializeDeps) -> Self {
+        self.rebuild_deps = Some(RegistryRebuildDeps { deps });
         self
     }
 
@@ -623,7 +640,7 @@ async fn do_extractor_cycle(
 /// row doesn't rebuild every cycle; a fresh upload re-flips it.
 ///
 /// No lock is held across an `.await`: the whole rebuild is synchronous
-/// (redb reads + `build_registry_with_gate`), and the write-lock swap is
+/// (redb reads + `build_registry_from_definitions`), and the write-lock swap is
 /// a single move. Single-writer-per-shard means the handler that sets
 /// the flag and this consumer never run concurrently.
 fn maybe_rebuild_registry(worker: &ExtractorWorker, ctx: &WorkerContext) {
@@ -668,7 +685,7 @@ fn maybe_rebuild_registry(worker: &ExtractorWorker, ctx: &WorkerContext) {
 
     let mut deps = rebuild.deps.clone();
     deps.entity_type_qnames = Arc::new(entity_types);
-    let (mut reg, errors) = build_registry_with_gate(&defs, &deps, rebuild.gate);
+    let (mut reg, errors) = build_registry_from_definitions(&defs, &deps);
     if !errors.is_empty() {
         // A genuinely-broken definition (bad JSON blob, unknown kind).
         // Operator LLM misconfigurations register as degraded extractors,
@@ -723,11 +740,28 @@ fn load_pending_batch(ctx: &WorkerContext, limit: usize) -> Result<Vec<MemoryId>
     // failures are reported "due" here and handled by the idempotency gate in
     // `drain_batch` (AlreadyExtracted → queue row removed). First-time and
     // succeeded-then-requeued ids are always due.
+    //
+    // The over-drain is what prevents head-of-line blocking: the queue is
+    // keyed by MemoryId, so a full front window of `limit` rows stuck in
+    // backoff (e.g. the oldest rows that reliably time out, widening their
+    // backoff) would otherwise yield zero due rows and stall every newer
+    // due row behind them. We page past the front, scanning up to a bounded
+    // multiple of `limit` rows, and return the first `limit` DUE rows found
+    // — bounding the total scan per cycle while never starving deeper rows.
     let now = now_unix_nanos();
-    let pending = brain_metadata::extraction_queue_drain(&rtxn, limit)
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let scan_cap = limit
+        .saturating_mul(EXTRACTION_QUEUE_OVERDRAIN_FACTOR)
+        .min(EXTRACTION_QUEUE_MAX_SCAN);
+    let pending = brain_metadata::extraction_queue_drain(&rtxn, scan_cap)
         .map_err(|e| format!("extraction_queue_drain: {e}"))?;
-    let mut due = Vec::with_capacity(pending.len());
+    let mut due = Vec::with_capacity(limit.min(pending.len()));
     for (id, _) in pending {
+        if due.len() >= limit {
+            break;
+        }
         match brain_metadata::pipeline_extraction_retry_due(&rtxn, id, now) {
             Ok(true) => due.push(id),
             Ok(false) => {} // backing off — leave queued, retry when due
@@ -823,6 +857,88 @@ enum StageDecision {
 /// `run_batch` call (amortising the GLiNER forward pass). Pattern +
 /// LLM tiers run per-memory because pattern is fast and LLM
 /// per-memory accounting drives the budget gate.
+/// Row-derived facts about one queued memory, read once per micro-batch.
+///
+/// Carries the event/write timestamps (so the temporal extractor can
+/// anchor relative dates to the real event time), the owning namespace
+/// and space (so the LLM tier scopes extractor selection AND keys its
+/// response cache by the memory's real space), the session, and the real
+/// stored kind (so a trigger `where memory.kind = ...` evaluates against
+/// the stored kind). A row miss omits the id; callers fall back to
+/// anonymous defaults — never a drop.
+struct RowFacts {
+    created_ns: u64,
+    occurred: Option<u64>,
+    namespace_id: u32,
+    space: SpaceId,
+    session_id: SessionId,
+    kind: MemoryKind,
+}
+
+/// Read each live memory's [`RowFacts`] in a single read txn. Ids whose
+/// row is absent (forgotten before extraction ran) are omitted.
+fn load_row_facts(
+    ctx: &WorkerContext,
+    live: &[(usize, MemoryId, Arc<str>)],
+) -> HashMap<MemoryId, RowFacts> {
+    use brain_metadata::tables::memory::MEMORIES_TABLE;
+    let mut m = HashMap::with_capacity(live.len());
+    if let Ok(rtxn) = ctx.ops.executor.metadata.read_txn() {
+        if let Ok(t) = rtxn.open_table(MEMORIES_TABLE) {
+            for (_, mid, _) in live {
+                if let Ok(Some(g)) = t.get(&mid.to_be_bytes()) {
+                    let row = g.value();
+                    m.insert(
+                        *mid,
+                        RowFacts {
+                            created_ns: row.created_at_unix_nanos,
+                            occurred: row.occurred_at_unix_nanos,
+                            namespace_id: row.namespace_id,
+                            space: row.space_id(),
+                            session_id: SessionId::from(row.session_id),
+                            kind: row.kind().unwrap_or(MemoryKind::Episodic),
+                        },
+                    );
+                }
+            }
+        }
+    }
+    m
+}
+
+/// Build the [`CoreMemory`] the extraction tiers see for each live row.
+///
+/// Threads each memory's REAL `(space, session)` from its row facts so
+/// the LLM tier's response-cache key is stable across cycles for the same
+/// `(text, space)`. Minting a fresh space per call would make the key
+/// change every cycle, so the per-shard LLM cache would never hit and the
+/// always-on tier's cost/latency control would be defeated. A row miss
+/// falls back to the anonymous defaults, never a drop.
+fn build_extraction_core_memories(
+    live: &[(usize, MemoryId, Arc<str>)],
+    row_facts: &HashMap<MemoryId, RowFacts>,
+) -> Vec<CoreMemory> {
+    live.iter()
+        .map(|(_, mid, text)| {
+            let (created_ns, occurred, space, session_id, kind) = row_facts
+                .get(mid)
+                .map(|f| (f.created_ns, f.occurred, f.space, f.session_id, f.kind))
+                .unwrap_or((0, None, SpaceId::NIL, SessionId(0), MemoryKind::Episodic));
+            CoreMemory {
+                id: *mid,
+                space,
+                session_id,
+                kind,
+                salience: Salience::default(),
+                text: Some(text.to_string()),
+                created_at_unix_ms: created_ns / 1_000_000,
+                last_accessed_at_unix_ms: 0,
+                occurred_at_unix_nanos: occurred,
+            }
+        })
+        .collect()
+}
+
 async fn drain_batch(
     worker: &ExtractorWorker,
     ctx: &WorkerContext,
@@ -905,56 +1021,8 @@ async fn drain_batch(
     // `where memory.kind = ...` evaluates against the stored kind, not a
     // hardcoded one). A row miss falls back to zero timestamps, the system
     // namespace, and Episodic — never drops the memory.
-    struct RowFacts {
-        created_ns: u64,
-        occurred: Option<u64>,
-        namespace_id: u32,
-        kind: MemoryKind,
-    }
-    let row_facts: HashMap<MemoryId, RowFacts> = {
-        use brain_metadata::tables::memory::MEMORIES_TABLE;
-        let mut m = HashMap::with_capacity(live.len());
-        if let Ok(rtxn) = ctx.ops.executor.metadata.read_txn() {
-            if let Ok(t) = rtxn.open_table(MEMORIES_TABLE) {
-                for (_, mid, _) in &live {
-                    if let Ok(Some(g)) = t.get(&mid.to_be_bytes()) {
-                        let row = g.value();
-                        m.insert(
-                            *mid,
-                            RowFacts {
-                                created_ns: row.created_at_unix_nanos,
-                                occurred: row.occurred_at_unix_nanos,
-                                namespace_id: row.namespace_id,
-                                kind: row.kind().unwrap_or(MemoryKind::Episodic),
-                            },
-                        );
-                    }
-                }
-            }
-        }
-        m
-    };
-
-    let live_mems: Vec<CoreMemory> = live
-        .iter()
-        .map(|(_, mid, text)| {
-            let (created_ns, occurred, kind) = row_facts
-                .get(mid)
-                .map(|f| (f.created_ns, f.occurred, f.kind))
-                .unwrap_or((0, None, MemoryKind::Episodic));
-            CoreMemory {
-                id: *mid,
-                space: SpaceId::new(),
-                session_id: SessionId(0),
-                kind,
-                salience: Salience::default(),
-                text: Some(text.to_string()),
-                created_at_unix_ms: created_ns / 1_000_000,
-                last_accessed_at_unix_ms: 0,
-                occurred_at_unix_nanos: occurred,
-            }
-        })
-        .collect();
+    let row_facts = load_row_facts(ctx, &live);
+    let live_mems: Vec<CoreMemory> = build_extraction_core_memories(&live, &row_facts);
 
     // Resolve each live memory's owning namespace to its name so the LLM
     // tier can scope selection: a namespace's own enabled LLM extractor
@@ -1035,43 +1103,28 @@ async fn drain_batch(
     }
 
     // Snapshot the active schema's entity types + kind taxonomy as the
-    // batch-level prompt blocks for the LLM tier. Read per cycle from ONE
-    // read txn so both blocks reflect a single consistent schema view; a
-    // user's SCHEMA_UPLOAD takes effect on the next batch without a restart.
-    // Empty string on any read error degrades to an unconstrained prompt
-    // rather than failing extraction.
+    // prompt blocks for the LLM tier. Read per cycle from ONE read txn so
+    // both reflect a single consistent schema view; a user's SCHEMA_UPLOAD
+    // takes effect on the next batch without a restart. Empty string on any
+    // read error degrades to an unconstrained prompt rather than failing
+    // extraction.
     //
-    // These are batch-level (identical for every memory). The per-memory
-    // candidate-predicate blocks are computed separately below because they
-    // depend on each memory's text embedding.
-    //
-    // The classifier (GLiNER) tier's entity-type label set is read from the
-    // same txn so a `SCHEMA_UPLOAD` that adds entity types reaches the
-    // classifier on the next batch without a shard restart (the labels baked
-    // in at spawn are only the fallback). Empty on read error → the classifier
-    // falls back to its construction-time labels.
-    let (declared_entity_types_block, declared_kinds_block, entity_type_labels): (
-        String,
-        String,
-        Vec<String>,
-    ) = match ctx.ops.executor.metadata.read_txn() {
-        Ok(rtxn) => (
-            brain_metadata::render_declared_entity_types_block(&rtxn).unwrap_or_default(),
-            brain_metadata::render_declared_kinds_block(&rtxn).unwrap_or_default(),
-            brain_metadata::entity_type_label_qnames(&rtxn).unwrap_or_default(),
-        ),
-        Err(_) => (String::new(), String::new(), Vec::new()),
-    };
-    let entity_type_labels = if entity_type_labels.is_empty() {
-        None
-    } else {
-        Some(entity_type_labels.as_slice())
-    };
-    let declared_entity_types = if declared_entity_types_block.is_empty() {
-        None
-    } else {
-        Some(declared_entity_types_block.as_str())
-    };
+    // The kind taxonomy is batch-level. The entity-type vocabulary is PER
+    // MEMORY NAMESPACE: Brain's built-in types + that namespace's own
+    // declared types (+ unclaimed ones), never another tenant's schema types.
+    // The same per-namespace label set feeds the classifier (GLiNER) tier, so
+    // a `SCHEMA_UPLOAD` that adds entity types reaches it on the next batch
+    // without a shard restart (the labels baked in at spawn are only the
+    // fallback). The pipeline runs once per namespace group so every
+    // LLM/classifier call carries its own namespace's labels.
+    let (entity_vocab, declared_kinds_block): (HashMap<String, NamespaceEntityVocab>, String) =
+        match ctx.ops.executor.metadata.read_txn() {
+            Ok(rtxn) => (
+                entity_vocab_by_namespace(&rtxn, &mem_namespaces),
+                brain_metadata::render_declared_kinds_block(&rtxn).unwrap_or_default(),
+            ),
+            Err(_) => (HashMap::new(), String::new()),
+        };
     let declared_kinds = if declared_kinds_block.is_empty() {
         None
     } else {
@@ -1085,7 +1138,7 @@ async fn drain_batch(
     // Best-effort: computed only when an embedder is wired and an LLM tier
     // will consume it; any embed/scan hiccup degrades a memory to an empty
     // block rather than failing extraction.
-    let candidate_predicate_map: Option<HashMap<MemoryId, String>> =
+    let mut candidate_predicate_map: Option<HashMap<MemoryId, String>> =
         match worker.embed_deps.as_ref() {
             Some(deps) if !skip_llm_budget_exhausted && llm_exts_count(&extractors) > 0 => ctx
                 .ops
@@ -1097,8 +1150,26 @@ async fn drain_batch(
             _ => None,
         };
 
-    // Extraction and HyPE are independent, unordered async stages (spec
-    // §05/17a). `build_neighborhood` resolves the entities a memory mentions
+    // Per-namespace declared vocabulary: a memory owned by a namespace whose
+    // ACTIVE user schema declares predicates / relation types sees THAT
+    // namespace's vocabulary (qname, kind, object type, from -> to,
+    // cardinality) appended to its candidate block, so the LLM emits
+    // `mirror:clones` instead of coining `built_clone_of`. Strictly
+    // per-namespace — a memory never sees another namespace's vocabulary —
+    // and independent of the embedder (the declared list is exact, not a
+    // nearest-neighbor recall). Best-effort: a read error adds nothing.
+    if !skip_llm_budget_exhausted && llm_exts_count(&extractors) > 0 {
+        if let Ok(rtxn) = ctx.ops.executor.metadata.read_txn() {
+            let blocks = declared_vocab_blocks(&rtxn, &mem_namespaces);
+            if !blocks.is_empty() {
+                let map = candidate_predicate_map.get_or_insert_with(HashMap::new);
+                merge_declared_vocab_blocks(map, &live_mems, &mem_namespaces, &blocks);
+            }
+        }
+    }
+
+    // Extraction and HyPE are independent, unordered async stages.
+    // `build_neighborhood` resolves the entities a memory mentions
     // against the *persisted* registry, not this batch's just-written graph,
     // so HyPE needs only the memory text — it does not depend on extraction's
     // output. Run the two LLM round-trips CONCURRENTLY instead of
@@ -1109,16 +1180,15 @@ async fn drain_batch(
     // memory's own just-extracted facts feeding its own bridge questions;
     // prior-graph bridging is unaffected.
     let extract_and_apply = async {
-        let outcomes = run_pipeline_batch(
+        let outcomes = run_pipeline_per_namespace(
             extractors,
             &live_mems,
             &mem_namespaces,
             skip_llm_budget_exhausted,
             extractor_context_map,
-            declared_entity_types,
+            &entity_vocab,
             candidate_predicate_map.as_ref(),
             declared_kinds,
-            entity_type_labels,
         )
         .await;
 
@@ -1185,7 +1255,7 @@ async fn run_hype_pass(worker: &ExtractorWorker, ctx: &WorkerContext, items: &[E
         return;
     };
     let cycle_budget = worker.knobs.llm_budget_per_cycle_micro_usd;
-    // Per-memory HyPE generation is independent (spec §05/17a): fan the LLM
+    // Per-memory HyPE generation is independent: fan the LLM
     // calls out concurrently so a whole micro-batch costs ~one round-trip
     // instead of N serial ones. Every future runs on this single glommio task
     // and interleaves only at await points — the network round-trips overlap
@@ -1686,7 +1756,11 @@ fn build_neighborhood(ctx: &WorkerContext, scope: brain_metadata::RowScope, text
 /// phrase ("brain:works_at" -> "works at") so the HyPE prompt reads naturally.
 /// This is prompt rendering only — not a matching heuristic.
 fn humanize_qname(qname: &str) -> String {
-    let name = qname.split(':').next_back().unwrap_or(qname);
+    // First-colon split (`namespace:rest`), consistent with every other qname
+    // parse site — a qname is `namespace:name` where `name` is a colon-free
+    // identifier, so this equals last-segment for well-formed input and is
+    // consistent (not divergent) for anything malformed.
+    let name = qname.split_once(':').map_or(qname, |(_, n)| n);
     name.replace('_', " ")
 }
 
@@ -1806,12 +1880,34 @@ async fn fetch_extractor_context_for_batch(
     out
 }
 
+/// Per-call audit facts for one tier of a pipeline run: which extractor
+/// produced the tier's recorded outcome, its version, the precise
+/// [`extraction_status`] byte, and any non-success reason. Captured
+/// alongside the coarse `tier_status` byte so `run_apply_body` can emit
+/// one historical [`ExtractionAudit`] row per extractor that actually ran
+/// (or was skipped) — `None` means the tier was absent (no extractor
+/// present), which produces no audit row.
+#[derive(Clone)]
+struct TierAudit {
+    extractor_id: u32,
+    extractor_version: u32,
+    /// One of [`extraction_status`] bytes; == `ExtractionStatus::as_u8()`.
+    status: u8,
+    /// `result.status_reason`; empty on Success.
+    reason: String,
+}
+
 /// Aggregate of one pipeline run across all enabled extractors.
 struct PipelineOutcome {
     items: Vec<ExtractedItem>,
     pattern: u8,
     classifier: u8,
     llm: u8,
+    /// Per-call audit facts for the extractor whose outcome each tier's
+    /// status byte reflects. `None` when the tier was absent.
+    pattern_audit: Option<TierAudit>,
+    classifier_audit: Option<TierAudit>,
+    llm_audit: Option<TierAudit>,
     failure_reason: Option<String>,
     /// Set when the LLM tier failed: whether the failure is transient
     /// (retry with backoff) or permanent (terminate). Drives the worker's
@@ -1821,6 +1917,155 @@ struct PipelineOutcome {
     /// Actual LLM cost in dollar-micro-units for this pipeline run.
     /// Non-LLM tiers always contribute zero.
     llm_cost_micro_usd: u64,
+}
+
+/// One namespace's entity-type vocabulary for extraction: the
+/// `{DECLARED_ENTITY_TYPES}` prompt block and the classifier label set.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct NamespaceEntityVocab {
+    block: String,
+    labels: Vec<String>,
+}
+
+/// Per-namespace entity-type vocabulary for every DISTINCT namespace in the
+/// batch (see [`brain_metadata::entity_type_labels_for_namespaces`]). On a
+/// scoping read error this degrades to the global label set for every
+/// namespace — the pre-scoping behavior — rather than an empty vocabulary
+/// (which would silently fall back to the classifier's spawn-time labels).
+fn entity_vocab_by_namespace(
+    rtxn: &redb::ReadTransaction,
+    mem_namespaces: &[String],
+) -> HashMap<String, NamespaceEntityVocab> {
+    let mut distinct: Vec<&str> = mem_namespaces.iter().map(String::as_str).collect();
+    distinct.sort_unstable();
+    distinct.dedup();
+    let labels_by_ns = match brain_metadata::entity_type_labels_for_namespaces(rtxn, &distinct) {
+        Ok(m) => m,
+        Err(e) => {
+            warn!(
+                target: "brain_workers::extractor",
+                error = %e,
+                "per-namespace entity-type scoping failed; using the global label set",
+            );
+            let global = brain_metadata::entity_type_label_qnames(rtxn).unwrap_or_default();
+            distinct
+                .iter()
+                .map(|ns| ((*ns).to_string(), global.clone()))
+                .collect()
+        }
+    };
+    labels_by_ns
+        .into_iter()
+        .map(|(ns, labels)| {
+            let block = brain_metadata::render_entity_type_labels_block(&labels);
+            (ns, NamespaceEntityVocab { block, labels })
+        })
+        .collect()
+}
+
+/// Group batch indices by owning namespace, preserving first-seen order both
+/// across groups and within each group (so a single-namespace batch is one
+/// group in original order).
+fn group_indices_by_namespace(mem_namespaces: &[String]) -> Vec<(&str, Vec<usize>)> {
+    let mut groups: Vec<(&str, Vec<usize>)> = Vec::new();
+    for (i, ns) in mem_namespaces.iter().enumerate() {
+        match groups.iter_mut().find(|(g, _)| *g == ns.as_str()) {
+            Some((_, idxs)) => idxs.push(i),
+            None => groups.push((ns.as_str(), vec![i])),
+        }
+    }
+    groups
+}
+
+/// Run the extraction pipeline once per memory-namespace group, handing
+/// each group ITS namespace's entity-type prompt block and classifier
+/// labels, and scatter the outcomes back into batch order. A namespace-B
+/// memory therefore never sees namespace A's schema entity types. A
+/// single-namespace batch (the common case) runs exactly one pipeline over
+/// the original slices.
+#[allow(clippy::too_many_arguments)]
+async fn run_pipeline_per_namespace(
+    extractors: Vec<Arc<dyn Extractor>>,
+    mems: &[CoreMemory],
+    mem_namespaces: &[String],
+    skip_llm_budget_exhausted: bool,
+    mut extractor_context_map: Option<HashMap<MemoryId, ExtractorContext>>,
+    entity_vocab: &HashMap<String, NamespaceEntityVocab>,
+    candidate_predicate_map: Option<&HashMap<MemoryId, String>>,
+    declared_kinds: Option<&str>,
+) -> Vec<PipelineOutcome> {
+    let vocab_for = |ns: &str| -> (Option<&str>, Option<&[String]>) {
+        match entity_vocab.get(ns) {
+            Some(v) => (
+                Some(v.block.as_str()).filter(|b| !b.is_empty()),
+                Some(v.labels.as_slice()).filter(|l| !l.is_empty()),
+            ),
+            None => (None, None),
+        }
+    };
+    let groups = group_indices_by_namespace(mem_namespaces);
+    if groups.len() <= 1 {
+        let ns = groups.first().map_or(SYSTEM_NAMESPACE, |(ns, _)| *ns);
+        let (block, labels) = vocab_for(ns);
+        return run_pipeline_batch(
+            extractors,
+            mems,
+            mem_namespaces,
+            skip_llm_budget_exhausted,
+            extractor_context_map,
+            block,
+            candidate_predicate_map,
+            declared_kinds,
+            labels,
+        )
+        .await;
+    }
+    let mut slots: Vec<Option<PipelineOutcome>> = (0..mems.len()).map(|_| None).collect();
+    for (ns, idxs) in groups {
+        let group_mems: Vec<CoreMemory> = idxs.iter().map(|&i| mems[i].clone()).collect();
+        let group_namespaces: Vec<String> = vec![ns.to_string(); idxs.len()];
+        let group_context = extractor_context_map.as_mut().map(|m| {
+            group_mems
+                .iter()
+                .filter_map(|gm| m.remove(&gm.id).map(|c| (gm.id, c)))
+                .collect::<HashMap<MemoryId, ExtractorContext>>()
+        });
+        let (block, labels) = vocab_for(ns);
+        let outs = run_pipeline_batch(
+            extractors.clone(),
+            &group_mems,
+            &group_namespaces,
+            skip_llm_budget_exhausted,
+            group_context,
+            block,
+            candidate_predicate_map,
+            declared_kinds,
+            labels,
+        )
+        .await;
+        for (i, o) in idxs.into_iter().zip(outs) {
+            slots[i] = Some(o);
+        }
+    }
+    // Every index belongs to exactly one group, so every slot is filled; the
+    // fallback is unreachable but keeps this panic-free.
+    slots
+        .into_iter()
+        .map(|o| {
+            o.unwrap_or_else(|| PipelineOutcome {
+                items: Vec::new(),
+                pattern: tier_status::ABSENT,
+                classifier: tier_status::ABSENT,
+                llm: tier_status::ABSENT,
+                pattern_audit: None,
+                classifier_audit: None,
+                llm_audit: None,
+                failure_reason: None,
+                llm_failure_class: ExtractionFailureClass::Unclassified,
+                llm_cost_micro_usd: 0,
+            })
+        })
+        .collect()
 }
 
 /// Run every enabled extractor over a batch of memories, returning
@@ -1856,6 +2101,9 @@ async fn run_pipeline_batch(
             pattern: tier_status::ABSENT,
             classifier: tier_status::ABSENT,
             llm: tier_status::ABSENT,
+            pattern_audit: None,
+            classifier_audit: None,
+            llm_audit: None,
             failure_reason: None,
             llm_failure_class: ExtractionFailureClass::Unclassified,
             llm_cost_micro_usd: 0,
@@ -1934,8 +2182,22 @@ async fn run_pipeline_batch(
         // Cycle-budget gate: skip the LLM tier across the whole batch
         // when prior cycles have eaten the budget. Pattern + classifier
         // already ran so cheap-tier output still lands under load.
+        // Attribute the skip to the first configured LLM extractor so the
+        // per-call audit records a SkippedBudget row rather than dropping
+        // the tier silently.
+        let llm_ident = llm_exts
+            .first()
+            .map(|e| (e.id().raw(), e.extractor_version()));
         for o in &mut outcomes {
             o.llm = tier_status::SKIPPED;
+            if let Some((extractor_id, extractor_version)) = llm_ident {
+                o.llm_audit = Some(TierAudit {
+                    extractor_id,
+                    extractor_version,
+                    status: extraction_status::SKIPPED_BUDGET,
+                    reason: "cycle LLM budget exhausted".to_string(),
+                });
+            }
         }
     } else {
         // Bounded inferential context per memory: top-10 similar
@@ -1996,10 +2258,19 @@ async fn run_tier_into(
     tier_kind: brain_core::ExtractorKind,
 ) {
     for extractor in tier_exts {
+        let ext_id = extractor.id().raw();
+        let ext_version = extractor.extractor_version();
         let results = extractor.run_batch(ctx, mems).await;
         debug_assert_eq!(results.len(), mems.len());
         for (i, result) in results.into_iter().enumerate() {
-            fold_tier_result(&mut outcomes[i], result, tier_kind, mems[i].id);
+            fold_tier_result(
+                &mut outcomes[i],
+                result,
+                tier_kind,
+                mems[i].id,
+                ext_id,
+                ext_version,
+            );
         }
     }
 }
@@ -2016,13 +2287,52 @@ fn fold_tier_result(
     result: ExtractionResult,
     tier_kind: brain_core::ExtractorKind,
     memory_id: MemoryId,
+    ext_id: u32,
+    ext_version: u32,
 ) {
     use brain_core::ExtractorKind;
     let outcome_byte = tier_outcome_for(&result);
+    // Two extractors can share one tier. Combine rather than overwrite so a
+    // later extractor's SKIP never erases an earlier extractor's real outcome
+    // (A=RAN + B=SkippedFilter must record RAN, not SKIPPED). Mirrors the LLM
+    // runner's ABSENT→SKIP guard; among two real outcomes the later wins, so
+    // RAN-vs-FAILED ordering (and the LLM retry decision it feeds) is
+    // unchanged.
+    let current = match tier_kind {
+        ExtractorKind::Pattern => slot.pattern,
+        ExtractorKind::Classifier => slot.classifier,
+        ExtractorKind::Llm => slot.llm,
+    };
+    // Whether the incoming outcome wins the combine — recomputed with the
+    // exact predicate `combine_tier_status` uses, so the captured per-call
+    // audit always describes the extractor whose byte we record.
+    let took_incoming = {
+        let cur_real = matches!(current, tier_status::RAN | tier_status::FAILED);
+        let inc_real = matches!(outcome_byte, tier_status::RAN | tier_status::FAILED);
+        !(cur_real && !inc_real)
+    };
+    let combined = combine_tier_status(current, outcome_byte);
     match tier_kind {
-        ExtractorKind::Pattern => slot.pattern = outcome_byte,
-        ExtractorKind::Classifier => slot.classifier = outcome_byte,
-        ExtractorKind::Llm => slot.llm = outcome_byte,
+        ExtractorKind::Pattern => slot.pattern = combined,
+        ExtractorKind::Classifier => slot.classifier = combined,
+        ExtractorKind::Llm => slot.llm = combined,
+    }
+    if took_incoming {
+        // Precise status byte for the historical audit row: `as_u8()`
+        // is byte-equal to `extraction_status::*` (Success=1 … Disabled=6),
+        // so a SkippedFilter / SkippedDuplicate keeps its exact reason
+        // rather than collapsing to the coarse tier byte.
+        let tier_audit = TierAudit {
+            extractor_id: ext_id,
+            extractor_version: ext_version,
+            status: result.status.as_u8(),
+            reason: result.status_reason.clone(),
+        };
+        match tier_kind {
+            ExtractorKind::Pattern => slot.pattern_audit = Some(tier_audit),
+            ExtractorKind::Classifier => slot.classifier_audit = Some(tier_audit),
+            ExtractorKind::Llm => slot.llm_audit = Some(tier_audit),
+        }
     }
     // Real provider cost flows from the LLM extractor's result into the
     // per-memory outcome, which the caller sums into the per-cycle spend
@@ -2114,6 +2424,8 @@ async fn run_llm_tier_into(
 
     for ext in llm_exts {
         let ext_ns = ext.namespace();
+        let ext_id = ext.id().raw();
+        let ext_version = ext.extractor_version();
         // Build this extractor's sub-batch: the memories it is effective
         // for (namespace rule) AND whose ENCODE trigger fires. Running a
         // per-extractor sub-batch preserves the concurrent-fan-out of
@@ -2141,6 +2453,12 @@ async fn run_llm_tier_into(
                     // a RAN with a SKIPPED).
                     if outcomes[i].llm == tier_status::ABSENT {
                         outcomes[i].llm = tier_status::SKIPPED;
+                        outcomes[i].llm_audit = Some(TierAudit {
+                            extractor_id: ext_id,
+                            extractor_version: ext_version,
+                            status: extraction_status::SKIPPED_FILTER,
+                            reason: "encode trigger where-clause did not match".to_string(),
+                        });
                     }
                     tracing::debug!(
                         target: "brain_debug::extractor",
@@ -2164,7 +2482,14 @@ async fn run_llm_tier_into(
         debug_assert_eq!(results.len(), sub_mems.len());
         for (k, result) in results.into_iter().enumerate() {
             let i = sub_idx[k];
-            fold_tier_result(&mut outcomes[i], result, ExtractorKind::Llm, mems[i].id);
+            fold_tier_result(
+                &mut outcomes[i],
+                result,
+                ExtractorKind::Llm,
+                mems[i].id,
+                ext_id,
+                ext_version,
+            );
         }
     }
 }
@@ -2267,6 +2592,11 @@ fn entity_mention_is_acceptable(text: &str) -> bool {
     if t.chars().count() > 50 {
         return false;
     }
+    // Serialization debris (`Mirror},{`) and internal identifiers
+    // (`space:<32 hex>`) are never real-world names.
+    if has_json_structural_fragment(t) || is_internal_selector_surface(t) {
+        return false;
+    }
     let words: Vec<&str> = t.split_whitespace().collect();
     if words.len() > 6 {
         return false;
@@ -2290,19 +2620,137 @@ fn entity_mention_is_acceptable(text: &str) -> bool {
     true
 }
 
+/// True when an entity surface carries JSON / serialization structure a
+/// real-world name never has: any curly brace, a `","` / `":"` key-value
+/// seam, unbalanced square brackets or parentheses, or an odd number of
+/// double quotes. Catches fragments like `Mirror},{` or `Acme"` that leak
+/// from a malformed model emission, while leaving names with balanced
+/// punctuation (`AT&T`, `Ben & Jerry's`, `Q3 (draft)`, `"Linear"`) intact.
+fn has_json_structural_fragment(t: &str) -> bool {
+    if t.contains('{') || t.contains('}') {
+        return true;
+    }
+    if t.contains("\",\"") || t.contains("\":") {
+        return true;
+    }
+    let count = |c: char| t.chars().filter(|&x| x == c).count();
+    if count('[') != count(']') || count('(') != count(')') {
+        return true;
+    }
+    count('"') % 2 == 1
+}
+
+/// True for the internal space selector shape `space:<32 lowercase hex>` —
+/// the canonical name [`ensure_space_self_entity`] gives a space's
+/// self-entity. That row is materialized deliberately (first-person facts
+/// attach to it by id); an EXTRACTED surface of this shape is an identifier
+/// echoed back from context, never a name, and must not mint a second
+/// entity (or bind a coined subject to the self-entity by name).
+fn is_internal_selector_surface(t: &str) -> bool {
+    t.strip_prefix("space:")
+        .is_some_and(|hex| hex.len() == 32 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 /// True if `candidate` is the better mention to keep for a surface
 /// than `current`: a typed mention (non-empty `entity_type_qname`)
 /// always beats an untyped one; among equally-typed mentions, higher
 /// confidence wins. This makes the classifier's typed span supersede
 /// the pattern tier's untyped capitalized-phrase guess.
-fn mention_is_better(candidate: &EntityMention, current: &EntityMention) -> bool {
+/// Which of two mentions of the same surface supplies its type. `*_rank` is
+/// the proposing tier (pattern 0 < classifier 1 < LLM 2, see
+/// [`extractor_tier_rank`]).
+///
+/// - A typed mention beats an untyped one.
+/// - Otherwise the higher tier wins: the LLM reads the whole memory and the
+///   namespace's schema, the classifier tags a span in isolation. Confidence
+///   used to decide this, and a zero-shot classifier is confidently wrong
+///   (a framework as a Person, the product "Mirror" as a Builder) — so its
+///   type beat the LLM's schema-aware one.
+/// - Except: an LLM offering only the generic `Concept` fallback does not
+///   override a specific BUILT-IN classifier type (a person stays a Person).
+///   For a type the memory's namespace DECLARES, though, the LLM is the
+///   authority: it was shown that exact list with each type's attributes, so
+///   when it typed the surface otherwise, the classifier's declared-type
+///   guess (the product "Mirror" as a `Builder`) loses.
+/// - Within a tier, confidence breaks the tie.
+fn mention_is_better(
+    candidate: &EntityMention,
+    cand_rank: u8,
+    current: &EntityMention,
+    cur_rank: u8,
+    is_declared: &dyn Fn(&str) -> bool,
+) -> bool {
     let cand_typed = !candidate.entity_type_qname.is_empty();
     let cur_typed = !current.entity_type_qname.is_empty();
     match (cand_typed, cur_typed) {
-        (true, false) => true,
-        (false, true) => false,
-        _ => candidate.confidence > current.confidence,
+        (true, false) => return true,
+        (false, true) => return false,
+        (false, false) => return candidate.confidence > current.confidence,
+        (true, true) => {}
     }
+    let generic = |m: &EntityMention| m.entity_type_qname == GENERIC_ENTITY_TYPE;
+    if cand_rank != cur_rank {
+        let (hi, lo) = if cand_rank > cur_rank {
+            (candidate, current)
+        } else {
+            (current, candidate)
+        };
+        let hi_wins = !(generic(hi) && !generic(lo) && !is_declared(&lo.entity_type_qname));
+        return hi_wins == (cand_rank > cur_rank);
+    }
+    candidate.confidence > current.confidence
+}
+
+/// Whether a retraction's object names the stored object it should retire.
+/// Entity objects must be the same entity. Text values match when one side's
+/// normalized word set contains the other's: the model restating a stored
+/// "the OAuth login flow" as "OAuth login flow" must still retire it — exact
+/// equality silently matched nothing. Word containment (not an article or
+/// stopword list) keeps this language-neutral; the caller has already scoped
+/// candidates to the same subject and predicate, which keeps it narrow.
+fn retraction_matches(stored: &StatementObject, retracted: &StatementObject) -> bool {
+    if stored == retracted {
+        return true;
+    }
+    let text = |o: &StatementObject| match o {
+        StatementObject::Value(brain_core::StatementValue::Text(t)) => Some(t.clone()),
+        _ => None,
+    };
+    let (Some(a), Some(b)) = (text(stored), text(retracted)) else {
+        return false;
+    };
+    let words = |t: &str| -> HashSet<String> {
+        brain_metadata::normalize_name(t)
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .map(str::to_owned)
+            .collect()
+    };
+    let (wa, wb) = (words(&a), words(&b));
+    !wa.is_empty() && !wb.is_empty() && (wa.is_subset(&wb) || wb.is_subset(&wa))
+}
+
+/// The generic fallback entity type (a noun no schema type fits).
+const GENERIC_ENTITY_TYPE: &str = "brain:Concept";
+
+/// Precedence of the tier that proposed a mention, from the extractor
+/// registry's `kind` (0 pattern, 1 classifier, 2 llm). Unknown ids rank as
+/// pattern. Cached per apply pass.
+fn extractor_tier_rank(
+    wtxn: &redb::WriteTransaction,
+    extractor_id: u32,
+    cache: &mut HashMap<u32, u8>,
+) -> u8 {
+    if let Some(&r) = cache.get(&extractor_id) {
+        return r;
+    }
+    let rank = wtxn
+        .open_table(brain_metadata::tables::extractor::EXTRACTORS_TABLE)
+        .ok()
+        .and_then(|t| t.get(&extractor_id).ok().flatten().map(|g| g.value().kind))
+        .map_or(0, |kind| kind.min(2));
+    cache.insert(extractor_id, rank);
+    rank
 }
 
 /// Snapshot every memory's currently-accumulated items into
@@ -2329,6 +2777,21 @@ fn tier_outcome_for(result: &ExtractionResult) -> u8 {
         | ExtractionStatus::SkippedFilter
         | ExtractionStatus::SkippedDuplicate
         | ExtractionStatus::SkippedDisabled => tier_status::SKIPPED,
+    }
+}
+
+/// Fold a later extractor's tier outcome into the tier's running status byte
+/// when two extractors share one tier. A real outcome (`RAN` / `FAILED`) must
+/// never be clobbered by a `SKIP` (or the initial `ABSENT`); among two real
+/// outcomes the later one wins, preserving the pre-existing RAN-vs-FAILED
+/// behavior the LLM retry path depends on.
+fn combine_tier_status(current: u8, incoming: u8) -> u8 {
+    let current_is_real = matches!(current, tier_status::RAN | tier_status::FAILED);
+    let incoming_is_real = matches!(incoming, tier_status::RAN | tier_status::FAILED);
+    if current_is_real && !incoming_is_real {
+        current
+    } else {
+        incoming
     }
 }
 
@@ -2375,6 +2838,95 @@ const RETRACT_MIN_CONFIDENCE: f32 = 0.7;
 /// memory's anchor carries a wall-clock time-of-day, so the anchor-vs-event
 /// comparison is done at whole-day granularity (`nanos / NANOS_PER_DAY`).
 const NANOS_PER_DAY: u64 = 86_400_000_000_000;
+
+/// BLAKE3 of the memory's source text, read from `TEXTS_TABLE` inside the
+/// open extraction `wtxn`. Feeds `ExtractionAudit::input_hash` so an
+/// operator can tell whether a re-extraction ran over edited text. Returns
+/// the all-zero hash when the text row is missing (shouldn't happen for a
+/// queued memory) rather than failing the audit.
+fn memory_text_hash(wtxn: &redb::WriteTransaction, memory_id: MemoryId) -> [u8; 32] {
+    use brain_metadata::tables::text::TEXTS_TABLE;
+    wtxn.open_table(TEXTS_TABLE)
+        .ok()
+        .and_then(|t| {
+            t.get(&memory_id.to_be_bytes())
+                .ok()
+                .flatten()
+                .map(|g| *blake3::hash(g.value()).as_bytes())
+        })
+        .unwrap_or([0u8; 32])
+}
+
+/// Emit one historical [`ExtractionAudit`] row per extractor tier that ran
+/// (or was skipped) for `memory_id`, into `EXTRACTOR_AUDIT_TABLE` + its
+/// three secondary indexes, inside the caller's extraction `wtxn` so the
+/// audit rows and the extracted graph commit atomically. A tier that was
+/// absent (no extractor present) yields no row — we never audit a call that
+/// didn't happen.
+///
+/// Best-effort observability: a write error is logged and skipped, never
+/// propagated, so a redb hiccup in the audit log can't fail the durable
+/// extraction it describes (matching how the post-commit fan-outs treat
+/// their own failures).
+fn emit_per_call_extraction_audit(
+    wtxn: &redb::WriteTransaction,
+    memory_id: MemoryId,
+    outcome: &PipelineOutcome,
+    now: u64,
+    input_hash: [u8; 32],
+) {
+    // Only the LLM tier carries provider cost; pattern + classifier are free.
+    let tiers = [
+        (&outcome.pattern_audit, 0u64),
+        (&outcome.classifier_audit, 0u64),
+        (&outcome.llm_audit, outcome.llm_cost_micro_usd),
+    ];
+    for (tier_audit, cost_micro_usd) in tiers {
+        let Some(t) = tier_audit else { continue };
+        // `schema_version` is 1: the pipeline runs every tier at
+        // `ExtractionContext { schema_version: 1, .. }`. `outputs` is left
+        // empty — per-tier attribution of committed entity/statement/relation
+        // ids is not tracked at this site (the surface-dedup collapses across
+        // tiers); the aggregate counts live on the per-memory
+        // `extractor_pipeline_audit` state row.
+        let mut row = if t.status == extraction_status::SUCCESS {
+            ExtractionAudit::success(
+                AuditId::new(),
+                memory_id,
+                t.extractor_id,
+                t.extractor_version,
+                1,
+                now,
+                now,
+                Vec::new(),
+                input_hash,
+            )
+        } else {
+            ExtractionAudit::non_success(
+                AuditId::new(),
+                memory_id,
+                t.extractor_id,
+                t.extractor_version,
+                1,
+                now,
+                now,
+                t.status,
+                t.reason.clone(),
+                input_hash,
+            )
+        };
+        row.cost_micro_usd = cost_micro_usd;
+        if let Err(e) = audit_write(wtxn, &row) {
+            warn!(
+                target: "brain_workers::extractor",
+                memory_id = ?memory_id,
+                extractor_id = t.extractor_id,
+                error = %e,
+                "per-call extraction audit write failed (best-effort; extraction unaffected)",
+            );
+        }
+    }
+}
 
 async fn apply_outcome(
     worker: &ExtractorWorker,
@@ -2540,20 +3092,59 @@ async fn apply_outcome(
     // Merge the freshly-committed typed graph into this memory's durable
     // write-artifact bundle (MEMORY_INSPECT), reading it back through the same
     // enrichment resolver RECALL uses. Post-commit only, so the read sees the
-    // rows we just wrote. Gated on non-empty extraction so a memory that
-    // produced no graph costs no extra transaction; the sync bundle already
-    // holds vector + record. Best-effort: a failure is logged, never fatal —
+    // rows we just wrote. Best-effort: a failure is logged, never fatal —
     // the durable graph itself already committed.
-    if counts.entities + counts.statements + counts.relations > 0 {
+    //
+    // Gated on non-empty extraction so a memory that produced no graph costs
+    // no extra transaction; the sync bundle already holds vector + record.
+    //
+    // The zero-count case is NOT unconditionally skippable, though. On a
+    // RE-extraction the bundle already holds the previous run's edges, and
+    // "extraction produced nothing" is precisely when those edges are stale
+    // and must go: `merge_graph_from_committed` replaces the extractor-owned
+    // edges with the committed set, so merging on an empty result is what
+    // clears them. Skipping it left a memory serving a stale graph that
+    // re-running extraction could never repair — the operator's only
+    // remaining move was to delete and re-encode the memory.
+    //
+    // So: merge when there is something to write, or when there is something
+    // stale to clear. The extra read only happens on the zero-count path.
+    let extracted_something = counts.entities + counts.statements + counts.relations > 0;
+    let has_stale_graph = !extracted_something
+        && brain_ops::memory_artifact::artifact_holds_extractor_graph(
+            ctx.ops.executor.metadata.as_ref(),
+            memory_id,
+        );
+    if extracted_something || has_stale_graph {
         let metadata = ctx.ops.executor.metadata.as_ref();
-        if let Err(e) = brain_ops::memory_artifact::merge_graph_from_committed(metadata, memory_id)
-        {
-            warn!(
-                target: "brain_workers::extractor",
-                memory_id = ?memory_id,
-                error = %e,
-                "artifact graph merge failed (durable graph is committed; bundle graph deferred)",
-            );
+        match brain_ops::memory_artifact::merge_graph_from_committed(metadata, memory_id) {
+            Ok(0) => {}
+            Ok(unresolved) => {
+                // Edges whose entity endpoint didn't resolve to a node are
+                // skipped, never persisted against the nil id.
+                for _ in 0..unresolved {
+                    worker
+                        .metrics
+                        .inc_apply_dropped("artifact_edge_endpoint_unresolved");
+                }
+                // debug, not warn: a relation another memory wrote to one of
+                // this memory's entities routinely has its far endpoint
+                // outside this memory's node set.
+                debug!(
+                    target: "brain_workers::extractor",
+                    memory_id = ?memory_id,
+                    unresolved,
+                    "artifact graph: skipped edges with an unresolved entity endpoint",
+                );
+            }
+            Err(e) => {
+                warn!(
+                    target: "brain_workers::extractor",
+                    memory_id = ?memory_id,
+                    error = %e,
+                    "artifact graph merge failed (durable graph is committed; bundle graph deferred)",
+                );
+            }
         }
     }
 
@@ -2673,6 +3264,36 @@ fn run_apply_body(
             })
     };
 
+    // The source memory's owning namespace NAME and that namespace's active
+    // declared vocabulary. Extracted predicates / relation types whose local
+    // name the memory's OWN namespace declares resolve onto that declaration
+    // (`mirror:blocked_by`) instead of an open-vocab `brain:` twin. Scoped to
+    // exactly this memory's namespace, so namespace A's memory can never
+    // resolve onto namespace B's vocabulary. An unresolvable namespace id or a
+    // schema read hiccup degrades to the system namespace / no vocabulary —
+    // i.e. exactly the pre-existing open-vocab behavior.
+    let mem_ns: String = brain_metadata::namespace::namespace_name_wtxn(
+        &wtxn,
+        brain_core::NamespaceId::from(source_scope.namespace_id),
+    )
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| SYSTEM_NAMESPACE.to_string());
+    let declared_vocab: Option<brain_metadata::DeclaredVocabulary> =
+        match brain_metadata::declared_vocabulary_wtxn(&wtxn, &mem_ns) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    memory_id = ?memory_id,
+                    namespace = %mem_ns,
+                    error = %e,
+                    "declared vocabulary read failed; resolving open-vocab only",
+                );
+                None
+            }
+        };
+    let declared_vocab = declared_vocab.as_ref();
+
     // The source memory's ANCHOR day — its client-supplied `occurred_at`, else
     // its record `created_at` — expressed as whole days since the unix epoch.
     // Three times are first-class and DISTINCT keys: the record time
@@ -2718,8 +3339,74 @@ fn run_apply_body(
     // reflects distinct entities, not raw mentions.
     let mut best_by_surface: HashMap<String, &EntityMention> = HashMap::new();
     let mut surface_order: Vec<String> = Vec::new();
-    for item in &outcome.items {
-        if let ExtractedItem::EntityMention(em) = item {
+    let mut tier_ranks: HashMap<u32, u8> = HashMap::new();
+    let declared_types: HashSet<String> = declared_vocab
+        .map(|v| {
+            v.entity_types
+                .iter()
+                .map(|e| format!("brain:{}", e.name))
+                .collect()
+        })
+        .unwrap_or_default();
+    let is_declared = |q: &str| declared_types.contains(q);
+    // Surfaces the LLM tier used in this memory ONLY as a literal value
+    // (`object_is_entity: false`), never as a subject or an entity object.
+    // Having read the whole memory, it judged them values ("prefers
+    // Gymnasium", a job title), so a lower tier's TYPE for the same span —
+    // the span classifier tagging a framework or a role as a Person — is not
+    // trusted: the span is still minted (it was mentioned; see
+    // `apply_value_object_beats_a_prior_entity_mention_of_the_same_surface`),
+    // but under the generic type rather than a wrong specific one.
+    let llm_value_only: HashSet<String> = {
+        let mut values = HashSet::new();
+        let mut entities = HashSet::new();
+        for item in &outcome.items {
+            let ExtractedItem::StatementMention(sm) = item else {
+                continue;
+            };
+            if extractor_tier_rank(&wtxn, sm.extractor_id, &mut tier_ranks) < 2 {
+                continue;
+            }
+            if let Some(subj) = &sm.subject_text {
+                entities.insert(normalize_surface(subj));
+            }
+            if let Some(obj) = &sm.object_text {
+                let key = normalize_surface(obj);
+                if sm.object_is_entity {
+                    entities.insert(key);
+                } else {
+                    values.insert(key);
+                }
+            }
+        }
+        values.difference(&entities).cloned().collect()
+    };
+    let mentions: Vec<EntityMention> = outcome
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ExtractedItem::EntityMention(em) => Some(em),
+            _ => None,
+        })
+        .map(|em| {
+            let mut em = em.clone();
+            if llm_value_only.contains(&normalize_surface(&em.text))
+                && extractor_tier_rank(&wtxn, em.extractor_id, &mut tier_ranks) < 2
+                && !em.entity_type_qname.is_empty()
+            {
+                trace!(
+                    memory_id = ?memory_id,
+                    text = %em.text,
+                    was = %em.entity_type_qname,
+                    "entity type untrusted: the LLM tier used this surface only as a value",
+                );
+                em.entity_type_qname = GENERIC_ENTITY_TYPE.to_string();
+            }
+            em
+        })
+        .collect();
+    for em in &mentions {
+        {
             if !entity_mention_is_acceptable(&em.text) {
                 trace!(
                     memory_id = ?memory_id,
@@ -2734,7 +3421,14 @@ fn run_apply_body(
                     best_by_surface.insert(key.clone(), em);
                     surface_order.push(key);
                 }
-                Some(existing) if mention_is_better(em, existing) => {
+                Some(existing)
+                    if {
+                        let cand = extractor_tier_rank(&wtxn, em.extractor_id, &mut tier_ranks);
+                        let cur =
+                            extractor_tier_rank(&wtxn, existing.extractor_id, &mut tier_ranks);
+                        mention_is_better(em, cand, existing, cur, &is_declared)
+                    } =>
+                {
                     best_by_surface.insert(key, em);
                 }
                 Some(_) => {}
@@ -2743,7 +3437,7 @@ fn run_apply_body(
     }
     for key in &surface_order {
         let em = best_by_surface[key];
-        let (entity_id, tier) = resolve_entity_mention(
+        let (entity_id, tier, confidence) = resolve_entity_mention(
             &wtxn,
             source_scope,
             em,
@@ -2752,6 +3446,26 @@ fn run_apply_body(
             &mut staged,
             disambiguation,
         )?;
+        // Log this mention→entity resolution as a derivation. Emitted here,
+        // after per-surface dedup, so a surface that several tiers proposed is
+        // resolved — and audited — exactly once. The entity_type_id is read
+        // back from the resolved row inside the txn so the audit records the
+        // referent's actual type (cross-type resolution can differ from the
+        // mention's hinted type). Best-effort, append-only; see
+        // `emit_resolution_audit`.
+        let resolved_type_id = entity_get_inside_wtxn(&wtxn, entity_id)
+            .ok()
+            .flatten()
+            .map_or(0, |e| e.entity_type.raw());
+        emit_resolution_audit(
+            &wtxn,
+            &em.text,
+            resolved_type_id,
+            entity_id,
+            tier,
+            confidence,
+            now,
+        );
         // Stage journal (S8 entity resolution). The resolver's own logs
         // never carry `memory_id`, so a resolve verdict couldn't be tied
         // back to the encode that triggered it. Log it here, where
@@ -2917,27 +3631,83 @@ fn run_apply_body(
                         );
                         continue;
                     };
-                    let pid = match resolve_or_intern_predicate(
-                        &wtxn,
-                        embed_deps,
-                        &worker.metrics,
-                        ns,
-                        name,
-                        now,
-                    ) {
-                        Ok(pid) => pid,
-                        Err(e) => {
-                            worker.metrics.inc_apply_dropped("predicate_invalid");
-                            warn!(
-                                memory_id = ?memory_id,
-                                predicate = %sm.predicate_qname,
-                                error = %e,
-                                "statement: predicate intern failed; skipping triple",
-                            );
-                            continue;
-                        }
+                    // A declared RELATION type links two entities. Emitted with
+                    // a literal value object ("defines_task: 20-step") it fits
+                    // neither store — interning it would mint an open-vocab
+                    // predicate named after the relation in the tenant's own
+                    // namespace. Drop the malformed triple before anything is
+                    // interned (a name declared as BOTH keeps the predicate).
+                    if !sm.object_is_entity
+                        && declared_vocab.is_some_and(|v| {
+                            v.relation_type(name).is_some() && v.predicate(name).is_none()
+                        })
+                    {
+                        worker.metrics.inc_apply_dropped("relation_value_object");
+                        debug!(
+                            memory_id = ?memory_id,
+                            predicate = %sm.predicate_qname,
+                            "statement: declared relation type used with a value object; skipping triple",
+                        );
+                        continue;
+                    }
+                    // Namespace-aware: a predicate the memory's OWN namespace
+                    // declares wins over the emitted `brain:` prefix and over
+                    // embedding consolidation onto a `brain:` synonym.
+                    let declared_pid =
+                        declared_predicate_in_namespace(&wtxn, declared_vocab, name)?;
+                    // The relation type this local name resolves to, looked up
+                    // before the predicate so we can tell whether a predicate is
+                    // needed at all.
+                    let declared_rt =
+                        declared_relation_type_in_namespace(&wtxn, declared_vocab, name)?;
+                    // A name the namespace declares ONLY as a relation type,
+                    // carrying an entity object, is headed for the relations
+                    // table — the routing decision below turns it into a
+                    // `StatementKind::Relation` and `continue`s before any
+                    // statement is written.
+                    //
+                    // Interning a predicate for it anyway minted a permanent
+                    // `ImplicitFromWrite` row that nothing ever referenced: the
+                    // relation store held the fact, and the predicate registry
+                    // grew a duplicate of a name the schema had already declared
+                    // on the other axis.
+                    //
+                    // `object_is_entity` is the LLM's per-triple judgment and is
+                    // only a PREDICTION of how the object will resolve — a
+                    // surface that fails to resolve to an entity falls back to a
+                    // text value, which does need a predicate. So this defers the
+                    // mint rather than skipping it, and the fallback below mints
+                    // on the way past.
+                    let predicate_deferred =
+                        declared_pid.is_none() && declared_rt.is_some() && sm.object_is_entity;
+                    let resolved_predicate = if predicate_deferred {
+                        None
+                    } else {
+                        Some(
+                            match resolve_extracted_predicate(
+                                &wtxn,
+                                embed_deps,
+                                &worker.metrics,
+                                declared_pid,
+                                &mem_ns,
+                                ns,
+                                name,
+                                now,
+                            ) {
+                                Ok(resolved) => resolved,
+                                Err(e) => {
+                                    worker.metrics.inc_apply_dropped("predicate_invalid");
+                                    warn!(
+                                        memory_id = ?memory_id,
+                                        predicate = %sm.predicate_qname,
+                                        error = %e,
+                                        "statement: predicate intern failed; skipping triple",
+                                    );
+                                    continue;
+                                }
+                            },
+                        )
                     };
-                    let used_qname = (ns.to_string(), name.to_string());
 
                     // Object axis: the predicate's declared object constraint
                     // (Entity→mint / Value→text) wins; else the LLM's per-object
@@ -2955,7 +3725,7 @@ fn run_apply_body(
                         source_scope,
                         memory_id,
                         sm,
-                        pid,
+                        resolved_predicate.map(|(pid, _)| pid),
                         &mut entity_map,
                         &mut mentioned,
                         embed_deps,
@@ -2971,6 +3741,74 @@ fn run_apply_body(
                             "statement object missing; skipping triple",
                         );
                         continue;
+                    };
+                    // The deferred mint, settled now that the object is known.
+                    //
+                    // Predicted-relation and it IS an entity → no predicate is
+                    // needed: the routing below writes a relation and `continue`s
+                    // before `statement_create`. Predicted-relation but the
+                    // surface did not resolve to an entity → this is an ordinary
+                    // value statement after all, so mint the predicate here.
+                    let routes_to_relation =
+                        predicate_deferred && matches!(object, StatementObject::Entity(_));
+                    let (pid, pred_ns) = match resolved_predicate {
+                        Some(resolved) => resolved,
+                        None if routes_to_relation => {
+                            // Placeholder: every read of it below degrades to the
+                            // same default an un-constrained predicate gives, and
+                            // the relation branch `continue`s before any write
+                            // that would persist it.
+                            (brain_core::PredicateId::from(0), mem_ns.as_str())
+                        }
+                        None => match resolve_extracted_predicate(
+                            &wtxn,
+                            embed_deps,
+                            &worker.metrics,
+                            declared_pid,
+                            &mem_ns,
+                            ns,
+                            name,
+                            now,
+                        ) {
+                            Ok(resolved) => resolved,
+                            Err(e) => {
+                                worker.metrics.inc_apply_dropped("predicate_invalid");
+                                warn!(
+                                    memory_id = ?memory_id,
+                                    predicate = %sm.predicate_qname,
+                                    error = %e,
+                                    "statement: predicate intern failed; skipping triple",
+                                );
+                                continue;
+                            }
+                        },
+                    };
+                    let used_qname = (pred_ns.to_string(), name.to_string());
+
+                    // A declared `Value<number>` / `Value<bool>` predicate stores
+                    // a typed value, not the LLM's text rendering of it.
+                    let object = if declared_pid.is_some() {
+                        match coerce_declared_value(
+                            object,
+                            declared_vocab.and_then(|v| v.predicate(name)),
+                        ) {
+                            Some(o) => o,
+                            None => {
+                                worker
+                                    .metrics
+                                    .inc_apply_dropped("declared_value_type_mismatch");
+                                debug!(
+                                    memory_id = ?memory_id,
+                                    predicate = %sm.predicate_qname,
+                                    object = ?sm.object_text,
+                                    "statement: object violates the predicate's declared \
+                                     value type; skipping triple",
+                                );
+                                continue;
+                            }
+                        }
+                    } else {
+                        object
                     };
 
                     // RETRACTION: the source text says this fact no longer holds
@@ -2997,7 +3835,10 @@ fn run_apply_body(
                                     limit: 0,
                                 },
                             ) {
-                                for s in rows.into_iter().filter(|s| s.object == object) {
+                                for s in rows
+                                    .into_iter()
+                                    .filter(|s| retraction_matches(&s.object, &object))
+                                {
                                     if brain_metadata::statement_tombstone(
                                         &wtxn,
                                         s.id,
@@ -3016,8 +3857,14 @@ fn run_apply_body(
                             // may mint the type if absent (harmless throwaway) — then
                             // there's simply nothing to retire.
                             if let StatementObject::Entity(to_id) = &object {
-                                if let Ok(rt) = relation_type_intern_or_get(&wtxn, ns, name, 0, now)
-                                {
+                                if let Ok((rt, _)) = resolve_extracted_relation_type(
+                                    &wtxn,
+                                    declared_rt,
+                                    &mem_ns,
+                                    ns,
+                                    name,
+                                    now,
+                                ) {
                                     if let Ok(rels) = brain_metadata::relation_list_from(
                                         &snap,
                                         source_scope,
@@ -3086,6 +3933,17 @@ fn run_apply_body(
                     if declared_kind.is_none() && sm.event_at_unix_nanos.is_some() {
                         kind = StatementKind::Event;
                     }
+                    // A local name the memory's namespace declares as a
+                    // RELATION TYPE (and not as a predicate) is an entity↔entity
+                    // link by schema: when the object resolved to an entity,
+                    // route it to the typed edge whatever kind the LLM guessed.
+                    if routes_to_relation
+                        || (declared_pid.is_none()
+                            && declared_rt.is_some()
+                            && matches!(object, StatementObject::Entity(_)))
+                    {
+                        kind = StatementKind::Relation;
+                    }
                     // Effective Time slot for this fact. An `event_at` the LLM
                     // already resolved for this exact statement wins (never
                     // overridden).
@@ -3134,7 +3992,7 @@ fn run_apply_body(
                         "apply: statement kind/time",
                     );
 
-                    // Axis-faithful entity-object routing (spec §02 data model).
+                    // Axis-faithful entity-object routing per the data model.
                     // `StatementObject::Entity` is a first-class statement object:
                     // `manages`, `is_a`, `met_with`, `traveled_to` are entity-object
                     // *statements*, read from the subject. Only a `kind=Relation`
@@ -3151,8 +4009,26 @@ fn run_apply_body(
                         _ => None,
                     };
                     if let Some(to_id) = entity_link {
-                        let rt = match relation_type_intern_or_get(&wtxn, ns, name, 0, now) {
-                            Ok(rt) => rt,
+                        // Defense in depth: never persist a typed edge with a
+                        // nil endpoint (a dangling edge no reader can render).
+                        if subject.0.is_nil() || to_id.0.is_nil() {
+                            worker.metrics.inc_apply_dropped("nil_endpoint");
+                            warn!(
+                                memory_id = ?memory_id,
+                                predicate = %sm.predicate_qname,
+                                "entity link endpoint resolved to the nil entity id; skipping triple",
+                            );
+                            continue;
+                        }
+                        let rt = match resolve_extracted_relation_type(
+                            &wtxn,
+                            declared_rt,
+                            &mem_ns,
+                            ns,
+                            name,
+                            now,
+                        ) {
+                            Ok((rt, _)) => rt,
                             Err(e) => {
                                 worker.metrics.inc_apply_dropped("create_rejected");
                                 warn!(
@@ -3185,9 +4061,11 @@ fn run_apply_body(
                             }
                             Err(e) => {
                                 worker.metrics.inc_apply_dropped("create_rejected");
+                                let rule = describe_endpoint_violation(&wtxn, &e);
                                 warn!(
                                     memory_id = ?memory_id,
                                     predicate = %sm.predicate_qname,
+                                    rule = %rule,
                                     error = %e,
                                     "relation_create rejected for entity link; skipping triple",
                                 );
@@ -3250,8 +4128,15 @@ fn run_apply_body(
                         }
                         Err(e) => {
                             worker.metrics.inc_apply_dropped("create_rejected");
+                            let rule = describe_statement_violation(&wtxn, &e);
                             warn!(
                                 memory_id = ?memory_id,
+                                // The predicate was missing entirely, so the
+                                // log said a triple was dropped without saying
+                                // which one — unactionable on a memory that
+                                // produced a dozen.
+                                predicate = %sm.predicate_qname,
+                                rule = %rule,
                                 error = %e,
                                 "statement_create rejected; skipping triple",
                             );
@@ -3324,8 +4209,30 @@ fn run_apply_body(
                     );
                     continue;
                 };
-                let rt = match relation_type_intern_or_get(&wtxn, ns, name, 0, now) {
-                    Ok(rt) => rt,
+                // Defense in depth: a relation row must never reference the
+                // nil entity (a dangling edge no reader can render).
+                if from.0.is_nil() || to.0.is_nil() {
+                    worker.metrics.inc_apply_dropped("nil_endpoint");
+                    warn!(
+                        memory_id = ?memory_id,
+                        relation_type = %rm.relation_type_qname,
+                        "relation endpoint resolved to the nil entity id; skipping relation",
+                    );
+                    continue;
+                }
+                // Namespace-aware, like statement predicates: a relation type
+                // the memory's OWN namespace declares wins over the emitted
+                // prefix; a foreign namespace is never written into.
+                let declared_rt = declared_relation_type_in_namespace(&wtxn, declared_vocab, name)?;
+                let rt = match resolve_extracted_relation_type(
+                    &wtxn,
+                    declared_rt,
+                    &mem_ns,
+                    ns,
+                    name,
+                    now,
+                ) {
+                    Ok((rt, _)) => rt,
                     Err(e) => {
                         worker.metrics.inc_apply_dropped("relation_type_invalid");
                         warn!(
@@ -3393,15 +4300,21 @@ fn run_apply_body(
     // accumulator drives the cross-memory budget gate separately.
     let (status_byte, reason) = decide_status(outcome, counts);
     let attempts = prior_attempts.saturating_add(1);
-    // A retryable failure is specifically the LLM tier failing (statements are
-    // LLM-only and a failed call wrote zero, so re-running can't duplicate
-    // them) with a transient cause. A TRANSIENT failure (timeout / rate-limit /
-    // 5xx) keeps the memory queued and is retried with backoff until it
-    // succeeds — a passing provider outage must never permanently strip a
-    // memory's grounding. A PERMANENT failure (bad key, no balance, malformed)
-    // is terminal at once: retrying can't help and only hides the problem.
-    // Pattern/classifier-only failures are never retried (their rows already
-    // committed; a re-run would duplicate).
+    // A retryable failure is specifically the LLM tier failing with a
+    // transient cause. A TRANSIENT failure (timeout / rate-limit / 5xx) keeps
+    // the memory queued and is retried with backoff until it succeeds — a
+    // passing provider outage must never permanently strip a memory's
+    // grounding. A PERMANENT failure (bad key, no balance, malformed) is
+    // terminal at once: retrying can't help and only hides the problem.
+    //
+    // A retry re-runs the whole pipeline, so the already-committed
+    // pattern/classifier-tier rows are re-applied. That is safe because
+    // relation/statement creation is content-idempotent at the apply layer:
+    // `relation_create` / `statement_create` no-op on a byte-identical active
+    // tuple rather than minting a duplicate (a user-declared pattern Relation
+    // with `Many` cardinality has no cardinality conflict to catch the repeat,
+    // so the content-dedup is what prevents the leak). Distinct multi-values
+    // still coexist; only exact re-applications collapse.
     let llm_failed = outcome.llm == brain_metadata::tier_status::FAILED;
     let failure_class_byte = match outcome.llm_failure_class {
         ExtractionFailureClass::Transient => brain_metadata::failure_class::TRANSIENT,
@@ -3437,6 +4350,15 @@ fn run_apply_body(
     .with_failure_class(failure_class_byte);
     record_extracted(&wtxn, &audit)
         .map_err(|e| ApplyError::Audit(format!("record_extracted: {e}")))?;
+
+    // Per-call historical audit: one `ExtractionAudit` row per tier that
+    // ran (or was skipped), written into THIS txn so the audit rows and the
+    // extracted graph commit atomically (no extra fsync). Append-only —
+    // each row mints a fresh UUIDv7 id, so a re-extraction adds rows rather
+    // than overwriting. Best-effort inside the helper: a write error is
+    // logged, never propagated, so the audit log can't fail the extraction.
+    let input_hash = memory_text_hash(&wtxn, memory_id);
+    emit_per_call_extraction_audit(&wtxn, memory_id, outcome, now, input_hash);
 
     // Hand the uncommitted txn back to the orchestrator, which commits
     // (or, for a plan pass that discovered ambiguity, rolls back) and then
@@ -3519,6 +4441,7 @@ async fn publish_extracted_graph(
         stage_outcome: Some(outcome),
         stage_payload: Some(payload),
         space_id,
+        vector: None,
     };
     ctx.ops.publish_stage_event(envelope).await;
 }
@@ -3564,6 +4487,7 @@ async fn publish_hype_completed(
         stage_outcome: Some(stage_outcome),
         stage_payload: Some(payload),
         space_id,
+        vector: None,
     };
     ctx.ops.publish_stage_event(envelope).await;
 }
@@ -3607,7 +4531,7 @@ fn resolve_entity_mention(
     embed_deps: Option<&EmbeddingDeps>,
     staged: &mut StagedEntityVectors,
     disambiguation: &mut Disambiguation<'_>,
-) -> Result<(EntityId, ResolutionTier), ApplyError> {
+) -> Result<(EntityId, ResolutionTier, f32), ApplyError> {
     let res = resolve_or_create_with_deps(
         wtxn,
         scope,
@@ -3620,7 +4544,7 @@ fn resolve_entity_mention(
         disambiguation,
     )
     .map_err(ApplyError::from)?;
-    Ok((res.entity_id, res.tier))
+    Ok((res.entity_id, res.tier, res.confidence))
 }
 
 fn resolution_tier_to_metric(tier: ResolutionTier) -> ResolverOutcome {
@@ -3632,6 +4556,92 @@ fn resolution_tier_to_metric(tier: ResolutionTier) -> ResolverOutcome {
         ResolutionTier::Disambiguated => ResolverOutcome::Disambiguated,
         ResolutionTier::Created => ResolverOutcome::Create,
     }
+}
+
+/// Map a resolver tier to the durable `resolution_outcome` byte written on a
+/// per-mention resolution audit row. `Alias` maps to `TIER_1_EXACT`: an alias
+/// hit (including the trigram-fuzzy and coref tiers, which alias the surface
+/// onto the matched entity) is an exact match against the alias index, so it
+/// belongs with the tier-1 exact-identity bucket. The resolver always resolves
+/// or mints an entity at this site, so the `AMBIGUOUS` / `NOT_RESOLVED`
+/// outcomes never arise here — they exist for callers that can abstain.
+fn resolution_tier_to_outcome(tier: ResolutionTier) -> u8 {
+    match tier {
+        ResolutionTier::Exact | ResolutionTier::Alias => resolution_outcome::TIER_1_EXACT,
+        ResolutionTier::Fuzzy => resolution_outcome::TIER_2_FUZZY,
+        ResolutionTier::Embedding => resolution_outcome::TIER_3_EMBEDDING,
+        ResolutionTier::Disambiguated => resolution_outcome::TIER_4_LLM,
+        ResolutionTier::Created => resolution_outcome::CREATED,
+    }
+}
+
+/// Append one per-mention resolution audit row inside the extraction write txn
+/// (no extra fsync — it rides the existing commit). A mention→entity
+/// resolution is a derivation, so the acceptance suite's "all derivations
+/// logged" line requires it to be queryable via `GET /v1/audit?by=resolution`.
+///
+/// Best-effort: a write failure is logged and swallowed, never failing the
+/// extraction — matching the extraction-audit emission and the sibling
+/// post-commit fan-outs. The row is append-only (a fresh `AuditId` per call),
+/// so re-extracting the same memory adds rows rather than overwriting, which
+/// preserves the resolution history.
+fn emit_resolution_audit(
+    wtxn: &redb::WriteTransaction,
+    candidate_name: &str,
+    entity_type_id: u32,
+    resolved: EntityId,
+    tier: ResolutionTier,
+    confidence: f32,
+    now: u64,
+) {
+    let mut audit = ResolutionAudit::new(
+        AuditId::new(),
+        candidate_name.to_string(),
+        entity_type_id,
+        resolution_tier_to_outcome(tier),
+        confidence,
+        now,
+    );
+    audit.resolved_entity_bytes = Some(resolved.to_bytes());
+    if let Err(e) = resolution_audit_write(wtxn, &audit) {
+        warn!(
+            target: "brain_workers::extractor",
+            surface = %candidate_name,
+            error = %e,
+            "resolution audit write failed; skipping (extraction unaffected)",
+        );
+    }
+}
+
+/// Append one resolution audit row for a cross-type exact-reuse resolution:
+/// a coined subject / relation endpoint that bound to an existing entity of a
+/// different type because exactly one entity carries this exact canonical name
+/// (see [`reuse_cross_type_exact`]). That reuse IS a mention→entity derivation
+/// even though it never passed through the tiered resolver, so "all derivations
+/// logged" requires a row. It is a deterministic exact-name match, so the
+/// outcome is `TIER_1_EXACT` at confidence 1.0. The `entity_type_id` is read
+/// back from the reused entity (its real type, not the coined generic), exactly
+/// as the sibling `emit_resolution_audit` call sites do. Best-effort: a failure
+/// is swallowed, never failing the extraction.
+fn emit_cross_type_reuse_audit(
+    wtxn: &redb::WriteTransaction,
+    candidate_name: &str,
+    reused: EntityId,
+    now: u64,
+) {
+    let resolved_type_id = entity_get_inside_wtxn(wtxn, reused)
+        .ok()
+        .flatten()
+        .map_or(0, |e| e.entity_type.raw());
+    emit_resolution_audit(
+        wtxn,
+        candidate_name,
+        resolved_type_id,
+        reused,
+        ResolutionTier::Exact,
+        1.0,
+        now,
+    );
 }
 
 /// Link `memory_id --Mentions--> entity_id`, annotated with the surface form
@@ -3824,12 +4834,34 @@ const CANDIDATE_PREDICATE_K: usize = 20;
 /// `is_declared` is intentionally ignored: BOTH declared and open-vocab
 /// existing predicates are valid reuse targets — the goal is convergence on
 /// whatever name already exists, not schema enforcement.
+/// Epsilon grid for candidate-cosine ranking. Cosines within one step are
+/// treated as tied so float noise doesn't reshuffle the block across cycles.
+const CANDIDATE_TIE_EPS: f32 = 1e-6;
+
+/// Total-order comparator for candidate ranking: higher cosine first (quantized
+/// to [`CANDIDATE_TIE_EPS`] so sub-epsilon noise collapses to one bucket), ties
+/// broken by the older (lower) predicate id.
+///
+/// This MUST be a total order. The previous form was an epsilon *band*
+/// (`|a-b| <= eps ? by-id : by-score`), which is non-transitive — `a ~ b` and
+/// `b ~ c` yet `a !~ c` — so `slice::sort_by` panics with "comparison function
+/// does not correctly implement a total order" and takes the shard down.
+/// Quantizing both scores to the same integer grid restores transitivity.
+/// NaN cannot reach here: callers filter to `sim > 0.0` first.
+fn candidate_cmp(
+    a: (f32, brain_core::PredicateId),
+    b: (f32, brain_core::PredicateId),
+) -> std::cmp::Ordering {
+    let qa = (a.0 / CANDIDATE_TIE_EPS).round() as i64;
+    let qb = (b.0 / CANDIDATE_TIE_EPS).round() as i64;
+    qb.cmp(&qa).then_with(|| a.1.cmp(&b.1))
+}
+
 fn select_candidate_predicates(
     query: &[f32],
     candidates: &[brain_metadata::schema::predicate::PredicateConsolidationCandidate],
     k: usize,
 ) -> Vec<String> {
-    const TIE_EPS: f32 = 1e-6;
     let mut scored: Vec<(f32, brain_core::PredicateId, &str)> = candidates
         .iter()
         .filter(|(_, name, _, _)| !name.starts_with("behavior_"))
@@ -3842,15 +4874,7 @@ fn select_candidate_predicates(
             }
         })
         .collect();
-    scored.sort_by(|a, b| {
-        // Higher cosine first; within an epsilon the older (lower) id wins so
-        // the block is deterministic across cycles.
-        if (a.0 - b.0).abs() <= TIE_EPS {
-            a.1.cmp(&b.1)
-        } else {
-            b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
-        }
-    });
+    scored.sort_by(|a, b| candidate_cmp((a.0, a.1), (b.0, b.1)));
     scored
         .into_iter()
         .take(k)
@@ -3907,6 +4931,57 @@ fn build_candidate_predicate_map(
         out.insert(m.id, block);
     }
     out
+}
+
+/// Render each DISTINCT memory namespace's declared-vocabulary prompt block
+/// once per batch (see [`brain_metadata::DeclaredVocabulary::render_prompt_block`]).
+/// Namespaces without an active user schema — and the system `brain`
+/// namespace — have no entry. Best-effort: a per-namespace read error simply
+/// omits that namespace.
+fn declared_vocab_blocks(
+    rtxn: &redb::ReadTransaction,
+    mem_namespaces: &[String],
+) -> HashMap<String, String> {
+    let mut out: HashMap<String, String> = HashMap::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for ns in mem_namespaces {
+        if !seen.insert(ns.as_str()) {
+            continue;
+        }
+        if let Ok(Some(vocab)) = brain_metadata::declared_vocabulary(rtxn, ns) {
+            let block = vocab.render_prompt_block();
+            if !block.is_empty() {
+                out.insert(ns.clone(), block);
+            }
+        }
+    }
+    out
+}
+
+/// Append each memory's OWNING namespace's declared-vocabulary block (from
+/// [`declared_vocab_blocks`]) to its per-memory candidate block. `mems` and
+/// `mem_namespaces` are index-aligned (both built from the same live batch).
+/// A memory only ever receives the block keyed by its own namespace, so
+/// namespace A's vocabulary can never reach a namespace-B memory's prompt.
+fn merge_declared_vocab_blocks(
+    map: &mut HashMap<MemoryId, String>,
+    mems: &[CoreMemory],
+    mem_namespaces: &[String],
+    blocks: &HashMap<String, String>,
+) {
+    for (m, ns) in mems.iter().zip(mem_namespaces.iter()) {
+        let Some(block) = blocks.get(ns) else {
+            continue;
+        };
+        let entry = map.entry(m.id).or_default();
+        if !entry.is_empty() {
+            if !entry.ends_with('\n') {
+                entry.push('\n');
+            }
+            entry.push('\n');
+        }
+        entry.push_str(block);
+    }
 }
 
 /// Embed the bare predicate name and scan same-namespace open-vocab
@@ -4012,6 +5087,269 @@ fn resolve_or_intern_predicate(
     Ok(pid)
 }
 
+// ---------------------------------------------------------------------------
+// Namespace-aware resolution of schema-declared vocabulary.
+//
+// The default extractor coins every predicate / relation type under `brain:`.
+// A memory owned by a namespace whose ACTIVE user schema declares a predicate
+// (or relation type) with the same LOCAL name must land on that declaration
+// (`mirror:blocked_by`), not on an open-vocab `brain:blocked_by` twin — only
+// the declared row carries the schema's kind, object type and retention.
+// ---------------------------------------------------------------------------
+
+/// The namespace an extracted predicate / relation-type local name resolves
+/// under, given the namespace the extractor emitted (`emitted_ns`), the
+/// namespace that OWNS the source memory (`mem_ns`), and whether `mem_ns`'s
+/// active schema declares that local name.
+///
+/// - Declared in the memory's own namespace → `mem_ns`. This beats both the
+///   emitted `brain:` prefix and any embedding consolidation onto a `brain:`
+///   synonym.
+/// - Otherwise the emitted namespace is kept when it is the system namespace
+///   or the memory's own namespace — exactly today's behavior.
+/// - Any OTHER namespace is coerced to the system namespace: an extraction
+///   for a memory in namespace A must never write into (or resolve onto)
+///   namespace B's vocabulary, whatever the model emitted.
+fn vocab_target_namespace<'a>(
+    emitted_ns: &'a str,
+    mem_ns: &'a str,
+    declared_in_mem_ns: bool,
+) -> &'a str {
+    if declared_in_mem_ns {
+        mem_ns
+    } else if emitted_ns == SYSTEM_NAMESPACE || emitted_ns == mem_ns {
+        emitted_ns
+    } else {
+        SYSTEM_NAMESPACE
+    }
+}
+
+/// The predicate id `vocab.namespace:name` when the memory namespace's active
+/// schema declares `name` AND its registry row is a schema-declared row of
+/// that namespace. `None` otherwise (including when the schema AST and the
+/// registry disagree, e.g. mid-`SCHEMA_DROP`) — the caller then takes the
+/// ordinary open-vocab path, so a mismatch degrades to today's behavior
+/// rather than dropping the triple.
+fn declared_predicate_in_namespace(
+    wtxn: &redb::WriteTransaction,
+    vocab: Option<&brain_metadata::DeclaredVocabulary>,
+    name: &str,
+) -> Result<Option<brain_core::PredicateId>, ApplyError> {
+    let Some(v) = vocab else {
+        return Ok(None);
+    };
+    if v.predicate(name).is_none() {
+        return Ok(None);
+    }
+    let Ok(Some(pid)) =
+        brain_metadata::schema::predicate::predicate_id_by_qname(wtxn, &v.namespace, name)
+    else {
+        return Ok(None);
+    };
+    let t = wtxn
+        .open_table(PREDICATES_TABLE)
+        .map_err(|e| ApplyError::Storage(format!("predicates open: {e}")))?;
+    let row = t
+        .get(&pid.raw())
+        .map_err(|e| ApplyError::Storage(format!("predicates get: {e}")))?
+        .map(|g| g.value());
+    Ok(row
+        .filter(|r| r.namespace == v.namespace && r.origin().is_schema_declared())
+        .map(|_| pid))
+}
+
+/// Relation-type counterpart to [`declared_predicate_in_namespace`].
+fn declared_relation_type_in_namespace(
+    wtxn: &redb::WriteTransaction,
+    vocab: Option<&brain_metadata::DeclaredVocabulary>,
+    name: &str,
+) -> Result<Option<brain_core::RelationTypeId>, ApplyError> {
+    use brain_metadata::tables::relation_type::RELATION_TYPES_TABLE;
+    let Some(v) = vocab else {
+        return Ok(None);
+    };
+    if v.relation_type(name).is_none() {
+        return Ok(None);
+    }
+    let Ok(Some(rt)) =
+        brain_metadata::relation::types::relation_type_id_by_qname(wtxn, &v.namespace, name)
+    else {
+        return Ok(None);
+    };
+    let t = wtxn
+        .open_table(RELATION_TYPES_TABLE)
+        .map_err(|e| ApplyError::Storage(format!("relation_types open: {e}")))?;
+    let row = t
+        .get(&rt.raw())
+        .map_err(|e| ApplyError::Storage(format!("relation_types get: {e}")))?
+        .map(|g| g.value());
+    Ok(row
+        .filter(|r| r.namespace == v.namespace && r.origin().is_schema_declared())
+        .map(|_| rt))
+}
+
+/// Resolve an extracted predicate for a memory owned by `mem_ns`. `declared`
+/// is [`declared_predicate_in_namespace`]'s answer for this local name: a
+/// declaration in the memory's own namespace wins outright (no consolidation
+/// scan — declared vocabulary is authoritative); otherwise the ordinary
+/// open-vocab path runs under [`vocab_target_namespace`]. Returns the id and
+/// the namespace it landed in.
+#[allow(clippy::too_many_arguments)]
+fn resolve_extracted_predicate<'a>(
+    wtxn: &redb::WriteTransaction,
+    embed_deps: Option<&EmbeddingDeps>,
+    metrics: &ExtractorMetrics,
+    declared: Option<brain_core::PredicateId>,
+    mem_ns: &'a str,
+    emitted_ns: &'a str,
+    name: &str,
+    now: u64,
+) -> Result<(brain_core::PredicateId, &'a str), brain_metadata::schema::predicate::PredicateOpError>
+{
+    if let Some(pid) = declared {
+        embed_predicate_if_absent(wtxn, embed_deps, pid, name);
+        return Ok((pid, mem_ns));
+    }
+    let ns = vocab_target_namespace(emitted_ns, mem_ns, false);
+    let pid = resolve_or_intern_predicate(wtxn, embed_deps, metrics, ns, name, now)?;
+    Ok((pid, ns))
+}
+
+/// Resolve an extracted relation type for a memory owned by `mem_ns`; the
+/// relation-type mirror of [`resolve_extracted_predicate`]. `declared` is
+/// [`declared_relation_type_in_namespace`]'s answer for this local name.
+fn resolve_extracted_relation_type<'a>(
+    wtxn: &redb::WriteTransaction,
+    declared: Option<brain_core::RelationTypeId>,
+    mem_ns: &'a str,
+    emitted_ns: &'a str,
+    name: &str,
+    now: u64,
+) -> Result<(brain_core::RelationTypeId, &'a str), brain_metadata::RelationTypeOpError> {
+    if let Some(rt) = declared {
+        return Ok((rt, mem_ns));
+    }
+    let ns = vocab_target_namespace(emitted_ns, mem_ns, false);
+    let rt = relation_type_intern_or_get(wtxn, ns, name, 0, now)?;
+    Ok((rt, ns))
+}
+
+/// Coerce a literal statement object to the value sub-type its DECLARED
+/// predicate specifies. The predicate registry row only records "Value", so
+/// the sub-type is read from the active schema AST: `Value<number>` turns a
+/// parseable `"0.74"` into `Float(0.74)`, `Value<bool>` turns `"true"` into
+/// `Bool(true)`. Anything that does not parse is kept as text — a type
+/// mismatch never loses the captured fact.
+fn coerce_declared_value(
+    object: StatementObject,
+    declared: Option<&brain_protocol::schema::PredicateDef>,
+) -> Option<StatementObject> {
+    use brain_protocol::schema::{AttrType, ObjectTypeDecl};
+    let Some(ObjectTypeDecl::Value { value_type }) = declared.map(|p| &p.object) else {
+        return Some(object);
+    };
+    let StatementObject::Value(StatementValue::Text(text)) = &object else {
+        return Some(object);
+    };
+    let t = text.trim();
+    match value_type {
+        AttrType::Number => match t.parse::<f64>() {
+            Ok(f) if f.is_finite() => Some(StatementObject::Value(StatementValue::Float(f))),
+            // Declared `Value<number>`, and the tier produced something that
+            // is not a number. Returning the text unchanged stored a row that
+            // contradicts the schema the operator wrote: a numeric filter over
+            // the predicate then silently skips it, and `episode_budget =
+            // "medium"` reads as a fact when it is a misparse. `None` = reject.
+            _ => None,
+        },
+        AttrType::Bool => match t.to_ascii_lowercase().as_str() {
+            "true" | "yes" => Some(StatementObject::Value(StatementValue::Bool(true))),
+            "false" | "no" => Some(StatementObject::Value(StatementValue::Bool(false))),
+            _ => None,
+        },
+        // A declared variant set is a closed vocabulary — the whole point of
+        // writing `enum [draft, building, ready, failed, archived]` instead
+        // of `text`. Letting anything through made the declaration
+        // decorative: a tier that answered `clone_status = "slack-clone-v1"`
+        // (the environment's own name, not a status) stored it as a fact,
+        // and a reader filtering on `ready` silently skipped the row.
+        //
+        // Matching is case-insensitive and normalises to the DECLARED
+        // spelling, so "Ready" stores as "ready". That is coercion in the
+        // same spirit as "yes" -> true above: the model's casing is not a
+        // semantic difference, but two spellings of one status would split
+        // every aggregate over it.
+        AttrType::Enum { variants } => variants
+            .iter()
+            .find(|v| v.eq_ignore_ascii_case(t))
+            .map(|v| StatementObject::Value(StatementValue::Text(v.clone()))),
+        // Text / date / ref: no closed vocabulary to violate.
+        _ => Some(object),
+    }
+}
+
+/// Render an entity type id as its declared name, falling back to the raw
+/// id when the row is missing. Never fails the caller: this is log text.
+fn type_name(wtxn: &redb::WriteTransaction, id: brain_core::EntityTypeId) -> String {
+    match brain_metadata::entity_type_name_by_id(wtxn, id) {
+        Ok(Some(name)) => name,
+        _ => format!("EntityTypeId({})", id.raw()),
+    }
+}
+
+/// Restate a relation endpoint violation as the schema rule it broke.
+///
+/// The underlying error is precise but unreadable — `requires
+/// EntityTypeId(9) but entity ... is EntityTypeId(8)` makes an operator go
+/// look up two ids to learn that `to:` wanted a CloneEnv and got a
+/// TargetApp. Empty string for any other error, so the caller's `error`
+/// field stays the sole detail in cases this does not improve.
+fn describe_endpoint_violation(
+    wtxn: &redb::WriteTransaction,
+    e: &brain_metadata::relation::ops::RelationOpError,
+) -> String {
+    use brain_metadata::relation::ops::RelationOpError as E;
+    match e {
+        E::EndpointTypeViolation {
+            side,
+            expected,
+            actual,
+            ..
+        } => format!(
+            "{side} must be {} but got {}",
+            type_name(wtxn, *expected),
+            type_name(wtxn, *actual)
+        ),
+        _ => String::new(),
+    }
+}
+
+/// The statement-side counterpart: restate a declared subject/object domain
+/// violation in type names rather than ids.
+fn describe_statement_violation(
+    wtxn: &redb::WriteTransaction,
+    e: &brain_metadata::statement::StatementOpError,
+) -> String {
+    use brain_metadata::statement::StatementOpError as E;
+    match e {
+        E::SubjectEntityTypeMismatch {
+            expected, actual, ..
+        } => format!(
+            "subject must be {} but got {}",
+            type_name(wtxn, *expected),
+            type_name(wtxn, *actual)
+        ),
+        E::ObjectEntityTypeMismatch {
+            expected, actual, ..
+        } => format!(
+            "object must be {} but got {}",
+            type_name(wtxn, *expected),
+            type_name(wtxn, *actual)
+        ),
+        _ => String::new(),
+    }
+}
+
 /// Embed a relation type's human phrase the first time it is interned, the
 /// edge-graph mirror of `embed_predicate_if_absent`. Open-vocab relation
 /// types carry no declared synonyms, so the embedding is the only way a
@@ -4088,7 +5426,12 @@ fn resolve_statement_object(
     scope: brain_metadata::RowScope,
     memory_id: MemoryId,
     sm: &StatementMention,
-    pid: brain_core::PredicateId,
+    // The predicate this triple resolved to, when one has been interned.
+    // `None` when the mint was deferred because the triple looks headed
+    // for the relations table — there is no declared constraint to read in
+    // that case, so the axis falls to the mention's own flag, which is
+    // exactly what an un-constrained predicate would have produced.
+    pid: Option<brain_core::PredicateId>,
     entity_map: &mut HashMap<String, EntityId>,
     mentioned: &mut HashSet<EntityId>,
     embed_deps: Option<&EmbeddingDeps>,
@@ -4111,7 +5454,11 @@ fn resolve_statement_object(
     // about it. Consulting the map first let that incidental hit silently
     // override both the explicit flag and a schema-declared `Value` constraint,
     // binding literals as entity objects.
-    let want_entity = match predicate_declared_object_constraint_in_write_txn(wtxn, pid)? {
+    let declared_object_constraint = match pid {
+        Some(pid) => predicate_declared_object_constraint_in_write_txn(wtxn, pid)?,
+        None => None,
+    };
+    let want_entity = match declared_object_constraint {
         Some(1) => true,
         Some(2) => false,
         _ => sm.object_is_entity,
@@ -4579,6 +5926,91 @@ mod object_normalize_tests {
         assert!(!is_vague_object("Senior Engineer"));
     }
 
+    fn typed(qname: &str, conf: f32) -> EntityMention {
+        EntityMention {
+            entity_type_qname: qname.to_string(),
+            text: "x".to_string(),
+            start: 0,
+            end: 1,
+            confidence: conf,
+            extractor_id: 0,
+            extractor_version: 1,
+        }
+    }
+
+    #[test]
+    fn llm_type_beats_a_more_confident_classifier_type() {
+        const CLASSIFIER: u8 = 1;
+        const LLM: u8 = 2;
+        let none = |_: &str| false;
+        let gliner = typed("brain:Person", 0.95); // "Playwright" as a Person
+        let llm = typed("brain:Concept", 0.7);
+        let llm_schema = typed("brain:CloneEnv", 0.7);
+        // A schema type from the LLM wins despite lower confidence.
+        assert!(mention_is_better(
+            &llm_schema,
+            LLM,
+            &gliner,
+            CLASSIFIER,
+            &none
+        ));
+        assert!(!mention_is_better(
+            &gliner,
+            CLASSIFIER,
+            &llm_schema,
+            LLM,
+            &none
+        ));
+        // The LLM's generic Concept does not override a specific built-in type.
+        assert!(!mention_is_better(&llm, LLM, &gliner, CLASSIFIER, &none));
+        assert!(mention_is_better(&gliner, CLASSIFIER, &llm, LLM, &none));
+        // ...but it does override the classifier's guess of a DECLARED type.
+        let declared = |q: &str| q == "brain:Builder";
+        let gliner_builder = typed("brain:Builder", 0.9); // "Mirror" as a Builder
+        assert!(mention_is_better(
+            &llm,
+            LLM,
+            &gliner_builder,
+            CLASSIFIER,
+            &declared
+        ));
+        // Within a tier, confidence decides; typed beats untyped.
+        let place = typed("brain:Place", 0.9);
+        assert!(mention_is_better(
+            &place,
+            1,
+            &typed("brain:Person", 0.8),
+            1,
+            &none
+        ));
+        assert!(mention_is_better(
+            &typed("brain:Place", 0.1),
+            0,
+            &typed("", 0.99),
+            2,
+            &none
+        ));
+    }
+
+    #[test]
+    fn retraction_matches_restated_values_but_not_other_ones() {
+        use brain_core::StatementValue;
+        let v = |t: &str| StatementObject::Value(StatementValue::Text(t.into()));
+        assert!(retraction_matches(
+            &v("the OAuth login flow"),
+            &v("OAuth login flow")
+        ));
+        assert!(retraction_matches(
+            &v("OAuth login flow"),
+            &v("the OAuth Login Flow.")
+        ));
+        assert!(!retraction_matches(
+            &v("OAuth login flow"),
+            &v("SAML redirect")
+        ));
+        assert!(!retraction_matches(&v("Gymnasium"), &v("Playwright")));
+    }
+
     #[test]
     fn split_compound_object_dedupes_case_insensitively() {
         assert_eq!(
@@ -4732,6 +6164,13 @@ fn resolve_statement_subject(
         // Concept doesn't permanently split from a correctly-typed entity
         // ("aspirin" the Drug). 0 or >1 matches fall through to the normal
         // type-scoped mint.
+        //
+        // This reuse is a genuine mention→entity derivation (the surface bound
+        // to an existing entity across a type boundary), so log it: an exact
+        // canonical-name match, hence TIER_1_EXACT at full (1.0) confidence.
+        // It runs only on an entity_map miss and then caches `id`, so a repeat
+        // surface this memory hits the cache branch above and never double-logs.
+        emit_cross_type_reuse_audit(wtxn, text, id, now);
         entity_map.insert(text.to_string(), id);
         id
     } else {
@@ -4747,6 +6186,25 @@ fn resolve_statement_subject(
             disambiguation,
         )
         .map_err(ApplyError::from)?;
+        // Coined-subject resolution is a mention→entity derivation not covered
+        // by the pass-1 entity-mention loop (this surface was never filed as an
+        // EntityMention), so log it here. The other unlogged branches above are
+        // an entity_map cache hit (already audited when first resolved) and a
+        // self-entity routing (deterministic, not a tier decision); the
+        // cross-type exact-reuse branch logs its own TIER_1_EXACT row inline.
+        let resolved_type_id = entity_get_inside_wtxn(wtxn, res.entity_id)
+            .ok()
+            .flatten()
+            .map_or(0, |e| e.entity_type.raw());
+        emit_resolution_audit(
+            wtxn,
+            text,
+            resolved_type_id,
+            res.entity_id,
+            res.tier,
+            res.confidence,
+            now,
+        );
         entity_map.insert(text.to_string(), res.entity_id);
         res.entity_id
     };
@@ -4848,6 +6306,12 @@ fn resolve_relation_endpoint(
     } else if !statement_subject_mintable(text) {
         return Ok(None);
     } else if let Some(id) = reuse_cross_type_exact(wtxn, scope, text)? {
+        // Cross-type exact reuse of an existing entity for this endpoint is a
+        // deterministic exact canonical-name match across a type boundary — a
+        // real mention→entity derivation, logged as TIER_1_EXACT at full (1.0)
+        // confidence (same rationale as `resolve_statement_subject`). Cached
+        // straight after, so a repeat surface hits the cache branch, not here.
+        emit_cross_type_reuse_audit(wtxn, text, id, now);
         entity_map.insert(text.to_string(), id);
         id
     } else {
@@ -4863,6 +6327,22 @@ fn resolve_relation_endpoint(
             disambiguation,
         )
         .map_err(ApplyError::from)?;
+        // A relation / statement-object endpoint resolved through the gauntlet
+        // is a mention→entity derivation; log it (same rationale and branch
+        // exclusions as `resolve_statement_subject`).
+        let resolved_type_id = entity_get_inside_wtxn(wtxn, res.entity_id)
+            .ok()
+            .flatten()
+            .map_or(0, |e| e.entity_type.raw());
+        emit_resolution_audit(
+            wtxn,
+            text,
+            resolved_type_id,
+            res.entity_id,
+            res.tier,
+            res.confidence,
+            now,
+        );
         entity_map.insert(text.to_string(), res.entity_id);
         res.entity_id
     };
@@ -4924,6 +6404,43 @@ enum ApplyError {
 
 #[cfg(test)]
 mod tests {
+    /// `candidate_cmp` must be a TOTAL order: `slice::sort_by` panics on any
+    /// comparator that isn't ("comparison function does not correctly implement
+    /// a total order"), which previously crashed the whole shard. The prior
+    /// epsilon-*band* form is non-transitive, so an epsilon-chain of scores
+    /// (each neighbour within TIE_EPS, endpoints far apart) trips the panic.
+    /// This builds such a chain, shuffles it, and sorts — it must not panic and
+    /// must come out consistently ordered.
+    #[test]
+    fn candidate_cmp_is_a_total_order_on_an_epsilon_chain() {
+        // 200 scores stepping by 0.6 * TIE_EPS: each adjacent pair is within
+        // one epsilon (a "tie"), but far-apart pairs are many epsilons apart.
+        let step = super::CANDIDATE_TIE_EPS * 0.6;
+        let mut v: Vec<(f32, PredicateId)> = (0..200u32)
+            .map(|i| (0.5 + i as f32 * step, PredicateId::from(200 - i)))
+            .collect();
+        // Interleave so the input isn't already sorted (forces real comparisons).
+        v.rotate_left(97);
+        for i in (0..v.len()).step_by(3) {
+            if i + 1 < v.len() {
+                v.swap(i, i + 1);
+            }
+        }
+        // Under the old band comparator this panics; with the quantized total
+        // order it sorts cleanly.
+        v.sort_by(|a, b| super::candidate_cmp(*a, *b));
+
+        // Sanity: non-increasing on the quantized score, ties by ascending id.
+        for w in v.windows(2) {
+            let qa = (w[0].0 / super::CANDIDATE_TIE_EPS).round() as i64;
+            let qb = (w[1].0 / super::CANDIDATE_TIE_EPS).round() as i64;
+            assert!(qa >= qb, "quantized score must be non-increasing");
+            if qa == qb {
+                assert!(w[0].1 <= w[1].1, "within a bucket, id must ascend");
+            }
+        }
+    }
+
     fn __ts() -> brain_metadata::RowScope {
         brain_metadata::RowScope::from_bytes(brain_core::NamespaceId::SYSTEM.raw(), [0xA1; 16])
     }
@@ -5189,10 +6706,105 @@ mod tests {
             pattern,
             classifier,
             llm,
+            pattern_audit: None,
+            classifier_audit: None,
+            llm_audit: None,
             failure_reason: None,
             llm_failure_class: ExtractionFailureClass::Unclassified,
             llm_cost_micro_usd: 0,
         }
+    }
+
+    /// Two extractors in one tier: the first succeeds (and yields an item),
+    /// the second skips on its where-clause. The tier byte must record the
+    /// real outcome (RAN), not be clobbered to SKIPPED by the later extractor,
+    /// and the successful extractor's items must be merged (not lost).
+    #[test]
+    fn fold_two_extractors_one_tier_success_then_skip_keeps_success() {
+        use brain_core::ExtractorKind;
+        let mem_id = MemoryId::pack(0, 1, 0);
+        let mut slot = outcome(
+            tier_status::ABSENT,
+            tier_status::ABSENT,
+            tier_status::ABSENT,
+        );
+
+        let item = ExtractedItem::EntityMention(EntityMention {
+            entity_type_qname: "brain:Person".into(),
+            text: "Alice".into(),
+            start: 0,
+            end: 5,
+            confidence: 0.9,
+            extractor_id: 1,
+            extractor_version: 1,
+        });
+        // Extractor A: success with one item.
+        fold_tier_result(
+            &mut slot,
+            ExtractionResult::success(vec![item], 0, 0),
+            ExtractorKind::Pattern,
+            mem_id,
+            1,
+            1,
+        );
+        assert_eq!(slot.pattern, tier_status::RAN);
+
+        // Extractor B in the SAME tier: filtered out by its where-clause.
+        fold_tier_result(
+            &mut slot,
+            ExtractionResult::skipped(ExtractionStatus::SkippedFilter, "where-clause", 0),
+            ExtractorKind::Pattern,
+            mem_id,
+            1,
+            1,
+        );
+
+        assert_eq!(
+            slot.pattern,
+            tier_status::RAN,
+            "a later SKIP must not clobber an earlier real outcome"
+        );
+        assert_eq!(
+            slot.items.len(),
+            1,
+            "the successful extractor's item is preserved"
+        );
+    }
+
+    /// The reverse order (skip first, success second) must also land on RAN.
+    #[test]
+    fn fold_two_extractors_one_tier_skip_then_success_keeps_success() {
+        use brain_core::ExtractorKind;
+        let mem_id = MemoryId::pack(0, 1, 0);
+        let mut slot = outcome(
+            tier_status::ABSENT,
+            tier_status::ABSENT,
+            tier_status::ABSENT,
+        );
+
+        fold_tier_result(
+            &mut slot,
+            ExtractionResult::skipped(ExtractionStatus::SkippedFilter, "where-clause", 0),
+            ExtractorKind::Classifier,
+            mem_id,
+            1,
+            1,
+        );
+        assert_eq!(slot.classifier, tier_status::SKIPPED);
+
+        fold_tier_result(
+            &mut slot,
+            ExtractionResult::success(Vec::new(), 0, 0),
+            ExtractorKind::Classifier,
+            mem_id,
+            1,
+            1,
+        );
+        assert_eq!(
+            slot.classifier,
+            tier_status::RAN,
+            "a real outcome upgrades a prior SKIP"
+        );
     }
 
     /// Reproduces the user-visible regression: pattern produces 1
@@ -5686,6 +7298,9 @@ mod tests {
                 pattern: tier_status::ABSENT,
                 classifier: tier_status::ABSENT,
                 llm: tier_status::ABSENT,
+                pattern_audit: None,
+                classifier_audit: None,
+                llm_audit: None,
                 failure_reason: None,
                 llm_failure_class: ExtractionFailureClass::Unclassified,
                 llm_cost_micro_usd: 0,
@@ -5901,6 +7516,9 @@ mod tests {
             pattern: tier_status::ABSENT,
             classifier: tier_status::ABSENT,
             llm: tier_status::RAN,
+            pattern_audit: None,
+            classifier_audit: None,
+            llm_audit: None,
             failure_reason: None,
             llm_failure_class: ExtractionFailureClass::Unclassified,
             llm_cost_micro_usd: 0,
@@ -6170,6 +7788,9 @@ mod tests {
             pattern: tier_status::ABSENT,
             classifier: tier_status::ABSENT,
             llm: tier_status::RAN,
+            pattern_audit: None,
+            classifier_audit: None,
+            llm_audit: None,
             failure_reason: None,
             llm_failure_class: ExtractionFailureClass::Unclassified,
             llm_cost_micro_usd: 0,
@@ -6402,6 +8023,9 @@ mod tests {
             pattern: tier_status::ABSENT,
             classifier: tier_status::ABSENT,
             llm: tier_status::RAN,
+            pattern_audit: None,
+            classifier_audit: None,
+            llm_audit: None,
             failure_reason: None,
             llm_failure_class: ExtractionFailureClass::Unclassified,
             llm_cost_micro_usd: 0,
@@ -6671,6 +8295,9 @@ mod tests {
             pattern: tier_status::RAN,
             classifier: tier_status::RAN,
             llm: tier_status::RAN,
+            pattern_audit: None,
+            classifier_audit: None,
+            llm_audit: None,
             failure_reason: None,
             llm_failure_class: ExtractionFailureClass::Unclassified,
             llm_cost_micro_usd: 0,
@@ -6866,6 +8493,9 @@ mod tests {
             pattern: tier_status::RAN,
             classifier: tier_status::RAN,
             llm: tier_status::RAN,
+            pattern_audit: None,
+            classifier_audit: None,
+            llm_audit: None,
             failure_reason: None,
             llm_failure_class: ExtractionFailureClass::Unclassified,
             llm_cost_micro_usd: 0,
@@ -7015,6 +8645,9 @@ mod tests {
             pattern: tier_status::ABSENT,
             classifier: tier_status::ABSENT,
             llm: tier_status::RAN,
+            pattern_audit: None,
+            classifier_audit: None,
+            llm_audit: None,
             failure_reason: None,
             llm_failure_class: ExtractionFailureClass::Unclassified,
             llm_cost_micro_usd: 0,
@@ -7321,6 +8954,16 @@ mod tests {
             brain_metadata::entity_resolve_canonical_all_types(&rtxn, __ts(), "senior engineer")
                 .unwrap();
         assert_eq!(role_entity.len(), 1, "the classifier's span stays minted");
+        // ...but not under the classifier's Person guess: the LLM used the
+        // surface only as a value, so the type falls back to the generic one.
+        let minted = brain_metadata::entity::ops::entity_get(&rtxn, role_entity[0])
+            .unwrap()
+            .expect("minted entity row");
+        assert_ne!(
+            minted.entity_type,
+            EntityType::PERSON_ID,
+            "a literal the LLM judged a value must not stay a Person"
+        );
         let mention_targets: Vec<brain_core::EntityId> = walk_outgoing(
             &rtxn,
             NodeRef::Memory(memory_id),
@@ -7469,6 +9112,9 @@ mod tests {
             pattern: tier_status::RAN,
             classifier: tier_status::ABSENT,
             llm: tier_status::RAN,
+            pattern_audit: None,
+            classifier_audit: None,
+            llm_audit: None,
             failure_reason: None,
             llm_failure_class: ExtractionFailureClass::Unclassified,
             llm_cost_micro_usd: 0,
@@ -7521,6 +9167,110 @@ mod tests {
             "expected exactly one statement for brain:{name}"
         );
         v.into_iter().next().unwrap()
+    }
+
+    /// Per-call extraction audit: applying an outcome writes one
+    /// `ExtractionAudit` row per tier that ran (absent tiers write none),
+    /// each reachable through the by-memory / by-extractor / by-time
+    /// indexes, and a re-apply ADDS rows rather than overwriting (history
+    /// preserved — the whole point of the append-only UUIDv7 log).
+    #[test]
+    fn apply_emits_per_call_extraction_audit_rows() {
+        use brain_metadata::{audit_by_extractor, audit_by_memory, audit_recent};
+
+        let (worker, ctx, metadata) = __join_env();
+        let memory_id = brain_core::MemoryId::pack(0, 7, 1);
+        __seed_memory_row(&metadata, memory_id, __ts());
+
+        // A pattern tier and an LLM tier both ran, attributed to distinct
+        // extractor ids; the classifier tier is absent (no extractor).
+        let mut outcome = __outcome(vec![
+            __alice(),
+            __entity_stmt("brain:likes", "coffee", false, StatementKind::Fact, None),
+        ]);
+        outcome.pattern_audit = Some(TierAudit {
+            extractor_id: 11,
+            extractor_version: 1,
+            status: extraction_status::SUCCESS,
+            reason: String::new(),
+        });
+        outcome.classifier_audit = None;
+        outcome.llm_audit = Some(TierAudit {
+            extractor_id: 22,
+            extractor_version: 3,
+            status: extraction_status::SUCCESS,
+            reason: String::new(),
+        });
+        outcome.llm_cost_micro_usd = 500;
+
+        futures_lite::future::block_on(apply_outcome(&worker, &ctx, memory_id, &outcome))
+            .expect("apply_outcome");
+
+        {
+            let rtxn = metadata.read_txn().unwrap();
+            // Two tiers ran → two rows, reachable by-memory.
+            let by_mem = audit_by_memory(&rtxn, memory_id, 100).unwrap();
+            assert_eq!(by_mem.len(), 2, "one audit row per tier that ran");
+            // by-extractor isolates each tier's extractor.
+            assert_eq!(audit_by_extractor(&rtxn, 11, 100).unwrap().len(), 1);
+            let llm_rows = audit_by_extractor(&rtxn, 22, 100).unwrap();
+            assert_eq!(llm_rows.len(), 1);
+            assert_eq!(llm_rows[0].cost_micro_usd, 500, "LLM cost attributed");
+            // The absent classifier tier wrote nothing.
+            assert!(audit_by_extractor(&rtxn, 33, 100).unwrap().is_empty());
+            // by-time returns both.
+            assert_eq!(audit_recent(&rtxn, 0, 100).unwrap().len(), 2);
+        }
+
+        // A SECOND apply ADDS new rows (append-only history), never overwrites.
+        futures_lite::future::block_on(apply_outcome(&worker, &ctx, memory_id, &outcome))
+            .expect("apply_outcome re-run");
+        {
+            let rtxn = metadata.read_txn().unwrap();
+            assert_eq!(
+                audit_by_memory(&rtxn, memory_id, 100).unwrap().len(),
+                4,
+                "re-extraction ADDS rows; never overwrites",
+            );
+        }
+    }
+
+    /// A failed tier records a Failure row carrying its reason; a
+    /// budget-skipped LLM tier records a SkippedBudget row.
+    #[test]
+    fn apply_emits_failure_and_skip_audit_rows() {
+        use brain_metadata::audit_by_extractor;
+
+        let (worker, ctx, metadata) = __join_env();
+        let memory_id = brain_core::MemoryId::pack(0, 8, 1);
+        __seed_memory_row(&metadata, memory_id, __ts());
+
+        let mut outcome = __outcome(vec![__alice()]);
+        outcome.pattern_audit = Some(TierAudit {
+            extractor_id: 44,
+            extractor_version: 1,
+            status: extraction_status::FAILURE,
+            reason: "boom".to_string(),
+        });
+        outcome.classifier_audit = None;
+        outcome.llm_audit = Some(TierAudit {
+            extractor_id: 55,
+            extractor_version: 1,
+            status: extraction_status::SKIPPED_BUDGET,
+            reason: "cycle LLM budget exhausted".to_string(),
+        });
+
+        futures_lite::future::block_on(apply_outcome(&worker, &ctx, memory_id, &outcome))
+            .expect("apply_outcome");
+
+        let rtxn = metadata.read_txn().unwrap();
+        let failed = audit_by_extractor(&rtxn, 44, 10).unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].status, extraction_status::FAILURE);
+        assert_eq!(failed[0].status_reason, "boom");
+        let skipped = audit_by_extractor(&rtxn, 55, 10).unwrap();
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].status, extraction_status::SKIPPED_BUDGET);
     }
 
     const D1: u64 = 1_684_540_800_000_000_000; // 2023-05-20
@@ -7892,6 +9642,1140 @@ mod tests {
             "action stays an Event; ambiguous dates just aren't stamped",
         );
     }
+
+    // ----- Extraction CoreMemory space threading + queue over-drain. -----
+
+    /// Minimal worker fixture: a temp metadata db (seeds the brain: system
+    /// schema) wired into an ops context, plus the metadata handle and the
+    /// tempdir the metadata db lives in (kept alive by the caller).
+    #[allow(clippy::arc_with_non_send_sync)] // OpsContext is !Send by design
+    fn __worker_fixture() -> (
+        crate::context::WorkerContext,
+        brain_planner::SharedMetadataDb,
+        tempfile::TempDir,
+    ) {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
+        use brain_index::{IndexParams, SharedHnsw};
+        use brain_metadata::MetadataDb;
+        use brain_ops::RealWriterHandle;
+        use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
+
+        use crate::context::WorkerContext;
+
+        struct ZeroDispatcher;
+        impl Dispatcher for ZeroDispatcher {
+            fn embed(&self, _t: &str) -> Result<[f32; VECTOR_DIM], EmbedError> {
+                Ok([0.0; VECTOR_DIM])
+            }
+            fn embed_batch(&self, t: &[&str]) -> Result<Vec<[f32; VECTOR_DIM]>, EmbedError> {
+                Ok(vec![[0.0; VECTOR_DIM]; t.len()])
+            }
+            fn fingerprint(&self) -> [u8; 16] {
+                [0xCD; 16]
+            }
+        }
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let metadata: SharedMetadataDb =
+            Arc::new(MetadataDb::open(tempdir.path().join("md.redb")).unwrap());
+        let (shared, hnsw_writer) = SharedHnsw::new(IndexParams::default_v1()).unwrap();
+        let writer = Arc::new(RealWriterHandle::new(metadata.clone(), hnsw_writer));
+        let executor = ExecutorContext::new(
+            Arc::new(ZeroDispatcher) as Arc<dyn Dispatcher>,
+            shared,
+            metadata.clone(),
+            writer as Arc<dyn WriterHandle>,
+        );
+        let ops = Arc::new(brain_ops::test_support::ops_context_for_tests_owning_tempdir(executor));
+        let ctx = WorkerContext {
+            ops,
+            shutdown: Arc::new(AtomicBool::new(false)),
+        };
+        (ctx, metadata, tempdir)
+    }
+
+    #[test]
+    fn extraction_core_memory_carries_real_space_for_stable_cache_key() {
+        use brain_core::{MemoryId, NamespaceId, SessionId, SpaceId};
+        use std::sync::Arc;
+
+        let (ctx, metadata, _tempdir) = __worker_fixture();
+
+        // Seed a memory row owning a known, non-NIL space.
+        let ns = NamespaceId::from(9);
+        let space = SpaceId::derive_from_string("tenant9", "space-x");
+        assert_ne!(space, SpaceId::NIL);
+        let mid = MemoryId::pack(0, 42, 1);
+        __seed_memory_row(&metadata, mid, brain_metadata::RowScope::new(ns, space));
+
+        let live: Vec<(usize, MemoryId, Arc<str>)> = vec![(0, mid, Arc::from("hello world"))];
+        let facts = load_row_facts(&ctx, &live);
+        let mems = build_extraction_core_memories(&live, &facts);
+        assert_eq!(mems.len(), 1);
+        assert_eq!(
+            mems[0].space, space,
+            "CoreMemory must carry the memory's REAL space (the LLM cache key folds it), \
+             not a freshly-minted per-call SpaceId"
+        );
+        assert_eq!(mems[0].session_id, SessionId(0));
+
+        // The old bug minted a fresh SpaceId every call, so two builds of the
+        // same id diverged and the response cache never hit across cycles.
+        // With the fix the space is stable, so the cache-key input is stable.
+        let mems2 = build_extraction_core_memories(&live, &facts);
+        assert_eq!(
+            mems[0].space, mems2[0].space,
+            "the extraction CoreMemory space must be stable across cycles"
+        );
+        assert_eq!(
+            <[u8; 16]>::from(mems[0].space),
+            <[u8; 16]>::from(space),
+            "the exact 16 bytes the LLM cache key folds must match the stored space"
+        );
+    }
+
+    #[test]
+    fn load_pending_batch_pages_past_backing_off_front_rows() {
+        use brain_core::MemoryId;
+        use brain_metadata::{
+            extraction_queue_enqueue, failure_class, pipeline_record_extracted, pipeline_status,
+            tier_status, ExtractorItemCounts, ExtractorPipelineAuditEntry,
+        };
+
+        let (ctx, metadata, _tempdir) = __worker_fixture();
+
+        // shard=0 keeps `slot` in the high bytes, so the queue's MemoryId
+        // byte order is slot order: the low-slot front rows come first, the
+        // high-slot due row last.
+        let front: Vec<MemoryId> = (1..=4).map(|s| MemoryId::pack(0, s, 1)).collect();
+        let due_id = MemoryId::pack(0, 100, 1);
+
+        let now = now_unix_nanos();
+        {
+            let wtxn = metadata.write_txn().unwrap();
+            for id in &front {
+                extraction_queue_enqueue(&wtxn, *id, now).unwrap();
+                // A retryable transient LLM failure with a high attempt count:
+                // its exponential backoff (capped at 1h) has NOT elapsed, so
+                // the row is queued-but-not-due this cycle.
+                let entry = ExtractorPipelineAuditEntry::new(
+                    *id,
+                    now,
+                    pipeline_status::FAILURE,
+                    String::new(),
+                    tier_status::SKIPPED,
+                    tier_status::SKIPPED,
+                    tier_status::FAILED,
+                    ExtractorItemCounts::zero(),
+                    0,
+                )
+                .with_attempts(20)
+                .with_failure_class(failure_class::TRANSIENT);
+                pipeline_record_extracted(&wtxn, &entry).unwrap();
+            }
+            // A newer row deeper in the queue with no audit row → due now.
+            extraction_queue_enqueue(&wtxn, due_id, now).unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        // `want` is smaller than the backing-off front window: draining exactly
+        // `want` (the old behaviour) would return only front rows, filter them
+        // all out, and make zero progress. The over-drain must page past them
+        // and surface the due row this cycle.
+        let due = load_pending_batch(&ctx, 2).unwrap();
+        assert!(
+            due.contains(&due_id),
+            "a due row behind a backing-off front window must be found this cycle"
+        );
+        for id in &front {
+            assert!(
+                !due.contains(id),
+                "backing-off front rows must not be returned as due"
+            );
+        }
+    }
+
+    // ----- Namespace-aware resolution of schema-declared vocabulary. -----
+
+    /// A user schema for namespace `mirror` declaring the predicates /
+    /// relation types the live test exercised. Relation endpoints are `Any` so
+    /// the declared endpoint-type check doesn't reject the Person test subject.
+    const __MIRROR_SCHEMA: &str = r#"
+        namespace mirror
+        define entity_type CloneEnv { attributes {} }
+        define predicate success_rate {
+            kind: Fact
+            object: Value<number>
+            description: "Fraction of episodes completed successfully."
+        }
+        define predicate blocked_by {
+            kind: Fact
+            object: Value<text>
+        }
+        define predicate clone_status {
+            kind: Fact
+            object: Value<enum [draft, building, ready, failed, archived]>
+        }
+        define relation_type clones {
+            from: Any
+            to: Any
+            cardinality: many-to-one
+        }
+        define relation_type forked_from {
+            from: Any
+            to: Any
+            cardinality: many-to-one
+        }
+    "#;
+
+    /// Upload `src` and intern its namespace; returns the row scope a memory
+    /// owned by that namespace carries.
+    fn __upload_schema_scope(
+        metadata: &brain_planner::SharedMetadataDb,
+        src: &str,
+        ns: &str,
+    ) -> brain_metadata::RowScope {
+        use brain_protocol::schema::{parse_schema, validate};
+        let validated = validate(&parse_schema(src).expect("parse")).expect("validate");
+        let wtxn = metadata.write_txn().unwrap();
+        let ns_id = brain_metadata::namespace::namespace_intern_or_get(&wtxn, ns, 1).unwrap();
+        brain_metadata::schema::store::schema_upload(&wtxn, &validated, 1).expect("upload");
+        wtxn.commit().unwrap();
+        brain_metadata::RowScope::from_bytes(ns_id.raw(), [0xA1; 16])
+    }
+
+    /// A namespace with NO schema, interned so its name resolves.
+    fn __plain_namespace_scope(
+        metadata: &brain_planner::SharedMetadataDb,
+        ns: &str,
+    ) -> brain_metadata::RowScope {
+        let wtxn = metadata.write_txn().unwrap();
+        let ns_id = brain_metadata::namespace::namespace_intern_or_get(&wtxn, ns, 1).unwrap();
+        wtxn.commit().unwrap();
+        brain_metadata::RowScope::from_bytes(ns_id.raw(), [0xA1; 16])
+    }
+
+    fn __alice_in(
+        rtxn: &redb::ReadTransaction,
+        scope: brain_metadata::RowScope,
+    ) -> brain_core::EntityId {
+        brain_metadata::entity::ops::entity_lookup_by_canonical_name(
+            rtxn,
+            scope,
+            brain_core::EntityType::PERSON_ID,
+            "Alice",
+        )
+        .unwrap()
+        .expect("Alice minted")
+    }
+
+    fn __statements_for(
+        rtxn: &redb::ReadTransaction,
+        scope: brain_metadata::RowScope,
+        subject: brain_core::EntityId,
+        ns: &str,
+        name: &str,
+    ) -> Vec<brain_core::Statement> {
+        use brain_metadata::statement::{statement_list, StatementListFilter};
+        let Some(p) = brain_metadata::predicate_lookup_by_qname(rtxn, ns, name).unwrap() else {
+            return Vec::new();
+        };
+        statement_list(
+            rtxn,
+            scope,
+            &StatementListFilter {
+                subject: Some(subject),
+                predicate: Some(p.id),
+                ..StatementListFilter::default()
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn vocab_target_namespace_rules() {
+        // Declared in the memory's own namespace wins over the emitted prefix.
+        assert_eq!(vocab_target_namespace("brain", "mirror", true), "mirror");
+        // Undeclared: system / own namespace kept as emitted (today's behavior).
+        assert_eq!(vocab_target_namespace("brain", "mirror", false), "brain");
+        assert_eq!(vocab_target_namespace("mirror", "mirror", false), "mirror");
+        assert_eq!(vocab_target_namespace("brain", "brain", false), "brain");
+        // A foreign namespace is never written into.
+        assert_eq!(vocab_target_namespace("globex", "mirror", false), "brain");
+        assert_eq!(vocab_target_namespace("mirror", "globex", false), "brain");
+    }
+
+    /// A declared RELATION type emitted with a literal value ("defines_task:
+    /// 20-step") must not mint a `mirror:defines_task` predicate or statement.
+    #[test]
+    fn declared_relation_with_a_value_object_is_dropped() {
+        use brain_core::{MemoryId, StatementKind};
+
+        let (worker, ctx, metadata) = __join_env();
+        let scope = __upload_schema_scope(&metadata, __MIRROR_SCHEMA, "mirror");
+        let memory_id = MemoryId::pack(0, 1, 8);
+        __seed_memory_row(&metadata, memory_id, scope);
+        let outcome = __outcome(vec![
+            __alice(),
+            __entity_stmt("mirror:clones", "20-step", false, StatementKind::Fact, None),
+        ]);
+        futures_lite::future::block_on(apply_outcome(&worker, &ctx, memory_id, &outcome))
+            .expect("apply_outcome");
+
+        let rtxn = metadata.read_txn().unwrap();
+        assert!(
+            brain_metadata::predicate_lookup_by_qname(&rtxn, "mirror", "clones")
+                .unwrap()
+                .is_none(),
+            "no predicate may be minted under a declared relation type's name"
+        );
+        let alice = __alice_in(&rtxn, scope);
+        assert!(__statements_for(&rtxn, scope, alice, "mirror", "clones").is_empty());
+    }
+
+    /// The live-test failure: `brain:success_rate` / `brain:blocked_by` /
+    /// `brain:clones` extracted for a `mirror` memory must land on the declared
+    /// `mirror:` vocabulary — with the declared kind (Fact, over the LLM's
+    /// Attribute guess), the declared `Value<number>` object type, and the
+    /// declared relation type — and never coin the `brain:` twins.
+    #[test]
+    fn a_value_outside_a_declared_enum_is_refused() {
+        // `clone_status` declares a lifecycle, not free text. A tier that
+        // answered with the environment's own name — the live failure was
+        // `clone_status = "slack-clone-v1"` — used to store it verbatim, so
+        // a reader filtering on `ready` silently skipped the row and the
+        // declaration was decorative.
+        use brain_core::{MemoryId, StatementKind};
+
+        let (worker, ctx, metadata) = __join_env();
+        let scope = __upload_schema_scope(&metadata, __MIRROR_SCHEMA, "mirror");
+        let memory_id = MemoryId::pack(0, 1, 41);
+        __seed_memory_row(&metadata, memory_id, scope);
+
+        let outcome = __outcome(vec![
+            __alice(),
+            __entity_stmt(
+                "brain:clone_status",
+                "ready",
+                false,
+                StatementKind::Fact,
+                None,
+            ),
+            __entity_stmt(
+                "brain:clone_status",
+                "slack-clone-v1",
+                false,
+                StatementKind::Fact,
+                None,
+            ),
+        ]);
+        futures_lite::future::block_on(apply_outcome(&worker, &ctx, memory_id, &outcome))
+            .expect("apply_outcome");
+
+        let rtxn = metadata.read_txn().unwrap();
+        let alice = __alice_in(&rtxn, scope);
+        let rows = __statements_for(&rtxn, scope, alice, "mirror", "clone_status");
+        assert_eq!(rows.len(), 1, "only the declared variant may persist");
+        assert_eq!(
+            rows[0].object,
+            StatementObject::Value(StatementValue::Text("ready".into())),
+        );
+    }
+
+    #[test]
+    fn enum_matching_normalises_to_the_declared_spelling() {
+        // "Ready" and "ready" are one status. Storing both would split every
+        // aggregate over the predicate, so the declared spelling wins —
+        // coercion in the same spirit as "yes" -> true.
+        use brain_core::{MemoryId, StatementKind};
+
+        let (worker, ctx, metadata) = __join_env();
+        let scope = __upload_schema_scope(&metadata, __MIRROR_SCHEMA, "mirror");
+        let memory_id = MemoryId::pack(0, 1, 42);
+        __seed_memory_row(&metadata, memory_id, scope);
+
+        let outcome = __outcome(vec![
+            __alice(),
+            __entity_stmt(
+                "brain:clone_status",
+                "ReAdY",
+                false,
+                StatementKind::Fact,
+                None,
+            ),
+        ]);
+        futures_lite::future::block_on(apply_outcome(&worker, &ctx, memory_id, &outcome))
+            .expect("apply_outcome");
+
+        let rtxn = metadata.read_txn().unwrap();
+        let alice = __alice_in(&rtxn, scope);
+        let rows = __statements_for(&rtxn, scope, alice, "mirror", "clone_status");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].object,
+            StatementObject::Value(StatementValue::Text("ready".into())),
+            "must store the DECLARED spelling, not the tier's casing",
+        );
+    }
+
+    #[test]
+    fn a_declared_value_object_stays_a_literal_even_when_it_names_an_entity() {
+        // `blocked_by` declares `object: Value<text>`, so its object is a
+        // literal whatever the tier guessed. The case that breaks it is an
+        // object whose TEXT happens to match an entity the same memory
+        // mentioned: the tier sets `object_is_entity`, and if the declared
+        // constraint does not win, the statement binds to that entity instead
+        // of storing the words — producing a self-referential edge like
+        // `trello-clone-v7 -(clone_status)-> trello-clone-v7` rather than the
+        // status value.
+        use brain_core::{MemoryId, StatementKind};
+
+        let (worker, ctx, metadata) = __join_env();
+        let scope = __upload_schema_scope(&metadata, __MIRROR_SCHEMA, "mirror");
+        let memory_id = MemoryId::pack(0, 1, 31);
+        __seed_memory_row(&metadata, memory_id, scope);
+
+        let outcome = __outcome(vec![
+            __alice(),
+            // Object text == the mentioned entity's name, tier says entity.
+            __entity_stmt("brain:blocked_by", "Alice", true, StatementKind::Fact, None),
+        ]);
+        futures_lite::future::block_on(apply_outcome(&worker, &ctx, memory_id, &outcome))
+            .expect("apply_outcome");
+
+        let rtxn = metadata.read_txn().unwrap();
+        let alice = __alice_in(&rtxn, scope);
+        let rows = __statements_for(&rtxn, scope, alice, "mirror", "blocked_by");
+        assert_eq!(rows.len(), 1, "the statement must persist");
+        assert_eq!(
+            rows[0].object,
+            StatementObject::Value(StatementValue::Text("Alice".into())),
+            "a declared Value<text> object must stay a literal, not bind to the entity",
+        );
+    }
+
+    #[test]
+    fn a_declared_relation_type_does_not_also_mint_a_predicate() {
+        // A name the namespace declares ONLY as a relation type, emitted as a
+        // statement triple with an entity object, is written to the relations
+        // table. It used to ALSO mint an `ImplicitFromWrite` predicate of the
+        // same name that nothing ever referenced — a duplicate of a name the
+        // schema had already declared on the other axis, which then showed up
+        // in the operator's promotion shortlist.
+        use brain_core::{MemoryId, StatementKind};
+
+        let (worker, ctx, metadata) = __join_env();
+        let scope = __upload_schema_scope(&metadata, __MIRROR_SCHEMA, "mirror");
+        let memory_id = MemoryId::pack(0, 1, 21);
+        __seed_memory_row(&metadata, memory_id, scope);
+
+        let outcome = __outcome(vec![
+            __alice(),
+            __entity_stmt("brain:clones", "Linear", true, StatementKind::Fact, None),
+        ]);
+        futures_lite::future::block_on(apply_outcome(&worker, &ctx, memory_id, &outcome))
+            .expect("apply_outcome");
+
+        let rtxn = metadata.read_txn().unwrap();
+        // The edge landed.
+        let rt = brain_metadata::relation_type_lookup_by_qname(&rtxn, "mirror", "clones")
+            .unwrap()
+            .expect("mirror:clones declared");
+        let alice = __alice_in(&rtxn, scope);
+        let edges = brain_metadata::relation::ops::relation_list_from(
+            &rtxn,
+            scope,
+            alice,
+            &brain_metadata::relation::ops::RelationListFilter {
+                relation_type: Some(rt.id),
+                current_only: true,
+                limit: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(edges.len(), 1, "the triple must persist as a relation");
+
+        // And no predicate twin was minted on either namespace spelling.
+        for ns in ["mirror", "brain"] {
+            assert!(
+                brain_metadata::predicate_lookup_by_qname(&rtxn, ns, "clones")
+                    .unwrap()
+                    .is_none(),
+                "{ns}:clones must not be minted as a predicate",
+            );
+        }
+    }
+
+    #[test]
+    fn a_declared_relation_type_with_an_unresolvable_object_still_gets_a_predicate() {
+        // The deferred mint is predicated on the LLM's `object_is_entity`
+        // flag, which is a prediction. When the surface does not resolve to an
+        // entity the triple is an ordinary value statement after all, and it
+        // must still get a predicate rather than being silently lost.
+        use brain_core::{MemoryId, StatementKind};
+
+        let (worker, ctx, metadata) = __join_env();
+        let scope = __upload_schema_scope(&metadata, __MIRROR_SCHEMA, "mirror");
+        let memory_id = MemoryId::pack(0, 1, 22);
+        __seed_memory_row(&metadata, memory_id, scope);
+
+        // `object_is_entity: false` → the earlier guard drops a declared
+        // relation type carrying a value object, so use the entity axis with a
+        // surface no entity mention backs.
+        let outcome = __outcome(vec![
+            __alice(),
+            __entity_stmt(
+                "brain:clones",
+                "a product nobody mentioned",
+                true,
+                StatementKind::Fact,
+                None,
+            ),
+        ]);
+        futures_lite::future::block_on(apply_outcome(&worker, &ctx, memory_id, &outcome))
+            .expect("apply_outcome");
+
+        let rtxn = metadata.read_txn().unwrap();
+        // Whichever axis it landed on, the triple was not dropped on the floor.
+        let alice = __alice_in(&rtxn, scope);
+        let as_statement = __statements_for(&rtxn, scope, alice, "mirror", "clones");
+        let rt = brain_metadata::relation_type_lookup_by_qname(&rtxn, "mirror", "clones")
+            .unwrap()
+            .expect("declared");
+        let as_relation = brain_metadata::relation::ops::relation_list_from(
+            &rtxn,
+            scope,
+            alice,
+            &brain_metadata::relation::ops::RelationListFilter {
+                relation_type: Some(rt.id),
+                current_only: true,
+                limit: 0,
+            },
+        )
+        .unwrap();
+        assert!(
+            as_statement.len() + as_relation.len() == 1,
+            "the triple must persist exactly once, on one axis or the other",
+        );
+    }
+
+    #[test]
+    fn a_value_that_violates_a_declared_number_type_is_refused() {
+        // `success_rate` is declared `object: Value<number>`. A tier that
+        // hands it "medium" used to have that stored verbatim as text, so a
+        // numeric read over the predicate silently skipped the row and the
+        // typed graph held a fact contradicting its own schema.
+        use brain_core::{MemoryId, StatementKind};
+
+        let (worker, ctx, metadata) = __join_env();
+        let scope = __upload_schema_scope(&metadata, __MIRROR_SCHEMA, "mirror");
+        let memory_id = MemoryId::pack(0, 1, 23);
+        __seed_memory_row(&metadata, memory_id, scope);
+
+        let outcome = __outcome(vec![
+            __alice(),
+            __entity_stmt(
+                "brain:success_rate",
+                "medium",
+                false,
+                StatementKind::Fact,
+                None,
+            ),
+            // A coercible sibling, so the test distinguishes "rejected the bad
+            // one" from "rejected everything".
+            __entity_stmt(
+                "brain:success_rate",
+                "0.62",
+                false,
+                StatementKind::Fact,
+                None,
+            ),
+        ]);
+        futures_lite::future::block_on(apply_outcome(&worker, &ctx, memory_id, &outcome))
+            .expect("apply_outcome");
+
+        let rtxn = metadata.read_txn().unwrap();
+        let alice = __alice_in(&rtxn, scope);
+        let rows = __statements_for(&rtxn, scope, alice, "mirror", "success_rate");
+        assert_eq!(rows.len(), 1, "only the numeric value may persist");
+        assert_eq!(
+            rows[0].object,
+            StatementObject::Value(StatementValue::Float(0.62)),
+        );
+    }
+
+    #[test]
+    fn apply_resolves_declared_vocabulary_of_memory_namespace() {
+        use brain_core::{MemoryId, StatementKind};
+        use brain_metadata::relation::ops::{relation_list_from, RelationListFilter};
+        use brain_metadata::relation_type_lookup_by_qname;
+
+        let (worker, ctx, metadata) = __join_env();
+        let scope = __upload_schema_scope(&metadata, __MIRROR_SCHEMA, "mirror");
+        let memory_id = MemoryId::pack(0, 1, 7);
+        __seed_memory_row(&metadata, memory_id, scope);
+
+        let outcome = __outcome(vec![
+            __alice(),
+            __entity_stmt(
+                "brain:success_rate",
+                "0.74",
+                false,
+                StatementKind::Attribute,
+                None,
+            ),
+            __entity_stmt(
+                "brain:blocked_by",
+                "the OAuth login flow",
+                false,
+                StatementKind::Fact,
+                None,
+            ),
+            // Declared as a RELATION TYPE: routed to the typed edge even though
+            // the LLM classified it as a Fact.
+            __entity_stmt("brain:clones", "Linear", true, StatementKind::Fact, None),
+            // Direct relation mention path.
+            ExtractedItem::RelationMention(brain_extractors::RelationMention {
+                relation_type_qname: "brain:forked_from".into(),
+                subject_text: "Alice".into(),
+                object_text: "linear-sandbox".into(),
+                confidence: 0.9,
+                extractor_id: 3,
+                extractor_version: 1,
+            }),
+        ]);
+        futures_lite::future::block_on(apply_outcome(&worker, &ctx, memory_id, &outcome))
+            .expect("apply_outcome");
+
+        let rtxn = metadata.read_txn().unwrap();
+        let alice = __alice_in(&rtxn, scope);
+
+        let rate = __statements_for(&rtxn, scope, alice, "mirror", "success_rate");
+        assert_eq!(
+            rate.len(),
+            1,
+            "success_rate must resolve to mirror:success_rate"
+        );
+        assert_eq!(
+            rate[0].kind,
+            StatementKind::Fact,
+            "declared Fact kind must override the LLM's Attribute guess"
+        );
+        assert_eq!(
+            rate[0].object,
+            StatementObject::Value(StatementValue::Float(0.74)),
+            "declared Value<number> must store a number, not text"
+        );
+        let blocked = __statements_for(&rtxn, scope, alice, "mirror", "blocked_by");
+        assert_eq!(
+            blocked.len(),
+            1,
+            "blocked_by must resolve to mirror:blocked_by"
+        );
+        assert_eq!(blocked[0].kind, StatementKind::Fact);
+
+        // No open-vocab brain: twins were coined for the declared predicates.
+        for name in ["success_rate", "blocked_by"] {
+            assert!(
+                brain_metadata::predicate_lookup_by_qname(&rtxn, "brain", name)
+                    .unwrap()
+                    .is_none(),
+                "brain:{name} must not be coined for a declared mirror predicate"
+            );
+        }
+
+        // Both relations landed on the declared mirror: relation types.
+        for name in ["clones", "forked_from"] {
+            let rt = relation_type_lookup_by_qname(&rtxn, "mirror", name)
+                .unwrap()
+                .expect("declared relation type");
+            let rels = relation_list_from(
+                &rtxn,
+                scope,
+                alice,
+                &RelationListFilter {
+                    relation_type: Some(rt.id),
+                    current_only: true,
+                    limit: 0,
+                },
+            )
+            .unwrap();
+            assert_eq!(rels.len(), 1, "one Alice --mirror:{name}--> edge");
+            assert!(
+                relation_type_lookup_by_qname(&rtxn, "brain", name)
+                    .unwrap()
+                    .is_none(),
+                "brain:{name} relation type must not be coined"
+            );
+        }
+    }
+
+    /// Declared vocabulary beats embedding consolidation onto a `brain:`
+    /// synonym: with an existing open-vocab `brain:success_rates` whose
+    /// embedding is identical (cosine 1.0 ≥ floor), a `mirror` memory's
+    /// `brain:success_rate` still lands on `mirror:success_rate`.
+    #[test]
+    fn declared_predicate_wins_over_brain_consolidation() {
+        use brain_core::{MemoryId, StatementKind};
+        use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
+
+        struct ConstEmbed;
+        impl Dispatcher for ConstEmbed {
+            fn embed(&self, _t: &str) -> Result<[f32; VECTOR_DIM], EmbedError> {
+                let mut v = [0.0; VECTOR_DIM];
+                v[0] = 1.0;
+                Ok(v)
+            }
+            fn embed_batch(&self, t: &[&str]) -> Result<Vec<[f32; VECTOR_DIM]>, EmbedError> {
+                t.iter().map(|s| self.embed(s)).collect()
+            }
+            fn fingerprint(&self) -> [u8; 16] {
+                [0xCE; 16]
+            }
+        }
+
+        let (worker, ctx, metadata) = __join_env();
+        let worker = worker.with_embed_deps(EmbeddingDeps {
+            hnsw: std::sync::Arc::new(parking_lot::RwLock::new(
+                brain_index::entity_hnsw::EntityHnswIndex::new(
+                    brain_index::entity_hnsw::EntityHnswParams::default_v1(),
+                )
+                .unwrap(),
+            )),
+            embedder: std::sync::Arc::new(ConstEmbed) as std::sync::Arc<dyn Dispatcher>,
+            embed_threshold: brain_extractors::resolver::EMBED_RESOLVE_THRESHOLD,
+        });
+        // An existing open-vocab brain: near-synonym carrying a vector.
+        {
+            let wtxn = metadata.write_txn().unwrap();
+            let p = predicate_intern_or_get(&wtxn, "brain", "success_rates", 0, 1).unwrap();
+            let mut v = vec![0.0f32; VECTOR_DIM];
+            v[0] = 1.0;
+            brain_metadata::predicate_embedding_put(&wtxn, p, &v).unwrap();
+            wtxn.commit().unwrap();
+        }
+        let scope = __upload_schema_scope(&metadata, __MIRROR_SCHEMA, "mirror");
+        let memory_id = MemoryId::pack(0, 1, 8);
+        __seed_memory_row(&metadata, memory_id, scope);
+        let outcome = __outcome(vec![
+            __alice(),
+            __entity_stmt(
+                "brain:success_rate",
+                "0.5",
+                false,
+                StatementKind::Fact,
+                None,
+            ),
+        ]);
+        futures_lite::future::block_on(apply_outcome(&worker, &ctx, memory_id, &outcome))
+            .expect("apply_outcome");
+
+        let rtxn = metadata.read_txn().unwrap();
+        let alice = __alice_in(&rtxn, scope);
+        assert_eq!(
+            __statements_for(&rtxn, scope, alice, "mirror", "success_rate").len(),
+            1,
+            "declared mirror:success_rate must win"
+        );
+        assert!(
+            __statements_for(&rtxn, scope, alice, "brain", "success_rates").is_empty(),
+            "must not consolidate onto the brain: synonym"
+        );
+    }
+
+    /// Tenant isolation: a memory in a namespace WITHOUT a schema behaves
+    /// exactly as before (`brain:blocked_by` stays `brain:`), and an emitted
+    /// qname naming ANOTHER namespace's declared vocabulary is coerced to
+    /// `brain:` rather than written into that namespace.
+    #[test]
+    fn declared_vocabulary_never_crosses_namespaces() {
+        use brain_core::{MemoryId, StatementKind};
+
+        let (worker, ctx, metadata) = __join_env();
+        let _mirror = __upload_schema_scope(&metadata, __MIRROR_SCHEMA, "mirror");
+        let globex = __plain_namespace_scope(&metadata, "globex");
+        let memory_id = MemoryId::pack(0, 1, 9);
+        __seed_memory_row(&metadata, memory_id, globex);
+        let outcome = __outcome(vec![
+            __alice(),
+            __entity_stmt(
+                "brain:blocked_by",
+                "a flaky CI",
+                false,
+                StatementKind::Fact,
+                None,
+            ),
+            __entity_stmt(
+                "mirror:success_rate",
+                "0.9",
+                false,
+                StatementKind::Fact,
+                None,
+            ),
+        ]);
+        futures_lite::future::block_on(apply_outcome(&worker, &ctx, memory_id, &outcome))
+            .expect("apply_outcome");
+
+        let rtxn = metadata.read_txn().unwrap();
+        let alice = __alice_in(&rtxn, globex);
+        assert_eq!(
+            __statements_for(&rtxn, globex, alice, "brain", "blocked_by").len(),
+            1,
+            "an unschema'd namespace keeps the open-vocab brain: predicate"
+        );
+        assert!(
+            __statements_for(&rtxn, globex, alice, "mirror", "blocked_by").is_empty(),
+            "a globex memory must never resolve onto mirror's vocabulary"
+        );
+        assert!(
+            __statements_for(&rtxn, globex, alice, "mirror", "success_rate").is_empty(),
+            "an emitted foreign qname must not write into mirror's vocabulary"
+        );
+        let coerced = __statements_for(&rtxn, globex, alice, "brain", "success_rate");
+        assert_eq!(coerced.len(), 1, "foreign qname coerced to brain:");
+        assert_eq!(
+            coerced[0].object,
+            StatementObject::Value(StatementValue::Text("0.9".into())),
+            "mirror's declared Value<number> must not apply to a globex memory"
+        );
+    }
+
+    /// The per-memory prompt block carries ONLY the owning namespace's
+    /// declared vocabulary, appended after the existing `brain:` candidates.
+    #[test]
+    fn declared_vocab_blocks_are_per_namespace() {
+        let (_worker, _ctx, metadata) = __join_env();
+        let _ = __upload_schema_scope(&metadata, __MIRROR_SCHEMA, "mirror");
+        let mem_namespaces = vec![
+            "mirror".to_string(),
+            "globex".to_string(),
+            SYSTEM_NAMESPACE.to_string(),
+            "mirror".to_string(),
+        ];
+        let rtxn = metadata.read_txn().unwrap();
+        let blocks = declared_vocab_blocks(&rtxn, &mem_namespaces);
+        assert_eq!(
+            blocks.len(),
+            1,
+            "only mirror declares vocabulary: {blocks:?}"
+        );
+        let block = &blocks["mirror"];
+        assert!(
+            block.contains("- mirror:success_rate (Fact, Value<number>)"),
+            "{block}"
+        );
+        assert!(
+            block.contains("- mirror:clones (Any -> Any, many-to-one)"),
+            "{block}"
+        );
+
+        let mems: Vec<CoreMemory> = (1..=4).map(|i| make_mem(i, "text")).collect();
+        let mut map: HashMap<MemoryId, String> = HashMap::new();
+        map.insert(mems[0].id, "- brain:works_at\n".to_string());
+        merge_declared_vocab_blocks(&mut map, &mems, &mem_namespaces, &blocks);
+
+        let m0 = &map[&mems[0].id];
+        assert!(m0.starts_with("- brain:works_at\n\n"), "{m0}");
+        assert!(m0.ends_with(block.as_str()), "{m0}");
+        assert!(
+            !map.contains_key(&mems[1].id),
+            "globex memory gets no block"
+        );
+        assert!(!map.contains_key(&mems[2].id), "brain memory gets no block");
+        assert_eq!(
+            &map[&mems[3].id], block,
+            "second mirror memory gets the block"
+        );
+        // Deterministic: re-rendering yields identical bytes.
+        assert_eq!(declared_vocab_blocks(&rtxn, &mem_namespaces), blocks);
+    }
+
+    // ----- Per-namespace entity-type vocabulary. -----
+
+    #[test]
+    fn group_indices_by_namespace_preserves_first_seen_order() {
+        let ns: Vec<String> = ["mirror", "globex", "mirror", "brain", "globex"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            group_indices_by_namespace(&ns),
+            vec![
+                ("mirror", vec![0, 2]),
+                ("globex", vec![1, 4]),
+                ("brain", vec![3]),
+            ]
+        );
+        assert!(group_indices_by_namespace(&[]).is_empty());
+    }
+
+    /// Namespace B never sees namespace A's schema entity types; A sees the
+    /// built-ins plus its own.
+    #[test]
+    fn entity_vocab_is_scoped_to_memory_namespace() {
+        let (_worker, _ctx, metadata) = __join_env();
+        let _ = __upload_schema_scope(&metadata, __MIRROR_SCHEMA, "mirror");
+        let _ = __plain_namespace_scope(&metadata, "globex");
+        let rtxn = metadata.read_txn().unwrap();
+        let vocab = entity_vocab_by_namespace(
+            &rtxn,
+            &[
+                "mirror".to_string(),
+                "globex".to_string(),
+                "brain".to_string(),
+            ],
+        );
+        let has = |ns: &str, l: &str| vocab[ns].labels.iter().any(|x| x == l);
+        for ns in ["mirror", "globex", "brain"] {
+            assert!(has(ns, "brain:Person"), "{ns} sees built-in Person");
+            assert!(vocab[ns].block.contains("- brain:Person\n"), "{ns}");
+        }
+        assert!(
+            has("mirror", "brain:CloneEnv"),
+            "mirror sees its own CloneEnv"
+        );
+        assert!(vocab["mirror"].block.contains("- brain:CloneEnv\n"));
+        for ns in ["globex", "brain"] {
+            assert!(
+                !has(ns, "brain:CloneEnv"),
+                "{ns} must not see mirror's CloneEnv"
+            );
+            assert!(!vocab[ns].block.contains("CloneEnv"), "{ns}");
+        }
+    }
+
+    /// End to end through the pipeline: each LLM / classifier call receives
+    /// ONLY its memory's namespace vocabulary, and outcomes come back in
+    /// batch order.
+    #[test]
+    fn pipeline_hands_each_namespace_its_own_entity_types() {
+        use brain_core::ExtractorId as TestExtractorId;
+        use brain_core::ExtractorKind;
+        use brain_extractors::{ExtractionFuture, ExtractionResult, Extractor as TestExtractor};
+        use std::sync::Mutex as StdMutex;
+
+        type Seen = Arc<StdMutex<Vec<(u128, Option<String>, Option<Vec<String>>)>>>;
+        struct Recording {
+            id: TestExtractorId,
+            kind: ExtractorKind,
+            name: String,
+            seen: Seen,
+        }
+        impl TestExtractor for Recording {
+            fn id(&self) -> TestExtractorId {
+                self.id
+            }
+            fn kind(&self) -> ExtractorKind {
+                self.kind
+            }
+            fn name(&self) -> &str {
+                &self.name
+            }
+            fn extractor_version(&self) -> u32 {
+                1
+            }
+            fn run<'a>(
+                &'a self,
+                ctx: &'a ExtractionContext<'a>,
+                mem: &'a CoreMemory,
+            ) -> ExtractionFuture<'a> {
+                let seen = self.seen.clone();
+                let rec = (
+                    mem.id.raw(),
+                    ctx.declared_entity_types.map(str::to_string),
+                    ctx.entity_type_labels.map(<[String]>::to_vec),
+                );
+                // Tag the outcome with the memory id so batch order is checkable.
+                let item = ExtractedItem::EntityMention(EntityMention {
+                    entity_type_qname: "brain:Person".into(),
+                    text: format!("m{}", mem.id.raw()),
+                    start: 0,
+                    end: 0,
+                    confidence: 0.9,
+                    extractor_id: self.id.raw(),
+                    extractor_version: 1,
+                });
+                Box::pin(async move {
+                    seen.lock().unwrap().push(rec);
+                    ExtractionResult::success(vec![item], 0, 0)
+                })
+            }
+        }
+
+        let llm_seen: Seen = Arc::new(StdMutex::new(Vec::new()));
+        let cls_seen: Seen = Arc::new(StdMutex::new(Vec::new()));
+        let extractors: Vec<Arc<dyn Extractor>> = vec![
+            Arc::new(Recording {
+                id: TestExtractorId::from(2),
+                kind: ExtractorKind::Classifier,
+                name: "brain:gliner".into(),
+                seen: cls_seen.clone(),
+            }),
+            Arc::new(Recording {
+                id: TestExtractorId::from(3),
+                kind: ExtractorKind::Llm,
+                name: "brain:llm".into(),
+                seen: llm_seen.clone(),
+            }),
+        ];
+        let vocab = |labels: &[&str]| {
+            let labels: Vec<String> = labels.iter().map(|s| s.to_string()).collect();
+            NamespaceEntityVocab {
+                block: brain_metadata::render_entity_type_labels_block(&labels),
+                labels,
+            }
+        };
+        let mut entity_vocab = HashMap::new();
+        entity_vocab.insert(
+            "mirror".to_string(),
+            vocab(&["brain:Person", "brain:CloneEnv"]),
+        );
+        entity_vocab.insert("globex".to_string(), vocab(&["brain:Person"]));
+
+        let mems = vec![make_mem(20, "a"), make_mem(21, "b"), make_mem(22, "c")];
+        let mem_namespaces = vec![
+            "mirror".to_string(),
+            "globex".to_string(),
+            "mirror".to_string(),
+        ];
+        let outcomes = futures_lite::future::block_on(run_pipeline_per_namespace(
+            extractors,
+            &mems,
+            &mem_namespaces,
+            false,
+            None,
+            &entity_vocab,
+            None,
+            None,
+        ));
+
+        // Outcomes are scattered back into batch order.
+        assert_eq!(outcomes.len(), 3);
+        for (m, o) in mems.iter().zip(&outcomes) {
+            let want = format!("m{}", m.id.raw());
+            assert!(
+                o.items
+                    .iter()
+                    .any(|i| matches!(i, ExtractedItem::EntityMention(e) if e.text == want)),
+                "outcome for {want} out of order"
+            );
+        }
+
+        let globex_id = mems[1].id.raw();
+        for (tier, seen) in [("llm", &llm_seen), ("classifier", &cls_seen)] {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 3, "{tier} ran once per memory");
+            for (mid, block, labels) in seen.iter() {
+                let block = block.clone().unwrap_or_default();
+                let labels = labels.clone().unwrap_or_default();
+                if *mid == globex_id {
+                    if tier == "llm" {
+                        assert!(
+                            !block.contains("CloneEnv"),
+                            "globex LLM prompt leaked: {block}"
+                        );
+                        assert!(block.contains("brain:Person"), "{block}");
+                    } else {
+                        assert_eq!(labels, vec!["brain:Person".to_string()], "globex labels");
+                    }
+                } else if tier == "llm" {
+                    assert!(
+                        block.contains("- brain:CloneEnv\n"),
+                        "mirror prompt: {block}"
+                    );
+                } else {
+                    assert!(
+                        labels.contains(&"brain:CloneEnv".to_string()),
+                        "mirror labels"
+                    );
+                }
+            }
+        }
+    }
+
+    // ----- Entity-name guards. -----
+
+    #[test]
+    fn entity_guard_rejects_json_fragments_and_selector_ids() {
+        for bad in [
+            "Mirror},{",
+            "{\"name\":\"Acme\"}",
+            "Acme\",\"",
+            "Acme\"",
+            "[Acme",
+            "Acme)",
+            "space:da6ce18abcb75e7bacc022e44956b287",
+        ] {
+            assert!(
+                !entity_mention_is_acceptable(bad),
+                "{bad:?} must be rejected"
+            );
+            assert!(!statement_subject_mintable(bad), "{bad:?} must not mint");
+        }
+        for good in [
+            "Mirror",
+            "AT&T",
+            "Ben & Jerry's",
+            "Q3 roadmap (draft)",
+            "\"Linear\"",
+            "linear-sandbox",
+            "space:not-a-selector",
+        ] {
+            assert!(
+                entity_mention_is_acceptable(good),
+                "{good:?} must be accepted"
+            );
+        }
+    }
+
+    /// End to end: a JSON-fragment surface from any tier never becomes an
+    /// entity, neither via pass 1 nor as a coined statement subject.
+    #[test]
+    fn apply_never_mints_json_fragment_entity() {
+        use brain_core::{MemoryId, StatementKind};
+
+        let (worker, ctx, metadata) = __join_env();
+        let memory_id = MemoryId::pack(0, 1, 10);
+        __seed_memory_row(&metadata, memory_id, __ts());
+        let outcome = __outcome(vec![
+            ExtractedItem::EntityMention(EntityMention {
+                entity_type_qname: "brain:Organization".into(),
+                text: "Mirror},{".into(),
+                start: 0,
+                end: 9,
+                confidence: 0.9,
+                extractor_id: 3,
+                extractor_version: 1,
+            }),
+            ExtractedItem::StatementMention(brain_extractors::StatementMention {
+                kind: statement_kind_to_byte(StatementKind::Fact),
+                subject_text: Some("space:da6ce18abcb75e7bacc022e44956b287".into()),
+                subject_is_memory: false,
+                predicate_qname: "brain:role".into(),
+                object_text: Some("lead".into()),
+                confidence: 0.9,
+                extractor_id: 3,
+                extractor_version: 1,
+                is_stateful: false,
+                object_is_entity: false,
+                event_at_unix_nanos: None,
+                subject_is_self: false,
+                retract: false,
+            }),
+        ]);
+        futures_lite::future::block_on(apply_outcome(&worker, &ctx, memory_id, &outcome))
+            .expect("apply_outcome");
+
+        let rtxn = metadata.read_txn().unwrap();
+        for name in ["Mirror},{", "space:da6ce18abcb75e7bacc022e44956b287"] {
+            let hits = brain_metadata::entity_resolve_canonical_all_types(&rtxn, __ts(), name)
+                .unwrap_or_default();
+            assert!(hits.is_empty(), "{name:?} must never be minted: {hits:?}");
+        }
+    }
 }
 
 /// Live registry-refresh on SCHEMA_UPLOAD: a newly-declared extractor
@@ -7903,7 +10787,7 @@ mod registry_refresh_tests {
     use std::sync::Arc;
 
     use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
-    use brain_extractors::{MaterializeDeps, TierGate};
+    use brain_extractors::MaterializeDeps;
     use brain_index::{IndexParams, SharedHnsw};
     use brain_metadata::MetadataDb;
     use brain_ops::RealWriterHandle;
@@ -7949,8 +10833,8 @@ mod registry_refresh_tests {
         // Worker wired with rebuild deps (no classifier model / LLM router
         // needed for a pattern extractor).
         let (_tx, rx) = flume::unbounded();
-        let worker = ExtractorWorker::new(rx)
-            .with_registry_rebuild_deps(MaterializeDeps::default(), TierGate::all_enabled());
+        let worker =
+            ExtractorWorker::new(rx).with_registry_rebuild_deps(MaterializeDeps::default());
 
         // Boot-time registry is empty (nothing declared yet).
         assert_eq!(
@@ -8026,8 +10910,8 @@ mod registry_refresh_tests {
             shutdown: Arc::new(AtomicBool::new(false)),
         };
         let (_tx, rx) = flume::unbounded();
-        let worker = ExtractorWorker::new(rx)
-            .with_registry_rebuild_deps(MaterializeDeps::default(), TierGate::all_enabled());
+        let worker =
+            ExtractorWorker::new(rx).with_registry_rebuild_deps(MaterializeDeps::default());
 
         // Persist an extractor but leave the flag unset: rebuild must not run,
         // so the (empty) boot-time registry stays untouched.

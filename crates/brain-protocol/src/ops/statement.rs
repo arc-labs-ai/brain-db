@@ -238,11 +238,17 @@ pub struct StatementRetractRequest {
 ///
 /// `anchor_id` may be a `StatementId` (any member of the chain) or
 /// a chain-root id — server resolves.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// `limit` must be in `1..=1000`. `cursor` is opaque — empty on the first
+/// page, then the `next_cursor` echoed from the previous response. Pagination
+/// is keyset on the immutable chain `version`; echoing a cursor back with a
+/// different `include_tombstoned` is rejected `stale_cursor`.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StatementHistoryRequest {
     #[serde(with = "serde_bytes")]
     pub anchor_id: WireUuid,
     pub include_tombstoned: bool,
+    pub limit: u32,
+    pub cursor: Vec<u8>,
 }
 
 /// `STATEMENT_LIST` (`0x0146`).
@@ -763,11 +769,16 @@ pub struct StatementRetractResponse {
 /// cut splits when it streams.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StatementHistoryResponseFrame {
-    /// Chain entries in `version` ascending order.
+    /// Chain entries in `version` ascending order (one page).
     pub items: Vec<StatementView>,
     #[serde(with = "serde_bytes")]
     pub chain_root: WireUuid,
+    /// The full chain length (not the page size), so a client can render
+    /// "page of N".
     pub total_versions: u32,
+    /// Empty when the chain is exhausted; otherwise the opaque keyset token
+    /// to resume from on the next request.
+    pub next_cursor: Vec<u8>,
     pub is_final: bool,
 }
 

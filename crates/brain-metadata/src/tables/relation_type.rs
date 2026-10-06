@@ -80,7 +80,6 @@ impl RelationTypeOrigin {
 }
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct RelationTypeDefinition {
     pub relation_type_id: u32,
     pub namespace: String,

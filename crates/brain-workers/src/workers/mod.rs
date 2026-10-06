@@ -20,6 +20,7 @@ pub mod hnsw_maint;
 pub mod hype;
 pub mod idempotency_cleanup;
 pub mod llm_cache_sweeper;
+pub mod predicate_gc;
 pub mod schema_migration;
 pub mod slot_reclaim;
 pub mod snapshot;

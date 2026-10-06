@@ -161,6 +161,7 @@ fn upload_request(source: &str) -> RequestBody {
         dry_run: false,
         allow_breaking: false,
         request_id: *uuid::Uuid::now_v7().as_bytes(),
+        act_as: None,
     })
 }
 
@@ -207,6 +208,7 @@ async fn upload_get_list_smoke() {
         RequestBody::SchemaGet(SchemaGetRequest {
             namespace: "acme".into(),
             version: 0,
+            act_as: None,
         }),
     )
     .await;
@@ -229,6 +231,7 @@ async fn upload_get_list_smoke() {
             namespace: "acme".into(),
             limit: 0,
             cursor: Vec::new(),
+            act_as: None,
         }),
     )
     .await;
@@ -276,6 +279,7 @@ async fn upload_bumps_version_and_list_is_newest_first() {
             namespace: "acme".into(),
             limit: 0,
             cursor: Vec::new(),
+            act_as: None,
         }),
     )
     .await;
@@ -315,6 +319,7 @@ async fn get_by_explicit_version_returns_that_version_not_active() {
         RequestBody::SchemaGet(SchemaGetRequest {
             namespace: "acme".into(),
             version: 0,
+            act_as: None,
         }),
     )
     .await;
@@ -333,6 +338,7 @@ async fn get_by_explicit_version_returns_that_version_not_active() {
         RequestBody::SchemaGet(SchemaGetRequest {
             namespace: "acme".into(),
             version: 1,
+            act_as: None,
         }),
     )
     .await;
@@ -366,6 +372,7 @@ async fn validate_dry_run_returns_would_be_version() {
         1,
         RequestBody::SchemaValidate(SchemaValidateRequest {
             schema_document: ACME_V1.into(),
+            act_as: None,
         }),
     )
     .await;
@@ -385,6 +392,7 @@ async fn validate_dry_run_returns_would_be_version() {
         5,
         RequestBody::SchemaValidate(SchemaValidateRequest {
             schema_document: ACME_V1.into(),
+            act_as: None,
         }),
     )
     .await;
@@ -403,6 +411,7 @@ async fn validate_dry_run_returns_would_be_version() {
             namespace: "acme".into(),
             limit: 0,
             cursor: Vec::new(),
+            act_as: None,
         }),
     )
     .await;
@@ -500,6 +509,7 @@ async fn schema_get_missing_returns_error_frame() {
         RequestBody::SchemaGet(SchemaGetRequest {
             namespace: "never_uploaded".into(),
             version: 0,
+            act_as: None,
         }),
     )
     .await;
@@ -526,6 +536,7 @@ async fn system_schema_visible_via_schema_get() {
         RequestBody::SchemaGet(SchemaGetRequest {
             namespace: "brain".into(),
             version: 0,
+            act_as: None,
         }),
     )
     .await;

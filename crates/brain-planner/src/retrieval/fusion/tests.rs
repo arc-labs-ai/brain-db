@@ -606,3 +606,202 @@ fn mixed_id_variants_fuse_independently() {
     .is_some());
     assert!(find(&fused, &RankedItemId::Entity(EntityId::from([1u8; 16]))).is_some());
 }
+
+// ---------------------------------------------------------------------------
+// Property tests — the RRF math surface: no-panic / no-NaN, determinism,
+// rank monotonicity, coverage monotonicity, single-lane passthrough, and
+// the adaptive-k buckets.
+// ---------------------------------------------------------------------------
+
+mod rrf_properties {
+    use super::*;
+    use crate::retrieval::fusion::adaptive_k;
+
+    use proptest::collection::vec as pvec;
+    use proptest::prelude::*;
+
+    /// Distinct retrievers so a lane list never sums a retriever with
+    /// itself (the planner never builds such inputs; that path is a
+    /// documented caller bug).
+    const RETRIEVERS: [Retriever; 3] = [Retriever::Semantic, Retriever::Lexical, Retriever::Graph];
+
+    fn weights() -> PerRetrieverWeights {
+        PerRetrieverWeights::default()
+    }
+
+    /// One ranked item drawn from a small id pool (slot 0..8) so ids
+    /// overlap across lanes, exercising the same-doc summation path.
+    /// Scores span negatives too — RRF must ignore magnitude entirely.
+    fn item_strategy() -> impl Strategy<Value = RankedItem> {
+        (0u64..8u64, 1u32..1000u32, -5.0f32..5.0f32)
+            .prop_map(|(slot, rank, score)| memory_item(slot, rank, score))
+    }
+
+    /// A single lane's items — including the empty lane.
+    fn lane_strategy() -> impl Strategy<Value = Vec<RankedItem>> {
+        pvec(item_strategy(), 0..15)
+    }
+
+    /// 0..=3 lanes, each bound to a distinct retriever.
+    fn outputs_strategy() -> impl Strategy<Value = Vec<(Retriever, Vec<RankedItem>)>> {
+        (0usize..=3).prop_flat_map(|n| {
+            pvec(lane_strategy(), n).prop_map(|lanes| {
+                lanes
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, l)| (RETRIEVERS[i], l))
+                    .collect()
+            })
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 128,
+            ..ProptestConfig::default()
+        })]
+
+        /// Arbitrary lane inputs — empty lanes, duplicate ids within
+        /// and across lanes, single lane, all-empty — never panic,
+        /// never produce a non-finite fused score, and always come
+        /// back in descending fused-score order.
+        #[test]
+        fn fuse_never_panics_or_nans(outputs in outputs_strategy()) {
+            let fused = fuse_rrf(&outputs, DEFAULT_K, &weights());
+            for f in &fused {
+                prop_assert!(f.fused_score.is_finite(), "non-finite score {}", f.fused_score);
+            }
+            for w in fused.windows(2) {
+                prop_assert!(
+                    w[0].fused_score >= w[1].fused_score - 1e-12,
+                    "not sorted descending: {} then {}",
+                    w[0].fused_score,
+                    w[1].fused_score,
+                );
+            }
+        }
+
+        /// Every fusion strategy (RRF + both relative-score variants)
+        /// is NaN-safe under the same arbitrary inputs.
+        #[test]
+        fn all_methods_are_nan_safe(outputs in outputs_strategy()) {
+            for method in [
+                FusionMethod::Rrf,
+                FusionMethod::RelativeScore,
+                FusionMethod::RelativeScoreZScore,
+            ] {
+                let fused = fuse(&outputs, DEFAULT_K, &weights(), method);
+                for f in &fused {
+                    prop_assert!(
+                        !f.fused_score.is_nan(),
+                        "{:?} produced NaN score",
+                        method,
+                    );
+                }
+            }
+        }
+
+        /// The id tie-break makes ordering total, so fusing identical
+        /// inputs twice yields byte-identical ordering and scores.
+        #[test]
+        fn fuse_is_deterministic(outputs in outputs_strategy()) {
+            let a = fuse_rrf(&outputs, DEFAULT_K, &weights());
+            let b = fuse_rrf(&outputs, DEFAULT_K, &weights());
+            prop_assert_eq!(a.len(), b.len(), "cardinality diverged");
+            for (x, y) in a.iter().zip(b.iter()) {
+                prop_assert_eq!(x.id, y.id, "order diverged on id");
+                prop_assert!(
+                    (x.fused_score - y.fused_score).abs() < 1e-12,
+                    "score diverged: {} vs {}",
+                    x.fused_score,
+                    y.fused_score,
+                );
+            }
+        }
+
+        /// Within a lane, a better (smaller) rank contributes a strictly
+        /// larger `1/(k+rank)` term.
+        #[test]
+        fn better_rank_scores_higher(r1 in 1u32..500u32, delta in 1u32..500u32) {
+            let r2 = r1 + delta;
+            let a = memory_item(1, r1, 0.5);
+            let b = memory_item(2, r2, 0.5);
+            let a_id = a.id;
+            let b_id = b.id;
+            let fused = fuse_rrf(&[(Retriever::Semantic, vec![a, b])], DEFAULT_K, &weights());
+            let sa = find(&fused, &a_id).unwrap().fused_score;
+            let sb = find(&fused, &b_id).unwrap().fused_score;
+            prop_assert!(sa > sb, "rank {r1} score {sa} !> rank {r2} score {sb}");
+        }
+
+        /// Coverage monotonicity: an id appearing in more lanes (same
+        /// rank, equal weights everywhere else) never ranks below an id
+        /// in fewer lanes.
+        #[test]
+        fn more_lanes_never_ranks_below_fewer(
+            count_a in 1usize..=3,
+            count_b in 1usize..=3,
+            rank in 1u32..100u32,
+        ) {
+            let (hi, lo) = if count_a >= count_b {
+                (count_a, count_b)
+            } else {
+                (count_b, count_a)
+            };
+            let hi_id = memory_item(1, rank, 0.5).id;
+            let lo_id = memory_item(2, rank, 0.5).id;
+            let mut outputs = Vec::new();
+            for (i, &r) in RETRIEVERS.iter().enumerate() {
+                let mut items = Vec::new();
+                if i < hi {
+                    items.push(memory_item(1, rank, 0.5));
+                }
+                if i < lo {
+                    items.push(memory_item(2, rank, 0.5));
+                }
+                if !items.is_empty() {
+                    outputs.push((r, items));
+                }
+            }
+            let fused = fuse_rrf(&outputs, DEFAULT_K, &weights());
+            let s_hi = find(&fused, &hi_id).unwrap().fused_score;
+            let s_lo = find(&fused, &lo_id).unwrap().fused_score;
+            prop_assert!(
+                s_hi + 1e-12 >= s_lo,
+                "{hi} lanes scored {s_hi} < {lo} lanes scored {s_lo}",
+            );
+        }
+
+        /// A single lane already in rank order comes back in exactly
+        /// that order (distinct ids, strictly increasing ranks → no
+        /// ties, score strictly decreasing).
+        #[test]
+        fn single_lane_preserves_rank_order(count in 1usize..12usize) {
+            let items: Vec<RankedItem> = (0..count)
+                .map(|i| memory_item(i as u64, (i as u32) + 1, 0.5))
+                .collect();
+            let want: Vec<RankedItemId> = items.iter().map(|it| it.id).collect();
+            let fused = fuse_rrf(&[(Retriever::Semantic, items)], DEFAULT_K, &weights());
+            let got: Vec<RankedItemId> = fused.iter().map(|f| f.id).collect();
+            prop_assert_eq!(got, want);
+        }
+
+        /// `adaptive_k` returns exactly the documented bucket for every
+        /// pool size, and is non-decreasing in pool size.
+        #[test]
+        fn adaptive_k_matches_documented_buckets(pool in 0usize..5000usize) {
+            let k = adaptive_k(pool);
+            let expected = if pool < 200 {
+                15
+            } else if pool < 2_000 {
+                30
+            } else {
+                DEFAULT_K
+            };
+            prop_assert_eq!(k, expected, "pool {} got k={}", pool, k);
+            if pool > 0 {
+                prop_assert!(adaptive_k(pool - 1) <= k, "adaptive_k not monotone at {pool}");
+            }
+        }
+    }
+}

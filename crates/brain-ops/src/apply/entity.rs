@@ -14,11 +14,43 @@ use brain_metadata::entity::ops::{
     normalize_name,
 };
 use brain_metadata::entity::review::{proposal_get_inside_wtxn, update_proposal_status};
+use brain_metadata::tables::entity::{EntityMetadata, ENTITIES_TABLE};
 use brain_metadata::tables::merge_review_queue::proposal_status;
-use redb::WriteTransaction;
+use redb::{ReadableTable, WriteTransaction};
 
 use super::ApplyError;
 use crate::write::{Phase, PhaseAck, TombstoneTarget, Write};
+
+/// Tenant wall for an entity mutation. Loads the primary row inside the
+/// wtxn and confirms it belongs to the caller's `(namespace, space)`
+/// scope; a row owned by another tenant (or a missing one) reads as
+/// NotFound — no existence leak. Mirrors the memory-layer wall in
+/// `apply_tombstone_memory`: the `entity::ops` mutators look rows up by
+/// global id alone, so the apply layer is the atomic last line of
+/// defense against a cross-tenant `EntityId`.
+fn entity_scope_guard(
+    wtxn: &WriteTransaction,
+    id: EntityId,
+    write: &Write,
+) -> Result<(), ApplyError> {
+    let row: Option<EntityMetadata> = {
+        let t = wtxn
+            .open_table(ENTITIES_TABLE)
+            .map_err(|e| ApplyError::Storage(format!("open entities: {e}")))?;
+        let got = t
+            .get(&id.to_bytes())
+            .map_err(|e| ApplyError::Storage(format!("entity lookup: {e}")))?;
+        got.map(|g| g.value())
+    };
+    let caller = brain_metadata::RowScope::new(write.namespace, write.space_id);
+    match row {
+        Some(m) if m.scope() == caller => Ok(()),
+        _ => Err(ApplyError::NotFound {
+            what: "entity",
+            detail: format!("{id:?}"),
+        }),
+    }
+}
 
 /// Build the [`Entity`] a [`Phase::UpsertEntity`] describes. Shared by
 /// the apply path (which persists it via `entity_put`) and the
@@ -83,7 +115,7 @@ pub fn apply_upsert_entity(
 pub fn apply_tombstone_entity(
     wtxn: &WriteTransaction,
     phase: &Phase,
-    _write: &Write,
+    write: &Write,
 ) -> Result<PhaseAck, ApplyError> {
     let Phase::Tombstone {
         target,
@@ -96,6 +128,7 @@ pub fn apply_tombstone_entity(
     let TombstoneTarget::Entity(id) = target else {
         return Err(ApplyError::PhaseMisShape("expected Tombstone(Entity)"));
     };
+    entity_scope_guard(wtxn, *id, write)?;
     entity_tombstone(wtxn, *id, *at_unix_nanos)
         .map_err(|e| ApplyError::Metadata(format!("entity_tombstone: {e}")))?;
     Ok(PhaseAck::Tombstoned {
@@ -107,7 +140,7 @@ pub fn apply_tombstone_entity(
 pub fn apply_merge_entities(
     wtxn: &WriteTransaction,
     phase: &Phase,
-    _write: &Write,
+    write: &Write,
 ) -> Result<PhaseAck, ApplyError> {
     let Phase::MergeEntities {
         source,
@@ -122,7 +155,12 @@ pub fn apply_merge_entities(
     else {
         return Err(ApplyError::PhaseMisShape("expected MergeEntities"));
     };
-    let audit_id = brain_metadata::entity::merge::merge_entity(
+    // Wall: the caller must own both endpoints. `merge_entity` already
+    // requires source and target to share a scope, but that scope could
+    // be a foreign tenant's — guard against the caller scope here.
+    entity_scope_guard(wtxn, *target, write)?;
+    entity_scope_guard(wtxn, *source, write)?;
+    let outcome = brain_metadata::entity::merge::merge_entity(
         wtxn,
         *target,
         *source,
@@ -136,14 +174,16 @@ pub fn apply_merge_entities(
     Ok(PhaseAck::EntityMerged {
         source: *source,
         target: *target,
-        audit_id,
+        audit_id: outcome.merge_id,
+        statements_rerouted: outcome.statements_rerouted,
+        relations_rerouted: outcome.relations_rerouted,
     })
 }
 
 pub fn apply_update_entity(
     wtxn: &WriteTransaction,
     phase: &Phase,
-    _write: &Write,
+    write: &Write,
 ) -> Result<PhaseAck, ApplyError> {
     let Phase::UpdateEntity {
         id,
@@ -155,6 +195,7 @@ pub fn apply_update_entity(
     else {
         return Err(ApplyError::PhaseMisShape("expected UpdateEntity"));
     };
+    entity_scope_guard(wtxn, *id, write)?;
     let current = entity_get_inside_wtxn(wtxn, *id)
         .map_err(|e| ApplyError::Metadata(format!("entity_get: {e}")))?
         .ok_or_else(|| ApplyError::NotFound {
@@ -183,7 +224,7 @@ pub fn apply_update_entity(
 pub fn apply_rename_entity(
     wtxn: &WriteTransaction,
     phase: &Phase,
-    _write: &Write,
+    write: &Write,
 ) -> Result<PhaseAck, ApplyError> {
     let Phase::RenameEntity {
         id,
@@ -193,6 +234,7 @@ pub fn apply_rename_entity(
     else {
         return Err(ApplyError::PhaseMisShape("expected RenameEntity"));
     };
+    entity_scope_guard(wtxn, *id, write)?;
     let current = entity_get_inside_wtxn(wtxn, *id)
         .map_err(|e| ApplyError::Metadata(format!("entity_get: {e}")))?
         .ok_or_else(|| ApplyError::NotFound {
@@ -298,7 +340,8 @@ pub fn apply_approve_merge_with_status(
         grace_seconds,
         at_unix_nanos,
     )
-    .map_err(|e| ApplyError::Metadata(format!("merge_entity: {e}")))?;
+    .map_err(|e| ApplyError::Metadata(format!("merge_entity: {e}")))?
+    .merge_id;
     update_proposal_status(
         wtxn,
         proposal_id,
@@ -355,7 +398,7 @@ pub fn apply_reject_merge(
 pub fn apply_unmerge_entities(
     wtxn: &WriteTransaction,
     phase: &Phase,
-    _write: &Write,
+    write: &Write,
 ) -> Result<PhaseAck, ApplyError> {
     let Phase::UnmergeEntities {
         merged,
@@ -365,6 +408,10 @@ pub fn apply_unmerge_entities(
     else {
         return Err(ApplyError::PhaseMisShape("expected UnmergeEntities"));
     };
+    // Wall: the caller must own the merged entity. Its survivor shares the
+    // same scope (a merge never crosses tenants), so guarding `merged` is
+    // sufficient.
+    entity_scope_guard(wtxn, *merged, write)?;
     let survivor =
         brain_metadata::entity::merge::unmerge_entity(wtxn, *merged, *actor, *at_unix_nanos)
             .map_err(|e| ApplyError::Metadata(format!("unmerge_entity: {e}")))?;
@@ -450,9 +497,182 @@ mod tests {
             reason: 0,
             at_unix_nanos: 1_700_000_001_000,
         };
+        // The write must carry the SAME scope the entity was seeded under
+        // (`__ts()`); the apply-layer tenant wall now rejects a mismatch.
+        let ts = __ts();
+        let scoped_write = Write::single(
+            WriteId::new(),
+            ts.space(),
+            Phase::ReclaimSlots { slots: Vec::new() },
+        )
+        .with_namespace(ts.namespace());
         let wtxn = db.write_txn().unwrap();
-        let ack = apply_tombstone_entity(&wtxn, &phase, &empty_write()).unwrap();
+        let ack = apply_tombstone_entity(&wtxn, &phase, &scoped_write).unwrap();
         assert!(matches!(ack, PhaseAck::Tombstoned { .. }));
         wtxn.commit().unwrap();
+    }
+}
+
+#[cfg(all(test, not(miri)))]
+mod tenant_wall_tests {
+    //! Cross-tenant write isolation for the entity apply path. A caller
+    //! in tenant B must not tombstone / update / rename / merge an entity
+    //! owned by tenant A; the mutation reads as NotFound and A's row is
+    //! left untouched.
+    use super::*;
+    use brain_core::EntityType;
+    use brain_metadata::entity::merge::MergeActor;
+    use brain_metadata::entity::ops::{entity_get, entity_put, normalize_name};
+    use brain_metadata::{MetadataDb, RowScope};
+    use tempfile::TempDir;
+
+    use crate::write::{Phase, TombstoneTarget, Write, WriteId};
+
+    const NOW: u64 = 1_700_000_000_000_000_000;
+
+    fn scope_a() -> RowScope {
+        RowScope::from_bytes(1, [0xA1; 16])
+    }
+    fn scope_b() -> RowScope {
+        RowScope::from_bytes(2, [0xB2; 16])
+    }
+
+    fn open_db() -> (TempDir, MetadataDb) {
+        let dir = TempDir::new().unwrap();
+        let db = MetadataDb::open(dir.path().join("meta.redb")).unwrap();
+        (dir, db)
+    }
+
+    fn write_for(scope: RowScope, phase: Phase) -> Write {
+        Write::single(WriteId::new(), scope.space(), phase).with_namespace(scope.namespace())
+    }
+
+    fn seed_entity(db: &MetadataDb, scope: RowScope, name: &str) -> EntityId {
+        let id = EntityId::new();
+        let e = Entity::new_active(
+            id,
+            EntityType::PERSON_ID,
+            name.into(),
+            normalize_name(name),
+            NOW,
+        );
+        let wtxn = db.write_txn().unwrap();
+        entity_put(&wtxn, scope, brain_core::SessionId::DEFAULT, &e).unwrap();
+        wtxn.commit().unwrap();
+        id
+    }
+
+    #[test]
+    fn cross_tenant_tombstone_denied_and_row_untouched() {
+        let (_dir, db) = open_db();
+        let id = seed_entity(&db, scope_a(), "Alice");
+        let phase = Phase::Tombstone {
+            target: TombstoneTarget::Entity(id),
+            reason: 1,
+            at_unix_nanos: NOW + 1_000,
+        };
+        let wtxn = db.write_txn().unwrap();
+        let err = apply_tombstone_entity(&wtxn, &phase, &write_for(scope_b(), phase.clone()))
+            .expect_err("tenant B must not tombstone tenant A's entity");
+        assert!(matches!(err, ApplyError::NotFound { what: "entity", .. }));
+        drop(wtxn);
+
+        let rtxn = db.read_txn().unwrap();
+        let got = entity_get(&rtxn, id).unwrap().expect("A's entity present");
+        assert_eq!(
+            got.flags & brain_metadata::tables::entity::flags::TOMBSTONED,
+            0
+        );
+    }
+
+    #[test]
+    fn cross_tenant_update_denied_and_row_untouched() {
+        let (_dir, db) = open_db();
+        let id = seed_entity(&db, scope_a(), "Alice");
+        let phase = Phase::UpdateEntity {
+            id,
+            canonical_name: "Mallory".into(),
+            aliases: Vec::new(),
+            attributes_blob: Vec::new(),
+            at_unix_nanos: NOW + 1_000,
+        };
+        let wtxn = db.write_txn().unwrap();
+        let err = apply_update_entity(&wtxn, &phase, &write_for(scope_b(), phase.clone()))
+            .expect_err("tenant B must not update tenant A's entity");
+        assert!(matches!(err, ApplyError::NotFound { what: "entity", .. }));
+        drop(wtxn);
+
+        let rtxn = db.read_txn().unwrap();
+        let got = entity_get(&rtxn, id).unwrap().unwrap();
+        assert_eq!(got.canonical_name, "Alice", "A's name must be unchanged");
+    }
+
+    #[test]
+    fn cross_tenant_rename_denied_and_row_untouched() {
+        let (_dir, db) = open_db();
+        let id = seed_entity(&db, scope_a(), "Alice");
+        let phase = Phase::RenameEntity {
+            id,
+            new_canonical_name: "Mallory".into(),
+            at_unix_nanos: NOW + 1_000,
+        };
+        let wtxn = db.write_txn().unwrap();
+        let err = apply_rename_entity(&wtxn, &phase, &write_for(scope_b(), phase.clone()))
+            .expect_err("tenant B must not rename tenant A's entity");
+        assert!(matches!(err, ApplyError::NotFound { what: "entity", .. }));
+        drop(wtxn);
+
+        let rtxn = db.read_txn().unwrap();
+        let got = entity_get(&rtxn, id).unwrap().unwrap();
+        assert_eq!(got.canonical_name, "Alice");
+    }
+
+    #[test]
+    fn cross_tenant_merge_denied_and_rows_untouched() {
+        let (_dir, db) = open_db();
+        let survivor = seed_entity(&db, scope_a(), "Alice");
+        let merged = seed_entity(&db, scope_a(), "Alicia");
+        let phase = Phase::MergeEntities {
+            source: merged,
+            target: survivor,
+            retain_aliases: true,
+            retain_attributes: true,
+            at_unix_nanos: NOW + 1_000,
+            confidence: 0.95,
+            reason: "b-initiated".into(),
+            actor: MergeActor::Space(scope_b().space_id_bytes),
+            grace_seconds: 7 * 24 * 60 * 60,
+        };
+        let wtxn = db.write_txn().unwrap();
+        let err = apply_merge_entities(&wtxn, &phase, &write_for(scope_b(), phase.clone()))
+            .expect_err("tenant B must not merge tenant A's entities");
+        assert!(matches!(err, ApplyError::NotFound { what: "entity", .. }));
+        drop(wtxn);
+
+        let rtxn = db.read_txn().unwrap();
+        let got = entity_get(&rtxn, merged).unwrap().unwrap();
+        assert!(got.merged_into.is_none(), "A's entity must not be merged");
+    }
+
+    #[test]
+    fn same_tenant_tombstone_succeeds() {
+        let (_dir, db) = open_db();
+        let id = seed_entity(&db, scope_a(), "Alice");
+        let phase = Phase::Tombstone {
+            target: TombstoneTarget::Entity(id),
+            reason: 1,
+            at_unix_nanos: NOW + 1_000,
+        };
+        let wtxn = db.write_txn().unwrap();
+        apply_tombstone_entity(&wtxn, &phase, &write_for(scope_a(), phase.clone()))
+            .expect("same-tenant tombstone must succeed");
+        wtxn.commit().unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        let got = entity_get(&rtxn, id).unwrap().unwrap();
+        assert_ne!(
+            got.flags & brain_metadata::tables::entity::flags::TOMBSTONED,
+            0
+        );
     }
 }

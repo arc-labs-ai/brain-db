@@ -20,7 +20,9 @@ pub struct ConnectorRequest {
     /// "the past 24 hours").
     pub since_unix_nanos: Option<u64>,
     /// Hard cap on items returned. The host treats more than this as a
-    /// contract violation.
+    /// contract violation and enforces it itself: `fetch_from_connector`
+    /// truncates any excess (fail-open) so an over-eager or hostile
+    /// connector cannot flood the encode pipeline.
     pub max_items: u32,
 }
 

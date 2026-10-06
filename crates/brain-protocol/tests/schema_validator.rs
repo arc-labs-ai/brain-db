@@ -53,6 +53,7 @@ fn duplicate_entity_type_fails() {
 fn duplicate_predicate_fails() {
     let p = || {
         SchemaItem::Predicate(PredicateDef {
+            subject: None,
             name: "prefers".into(),
             kind: StatementKindAst::Preference,
             object: ObjectTypeDecl::Value {
@@ -60,6 +61,7 @@ fn duplicate_predicate_fails() {
             },
             stateful: None,
             description: None,
+            retention: None,
         })
     };
     let s = s_with_items(vec![p(), p()]);
@@ -84,6 +86,7 @@ fn unresolved_relation_from_type_fails() {
 #[test]
 fn preference_entity_object_mismatches() {
     let p = SchemaItem::Predicate(PredicateDef {
+        subject: None,
         name: "prefers".into(),
         kind: StatementKindAst::Preference,
         object: ObjectTypeDecl::Entity {
@@ -91,6 +94,7 @@ fn preference_entity_object_mismatches() {
         },
         stateful: None,
         description: None,
+        retention: None,
     });
     let s = s_with_items(vec![person_entity(), p]);
     assert_has_code(&s, ValidationErrorCode::PredicateKindObjectMismatch);
@@ -99,11 +103,13 @@ fn preference_entity_object_mismatches() {
 #[test]
 fn event_statement_object_mismatches() {
     let p = SchemaItem::Predicate(PredicateDef {
+        subject: None,
         name: "scheduled".into(),
         kind: StatementKindAst::Event,
         object: ObjectTypeDecl::Statement,
         stateful: None,
         description: None,
+        retention: None,
     });
     let s = s_with_items(vec![p]);
     assert_has_code(&s, ValidationErrorCode::PredicateKindObjectMismatch);

@@ -295,6 +295,11 @@ struct AnthropicResponseBody {
     model: String,
     content: Vec<AnthropicContent>,
     usage: AnthropicUsage,
+    /// `"end_turn"` on a clean finish, `"max_tokens"` when the output
+    /// hit the ceiling. Optional so an unexpected/absent value reads as
+    /// NOT truncated rather than masking a real schema failure.
+    #[serde(default)]
+    stop_reason: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -347,6 +352,8 @@ fn decode_anthropic_response(
         + payload.usage.output_tokens * PRICE_OUTPUT_PER_TOKEN_DEFAULT
         + payload.usage.cache_creation_input_tokens * PRICE_CACHE_WRITE_PER_TOKEN_DEFAULT;
 
+    let truncated = payload.stop_reason.as_deref() == Some("max_tokens");
+
     Ok(LlmResponse {
         content,
         tokens_in: payload.usage.input_tokens,
@@ -355,6 +362,7 @@ fn decode_anthropic_response(
         cache_read_input_tokens: payload.usage.cache_read_input_tokens,
         cost_micro_usd,
         model_version: payload.model,
+        truncated,
     })
 }
 
@@ -535,6 +543,7 @@ mod tests {
     #[test]
     fn decode_response_joins_text_blocks_and_computes_cost() {
         let payload = AnthropicResponseBody {
+            stop_reason: None,
             model: "claude-haiku-4-5-20240307".into(),
             content: vec![
                 AnthropicContent {
@@ -619,6 +628,7 @@ mod tests {
     #[test]
     fn decode_response_skips_non_text_blocks() {
         let payload = AnthropicResponseBody {
+            stop_reason: None,
             model: "m".into(),
             content: vec![
                 AnthropicContent {
@@ -645,6 +655,7 @@ mod tests {
     #[test]
     fn decode_response_errors_when_no_text_blocks() {
         let payload = AnthropicResponseBody {
+            stop_reason: None,
             model: "m".into(),
             content: vec![AnthropicContent {
                 kind: "tool_use".into(),
@@ -664,6 +675,7 @@ mod tests {
     #[test]
     fn cache_hit_ratio_handles_zero_total() {
         let mut r = LlmResponse {
+            truncated: false,
             content: "x".into(),
             tokens_in: 0,
             tokens_out: 0,

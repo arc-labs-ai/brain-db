@@ -69,3 +69,23 @@ pub const DEFAULT_GLINER_THRESHOLD: f32 = 0.5;
 pub(super) fn simple_label(qname: &str) -> &str {
     qname.split_once(':').map(|(_, rest)| rest).unwrap_or(qname)
 }
+
+/// The label text GLiNER sees for a type qname: the simple name with its
+/// camel-case words split (`brain:CloneEnv` → `Clone Env`). A zero-shot
+/// tagger matches labels as natural language; `CloneEnv` / `EvalRun` are
+/// near-meaningless tokens to it, so custom schema types were never tagged.
+/// Single-word names (`Person`, `Organization`) come through unchanged, so
+/// the built-in labels — and their behaviour — are untouched.
+pub(super) fn gliner_label(qname: &str) -> String {
+    let simple = simple_label(qname);
+    let mut out = String::with_capacity(simple.len() + 4);
+    let mut prev: Option<char> = None;
+    for c in simple.chars() {
+        if c.is_uppercase() && prev.is_some_and(|p| p.is_lowercase() || p.is_ascii_digit()) {
+            out.push(' ');
+        }
+        out.push(if c == '_' { ' ' } else { c });
+        prev = Some(c);
+    }
+    out
+}

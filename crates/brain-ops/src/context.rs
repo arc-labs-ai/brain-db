@@ -16,13 +16,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use brain_extractors::{ClassifierConfig, ExtractorRegistry};
-use brain_index::{GraphRetriever, LexicalRetriever, SemanticRetriever, TantivyShard};
+use brain_index::{
+    EntityVectorIndex, GraphRetriever, LexicalRetriever, SemanticRetriever, TantivyShard,
+};
 use brain_metadata::LlmCacheDb;
 use brain_planner::{ExecutorContext, PlannerContext};
 use brain_rerank::RerankService;
 use parking_lot::{Mutex, RwLock};
 
 use crate::index::text_indexer::{MemoryTextDispatcher, StatementTextDispatcher};
+use crate::metrics::{QueryMetrics, RetrieverMetrics};
 use crate::state::access_buffer::AccessBuffer;
 use crate::subscribe::{EventBus, EventEnvelope, SubscriptionRegistry};
 use crate::txn::TxnStore;
@@ -96,9 +99,24 @@ pub struct OpsContext {
     /// Inner executor context — embedder, index, metadata, writer.
     /// Handlers borrow this to call brain-planner's `execute_*`.
     pub executor: ExecutorContext,
+    /// Wire-level session that issued **this request**, stamped
+    /// per-request by `brain-ops::dispatch` from the authenticated
+    /// caller. Transaction handlers compare it against the opener's
+    /// `TxnEntry::connection_id` so only the connection that opened a
+    /// txn can read its pending writes, buffer into it, or commit/abort
+    /// it. All-zero means "no session" (in-process test path); a txn
+    /// opened without a session imposes no ownership binding.
+    pub caller_connection_id: [u8; 16],
     /// Planner-side config + budgets. Defaults are fine for v1; the
     /// builder is here so the server can override budgets at startup.
     pub planner_ctx: PlannerContext,
+    /// How many shards this deployment runs.
+    ///
+    /// A handler only ever sees its own shard's data, so this is what
+    /// lets a per-shard answer say whether it is the WHOLE answer:
+    /// `SPACE_LIST` is complete at `1` and partial above it. Defaults to
+    /// `1`; the shard-spawn path overrides it with the real count.
+    pub shard_count: usize,
     /// Per-shard transaction registry.
     pub txn_store: Arc<TxnStore>,
     /// Per-shard change-feed bus. Cross-shard fan-out is the
@@ -173,6 +191,11 @@ pub struct OpsContext {
     /// the moment the shard spawns; the retriever just dispatches
     /// into it.
     pub graph_retriever: Arc<dyn GraphRetriever>,
+    /// Per-shard entity vector index for the resolver's tier-3 embedding
+    /// tie-break. `None` until the shard-spawn path wires it via
+    /// [`OpsContext::with_entity_vector_index`]; when absent the resolver
+    /// skips tier 3 and falls through to the create fallback.
+    pub entity_vector_index: Option<Arc<dyn EntityVectorIndex>>,
     /// Per-shard cross-encoder (W2.2 rerank pass). Shared across
     /// shards because the model is read-only and CPU-heavy.
     ///
@@ -203,6 +226,18 @@ pub struct OpsContext {
     /// commit and WAL append loses the matching subscribe event for
     /// that op, not the underlying typed-graph data.
     pub wal_sink: Option<Arc<dyn WalSink>>,
+    /// Per-shard read-path retriever metric family. Shared by `Arc`
+    /// with `brain-server`'s `/metrics` exposition. The RECALL handler
+    /// records per-lane invocations / candidates / latency here after
+    /// `execute` returns — the hot fan-out loop is untouched. Always
+    /// present (recall runs on every shard); tests get a fresh zeroed
+    /// instance.
+    pub retriever_metrics: Arc<RetrieverMetrics>,
+    /// Per-shard end-to-end RECALL metric family. Same shared-by-`Arc`
+    /// shape as [`Self::retriever_metrics`]; recorded once per served
+    /// recall with the end-to-end latency, effective fusion `k`, rerank
+    /// flag, and answer shape.
+    pub query_metrics: Arc<QueryMetrics>,
 }
 
 impl OpsContext {
@@ -221,7 +256,9 @@ impl OpsContext {
         let subscriptions = Arc::new(SubscriptionRegistry::new(events.clone()));
         Self {
             executor,
+            caller_connection_id: [0u8; 16],
             planner_ctx: PlannerContext::default(),
+            shard_count: 1,
             txn_store: Arc::new(TxnStore::new()),
             events,
             subscriptions,
@@ -238,9 +275,36 @@ impl OpsContext {
             lexical_retriever,
             semantic_retriever,
             graph_retriever,
+            entity_vector_index: None,
             cross_encoder: CrossEncoderSlot::Disabled,
             wal_sink: None,
+            retriever_metrics: Arc::new(RetrieverMetrics::new()),
+            query_metrics: Arc::new(QueryMetrics::new()),
         }
+    }
+
+    /// Record the deployment's shard count. Set once by the shard-spawn
+    /// path. `0` is coerced to `1`: a listing is never "complete across
+    /// zero shards", and the value is only ever compared against 1.
+    #[must_use]
+    pub fn with_shard_count(mut self, count: usize) -> Self {
+        self.shard_count = count.max(1);
+        self
+    }
+
+    /// Whether a single-shard answer covers the whole deployment.
+    #[must_use]
+    pub fn single_shard_deployment(&self) -> bool {
+        single_shard_deployment(self.shard_count)
+    }
+
+    /// Wire the per-shard entity vector index for the resolver's tier-3
+    /// embedding tie-break. The shard-spawn path calls this with an adapter
+    /// over its `EntityHnswIndex`; left unset (tests), tier 3 is skipped.
+    #[must_use]
+    pub fn with_entity_vector_index(mut self, index: Arc<dyn EntityVectorIndex>) -> Self {
+        self.entity_vector_index = Some(index);
+        self
     }
 
     /// Override the bounded poll window for the one-shot subscribe
@@ -270,6 +334,17 @@ impl OpsContext {
     #[must_use]
     pub fn with_txn_store(mut self, store: Arc<TxnStore>) -> Self {
         self.txn_store = store;
+        self
+    }
+
+    /// Stamp the per-request wire-level session id. Called by
+    /// `brain-ops::dispatch` from the authenticated caller so the
+    /// transaction handlers can enforce connection ownership on every
+    /// in-txn op. Tests set it directly to simulate distinct
+    /// connections.
+    #[must_use]
+    pub fn with_caller_connection_id(mut self, connection_id: [u8; 16]) -> Self {
+        self.caller_connection_id = connection_id;
         self
     }
 
@@ -393,6 +468,22 @@ impl OpsContext {
     #[must_use]
     pub fn with_wal_sink(mut self, sink: Option<Arc<dyn WalSink>>) -> Self {
         self.wal_sink = sink;
+        self
+    }
+
+    /// Install the shared read-path metric families. The server calls
+    /// this once at shard startup with the same `Arc`s it stashes on
+    /// the `ShardHandle`, so the RECALL handler and `/metrics`
+    /// exposition observe one counter set. Tests that don't care keep
+    /// the fresh zeroed instances from [`Self::new`].
+    #[must_use]
+    pub fn with_recall_metrics(
+        mut self,
+        retriever_metrics: Arc<RetrieverMetrics>,
+        query_metrics: Arc<QueryMetrics>,
+    ) -> Self {
+        self.retriever_metrics = retriever_metrics;
+        self.query_metrics = query_metrics;
         self
     }
 
@@ -536,4 +627,36 @@ impl OpsContext {
 
 fn now_unix_nanos_ctx() -> u64 {
     crate::clock::now_unix_nanos()
+}
+
+/// Whether a listing produced by one shard covers the whole deployment.
+///
+/// The rule behind `SPACE_LIST.cross_shard_complete`. A free function so
+/// it is stated once and testable without standing up an `OpsContext`.
+/// `0` reads as `1`: a misconfigured shard count must not make every
+/// listing claim completeness across nothing.
+#[must_use]
+pub fn single_shard_deployment(shard_count: usize) -> bool {
+    shard_count.max(1) <= 1
+}
+
+#[cfg(test)]
+mod shard_count_tests {
+    use super::single_shard_deployment;
+
+    /// This must be a real function of the deployment, not a constant — a
+    /// flag that never changes teaches every caller to ignore it, which is
+    /// how the hardcoded `false` managed to be both wrong on single-shard
+    /// deployments and useless on multi-shard ones.
+    #[test]
+    fn one_shard_is_complete_and_more_than_one_is_not() {
+        assert!(single_shard_deployment(1));
+        assert!(!single_shard_deployment(2));
+        assert!(!single_shard_deployment(64));
+    }
+
+    #[test]
+    fn zero_shards_reads_as_one() {
+        assert!(single_shard_deployment(0));
+    }
 }

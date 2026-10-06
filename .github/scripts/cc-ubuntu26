@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Glommio 0.9.0's bundled liburing header needs linux/openat2.h on Ubuntu
+# 26.04. Do not add it to assembly compilations: crates such as blake3 pass
+# their .S files through the same CC environment, and the C header is invalid
+# assembly input.
+for arg in "$@"; do
+    case "$arg" in
+        *.S|*.s|*.asm)
+            exec /usr/bin/cc "$@"
+            ;;
+    esac
+done
+
+exec /usr/bin/cc -include linux/openat2.h "$@"

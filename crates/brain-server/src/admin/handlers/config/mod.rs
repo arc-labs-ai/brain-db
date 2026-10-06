@@ -2,8 +2,11 @@
 //!
 //! Routes:
 //! - `GET /v1/config[?key=a.b.c]` → 200 + JSON (whole config or subtree).
-//! - `POST /v1/config/reload` → 501 (no live-reload pathway yet).
-//! - `POST /v1/config?key=…` → 501 (no editable in-memory store).
+//! - `POST /v1/config/reload` → 200 + JSON summary. Re-reads the config
+//!   file and applies the live-safe subset (log level); reports every
+//!   other changed key under `requires_restart`.
+//! - `POST /v1/config?key=…&value=…` → 200 for the one runtime-settable
+//!   key (`monitoring.logging.level`); 501 for boot-fixed keys.
 
 mod get;
 mod reload;

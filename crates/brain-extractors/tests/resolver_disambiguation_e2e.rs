@@ -90,6 +90,7 @@ impl LlmClient for FakeDisambiguator {
         let content = self.reply.clone();
         Box::pin(async move {
             Ok(LlmResponse {
+                truncated: false,
                 content,
                 tokens_in: 0,
                 tokens_out: 0,

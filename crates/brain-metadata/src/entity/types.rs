@@ -4,16 +4,28 @@
 //! [`crate::relation::types`]; every entity-type registration flows
 //! through the shared apply path.
 //!
-//! Entity types don't have a `(namespace, name)` qname today —
-//! `Person` lives at the bare name "Person" with the implicit
-//! `brain:` namespace. The on-disk row layout pre-dates the namespace
-//! scheme; widening it to a per-namespace ID space is a future
-//! migration concern. For now the registry is keyed on bare `name`.
+//! Entity types are scoped by `(namespace_id, name)`.
+//!
+//! They used to be keyed on bare `name` alone, globally, which made the
+//! registry a shared space every tenant wrote into: two namespaces
+//! declaring `Builder` either silently shared one definition (identical
+//! blobs) or the SECOND upload failed with `AlreadyExists` naming a type
+//! the operator never declared. Built-ins (`Person`, `Organization`, …)
+//! stay under `NamespaceId::SYSTEM` and remain visible to every tenant,
+//! so a namespace resolves its own name first and falls back to the
+//! shared one.
+//!
+//! The LABEL surface is deliberately unchanged: types are still offered
+//! to the classifier as `brain:<Name>` regardless of owner, because that
+//! is the format the classifier was tuned against. Scoping is a registry
+//! concern, not a prompt one.
 
 use brain_core::EntityTypeId;
 use redb::{ReadTransaction, ReadableTable, WriteTransaction};
 
-use crate::tables::entity_type::{EntityTypeDefinition, ENTITY_TYPES_TABLE};
+use crate::tables::entity_type::{
+    EntityTypeDefinition, ENTITY_TYPES_BY_SCOPE_TABLE, ENTITY_TYPES_TABLE,
+};
 
 #[derive(thiserror::Error, Debug)]
 pub enum EntityTypeOpError {
@@ -32,40 +44,90 @@ pub enum EntityTypeOpError {
     },
 }
 
-/// Look up an entity_type by its bare `name`. Linear scan; the
-/// registry is small (≤ a few hundred entries in any v1
-/// deployment). Returns `Ok(None)` if not found.
-pub fn entity_type_lookup_by_name(
+/// The system namespace that owns the built-in entity types.
+const SYSTEM_NS: u32 = brain_core::NamespaceId::SYSTEM.raw();
+
+/// Look up an entity_type visible to `namespace_id`: the namespace's own
+/// declaration first, then the shared system built-in.
+///
+/// The two-step is the whole point of scoping. A tenant that declares
+/// `Person` gets THEIR `Person`; one that never did still sees the
+/// built-in. Checking the system namespace first would let a built-in
+/// name quietly shadow a tenant's own declaration of it.
+pub fn entity_type_lookup(
     wtxn: &WriteTransaction,
+    namespace_id: u32,
     name: &str,
 ) -> Result<Option<EntityTypeDefinition>, EntityTypeOpError> {
-    let t = wtxn.open_table(ENTITY_TYPES_TABLE)?;
-    for entry in t.iter()? {
-        let (_k, v) = entry?;
-        let row = v.value();
-        if row.name == name {
-            return Ok(Some(row));
+    for ns in scope_chain(namespace_id) {
+        if let Some(id) = scope_index_get(wtxn, ns, name)? {
+            let t = wtxn.open_table(ENTITY_TYPES_TABLE)?;
+            // Bind before testing so the get-guard's borrow of `t` drops at
+            // the semicolon, ahead of `t` itself.
+            let row = t.get(&id)?.map(|g| g.value());
+            if let Some(row) = row {
+                return Ok(Some(row));
+            }
         }
     }
     Ok(None)
 }
 
-/// Read-only counterpart to [`entity_type_lookup_by_name`]. Used by
-/// the schema-upload pre-flight to classify each declared entity_type
-/// as new/idempotent/conflict without opening a write transaction.
-pub fn entity_type_lookup_by_name_rtxn(
+/// Read-only counterpart to [`entity_type_lookup`]. Used by the
+/// schema-upload pre-flight to classify each declared entity_type as
+/// new/idempotent/conflict without opening a write transaction.
+pub fn entity_type_lookup_rtxn(
     rtxn: &ReadTransaction,
+    namespace_id: u32,
     name: &str,
 ) -> Result<Option<EntityTypeDefinition>, EntityTypeOpError> {
-    let t = rtxn.open_table(ENTITY_TYPES_TABLE)?;
-    for entry in t.iter()? {
-        let (_k, v) = entry?;
-        let row = v.value();
-        if row.name == name {
-            return Ok(Some(row));
+    let idx = rtxn.open_table(ENTITY_TYPES_BY_SCOPE_TABLE)?;
+    let types = rtxn.open_table(ENTITY_TYPES_TABLE)?;
+    for ns in scope_chain(namespace_id) {
+        let id = idx.get(&(ns, name))?.map(|g| g.value());
+        if let Some(id) = id {
+            let row = types.get(&id)?.map(|g| g.value());
+            if let Some(row) = row {
+                return Ok(Some(row));
+            }
         }
     }
     Ok(None)
+}
+
+/// The display name of an entity type, by id.
+///
+/// Exists for error and log messages. A type violation that prints
+/// `EntityTypeId(9) but ... is EntityTypeId(8)` is technically complete and
+/// practically unreadable: the operator has to query the registry to learn
+/// which schema rule they broke. The ids are the durable key; the name is
+/// what makes the message actionable.
+pub fn entity_type_name_by_id(
+    wtxn: &WriteTransaction,
+    id: EntityTypeId,
+) -> Result<Option<String>, EntityTypeOpError> {
+    let t = wtxn.open_table(ENTITY_TYPES_TABLE)?;
+    let name = t.get(&id.raw())?.map(|g| g.value().name);
+    Ok(name)
+}
+
+/// The namespaces a lookup consults, in order: the caller's own, then
+/// the shared system namespace. A system-namespace caller consults it
+/// once, not twice.
+fn scope_chain(namespace_id: u32) -> impl Iterator<Item = u32> {
+    let own = std::iter::once(namespace_id);
+    let system = (namespace_id != SYSTEM_NS).then_some(SYSTEM_NS);
+    own.chain(system)
+}
+
+fn scope_index_get(
+    wtxn: &WriteTransaction,
+    namespace_id: u32,
+    name: &str,
+) -> Result<Option<u32>, EntityTypeOpError> {
+    let idx = wtxn.open_table(ENTITY_TYPES_BY_SCOPE_TABLE)?;
+    let got = idx.get(&(namespace_id, name))?.map(|g| g.value());
+    Ok(got)
 }
 
 /// Snapshot the active entity-type names as zero-shot classifier labels —
@@ -126,18 +188,30 @@ pub fn render_declared_entity_types_block(
 /// gets id `1` because it's the first item in the system schema
 pub fn entity_type_intern(
     wtxn: &WriteTransaction,
+    namespace_id: u32,
     name: &str,
     schema_blob: Vec<u8>,
     now_unix_nanos: u64,
 ) -> Result<EntityTypeId, EntityTypeOpError> {
-    if let Some(existing) = entity_type_lookup_by_name(wtxn, name)? {
-        if existing.schema_blob == schema_blob {
-            return Ok(existing.id());
+    // Only this namespace's OWN row can conflict. A built-in of the same
+    // name is not a conflict — declaring `Person` in your namespace is a
+    // legitimate override, and before scoping it was an error naming a
+    // type the operator had never written.
+    if let Some(id) = scope_index_get(wtxn, namespace_id, name)? {
+        let existing = {
+            let t = wtxn.open_table(ENTITY_TYPES_TABLE)?;
+            let row = t.get(&id)?.map(|g| g.value());
+            row
+        };
+        if let Some(existing) = existing {
+            if existing.schema_blob == schema_blob {
+                return Ok(existing.id());
+            }
+            return Err(EntityTypeOpError::AlreadyExists {
+                name: name.to_string(),
+                existing_id: existing.id(),
+            });
         }
-        return Err(EntityTypeOpError::AlreadyExists {
-            name: name.to_string(),
-            existing_id: existing.id(),
-        });
     }
 
     // Fresh registration.
@@ -156,6 +230,7 @@ pub fn entity_type_intern(
 
     let row = EntityTypeDefinition::new(
         EntityTypeId::from(next_id_raw),
+        namespace_id,
         name.to_string(),
         schema_blob,
         now_unix_nanos,
@@ -163,6 +238,10 @@ pub fn entity_type_intern(
     {
         let mut t = wtxn.open_table(ENTITY_TYPES_TABLE)?;
         t.insert(&row.entity_type_id, &row)?;
+    }
+    {
+        let mut idx = wtxn.open_table(ENTITY_TYPES_BY_SCOPE_TABLE)?;
+        idx.insert(&(namespace_id, name), &row.entity_type_id)?;
     }
     Ok(EntityTypeId::from(next_id_raw))
 }
@@ -175,6 +254,12 @@ mod tests {
 
     const NOW: u64 = 1_700_000_000_000_000_000;
 
+    fn open_db() -> (tempfile::TempDir, redb::Database) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(&dir);
+        (dir, db)
+    }
+
     #[test]
     fn render_block_lists_labels_sorted_with_brain_prefix() {
         let dir = tempfile::tempdir().unwrap();
@@ -182,9 +267,30 @@ mod tests {
         {
             let wtxn = db.begin_write().unwrap();
             // Intern out of lexical order so the sort is exercised.
-            entity_type_intern(&wtxn, "Person", Vec::new(), NOW).unwrap();
-            entity_type_intern(&wtxn, "Drug", Vec::new(), NOW).unwrap();
-            entity_type_intern(&wtxn, "Organization", Vec::new(), NOW).unwrap();
+            entity_type_intern(
+                &wtxn,
+                brain_core::NamespaceId::SYSTEM.raw(),
+                "Person",
+                Vec::new(),
+                NOW,
+            )
+            .unwrap();
+            entity_type_intern(
+                &wtxn,
+                brain_core::NamespaceId::SYSTEM.raw(),
+                "Drug",
+                Vec::new(),
+                NOW,
+            )
+            .unwrap();
+            entity_type_intern(
+                &wtxn,
+                brain_core::NamespaceId::SYSTEM.raw(),
+                "Organization",
+                Vec::new(),
+                NOW,
+            )
+            .unwrap();
             wtxn.commit().unwrap();
         }
         let rtxn = db.begin_read().unwrap();
@@ -216,5 +322,148 @@ mod tests {
         assert!(render_declared_entity_types_block(&rtxn)
             .unwrap()
             .is_empty());
+    }
+
+    // ── tenant isolation ────────────────────────────────────────────────
+
+    const ACME: u32 = 7;
+    const GLOBEX: u32 = 8;
+
+    #[test]
+    fn two_tenants_may_declare_the_same_type_name() {
+        // The reported bug: entity types lived in one global name space.
+        // Globex declaring `Builder` after Acme did either silently reused
+        // Acme's definition or failed with `AlreadyExists` naming a type
+        // Globex had never written.
+        let (_dir, db) = open_db();
+        let wtxn = db.begin_write().unwrap();
+        let acme_id = entity_type_intern(&wtxn, ACME, "Builder", vec![1], NOW).unwrap();
+        let globex_id = entity_type_intern(&wtxn, GLOBEX, "Builder", vec![2, 2], NOW).unwrap();
+        wtxn.commit().unwrap();
+
+        assert_ne!(
+            acme_id, globex_id,
+            "same name in two tenants must be two rows"
+        );
+
+        let wtxn = db.begin_write().unwrap();
+        assert_eq!(
+            entity_type_lookup(&wtxn, ACME, "Builder")
+                .unwrap()
+                .unwrap()
+                .schema_blob,
+            vec![1]
+        );
+        assert_eq!(
+            entity_type_lookup(&wtxn, GLOBEX, "Builder")
+                .unwrap()
+                .unwrap()
+                .schema_blob,
+            vec![2, 2]
+        );
+    }
+
+    #[test]
+    fn re_declaring_your_own_type_identically_is_idempotent() {
+        let (_dir, db) = open_db();
+        let wtxn = db.begin_write().unwrap();
+        let first = entity_type_intern(&wtxn, ACME, "Builder", vec![1], NOW).unwrap();
+        let again = entity_type_intern(&wtxn, ACME, "Builder", vec![1], NOW).unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(
+            first, again,
+            "re-uploading an unchanged schema must not mint"
+        );
+    }
+
+    #[test]
+    fn redeclaring_your_own_type_differently_still_conflicts() {
+        // Scoping must not weaken the guard WITHIN a tenant: changing a
+        // type's definition under the same name is still a conflict the
+        // operator has to resolve, just no longer one another tenant can
+        // cause.
+        let (_dir, db) = open_db();
+        let wtxn = db.begin_write().unwrap();
+        entity_type_intern(&wtxn, ACME, "Builder", vec![1], NOW).unwrap();
+        let err = entity_type_intern(&wtxn, ACME, "Builder", vec![9], NOW).unwrap_err();
+        assert!(
+            matches!(err, EntityTypeOpError::AlreadyExists { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn builtins_are_visible_to_every_tenant() {
+        let (_dir, db) = open_db();
+        let wtxn = db.begin_write().unwrap();
+        let person = entity_type_intern(&wtxn, SYSTEM_NS, "Person", Vec::new(), NOW).unwrap();
+        wtxn.commit().unwrap();
+
+        let wtxn = db.begin_write().unwrap();
+        for ns in [ACME, GLOBEX] {
+            assert_eq!(
+                entity_type_lookup(&wtxn, ns, "Person")
+                    .unwrap()
+                    .unwrap()
+                    .id(),
+                person,
+                "a tenant that declared nothing still sees the built-ins",
+            );
+        }
+    }
+
+    #[test]
+    fn a_tenants_own_type_shadows_the_builtin_of_the_same_name() {
+        // Own-namespace-first ordering. If the system namespace were
+        // consulted first, declaring `Person` would appear to succeed and
+        // then silently resolve to the built-in forever.
+        let (_dir, db) = open_db();
+        let wtxn = db.begin_write().unwrap();
+        let builtin = entity_type_intern(&wtxn, SYSTEM_NS, "Person", Vec::new(), NOW).unwrap();
+        let own = entity_type_intern(&wtxn, ACME, "Person", vec![42], NOW).unwrap();
+        wtxn.commit().unwrap();
+        assert_ne!(builtin, own);
+
+        let wtxn = db.begin_write().unwrap();
+        assert_eq!(
+            entity_type_lookup(&wtxn, ACME, "Person")
+                .unwrap()
+                .unwrap()
+                .id(),
+            own
+        );
+        assert_eq!(
+            entity_type_lookup(&wtxn, GLOBEX, "Person")
+                .unwrap()
+                .unwrap()
+                .id(),
+            builtin
+        );
+    }
+
+    #[test]
+    fn read_txn_lookup_agrees_with_write_txn_lookup() {
+        // The pre-flight classifier uses the rtxn variant; if the two
+        // disagreed, an upload could pass pre-flight and then conflict.
+        let (_dir, db) = open_db();
+        let wtxn = db.begin_write().unwrap();
+        entity_type_intern(&wtxn, SYSTEM_NS, "Person", Vec::new(), NOW).unwrap();
+        let own = entity_type_intern(&wtxn, ACME, "Builder", vec![1], NOW).unwrap();
+        wtxn.commit().unwrap();
+
+        let rtxn = db.begin_read().unwrap();
+        assert_eq!(
+            entity_type_lookup_rtxn(&rtxn, ACME, "Builder")
+                .unwrap()
+                .unwrap()
+                .id(),
+            own
+        );
+        assert!(entity_type_lookup_rtxn(&rtxn, GLOBEX, "Builder")
+            .unwrap()
+            .is_none());
+        assert!(entity_type_lookup_rtxn(&rtxn, GLOBEX, "Person")
+            .unwrap()
+            .is_some());
     }
 }

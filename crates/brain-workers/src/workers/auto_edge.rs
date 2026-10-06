@@ -48,7 +48,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use brain_core::{EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NodeRef, SessionId, SpaceId};
+use brain_core::{
+    EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NamespaceId, NodeRef, RequestId, SessionId,
+    SpaceId,
+};
 use brain_metadata::tables::edge::{
     derived_by, list_memory_edges_from, origin, zero_disambiguator,
 };
@@ -62,11 +65,18 @@ use brain_protocol::shared::enums::{
 use futures_lite::FutureExt;
 use glommio::timer::sleep;
 use tracing::{trace, warn};
+use uuid::Uuid;
 
 use crate::config::{WorkerConfig, WorkerKind};
 use crate::context::WorkerContext;
 use crate::error::WorkerError;
 use crate::worker::Worker;
+
+/// A memory's owning tenant scope: `(namespace_id, space_id_bytes)`. The
+/// worker links two memories only when their scopes are byte-equal, and
+/// submits each scope's edge batch as that scope's real space so the apply
+/// layer's Link tenant wall accepts it.
+type Scope = (u32, [u8; 16]);
 
 /// Knobs that don't fit `WorkerConfig`'s generic shape. Defaults match
 /// the master plan's latency budget: ~0.5 ms HNSW query × 5
@@ -244,9 +254,19 @@ async fn do_auto_edge_cycle(
     // a `StageCompleted{AutoEdge}` event for each. Wait helpers depend
     // on per-source completion signals; skipping the "no edges" case
     // would hang the client.
-    let mut to_link: Vec<(MemoryId, MemoryId, f32)> = Vec::new();
+    // Each derived link carries the `(namespace_id, space_id_bytes)` scope
+    // both endpoints share — the writer's Link-apply tenant wall requires the
+    // submitted `Write` to run as the memories' real space, and cross-scope
+    // pairs are dropped entirely (linking two tenants' memories would itself
+    // be a tenancy violation). The HNSW neighbour search is shard-wide and
+    // scope-blind, so we resolve + compare each endpoint's owning scope here.
+    let mut to_link: Vec<(Scope, MemoryId, MemoryId, f32)> = Vec::new();
     let mut drained_sources: Vec<MemoryId> = Vec::new();
     let mut per_source_edges: HashMap<MemoryId, u32> = HashMap::new();
+    // Per-cycle memcache of each memory's owning scope, keyed by id. `None`
+    // means the MEMORIES row was absent (forgotten / never committed) — those
+    // ids can't be tenant-placed, so they never receive an edge.
+    let mut scope_cache: HashMap<MemoryId, Option<Scope>> = HashMap::new();
     let mut processed = 0usize;
     let mut neighbours_found = 0u64;
     while processed < cfg.batch_size {
@@ -328,6 +348,16 @@ async fn do_auto_edge_cycle(
             continue;
         }
 
+        // Resolve the source's owning scope. A source with no MEMORIES row
+        // can't be tenant-placed — skip it rather than risk an untenanted
+        // edge. (Shouldn't happen for a memory the writer just committed.)
+        let source_scope = *scope_cache
+            .entry(source_id)
+            .or_insert_with(|| load_memory_scope(ctx, source_id));
+        let Some(source_scope) = source_scope else {
+            continue;
+        };
+
         // Over-fetch by one so the self-hit doesn't eat into the
         // requested k. HNSW's search_active already filters tombstones,
         // so per-neighbour is_tombstoned checks would be redundant.
@@ -350,6 +380,18 @@ async fn do_auto_edge_cycle(
             if similarity < knobs.similarity_threshold {
                 continue;
             }
+            // Tenant wall (worker side). Only link two memories in the SAME
+            // (namespace, space) scope — a cross-scope SimilarTo edge would be
+            // a tenancy violation the apply layer rejects anyway. Cross-scope
+            // neighbours are dropped WITHOUT spending the source's budget:
+            // they aren't edges, so they mustn't shed a genuine same-scope
+            // link the source could still form from a weaker neighbour.
+            let neighbour_scope = *scope_cache
+                .entry(neighbour)
+                .or_insert_with(|| load_memory_scope(ctx, neighbour));
+            if neighbour_scope != Some(source_scope) {
+                continue;
+            }
             // Stop once the source has spent its out-edge budget. HNSW
             // returns neighbours strongest-first, so the edges we keep
             // are the highest-similarity ones — the cap sheds the
@@ -357,7 +399,7 @@ async fn do_auto_edge_cycle(
             if *budget == 0 {
                 break;
             }
-            to_link.push((source_id, neighbour, similarity));
+            to_link.push((source_scope, source_id, neighbour, similarity));
             *per_source_edges.entry(source_id).or_insert(0) += 1;
             *budget -= 1;
             neighbours_found += 1;
@@ -380,22 +422,15 @@ async fn do_auto_edge_cycle(
     let written = if to_link.is_empty() {
         0
     } else {
-        let phases: Vec<Phase> = to_link
-            .iter()
-            .map(|(from, to, sim)| Phase::Link {
-                from: NodeRef::Memory(*from),
-                to: NodeRef::Memory(*to),
-                kind: EdgeKindRef::Builtin(EdgeKind::SimilarTo),
-                weight: *sim,
-                origin: origin::AUTO_DERIVED,
-                derived_by: derived_by::SIMILARITY_WORKER,
-                disambiguator: zero_disambiguator(),
-                created_at_unix_nanos: created_at,
-            })
-            .collect();
-        let request_hash = hash_link_batch(&to_link);
-        let write = Write::from_phases(WriteId::new(), SpaceId::default(), phases)
-            .with_request_hash(request_hash);
+        // Bucket the derived links by the scope both endpoints share, then
+        // submit one Write per scope stamped with that scope's real space +
+        // namespace so the apply layer's tenant wall passes. A NIL-space
+        // submit (the previous bug) failed `memory_in_space` for every real
+        // memory and silently dropped every edge.
+        let mut by_scope: HashMap<Scope, Vec<(MemoryId, MemoryId, f32)>> = HashMap::new();
+        for (scope, from, to, sim) in &to_link {
+            by_scope.entry(*scope).or_default().push((*from, *to, *sim));
+        }
         let real_writer = ctx
             .ops
             .executor
@@ -405,11 +440,40 @@ async fn do_auto_edge_cycle(
             .ok_or_else(|| {
                 WorkerError::Ops("auto_edge: unified path requires RealWriterHandle".into())
             })?;
-        real_writer
-            .submit(write)
-            .await
-            .map_err(|e| WorkerError::Ops(format!("submit: {e:?}")))?;
-        to_link.len()
+        let mut written = 0usize;
+        for (scope, pairs) in &by_scope {
+            let (namespace_id, space_id_bytes) = *scope;
+            let space = SpaceId::from(space_id_bytes);
+            let namespace = NamespaceId::from(namespace_id);
+            let phases: Vec<Phase> = pairs
+                .iter()
+                .map(|(from, to, sim)| Phase::Link {
+                    from: NodeRef::Memory(*from),
+                    to: NodeRef::Memory(*to),
+                    kind: EdgeKindRef::Builtin(EdgeKind::SimilarTo),
+                    weight: *sim,
+                    origin: origin::AUTO_DERIVED,
+                    derived_by: derived_by::SIMILARITY_WORKER,
+                    disambiguator: zero_disambiguator(),
+                    created_at_unix_nanos: created_at,
+                })
+                .collect();
+            // Deterministic WriteId folds the batch hash (as a RequestId)
+            // with the scope's space, so a same-scope retry of the identical
+            // pair set collapses onto the cached ack, while different scopes
+            // never share an idempotency key.
+            let request_hash = hash_link_batch(pairs);
+            let write_id = WriteId::from_request(request_id_from_hash(&request_hash), space);
+            let write = Write::from_phases(write_id, space, phases)
+                .with_namespace(namespace)
+                .with_request_hash(request_hash);
+            real_writer
+                .submit(write)
+                .await
+                .map_err(|e| WorkerError::Ops(format!("submit: {e:?}")))?;
+            written += pairs.len();
+        }
+        written
     };
 
     // Merge the real per-source edge detail (target memory id + cosine
@@ -423,7 +487,7 @@ async fn do_auto_edge_cycle(
     if written > 0 {
         let metadata = ctx.ops.executor.metadata.as_ref();
         let mut by_source: HashMap<MemoryId, Vec<(MemoryId, MemoryId, f32)>> = HashMap::new();
-        for (source, neighbour, similarity) in &to_link {
+        for (_scope, source, neighbour, similarity) in &to_link {
             by_source
                 .entry(*source)
                 .or_default()
@@ -477,6 +541,7 @@ async fn do_auto_edge_cycle(
                 edges_written,
             })),
             space_id: memory_space_id(ctx, source_id),
+            vector: None,
         };
         ctx.ops.publish_stage_event(envelope).await;
     }
@@ -518,6 +583,37 @@ fn memory_space_id(ctx: &WorkerContext, memory_id: MemoryId) -> SpaceId {
                 .map(|g| g.value().space_id())
         })
         .unwrap_or_default()
+}
+
+/// Read a memory's owning `(namespace_id, space_id_bytes)` scope from
+/// `MEMORIES_TABLE`. Returns `None` when the row is absent — a memory that
+/// can't be tenant-placed never receives an auto-derived edge (the apply
+/// layer's Link tenant wall would drop it anyway).
+fn load_memory_scope(ctx: &WorkerContext, memory_id: MemoryId) -> Option<Scope> {
+    ctx.ops
+        .executor
+        .metadata
+        .as_ref()
+        .read_txn()
+        .ok()
+        .and_then(|rtxn| {
+            rtxn.open_table(MEMORIES_TABLE)
+                .ok()
+                .and_then(|t| t.get(&memory_id.to_be_bytes()).ok().flatten())
+                .map(|g| {
+                    let meta = g.value();
+                    (meta.namespace_id, meta.space_id_bytes)
+                })
+        })
+}
+
+/// Fold a 32-byte batch hash into a 16-byte [`RequestId`]. Feeds
+/// [`WriteId::from_request`] so a same-scope retry of the identical pair set
+/// lands on the same idempotency key.
+fn request_id_from_hash(hash: &[u8; 32]) -> RequestId {
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&hash[..16]);
+    RequestId(Uuid::from_bytes(bytes))
 }
 
 /// Deterministic hash of a batch of `(source, target, weight)` tuples.

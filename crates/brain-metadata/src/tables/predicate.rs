@@ -22,11 +22,19 @@ pub const PREDICATES_BY_QNAME_TABLE: TableDefinition<'static, &str, u32> =
     TableDefinition::new("predicates_by_qname");
 
 /// `predicate_review_queue` — durable record of predicate qnames the
-/// extractor proposed but that are NOT declared in the active schema, so
-/// closed-vocab extraction dropped them from the live graph. Key is the
-/// canonical `"namespace:name"`; value is the number of times it was
-/// seen. Operators scan this to decide which coined predicates to promote
-/// into a schema via `SCHEMA_UPLOAD`. Nothing reads it on the hot path.
+/// extractor coined that NO schema declared. Key is the canonical
+/// `"namespace:name"`; value is the number of times it was seen.
+///
+/// The statement itself is committed and queryable: Brain's predicate
+/// vocabulary is open, and a coined name is interned on demand
+/// (`SchemaOrigin::ImplicitFromWrite`). This queue exists so an operator
+/// can see WHICH names the corpus keeps inventing and promote the
+/// recurring ones into a real `SCHEMA_UPLOAD`, rather than scanning the
+/// whole predicate registry for implicit rows.
+///
+/// Written by `predicate_intern_or_get`, read by `predicate_review_list`
+/// (surfaced on the admin `/schema/review` endpoint). Nothing reads it on
+/// the hot path.
 pub const PREDICATE_REVIEW_QUEUE_TABLE: TableDefinition<'static, &str, u64> =
     TableDefinition::new("predicate_review_queue");
 
@@ -121,7 +129,6 @@ impl SchemaOrigin {
 /// Implicit-from-write rows are how Brain supports open-vocabulary
 /// STATEMENT_CREATE without a schema declaration.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct PredicateDefinition {
     pub predicate_id: u32,
     pub namespace: String,
@@ -140,6 +147,17 @@ pub struct PredicateDefinition {
     /// any prior active statement with the same `(subject, predicate)`
     /// before inserting the new row.
     pub is_stateful: bool,
+    /// Explicit time-to-live for statements of this predicate, in seconds.
+    /// `0` = no TTL (persist indefinitely, the default). When non-zero, the
+    /// reclaim worker soft-tombstones statements older than this (measured
+    /// per kind from `event_at` for Events, `valid_from` otherwise). Set from
+    /// the schema DSL `retention:` attribute at schema-apply time; lives only
+    /// on the persisted row, not on the projected `Predicate` value type.
+    pub retention_seconds: u64,
+    /// The `EntityTypeId` a statement's SUBJECT must have for this
+    /// predicate; `0` = any. Mirrors `object_entity_type_id` on the
+    /// subject side. Appended last so the field order stays append-only.
+    pub subject_entity_type_id: u32,
 }
 
 impl PredicateDefinition {
@@ -174,12 +192,17 @@ impl PredicateDefinition {
             kind_constraint: encode_kind_constraint(p.kind_constraint),
             object_type_constraint_byte: p.object_type_constraint_byte,
             object_entity_type_id: p.object_entity_type_id,
+            subject_entity_type_id: p.subject_entity_type_id,
             schema_version: p.schema_version,
             description: p.description.clone(),
             created_at_unix_nanos,
             origin_tag: origin.tag(),
             origin_payload: origin.payload(),
             is_stateful: p.is_stateful,
+            // Retention is a storage-only policy set separately at schema-apply
+            // via `predicate_set_retention`; a freshly-built row defaults to
+            // "no TTL" and the apply path stamps the declared value.
+            retention_seconds: 0,
         }
     }
 
@@ -199,6 +222,7 @@ impl PredicateDefinition {
             kind_constraint: decode_kind_constraint(self.kind_constraint),
             object_type_constraint_byte: self.object_type_constraint_byte,
             object_entity_type_id: self.object_entity_type_id,
+            subject_entity_type_id: self.subject_entity_type_id,
             schema_version: self.schema_version,
             description: self.description.clone(),
             is_stateful: self.is_stateful,
@@ -257,6 +281,9 @@ mod tests {
             kind_constraint: Some(StatementKind::Fact),
             object_type_constraint_byte: 1,
             object_entity_type_id: 5,
+            // Non-zero and different from the object's, so the round-trip
+            // would fail if the two were ever crossed or one was dropped.
+            subject_entity_type_id: 9,
             schema_version: 3,
             description: "Reports-to relation".into(),
             is_stateful: false,

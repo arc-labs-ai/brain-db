@@ -385,22 +385,19 @@ fn build_fusion_step(
     FusionStep {
         k,
         weights,
-        method: fusion_method_from_env(),
+        method: fusion_method_from_config(),
     }
 }
 
 /// Deploy-time fusion-method selector. Defaults to RRF (the
 /// score-scale-invariant rank fusion the spec mandates as the default);
-/// `BRAIN_FUSION_METHOD=relative|zscore` opts into the score-aware
-/// strategies without a recompile so they can be A/B'd on a fixed corpus.
-fn fusion_method_from_env() -> FusionMethod {
-    match std::env::var("BRAIN_FUSION_METHOD")
-        .ok()
-        .as_deref()
-        .map(str::trim)
-    {
-        Some("relative" | "relative_score") => FusionMethod::RelativeScore,
-        Some("zscore" | "relative_zscore") => FusionMethod::RelativeScoreZScore,
+/// `[retrieval] fusion_method = "relative"|"zscore"` opts into the score-aware
+/// strategies so they can be A/B'd on a fixed corpus. Sourced from the parsed
+/// deploy config (installed at boot); an unrecognized value falls back to RRF.
+fn fusion_method_from_config() -> FusionMethod {
+    match brain_core::RetrievalTuning::active().fusion_method.trim() {
+        "relative" | "relative_score" => FusionMethod::RelativeScore,
+        "zscore" | "relative_zscore" => FusionMethod::RelativeScoreZScore,
         _ => FusionMethod::Rrf,
     }
 }

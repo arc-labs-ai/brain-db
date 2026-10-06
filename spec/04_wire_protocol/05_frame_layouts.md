@@ -11,11 +11,14 @@ Data-plane op requests carry one shared, **optional** identity field, `act_as`. 
 ```rust
 struct ActAs {
     namespace: String,                       // effective namespace; must be within the principal's may_act allowlist
-    agent_id: WireUuid,                       // 16-byte effective agent id
+    space_id: String,                        // structured effective-space selector; "" = the key-bound space
+    grant: u32,                              // optional (omitted when 0): delegable bits added for this op
 }
 ```
 
-`act_as: Option<ActAs>` appears on every data-plane op request: `ENCODE_REQ`, `RECALL_REQ`, `FORGET_REQ`, `LINK_REQ`, `UNLINK_REQ`, `PLAN_REQ`, `REASON_REQ`, `ENTITY_CREATE_REQ`, `STATEMENT_CREATE_REQ`, `RELATION_CREATE_REQ`, and `SUBSCRIBE_REQ`. It is honored only if the connection principal holds `can_act_as` and `act_as.namespace` is within its `may_act` allowlist — otherwise the op is rejected with `ActAsDenied` (see [`07_error_handling.md`](07_error_handling.md) §3.3). It is absent from every connection-management, introspection, schema, and admin frame, and it never appears in `AUTH`. (`SUBSCRIBE_REQ`'s `act_as` support has a structural history worth knowing — see the note under §7 below.)
+`act_as: Option<ActAs>` appears on every data-plane op request: `ENCODE_REQ`, `RECALL_REQ`, `FORGET_REQ`, `LINK_REQ`, `UNLINK_REQ`, `PLAN_REQ`, `REASON_REQ`, `ENTITY_CREATE_REQ`, `STATEMENT_CREATE_REQ`, `RELATION_CREATE_REQ`, and `SUBSCRIBE_REQ`. It is honored only if the connection principal holds `can_act_as` and `act_as.namespace` is within its `may_act` allowlist — otherwise the op is rejected with `ActAsDenied` (see [`07_error_handling.md`](07_error_handling.md) §3.3). It is also carried by `GET_CAPABILITIES_REQ` and the schema family (`SCHEMA_UPLOAD_REQ`, `SCHEMA_GET_REQ`, `SCHEMA_LIST_REQ`, `SCHEMA_VALIDATE_REQ`, `SCHEMA_REPLACE_REQ`, `SCHEMA_DROP_REQ`) so a shared-pool gateway can run them as the tenant: every schema namespace check binds to the effective namespace, and `GET_CAPABILITIES.schema_namespaces` is filtered to the (effective) caller's own namespace for every caller. It is absent from every other connection-management, introspection, and admin frame, and it never appears in `AUTH`.
+
+**Delegated grant.** `ActAs` carries a third, optional key, `grant: u32` (omitted from the CBOR map when `0`, defaulted to `0` when absent, so a two-key selector is byte-identical to the historical form). A delegated op always runs with the fixed `STANDARD_SPACE` mask; `grant` lets the trusted delegator add the **delegable** bits — `SCHEMA_UPLOAD` (`1 << 4`) and `ADMIN` (`1 << 5`) — for that one op: `effective = STANDARD_SPACE | (grant & delegator_permissions & (SCHEMA_UPLOAD | ADMIN))`. A grant naming any other bit (including `ACT_AS`), or a bit the connection principal does not itself hold, is rejected with `ActAsDenied`. Whether a tenant's role allows schema rights is the delegator's decision; Brain only guarantees the delegator can never hand out more than it holds. (`SUBSCRIBE_REQ`'s `act_as` support has a structural history worth knowing — see the note under §7 below.)
 
 ### 1. ENCODE_REQ (0x20)
 
@@ -83,6 +86,7 @@ The server validates:
 
 ```rust
 struct RecallRequest {
+    scope: RecallScope,                      // Space (default) | Namespace; see §05/03 "Recall scope"
     cue_text: String,                        // the query
     cue_vector_offset: u32,                  // 0 if text-only
     cue_vector_dim: u16,                     // 0 if text-only; 384 if vector pre-supplied
@@ -108,6 +112,7 @@ graph, fused via RRF). The client cannot select between paths.
 
 Fields:
 
+- `scope` — `Space` (wire default) or `Namespace`. `Space` serves the request on the single shard the caller's `(namespace, space)` hashes to. `Namespace` fans the request out across every shard, widening each shard's scope filter from `(namespace, space)` to `namespace_id` only, and shapes once over the globally-merged pool — spanning every space in the caller's own namespace and never another tenant's. Reuses the `RECALL` permission. Full semantics in [`../05_operations/03_read_pipeline.md`](../05_operations/03_read_pipeline.md) §"Recall scope"; the cross-shard RRF merge is noted in [`../13_retrievers/01_rrf_fusion.md`](../13_retrievers/01_rrf_fusion.md).
 - `top_k` — max results returned. Default 10. Hard cap: 1000.
 - `confidence_threshold` — results with confidence below this are filtered out. Default: 0.0.
 - `context_filter` — restrict to specific contexts. None means search across all contexts the agent owns. Up to 16 context IDs allowed.

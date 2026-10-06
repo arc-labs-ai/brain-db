@@ -157,6 +157,8 @@ namespace-as-tenant case.
 
 ## OQ-23-E: Cross-shard retrieval result merging
 
+**✅ RESOLVED — landed (2026-09).** RECALL now takes a `scope = Namespace`: the connection layer fans out to every shard, each returns raw scored candidates over its whole namespace (all its spaces), and the router does a global RRF merge with a single global membership/shaping pass. See `spec/05_operations/03_read_pipeline.md` §"Recall scope" and `spec/13_retrievers/01_rrf_fusion.md`. The original open question and its deferral rationale are retained below for historical reference.
+
 **Current:** the retrieval pipeline runs per-shard. Multi-shard deployments fan RECALL / QUERY out at the connection layer and merge results by score upstream of the retrieval engine.
 **Open:** push the cross-shard merge into the query layer — global RRF fusion across shards, with per-shard partial results streamed in.
 **Why deferred:** single-shard deployments are the v1 default; multi-shard with cross-shard retrieval fusion adds latency-budget pressure that's better tackled once production telemetry is in.
@@ -853,7 +855,7 @@ V1.0 ships best-effort: primary writes succeed; reverse index updates asynchrono
 
 ### S-OQ-11: `STATEMENT_LIST` cursor pagination
 
-V1.0 ships single-frame snapshot with limit cap 1000. Cursor pagination deferred.
+**✅ RESOLVED — landed.** `STATEMENT_LIST` (`0x0146`) and `STATEMENT_HISTORY` (`0x0145`) both take `limit` + opaque `cursor` and return a page + `next_cursor`, keyset-paginated on the immutable `version`. The original note ("V1.0 ships single-frame snapshot with limit cap 1000; cursor pagination deferred") no longer applies.
 
 ### S-OQ-12: Statement-on-statement (meta-statements)
 
@@ -1383,11 +1385,13 @@ Default leaning: (a) until a real workload proves otherwise.
 
 ### OQ-WP-K9 — Schema removal (`SCHEMA_DROP`)
 
+**✅ RESOLVED — landed as a wire opcode.** `SCHEMA_DROP` (`0x0125` / resp `0x01A5`, admin-only) narrows the active schema by removing one predicate or relation type behind an in-use safety gate, and `SCHEMA_REPLACE` (`0x0127`, requires `force_drop_existing`) is the destructive whole-schema escape hatch. Both are routed through `submit(Write)`, so they are WAL-durable and replayed on recovery — not offline file surgery. The accidental-erasure concern below is handled by the in-use gate (drop) and the explicit force flag (replace). Original question retained for reference.
+
 Once a schema is declared, there's no opcode to revert. Should a `SCHEMA_DROP` opcode exist?
 
 **Trade-off:** symmetric API vs accidental-erasure risk. A deployment with 10M statements losing schema would orphan them entirely.
 
-**Status:** deferred. **Likely outcome:** never as a wire opcode; only as an offline admin action.
+**Status:** ~~deferred~~ → shipped (see resolution above).
 
 ### OQ-WP-K10 — `ENTITY_LIST` cursor pagination + multi-frame streaming
 

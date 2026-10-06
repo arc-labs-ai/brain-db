@@ -47,7 +47,7 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 # image doesn't depend on third-party install scripts.
 RUN rustup component add rustfmt clippy \
     && rustup toolchain install nightly --component miri --component rust-src \
-    && cargo install --locked just cargo-fuzz cargo-audit cargo-nextest
+    && cargo install --locked just cargo-fuzz cargo-audit cargo-nextest cargo-sweep
 
 # Workspace mount point. Source bind-mounts here at runtime via
 # devcontainer.json.

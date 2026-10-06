@@ -29,6 +29,8 @@ use redb::TableDefinition;
 
 /// `(namespace_id, space_id_bytes, entity_type_id, normalized_alias, EntityId)`.
 type AliasKey = (u32, [u8; 16], u32, &'static str, [u8; 16]);
+/// `(namespace_id, space_id_bytes, entity_type_id, EntityId)`.
+pub type ByTypeKey = (u32, [u8; 16], u32, [u8; 16]);
 /// `(namespace_id, space_id_bytes, entity_type_id, trigram, EntityId)`.
 type TrigramKey = (u32, [u8; 16], u32, [u8; 3], [u8; 16]);
 /// `(namespace_id, space_id_bytes, EntityId, MemoryId)`.
@@ -65,6 +67,25 @@ pub const ENTITY_TRIGRAMS_TABLE: TableDefinition<'static, TrigramKey, ()> =
 /// MemoryId.to_be_bytes())` → [`MentionMetadata`].
 pub const ENTITY_MENTIONS_TABLE: TableDefinition<'static, MentionKey, MentionMetadata> =
     TableDefinition::new("entity_mentions");
+
+/// `(namespace_id, space_id_bytes, entity_type_id, EntityId.to_bytes())` →
+/// `()`. The by-`(scope, type)` listing index: `ENTITY_LIST` range-scans
+/// the contiguous `(namespace, space, type)` prefix in ascending EntityId
+/// order (the same order the wire cursor resumes on) instead of scanning
+/// the whole cross-tenant primary table. The trailing EntityId makes each
+/// row unique.
+///
+/// Maintained on create ([`entity_put`]) and on a type change
+/// ([`entity_update`]); scope is immutable so a row never moves tenant.
+/// Deliberately NOT torn down on tombstone or merge — unlike the resolver
+/// indexes — because the primary row is kept for audit/unmerge and the
+/// listing supports `include_tombstoned` / `include_merged`, which need
+/// those rows to remain discoverable.
+///
+/// [`entity_put`]: crate::entity::ops::entity_put
+/// [`entity_update`]: crate::entity::ops::entity_update
+pub const ENTITY_BY_TYPE_TABLE: TableDefinition<'static, ByTypeKey, ()> =
+    TableDefinition::new("entity_by_type");
 
 /// Bytes per persisted entity vector — 384 f32 components × 4 bytes
 /// each. Pinned to the BGE-small dimensionality. If/when a deployment
@@ -130,7 +151,6 @@ pub mod mention_context {
 /// `aliases` is a typed `Vec<String>`. `attributes` remains an opaque
 /// blob until the schema DSL defines the typed `Value` union.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct EntityMetadata {
     pub entity_id_bytes: [u8; 16],
     /// Owning namespace (tenant) — the outer half of the
@@ -306,7 +326,6 @@ impl From<&EntityMetadata> for Entity {
 
 /// Per-mention metadata: how an entity appears in a given memory.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct MentionMetadata {
     pub mentioned_at_unix_nanos: u64,
     pub mention_context: u8,

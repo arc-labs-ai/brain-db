@@ -50,13 +50,13 @@ pub use framework::{
     evaluate_trigger_on_encode, EntityMention, ExtractedItem, ExtractionContext,
     ExtractionFailureClass, ExtractionFuture, ExtractionResult, ExtractionStatus, Extractor,
     ExtractorContext, ExtractorError, ExtractorRegistry, ExtractorRunOptions, NeighborMemory,
-    RelationMention, StatementMention, TierGate, TierState, TriggerDecision, SYSTEM_NAMESPACE,
+    RelationMention, StatementMention, TriggerDecision, SYSTEM_NAMESPACE,
 };
 pub use idempotency::{hash_memory_text, IdempotencyKey};
 pub use llm::{estimate_cost, CostBudget, LlmExtractor, LlmExtractorInner, Pricing};
 pub use materialize::{
-    build_registry_from_definitions, build_registry_with_gate, materialize_classifier_extractor,
-    materialize_llm_extractor, materialize_pattern_extractor, MaterializeDeps,
+    build_registry_from_definitions, materialize_classifier_extractor, materialize_llm_extractor,
+    materialize_pattern_extractor, MaterializeDeps,
 };
 pub use pattern::{CompiledRegex, PatternExtractor, TemporalExtractor};
 pub use resolver::{

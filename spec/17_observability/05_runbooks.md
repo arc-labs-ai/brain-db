@@ -158,11 +158,11 @@ Memory growth is unexplained. Likely a Brain bug worth investigation.
    ```
    brain_wal_size_bytes
    ```
-   If large: WAL retention worker may be stuck. Force its cycle:
+   If large: WAL retention worker may be stuck. Force its cycle — this is how an operator deletes eligible WAL segments now rather than waiting for the scheduled cycle:
    ```bash
-   curl -s -X POST http://127.0.0.1:9092/v1/workers/wal-retention/run-now -d '{"shard":"<id>"}'
+   curl -s -X POST http://127.0.0.1:9092/v1/workers/wal_retention/run-now -d '{"shard":"<id>"}'
    ```
-   For an immediate `wal`-type garbage collection, administer via the admin HTTP API (`/v1/*` on the admin listener); see [§17.04](04_admin_ops.md). (Operator action: delete eligible WAL segments now. Route name TBD.)
+   See [§17.04](04_admin_ops.md) for the generic `POST /v1/workers/<name>/run-now` control plane.
 
 3. Check for large agents:
    ```bash
@@ -171,7 +171,7 @@ Memory growth is unexplained. Likely a Brain bug worth investigation.
 
 4. Mitigations:
    - Free WAL: run the `wal-retention` worker (above) or the `wal` GC action.
-   - Free old slots: run the slot-reclamation worker, or the `slots` GC action — administer via the admin HTTP API (`/v1/*`); see [§17.04](04_admin_ops.md). (Operator action: reclaim eligible slots now. Route name TBD.)
+   - Free old slots: reclaim eligible slots now with `curl -s -X POST http://127.0.0.1:9092/v1/workers/slot_reclamation/run-now` — the generic worker run-now control plane; see [§17.04](04_admin_ops.md).
    - Delete old snapshots: `curl -s http://127.0.0.1:9092/v1/snapshots`, then `curl -s -X DELETE http://127.0.0.1:9092/v1/snapshots/<name>` for unneeded ones.
 
 5. If can't free enough:

@@ -90,10 +90,22 @@ pub async fn handle_space_list(
         .collect();
     Ok(SpaceListResponse {
         spaces,
-        // TODO(tenancy): spaces are spread across shards by hash(space); v1
-        // lists only this shard's spaces. A bounded cross-shard scatter-gather
-        // (or a namespace-home-shard registry replica) makes this complete.
-        cross_shard_complete: false,
+        // Spaces are spread across shards by hash(space), and this handler
+        // only ever sees its own shard — so the listing covers everything
+        // exactly when there IS only one shard.
+        //
+        // This used to be hardcoded `false`, which made it useless in both
+        // directions: it cried "partial" on every single-shard deployment
+        // (where the listing is complete), and a reader who learned to
+        // ignore it would then miss a genuinely truncated multi-shard
+        // listing. A flag that is always the same value teaches callers to
+        // stop reading it.
+        //
+        // TODO(tenancy): a bounded cross-shard scatter-gather (or a
+        // namespace-home-shard registry replica) would let this be true on
+        // multi-shard deployments too. Until then, above one shard the
+        // listing really is partial and now says so honestly.
+        cross_shard_complete: ctx.single_shard_deployment(),
     })
 }
 

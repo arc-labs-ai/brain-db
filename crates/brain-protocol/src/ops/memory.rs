@@ -27,6 +27,25 @@ pub struct ActAs {
     /// never parsed for sub-scopes. An empty string selects the
     /// connection's key-bound space (single-space keys, zero ceremony).
     pub space_id: String,
+    /// Extra permission bits the delegating principal grants this one
+    /// delegated op, on top of the fixed `STANDARD_SPACE` mask the
+    /// effective identity always receives. Only the delegable bits —
+    /// `SCHEMA_UPLOAD` (`1 << 4`) and `ADMIN` (`1 << 5`) — may be set, and
+    /// only ones the connection principal itself holds; anything else is
+    /// rejected with `ActAsDenied` (a delegator can never grant more than
+    /// it has). `0` (the default) means "no extra rights" — exactly the
+    /// pre-`grant` behaviour.
+    ///
+    /// Wire: omitted from the CBOR map when `0` and defaulted to `0` when
+    /// absent, so a selector without a grant encodes byte-identically to
+    /// the two-field form and old peers interoperate unchanged.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub grant: u32,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if passes `&T`.
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 
 /// `ENCODE_REQ` body. Expresses client *intent* only: the text to
@@ -250,6 +269,21 @@ pub struct RecallRequest {
     /// key-bound identity.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub act_as: Option<ActAs>,
+    /// Scope of the recall: the caller's single `(namespace, space)` (default),
+    /// or every space in the caller's namespace — fanned out across shards and
+    /// merged. See `spec/05_operations/03_read_pipeline.md` §"Recall scope".
+    #[serde(default)]
+    pub scope: RecallScopeWire,
+}
+
+/// RECALL scope selector. `Space` (default) serves the caller's single space on
+/// its shard; `Namespace` spans every space in the caller's namespace via
+/// cross-shard fan-out + global merge. Never crosses namespaces.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum RecallScopeWire {
+    #[default]
+    Space,
+    Namespace,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -1204,6 +1238,22 @@ pub struct EnrichedStatement {
     /// Stringified object — entity canonical name for entity objects,
     /// formatted scalar for literal objects.
     pub object_label: String,
+    /// The object's entity id when the object IS an entity; `None` for a
+    /// literal value.
+    ///
+    /// [`Self::object_label`] alone cannot answer "is this an entity?" — it
+    /// stringifies both cases — so a consumer had to guess by matching the
+    /// label against known entity names. That guess is wrong exactly when a
+    /// literal's text happens to equal an entity's name: a stored
+    /// `clone_status = "trello-clone-v7"` text value was drawn as an edge
+    /// pointing at the `trello-clone-v7` entity, inventing a
+    /// self-referential link the store never held. It also picked
+    /// arbitrarily between two entities sharing a canonical name.
+    ///
+    /// Optional on the wire so an older peer that omits it still decodes;
+    /// absent means "no entity object", which is the safe reading.
+    #[serde(default, with = "crate::codec::cbor::opt_byte_array16")]
+    pub object_entity_id: Option<[u8; 16]>,
     pub confidence: f32,
     /// When the statement's EVENT happened, in unix nanos — the reified
     /// Time slot of an Event-kind statement. `None` for a statement with
@@ -1567,6 +1617,7 @@ mod memory_list_tests {
         req.act_as = Some(ActAs {
             namespace: "acme".into(),
             space_id: "acme:space".into(),
+            grant: 0,
         });
         req.cursor = Vec::new();
         let body = RequestBody::MemoryList(req);

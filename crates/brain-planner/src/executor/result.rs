@@ -247,6 +247,28 @@ pub struct ReasonResult {
     /// `CausalExplanation` is reserved for a future causal-chain
     /// executor path that doesn't exist yet.
     pub inference_kind: InferenceKind,
+    /// The claim the aggregate step evaluates: the observation text for
+    /// a `ByText` observation, `None` for `ByMemoryId` (the handler then
+    /// leaves the wire claim empty, as before).
+    pub claim: Option<String>,
+    /// Claims drawn outward from the typed graph around the observation
+    /// (see `executor::stance::derive_claims`), best first. Each becomes
+    /// its own `InferenceStep` after the aggregate step.
+    pub derived: Vec<DerivedInference>,
+}
+
+/// One claim drawn outward from the typed graph by REASON — a statement
+/// about the entities the observation's evidence involves, with its own
+/// supporting / contradicting evidence and confidence.
+#[derive(Debug, Clone)]
+pub struct DerivedInference {
+    pub claim: String,
+    pub supporting: Vec<EvidenceItem>,
+    pub contradicting: Vec<EvidenceItem>,
+    /// In `[0, 1]`: the statement's confidence, damped when the claim is
+    /// superseded or contradicted by newer evidence.
+    pub confidence: f32,
+    pub inference_kind: InferenceKind,
 }
 
 /// Which inference pattern produced a `ReasonResult` / `InferenceStep`.
@@ -441,6 +463,10 @@ pub enum ReasonStatus {
 pub struct InferenceStep {
     /// Position in the emission order; first emitted step is 0.
     pub step_index: u32,
+    /// What this step asserts. `None` on the aggregate step of a
+    /// `ByMemoryId` observation (no text to quote); `Some` for a `ByText`
+    /// aggregate step (the observation) and for every derived step.
+    pub claim: Option<String>,
     pub base_memories: Vec<MemoryId>,
     pub supporting: Vec<EvidenceItem>,
     pub contradicting: Vec<EvidenceItem>,

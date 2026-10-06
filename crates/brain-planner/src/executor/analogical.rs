@@ -111,7 +111,7 @@ pub fn resolve_statement_triple(
     })
 }
 
-fn render_subject(rtxn: &redb::ReadTransaction, subject: &SubjectRef) -> Option<String> {
+pub(crate) fn render_subject(rtxn: &redb::ReadTransaction, subject: &SubjectRef) -> Option<String> {
     match subject {
         SubjectRef::Entity(eid) => entity_get(rtxn, *eid)
             .ok()
@@ -123,7 +123,10 @@ fn render_subject(rtxn: &redb::ReadTransaction, subject: &SubjectRef) -> Option<
     }
 }
 
-fn render_object(rtxn: &redb::ReadTransaction, object: &StatementObject) -> Option<String> {
+pub(crate) fn render_object(
+    rtxn: &redb::ReadTransaction,
+    object: &StatementObject,
+) -> Option<String> {
     match object {
         StatementObject::Entity(eid) => entity_get(rtxn, *eid)
             .ok()

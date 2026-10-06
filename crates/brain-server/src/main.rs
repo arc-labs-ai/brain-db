@@ -78,6 +78,28 @@ fn main() -> ExitCode {
         }
     };
 
+    // Install the process-wide retrieval tuning from the parsed `[retrieval]`
+    // section before any shard or read path runs. This replaces the former
+    // bespoke `BRAIN_*` env reads at the fusion / retriever / RECALL call
+    // sites; the generic `BRAIN__RETRIEVAL__*` override already applied during
+    // `Config::load`, so TOML is the single source of truth.
+    let _ = brain_core::RetrievalTuning {
+        fusion_method: cfg.retrieval.fusion_method.clone(),
+        hype_rrf: cfg.retrieval.hype_rrf,
+        ef_occupancy_scaling: cfg.retrieval.ef_occupancy_scaling,
+        autocut: cfg.retrieval.autocut,
+    }
+    .install();
+
+    // Same one-shot install for the precision-decision tuning from `[precision]`.
+    // Defaults are no-ops, so an uncalibrated deploy shapes answers exactly as
+    // before; a fitted calibration makes None reachable and Many minimal.
+    let _ = brain_core::PrecisionTuning {
+        commit_min_support: cfg.precision.commit_min_support,
+        many_min_support: cfg.precision.many_min_support,
+    }
+    .install();
+
     // Apply the configured formatter + level immediately, so the startup
     // logs below already honor `[monitoring.logging]`. OTel is attached
     // later, from inside the Tokio runtime (its exporter needs one).
@@ -114,7 +136,7 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        linux_main::run(cfg, dispatcher, log_handle)
+        linux_main::run(cfg, dispatcher, log_handle, args.config)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -149,9 +171,9 @@ mod linux_main {
     use crate::shard::{
         spawn_shard, AmbiguityResolverSpawnConfig, AutoEdgeSpawnConfig, CausalEdgeSpawnConfig,
         ConfidenceSweepSpawnConfig, ExtractorSpawnConfig, ExtractorTuningSpawnConfig,
-        IndexSpawnConfig, LlmCacheSweepSpawnConfig, RerankSpawnConfig, ShardHandle, ShardJoiner,
-        ShardSpawnConfig, StatementReclaimSpawnConfig, SupersessionSweeperSpawnConfig,
-        TemporalEdgeSpawnConfig,
+        IndexSpawnConfig, LlmCacheSweepSpawnConfig, PredicateGcSpawnConfig, RerankSpawnConfig,
+        ShardHandle, ShardJoiner, ShardSpawnConfig, StatementReclaimSpawnConfig,
+        SupersessionSweeperSpawnConfig, TemporalEdgeSpawnConfig,
     };
 
     /// Errors surfaced by [`build_dispatcher`]. Hand-rolled `Display`
@@ -212,6 +234,7 @@ mod linux_main {
         cfg: Config,
         dispatcher: Arc<dyn brain_embed::Dispatcher>,
         log_handle: crate::logging::LoggingHandle,
+        config_path: std::path::PathBuf,
     ) -> ExitCode {
         // Build the configured Summarizer (default
         // `DisabledSummarizer`). Construction happens once and the
@@ -237,6 +260,9 @@ mod linux_main {
             let llm_cfg = crate::shard::LlmSpawnConfig {
                 api_key: cfg.llm.api_key.clone(),
                 model: cfg.llm.model.clone(),
+                // Preflight only checks the credential; the ceiling is
+                // irrelevant to it.
+                extractor_max_tokens: None,
             };
             match preflight_llm_auth(&llm_cfg) {
                 LlmPreflight::Ok => {
@@ -360,13 +386,19 @@ mod linux_main {
             //   - admin   → `/v1/*`                  on `admin_addr` (loopback default)
             // Both share the same ShutdownSignal so a single ctrl-c brings
             // them down together.
-            let admin_state = Arc::new(crate::admin::AdminState::new(
-                topology.shards.clone(),
-                connection_metrics.clone(),
-                Arc::new(cfg.clone()),
-                request_metrics.clone(),
-                topology.auth_store.clone(),
-            ));
+            let admin_state = Arc::new(
+                crate::admin::AdminState::new(
+                    topology.shards.clone(),
+                    connection_metrics.clone(),
+                    Arc::new(cfg.clone()),
+                    request_metrics.clone(),
+                    topology.auth_store.clone(),
+                )
+                .with_reload(config_path, {
+                    let h = log_handle.clone();
+                    Arc::new(move |level: &str| h.set_level(level))
+                }),
+            );
 
             let public = crate::admin::AdminServer::public(
                 cfg.server.metrics_addr,
@@ -388,7 +420,7 @@ mod linux_main {
             // minting data-plane keys, so it must be gated by an operator
             // secret. Without one configured, refuse to start it rather than
             // expose an unauthenticated mint endpoint.
-            if cfg.admin.token.as_deref().unwrap_or("").is_empty() {
+            if !cfg.admin.has_token() {
                 tracing::error!(
                     hint = "set [admin] token or BRAIN__ADMIN__TOKEN",
                     "admin secret not configured: the admin HTTP listener mints \
@@ -511,6 +543,7 @@ mod linux_main {
             spawn_cfg.llm = crate::shard::LlmSpawnConfig {
                 api_key: cfg.llm.api_key.clone(),
                 model: cfg.llm.model.clone(),
+                extractor_max_tokens: Some(cfg.extractors.llm.max_tokens),
             };
             // Ferry the operator's `[workers.auto_edge]`
             // overrides into the per-shard spawn config so the
@@ -539,6 +572,7 @@ mod linux_main {
                 channel_capacity: cfg.workers.extractor.channel_capacity,
                 skip_already_extracted: cfg.workers.extractor.skip_already_extracted,
                 batch_size: cfg.workers.extractor.batch_size,
+                reextract_on_schema_change: cfg.workers.extractor.reextract_on_schema_change,
             };
             // Ferry the operator's `[workers.temporal_edge]`
             // overrides into the per-shard spawn config.
@@ -605,6 +639,12 @@ mod linux_main {
             };
             // Ferry the per-worker cadence / gate knobs that previously
             // only had bespoke `BRAIN_*` env vars.
+            spawn_cfg.predicate_gc = PredicateGcSpawnConfig {
+                enabled: cfg.workers.predicate_gc.enabled,
+                grace_seconds: cfg.workers.predicate_gc.grace_seconds,
+                period_seconds: cfg.workers.predicate_gc.period_seconds,
+                dry_run: cfg.workers.predicate_gc.dry_run,
+            };
             spawn_cfg.statement_reclaim = StatementReclaimSpawnConfig {
                 enabled: cfg.workers.statement_reclaim.enabled,
                 grace_seconds: cfg.workers.statement_reclaim.grace_seconds,
@@ -636,6 +676,10 @@ mod linux_main {
                 classifier_threshold: cfg.extractors.classifier.threshold,
                 hype_num_questions: cfg.extractors.hype.num_questions,
             };
+            // The deployment's shard count. A shard reads only its own
+            // data, so handlers need this to say whether a per-shard answer
+            // is the whole answer (`SPACE_LIST.cross_shard_complete`).
+            spawn_cfg.total_shards = cfg.storage.shard_count;
             // Ferry the tantivy commit cadence.
             spawn_cfg.index = IndexSpawnConfig {
                 tantivy_commit_n: cfg.index.tantivy_commit_n,

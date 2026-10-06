@@ -243,7 +243,11 @@ pub fn space_delete_registry(
         let (start, end) = session_range_bounds(namespace_id, space_id);
         for entry in sessions.range(start..=end).map_err(store)? {
             let (k, v) = entry.map_err(store)?;
-            let session_id = u64::from_be_bytes(k.value()[20..28].try_into().unwrap());
+            let session_id = u64::from_be_bytes(
+                k.value()[20..28]
+                    .try_into()
+                    .expect("invariant: 8-byte session_id slice from a fixed-width key"),
+            );
             victims.push((session_id, v.value().last_active_unix_nanos));
         }
     }
@@ -346,7 +350,11 @@ pub fn session_list(
     let mut out = Vec::new();
     for entry in scope.range(start..=end).map_err(store)?.rev() {
         let (k, _) = entry.map_err(store)?;
-        let session_id = u64::from_be_bytes(k.value()[28..36].try_into().unwrap());
+        let session_id = u64::from_be_bytes(
+            k.value()[28..36]
+                .try_into()
+                .expect("invariant: 8-byte session_id slice from a fixed-width key"),
+        );
         if let Some(g) = sessions
             .get(&session_key(namespace_id, space_id, session_id))
             .map_err(store)?

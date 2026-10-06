@@ -52,7 +52,9 @@ fn render_plan_includes_each_retriever_label() {
 fn render_plan_fusion_line_format() {
     let qp = plan(&req_with_text("budget")).expect("plan");
     let out = render_plan(&qp);
-    assert!(out.contains("FUSION: RRF(k=60"), "got {out}");
+    // Plan-only EXPLAIN cannot know the pool-derived RRF k, so it reports
+    // `adaptive` rather than the (overridden) nominal plan k.
+    assert!(out.contains("FUSION: RRF(k=adaptive"), "got {out}");
     assert!(out.contains("weights={sem="));
 }
 
@@ -155,6 +157,7 @@ fn sample_metadata() -> QueryMetadata {
             ..Default::default()
         },
         total_latency_ms: 22.4,
+        effective_fusion_k: 15,
         rerank: None,
         ..Default::default()
     }
@@ -164,9 +167,34 @@ fn sample_metadata() -> QueryMetadata {
 fn render_trace_appends_execution_block() {
     let qp = plan(&req_with_text("topic")).expect("plan");
     let trace = render_trace(&qp, &sample_metadata());
-    let plan_only = render_plan(&qp);
-    assert!(trace.starts_with(&plan_only));
+    // TRACE is the plan sections followed by an EXECUTION block. The plan
+    // portion mirrors EXPLAIN except the fusion line reports the concrete
+    // effective k (execution ran) rather than `adaptive`.
+    assert!(trace.contains("PLAN:"));
+    assert!(trace.contains("ROUTING:"));
     assert!(trace.contains("EXECUTION:"));
+    assert!(
+        trace.find("ROUTING:") < trace.find("EXECUTION:"),
+        "plan sections must precede the execution block:\n{trace}"
+    );
+}
+
+#[test]
+fn render_trace_fusion_line_reports_effective_k() {
+    // The fusion line in a TRACE must show the k execution actually fused
+    // at, not the plan's nominal k — for each adaptive_k pool bucket.
+    use crate::retrieval::fusion::adaptive_k;
+    let qp = plan(&req_with_text("topic")).expect("plan");
+    for pool in [10usize, 500, 5_000] {
+        let k = adaptive_k(pool);
+        let mut meta = sample_metadata();
+        meta.effective_fusion_k = k;
+        let trace = render_trace(&qp, &meta);
+        assert!(
+            trace.contains(&format!("FUSION: RRF(k={k}")),
+            "pool {pool} → adaptive_k {k}; trace fusion line mismatch:\n{trace}"
+        );
+    }
 }
 
 #[test]

@@ -11,6 +11,61 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Deserializer, Serialize};
 
+// The worker implementation is Linux-only because it runs on Glommio. Keep
+// the configuration defaults available on other hosts so the portable config
+// parser and CLI can still be checked and used there.
+#[cfg(target_os = "linux")]
+mod worker_defaults {
+    pub use brain_extractors::classifier::DEFAULT_GLINER_THRESHOLD as GLINER_THRESHOLD;
+    pub use brain_extractors::resolver::EMBED_RESOLVE_THRESHOLD;
+    pub use brain_ops::index::text_indexer::DEFAULT_COMMIT_MS as TEXT_INDEX_COMMIT_MS;
+    pub use brain_ops::index::text_indexer::DEFAULT_COMMIT_N as TEXT_INDEX_COMMIT_N;
+    pub use brain_workers::workers::ambiguity_resolver::DEFAULT_INTERVAL_SECS as AMBIGUITY_RESOLVER_INTERVAL_SECS;
+    pub use brain_workers::workers::confidence_sweep::DEFAULT_INTERVAL_SECS as CONFIDENCE_SWEEP_INTERVAL_SECS;
+    pub use brain_workers::workers::llm_cache_sweeper::DEFAULT_INTERVAL_SECS as LLM_CACHE_SWEEP_INTERVAL_SECS;
+    pub use brain_workers::workers::statement_reclaim::{
+        DEFAULT_GRACE_SECONDS as STATEMENT_RECLAIM_GRACE_SECONDS,
+        DEFAULT_PERIOD_SECONDS as STATEMENT_RECLAIM_PERIOD_SECONDS,
+    };
+    pub use brain_workers::workers::supersession_sweeper::DEFAULT_PERIOD_SECONDS as SUPERSESSION_PERIOD_SECONDS;
+    pub use brain_workers::{
+        DEFAULT_AUTO_EDGE_SIMILARITY_THRESHOLD as AUTO_EDGE_SIMILARITY_THRESHOLD,
+        DEFAULT_EXTRACTOR_BATCH_SIZE as EXTRACTOR_BATCH_SIZE,
+        DEFAULT_MAX_CAUSE_MEMORIES as MAX_CAUSE_MEMORIES,
+        DEFAULT_MAX_EFFECT_MEMORIES as MAX_EFFECT_MEMORIES,
+        DEFAULT_MAX_RELATED_STATEMENTS as MAX_RELATED_STATEMENTS,
+        DEFAULT_TEMPORAL_EDGE_TOPICAL_THRESHOLD as TEMPORAL_EDGE_TOPICAL_THRESHOLD,
+        DEFAULT_WHITELIST_QNAMES as WHITELIST_QNAMES,
+    };
+}
+
+#[cfg(not(target_os = "linux"))]
+mod worker_defaults {
+    pub const GLINER_THRESHOLD: f32 = 0.5;
+    pub const EMBED_RESOLVE_THRESHOLD: f32 = 0.78;
+    pub const TEXT_INDEX_COMMIT_MS: u64 = 1000;
+    pub const TEXT_INDEX_COMMIT_N: usize = 256;
+    pub const AMBIGUITY_RESOLVER_INTERVAL_SECS: u64 = 3600;
+    pub const CONFIDENCE_SWEEP_INTERVAL_SECS: u64 = 3600;
+    pub const LLM_CACHE_SWEEP_INTERVAL_SECS: u64 = 3600;
+    pub const STATEMENT_RECLAIM_GRACE_SECONDS: u64 = 30 * 24 * 60 * 60;
+    pub const STATEMENT_RECLAIM_PERIOD_SECONDS: u64 = 86_400;
+    pub const SUPERSESSION_PERIOD_SECONDS: u64 = 86_400;
+    pub const AUTO_EDGE_SIMILARITY_THRESHOLD: f32 = 0.85;
+    pub const EXTRACTOR_BATCH_SIZE: usize = 8;
+    pub const MAX_CAUSE_MEMORIES: usize = 3;
+    pub const MAX_EFFECT_MEMORIES: usize = 3;
+    pub const MAX_RELATED_STATEMENTS: usize = 5;
+    pub const TEMPORAL_EDGE_TOPICAL_THRESHOLD: f32 = 0.4;
+    pub const WHITELIST_QNAMES: &[(&str, &str)] = &[
+        ("brain", "caused_by"),
+        ("brain", "triggered"),
+        ("brain", "led_to"),
+        ("brain", "resulted_in"),
+        ("brain", "because_of"),
+    ];
+}
+
 // ----------------------------------------------------------------------------
 // Top-level Config
 // ----------------------------------------------------------------------------
@@ -42,6 +97,13 @@ pub struct Config {
     #[serde(default)]
     pub index: IndexConfig,
     #[serde(default)]
+    pub retrieval: RetrievalConfig,
+    /// Deploy-time precision-decision tuning (calibrated selective shaping of
+    /// the RECALL answer). Every field defaults to a no-op, so the section may
+    /// be omitted and an uncalibrated deploy behaves as before.
+    #[serde(default)]
+    pub precision: PrecisionConfig,
+    #[serde(default)]
     pub monitoring: MonitoringConfig,
     /// Operator admin-plane config. The admin HTTP listener (key mint /
     /// revoke / stats) is gated on `token`; without it the listener refuses
@@ -71,7 +133,7 @@ pub struct Config {
 /// (`BRAIN__LLM__API_KEY` / `BRAIN__LLM__MODEL`) wins when present.
 /// Prefer the environment for production secrets — values committed to
 /// TOML leak into version control.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct LlmConfig {
     /// API key for the configured model's provider. Override with
@@ -83,6 +145,18 @@ pub struct LlmConfig {
     /// falls back to the built-in default when unset.
     #[serde(default)]
     pub model: Option<String>,
+}
+
+// Redact the provider key from `Debug` output. A future `debug!(?cfg)` must
+// never leak the LLM credential; the model id is safe to show. `Serialize`
+// (GET /v1/config) redacts separately and is left untouched.
+impl std::fmt::Debug for LlmConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LlmConfig")
+            .field("api_key", &self.api_key.as_ref().map(|_| "[redacted]"))
+            .field("model", &self.model)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -239,6 +313,44 @@ pub struct ExtractorsConfig {
     /// Write-time HyPE (hypothetical-question) generation tuning.
     #[serde(default)]
     pub hype: HypeExtractorConfig,
+    /// LLM tier tuning.
+    #[serde(default)]
+    pub llm: LlmExtractorConfig,
+}
+
+/// `[extractors.llm]` TOML sub-section. The LLM tier's tuning. The tier
+/// is always-on (no gate) — this only sizes its calls.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LlmExtractorConfig {
+    /// Output-token ceiling for one extraction call.
+    ///
+    /// The tier asks for the whole typed graph of a memory as a single
+    /// JSON document, so the ceiling scales with how much the memory
+    /// says, not how long it is. Hitting it truncates the JSON mid-token,
+    /// which reads downstream as malformed output rather than as a budget
+    /// problem — the provider's `finish_reason` is what tells the two
+    /// apart, and the extractor now reports truncation by name.
+    ///
+    /// Was 1024, which a single dense paragraph could exceed: eight
+    /// entities with their statements and relations runs past it, and the
+    /// memory then landed with entities but zero statements and zero
+    /// relations. 4096 fits the dense case with headroom; raise it if
+    /// `response truncated at max_tokens` appears in the extractor log.
+    #[serde(default = "default_llm_max_tokens")]
+    pub max_tokens: u32,
+}
+
+impl Default for LlmExtractorConfig {
+    fn default() -> Self {
+        Self {
+            max_tokens: default_llm_max_tokens(),
+        }
+    }
+}
+
+fn default_llm_max_tokens() -> u32 {
+    4096
 }
 
 /// `[extractors.classifier]` TOML sub-section. The classifier tier's
@@ -268,7 +380,7 @@ impl Default for ClassifierExtractorConfig {
 }
 
 fn default_classifier_threshold() -> f32 {
-    brain_extractors::classifier::DEFAULT_GLINER_THRESHOLD
+    worker_defaults::GLINER_THRESHOLD
 }
 
 /// `[extractors.resolver]` TOML sub-section. Entity-resolution
@@ -292,7 +404,7 @@ impl Default for ResolverExtractorConfig {
 }
 
 fn default_resolver_embed_threshold() -> f32 {
-    brain_extractors::resolver::EMBED_RESOLVE_THRESHOLD
+    worker_defaults::EMBED_RESOLVE_THRESHOLD
 }
 
 /// `[extractors.hype]` TOML sub-section. Write-time hypothetical-
@@ -361,6 +473,8 @@ pub struct WorkersConfig {
     /// retract grace window. Off by default. Section may be omitted.
     #[serde(default)]
     pub statement_reclaim: StatementReclaimWorkerConfig,
+    #[serde(default)]
+    pub predicate_gc: PredicateGcWorkerConfig,
     /// Entity merge-review-queue sweeper cadence. Section may be
     /// omitted; the field defaults.
     #[serde(default)]
@@ -427,7 +541,54 @@ fn default_supersession_retention_seconds() -> u64 {
     0
 }
 fn default_supersession_period_seconds() -> u64 {
-    brain_workers::workers::supersession_sweeper::DEFAULT_PERIOD_SECONDS
+    worker_defaults::SUPERSESSION_PERIOD_SECONDS
+}
+
+/// `[workers.predicate_gc]` TOML section. Controls reclamation of coined
+/// (`ImplicitFromWrite`) predicates that no live statement references. Off by
+/// default: the review queue is a shortlist of names worth promoting into a
+/// schema, so an operator may prefer coined vocabulary to accumulate.
+/// Schema-declared predicates are never touched.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PredicateGcWorkerConfig {
+    /// Master switch. `false` (default) leaves the worker unregistered.
+    #[serde(default = "default_predicate_gc_enabled")]
+    pub enabled: bool,
+    /// Grace window in seconds measured from the predicate's intern time,
+    /// covering the gap between coining a name and its statement landing.
+    /// Defaults to 7 days.
+    #[serde(default = "default_predicate_gc_grace_seconds")]
+    pub grace_seconds: u64,
+    /// Sweep cadence in seconds. Defaults to 1 day.
+    #[serde(default = "default_predicate_gc_period_seconds")]
+    pub period_seconds: u64,
+    /// Report-only. `true` logs what each cycle would reclaim and deletes
+    /// nothing — the way to see the shape of a deployment's coined
+    /// vocabulary before trusting a GC with it.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+impl Default for PredicateGcWorkerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_predicate_gc_enabled(),
+            grace_seconds: default_predicate_gc_grace_seconds(),
+            period_seconds: default_predicate_gc_period_seconds(),
+            dry_run: false,
+        }
+    }
+}
+
+fn default_predicate_gc_enabled() -> bool {
+    false
+}
+fn default_predicate_gc_grace_seconds() -> u64 {
+    brain_workers::workers::predicate_gc::DEFAULT_GRACE_SECONDS
+}
+fn default_predicate_gc_period_seconds() -> u64 {
+    brain_workers::workers::predicate_gc::DEFAULT_PERIOD_SECONDS
 }
 
 /// `[workers.statement_reclaim]` TOML section. Controls the retracted-
@@ -466,10 +627,10 @@ fn default_statement_reclaim_enabled() -> bool {
     false
 }
 fn default_statement_reclaim_grace_seconds() -> u64 {
-    brain_workers::workers::statement_reclaim::DEFAULT_GRACE_SECONDS
+    worker_defaults::STATEMENT_RECLAIM_GRACE_SECONDS
 }
 fn default_statement_reclaim_period_seconds() -> u64 {
-    brain_workers::workers::statement_reclaim::DEFAULT_PERIOD_SECONDS
+    worker_defaults::STATEMENT_RECLAIM_PERIOD_SECONDS
 }
 
 /// `[workers.ambiguity_resolver]` TOML section. Controls the entity
@@ -498,7 +659,7 @@ impl Default for AmbiguityResolverWorkerConfig {
 }
 
 fn default_ambiguity_resolver_interval_secs() -> u64 {
-    brain_workers::workers::ambiguity_resolver::DEFAULT_INTERVAL_SECS
+    worker_defaults::AMBIGUITY_RESOLVER_INTERVAL_SECS
 }
 
 /// `[workers.confidence_sweep]` TOML section. Controls the Statement
@@ -525,7 +686,7 @@ impl Default for ConfidenceSweepWorkerConfig {
 }
 
 fn default_confidence_sweep_interval_secs() -> u64 {
-    brain_workers::workers::confidence_sweep::DEFAULT_INTERVAL_SECS
+    worker_defaults::CONFIDENCE_SWEEP_INTERVAL_SECS
 }
 
 /// Shared default for low-cost maintenance workers that are on unless an
@@ -558,7 +719,7 @@ impl Default for LlmCacheSweepWorkerConfig {
 }
 
 fn default_llm_cache_sweep_interval_secs() -> u64 {
-    brain_workers::workers::llm_cache_sweeper::DEFAULT_INTERVAL_SECS
+    worker_defaults::LLM_CACHE_SWEEP_INTERVAL_SECS
 }
 
 /// `[index]` TOML section. Index-pipeline tuning. Currently the tantivy
@@ -587,10 +748,68 @@ impl Default for IndexConfig {
 }
 
 fn default_tantivy_commit_n() -> usize {
-    brain_ops::index::text_indexer::DEFAULT_COMMIT_N
+    worker_defaults::TEXT_INDEX_COMMIT_N
 }
 fn default_tantivy_commit_ms() -> u64 {
-    brain_ops::index::text_indexer::DEFAULT_COMMIT_MS
+    worker_defaults::TEXT_INDEX_COMMIT_MS
+}
+
+/// `[retrieval]` TOML section. Deploy-time read-path tuning that was
+/// previously read via bespoke `BRAIN_*` env vars deep in the planner /
+/// retriever / RECALL handler. Every field defaults to the historical
+/// env-unset behaviour, so the section may be omitted entirely. The generic
+/// `BRAIN__RETRIEVAL__FIELD` override applies like any other section.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RetrievalConfig {
+    /// Rank-fusion strategy: `"rrf"` (default), `"relative"`, or `"zscore"`.
+    #[serde(default = "default_fusion_method")]
+    pub fusion_method: String,
+    /// HyPE joins the semantic lane as its own RRF rank list rather than a
+    /// non-displacing append. Default false.
+    #[serde(default)]
+    pub hype_rrf: bool,
+    /// Scale the memory probe's `ef_search` by index occupancy. Default false.
+    #[serde(default)]
+    pub ef_occupancy_scaling: bool,
+    /// Relative-drop autocut of the ranked result tail. Default false.
+    #[serde(default)]
+    pub autocut: bool,
+}
+
+impl Default for RetrievalConfig {
+    fn default() -> Self {
+        Self {
+            fusion_method: default_fusion_method(),
+            hype_rrf: false,
+            ef_occupancy_scaling: false,
+            autocut: false,
+        }
+    }
+}
+
+fn default_fusion_method() -> String {
+    "rrf".to_string()
+}
+
+/// `[precision]` TOML section. Deploy-time tuning for the read path's calibrated
+/// precision decision (RECALL membership → answer shape / abstention). Both
+/// fields default to `0`, a no-op that reproduces the pre-precision behaviour, so
+/// the section may be omitted. The generic `BRAIN__PRECISION__FIELD` override
+/// applies like any other section. See `spec/13_retrievers/07_precision_engine.md`.
+/// The derived `Default` is all-zero — the no-op that reproduces the
+/// pre-precision behaviour, so the whole section may be omitted.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct PrecisionConfig {
+    /// Minimum cross-lane `support` (0..=5) the uncommitted lead must carry to
+    /// commit rather than abstain with `None`. `0` never abstains on this signal.
+    #[serde(default)]
+    pub commit_min_support: u8,
+    /// Minimum `support` a member needs to join a `Many` answer's committed set
+    /// (vs. retained context). `0` keeps every band member (no trim).
+    #[serde(default)]
+    pub many_min_support: u8,
 }
 
 /// `[workers.auto_edge]` TOML section. Controls the substrate
@@ -657,7 +876,7 @@ fn default_auto_edge_similarity_threshold() -> f32 {
     // false SimilarTo edges and hub clutter. Operators override via
     // `BRAIN__WORKERS__AUTO_EDGE__SIMILARITY_THRESHOLD` (the generic
     // env-override path) or directly in TOML.
-    brain_workers::DEFAULT_AUTO_EDGE_SIMILARITY_THRESHOLD
+    worker_defaults::AUTO_EDGE_SIMILARITY_THRESHOLD
 }
 fn default_auto_edge_top_k() -> usize {
     5
@@ -748,7 +967,7 @@ fn default_temporal_edge_cross_session() -> bool {
     false
 }
 fn default_temporal_edge_topical_threshold() -> f32 {
-    brain_workers::DEFAULT_TEMPORAL_EDGE_TOPICAL_THRESHOLD
+    worker_defaults::TEMPORAL_EDGE_TOPICAL_THRESHOLD
 }
 
 /// `[workers.causal_edge]` TOML section. Controls extractor-driven
@@ -824,19 +1043,19 @@ fn default_causal_edge_min_confidence() -> f32 {
     0.6
 }
 fn default_causal_edge_whitelist() -> Vec<String> {
-    brain_workers::DEFAULT_WHITELIST_QNAMES
+    worker_defaults::WHITELIST_QNAMES
         .iter()
         .map(|(ns, name)| format!("{ns}:{name}"))
         .collect()
 }
 fn default_causal_edge_max_effect_memories() -> usize {
-    brain_workers::DEFAULT_MAX_EFFECT_MEMORIES
+    worker_defaults::MAX_EFFECT_MEMORIES
 }
 fn default_causal_edge_max_cause_memories() -> usize {
-    brain_workers::DEFAULT_MAX_CAUSE_MEMORIES
+    worker_defaults::MAX_CAUSE_MEMORIES
 }
 fn default_causal_edge_max_related_statements() -> usize {
-    brain_workers::DEFAULT_MAX_RELATED_STATEMENTS
+    worker_defaults::MAX_RELATED_STATEMENTS
 }
 fn default_causal_edge_channel_capacity() -> usize {
     1024
@@ -874,6 +1093,26 @@ pub struct ExtractorWorkerConfig {
     /// per-memory cost down by ~4-5x on a CPU host.
     #[serde(default = "default_extractor_batch_size")]
     pub batch_size: usize,
+    /// Re-extract a namespace's already-committed memories when a new
+    /// schema version is uploaded for it.
+    ///
+    /// **Default `false`, and that default is deliberate.** Re-extraction
+    /// costs one LLM call per affected memory, so a single `SCHEMA_UPLOAD`
+    /// on a large corpus can turn into thousands of paid calls with no
+    /// operator in the loop. With this off, the schema-migration worker
+    /// still does its flag sweep and now REPORTS how many memories fell
+    /// outside the new schema, so the operator can trigger the same work
+    /// deliberately via `POST /v1/extract/backfill`.
+    ///
+    /// Turning it on makes a namespace self-healing: upload a schema and
+    /// its corpus re-aligns to the new vocabulary without a second step.
+    /// Choose it when schema churn is rare and the corpus is small.
+    ///
+    /// Either way, re-extraction is bounded by the extractor's own
+    /// `channel_capacity` and per-cycle `llm_budget_per_cycle_micro_usd` —
+    /// enabling this cannot outrun those ceilings, it only fills them.
+    #[serde(default = "default_reextract_on_schema_change")]
+    pub reextract_on_schema_change: bool,
 }
 
 impl Default for ExtractorWorkerConfig {
@@ -885,6 +1124,7 @@ impl Default for ExtractorWorkerConfig {
             channel_capacity: default_extractor_channel_capacity(),
             skip_already_extracted: default_extractor_skip_audited(),
             batch_size: default_extractor_batch_size(),
+            reextract_on_schema_change: default_reextract_on_schema_change(),
         }
     }
 }
@@ -905,7 +1145,11 @@ fn default_extractor_skip_audited() -> bool {
     true
 }
 fn default_extractor_batch_size() -> usize {
-    brain_workers::DEFAULT_EXTRACTOR_BATCH_SIZE
+    worker_defaults::EXTRACTOR_BATCH_SIZE
+}
+/// Off. Spending money on the operator's behalf is not a default.
+fn default_reextract_on_schema_change() -> bool {
+    false
 }
 
 /// `[monitoring]` TOML section. Groups logging and distributed-tracing
@@ -972,7 +1216,7 @@ fn default_service_name() -> String {
 /// mint / revoke / stats). Data-plane auth is always mandatory and is not
 /// configurable here — identity is the API key. Override the token with
 /// `BRAIN__ADMIN__TOKEN`; prefer the environment for production secrets.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AdminConfig {
     /// Operator admin secret. Every admin HTTP request must present it as
@@ -981,6 +1225,27 @@ pub struct AdminConfig {
     /// channel.
     #[serde(default)]
     pub token: Option<String>,
+}
+
+impl AdminConfig {
+    /// Whether a usable admin secret is configured. A token that is unset
+    /// or whitespace-only is treated as absent: the admin listener mints
+    /// data-plane API keys, so a blank secret is no secret at all. The
+    /// boot gate in `main.rs` fails closed on `!has_token()`.
+    pub fn has_token(&self) -> bool {
+        self.token.as_deref().is_some_and(|t| !t.trim().is_empty())
+    }
+}
+
+// Redact the admin secret from `Debug` output. A future `debug!(?cfg)` must
+// never leak the operator token; `Serialize` (GET /v1/config) redacts
+// separately and is left untouched.
+impl std::fmt::Debug for AdminConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdminConfig")
+            .field("token", &self.token.as_ref().map(|_| "[redacted]"))
+            .finish()
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -1116,6 +1381,16 @@ pub enum ConfigError {
 // human_bytes
 // ----------------------------------------------------------------------------
 
+/// Reject a zero value for a cadence / capacity / timeout field with a clear,
+/// field-named boot error. A zero interval busy-spins a shard core, a zero
+/// channel capacity drops all work, and a zero timeout hangs on retries.
+fn require_nonzero(name: &str, v: u64) -> Result<(), ConfigError> {
+    if v == 0 {
+        return Err(ConfigError::Invariant(format!("{name} must be >= 1")));
+    }
+    Ok(())
+}
+
 fn deserialize_human_bytes<'de, D>(d: D) -> Result<u64, D::Error>
 where
     D: Deserializer<'de>,
@@ -1164,6 +1439,12 @@ pub fn parse_human_bytes(s: &str) -> Result<u64, ConfigError> {
 /// re-typed (bool / integer / float / string) so the subsequent `serde`
 /// deserialize sees a value of the expected primitive type.
 fn apply_env_overrides(value: &mut toml::Value, env: &HashMap<String, String>) {
+    // Type oracle: a fully-typed reference tree of the target `Config`, used
+    // to decide whether an env leaf is a genuine numeric/bool field (coerce)
+    // or a string field — secrets, model ids, paths — that must stay a string
+    // even when its value looks numeric or boolean (e.g. a pure-digit API
+    // key, or an admin token of "48291057").
+    let reference = coercion_reference();
     for (key, val) in env {
         let Some(suffix) = key.strip_prefix("BRAIN__") else {
             continue;
@@ -1172,14 +1453,57 @@ fn apply_env_overrides(value: &mut toml::Value, env: &HashMap<String, String>) {
         if path.is_empty() || path.iter().any(String::is_empty) {
             continue;
         }
-        set_path(value, &path, val);
+        set_path(value, &path, val, &reference);
     }
 }
 
+/// A fully-typed reference `toml::Value` for the target [`Config`]. Every
+/// string-typed leaf (including `Option<String>` / `Option<PathBuf>` fields
+/// that default to `None`, and `SocketAddr` / byte-size fields serialized as
+/// strings) is populated so [`reference_leaf_is_string`] can distinguish a
+/// string target from a numeric/bool one. Absent leaves (genuinely numeric
+/// `Option<u64>` worker cadences, or fields added in the future) fall through
+/// to the numeric heuristic, which is the correct default for them.
+fn coercion_reference() -> toml::Value {
+    let mut cfg = Config::for_tests();
+    // Populate the `None`-by-default string-typed options so their `String`
+    // type is visible in the serialized oracle.
+    cfg.llm.api_key = Some(String::new());
+    cfg.llm.model = Some(String::new());
+    cfg.extractors.classifier.model_path = Some(String::new());
+    cfg.server.tls.cert = Some(PathBuf::from("x"));
+    cfg.server.tls.key = Some(PathBuf::from("x"));
+    // admin.token is already `Some(..)` in `for_tests`.
+    toml::Value::try_from(cfg).expect("invariant: Config serializes to TOML")
+}
+
+/// Whether the reference tree marks the leaf at `path` as a `String`.
+/// A missing leaf returns `false` so the caller applies the numeric
+/// heuristic (correct for numeric `Option` cadences and unknown fields).
+fn reference_leaf_is_string(reference: &toml::Value, path: &[String]) -> bool {
+    let mut cursor = reference;
+    for segment in path {
+        let toml::Value::Table(table) = cursor else {
+            return false;
+        };
+        match table.get(segment) {
+            Some(next) => cursor = next,
+            None => return false,
+        }
+    }
+    matches!(cursor, toml::Value::String(_))
+}
+
 /// Coerce a raw env-var string to the most specific TOML scalar that fits.
-/// Fields that look like byte-size strings (e.g. "2GiB") fall through to
-/// `String`, which is exactly what `deserialize_human_bytes` expects.
-fn coerce_leaf(raw: &str) -> toml::Value {
+/// When `force_string` is set the value is kept verbatim as a `String` — this
+/// is how string-typed targets (secrets, model ids, addresses, paths) accept
+/// values that happen to look numeric or boolean. Byte-size strings (e.g.
+/// "2GiB") also fall through to `String`, which is what
+/// `deserialize_human_bytes` expects.
+fn coerce_leaf(raw: &str, force_string: bool) -> toml::Value {
+    if force_string {
+        return toml::Value::String(raw.to_owned());
+    }
     match raw {
         "true" => return toml::Value::Boolean(true),
         "false" => return toml::Value::Boolean(false),
@@ -1195,10 +1519,11 @@ fn coerce_leaf(raw: &str) -> toml::Value {
     toml::Value::String(raw.to_owned())
 }
 
-fn set_path(value: &mut toml::Value, path: &[String], leaf: &str) {
+fn set_path(value: &mut toml::Value, path: &[String], leaf: &str, reference: &toml::Value) {
     if path.is_empty() {
         return;
     }
+    let force_string = reference_leaf_is_string(reference, path);
     let mut cursor = value;
     for segment in &path[..path.len() - 1] {
         if !matches!(cursor, toml::Value::Table(_)) {
@@ -1218,7 +1543,7 @@ fn set_path(value: &mut toml::Value, path: &[String], leaf: &str) {
         unreachable!("ensured above");
     };
     let leaf_key = path.last().expect("path non-empty").clone();
-    table.insert(leaf_key, coerce_leaf(leaf));
+    table.insert(leaf_key, coerce_leaf(leaf, force_string));
 }
 
 // ----------------------------------------------------------------------------
@@ -1295,6 +1620,8 @@ impl Config {
             extractors: ExtractorsConfig::default(),
             workers: WorkersConfig::default(),
             index: IndexConfig::default(),
+            retrieval: RetrievalConfig::default(),
+            precision: PrecisionConfig::default(),
             monitoring: MonitoringConfig::default(),
             admin: AdminConfig {
                 // Non-empty so the admin listener boots in tests; admin
@@ -1306,6 +1633,7 @@ impl Config {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn validate_post(&self) -> Result<(), ConfigError> {
         if self.storage.shard_count == 0 {
             return Err(ConfigError::Invariant(
@@ -1355,6 +1683,139 @@ impl Config {
                 "server.tls.enabled = true requires both server.tls.cert and server.tls.key".into(),
             ));
         }
+
+        // A zero embedder batch window would flush every embed immediately —
+        // defeating batching without disabling it — so reject it explicitly.
+        require_nonzero(
+            "embedder.batch_window_ms",
+            u64::from(self.embedder.batch_window_ms),
+        )?;
+
+        // Worker cadences and queue depths. A zero interval busy-spins a shard
+        // core (the scheduler sleeps for the interval each tick); a zero
+        // channel capacity silently drops every enqueued item; a zero
+        // drain/batch stalls the worker. All are config errors, not runtime
+        // surprises — validate them at boot.
+        let w = &self.workers;
+
+        // Optional maintenance cadences: only constrained when set.
+        for (name, v) in [
+            ("workers.decay_interval_sec", w.decay_interval_sec),
+            (
+                "workers.consolidation_interval_sec",
+                w.consolidation_interval_sec,
+            ),
+            (
+                "workers.hnsw_maintenance_interval_sec",
+                w.hnsw_maintenance_interval_sec,
+            ),
+            (
+                "workers.idempotency_cleanup_interval_sec",
+                w.idempotency_cleanup_interval_sec,
+            ),
+            (
+                "workers.slot_reclamation_interval_sec",
+                w.slot_reclamation_interval_sec,
+            ),
+            (
+                "workers.wal_retention_interval_sec",
+                w.wal_retention_interval_sec,
+            ),
+            ("workers.edge_scrub_interval_sec", w.edge_scrub_interval_sec),
+            (
+                "workers.counter_reconciliation_interval_sec",
+                w.counter_reconciliation_interval_sec,
+            ),
+            (
+                "workers.statistics_update_interval_sec",
+                w.statistics_update_interval_sec,
+            ),
+            (
+                "workers.embedder_cache_eviction_interval_sec",
+                w.embedder_cache_eviction_interval_sec,
+            ),
+            ("workers.snapshot_interval_sec", w.snapshot_interval_sec),
+        ] {
+            if let Some(v) = v {
+                require_nonzero(name, v)?;
+            }
+        }
+
+        require_nonzero("workers.auto_edge.interval_ms", w.auto_edge.interval_ms)?;
+        require_nonzero(
+            "workers.auto_edge.channel_capacity",
+            w.auto_edge.channel_capacity as u64,
+        )?;
+        require_nonzero(
+            "workers.auto_edge.batch_size",
+            w.auto_edge.batch_size as u64,
+        )?;
+
+        require_nonzero(
+            "workers.temporal_edge.interval_ms",
+            w.temporal_edge.interval_ms,
+        )?;
+        require_nonzero(
+            "workers.temporal_edge.channel_capacity",
+            w.temporal_edge.channel_capacity as u64,
+        )?;
+        require_nonzero(
+            "workers.temporal_edge.batch_size",
+            w.temporal_edge.batch_size as u64,
+        )?;
+
+        require_nonzero("workers.causal_edge.interval_ms", w.causal_edge.interval_ms)?;
+        require_nonzero(
+            "workers.causal_edge.channel_capacity",
+            w.causal_edge.channel_capacity as u64,
+        )?;
+        require_nonzero(
+            "workers.causal_edge.batch_size",
+            w.causal_edge.batch_size as u64,
+        )?;
+
+        require_nonzero("workers.extractor.interval_ms", w.extractor.interval_ms)?;
+        require_nonzero(
+            "workers.extractor.channel_capacity",
+            w.extractor.channel_capacity as u64,
+        )?;
+        require_nonzero(
+            "workers.extractor.drain_per_cycle",
+            w.extractor.drain_per_cycle as u64,
+        )?;
+        require_nonzero(
+            "workers.extractor.batch_size",
+            w.extractor.batch_size as u64,
+        )?;
+
+        require_nonzero(
+            "workers.ambiguity_resolver.interval_secs",
+            w.ambiguity_resolver.interval_secs,
+        )?;
+        require_nonzero(
+            "workers.confidence_sweep.interval_secs",
+            w.confidence_sweep.interval_secs,
+        )?;
+        require_nonzero(
+            "workers.llm_cache_sweep.interval_secs",
+            w.llm_cache_sweep.interval_secs,
+        )?;
+        require_nonzero(
+            "workers.supersession_sweeper.period_seconds",
+            w.supersession_sweeper.period_seconds,
+        )?;
+        require_nonzero(
+            "workers.statement_reclaim.period_seconds",
+            w.statement_reclaim.period_seconds,
+        )?;
+
+        // Every LLM round-trip is bounded by this; a zero timeout would fail
+        // instantly, hanging the consolidation worker on retries.
+        require_nonzero(
+            "summarizer.request_timeout_sec",
+            u64::from(self.summarizer.request_timeout_sec),
+        )?;
+
         Ok(())
     }
 
@@ -1474,27 +1935,135 @@ mod tests {
 
     #[test]
     fn coerce_leaf_handles_primitive_types() {
-        assert_eq!(coerce_leaf("true"), toml::Value::Boolean(true));
-        assert_eq!(coerce_leaf("false"), toml::Value::Boolean(false));
-        assert_eq!(coerce_leaf("42"), toml::Value::Integer(42));
-        assert_eq!(coerce_leaf("-7"), toml::Value::Integer(-7));
-        assert_eq!(coerce_leaf("0.5"), toml::Value::Float(0.5));
-        assert_eq!(coerce_leaf("1e3"), toml::Value::Float(1000.0));
+        assert_eq!(coerce_leaf("true", false), toml::Value::Boolean(true));
+        assert_eq!(coerce_leaf("false", false), toml::Value::Boolean(false));
+        assert_eq!(coerce_leaf("42", false), toml::Value::Integer(42));
+        assert_eq!(coerce_leaf("-7", false), toml::Value::Integer(-7));
+        assert_eq!(coerce_leaf("0.5", false), toml::Value::Float(0.5));
+        assert_eq!(coerce_leaf("1e3", false), toml::Value::Float(1000.0));
         // Strings that aren't numeric or bool keep type String — including
         // byte-size syntax that human_bytes will parse downstream.
-        assert_eq!(coerce_leaf("2GiB"), toml::Value::String("2GiB".into()));
         assert_eq!(
-            coerce_leaf("127.0.0.1:9090"),
+            coerce_leaf("2GiB", false),
+            toml::Value::String("2GiB".into())
+        );
+        assert_eq!(
+            coerce_leaf("127.0.0.1:9090", false),
             toml::Value::String("127.0.0.1:9090".into())
         );
     }
 
     #[test]
+    fn coerce_leaf_force_string_keeps_numeric_looking_values() {
+        // A string-typed target (secret / model id / path) must keep a
+        // numeric- or bool-looking value verbatim rather than re-typing it.
+        assert_eq!(
+            coerce_leaf("12345678", true),
+            toml::Value::String("12345678".into())
+        );
+        assert_eq!(
+            coerce_leaf("true", true),
+            toml::Value::String("true".into())
+        );
+        assert_eq!(
+            coerce_leaf("99999", true),
+            toml::Value::String("99999".into())
+        );
+    }
+
+    #[test]
+    fn reference_marks_string_secrets_and_numeric_fields() {
+        let reference = coercion_reference();
+        // Secrets / ids / addresses are string-typed.
+        assert!(reference_leaf_is_string(
+            &reference,
+            &["admin".into(), "token".into()]
+        ));
+        assert!(reference_leaf_is_string(
+            &reference,
+            &["llm".into(), "api_key".into()]
+        ));
+        assert!(reference_leaf_is_string(
+            &reference,
+            &["llm".into(), "model".into()]
+        ));
+        assert!(reference_leaf_is_string(
+            &reference,
+            &["server".into(), "listen_addr".into()]
+        ));
+        // Genuine numeric fields are not string-typed.
+        assert!(!reference_leaf_is_string(
+            &reference,
+            &["storage".into(), "shard_count".into()]
+        ));
+        assert!(!reference_leaf_is_string(
+            &reference,
+            &["workers".into(), "auto_edge".into(), "interval_ms".into()]
+        ));
+        // Unknown paths default to non-string (numeric heuristic).
+        assert!(!reference_leaf_is_string(
+            &reference,
+            &["nope".into(), "missing".into()]
+        ));
+    }
+
+    #[test]
     fn set_path_replaces_existing_scalar() {
+        let reference = coercion_reference();
         let mut value: toml::Value = toml::from_str("[a]\nb = 1\n").unwrap();
-        set_path(&mut value, &["a".into(), "b".into()], "0.0.0.0:8080");
+        set_path(
+            &mut value,
+            &["a".into(), "b".into()],
+            "0.0.0.0:8080",
+            &reference,
+        );
         let s = value["a"]["b"].as_str().unwrap();
         assert_eq!(s, "0.0.0.0:8080");
+    }
+
+    #[test]
+    fn set_path_forces_string_for_secret_leaf() {
+        let reference = coercion_reference();
+        let mut value: toml::Value = toml::from_str("[admin]\ntoken = \"x\"\n").unwrap();
+        set_path(
+            &mut value,
+            &["admin".into(), "token".into()],
+            "48291057",
+            &reference,
+        );
+        assert_eq!(value["admin"]["token"].as_str().unwrap(), "48291057");
+    }
+
+    #[test]
+    fn admin_config_has_token_trims_whitespace() {
+        let mut admin = AdminConfig::default();
+        assert!(!admin.has_token(), "unset token is not usable");
+        admin.token = Some("   ".to_string());
+        assert!(!admin.has_token(), "whitespace-only token is not usable");
+        admin.token = Some(String::new());
+        assert!(!admin.has_token(), "empty token is not usable");
+        admin.token = Some("real-secret".to_string());
+        assert!(admin.has_token(), "a real token is usable");
+    }
+
+    #[test]
+    fn debug_redacts_secrets() {
+        let mut cfg = Config::for_tests();
+        cfg.llm.api_key = Some("sk-supersecret-value".to_string());
+        cfg.admin.token = Some("operator-token-value".to_string());
+        let rendered = format!("{cfg:?}");
+        assert!(
+            !rendered.contains("sk-supersecret-value"),
+            "api_key must not appear in Debug output"
+        );
+        assert!(
+            !rendered.contains("operator-token-value"),
+            "admin token must not appear in Debug output"
+        );
+        assert!(
+            rendered.contains("[redacted]"),
+            "Debug output must mark secrets as [redacted]"
+        );
     }
 
     fn embedder(model: &str) -> EmbedderConfig {
@@ -1577,8 +2146,14 @@ mod tests {
     #[test]
     fn set_path_inserts_into_missing_section() {
         let mut value: toml::Value = toml::from_str("[a]\nb = 1\n").unwrap();
-        set_path(&mut value, &["c".into(), "d".into(), "e".into()], "true");
-        // "true" coerces to a Boolean.
+        let reference = coercion_reference();
+        set_path(
+            &mut value,
+            &["c".into(), "d".into(), "e".into()],
+            "true",
+            &reference,
+        );
+        // "true" coerces to a Boolean (unknown path → numeric heuristic).
         assert!(value["c"]["d"]["e"].as_bool().unwrap());
     }
 }

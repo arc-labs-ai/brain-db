@@ -98,6 +98,15 @@ pub struct PredicateDef {
     /// Local name; the qname is `{schema.namespace}:{name}`.
     pub name: String,
     pub kind: StatementKindAst,
+    /// Which entity type may be this predicate's SUBJECT.
+    ///
+    /// `None` (the field omitted) means any subject, which is how every
+    /// schema written before this field behaved — so adding it never
+    /// narrows an existing schema. Declaring it lets the store reject a
+    /// statement that hangs a predicate off the wrong kind of thing, which
+    /// `object` alone could never express.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<SubjectTypeDecl>,
     pub object: ObjectTypeDecl,
     /// Explicit per-predicate supersession flag. When set, a new
     /// statement with the same `(subject, predicate)` tombstones the
@@ -109,14 +118,24 @@ pub struct PredicateDef {
     pub stateful: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Explicit time-to-live for statements of this predicate. When set, a
+    /// statement older than this (measured per kind from `event_at` for
+    /// Events, `valid_from` for Facts/Preferences) is soft-tombstoned by the
+    /// reclaim worker, then hard-reclaimed on the standard tombstone grace.
+    /// `None` (the default) keeps statements indefinitely — subject only to
+    /// confidence decay, supersession, and explicit FORGET/RETRACT. Distinct
+    /// from decay, which dims confidence but never removes a row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<DurationAst>,
 }
 
 impl PredicateDef {
     /// Resolve the `stateful` flag against its kind-derived default.
-    /// Preference predicates default to stateful (each new preference
-    /// supersedes the prior one); Fact and Event default to cumulative.
-    /// `Any` is treated as Fact-like — no auto-supersession unless the
-    /// author opts in explicitly.
+    /// Only the single-valued kinds (Attribute, Directive) default to
+    /// stateful — a newer value supersedes the prior one. Fact, Event and
+    /// Preference default to cumulative (one can like many things), so a
+    /// single-valued preference such as "the framework to use" must declare
+    /// `stateful: true` to supersede. `Any` is treated as Fact-like.
     #[must_use]
     pub fn resolved_stateful(&self) -> bool {
         self.stateful.unwrap_or(match self.kind {
@@ -203,6 +222,15 @@ pub enum ObjectKindAst {
     Time,
     Quantity,
     List,
+}
+
+/// The declared subject domain of a predicate.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum SubjectTypeDecl {
+    /// `subject: Entity<Builder>` — only entities of that type.
+    Entity { entity_type: String },
+    /// `subject: Any` — the explicit spelling of the default.
+    Any,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -330,6 +358,20 @@ pub enum DurationUnit {
     Days,
 }
 
+impl DurationAst {
+    /// Total seconds this duration represents (saturating).
+    #[must_use]
+    pub fn to_seconds(self) -> u64 {
+        let mult = match self.unit {
+            DurationUnit::Seconds => 1,
+            DurationUnit::Minutes => 60,
+            DurationUnit::Hours => 3_600,
+            DurationUnit::Days => 86_400,
+        };
+        self.amount.saturating_mul(mult)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct CostExpr {
     pub amount: f64,
@@ -421,6 +463,7 @@ mod tests {
                     }],
                 }),
                 SchemaItem::Predicate(PredicateDef {
+                    subject: None,
                     name: "role".into(),
                     kind: StatementKindAst::Fact,
                     object: ObjectTypeDecl::Value {
@@ -428,8 +471,10 @@ mod tests {
                     },
                     stateful: None,
                     description: None,
+                    retention: None,
                 }),
                 SchemaItem::Predicate(PredicateDef {
+                    subject: None,
                     name: "prefers".into(),
                     kind: StatementKindAst::Preference,
                     object: ObjectTypeDecl::Value {
@@ -437,6 +482,7 @@ mod tests {
                     },
                     stateful: None,
                     description: None,
+                    retention: None,
                 }),
                 SchemaItem::RelationType(RelationTypeDef {
                     name: "reports_to".into(),

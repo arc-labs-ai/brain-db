@@ -214,6 +214,7 @@ fn make_ctx(
         metadata: Arc::new(metadata),
         caller_namespace: brain_core::NamespaceId::SYSTEM.raw(),
         caller_space: brain_core::SpaceId::default(),
+        scope_mode: brain_metadata::ScopeMode::Space,
         cross_encoder: None,
         space_vectors: None,
     };
@@ -788,6 +789,7 @@ fn dynamic_k_deepens_when_filters_thin_the_pool() {
         metadata: Arc::new(metadata),
         caller_namespace: brain_core::NamespaceId::SYSTEM.raw(),
         caller_space: brain_core::SpaceId::default(),
+        scope_mode: brain_metadata::ScopeMode::Space,
         cross_encoder: None,
         space_vectors: None,
     };
@@ -874,6 +876,59 @@ fn dynamic_k_no_deepen_when_first_pass_fills_limit() {
     assert_eq!(result.items.len(), 10);
 }
 
+#[test]
+fn union_deepened_keeps_shallow_survivor_dropped_by_deep_truncation() {
+    use crate::retrieval::executor::{QueryMetadata, QueryResult};
+    use crate::retrieval::fusion::{FusedItem, RetrieverContribution};
+
+    // Build a fused item for a slot. The two passes fuse at different
+    // adaptive_k, so their orderings differ; we model that directly.
+    let fi = |slot: u64| FusedItem {
+        id: RankedItemId::Memory(MemoryId::pack(0, slot, 0)),
+        fused_score: 1.0,
+        contributing: vec![RetrieverContribution {
+            retriever: Retriever::Semantic,
+            rank: 1,
+            raw_score: 0.9,
+        }],
+        rerank_score: None,
+    };
+    let result = |slots: &[u64]| QueryResult {
+        items: slots.iter().map(|s| fi(*s)).collect(),
+        metadata: QueryMetadata::default(),
+    };
+    let slot_of = |f: &FusedItem| match f.id {
+        RankedItemId::Memory(m) => m.slot(),
+        _ => unreachable!(),
+    };
+
+    // Shallow pass under-filled (2 < limit 3) with survivors {1, 2}. The
+    // deep pass, fused at a different k and truncated to limit, is
+    // [1, 5, 6] — it kept shallow slot 1 but dropped shallow slot 2 past
+    // the cut. Returning `retry` wholesale (the old behaviour) would lose
+    // slot 2; the union must keep it.
+    let shallow = result(&[1, 2]);
+    let deep = result(&[1, 5, 6]);
+
+    let out = super::union_deepened(shallow, deep, 3);
+
+    let out_slots: std::collections::HashSet<u64> = out.items.iter().map(slot_of).collect();
+    assert!(out.items.len() <= 3, "must not exceed limit: {out_slots:?}");
+    assert!(
+        out_slots.contains(&2),
+        "shallow survivor dropped by deep truncation must be preserved: {out_slots:?}"
+    );
+    // Both shallow survivors kept.
+    assert!(out_slots.contains(&1) && out_slots.contains(&2));
+    // A deep-only item fills the remaining slot (deep order preferred).
+    assert!(out_slots.contains(&5));
+    // after_limit reflects the unioned length.
+    assert_eq!(
+        out.metadata.filter_stats.after_limit,
+        out.items.len() as u32
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Cue→anchor entity-graph expansion.
 // ---------------------------------------------------------------------------
@@ -900,6 +955,7 @@ fn cue_ctx(metadata: MetadataDb) -> RetrievalExecutorContext {
         metadata: Arc::new(metadata),
         caller_namespace: brain_core::NamespaceId::SYSTEM.raw(),
         caller_space: brain_core::SpaceId::default(),
+        scope_mode: brain_metadata::ScopeMode::Space,
         cross_encoder: None,
         space_vectors: None,
     }
@@ -1145,6 +1201,7 @@ fn prf_reprobes_lexical_with_expansion_on_low_specificity_query() {
         metadata: Arc::new(metadata),
         caller_namespace: brain_core::NamespaceId::SYSTEM.raw(),
         caller_space: brain_core::SpaceId::default(),
+        scope_mode: brain_metadata::ScopeMode::Space,
         cross_encoder: None,
         space_vectors: None,
     };
@@ -1195,6 +1252,7 @@ fn prf_skips_high_specificity_query() {
         metadata: Arc::new(metadata),
         caller_namespace: brain_core::NamespaceId::SYSTEM.raw(),
         caller_space: brain_core::SpaceId::default(),
+        scope_mode: brain_metadata::ScopeMode::Space,
         cross_encoder: None,
         space_vectors: None,
     };
@@ -1221,7 +1279,7 @@ fn __ts() -> brain_metadata::RowScope {
 }
 
 #[test]
-fn correct_derived_lexical_partitions_by_provenance() {
+fn correct_derived_lexical_keeps_genuine_drops_prf_echo() {
     use crate::retrieval::fusion::{FusedItem, RetrieverContribution};
     use std::collections::HashSet;
 
@@ -1245,13 +1303,11 @@ fn correct_derived_lexical_partitions_by_provenance() {
         rerank_score: None,
     };
     let id = |slot: u64| RankedItemId::Memory(MemoryId::pack(0, slot, 0));
-    // slot 1: genuine original-query lexical hit; slot 2: PRF-only (echo);
-    // slot 3: graph-expansion hit.
-    let mut fused = vec![mk(1), mk(2), mk(3)];
+    // slot 1: genuine original-query lexical hit; slot 2: PRF-only (echo).
+    let mut fused = vec![mk(1), mk(2)];
     let orig: HashSet<RankedItemId> = [id(1)].into_iter().collect();
-    let graph_added: HashSet<RankedItemId> = [id(3)].into_iter().collect();
 
-    super::correct_derived_lexical(&mut fused, &orig, &graph_added);
+    super::correct_derived_lexical(&mut fused, &orig);
 
     let lanes = |f: &FusedItem| {
         f.contributing
@@ -1266,13 +1322,43 @@ fn correct_derived_lexical_partitions_by_provenance() {
     );
     // PRF-only echo loses the Lexical tag entirely (circular, not independent).
     assert_eq!(lanes(&fused[1]), vec![Retriever::Semantic]);
-    // Graph-expansion hit is re-tagged Graph (independent graph signal).
-    assert_eq!(
-        lanes(&fused[2]),
-        vec![Retriever::Semantic, Retriever::Graph]
-    );
     // fused_score is never touched — recall/ranking preserved.
     assert!(fused
         .iter()
         .all(|f| (f.fused_score - 1.0).abs() < f32::EPSILON as f64));
+}
+
+#[test]
+fn correct_derived_lexical_preserves_graph_tag() {
+    use crate::retrieval::fusion::{FusedItem, RetrieverContribution};
+    use std::collections::HashSet;
+
+    // A graph-expansion hit arrives already tagged Graph — it is routed
+    // into the GRAPH lane upstream, so fusion stamps it Graph before this
+    // runs. It also picked up a PRF-echo Lexical tag (not in orig). The
+    // echo lexical tag must be dropped while the independent Graph tag
+    // survives, so graph-expansion hits stay tagged Graph.
+    let mut fused = vec![FusedItem {
+        id: RankedItemId::Memory(MemoryId::pack(0, 3, 0)),
+        fused_score: 1.0,
+        contributing: vec![
+            RetrieverContribution {
+                retriever: Retriever::Graph,
+                rank: 1,
+                raw_score: 0.7,
+            },
+            RetrieverContribution {
+                retriever: Retriever::Lexical,
+                rank: 2,
+                raw_score: 0.4,
+            },
+        ],
+        rerank_score: None,
+    }];
+    let orig: HashSet<RankedItemId> = HashSet::new();
+
+    super::correct_derived_lexical(&mut fused, &orig);
+
+    let lanes: Vec<Retriever> = fused[0].contributing.iter().map(|c| c.retriever).collect();
+    assert_eq!(lanes, vec![Retriever::Graph]);
 }

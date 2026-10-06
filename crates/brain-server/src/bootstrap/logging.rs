@@ -173,6 +173,20 @@ impl LoggingHandle {
         );
     }
 
+    /// Reload only the global level filter, leaving the output slot (the
+    /// formatter and any attached OTel layer) untouched. This is the one
+    /// logging knob safe to change on a live server: the `EnvFilter` layer
+    /// is independent of the output layer, so swapping it never disturbs an
+    /// already-attached trace exporter. `level` is a standard
+    /// `EnvFilter`/`RUST_LOG`-style directive (e.g. `debug`,
+    /// `brain=trace,info`). Honors the `BRAIN_LOG` override exactly as at
+    /// boot. Returns whether the reload applied.
+    pub fn set_level(&self, level: &str) -> bool {
+        let applied = self.filter.reload(build_filter(level)).is_ok();
+        info!(level = %level, applied, "log level reloaded live");
+        applied
+    }
+
     /// Build the OpenTelemetry pipeline and reload it into the live
     /// subscriber. MUST be called from inside a running Tokio runtime — the
     /// OTLP batch exporter spawns its background task there.

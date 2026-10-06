@@ -28,11 +28,17 @@ pub enum WorkerKind {
     SupersessionSweeper,
     /// Physically reclaims retracted statement rows (and their
     /// secondary-index + evidence-overflow entries) once the retract
-    /// grace period elapses. **Off by default** — operators opt in via
-    /// `BRAIN_STATEMENT_RECLAIM_ENABLED`. Closes the
+    /// grace period elapses. **Off by default** — enabled via the
+    /// worker's `[workers.<w>].enabled` TOML knob (C2). Closes the
     /// tombstone-grace-then-reclaim loop on the statement side, the way
     /// slot reclamation does for memories.
     StatementReclaim,
+    /// Reclaims coined (`ImplicitFromWrite`) predicates that no live
+    /// statement references any more. **Off by default** — enabled via
+    /// `[workers.predicate_gc] enabled`. Closes the vocabulary side of the
+    /// reclaim story: statements are hard-deleted by StatementReclaim and
+    /// FORGET cascades, and the names coined for them outlived them.
+    PredicateGc,
     AuditLogSweeper,
     LlmCacheSweeper,
     StaleExtractionDetector,
@@ -108,6 +114,7 @@ impl WorkerKind {
             Self::SchemaMigration => "schema_migration",
             Self::SupersessionSweeper => "supersession_sweeper",
             Self::StatementReclaim => "statement_reclaim",
+            Self::PredicateGc => "predicate_gc",
             Self::AuditLogSweeper => "audit_log_sweeper",
             Self::LlmCacheSweeper => "llm_cache_sweeper",
             Self::StaleExtractionDetector => "stale_extraction_detector",
@@ -168,6 +175,11 @@ impl WorkerConfig {
             // Off by default — like EntityGc, the operator opts in. Daily
             // cadence, bounded batch keeps each reclamation wtxn small.
             WorkerKind::StatementReclaim => (false, Duration::from_secs(86400), 256, 30_000),
+            // Off by default like the other reclaimers. The pass scans the
+            // predicate table and probes the statement index per candidate,
+            // so the batch is small and the cadence daily — vocabulary
+            // drifts slowly.
+            WorkerKind::PredicateGc => (false, Duration::from_secs(86400), 128, 30_000),
             WorkerKind::AuditLogSweeper => (true, Duration::from_secs(86400), 1024, 30_000),
             WorkerKind::LlmCacheSweeper => (true, Duration::from_secs(3600), 1024, 10_000),
             WorkerKind::StaleExtractionDetector => (true, Duration::from_secs(3600), 512, 10_000),

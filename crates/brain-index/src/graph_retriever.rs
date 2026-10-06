@@ -139,6 +139,16 @@ pub struct GraphRetrieverConfig {
     pub caller_namespace: u32,
     /// The caller's owning space (app) — the inner half of the scope.
     pub caller_space_bytes: [u8; 16],
+    /// Read-scope width. `false` (the default) pins the walk to the
+    /// caller's single `(namespace, space)`. `true` widens the *space*
+    /// half only — the walk admits every space the caller owns within
+    /// its own namespace (namespace-wide RECALL). The namespace wall is
+    /// **never** relaxed: even namespace-wide, a walk can only ever reach
+    /// the caller's own tenant. Carried as a plain `bool` (not
+    /// `brain_metadata::ScopeMode`) so `brain-index` keeps its lean
+    /// dependency set; `brain-ops` maps it to `ScopeMode` at the read
+    /// boundary.
+    pub namespace_wide: bool,
 }
 
 impl Default for GraphRetrieverConfig {
@@ -150,6 +160,7 @@ impl Default for GraphRetrieverConfig {
             timeout_ms: DEFAULT_TIMEOUT_MS,
             caller_namespace: brain_core::NamespaceId::SYSTEM.raw(),
             caller_space_bytes: [0u8; 16],
+            namespace_wide: false,
         }
     }
 }

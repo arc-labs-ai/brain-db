@@ -57,6 +57,26 @@ pub fn config_key(query: &str) -> Option<&str> {
     None
 }
 
+/// Parse `?value=…` returning `None` if absent or empty. Used by the
+/// config-set handler for the new value of a runtime-settable key.
+/// Everything after `value=` up to the next `&` is returned verbatim
+/// (no URL-decoding) — the settable knobs (log level / format) never
+/// contain `&`, and an `EnvFilter` directive's `=` and `,` are safe.
+pub fn config_value(query: &str) -> Option<&str> {
+    if query.is_empty() {
+        return None;
+    }
+    for kv in query.split('&') {
+        if let Some(rest) = kv.strip_prefix("value=") {
+            if rest.is_empty() {
+                return None;
+            }
+            return Some(rest);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,5 +124,21 @@ mod tests {
         );
         assert_eq!(config_key("other=1"), None);
         assert_eq!(config_key("key="), None);
+    }
+
+    #[test]
+    fn config_value_extracts() {
+        assert_eq!(config_value(""), None);
+        assert_eq!(
+            config_value("key=monitoring.logging.level&value=debug"),
+            Some("debug")
+        );
+        // EnvFilter directive with `=` after the value= prefix survives.
+        assert_eq!(
+            config_value("key=monitoring.logging.level&value=brain=trace,info"),
+            Some("brain=trace,info")
+        );
+        assert_eq!(config_value("key=x"), None);
+        assert_eq!(config_value("value="), None);
     }
 }

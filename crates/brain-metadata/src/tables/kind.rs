@@ -32,7 +32,6 @@ pub const KINDS_BY_BYTE_TABLE: TableDefinition<'static, u8, &str> =
 /// `cardinality` / `temporal` mirror `brain_core::KindCardinality::as_u8`
 /// and `brain_core::TemporalModel::as_u8`.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct KindDefinition {
     pub byte_id: u8,
     pub namespace: String,

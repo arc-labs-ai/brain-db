@@ -634,6 +634,8 @@ async fn history_returns_chain_in_version_order() {
         RequestBody::StatementHistory(StatementHistoryRequest {
             anchor_id: p1,
             include_tombstoned: false,
+            limit: 100,
+            cursor: Vec::new(),
         }),
     )
     .await;
@@ -646,10 +648,81 @@ async fn history_returns_chain_in_version_order() {
             assert_eq!(r.items[2].statement_id, p3);
             assert_eq!(r.chain_root, p1);
             assert_eq!(r.total_versions, 3);
+            assert!(
+                r.next_cursor.is_empty(),
+                "limit 100 exhausts the 3-version chain"
+            );
             assert!(r.is_final);
         }
         other => panic!("{other:?}"),
     }
+
+    // Paginate the same chain at limit 2: page 1 = [p1, p2] + a cursor,
+    // page 2 = [p3] + empty cursor. Exhaustive tiling over the wire.
+    let (_, body) = round_trip(
+        &mut client,
+        11,
+        RequestBody::StatementHistory(StatementHistoryRequest {
+            anchor_id: p1,
+            include_tombstoned: false,
+            limit: 2,
+            cursor: Vec::new(),
+        }),
+    )
+    .await;
+    let page1_cursor = match body {
+        ResponseBody::StatementHistory(r) => {
+            assert_eq!(r.items.len(), 2);
+            assert_eq!(r.items[0].statement_id, p1);
+            assert_eq!(r.items[1].statement_id, p2);
+            assert_eq!(
+                r.total_versions, 3,
+                "total is the full chain length, not the page"
+            );
+            assert!(!r.next_cursor.is_empty(), "more remains after page 1");
+            r.next_cursor
+        }
+        other => panic!("{other:?}"),
+    };
+
+    let (_, body) = round_trip(
+        &mut client,
+        13,
+        RequestBody::StatementHistory(StatementHistoryRequest {
+            anchor_id: p1,
+            include_tombstoned: false,
+            limit: 2,
+            cursor: page1_cursor.clone(),
+        }),
+    )
+    .await;
+    match body {
+        ResponseBody::StatementHistory(r) => {
+            assert_eq!(r.items.len(), 1);
+            assert_eq!(r.items[0].statement_id, p3);
+            assert!(r.next_cursor.is_empty(), "chain exhausted after page 2");
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // Echoing page 1's cursor with a flipped include_tombstoned is rejected
+    // (stale_cursor) rather than silently gapping the filtered tiling.
+    let (op, _) = round_trip(
+        &mut client,
+        15,
+        RequestBody::StatementHistory(StatementHistoryRequest {
+            anchor_id: p1,
+            include_tombstoned: true,
+            limit: 2,
+            cursor: page1_cursor,
+        }),
+    )
+    .await;
+    assert_ne!(
+        op,
+        Opcode::StatementHistoryResp.as_u16(),
+        "toggled cursor must be an error, not a successful page"
+    );
 
     server.stop().await;
 }

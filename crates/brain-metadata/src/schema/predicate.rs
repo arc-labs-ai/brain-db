@@ -36,6 +36,15 @@ pub enum PredicateOpError {
         qname: String,
         existing_id: PredicateId,
     },
+
+    #[error("predicate {0:?} not found")]
+    NotFound(PredicateId),
+
+    /// A neighbouring subsystem a predicate operation had to consult
+    /// failed — the namespace registry or the statement index during
+    /// orphan reclamation. Carries that error's message.
+    #[error("dependency failed: {0}")]
+    Dependency(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -229,6 +238,41 @@ pub fn predicate_get(
     Ok(row.as_ref().map(PredicateDefinition::to_predicate))
 }
 
+/// Set (or clear, with `0`) the explicit retention TTL for a predicate, in
+/// seconds. Called from schema-apply after the predicate is interned — retention
+/// is a storage-only policy the projected `Predicate` value type doesn't carry,
+/// so it's stamped directly on the row here. Idempotent; a no-op when the value
+/// is already current. Errors if the predicate row doesn't exist.
+pub fn predicate_set_retention(
+    wtxn: &WriteTransaction,
+    id: PredicateId,
+    retention_seconds: u64,
+) -> Result<(), PredicateOpError> {
+    let mut t = wtxn.open_table(PREDICATES_TABLE)?;
+    let Some(mut row) = t.get(&id.raw())?.map(|g| g.value()) else {
+        return Err(PredicateOpError::NotFound(id));
+    };
+    if row.retention_seconds == retention_seconds {
+        return Ok(());
+    }
+    row.retention_seconds = retention_seconds;
+    t.insert(&id.raw(), &row)?;
+    Ok(())
+}
+
+/// The explicit retention TTL for a predicate, in seconds (`0` = none). Reads
+/// the persisted row directly, since [`predicate_get`]'s projected `Predicate`
+/// drops this storage-only field. Missing predicate ⇒ `0`.
+pub fn predicate_retention_seconds(
+    rtxn: &ReadTransaction,
+    id: PredicateId,
+) -> Result<u64, PredicateOpError> {
+    let t = rtxn.open_table(PREDICATES_TABLE)?;
+    Ok(t.get(&id.raw())?
+        .map(|g| g.value().retention_seconds)
+        .unwrap_or(0))
+}
+
 /// Look up a predicate by its namespaced qname. Identifier validation
 /// is enforced — invalid namespace/name produces
 /// [`PredicateOpError::InvalidIdentifier`] instead of `Ok(None)`.
@@ -391,17 +435,78 @@ pub fn predicate_embedding_get(
     };
     let bytes = g.value();
     let mut out = Vec::with_capacity(bytes.len() / 4);
-    for chunk in bytes.chunks_exact(4) {
+    for chunk in bytes.as_chunks::<4>().0.iter() {
         out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }
     Ok(Some(out))
 }
 
+/// Whether this qname is declared anywhere in the schema — as a
+/// SCHEMA-DECLARED predicate, or as a relation type.
+///
+/// Note what does NOT count: a predicate row that merely exists. Every
+/// coined name has one (that is what "coined" means, and it carries
+/// `SchemaOrigin::ImplicitFromWrite`), so presence alone would filter the
+/// entire queue away. Only an explicit declaration disqualifies a
+/// candidate.
+fn qname_is_declared(rtxn: &ReadTransaction, qname: &str) -> Result<bool, PredicateOpError> {
+    use crate::tables::relation_type::RELATION_TYPES_BY_QNAME_TABLE;
+
+    if let Ok(idx) = rtxn.open_table(RELATION_TYPES_BY_QNAME_TABLE) {
+        if idx.get(qname)?.is_some() {
+            return Ok(true);
+        }
+    }
+    let Ok(idx) = rtxn.open_table(PREDICATES_BY_QNAME_TABLE) else {
+        return Ok(false);
+    };
+    let Some(id) = idx.get(qname)?.map(|g| g.value()) else {
+        return Ok(false);
+    };
+    let Ok(t) = rtxn.open_table(PREDICATES_TABLE) else {
+        return Ok(false);
+    };
+    let origin = t.get(&id)?.map(|g| g.value().origin());
+    Ok(origin.is_some_and(|o| o.is_schema_declared()))
+}
+
+/// Whether `(namespace, name)` is declared as a relation type.
+///
+/// Used to keep the predicate review queue honest: the same local name can
+/// be declared as a relation type and still arrive here as a statement
+/// triple, and that is a declared name, not a coined one.
+fn name_is_declared_relation_type(
+    wtxn: &WriteTransaction,
+    namespace: &str,
+    name: &str,
+) -> Result<bool, PredicateOpError> {
+    use crate::tables::relation_type::RELATION_TYPES_BY_QNAME_TABLE;
+    let q = qname(namespace, name);
+    let idx = match wtxn.open_table(RELATION_TYPES_BY_QNAME_TABLE) {
+        Ok(t) => t,
+        // Never-written table on a fresh DB → nothing is declared.
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    let found = idx.get(q.as_str())?.is_some();
+    Ok(found)
+}
+
 /// Record one sighting of an undeclared predicate qname in the review
-/// queue, incrementing its count. Called by the extractor's closed-vocab
-/// gate when a proposed predicate isn't in the active schema, so the
-/// candidate is captured durably for later promotion instead of silently
-/// lost. Composed inside the caller's write txn.
+/// queue, incrementing its count.
+///
+/// Called from [`predicate_intern_or_get`] — the open-vocabulary write
+/// path — each time a qname is minted that no schema declared. Brain's
+/// vocabulary is OPEN: the statement is still committed and queryable,
+/// exactly as before. This queue is the operator's list of names the
+/// corpus coined often enough to be worth promoting into a real
+/// `SCHEMA_UPLOAD`, read back via [`predicate_review_list`].
+///
+/// (An earlier version of this comment claimed a "closed-vocab gate"
+/// called it and dropped the statement. No such gate exists, and nothing
+/// called this function at all, so coined predicates were invisible.)
+///
+/// Composed inside the caller's write txn.
 pub fn predicate_review_record(
     wtxn: &WriteTransaction,
     qname: &str,
@@ -413,7 +518,23 @@ pub fn predicate_review_record(
 }
 
 /// List the review queue as `(qname, count)` pairs, descending by count.
-/// For operator review — which coined predicates recur enough to promote.
+/// For operator review — which coined predicates are worth promoting.
+///
+/// Filters on READ, not just on write. A name is a promotion CANDIDATE only
+/// while it is still undeclared, and that can stop being true after the
+/// sighting was recorded: the operator promotes it in a `SCHEMA_UPLOAD`, or
+/// it turns out to be declared as a relation type. A queue that only
+/// filtered at write time would keep recommending work already done, and
+/// the operator would have to remember which entries they had dealt with.
+///
+/// So a row is dropped when either:
+///   - its predicate is now `SchemaDeclared` (promoted, or adopted by a
+///     later upload), or
+///   - the same qname is declared as a relation type.
+///
+/// The row is left in place rather than deleted: this is a read-only call,
+/// and a name can become undeclared again if a schema drops it — at which
+/// point its history is worth keeping.
 pub fn predicate_review_list(
     rtxn: &ReadTransaction,
 ) -> Result<Vec<(String, u64)>, PredicateOpError> {
@@ -426,7 +547,11 @@ pub fn predicate_review_list(
     let mut out: Vec<(String, u64)> = Vec::new();
     for entry in t.iter()? {
         let (k, v) = entry?;
-        out.push((k.value().to_string(), v.value()));
+        let qname = k.value().to_string();
+        if qname_is_declared(rtxn, &qname)? {
+            continue;
+        }
+        out.push((qname, v.value()));
     }
     out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     Ok(out)
@@ -449,6 +574,9 @@ pub fn predicate_review_list(
 ///   override schema decisions.
 ///
 /// Validation is enforced before any storage access.
+/// Intern a predicate with no declared subject domain — any subject is
+/// admitted. This is the shape every caller but the schema-apply path
+/// wants, and what every schema written before `subject:` existed means.
 #[allow(clippy::too_many_arguments)]
 pub fn predicate_intern(
     wtxn: &WriteTransaction,
@@ -456,6 +584,39 @@ pub fn predicate_intern(
     name: &str,
     kind_constraint: Option<StatementKind>,
     object_constraint: impl Into<ObjectConstraint>,
+    schema_version: u32,
+    description: &str,
+    is_stateful: bool,
+    now_unix_nanos: u64,
+) -> Result<PredicateId, PredicateOpError> {
+    predicate_intern_with_subject(
+        wtxn,
+        namespace,
+        name,
+        kind_constraint,
+        object_constraint,
+        /* subject_entity_type_id */ 0,
+        schema_version,
+        description,
+        is_stateful,
+        now_unix_nanos,
+    )
+}
+
+/// As [`predicate_intern`], plus the declared subject domain.
+///
+/// `subject_entity_type_id` is the `EntityTypeId` a statement's SUBJECT
+/// must have, from a declared `subject: Entity<T>`; `0` means any. Only
+/// the schema-apply path passes a non-zero value — a predicate minted any
+/// other way has no schema to narrow it.
+#[allow(clippy::too_many_arguments)]
+pub fn predicate_intern_with_subject(
+    wtxn: &WriteTransaction,
+    namespace: &str,
+    name: &str,
+    kind_constraint: Option<StatementKind>,
+    object_constraint: impl Into<ObjectConstraint>,
+    subject_entity_type_id: u32,
     schema_version: u32,
     description: &str,
     is_stateful: bool,
@@ -506,6 +667,11 @@ pub fn predicate_intern(
             == crate::tables::predicate::encode_kind_constraint(kind_constraint)
             && row.object_type_constraint_byte == object_type_constraint_byte
             && row.object_entity_type_id == object_entity_type_id
+            // Without this, re-uploading a schema that ADDS `subject:
+            // Entity<T>` to an existing predicate would match as
+            // "unchanged" and the new constraint would never reach the
+            // row — the upload would report success and enforce nothing.
+            && row.subject_entity_type_id == subject_entity_type_id
             && row.description == description
             && row.is_stateful == is_stateful;
 
@@ -526,6 +692,7 @@ pub fn predicate_intern(
                 kind_constraint,
                 object_type_constraint_byte,
                 object_entity_type_id,
+                subject_entity_type_id,
                 schema_version,
                 description: description.to_string(),
                 is_stateful,
@@ -553,6 +720,7 @@ pub fn predicate_intern(
                 kind_constraint,
                 object_type_constraint_byte,
                 object_entity_type_id,
+                subject_entity_type_id,
                 schema_version,
                 description: description.to_string(),
                 is_stateful,
@@ -595,6 +763,7 @@ pub fn predicate_intern(
         kind_constraint,
         object_type_constraint_byte,
         object_entity_type_id,
+        subject_entity_type_id,
         schema_version,
         description: description.to_string(),
         is_stateful,
@@ -673,6 +842,10 @@ pub fn predicate_intern_or_get(
         kind_constraint: None,
         object_type_constraint_byte: 0,
         object_entity_type_id: 0,
+        // No declared subject domain: an open-vocabulary write has no
+        // schema to narrow it, and inventing one here would reject the
+        // very statement that caused the predicate to exist.
+        subject_entity_type_id: 0,
         // `schema_version = 0` reserves the slot for "not declared
         // by any schema yet". The origin tag carries the real
         // provenance via `ImplicitFromWrite`.
@@ -696,6 +869,22 @@ pub fn predicate_intern_or_get(
         let mut idx = wtxn.open_table(PREDICATES_BY_QNAME_TABLE)?;
         idx.insert(q.as_str(), &row.predicate_id)?;
     }
+
+    // Reaching the mint branch means the qname was in no PREDICATE index,
+    // so no schema declared it as a predicate — the schema path is
+    // `predicate_intern`, not this function.
+    //
+    // That is not the same as "the schema never mentions this name". A
+    // name declared as a RELATION TYPE reaches here whenever the extractor
+    // emits it as a statement triple, and listing it as a promotion
+    // candidate would tell an operator to declare something they already
+    // declared. "Coined" means declared in NEITHER registry.
+    if !name_is_declared_relation_type(wtxn, namespace, name)? {
+        // Composed inside the caller's write txn, so it commits with the
+        // predicate or not at all.
+        predicate_review_record(wtxn, &q)?;
+    }
+
     Ok(PredicateId::from(next_id_raw))
 }
 
@@ -840,7 +1029,7 @@ pub fn predicate_consolidation_candidates_rtxn(
 /// The embedding is stored as little-endian `f32`s.
 fn decode_candidate(row: &PredicateDefinition, bytes: &[u8]) -> PredicateConsolidationCandidate {
     let mut vec = Vec::with_capacity(bytes.len() / 4);
-    for chunk in bytes.chunks_exact(4) {
+    for chunk in bytes.as_chunks::<4>().0.iter() {
         vec.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }
     (
@@ -892,6 +1081,173 @@ pub fn predicate_drop_schema_declared(
         }
     }
     Ok(count)
+}
+
+/// Drop a single schema-declared predicate row identified by
+/// `(namespace, name)`. The scoped counterpart to
+/// [`predicate_drop_schema_declared`]: `SCHEMA_DROP` narrows one
+/// declaration instead of wiping the whole namespace.
+///
+/// Returns `Some(id)` when a schema-declared predicate with that qname
+/// existed and was removed, `None` when no schema-declared predicate
+/// with that qname exists. An implicit-from-write row sharing the qname
+/// is deliberately left untouched — the declared vocabulary is the only
+/// thing `SCHEMA_DROP` narrows, and an open-vocab row is not part of it.
+/// The embedding row is left in place (a harmless orphan), matching
+/// [`predicate_drop_schema_declared`].
+pub fn predicate_drop_one(
+    wtxn: &WriteTransaction,
+    namespace: &str,
+    name: &str,
+) -> Result<Option<PredicateId>, PredicateOpError> {
+    validate_namespace(namespace)?;
+    validate_name(name)?;
+
+    let q = qname(namespace, name);
+    let victim: Option<u32> = {
+        let idx = wtxn.open_table(PREDICATES_BY_QNAME_TABLE)?;
+        let id = idx.get(q.as_str())?.map(|g| g.value());
+        drop(idx);
+        match id {
+            Some(id) => {
+                let t = wtxn.open_table(PREDICATES_TABLE)?;
+                let row: Option<PredicateDefinition> = t.get(&id)?.map(|g| g.value());
+                match row {
+                    Some(r) if r.origin().is_schema_declared() => Some(id),
+                    _ => None,
+                }
+            }
+            None => None,
+        }
+    };
+    if let Some(id) = victim {
+        {
+            let mut t = wtxn.open_table(PREDICATES_TABLE)?;
+            t.remove(&id)?;
+        }
+        {
+            let mut idx = wtxn.open_table(PREDICATES_BY_QNAME_TABLE)?;
+            idx.remove(q.as_str())?;
+        }
+    }
+    Ok(victim.map(PredicateId::from))
+}
+
+// ---------------------------------------------------------------------------
+// Orphaned-predicate reclamation.
+//
+// Brain's predicate vocabulary is open: a name the corpus uses but no schema
+// declares is interned on demand (`SchemaOrigin::ImplicitFromWrite`). Nothing
+// ever removed those rows, while the statements that justified them do get
+// removed — `statement_reclaim` hard-deletes retracted and retention-expired
+// rows, FORGET cascades delete more. The predicate that was coined for them
+// outlives its last user, keeping a `PREDICATES_TABLE` row, a qname-index
+// entry, possibly an embedding, and a review-queue entry naming vocabulary
+// the corpus no longer contains.
+//
+// A declared predicate is never a candidate, however unused: the schema is
+// the statement of intent, and dropping it belongs to SCHEMA_DROP.
+// ---------------------------------------------------------------------------
+
+/// What one reclamation pass did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PredicateReclaimSummary {
+    /// Coined predicates examined (past grace, not schema-declared).
+    pub examined: usize,
+    /// Coined predicates dropped because no live statement used them.
+    pub reclaimed: usize,
+    /// Coined predicates left alone because a live statement still uses them.
+    pub still_referenced: usize,
+}
+
+/// Drop coined predicates that no live statement references.
+///
+/// `grace_nanos` protects a name that was just coined: interning happens in
+/// the same write as the statement, but a crash between them — or a row
+/// tombstoned immediately — would otherwise let the next pass reap a
+/// predicate the corpus is actively minting. `limit` bounds how many
+/// predicates one pass may reclaim so a worker cycle stays short.
+///
+/// `dry_run` reports what would be reclaimed without deleting anything —
+/// the same escape hatch [`crate::extractor::sweep::reclaim_retracted_statements`]
+/// offers, and worth having before trusting a GC with vocabulary.
+pub fn predicate_reclaim_orphans(
+    wtxn: &WriteTransaction,
+    now_unix_nanos: u64,
+    grace_nanos: u64,
+    limit: usize,
+    dry_run: bool,
+) -> Result<PredicateReclaimSummary, PredicateOpError> {
+    let mut summary = PredicateReclaimSummary::default();
+    if limit == 0 {
+        return Ok(summary);
+    }
+
+    // Pass 1 — collect candidates, then close the table before the
+    // statement-index reads and the deletes below.
+    let mut candidates: Vec<(u32, String, String)> = Vec::new();
+    {
+        let t = wtxn.open_table(PREDICATES_TABLE)?;
+        for entry in t.iter()? {
+            let (k, v) = entry?;
+            let row = v.value();
+            if row.origin().is_schema_declared() {
+                continue;
+            }
+            if now_unix_nanos.saturating_sub(row.created_at_unix_nanos) < grace_nanos {
+                continue;
+            }
+            candidates.push((k.value(), row.namespace.clone(), row.name.clone()));
+        }
+    }
+
+    // Pass 2 — keep only those with no live statement.
+    let mut victims: Vec<(u32, String)> = Vec::new();
+    for (id, namespace, name) in candidates {
+        if victims.len() >= limit {
+            break;
+        }
+        summary.examined += 1;
+        // Deliberately namespace-agnostic: a statement's `namespace_id` need
+        // not match the namespace its predicate was coined under, so scoping
+        // this to the predicate's own namespace would miss live references
+        // and delete a row something still points at.
+        let live =
+            crate::statement::crud::statement_any_live_by_predicate(wtxn, PredicateId::from(id))
+                .map_err(|e| PredicateOpError::Dependency(format!("live statement probe: {e}")))?;
+        if live {
+            summary.still_referenced += 1;
+            continue;
+        }
+        victims.push((id, qname(&namespace, &name)));
+    }
+
+    // Pass 3 — delete the row and everything keyed off it.
+    summary.reclaimed = victims.len();
+    if dry_run {
+        return Ok(summary);
+    }
+    for (id, q) in &victims {
+        {
+            let mut t = wtxn.open_table(PREDICATES_TABLE)?;
+            t.remove(id)?;
+        }
+        {
+            let mut idx = wtxn.open_table(PREDICATES_BY_QNAME_TABLE)?;
+            idx.remove(q.as_str())?;
+        }
+        {
+            let mut emb = wtxn.open_table(PREDICATE_EMBEDDINGS_TABLE)?;
+            emb.remove(id)?;
+        }
+        {
+            // The review queue is a shortlist of names worth promoting into a
+            // schema; a name with nothing left to promote does not belong on it.
+            let mut rq = wtxn.open_table(crate::tables::predicate::PREDICATE_REVIEW_QUEUE_TABLE)?;
+            rq.remove(q.as_str())?;
+        }
+    }
+    Ok(summary)
 }
 
 // ---------------------------------------------------------------------------
@@ -1417,5 +1773,285 @@ mod tests {
         matches!(err, PredicateOpError::InvalidIdentifier { .. })
             .then_some(())
             .expect("expected InvalidIdentifier");
+    }
+
+    // ── review queue ────────────────────────────────────────────────────
+
+    #[test]
+    fn open_vocab_intern_records_a_review_sighting() {
+        let (_dir, db) = open_db();
+        {
+            let wtxn = db.begin_write().unwrap();
+            predicate_intern_or_get(&wtxn, "brain", "difficulty", 7, 1).unwrap();
+            wtxn.commit().unwrap();
+        }
+        let rtxn = db.begin_read().unwrap();
+        let queue = predicate_review_list(&rtxn).unwrap();
+        assert_eq!(queue, vec![("brain:difficulty".to_string(), 1)]);
+    }
+
+    #[test]
+    fn repeat_sightings_accumulate_but_only_mint_once() {
+        let (_dir, db) = open_db();
+        let mut ids = Vec::new();
+        for lsn in 0..3 {
+            let wtxn = db.begin_write().unwrap();
+            ids.push(predicate_intern_or_get(&wtxn, "brain", "horizon", lsn, 1).unwrap());
+            wtxn.commit().unwrap();
+        }
+        // Same predicate id every time — the registry is not duplicated.
+        assert_eq!(ids[0], ids[1]);
+        assert_eq!(ids[1], ids[2]);
+
+        // The count is 1, NOT 3: the qname index short-circuits before the
+        // mint branch on every repeat. The queue answers "which names did
+        // this corpus have to invent", which is a property of the name, not
+        // of how often it is mentioned. If a future change moves the record
+        // call above the index probe, this assertion is what catches it.
+        let rtxn = db.begin_read().unwrap();
+        assert_eq!(
+            predicate_review_list(&rtxn).unwrap(),
+            vec![("brain:horizon".to_string(), 1)]
+        );
+    }
+
+    #[test]
+    fn schema_declared_predicates_never_enter_the_review_queue() {
+        let (_dir, db) = open_db();
+        {
+            let wtxn = db.begin_write().unwrap();
+            // `predicate_intern` is the SCHEMA_UPLOAD path. A declared
+            // predicate is the opposite of a promotion candidate, so it must
+            // not show up in the operator's list.
+            predicate_intern(&wtxn, "mirror", "clone_status", None, 0, 1, "", true, 0).unwrap();
+            wtxn.commit().unwrap();
+        }
+        let rtxn = db.begin_read().unwrap();
+        assert!(predicate_review_list(&rtxn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn promoting_a_coined_predicate_removes_it_from_the_queue() {
+        // The operator's workflow: see a candidate, declare it, stop being
+        // told about it. A write-time-only filter could never do this — the
+        // sighting was recorded back when the name really was undeclared.
+        let (_dir, db) = open_db();
+        {
+            let wtxn = db.begin_write().unwrap();
+            predicate_intern_or_get(&wtxn, "mirror", "difficulty", 0, 1).unwrap();
+            wtxn.commit().unwrap();
+        }
+        {
+            let rtxn = db.begin_read().unwrap();
+            assert_eq!(predicate_review_list(&rtxn).unwrap().len(), 1);
+        }
+
+        // Promote it via the schema path.
+        {
+            let wtxn = db.begin_write().unwrap();
+            predicate_intern(&wtxn, "mirror", "difficulty", None, 0, 1, "", false, 0).unwrap();
+            wtxn.commit().unwrap();
+        }
+        let rtxn = db.begin_read().unwrap();
+        assert!(
+            predicate_review_list(&rtxn).unwrap().is_empty(),
+            "a promoted name is no longer a candidate",
+        );
+    }
+
+    #[test]
+    fn a_name_declared_as_a_relation_type_is_not_a_candidate() {
+        // Declared on the other axis. Listing it would tell the operator to
+        // declare something they already declared.
+        let (_dir, db) = open_db();
+        {
+            let wtxn = db.begin_write().unwrap();
+            // Record directly, as a pre-existing row from before the write
+            // -time filter existed.
+            predicate_review_record(&wtxn, "mirror:requested").unwrap();
+            crate::relation::types::relation_type_intern(
+                &wtxn,
+                "mirror",
+                "requested",
+                None,
+                None,
+                brain_core::Cardinality::ManyToMany,
+                false,
+                1,
+                "",
+                0,
+            )
+            .unwrap();
+            wtxn.commit().unwrap();
+        }
+        let rtxn = db.begin_read().unwrap();
+        assert!(
+            predicate_review_list(&rtxn).unwrap().is_empty(),
+            "a declared relation type is not a coined predicate",
+        );
+    }
+
+    #[test]
+    fn review_list_orders_by_count_then_name() {
+        let (_dir, db) = open_db();
+        {
+            let wtxn = db.begin_write().unwrap();
+            for _ in 0..3 {
+                predicate_review_record(&wtxn, "brain:often").unwrap();
+            }
+            predicate_review_record(&wtxn, "brain:zeta").unwrap();
+            predicate_review_record(&wtxn, "brain:alpha").unwrap();
+            wtxn.commit().unwrap();
+        }
+        let rtxn = db.begin_read().unwrap();
+        assert_eq!(
+            predicate_review_list(&rtxn).unwrap(),
+            vec![
+                ("brain:often".to_string(), 3),
+                ("brain:alpha".to_string(), 1),
+                ("brain:zeta".to_string(), 1),
+            ]
+        );
+    }
+}
+
+#[cfg(all(test, not(miri)))]
+mod predicate_gc_tests {
+    use super::*;
+    use crate::tables::fresh_db;
+    use redb::ReadableDatabase;
+
+    const DAY: u64 = 24 * 60 * 60 * 1_000_000_000;
+    const GRACE: u64 = 7 * DAY;
+
+    fn db() -> (tempfile::TempDir, redb::Database) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(&dir);
+        (dir, db)
+    }
+
+    /// Coin a predicate (`ImplicitFromWrite`) created `age_nanos` ago.
+    fn coin(db: &redb::Database, name: &str, created_at: u64) -> PredicateId {
+        let wtxn = db.begin_write().unwrap();
+        let id = predicate_intern_or_get(&wtxn, "brain", name, 1, created_at).unwrap();
+        wtxn.commit().unwrap();
+        id
+    }
+
+    fn exists(db: &redb::Database, name: &str) -> bool {
+        let rtxn = db.begin_read().unwrap();
+        let idx = rtxn.open_table(PREDICATES_BY_QNAME_TABLE).unwrap();
+        idx.get(qname("brain", name).as_str()).unwrap().is_some()
+    }
+
+    fn reclaim(db: &redb::Database, now: u64, limit: usize) -> PredicateReclaimSummary {
+        let wtxn = db.begin_write().unwrap();
+        let s = predicate_reclaim_orphans(&wtxn, now, GRACE, limit, false).unwrap();
+        wtxn.commit().unwrap();
+        s
+    }
+
+    /// The leak this closes: a coined name whose statements are gone.
+    #[test]
+    fn an_unreferenced_coined_predicate_is_reclaimed() {
+        let (_d, db) = db();
+        coin(&db, "agreed_to_lead", 0);
+        assert!(exists(&db, "agreed_to_lead"));
+
+        let s = reclaim(&db, 30 * DAY, 100);
+        assert_eq!(s.reclaimed, 1);
+        assert_eq!(s.still_referenced, 0);
+        assert!(!exists(&db, "agreed_to_lead"), "orphaned name is gone");
+    }
+
+    /// A declared predicate is intent, not residue — never a candidate,
+    /// however unused. Dropping it belongs to SCHEMA_DROP.
+    #[test]
+    fn a_schema_declared_predicate_is_never_reclaimed() {
+        let (_d, db) = db();
+        {
+            let wtxn = db.begin_write().unwrap();
+            predicate_intern(&wtxn, "acme", "manages", None, 1, 1, "", false, 0).unwrap();
+            wtxn.commit().unwrap();
+        }
+        let s = reclaim(&db, 365 * DAY, 100);
+        assert_eq!(s.reclaimed, 0, "declared vocabulary is untouched");
+        let rtxn = db.begin_read().unwrap();
+        let idx = rtxn.open_table(PREDICATES_BY_QNAME_TABLE).unwrap();
+        assert!(idx
+            .get(qname("acme", "manages").as_str())
+            .unwrap()
+            .is_some());
+    }
+
+    /// Interning happens in the same write as the statement; a freshly
+    /// coined name must survive until the grace window closes.
+    #[test]
+    fn a_freshly_coined_predicate_is_inside_the_grace_window() {
+        let (_d, db) = db();
+        coin(&db, "just_minted", 10 * DAY);
+
+        let s = reclaim(&db, 10 * DAY + 1, 100);
+        assert_eq!(s.examined, 0, "inside grace, not even examined");
+        assert!(exists(&db, "just_minted"));
+
+        let s = reclaim(&db, 10 * DAY + GRACE + 1, 100);
+        assert_eq!(s.reclaimed, 1, "past grace it is reclaimable");
+    }
+
+    /// The review queue is a shortlist of names worth promoting into a
+    /// schema; a reclaimed name has nothing left to promote.
+    #[test]
+    fn reclaiming_clears_the_review_queue_entry() {
+        let (_d, db) = db();
+        coin(&db, "queued_name", 0);
+        {
+            let rtxn = db.begin_read().unwrap();
+            let q = predicate_review_list(&rtxn).unwrap();
+            assert!(
+                q.iter().any(|(n, _)| n == "brain:queued_name"),
+                "coining enqueues it for review"
+            );
+        }
+        reclaim(&db, 30 * DAY, 100);
+        let rtxn = db.begin_read().unwrap();
+        let q = predicate_review_list(&rtxn).unwrap();
+        assert!(
+            !q.iter().any(|(n, _)| n == "brain:queued_name"),
+            "and reclaiming dequeues it"
+        );
+    }
+
+    /// Report-only must report and delete nothing.
+    #[test]
+    fn a_dry_run_reports_without_deleting() {
+        let (_d, db) = db();
+        coin(&db, "preview_me", 0);
+
+        let s = {
+            let wtxn = db.begin_write().unwrap();
+            let s = predicate_reclaim_orphans(&wtxn, 30 * DAY, GRACE, 100, true).unwrap();
+            wtxn.commit().unwrap();
+            s
+        };
+        assert_eq!(s.reclaimed, 1, "reports what it would reclaim");
+        assert!(exists(&db, "preview_me"), "but the row is still there");
+
+        let s = reclaim(&db, 30 * DAY, 100);
+        assert_eq!(s.reclaimed, 1, "a real pass then removes it");
+        assert!(!exists(&db, "preview_me"));
+    }
+
+    /// One pass must stay bounded so a worker cycle stays short.
+    #[test]
+    fn a_pass_reclaims_at_most_its_limit() {
+        let (_d, db) = db();
+        for i in 0..5 {
+            coin(&db, &format!("spare_{i}"), 0);
+        }
+        let s = reclaim(&db, 30 * DAY, 2);
+        assert_eq!(s.reclaimed, 2, "limit honoured");
+        let s = reclaim(&db, 30 * DAY, 100);
+        assert_eq!(s.reclaimed, 3, "the rest go on the next pass");
     }
 }

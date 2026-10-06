@@ -76,7 +76,6 @@ pub const RELATION_TYPE_EMBEDDINGS_TABLE: TableDefinition<'static, u32, &[u8]> =
 /// rkyv's `check_bytes` mode rejecting nested enums on the bytes-of
 /// fast path.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct RelationMetadata {
     /// Owning namespace (tenant) — the outer half of the
     /// `(namespace, space)` scope key. Required; stamped from the

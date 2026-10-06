@@ -301,8 +301,15 @@ impl From<brain_metadata::schema::predicate::PredicateOpError> for OpError {
             E::AlreadyExists { qname, existing_id } => OpError::Conflict(format!(
                 "predicate {qname:?} already exists with id {existing_id:?}"
             )),
+            E::NotFound(id) => OpError::NotFound {
+                what: "predicate",
+                detail: format!("{id:?}"),
+            },
             E::Storage(e) => OpError::Internal(format!("redb storage: {e}")),
             E::Table(e) => OpError::Internal(format!("redb table: {e}")),
+            // A neighbouring subsystem failed underneath a predicate op; the
+            // caller did nothing wrong, so this is ours, not theirs.
+            E::Dependency(detail) => OpError::Internal(format!("predicate dependency: {detail}")),
         }
     }
 }
@@ -332,6 +339,11 @@ impl From<brain_metadata::statement::StatementOpError> for OpError {
             // violated — the client can fix it by pointing at an
             // entity of the declared type.
             e @ E::ObjectEntityTypeMismatch { .. } => OpError::InvalidRequest(e.to_string()),
+            // Same, on the subject side: the predicate declares
+            // `subject: Entity<Type>` and the write hung it off a
+            // different kind of thing. Client-fixable, so InvalidRequest
+            // rather than a server fault.
+            e @ E::SubjectEntityTypeMismatch { .. } => OpError::InvalidRequest(e.to_string()),
             E::InvalidArgument(s) => OpError::InvalidRequest(s.to_string()),
             E::AlreadySuperseded(id, by) => {
                 OpError::Conflict(format!("statement {id:?} already superseded by {by:?}"))
@@ -382,6 +394,9 @@ impl From<brain_metadata::entity::ops::EntityOpError> for OpError {
             E::Storage(e) => OpError::Internal(format!("redb storage: {e}")),
             E::Table(e) => OpError::Internal(format!("redb table: {e}")),
             E::TrigramOp(e) => OpError::Internal(format!("trigram op: {e}")),
+            E::MergeRedirectCycle(id) => {
+                OpError::Internal(format!("entity {id:?} merge-redirect chain is a cycle"))
+            }
         }
     }
 }

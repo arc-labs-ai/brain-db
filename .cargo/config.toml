@@ -6,6 +6,18 @@
 # RUSTFLAGS overrides empty unless you genuinely need to override.
 
 # ---------------------------------------------------------------------------
+# Build cache hygiene. Cargo never garbage-collects `target/`, so anything
+# that churns artifacts grows the (volume-backed) target dir without bound.
+# Incremental compilation is the single largest offender — its per-crate
+# fragment caches ran to ~21 GiB in the dev container — and it buys little in
+# a workflow dominated by full `cargo nextest run --workspace` sweeps and
+# fresh agent builds rather than tight single-crate edit loops. Turn it off
+# repo-wide (all invocations read this file) so the target dir stays bounded;
+# `just docker-gc` reclaims the rest.
+[build]
+incremental = false
+
+# ---------------------------------------------------------------------------
 # aarch64 Linux — covers AWS Graviton, Apple Silicon under a Linux VM (the
 # dev container on M-series Macs), and any bare aarch64 server.
 # ---------------------------------------------------------------------------

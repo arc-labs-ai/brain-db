@@ -2,7 +2,9 @@
 //!
 //! Scans for memories whose `tombstoned_at_unix_nanos + grace_period`
 //! is past, and reclaims them: delete the MEMORIES row + adjacent
-//! edges — one wtxn per memory keeps lock duration small.
+//! edges + the plaintext (TEXTS) + the write-artifact bundle (embedding
+//! vector + derived graph) that a soft FORGET deferred to grace expiry —
+//! one wtxn per memory keeps lock duration small.
 //!
 //! ## v1 deviations (documented)
 //!
@@ -18,9 +20,20 @@
 //!   `source = id` and `EDGES_IN` where `target = id`. Other-direction
 //!   dangling edges (`EDGES_OUT` where `target = id`) survive — the
 //!   edge-scrub worker cleans those up.
-//! - **No HNSW node deletion.** — the HNSW node referencing
-//!   the reclaimed slot is left for the maintenance worker to
-//!   rebuild away.
+//! - **HNSW node: tombstoned at forget, dropped at rebuild.** The
+//!   memory's HNSW node is marked tombstoned when the FORGET commits
+//!   (the writer's `Tombstone(Memory)` side-effect), so the semantic
+//!   lane already excludes it; the tombstoned node itself is dropped
+//!   from the graph on the next HNSW maintenance rebuild. Reclamation
+//!   does not touch the HNSW.
+//! - **HyPE question-vectors purged here as a backstop.** FORGET
+//!   removes a memory's durable HyPE rows promptly, but reclamation
+//!   re-runs the same idempotent delete so a memory tombstoned before
+//!   that path existed (or via a code path that skipped it) can't leave
+//!   the redb rows around past grace. The delete is a no-op when the
+//!   memory owns no HyPE rows. The tiny `(memory_id -> neighborhood
+//!   hash)` gate row is left behind — it's only ever read by the HyPE
+//!   refresh worker, which never runs on a gone memory.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -28,7 +41,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use brain_core::MemoryId;
 use brain_metadata::tables::edge::{EDGES_REVERSE_TABLE, EDGES_TABLE};
+use brain_metadata::tables::forget_undo::FORGET_UNDO_LOG_TABLE;
 use brain_metadata::tables::memory::MEMORIES_TABLE;
+use brain_metadata::tables::statement::STATEMENTS_BY_EVIDENCE_TABLE;
+use brain_metadata::tables::text::TEXTS_TABLE;
 use redb::ReadableTable;
 use tracing::trace;
 
@@ -182,7 +198,11 @@ fn reclaim_one(
     let wtxn = metadata
         .write_txn()
         .map_err(|e| WorkerError::Ops(format!("reclaim_one write_txn: {e:?}")))?;
-    let did_remove = {
+    // Scope of the reclaimed memory, captured before the row is
+    // removed so the residual reverse-index sweep can range-scan the
+    // memory's `(namespace, space)` prefix. `Some` iff the row was
+    // reclaimed.
+    let reclaimed_scope = {
         let mut memories = wtxn
             .open_table(MEMORIES_TABLE)
             .map_err(|e| WorkerError::Ops(format!("open MEMORIES: {e:?}")))?;
@@ -196,20 +216,67 @@ fn reclaim_one(
         //   - tombstoned_at unset (defensive; covers a future
         //     ADMIN_RESTORE) → false.
         //   - tombstoned_at >= cutoff (set-once but defensive) → false.
-        let eligible = matches!(
-            row.as_ref().and_then(|m| m.tombstoned_at_unix_nanos),
-            Some(ts) if ts < cutoff_nanos
-        );
-        if eligible {
+        let scope = row.as_ref().and_then(|m| {
+            (matches!(m.tombstoned_at_unix_nanos, Some(ts) if ts < cutoff_nanos))
+                .then_some((m.namespace_id, m.space_id_bytes))
+        });
+        if scope.is_some() {
             memories
                 .remove(key)
                 .map_err(|e| WorkerError::Ops(format!("memories remove: {e:?}")))?;
         }
-        eligible
+        scope
     };
+    let did_remove = reclaimed_scope.is_some();
 
-    if did_remove {
+    if let Some((namespace_id, space_id_bytes)) = reclaimed_scope {
         purge_adjacent_edges(&wtxn, id)?;
+
+        // Defensive backstop for the STATEMENTS_BY_EVIDENCE reverse
+        // index. FORGET's cascade strips a soft-forgotten memory's rows
+        // at tombstone time, but a hard FORGET (immediate reclaim) and
+        // any pre-existing orphan can leave rows whose primary memory is
+        // now gone. Range-scan the memory's `(scope, memory)` prefix and
+        // delete every residual row so a dangling reverse-index entry
+        // can never point at a reclaimed memory.
+        strip_evidence_rows(&wtxn, namespace_id, space_id_bytes, id)?;
+
+        // Soft FORGET deliberately keeps the plaintext + write-artifact
+        // bundle recoverable during the grace window (only a hard FORGET
+        // purges them at tombstone time). Reclamation is the grace-expiry
+        // path, so it must purge that recoverable data now — otherwise a
+        // default (soft) FORGET would leave plaintext in TEXTS_TABLE and the
+        // embedding + derived graph in MEMORY_ARTIFACTS/MEMORY_VECTORS
+        // forever (breaks invariant #6, grows unbounded, and keeps the
+        // vector resolvable via get_artifact_vector). All in this same wtxn
+        // as the row + edge deletes so the memory disappears atomically.
+        {
+            let mut texts = wtxn
+                .open_table(TEXTS_TABLE)
+                .map_err(|e| WorkerError::Ops(format!("open TEXTS: {e:?}")))?;
+            let _ = texts
+                .remove(&id.to_be_bytes())
+                .map_err(|e| WorkerError::Ops(format!("TEXTS remove: {e:?}")))?;
+        }
+        // Removes the MEMORY_ARTIFACTS bundle AND the raw MEMORY_VECTORS row,
+        // so get_artifact_vector returns None after reclamation.
+        brain_ops::memory_artifact::delete_memory_artifact(&wtxn, id.to_be_bytes())
+            .map_err(|e| WorkerError::Ops(format!("reclaim artifact delete: {e}")))?;
+
+        // Idempotent backstop: FORGET already dropped these at tombstone
+        // time, but re-run the delete so a memory tombstoned before that
+        // path existed can't leave orphan HyPE rows past grace. No-op
+        // (removes 0) when the memory owns none.
+        brain_metadata::hype_vectors_delete_memory(&wtxn, id)
+            .map_err(|e| WorkerError::Ops(format!("reclaim hype delete: {e:?}")))?;
+
+        // Grace has expired for this memory, so its soft-FORGET cascade is
+        // now irreversible: drop every undo-log row keyed on it. This is the
+        // one place the undo journal is reaped, so a memory that is never
+        // restored can't leak undo rows, and a restore attempted after grace
+        // finds nothing to replay. Idempotent (removes 0) for a hard FORGET,
+        // which wrote no undo rows.
+        strip_undo_rows(&wtxn, id)?;
     }
 
     wtxn.commit()
@@ -275,9 +342,381 @@ fn purge_adjacent_edges(wtxn: &redb::WriteTransaction, id: MemoryId) -> Result<(
     Ok(())
 }
 
+/// Remove every residual `STATEMENTS_BY_EVIDENCE` row keyed on the
+/// reclaimed memory — `(namespace_id, space_id_bytes, memory, *)`.
+///
+/// The FORGET cascade already strips these when a soft-forgotten
+/// memory's statements are updated, so this is a defensive backstop: it
+/// covers a hard FORGET (which reclaims immediately, bypassing the
+/// grace-window cascade for orphaning) and any pre-existing orphan rows
+/// left by earlier code paths. `remove` on the collected keys is a
+/// no-op if the row is already gone, so it never double-errors.
+fn strip_evidence_rows(
+    wtxn: &redb::WriteTransaction,
+    namespace_id: u32,
+    space_id_bytes: [u8; 16],
+    id: MemoryId,
+) -> Result<(), WorkerError> {
+    let mem = id.to_be_bytes();
+    let lo = (namespace_id, space_id_bytes, mem, [0u8; 16]);
+    let hi = (namespace_id, space_id_bytes, mem, [0xFFu8; 16]);
+    let mut by_evidence = wtxn
+        .open_table(STATEMENTS_BY_EVIDENCE_TABLE)
+        .map_err(|e| WorkerError::Ops(format!("open STATEMENTS_BY_EVIDENCE: {e:?}")))?;
+    // Only the trailing statement-id varies across the prefix; collect
+    // it and rebuild the full key on removal.
+    let victims: Vec<[u8; 16]> = by_evidence
+        .range(lo..=hi)
+        .map_err(|e| WorkerError::Ops(format!("STATEMENTS_BY_EVIDENCE range: {e:?}")))?
+        .map(|entry| match entry {
+            Ok((k, _)) => Ok(k.value().3),
+            Err(e) => Err(WorkerError::Ops(format!(
+                "STATEMENTS_BY_EVIDENCE row: {e:?}"
+            ))),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for stmt in victims {
+        by_evidence
+            .remove(&(namespace_id, space_id_bytes, mem, stmt))
+            .map_err(|e| WorkerError::Ops(format!("STATEMENTS_BY_EVIDENCE remove: {e:?}")))?;
+    }
+    Ok(())
+}
+
+/// Remove every `FORGET_UNDO_LOG` row keyed on the reclaimed memory —
+/// `(memory, *)`. Called at grace expiry so a soft FORGET becomes
+/// irreversible and its undo journal can't leak. Idempotent (removes 0)
+/// for a hard FORGET, which wrote no undo rows.
+fn strip_undo_rows(wtxn: &redb::WriteTransaction, id: MemoryId) -> Result<(), WorkerError> {
+    let mem = id.to_be_bytes();
+    let lo = (mem, [0u8; 16]);
+    let hi = (mem, [0xFFu8; 16]);
+    let mut undo = wtxn
+        .open_table(FORGET_UNDO_LOG_TABLE)
+        .map_err(|e| WorkerError::Ops(format!("open FORGET_UNDO_LOG: {e:?}")))?;
+    // Only the trailing dependent-id varies across the prefix; collect it
+    // and rebuild the full key on removal.
+    let victims: Vec<[u8; 16]> = undo
+        .range(lo..=hi)
+        .map_err(|e| WorkerError::Ops(format!("FORGET_UNDO_LOG range: {e:?}")))?
+        .map(|entry| match entry {
+            Ok((k, _)) => Ok(k.value().1),
+            Err(e) => Err(WorkerError::Ops(format!("FORGET_UNDO_LOG row: {e:?}"))),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for dep in victims {
+        undo.remove(&(mem, dep))
+            .map_err(|e| WorkerError::Ops(format!("FORGET_UNDO_LOG remove: {e:?}")))?;
+    }
+    Ok(())
+}
+
 fn now_unix_nanos() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use brain_core::{MemoryKind, NamespaceId, SessionId, SpaceId};
+    use brain_metadata::tables::memory::{flags, MemoryMetadata};
+    use brain_metadata::MetadataDb;
+
+    fn open_shared() -> (tempfile::TempDir, Arc<MetadataDb>) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = MetadataDb::open(dir.path().join("meta.redb")).unwrap();
+        (dir, Arc::new(db))
+    }
+
+    /// Seed a tombstoned (soft-forgotten) memory: the MEMORIES row (inactive,
+    /// tombstoned_at stamped), its plaintext (TEXTS), and its write-artifact
+    /// bundle (MEMORY_ARTIFACTS + raw MEMORY_VECTORS). This mirrors the state
+    /// a default soft FORGET leaves behind — the text/artifact are deferred to
+    /// reclamation, not purged at tombstone time.
+    fn seed_soft_forgotten(db: &MetadataDb, id: MemoryId, tombstoned_at: u64) {
+        let mut row = MemoryMetadata::new_active(
+            id,
+            NamespaceId::SYSTEM,
+            SpaceId::default(),
+            SessionId(1),
+            id.slot(),
+            id.version(),
+            MemoryKind::Episodic,
+            [0xAB; 16],
+            0.5,
+            11,
+            1_000,
+        );
+        row.flags &= !flags::ACTIVE;
+        row.tombstoned_at_unix_nanos = Some(tombstoned_at);
+
+        let key = id.to_be_bytes();
+        let wtxn = db.write_txn().unwrap();
+        {
+            let mut m = wtxn.open_table(MEMORIES_TABLE).unwrap();
+            m.insert(&key, &row).unwrap();
+        }
+        {
+            let mut t = wtxn.open_table(TEXTS_TABLE).unwrap();
+            t.insert(&key, b"hello world".as_slice()).unwrap();
+        }
+        wtxn.commit().unwrap();
+
+        // Write the artifact bundle + raw by-id vector through the ops helper
+        // so get_artifact_vector resolves the seeded memory pre-reclaim.
+        let wtxn = db.write_txn().unwrap();
+        let dim = brain_embed::VECTOR_DIM;
+        let record = brain_ops::memory_artifact::sync_record(key, 0, 0.5, 1_000, 0, dim as u32, 11);
+        brain_ops::memory_artifact::put_sync_artifact(
+            &wtxn,
+            key,
+            vec![0.1_f32; dim],
+            record,
+            Vec::new(),
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+    }
+
+    /// A soft FORGET defers plaintext + artifact purge to grace expiry, so
+    /// reclamation (the grace path) must remove the MEMORIES row, the TEXTS
+    /// row, and the whole artifact bundle (leaving get_artifact_vector at
+    /// None and the raw MEMORY_VECTORS row gone). Otherwise invariant #6 is
+    /// violated and a forgotten memory's vector stays id-resolvable forever.
+    #[test]
+    fn reclaim_purges_text_and_artifact_after_grace() {
+        let (_dir, db) = open_shared();
+        let id = MemoryId::pack(1, 5, 0);
+        let key = id.to_be_bytes();
+        let tombstoned_at = 10_000u64;
+        seed_soft_forgotten(&db, id, tombstoned_at);
+
+        // Pre-reclaim: everything is present.
+        {
+            let rtxn = db.read_txn().unwrap();
+            assert!(rtxn
+                .open_table(MEMORIES_TABLE)
+                .unwrap()
+                .get(&key)
+                .unwrap()
+                .is_some());
+            assert!(rtxn
+                .open_table(TEXTS_TABLE)
+                .unwrap()
+                .get(&key)
+                .unwrap()
+                .is_some());
+            assert!(brain_ops::memory_artifact::get_artifact_vector(&rtxn, key).is_some());
+        }
+
+        // Grace has expired: cutoff sits strictly after tombstoned_at.
+        let reclaimed = reclaim_one(&db, id, tombstoned_at + 1).unwrap();
+        assert!(reclaimed, "an eligible tombstone must be reclaimed");
+
+        // Post-reclaim: row, text, artifact, and raw vector are all gone.
+        let rtxn = db.read_txn().unwrap();
+        assert!(
+            rtxn.open_table(MEMORIES_TABLE)
+                .unwrap()
+                .get(&key)
+                .unwrap()
+                .is_none(),
+            "MEMORIES row must be reclaimed"
+        );
+        assert!(
+            rtxn.open_table(TEXTS_TABLE)
+                .unwrap()
+                .get(&key)
+                .unwrap()
+                .is_none(),
+            "plaintext must be purged after grace"
+        );
+        assert!(
+            brain_ops::memory_artifact::get_artifact_vector(&rtxn, key).is_none(),
+            "artifact vector must be unresolvable after grace"
+        );
+        // The raw by-id vector row underlying get_artifact_vector is gone.
+        use brain_metadata::tables::memory_vector::MEMORY_VECTORS_TABLE;
+        assert!(
+            rtxn.open_table(MEMORY_VECTORS_TABLE)
+                .unwrap()
+                .get(&key)
+                .unwrap()
+                .is_none(),
+            "raw memory-vector row must be purged after grace"
+        );
+    }
+
+    /// Regression: reclamation must strip any residual
+    /// STATEMENTS_BY_EVIDENCE rows keyed on the reclaimed memory, so a
+    /// hard-forgotten memory (immediate reclaim) or a pre-existing
+    /// orphan can never leave a dangling reverse-index entry whose
+    /// primary memory is gone. Mirrors the RELATION_BY_EVIDENCE cleanup.
+    #[test]
+    fn reclaim_strips_residual_statement_evidence_rows() {
+        use brain_metadata::tables::scope::RowScope;
+
+        let (_dir, db) = open_shared();
+        let id = MemoryId::pack(1, 7, 0);
+        let tombstoned_at = 10_000u64;
+        seed_soft_forgotten(&db, id, tombstoned_at);
+
+        // The seeded memory carries the SYSTEM/default scope. Plant two
+        // residual evidence rows keyed on it (as if a cascade had been
+        // skipped), plus a row for an UNRELATED memory that must survive.
+        let scope = RowScope::new(NamespaceId::SYSTEM, SpaceId::default());
+        let other = MemoryId::pack(2, 8, 0);
+        let stmt_a = [0x11u8; 16];
+        let stmt_b = [0x22u8; 16];
+        {
+            let wtxn = db.write_txn().unwrap();
+            {
+                let mut t = wtxn.open_table(STATEMENTS_BY_EVIDENCE_TABLE).unwrap();
+                t.insert(
+                    &(
+                        scope.namespace_id,
+                        scope.space_id_bytes,
+                        id.to_be_bytes(),
+                        stmt_a,
+                    ),
+                    &(),
+                )
+                .unwrap();
+                t.insert(
+                    &(
+                        scope.namespace_id,
+                        scope.space_id_bytes,
+                        id.to_be_bytes(),
+                        stmt_b,
+                    ),
+                    &(),
+                )
+                .unwrap();
+                t.insert(
+                    &(
+                        scope.namespace_id,
+                        scope.space_id_bytes,
+                        other.to_be_bytes(),
+                        stmt_a,
+                    ),
+                    &(),
+                )
+                .unwrap();
+            }
+            wtxn.commit().unwrap();
+        }
+
+        let reclaimed = reclaim_one(&db, id, tombstoned_at + 1).unwrap();
+        assert!(reclaimed, "an eligible tombstone must be reclaimed");
+
+        let rtxn = db.read_txn().unwrap();
+        let t = rtxn.open_table(STATEMENTS_BY_EVIDENCE_TABLE).unwrap();
+        // No residual rows remain for the reclaimed memory.
+        let lo = (
+            scope.namespace_id,
+            scope.space_id_bytes,
+            id.to_be_bytes(),
+            [0u8; 16],
+        );
+        let hi = (
+            scope.namespace_id,
+            scope.space_id_bytes,
+            id.to_be_bytes(),
+            [0xFFu8; 16],
+        );
+        assert_eq!(
+            t.range(lo..=hi).unwrap().count(),
+            0,
+            "reclaim must strip residual evidence rows for the reclaimed memory"
+        );
+        // The unrelated memory's row is untouched.
+        assert!(t
+            .get(&(
+                scope.namespace_id,
+                scope.space_id_bytes,
+                other.to_be_bytes(),
+                stmt_a
+            ))
+            .unwrap()
+            .is_some());
+    }
+
+    /// Reclamation is not eligible before grace expires (cutoff <= tombstoned).
+    #[test]
+    fn reclaim_skips_before_grace() {
+        let (_dir, db) = open_shared();
+        let id = MemoryId::pack(1, 6, 0);
+        let tombstoned_at = 10_000u64;
+        seed_soft_forgotten(&db, id, tombstoned_at);
+
+        // cutoff == tombstoned_at → not strictly past grace → skip.
+        let reclaimed = reclaim_one(&db, id, tombstoned_at).unwrap();
+        assert!(!reclaimed, "must not reclaim before grace expiry");
+
+        let rtxn = db.read_txn().unwrap();
+        assert!(rtxn
+            .open_table(TEXTS_TABLE)
+            .unwrap()
+            .get(&id.to_be_bytes())
+            .unwrap()
+            .is_some());
+    }
+
+    /// Grace-expiry reclamation must also reap the memory's soft-FORGET
+    /// undo-log rows, so a post-grace forget is irreversible and the undo
+    /// journal never leaks.
+    #[test]
+    fn reclaim_reaps_forget_undo_rows_after_grace() {
+        use brain_metadata::tables::forget_undo::{
+            outcome, record_kind, ForgetUndoRecord, FORGET_UNDO_LOG_TABLE,
+        };
+        let (_dir, db) = open_shared();
+        let id = MemoryId::pack(1, 7, 0);
+        let mem = id.to_be_bytes();
+        let tombstoned_at = 10_000u64;
+        seed_soft_forgotten(&db, id, tombstoned_at);
+
+        // Seed two undo rows keyed on this memory (a statement + a relation).
+        let dep_a = [0x11u8; 16];
+        let dep_b = [0x22u8; 16];
+        {
+            let wtxn = db.write_txn().unwrap();
+            {
+                let mut t = wtxn.open_table(FORGET_UNDO_LOG_TABLE).unwrap();
+                let rec = ForgetUndoRecord {
+                    record_kind: record_kind::STATEMENT,
+                    dropped_memory_id_bytes: mem,
+                    dropped_confidence_milli: 900,
+                    dropped_timestamp_unix_nanos: 1_000,
+                    dropped_extractor_id: 0,
+                    prior_confidence: 0.9,
+                    prior_is_current: 1,
+                    prior_tombstone_reason: 0,
+                    prior_overflow_id_bytes: None,
+                    outcome: outcome::TOMBSTONED,
+                    grace_expiry_unix_nanos: tombstoned_at + 100,
+                };
+                t.insert(&(mem, dep_a), &rec).unwrap();
+                let mut rel = rec.clone();
+                rel.record_kind = record_kind::RELATION;
+                t.insert(&(mem, dep_b), &rel).unwrap();
+            }
+            wtxn.commit().unwrap();
+        }
+
+        // Grace expired → reclaim.
+        let reclaimed = reclaim_one(&db, id, tombstoned_at + 1).unwrap();
+        assert!(reclaimed);
+
+        // Undo rows for this memory are gone.
+        let rtxn = db.read_txn().unwrap();
+        let t = rtxn.open_table(FORGET_UNDO_LOG_TABLE).unwrap();
+        assert!(t.get(&(mem, dep_a)).unwrap().is_none());
+        assert!(t.get(&(mem, dep_b)).unwrap().is_none());
+    }
 }

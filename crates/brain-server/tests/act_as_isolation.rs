@@ -43,7 +43,7 @@ use brain_protocol::envelope::request::{
     EncodeRequest, RecallRequest, RequestBody, SubscribeRequest, SubscriptionFilter,
 };
 use brain_protocol::envelope::response::{ErrorCodeWire, ResponseBody};
-use brain_protocol::{ActAs, EventType, Frame};
+use brain_protocol::{ActAs, EventType, Frame, TxnBeginRequest, TxnCommitRequest};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -219,6 +219,7 @@ async fn recall_ids_as(
     act_as: Option<ActAs>,
 ) -> Vec<u128> {
     let req = RecallRequest {
+        scope: Default::default(),
         trace: false,
         cue_text: cue.into(),
         subject_name: String::new(),
@@ -255,7 +256,65 @@ fn act_as(namespace: &str, space: &str) -> ActAs {
     ActAs {
         namespace: namespace.to_string(),
         space_id: space.to_string(),
+        grant: 0,
     }
+}
+
+/// Open a transaction as `act_as` (when `Some`), returning the opcode/body so a
+/// caller can assert either success (`TxnBeginResp`) or a denial (`Error`).
+async fn txn_begin_as(
+    client: &mut TcpStream,
+    stream_id: u32,
+    txn_id: [u8; 16],
+    act_as: Option<ActAs>,
+) -> (u16, ResponseBody) {
+    let req = TxnBeginRequest {
+        txn_id,
+        timeout_seconds: 60,
+        act_as,
+    };
+    round_trip(client, stream_id, RequestBody::TxnBegin(req)).await
+}
+
+/// Buffer an ENCODE into an open transaction, returning the reserved
+/// `memory_id`. Runs as the connection's own identity (no per-op `act_as`) —
+/// the delegation fixed at begin governs where the committed row lands.
+async fn encode_in_txn(
+    client: &mut TcpStream,
+    stream_id: u32,
+    txn_id: [u8; 16],
+    text: &str,
+) -> u128 {
+    let req = EncodeRequest {
+        text: text.into(),
+        session_id: 0,
+        request_id: *uuid::Uuid::now_v7().as_bytes(),
+        txn_id: Some(txn_id),
+        occurred_at_unix_nanos: None,
+        act_as: None,
+        wait: brain_protocol::WaitMode::Ack,
+        allow_duplicates: false,
+    };
+    let (opcode, body) = round_trip(client, stream_id, RequestBody::Encode(req)).await;
+    match body {
+        ResponseBody::Encode(r) if opcode == Opcode::EncodeResp.as_u16() => r.memory_id,
+        other => panic!("encode-in-txn failed: opcode=0x{opcode:04x} body={other:?}"),
+    }
+}
+
+/// Commit an open transaction (never carries `act_as`).
+async fn txn_commit(client: &mut TcpStream, stream_id: u32, txn_id: [u8; 16]) {
+    let (opcode, body) = round_trip(
+        client,
+        stream_id,
+        RequestBody::TxnCommit(TxnCommitRequest { txn_id }),
+    )
+    .await;
+    assert_eq!(
+        opcode,
+        Opcode::TxnCommitResp.as_u16(),
+        "expected TxnCommitResp, got 0x{opcode:04x}: {body:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -737,6 +796,388 @@ async fn subscribe_act_as_outside_allowlist_is_denied() {
         ),
         other => panic!("expected Error body, got {other:?}"),
     }
+
+    server.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Delegated transactions (act_as on TXN_BEGIN)
+// ---------------------------------------------------------------------------
+
+/// A transaction begun with `act_as` commits its buffered writes under the
+/// delegated identity — the shared-pool gateway model at the transaction level.
+/// One service-principal connection opens a txn on behalf of a tenant, buffers
+/// a write as its own identity, and commits (TXN_COMMIT never carries
+/// `act_as`); the committed memory must be reachable by the tenant's effective
+/// identity and invisible to the connection's own identity.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn txn_begun_with_act_as_commits_under_delegated_identity() {
+    let server = start(1).await; // one shard → begin/commit collocated
+
+    let svc_space = *uuid::Uuid::now_v7().as_bytes();
+    let svc_token = server.mint_with_may_act(
+        "svc",
+        svc_space,
+        brain_metadata::api_keys::bits::ACT_AS | brain_metadata::api_keys::bits::STANDARD_SPACE,
+        vec!["tenant_txn".to_string()],
+    );
+
+    let mut svc = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect svc");
+    handshake_as(&mut svc, &svc_token).await;
+
+    let txn_id = *uuid::Uuid::now_v7().as_bytes();
+
+    // BEGIN as tenant_txn.
+    let (opcode, body) =
+        txn_begin_as(&mut svc, 1, txn_id, Some(act_as("tenant_txn", "space-txn"))).await;
+    assert_eq!(
+        opcode,
+        Opcode::TxnBeginResp.as_u16(),
+        "delegated TXN_BEGIN should succeed, got 0x{opcode:04x}: {body:?}"
+    );
+
+    // Buffer a write (as the connection's own identity), then COMMIT (which
+    // carries no act_as). The delegation fixed at begin must still steer it.
+    let mem = encode_in_txn(
+        &mut svc,
+        3,
+        txn_id,
+        "tenant_txn secret: the pager code is 8080",
+    )
+    .await;
+    txn_commit(&mut svc, 5, txn_id).await;
+
+    // The delegated identity sees the committed memory. The txn commit makes the
+    // memory durable + semantically indexed synchronously, but the lexical
+    // (tantivy) lane is maintained asynchronously — and the stub embedder makes
+    // every semantic cosine 0.0, so under the test harness this recall is served
+    // entirely by the lexical lane. Poll until the async index catches up
+    // (fresh request_id per attempt, so RECALL idempotency never pins an early
+    // empty result) rather than racing the indexer with a single shot.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let delegated_ids = loop {
+        let ids = recall_ids_as(
+            &mut svc,
+            7,
+            "pager code secret",
+            Some(act_as("tenant_txn", "space-txn")),
+        )
+        .await;
+        if ids.contains(&mem) || std::time::Instant::now() >= deadline {
+            break ids;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    };
+    assert!(
+        delegated_ids.contains(&mem),
+        "delegated identity's RECALL must find the txn-committed memory {mem}; got {delegated_ids:?}"
+    );
+
+    // The connection's OWN identity (act_as = None) must NOT — proving the
+    // write landed in the delegated space, not the committing connection's.
+    let own_ids = recall_ids_as(&mut svc, 9, "pager code secret", None).await;
+    assert!(
+        !own_ids.contains(&mem),
+        "TENANCY BREACH: the committing connection's own identity saw the delegated txn write {mem}; got {own_ids:?}"
+    );
+
+    server.stop().await;
+}
+
+/// R1 at the transaction boundary: a principal WITHOUT the `ACT_AS` grant that
+/// opens a txn with an `act_as` selector is hard-rejected with `ActAsDenied` —
+/// the same gate ENCODE enforces, reached through TXN_BEGIN's own dispatch arm.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn txn_begin_act_as_without_grant_is_denied() {
+    let server = start(1).await;
+
+    let space = [0xC5u8; 16];
+    // FULL deliberately excludes ACT_AS.
+    let token = server.mint("plain", space, brain_metadata::api_keys::bits::FULL);
+
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
+    handshake_as(&mut client, &token).await;
+
+    let txn_id = *uuid::Uuid::now_v7().as_bytes();
+    let (opcode, body) =
+        txn_begin_as(&mut client, 1, txn_id, Some(act_as("tenant_a", "space-a"))).await;
+    assert_eq!(
+        opcode,
+        Opcode::Error.as_u16(),
+        "expected an Error frame, got 0x{opcode:04x}: {body:?}"
+    );
+    match body {
+        ResponseBody::Error(e) => assert_eq!(
+            e.code,
+            ErrorCodeWire::ActAsDenied,
+            "expected ActAsDenied, got {:?}: {}",
+            e.code,
+            e.message
+        ),
+        other => panic!("expected Error body, got {other:?}"),
+    }
+
+    server.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Delegated capabilities + schema ops (`act_as` + `grant`)
+// ---------------------------------------------------------------------------
+
+fn act_as_granting(namespace: &str, space: &str, grant: u32) -> ActAs {
+    ActAs {
+        grant,
+        ..act_as(namespace, space)
+    }
+}
+
+fn expect_error(opcode: u16, body: &ResponseBody, code: ErrorCodeWire, what: &str) {
+    assert_eq!(
+        opcode,
+        Opcode::Error.as_u16(),
+        "{what}: expected an Error frame, got 0x{opcode:04x}: {body:?}"
+    );
+    match body {
+        ResponseBody::Error(e) => assert_eq!(
+            e.code, code,
+            "{what}: expected {code:?}, got {:?}: {}",
+            e.code, e.message
+        ),
+        other => panic!("{what}: expected Error body, got {other:?}"),
+    }
+}
+
+async fn schema_upload_as(
+    client: &mut TcpStream,
+    stream_id: u32,
+    doc: &str,
+    act_as: Option<ActAs>,
+) -> (u16, ResponseBody) {
+    use brain_protocol::SchemaUploadRequest;
+    round_trip(
+        client,
+        stream_id,
+        RequestBody::SchemaUpload(SchemaUploadRequest {
+            schema_document: doc.into(),
+            dry_run: false,
+            allow_breaking: false,
+            request_id: *uuid::Uuid::now_v7().as_bytes(),
+            act_as,
+        }),
+    )
+    .await
+}
+
+async fn capabilities_as(
+    client: &mut TcpStream,
+    stream_id: u32,
+    act_as: Option<ActAs>,
+) -> Vec<String> {
+    use brain_protocol::envelope::response::GetCapabilitiesRequest;
+    let (opcode, body) = round_trip(
+        client,
+        stream_id,
+        RequestBody::GetCapabilities(GetCapabilitiesRequest { act_as }),
+    )
+    .await;
+    match body {
+        ResponseBody::GetCapabilities(r) => {
+            let mut v = r.capabilities.schema_namespaces;
+            v.sort();
+            v
+        }
+        other => panic!("capabilities failed: opcode=0x{opcode:04x} body={other:?}"),
+    }
+}
+
+/// The shared-pool gateway runs schema ops and capability discovery AS the
+/// tenant: a delegated SCHEMA_UPLOAD (with an explicit `SCHEMA_UPLOAD`
+/// grant) lands in the tenant's namespace, SCHEMA_GET binds to the effective
+/// namespace (a foreign one is refused), a delegated upload WITHOUT a grant
+/// keeps the historical STANDARD_SPACE rights and is refused, and
+/// GET_CAPABILITIES lists only the effective caller's own namespace.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn act_as_schema_ops_and_capabilities_run_as_tenant() {
+    use brain_metadata::api_keys::bits;
+    use brain_protocol::SchemaGetRequest;
+
+    let server = start(1).await;
+    let svc_space = *uuid::Uuid::now_v7().as_bytes();
+    let svc_token = server.mint_with_may_act(
+        "svc",
+        svc_space,
+        bits::ACT_AS | bits::STANDARD_SPACE | bits::SCHEMA_UPLOAD,
+        vec!["*".to_string()],
+    );
+    let mut svc = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect svc");
+    handshake_as(&mut svc, &svc_token).await;
+
+    let su = bits::SCHEMA_UPLOAD;
+    let doc_a =
+        "namespace tenant_a\ndefine predicate prefers { kind: Preference object: Value<text> }\n";
+    let doc_b =
+        "namespace tenant_b\ndefine predicate dislikes { kind: Preference object: Value<text> }\n";
+
+    // No grant → STANDARD_SPACE → no SCHEMA_UPLOAD: refused, as before.
+    let (op, body) =
+        schema_upload_as(&mut svc, 1, doc_a, Some(act_as("tenant_a", "space-a"))).await;
+    expect_error(
+        op,
+        &body,
+        ErrorCodeWire::PermissionDenied,
+        "upload w/o grant",
+    );
+
+    // Granted: each tenant's upload lands in its own namespace.
+    for (i, (ns, space, doc)) in [
+        ("tenant_a", "space-a", doc_a),
+        ("tenant_b", "space-b", doc_b),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (op, body) = schema_upload_as(
+            &mut svc,
+            3 + 2 * i as u32,
+            doc,
+            Some(act_as_granting(ns, space, su)),
+        )
+        .await;
+        match body {
+            ResponseBody::SchemaUpload(r) if op == Opcode::SchemaUploadResp.as_u16() => {
+                assert!(r.validation_errors.is_empty(), "{:?}", r.validation_errors);
+                assert_eq!(r.namespace, ns);
+                assert!(r.schema_version >= 1);
+            }
+            other => panic!("granted upload for {ns} failed: 0x{op:04x} {other:?}"),
+        }
+    }
+
+    // Cross-tenant write: acting as tenant_a with tenant_b's DSL.
+    let (op, body) = schema_upload_as(
+        &mut svc,
+        7,
+        doc_b,
+        Some(act_as_granting("tenant_a", "space-a", su)),
+    )
+    .await;
+    expect_error(
+        op,
+        &body,
+        ErrorCodeWire::PermissionDenied,
+        "cross-tenant upload",
+    );
+
+    // SCHEMA_GET binds to the effective namespace.
+    let get = |namespace: &str| {
+        RequestBody::SchemaGet(SchemaGetRequest {
+            namespace: namespace.into(),
+            version: 0,
+            act_as: Some(act_as("tenant_a", "space-a")),
+        })
+    };
+    let (op, body) = round_trip(&mut svc, 9, get("tenant_a")).await;
+    match body {
+        ResponseBody::SchemaGet(r) if op == Opcode::SchemaGetResp.as_u16() => {
+            assert_eq!(r.namespace, "tenant_a");
+        }
+        other => panic!("own-namespace get failed: 0x{op:04x} {other:?}"),
+    }
+    let (op, body) = round_trip(&mut svc, 11, get("tenant_b")).await;
+    expect_error(
+        op,
+        &body,
+        ErrorCodeWire::PermissionDenied,
+        "cross-tenant get",
+    );
+
+    // Capabilities: each effective caller sees only its own namespace; the
+    // gateway's own identity ("svc", no schema) sees none of the tenants.
+    assert_eq!(
+        capabilities_as(&mut svc, 13, Some(act_as("tenant_a", "space-a"))).await,
+        ["tenant_a"]
+    );
+    assert_eq!(
+        capabilities_as(&mut svc, 15, Some(act_as("tenant_b", "space-b"))).await,
+        ["tenant_b"]
+    );
+    assert!(capabilities_as(&mut svc, 17, None).await.is_empty());
+
+    server.stop().await;
+}
+
+/// A delegator can never grant more than it holds: a grant naming a bit the
+/// principal lacks (ADMIN here), or a non-delegable bit (ACT_AS), is
+/// hard-rejected with `ActAsDenied` before any work runs — on the normal
+/// dispatch path and on SUBSCRIBE's separate branch alike (both call
+/// `check_act_as`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn act_as_grant_beyond_delegator_is_denied() {
+    use brain_metadata::api_keys::bits;
+    use brain_protocol::SchemaReplaceRequest;
+
+    let server = start(1).await;
+    let svc_space = *uuid::Uuid::now_v7().as_bytes();
+    // Holds SCHEMA_UPLOAD but NOT ADMIN.
+    let svc_token = server.mint_with_may_act(
+        "svc",
+        svc_space,
+        bits::ACT_AS | bits::STANDARD_SPACE | bits::SCHEMA_UPLOAD,
+        vec!["*".to_string()],
+    );
+    let mut svc = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect svc");
+    handshake_as(&mut svc, &svc_token).await;
+
+    let replace = RequestBody::SchemaReplace(SchemaReplaceRequest {
+        schema_document: "namespace tenant_a\ndefine predicate prefers { kind: Preference object: Value<text> }\n".into(),
+        force_drop_existing: true,
+        request_id: *uuid::Uuid::now_v7().as_bytes(),
+        act_as: Some(act_as_granting("tenant_a", "space-a", bits::ADMIN)),
+    });
+    let (op, body) = round_trip(&mut svc, 1, replace).await;
+    expect_error(
+        op,
+        &body,
+        ErrorCodeWire::ActAsDenied,
+        "ADMIN grant w/o ADMIN",
+    );
+
+    // ACT_AS is never delegable, even by a principal that holds it.
+    let (op, body) = schema_upload_as(
+        &mut svc,
+        3,
+        "namespace tenant_a\n",
+        Some(act_as_granting("tenant_a", "space-a", bits::ACT_AS)),
+    )
+    .await;
+    expect_error(op, &body, ErrorCodeWire::ActAsDenied, "ACT_AS grant");
+
+    // The same bound applies to non-schema ops carrying a grant.
+    let req = EncodeRequest {
+        text: "never written".into(),
+        session_id: 0,
+        request_id: *uuid::Uuid::now_v7().as_bytes(),
+        txn_id: None,
+        occurred_at_unix_nanos: None,
+        act_as: Some(act_as_granting("tenant_a", "space-a", bits::ADMIN)),
+        wait: brain_protocol::WaitMode::Ack,
+        allow_duplicates: false,
+    };
+    let (op, body) = round_trip(&mut svc, 5, RequestBody::Encode(req)).await;
+    expect_error(
+        op,
+        &body,
+        ErrorCodeWire::ActAsDenied,
+        "ADMIN grant on encode",
+    );
 
     server.stop().await;
 }

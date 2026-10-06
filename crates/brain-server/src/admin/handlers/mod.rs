@@ -10,13 +10,16 @@
 
 pub mod api_keys;
 pub mod audit;
+pub mod backfill;
 pub mod config;
 pub mod diagnostics;
 pub mod extract;
 pub mod healthz;
+pub mod memory;
 pub mod metrics;
 pub mod readyz;
 pub mod rebuild;
+pub mod schema;
 pub mod shard;
 pub mod snapshot;
 pub mod space;

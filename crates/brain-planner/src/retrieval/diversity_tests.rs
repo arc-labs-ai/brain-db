@@ -15,6 +15,18 @@ fn item(slot: u64, rerank: f32) -> FusedItem {
     }
 }
 
+/// A fused item where the fusion signal and the raw cross-encoder logit
+/// DISAGREE — the realistic post-rerank shape the MMR relevance blend must
+/// respect.
+fn item_fr(slot: u64, fused: f64, rerank: f32) -> FusedItem {
+    FusedItem {
+        id: RankedItemId::Memory(MemoryId::pack(0, slot, 0)),
+        fused_score: fused,
+        contributing: Vec::new(),
+        rerank_score: Some(rerank),
+    }
+}
+
 fn ids(items: &[FusedItem]) -> Vec<u64> {
     items
         .iter()
@@ -38,6 +50,40 @@ fn first_pick_is_always_argmax_relevance() {
     ];
     mmr_reorder(&mut items, &toks, MMR_LAMBDA_LIST);
     assert_eq!(ids(&items)[0], 1, "highest-relevance item stays at rank 0");
+}
+
+#[test]
+fn first_pick_follows_the_blended_key_not_the_raw_logit() {
+    // The bug: MMR used the raw cross-encoder logit as relevance, so its
+    // first pick became argmax(raw_logit) — flipping the order the rerank
+    // stage's α-bound blend deliberately protected. Here the fusion signal
+    // and the logit DISAGREE:
+    //   fus range [0, 1]; rer range [0.1, 0.9].
+    //   A: fused 1.0, logit 0.1 → blend 1.0 + 0.5·0.0 = 1.00
+    //   C: fused 0.5, logit 0.5 → blend 0.5 + 0.5·0.5 = 0.75
+    //   B: fused 0.0, logit 0.9 → blend 0.0 + 0.5·1.0 = 0.50
+    // Blended rank-0 is A; the incoming order is the rerank-blend order
+    // [A, C, B]. But argmax(raw_logit) is B (0.9). With the old code B would
+    // seize the first pick; with the blend, A must stay at rank 0.
+    let mut items = vec![
+        item_fr(1, 1.0, 0.1), // A — blended winner
+        item_fr(3, 0.5, 0.5), // C
+        item_fr(2, 0.0, 0.9), // B — raw-logit argmax
+    ];
+    // Distinct texts so the first pick is pure argmax(relevance), untouched
+    // by the Jaccard term.
+    let toks = vec![
+        tokenize("alice enjoys mountain hiking on weekends"),
+        tokenize("bob restores vintage motorcycles in his garage"),
+        tokenize("carol paints watercolour seascapes at dawn"),
+    ];
+    mmr_reorder(&mut items, &toks, MMR_LAMBDA_LIST);
+    assert_eq!(
+        ids(&items)[0],
+        1,
+        "MMR must keep the blended rank-0 (A), not the raw-logit argmax (B); got {:?}",
+        ids(&items),
+    );
 }
 
 #[test]

@@ -58,6 +58,10 @@ fn write_memory(
     doc.add_u64(created_field, created_at_ms);
     writer.add_document(doc).expect("add doc");
     writer.commit().expect("commit");
+    // Mirror the production indexer: a commit advances the handle's commit
+    // generation so the retriever knows to reload. Without this the
+    // reload-gated retriever would not observe writes made across queries.
+    shard.memory_text.bump_commit_generation();
 }
 
 // Test helper that mirrors the underlying schema's field set; introducing a
@@ -66,6 +70,33 @@ fn write_memory(
 #[allow(clippy::too_many_arguments)]
 fn write_statement(
     shard: &TantivyShard,
+    id: StatementId,
+    subject_name: &str,
+    predicate_name: &str,
+    predicate_id: u32,
+    object_text: &str,
+    kind: StatementKind,
+    confidence: f32,
+    extracted_at_ms: u64,
+) {
+    write_statement_in(
+        shard,
+        [0u8; 16],
+        id,
+        subject_name,
+        predicate_name,
+        predicate_id,
+        object_text,
+        kind,
+        confidence,
+        extracted_at_ms,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_statement_in(
+    shard: &TantivyShard,
+    space: [u8; 16],
     id: StatementId,
     subject_name: &str,
     predicate_name: &str,
@@ -84,6 +115,7 @@ fn write_statement(
     let kind_field = schema.get_field("kind").unwrap();
     let bucket_field = schema.get_field("confidence_bucket").unwrap();
     let extracted_field = schema.get_field("extracted_at").unwrap();
+    let space_field = schema.get_field("space_id").unwrap();
 
     // Mirrors the canonical bucket formula (floor(c*10).clamp(0,10),
     // 0..=10) used by brain-metadata + the brain-ops tantivy writer.
@@ -103,8 +135,12 @@ fn write_statement(
     doc.add_u64(kind_field, u64::from(kind.as_u8()));
     doc.add_u64(bucket_field, bucket);
     doc.add_u64(extracted_field, extracted_at_ms);
+    doc.add_bytes(space_field, &space);
     writer.add_document(doc).expect("add doc");
     writer.commit().expect("commit");
+    // Mirror the production indexer: advance the commit generation so the
+    // reload-gated retriever reloads and observes this write.
+    shard.statements.bump_commit_generation();
 }
 
 fn term_query(term: &str) -> LexicalQuery {
@@ -506,14 +542,30 @@ fn confidence_bucket_range_filter() {
 }
 
 #[test]
-fn space_id_filter_on_statement_scope_errors() {
-    let (_dir, _shard, retriever) = fresh();
-    let err = retriever
+fn space_id_filter_walls_statement_hits() {
+    let (_dir, shard, retriever) = fresh();
+    let mine = SpaceId::new();
+    let theirs = SpaceId::new();
+    for (space, id) in [(mine, 1u8), (theirs, 2u8)] {
+        write_statement_in(
+            &shard,
+            space.into(),
+            StatementId::from([id; 16]),
+            "Diego",
+            "joined",
+            1,
+            "billing team",
+            StatementKind::Fact,
+            0.9,
+            0,
+        );
+    }
+    let result = retriever
         .retrieve(
             &LexicalQuery {
-                terms: vec!["x".into()],
+                terms: vec!["billing".into()],
                 filters: LexicalFilters {
-                    space_ids: vec![SpaceId::new()],
+                    space_ids: vec![mine],
                     ..Default::default()
                 },
                 ..Default::default()
@@ -521,8 +573,12 @@ fn space_id_filter_on_statement_scope_errors() {
             LexicalScope::StatementText,
             &LexicalRetrieverConfig::default(),
         )
-        .expect_err("must reject wrong-scope filter");
-    assert!(matches!(err, LexicalError::QueryParseFailed(_)));
+        .expect("retrieve");
+    assert_eq!(result.len(), 1, "the other space's statement is walled off");
+    assert_eq!(
+        result[0].id,
+        RankedItemId::Statement(StatementId::from([1u8; 16]))
+    );
 }
 
 #[test]
@@ -588,4 +644,238 @@ fn empty_query_returns_empty_result() {
         )
         .expect("retrieve");
     assert!(result.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Hot swap (swap_shard) — the read side of the live tantivy rebuild.
+// ---------------------------------------------------------------------------
+
+/// After `swap_shard`, `retrieve` serves the new index's content and no
+/// longer the old — the atomic publish flips the whole bundle (shard +
+/// both readers) without ever exposing a mixed view.
+#[test]
+fn swap_shard_flips_reads_to_the_new_index() {
+    // Old index: one memory "alpha".
+    let (_dir_a, shard_a, retriever) = fresh();
+    let alpha = MemoryId::pack(0, 1, 0);
+    write_memory(
+        &shard_a,
+        alpha,
+        "alpha",
+        SpaceId::new(),
+        MemoryKind::Episodic,
+        0,
+    );
+    let hits = retriever
+        .retrieve(
+            &term_query("alpha"),
+            LexicalScope::MemoryText,
+            &LexicalRetrieverConfig::default(),
+        )
+        .expect("retrieve alpha");
+    assert_eq!(hits.len(), 1, "old index serves alpha before swap");
+    assert_eq!(hits[0].id, RankedItemId::Memory(alpha));
+
+    // New index in a separate directory: one memory "beta".
+    let dir_b = TempDir::new().expect("tempdir b");
+    let shard_b = TantivyShard::open(dir_b.path()).expect("open b").shard;
+    let beta = MemoryId::pack(1, 2, 0);
+    write_memory(
+        &shard_b,
+        beta,
+        "beta",
+        SpaceId::new(),
+        MemoryKind::Episodic,
+        0,
+    );
+
+    retriever.swap_shard(shard_b).expect("swap");
+
+    // Post-swap: beta is visible, alpha is gone. Never an error, never a
+    // stale-mixed result (invariant #7).
+    let after_beta = retriever
+        .retrieve(
+            &term_query("beta"),
+            LexicalScope::MemoryText,
+            &LexicalRetrieverConfig::default(),
+        )
+        .expect("retrieve beta");
+    assert_eq!(after_beta.len(), 1, "new index serves beta after swap");
+    assert_eq!(after_beta[0].id, RankedItemId::Memory(beta));
+
+    let after_alpha = retriever
+        .retrieve(
+            &term_query("alpha"),
+            LexicalScope::MemoryText,
+            &LexicalRetrieverConfig::default(),
+        )
+        .expect("retrieve alpha after swap");
+    assert!(
+        after_alpha.is_empty(),
+        "old index content is gone after swap",
+    );
+}
+
+/// A second swap composes: reads always reflect the most recently
+/// published bundle.
+#[test]
+fn swap_shard_is_repeatable() {
+    let (_dir_a, shard_a, retriever) = fresh();
+    write_memory(
+        &shard_a,
+        MemoryId::pack(0, 1, 0),
+        "first",
+        SpaceId::new(),
+        MemoryKind::Episodic,
+        0,
+    );
+
+    for (i, term) in ["second", "third"].iter().enumerate() {
+        let dir = TempDir::new().expect("tempdir");
+        let shard = TantivyShard::open(dir.path()).expect("open").shard;
+        write_memory(
+            &shard,
+            MemoryId::pack(0, i as u64 + 2, 0),
+            term,
+            SpaceId::new(),
+            MemoryKind::Episodic,
+            0,
+        );
+        retriever.swap_shard(shard).expect("swap");
+        let hits = retriever
+            .retrieve(
+                &term_query(term),
+                LexicalScope::MemoryText,
+                &LexicalRetrieverConfig::default(),
+            )
+            .expect("retrieve");
+        assert_eq!(hits.len(), 1, "reads reflect the latest swap for {term}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Commit-generation reload gating — the retriever reloads only when the
+// indexer's commit generation has advanced, but must still observe every
+// committed write (read-your-commits, invariant #7). This guards the specific
+// failure the optimization could introduce: a stale read that skips a reload
+// after a real commit.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn retrieve_observes_each_commit_as_the_generation_advances() {
+    let (_dir, shard, retriever) = fresh();
+
+    // Each `write_memory` commits and bumps the generation (mirroring the
+    // production indexer). The first query reloads off the sentinel; every
+    // later query must reload again because the generation advanced — a gate
+    // that reloaded only once would miss beta and gamma.
+    let alpha = MemoryId::pack(0, 1, 0);
+    write_memory(
+        &shard,
+        alpha,
+        "alpha",
+        SpaceId::new(),
+        MemoryKind::Episodic,
+        0,
+    );
+    assert_eq!(
+        retriever
+            .retrieve(
+                &term_query("alpha"),
+                LexicalScope::MemoryText,
+                &LexicalRetrieverConfig::default(),
+            )
+            .expect("retrieve alpha")
+            .len(),
+        1,
+        "first commit is visible",
+    );
+
+    let beta = MemoryId::pack(0, 2, 0);
+    write_memory(
+        &shard,
+        beta,
+        "beta",
+        SpaceId::new(),
+        MemoryKind::Episodic,
+        0,
+    );
+    assert_eq!(
+        retriever
+            .retrieve(
+                &term_query("beta"),
+                LexicalScope::MemoryText,
+                &LexicalRetrieverConfig::default(),
+            )
+            .expect("retrieve beta")
+            .len(),
+        1,
+        "second commit is visible after the generation advanced",
+    );
+
+    let gamma = MemoryId::pack(0, 3, 0);
+    write_memory(
+        &shard,
+        gamma,
+        "gamma",
+        SpaceId::new(),
+        MemoryKind::Episodic,
+        0,
+    );
+    assert_eq!(
+        retriever
+            .retrieve(
+                &term_query("gamma"),
+                LexicalScope::MemoryText,
+                &LexicalRetrieverConfig::default(),
+            )
+            .expect("retrieve gamma")
+            .len(),
+        1,
+        "third commit is visible",
+    );
+
+    // The earlier commits are still present — reloading forward never drops
+    // prior segments.
+    assert_eq!(
+        retriever
+            .retrieve(
+                &term_query("alpha"),
+                LexicalScope::MemoryText,
+                &LexicalRetrieverConfig::default(),
+            )
+            .expect("retrieve alpha again")
+            .len(),
+        1,
+        "prior commits remain visible",
+    );
+}
+
+#[test]
+fn retrieve_is_stable_across_repeated_queries_without_new_commits() {
+    // No new commit between queries ⇒ the generation does not advance ⇒ the
+    // gate skips the reload, and results stay identical (the idempotency
+    // contract the reload used to guarantee by reloading unconditionally).
+    let (_dir, shard, retriever) = fresh();
+    let id = MemoryId::pack(0, 1, 0);
+    write_memory(
+        &shard,
+        id,
+        "stable",
+        SpaceId::new(),
+        MemoryKind::Episodic,
+        0,
+    );
+
+    for _ in 0..3 {
+        let hits = retriever
+            .retrieve(
+                &term_query("stable"),
+                LexicalScope::MemoryText,
+                &LexicalRetrieverConfig::default(),
+            )
+            .expect("retrieve");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, RankedItemId::Memory(id));
+    }
 }

@@ -12,6 +12,15 @@ you run is exactly what we run.
 - **SDKs** (talk to Brain without touching the wire protocol):
   `cargo add brain-db-sdk` · `npm i @brain-db/sdk` · `pip install brain-db-sdk`
 
+> **Scope.** This is the *deployment on-ramp* — getting the container running and a
+> client connected. It is **not** the operational reference: the authoritative
+> runbooks (GC / WAL-retention / slot-reclaim triggers, corruption recovery,
+> per-shard restart, admin-op semantics) live in
+> [`spec/17_observability/`](spec/17_observability/00_purpose.md) and
+> [`spec/18_failure_recovery/`](spec/18_failure_recovery/00_purpose.md), and the
+> wire/admin surface in [`spec/04_wire_protocol/`](spec/04_wire_protocol/00_purpose.md).
+> This file links there rather than restating it.
+
 ---
 
 ## Prerequisites
@@ -70,7 +79,7 @@ Pin a version in `.env`: `BRAIN_VERSION=0.1.0`.
 |---|---|---|
 | **8080** | Data plane — binary wire protocol (CBOR). SDKs connect here. | yes (`-p 8080`) |
 | **9091** | Public HTTP — `/healthz`, `/metrics` only. | yes (`-p 9091`) |
-| **9092** | Admin HTTP — `/v1/*` (API-key mint, stats, revoke). | **no** — loopback inside the container |
+| **9092** | Admin HTTP — `/v1/*` (API-key mint/revoke, worker control, audit, snapshots, per-shard status). Stats/metrics live on the public `:9091/metrics`, not here. | **no** — loopback inside the container |
 
 The admin plane has no built-in auth beyond the operator token — it stays on
 container loopback by design. Reach it via `docker compose exec`:
@@ -82,7 +91,8 @@ docker compose exec brain \
 ```
 
 To front it externally, put it behind your own token/mTLS proxy — never map
-`-p 9092` to a public interface.
+`-p 9092` to a public interface. Full admin-op catalog + semantics:
+[`spec/17_observability/04_admin_ops.md`](spec/17_observability/04_admin_ops.md).
 
 ---
 
@@ -131,8 +141,9 @@ docker compose pull && docker compose up -d
 
 Data (`brain-data` volume) and the model cache (`brain-models`) survive across
 upgrades. On restart Brain replays its WAL and recovers to the last fsynced
-write. Read the release notes before crossing a minor — pre-1.0, breaking
-changes to the redb layout / wire protocol are made in place without shims.
+write (mechanism: [`spec/18_failure_recovery/`](spec/18_failure_recovery/00_purpose.md)).
+Read the release notes before crossing a minor — pre-1.0, breaking changes to the
+redb layout / wire protocol are made in place without shims.
 
 ---
 
@@ -149,7 +160,9 @@ docker compose start brain
 ```
 
 For hot backups, use the volume driver's snapshot facility (LVM/ZFS/EBS) rather
-than copying files from under a running writer.
+than copying files from under a running writer, or Brain's own HTTP snapshot +
+restore endpoints (`/v1/snapshots`) — see
+[`spec/17_observability/04_admin_ops.md`](spec/17_observability/04_admin_ops.md).
 
 ---
 

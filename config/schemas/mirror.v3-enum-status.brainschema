@@ -1,0 +1,175 @@
+# Mirror — a chat-based builder of RL environment clones.
+#
+# A Builder chats with Mirror to clone a real product (a TargetApp) into a
+# sandboxed RL environment (CloneEnv). Each environment defines tasks
+# (TaskSpec) scored by reward functions (RewardFn); agent policies
+# (AgentPolicy) are trained in environments and measured by evaluation runs
+# (EvalRun). Type names avoid Brain's built-ins (Person, Project, …), which
+# are global.
+
+namespace mirror
+
+# --- Entity types ---------------------------------------------------
+
+define entity_type Builder {
+    attributes {
+        email:  text optional unique
+        role:   text optional
+    }
+}
+
+define entity_type TargetApp {
+    attributes {
+        url:       text optional
+        category:  text optional
+    }
+}
+
+define entity_type CloneEnv {
+    attributes {
+        status:     enum [draft, building, ready, failed, archived] optional
+        framework:  text optional
+        fidelity:   number optional
+    }
+}
+
+define entity_type TaskSpec {
+    attributes {
+        difficulty:  enum [easy, medium, hard] optional
+        horizon:     number optional
+    }
+}
+
+define entity_type RewardFn {
+    attributes {
+        shape:  enum [sparse, dense, shaped, learned] optional
+    }
+}
+
+define entity_type AgentPolicy {
+    attributes {
+        model:      text optional
+        algorithm:  text optional
+    }
+}
+
+define entity_type EvalRun {
+    attributes {
+        success_rate:  number optional
+        episodes:      number optional
+        run_at:        timestamp optional
+    }
+}
+
+# --- Predicates -----------------------------------------------------
+
+# Preferences supersede: a Builder's newer choice replaces the older one.
+define predicate prefers_framework {
+    kind: Preference
+    subject: Entity<Builder>
+    object: Value<text>
+    stateful: true
+    description: "The RL / browser-automation framework a builder wants clones built on (e.g. Gymnasium, Playwright)."
+}
+
+define predicate prefers_fidelity {
+    kind: Preference
+    subject: Entity<Builder>
+    object: Value<text>
+    stateful: true
+    description: "How closely a builder wants clones to match the real app (pixel-level, flow-level, API-only)."
+}
+
+define predicate clone_status {
+    kind: Fact
+    subject: Entity<CloneEnv>
+    object: Value<enum [draft, building, ready, failed, archived]>
+    stateful: true
+    description: "Lifecycle state of a clone environment: draft, building, ready, failed, archived."
+}
+
+define predicate episode_budget {
+    kind: Preference
+    subject: Entity<Builder>
+    object: Value<number>
+    description: "Maximum episodes a builder allows per training run."
+}
+
+define predicate success_rate {
+    kind: Fact
+    subject: Entity<EvalRun>
+    object: Value<number>
+    description: "Fraction of episodes an agent policy completed successfully in an environment."
+}
+
+# Single-valued: the CURRENT blocker. Resolving it is a new value ("none"),
+# which supersedes the old blocker instead of leaving it live forever.
+define predicate blocked_by {
+    kind: Fact
+    subject: Entity<CloneEnv>
+    object: Value<text>
+    stateful: true
+    description: "What is currently preventing a clone from being built or a task from being solvable. When the blocker is fixed or resolved, set it to 'none'."
+}
+
+# Training runs are time-stamped; episode-level chatter expires after 90 days.
+define predicate training_run {
+    kind: Event
+    subject: Entity<AgentPolicy>
+    object: Value<text>
+    description: "A training or evaluation run started or finished for an agent policy."
+    retention: 90d
+}
+
+# --- Relation types -------------------------------------------------
+
+define relation_type requested {
+    from: Builder
+    to: CloneEnv
+    cardinality: one-to-many
+}
+
+define relation_type clones {
+    from: CloneEnv
+    to: TargetApp
+    cardinality: many-to-one
+}
+
+define relation_type forked_from {
+    from: CloneEnv
+    to: CloneEnv
+    cardinality: many-to-one
+}
+
+define relation_type defines_task {
+    from: CloneEnv
+    to: TaskSpec
+    cardinality: one-to-many
+}
+
+define relation_type scored_by {
+    from: TaskSpec
+    to: RewardFn
+    cardinality: many-to-one
+}
+
+define relation_type trained_in {
+    from: AgentPolicy
+    to: CloneEnv
+    cardinality: many-to-many
+}
+
+define relation_type evaluated {
+    from: EvalRun
+    to: AgentPolicy
+    cardinality: many-to-one
+    properties {
+        score: number optional
+    }
+}
+
+define relation_type ran_on {
+    from: EvalRun
+    to: CloneEnv
+    cardinality: many-to-one
+}

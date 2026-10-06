@@ -21,9 +21,7 @@ use tokenizers::Tokenizer;
 use crate::config::EmbedderConfig;
 use crate::error::EmbedError;
 use crate::fingerprint::{blake3_hash_file, compute_fingerprint};
-
-/// The output dimensionality for v1 (BGE-small-en-v1.5).
-const VECTOR_DIM: u32 = 384;
+use crate::model::VECTOR_DIM;
 
 /// File names inside the configured `model_path` directory.
 const CONFIG_FILE: &str = "config.json";
@@ -102,7 +100,7 @@ impl ModelHandle {
             &config_bytes,
             &tokenizer_bytes,
             &weights_blake3,
-            VECTOR_DIM,
+            VECTOR_DIM as u32,
             /* normalize */ true,
         );
 
@@ -203,6 +201,16 @@ mod tests {
 
     fn cfg(path: PathBuf) -> EmbedderConfig {
         EmbedderConfig::new(path)
+    }
+
+    #[test]
+    fn fingerprint_dim_matches_output_dim() {
+        // The fingerprint feeds `VECTOR_DIM as u32`; the forward pass
+        // checks output against `VECTOR_DIM: usize`. Single source of
+        // truth means they can never desync. This asserts the cast is
+        // lossless and the two uses are the same value.
+        assert_eq!(VECTOR_DIM as u32 as usize, VECTOR_DIM);
+        assert_eq!(u32::try_from(VECTOR_DIM).unwrap(), 384u32);
     }
 
     #[test]

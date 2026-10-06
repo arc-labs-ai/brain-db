@@ -85,6 +85,15 @@ What "the typed graph is done" means. Concrete tests that must pass.
 
 ## Performance acceptance
 
+> **v1.0 status — OPTIONAL / off the critical path.** The performance, throughput,
+> and storage-performance targets in this section are **advisory for v1.0**, not a
+> lock gate. They require reference hardware (16-core x86_64, 64 GiB, NVMe) and a
+> quiet measured run that v1.0 deliberately does **not** block on. v1.0 is locked
+> on the **functional** and **operational** correctness gates above and below —
+> which are hardware-independent and run in CI on any box. The numbers here stay
+> as engineering targets to measure post-lock; a miss is a tuning follow-up, never
+> a v1.0 blocker. (Owner decision, 2026-09-07.)
+
 ### Latency (P50 / P99, single shard, warm)
 
 Targets below assume the default text-input path (CPU embedding ~5–10 ms). The GPU-batched and `ENCODE_VECTOR_DIRECT` (pre-supplied vector) paths have separate, lower targets — see [`../01_architecture/05_hardware_and_targets.md`](../01_architecture/05_hardware_and_targets.md) §7.1.
@@ -177,4 +186,11 @@ cargo bench --workspace
 ./scripts/schema-off.sh
 ```
 
-Acceptance is met when all the above pass on the reference hardware (16 cores, 64 GB RAM, NVMe SSD, Linux 6.6+).
+**v1.0 lock gate.** v1.0 is locked when the **functional** and **operational**
+acceptance sections pass — the `cargo test --workspace` regression plus the
+end-to-end / schema-transition scripts — on **any** supported box (they are
+hardware-independent and run in CI). The **performance acceptance** section (and
+the storage-*performance* items) is **optional / off the grid for v1.0**: those
+targets want reference hardware (16 cores, 64 GB RAM, NVMe SSD, Linux 6.6+) and a
+measured run that v1.0 does not block on — they are engineering targets to capture
+post-lock, not lock criteria. (Owner decision, 2026-09-07.)

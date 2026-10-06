@@ -32,6 +32,7 @@ use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::tables::edge::{
     link, zero_disambiguator, EdgeData, EDGES_REVERSE_TABLE, EDGES_TABLE,
 };
+use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
 use brain_metadata::tables::text::TEXTS_TABLE;
 use brain_metadata::MetadataDb;
 use brain_ops::test_support::{run_in_glommio, single_body};
@@ -122,6 +123,39 @@ impl Fixture {
             let mut t = wtxn.open_table(TEXTS_TABLE).expect("texts");
             t.insert(&id.to_be_bytes(), text.as_bytes())
                 .expect("insert");
+        }
+        wtxn.commit().expect("commit");
+    }
+
+    /// Insert the primary `MEMORIES_TABLE` row for a seeded memory under the
+    /// caller's tenant. In production every memory has this row; the raw
+    /// edge/text seeds above skip it, so GRAPH_FETCH's per-memory tenant
+    /// check (`memory_in_scope`, which reads MEMORIES_TABLE) would otherwise
+    /// treat these synthetic memories as out-of-scope and drop them.
+    fn put_memory(&self, id: MemoryId) {
+        let ns = {
+            let rtxn = self.metadata.read_txn().expect("read txn");
+            brain_metadata::namespace::namespace_lookup_by_name(&rtxn, "acme")
+                .expect("namespace lookup")
+                .expect("acme interned")
+        };
+        let wtxn = self.metadata.write_txn().expect("write txn");
+        {
+            let mut t = wtxn.open_table(MEMORIES_TABLE).expect("memories");
+            let row = MemoryMetadata::new_active(
+                id,
+                ns,
+                brain_core::SpaceId(uuid::Uuid::from_bytes(SPACE)),
+                brain_core::SessionId::DEFAULT,
+                0,
+                1,
+                brain_core::MemoryKind::Episodic,
+                [0xAB; 16],
+                1.0,
+                0,
+                1_700_000_000_000_000_000,
+            );
+            t.insert(&id.to_be_bytes(), &row).expect("insert");
         }
         wtxn.commit().expect("commit");
     }
@@ -247,6 +281,7 @@ async fn seed_graph(fix: &Fixture) {
         (M4, "beta owns the release checklist"),
         (M5, "an unmentioned note about pipelines"),
     ] {
+        fix.put_memory(mem(slot));
         fix.put_text(mem(slot), text);
     }
 

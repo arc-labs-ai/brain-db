@@ -139,6 +139,21 @@ fn seed_edge(metadata: &SharedMetadataDb, src: MemoryId, kind: EdgeKind, tgt: Me
     wtxn.commit().unwrap();
 }
 
+fn seed_hype_vectors(metadata: &SharedMetadataDb, id: MemoryId, n: u8) {
+    let wtxn = metadata.write_txn().unwrap();
+    for i in 0..n {
+        let mut v = [0.0f32; VECTOR_DIM];
+        v[usize::from(i) % VECTOR_DIM] = 1.0;
+        brain_metadata::hype_vector_put(&wtxn, id, i, &v).unwrap();
+    }
+    wtxn.commit().unwrap();
+}
+
+fn has_hype_vectors(metadata: &SharedMetadataDb, id: MemoryId) -> bool {
+    let rtxn = metadata.read_txn().unwrap();
+    brain_metadata::hype_has_vectors(&rtxn, id).unwrap()
+}
+
 fn count_memories(metadata: &SharedMetadataDb) -> usize {
     let rtxn = metadata.read_txn().unwrap();
     let table = rtxn.open_table(MEMORIES_TABLE).unwrap();
@@ -317,6 +332,41 @@ fn dangling_edges_other_direction_are_left_for_edge_scrub() {
             1,
             "dangling EDGES_OUT survives slot reclamation (edge scrub's job)"
         );
+    });
+}
+
+#[test]
+fn reclaim_purges_hype_vectors() {
+    glommio_run(|| async {
+        let fix = build_fixture();
+        let doomed = seed_memory(&fix.metadata, 1, Some(now_unix_nanos() - 10 * DAY_NS));
+        seed_hype_vectors(&fix.metadata, doomed, 3);
+        assert!(has_hype_vectors(&fix.metadata, doomed));
+
+        let worker = SlotReclamationWorker::new();
+        let processed = run_one(&worker, fix.ctx).await.unwrap();
+        assert_eq!(processed, 1);
+        assert!(!memory_exists(&fix.metadata, doomed));
+        assert!(
+            !has_hype_vectors(&fix.metadata, doomed),
+            "reclaim must purge the memory's HyPE question-vectors"
+        );
+    });
+}
+
+#[test]
+fn reclaim_hype_delete_is_noop_when_absent() {
+    glommio_run(|| async {
+        // A tombstoned memory that owns no HyPE vectors (the common case:
+        // the HyPE table may not even exist yet) reclaims cleanly — the
+        // idempotent backstop delete removes 0 rows and never errors.
+        let fix = build_fixture();
+        let doomed = seed_memory(&fix.metadata, 1, Some(now_unix_nanos() - 10 * DAY_NS));
+
+        let worker = SlotReclamationWorker::new();
+        let processed = run_one(&worker, fix.ctx).await.unwrap();
+        assert_eq!(processed, 1);
+        assert!(!memory_exists(&fix.metadata, doomed));
     });
 }
 

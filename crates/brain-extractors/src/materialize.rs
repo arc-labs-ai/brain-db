@@ -25,7 +25,7 @@ use serde_json::Value;
 
 use crate::classifier::{ClassifierExtractor, ClassifierModel};
 use crate::framework::extractor::ExtractorError;
-use crate::framework::registry::{ExtractorRegistry, TierGate};
+use crate::framework::registry::ExtractorRegistry;
 use crate::llm::{CostBudget, LlmExtractor};
 use crate::pattern::extractor::PatternExtractor;
 
@@ -48,6 +48,10 @@ pub struct MaterializeDeps {
     pub entity_type_qnames: Arc<Vec<String>>,
     pub model_router: Option<Arc<ModelRouter>>,
     pub llm_cache: Option<Arc<Mutex<LlmCacheDb>>>,
+    /// Output-token ceiling for one LLM extraction call
+    /// (`[extractors.llm] max_tokens`). `None` uses
+    /// [`crate::llm::DEFAULT_LLM_MAX_TOKENS`].
+    pub llm_max_tokens: Option<u32>,
 }
 
 /// Materialise a pattern extractor from a persisted row. Decodes
@@ -268,6 +272,7 @@ fn materialize_llm_extractor_core(
         threshold,
         cost_budget,
         cache_ttl,
+        deps.llm_max_tokens,
     );
     Ok(extractor)
 }
@@ -285,11 +290,11 @@ fn materialize_llm_extractor_core(
 /// to do with errors. The recommended pattern is `tracing::warn`
 /// each error then proceed.
 ///
-/// Tiers the operator turned off in config are skipped silently
-/// (the row is never materialised, no error pushed). Use
-/// [`build_registry_with_gate`] to thread an explicit gate; this
-/// helper preserves the all-tiers-enabled default for callers that
-/// haven't migrated yet.
+/// Build the extractor registry from the persisted definitions. Extraction
+/// is always-on (C0): every materialisable definition is registered — there
+/// is no per-tier enable/disable gate. A definition that fails to
+/// materialise (e.g. an LLM extractor with no provider key) is returned in
+/// the error list, not silently skipped.
 #[must_use]
 pub fn build_registry_from_definitions(
     defs: &[ExtractorDefinition],
@@ -298,32 +303,12 @@ pub fn build_registry_from_definitions(
     ExtractorRegistry,
     Vec<(brain_core::ExtractorId, ExtractorError)>,
 ) {
-    build_registry_with_gate(defs, deps, TierGate::all_enabled())
-}
-
-/// Same as [`build_registry_from_definitions`] but with an explicit
-/// per-tier gate. A `Disabled` tier means rows of that kind are
-/// skipped silently — operator opted out, not a degradation.
-#[must_use]
-pub fn build_registry_with_gate(
-    defs: &[ExtractorDefinition],
-    deps: &MaterializeDeps,
-    gate: TierGate,
-) -> (
-    ExtractorRegistry,
-    Vec<(brain_core::ExtractorId, ExtractorError)>,
-) {
-    let mut registry = ExtractorRegistry::with_tier_gate(gate);
+    let mut registry = ExtractorRegistry::new();
     let mut errors: Vec<(brain_core::ExtractorId, ExtractorError)> = Vec::new();
 
     for def in defs {
         let id = def.id();
         match def.kind() {
-            Some(kind) if !gate.state(kind).is_enabled() => {
-                // Tier disabled by operator config — skip materialisation
-                // entirely. No registry row, no error.
-                continue;
-            }
             Some(ExtractorKind::Pattern) => match materialize_pattern_extractor(def) {
                 Ok(p) => registry.register(Arc::new(p)),
                 Err(e) => errors.push((id, e)),
@@ -697,6 +682,7 @@ mod tests {
             "brain:Project".to_string(),
         ]);
         let deps = MaterializeDeps {
+            llm_max_tokens: None,
             classifier_model: Some(Arc::new(DummyModel)),
             entity_type_qnames: labels.clone(),
             model_router: None,
@@ -883,6 +869,7 @@ mod tests {
         );
         let r = row(7, ExtractorKind::Llm, blob);
         let deps = MaterializeDeps {
+            llm_max_tokens: None,
             classifier_model: None,
             model_router: Some(anthropic_router()),
             llm_cache: None,
@@ -944,6 +931,7 @@ mod tests {
         );
         let r = row(1, ExtractorKind::Llm, blob);
         let deps = MaterializeDeps {
+            llm_max_tokens: None,
             classifier_model: None,
             model_router: Some(anthropic_router()),
             llm_cache: None,
@@ -965,6 +953,7 @@ mod tests {
         );
         let r = row(1, ExtractorKind::Llm, blob);
         let deps = MaterializeDeps {
+            llm_max_tokens: None,
             classifier_model: None,
             model_router: Some(anthropic_router()),
             llm_cache: None,
@@ -979,6 +968,7 @@ mod tests {
         let blob = llm_ast("p", vec![ExtractorField::Model("claude-haiku-4-5".into())]);
         let r = row(1, ExtractorKind::Llm, blob);
         let deps = MaterializeDeps {
+            llm_max_tokens: None,
             classifier_model: None,
             model_router: Some(anthropic_router()),
             llm_cache: None,
@@ -993,6 +983,7 @@ mod tests {
         let blob = llm_ast("p", vec![ExtractorField::Prompt("x".into())]);
         let r = row(1, ExtractorKind::Llm, blob);
         let deps = MaterializeDeps {
+            llm_max_tokens: None,
             classifier_model: None,
             model_router: Some(anthropic_router()),
             llm_cache: None,
@@ -1015,6 +1006,7 @@ mod tests {
         );
         let r = row(1, ExtractorKind::Llm, blob);
         let deps = MaterializeDeps {
+            llm_max_tokens: None,
             classifier_model: None,
             model_router: Some(anthropic_router()),
             llm_cache: None,
@@ -1039,6 +1031,7 @@ mod tests {
         );
         let r = row(1, ExtractorKind::Llm, blob);
         let deps = MaterializeDeps {
+            llm_max_tokens: None,
             classifier_model: None,
             model_router: Some(anthropic_router()),
             llm_cache: None,
@@ -1093,6 +1086,7 @@ mod tests {
             ),
         );
         let deps = MaterializeDeps {
+            llm_max_tokens: None,
             classifier_model: None,
             model_router: Some(anthropic_router()),
             llm_cache: None,

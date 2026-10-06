@@ -144,6 +144,7 @@ pub enum RequestBody {
     SchemaList(SchemaListRequest),
     SchemaValidate(SchemaValidateRequest),
     SchemaReplace(SchemaReplaceRequest),
+    SchemaDrop(SchemaDropRequest),
 
     // Extractor introspection (read-only).
     ExtractorList(ExtractorListRequest),
@@ -235,6 +236,7 @@ impl RequestBody {
             Self::SchemaList(_) => Opcode::SchemaListReq,
             Self::SchemaValidate(_) => Opcode::SchemaValidateReq,
             Self::SchemaReplace(_) => Opcode::SchemaReplaceReq,
+            Self::SchemaDrop(_) => Opcode::SchemaDropReq,
             Self::ExtractorList(_) => Opcode::ExtractorListReq,
             Self::QueryExplain(_) => Opcode::QueryExplainReq,
             Self::QueryTrace(_) => Opcode::QueryTraceReq,
@@ -322,6 +324,7 @@ impl RequestBody {
             Self::SchemaList(r) => to_cbor_bytes(r),
             Self::SchemaValidate(r) => to_cbor_bytes(r),
             Self::SchemaReplace(r) => to_cbor_bytes(r),
+            Self::SchemaDrop(r) => to_cbor_bytes(r),
             Self::ExtractorList(r) => to_cbor_bytes(r),
             Self::QueryExplain(r) => to_cbor_bytes(r),
             Self::QueryTrace(r) => to_cbor_bytes(r),
@@ -414,6 +417,7 @@ impl RequestBody {
             Opcode::SchemaListReq => Self::SchemaList(from_cbor_bytes(bytes)?),
             Opcode::SchemaValidateReq => Self::SchemaValidate(from_cbor_bytes(bytes)?),
             Opcode::SchemaReplaceReq => Self::SchemaReplace(from_cbor_bytes(bytes)?),
+            Opcode::SchemaDropReq => Self::SchemaDrop(from_cbor_bytes(bytes)?),
             Opcode::ExtractorListReq => Self::ExtractorList(from_cbor_bytes(bytes)?),
             Opcode::QueryExplainReq => Self::QueryExplain(from_cbor_bytes(bytes)?),
             Opcode::QueryTraceReq => Self::QueryTrace(from_cbor_bytes(bytes)?),
@@ -465,7 +469,7 @@ impl RequestBody {
 ///     request_id: [0; 16],
 ///     txn_id: None,
 ///     occurred_at_unix_nanos: None,
-///     act_as: Some(ActAs { namespace: "acme".into(), space_id: "acme:u1".into() }),
+///     act_as: Some(ActAs { namespace: "acme".into(), space_id: "acme:u1".into(), grant: 0 }),
 ///     wait: WaitMode::Ack,
 ///     allow_duplicates: false,
 /// });
@@ -503,6 +507,26 @@ pub fn act_as_of(body: &RequestBody) -> Option<&ActAs> {
         RequestBody::SessionCreate(r) => r.act_as.as_ref(),
         RequestBody::SessionList(r) => r.act_as.as_ref(),
         RequestBody::SessionDelete(r) => r.act_as.as_ref(),
+        // Delegation is established once, at begin, and is fixed for the
+        // life of the txn: TXN_BEGIN carries the `act_as` and every write
+        // buffered under this txn commits as that identity. TXN_COMMIT /
+        // TXN_ABORT deliberately carry none — the commit runs under the
+        // identity the begin fixed, not a fresh selector on the commit.
+        RequestBody::TxnBegin(r) => r.act_as.as_ref(),
+        // Capability introspection and the schema family. A shared-pool
+        // gateway needs these to run as the tenant: capabilities filters
+        // `schema_namespaces` to the effective namespace, and every schema
+        // op binds its namespace check to the effective caller. The
+        // mutating ones (UPLOAD / REPLACE / DROP) still need SCHEMA_UPLOAD /
+        // ADMIN on the effective caller, which a delegated op only gets via
+        // an explicit `act_as.grant` (see `ActAs::grant`).
+        RequestBody::GetCapabilities(r) => r.act_as.as_ref(),
+        RequestBody::SchemaUpload(r) => r.act_as.as_ref(),
+        RequestBody::SchemaGet(r) => r.act_as.as_ref(),
+        RequestBody::SchemaList(r) => r.act_as.as_ref(),
+        RequestBody::SchemaValidate(r) => r.act_as.as_ref(),
+        RequestBody::SchemaReplace(r) => r.act_as.as_ref(),
+        RequestBody::SchemaDrop(r) => r.act_as.as_ref(),
         // Exhaustive on purpose: no `_ => None`.
         //
         // Silently dropping an `act_as` is a tenancy violation that returns
@@ -518,8 +542,6 @@ pub fn act_as_of(body: &RequestBody) -> Option<&ActAs> {
         RequestBody::Auth(_) => None,
         RequestBody::EncodeVectorDirect(_) => None,
         RequestBody::Unsubscribe(_) => None,
-        RequestBody::GetCapabilities(_) => None,
-        RequestBody::TxnBegin(_) => None,
         RequestBody::TxnCommit(_) => None,
         RequestBody::TxnAbort(_) => None,
         RequestBody::CancelStream(_) => None,
@@ -550,11 +572,6 @@ pub fn act_as_of(body: &RequestBody) -> Option<&ActAs> {
         RequestBody::StatementHistory(_) => None,
         RequestBody::RelationSupersede(_) => None,
         RequestBody::RelationTombstone(_) => None,
-        RequestBody::SchemaUpload(_) => None,
-        RequestBody::SchemaGet(_) => None,
-        RequestBody::SchemaList(_) => None,
-        RequestBody::SchemaValidate(_) => None,
-        RequestBody::SchemaReplace(_) => None,
         RequestBody::ExtractorList(_) => None,
         RequestBody::QueryExplain(_) => None,
         RequestBody::QueryTrace(_) => None,
@@ -617,6 +634,7 @@ mod tests {
             act_as: Some(ActAs {
                 namespace: "acme".into(),
                 space_id: "acme:space".into(),
+                grant: 0,
             }),
             wait: WaitMode::Ack,
             allow_duplicates: false,
@@ -649,6 +667,7 @@ mod tests {
     #[test]
     fn recall_round_trips() {
         round_trip(RequestBody::Recall(RecallRequest {
+            scope: Default::default(),
             cue_text: "what about budgets".into(),
             subject_name: "Alice".into(),
             max_results: 10,
@@ -740,6 +759,7 @@ mod tests {
             act_as: Some(ActAs {
                 namespace: "acme".into(),
                 space_id: "acme:space".into(),
+                grant: 0,
             }),
         }));
     }
@@ -780,6 +800,7 @@ mod tests {
             act_as: Some(ActAs {
                 namespace: "acme".into(),
                 space_id: "acme:space".into(),
+                grant: 0,
             }),
         }));
     }
@@ -797,6 +818,17 @@ mod tests {
         round_trip(RequestBody::TxnBegin(TxnBeginRequest {
             txn_id: id,
             timeout_seconds: 60,
+            act_as: None,
+        }));
+        // A delegated begin must round-trip its `act_as` selector too.
+        round_trip(RequestBody::TxnBegin(TxnBeginRequest {
+            txn_id: id,
+            timeout_seconds: 60,
+            act_as: Some(crate::ops::memory::ActAs {
+                namespace: "acme".to_string(),
+                space_id: "support-bot:user123".to_string(),
+                grant: 0,
+            }),
         }));
         round_trip(RequestBody::TxnCommit(TxnCommitRequest { txn_id: id }));
         round_trip(RequestBody::TxnAbort(TxnAbortRequest { txn_id: id }));
@@ -818,7 +850,9 @@ mod tests {
 
     #[test]
     fn get_capabilities_request_round_trips() {
-        round_trip(RequestBody::GetCapabilities(GetCapabilitiesRequest {}));
+        round_trip(RequestBody::GetCapabilities(GetCapabilitiesRequest {
+            act_as: None,
+        }));
     }
 
     #[test]
@@ -959,11 +993,108 @@ mod tests {
         }
     }
 
+    /// `act_as` on capabilities + the schema family: round-trips, is
+    /// surfaced by `act_as_of`, and — when absent — leaves the historical
+    /// byte layout untouched (an old client's bytes still decode, and a new
+    /// encoder with `act_as: None` emits exactly what the old one did).
+    #[test]
+    fn capabilities_and_schema_ops_carry_act_as() {
+        let sel = ActAs {
+            namespace: "acme".into(),
+            space_id: "acme:u1".into(),
+            grant: 1 << 4,
+        };
+        let bodies = [
+            RequestBody::GetCapabilities(GetCapabilitiesRequest {
+                act_as: Some(sel.clone()),
+            }),
+            RequestBody::SchemaUpload(SchemaUploadRequest {
+                schema_document: "namespace acme\n".into(),
+                dry_run: false,
+                allow_breaking: false,
+                request_id: sample_uuid(4),
+                act_as: Some(sel.clone()),
+            }),
+            RequestBody::SchemaGet(SchemaGetRequest {
+                namespace: "acme".into(),
+                version: 0,
+                act_as: Some(sel.clone()),
+            }),
+            RequestBody::SchemaList(SchemaListRequest {
+                namespace: "acme".into(),
+                limit: 0,
+                cursor: Vec::new(),
+                act_as: Some(sel.clone()),
+            }),
+            RequestBody::SchemaValidate(SchemaValidateRequest {
+                schema_document: "namespace acme\n".into(),
+                act_as: Some(sel.clone()),
+            }),
+            RequestBody::SchemaReplace(SchemaReplaceRequest {
+                schema_document: "namespace acme\n".into(),
+                force_drop_existing: true,
+                request_id: sample_uuid(5),
+                act_as: Some(sel.clone()),
+            }),
+            RequestBody::SchemaDrop(SchemaDropRequest {
+                namespace: "acme".into(),
+                target_kind: 0,
+                target_name: "p".into(),
+                force: false,
+                request_id: sample_uuid(6),
+                act_as: Some(sel.clone()),
+            }),
+        ];
+        for body in bodies {
+            assert_eq!(act_as_of(&body), Some(&sel), "{:?}", body.opcode());
+            round_trip(body);
+        }
+
+        // Back-compat: the historical fieldless GET_CAPABILITIES body is the
+        // empty CBOR map, and still is when `act_as` is None.
+        let empty = RequestBody::GetCapabilities(GetCapabilitiesRequest::default());
+        assert_eq!(empty.encode(), vec![0xA0]);
+        assert_eq!(
+            RequestBody::decode(Opcode::GetCapabilitiesReq, &[0xA0]).unwrap(),
+            empty
+        );
+        assert!(act_as_of(&empty).is_none());
+    }
+
+    /// `grant` is optional on the `act_as` map: absent → 0 on decode, 0 →
+    /// omitted on encode. A two-key selector from an old peer decodes, and a
+    /// no-grant selector from a new peer is byte-identical to the old form.
+    #[test]
+    fn act_as_grant_is_optional_and_omitted_when_zero() {
+        #[derive(serde::Serialize)]
+        struct LegacyActAs<'a> {
+            namespace: &'a str,
+            space_id: &'a str,
+        }
+        let legacy = crate::codec::cbor::to_cbor_bytes(&LegacyActAs {
+            namespace: "acme",
+            space_id: "acme:u1",
+        });
+        let decoded: ActAs = crate::codec::cbor::from_cbor_bytes(&legacy).unwrap();
+        assert_eq!(decoded.grant, 0);
+        assert_eq!(crate::codec::cbor::to_cbor_bytes(&decoded), legacy);
+
+        let granted = ActAs {
+            grant: 1 << 5,
+            ..decoded
+        };
+        let bytes = crate::codec::cbor::to_cbor_bytes(&granted);
+        assert_ne!(bytes, legacy, "a non-zero grant must reach the wire");
+        let back: ActAs = crate::codec::cbor::from_cbor_bytes(&bytes).unwrap();
+        assert_eq!(back.grant, 1 << 5);
+    }
+
     #[test]
     fn act_as_of_returns_selector_for_supported_ops() {
         let selector = ActAs {
             namespace: "acme".into(),
             space_id: "acme:space".into(),
+            grant: 0,
         };
 
         let encode = RequestBody::Encode(EncodeRequest {
@@ -979,6 +1110,7 @@ mod tests {
         assert_eq!(act_as_of(&encode), Some(&selector));
 
         let recall = RequestBody::Recall(RecallRequest {
+            scope: Default::default(),
             cue_text: "x".into(),
             subject_name: String::new(),
             max_results: 1,
@@ -1199,6 +1331,15 @@ mod tests {
             act_as: Some(selector.clone()),
         });
         assert_eq!(act_as_of(&relation_list_to), Some(&selector));
+
+        // TXN_BEGIN carries the delegation for the whole transaction; the
+        // commit inherits it and carries none of its own.
+        let txn_begin = RequestBody::TxnBegin(TxnBeginRequest {
+            txn_id: sample_uuid(1),
+            timeout_seconds: 30,
+            act_as: Some(selector.clone()),
+        });
+        assert_eq!(act_as_of(&txn_begin), Some(&selector));
     }
 
     #[test]
@@ -1215,6 +1356,21 @@ mod tests {
             allow_duplicates: false,
         });
         assert!(act_as_of(&encode).is_none());
+
+        // A non-delegated begin carries no selector.
+        let txn_begin = RequestBody::TxnBegin(TxnBeginRequest {
+            txn_id: sample_uuid(1),
+            timeout_seconds: 30,
+            act_as: None,
+        });
+        assert!(act_as_of(&txn_begin).is_none());
+
+        // TXN_COMMIT never carries a selector of its own — the identity is
+        // fixed at begin.
+        let txn_commit = RequestBody::TxnCommit(TxnCommitRequest {
+            txn_id: sample_uuid(1),
+        });
+        assert!(act_as_of(&txn_commit).is_none());
 
         // Op that does not carry an `act_as` field at all.
         let ping = RequestBody::Ping(PingRequest {
@@ -1268,6 +1424,7 @@ mod tests {
             schema_document: "namespace acme\ndefine entity_type Widget { attributes {} }\n".into(),
             force_drop_existing: true,
             request_id: [0xAB; 16],
+            act_as: None,
         }));
     }
 

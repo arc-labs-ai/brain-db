@@ -42,6 +42,22 @@ For Brain:
 - Per-query override is allowed.
 - The query router may select `k` based on query class (e.g., higher `k` for ambiguous queries where no single retriever is trusted; lower `k` for entity-anchored queries where graph is trusted).
 
+## Cross-shard merge (namespace-wide RECALL)
+
+RRF fuses per-retriever lanes on one shard. A **namespace-wide** RECALL
+(`scope = Namespace`, see [`../05_operations/03_read_pipeline.md`](../05_operations/03_read_pipeline.md)
+§"Recall scope") fans out to every shard and applies RRF a **second time to merge
+the per-shard candidate pools**. Raw fused scores are normalized per shard and are
+not comparable across shards, so the cross-shard merge keys on each hit's
+**within-shard rank** — the one cross-comparable signal — with the same `k = 60`:
+a rank-`r` hit contributes `1/(60 + r)`. A memory is owned by exactly one shard, so
+the pools' ids are disjoint; the merge dedups defensively (keeping the higher RRF
+score), orders by the cross-shard RRF score (ties broken on memory id for
+determinism), and truncates to the candidate-pool budget so the single downstream
+shaping pass stays bounded regardless of shard count. Membership/precision shaping
+then runs **once** over this merged pool, so `Single`/`Many`/`None` is decided
+globally, never per shard.
+
 ## Per-retriever weights
 
 Weights let operators tune the relative trust of retrievers:

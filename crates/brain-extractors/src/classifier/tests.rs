@@ -575,3 +575,67 @@ fn real_inference_returns_brain_qnames_for_alice() {
         .iter()
         .any(|s| s.label == "brain:Place" && s.text.contains("Paris")));
 }
+
+#[test]
+fn gliner_label_splits_camel_case_and_leaves_single_words() {
+    use super::gliner_label;
+    let cases = [
+        ("brain:CloneEnv", "Clone Env"),
+        ("brain:AgentPolicy", "Agent Policy"),
+        ("brain:EvalRun", "Eval Run"),
+        ("brain:TargetApp", "Target App"),
+        ("brain:Person", "Person"),
+        ("brain:Organization", "Organization"),
+        ("acme:Http2Server", "Http2 Server"),
+        ("brain:snake_case", "snake case"),
+    ];
+    for (q, want) in cases {
+        assert_eq!(gliner_label(q), want, "input={q:?}");
+    }
+}
+
+#[cfg(test)]
+mod label_echo_tests {
+    use super::super::extractor::is_label_echo;
+
+    /// The observed failure: "the agent policy CheckoutBot" made GLiNER tag
+    /// the type words as an `AgentPolicy`, so the graph gained an entity
+    /// literally named "agent policy" beside the real CheckoutBot.
+    #[test]
+    fn a_span_that_restates_its_type_is_dropped() {
+        assert!(is_label_echo("agent policy", "mirror:AgentPolicy"));
+        assert!(is_label_echo("Agent Policy", "mirror:AgentPolicy"));
+        assert!(is_label_echo("AgentPolicy", "mirror:AgentPolicy"));
+        assert!(is_label_echo("EvalRun", "mirror:EvalRun"));
+        assert!(is_label_echo("eval run", "mirror:EvalRun"));
+    }
+
+    /// An instance that merely extends the type name must survive — this is
+    /// the one that matters, because "EvalRun-42" is the real referent and
+    /// dropping it would be worse than the bug.
+    #[test]
+    fn an_instance_named_after_its_type_survives() {
+        assert!(!is_label_echo("EvalRun-42", "mirror:EvalRun"));
+        assert!(!is_label_echo("EvalRun 77", "mirror:EvalRun"));
+        assert!(!is_label_echo("CheckoutBot", "mirror:AgentPolicy"));
+        assert!(!is_label_echo("ShopSim", "mirror:CloneEnv"));
+        assert!(!is_label_echo("Priya Raman", "mirror:Builder"));
+    }
+
+    /// Unqualified labels and empty spans must not misbehave.
+    #[test]
+    fn edges_are_handled() {
+        assert!(
+            is_label_echo("Person", "Person"),
+            "bare label, no namespace"
+        );
+        assert!(
+            !is_label_echo("", "mirror:EvalRun"),
+            "empty text is not an echo"
+        );
+        assert!(
+            !is_label_echo("   ", "mirror:EvalRun"),
+            "whitespace is not an echo"
+        );
+    }
+}

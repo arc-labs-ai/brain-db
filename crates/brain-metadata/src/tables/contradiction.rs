@@ -38,7 +38,6 @@ pub const STATEMENT_CONTRADICTION_AUDIT_TABLE: TableDefinition<
 > = TableDefinition::new("statement_contradiction_audit");
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
-#[archive(check_bytes)]
 pub struct ContradictionAudit {
     /// Stable UUIDv7, allocated at first detection and preserved across
     /// updates. Lets operators reference a specific contradiction.

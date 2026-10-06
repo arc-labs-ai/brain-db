@@ -116,7 +116,7 @@ const GROUNDED_MATCH_FLOOR: f32 = 0.5;
 /// so this is effectively a dot product — but we divide by the norms
 /// defensively. A zero-norm or length-mismatched vector yields `0.0` rather
 /// than `NaN`, so it simply fails the floor instead of poisoning the ranking.
-fn cosine(a: &[f32], b: &[f32]) -> f32 {
+pub(crate) fn cosine(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() {
         return 0.0;
     }
