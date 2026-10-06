@@ -58,9 +58,6 @@ concurrency:
 # fine here.
 env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/brain-db
-  # Run JavaScript actions (docker/login-action et al.) on Node 24 rather
-  # than the deprecated Node 20, silencing the per-step deprecation warning.
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   build:
@@ -76,7 +73,7 @@ jobs:
           - platform: linux/arm64
             runner: ubuntu-26.04-arm
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # On a tag push this is already the tag; on a manual dispatch
           # github.ref is the branch the hatch was fired from, so the tag the
@@ -89,10 +86,10 @@ jobs:
           echo "PLATFORM_PAIR=${platform//\//-}" >> "$GITHUB_ENV"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -100,7 +97,7 @@ jobs:
 
       - name: Build and push by digest
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: ${{ matrix.platform }}
@@ -115,7 +112,7 @@ jobs:
           touch "/tmp/digests/${digest#sha256:}"
 
       - name: Upload digest
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: digests-${{ env.PLATFORM_PAIR }}
           path: /tmp/digests/*
@@ -129,7 +126,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Download digests
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           path: /tmp/digests
           pattern: digests-*
@@ -137,7 +134,7 @@ jobs:
 
       - name: Derive image tags
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.IMAGE }}
           # `value=` pins what semver parses. On a tag push github.ref_name is
@@ -150,10 +147,10 @@ jobs:
             type=raw,value=latest
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -191,10 +188,18 @@ jobs:
       # the exact image coordinates so a reader can copy a digest-pinned
       # `docker run` straight out of the release.
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           generate_release_notes: true
+          # release-please has already created the release for this tag and
+          # filled it with the changelog. Without append_body the action finds
+          # that existing release, drops the draft it built, and keeps the old
+          # body — discarding everything below and still reporting success.
+          # That is exactly what happened to v0.1.0: the release shipped with
+          # no image coordinates at all. Appending preserves the changelog and
+          # adds the pull instructions under it.
+          append_body: true
           body: |
             ## Container image
 

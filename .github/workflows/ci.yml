@@ -31,9 +31,6 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # Opt in to Node.js 24 for JavaScript actions ahead of GitHub's forced
-  # cutover on 2026-06-02. Removes the deprecation warning from each job.
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   build-and-test:
@@ -45,7 +42,7 @@ jobs:
       # sources must not receive the Linux header injection.
       CC: ${{ github.workspace }}/.github/scripts/cc-ubuntu26
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-rust
         with:
           components: rustfmt, clippy
@@ -98,7 +95,7 @@ jobs:
       MIRIFLAGS: -Zmiri-disable-isolation
       CC: ${{ github.workspace }}/.github/scripts/cc-ubuntu26
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-rust
         with:
           toolchain: nightly
@@ -115,7 +112,7 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-rust
         with:
           cache: "false"
