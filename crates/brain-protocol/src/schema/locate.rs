@@ -16,11 +16,12 @@ use super::validator::{
     validate_with, DeclaredContext, SourceSpan, ValidatedSchema, ValidationErrors,
 };
 
-/// [`validate`], with each error's `source_span` resolved against `source` (the
+/// [`validate`](super::validator::validate), with each error's `source_span`
+/// resolved against `source` (the
 /// text `schema` was parsed from) when the validator left it empty.
 ///
 /// # Errors
-/// The same errors as [`validate`], now positioned.
+/// The same errors as [`validate`](super::validator::validate), now positioned.
 pub fn validate_located(
     source: &str,
     schema: &Schema,
