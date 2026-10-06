@@ -95,12 +95,26 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # The merge job runs metadata-action too, but only to tag and annotate
+      # the manifest LIST. Labels live in each platform image's own config, so
+      # they have to be computed and applied here or the published image
+      # carries none at all — which is what v0.1.0 shipped with: empty
+      # version, revision and source. `source` in particular is what ties the
+      # package back to this repo and lets a reader trace an image to a commit.
+      - name: Derive image labels
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          tags: type=semver,pattern={{version}},value=${{ inputs.tag || github.ref_name }}
+
       - name: Build and push by digest
         id: build
         uses: docker/build-push-action@v7
         with:
           context: .
           platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ matrix.platform }}
           cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
