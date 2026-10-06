@@ -195,6 +195,14 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           generate_release_notes: true
+          # release-please has already created the release for this tag and
+          # filled it with the changelog. Without append_body the action finds
+          # that existing release, drops the draft it built, and keeps the old
+          # body — discarding everything below and still reporting success.
+          # That is exactly what happened to v0.1.0: the release shipped with
+          # no image coordinates at all. Appending preserves the changelog and
+          # adds the pull instructions under it.
+          append_body: true
           body: |
             ## Container image
 
