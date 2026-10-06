@@ -47,16 +47,52 @@ docker run -d --name brain \
   -e BRAIN__LLM__MODEL=gpt-4o-mini \
   -e BRAIN__ADMIN__TOKEN="$(openssl rand -hex 32)" \
   -v brain-data:/var/lib/brain/data \
-  -v brain-models:/var/lib/brain/models \
   ghcr.io/arc-labs-ai/brain-db:latest
 
 # Liveness:
 curl -fsS http://localhost:9091/healthz
 ```
 
-The embedding model (BGE-small, 384-dim) downloads from HuggingFace on first
-boot and is cached in the `brain-models` volume, so restarts don't re-download.
-First boot therefore needs egress; later boots don't.
+The embedding model (BGE-small-en-v1.5, 384-dim) **ships inside the image** at
+`/opt/brain/models/bge-small-en-v1.5` — no volume, no download, no egress at
+any boot. brain-server has no download path and cannot start without a model on
+disk, so bundling it is what makes `docker run` a single command. It accounts
+for ~130 MB of the image.
+
+To run a different BERT-shaped model, mount it and point the server at it:
+
+```bash
+-v /path/to/my-model:/models/my-model \
+-e BRAIN_EMBED_MODEL_DIR=/models/my-model
+```
+
+That variable is the first branch of the server's model-path resolution, so it
+wins over everything else. The directory must contain `config.json`,
+`tokenizer.json` and `model.safetensors`.
+
+Changing the embedding model changes the embedding fingerprint; vectors written
+under one model are not comparable with another. Re-embed rather than mixing.
+
+The GLiNER NER model (`gliner-small-v2.1`) also ships in the image, at
+`/opt/brain/models/gliner-small-v2.1`. It is the classifier tier of the
+extractor pipeline — the tier that fixes entity span boundaries. Unlike the
+embedder it degrades rather than failing: if it cannot load, the server starts
+anyway with that tier unloaded and extraction quietly gets weaker. Bundling it
+means the stock image never runs in that degraded mode.
+
+Together the two models account for roughly 720 MB of the image. To point the
+classifier at your own GLiNER build, override the config field:
+
+```bash
+-v /path/to/my-gliner:/models/my-gliner \
+-e BRAIN__EXTRACTORS__CLASSIFIER__MODEL_PATH=/models/my-gliner
+```
+
+That directory needs `pytorch_model.bin`, `gliner_config.json`,
+`tokenizer.json` and `config.json`, and its `tokenizer.json` must carry
+`<<ENT>>` at id 128001 and `<<SEP>>` at 128002 — the loader resolves those by
+name and refuses to load without them. See
+[`crates/brain-extractors/docs/bundled-ner.md`](crates/brain-extractors/docs/bundled-ner.md).
 
 ## Recommended — `docker compose`
 
@@ -139,8 +175,8 @@ sed -i 's/^BRAIN_VERSION=.*/BRAIN_VERSION=0.1.0/' .env
 docker compose pull && docker compose up -d
 ```
 
-Data (`brain-data` volume) and the model cache (`brain-models`) survive across
-upgrades. On restart Brain replays its WAL and recovers to the last fsynced
+Data (the `brain-data` volume) survives across upgrades; the embedding model
+rides in the image, so it needs no volume and is replaced with the image. On restart Brain replays its WAL and recovers to the last fsynced
 write (mechanism: [`spec/18_failure_recovery/`](spec/18_failure_recovery/00_purpose.md)).
 Read the release notes before crossing a minor — pre-1.0, breaking changes to the
 redb layout / wire protocol are made in place without shims.

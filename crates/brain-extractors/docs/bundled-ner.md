@@ -7,7 +7,10 @@ from an operator-provided directory and emits spans tagged with the
 **active schema's entity-type qnames** — labels are passed per
 inference call, not baked into the weights.
 
-The substrate does **not** bundle or auto-download the model.
+The published container image **does** bundle the model (see the `model`
+stage in `Dockerfile`); `config/docker.toml` points the classifier at
+`/opt/brain/models/gliner-small-v2.1`. Outside the image the substrate
+neither bundles nor auto-downloads it: use `.devcontainer/bootstrap-model.sh`.
 
 ## Why GLiNER
 
@@ -32,10 +35,16 @@ The substrate does **not** bundle or auto-download the model.
 └── gliner_config.json    # max_width / max_len / hidden_size
 ```
 
-The `[ENT]` marker token is required — it's the per-label pool
-position the head reads from when computing label embeddings. The
-substrate appends it via `tokenizers::Tokenizer::add_special_tokens`
-on every load, so the file on disk stays vanilla DeBERTa-v3.
+The `<<ENT>>` marker token is required — it's the per-label pool
+position the head reads from when computing label embeddings, and
+`<<SEP>>` separates the label block from the text.
+
+Both must be present **in `tokenizer.json` on disk**. The loader resolves
+them with `token_to_id` and fails with `MissingToken` if either is absent
+(`classifier/gliner/mod.rs:631`); it does not add them. `<<ENT>>` must be
+id 128001 and `<<SEP>>` id 128002. `bootstrap-model.sh`'s
+`patch_gliner_tokenizer` writes them, and the image's `model` stage applies
+the identical patch.
 
 ## Download script
 
@@ -50,12 +59,18 @@ curl -L -o gliner_config.json \
     https://huggingface.co/urchade/gliner_small-v2.1/resolve/main/gliner_config.json
 
 # DeBERTa-v3-small companion files (tokenizer / backbone config / SPM).
+# From onnx-community, NOT microsoft: the upstream repo ships only
+# spm.model + tokenizer_config.json, and the `tokenizers` crate needs a
+# JSON tokenizer. microsoft/deberta-v3-small/tokenizer.json is a 404.
 curl -L -o tokenizer.json \
-    https://huggingface.co/microsoft/deberta-v3-small/resolve/main/tokenizer.json
+    https://huggingface.co/onnx-community/deberta-v3-small/resolve/main/tokenizer.json
 curl -L -o config.json \
-    https://huggingface.co/microsoft/deberta-v3-small/resolve/main/config.json
+    https://huggingface.co/onnx-community/deberta-v3-small/resolve/main/config.json
 curl -L -o spm.model \
-    https://huggingface.co/microsoft/deberta-v3-small/resolve/main/spm.model
+    https://huggingface.co/onnx-community/deberta-v3-small/resolve/main/spm.model
+
+# Then patch <<ENT>>/<<SEP>> into tokenizer.json — see above; the model
+# cannot load without them.
 ```
 
 ## Security posture
