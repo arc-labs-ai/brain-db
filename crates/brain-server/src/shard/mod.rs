@@ -801,6 +801,14 @@ pub struct ExtractorTuningSpawnConfig {
     pub classifier_model_path: Option<String>,
     /// GLiNER post-sigmoid acceptance threshold.
     pub classifier_threshold: f32,
+    /// Whether a missing classifier model is fatal.
+    ///
+    /// `true` on the real boot path (`main.rs`): a brain-server that starts is
+    /// one that extracts at full strength, and a missing model is loud rather
+    /// than inferable from one INFO line. `false` by default so tests can spawn
+    /// shards without the ~590MB GLiNER weights on disk — they exercise the
+    /// pattern tier, not the classifier.
+    pub classifier_required: bool,
     /// Hypothetical questions generated per memory at write time.
     pub hype_num_questions: usize,
 }
@@ -811,6 +819,7 @@ impl Default for ExtractorTuningSpawnConfig {
             resolver_embed_threshold: brain_extractors::resolver::EMBED_RESOLVE_THRESHOLD,
             classifier_model_path: None,
             classifier_threshold: brain_extractors::classifier::DEFAULT_GLINER_THRESHOLD,
+            classifier_required: false,
             hype_num_questions: 6,
         }
     }
@@ -3215,9 +3224,9 @@ pub fn spawn_shard(
                         "classifier tier wired",
                     );
                     Some(Arc::new(m))
-                } else {
-                    // No model: fail stop. The classifier is a required tier,
-                    // not an enhancement.
+                } else if extractor_tuning_spawn_cfg.classifier_required {
+                    // No model on the real boot path: fail stop. The classifier
+                    // is a required tier, not an enhancement.
                     //
                     // This used to log "classifier tier inactive" and carry on
                     // with the pattern tier alone. That is the failure mode that
@@ -3244,6 +3253,16 @@ pub fn spawn_shard(
                          published container image ships it at \
                          /opt/brain/models/gliner-small-v2.1."
                     );
+                } else {
+                    // Only reachable from tests and embedders that opt out via
+                    // `classifier_required: false`. The real server never takes
+                    // this branch.
+                    tracing::info!(
+                        target: "brain_server::shard",
+                        "classifier tier inactive (classifier_required = false); \
+                         only the pattern tier will contribute",
+                    );
+                    None
                 };
 
             // Captured out of the registry-build block below so the
