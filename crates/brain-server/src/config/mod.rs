@@ -78,9 +78,18 @@ pub struct Config {
     pub shard: ShardConfig,
     pub hnsw: HnswConfig,
     pub embedder: EmbedderConfig,
-    /// Cross-encoder rerank capability. Defaults to enabled; when the
-    /// operator turns it off, opt-in rerank requests hard-fail with
-    /// `CapabilityNotEnabled` instead of silently falling back to RRF.
+    /// Cross-encoder rerank capability. **Defaults to disabled**
+    /// (`default_rerank_enabled() == false`).
+    ///
+    /// While disabled, an opt-in rerank request hard-fails with
+    /// `CapabilityNotEnabled` rather than silently falling back to RRF, so a
+    /// caller is told the capability is off instead of quietly getting
+    /// different results. `GET /v1/capabilities` reports `rerank: false`.
+    ///
+    /// Not part of the current release. The published image carries no
+    /// cross-encoder model, and `enabled = true` without one is a fatal
+    /// `ShardError::CrossEncoderInitFailed` at boot rather than a degradation —
+    /// so turning it on in the stock image stops the server starting.
     #[serde(default)]
     pub rerank: RerankConfig,
     /// Extractor-pipeline tuning. Extraction itself is always-on and
@@ -283,6 +292,9 @@ pub struct RerankConfig {
     /// neither its load cost nor its per-read latency by default. Set
     /// `true` to load it; enabled-but-failed-to-load is a spawn failure
     /// (no silently-degraded reranker).
+    /// Off by default. See the note on [`Config::rerank`]: enabling this
+    /// without a cross-encoder model on disk is a fatal boot error, and the
+    /// published image does not carry one.
     #[serde(default = "default_rerank_enabled")]
     pub enabled: bool,
 }

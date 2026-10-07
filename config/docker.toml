@@ -133,6 +133,16 @@ max_cause_memories_per_statement         = 3
 max_related_statements_per_entity        = 5
 channel_capacity                         = 1024
 
+[rerank]
+# Cross-encoder rerank is NOT part of this release. Off, and stated explicitly
+# here so the default is visible rather than inherited from code.
+#
+# The image carries no cross-encoder model, and `enabled = true` without one is
+# a fatal boot error rather than a degradation — the shard refuses to start
+# rather than let an opt-in rerank request silently fall back to RRF. Leave
+# this false.
+enabled = false
+
 [summarizer]
 # Consolidation worker is a no-op until an LLM backend is wired.
 # Set to openai / ollama at build time to enable summarization.

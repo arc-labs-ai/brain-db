@@ -73,6 +73,12 @@ wins over everything else. The directory must contain `config.json`,
 Changing the embedding model changes the embedding fingerprint; vectors written
 under one model are not comparable with another. Re-embed rather than mixing.
 
+### Cross-encoder rerank is not available in this release
+
+`[rerank]` ships `enabled = false` and the image carries no cross-encoder model.
+Opt-in rerank requests return `CapabilityNotEnabled`, and
+`GET /v1/capabilities` reports `rerank: false`. Retrieval fuses with RRF.
+
 The GLiNER NER model (`gliner-small-v2.1`) also ships in the image, at
 `/opt/brain/models/gliner-small-v2.1`. It is the classifier tier of the
 extractor pipeline — the tier that fixes entity span boundaries. Unlike the

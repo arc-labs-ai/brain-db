@@ -8,9 +8,9 @@
 #      mounts so repeated builds reuse the cargo registry + target dir.
 #   2. `runtime` is debian:bookworm-slim (glibc — candle's tensor
 #      kernels and io_uring's helper libs both expect it). Adds
-#      ca-certificates (for the embedding-model download on first
-#      run), tini (PID 1 → clean SIGTERM propagation to brain-server),
-#      and curl (used by HEALTHCHECK).
+#      ca-certificates, tini (PID 1 → clean SIGTERM propagation to
+#      brain-server), and curl (used by HEALTHCHECK). The models ship
+#      in the image, so nothing is downloaded at runtime.
 #
 # Build:
 #   docker build -t brain:latest .
