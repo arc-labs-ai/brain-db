@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.1](https://github.com/arc-labs-ai/brain-db/compare/v0.1.0...v0.1.1) (2026-10-07)
+
+
+### Bug Fixes
+
+* **shard:** bind the classifier requirement to the boot path, not every spawn ([bafd681](https://github.com/arc-labs-ai/brain-db/commit/bafd6816d665262704b1cb7334393bb61f3bbab2))
+* **shard:** require the classifier model; stop degrading silently ([b4d9a18](https://github.com/arc-labs-ai/brain-db/commit/b4d9a18a0e587fe59edeb774bb30b737bff86fcc))
+
 ## 0.1.0 (2026-10-06)
 
 
