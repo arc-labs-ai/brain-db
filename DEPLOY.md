@@ -81,10 +81,12 @@ Opt-in rerank requests return `CapabilityNotEnabled`, and
 
 The GLiNER NER model (`gliner-small-v2.1`) also ships in the image, at
 `/opt/brain/models/gliner-small-v2.1`. It is the classifier tier of the
-extractor pipeline — the tier that fixes entity span boundaries. Unlike the
-embedder it degrades rather than failing: if it cannot load, the server starts
-anyway with that tier unloaded and extraction quietly gets weaker. Bundling it
-means the stock image never runs in that degraded mode.
+extractor pipeline — the tier that fixes entity span boundaries — and it is
+**required**: like the embedder, Brain refuses to start without it.
+
+It used to degrade instead, starting with the tier unloaded and extracting more
+weakly on every write while still reporting itself healthy. That is how v0.1.0
+shipped. A Brain that starts is now a Brain that extracts at full strength.
 
 Together the two models account for roughly 720 MB of the image. To point the
 classifier at your own GLiNER build, override the config field:
