@@ -801,6 +801,14 @@ pub struct ExtractorTuningSpawnConfig {
     pub classifier_model_path: Option<String>,
     /// GLiNER post-sigmoid acceptance threshold.
     pub classifier_threshold: f32,
+    /// Whether a missing classifier model is fatal.
+    ///
+    /// `true` on the real boot path (`main.rs`): a brain-server that starts is
+    /// one that extracts at full strength, and a missing model is loud rather
+    /// than inferable from one INFO line. `false` by default so tests can spawn
+    /// shards without the ~590MB GLiNER weights on disk — they exercise the
+    /// pattern tier, not the classifier.
+    pub classifier_required: bool,
     /// Hypothetical questions generated per memory at write time.
     pub hype_num_questions: usize,
 }
@@ -811,6 +819,7 @@ impl Default for ExtractorTuningSpawnConfig {
             resolver_embed_threshold: brain_extractors::resolver::EMBED_RESOLVE_THRESHOLD,
             classifier_model_path: None,
             classifier_threshold: brain_extractors::classifier::DEFAULT_GLINER_THRESHOLD,
+            classifier_required: false,
             hype_num_questions: 6,
         }
     }
@@ -3215,20 +3224,43 @@ pub fn spawn_shard(
                         "classifier tier wired",
                     );
                     Some(Arc::new(m))
-                } else {
-                    // Surface where Brain *would* have looked so the
-                    // operator can see the install convention at a
-                    // glance. Falls back to a hint when neither HOME
-                    // nor XDG_DATA_HOME is available — at which point
-                    // the explicit env var is the only path in.
+                } else if extractor_tuning_spawn_cfg.classifier_required {
+                    // No model on the real boot path: fail stop. The classifier
+                    // is a required tier, not an enhancement.
+                    //
+                    // This used to log "classifier tier inactive" and carry on
+                    // with the pattern tier alone. That is the failure mode that
+                    // shipped in v0.1.0: the published image carried no GLiNER
+                    // weights, every ENCODE ran a weaker extractor, the server
+                    // reported itself healthy, and GET /v1/capabilities said
+                    // `classifier_extractor: true` because the tier exists in the
+                    // build. Nothing distinguished "running correctly" from
+                    // "running degraded" except one INFO line at boot.
+                    //
+                    // The embedder already fails stop for the same reason. Making
+                    // the two consistent means a Brain that starts is a Brain that
+                    // extracts at full strength, and a missing model is loud.
                     let expected = brain_extractors::default_xdg_model_dir()
                         .map(|p| p.display().to_string())
                         .unwrap_or_else(|| "<unknown: set HOME or XDG_DATA_HOME>".to_string());
+                    panic!(
+                        "classifier (NER) model not found. Brain requires it: the \
+                         classifier tier of the extractor pipeline is mandatory, and \
+                         running without it silently degrades every write. Looked at \
+                         {expected} and found no model. Set \
+                         [extractors.classifier] model_path, or install the model \
+                         there with .devcontainer/bootstrap-model.sh ner. The \
+                         published container image ships it at \
+                         /opt/brain/models/gliner-small-v2.1."
+                    );
+                } else {
+                    // Only reachable from tests and embedders that opt out via
+                    // `classifier_required: false`. The real server never takes
+                    // this branch.
                     tracing::info!(
                         target: "brain_server::shard",
-                        expected = %expected,
-                        "classifier tier inactive (no model at default path or via \
-                         [extractors.classifier] model_path); only the pattern tier will contribute",
+                        "classifier tier inactive (classifier_required = false); \
+                         only the pattern tier will contribute",
                     );
                     None
                 };
