@@ -119,6 +119,67 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.platform }}
           cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
 
+      # Nothing in this workflow started the image before. v0.1.0 shipped
+      # unable to boot at all — the embedding model was not on the path the
+      # server reads — and the GLiNER classifier tier was silently unloaded,
+      # because a build that compiles is not a server that runs. Both would
+      # have been caught here.
+      #
+      # Runs on the native runner, so the just-pushed digest for this platform
+      # can be pulled and started directly. No secret needed: blackholing the
+      # provider host makes Brain's boot credential preflight INCONCLUSIVE
+      # rather than fatal, which is enough to reach shard init and load models.
+      - name: Smoke-test the pushed image
+        run: |
+          set -euo pipefail
+          IMG="${{ env.IMAGE }}@${{ steps.build.outputs.digest }}"
+          echo "::group::starting $IMG"
+          docker run -d --name smoke \
+            --security-opt seccomp=unconfined --ulimit memlock=-1 \
+            --add-host=api.openai.com:127.0.0.1 \
+            --add-host=api.anthropic.com:127.0.0.1 \
+            -e BRAIN__LLM__API_KEY=smoke-probe-not-a-real-key \
+            -e BRAIN__ADMIN__TOKEN=smoke-admin-token \
+            "$IMG"
+          echo "::endgroup::"
+
+          # The image declares its own HEALTHCHECK (curl /healthz on 9091);
+          # waiting on Docker's verdict tests that too, not just the route.
+          for i in $(seq 1 60); do
+            status="$(docker inspect -f '{{.State.Health.Status}}' smoke 2>/dev/null || echo missing)"
+            [ "$status" = "healthy" ] && break
+            if [ "$(docker inspect -f '{{.State.Status}}' smoke 2>/dev/null)" != "running" ]; then
+              echo "::error title=Smoke test failed::container exited before becoming healthy"
+              docker logs smoke; docker rm -f smoke; exit 1
+            fi
+            sleep 2
+          done
+
+          if [ "$(docker inspect -f '{{.State.Health.Status}}' smoke)" != "healthy" ]; then
+            echo "::error title=Smoke test failed::never became healthy within 120s"
+            docker inspect -f '{{range .State.Health.Log}}{{.Output}}{{end}}' smoke || true
+            docker logs smoke; docker rm -f smoke; exit 1
+          fi
+
+          # Both bundled models must actually load. Absence of the classifier is
+          # not fatal to startup, so only an explicit check catches it — that is
+          # exactly how v0.1.0 shipped with the tier silently unloaded.
+          logs="$(docker logs smoke 2>&1)"
+          for want in "loaded embedding model" "loaded gliner classifier" "brain-server listening"; do
+            if ! grep -qF "$want" <<<"$logs"; then
+              echo "::error title=Smoke test failed::missing from startup log: $want"
+              echo "$logs" | tail -40; docker rm -f smoke; exit 1
+            fi
+          done
+
+          if grep -q '"level":"ERROR"' <<<"$logs"; then
+            echo "::error title=Smoke test failed::ERROR lines during startup"
+            grep '"level":"ERROR"' <<<"$logs" | head -20; docker rm -f smoke; exit 1
+          fi
+
+          echo "healthy; both models loaded; no ERROR lines"
+          docker rm -f smoke
+
       - name: Export digest
         run: |
           mkdir -p /tmp/digests
