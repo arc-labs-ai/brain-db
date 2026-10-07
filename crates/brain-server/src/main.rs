@@ -673,6 +673,8 @@ mod linux_main {
             spawn_cfg.extractor_tuning = ExtractorTuningSpawnConfig {
                 resolver_embed_threshold: cfg.extractors.resolver.embed_threshold,
                 classifier_model_path: cfg.extractors.classifier.model_path.clone(),
+                // The real boot path requires it; see the field's doc.
+                classifier_required: true,
                 classifier_threshold: cfg.extractors.classifier.threshold,
                 hype_num_questions: cfg.extractors.hype.num_questions,
             };
