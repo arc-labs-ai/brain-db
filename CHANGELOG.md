@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.1](https://github.com/arc-labs-ai/brain-db/compare/v0.3.0...v0.3.1) (2026-10-21)
+
+
+### Bug Fixes
+
+* **release:** match Cargo.lock entries the way release-please parses them ([#44](https://github.com/arc-labs-ai/brain-db/issues/44)) ([111f80d](https://github.com/arc-labs-ai/brain-db/commit/111f80d81cdd253a0ec6f642382f9ba5916d0203))
+
+
+### Tests
+
+* **index:** measure the over-fetch tests, stop rolling dice on them ([e6dd2d1](https://github.com/arc-labs-ai/brain-db/commit/e6dd2d1777ff262de3cd4a5fe3329f158f990737))
+
 ## [0.3.0](https://github.com/arc-labs-ai/brain-db/compare/v0.2.1...v0.3.0) (2026-10-21)
 
 
