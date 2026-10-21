@@ -332,6 +332,33 @@ mod tests {
         MemoryId::pack(1, n, 1)
     }
 
+    /// A corpus with real distance structure, for the over-fetch tests.
+    ///
+    /// `one_hot` makes every vector mutually orthogonal, so under cosine
+    /// EVERY non-exact match sits at distance 1.0 — identical. A greedy graph
+    /// walk then has no gradient to follow and the result rests entirely on
+    /// how `hnsw_rs` happened to assign layers, which it seeds with
+    /// `StdRng::from_os_rng()` — a fresh OS seed on every single run. That is
+    /// not a corpus the over-fetch logic can be measured against; it made
+    /// `search_fills_k_through_a_selective_filter` return 1 of 10 in CI while
+    /// passing 14,120 consecutive local runs.
+    ///
+    /// Here every vector shares one axis with the query and tilts away from it
+    /// by a distinct amount, so cosine similarity is strictly decreasing in
+    /// `n` and every pair is distinguishable. That is also the shape of the
+    /// real input: BGE embeddings are L2-normalised and clustered, never
+    /// mutually orthogonal. Unit norm holds exactly, since
+    /// `(1 - t^2) + t^2 == 1`.
+    fn graded(n: usize) -> [f32; VECTOR_DIM] {
+        let mut v = [0.0; VECTOR_DIM];
+        // t stays well under 1 for the corpus sizes used below, so the shared
+        // component never vanishes and the ordering never degenerates.
+        let t = n as f32 / 128.0;
+        v[0] = (1.0 - t * t).sqrt();
+        v[1 + (n % (VECTOR_DIM - 1))] = t;
+        v
+    }
+
     /// End-to-end scenario over the live `HnswIndex`: insert →
     /// contains → search returns it → tombstone excludes → tombstone
     /// of an unknown id errors. Mirrors the entity/statement HNSW
@@ -443,13 +470,41 @@ mod tests {
     fn search_returns_all_live_matches_when_over_fetching() {
         let mut idx = HnswIndex::new(IndexParams::default()).unwrap();
         for n in 1..=40u64 {
-            idx.insert(mid(n), &one_hot(n as usize)).unwrap();
+            idx.insert(mid(n), &graded(n as usize)).unwrap();
         }
         // k = 20 -> fetch_k = 40 = every node, with a beam that now covers it.
-        let hits = idx.search_all(&one_hot(1), 20, None);
+        let hits = idx.search_all(&graded(1), 20, None);
         assert_eq!(hits.len(), 20, "a full beam returns a full result set");
         // The exact match must rank first.
         assert_eq!(hits[0].0, mid(1));
+        assert_distinct_and_ordered(&hits);
+        // NOT the exact nearest 20. `fetch_k` reaching every node does not mean
+        // the walk visits every node — HNSW is approximate, and ef is 64 against
+        // a 40-node corpus. Measured: it returns slots
+        // [1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 17, 18, 19, 20, 21, 22, 23],
+        // skipping 2, 12 and 16. Asserting identities here passed once by luck
+        // and then failed on the next run, so it would only have traded one
+        // flake for another.
+    }
+
+    /// The properties a correct result set has whatever the graph topology
+    /// turned out to be: no id twice, and similarity non-increasing. Both are
+    /// independent of which nodes the approximate walk happened to reach, so
+    /// they hold on every seed rather than on a lucky one.
+    fn assert_distinct_and_ordered(hits: &[(MemoryId, f32)]) {
+        let ids: Vec<u64> = hits.iter().map(|(m, _)| m.slot()).collect();
+        let mut distinct = ids.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            ids.len(),
+            "no id may be returned twice: {ids:?}"
+        );
+        assert!(
+            hits.windows(2).all(|w| w[0].1 >= w[1].1),
+            "similarity must be non-increasing: {hits:?}",
+        );
     }
 
     /// A filter that rejects most of the corpus is the case the over-fetch
@@ -458,14 +513,22 @@ mod tests {
     fn search_fills_k_through_a_selective_filter() {
         let mut idx = HnswIndex::new(IndexParams::default()).unwrap();
         for n in 1..=60u64 {
-            idx.insert(mid(n), &one_hot(n as usize)).unwrap();
+            idx.insert(mid(n), &graded(n as usize)).unwrap();
         }
-        // Keep only even ids: half the corpus is filtered out.
-        let hits = idx.search(&one_hot(2), 10, None, |m| m.slot().is_multiple_of(2));
+        // Keep only even ids: half the corpus is filtered out, so filling k =
+        // 10 needs the walk to reach 20 nodes deep. The first fetch asks for
+        // OVER_FACTOR * k = 20 and can only yield 10 evens if nothing is lost
+        // on the way, which is exactly the bailout loop's job.
+        let hits = idx.search(&graded(0), 10, None, |m| m.slot().is_multiple_of(2));
         assert_eq!(hits.len(), 10, "escalation must fill k past the filter");
         assert!(
             hits.iter().all(|(m, _)| m.slot().is_multiple_of(2)),
             "the filter must hold"
         );
+        // NOT the exact ten nearest: the loop breaks the moment k is filled,
+        // so this returns the evens among the first `fetch_k = 20` raw
+        // neighbours. Measured: [4, 6, 8, 10, 14, 16, 18, 20, 22, 24], skipping
+        // 2 and 12.
+        assert_distinct_and_ordered(&hits);
     }
 }
