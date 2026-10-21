@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.3.0](https://github.com/arc-labs-ai/brain-db/compare/v0.2.1...v0.3.0) (2026-10-21)
+
+
+### ⚠ BREAKING CHANGES
+
+* **protocol:** `MemoryInspectResponse` gains an `edges` field. SDKs decode by name and default it to empty, so an older client reading a newer server is unaffected, but each SDK must mirror `MemoryEdgeWire` to surface the edges.
+
+### Features
+
+* **protocol:** memory edges on MEMORY_INSPECT, conflict classification, namespace resolution ([5eaa4c7](https://github.com/arc-labs-ai/brain-db/commit/5eaa4c7c45288a024ac40e5cee9c7f9a23bd7d4a))
+
 ## [0.2.1](https://github.com/arc-labs-ai/brain-db/compare/v0.2.0...v0.2.1) (2026-10-21)
 
 
