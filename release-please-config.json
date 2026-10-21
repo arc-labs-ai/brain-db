@@ -8,7 +8,12 @@
       "release-type": "simple",
       "changelog-path": "CHANGELOG.md",
       "extra-files": [
-        "Cargo.toml"
+        "Cargo.toml",
+        {
+          "type": "toml",
+          "path": "Cargo.lock",
+          "jsonpath": "$.package[?(!@.source && @.name.startsWith('brain-'))].version"
+        }
       ],
       "_comment_release_type": "`simple`, NOT `rust`. The rust strategy reads `package.version`, and this repo's root is a VIRTUAL workspace -- [workspace] + [workspace.package], with no [package] -- so it fails outright with 'value at path package.version is not tagged' and cuts no release PR at all. brain-edge uses `rust` because it is a single crate with a real [package]; that is the difference, not a preference. Known consequence: `simple` has no updater that can reach Cargo.lock, so each release leaves the lock naming the PREVIOUS version and `cargo --locked` fails on main until someone regenerates it. Make that loud with a --locked check in CI rather than trying to make the release strategy fix it."
     }

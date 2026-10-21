@@ -50,6 +50,14 @@ jobs:
       - name: Format check
         run: cargo fmt --all -- --check
 
+      # The lockfile carries every workspace member's own version, so a release
+      # that bumps `[workspace.package] version` without restamping Cargo.lock
+      # leaves the two disagreeing — and a `--locked` build (any reproducible
+      # one, including the release image) then refuses to start. release-please
+      # restamps it via `extra-files`; this is the gate that proves it did.
+      - name: Lockfile agrees with the manifest
+        run: cargo metadata --locked --format-version 1 > /dev/null
+
       - name: Build (workspace)
         run: cargo build --workspace --all-targets
 
