@@ -274,7 +274,7 @@ impl RealWriterHandle {
                 metrics.record_idempotency(IdempotencyOutcome::Conflict);
                 record_phase_outcomes(&metrics, &write, SubmitOutcome::Conflict, start.elapsed());
                 return Err(WriterError::Conflict(format!(
-                    "request_id replay with different params: write_id={:?}",
+                    "idempotency: request_id replay with different params: write_id={:?}",
                     write.write_id
                 )));
             }
@@ -1036,6 +1036,10 @@ fn map_apply_err(e: ApplyError) -> WriterError {
         }
         ApplyError::Invariant(s) => WriterError::Internal(format!("invariant: {s}")),
         ApplyError::SchemaAdmission(s) => WriterError::Internal(format!("schema: {s}")),
+        // The one apply error that is the caller's, not ours. `WriterError::
+        // Conflict` already maps to `ErrorCode::Conflict` on the wire, which
+        // the edge renders as 409 — a status clients do not retry.
+        ApplyError::Conflict(s) => WriterError::Conflict(s),
         ApplyError::Metadata(s) => WriterError::Internal(format!("metadata: {s}")),
         ApplyError::PhaseMisShape(s) => WriterError::Internal(format!("phase mis-shape: {s}")),
     }
@@ -1044,6 +1048,40 @@ fn map_apply_err(e: ApplyError) -> WriterError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A duplicate canonical name is the caller's doing, so it must leave the
+    /// writer as a conflict — not an internal error.
+    ///
+    /// It used to be flattened into `ApplyError::Metadata`, which maps to
+    /// `WriterError::Internal` and reaches a client as 500/502. A client that
+    /// reads the status then retries a write the engine refuses every time:
+    /// observed live as `create_entity` returning 502 with
+    /// `brain Internal: writer rejected: ... duplicate canonical_name "ada"`,
+    /// which told the agent the failure might be transient.
+    #[test]
+    fn a_duplicate_canonical_name_leaves_the_writer_as_a_conflict() {
+        let err = map_apply_err(ApplyError::Conflict(
+            r#"entity_put: duplicate canonical_name "ada""#.into(),
+        ));
+        match err {
+            WriterError::Conflict(detail) => assert!(detail.contains("duplicate canonical_name")),
+            other => panic!("expected WriterError::Conflict, got {other:?}"),
+        }
+    }
+
+    /// The sibling that must NOT change: a genuine engine fault stays internal.
+    #[test]
+    fn an_engine_fault_is_still_internal() {
+        assert!(matches!(
+            map_apply_err(ApplyError::Metadata("redb exploded".into())),
+            WriterError::Internal(_)
+        ));
+        assert!(matches!(
+            map_apply_err(ApplyError::Storage("disk".into())),
+            WriterError::Internal(_)
+        ));
+    }
+
     use crate::write::{Phase, Write, WriteId};
     use crate::writer::RealWriterHandle;
     use brain_core::{EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NodeRef, SessionId, SpaceId};

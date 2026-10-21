@@ -32,10 +32,15 @@ pub enum OpError {
     #[error("no LLM provider credential for namespace {namespace}: {detail}")]
     LlmCredentialMissing { namespace: String, detail: String },
 
-    /// — idempotency mismatch on duplicate
-    /// `request_id`: "same RequestId returns same
-    /// response within 24h; different params → Conflict".
-    #[error("idempotency conflict: {0}")]
+    /// The request conflicts with committed state. Two causes: an
+    /// idempotency mismatch on a duplicate `request_id` ("same RequestId
+    /// returns same response within 24h; different params → Conflict"), and a
+    /// write refused by a uniqueness invariant such as a duplicate canonical
+    /// name. Neither succeeds on a retry.
+    ///
+    /// The display stays neutral so the second cause is not mislabelled as
+    /// the first; the detail each call site passes names it.
+    #[error("conflict: {0}")]
     Conflict(String),
 
     /// — space limits exceeded.

@@ -130,10 +130,15 @@ pub enum WriterError {
     /// queue over its max length → reject + retry.
     #[error("writer queue overloaded")]
     Overloaded,
-    /// Duplicate `request_id` with a different `request_hash`. Client
-    /// retries should carry the same params; a hash mismatch indicates
-    /// a client bug or RequestId reuse.
-    #[error("idempotency conflict: {0}")]
+    /// The request conflicts with committed state and cannot succeed on a
+    /// retry. Two causes reach here: a duplicate `request_id` carrying a
+    /// different `request_hash` (client bug or RequestId reuse), and a write
+    /// refused by a uniqueness invariant such as a duplicate canonical name.
+    ///
+    /// The display is deliberately neutral — it used to hard-code
+    /// "idempotency conflict", which labelled every canonical-name collision
+    /// as an idempotency problem. Each call site names its own cause.
+    #[error("conflict: {0}")]
     Conflict(String),
     #[error("writer internal error: {0}")]
     Internal(String),

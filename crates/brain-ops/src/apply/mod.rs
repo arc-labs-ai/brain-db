@@ -58,6 +58,17 @@ pub enum ApplyError {
     #[error("schema admission failed: {0}")]
     SchemaAdmission(String),
 
+    /// The caller asked for something that conflicts with state already
+    /// committed — a duplicate canonical name being the live case.
+    ///
+    /// Distinct from [`ApplyError::Metadata`] on purpose. Both originate in
+    /// the same helpers, but this one is the caller's doing and retrying it
+    /// unchanged can never succeed, whereas `Metadata` is the engine's own
+    /// fault and may well be transient. Collapsing the two tells a client to
+    /// retry forever against a request that is permanently refused.
+    #[error("conflict: {0}")]
+    Conflict(String),
+
     /// Underlying brain-metadata helper returned an error.
     #[error("metadata helper: {0}")]
     Metadata(String),
@@ -77,6 +88,7 @@ impl ApplyError {
             Self::NotFound { .. } => "not_found",
             Self::Invariant(_) => "invariant",
             Self::SchemaAdmission(_) => "schema_admission",
+            Self::Conflict(_) => "conflict",
             Self::Metadata(_) => "metadata",
             Self::PhaseMisShape(_) => "phase_mis_shape",
         }

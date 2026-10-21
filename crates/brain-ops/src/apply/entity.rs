@@ -97,8 +97,21 @@ pub fn apply_upsert_entity(
     let e = entity_from_upsert_phase(phase)
         .ok_or(ApplyError::PhaseMisShape("expected UpsertEntity"))?;
     let id = e.id;
-    entity_put(wtxn, scope, *session, &e)
-        .map_err(|err| ApplyError::Metadata(format!("entity_put: {err}")))?;
+    entity_put(wtxn, scope, *session, &e).map_err(|err| {
+        // A canonical name already held by a different id is the caller's
+        // request conflicting with committed state, not an engine fault.
+        // Flattened into `Metadata` it reached the client as a 500/502, and
+        // a client that trusts the status retries a write that is refused
+        // every time.
+        if matches!(
+            err,
+            brain_metadata::entity::ops::EntityOpError::DuplicateCanonicalName { .. }
+        ) {
+            ApplyError::Conflict(format!("entity_put: {err}"))
+        } else {
+            ApplyError::Metadata(format!("entity_put: {err}"))
+        }
+    })?;
     // Write-path trace: which entity (canonical name) was minted/updated.
     // Subject resolution at read time keys on this canonical name, so a read
     // miss often traces back to a name that was never written this way.
