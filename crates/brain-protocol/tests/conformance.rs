@@ -49,6 +49,7 @@ use brain_protocol::ops::query::{
     QueryTraceResponse, RetrieverSelectionWire, RetrieverWire, TimeRangeWire,
 };
 use brain_protocol::{
+    EdgeDirectionWire, MemoryEdgeWire,
     ActAs, AnswerKindWire, ByeRequest, CancelStreamAck, CancelStreamRequest, CancellationReason,
     ClientPongRequest, EdgeKindWire, EncodeGraphEdge, EncodeGraphNode, EncodeRequest,
     EncodeResponse, EncodeStageArtifact, EncodeStageGraph, EncodeStageKeywordField,
@@ -891,6 +892,28 @@ fn sample_memory_inspect_response() -> MemoryInspectResponse {
                 }],
             }),
         },
+        // Two edges, one per direction, so the golden pins both discriminants
+        // and the omitted-annotation encoding. `artifact.graph` above is the
+        // extractor's write-time view; these are the LINK-asserted edges, and
+        // the fixture carries both to keep them visibly distinct.
+        edges: vec![
+            MemoryEdgeWire {
+                kind: EdgeKindWire::Caused,
+                direction: EdgeDirectionWire::Outgoing,
+                peer: mid(),
+                weight: 1.0,
+                created_at_unix_nanos: 1_700_000_000_000_000_000,
+                annotation: None,
+            },
+            MemoryEdgeWire {
+                kind: EdgeKindWire::Supports,
+                direction: EdgeDirectionWire::Incoming,
+                peer: mid(),
+                weight: 0.5,
+                created_at_unix_nanos: 1_700_000_000_000_000_001,
+                annotation: Some("manually asserted".into()),
+            },
+        ],
     }
 }
 

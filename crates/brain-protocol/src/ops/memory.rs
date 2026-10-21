@@ -530,6 +530,48 @@ pub struct MemoryInspectResponse {
     pub memory_id: [u8; 16],
     pub text: String,
     pub artifact: EncodeStageArtifact,
+    /// Memory↔memory edges anchored at this memory, both directions.
+    ///
+    /// `artifact.graph` is NOT this: it is the knowledge graph the extractor
+    /// produced at ENCODE time, so an edge asserted later with `LINK` never
+    /// appears there. Without this field `LINK`/`UNLINK` were write-only over
+    /// the wire — a client could assert an edge and had no operation that
+    /// could read it back, in `MEMORY_INSPECT` or anywhere else.
+    ///
+    /// `#[serde(default)]` so a newer client decoding an older server's
+    /// response gets an empty list rather than a decode error.
+    #[serde(default)]
+    pub edges: Vec<MemoryEdgeWire>,
+}
+
+/// One memory↔memory edge as returned by `MEMORY_INSPECT`.
+///
+/// `direction` is relative to the inspected memory: `Outgoing` means the
+/// inspected memory is the edge's source. Without it a caller cannot tell
+/// "this caused that" from "that caused this", since `peer` alone is
+/// ambiguous.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MemoryEdgeWire {
+    pub kind: crate::shared::primitives::EdgeKindWire,
+    pub direction: EdgeDirectionWire,
+    /// The memory at the other end.
+    pub peer: WireMemoryId,
+    pub weight: f32,
+    pub created_at_unix_nanos: u64,
+    #[serde(default)]
+    pub annotation: Option<String>,
+}
+
+/// Which way an edge points relative to the memory being inspected.
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, serde_repr::Serialize_repr, serde_repr::Deserialize_repr,
+)]
+#[repr(u8)]
+pub enum EdgeDirectionWire {
+    /// The inspected memory is the edge's source.
+    Outgoing = 0,
+    /// The inspected memory is the edge's target.
+    Incoming = 1,
 }
 
 // ============================================================
