@@ -149,8 +149,13 @@ impl RequestCaller {
     /// Returns `Err(OpError::Unauthorized)` when the schema namespace the
     /// request targets doesn't match the key's namespace. An empty caller
     /// namespace (test-only callers) imposes no lock.
+    /// An empty `claimed` is not a claim at all: the caller named no
+    /// namespace, so the handler resolves it to this key's own. Comparing it
+    /// literally rejected every request that simply omitted the field — which
+    /// is the whole default path for `SCHEMA_GET` over the edge, since its
+    /// query parameter defaults to `""`.
     pub fn require_namespace(&self, claimed: &str, what: &'static str) -> Result<(), OpError> {
-        if self.namespace.is_empty() || self.namespace == claimed {
+        if self.namespace.is_empty() || claimed.is_empty() || self.namespace == claimed {
             Ok(())
         } else {
             Err(OpError::Unauthorized(format!(
@@ -957,6 +962,47 @@ mod tests {
             act_as: None,
         });
         assert!(enforce_namespace(&caller, &req).is_ok());
+    }
+
+    #[test]
+    fn omitting_the_namespace_is_not_a_cross_tenant_claim() {
+        // A client that simply does not pass a namespace sent `""`, which was
+        // compared literally against the key's binding and rejected as if it
+        // were someone else's tenant. That is the default path over the edge,
+        // whose query parameter defaults to empty, so SCHEMA_GET was
+        // unauthorized for every caller that did not spell out their own
+        // namespace. The handler resolves `""` to the caller's own.
+        let caller = strict(perm_bits::RECALL, "mcplive", space(1));
+        for req in [
+            RequestBody::SchemaGet(SchemaGetRequest {
+                namespace: String::new(),
+                version: 0,
+                act_as: None,
+            }),
+            RequestBody::SchemaList(SchemaListRequest {
+                namespace: String::new(),
+                limit: 0,
+                cursor: Vec::new(),
+                act_as: None,
+            }),
+        ] {
+            assert!(
+                enforce_namespace(&caller, &req).is_ok(),
+                "an omitted namespace must not read as a foreign tenant",
+            );
+        }
+
+        // Naming a different tenant is still refused — the relaxation is for
+        // the unspecified case only.
+        let foreign = RequestBody::SchemaGet(SchemaGetRequest {
+            namespace: "someone-else".into(),
+            version: 0,
+            act_as: None,
+        });
+        assert!(matches!(
+            enforce_namespace(&caller, &foreign).unwrap_err(),
+            OpError::Unauthorized(_)
+        ));
     }
 
     #[test]

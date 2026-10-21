@@ -249,17 +249,24 @@ pub async fn handle_schema_get(
     req: SchemaGetRequest,
     ctx: &OpsContext,
 ) -> Result<SchemaGetResponse, OpError> {
-    if req.namespace.is_empty() {
-        return Err(OpError::InvalidRequest(
-            "schema_get: namespace must be non-empty".into(),
-        ));
-    }
     // Tenant binding. A caller may read only their own namespace or the
     // always-public `brain` system namespace. For any other namespace,
     // return the same `NotFound` a caller would see for a genuinely
     // absent schema, so the response can't distinguish "foreign namespace
     // exists" from "foreign namespace doesn't exist".
     let caller_name = caller_namespace_name(ctx)?;
+    // Omitting the namespace means "my own". It cannot widen access: it
+    // resolves to the key's own binding, which is strictly narrower than
+    // naming one. Rejecting it instead made the common case — a client that
+    // simply does not pass the field — fail as a cross-tenant attempt.
+    let req = SchemaGetRequest {
+        namespace: if req.namespace.is_empty() {
+            caller_name.clone()
+        } else {
+            req.namespace
+        },
+        ..req
+    };
     if !caller_may_read_namespace(&caller_name, &req.namespace) {
         return Err(OpError::NotFound {
             what: "schema",
@@ -321,17 +328,22 @@ pub async fn handle_schema_list(
     req: SchemaListRequest,
     ctx: &OpsContext,
 ) -> Result<SchemaListResponseFrame, OpError> {
-    if req.namespace.is_empty() {
-        return Err(OpError::InvalidRequest(
-            "schema_list: namespace must be non-empty".into(),
-        ));
-    }
     // Tenant binding. A caller may list only their own namespace or the
     // always-public `brain` system namespace. For any other namespace,
     // return the empty-list shape a caller would see for a namespace with
     // no declared schema, so the response can't be used as an existence
     // oracle for a foreign tenant's declarations.
     let caller_name = caller_namespace_name(ctx)?;
+    // As in `handle_schema_get`: an omitted namespace is "my own", not a
+    // cross-tenant claim.
+    let req = SchemaListRequest {
+        namespace: if req.namespace.is_empty() {
+            caller_name.clone()
+        } else {
+            req.namespace
+        },
+        ..req
+    };
     if !caller_may_read_namespace(&caller_name, &req.namespace) {
         return Ok(SchemaListResponseFrame {
             namespace: req.namespace,
