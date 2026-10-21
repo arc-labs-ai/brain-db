@@ -49,10 +49,9 @@ use brain_protocol::ops::query::{
     QueryTraceResponse, RetrieverSelectionWire, RetrieverWire, TimeRangeWire,
 };
 use brain_protocol::{
-    EdgeDirectionWire, MemoryEdgeWire,
     ActAs, AnswerKindWire, ByeRequest, CancelStreamAck, CancelStreamRequest, CancellationReason,
-    ClientPongRequest, EdgeKindWire, EncodeGraphEdge, EncodeGraphNode, EncodeRequest,
-    EncodeResponse, EncodeStageArtifact, EncodeStageGraph, EncodeStageKeywordField,
+    ClientPongRequest, EdgeDirectionWire, EdgeKindWire, EncodeGraphEdge, EncodeGraphNode,
+    EncodeRequest, EncodeResponse, EncodeStageArtifact, EncodeStageGraph, EncodeStageKeywordField,
     EncodeStageRecord, EncodeTrace, EncodeTraceArtifacts, EncodeTraceDedup, EncodeTraceEntity,
     EncodeTraceIndex, EncodeTraceRelation, EncodeTraceStage, EncodeTraceStageStatus,
     EncodeTraceStatement, EncodeVectorDirectRequest, EntityCreateRequest, EntityCreateResponse,
@@ -64,8 +63,8 @@ use brain_protocol::{
     ExtractorListRequest, ExtractorListResponseFrame, ForgetMode, ForgetRequest, ForgetResponse,
     Frame, GraphEdge, GraphFetchRequest, GraphFetchResponseFrame, GraphNode, InferenceKind,
     InferenceStep, LinkRequest, LinkResponse, MaterializeProceduralRequest,
-    MaterializeProceduralResponse, MemoryInspectRequest, MemoryInspectResponse, MemoryKindWire,
-    MemoryListDirWire, MemoryListItem, MemoryListRequest, MemoryListResponseFrame,
+    MaterializeProceduralResponse, MemoryEdgeWire, MemoryInspectRequest, MemoryInspectResponse,
+    MemoryKindWire, MemoryListDirWire, MemoryListItem, MemoryListRequest, MemoryListResponseFrame,
     MemoryListSortWire, MemoryListTimeAxisWire, ObservationInput, Opcode, PingRequest, PlanBudget,
     PlanRequest, PlanResponseFrame, PlanState, PlanStatus, PlanStep, PlanTrace, PlanTraceDirection,
     PlanTraceMeetingPoint, PlanTraceNode, PongResponse, RankedItemKindWire, ReasonRequest,

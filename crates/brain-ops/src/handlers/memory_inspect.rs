@@ -15,7 +15,9 @@ use brain_metadata::tables::memory_artifacts::MEMORY_ARTIFACTS_TABLE;
 use brain_metadata::tables::text::TEXTS_TABLE;
 use brain_protocol::envelope::response::EncodeStageArtifact;
 use brain_protocol::shared::primitives::EdgeKindWire;
-use brain_protocol::{EdgeDirectionWire, MemoryEdgeWire, MemoryInspectRequest, MemoryInspectResponse};
+use brain_protocol::{
+    EdgeDirectionWire, MemoryEdgeWire, MemoryInspectRequest, MemoryInspectResponse,
+};
 
 use crate::context::OpsContext;
 use crate::error::OpError;
@@ -182,6 +184,10 @@ mod tests {
         let mut sorted = mapped.clone();
         sorted.sort_unstable();
         sorted.dedup();
-        assert_eq!(sorted.len(), all.len(), "mapping is not injective: {mapped:?}");
+        assert_eq!(
+            sorted.len(),
+            all.len(),
+            "mapping is not injective: {mapped:?}"
+        );
     }
 }
