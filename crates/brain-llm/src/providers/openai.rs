@@ -147,17 +147,36 @@ impl LlmClient for OpenAIClient {
             // reactor. See `providers::runtime`.
             run_on_provider_runtime(
                 async move {
-                    let resp = tokio::time::timeout(
-                        timeout,
-                        http.post(&url)
-                            .bearer_auth(&api_key)
-                            .header("content-type", "application/json")
-                            .json(&body)
-                            .send(),
-                    )
-                    .await
-                    .map_err(|_| LlmError::Timeout)?
-                    .map_err(LlmError::from)?;
+                    let mut body = body;
+                    let mut resp = send_chat(&http, &url, &api_key, &body, timeout).await?;
+
+                    // Some models accept only their default temperature and
+                    // reject any explicit value with a 400. Retry once without
+                    // the field rather than fail the call: the caller's
+                    // temperature is a preference, and for HyPE — which is
+                    // mandatory and always-on — losing the whole generation
+                    // over a sampling nudge is the wrong trade.
+                    //
+                    // Dropping it is expressible because `temperature` is
+                    // skipped when zero, which is also why every caller that
+                    // leaves it at the default already works on these models.
+                    if resp.status() == 400 && body.temperature != 0.0 {
+                        let detail = resp.text().await.unwrap_or_default();
+                        if rejects_temperature(&detail) {
+                            tracing::debug!(
+                                target: "brain_llm::openai",
+                                model = %body.model,
+                                "model rejected an explicit temperature; retrying with its default",
+                            );
+                            body.temperature = 0.0;
+                            resp = send_chat(&http, &url, &api_key, &body, timeout).await?;
+                        } else {
+                            return Err(LlmError::ProviderError {
+                                status: 400,
+                                message: detail,
+                            });
+                        }
+                    }
 
                     let status = resp.status();
                     if status == 401 || status == 403 {
@@ -206,6 +225,41 @@ impl LlmClient for OpenAIClient {
     fn model_id_hash(&self) -> u64 {
         self.model_id_hash
     }
+}
+
+/// One chat-completions POST. Split out so the temperature retry can repeat it
+/// without duplicating the request construction.
+async fn send_chat(
+    http: &reqwest::Client,
+    url: &str,
+    api_key: &str,
+    body: &OpenAIRequestBody,
+    timeout: std::time::Duration,
+) -> Result<reqwest::Response, LlmError> {
+    tokio::time::timeout(
+        timeout,
+        http.post(url)
+            .bearer_auth(api_key)
+            .header("content-type", "application/json")
+            .json(body)
+            .send(),
+    )
+    .await
+    .map_err(|_| LlmError::Timeout)?
+    .map_err(LlmError::from)
+}
+
+/// Whether a 400 body is the provider refusing an explicit temperature.
+///
+/// Matched on the error's own `param`/`code` fields rather than its prose,
+/// which is not a stable interface. Both must be present: a 400 that merely
+/// mentions temperature somewhere else is a different fault and must keep its
+/// own error.
+fn rejects_temperature(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body).is_ok_and(|v| {
+        let err = &v["error"];
+        err["param"] == "temperature" && err["code"] == "unsupported_value"
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -680,5 +734,43 @@ mod tests {
             out.is_err(),
             "an unreachable provider is an error, not a panic"
         );
+    }
+
+    /// The shape the provider actually sent when a model refused an explicit
+    /// temperature, trimmed to the fields matched on.
+    const TEMPERATURE_REFUSAL: &str = r#"{
+      "error": {
+        "message": "Unsupported value: 'temperature' does not support 0.3 with this model. Only the default (1) value is supported.",
+        "type": "invalid_request_error",
+        "param": "temperature",
+        "code": "unsupported_value"
+      }
+    }"#;
+
+    #[test]
+    fn a_temperature_refusal_is_recognised() {
+        assert!(rejects_temperature(TEMPERATURE_REFUSAL));
+    }
+
+    /// The retry must not swallow unrelated 400s. A model that does not exist,
+    /// or a malformed request, has to keep its own error — otherwise the
+    /// second attempt fails the same way and the caller sees a confusing
+    /// duplicate instead of the real cause.
+    #[test]
+    fn other_four_hundreds_are_not_temperature_refusals() {
+        for body in [
+            r#"{"error":{"message":"The model `nope` does not exist","type":"invalid_request_error","param":null,"code":"model_not_found"}}"#,
+            // Mentions temperature in prose, but is not a refusal OF it.
+            r#"{"error":{"message":"temperature must be a number","type":"invalid_request_error","param":"max_tokens","code":"unsupported_value"}}"#,
+            // Right param, different code.
+            r#"{"error":{"message":"x","type":"invalid_request_error","param":"temperature","code":"invalid_type"}}"#,
+            "not json at all",
+            "",
+        ] {
+            assert!(
+                !rejects_temperature(body),
+                "must not treat this as a temperature refusal: {body}"
+            );
+        }
     }
 }
