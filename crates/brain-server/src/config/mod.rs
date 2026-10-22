@@ -145,12 +145,13 @@ pub struct Config {
 #[derive(Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct LlmConfig {
-    /// How a namespace's credential is resolved. See [`LlmMode`].
-    #[serde(default)]
-    pub mode: LlmMode,
     /// API key for the configured model's provider. Override with
-    /// `BRAIN__LLM__API_KEY`. Required in [`LlmMode::Static`]; ignored in
-    /// [`LlmMode::Broker`], where credentials are per namespace.
+    /// `BRAIN__LLM__API_KEY`.
+    ///
+    /// Not the serving credential: every namespace resolves its own key
+    /// through `[llm.broker]`. This one is read only by the shard-wide
+    /// consumers that still hold a process-wide client. Setting it does not
+    /// make a keyless namespace work.
     #[serde(default)]
     pub api_key: Option<String>,
     /// Model id (e.g. `gpt-4o-mini`, `claude-haiku-4-5`). The provider
@@ -158,30 +159,9 @@ pub struct LlmConfig {
     /// falls back to the built-in default when unset.
     #[serde(default)]
     pub model: Option<String>,
-    /// `[llm.broker]` — required when `mode = "broker"`.
+    /// `[llm.broker]` — required. Credentials are resolved per namespace.
     #[serde(default)]
     pub broker: Option<LlmBrokerConfig>,
-}
-
-/// How Brain resolves the LLM credential for a namespace.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum LlmMode {
-    /// One credential, every namespace — pre-BYOK behaviour, and the
-    /// self-host default. `[llm] api_key` is mandatory: a keyless server
-    /// cannot run, because HyPE is mandatory and always-on.
-    #[default]
-    Static,
-    /// Per-namespace credentials resolved from an Arc Labs LLM broker.
-    ///
-    /// Brain holds a namespace-scoped **grant**, never the tenant's provider
-    /// key: the broker swaps the grant for the real key on the way upstream.
-    /// That keeps customer OpenAI/Anthropic keys out of Brain's WAL, snapshots
-    /// and backups.
-    ///
-    /// A keyless boot is legal here — and only here — because the credential
-    /// is not known until a write names its namespace.
-    Broker,
 }
 
 /// `[llm.broker]` — where Brain resolves per-namespace credentials.
@@ -225,7 +205,6 @@ impl std::fmt::Debug for LlmBrokerConfig {
 impl std::fmt::Debug for LlmConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LlmConfig")
-            .field("mode", &self.mode)
             .field("api_key", &self.api_key.as_ref().map(|_| "[redacted]"))
             .field("model", &self.model)
             .field("broker", &self.broker)
@@ -529,7 +508,7 @@ fn default_resolver_embed_threshold() -> f32 {
 /// `[extractors.hype]` TOML sub-section. Write-time hypothetical-
 /// question generation tuning. HyPE is **mandatory and always-on** —
 /// there is no flag to disable it, and the LLM it depends on is a hard
-/// startup requirement (see `Config::validate_llm_provider`). The only
+/// startup requirement (see `Config::validate_llm_broker`). The only
 /// tunable is the question count.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -1698,7 +1677,7 @@ impl Config {
             source,
         })?;
         cfg.validate_post()?;
-        cfg.validate_llm_provider()?;
+        cfg.validate_llm_broker()?;
         Ok(cfg)
     }
 
@@ -1939,69 +1918,40 @@ impl Config {
         Ok(())
     }
 
-    /// Hard, unconditional startup gate on the LLM provider key. An LLM
-    /// is a mandatory dependency of every Brain shard — it is not a tier
-    /// the operator can opt out of. Write-time HyPE hypothetical-question
-    /// generation is always-on (there is no flag to disable it), and HyPE
-    /// has no fallback path: without an LLM there are no question vectors,
-    /// no entity/statement/relation extraction, and the read-side
-    /// question-vector bridge is empty. So the server refuses to boot
-    /// without a provider key, period — there is no substrate-only mode.
+    /// Hard, unconditional startup gate on the credential broker.
     ///
-    /// The key is read from the single `[llm] api_key` field — which the
-    /// generic `BRAIN__LLM__API_KEY` env override has already folded into
-    /// `self.llm` by this point, so there is exactly one source to check.
+    /// An LLM is a mandatory dependency of every Brain shard — it is not a
+    /// tier the operator can opt out of. Write-time HyPE hypothetical-question
+    /// generation is always-on, and without it there are no question vectors
+    /// and the read-side question-vector bridge is empty.
     ///
-    /// There is no `[extractors.llm]` on/off gate — extraction is always-on
-    /// — so nothing can lift this requirement: the LLM is mandatory and a
-    /// missing key is always a hard startup error.
-    fn validate_llm_provider(&self) -> Result<(), ConfigError> {
-        match self.llm.mode {
-            // Per-namespace credentials: the serving key is not known until a
-            // write names its namespace, so there is nothing to check here
-            // beyond the broker being addressable. A keyless boot is correct
-            // in this mode — and only in this mode.
-            LlmMode::Broker => {
-                let Some(broker) = self.llm.broker.as_ref() else {
-                    return Err(ConfigError::Invariant(
-                        "`[llm] mode = \"broker\"` requires an `[llm.broker]` section with a \
-                         `url`. Without it no namespace can resolve a credential and every \
-                         write would fail at derivation time."
-                            .into(),
-                    ));
-                };
-                if broker.url.trim().is_empty() {
-                    return Err(ConfigError::Invariant(
-                        "`[llm.broker] url` is empty.".into(),
-                    ));
-                }
-                Ok(())
-            }
-            // One credential for every namespace. Unchanged from pre-BYOK: a
-            // missing key is a hard startup error, because HyPE is mandatory
-            // and always-on and there is nothing to fall back to.
-            LlmMode::Static => {
-                let have_provider = self
-                    .llm
-                    .api_key
-                    .as_deref()
-                    .is_some_and(|v| !v.trim().is_empty());
-                if !have_provider {
-                    return Err(ConfigError::Invariant(
-                        "no LLM provider key configured. Brain requires an LLM: write-time HyPE \
-                         hypothetical-question generation is mandatory and always-on, and the \
-                         write path (entity / statement / relation extraction) depends on it. \
-                         There is no way to disable HyPE or run without an LLM. \
-                         Set BRAIN__LLM__API_KEY in the environment, or `[llm] api_key` in the \
-                         config, and ensure `[llm] model` names a provider you hold a key for. \
-                         To resolve credentials per namespace instead (BYOK), set \
-                         `[llm] mode = \"broker\"` and configure `[llm.broker]`."
-                            .into(),
-                    ));
-                }
-                Ok(())
-            }
+    /// What the shard needs at boot is therefore the broker, not a key: the
+    /// serving credential belongs to a namespace and is not known until a
+    /// write names one. A shard with no broker can never resolve a credential
+    /// for any namespace, which is the failure this refuses to start with.
+    ///
+    /// A namespace that has no registered key is a different matter and not a
+    /// boot-time concern: its writes still land, with the LLM tier reporting
+    /// that it could not run.
+    fn validate_llm_broker(&self) -> Result<(), ConfigError> {
+        let Some(broker) = self.llm.broker.as_ref() else {
+            return Err(ConfigError::Invariant(
+                "`[llm.broker]` is missing. Brain resolves an LLM credential per \
+                 namespace: the serving key is not known until a write names its \
+                 namespace, so there is nothing for a process-wide key to serve. \
+                 `[llm] api_key` is not a substitute. Set `[llm.broker] url` (and \
+                 `service_key`) to the broker that mints namespace grants."
+                    .into(),
+            ));
+        };
+        if broker.url.trim().is_empty() {
+            return Err(ConfigError::Invariant(
+                "`[llm.broker] url` is empty. Without it no namespace can resolve a \
+                 credential and every write would fail at derivation time."
+                    .into(),
+            ));
         }
+        Ok(())
     }
 }
 
@@ -2059,25 +2009,35 @@ mod tests {
     }
 
     #[test]
-    fn llm_provider_gate_requires_key_unconditionally() {
+    fn llm_gate_requires_a_broker_and_ignores_the_api_key() {
         let mut cfg = Config::for_tests();
 
-        // No key → refuse to start.
-        cfg.llm.api_key = None;
+        // A provider key is not a substitute for the broker. A process-wide
+        // key cannot serve a namespace, so it cannot satisfy the gate.
+        cfg.llm.api_key = Some("sk-cfg".to_string());
+        cfg.llm.broker = None;
         assert!(
-            cfg.validate_llm_provider().is_err(),
-            "no provider key must fail startup — the LLM is mandatory"
+            cfg.validate_llm_broker().is_err(),
+            "an api_key must not satisfy the gate — credentials are per namespace"
         );
 
-        // A key in `[llm] api_key` satisfies it. The generic
-        // `BRAIN__LLM__API_KEY` override folds into this same field before
-        // validation, so there is exactly one source to check.
-        cfg.llm.api_key = Some("sk-cfg".to_string());
-        assert!(cfg.validate_llm_provider().is_ok());
+        // The broker alone satisfies it, with no provider key at all: the
+        // serving credential is not known until a write names its namespace.
+        cfg.llm.api_key = None;
+        cfg.llm.broker = Some(LlmBrokerConfig {
+            url: "http://127.0.0.1:9900".to_string(),
+            service_key: None,
+            ttl_secs: default_broker_ttl_secs(),
+        });
+        assert!(cfg.validate_llm_broker().is_ok());
 
-        // Whitespace-only key does not count.
-        cfg.llm.api_key = Some("   ".to_string());
-        assert!(cfg.validate_llm_provider().is_err());
+        // A declared-but-empty url is the same failure as no broker.
+        cfg.llm.broker = Some(LlmBrokerConfig {
+            url: "   ".to_string(),
+            service_key: None,
+            ttl_secs: default_broker_ttl_secs(),
+        });
+        assert!(cfg.validate_llm_broker().is_err());
     }
 
     #[test]

@@ -1,10 +1,12 @@
 //! Write-time HyPE generation: hypothetical-question embeddings.
 //!
 //! HyPE is **mandatory and always-on**. There is no config flag to
-//! disable it: every shard runs it, and the LLM it depends on is a hard
-//! startup requirement (a keyless server refuses to boot — see
-//! `brain_server::config::Config::validate_llm_provider`). The generator
-//! is unconditionally wired into the extractor worker at shard spawn.
+//! disable it: every shard runs it, and the credential it depends on is
+//! resolved per namespace from `[llm.broker]`, which config load requires
+//! (see `brain_server::config::Config::validate_llm_broker`). The generator
+//! is unconditionally wired into the extractor worker at shard spawn. A
+//! namespace with no registered key still writes — the LLM tier reports
+//! that it could not run, rather than the write failing.
 //!
 //! For each freshly-encoded memory the generator asks an LLM for several
 //! diverse questions whose answer is the memory, embeds each locally, and

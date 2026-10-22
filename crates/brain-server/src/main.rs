@@ -158,18 +158,13 @@ fn main() -> ExitCode {
 #[cfg(target_os = "linux")]
 mod linux_main {
 
-    /// Ferry `[llm.broker]` into the spawn path, but only in `broker` mode.
+    /// Ferry `[llm.broker]` into the spawn path.
     ///
-    /// Gated on the mode rather than on the section merely being present: a config
-    /// that still has an `[llm.broker]` block from an earlier experiment must not
-    /// silently start resolving credentials per namespace while `mode = "static"`
-    /// says a single key is in use. The mode is the declaration; the section is
-    /// just its parameters.
+    /// `Option` only because `spawn_shard` is the lower-level API beneath the
+    /// config gate; a server that reached here without a broker has no way to
+    /// resolve a credential for any namespace, and `Config::validate_llm_broker`
+    /// has already refused to start.
     fn broker_spawn_cfg(cfg: &Config) -> Option<crate::shard::LlmBrokerSpawnConfig> {
-        use crate::config::LlmMode;
-        if cfg.llm.mode != LlmMode::Broker {
-            return None;
-        }
         cfg.llm
             .broker
             .as_ref()

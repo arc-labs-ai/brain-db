@@ -66,22 +66,19 @@ cache_size       = 10000
 batch_size       = 32
 batch_window_ms  = 5
 
-# No [llm] section here on purpose: the image carries no key, and the operator
-# supplies one at run time with BRAIN__LLM__API_KEY. The provider is derived
-# from BRAIN__LLM__MODEL.
+# No [llm] api_key here on purpose: the image carries no key, and the
+# operator supplies one at run time if they want the entity disambiguator.
 #
-# For BYOK, Brain resolves a credential per namespace from a broker instead of
-# using one house key:
+# The serving credential is resolved per namespace from the broker, which
+# every deployment must configure:
 #
-#   -e BRAIN__LLM__MODE=broker
 #   -e BRAIN__LLM__BROKER__URL=http://brain-edge:8080
 #   -e BRAIN__LLM__BROKER__SERVICE_KEY=...   # Brain's identity to the broker,
 #                                            # NOT a provider key
 #
-# In that mode BRAIN__LLM__API_KEY is ignored and a keyless boot is legal, but
-# a namespace with no registered key fails its writes with
-# `llm_credential.missing` rather than falling back to a house key. See
-# config/dev.toml's [llm] block for the full explanation.
+# A namespace with no registered key still writes — the LLM tier reports that
+# it could not run, so you get entities without statements. See config/dev.toml's
+# [llm] block for the full explanation.
 
 [admin]
 # Operator admin secret gating the /v1/* admin HTTP plane (key mint /
