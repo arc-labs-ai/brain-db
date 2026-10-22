@@ -80,6 +80,18 @@ pub struct HypeGenOutcome {
     pub questions_written: usize,
     /// LLM micro-USD spent (0 on a cache hit).
     pub cost_micro_usd: u64,
+    /// The stage could not run, as opposed to running and finding nothing.
+    ///
+    /// HyPE stays best-effort — a failure here is still logged, folded into a
+    /// zero-question outcome, and never fails the surrounding write. What
+    /// changes is that the failure is no longer INVISIBLE: every zero outcome
+    /// used to publish `StageOutcome::Empty`, which the encode trace maps to
+    /// `Ok`, so "the namespace has no LLM provider key" and "this text
+    /// warranted no questions" were byte-identical in the trace. A degraded
+    /// write then looked exactly like a healthy one, which is how a sandbox
+    /// ends up with entities, no statements, an empty graph, and nothing
+    /// anywhere saying why.
+    pub failed: bool,
 }
 
 impl HypeGenerator {
@@ -140,13 +152,17 @@ impl HypeGenerator {
                     error = %e,
                     "HyPE question generation failed; skipping",
                 );
-                return HypeGenOutcome::default();
+                return HypeGenOutcome {
+                    failed: true,
+                    ..Default::default()
+                };
             }
         };
         if questions.is_empty() {
             return HypeGenOutcome {
                 questions_written: 0,
                 cost_micro_usd: cost_micro,
+                failed: false,
             };
         }
 
@@ -171,6 +187,7 @@ impl HypeGenerator {
             return HypeGenOutcome {
                 questions_written: 0,
                 cost_micro_usd: cost_micro,
+                failed: false,
             };
         }
 
@@ -192,6 +209,9 @@ impl HypeGenerator {
                 return HypeGenOutcome {
                     questions_written: 0,
                     cost_micro_usd: cost_micro,
+                    // Questions were generated and then lost. That is a
+                    // failure, not an absence.
+                    failed: true,
                 };
             }
         }
@@ -221,6 +241,7 @@ impl HypeGenerator {
         HypeGenOutcome {
             questions_written: vectors.len(),
             cost_micro_usd: cost_micro,
+            failed: false,
         }
     }
 
@@ -268,13 +289,17 @@ impl HypeGenerator {
                     error = %e,
                     "HyPE refresh generation failed; keeping prior questions",
                 );
-                return HypeGenOutcome::default();
+                return HypeGenOutcome {
+                    failed: true,
+                    ..Default::default()
+                };
             }
         };
         if questions.is_empty() {
             return HypeGenOutcome {
                 questions_written: 0,
                 cost_micro_usd: cost_micro,
+                failed: false,
             };
         }
 
@@ -288,6 +313,7 @@ impl HypeGenerator {
             return HypeGenOutcome {
                 questions_written: 0,
                 cost_micro_usd: cost_micro,
+                failed: false,
             };
         }
 
@@ -305,6 +331,7 @@ impl HypeGenerator {
                 return HypeGenOutcome {
                     questions_written: 0,
                     cost_micro_usd: cost_micro,
+                    failed: false,
                 };
             }
         }
@@ -313,6 +340,7 @@ impl HypeGenerator {
         HypeGenOutcome {
             questions_written: vectors.len(),
             cost_micro_usd: cost_micro,
+            failed: false,
         }
     }
 

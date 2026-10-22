@@ -4514,20 +4514,28 @@ async fn publish_extracted_graph(
 /// `--wait` can decrement their pending-stage checklist for this memory.
 /// Called once per memory that actually ran [`HypeGenerator::generate_for`]
 /// (skipped entirely for memories the idempotency check or the per-cycle
-/// LLM budget bypassed — those never reach this point). `generate_for` is
-/// best-effort and infallible: an internal LLM/embed/persist failure is
-/// logged and folded into a zero-question outcome rather than surfaced as
-/// an error, so there is no `Failed` case here — a zero outcome (LLM
-/// failure, empty reply, or memory text genuinely yielding no questions)
-/// and an "already had vectors" skip both round to `StageOutcome::Empty`,
-/// same as the extractor's `Skipped` mapping in `publish_extracted_graph`.
+/// LLM budget bypassed — those never reach this point).
+///
+/// `generate_for` stays best-effort: an internal LLM/embed/persist failure is
+/// logged and folded into a zero-question outcome rather than failing the
+/// surrounding write. It is no longer INDISTINGUISHABLE, though. Every zero
+/// outcome used to publish `StageOutcome::Empty`, and the encode trace maps
+/// `Empty` to `Ok` — so a namespace with no LLM provider key produced a
+/// `hype` stage reporting `status: 0, questions=0`, identical to text that
+/// simply warranted no questions. The write looked healthy, the graph came
+/// back empty, and nothing connected the two.
+///
+/// So the three cases now separate: `failed` → `Failed` (could not run),
+/// zero questions → `Empty` (ran, found nothing), questions → `Ok`.
 async fn publish_hype_completed(
     ctx: &WorkerContext,
     memory_id: MemoryId,
     space_id: SpaceId,
     outcome: HypeGenOutcome,
 ) {
-    let stage_outcome = if outcome.questions_written > 0 {
+    let stage_outcome = if outcome.failed {
+        StageOutcome::Failed
+    } else if outcome.questions_written > 0 {
         StageOutcome::Ok
     } else {
         StageOutcome::Empty
