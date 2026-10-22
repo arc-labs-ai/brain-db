@@ -55,19 +55,41 @@ const DEFAULT_KIND: MemoryKind = MemoryKind::Episodic;
 const DEFAULT_SALIENCE: f32 = 0.5;
 
 #[tracing::instrument(name = "brain.encode", skip_all)]
-/// Reject the write when this namespace has no usable LLM provider credential.
+/// Reject the write when this namespace is KNOWN to have no usable LLM
+/// provider credential.
 ///
-/// Brain cannot store a memory it will not be able to ground: HyPE and the
-/// extraction tier are mandatory, so a write admitted without a credential
-/// lands as text with no questions, no entities and no statements — it looks
-/// stored, and recall quietly gets worse, with nothing telling the caller why.
-/// Failing at the door makes that visible and actionable.
+/// Brain cannot ground a memory it has no key for: HyPE and the extraction
+/// tier both need one, so a write admitted without a credential lands as text
+/// with no questions, no entities and no statements. It looks stored, and
+/// recall quietly gets worse.
 ///
 /// **Cache-only.** The probe never performs I/O: the synchronous write path
 /// must not block on a credential broker. `None` means "unknown without I/O"
 /// and **admits** the write — a cold cache is not evidence of a missing key,
 /// and the derivation stages re-resolve properly (and retry a transient
 /// failure) when they run.
+///
+/// ## This is an optimisation, not a guarantee — do not read it as one
+///
+/// It fires only while a `Cached::Missing` entry is live, and that entry's
+/// TTL is `DEFAULT_NEGATIVE_TTL` (10s). Under sustained traffic the first
+/// write pays the silent degradation and the ones behind it are refused at
+/// the door. Under sparse traffic — a sandbox, a demo, anything with gaps
+/// longer than the TTL — the entry has always expired, every write is
+/// admitted, and NONE of them are refused. That is working as designed.
+///
+/// Lengthening the negative TTL does not fix it and makes things worse: this
+/// gate runs before any derivation, so a namespace stuck on `Missing` never
+/// issues the fetch that would store `Ready`. The negative entry becomes
+/// self-sustaining, and a tenant who registers a key stays rejected with
+/// nothing able to clear it. The short TTL is what keeps that recoverable.
+///
+/// So the honest signal for a degraded write is NOT this gate — it is the
+/// per-stage status in the encode trace. `publish_hype_completed` reports
+/// `StageOutcome::Failed` when HyPE could not run, which is what separates
+/// "no key registered" from "this text warranted no questions". A caller
+/// diagnosing an empty graph should read the stage statuses, not infer from
+/// the write having been accepted.
 fn reject_if_no_llm_credential(ctx: &OpsContext) -> Result<(), OpError> {
     let Some(resolver) = ctx.llm_credential_resolver.as_ref() else {
         // No resolver wired (tests, credential-free deployments): admit.
