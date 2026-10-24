@@ -28,6 +28,7 @@
 //! OUTSIDE_ACTIVE_SCHEMA flag-sweep all follow the `SCHEMA_REPLACE`
 //! handler's shape.
 
+use crate::clock::now_unix_nanos;
 use brain_core::RequestId;
 use brain_metadata::relation::ops::relation_live_count_by_type;
 use brain_metadata::relation::types::relation_type_id_by_qname;
@@ -93,7 +94,7 @@ pub async fn handle_schema_drop(
     //    re-version is then applied through the unified submit(Write) path so
     //    it is WAL-durable and replayed on recovery (the WAL is the source of
     //    truth; a redb-only mutation is lost if redb is ever rebuilt from it).
-    let now = crate::txn::now_unix_nanos_pub();
+    let now = now_unix_nanos();
 
     // 3a. Load the active schema document. No active version → nothing is
     //     declared, so the target cannot be dropped: a no-op success,

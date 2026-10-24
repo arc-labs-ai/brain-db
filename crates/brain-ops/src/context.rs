@@ -11,6 +11,7 @@
 //! single-threaded usage is enforced by the per-shard Glommio
 //! executor, not by the field types.
 
+use crate::clock::now_unix_nanos;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
@@ -573,7 +574,7 @@ impl OpsContext {
                 // CBOR body as a row and fail (kinds collide across the two
                 // record classes).
                 flags: brain_storage::wal::record::FLAG_SUBSCRIBE_EVENT,
-                timestamp_ns: now_unix_nanos_ctx(),
+                timestamp_ns: now_unix_nanos(),
                 space_id_lo64: 0,
                 payload: body,
             };
@@ -650,10 +651,6 @@ impl OpsContext {
         )
         .await;
     }
-}
-
-fn now_unix_nanos_ctx() -> u64 {
-    crate::clock::now_unix_nanos()
 }
 
 /// Whether a listing produced by one shard covers the whole deployment.

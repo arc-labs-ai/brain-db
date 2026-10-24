@@ -745,10 +745,6 @@ pub struct EncodeStageArtifact {
 /// The redb metadata row a `persist` stage wrote — the durable record fields.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EncodeStageRecord {
-    /// Tolerant on the way in only: this struct is persisted as JSON as well as
-    /// sent on the wire, so a bundle written before ids were unified still
-    /// reads. See [`crate::codec::cbor::memory_id_at_rest`].
-    #[serde(with = "crate::codec::cbor::memory_id_at_rest")]
     pub memory_id: WireMemoryId,
     /// Memory kind discriminant (as stored).
     pub kind: u8,
@@ -931,7 +927,6 @@ pub struct EncodeTraceDedup {
     pub was_deduplicated: bool,
     /// The memory the write deduplicated against, when
     /// `was_deduplicated`; `None` for a fresh write.
-    #[serde(with = "crate::codec::cbor::opt_memory_id_at_rest")]
     pub matched_memory_id: Option<WireMemoryId>,
 }
 

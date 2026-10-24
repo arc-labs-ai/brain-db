@@ -23,6 +23,7 @@
 //! aren't useful. A non-None `txn_id` is rejected so we don't
 //! silently degrade the user's intent.
 
+use crate::clock::now_unix_nanos;
 use brain_core::{EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NodeRef, Salience, SessionId};
 use brain_embed::VECTOR_DIM;
 use brain_planner::{EdgeOutcome, EncodeOp, EncodeOpEdge};
@@ -457,10 +458,6 @@ fn reconstruct_response(
         has_active_schema: true,
         trace: None,
     })
-}
-
-fn now_unix_nanos() -> u64 {
-    crate::clock::now_unix_nanos()
 }
 
 fn hex_short(bytes: &[u8; 16]) -> String {

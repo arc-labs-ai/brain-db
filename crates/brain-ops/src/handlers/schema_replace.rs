@@ -20,6 +20,7 @@
 //! operation — a `false` value is rejected with `InvalidRequest` so
 //! a typo in a client can't accidentally wipe a deployment's schema.
 
+use crate::clock::now_unix_nanos;
 use brain_core::RequestId;
 use brain_protocol::schema::{parse_schema, validate_located_with};
 use brain_protocol::{SchemaReplaceRequest, SchemaReplaceResponse};
@@ -129,7 +130,7 @@ pub async fn handle_schema_replace(
     //    intact. submit also supplies the WriteId idempotency replay and the
     //    post-commit OUTSIDE_ACTIVE_SCHEMA flag sweep this handler used to
     //    hand-roll.
-    let now = crate::txn::now_unix_nanos_pub();
+    let now = now_unix_nanos();
     let from_version = schema_scope::current_active(ctx, &namespace)?.unwrap_or(0);
     let real_writer = crate::handlers::writer_handle::real_writer_handle(ctx)?;
     let write_id =

@@ -15,6 +15,7 @@
 //! the response body's `validation_errors` field with
 //! `schema_version = 0`.
 
+use crate::clock::now_unix_nanos;
 use brain_core::{Cardinality, RequestId, StatementKind};
 use brain_metadata::entity::types::entity_type_lookup_rtxn;
 use brain_metadata::extractor::ops::extractor_lookup_by_qname;
@@ -44,7 +45,7 @@ use crate::context::OpsContext;
 use crate::handlers::schema_scope;
 use crate::handlers::schema_wire;
 use crate::error::OpError;
-use crate::handlers::entity::emit_graph_event;
+use crate::handlers::events::emit_graph_event;
 use crate::handlers::writer_handle::real_writer_handle;
 use crate::write::{Phase, PhaseAck, Write, WriteId};
 
@@ -162,7 +163,7 @@ pub async fn handle_schema_upload(
     }
 
     // 5. Persist via the unified submit(Write) path.
-    let now = crate::txn::now_unix_nanos_pub();
+    let now = now_unix_nanos();
     let from_version = schema_scope::current_active(ctx, &namespace)?.unwrap_or(0);
 
     let real_writer = real_writer_handle(ctx)?;

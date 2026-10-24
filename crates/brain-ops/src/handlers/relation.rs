@@ -18,6 +18,7 @@
 //! These handlers do NOT yet handle cross-shard relation reads
 //! or the relation embedding worker — both deferred.
 
+use crate::clock::now_unix_nanos;
 use brain_core::Relation;
 use brain_core::{Cardinality, EntityId, RelationId, RelationTypeId, RequestId};
 use brain_metadata::relation::ops::{
@@ -46,7 +47,7 @@ use redb::ReadableTable;
 
 use crate::context::OpsContext;
 use crate::error::OpError;
-use crate::handlers::entity::emit_graph_event;
+use crate::handlers::events::emit_graph_event;
 use crate::handlers::writer_handle::real_writer_handle;
 use crate::write::{
     Phase, PhaseAck, SupersedeReplacement, SupersedeReplacementId, SupersedeTarget,
@@ -100,7 +101,7 @@ pub async fn handle_relation_create(
             "confidence must be in [0, 1] and not NaN".into(),
         ));
     }
-    let now = crate::txn::now_unix_nanos_pub();
+    let now = now_unix_nanos();
     let (namespace, name) = split_qname(&req.relation_type)?;
 
     // Resolve the relation-type qname (strict vs schemaless dispatch).
@@ -305,7 +306,7 @@ pub async fn handle_relation_supersede(
     }
 
     let old_id = RelationId::from(req.old_relation_id);
-    let now = crate::txn::now_unix_nanos_pub();
+    let now = now_unix_nanos();
     let (namespace, name) = split_qname(&req.new_relation.relation_type)?;
 
     // Resolve the relation-type qname (strict vs schemaless dispatch)
@@ -439,7 +440,7 @@ pub async fn handle_relation_tombstone(
         return Err(OpError::InvalidRequest("reason exceeds 4 KiB".into()));
     }
     let id = RelationId::from(req.relation_id);
-    let now = crate::txn::now_unix_nanos_pub();
+    let now = now_unix_nanos();
 
     // Pre-submit existence + ownership check — submit-path failures
     // collapse into WriterError::Internal, so check first to keep the

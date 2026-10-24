@@ -478,7 +478,7 @@ impl EventEnvelope {
                 // Decode the CBOR body back into the typed-graph
                 // event so subscribers see the same shape as a live
                 // publish. Pair with `wal_kind_for_event` in
-                // `crate::handlers::entity` and `OpsContext::publish_notification`.
+                // `crate::handlers::events` and `OpsContext::publish_notification`.
                 let Ok(payload) =
                     ciborium::from_reader::<GraphEventPayload, _>(&body_record.body[..])
                 else {

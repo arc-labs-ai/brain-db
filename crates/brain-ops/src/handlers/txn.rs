@@ -10,6 +10,7 @@
 //! Out of scope for v1: WAL records, cross-shard txns,
 //! substrate-level nested-txn detection.
 
+use crate::clock::now_unix_nanos;
 use std::collections::{HashMap, HashSet};
 
 use brain_core::{EdgeKind, MemoryId};
@@ -393,10 +394,6 @@ pub fn txn_owned_by(entry_connection_id: [u8; 16], caller_connection_id: [u8; 16
     entry_connection_id == [0u8; 16] || entry_connection_id == caller_connection_id
 }
 
-fn now_unix_nanos() -> u64 {
-    crate::clock::now_unix_nanos()
-}
-
 // ---------------------------------------------------------------------------
 // Handlers.
 // ---------------------------------------------------------------------------
@@ -590,7 +587,7 @@ pub async fn handle_txn_commit(
                 })
                 .await;
         }
-        crate::handlers::forget::delete_hype_vectors(ctx, *memory_id);
+        crate::handlers::hype_vectors::delete_hype_vectors(ctx, *memory_id);
     }
 
     let committed_at = now_unix_nanos();
@@ -764,11 +761,6 @@ pub use self::{
     BufferedEncode as PendingMemory, BufferedForget as PendingForget, BufferedLink as PendingLink,
     BufferedUnlink as PendingUnlink,
 };
-
-#[must_use]
-pub fn now_unix_nanos_pub() -> u64 {
-    now_unix_nanos()
-}
 
 /// Deterministic WriteId for a TXN_COMMIT. TxnCommitRequest has no
 /// `request_id`, so we derive the WriteId from the `txn_id` itself —

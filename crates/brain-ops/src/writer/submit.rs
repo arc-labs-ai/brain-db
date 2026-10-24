@@ -23,6 +23,7 @@
 //! only place those side-effects live; adding them later doesn't
 //! require apply changes.
 
+use crate::clock::now_unix_nanos;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -611,10 +612,6 @@ impl RealWriterHandle {
             now_unix_nanos()
         }
     }
-}
-
-fn now_unix_nanos() -> u64 {
-    crate::clock::now_unix_nanos()
 }
 
 /// Record one submit outcome per phase in the parent [`Write`]. The

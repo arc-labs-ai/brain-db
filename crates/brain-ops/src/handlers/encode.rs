@@ -11,6 +11,7 @@
 //! With `txn_id`: validate + embed + reserve a `MemoryId`, push to
 //! the buffer, return a preview response. Writes happen at TXN_COMMIT.
 
+use crate::clock::now_unix_nanos;
 use std::time::{Duration, Instant};
 
 use brain_core::{MemoryId, MemoryKind, Salience, SessionId};
@@ -741,7 +742,7 @@ fn build_encode_artifacts(
                 ctx.executor.caller_namespace,
                 ctx.executor.caller_space,
             );
-            match crate::handlers::recall::fetch_enrichment_for(&[memory_id], scope, None, &rtxn) {
+            match crate::handlers::graph_enrichment::fetch_enrichment_for(&[memory_id], scope, None, &rtxn) {
                 Ok(mut enr) => {
                     let g = enr.pop().unwrap_or_else(|| {
                         brain_protocol::envelope::response::GraphEnrichment {
@@ -876,10 +877,6 @@ fn encode_request_hash(
         space_id: space,
     };
     crate::state::idempotency::hash_encode_request(&op)
-}
-
-fn now_unix_nanos() -> u64 {
-    crate::clock::now_unix_nanos()
 }
 
 /// Build the response for an idempotency-replay hit. The cached
@@ -1054,7 +1051,7 @@ async fn handle_encode_in_txn(
         .reserve_memory_id()
         .await
         .map_err(|e| OpError::ExecError(brain_planner::ExecError::WriterFailed(e)))?;
-    let created_at = crate::txn::now_unix_nanos_pub();
+    let created_at = now_unix_nanos();
 
     // 7. ENCODE carries no client edges — the auto/temporal-edge
     //    workers derive edges post-commit. The buffer therefore stores

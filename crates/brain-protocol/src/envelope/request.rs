@@ -1062,29 +1062,33 @@ mod tests {
     }
 
     /// `grant` is optional on the `act_as` map: absent → 0 on decode, 0 →
-    /// omitted on encode. A two-key selector from an old peer decodes, and a
-    /// no-grant selector from a new peer is byte-identical to the old form.
+    /// omitted on encode.
+    ///
+    /// The delegable bits are absent from the map when nobody is delegating,
+    /// the same way `act_as` itself is absent when nobody is acting as anyone.
+    /// What this pins is that the round trip is byte-identical, so the common
+    /// two-key selector costs nothing extra on the wire.
     #[test]
     fn act_as_grant_is_optional_and_omitted_when_zero() {
         #[derive(serde::Serialize)]
-        struct LegacyActAs<'a> {
+        struct UngrantedActAs<'a> {
             namespace: &'a str,
-            space_id: &'a str,
+            space: &'a str,
         }
-        let legacy = crate::codec::cbor::to_cbor_bytes(&LegacyActAs {
+        let ungranted = crate::codec::cbor::to_cbor_bytes(&UngrantedActAs {
             namespace: "acme",
-            space_id: "acme:u1",
+            space: "acme:u1",
         });
-        let decoded: ActAs = crate::codec::cbor::from_cbor_bytes(&legacy).unwrap();
+        let decoded: ActAs = crate::codec::cbor::from_cbor_bytes(&ungranted).unwrap();
         assert_eq!(decoded.grant, 0);
-        assert_eq!(crate::codec::cbor::to_cbor_bytes(&decoded), legacy);
+        assert_eq!(crate::codec::cbor::to_cbor_bytes(&decoded), ungranted);
 
         let granted = ActAs {
             grant: 1 << 5,
             ..decoded
         };
         let bytes = crate::codec::cbor::to_cbor_bytes(&granted);
-        assert_ne!(bytes, legacy, "a non-zero grant must reach the wire");
+        assert_ne!(bytes, ungranted, "a non-zero grant must reach the wire");
         let back: ActAs = crate::codec::cbor::from_cbor_bytes(&bytes).unwrap();
         assert_eq!(back.grant, 1 << 5);
     }

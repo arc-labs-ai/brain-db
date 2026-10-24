@@ -44,7 +44,7 @@ use redb::{ReadTransaction, ReadableTable, WriteTransaction};
 
 /// Edge kinds the extractor stage owns. It always recomputes the *full*
 /// current committed entity/statement/relation graph on every call (via
-/// [`crate::handlers::recall::fetch_enrichment_for`]), so its merge fully
+/// [`crate::handlers::graph_enrichment::fetch_enrichment_for`]), so its merge fully
 /// replaces edges of these kinds — but must leave edges of every other kind
 /// (the `auto_edge` / `temporal_edge` derived edges, which share the same
 /// bundle field) untouched.
@@ -214,7 +214,7 @@ pub fn merge_graph_from_committed(
             // nothing to enrich, and the bundle was purged with the row.
             return Ok(0);
         };
-        let enr = crate::handlers::recall::fetch_enrichment_for(&[memory_id], scope, None, &rtxn)
+        let enr = crate::handlers::graph_enrichment::fetch_enrichment_for(&[memory_id], scope, None, &rtxn)
             .map_err(|e| format!("graph enrichment: {e}"))?;
         enrichment_to_graph_counted(enr.into_iter().next())
     };

@@ -7,7 +7,7 @@
 //! statement row pointing back at them via `STATEMENTS_BY_EVIDENCE_TABLE`
 //! — the exact reverse lookup RECALL's `include_graph` enrichment
 //! already uses to bridge a memory id to its sourced statements
-//! (`brain-ops::handlers::recall::fetch_enrichment_for`). This module
+//! (`brain-ops::handlers::graph_enrichment::fetch_enrichment_for`). This module
 //! reuses that lookup pattern rather than inventing a new one.
 
 use brain_core::{MemoryId, Statement, StatementId, StatementObject, StatementValue, SubjectRef};

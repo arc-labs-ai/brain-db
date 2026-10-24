@@ -7,6 +7,7 @@
 //! `merge_entity` call lands in WAL + redb in one atomic transaction;
 //! the list path is a plain read.
 
+use crate::clock::now_unix_nanos;
 use brain_core::MergeId;
 use brain_metadata::entity::merge::{MergeActor, DEFAULT_MERGE_GRACE_NANOS};
 use brain_metadata::entity::review::{list_proposals_by_status, proposal_get};
@@ -117,7 +118,7 @@ pub async fn handle_admin_approve_merge(
         }
     }
 
-    let now = crate::txn::now_unix_nanos_pub();
+    let now = now_unix_nanos();
     let actor = MergeActor::Space(ctx.executor.caller_space.into());
     let phase = Phase::ApproveMerge {
         proposal_id,
@@ -173,7 +174,7 @@ pub async fn handle_admin_reject_merge(
         }
     }
 
-    let now = crate::txn::now_unix_nanos_pub();
+    let now = now_unix_nanos();
     let phase = Phase::RejectMerge {
         proposal_id,
         at_unix_nanos: now,

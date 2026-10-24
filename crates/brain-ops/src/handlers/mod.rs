@@ -8,7 +8,6 @@ pub mod cursor;
 pub mod encode;
 pub mod encode_vector_direct;
 pub mod entity;
-pub mod events;
 pub mod extractor_admin;
 pub mod forget;
 pub mod graph_fetch;
@@ -33,6 +32,14 @@ pub mod space;
 pub mod statement;
 pub mod subscribe;
 pub mod txn;
-// Private: `real_writer_handle` is only ever needed by sibling handlers,
-// so the module stays inside the `handlers` tree.
+// Private: each of these holds one piece of shared ground that only
+// sibling handlers ever need, so the module stays inside the `handlers`
+// tree rather than widening the crate's surface.
+mod events;
+mod hype_vectors;
 mod writer_handle;
+
+// `fetch_enrichment_for` is also the memory-artifact merge's projection,
+// and that runs at the crate root — so this one module is crate-visible
+// where its siblings above are not.
+pub(crate) mod graph_enrichment;

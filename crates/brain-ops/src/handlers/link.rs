@@ -1,6 +1,7 @@
 //! LINK / UNLINK handlers — submit Link / Unlink phases through the
 //! unified writer; in-TXN ops buffer for later commit.
 
+use crate::clock::now_unix_nanos;
 use brain_core::{EdgeKind, EdgeKindRef, MemoryId, NodeRef, RequestId};
 use brain_planner::{LinkOp, UnlinkOp, WriterError};
 use brain_protocol::envelope::request::{EdgeKindWire, LinkRequest, UnlinkRequest};
@@ -163,10 +164,6 @@ fn peek_link_state(
     let already_existed = edges_t.get(key.as_slice()).ok().flatten().is_some();
 
     Ok((src_exists, tgt_exists, already_existed))
-}
-
-fn now_unix_nanos() -> u64 {
-    crate::clock::now_unix_nanos()
 }
 
 pub async fn handle_unlink(
@@ -423,7 +420,7 @@ async fn handle_link_in_txn(
         (committed_has || pending_has) && !pending_unlinked
     };
 
-    let created_at = crate::txn::now_unix_nanos_pub();
+    let created_at = now_unix_nanos();
     let buffered = BufferedLink {
         source,
         target,
@@ -567,7 +564,7 @@ async fn handle_unlink_in_txn(
 
     let removed = (committed_has || pending_has) && !already_unlinked;
 
-    let created_at = crate::txn::now_unix_nanos_pub();
+    let created_at = now_unix_nanos();
     let buffered = BufferedUnlink {
         source,
         target,
