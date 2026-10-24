@@ -443,6 +443,7 @@ async fn supersede_explicit_returns_new_id_and_version() {
             old_relation_id: old_id,
             new_relation: create_request("brain:related_to", a, b),
             request_id: rid(),
+            act_as: None,
         }),
     )
     .await;
@@ -486,6 +487,7 @@ async fn tombstone_flips_current_state() {
             relation_id: rel_id,
             reason: "test".into(),
             request_id: rid(),
+            act_as: None,
         }),
     )
     .await;
@@ -708,6 +710,7 @@ async fn traverse_two_hop() {
             relation_id: ab,
             reason: "test tombstone".into(),
             request_id: rid(),
+            act_as: None,
         }),
     )
     .await;

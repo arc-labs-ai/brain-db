@@ -202,6 +202,12 @@ pub struct EncodeVectorDirectRequest {
     #[serde(with = "crate::codec::cbor::opt_byte_array16")]
     pub txn_id: Option<WireUuid>,
     pub deduplicate: bool,
+    /// Effective identity this direct-vector encode runs as, on behalf of the
+    /// authenticated connection principal. `None` (the common case, and
+    /// omitted on the wire) means the op runs as the connection's own
+    /// key-bound identity.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
 }
 
 /// Edge attached to an `ENCODE_REQ`.
@@ -1753,6 +1759,7 @@ mod serde_smoke {
             request_id: [3u8; 16],
             txn_id: None,
             deduplicate: false,
+            act_as: None,
         };
 
         // Same struct, different vector. Because `vector` is skipped from

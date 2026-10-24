@@ -199,6 +199,7 @@ async fn merge_and_unmerge_round_trip() {
             confidence: 0.92,
             reason: "duplicate found".into(),
             request_id: *uuid::Uuid::now_v7().as_bytes(),
+            act_as: None,
         }),
     )
     .await;
@@ -292,6 +293,7 @@ async fn merge_and_unmerge_round_trip() {
         RequestBody::EntityUnmerge(EntityUnmergeRequest {
             merged_entity: alyss,
             request_id: *uuid::Uuid::now_v7().as_bytes(),
+            act_as: None,
         }),
     )
     .await;
@@ -371,6 +373,7 @@ async fn merge_self_returns_error() {
             confidence: 0.9,
             reason: "self-merge".into(),
             request_id: *uuid::Uuid::now_v7().as_bytes(),
+            act_as: None,
         }),
     )
     .await;
@@ -402,6 +405,7 @@ async fn merge_low_confidence_returns_error() {
             confidence: 0.5, // below threshold
             reason: "low-confidence test".into(),
             request_id: *uuid::Uuid::now_v7().as_bytes(),
+            act_as: None,
         }),
     )
     .await;
@@ -427,6 +431,7 @@ async fn tombstone_then_get_shows_flag() {
             entity_id: alice,
             reason: "obsolete".into(),
             request_id: *uuid::Uuid::now_v7().as_bytes(),
+            act_as: None,
         }),
     )
     .await;

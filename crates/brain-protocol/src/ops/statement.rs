@@ -202,6 +202,17 @@ pub struct StatementSupersedeRequest {
     pub new_statement: StatementCreateRequest,
     #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
+    /// Effective identity this supersede runs as, on behalf of the
+    /// authenticated connection principal. `None` (the common case, and
+    /// omitted on the wire) means the op runs as the connection's own
+    /// key-bound identity.
+    ///
+    /// This is the one that counts: `new_statement` carries its own `act_as`
+    /// field because it is a standalone request type, but the server reads
+    /// the selector off the outer request, so setting it on the inner one
+    /// has no effect.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
 }
 
 /// `STATEMENT_TOMBSTONE` (`0x0143`).
@@ -217,6 +228,12 @@ pub struct StatementTombstoneRequest {
     pub reason_message: String,
     #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
+    /// Effective identity this tombstone runs as, on behalf of the
+    /// authenticated connection principal. `None` (the common case, and
+    /// omitted on the wire) means the op runs as the connection's own
+    /// key-bound identity.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
 }
 
 /// `STATEMENT_RETRACT` (`0x0144`).
@@ -232,6 +249,12 @@ pub struct StatementRetractRequest {
     pub reason_message: String,
     #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
+    /// Effective identity this retraction runs as, on behalf of the
+    /// authenticated connection principal. `None` (the common case, and
+    /// omitted on the wire) means the op runs as the connection's own
+    /// key-bound identity.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
 }
 
 /// `STATEMENT_HISTORY` (`0x0145`).
@@ -249,6 +272,14 @@ pub struct StatementHistoryRequest {
     pub include_tombstoned: bool,
     pub limit: u32,
     pub cursor: Vec<u8>,
+    /// Effective identity this history read runs as, on behalf of the
+    /// authenticated connection principal. `None` (the common case, and
+    /// omitted on the wire) means the op runs as the connection's own
+    /// key-bound identity.
+    /// Scoped to the effective `(namespace, space)`, so the returned revisions
+    /// are the target identity's, never the connection principal's.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
 }
 
 /// `STATEMENT_LIST` (`0x0146`).

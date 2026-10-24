@@ -70,6 +70,17 @@ pub struct RelationSupersedeRequest {
     pub new_relation: RelationCreateRequest,
     #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
+    /// Effective identity this supersede runs as, on behalf of the
+    /// authenticated connection principal. `None` (the common case, and
+    /// omitted on the wire) means the op runs as the connection's own
+    /// key-bound identity.
+    ///
+    /// This is the one that counts: `new_relation` carries its own `act_as`
+    /// field because it is a standalone request type, but the server reads
+    /// the selector off the outer request, so setting it on the inner one
+    /// has no effect.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
 }
 
 /// `RELATION_TOMBSTONE` (`0x0153`).
@@ -80,6 +91,12 @@ pub struct RelationTombstoneRequest {
     pub reason: String,
     #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
+    /// Effective identity this tombstone runs as, on behalf of the
+    /// authenticated connection principal. `None` (the common case, and
+    /// omitted on the wire) means the op runs as the connection's own
+    /// key-bound identity.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
 }
 
 /// `RELATION_LIST_FROM` (`0x0154`).

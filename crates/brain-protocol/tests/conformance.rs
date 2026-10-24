@@ -351,6 +351,7 @@ fn sample_encode_vector_direct() -> EncodeVectorDirectRequest {
         request_id: RID,
         txn_id: None,
         deduplicate: false,
+        act_as: None,
     }
 }
 
@@ -1319,6 +1320,7 @@ fn corpus() -> Vec<Case> {
         min_confidence: 0.5,
         categories: vec!["tone".into()],
         request_id: RID,
+        act_as: None,
     };
     cases.push(req_case(
         "req_materialize_procedural",
@@ -1369,6 +1371,7 @@ fn corpus() -> Vec<Case> {
     };
     let query_explain = QueryExplainRequest {
         query: query.clone(),
+        act_as: None,
     };
     cases.push(req_case(
         "req_query_explain",
@@ -1377,6 +1380,7 @@ fn corpus() -> Vec<Case> {
     ));
     let query_trace = QueryTraceRequest {
         query: query.clone(),
+        act_as: None,
     };
     cases.push(req_case(
         "req_query_trace",
@@ -1740,10 +1744,10 @@ fn corpus() -> Vec<Case> {
     ));
 
     // ---- Extractor introspection ----
-    let extractor_list_req = ExtractorListRequest {};
+    let extractor_list_req = ExtractorListRequest { act_as: None };
     cases.push(req_case(
         "req_extractor_list",
-        RequestBody::ExtractorList(extractor_list_req),
+        RequestBody::ExtractorList(extractor_list_req.clone()),
         &extractor_list_req,
     ));
     cases.push(resp_case(
@@ -2104,6 +2108,7 @@ fn corpus() -> Vec<Case> {
         ],
         attributes_blob: b"role=mathematician;team=analytical-engine".to_vec(),
         request_id: RID,
+        act_as: None,
     };
     cases.push(req_case(
         "req_entity_update",
@@ -2122,6 +2127,7 @@ fn corpus() -> Vec<Case> {
         new_canonical_name: "Augusta Ada King".into(),
         move_to_alias: true,
         request_id: RID,
+        act_as: None,
     };
     cases.push(req_case(
         "req_entity_rename",
@@ -2140,6 +2146,7 @@ fn corpus() -> Vec<Case> {
         confidence: 0.87,
         reason: "same github handle and work email domain".into(),
         request_id: RID,
+        act_as: None,
     };
     cases.push(req_case(
         "req_entity_merge",
@@ -2153,10 +2160,11 @@ fn corpus() -> Vec<Case> {
     let entity_unmerge = EntityUnmergeRequest {
         merged_entity: ENT_DUP,
         request_id: RID,
+        act_as: None,
     };
     cases.push(req_case(
         "req_entity_unmerge",
-        RequestBody::EntityUnmerge(entity_unmerge),
+        RequestBody::EntityUnmerge(entity_unmerge.clone()),
         &entity_unmerge,
     ));
 
@@ -2229,6 +2237,7 @@ fn corpus() -> Vec<Case> {
         entity_id: ENT_STALE,
         reason: "bad extraction: matched a product name, not a person".into(),
         request_id: RID,
+        act_as: None,
     };
     cases.push(req_case(
         "req_entity_tombstone",
@@ -2462,6 +2471,7 @@ fn corpus() -> Vec<Case> {
             act_as: Some(graph_act_as.clone()),
         },
         request_id: RID,
+        act_as: None,
     };
     cases.push(req_case(
         "req_relation_supersede",
@@ -2477,6 +2487,7 @@ fn corpus() -> Vec<Case> {
         relation_id: REL_ID,
         reason: "superseded by a corrected extraction run".into(),
         request_id: RID,
+        act_as: None,
     };
     cases.push(req_case(
         "req_relation_tombstone",
@@ -2771,6 +2782,7 @@ fn corpus() -> Vec<Case> {
             act_as: Some(graph_act_as.clone()),
         },
         request_id: RID,
+        act_as: None,
     };
     cases.push(req_case(
         "req_statement_supersede",
@@ -2787,6 +2799,7 @@ fn corpus() -> Vec<Case> {
         reason: 3,
         reason_message: "predicate org:works_on removed in schema v4".into(),
         request_id: RID,
+        act_as: None,
     };
     cases.push(req_case(
         "req_statement_tombstone",
@@ -2805,6 +2818,7 @@ fn corpus() -> Vec<Case> {
         reason: 2,
         reason_message: "user asked to delete the dietary-preference statement".into(),
         request_id: RID,
+        act_as: None,
     };
     cases.push(req_case(
         "req_statement_retract",
@@ -2821,6 +2835,7 @@ fn corpus() -> Vec<Case> {
         include_tombstoned: true,
         limit: 100,
         cursor: Vec::new(),
+        act_as: None,
     };
     cases.push(req_case(
         "req_statement_history",

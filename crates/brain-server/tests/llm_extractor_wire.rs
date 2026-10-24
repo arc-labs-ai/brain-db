@@ -216,7 +216,7 @@ async fn schema_upload_registers_llm_extractor_in_list() {
     let (opcode, body) = round_trip(
         &mut client,
         3,
-        RequestBody::ExtractorList(ExtractorListRequest {}),
+        RequestBody::ExtractorList(ExtractorListRequest { act_as: None }),
     )
     .await;
     assert_eq!(opcode, Opcode::ExtractorListResp.as_u16());

@@ -63,6 +63,14 @@ pub struct EntityUpdateRequest {
     pub attributes_blob: Vec<u8>,
     #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
+    /// Effective identity this update runs as, on behalf of the
+    /// authenticated connection principal. `None` (the common case, and
+    /// omitted on the wire) means the op runs as the connection's own
+    /// key-bound identity.
+    /// The update is scoped to the effective `(namespace, space)`: a foreign
+    /// tenant's entity id reads as `NotFound`, never across the boundary.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
 }
 
 /// `ENTITY_RENAME` (0x0133).
@@ -80,6 +88,12 @@ pub struct EntityRenameRequest {
     pub move_to_alias: bool,
     #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
+    /// Effective identity this rename runs as, on behalf of the
+    /// authenticated connection principal. `None` (the common case, and
+    /// omitted on the wire) means the op runs as the connection's own
+    /// key-bound identity.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
 }
 
 /// `ENTITY_MERGE` (0x0134).
@@ -93,15 +107,28 @@ pub struct EntityMergeRequest {
     pub reason: String,
     #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
+    /// Effective identity this merge runs as, on behalf of the
+    /// authenticated connection principal. `None` (the common case, and
+    /// omitted on the wire) means the op runs as the connection's own
+    /// key-bound identity.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
 }
 
 /// `ENTITY_UNMERGE` (0x0135).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// No longer `Copy`: the `act_as` selector owns two `String`s.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EntityUnmergeRequest {
     #[serde(with = "serde_bytes")]
     pub merged_entity: WireUuid,
     #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
+    /// Effective identity this unmerge runs as, on behalf of the
+    /// authenticated connection principal. `None` (the common case, and
+    /// omitted on the wire) means the op runs as the connection's own
+    /// key-bound identity.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
 }
 
 /// `ENTITY_RESOLVE` (0x0136).
@@ -157,6 +184,14 @@ pub struct EntityTombstoneRequest {
     pub reason: String,
     #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
+    /// Effective identity this tombstone runs as, on behalf of the
+    /// authenticated connection principal. `None` (the common case, and
+    /// omitted on the wire) means the op runs as the connection's own
+    /// key-bound identity.
+    /// Scoped to the effective `(namespace, space)` — a foreign tenant's
+    /// entity id reads as `NotFound` rather than being tombstoned.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
 }
 
 #[cfg(test)]

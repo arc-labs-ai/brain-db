@@ -256,7 +256,7 @@ async fn extractor_list_returns_seeded_builtins() {
     let (opcode, body) = round_trip(
         &mut client,
         1,
-        RequestBody::ExtractorList(ExtractorListRequest {}),
+        RequestBody::ExtractorList(ExtractorListRequest { act_as: None }),
     )
     .await;
     assert_eq!(opcode, Opcode::ExtractorListResp.as_u16());

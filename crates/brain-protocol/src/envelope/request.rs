@@ -527,6 +527,30 @@ pub fn act_as_of(body: &RequestBody) -> Option<&ActAs> {
         RequestBody::SchemaValidate(r) => r.act_as.as_ref(),
         RequestBody::SchemaReplace(r) => r.act_as.as_ref(),
         RequestBody::SchemaDrop(r) => r.act_as.as_ref(),
+        // The typed-graph mutation verbs, the query-introspection pair and
+        // the remaining single-space ops. These were the last requests with no
+        // `act_as` field, which meant a shared-pool gateway could not offer
+        // them to a tenant at all: with nowhere to put the identity they would
+        // have run as the gateway's own principal, in the gateway's own space.
+        // Each is scoped to the effective `(namespace, space)` like every
+        // other delegated op, and the mutating ones still need their bit on
+        // the effective caller.
+        RequestBody::EntityUpdate(r) => r.act_as.as_ref(),
+        RequestBody::EntityRename(r) => r.act_as.as_ref(),
+        RequestBody::EntityMerge(r) => r.act_as.as_ref(),
+        RequestBody::EntityUnmerge(r) => r.act_as.as_ref(),
+        RequestBody::EntityTombstone(r) => r.act_as.as_ref(),
+        RequestBody::StatementSupersede(r) => r.act_as.as_ref(),
+        RequestBody::StatementTombstone(r) => r.act_as.as_ref(),
+        RequestBody::StatementRetract(r) => r.act_as.as_ref(),
+        RequestBody::StatementHistory(r) => r.act_as.as_ref(),
+        RequestBody::RelationSupersede(r) => r.act_as.as_ref(),
+        RequestBody::RelationTombstone(r) => r.act_as.as_ref(),
+        RequestBody::ExtractorList(r) => r.act_as.as_ref(),
+        RequestBody::QueryExplain(r) => r.act_as.as_ref(),
+        RequestBody::QueryTrace(r) => r.act_as.as_ref(),
+        RequestBody::MaterializeProcedural(r) => r.act_as.as_ref(),
+        RequestBody::EncodeVectorDirect(r) => r.act_as.as_ref(),
         // Exhaustive on purpose: no `_ => None`.
         //
         // Silently dropping an `act_as` is a tenancy violation that returns
@@ -537,10 +561,20 @@ pub fn act_as_of(body: &RequestBody) -> Option<&ActAs> {
         // the two an op is.
         //
         // These carry no `act_as` field on the wire and always run as the
-        // connection's key-bound identity.
+        // connection's key-bound identity. Three kinds, and the reason differs
+        // for each:
+        //
+        //   - Handshake and stream control (HELLO, AUTH, PING, CLIENT_PONG,
+        //     BYE, UNSUBSCRIBE, CANCEL_STREAM). These are properties of the
+        //     connection itself; there is no data to scope.
+        //   - TXN_COMMIT / TXN_ABORT. Delegation is established once at
+        //     TXN_BEGIN and fixed for the life of the txn, so a selector on
+        //     the commit would be a second, conflicting answer.
+        //   - The ADMIN_* family. Operator ops against the deployment, not
+        //     tenant data — they are gated on ADMIN on the connection
+        //     principal and deliberately have no delegated form.
         RequestBody::Hello(_) => None,
         RequestBody::Auth(_) => None,
-        RequestBody::EncodeVectorDirect(_) => None,
         RequestBody::Unsubscribe(_) => None,
         RequestBody::TxnCommit(_) => None,
         RequestBody::TxnAbort(_) => None,
@@ -561,21 +595,6 @@ pub fn act_as_of(body: &RequestBody) -> Option<&ActAs> {
         RequestBody::AdminListPendingContradictions(_) => None,
         RequestBody::AdminBackfill(_) => None,
         RequestBody::AdminBackfillCancel(_) => None,
-        RequestBody::EntityUpdate(_) => None,
-        RequestBody::EntityRename(_) => None,
-        RequestBody::EntityMerge(_) => None,
-        RequestBody::EntityUnmerge(_) => None,
-        RequestBody::EntityTombstone(_) => None,
-        RequestBody::StatementSupersede(_) => None,
-        RequestBody::StatementTombstone(_) => None,
-        RequestBody::StatementRetract(_) => None,
-        RequestBody::StatementHistory(_) => None,
-        RequestBody::RelationSupersede(_) => None,
-        RequestBody::RelationTombstone(_) => None,
-        RequestBody::ExtractorList(_) => None,
-        RequestBody::QueryExplain(_) => None,
-        RequestBody::QueryTrace(_) => None,
-        RequestBody::MaterializeProcedural(_) => None,
     }
 }
 
@@ -661,6 +680,7 @@ mod tests {
             request_id: sample_uuid(2),
             txn_id: Some(sample_uuid(3)),
             deduplicate: true,
+            act_as: None,
         }));
     }
 
@@ -1344,6 +1364,194 @@ mod tests {
             act_as: Some(selector.clone()),
         });
         assert_eq!(act_as_of(&txn_begin), Some(&selector));
+    }
+
+    /// The sixteen ops that gained an `act_as` selector: the typed-graph
+    /// mutation verbs, the query-introspection pair, direct vector encode,
+    /// procedural materialization and the extractor list.
+    ///
+    /// Each is round-tripped through encode → decode *before* the assertion,
+    /// so this fails two different ways: if the field never reaches the wire,
+    /// and if `act_as_of` has no arm for the variant. Either one means a
+    /// shared-pool gateway silently runs the op as its own principal, in its
+    /// own space, while the caller believes it ran as the tenant.
+    #[test]
+    fn newly_delegable_ops_carry_their_selector_across_the_wire() {
+        let selector = ActAs {
+            namespace: "acme".into(),
+            space: "acme:space".into(),
+            grant: 0,
+        };
+        let sel = || Some(selector.clone());
+
+        let relation_create = RelationCreateRequest {
+            relation_type: "r".into(),
+            from_entity: sample_uuid(1),
+            to_entity: sample_uuid(2),
+            properties_blob: Vec::new(),
+            evidence: EvidenceRefWire::Inline(Vec::new()),
+            extractor_id: 0,
+            confidence: 1.0,
+            valid_from_unix_nanos: 0,
+            valid_to_unix_nanos: 0,
+            session_id: 0,
+            request_id: sample_uuid(1),
+            act_as: None,
+        };
+        let statement_create = StatementCreateRequest {
+            kind: StatementKindWire::Fact,
+            subject: sample_uuid(1),
+            predicate: "p".into(),
+            object: StatementObjectWire::Value(StatementValueWire::Text("v".into())),
+            confidence: 1.0,
+            evidence: EvidenceRefWire::Inline(Vec::new()),
+            extractor_id: 0,
+            valid_from_unix_nanos: 0,
+            valid_to_unix_nanos: 0,
+            event_at_unix_nanos: 0,
+            schema_version: 0,
+            session_id: 0,
+            request_id: sample_uuid(1),
+            act_as: None,
+        };
+        let query = QueryRequest {
+            text: "q".into(),
+            entity_anchor: None,
+            kind_filter: Vec::new(),
+            predicate_filter: Vec::new(),
+            session_filter: None,
+            time_filter: None,
+            as_of_record_time_unix_nanos: None,
+            confidence_min: None,
+            include_tombstoned: false,
+            include_superseded: false,
+            limit: 10,
+            retrievers: RetrieverSelectionWire::Auto,
+            fusion_config: None,
+            request_id: sample_uuid(1),
+        };
+
+        let bodies = vec![
+            RequestBody::EntityUpdate(EntityUpdateRequest {
+                entity_id: sample_uuid(1),
+                canonical_name: "n".into(),
+                aliases: Vec::new(),
+                attributes_blob: Vec::new(),
+                request_id: sample_uuid(2),
+                act_as: sel(),
+            }),
+            RequestBody::EntityRename(EntityRenameRequest {
+                entity_id: sample_uuid(1),
+                new_canonical_name: "n2".into(),
+                move_to_alias: true,
+                request_id: sample_uuid(2),
+                act_as: sel(),
+            }),
+            RequestBody::EntityMerge(EntityMergeRequest {
+                survivor: sample_uuid(1),
+                merged: sample_uuid(2),
+                confidence: 1.0,
+                reason: "dup".into(),
+                request_id: sample_uuid(3),
+                act_as: sel(),
+            }),
+            RequestBody::EntityUnmerge(EntityUnmergeRequest {
+                merged_entity: sample_uuid(1),
+                request_id: sample_uuid(2),
+                act_as: sel(),
+            }),
+            RequestBody::EntityTombstone(EntityTombstoneRequest {
+                entity_id: sample_uuid(1),
+                reason: "gone".into(),
+                request_id: sample_uuid(2),
+                act_as: sel(),
+            }),
+            RequestBody::StatementSupersede(StatementSupersedeRequest {
+                old_statement_id: sample_uuid(1),
+                new_statement: statement_create.clone(),
+                request_id: sample_uuid(2),
+                act_as: sel(),
+            }),
+            RequestBody::StatementTombstone(StatementTombstoneRequest {
+                statement_id: sample_uuid(1),
+                reason: 0,
+                reason_message: "m".into(),
+                request_id: sample_uuid(2),
+                act_as: sel(),
+            }),
+            RequestBody::StatementRetract(StatementRetractRequest {
+                statement_id: sample_uuid(1),
+                reason: 0,
+                reason_message: "m".into(),
+                request_id: sample_uuid(2),
+                act_as: sel(),
+            }),
+            RequestBody::StatementHistory(StatementHistoryRequest {
+                anchor_id: sample_uuid(1),
+                include_tombstoned: true,
+                limit: 10,
+                cursor: Vec::new(),
+                act_as: sel(),
+            }),
+            RequestBody::RelationSupersede(RelationSupersedeRequest {
+                old_relation_id: sample_uuid(1),
+                new_relation: relation_create.clone(),
+                request_id: sample_uuid(2),
+                act_as: sel(),
+            }),
+            RequestBody::RelationTombstone(RelationTombstoneRequest {
+                relation_id: sample_uuid(1),
+                reason: "gone".into(),
+                request_id: sample_uuid(2),
+                act_as: sel(),
+            }),
+            RequestBody::ExtractorList(ExtractorListRequest { act_as: sel() }),
+            RequestBody::QueryExplain(QueryExplainRequest {
+                query: query.clone(),
+                act_as: sel(),
+            }),
+            RequestBody::QueryTrace(QueryTraceRequest {
+                query: query.clone(),
+                act_as: sel(),
+            }),
+            RequestBody::MaterializeProcedural(MaterializeProceduralRequest {
+                space_id: sample_uuid(1),
+                session_filter: None,
+                top_k: 5,
+                min_confidence: 0.5,
+                categories: Vec::new(),
+                request_id: sample_uuid(2),
+                act_as: sel(),
+            }),
+            RequestBody::EncodeVectorDirect(EncodeVectorDirectRequest {
+                text: "t".into(),
+                vector: vec![0.0; 4],
+                model_fingerprint: [0u8; 16],
+                session_id: 0,
+                kind: MemoryKindWire::Episodic,
+                salience_hint: 0.5,
+                edges: Vec::new(),
+                request_id: sample_uuid(1),
+                txn_id: None,
+                deduplicate: false,
+                act_as: sel(),
+            }),
+        ];
+        assert_eq!(bodies.len(), 16, "one case per newly-delegable op");
+
+        for body in bodies {
+            let opcode = body.opcode();
+            let bytes = body.encode();
+            let decoded = RequestBody::decode(opcode, &bytes)
+                .unwrap_or_else(|e| panic!("decode failed for {opcode:?}: {e}"));
+            assert_eq!(decoded, body, "{opcode:?} did not round-trip");
+            assert_eq!(
+                act_as_of(&decoded),
+                Some(&selector),
+                "{opcode:?} lost its act_as selector between the wire and \
+                 `act_as_of` — the op would run as the connection principal"
+            );
+        }
     }
 
     #[test]

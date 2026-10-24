@@ -467,6 +467,7 @@ async fn supersede_returns_new_id_and_version() {
             old_statement_id: f1,
             new_statement: fact_request(priya, mgr_b),
             request_id: rid(),
+            act_as: None,
         }),
     )
     .await;
@@ -512,6 +513,7 @@ async fn tombstone_returns_timestamp() {
             reason: 2, // UserRequest
             reason_message: "test tombstone".into(),
             request_id: rid(),
+            act_as: None,
         }),
     )
     .await;
@@ -572,6 +574,7 @@ async fn retract_returns_will_zero_hint() {
             reason: 4, // ExtractorRetraction
             reason_message: "wrong extraction".into(),
             request_id: rid(),
+            act_as: None,
         }),
     )
     .await;
@@ -636,6 +639,7 @@ async fn history_returns_chain_in_version_order() {
             include_tombstoned: false,
             limit: 100,
             cursor: Vec::new(),
+            act_as: None,
         }),
     )
     .await;
@@ -667,6 +671,7 @@ async fn history_returns_chain_in_version_order() {
             include_tombstoned: false,
             limit: 2,
             cursor: Vec::new(),
+            act_as: None,
         }),
     )
     .await;
@@ -693,6 +698,7 @@ async fn history_returns_chain_in_version_order() {
             include_tombstoned: false,
             limit: 2,
             cursor: page1_cursor.clone(),
+            act_as: None,
         }),
     )
     .await;
@@ -715,6 +721,7 @@ async fn history_returns_chain_in_version_order() {
             include_tombstoned: true,
             limit: 2,
             cursor: page1_cursor,
+            act_as: None,
         }),
     )
     .await;

@@ -9,6 +9,7 @@
 //! The response side lives in the envelope response module.
 
 use crate::envelope::request::{WireSessionId, WireUuid};
+use crate::ActAs;
 
 /// `MATERIALIZE_PROCEDURAL` (`0x0164`).
 ///
@@ -36,6 +37,12 @@ pub struct MaterializeProceduralRequest {
     pub categories: Vec<String>,
     #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
+    /// Effective identity this materialization runs as, on behalf of the
+    /// authenticated connection principal. `None` (the common case, and
+    /// omitted on the wire) means the op runs as the connection's own
+    /// key-bound identity.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
 }
 
 #[cfg(test)]
@@ -61,6 +68,7 @@ mod tests_req {
             min_confidence: 0.0,
             categories: Vec::new(),
             request_id: sample_uuid(6),
+            act_as: None,
         };
         let body = RequestBody::MaterializeProcedural(req.clone());
         assert_eq!(body.opcode(), Opcode::MaterializeProceduralReq);

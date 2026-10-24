@@ -194,6 +194,7 @@ async fn query_explain_returns_plan_text_without_execution() {
         1,
         RequestBody::QueryExplain(QueryExplainRequest {
             query: text_only_query("budget pushback"),
+            act_as: None,
         }),
     )
     .await;
@@ -232,6 +233,7 @@ async fn query_trace_returns_execution_block() {
         1,
         RequestBody::QueryTrace(QueryTraceRequest {
             query: text_only_query("budget pushback"),
+            act_as: None,
         }),
     )
     .await;
@@ -268,7 +270,7 @@ async fn query_no_signal_returns_error() {
     let (opcode, body) = round_trip(
         &mut client,
         1,
-        RequestBody::QueryExplain(QueryExplainRequest { query: req }),
+        RequestBody::QueryExplain(QueryExplainRequest { query: req , act_as: None }),
     )
     .await;
     assert_eq!(opcode, Opcode::Error.as_u16());
@@ -306,7 +308,7 @@ async fn query_explicit_retriever_list_overflow_is_rejected() {
     let (opcode, body) = round_trip(
         &mut client,
         1,
-        RequestBody::QueryExplain(QueryExplainRequest { query: req }),
+        RequestBody::QueryExplain(QueryExplainRequest { query: req , act_as: None }),
     )
     .await;
     assert_eq!(opcode, Opcode::Error.as_u16());

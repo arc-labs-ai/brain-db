@@ -1181,3 +1181,154 @@ async fn act_as_grant_beyond_delegator_is_denied() {
 
     server.stop().await;
 }
+
+/// The typed-graph mutation verbs under delegation.
+///
+/// These are the ops that had no `act_as` field at all until the protocol grew
+/// one for them, which is why a shared-pool gateway could not offer them to a
+/// tenant: with nowhere to carry the identity they would have run as the
+/// service principal, in the service principal's own space. This asserts the
+/// two halves of that fix — a delegated mutation reaches the target tenant's
+/// entity, and the same mutation aimed at another tenant's entity does not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn act_as_scopes_the_typed_graph_mutation_verbs() {
+    use brain_metadata::api_keys::bits;
+    use brain_protocol::{
+        EntityCreateRequest, EntityGetRequest, EntityRenameRequest, EntityTombstoneRequest,
+        EntityUpdateRequest,
+    };
+
+    /// `Person`, seeded by `MetadataDb::open`.
+    const PERSON_TYPE_ID: u32 = 1;
+
+    let server = start(1).await; // one shard → both identities collocated
+    let svc_space = *uuid::Uuid::now_v7().as_bytes();
+    let svc_token = server.mint_with_may_act(
+        "svc",
+        svc_space,
+        bits::ACT_AS | bits::STANDARD_SPACE,
+        vec!["*".to_string()],
+    );
+    let mut svc = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect svc");
+    handshake_as(&mut svc, &svc_token).await;
+
+    let as_a = || Some(act_as("tenant_a", "space-a"));
+    let as_b = || Some(act_as("tenant_b", "space-b"));
+
+    // Tenant A creates an entity. ENTITY_CREATE already carried `act_as`; it
+    // is here to give the mutation verbs something of A's to aim at.
+    let (op, body) = round_trip(
+        &mut svc,
+        1,
+        RequestBody::EntityCreate(EntityCreateRequest {
+            entity_type_id: PERSON_TYPE_ID,
+            canonical_name: "Alice".into(),
+            aliases: vec![],
+            attributes_blob: Vec::new(),
+            session_id: 0,
+            request_id: *uuid::Uuid::now_v7().as_bytes(),
+            act_as: as_a(),
+        }),
+    )
+    .await;
+    let entity_id = match body {
+        ResponseBody::EntityCreate(r) if op == Opcode::EntityCreateResp.as_u16() => r.entity_id,
+        other => panic!("create as tenant_a failed: 0x{op:04x} {other:?}"),
+    };
+
+    // A delegated ENTITY_UPDATE reaches A's own entity.
+    let (op, body) = round_trip(
+        &mut svc,
+        3,
+        RequestBody::EntityUpdate(EntityUpdateRequest {
+            entity_id,
+            canonical_name: "Alice Cooper".into(),
+            aliases: vec!["Al".into()],
+            attributes_blob: Vec::new(),
+            request_id: *uuid::Uuid::now_v7().as_bytes(),
+            act_as: as_a(),
+        }),
+    )
+    .await;
+    assert_eq!(
+        op,
+        Opcode::EntityUpdateResp.as_u16(),
+        "delegated update as the owning tenant must succeed, got {body:?}"
+    );
+
+    // The same id, aimed at it as tenant B. A's entity must be unreachable:
+    // anything other than a refusal here is the breach this whole mechanism
+    // exists to prevent — B editing A's graph through the shared connection.
+    for (stream_id, label, req) in [
+        (
+            5u32,
+            "update",
+            RequestBody::EntityUpdate(EntityUpdateRequest {
+                entity_id,
+                canonical_name: "Owned By B".into(),
+                aliases: vec![],
+                attributes_blob: Vec::new(),
+                request_id: *uuid::Uuid::now_v7().as_bytes(),
+                act_as: as_b(),
+            }),
+        ),
+        (
+            7,
+            "rename",
+            RequestBody::EntityRename(EntityRenameRequest {
+                entity_id,
+                new_canonical_name: "Renamed By B".into(),
+                move_to_alias: false,
+                request_id: *uuid::Uuid::now_v7().as_bytes(),
+                act_as: as_b(),
+            }),
+        ),
+        (
+            9,
+            "tombstone",
+            RequestBody::EntityTombstone(EntityTombstoneRequest {
+                entity_id,
+                reason: "not yours".into(),
+                request_id: *uuid::Uuid::now_v7().as_bytes(),
+                act_as: as_b(),
+            }),
+        ),
+    ] {
+        let (op, body) = round_trip(&mut svc, stream_id, req).await;
+        assert_eq!(
+            op,
+            Opcode::Error.as_u16(),
+            "ISOLATION BREACH: delegated {label} as tenant_b reached tenant_a's \
+             entity instead of being refused; got {body:?}"
+        );
+    }
+
+    // And A's entity is intact: still there, still carrying A's own update and
+    // none of B's attempts.
+    let (op, body) = round_trip(
+        &mut svc,
+        11,
+        RequestBody::EntityGet(EntityGetRequest {
+            entity_id,
+            act_as: as_a(),
+        }),
+    )
+    .await;
+    match body {
+        ResponseBody::EntityGet(r) if op == Opcode::EntityGetResp.as_u16() => {
+            assert_eq!(
+                r.entity.entity_id, entity_id,
+                "tenant_a's entity must still be the one that comes back"
+            );
+            assert_eq!(
+                r.entity.canonical_name, "Alice Cooper",
+                "tenant_a's own update must be the surviving state"
+            );
+        }
+        other => panic!("get as tenant_a failed: 0x{op:04x} {other:?}"),
+    }
+
+    server.stop().await;
+}
