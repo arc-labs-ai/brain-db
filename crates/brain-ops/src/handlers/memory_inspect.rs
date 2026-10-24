@@ -60,22 +60,32 @@ pub async fn handle_memory_inspect(
         .read_txn()
         .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
 
-    // Tenancy: the memory must exist and be owned by the caller. A memory id
-    // that belongs to another `(namespace, space)` is indistinguishable from a
-    // missing one to this caller.
+    // Tenancy and liveness. A memory id that belongs to another
+    // `(namespace, space)` is indistinguishable from a missing one to this
+    // caller, and so is a tombstoned one.
+    //
+    // The tombstone check is not incidental. FORGET leaves the metadata row
+    // behind — a hard forget zeroes the text and the vector but keeps the row
+    // for the tombstone itself — so checking only ownership answered a
+    // forgotten memory with a *success* carrying an empty `artifact`. That is
+    // the same answer this verb gives a memory whose bundle has not been
+    // written yet, which is a genuinely different condition, and keeping those
+    // two apart is the whole reason the empty-artifact success exists. Every
+    // sibling read already treats a tombstone as gone: MEMORY_LIST excludes
+    // them unless asked, and RECALL never returns one.
     {
         let memories = rtxn
             .open_table(MEMORIES_TABLE)
             .map_err(|e| OpError::Internal(format!("open memories: {e}")))?;
-        let owned = memories
+        let readable = memories
             .get(&memory_key)
             .map_err(|e| OpError::Internal(format!("memory read: {e}")))?
             .map(|g| {
                 let m = g.value();
-                m.namespace_id == caller_ns && m.space_id_bytes == caller_space
+                m.namespace_id == caller_ns && m.space_id_bytes == caller_space && m.is_active()
             })
             .unwrap_or(false);
-        if !owned {
+        if !readable {
             return Err(not_found());
         }
     }
