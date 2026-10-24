@@ -24,7 +24,7 @@ use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_protocol::envelope::request::{EncodeRequest, ForgetRequest, RequestBody};
 use brain_protocol::envelope::response::{EncodeResponse, ResponseBody};
 use brain_protocol::{
-    ForgetMode, MemoryListDirWire, MemoryListItem, MemoryListRequest, MemoryListResponseFrame,
+    ForgetMode, MemoryListDirWire, MemoryListRequest, MemoryListResponseFrame,
     MemoryListSortWire, MemoryListTimeAxisWire,
 };
 
@@ -191,11 +191,6 @@ async fn list(
     }
 }
 
-/// `memory_id` bytes → the u128 wire id used by ENCODE responses.
-fn item_id(item: &MemoryListItem) -> u128 {
-    u128::from_be_bytes(item.memory_id)
-}
-
 // ---------------------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------------------
@@ -235,7 +230,7 @@ fn paginates_full_corpus_without_dup_or_skip() {
             assert!(frame.is_final, "each MEMORY_LIST frame is final in v1");
             assert!(frame.items.len() <= 7, "page must not exceed limit");
             for it in &frame.items {
-                seen.push(item_id(it));
+                seen.push(it.memory_id);
             }
             pages += 1;
             if frame.next_cursor.is_empty() {
@@ -372,7 +367,7 @@ fn tombstoned_memory_excluded() {
         forget(&fix, caller(), [9; 16], drop).await;
 
         let frame = list(&fix, caller(), list_req()).await;
-        let ids: Vec<u128> = frame.items.iter().map(item_id).collect();
+        let ids: Vec<u128> = frame.items.iter().map(|it| it.memory_id).collect();
         assert!(ids.contains(&keep), "surviving memory must be listed");
         assert!(
             !ids.contains(&drop),
@@ -385,7 +380,7 @@ fn tombstoned_memory_excluded() {
         let mut req = list_req();
         req.include_tombstoned = true;
         let frame = list(&fix, caller(), req).await;
-        let ids: Vec<u128> = frame.items.iter().map(item_id).collect();
+        let ids: Vec<u128> = frame.items.iter().map(|it| it.memory_id).collect();
         assert!(ids.contains(&keep));
         assert!(!ids.contains(&drop));
     })
@@ -427,8 +422,8 @@ fn created_time_range_filter() {
             );
         }
         // Every row in the window must be present.
-        let want: Vec<u128> = all.items[1..=4].iter().map(item_id).collect();
-        let got: std::collections::BTreeSet<u128> = frame.items.iter().map(item_id).collect();
+        let want: Vec<u128> = all.items[1..=4].iter().map(|it| it.memory_id).collect();
+        let got: std::collections::BTreeSet<u128> = frame.items.iter().map(|it| it.memory_id).collect();
         for id in want {
             assert!(got.contains(&id), "windowed row {id} missing");
         }
@@ -498,7 +493,7 @@ fn scope_isolation_between_spaces() {
         assert_ne!(a_mem, b_mem);
 
         let a_view = list(&fix, caller_for("acme", SPACE_A), list_req()).await;
-        let a_ids: Vec<u128> = a_view.items.iter().map(item_id).collect();
+        let a_ids: Vec<u128> = a_view.items.iter().map(|it| it.memory_id).collect();
         assert!(a_ids.contains(&a_mem), "A must see its own memory");
         assert!(
             !a_ids.contains(&b_mem),
@@ -506,7 +501,7 @@ fn scope_isolation_between_spaces() {
         );
 
         let b_view = list(&fix, caller_for("acme", SPACE_B), list_req()).await;
-        let b_ids: Vec<u128> = b_view.items.iter().map(item_id).collect();
+        let b_ids: Vec<u128> = b_view.items.iter().map(|it| it.memory_id).collect();
         assert!(b_ids.contains(&b_mem), "B must see its own memory");
         assert!(
             !b_ids.contains(&a_mem),

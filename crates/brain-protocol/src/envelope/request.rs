@@ -469,7 +469,7 @@ impl RequestBody {
 ///     request_id: [0; 16],
 ///     txn_id: None,
 ///     occurred_at_unix_nanos: None,
-///     act_as: Some(ActAs { namespace: "acme".into(), space_id: "acme:u1".into(), grant: 0 }),
+///     act_as: Some(ActAs { namespace: "acme".into(), space: "acme:u1".into(), grant: 0 }),
 ///     wait: WaitMode::Ack,
 ///     allow_duplicates: false,
 /// });
@@ -633,7 +633,7 @@ mod tests {
             occurred_at_unix_nanos: None,
             act_as: Some(ActAs {
                 namespace: "acme".into(),
-                space_id: "acme:space".into(),
+                space: "acme:space".into(),
                 grant: 0,
             }),
             wait: WaitMode::Ack,
@@ -758,7 +758,7 @@ mod tests {
             txn_id: None,
             act_as: Some(ActAs {
                 namespace: "acme".into(),
-                space_id: "acme:space".into(),
+                space: "acme:space".into(),
                 grant: 0,
             }),
         }));
@@ -799,7 +799,7 @@ mod tests {
             max_inflight: 16,
             act_as: Some(ActAs {
                 namespace: "acme".into(),
-                space_id: "acme:space".into(),
+                space: "acme:space".into(),
                 grant: 0,
             }),
         }));
@@ -826,7 +826,7 @@ mod tests {
             timeout_seconds: 60,
             act_as: Some(crate::ops::memory::ActAs {
                 namespace: "acme".to_string(),
-                space_id: "support-bot:user123".to_string(),
+                space: "support-bot:user123".to_string(),
                 grant: 0,
             }),
         }));
@@ -1001,7 +1001,7 @@ mod tests {
     fn capabilities_and_schema_ops_carry_act_as() {
         let sel = ActAs {
             namespace: "acme".into(),
-            space_id: "acme:u1".into(),
+            space: "acme:u1".into(),
             grant: 1 << 4,
         };
         let bodies = [
@@ -1093,7 +1093,7 @@ mod tests {
     fn act_as_of_returns_selector_for_supported_ops() {
         let selector = ActAs {
             namespace: "acme".into(),
-            space_id: "acme:space".into(),
+            space: "acme:space".into(),
             grant: 0,
         };
 

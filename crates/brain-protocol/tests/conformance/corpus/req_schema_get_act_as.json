@@ -3,6 +3,6 @@
   "version": 3,
   "act_as": {
     "namespace": "org",
-    "space_id": "support-bot:user123"
+    "space": "support-bot:user123"
   }
 }

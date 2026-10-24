@@ -705,7 +705,9 @@ pub fn sync_record(
     text_len: u32,
 ) -> EncodeStageRecord {
     EncodeStageRecord {
-        memory_id,
+        // The parameter is the redb key (big-endian bytes); the wire carries
+        // the id itself.
+        memory_id: u128::from_be_bytes(memory_id),
         kind: kind_byte,
         salience,
         created_at_unix_nanos,

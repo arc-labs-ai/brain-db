@@ -255,7 +255,7 @@ async fn recall_ids_as(
 fn act_as(namespace: &str, space: &str) -> ActAs {
     ActAs {
         namespace: namespace.to_string(),
-        space_id: space.to_string(),
+        space: space.to_string(),
         grant: 0,
     }
 }

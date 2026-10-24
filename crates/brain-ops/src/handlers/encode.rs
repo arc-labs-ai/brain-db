@@ -334,7 +334,7 @@ pub async fn handle_encode(
             detail: format!("lsn={}", ack.lsn_first.raw()),
             artifact: Some(EncodeStageArtifact {
                 record: Some(EncodeStageRecord {
-                    memory_id: memory_id.to_be_bytes(),
+                    memory_id: memory_id.raw(),
                     kind: kind_byte,
                     salience,
                     created_at_unix_nanos: created_at,
@@ -819,7 +819,7 @@ fn build_encode_artifacts(
         indexes,
         dedup: EncodeTraceDedup {
             was_deduplicated,
-            matched_memory_id: matched_memory_id.map(|m| m.to_be_bytes()),
+            matched_memory_id: matched_memory_id.map(|m| m.raw()),
         },
     }
 }

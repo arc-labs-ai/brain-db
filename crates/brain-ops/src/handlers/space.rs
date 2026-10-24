@@ -57,7 +57,7 @@ pub async fn handle_space_create(
         .unwrap_or_else(|| (ctx.executor.caller_space_string.clone(), now, now, 0, 0));
 
     Ok(SpaceCreateResponse {
-        space_id: space_string,
+        space: space_string,
         created,
         created_at_unix_nanos: created_at,
         last_active_unix_nanos: last_active,
@@ -81,7 +81,7 @@ pub async fn handle_space_list(
     let spaces = rows
         .into_iter()
         .map(|e| SpaceView {
-            space_id: e.meta.space_string,
+            space: e.meta.space_string,
             created_at_unix_nanos: e.meta.created_at_unix_nanos,
             last_active_unix_nanos: e.meta.last_active_unix_nanos,
             memory_count: e.meta.memory_count,
@@ -130,7 +130,7 @@ pub async fn handle_space_delete(
     let existed = matches!(ack.single_phase(), PhaseAck::SpaceDeleted { existed: true });
 
     Ok(SpaceDeleteResponse {
-        space_id: space_string,
+        space: space_string,
         existed,
         memories_forgotten,
     })

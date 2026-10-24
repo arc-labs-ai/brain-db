@@ -36,6 +36,9 @@ pub async fn handle_memory_inspect(
     ctx: &OpsContext,
 ) -> Result<MemoryInspectResponse, OpError> {
     let memory_id = req.memory_id;
+    // The redb tables are keyed by the id's big-endian bytes, which is what
+    // gives them id order on a range scan. The wire carries the id itself.
+    let memory_key = memory_id.to_be_bytes();
     // An absent memory is an error, not a success carrying a flag — the same
     // answer every sibling read gives. The generic `NotFound` is what the
     // dispatcher turns into the wire's `MemoryNotFound` (the reason
@@ -45,7 +48,7 @@ pub async fn handle_memory_inspect(
     // the protocol.
     let not_found = || OpError::NotFound {
         what: "memory",
-        detail: format!("memory {} does not exist", u128::from_be_bytes(memory_id)),
+        detail: format!("memory {memory_id} does not exist"),
     };
 
     let caller_ns = u32::from(ctx.executor.caller_namespace);
@@ -65,7 +68,7 @@ pub async fn handle_memory_inspect(
             .open_table(MEMORIES_TABLE)
             .map_err(|e| OpError::Internal(format!("open memories: {e}")))?;
         let owned = memories
-            .get(&memory_id)
+            .get(&memory_key)
             .map_err(|e| OpError::Internal(format!("memory read: {e}")))?
             .map(|g| {
                 let m = g.value();
@@ -82,7 +85,7 @@ pub async fn handle_memory_inspect(
             .open_table(TEXTS_TABLE)
             .map_err(|e| OpError::Internal(format!("open texts: {e}")))?;
         texts
-            .get(&memory_id)
+            .get(&memory_key)
             .map_err(|e| OpError::Internal(format!("text read: {e}")))?
             .and_then(|g| String::from_utf8(g.value().to_vec()).ok())
             .unwrap_or_default()
@@ -93,7 +96,7 @@ pub async fn handle_memory_inspect(
             .open_table(MEMORY_ARTIFACTS_TABLE)
             .map_err(|e| OpError::Internal(format!("open memory_artifacts: {e}")))?;
         bundles
-            .get(&memory_id)
+            .get(&memory_key)
             .map_err(|e| OpError::Internal(format!("artifact read: {e}")))?
             .and_then(|g| serde_json::from_str::<EncodeStageArtifact>(g.value()).ok())
             .unwrap_or_default()
@@ -108,7 +111,7 @@ pub async fn handle_memory_inspect(
     // indistinguishable from a memory that genuinely has no edges, and a
     // caller would conclude its LINK had been lost.
     let edges = {
-        let id = MemoryId::from_raw(u128::from_be_bytes(memory_id));
+        let id = MemoryId::from_raw(memory_id);
         let mut out = Vec::new();
         for (dir, rows) in [
             (

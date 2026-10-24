@@ -35,7 +35,7 @@
   "trace": false,
   "act_as": {
     "namespace": "tenant-acme",
-    "space_id": "support-bot:user123"
+    "space": "support-bot:user123"
   },
   "scope": "Space"
 }

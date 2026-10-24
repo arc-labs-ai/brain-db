@@ -225,7 +225,7 @@ async fn recall_ids(client: &mut TcpStream, stream_id: u32, cue: &str) -> Vec<u1
 /// do with whether the bytes are on disk.
 async fn inspect_found(client: &mut TcpStream, stream_id: u32, memory_id: u128) -> bool {
     let req = MemoryInspectRequest {
-        memory_id: memory_id.to_be_bytes(),
+        memory_id,
         act_as: None,
     };
     let (_opcode, body) = round_trip(client, stream_id, RequestBody::MemoryInspect(req)).await;

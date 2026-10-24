@@ -45,7 +45,7 @@
     "name": "req_recall_act_as",
     "opcode": "0x0021",
     "kind": "request",
-    "payload_len": 347
+    "payload_len": 344
   },
   {
     "name": "req_forget",
@@ -57,25 +57,25 @@
     "name": "req_forget_act_as",
     "opcode": "0x0024",
     "kind": "request",
-    "payload_len": 124
+    "payload_len": 121
   },
   {
     "name": "req_encode_act_as",
     "opcode": "0x0020",
     "kind": "request",
-    "payload_len": 159
+    "payload_len": 156
   },
   {
     "name": "req_plan_act_as",
     "opcode": "0x0022",
     "kind": "request",
-    "payload_len": 243
+    "payload_len": 240
   },
   {
     "name": "req_reason_act_as",
     "opcode": "0x0023",
     "kind": "request",
-    "payload_len": 221
+    "payload_len": 218
   },
   {
     "name": "req_entity_create",
@@ -87,7 +87,7 @@
     "name": "req_entity_create_act_as",
     "opcode": "0x0130",
     "kind": "request",
-    "payload_len": 194
+    "payload_len": 191
   },
   {
     "name": "req_statement_create",
@@ -135,7 +135,7 @@
     "name": "req_memory_inspect",
     "opcode": "0x0028",
     "kind": "request",
-    "payload_len": 28
+    "payload_len": 23
   },
   {
     "name": "req_graph_fetch",
@@ -171,7 +171,7 @@
     "name": "resp_encode_trace",
     "opcode": "0x00A0",
     "kind": "response",
-    "payload_len": 1682
+    "payload_len": 1677
   },
   {
     "name": "resp_recall",
@@ -273,13 +273,13 @@
     "name": "resp_memory_list",
     "opcode": "0x00A7",
     "kind": "response",
-    "payload_len": 359
+    "payload_len": 360
   },
   {
     "name": "resp_memory_inspect",
     "opcode": "0x00A8",
     "kind": "response",
-    "payload_len": 716
+    "payload_len": 706
   },
   {
     "name": "resp_graph_fetch",
@@ -357,7 +357,7 @@
     "name": "resp_space_create",
     "opcode": "0x00F0",
     "kind": "response",
-    "payload_len": 131
+    "payload_len": 128
   },
   {
     "name": "req_space_list",
@@ -369,7 +369,7 @@
     "name": "resp_space_list",
     "opcode": "0x00F1",
     "kind": "response",
-    "payload_len": 154
+    "payload_len": 151
   },
   {
     "name": "req_space_delete",
@@ -381,7 +381,7 @@
     "name": "resp_space_delete",
     "opcode": "0x00F2",
     "kind": "response",
-    "payload_len": 60
+    "payload_len": 57
   },
   {
     "name": "req_session_create",
@@ -543,7 +543,7 @@
     "name": "req_entity_get",
     "opcode": "0x0131",
     "kind": "request",
-    "payload_len": 87
+    "payload_len": 84
   },
   {
     "name": "req_entity_update",
@@ -573,13 +573,13 @@
     "name": "req_entity_resolve",
     "opcode": "0x0136",
     "kind": "request",
-    "payload_len": 213
+    "payload_len": 210
   },
   {
     "name": "req_entity_list",
     "opcode": "0x0137",
     "kind": "request",
-    "payload_len": 201
+    "payload_len": 198
   },
   {
     "name": "req_entity_tombstone",
@@ -627,13 +627,13 @@
     "name": "req_relation_get",
     "opcode": "0x0151",
     "kind": "request",
-    "payload_len": 110
+    "payload_len": 107
   },
   {
     "name": "req_relation_supersede",
     "opcode": "0x0152",
     "kind": "request",
-    "payload_len": 476
+    "payload_len": 473
   },
   {
     "name": "req_relation_tombstone",
@@ -645,19 +645,19 @@
     "name": "req_relation_list_from",
     "opcode": "0x0154",
     "kind": "request",
-    "payload_len": 258
+    "payload_len": 255
   },
   {
     "name": "req_relation_list_to",
     "opcode": "0x0155",
     "kind": "request",
-    "payload_len": 257
+    "payload_len": 254
   },
   {
     "name": "req_relation_traverse",
     "opcode": "0x0156",
     "kind": "request",
-    "payload_len": 244
+    "payload_len": 241
   },
   {
     "name": "resp_relation_get",
@@ -693,13 +693,13 @@
     "name": "req_statement_get",
     "opcode": "0x0141",
     "kind": "request",
-    "payload_len": 111
+    "payload_len": 108
   },
   {
     "name": "req_statement_supersede",
     "opcode": "0x0142",
     "kind": "request",
-    "payload_len": 458
+    "payload_len": 455
   },
   {
     "name": "req_statement_tombstone",
@@ -723,7 +723,7 @@
     "name": "req_statement_list",
     "opcode": "0x0146",
     "kind": "request",
-    "payload_len": 264
+    "payload_len": 261
   },
   {
     "name": "resp_statement_supersede",
@@ -783,37 +783,37 @@
     "name": "req_schema_get_act_as",
     "opcode": "0x0121",
     "kind": "request",
-    "payload_len": 75
+    "payload_len": 72
   },
   {
     "name": "req_schema_list_act_as",
     "opcode": "0x0122",
     "kind": "request",
-    "payload_len": 88
+    "payload_len": 85
   },
   {
     "name": "req_schema_validate_act_as",
     "opcode": "0x0123",
     "kind": "request",
-    "payload_len": 139
+    "payload_len": 136
   },
   {
     "name": "req_schema_upload_act_as_grant",
     "opcode": "0x0120",
     "kind": "request",
-    "payload_len": 170
+    "payload_len": 167
   },
   {
     "name": "req_schema_replace_act_as_grant",
     "opcode": "0x0127",
     "kind": "request",
-    "payload_len": 207
+    "payload_len": 204
   },
   {
     "name": "req_schema_drop_act_as_grant",
     "opcode": "0x0125",
     "kind": "request",
-    "payload_len": 142
+    "payload_len": 139
   },
   {
     "name": "resp_schema_get",
@@ -867,7 +867,7 @@
     "name": "req_subscribe",
     "opcode": "0x0030",
     "kind": "request",
-    "payload_len": 276
+    "payload_len": 273
   },
   {
     "name": "req_unsubscribe",
@@ -915,19 +915,19 @@
     "name": "req_get_capabilities_act_as",
     "opcode": "0x0032",
     "kind": "request",
-    "payload_len": 60
+    "payload_len": 57
   },
   {
     "name": "req_link",
     "opcode": "0x0025",
     "kind": "request",
-    "payload_len": 166
+    "payload_len": 163
   },
   {
     "name": "req_unlink",
     "opcode": "0x0026",
     "kind": "request",
-    "payload_len": 156
+    "payload_len": 153
   },
   {
     "name": "resp_unlink",

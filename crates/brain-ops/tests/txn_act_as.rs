@@ -161,7 +161,7 @@ fn txn_begun_with_act_as_commits_under_delegated_identity() {
                     timeout_seconds: 60,
                     act_as: Some(ActAs {
                         namespace: "acme".into(),
-                        space_id: "acme:main".into(),
+                        space: "acme:main".into(),
                         grant: 0,
                     }),
                 }),
@@ -272,13 +272,13 @@ fn txn_begun_with_act_as_commits_under_delegated_identity() {
 
         let acme_ids = list_as(caller("acme", ACME_SPACE)).await;
         assert!(
-            acme_ids.contains(&id_bytes),
+            acme_ids.contains(&memory_id),
             "delegated identity's MEMORY_LIST must find the txn-committed memory"
         );
 
         let gateway_ids = list_as(caller("gateway", GATEWAY_SPACE)).await;
         assert!(
-            !gateway_ids.contains(&id_bytes),
+            !gateway_ids.contains(&memory_id),
             "the committing connection's own identity must NOT see the delegated write"
         );
     });

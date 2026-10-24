@@ -83,24 +83,7 @@
         "detail": "lsn=42",
         "artifact": {
           "record": {
-            "memory_id": [
-              0,
-              0,
-              0,
-              0,
-              0,
-              0,
-              7,
-              0,
-              42,
-              0,
-              0,
-              0,
-              0,
-              18,
-              52,
-              86
-            ],
+            "memory_id": 33059591799037110662230,
             "kind": 0,
             "salience": 0.5,
             "created_at_unix_nanos": 1700000000000000000,

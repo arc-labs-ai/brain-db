@@ -79,7 +79,7 @@ fn build_ctx() -> (tempfile::TempDir, OpsContext) {
 fn act_as(namespace: &str, grant: u32) -> Option<ActAs> {
     Some(ActAs {
         namespace: namespace.into(),
-        space_id: format!("{namespace}:gateway-user"),
+        space: format!("{namespace}:gateway-user"),
         grant,
     })
 }
