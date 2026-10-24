@@ -8,7 +8,7 @@ use brain_protocol::envelope::response::ForgetResponse;
 
 use crate::context::OpsContext;
 use crate::error::OpError;
-use crate::handlers::link::downcast_writer_pub;
+use crate::handlers::writer_handle::real_writer_handle;
 use crate::index::text_indexer::MemoryTextOp;
 use crate::state::idempotency::hash_forget_request;
 use crate::txn::{BufferedForget, BufferedReplay};
@@ -28,7 +28,7 @@ pub async fn handle_forget(
     let _ = plan_forget_inner(&req, &ctx.planner_ctx)?;
 
     let memory_id = MemoryId::from(memory_id_wire);
-    let real_writer = downcast_writer_pub(ctx)?;
+    let real_writer = real_writer_handle(ctx)?;
     let write_id = WriteId::from_request(
         brain_core::RequestId::from(req.request_id),
         ctx.executor.caller_space,

@@ -13,7 +13,7 @@ use brain_protocol::envelope::response::{
 
 use crate::context::OpsContext;
 use crate::error::OpError;
-use crate::handlers::link::downcast_writer_pub;
+use crate::handlers::writer_handle::real_writer_handle;
 use crate::write::{Phase, PhaseAck, Write, WriteId};
 
 use super::registry_cascade::{tombstone_space_memories, writer_err};
@@ -32,7 +32,7 @@ pub async fn handle_space_create(
         metadata: req.metadata.clone(),
     };
     let write = build_write(&req.request_id, ctx, phase, b"space_create");
-    let writer = downcast_writer_pub(ctx)?;
+    let writer = real_writer_handle(ctx)?;
     let ack = writer.submit(write).await.map_err(writer_err)?;
     let created = matches!(ack.single_phase(), PhaseAck::SpaceCreated { created: true });
 
@@ -125,7 +125,7 @@ pub async fn handle_space_delete(
 
     let phase = Phase::SpaceDelete { at_unix_nanos: now };
     let write = build_write(&req.request_id, ctx, phase, b"space_delete");
-    let writer = downcast_writer_pub(ctx)?;
+    let writer = real_writer_handle(ctx)?;
     let ack = writer.submit(write).await.map_err(writer_err)?;
     let existed = matches!(ack.single_phase(), PhaseAck::SpaceDeleted { existed: true });
 

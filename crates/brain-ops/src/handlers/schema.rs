@@ -45,7 +45,7 @@ use crate::handlers::schema_scope;
 use crate::handlers::schema_wire;
 use crate::error::OpError;
 use crate::handlers::entity::emit_graph_event;
-use crate::handlers::link::downcast_writer_pub;
+use crate::handlers::writer_handle::real_writer_handle;
 use crate::write::{Phase, PhaseAck, Write, WriteId};
 
 
@@ -165,7 +165,7 @@ pub async fn handle_schema_upload(
     let now = crate::txn::now_unix_nanos_pub();
     let from_version = schema_scope::current_active(ctx, &namespace)?.unwrap_or(0);
 
-    let real_writer = downcast_writer_pub(ctx)?;
+    let real_writer = real_writer_handle(ctx)?;
     let write_id =
         WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_schema_upload_request(&req);

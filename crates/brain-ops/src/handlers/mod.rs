@@ -33,3 +33,6 @@ pub mod space;
 pub mod statement;
 pub mod subscribe;
 pub mod txn;
+// Private: `real_writer_handle` is only ever needed by sibling handlers,
+// so the module stays inside the `handlers` tree.
+mod writer_handle;

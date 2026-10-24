@@ -21,7 +21,7 @@
 use crate::context::OpsContext;
 use crate::error::OpError;
 use crate::handlers::entity::emit_graph_event;
-use crate::handlers::link::downcast_writer_pub;
+use crate::handlers::writer_handle::real_writer_handle;
 use crate::index::text_indexer::StatementTextOp;
 use crate::write::{
     EvidenceRefPhase, Phase, PhaseAck, SupersedeReplacement, SupersedeReplacementId,
@@ -168,7 +168,7 @@ pub async fn handle_statement_create(
     // Submit the UpsertStatement phase through the unified writer. The
     // apply function runs (optional) predicate intern + statement_create
     // + (optional) IMPLICIT_PREDICATE flag stamp in one wtxn.
-    let real_writer = downcast_writer_pub(ctx)?;
+    let real_writer = real_writer_handle(ctx)?;
     let write_id =
         WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_statement_create_request(&req);
@@ -413,7 +413,7 @@ pub async fn handle_statement_supersede(
     // call statement_supersede inside one wtxn.
     let new_statement = build_statement_from_create(&req.new_statement, predicate_id, now, kind)?;
 
-    let real_writer = downcast_writer_pub(ctx)?;
+    let real_writer = real_writer_handle(ctx)?;
     let write_id =
         WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_statement_supersede_request(&req);
@@ -506,7 +506,7 @@ pub async fn handle_statement_tombstone(
         });
     }
 
-    let real_writer = downcast_writer_pub(ctx)?;
+    let real_writer = real_writer_handle(ctx)?;
     let write_id =
         WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_statement_tombstone_request(&req);
@@ -590,7 +590,7 @@ pub async fn handle_statement_retract(
     // immediately, hidden from STATEMENT_HISTORY) plus the durable
     // `Retract` reason byte that lets the GC worker reclaim the row
     // after the grace period.
-    let real_writer = downcast_writer_pub(ctx)?;
+    let real_writer = real_writer_handle(ctx)?;
     let write_id =
         WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_statement_retract_request(&req);

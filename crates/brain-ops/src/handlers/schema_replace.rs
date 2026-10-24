@@ -131,7 +131,7 @@ pub async fn handle_schema_replace(
     //    hand-roll.
     let now = crate::txn::now_unix_nanos_pub();
     let from_version = schema_scope::current_active(ctx, &namespace)?.unwrap_or(0);
-    let real_writer = crate::handlers::link::downcast_writer_pub(ctx)?;
+    let real_writer = crate::handlers::writer_handle::real_writer_handle(ctx)?;
     let write_id =
         WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_schema_replace_request(&req);

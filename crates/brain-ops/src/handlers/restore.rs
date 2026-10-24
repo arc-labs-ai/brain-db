@@ -25,7 +25,7 @@ use brain_core::MemoryId;
 
 use crate::context::OpsContext;
 use crate::error::OpError;
-use crate::handlers::link::downcast_writer_pub;
+use crate::handlers::writer_handle::real_writer_handle;
 use crate::write::{Phase, PhaseAck, Write, WriteId};
 
 /// What [`handle_admin_restore`] resolved the request to. The HTTP layer
@@ -122,7 +122,7 @@ pub async fn handle_admin_restore(
 
     // Submit the WAL-durable un-tombstone. The writer's post-commit
     // fan-out enqueues the revert cascade for the dependent graph rows.
-    let real_writer = downcast_writer_pub(ctx)?;
+    let real_writer = real_writer_handle(ctx)?;
     let phase = Phase::RestoreMemory {
         id: memory_id,
         at_unix_nanos: now_unix_nanos,

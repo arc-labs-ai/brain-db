@@ -26,7 +26,7 @@ use brain_protocol::StageKind;
 
 use crate::context::OpsContext;
 use crate::error::OpError;
-use crate::handlers::link::downcast_writer_pub;
+use crate::handlers::writer_handle::real_writer_handle;
 use crate::txn::{BufferedEncode, BufferedReplay};
 use crate::write::{Phase, PhaseAck, Write, WriteId};
 
@@ -169,7 +169,7 @@ pub async fn handle_encode(
     // behind submit() — by then we've already burned embedding work
     // and a slot reservation. Peek it up-front so a replay is free.
     // A mismatched request hash on the same WriteId is a Conflict.
-    let real_writer = downcast_writer_pub(ctx)?;
+    let real_writer = real_writer_handle(ctx)?;
     let write_id = WriteId::from_request(
         brain_core::RequestId::from(req.request_id),
         ctx.executor.caller_space,

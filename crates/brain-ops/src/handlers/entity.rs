@@ -40,7 +40,7 @@ use brain_protocol::{
 
 use crate::context::OpsContext;
 use crate::error::OpError;
-use crate::handlers::link::downcast_writer_pub;
+use crate::handlers::writer_handle::real_writer_handle;
 use crate::write::{Phase, PhaseAck, TombstoneTarget, Write, WriteId};
 
 // Default grace window for ENTITY_MERGE — 7 days.
@@ -138,7 +138,7 @@ pub async fn handle_entity_create(
     let normalized = normalize_name(&req.canonical_name);
     let attributes = EntityAttributes::from(req.attributes_blob.clone());
 
-    let real_writer = downcast_writer_pub(ctx)?;
+    let real_writer = real_writer_handle(ctx)?;
     let write_id =
         WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_entity_create_request(&req);
@@ -259,7 +259,7 @@ pub async fn handle_entity_update(
         });
     }
 
-    let real_writer = downcast_writer_pub(ctx)?;
+    let real_writer = real_writer_handle(ctx)?;
     let write_id =
         WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_entity_update_request(&req, id);
@@ -335,7 +335,7 @@ pub async fn handle_entity_rename(
         });
     }
 
-    let real_writer = downcast_writer_pub(ctx)?;
+    let real_writer = real_writer_handle(ctx)?;
     let write_id =
         WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_entity_rename_request(&req, id);
@@ -405,7 +405,7 @@ pub async fn handle_entity_merge(
         });
     }
 
-    let real_writer = downcast_writer_pub(ctx)?;
+    let real_writer = real_writer_handle(ctx)?;
     let write_id =
         WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_entity_merge_request(&req);
@@ -485,7 +485,7 @@ pub async fn handle_entity_unmerge(
         });
     }
 
-    let real_writer = downcast_writer_pub(ctx)?;
+    let real_writer = real_writer_handle(ctx)?;
     let write_id =
         WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_entity_unmerge_request(&req, merged);
@@ -544,7 +544,7 @@ pub async fn handle_entity_tombstone(
     let id = EntityId::from(req.entity_id);
     let now = crate::txn::now_unix_nanos_pub();
 
-    let real_writer = downcast_writer_pub(ctx)?;
+    let real_writer = real_writer_handle(ctx)?;
     let write_id =
         WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_entity_tombstone_request(&req, id);
@@ -987,7 +987,7 @@ async fn create_fallback_entity(
     let entity_type = EntityTypeId(req.entity_type_hint);
     let normalized = normalize_name(&req.candidate_name);
 
-    let real_writer = downcast_writer_pub(ctx)?;
+    let real_writer = real_writer_handle(ctx)?;
     let write_id =
         WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let phase = Phase::UpsertEntity {

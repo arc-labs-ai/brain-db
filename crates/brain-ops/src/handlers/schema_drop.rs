@@ -238,7 +238,7 @@ pub async fn handle_schema_drop(
     let narrowed_json = serde_json::to_vec(validated.as_schema())
         .map_err(|e| OpError::Internal(format!("encode narrowed schema: {e}")))?;
 
-    let real_writer = crate::handlers::link::downcast_writer_pub(ctx)?;
+    let real_writer = crate::handlers::writer_handle::real_writer_handle(ctx)?;
     let write_id =
         WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_schema_drop_request(&req);

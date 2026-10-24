@@ -544,7 +544,7 @@ pub async fn handle_txn_commit(
         .with_namespace(namespace)
         .with_space_string(space_string)
         .with_request_hash(request_hash);
-    let real_writer = crate::handlers::link::downcast_writer_pub(ctx)?;
+    let real_writer = crate::handlers::writer_handle::real_writer_handle(ctx)?;
     match real_writer.submit(write).await {
         Ok(_ack) => {}
         Err(err) => {

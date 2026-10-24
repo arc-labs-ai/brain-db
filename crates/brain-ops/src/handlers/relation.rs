@@ -47,7 +47,7 @@ use redb::ReadableTable;
 use crate::context::OpsContext;
 use crate::error::OpError;
 use crate::handlers::entity::emit_graph_event;
-use crate::handlers::link::downcast_writer_pub;
+use crate::handlers::writer_handle::real_writer_handle;
 use crate::write::{
     Phase, PhaseAck, SupersedeReplacement, SupersedeReplacementId, SupersedeTarget,
     TombstoneTarget, Write, WriteId,
@@ -182,7 +182,7 @@ pub async fn handle_relation_create(
         now
     };
 
-    let real_writer = downcast_writer_pub(ctx)?;
+    let real_writer = real_writer_handle(ctx)?;
     let write_id =
         WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_relation_create_request(&req);
@@ -369,7 +369,7 @@ pub async fn handle_relation_supersede(
 
     let new_relation = build_relation_from_create(&req.new_relation, &rt, now)?;
 
-    let real_writer = downcast_writer_pub(ctx)?;
+    let real_writer = real_writer_handle(ctx)?;
     let write_id =
         WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_relation_supersede_request(&req);
@@ -453,7 +453,7 @@ pub async fn handle_relation_tombstone(
         });
     }
 
-    let real_writer = downcast_writer_pub(ctx)?;
+    let real_writer = real_writer_handle(ctx)?;
     let write_id =
         WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_relation_tombstone_request(&req);

@@ -14,7 +14,7 @@ use brain_metadata::tables::merge_review_queue::{proposal_status, MergeReviewPro
 
 use crate::context::OpsContext;
 use crate::error::OpError;
-use crate::handlers::link::downcast_writer_pub;
+use crate::handlers::writer_handle::real_writer_handle;
 use crate::write::{Phase, PhaseAck, Write, WriteId};
 
 /// Default grace window for an admin-approved merge (matches
@@ -126,7 +126,7 @@ pub async fn handle_admin_approve_merge(
         at_unix_nanos: now,
     };
     let write = Write::single(WriteId::new(), ctx.executor.caller_space, phase);
-    let real_writer = downcast_writer_pub(ctx)?;
+    let real_writer = real_writer_handle(ctx)?;
     let ack = real_writer
         .submit(write)
         .await
@@ -179,7 +179,7 @@ pub async fn handle_admin_reject_merge(
         at_unix_nanos: now,
     };
     let write = Write::single(WriteId::new(), ctx.executor.caller_space, phase);
-    let real_writer = downcast_writer_pub(ctx)?;
+    let real_writer = real_writer_handle(ctx)?;
     let ack = real_writer
         .submit(write)
         .await
