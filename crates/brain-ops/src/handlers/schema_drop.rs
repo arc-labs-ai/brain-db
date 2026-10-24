@@ -34,10 +34,11 @@ use brain_metadata::relation::types::relation_type_id_by_qname;
 use brain_metadata::schema::predicate::predicate_id_by_qname;
 use brain_metadata::schema::store::schema_active_row;
 use brain_metadata::statement::crud::statement_live_count_by_predicate;
-use brain_protocol::schema::{validate, Schema, SchemaItem};
+use brain_protocol::schema::{validate_with, Schema, SchemaItem};
 use brain_protocol::{schema_drop_target, SchemaDropRequest, SchemaDropResponse};
 
 use crate::context::OpsContext;
+use crate::handlers::schema_scope;
 use crate::handlers::schema_wire;
 use crate::error::OpError;
 use crate::write::{Phase, PhaseAck, Write, WriteId};
@@ -78,7 +79,7 @@ pub async fn handle_schema_drop(
     //    foreign tenant's vocabulary nor use the response as an existence
     //    oracle. The seeded `brain` system namespace is never a user's own
     //    name, so this also blocks narrowing the system schema.
-    let caller_name = crate::handlers::schema::caller_namespace_name(ctx)?;
+    let caller_name = schema_scope::caller_namespace_name(ctx)?;
     if req.namespace != caller_name {
         return Err(OpError::Unauthorized(format!(
             "schema_drop: caller in namespace {caller_name:?} cannot drop from namespace {:?}",
@@ -211,7 +212,16 @@ pub async fn handle_schema_drop(
     //
     // `dropped: false` is the shape `not_declared_response` already uses for
     // "I did not drop it"; this is the same answer with the reasons attached.
-    let validated = match validate(&schema) {
+    // Re-validate the narrowed document against the system schema — not
+    // against an empty context, and not against this namespace's active
+    // schema. `schema_scope::system_declared_context` carries the reasoning;
+    // the short version is that an empty context reported every shared entity
+    // type (`Person`, `Organization`, …) as undeclared, which made every drop
+    // in a namespace with one relation_type fail no matter what was targeted,
+    // and the active schema would resolve a reference to the very type being
+    // dropped and so never catch a dangling one.
+    let declared = schema_scope::system_declared_context(ctx)?;
+    let validated = match validate_with(&schema, &declared) {
         Ok(v) => v,
         Err(errs) => {
             return Ok(SchemaDropResponse {
@@ -248,7 +258,7 @@ pub async fn handle_schema_drop(
     let ack = real_writer
         .submit(write)
         .await
-        .map_err(crate::handlers::schema::map_writer_err)?;
+        .map_err(schema_scope::map_writer_err)?;
     let (schema_version, dropped_n) = match ack.single_phase() {
         PhaseAck::UpsertedSchema {
             version, dropped, ..
@@ -521,7 +531,11 @@ mod tests {
 
     fn seed(metadata: &SharedMetadataDb, doc: &str) {
         let parsed = parse_schema(doc).unwrap();
-        let validated = validate(&parsed).unwrap();
+        // The seed document declares its own types, so an empty context is
+        // right here — unlike the handler, which must resolve the shared
+        // system entity types.
+        let validated =
+            brain_protocol::schema::validate(&parsed).unwrap();
         let wtxn = metadata.write_txn().unwrap();
         store_schema_upload(&wtxn, &validated, 1).unwrap();
         wtxn.commit().unwrap();
