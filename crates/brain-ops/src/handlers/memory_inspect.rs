@@ -3,10 +3,19 @@
 //! the one just written via the ENCODE trace).
 //!
 //! Read-only. It resolves the memory under the caller's `(namespace, space)`
-//! scope (cross-tenant ids read as "not found", never leak), then returns the
-//! memory text plus the stored artifact bundle. The bundle is populated
-//! incrementally by the write path + async workers; a memory whose bundle has
-//! not been written yet returns `found = true` with an empty artifact.
+//! scope, then returns the memory text plus the stored artifact bundle.
+//!
+//! An id that does not exist — or belongs to another `(namespace, space)`,
+//! which is deliberately indistinguishable to this caller — is
+//! `MemoryNotFound`. It used to be a success carrying `found: false`, the only
+//! such flag in the protocol; every sibling read already answered with the
+//! `NotFound` category, and a client should not need a second mechanism for
+//! one verb.
+//!
+//! The bundle is populated incrementally by the write path + async workers; a
+//! memory whose bundle has not been written yet is still a success, with an
+//! empty artifact. That is a different condition from the memory being
+//! absent, and keeping the two apart is the point.
 
 use brain_core::{EdgeKind, MemoryId};
 use brain_metadata::tables::edge::{list_memory_edges_from, list_memory_edges_to};
@@ -27,12 +36,16 @@ pub async fn handle_memory_inspect(
     ctx: &OpsContext,
 ) -> Result<MemoryInspectResponse, OpError> {
     let memory_id = req.memory_id;
-    let not_found = || MemoryInspectResponse {
-        found: false,
-        memory_id,
-        text: String::new(),
-        artifact: EncodeStageArtifact::default(),
-        edges: Vec::new(),
+    // An absent memory is an error, not a success carrying a flag — the same
+    // answer every sibling read gives. The generic `NotFound` is what the
+    // dispatcher turns into the wire's `MemoryNotFound` (the reason
+    // `EntityNotFound` and `StatementNotFound` exist as separate ops codes at
+    // all), so the client branches on the taxonomy it already handles rather
+    // than on a boolean that existed on this one response and nowhere else in
+    // the protocol.
+    let not_found = || OpError::NotFound {
+        what: "memory",
+        detail: format!("memory {} does not exist", u128::from_be_bytes(memory_id)),
     };
 
     let caller_ns = u32::from(ctx.executor.caller_namespace);
@@ -60,7 +73,7 @@ pub async fn handle_memory_inspect(
             })
             .unwrap_or(false);
         if !owned {
-            return Ok(not_found());
+            return Err(not_found());
         }
     }
 
@@ -124,7 +137,6 @@ pub async fn handle_memory_inspect(
     };
 
     Ok(MemoryInspectResponse {
-        found: true,
         memory_id,
         text,
         artifact,

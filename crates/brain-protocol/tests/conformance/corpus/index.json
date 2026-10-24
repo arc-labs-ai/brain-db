@@ -279,7 +279,7 @@
     "name": "resp_memory_inspect",
     "opcode": "0x00A8",
     "kind": "response",
-    "payload_len": 723
+    "payload_len": 716
   },
   {
     "name": "resp_graph_fetch",

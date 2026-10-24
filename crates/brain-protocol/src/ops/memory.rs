@@ -521,11 +521,19 @@ pub struct MemoryInspectRequest {
 /// write stage produced (embedding vector, redb record, analyzed keyword terms,
 /// write-time HyPE questions, the extracted knowledge graph), plus the memory
 /// text. Reuses [`EncodeStageArtifact`] as the bundle shape so the live ENCODE
-/// trace and the stored inspection view are one type. `found = false` (with an
-/// empty `artifact`) when no memory / no bundle exists for the id.
+/// trace and the stored inspection view are one type.
+///
+/// There is no `found` flag. An id with no memory behind it — or one owned by
+/// another `(namespace, space)`, which is deliberately indistinguishable — is
+/// answered with `MemoryNotFound` in the `NotFound` category, as every sibling
+/// read already does. It was the only `found`-style flag in the protocol, and
+/// a client needing a second mechanism for one verb is what was wrong with it.
+///
+/// A memory that exists but whose bundle has not been written yet is still a
+/// success, with an empty `artifact`. That is a different condition from the
+/// memory being absent, and keeping the two apart is the point.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MemoryInspectResponse {
-    pub found: bool,
     #[serde(with = "serde_bytes")]
     pub memory_id: [u8; 16],
     pub text: String,

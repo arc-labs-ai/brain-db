@@ -851,7 +851,6 @@ fn sample_memory_inspect_request() -> MemoryInspectRequest {
 
 fn sample_memory_inspect_response() -> MemoryInspectResponse {
     MemoryInspectResponse {
-        found: true,
         memory_id: mid().to_be_bytes(),
         text: "niraj works on brain".into(),
         artifact: EncodeStageArtifact {

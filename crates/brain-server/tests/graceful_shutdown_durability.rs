@@ -31,6 +31,7 @@ use brain_protocol::envelope::request::{
     EncodeRequest, MemoryInspectRequest, RecallRequest, RequestBody,
 };
 use brain_protocol::envelope::response::ResponseBody;
+use brain_protocol::shared::enums::ErrorCategoryWire;
 use brain_protocol::Frame;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -229,8 +230,13 @@ async fn inspect_found(client: &mut TcpStream, stream_id: u32, memory_id: u128) 
     };
     let (_opcode, body) = round_trip(client, stream_id, RequestBody::MemoryInspect(req)).await;
     match body {
-        ResponseBody::MemoryInspect(r) => r.found,
-        other => panic!("expected MEMORY_INSPECT_RESP, got {other:?}"),
+        // Present. A durable memory answers with its bundle.
+        ResponseBody::MemoryInspect(_) => true,
+        // Absent. `MEMORY_INSPECT` reports a missing memory with the
+        // `NotFound` category now, like every sibling read, rather than a
+        // success carrying `found: false`.
+        ResponseBody::Error(e) if e.category == ErrorCategoryWire::NotFound => false,
+        other => panic!("expected MEMORY_INSPECT_RESP or a NotFound error, got {other:?}"),
     }
 }
 
