@@ -26,6 +26,7 @@ pub mod restore;
 pub mod schema;
 pub mod schema_drop;
 pub mod schema_replace;
+pub mod schema_wire;
 pub mod session;
 pub mod space;
 pub mod statement;

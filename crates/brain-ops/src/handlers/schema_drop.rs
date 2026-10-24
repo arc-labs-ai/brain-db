@@ -38,6 +38,7 @@ use brain_protocol::schema::{validate, Schema, SchemaItem};
 use brain_protocol::{schema_drop_target, SchemaDropRequest, SchemaDropResponse};
 
 use crate::context::OpsContext;
+use crate::handlers::schema_wire;
 use crate::error::OpError;
 use crate::write::{Phase, PhaseAck, Write, WriteId};
 
@@ -196,12 +197,34 @@ pub async fn handle_schema_drop(
     // It used to be cleared, so every drop left a version with no source
     // text (a blank document to anyone reading or editing it).
     schema.source = narrowed_source(prior_text.as_deref(), &schema, target_kind, target_name);
-    let validated = validate(&schema).map_err(|errs| {
-        OpError::Internal(format!(
-            "schema_drop: narrowed document failed re-validation: {} error(s)",
-            errs.len()
-        ))
-    })?;
+    // A narrowed document that no longer validates is a REFUSAL carrying its
+    // reasons, not an internal fault.
+    //
+    // Dropping a predicate that a relation type still references leaves a
+    // document the validator rejects — caused by what the caller asked for,
+    // and answerable: `SchemaDropResponse.validation_errors` exists for
+    // exactly this and was never populated. Reporting it as `Internal`
+    // discarded the errors and surfaced at the edge as a bare 502
+    // `engine.error`, which tells a caller nothing about the drop they
+    // requested and sends whoever debugs it looking for an engine fault that
+    // is not there.
+    //
+    // `dropped: false` is the shape `not_declared_response` already uses for
+    // "I did not drop it"; this is the same answer with the reasons attached.
+    let validated = match validate(&schema) {
+        Ok(v) => v,
+        Err(errs) => {
+            return Ok(SchemaDropResponse {
+                namespace,
+                schema_version: current_version,
+                target_kind,
+                target_name: req.target_name.clone(),
+                dropped: false,
+                live_rows: live_rows as u32,
+                validation_errors: schema_wire::validation_errors(errs.iter()),
+            });
+        }
+    };
     let narrowed_json = serde_json::to_vec(validated.as_schema())
         .map_err(|e| OpError::Internal(format!("encode narrowed schema: {e}")))?;
 

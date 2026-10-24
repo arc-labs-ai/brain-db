@@ -31,10 +31,7 @@ use brain_metadata::system_schema::SYSTEM_SCHEMA_NAMESPACE;
 use brain_planner::WriterError;
 use brain_protocol::envelope::response::EventType;
 use brain_protocol::schema::render::render_schema_verified;
-use brain_protocol::schema::{
-    parse_schema, validate_located_with, validate_namespace, DeclaredContext, ParseError,
-    ValidationError,
-};
+use brain_protocol::schema::{parse_schema, validate_located_with, validate_namespace, DeclaredContext, ParseError};
 use brain_protocol::schema::{
     CardinalityAst, ExtractorKindAst, SchemaItem, StatementKindAst, SubjectTypeDecl,
     ValidatedSchema,
@@ -42,10 +39,11 @@ use brain_protocol::schema::{
 use brain_protocol::{
     GraphEventPayload, SchemaGetRequest, SchemaGetResponse, SchemaListItemWire, SchemaListRequest,
     SchemaListResponseFrame, SchemaUpdatedEvent, SchemaUploadRequest, SchemaUploadResponse,
-    SchemaValidateRequest, SchemaValidateResponse, SchemaValidationErrorWire,
+    SchemaValidateRequest, SchemaValidateResponse,
 };
 
 use crate::context::OpsContext;
+use crate::handlers::schema_wire;
 use crate::error::OpError;
 use crate::handlers::entity::emit_graph_event;
 use crate::handlers::link::downcast_writer_pub;
@@ -77,7 +75,7 @@ pub async fn handle_schema_upload(
         return Ok(SchemaUploadResponse {
             namespace: schema.namespace.clone(),
             schema_version: 0,
-            validation_errors: errs.iter().map(validation_error_to_wire).collect(),
+            validation_errors: schema_wire::validation_errors(errs.iter()),
             backward_compatible: true,
             migration_summary_blob: Vec::new(),
         });
@@ -112,7 +110,7 @@ pub async fn handle_schema_upload(
             return Ok(SchemaUploadResponse {
                 namespace,
                 schema_version: 0,
-                validation_errors: errs.iter().map(validation_error_to_wire).collect(),
+                validation_errors: schema_wire::validation_errors(errs.iter()),
                 backward_compatible: true,
                 migration_summary_blob: Vec::new(),
             });
@@ -407,7 +405,7 @@ pub async fn handle_schema_validate(
             return Ok(SchemaValidateResponse {
                 namespace: String::new(),
                 would_be_version: 0,
-                validation_errors: vec![parse_error_to_wire(e)],
+                validation_errors: vec![schema_wire::parse_error(&e)],
             });
         }
     };
@@ -417,7 +415,7 @@ pub async fn handle_schema_validate(
         return Ok(SchemaValidateResponse {
             namespace: schema.namespace.clone(),
             would_be_version: 0,
-            validation_errors: errs.iter().map(validation_error_to_wire).collect(),
+            validation_errors: schema_wire::validation_errors(errs.iter()),
         });
     }
 
@@ -451,7 +449,7 @@ pub async fn handle_schema_validate(
         Err(errs) => Ok(SchemaValidateResponse {
             namespace: schema.namespace,
             would_be_version: 0,
-            validation_errors: errs.iter().map(validation_error_to_wire).collect(),
+            validation_errors: schema_wire::validation_errors(errs.iter()),
         }),
     }
 }
@@ -580,43 +578,9 @@ fn parse_failed_upload_response(e: ParseError) -> SchemaUploadResponse {
     SchemaUploadResponse {
         namespace: String::new(),
         schema_version: 0,
-        validation_errors: vec![parse_error_to_wire(e)],
+        validation_errors: vec![schema_wire::parse_error(&e)],
         backward_compatible: true,
         migration_summary_blob: Vec::new(),
-    }
-}
-
-fn parse_error_to_wire(e: ParseError) -> SchemaValidationErrorWire {
-    let (code, line, col) = match &e {
-        ParseError::Syntax { line, col, .. } => ("Syntax", *line, *col),
-        ParseError::InvalidNumber { line, col, .. } => ("InvalidNumber", *line, *col),
-        ParseError::InvalidJson { line, col, .. } => ("InvalidJson", *line, *col),
-        ParseError::InvalidDuration { line, col, .. } => ("InvalidDuration", *line, *col),
-        ParseError::InvalidCost { line, col, .. } => ("InvalidCost", *line, *col),
-        ParseError::MissingField { line, col, .. } => ("MissingField", *line, *col),
-    };
-    SchemaValidationErrorWire {
-        code: code.to_string(),
-        message: e.to_string(),
-        line: line as u32,
-        column: col as u32,
-        length: 0,
-        severity: 2,
-    }
-}
-
-fn validation_error_to_wire(e: &ValidationError) -> SchemaValidationErrorWire {
-    let (line, column, length) = e
-        .source_span
-        .map(|s| (s.line, s.column, s.length))
-        .unwrap_or((0, 0, 0));
-    SchemaValidationErrorWire {
-        code: format!("{:?}", e.code),
-        message: e.message.clone(),
-        line,
-        column,
-        length,
-        severity: 2,
     }
 }
 
@@ -919,7 +883,6 @@ fn map_extractor_kind_byte(k: ExtractorKindAst) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brain_protocol::schema::{SourceSpan, ValidationErrorCode};
 
     // -----------------------------------------------------------------
     // Tenant-binding tests. These drive the handlers directly with a
@@ -1321,50 +1284,6 @@ mod tests {
         assert!(check_document_cap("namespace acme").is_ok());
     }
 
-    #[test]
-    fn parse_error_to_wire_carries_position() {
-        let wire = parse_error_to_wire(ParseError::Syntax {
-            line: 7,
-            col: 3,
-            message: "boom".into(),
-        });
-        assert_eq!(wire.code, "Syntax");
-        assert_eq!(wire.line, 7);
-        assert_eq!(wire.column, 3);
-        assert_eq!(wire.severity, 2);
-    }
-
-    #[test]
-    fn validation_error_to_wire_uses_span_when_present() {
-        let e = ValidationError {
-            code: ValidationErrorCode::DuplicateDefinition,
-            message: "dup".into(),
-            source_span: Some(SourceSpan {
-                line: 4,
-                column: 5,
-                length: 6,
-            }),
-        };
-        let wire = validation_error_to_wire(&e);
-        assert_eq!(wire.code, "DuplicateDefinition");
-        assert_eq!(wire.line, 4);
-        assert_eq!(wire.column, 5);
-        assert_eq!(wire.length, 6);
-        assert_eq!(wire.severity, 2);
-    }
-
-    #[test]
-    fn validation_error_to_wire_uses_zero_when_span_absent() {
-        let e = ValidationError {
-            code: ValidationErrorCode::NamespaceMissing,
-            message: "missing".into(),
-            source_span: None,
-        };
-        let wire = validation_error_to_wire(&e);
-        assert_eq!(wire.line, 0);
-        assert_eq!(wire.column, 0);
-        assert_eq!(wire.length, 0);
-    }
 
     #[test]
     fn parse_failed_upload_response_zero_version() {

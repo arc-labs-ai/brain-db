@@ -25,6 +25,7 @@ use brain_protocol::schema::{parse_schema, validate_located};
 use brain_protocol::{SchemaReplaceRequest, SchemaReplaceResponse};
 
 use crate::context::OpsContext;
+use crate::handlers::schema_wire;
 use crate::error::OpError;
 use crate::write::{Phase, PhaseAck, Write, WriteId};
 
@@ -84,17 +85,7 @@ pub async fn handle_schema_replace(
                 namespace: parsed.namespace.clone(),
                 schema_version: 0,
                 dropped_count: 0,
-                validation_errors: errs
-                    .iter()
-                    .map(|e| brain_protocol::SchemaValidationErrorWire {
-                        code: format!("{:?}", e.code),
-                        message: e.message.clone(),
-                        line: e.source_span.map(|s| s.line).unwrap_or(0),
-                        column: e.source_span.map(|s| s.column).unwrap_or(0),
-                        length: e.source_span.map(|s| s.length).unwrap_or(0),
-                        severity: 2,
-                    })
-                    .collect(),
+                validation_errors: schema_wire::validation_errors(errs.iter()),
             });
         }
     };
