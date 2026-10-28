@@ -13,8 +13,15 @@
 //! the statements on the page, plus the relation/mention neighbours of those
 //! entities — rather than a dedicated entity index. A purely-relational
 //! entity that is never a statement subject/object surfaces only if a
-//! neighbouring statemented entity pulls it in; a fully-isolated entity does
-//! not surface at all (it has nothing to render).
+//! neighbouring statemented entity pulls it in.
+//!
+//! Once that spine is exhausted the export pages the scope's own
+//! `ENTITY_BY_TYPE` index, which is `(namespace, space)`-prefixed and so as
+//! cheap to range as the spine. That second phase is what reaches an entity
+//! no statement names. It used to be skipped on the grounds that an isolated
+//! entity "has nothing to render" — true of the canvas, but this same walk is
+//! what COUNTS a space's entities, so a space whose writes produced entities
+//! and no facts between them reported zero while holding dozens.
 //!
 //! ## Completeness, not disjointness
 //!
@@ -51,6 +58,7 @@ use brain_metadata::schema::predicate::predicate_get;
 use brain_metadata::statement::statement_get;
 use brain_metadata::tables::edge::{walk_incoming, walk_outgoing};
 use brain_metadata::tables::entity::ENTITIES_TABLE;
+use brain_metadata::tables::entity::{ByTypeKey, ENTITY_BY_TYPE_TABLE};
 use brain_metadata::tables::entity_type::ENTITY_TYPES_TABLE;
 use brain_metadata::tables::memory::MEMORIES_TABLE;
 use brain_metadata::tables::relation::RELATION_METADATA_TABLE;
@@ -66,14 +74,49 @@ use crate::error::OpError;
 
 /// Cursor wire-format version. A mismatch means the client echoed a cursor
 /// minted by an incompatible server build → treat as stale.
-const CURSOR_VERSION: u8 = 1;
+/// Bumped to 2 when the entity phase was added: a v1 cursor names a position
+/// in the statement spine with no phase byte, so honouring one would resume
+/// the wrong walk. `decode_cursor` rejects it as stale and the client starts
+/// the export again, which is the same thing a layer-toggle change already
+/// did. The cursor is opaque bytes on the wire, so this is not a protocol
+/// change — no SDK reads it.
+const CURSOR_VERSION: u8 = 2;
+
+/// Which walk a cursor resumes.
+///
+/// The statement spine cannot reach an entity that is not a statement
+/// subject or object, and a space whose writes produced entities but no
+/// facts between them — a tenant with no model provider, say — has nothing
+/// else to reach them by. So the export runs the spine first and then pages
+/// the scope's own entity index, which is `(namespace, space)`-prefixed and
+/// therefore as cheap to range as the spine is.
+///
+/// Re-emitting an entity the spine already returned costs nothing: this
+/// export guarantees every node appears in *at least one* page, not that
+/// pages are disjoint, and the client dedups by id. That is what lets the
+/// second phase be a plain scan with no "already seen" set to carry.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Phase {
+    /// Walking `STATEMENTS_BY_SUBJECT`, resuming after this key.
+    Statements(StmtKey),
+    /// Walking `ENTITY_BY_TYPE`, resuming after this key.
+    Entities(ByTypeKey),
+}
+
+const PHASE_STATEMENTS: u8 = 0;
+const PHASE_ENTITIES: u8 = 1;
+
+/// Serialized `ENTITY_BY_TYPE` key: `ns(4) + space(16) + type(4) + entity(16)`.
+const ENTITY_KEY_LEN: usize = 4 + 16 + 4 + 16;
 
 /// Serialized `STATEMENTS_BY_SUBJECT` key: `ns(4) + space(16) + subject(16)
 /// + kind(1) + predicate(4) + is_current(1) + statement_id(16)`.
 const STMT_KEY_LEN: usize = 4 + 16 + 16 + 1 + 4 + 1 + 16;
 
-/// `[version(1)][flags(1)][stmt_key(58)]`.
-const CURSOR_LEN: usize = 1 + 1 + STMT_KEY_LEN;
+/// `[version(1)][flags(1)][phase(1)][key(58 | 40)]`.
+const CURSOR_LEN: usize = 1 + 1 + 1 + STMT_KEY_LEN;
+/// The same, for an entity-phase cursor.
+const ENTITY_CURSOR_LEN: usize = 1 + 1 + 1 + ENTITY_KEY_LEN;
 
 /// Max statements consumed off the spine per page. The wire caps `limit` at
 /// this too; nodes/edges per page are bounded by it via the traversal.
@@ -132,11 +175,18 @@ pub fn handle_graph_fetch(
     let scope = RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_space);
 
     let flags = req_flags(&req);
-    let after_key: Option<StmtKey> = if req.cursor.is_empty() {
+    let resume: Option<Phase> = if req.cursor.is_empty() {
         None
     } else {
         Some(decode_cursor(&req.cursor, flags, scope)?)
     };
+    // The entity phase runs alone once the spine is done; a cursor naming it
+    // skips the statement walk entirely.
+    let after_key: Option<StmtKey> = match resume {
+        Some(Phase::Statements(k)) => Some(k),
+        _ => None,
+    };
+    let entities_only = matches!(resume, Some(Phase::Entities(_)));
 
     let rtxn = ctx
         .executor
@@ -185,6 +235,9 @@ pub fn handle_graph_fetch(
     let mut has_more = false;
 
     for entry in range {
+        if entities_only {
+            break;
+        }
         if consumed == req.limit {
             has_more = true;
             break;
@@ -260,7 +313,54 @@ pub fn handle_graph_fetch(
         }
     }
 
-    // Relation + mention edges for every entity discovered on this page.
+    // Phase two: the scope's own entities, once the spine has nothing left.
+    //
+    // Runs only when the statement walk is finished — either it ran dry on
+    // this page, or a cursor said the export is already past it. This is what
+    // reaches an entity no statement names, which is every entity in a space
+    // whose extractions produced mentions but no facts; before it, such a
+    // space exported an empty graph and counted zero entities while holding
+    // dozens.
+    let mut last_entity: Option<ByTypeKey> = None;
+    if !has_more {
+        let by_type = rtxn
+            .open_table(ENTITY_BY_TYPE_TABLE)
+            .map_err(|e| OpError::Internal(format!("open entity_by_type: {e}")))?;
+        // Whole-space range: every type the scope has, in id order.
+        let lo_e: ByTypeKey = (ns, ag, 0, [0u8; 16]);
+        let hi_e: ByTypeKey = (ns, ag, u32::MAX, [0xffu8; 16]);
+        let lower_e = match resume {
+            Some(Phase::Entities(k)) if k > lo_e => std::ops::Bound::Excluded(k),
+            _ => std::ops::Bound::Included(lo_e),
+        };
+        let e_range = by_type
+            .range((lower_e, std::ops::Bound::Included(hi_e)))
+            .map_err(|e| OpError::Internal(format!("entity range: {e}")))?;
+        for entry in e_range {
+            if consumed == req.limit {
+                has_more = true;
+                break;
+            }
+            let (k, _) = entry.map_err(|e| OpError::Internal(format!("entity row: {e}")))?;
+            let key = k.value();
+            let (row_ns, row_ag, _type_id, eid_bytes) = key;
+            // Tenant wall, as on the spine: never trust a row's scope because
+            // the range was built from it.
+            if row_ns != ns || row_ag != ag {
+                continue;
+            }
+            last_entity = Some(key);
+            consumed += 1;
+            // `emit_entity` re-reads the primary row and drops anything whose
+            // owning scope is not the caller's, so a stale index row cannot
+            // put a foreign entity on the page.
+            builder.emit_entity(&rtxn, EntityId::from_bytes(eid_bytes))?;
+        }
+    }
+
+    // Relation + mention edges for every entity discovered on this page —
+    // from either phase, so an entity reached by the entity scan still gets
+    // its relations and the memories that mention it.
     let page_entities: Vec<EntityId> = builder.entities_this_page.clone();
     for eid in page_entities {
         builder.emit_relations(&rtxn, eid)?;
@@ -279,11 +379,16 @@ pub fn handle_graph_fetch(
         }
     }
 
-    let next_cursor = if has_more {
-        match last_key {
-            Some(k) => encode_cursor(flags, &k),
-            None => Vec::new(),
-        }
+    // Which walk the next page resumes. The entity phase only ever runs once
+    // the spine is exhausted, so a position in it supersedes the statement
+    // key: handing back the statement cursor here would replay the spine and
+    // never reach the entities again.
+    let next_cursor = if !has_more {
+        Vec::new()
+    } else if let Some(k) = last_entity {
+        encode_cursor(flags, &Phase::Entities(k))
+    } else if let Some(k) = last_key {
+        encode_cursor(flags, &Phase::Statements(k))
     } else {
         Vec::new()
     };
@@ -712,11 +817,43 @@ fn bytes_to_key(b: &[u8]) -> Option<StmtKey> {
     Some((ns, ag, subj, kind, pred, is_current, sid))
 }
 
-fn encode_cursor(flags: u8, key: &StmtKey) -> Vec<u8> {
+fn entity_key_to_bytes(k: &ByTypeKey) -> [u8; ENTITY_KEY_LEN] {
+    let (ns, space, type_id, eid) = k;
+    let mut out = [0u8; ENTITY_KEY_LEN];
+    out[0..4].copy_from_slice(&ns.to_be_bytes());
+    out[4..20].copy_from_slice(space);
+    out[20..24].copy_from_slice(&type_id.to_be_bytes());
+    out[24..40].copy_from_slice(eid);
+    out
+}
+
+fn bytes_to_entity_key(b: &[u8]) -> Option<ByTypeKey> {
+    if b.len() != ENTITY_KEY_LEN {
+        return None;
+    }
+    let ns = u32::from_be_bytes(b[0..4].try_into().ok()?);
+    let mut space = [0u8; 16];
+    space.copy_from_slice(&b[4..20]);
+    let type_id = u32::from_be_bytes(b[20..24].try_into().ok()?);
+    let mut eid = [0u8; 16];
+    eid.copy_from_slice(&b[24..40]);
+    Some((ns, space, type_id, eid))
+}
+
+fn encode_cursor(flags: u8, phase: &Phase) -> Vec<u8> {
     let mut out = Vec::with_capacity(CURSOR_LEN);
     out.push(CURSOR_VERSION);
     out.push(flags);
-    out.extend_from_slice(&key_to_bytes(key));
+    match phase {
+        Phase::Statements(key) => {
+            out.push(PHASE_STATEMENTS);
+            out.extend_from_slice(&key_to_bytes(key));
+        }
+        Phase::Entities(key) => {
+            out.push(PHASE_ENTITIES);
+            out.extend_from_slice(&entity_key_to_bytes(key));
+        }
+    }
     out
 }
 
@@ -730,19 +867,44 @@ fn encode_cursor(flags: u8, key: &StmtKey) -> Vec<u8> {
 /// sorting beneath it — a cross-tenant read. The version/flags checks stay:
 /// a cursor that survives them but points at another tenant is rejected as
 /// out-of-tenant, not silently honoured.
-fn decode_cursor(cursor: &[u8], flags: u8, scope: RowScope) -> Result<StmtKey, OpError> {
+fn decode_cursor(cursor: &[u8], flags: u8, scope: RowScope) -> Result<Phase, OpError> {
     let stale = || OpError::InvalidRequest("stale_cursor: layer toggles changed".into());
-    if cursor.len() != CURSOR_LEN || cursor[0] != CURSOR_VERSION || cursor[1] != flags {
+    // Version, flags and phase are checked before any key is read, so a
+    // cursor minted for a different export shape never reaches the decoders.
+    if cursor.len() < 3 || cursor[0] != CURSOR_VERSION || cursor[1] != flags {
         return Err(stale());
     }
-    let key = bytes_to_key(&cursor[2..]).ok_or_else(stale)?;
-    let (ns, ag, ..) = key;
-    if ns != scope.namespace_id || ag != scope.space_id_bytes {
-        return Err(OpError::InvalidRequest(
-            "cursor does not belong to the caller's tenant".into(),
-        ));
+    let out_of_tenant =
+        || OpError::InvalidRequest("cursor does not belong to the caller's tenant".into());
+    // Both key types lead with `(namespace, space)`, so both are bound to a
+    // tenant the same way: a cursor naming another one is refused rather than
+    // used as a scan floor. Without this a forged cursor sorting below the
+    // caller's range would widen the scan onto a neighbour's rows.
+    match cursor[2] {
+        PHASE_STATEMENTS => {
+            if cursor.len() != CURSOR_LEN {
+                return Err(stale());
+            }
+            let key = bytes_to_key(&cursor[3..]).ok_or_else(stale)?;
+            let (ns, ag, ..) = key;
+            if ns != scope.namespace_id || ag != scope.space_id_bytes {
+                return Err(out_of_tenant());
+            }
+            Ok(Phase::Statements(key))
+        }
+        PHASE_ENTITIES => {
+            if cursor.len() != ENTITY_CURSOR_LEN {
+                return Err(stale());
+            }
+            let key = bytes_to_entity_key(&cursor[3..]).ok_or_else(stale)?;
+            let (ns, ag, ..) = key;
+            if ns != scope.namespace_id || ag != scope.space_id_bytes {
+                return Err(out_of_tenant());
+            }
+            Ok(Phase::Entities(key))
+        }
+        _ => Err(stale()),
     }
-    Ok(key)
 }
 
 #[cfg(test)]
@@ -771,23 +933,26 @@ mod tests {
     #[test]
     fn cursor_round_trips_and_binds_flags() {
         let flags = FLAG_STATEMENTS | FLAG_MEMORIES;
-        let cur = encode_cursor(flags, &key());
+        let cur = encode_cursor(flags, &Phase::Statements(key()));
         assert_eq!(cur.len(), CURSOR_LEN);
-        assert_eq!(decode_cursor(&cur, flags, caller_scope()).unwrap(), key());
+        assert_eq!(
+            decode_cursor(&cur, flags, caller_scope()).unwrap(),
+            Phase::Statements(key())
+        );
     }
 
     #[test]
     fn cursor_rejects_changed_flags() {
         // A cursor minted with statements+memories must not resume a request
         // that dropped a layer — the derived result set would differ.
-        let cur = encode_cursor(FLAG_STATEMENTS | FLAG_MEMORIES, &key());
+        let cur = encode_cursor(FLAG_STATEMENTS | FLAG_MEMORIES, &Phase::Statements(key()));
         assert!(decode_cursor(&cur, FLAG_STATEMENTS, caller_scope()).is_err());
         assert!(decode_cursor(&cur, 0, caller_scope()).is_err());
     }
 
     #[test]
     fn cursor_rejects_wrong_version_and_length() {
-        let mut cur = encode_cursor(0, &key());
+        let mut cur = encode_cursor(0, &Phase::Statements(key()));
         assert!(decode_cursor(&cur[..CURSOR_LEN - 1], 0, caller_scope()).is_err());
         cur[0] = CURSOR_VERSION.wrapping_add(1);
         assert!(decode_cursor(&cur, 0, caller_scope()).is_err());
@@ -798,9 +963,12 @@ mod tests {
     /// same namespace — must be rejected, not honoured as a scan lower bound.
     #[test]
     fn cursor_rejects_wrong_tenant() {
-        let cur = encode_cursor(0, &key());
+        let cur = encode_cursor(0, &Phase::Statements(key()));
         // Same layout, in-tenant → accepted.
-        assert_eq!(decode_cursor(&cur, 0, caller_scope()).unwrap(), key());
+        assert_eq!(
+            decode_cursor(&cur, 0, caller_scope()).unwrap(),
+            Phase::Statements(key())
+        );
         // Foreign namespace.
         let other_ns = RowScope::from_bytes(8, [1u8; 16]);
         assert!(decode_cursor(&cur, 0, other_ns).is_err());
@@ -819,13 +987,72 @@ mod tests {
         // A well-formed cursor (correct len, version, flags) whose embedded
         // key names the reserved zero scope rather than the caller's.
         let forged_key: StmtKey = (0, [0u8; 16], [0u8; 16], 0, 0, 1, [0u8; 16]);
-        let cur = encode_cursor(0, &forged_key);
+        let cur = encode_cursor(0, &Phase::Statements(forged_key));
         assert_eq!(cur.len(), CURSOR_LEN);
         assert_eq!(cur[0], CURSOR_VERSION);
         assert_eq!(cur[1], 0);
         // Rejected loudly for a real tenant rather than used as the floor.
         let err = decode_cursor(&cur, 0, caller_scope()).unwrap_err();
         assert!(matches!(err, OpError::InvalidRequest(_)));
+    }
+
+    fn entity_key() -> ByTypeKey {
+        (7, [1u8; 16], 0x00AB_CDEF, [0x5Au8; 16])
+    }
+
+    /// The entity phase's cursor round-trips and is distinguishable from a
+    /// statement one, so resuming cannot land in the wrong walk.
+    #[test]
+    fn entity_cursor_round_trips_and_is_its_own_phase() {
+        let cur = encode_cursor(0, &Phase::Entities(entity_key()));
+        assert_eq!(cur.len(), ENTITY_CURSOR_LEN);
+        assert_eq!(cur[2], PHASE_ENTITIES);
+        assert_eq!(
+            decode_cursor(&cur, 0, caller_scope()).unwrap(),
+            Phase::Entities(entity_key())
+        );
+
+        let stmt = encode_cursor(0, &Phase::Statements(key()));
+        assert_eq!(stmt[2], PHASE_STATEMENTS);
+        assert_ne!(stmt.len(), cur.len());
+    }
+
+    /// The entity index is `(namespace, space)`-prefixed exactly like the
+    /// statement spine, so its cursor carries the same tenant bind — a
+    /// forged one must not become the floor of a scan over a neighbour's
+    /// entities.
+    #[test]
+    fn entity_cursor_rejects_wrong_tenant() {
+        let cur = encode_cursor(0, &Phase::Entities(entity_key()));
+        assert!(decode_cursor(&cur, 0, RowScope::from_bytes(8, [1u8; 16])).is_err());
+        assert!(decode_cursor(&cur, 0, RowScope::from_bytes(7, [2u8; 16])).is_err());
+
+        // And the same zero-scope forgery the statement phase refuses.
+        let forged: ByTypeKey = (0, [0u8; 16], 0, [0u8; 16]);
+        let cur = encode_cursor(0, &Phase::Entities(forged));
+        assert!(matches!(
+            decode_cursor(&cur, 0, caller_scope()).unwrap_err(),
+            OpError::InvalidRequest(_)
+        ));
+    }
+
+    /// A cursor minted before the entity phase existed names a position in a
+    /// walk that no longer has that shape. It is refused as stale so the
+    /// export restarts, rather than being read as a phase byte plus a short
+    /// key.
+    #[test]
+    fn a_previous_version_cursor_is_stale() {
+        let mut old = vec![1u8, 0u8];
+        old.extend_from_slice(&key_to_bytes(&key()));
+        assert!(decode_cursor(&old, 0, caller_scope()).is_err());
+    }
+
+    /// An unknown phase byte is refused rather than defaulted to a walk.
+    #[test]
+    fn an_unknown_phase_is_stale() {
+        let mut cur = encode_cursor(0, &Phase::Statements(key()));
+        cur[2] = 9;
+        assert!(decode_cursor(&cur, 0, caller_scope()).is_err());
     }
 
     #[test]
@@ -871,11 +1098,14 @@ mod tests {
     #[test]
     fn cursor_rejects_memory_edge_toggle_mid_scroll() {
         let with = FLAG_MEMORIES | FLAG_MEMORY_EDGES;
-        let cur = encode_cursor(with, &key());
-        assert_eq!(decode_cursor(&cur, with, caller_scope()).unwrap(), key());
+        let cur = encode_cursor(with, &Phase::Statements(key()));
+        assert_eq!(
+            decode_cursor(&cur, with, caller_scope()).unwrap(),
+            Phase::Statements(key())
+        );
         assert!(decode_cursor(&cur, FLAG_MEMORIES, caller_scope()).is_err());
 
-        let without = encode_cursor(FLAG_MEMORIES, &key());
+        let without = encode_cursor(FLAG_MEMORIES, &Phase::Statements(key()));
         assert!(decode_cursor(&without, with, caller_scope()).is_err());
     }
 
