@@ -724,13 +724,22 @@ async fn already_audited_memory_removes_stale_queue_row_without_reextracting() {
 struct FakeHypeLlmClient {
     reply: String,
     cost_micro_usd: u64,
+    /// When set, `complete` errors with this reason instead of replying.
+    /// Models the real failure shapes — no provider key for the namespace,
+    /// a completion budget too small for a reasoning model — which is the
+    /// only way to exercise the `Failed` publish path.
+    fail_with: Option<String>,
 }
 
 impl LlmClient for FakeHypeLlmClient {
     fn complete<'a>(&'a self, _request: LlmRequest) -> LlmFuture<'a> {
         let content = self.reply.clone();
         let cost_micro_usd = self.cost_micro_usd;
+        let fail_with = self.fail_with.clone();
         Box::pin(async move {
+            if let Some(reason) = fail_with {
+                return Err(brain_llm::LlmError::OutputDecodeFailed { reason });
+            }
             Ok(LlmResponse {
                 truncated: false,
                 content,
@@ -759,6 +768,25 @@ fn build_hype_generator(
     reply: &str,
     cost_micro_usd: u64,
 ) -> HypeGenerator {
+    build_hype_generator_inner(metadata, tempdir, reply, cost_micro_usd, None)
+}
+
+/// As [`build_hype_generator`], but the LLM client fails with `reason`.
+fn build_failing_hype_generator(
+    metadata: SharedMetadataDb,
+    tempdir: &tempfile::TempDir,
+    reason: &str,
+) -> HypeGenerator {
+    build_hype_generator_inner(metadata, tempdir, "", 0, Some(reason))
+}
+
+fn build_hype_generator_inner(
+    metadata: SharedMetadataDb,
+    tempdir: &tempfile::TempDir,
+    reply: &str,
+    cost_micro_usd: u64,
+    fail_with: Option<&str>,
+) -> HypeGenerator {
     let cache_path = tempdir.path().join("llm_cache.redb");
     let cache = LlmCacheDb::open(&cache_path).expect("open llm cache");
     let index = Arc::new(PLRwLock::new(
@@ -768,6 +796,7 @@ fn build_hype_generator(
     let client: Arc<dyn LlmClient> = Arc::new(FakeHypeLlmClient {
         reply: reply.to_string(),
         cost_micro_usd,
+        fail_with: fail_with.map(str::to_string),
     });
     HypeGenerator::new(
         Arc::new(brain_llm::FixedResolver::new(client)),
@@ -833,9 +862,14 @@ async fn hype_pass_publishes_one_ok_event_with_questions_and_cost() {
         StagePayload::Hype(StageHypePayload {
             questions_written,
             cost_micro_usd,
+            error_message,
         }) => {
             assert_eq!(*questions_written, 3, "fake client returns 3 questions");
             assert_eq!(*cost_micro_usd, 777, "fake client's cost, not a cache hit");
+            assert!(
+                error_message.is_empty(),
+                "a stage that succeeded carries no reason, got {error_message:?}",
+            );
         }
         other => panic!("unexpected stage payload: {other:?}"),
     }
@@ -880,6 +914,71 @@ async fn hype_pass_with_empty_reply_publishes_one_empty_event() {
             questions_written, ..
         }) => {
             assert_eq!(*questions_written, 0);
+        }
+        other => panic!("unexpected stage payload: {other:?}"),
+    }
+}
+
+/// A HyPE stage that could not run publishes `Failed` **with the reason**.
+///
+/// This is the gap the payload used to have. `Failed` plus `questions_written:
+/// 0` is the same record for a namespace with no provider key, a completion
+/// budget too small for a reasoning model, and a dead embedder — three faults
+/// with three different fixes. The cause was known at the failure site and
+/// logged, but the stage record carried no field to put it in, so everything
+/// downstream (the write trace, the analytics row an operator actually reads)
+/// could say only that something broke.
+#[tokio::test(flavor = "current_thread")]
+async fn a_failed_hype_pass_publishes_the_reason_it_failed() {
+    let registry = ExtractorRegistry::new();
+    let tempdir = tempfile::tempdir().unwrap();
+    let db_path = tempdir.path().join("metadata.redb");
+    let metadata: SharedMetadataDb = Arc::new(MetadataDb::open(&db_path).unwrap());
+    // The real text of the budget fault, so this test also pins that the
+    // provider's explanation survives the whole way to the stage record.
+    let hype = build_failing_hype_generator(
+        metadata.clone(),
+        &tempdir,
+        "openai returned no content: the completion budget was spent before any \
+         output (finish_reason=length)",
+    );
+
+    let fixture = build_fixture_with_registry_and_hype(registry, Some(hype));
+    let mut rx = fixture.ops.events.receiver();
+
+    let memory_id = make_memory_id(202);
+    fixture.enqueue(memory_id, "a memory whose hype pass cannot run");
+
+    let drained = run_cycle(&fixture).await;
+    assert_eq!(drained, 1);
+    tokio::time::sleep(Duration::from_millis(0)).await;
+
+    let events = drain_bus(&mut rx);
+    let hype_events: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            e.event_type == EventType::StageCompleted && e.stage_kind == Some(StageKind::Hype)
+        })
+        .collect();
+    assert_eq!(hype_events.len(), 1);
+    let env = hype_events[0];
+    assert_eq!(env.memory_id, memory_id);
+    assert_eq!(
+        env.stage_outcome,
+        Some(StageOutcome::Failed),
+        "a stage that could not run is Failed, not Empty",
+    );
+    match env.stage_payload.as_ref().expect("payload populated") {
+        StagePayload::Hype(StageHypePayload {
+            questions_written,
+            error_message,
+            ..
+        }) => {
+            assert_eq!(*questions_written, 0);
+            assert!(
+                error_message.contains("finish_reason=length"),
+                "the failure must name its cause; got {error_message:?}",
+            );
         }
         other => panic!("unexpected stage payload: {other:?}"),
     }

@@ -4533,7 +4533,7 @@ async fn publish_hype_completed(
     space_id: SpaceId,
     outcome: HypeGenOutcome,
 ) {
-    let stage_outcome = if outcome.failed {
+    let stage_outcome = if outcome.failed() {
         StageOutcome::Failed
     } else if outcome.questions_written > 0 {
         StageOutcome::Ok
@@ -4543,6 +4543,9 @@ async fn publish_hype_completed(
     let payload = StagePayload::Hype(StageHypePayload {
         questions_written: outcome.questions_written as u32,
         cost_micro_usd: outcome.cost_micro_usd,
+        // Carried only on `Failed`, so the two agree by construction: the
+        // outcome is `Failed` exactly when a reason exists.
+        error_message: outcome.failure.clone().unwrap_or_default(),
     });
     let envelope = EventEnvelope {
         lsn: 0,

@@ -212,7 +212,7 @@ pub struct StageTemporalEdgePayload {
     pub edges_written: u32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StageHypePayload {
     /// How many hypothetical questions were embedded, persisted, and
     /// inserted into the memory HNSW index.
@@ -220,6 +220,18 @@ pub struct StageHypePayload {
     /// LLM micro-USD spent generating the questions (`0` on a cache
     /// hit).
     pub cost_micro_usd: u64,
+    /// Why the stage failed. Populated whenever the parent outcome is
+    /// [`StageOutcome::Failed`], empty otherwise — the same contract
+    /// [`StageExtractorPayload::error_message`] carries.
+    ///
+    /// Without this a failed HyPE stage could not explain itself. The
+    /// outcome byte said `Failed` and the two counters said zero, which is
+    /// also what a namespace with no provider key, a budget too small for a
+    /// reasoning model, and a dead embedder all look like. The reason
+    /// existed — every failure path logs it — but it reached only the
+    /// server's own stdout, so an operator reading the stage record saw
+    /// that something broke and had nothing to act on.
+    pub error_message: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

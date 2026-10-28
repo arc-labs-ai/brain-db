@@ -76,13 +76,22 @@ pub struct HypeGenerator {
 
 /// Outcome of one memory's generation, folded into the worker's
 /// per-cycle bookkeeping.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct HypeGenOutcome {
     /// Questions embedded + persisted + inserted.
     pub questions_written: usize,
     /// LLM micro-USD spent (0 on a cache hit).
     pub cost_micro_usd: u64,
-    /// The stage could not run, as opposed to running and finding nothing.
+    /// Why the stage could not run, as opposed to running and finding
+    /// nothing. `None` is a stage that ran.
+    ///
+    /// A reason rather than a flag because the flag alone was not actionable.
+    /// Every failure path here already had the cause in hand and passed it to
+    /// `tracing`, then returned a bare `true` — so the stage record said a
+    /// write was degraded without saying what to fix, and the one place the
+    /// answer existed was a log line nobody correlates to a memory id. An
+    /// `Option<String>` also makes "failed, reason unknown" unrepresentable,
+    /// which is the state the record used to be stuck in.
     ///
     /// HyPE stays best-effort — a failure here is still logged, folded into a
     /// zero-question outcome, and never fails the surrounding write. What
@@ -93,7 +102,15 @@ pub struct HypeGenOutcome {
     /// write then looked exactly like a healthy one, which is how a sandbox
     /// ends up with entities, no statements, an empty graph, and nothing
     /// anywhere saying why.
-    pub failed: bool,
+    pub failure: Option<String>,
+}
+
+impl HypeGenOutcome {
+    /// Whether the stage failed. The reason is [`Self::failure`].
+    #[must_use]
+    pub const fn failed(&self) -> bool {
+        self.failure.is_some()
+    }
 }
 
 impl HypeGenerator {
@@ -155,7 +172,7 @@ impl HypeGenerator {
                     "HyPE question generation failed; skipping",
                 );
                 return HypeGenOutcome {
-                    failed: true,
+                    failure: Some(e.to_string()),
                     ..Default::default()
                 };
             }
@@ -164,7 +181,7 @@ impl HypeGenerator {
             return HypeGenOutcome {
                 questions_written: 0,
                 cost_micro_usd: cost_micro,
-                failed: false,
+                failure: None,
             };
         }
 
@@ -189,7 +206,7 @@ impl HypeGenerator {
             return HypeGenOutcome {
                 questions_written: 0,
                 cost_micro_usd: cost_micro,
-                failed: false,
+                failure: None,
             };
         }
 
@@ -213,7 +230,7 @@ impl HypeGenerator {
                     cost_micro_usd: cost_micro,
                     // Questions were generated and then lost. That is a
                     // failure, not an absence.
-                    failed: true,
+                    failure: Some(format!("hype vector persist failed: {e}")),
                 };
             }
         }
@@ -243,7 +260,7 @@ impl HypeGenerator {
         HypeGenOutcome {
             questions_written: vectors.len(),
             cost_micro_usd: cost_micro,
-            failed: false,
+            failure: None,
         }
     }
 
@@ -292,7 +309,7 @@ impl HypeGenerator {
                     "HyPE refresh generation failed; keeping prior questions",
                 );
                 return HypeGenOutcome {
-                    failed: true,
+                    failure: Some(e.to_string()),
                     ..Default::default()
                 };
             }
@@ -301,7 +318,7 @@ impl HypeGenerator {
             return HypeGenOutcome {
                 questions_written: 0,
                 cost_micro_usd: cost_micro,
-                failed: false,
+                failure: None,
             };
         }
 
@@ -315,7 +332,7 @@ impl HypeGenerator {
             return HypeGenOutcome {
                 questions_written: 0,
                 cost_micro_usd: cost_micro,
-                failed: false,
+                failure: None,
             };
         }
 
@@ -333,7 +350,7 @@ impl HypeGenerator {
                 return HypeGenOutcome {
                     questions_written: 0,
                     cost_micro_usd: cost_micro,
-                    failed: false,
+                    failure: None,
                 };
             }
         }
@@ -342,7 +359,7 @@ impl HypeGenerator {
         HypeGenOutcome {
             questions_written: vectors.len(),
             cost_micro_usd: cost_micro,
-            failed: false,
+            failure: None,
         }
     }
 
