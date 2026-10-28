@@ -423,7 +423,14 @@ impl HypeGenerator {
             }],
             response_schema: None,
             temperature: 0.3,
-            max_tokens: 256,
+            // Must cover REASONING tokens, not just the questions. 256 was
+            // sized for the visible output alone; on a reasoning model the
+            // budget is spent thinking before a single question is written,
+            // so every call returned empty, was treated as a transient
+            // hiccup, and was retried on the next cycle forever — billed
+            // each time, for nothing. Unused budget is not charged, so
+            // sizing this for the slower case costs nothing in the fast one.
+            max_tokens: 2048,
             timeout: Duration::from_secs(30),
         };
         let resp = client

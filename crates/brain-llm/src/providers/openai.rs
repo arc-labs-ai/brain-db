@@ -388,6 +388,12 @@ struct OpenAIUsage {
 }
 
 fn decode_openai_response(payload: OpenAIResponseBody) -> Result<LlmResponse, LlmError> {
+    let truncated = payload
+        .choices
+        .first()
+        .and_then(|c| c.finish_reason.as_deref())
+        == Some("length");
+
     let content = payload
         .choices
         .first()
@@ -396,16 +402,24 @@ fn decode_openai_response(payload: OpenAIResponseBody) -> Result<LlmResponse, Ll
             reason: "openai response had no choices[0].message.content".into(),
         })?;
     if content.is_empty() {
+        // `truncated` is computed FIRST so this can say which empty it is.
+        // A reasoning model spends the completion budget on reasoning before
+        // it writes anything, so too small a budget returns `finish_reason =
+        // length` with no content at all — and reported as a bare "content
+        // was empty" that is indistinguishable from a malformed reply, which
+        // callers retry. Every retry is billed and returns empty again.
         return Err(LlmError::OutputDecodeFailed {
-            reason: "openai response content was empty".into(),
+            reason: if truncated {
+                "openai returned no content: the completion budget was spent \
+                 before any output (finish_reason=length). On a reasoning \
+                 model the budget must cover the reasoning tokens too — raise \
+                 max_tokens for this call, or configure a non-reasoning model"
+                    .into()
+            } else {
+                "openai response content was empty".into()
+            },
         });
     }
-
-    let truncated = payload
-        .choices
-        .first()
-        .and_then(|c| c.finish_reason.as_deref())
-        == Some("length");
 
     let cost_micro_usd = payload.usage.prompt_tokens * PRICE_INPUT_PER_TOKEN_DEFAULT
         + payload.usage.completion_tokens * PRICE_OUTPUT_PER_TOKEN_DEFAULT;
@@ -666,6 +680,36 @@ mod tests {
         // second identical call to learn nothing.
         let r = decode_openai_response(body_with_finish(Some("length"))).unwrap();
         assert!(r.truncated);
+    }
+
+    /// A reasoning model with too small a budget answers 200 with empty
+    /// content and `finish_reason = length`. Reported as a bare "content was
+    /// empty" it reads as a transient hiccup, so the caller retries it — and
+    /// retries it, billed every time, because nothing about the request has
+    /// changed. The error has to name the budget for anyone to fix it.
+    #[test]
+    fn an_empty_truncated_reply_blames_the_budget_not_the_model() {
+        let mut body = body_with_finish(Some("length"));
+        body.choices[0].message.content = Some(String::new());
+
+        let err = decode_openai_response(body).expect_err("empty content is an error");
+        let msg = err.to_string();
+        assert!(msg.contains("finish_reason=length"), "{msg}");
+        assert!(msg.contains("max_tokens"), "{msg}");
+    }
+
+    /// An empty reply that was NOT truncated is a different fault and must
+    /// not be mislabelled as a budget problem.
+    #[test]
+    fn an_empty_reply_that_finished_cleanly_is_not_blamed_on_the_budget() {
+        let mut body = body_with_finish(Some("stop"));
+        body.choices[0].message.content = Some(String::new());
+
+        let msg = decode_openai_response(body)
+            .expect_err("empty content is an error")
+            .to_string();
+        assert!(msg.contains("content was empty"), "{msg}");
+        assert!(!msg.contains("max_tokens"), "{msg}");
     }
 
     #[test]
