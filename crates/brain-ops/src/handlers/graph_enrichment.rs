@@ -321,8 +321,9 @@ mod tests {
     use super::*;
     use brain_core::{Entity, EntityId, EntityType, NodeRef, SessionId};
     use brain_metadata::entity::ops::entity_put;
-    use brain_metadata::tables::edge::{link, zero_disambiguator, EdgeData, EDGES_REVERSE_TABLE,
-        EDGES_TABLE};
+    use brain_metadata::tables::edge::{
+        link, zero_disambiguator, EdgeData, EDGES_REVERSE_TABLE, EDGES_TABLE,
+    };
     use brain_metadata::{MetadataDb, RowScope};
     use brain_protocol::envelope::response::GraphEnrichment;
 
@@ -358,9 +359,7 @@ mod tests {
         entity_put(&wtxn, scope(), SessionId::DEFAULT, &entity).expect("entity_put");
         {
             let mut e = wtxn.open_table(EDGES_TABLE).expect("edges");
-            let mut r = wtxn
-                .open_table(EDGES_REVERSE_TABLE)
-                .expect("edges_reverse");
+            let mut r = wtxn.open_table(EDGES_REVERSE_TABLE).expect("edges_reverse");
             let data = EdgeData::new(
                 1.0,
                 brain_metadata::tables::edge::origin::AUTO_DERIVED,
@@ -389,9 +388,7 @@ mod tests {
         let wtxn = db.write_txn().expect("write txn");
         {
             let mut e = wtxn.open_table(EDGES_TABLE).expect("edges");
-            let mut r = wtxn
-                .open_table(EDGES_REVERSE_TABLE)
-                .expect("edges_reverse");
+            let mut r = wtxn.open_table(EDGES_REVERSE_TABLE).expect("edges_reverse");
             let data = EdgeData::new(
                 1.0,
                 brain_metadata::tables::edge::origin::AUTO_DERIVED,

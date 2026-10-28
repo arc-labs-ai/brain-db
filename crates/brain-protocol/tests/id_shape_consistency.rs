@@ -119,7 +119,10 @@ fn every_id_field_is_carried_in_exactly_one_shape() {
         if by_shape.len() < 2 || allowed.contains(field.as_str()) {
             continue;
         }
-        failures.push_str(&format!("\n`{field}` is carried in {} shapes:\n", by_shape.len()));
+        failures.push_str(&format!(
+            "\n`{field}` is carried in {} shapes:\n",
+            by_shape.len()
+        ));
         for (shape, sites) in by_shape {
             failures.push_str(&format!("    {shape}\n"));
             for site in sites.iter().take(6) {

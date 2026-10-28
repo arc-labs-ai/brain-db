@@ -39,9 +39,9 @@ use brain_protocol::schema::{validate_with, Schema, SchemaItem};
 use brain_protocol::{schema_drop_target, SchemaDropRequest, SchemaDropResponse};
 
 use crate::context::OpsContext;
+use crate::error::OpError;
 use crate::handlers::schema_scope;
 use crate::handlers::schema_wire;
-use crate::error::OpError;
 use crate::write::{Phase, PhaseAck, Write, WriteId};
 
 /// Cap on the in-use scan: the safety gate only needs to know "any live
@@ -535,8 +535,7 @@ mod tests {
         // The seed document declares its own types, so an empty context is
         // right here — unlike the handler, which must resolve the shared
         // system entity types.
-        let validated =
-            brain_protocol::schema::validate(&parsed).unwrap();
+        let validated = brain_protocol::schema::validate(&parsed).unwrap();
         let wtxn = metadata.write_txn().unwrap();
         store_schema_upload(&wtxn, &validated, 1).unwrap();
         wtxn.commit().unwrap();

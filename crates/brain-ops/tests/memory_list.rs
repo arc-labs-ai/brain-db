@@ -24,8 +24,8 @@ use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_protocol::envelope::request::{EncodeRequest, ForgetRequest, RequestBody};
 use brain_protocol::envelope::response::{EncodeResponse, ResponseBody};
 use brain_protocol::{
-    ForgetMode, MemoryListDirWire, MemoryListRequest, MemoryListResponseFrame,
-    MemoryListSortWire, MemoryListTimeAxisWire,
+    ForgetMode, MemoryListDirWire, MemoryListRequest, MemoryListResponseFrame, MemoryListSortWire,
+    MemoryListTimeAxisWire,
 };
 
 // ---------------------------------------------------------------------------
@@ -423,7 +423,8 @@ fn created_time_range_filter() {
         }
         // Every row in the window must be present.
         let want: Vec<u128> = all.items[1..=4].iter().map(|it| it.memory_id).collect();
-        let got: std::collections::BTreeSet<u128> = frame.items.iter().map(|it| it.memory_id).collect();
+        let got: std::collections::BTreeSet<u128> =
+            frame.items.iter().map(|it| it.memory_id).collect();
         for id in want {
             assert!(got.contains(&id), "windowed row {id} missing");
         }

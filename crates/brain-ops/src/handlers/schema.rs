@@ -24,9 +24,7 @@ use brain_metadata::relation::types::relation_type_lookup_by_qname;
 // the pre-flight can't classify a re-upload differently than apply does.
 use brain_metadata::schema::apply::{declared_object_entity_type, object_type_constraint_byte};
 use brain_metadata::schema::predicate::predicate_lookup_by_qname;
-use brain_metadata::schema::store::{
-    active_source_covers, schema_active, schema_get, schema_list,
-};
+use brain_metadata::schema::store::{active_source_covers, schema_active, schema_get, schema_list};
 use brain_metadata::system_schema::SYSTEM_SCHEMA_NAMESPACE;
 use brain_protocol::envelope::response::EventType;
 use brain_protocol::schema::render::render_schema_verified;
@@ -42,13 +40,12 @@ use brain_protocol::{
 };
 
 use crate::context::OpsContext;
-use crate::handlers::schema_scope;
-use crate::handlers::schema_wire;
 use crate::error::OpError;
 use crate::handlers::events::emit_graph_event;
+use crate::handlers::schema_scope;
+use crate::handlers::schema_wire;
 use crate::handlers::writer_handle::real_writer_handle;
 use crate::write::{Phase, PhaseAck, Write, WriteId};
-
 
 // ---------------------------------------------------------------------------
 // SCHEMA_UPLOAD
@@ -192,7 +189,10 @@ pub async fn handle_schema_upload(
     };
     let write =
         Write::single(write_id, ctx.executor.caller_space, phase).with_request_hash(request_hash);
-    let ack = real_writer.submit(write).await.map_err(schema_scope::map_writer_err)?;
+    let ack = real_writer
+        .submit(write)
+        .await
+        .map_err(schema_scope::map_writer_err)?;
     let new_version = match ack.single_phase() {
         PhaseAck::UpsertedSchema { version, .. } => *version,
         other => {
@@ -566,7 +566,8 @@ fn classify_schema_merge(
         .read_txn()
         .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
 
-    let current_version = schema_active(&rtxn, namespace).map_err(schema_scope::map_schema_store_error)?;
+    let current_version =
+        schema_active(&rtxn, namespace).map_err(schema_scope::map_schema_store_error)?;
 
     // Entity types are scoped per tenant, so the pre-flight must classify
     // against THIS namespace's registry. An unregistered namespace (a
@@ -1216,7 +1217,6 @@ mod tests {
         assert!(check_document_cap(&big).is_err());
         assert!(check_document_cap("namespace acme").is_ok());
     }
-
 
     #[test]
     fn parse_failed_upload_response_zero_version() {

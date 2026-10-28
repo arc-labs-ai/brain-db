@@ -214,8 +214,13 @@ pub fn merge_graph_from_committed(
             // nothing to enrich, and the bundle was purged with the row.
             return Ok(0);
         };
-        let enr = crate::handlers::graph_enrichment::fetch_enrichment_for(&[memory_id], scope, None, &rtxn)
-            .map_err(|e| format!("graph enrichment: {e}"))?;
+        let enr = crate::handlers::graph_enrichment::fetch_enrichment_for(
+            &[memory_id],
+            scope,
+            None,
+            &rtxn,
+        )
+        .map_err(|e| format!("graph enrichment: {e}"))?;
         enrichment_to_graph_counted(enr.into_iter().next())
     };
 

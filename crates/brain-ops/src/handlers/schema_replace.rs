@@ -26,9 +26,9 @@ use brain_protocol::schema::{parse_schema, validate_located_with};
 use brain_protocol::{SchemaReplaceRequest, SchemaReplaceResponse};
 
 use crate::context::OpsContext;
+use crate::error::OpError;
 use crate::handlers::schema_scope;
 use crate::handlers::schema_wire;
-use crate::error::OpError;
 use crate::write::{Phase, PhaseAck, Write, WriteId};
 
 /// Handle a `SCHEMA_REPLACE` request. Admin-only at the dispatch
