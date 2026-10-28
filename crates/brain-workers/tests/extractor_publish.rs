@@ -317,6 +317,15 @@ async fn drain_success_publishes_one_ok_event() {
             assert_eq!(p.statement_count, 0);
             assert_eq!(p.relation_count, 0);
             assert_eq!(p.audit_status, StageAuditStatus::Succeeded);
+            // The other half of the contract: a clean pass says nothing.
+            // A reason on a `Succeeded` row would be a false alarm an
+            // operator has to chase, so the field's emptiness here is as
+            // load-bearing as its content on a failure.
+            assert!(
+                p.error_message.is_empty(),
+                "a succeeded extraction must carry no failure reason; got {:?}",
+                p.error_message,
+            );
         }
         other => panic!("unexpected stage payload: {other:?}"),
     }
@@ -359,6 +368,17 @@ async fn drain_pipeline_failure_publishes_one_failed_event() {
             assert_eq!(p.entity_count, 0);
             assert_eq!(p.statement_count, 0);
             assert_eq!(p.relation_count, 0);
+            // The tier's own words, carried the whole way out: the stub
+            // fails with "forced failure", `decide_status` folds that into
+            // the audit reason, and the published payload must repeat it.
+            // Three zero counts and a `Failed` byte describe every way
+            // extraction can break; this is the only field that says which
+            // one happened.
+            assert!(
+                p.error_message.contains("forced failure"),
+                "the failing tier's reason must reach the published payload; got {:?}",
+                p.error_message,
+            );
         }
         other => panic!("unexpected stage payload: {other:?}"),
     }

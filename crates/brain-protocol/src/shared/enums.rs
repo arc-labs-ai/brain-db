@@ -221,8 +221,9 @@ pub struct StageHypePayload {
     /// hit).
     pub cost_micro_usd: u64,
     /// Why the stage failed. Populated whenever the parent outcome is
-    /// [`StageOutcome::Failed`], empty otherwise — the same contract
-    /// [`StageExtractorPayload::error_message`] carries.
+    /// [`StageOutcome::Failed`], empty otherwise. HyPE either produced
+    /// questions or could not run, so it has no partial state of the kind
+    /// [`StageExtractorPayload::error_message`] also reports on.
     ///
     /// Without this a failed HyPE stage could not explain itself. The
     /// outcome byte said `Failed` and the two counters said zero, which is
@@ -240,7 +241,15 @@ pub struct StageExtractorPayload {
     pub statement_count: u32,
     pub relation_count: u32,
     pub audit_status: StageAuditStatus,
-    /// Populated only when `audit_status == Failed`. Empty otherwise.
+    /// Why extraction failed, or partly failed. Populated whenever
+    /// `audit_status` is `Failed` or `PartiallyApplied`, empty on
+    /// `Succeeded` and `Skipped`.
+    ///
+    /// `PartiallyApplied` is included deliberately. It is the common
+    /// failure — one tier of three fell over and the rest still wrote a
+    /// graph — and it reaches a caller as `StageOutcome::Ok`, so the
+    /// counts alone look like an ordinary small extraction. `audit_status`
+    /// distinguishes the two cases; this says which tier and why.
     pub error_message: String,
 }
 
