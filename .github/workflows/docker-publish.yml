@@ -129,6 +129,21 @@ jobs:
       # can be pulled and started directly. No secret needed: blackholing the
       # provider host makes Brain's boot credential preflight INCONCLUSIVE
       # rather than fatal, which is enough to reach shard init and load models.
+      #
+      # `[llm.broker]` is a HARD startup gate — a shard that cannot resolve a
+      # per-namespace credential refuses to boot, and a process-wide
+      # `[llm] api_key` is explicitly not a substitute. So the broker must be
+      # configured here even though this test never writes. v0.4.0 is where
+      # that gate landed, and this step still passed the old `api_key` env:
+      # the image built and pushed, the smoke test rejected it, and the
+      # multi-arch manifest never published.
+      #
+      # The url points at the discard port so it stays as unreachable as the
+      # blackholed provider hosts — the gate checks that a broker is
+      # CONFIGURED, not that it answers, and nothing here should be able to
+      # reach the network. No `BRAIN__LLM__API_KEY`: the image ships without
+      # one by design (see config/docker.toml), and its only effect is the
+      # shard-wide entity disambiguator, which logs a WARN when absent.
       - name: Smoke-test the pushed image
         run: |
           set -euo pipefail
@@ -138,7 +153,8 @@ jobs:
             --security-opt seccomp=unconfined --ulimit memlock=-1 \
             --add-host=api.openai.com:127.0.0.1 \
             --add-host=api.anthropic.com:127.0.0.1 \
-            -e BRAIN__LLM__API_KEY=smoke-probe-not-a-real-key \
+            -e BRAIN__LLM__BROKER__URL=http://127.0.0.1:9 \
+            -e BRAIN__LLM__BROKER__SERVICE_KEY=smoke-not-a-real-service-key \
             -e BRAIN__ADMIN__TOKEN=smoke-admin-token \
             "$IMG"
           echo "::endgroup::"
