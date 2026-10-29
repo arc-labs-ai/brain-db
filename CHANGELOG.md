@@ -1,5 +1,41 @@
 # Changelog
 
+## [0.4.0](https://github.com/arc-labs-ai/brain-db/compare/v0.3.1...v0.4.0) (2026-10-29)
+
+
+### ⚠ BREAKING CHANGES
+
+* **protocol:** one shape per id, one name per value
+* **llm:** `[llm] mode` is gone and `[llm.broker]` is required. A config without a broker section no longer starts, and `[llm] api_key` does not substitute for one.
+
+### Features
+
+* **llm:** resolve every namespace's credential through the broker ([4958900](https://github.com/arc-labs-ai/brain-db/commit/4958900625c7e0c733ceaa1d00ea4bdc2f4906ea))
+* **protocol:** let every tenant-scoped request carry act_as ([721a96b](https://github.com/arc-labs-ai/brain-db/commit/721a96b4f292bf3fe1fe1ef358e813b861536954))
+
+
+### Bug Fixes
+
+* **extractor:** let a failed stage say why it failed ([4617234](https://github.com/arc-labs-ai/brain-db/commit/46172343d24d52272f6a51711e15e5849e0d003f))
+* **graph:** export the entities no statement names ([fb0b815](https://github.com/arc-labs-ai/brain-db/commit/fb0b815ed78b03687c71481df7c5fdbb97c26994))
+* **hype:** let a failed stage say why it failed ([49ed8bd](https://github.com/arc-labs-ai/brain-db/commit/49ed8bd48d9cbdff13315f94b7fed167b69e4104))
+* **hype:** size the completion budget for reasoning models, and say so when it is not ([7f9f5e6](https://github.com/arc-labs-ai/brain-db/commit/7f9f5e6f0d2019003d9c270a840218cd1205f3b7))
+* **llm:** let the broker's negative credential gate heal itself ([fe99f0c](https://github.com/arc-labs-ai/brain-db/commit/fe99f0c6f4039aae6f4307889ead5cd361a375c9))
+* **llm:** retry without temperature when a model refuses an explicit one ([c00bf9e](https://github.com/arc-labs-ai/brain-db/commit/c00bf9e4cceac2f6398ef6dc9793d12a7320b425))
+* **llm:** run provider completions on a Tokio runtime, not the shard executor ([8089eb8](https://github.com/arc-labs-ai/brain-db/commit/8089eb83d6c476c0403e10b0526eb09a39058a50))
+* **memory:** refuse an inspect of a forgotten memory ([9987ed8](https://github.com/arc-labs-ai/brain-db/commit/9987ed882c2439645b0a7a1db013bf220c71a135))
+* **memory:** report an absent memory as NotFound, not a success flag ([2be3d7f](https://github.com/arc-labs-ai/brain-db/commit/2be3d7fe4597817359d767e32649a9ab743702e6))
+* **protocol:** one shape per id, one name per value ([17bd159](https://github.com/arc-labs-ai/brain-db/commit/17bd159e1fadfbfb9eaf9390dadb41f7b86c2f77))
+* **schema:** answer a failed drop with its reasons, not an internal error ([68fd372](https://github.com/arc-labs-ai/brain-db/commit/68fd372cebb1b66caefcf49d56943dcbe44adf5e))
+* **schema:** resolve shared entity types when re-validating a narrowed schema ([77b2546](https://github.com/arc-labs-ai/brain-db/commit/77b2546445f9a0c7a9d5a2101a65625d8559d500))
+* **workers:** distinguish a hype stage that failed from one that found nothing ([ffbdd8d](https://github.com/arc-labs-ai/brain-db/commit/ffbdd8d46e2213ba40bbffe65c7ce8b8cc4aea1a))
+
+
+### Refactoring
+
+* **ops:** collapse the wall-clock and the last reach-arounds ([98266d7](https://github.com/arc-labs-ai/brain-db/commit/98266d7fc90e6dd5a23ad7563f4f53b73ebc3a24))
+* **ops:** give the writer downcast its own module ([0df285a](https://github.com/arc-labs-ai/brain-db/commit/0df285a676df06ec5124cd167bdfeeb3566dc9c3))
+
 ## [0.3.1](https://github.com/arc-labs-ai/brain-db/compare/v0.3.0...v0.3.1) (2026-10-21)
 
 
