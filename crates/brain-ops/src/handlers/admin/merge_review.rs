@@ -7,6 +7,7 @@
 //! `merge_entity` call lands in WAL + redb in one atomic transaction;
 //! the list path is a plain read.
 
+use crate::clock::now_unix_nanos;
 use brain_core::MergeId;
 use brain_metadata::entity::merge::{MergeActor, DEFAULT_MERGE_GRACE_NANOS};
 use brain_metadata::entity::review::{list_proposals_by_status, proposal_get};
@@ -14,7 +15,7 @@ use brain_metadata::tables::merge_review_queue::{proposal_status, MergeReviewPro
 
 use crate::context::OpsContext;
 use crate::error::OpError;
-use crate::handlers::link::downcast_writer_pub;
+use crate::handlers::writer_handle::real_writer_handle;
 use crate::write::{Phase, PhaseAck, Write, WriteId};
 
 /// Default grace window for an admin-approved merge (matches
@@ -117,7 +118,7 @@ pub async fn handle_admin_approve_merge(
         }
     }
 
-    let now = crate::txn::now_unix_nanos_pub();
+    let now = now_unix_nanos();
     let actor = MergeActor::Space(ctx.executor.caller_space.into());
     let phase = Phase::ApproveMerge {
         proposal_id,
@@ -126,7 +127,7 @@ pub async fn handle_admin_approve_merge(
         at_unix_nanos: now,
     };
     let write = Write::single(WriteId::new(), ctx.executor.caller_space, phase);
-    let real_writer = downcast_writer_pub(ctx)?;
+    let real_writer = real_writer_handle(ctx)?;
     let ack = real_writer
         .submit(write)
         .await
@@ -173,13 +174,13 @@ pub async fn handle_admin_reject_merge(
         }
     }
 
-    let now = crate::txn::now_unix_nanos_pub();
+    let now = now_unix_nanos();
     let phase = Phase::RejectMerge {
         proposal_id,
         at_unix_nanos: now,
     };
     let write = Write::single(WriteId::new(), ctx.executor.caller_space, phase);
-    let real_writer = downcast_writer_pub(ctx)?;
+    let real_writer = real_writer_handle(ctx)?;
     let ack = real_writer
         .submit(write)
         .await

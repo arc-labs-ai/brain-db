@@ -13,7 +13,7 @@ use brain_protocol::envelope::response::{
 
 use crate::context::OpsContext;
 use crate::error::OpError;
-use crate::handlers::link::downcast_writer_pub;
+use crate::handlers::writer_handle::real_writer_handle;
 use crate::write::{Phase, PhaseAck, Write, WriteId};
 
 use super::registry_cascade::{tombstone_space_memories, writer_err};
@@ -32,7 +32,7 @@ pub async fn handle_space_create(
         metadata: req.metadata.clone(),
     };
     let write = build_write(&req.request_id, ctx, phase, b"space_create");
-    let writer = downcast_writer_pub(ctx)?;
+    let writer = real_writer_handle(ctx)?;
     let ack = writer.submit(write).await.map_err(writer_err)?;
     let created = matches!(ack.single_phase(), PhaseAck::SpaceCreated { created: true });
 
@@ -57,7 +57,7 @@ pub async fn handle_space_create(
         .unwrap_or_else(|| (ctx.executor.caller_space_string.clone(), now, now, 0, 0));
 
     Ok(SpaceCreateResponse {
-        space_id: space_string,
+        space: space_string,
         created,
         created_at_unix_nanos: created_at,
         last_active_unix_nanos: last_active,
@@ -81,7 +81,7 @@ pub async fn handle_space_list(
     let spaces = rows
         .into_iter()
         .map(|e| SpaceView {
-            space_id: e.meta.space_string,
+            space: e.meta.space_string,
             created_at_unix_nanos: e.meta.created_at_unix_nanos,
             last_active_unix_nanos: e.meta.last_active_unix_nanos,
             memory_count: e.meta.memory_count,
@@ -125,12 +125,12 @@ pub async fn handle_space_delete(
 
     let phase = Phase::SpaceDelete { at_unix_nanos: now };
     let write = build_write(&req.request_id, ctx, phase, b"space_delete");
-    let writer = downcast_writer_pub(ctx)?;
+    let writer = real_writer_handle(ctx)?;
     let ack = writer.submit(write).await.map_err(writer_err)?;
     let existed = matches!(ack.single_phase(), PhaseAck::SpaceDeleted { existed: true });
 
     Ok(SpaceDeleteResponse {
-        space_id: space_string,
+        space: space_string,
         existed,
         memories_forgotten,
     })

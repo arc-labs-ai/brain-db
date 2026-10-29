@@ -1,10 +1,12 @@
 //! Write-time HyPE generation: hypothetical-question embeddings.
 //!
 //! HyPE is **mandatory and always-on**. There is no config flag to
-//! disable it: every shard runs it, and the LLM it depends on is a hard
-//! startup requirement (a keyless server refuses to boot — see
-//! `brain_server::config::Config::validate_llm_provider`). The generator
-//! is unconditionally wired into the extractor worker at shard spawn.
+//! disable it: every shard runs it, and the credential it depends on is
+//! resolved per namespace from `[llm.broker]`, which config load requires
+//! (see `brain_server::config::Config::validate_llm_broker`). The generator
+//! is unconditionally wired into the extractor worker at shard spawn. A
+//! namespace with no registered key still writes — the LLM tier reports
+//! that it could not run, rather than the write failing.
 //!
 //! For each freshly-encoded memory the generator asks an LLM for several
 //! diverse questions whose answer is the memory, embeds each locally, and
@@ -74,12 +76,41 @@ pub struct HypeGenerator {
 
 /// Outcome of one memory's generation, folded into the worker's
 /// per-cycle bookkeeping.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct HypeGenOutcome {
     /// Questions embedded + persisted + inserted.
     pub questions_written: usize,
     /// LLM micro-USD spent (0 on a cache hit).
     pub cost_micro_usd: u64,
+    /// Why the stage could not run, as opposed to running and finding
+    /// nothing. `None` is a stage that ran.
+    ///
+    /// A reason rather than a flag because the flag alone was not actionable.
+    /// Every failure path here already had the cause in hand and passed it to
+    /// `tracing`, then returned a bare `true` — so the stage record said a
+    /// write was degraded without saying what to fix, and the one place the
+    /// answer existed was a log line nobody correlates to a memory id. An
+    /// `Option<String>` also makes "failed, reason unknown" unrepresentable,
+    /// which is the state the record used to be stuck in.
+    ///
+    /// HyPE stays best-effort — a failure here is still logged, folded into a
+    /// zero-question outcome, and never fails the surrounding write. What
+    /// changes is that the failure is no longer INVISIBLE: every zero outcome
+    /// used to publish `StageOutcome::Empty`, which the encode trace maps to
+    /// `Ok`, so "the namespace has no LLM provider key" and "this text
+    /// warranted no questions" were byte-identical in the trace. A degraded
+    /// write then looked exactly like a healthy one, which is how a sandbox
+    /// ends up with entities, no statements, an empty graph, and nothing
+    /// anywhere saying why.
+    pub failure: Option<String>,
+}
+
+impl HypeGenOutcome {
+    /// Whether the stage failed. The reason is [`Self::failure`].
+    #[must_use]
+    pub const fn failed(&self) -> bool {
+        self.failure.is_some()
+    }
 }
 
 impl HypeGenerator {
@@ -140,13 +171,17 @@ impl HypeGenerator {
                     error = %e,
                     "HyPE question generation failed; skipping",
                 );
-                return HypeGenOutcome::default();
+                return HypeGenOutcome {
+                    failure: Some(e.to_string()),
+                    ..Default::default()
+                };
             }
         };
         if questions.is_empty() {
             return HypeGenOutcome {
                 questions_written: 0,
                 cost_micro_usd: cost_micro,
+                failure: None,
             };
         }
 
@@ -171,6 +206,7 @@ impl HypeGenerator {
             return HypeGenOutcome {
                 questions_written: 0,
                 cost_micro_usd: cost_micro,
+                failure: None,
             };
         }
 
@@ -192,6 +228,9 @@ impl HypeGenerator {
                 return HypeGenOutcome {
                     questions_written: 0,
                     cost_micro_usd: cost_micro,
+                    // Questions were generated and then lost. That is a
+                    // failure, not an absence.
+                    failure: Some(format!("hype vector persist failed: {e}")),
                 };
             }
         }
@@ -221,6 +260,7 @@ impl HypeGenerator {
         HypeGenOutcome {
             questions_written: vectors.len(),
             cost_micro_usd: cost_micro,
+            failure: None,
         }
     }
 
@@ -268,13 +308,17 @@ impl HypeGenerator {
                     error = %e,
                     "HyPE refresh generation failed; keeping prior questions",
                 );
-                return HypeGenOutcome::default();
+                return HypeGenOutcome {
+                    failure: Some(e.to_string()),
+                    ..Default::default()
+                };
             }
         };
         if questions.is_empty() {
             return HypeGenOutcome {
                 questions_written: 0,
                 cost_micro_usd: cost_micro,
+                failure: None,
             };
         }
 
@@ -288,6 +332,7 @@ impl HypeGenerator {
             return HypeGenOutcome {
                 questions_written: 0,
                 cost_micro_usd: cost_micro,
+                failure: None,
             };
         }
 
@@ -305,6 +350,7 @@ impl HypeGenerator {
                 return HypeGenOutcome {
                     questions_written: 0,
                     cost_micro_usd: cost_micro,
+                    failure: None,
                 };
             }
         }
@@ -313,6 +359,7 @@ impl HypeGenerator {
         HypeGenOutcome {
             questions_written: vectors.len(),
             cost_micro_usd: cost_micro,
+            failure: None,
         }
     }
 
@@ -393,7 +440,14 @@ impl HypeGenerator {
             }],
             response_schema: None,
             temperature: 0.3,
-            max_tokens: 256,
+            // Must cover REASONING tokens, not just the questions. 256 was
+            // sized for the visible output alone; on a reasoning model the
+            // budget is spent thinking before a single question is written,
+            // so every call returned empty, was treated as a transient
+            // hiccup, and was retried on the next cycle forever — billed
+            // each time, for nothing. Unused budget is not charged, so
+            // sizing this for the slower case costs nothing in the fast one.
+            max_tokens: 2048,
             timeout: Duration::from_secs(30),
         };
         let resp = client

@@ -20,12 +20,15 @@
 //! operation — a `false` value is rejected with `InvalidRequest` so
 //! a typo in a client can't accidentally wipe a deployment's schema.
 
+use crate::clock::now_unix_nanos;
 use brain_core::RequestId;
-use brain_protocol::schema::{parse_schema, validate_located};
+use brain_protocol::schema::{parse_schema, validate_located_with};
 use brain_protocol::{SchemaReplaceRequest, SchemaReplaceResponse};
 
 use crate::context::OpsContext;
 use crate::error::OpError;
+use crate::handlers::schema_scope;
+use crate::handlers::schema_wire;
 use crate::write::{Phase, PhaseAck, Write, WriteId};
 
 /// Handle a `SCHEMA_REPLACE` request. Admin-only at the dispatch
@@ -48,11 +51,11 @@ pub async fn handle_schema_replace(
             "schema_document must be non-empty".into(),
         ));
     }
-    if req.schema_document.len() > crate::handlers::schema::MAX_SCHEMA_DOCUMENT_BYTES {
+    if req.schema_document.len() > schema_scope::MAX_SCHEMA_DOCUMENT_BYTES {
         return Err(OpError::InvalidRequest(format!(
             "schema_document exceeds cap ({} > {} bytes)",
             req.schema_document.len(),
-            crate::handlers::schema::MAX_SCHEMA_DOCUMENT_BYTES,
+            schema_scope::MAX_SCHEMA_DOCUMENT_BYTES,
         )));
     }
 
@@ -77,24 +80,26 @@ pub async fn handle_schema_replace(
             });
         }
     };
-    let validated = match validate_located(&req.schema_document, &parsed) {
+    // Validate against the system schema, and only the system schema.
+    //
+    // Not against the namespace's active schema: REPLACE discards it, so
+    // resolving a reference there would accept a document that is broken the
+    // moment it lands. Not against nothing either, which was the bug —
+    // `Person`, `Organization`, `Place` and the rest are declared once in the
+    // `brain` namespace and referenced by tenant documents without being
+    // re-declared, so a standalone validation rejected every REPLACE that
+    // named one. Reading the system schema here needs no tenant binding
+    // (which happens below): it is the same public vocabulary any caller can
+    // already read through SCHEMA_GET.
+    let declared = schema_scope::system_declared_context(ctx)?;
+    let validated = match validate_located_with(&req.schema_document, &parsed, &declared) {
         Ok(v) => v,
         Err(errs) => {
             return Ok(SchemaReplaceResponse {
                 namespace: parsed.namespace.clone(),
                 schema_version: 0,
                 dropped_count: 0,
-                validation_errors: errs
-                    .iter()
-                    .map(|e| brain_protocol::SchemaValidationErrorWire {
-                        code: format!("{:?}", e.code),
-                        message: e.message.clone(),
-                        line: e.source_span.map(|s| s.line).unwrap_or(0),
-                        column: e.source_span.map(|s| s.column).unwrap_or(0),
-                        length: e.source_span.map(|s| s.length).unwrap_or(0),
-                        severity: 2,
-                    })
-                    .collect(),
+                validation_errors: schema_wire::validation_errors(errs.iter()),
             });
         }
     };
@@ -108,7 +113,7 @@ pub async fn handle_schema_replace(
     //     existence oracle. The seeded `brain` system namespace is never a
     //     user's own name (dispatch refuses a caller that resolves to
     //     SYSTEM), so this also blocks replacing the system schema.
-    let caller_name = crate::handlers::schema::caller_namespace_name(ctx)?;
+    let caller_name = schema_scope::caller_namespace_name(ctx)?;
     if namespace != caller_name {
         return Err(OpError::Unauthorized(format!(
             "schema_replace: caller in namespace {caller_name:?} cannot replace schema for namespace {namespace:?}"
@@ -125,9 +130,9 @@ pub async fn handle_schema_replace(
     //    intact. submit also supplies the WriteId idempotency replay and the
     //    post-commit OUTSIDE_ACTIVE_SCHEMA flag sweep this handler used to
     //    hand-roll.
-    let now = crate::txn::now_unix_nanos_pub();
-    let from_version = crate::handlers::schema::current_active(ctx, &namespace)?.unwrap_or(0);
-    let real_writer = crate::handlers::link::downcast_writer_pub(ctx)?;
+    let now = now_unix_nanos();
+    let from_version = schema_scope::current_active(ctx, &namespace)?.unwrap_or(0);
+    let real_writer = crate::handlers::writer_handle::real_writer_handle(ctx)?;
     let write_id =
         WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_schema_replace_request(&req);
@@ -151,7 +156,7 @@ pub async fn handle_schema_replace(
     let ack = real_writer
         .submit(write)
         .await
-        .map_err(crate::handlers::schema::map_writer_err)?;
+        .map_err(schema_scope::map_writer_err)?;
     let (schema_version, dropped_count) = match ack.single_phase() {
         PhaseAck::UpsertedSchema {
             version, dropped, ..

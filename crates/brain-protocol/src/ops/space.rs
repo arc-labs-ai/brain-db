@@ -13,8 +13,9 @@ use crate::ops::memory::ActAs;
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SpaceView {
     /// The human-readable structured space string from the registry
-    /// (e.g. `"support-bot:user123"`), not the derived storage id.
-    pub space_id: String,
+    /// (e.g. `"support-bot:user123"`). The derived 16-byte storage id is
+    /// what `space_id` means elsewhere; this is the string it comes from.
+    pub space: String,
     pub created_at_unix_nanos: u64,
     pub last_active_unix_nanos: u64,
     pub memory_count: u64,
@@ -42,8 +43,8 @@ pub struct SpaceCreateRequest {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SpaceCreateResponse {
     /// The human-readable structured space string this create resolved
-    /// to (as stored in the registry).
-    pub space_id: String,
+    /// to (as stored in the registry), not the derived storage id.
+    pub space: String,
     /// `false` on an idempotent replay of an existing space.
     pub created: bool,
     pub created_at_unix_nanos: u64,
@@ -90,8 +91,9 @@ pub struct SpaceDeleteRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SpaceDeleteResponse {
-    /// The human-readable structured space string this delete targeted.
-    pub space_id: String,
+    /// The human-readable structured space string this delete targeted,
+    /// not the derived storage id.
+    pub space: String,
     /// `false` when the space had no registry row.
     pub existed: bool,
     /// Number of memories tombstoned by the cascade.

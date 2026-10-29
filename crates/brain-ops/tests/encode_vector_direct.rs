@@ -90,6 +90,7 @@ fn vector_direct_req(request_id: [u8; 16], slot: usize) -> EncodeVectorDirectReq
         request_id,
         txn_id: None,
         deduplicate: false,
+        act_as: None,
     }
 }
 

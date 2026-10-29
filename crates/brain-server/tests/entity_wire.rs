@@ -228,6 +228,7 @@ async fn entity_create_get_update_rename_lifecycle() {
             aliases: vec!["A.".into()],
             attributes_blob: b"bio=astronaut".to_vec(),
             request_id: *uuid::Uuid::now_v7().as_bytes(),
+            act_as: None,
         }),
     )
     .await;
@@ -252,6 +253,7 @@ async fn entity_create_get_update_rename_lifecycle() {
             new_canonical_name: "Alice Cooper".into(),
             move_to_alias: true,
             request_id: *uuid::Uuid::now_v7().as_bytes(),
+            act_as: None,
         }),
     )
     .await;

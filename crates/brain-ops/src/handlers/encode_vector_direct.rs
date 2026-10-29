@@ -23,6 +23,7 @@
 //! aren't useful. A non-None `txn_id` is rejected so we don't
 //! silently degrade the user's intent.
 
+use crate::clock::now_unix_nanos;
 use brain_core::{EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NodeRef, Salience, SessionId};
 use brain_embed::VECTOR_DIM;
 use brain_planner::{EdgeOutcome, EncodeOp, EncodeOpEdge};
@@ -31,7 +32,7 @@ use brain_protocol::envelope::response::EncodeResponse;
 
 use crate::context::OpsContext;
 use crate::error::OpError;
-use crate::handlers::link::downcast_writer_pub;
+use crate::handlers::writer_handle::real_writer_handle;
 use crate::state::idempotency::hash_encode_request;
 use crate::write::{Phase, PhaseAck, Write, WriteId};
 
@@ -106,7 +107,7 @@ pub async fn handle_encode_vector_direct(
     // 4. Idempotency replay short-circuit. Same hash schema as
     //    text-encode so a request_id that hops between the two paths
     //    is detected as a conflict.
-    let real_writer = downcast_writer_pub(ctx)?;
+    let real_writer = real_writer_handle(ctx)?;
     let write_id = WriteId::from_request(
         brain_core::RequestId::from(req.request_id),
         ctx.executor.caller_space,
@@ -457,10 +458,6 @@ fn reconstruct_response(
         has_active_schema: true,
         trace: None,
     })
-}
-
-fn now_unix_nanos() -> u64 {
-    crate::clock::now_unix_nanos()
 }
 
 fn hex_short(bytes: &[u8; 16]) -> String {

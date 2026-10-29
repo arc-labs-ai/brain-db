@@ -562,25 +562,30 @@ async fn do_extractor_cycle(
             // extraction.
             let keep_queued = matches!(
                 decision,
-                StageDecision::GateFailed
-                    | StageDecision::AppliedFailed
+                StageDecision::GateFailed { .. }
+                    | StageDecision::AppliedFailed { .. }
                     | StageDecision::Applied {
                         retry_pending: true,
                         ..
                     }
             );
-            let (counts, audit_status) = match decision {
+            let (counts, audit_status, reason) = match decision {
                 StageDecision::Applied {
                     counts,
                     status_byte,
+                    reason,
                     ..
-                } => (counts, audit_status_from_byte(status_byte)),
-                StageDecision::AppliedFailed | StageDecision::GateFailed => {
-                    (ExtractorItemCounts::zero(), StageAuditStatus::Failed)
-                }
-                StageDecision::AlreadyExtracted => {
-                    (ExtractorItemCounts::zero(), StageAuditStatus::Skipped)
-                }
+                } => (counts, audit_status_from_byte(status_byte), reason),
+                StageDecision::AppliedFailed { reason } | StageDecision::GateFailed { reason } => (
+                    ExtractorItemCounts::zero(),
+                    StageAuditStatus::Failed,
+                    reason,
+                ),
+                StageDecision::AlreadyExtracted => (
+                    ExtractorItemCounts::zero(),
+                    StageAuditStatus::Skipped,
+                    String::new(),
+                ),
             };
             if !keep_queued {
                 if let Err(e) = remove_queue_row(ctx, *memory_id) {
@@ -589,7 +594,7 @@ async fn do_extractor_cycle(
             }
             let produced_statements = counts.statements > 0;
             let space_id = memory_scope_and_session(ctx, *memory_id).0.space();
-            publish_extracted_graph(ctx, *memory_id, space_id, counts, audit_status).await;
+            publish_extracted_graph(ctx, *memory_id, space_id, counts, audit_status, reason).await;
             // Reclassify the memory kind from what extraction produced: an
             // Event-shaped statement → Episodic, timeless facts/preferences →
             // Semantic. Only on a terminal apply (`!keep_queued`) that produced
@@ -832,16 +837,23 @@ enum StageDecision {
         /// audit row is written (advancing the attempt count) but the
         /// queue row is KEPT so the next cycle re-extracts.
         retry_pending: bool,
+        /// `decide_status`'s verdict in words — empty on a clean success
+        /// or a skip, the failing tier's reason otherwise. Carried so the
+        /// published stage event can say what the audit row already knows.
+        reason: String,
     },
     /// `apply_outcome` returned a transient error and rolled back without
     /// persisting anything (no audit row written). The durable queue row is
     /// left in place so the next cycle retries; the publish records `Failed`
     /// with zero counts so subscribers unblock.
-    AppliedFailed,
+    ///
+    /// No audit row means the stage event is the ONLY record this attempt
+    /// happened, so `reason` is the only place its cause can be read.
+    AppliedFailed { reason: String },
     /// A pre-pipeline gate (read_txn open, audit probe) errored
     /// before any work was attempted. The publish still records
     /// `Failed` with zero counts so subscribers unblock.
-    GateFailed,
+    GateFailed { reason: String },
     /// `skip_already_extracted` saw an existing audit row for this
     /// memory. No work attempted; publish records `Skipped`.
     AlreadyExtracted,
@@ -985,9 +997,17 @@ async fn drain_batch(
     items: &[ExtractorEnqueue],
 ) -> Vec<StageDecision> {
     // Pre-allocate the output with a placeholder; we overwrite as
-    // each row resolves.
+    // each row resolves. The placeholder names itself: a slot still
+    // holding it at publish time means no path claimed that memory —
+    // today that needs `run_pipeline_per_namespace` to hand back fewer
+    // outcomes than it was given live memories, which the `zip` below
+    // would truncate silently. Giving it a distinct reason makes that
+    // bug legible in the stage record instead of indistinguishable from
+    // a gate probe that failed with nothing to say.
     let mut decisions: Vec<StageDecision> = (0..items.len())
-        .map(|_| StageDecision::GateFailed)
+        .map(|_| StageDecision::GateFailed {
+            reason: "extractor produced no decision for this memory".to_string(),
+        })
         .collect();
 
     // Idempotency probe each row. Failures and AlreadyExtracted slots
@@ -1017,7 +1037,9 @@ async fn drain_batch(
                         error = %e,
                         "extractor gate probe failed; publishing Failed so wait-for-extraction unblocks",
                     );
-                    decisions[idx] = StageDecision::GateFailed;
+                    decisions[idx] = StageDecision::GateFailed {
+                        reason: format!("extractor gate probe failed: {e}"),
+                    };
                     continue;
                 }
             }
@@ -1225,6 +1247,7 @@ async fn drain_batch(
                     counts: applied.counts,
                     status_byte: applied.status_byte,
                     retry_pending: applied.retry_pending,
+                    reason: applied.reason,
                 },
                 Err(e) => {
                     // A per-item data-shape problem (bad predicate, rejected
@@ -1240,7 +1263,9 @@ async fn drain_batch(
                         error = %e,
                         "extractor apply failed (transient); leaving queued for retry",
                     );
-                    StageDecision::AppliedFailed
+                    StageDecision::AppliedFailed {
+                        reason: format!("extractor apply failed (transient): {e}"),
+                    }
                 }
             };
             decisions[idx] = decision;
@@ -2869,6 +2894,9 @@ struct ApplyOutcome {
     /// attempt budget — the cycle keeps the queue row so the memory is
     /// re-extracted next cycle instead of being abandoned.
     retry_pending: bool,
+    /// The failure text `decide_status` paired with `status_byte`. Empty
+    /// on a clean success or a skip.
+    reason: String,
 }
 
 /// What one run of the transactional apply body produces. Returned to the
@@ -2879,6 +2907,10 @@ struct ApplyBody {
     counts: ExtractorItemCounts,
     status_byte: u8,
     retry_pending: bool,
+    /// The failure text written onto this pass's audit row, kept so the
+    /// published stage event can carry it too. The audit row is durable
+    /// but private to the server; the stage event is what a caller sees.
+    reason: String,
     causal_enqueues: Vec<brain_core::StatementId>,
     created_statement_ids: Vec<brain_core::StatementId>,
     /// Entity vectors this pass minted, published into the in-RAM entity
@@ -3084,6 +3116,7 @@ async fn apply_outcome(
         counts,
         status_byte,
         retry_pending,
+        reason,
         causal_enqueues,
         created_statement_ids,
         staged_entity_vectors,
@@ -3216,6 +3249,7 @@ async fn apply_outcome(
         counts,
         status_byte,
         retry_pending,
+        reason,
     })
 }
 
@@ -4403,7 +4437,7 @@ fn run_apply_body(
         memory_id,
         now,
         status_byte,
-        reason,
+        reason.clone(),
         outcome.pattern,
         outcome.classifier,
         outcome.llm,
@@ -4433,6 +4467,7 @@ fn run_apply_body(
             counts,
             status_byte,
             retry_pending,
+            reason,
             causal_enqueues,
             created_statement_ids,
             staged_entity_vectors: staged,
@@ -4466,6 +4501,7 @@ async fn publish_extracted_graph(
     space_id: SpaceId,
     counts: ExtractorItemCounts,
     audit_status: StageAuditStatus,
+    error_message: String,
 ) {
     let outcome = match audit_status {
         StageAuditStatus::Succeeded | StageAuditStatus::PartiallyApplied => StageOutcome::Ok,
@@ -4488,7 +4524,12 @@ async fn publish_extracted_graph(
         statement_count: counts.statements,
         relation_count: counts.relations,
         audit_status,
-        error_message: String::new(),
+        // Non-empty exactly when a tier failed, which `decide_status`
+        // already guarantees: it returns a reason for FAILURE and
+        // PARTIAL_FAILURE and an empty string for SUCCESS and SKIPPED.
+        // The two failure paths that never reach `decide_status` — a gate
+        // probe error and a rolled-back apply — supply their own.
+        error_message,
     });
     let envelope = EventEnvelope {
         lsn: 0,
@@ -4514,20 +4555,28 @@ async fn publish_extracted_graph(
 /// `--wait` can decrement their pending-stage checklist for this memory.
 /// Called once per memory that actually ran [`HypeGenerator::generate_for`]
 /// (skipped entirely for memories the idempotency check or the per-cycle
-/// LLM budget bypassed — those never reach this point). `generate_for` is
-/// best-effort and infallible: an internal LLM/embed/persist failure is
-/// logged and folded into a zero-question outcome rather than surfaced as
-/// an error, so there is no `Failed` case here — a zero outcome (LLM
-/// failure, empty reply, or memory text genuinely yielding no questions)
-/// and an "already had vectors" skip both round to `StageOutcome::Empty`,
-/// same as the extractor's `Skipped` mapping in `publish_extracted_graph`.
+/// LLM budget bypassed — those never reach this point).
+///
+/// `generate_for` stays best-effort: an internal LLM/embed/persist failure is
+/// logged and folded into a zero-question outcome rather than failing the
+/// surrounding write. It is no longer INDISTINGUISHABLE, though. Every zero
+/// outcome used to publish `StageOutcome::Empty`, and the encode trace maps
+/// `Empty` to `Ok` — so a namespace with no LLM provider key produced a
+/// `hype` stage reporting `status: 0, questions=0`, identical to text that
+/// simply warranted no questions. The write looked healthy, the graph came
+/// back empty, and nothing connected the two.
+///
+/// So the three cases now separate: `failed` → `Failed` (could not run),
+/// zero questions → `Empty` (ran, found nothing), questions → `Ok`.
 async fn publish_hype_completed(
     ctx: &WorkerContext,
     memory_id: MemoryId,
     space_id: SpaceId,
     outcome: HypeGenOutcome,
 ) {
-    let stage_outcome = if outcome.questions_written > 0 {
+    let stage_outcome = if outcome.failed() {
+        StageOutcome::Failed
+    } else if outcome.questions_written > 0 {
         StageOutcome::Ok
     } else {
         StageOutcome::Empty
@@ -4535,6 +4584,9 @@ async fn publish_hype_completed(
     let payload = StagePayload::Hype(StageHypePayload {
         questions_written: outcome.questions_written as u32,
         cost_micro_usd: outcome.cost_micro_usd,
+        // Carried only on `Failed`, so the two agree by construction: the
+        // outcome is `Failed` exactly when a reason exists.
+        error_message: outcome.failure.clone().unwrap_or_default(),
     });
     let envelope = EventEnvelope {
         lsn: 0,

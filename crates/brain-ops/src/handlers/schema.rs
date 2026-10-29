@@ -15,6 +15,7 @@
 //! the response body's `validation_errors` field with
 //! `schema_version = 0`.
 
+use crate::clock::now_unix_nanos;
 use brain_core::{Cardinality, RequestId, StatementKind};
 use brain_metadata::entity::types::entity_type_lookup_rtxn;
 use brain_metadata::extractor::ops::extractor_lookup_by_qname;
@@ -23,18 +24,11 @@ use brain_metadata::relation::types::relation_type_lookup_by_qname;
 // the pre-flight can't classify a re-upload differently than apply does.
 use brain_metadata::schema::apply::{declared_object_entity_type, object_type_constraint_byte};
 use brain_metadata::schema::predicate::predicate_lookup_by_qname;
-use brain_metadata::schema::store::{
-    active_source_covers, declared_context, schema_active, schema_get, schema_list,
-    SchemaStoreError,
-};
+use brain_metadata::schema::store::{active_source_covers, schema_active, schema_get, schema_list};
 use brain_metadata::system_schema::SYSTEM_SCHEMA_NAMESPACE;
-use brain_planner::WriterError;
 use brain_protocol::envelope::response::EventType;
 use brain_protocol::schema::render::render_schema_verified;
-use brain_protocol::schema::{
-    parse_schema, validate_located_with, validate_namespace, DeclaredContext, ParseError,
-    ValidationError,
-};
+use brain_protocol::schema::{parse_schema, validate_located_with, validate_namespace, ParseError};
 use brain_protocol::schema::{
     CardinalityAst, ExtractorKindAst, SchemaItem, StatementKindAst, SubjectTypeDecl,
     ValidatedSchema,
@@ -42,17 +36,16 @@ use brain_protocol::schema::{
 use brain_protocol::{
     GraphEventPayload, SchemaGetRequest, SchemaGetResponse, SchemaListItemWire, SchemaListRequest,
     SchemaListResponseFrame, SchemaUpdatedEvent, SchemaUploadRequest, SchemaUploadResponse,
-    SchemaValidateRequest, SchemaValidateResponse, SchemaValidationErrorWire,
+    SchemaValidateRequest, SchemaValidateResponse,
 };
 
 use crate::context::OpsContext;
 use crate::error::OpError;
-use crate::handlers::entity::emit_graph_event;
-use crate::handlers::link::downcast_writer_pub;
+use crate::handlers::events::emit_graph_event;
+use crate::handlers::schema_scope;
+use crate::handlers::schema_wire;
+use crate::handlers::writer_handle::real_writer_handle;
 use crate::write::{Phase, PhaseAck, Write, WriteId};
-
-/// 1 MiB cap on the uploaded schema document.
-pub const MAX_SCHEMA_DOCUMENT_BYTES: usize = 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // SCHEMA_UPLOAD
@@ -77,7 +70,7 @@ pub async fn handle_schema_upload(
         return Ok(SchemaUploadResponse {
             namespace: schema.namespace.clone(),
             schema_version: 0,
-            validation_errors: errs.iter().map(validation_error_to_wire).collect(),
+            validation_errors: schema_wire::validation_errors(errs.iter()),
             backward_compatible: true,
             migration_summary_blob: Vec::new(),
         });
@@ -92,7 +85,7 @@ pub async fn handle_schema_upload(
     //    is never a user's own name (dispatch refuses a caller that resolves
     //    to SYSTEM), so this also blocks writing the system schema.
     let namespace = schema.namespace.clone();
-    let caller_name = caller_namespace_name(ctx)?;
+    let caller_name = schema_scope::caller_namespace_name(ctx)?;
     if namespace != caller_name {
         return Err(OpError::Unauthorized(format!(
             "schema_upload: caller in namespace {caller_name:?} cannot declare schema for namespace {namespace:?}"
@@ -103,7 +96,7 @@ pub async fn handle_schema_upload(
     //     the document alone. UPLOAD is additive, so naming a type an earlier
     //     upload (or the system schema) declared is legitimate — validating in
     //     isolation rejected it as "not a declared entity_type".
-    let declared = declared_context_for(ctx, &namespace)?;
+    let declared = schema_scope::merge_declared_context(ctx, &namespace)?;
 
     // 2b. Validate.
     let validated = match validate_located_with(&req.schema_document, &schema, &declared) {
@@ -112,7 +105,7 @@ pub async fn handle_schema_upload(
             return Ok(SchemaUploadResponse {
                 namespace,
                 schema_version: 0,
-                validation_errors: errs.iter().map(validation_error_to_wire).collect(),
+                validation_errors: schema_wire::validation_errors(errs.iter()),
                 backward_compatible: true,
                 migration_summary_blob: Vec::new(),
             });
@@ -142,7 +135,7 @@ pub async fn handle_schema_upload(
     // 4. Dry-run → don't persist. An all-idempotent document would not
     //    bump the version, so report the current one.
     if req.dry_run {
-        let current = current_active(ctx, &namespace)?;
+        let current = schema_scope::current_active(ctx, &namespace)?;
         let would_be = match (is_no_op, current) {
             (true, Some(version)) => version,
             _ => current.unwrap_or(0).saturating_add(1),
@@ -167,10 +160,10 @@ pub async fn handle_schema_upload(
     }
 
     // 5. Persist via the unified submit(Write) path.
-    let now = crate::txn::now_unix_nanos_pub();
-    let from_version = current_active(ctx, &namespace)?.unwrap_or(0);
+    let now = now_unix_nanos();
+    let from_version = schema_scope::current_active(ctx, &namespace)?.unwrap_or(0);
 
-    let real_writer = downcast_writer_pub(ctx)?;
+    let real_writer = real_writer_handle(ctx)?;
     let write_id =
         WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_schema_upload_request(&req);
@@ -196,7 +189,10 @@ pub async fn handle_schema_upload(
     };
     let write =
         Write::single(write_id, ctx.executor.caller_space, phase).with_request_hash(request_hash);
-    let ack = real_writer.submit(write).await.map_err(map_writer_err)?;
+    let ack = real_writer
+        .submit(write)
+        .await
+        .map_err(schema_scope::map_writer_err)?;
     let new_version = match ack.single_phase() {
         PhaseAck::UpsertedSchema { version, .. } => *version,
         other => {
@@ -254,7 +250,7 @@ pub async fn handle_schema_get(
     // return the same `NotFound` a caller would see for a genuinely
     // absent schema, so the response can't distinguish "foreign namespace
     // exists" from "foreign namespace doesn't exist".
-    let caller_name = caller_namespace_name(ctx)?;
+    let caller_name = schema_scope::caller_namespace_name(ctx)?;
     // Omitting the namespace means "my own". It cannot widen access: it
     // resolves to the key's own binding, which is strictly narrower than
     // naming one. Rejecting it instead made the common case — a client that
@@ -281,7 +277,7 @@ pub async fn handle_schema_get(
 
     let resolved_version = if req.version == 0 {
         schema_active(&rtxn, &req.namespace)
-            .map_err(map_schema_store_error)?
+            .map_err(schema_scope::map_schema_store_error)?
             .ok_or_else(|| OpError::NotFound {
                 what: "schema",
                 detail: format!("no active schema for namespace {:?}", req.namespace),
@@ -291,7 +287,7 @@ pub async fn handle_schema_get(
     };
 
     let row = schema_get(&rtxn, &req.namespace, resolved_version)
-        .map_err(map_schema_store_error)?
+        .map_err(schema_scope::map_schema_store_error)?
         .ok_or_else(|| OpError::NotFound {
             what: "schema",
             detail: format!("namespace={:?} version={resolved_version}", req.namespace),
@@ -333,7 +329,7 @@ pub async fn handle_schema_list(
     // return the empty-list shape a caller would see for a namespace with
     // no declared schema, so the response can't be used as an existence
     // oracle for a foreign tenant's declarations.
-    let caller_name = caller_namespace_name(ctx)?;
+    let caller_name = schema_scope::caller_namespace_name(ctx)?;
     // As in `handle_schema_get`: an omitted namespace is "my own", not a
     // cross-tenant claim.
     let req = SchemaListRequest {
@@ -359,7 +355,7 @@ pub async fn handle_schema_list(
             .metadata
             .read_txn()
             .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
-        schema_list(&rtxn, &req.namespace).map_err(map_schema_store_error)?
+        schema_list(&rtxn, &req.namespace).map_err(schema_scope::map_schema_store_error)?
     };
     let items: Vec<SchemaListItemWire> = if req.limit == 0 {
         rows.iter()
@@ -407,7 +403,7 @@ pub async fn handle_schema_validate(
             return Ok(SchemaValidateResponse {
                 namespace: String::new(),
                 would_be_version: 0,
-                validation_errors: vec![parse_error_to_wire(e)],
+                validation_errors: vec![schema_wire::parse_error(&e)],
             });
         }
     };
@@ -417,7 +413,7 @@ pub async fn handle_schema_validate(
         return Ok(SchemaValidateResponse {
             namespace: schema.namespace.clone(),
             would_be_version: 0,
-            validation_errors: errs.iter().map(validation_error_to_wire).collect(),
+            validation_errors: schema_wire::validation_errors(errs.iter()),
         });
     }
 
@@ -426,7 +422,7 @@ pub async fn handle_schema_validate(
     // consulted so neither `would_be_version` nor the merge context can serve
     // as an existence oracle for another tenant.
     let namespace = schema.namespace.clone();
-    let caller_name = caller_namespace_name(ctx)?;
+    let caller_name = schema_scope::caller_namespace_name(ctx)?;
     if namespace != caller_name {
         return Err(OpError::Unauthorized(format!(
             "schema_validate: caller in namespace {caller_name:?} cannot validate schema for namespace {namespace:?}"
@@ -434,12 +430,12 @@ pub async fn handle_schema_validate(
     }
     // VALIDATE must predict UPLOAD, so it resolves references against the
     // same merge target.
-    let declared = declared_context_for(ctx, &namespace)?;
+    let declared = schema_scope::merge_declared_context(ctx, &namespace)?;
 
     match validate_located_with(&req.schema_document, &schema, &declared) {
         Ok(v) => {
             let namespace = v.as_schema().namespace.clone();
-            let would_be = current_active(ctx, &namespace)?
+            let would_be = schema_scope::current_active(ctx, &namespace)?
                 .unwrap_or(0)
                 .saturating_add(1);
             Ok(SchemaValidateResponse {
@@ -451,7 +447,7 @@ pub async fn handle_schema_validate(
         Err(errs) => Ok(SchemaValidateResponse {
             namespace: schema.namespace,
             would_be_version: 0,
-            validation_errors: errs.iter().map(validation_error_to_wire).collect(),
+            validation_errors: schema_wire::validation_errors(errs.iter()),
         }),
     }
 }
@@ -480,76 +476,20 @@ fn check_document_cap(doc: &str) -> Result<(), OpError> {
             "schema_document must be non-empty".into(),
         ));
     }
-    if doc.len() > MAX_SCHEMA_DOCUMENT_BYTES {
+    let cap = schema_scope::MAX_SCHEMA_DOCUMENT_BYTES;
+    if doc.len() > cap {
         return Err(OpError::InvalidRequest(format!(
-            "schema_document exceeds cap ({} > {MAX_SCHEMA_DOCUMENT_BYTES} bytes)",
+            "schema_document exceeds cap ({} > {cap} bytes)",
             doc.len()
         )));
     }
     Ok(())
 }
 
-/// Map `WriterError` from `submit(UpsertSchema)` back into the wire
-/// taxonomy. Internal failures bubble as `OpError::Internal`; on a
-/// genuine conflict from idempotency we surface `OpError::Conflict`.
-/// Shared by the REPLACE / DROP handlers, which submit the same phase.
-pub(crate) fn map_writer_err(err: WriterError) -> OpError {
-    match err {
-        WriterError::Conflict(msg) => OpError::Conflict(msg),
-        WriterError::Overloaded => OpError::Overloaded("writer overloaded".into()),
-        WriterError::Internal(msg) => OpError::Internal(msg),
-    }
-}
-
-/// Resolve the authenticated caller's namespace id to its registered
-/// name, for comparison against a client-supplied namespace string. The
-/// caller namespace is interned at dispatch time, so a live request
-/// always has a registry row; a miss is an internal invariant break
-/// (surfaced as `Internal`, never as a client-visible authz bypass).
-pub(crate) fn caller_namespace_name(ctx: &OpsContext) -> Result<String, OpError> {
-    let caller = ctx.executor.caller_namespace;
-    let rtxn = ctx
-        .executor
-        .metadata
-        .read_txn()
-        .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
-    brain_metadata::namespace::namespace_name(&rtxn, caller)
-        .map_err(|e| OpError::Internal(format!("namespace_name lookup: {e}")))?
-        .ok_or_else(|| {
-            OpError::Internal(format!(
-                "caller namespace id {} has no registry row",
-                caller.raw()
-            ))
-        })
-}
-
 /// True when the client-supplied namespace is one the caller may read:
 /// their own tenant, or the always-public `brain` system namespace.
 fn caller_may_read_namespace(caller_name: &str, requested: &str) -> bool {
     requested == caller_name || requested == SYSTEM_SCHEMA_NAMESPACE
-}
-
-pub(crate) fn current_active(ctx: &OpsContext, namespace: &str) -> Result<Option<u32>, OpError> {
-    let rtxn = ctx
-        .executor
-        .metadata
-        .read_txn()
-        .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
-    schema_active(&rtxn, namespace).map_err(map_schema_store_error)
-}
-
-/// Type names an additive upload to `namespace` may reference without
-/// re-declaring: the namespace's active schema plus the system `brain` one.
-///
-/// Callers must have already bound the request to its own namespace — this
-/// reads persisted state for `namespace`.
-fn declared_context_for(ctx: &OpsContext, namespace: &str) -> Result<DeclaredContext, OpError> {
-    let rtxn = ctx
-        .executor
-        .metadata
-        .read_txn()
-        .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
-    declared_context(&rtxn, namespace).map_err(map_schema_store_error)
 }
 
 /// Whether `namespace`'s stored source already declares everything in
@@ -564,59 +504,16 @@ fn active_source_covers_for(
         .metadata
         .read_txn()
         .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
-    active_source_covers(&rtxn, namespace, schema).map_err(map_schema_store_error)
-}
-
-fn map_schema_store_error(e: SchemaStoreError) -> OpError {
-    match e {
-        SchemaStoreError::VersionOverflow { namespace } => OpError::Conflict(format!(
-            "schema_version overflow for namespace {namespace:?}"
-        )),
-        other => OpError::Internal(other.to_string()),
-    }
+    active_source_covers(&rtxn, namespace, schema).map_err(schema_scope::map_schema_store_error)
 }
 
 fn parse_failed_upload_response(e: ParseError) -> SchemaUploadResponse {
     SchemaUploadResponse {
         namespace: String::new(),
         schema_version: 0,
-        validation_errors: vec![parse_error_to_wire(e)],
+        validation_errors: vec![schema_wire::parse_error(&e)],
         backward_compatible: true,
         migration_summary_blob: Vec::new(),
-    }
-}
-
-fn parse_error_to_wire(e: ParseError) -> SchemaValidationErrorWire {
-    let (code, line, col) = match &e {
-        ParseError::Syntax { line, col, .. } => ("Syntax", *line, *col),
-        ParseError::InvalidNumber { line, col, .. } => ("InvalidNumber", *line, *col),
-        ParseError::InvalidJson { line, col, .. } => ("InvalidJson", *line, *col),
-        ParseError::InvalidDuration { line, col, .. } => ("InvalidDuration", *line, *col),
-        ParseError::InvalidCost { line, col, .. } => ("InvalidCost", *line, *col),
-        ParseError::MissingField { line, col, .. } => ("MissingField", *line, *col),
-    };
-    SchemaValidationErrorWire {
-        code: code.to_string(),
-        message: e.to_string(),
-        line: line as u32,
-        column: col as u32,
-        length: 0,
-        severity: 2,
-    }
-}
-
-fn validation_error_to_wire(e: &ValidationError) -> SchemaValidationErrorWire {
-    let (line, column, length) = e
-        .source_span
-        .map(|s| (s.line, s.column, s.length))
-        .unwrap_or((0, 0, 0));
-    SchemaValidationErrorWire {
-        code: format!("{:?}", e.code),
-        message: e.message.clone(),
-        line,
-        column,
-        length,
-        severity: 2,
     }
 }
 
@@ -669,7 +566,8 @@ fn classify_schema_merge(
         .read_txn()
         .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
 
-    let current_version = schema_active(&rtxn, namespace).map_err(map_schema_store_error)?;
+    let current_version =
+        schema_active(&rtxn, namespace).map_err(schema_scope::map_schema_store_error)?;
 
     // Entity types are scoped per tenant, so the pre-flight must classify
     // against THIS namespace's registry. An unregistered namespace (a
@@ -919,7 +817,6 @@ fn map_extractor_kind_byte(k: ExtractorKindAst) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brain_protocol::schema::{SourceSpan, ValidationErrorCode};
 
     // -----------------------------------------------------------------
     // Tenant-binding tests. These drive the handlers directly with a
@@ -1316,54 +1213,9 @@ mod tests {
     #[test]
     fn check_document_cap_rejects_empty_and_oversized() {
         assert!(check_document_cap("").is_err());
-        let big = "x".repeat(MAX_SCHEMA_DOCUMENT_BYTES + 1);
+        let big = "x".repeat(schema_scope::MAX_SCHEMA_DOCUMENT_BYTES + 1);
         assert!(check_document_cap(&big).is_err());
         assert!(check_document_cap("namespace acme").is_ok());
-    }
-
-    #[test]
-    fn parse_error_to_wire_carries_position() {
-        let wire = parse_error_to_wire(ParseError::Syntax {
-            line: 7,
-            col: 3,
-            message: "boom".into(),
-        });
-        assert_eq!(wire.code, "Syntax");
-        assert_eq!(wire.line, 7);
-        assert_eq!(wire.column, 3);
-        assert_eq!(wire.severity, 2);
-    }
-
-    #[test]
-    fn validation_error_to_wire_uses_span_when_present() {
-        let e = ValidationError {
-            code: ValidationErrorCode::DuplicateDefinition,
-            message: "dup".into(),
-            source_span: Some(SourceSpan {
-                line: 4,
-                column: 5,
-                length: 6,
-            }),
-        };
-        let wire = validation_error_to_wire(&e);
-        assert_eq!(wire.code, "DuplicateDefinition");
-        assert_eq!(wire.line, 4);
-        assert_eq!(wire.column, 5);
-        assert_eq!(wire.length, 6);
-        assert_eq!(wire.severity, 2);
-    }
-
-    #[test]
-    fn validation_error_to_wire_uses_zero_when_span_absent() {
-        let e = ValidationError {
-            code: ValidationErrorCode::NamespaceMissing,
-            message: "missing".into(),
-            source_span: None,
-        };
-        let wire = validation_error_to_wire(&e);
-        assert_eq!(wire.line, 0);
-        assert_eq!(wire.column, 0);
-        assert_eq!(wire.length, 0);
     }
 
     #[test]

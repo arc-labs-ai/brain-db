@@ -46,6 +46,7 @@ use serde_json::{json, Value};
 
 use crate::client::{model_id_hash, LlmClient, LlmFuture};
 use crate::error::LlmError;
+use crate::providers::runtime::run_on_provider_runtime;
 use crate::types::{LlmRequest, LlmResponse, LlmRole, SystemBlock};
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -128,58 +129,80 @@ impl AnthropicClient {
 
 impl LlmClient for AnthropicClient {
     fn complete<'a>(&'a self, request: LlmRequest) -> LlmFuture<'a> {
+        // Owned clones so the task is `'static`. `reqwest::Client` is an Arc
+        // inside, so this shares one connection pool rather than building one
+        // per completion.
+        let http = self.http.clone();
+        let api_key = self.api_key.clone();
+        let model = self.model.clone();
+        let url = format!("{}/v1/messages", self.base_url);
+        let body = build_request_body(&request);
+        let timeout = request.timeout;
+
         Box::pin(async move {
-            if self.api_key.is_empty() {
+            if api_key.is_empty() {
                 return Err(LlmError::Auth {
                     provider: crate::router::PROVIDER_ANTHROPIC,
                 });
             }
 
-            let body = build_request_body(&request);
-            let url = format!("{}/v1/messages", self.base_url);
+            // Every line below runs on the provider runtime, not on the
+            // caller's executor, which is a glommio shard thread with no Tokio
+            // reactor. See `providers::runtime`.
+            run_on_provider_runtime(
+                async move {
+                    let resp = tokio::time::timeout(
+                        timeout,
+                        http.post(&url)
+                            .header("x-api-key", &api_key)
+                            .header("anthropic-version", API_VERSION)
+                            .header("content-type", "application/json")
+                            .json(&body)
+                            .send(),
+                    )
+                    .await
+                    .map_err(|_| LlmError::Timeout)?
+                    .map_err(LlmError::from)?;
 
-            let resp = tokio::time::timeout(
-                request.timeout,
-                self.http
-                    .post(&url)
-                    .header("x-api-key", &self.api_key)
-                    .header("anthropic-version", API_VERSION)
-                    .header("content-type", "application/json")
-                    .json(&body)
-                    .send(),
+                    let status = resp.status();
+                    if status == 401 || status == 403 {
+                        return Err(LlmError::Auth {
+                            provider: crate::router::PROVIDER_ANTHROPIC,
+                        });
+                    }
+                    if status == 429 {
+                        let retry_after_ms = parse_retry_after(resp.headers());
+                        return Err(LlmError::RateLimit { retry_after_ms });
+                    }
+                    if !status.is_success() {
+                        let message = resp.text().await.unwrap_or_default();
+                        return Err(LlmError::ProviderError {
+                            status: status.as_u16(),
+                            message,
+                        });
+                    }
+
+                    let payload: AnthropicResponseBody =
+                        resp.json()
+                            .await
+                            .map_err(|e| LlmError::OutputDecodeFailed {
+                                reason: format!("anthropic response JSON decode: {e}"),
+                            })?;
+
+                    let response = decode_anthropic_response(payload, &request)?;
+                    log_call(&model, &response);
+                    Ok(response)
+                },
+                || LlmError::ProviderError {
+                    status: 0,
+                    message: "no provider runtime; LLM completions are disabled".to_string(),
+                },
+                |e| LlmError::ProviderError {
+                    status: 0,
+                    message: format!("anthropic completion task failed: {e}"),
+                },
             )
             .await
-            .map_err(|_| LlmError::Timeout)?
-            .map_err(LlmError::from)?;
-
-            let status = resp.status();
-            if status == 401 || status == 403 {
-                return Err(LlmError::Auth {
-                    provider: crate::router::PROVIDER_ANTHROPIC,
-                });
-            }
-            if status == 429 {
-                let retry_after_ms = parse_retry_after(resp.headers());
-                return Err(LlmError::RateLimit { retry_after_ms });
-            }
-            if !status.is_success() {
-                let message = resp.text().await.unwrap_or_default();
-                return Err(LlmError::ProviderError {
-                    status: status.as_u16(),
-                    message,
-                });
-            }
-
-            let payload: AnthropicResponseBody =
-                resp.json()
-                    .await
-                    .map_err(|e| LlmError::OutputDecodeFailed {
-                        reason: format!("anthropic response JSON decode: {e}"),
-                    })?;
-
-            let response = decode_anthropic_response(payload, &request)?;
-            log_call(&self.model, &response);
-            Ok(response)
         })
     }
 

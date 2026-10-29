@@ -12,6 +12,7 @@
 //! parsed.
 
 use crate::envelope::request::{WireSessionId, WireUuid};
+use crate::ActAs;
 
 // ---------------------------------------------------------------------------
 // Shared wire-domain types — used by the query request body.
@@ -99,6 +100,14 @@ pub struct QueryRequest {
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct QueryExplainRequest {
     pub query: QueryRequest,
+    /// Effective identity this explain runs as, on behalf of the
+    /// authenticated connection principal. `None` (the common case, and
+    /// omitted on the wire) means the op runs as the connection's own
+    /// key-bound identity.
+    /// Planning runs against the effective identity's data, so an explain
+    /// reflects what that tenant's query would actually do.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
 }
 
 // ---------------------------------------------------------------------------
@@ -108,6 +117,14 @@ pub struct QueryExplainRequest {
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct QueryTraceRequest {
     pub query: QueryRequest,
+    /// Effective identity this trace runs as, on behalf of the
+    /// authenticated connection principal. `None` (the common case, and
+    /// omitted on the wire) means the op runs as the connection's own
+    /// key-bound identity.
+    /// The trace runs against the effective identity's data, so its timings
+    /// and candidate counts are that tenant's.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
 }
 
 #[cfg(test)]

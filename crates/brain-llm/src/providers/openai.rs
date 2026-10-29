@@ -50,6 +50,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::client::{model_id_hash, LlmClient, LlmFuture};
 use crate::error::LlmError;
+use crate::providers::runtime::run_on_provider_runtime;
 use crate::types::{LlmRequest, LlmResponse, LlmRole};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com";
@@ -125,55 +126,95 @@ impl OpenAIClient {
 
 impl LlmClient for OpenAIClient {
     fn complete<'a>(&'a self, request: LlmRequest) -> LlmFuture<'a> {
+        // Owned clones so the task is `'static`. `reqwest::Client` is an Arc
+        // inside, so this shares one connection pool rather than building one
+        // per completion.
+        let http = self.http.clone();
+        let api_key = self.api_key.clone();
+        let url = format!("{}/v1/chat/completions", self.base_url);
+        let body = OpenAIRequestBody::from(&request);
+        let timeout = request.timeout;
+
         Box::pin(async move {
-            if self.api_key.is_empty() {
+            if api_key.is_empty() {
                 return Err(LlmError::Auth {
                     provider: crate::router::PROVIDER_OPENAI,
                 });
             }
 
-            let body = OpenAIRequestBody::from(&request);
-            let url = format!("{}/v1/chat/completions", self.base_url);
+            // Every line below runs on the provider runtime, not on the
+            // caller's executor, which is a glommio shard thread with no Tokio
+            // reactor. See `providers::runtime`.
+            run_on_provider_runtime(
+                async move {
+                    let mut body = body;
+                    let mut resp = send_chat(&http, &url, &api_key, &body, timeout).await?;
 
-            let resp = tokio::time::timeout(
-                request.timeout,
-                self.http
-                    .post(&url)
-                    .bearer_auth(&self.api_key)
-                    .header("content-type", "application/json")
-                    .json(&body)
-                    .send(),
+                    // Some models accept only their default temperature and
+                    // reject any explicit value with a 400. Retry once without
+                    // the field rather than fail the call: the caller's
+                    // temperature is a preference, and for HyPE — which is
+                    // mandatory and always-on — losing the whole generation
+                    // over a sampling nudge is the wrong trade.
+                    //
+                    // Dropping it is expressible because `temperature` is
+                    // skipped when zero, which is also why every caller that
+                    // leaves it at the default already works on these models.
+                    if resp.status() == 400 && body.temperature != 0.0 {
+                        let detail = resp.text().await.unwrap_or_default();
+                        if rejects_temperature(&detail) {
+                            tracing::debug!(
+                                target: "brain_llm::openai",
+                                model = %body.model,
+                                "model rejected an explicit temperature; retrying with its default",
+                            );
+                            body.temperature = 0.0;
+                            resp = send_chat(&http, &url, &api_key, &body, timeout).await?;
+                        } else {
+                            return Err(LlmError::ProviderError {
+                                status: 400,
+                                message: detail,
+                            });
+                        }
+                    }
+
+                    let status = resp.status();
+                    if status == 401 || status == 403 {
+                        return Err(LlmError::Auth {
+                            provider: crate::router::PROVIDER_OPENAI,
+                        });
+                    }
+                    if status == 429 {
+                        let retry_after_ms = parse_retry_after(resp.headers());
+                        return Err(LlmError::RateLimit { retry_after_ms });
+                    }
+                    if !status.is_success() {
+                        let message = resp.text().await.unwrap_or_default();
+                        return Err(LlmError::ProviderError {
+                            status: status.as_u16(),
+                            message,
+                        });
+                    }
+
+                    let payload: OpenAIResponseBody =
+                        resp.json()
+                            .await
+                            .map_err(|e| LlmError::OutputDecodeFailed {
+                                reason: format!("openai response JSON decode: {e}"),
+                            })?;
+
+                    decode_openai_response(payload)
+                },
+                || LlmError::ProviderError {
+                    status: 0,
+                    message: "no provider runtime; LLM completions are disabled".to_string(),
+                },
+                |e| LlmError::ProviderError {
+                    status: 0,
+                    message: format!("openai completion task failed: {e}"),
+                },
             )
             .await
-            .map_err(|_| LlmError::Timeout)?
-            .map_err(LlmError::from)?;
-
-            let status = resp.status();
-            if status == 401 || status == 403 {
-                return Err(LlmError::Auth {
-                    provider: crate::router::PROVIDER_OPENAI,
-                });
-            }
-            if status == 429 {
-                let retry_after_ms = parse_retry_after(resp.headers());
-                return Err(LlmError::RateLimit { retry_after_ms });
-            }
-            if !status.is_success() {
-                let message = resp.text().await.unwrap_or_default();
-                return Err(LlmError::ProviderError {
-                    status: status.as_u16(),
-                    message,
-                });
-            }
-
-            let payload: OpenAIResponseBody =
-                resp.json()
-                    .await
-                    .map_err(|e| LlmError::OutputDecodeFailed {
-                        reason: format!("openai response JSON decode: {e}"),
-                    })?;
-
-            decode_openai_response(payload)
         })
     }
 
@@ -184,6 +225,41 @@ impl LlmClient for OpenAIClient {
     fn model_id_hash(&self) -> u64 {
         self.model_id_hash
     }
+}
+
+/// One chat-completions POST. Split out so the temperature retry can repeat it
+/// without duplicating the request construction.
+async fn send_chat(
+    http: &reqwest::Client,
+    url: &str,
+    api_key: &str,
+    body: &OpenAIRequestBody,
+    timeout: std::time::Duration,
+) -> Result<reqwest::Response, LlmError> {
+    tokio::time::timeout(
+        timeout,
+        http.post(url)
+            .bearer_auth(api_key)
+            .header("content-type", "application/json")
+            .json(body)
+            .send(),
+    )
+    .await
+    .map_err(|_| LlmError::Timeout)?
+    .map_err(LlmError::from)
+}
+
+/// Whether a 400 body is the provider refusing an explicit temperature.
+///
+/// Matched on the error's own `param`/`code` fields rather than its prose,
+/// which is not a stable interface. Both must be present: a 400 that merely
+/// mentions temperature somewhere else is a different fault and must keep its
+/// own error.
+fn rejects_temperature(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body).is_ok_and(|v| {
+        let err = &v["error"];
+        err["param"] == "temperature" && err["code"] == "unsupported_value"
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -312,6 +388,12 @@ struct OpenAIUsage {
 }
 
 fn decode_openai_response(payload: OpenAIResponseBody) -> Result<LlmResponse, LlmError> {
+    let truncated = payload
+        .choices
+        .first()
+        .and_then(|c| c.finish_reason.as_deref())
+        == Some("length");
+
     let content = payload
         .choices
         .first()
@@ -320,16 +402,24 @@ fn decode_openai_response(payload: OpenAIResponseBody) -> Result<LlmResponse, Ll
             reason: "openai response had no choices[0].message.content".into(),
         })?;
     if content.is_empty() {
+        // `truncated` is computed FIRST so this can say which empty it is.
+        // A reasoning model spends the completion budget on reasoning before
+        // it writes anything, so too small a budget returns `finish_reason =
+        // length` with no content at all — and reported as a bare "content
+        // was empty" that is indistinguishable from a malformed reply, which
+        // callers retry. Every retry is billed and returns empty again.
         return Err(LlmError::OutputDecodeFailed {
-            reason: "openai response content was empty".into(),
+            reason: if truncated {
+                "openai returned no content: the completion budget was spent \
+                 before any output (finish_reason=length). On a reasoning \
+                 model the budget must cover the reasoning tokens too — raise \
+                 max_tokens for this call, or configure a non-reasoning model"
+                    .into()
+            } else {
+                "openai response content was empty".into()
+            },
         });
     }
-
-    let truncated = payload
-        .choices
-        .first()
-        .and_then(|c| c.finish_reason.as_deref())
-        == Some("length");
 
     let cost_micro_usd = payload.usage.prompt_tokens * PRICE_INPUT_PER_TOKEN_DEFAULT
         + payload.usage.completion_tokens * PRICE_OUTPUT_PER_TOKEN_DEFAULT;
@@ -592,6 +682,36 @@ mod tests {
         assert!(r.truncated);
     }
 
+    /// A reasoning model with too small a budget answers 200 with empty
+    /// content and `finish_reason = length`. Reported as a bare "content was
+    /// empty" it reads as a transient hiccup, so the caller retries it — and
+    /// retries it, billed every time, because nothing about the request has
+    /// changed. The error has to name the budget for anyone to fix it.
+    #[test]
+    fn an_empty_truncated_reply_blames_the_budget_not_the_model() {
+        let mut body = body_with_finish(Some("length"));
+        body.choices[0].message.content = Some(String::new());
+
+        let err = decode_openai_response(body).expect_err("empty content is an error");
+        let msg = err.to_string();
+        assert!(msg.contains("finish_reason=length"), "{msg}");
+        assert!(msg.contains("max_tokens"), "{msg}");
+    }
+
+    /// An empty reply that was NOT truncated is a different fault and must
+    /// not be mislabelled as a budget problem.
+    #[test]
+    fn an_empty_reply_that_finished_cleanly_is_not_blamed_on_the_budget() {
+        let mut body = body_with_finish(Some("stop"));
+        body.choices[0].message.content = Some(String::new());
+
+        let msg = decode_openai_response(body)
+            .expect_err("empty content is an error")
+            .to_string();
+        assert!(msg.contains("content was empty"), "{msg}");
+        assert!(!msg.contains("max_tokens"), "{msg}");
+    }
+
     #[test]
     fn a_clean_stop_is_not_truncated() {
         let r = decode_openai_response(body_with_finish(Some("stop"))).unwrap();
@@ -606,6 +726,95 @@ mod tests {
         for reason in [None, Some("content_filter"), Some("tool_calls")] {
             let r = decode_openai_response(body_with_finish(reason)).unwrap();
             assert!(!r.truncated, "{reason:?} must not read as truncated");
+        }
+    }
+
+    /// Drive a future to completion with no reactor of any kind.
+    ///
+    /// As far as Tokio is concerned this is the shape of a glommio shard
+    /// executor: a thread polling futures with nothing registered to service
+    /// I/O. Hand-rolled rather than pulled from a crate so the test cannot
+    /// accidentally acquire the very runtime it is meant to do without.
+    fn block_on_without_reactor<F: std::future::Future>(fut: F) -> F::Output {
+        use std::sync::Arc;
+        use std::task::{Context, Poll, Wake, Waker};
+
+        struct Unparker(std::thread::Thread);
+        impl Wake for Unparker {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+
+        let waker = Waker::from(Arc::new(Unparker(std::thread::current())));
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = Box::pin(fut);
+        loop {
+            match fut.as_mut().poll(&mut cx) {
+                Poll::Ready(v) => return v,
+                Poll::Pending => std::thread::park(),
+            }
+        }
+    }
+
+    #[test]
+    fn completing_without_a_tokio_reactor_does_not_panic() {
+        // The sibling of `broker::resolving_without_a_tokio_reactor_does_not_panic`,
+        // one layer further on. Every other provider test is `#[tokio::test]`,
+        // which hands the client a reactor that production does NOT have:
+        // `complete` is awaited from the extractor tier and the HyPE generator
+        // on a glommio shard executor.
+        //
+        // The suite stayed green through that gap because no write could reach
+        // this call: resolution returned `Missing` for every namespace, so the
+        // write degraded before a client was built. The first namespace with a
+        // registered credential aborted the shard (SIGABRT) on its first write.
+        //
+        // Port 1 refuses immediately, so this exercises the connect path — the
+        // one that panicked — without needing a server.
+        let client = OpenAIClient::with_endpoint("gpt-4o-mini", "sk-test", "http://127.0.0.1:1");
+        let out = block_on_without_reactor(client.complete(LlmRequest::new("gpt-4o-mini", "hi")));
+        assert!(
+            out.is_err(),
+            "an unreachable provider is an error, not a panic"
+        );
+    }
+
+    /// The shape the provider actually sent when a model refused an explicit
+    /// temperature, trimmed to the fields matched on.
+    const TEMPERATURE_REFUSAL: &str = r#"{
+      "error": {
+        "message": "Unsupported value: 'temperature' does not support 0.3 with this model. Only the default (1) value is supported.",
+        "type": "invalid_request_error",
+        "param": "temperature",
+        "code": "unsupported_value"
+      }
+    }"#;
+
+    #[test]
+    fn a_temperature_refusal_is_recognised() {
+        assert!(rejects_temperature(TEMPERATURE_REFUSAL));
+    }
+
+    /// The retry must not swallow unrelated 400s. A model that does not exist,
+    /// or a malformed request, has to keep its own error — otherwise the
+    /// second attempt fails the same way and the caller sees a confusing
+    /// duplicate instead of the real cause.
+    #[test]
+    fn other_four_hundreds_are_not_temperature_refusals() {
+        for body in [
+            r#"{"error":{"message":"The model `nope` does not exist","type":"invalid_request_error","param":null,"code":"model_not_found"}}"#,
+            // Mentions temperature in prose, but is not a refusal OF it.
+            r#"{"error":{"message":"temperature must be a number","type":"invalid_request_error","param":"max_tokens","code":"unsupported_value"}}"#,
+            // Right param, different code.
+            r#"{"error":{"message":"x","type":"invalid_request_error","param":"temperature","code":"invalid_type"}}"#,
+            "not json at all",
+            "",
+        ] {
+            assert!(
+                !rejects_temperature(body),
+                "must not treat this as a temperature refusal: {body}"
+            );
         }
     }
 }

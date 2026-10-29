@@ -35,7 +35,7 @@ use brain_extractors::{ClassifierModel, EntityDisambiguator, MaterializeDeps};
 use brain_llm::client::LlmFuture;
 use brain_llm::{
     AnthropicClient, BrokerResolver, LlmClient, LlmCredentialResolver, LlmError, LlmRequest,
-    ModelRouter, OpenAIClient, StaticResolver,
+    ModelRouter, OpenAIClient,
 };
 use brain_metadata::LlmCacheDb;
 use parking_lot::Mutex;
@@ -154,12 +154,9 @@ pub struct LlmDeps {
     pub router: Option<Arc<ModelRouter>>,
     /// Per-namespace credential resolution — the BYOK seam.
     ///
-    /// In `static` mode this is a [`StaticResolver`] over [`Self::router`],
-    /// which reproduces pre-BYOK behaviour exactly: one credential, every
-    /// namespace. A broker-backed resolver takes its place when the
-    /// deployment resolves credentials per tenant.
-    ///
-    /// `None` only when no provider key was resolvable at all.
+    /// Backed by `[llm.broker]`, which every deployment configures. `None`
+    /// when the broker is declared but unusable, which degrades the LLM tier
+    /// with a per-write reason rather than failing the shard.
     pub resolver: Option<Arc<dyn LlmCredentialResolver>>,
     pub cache: Option<Arc<Mutex<LlmCacheDb>>>,
     /// Optional partial-match disambiguator. Populated when at least
@@ -220,18 +217,11 @@ pub fn build_llm_deps(shard_dir: &Path, llm_cfg: &LlmSpawnConfig) -> LlmDeps {
         .clone()
         .map(|c| Arc::new(EntityDisambiguator::new(c, primary_model.clone())));
     let router = build_router(llm_cfg);
-    // BYOK (`mode = "broker"`) wins when configured: credentials are resolved
-    // per namespace from the edge, and `[llm] api_key` is not consulted at all.
-    // Otherwise `static` mode gives one credential to every namespace, exactly
-    // as this shard behaved before BYOK existed.
+    // The one way a namespace gets a serving credential. `[llm] api_key` is
+    // not consulted here: a process-wide key would serve every namespace on
+    // the shard, which is the opposite of what a per-tenant credential means.
     let resolver: Option<Arc<dyn LlmCredentialResolver>> =
-        if let Some(broker) = llm_cfg.broker.as_ref() {
-            build_broker_resolver(broker)
-        } else {
-            router
-                .clone()
-                .map(|r| Arc::new(StaticResolver::new(r, primary_model.clone())) as Arc<_>)
-        };
+        llm_cfg.broker.as_ref().and_then(build_broker_resolver);
     LlmDeps {
         router,
         resolver,

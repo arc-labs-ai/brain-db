@@ -11,6 +11,7 @@
 //! With `txn_id`: validate + embed + reserve a `MemoryId`, push to
 //! the buffer, return a preview response. Writes happen at TXN_COMMIT.
 
+use crate::clock::now_unix_nanos;
 use std::time::{Duration, Instant};
 
 use brain_core::{MemoryId, MemoryKind, Salience, SessionId};
@@ -26,7 +27,7 @@ use brain_protocol::StageKind;
 
 use crate::context::OpsContext;
 use crate::error::OpError;
-use crate::handlers::link::downcast_writer_pub;
+use crate::handlers::writer_handle::real_writer_handle;
 use crate::txn::{BufferedEncode, BufferedReplay};
 use crate::write::{Phase, PhaseAck, Write, WriteId};
 
@@ -55,19 +56,41 @@ const DEFAULT_KIND: MemoryKind = MemoryKind::Episodic;
 const DEFAULT_SALIENCE: f32 = 0.5;
 
 #[tracing::instrument(name = "brain.encode", skip_all)]
-/// Reject the write when this namespace has no usable LLM provider credential.
+/// Reject the write when this namespace is KNOWN to have no usable LLM
+/// provider credential.
 ///
-/// Brain cannot store a memory it will not be able to ground: HyPE and the
-/// extraction tier are mandatory, so a write admitted without a credential
-/// lands as text with no questions, no entities and no statements — it looks
-/// stored, and recall quietly gets worse, with nothing telling the caller why.
-/// Failing at the door makes that visible and actionable.
+/// Brain cannot ground a memory it has no key for: HyPE and the extraction
+/// tier both need one, so a write admitted without a credential lands as text
+/// with no questions, no entities and no statements. It looks stored, and
+/// recall quietly gets worse.
 ///
 /// **Cache-only.** The probe never performs I/O: the synchronous write path
 /// must not block on a credential broker. `None` means "unknown without I/O"
 /// and **admits** the write — a cold cache is not evidence of a missing key,
 /// and the derivation stages re-resolve properly (and retry a transient
 /// failure) when they run.
+///
+/// ## This is an optimisation, not a guarantee — do not read it as one
+///
+/// It fires only while a `Cached::Missing` entry is live, and that entry's
+/// TTL is `DEFAULT_NEGATIVE_TTL` (10s). Under sustained traffic the first
+/// write pays the silent degradation and the ones behind it are refused at
+/// the door. Under sparse traffic — a sandbox, a demo, anything with gaps
+/// longer than the TTL — the entry has always expired, every write is
+/// admitted, and NONE of them are refused. That is working as designed.
+///
+/// Lengthening the negative TTL does not fix it and makes things worse: this
+/// gate runs before any derivation, so a namespace stuck on `Missing` never
+/// issues the fetch that would store `Ready`. The negative entry becomes
+/// self-sustaining, and a tenant who registers a key stays rejected with
+/// nothing able to clear it. The short TTL is what keeps that recoverable.
+///
+/// So the honest signal for a degraded write is NOT this gate — it is the
+/// per-stage status in the encode trace. `publish_hype_completed` reports
+/// `StageOutcome::Failed` when HyPE could not run, which is what separates
+/// "no key registered" from "this text warranted no questions". A caller
+/// diagnosing an empty graph should read the stage statuses, not infer from
+/// the write having been accepted.
 fn reject_if_no_llm_credential(ctx: &OpsContext) -> Result<(), OpError> {
     let Some(resolver) = ctx.llm_credential_resolver.as_ref() else {
         // No resolver wired (tests, credential-free deployments): admit.
@@ -147,7 +170,7 @@ pub async fn handle_encode(
     // behind submit() — by then we've already burned embedding work
     // and a slot reservation. Peek it up-front so a replay is free.
     // A mismatched request hash on the same WriteId is a Conflict.
-    let real_writer = downcast_writer_pub(ctx)?;
+    let real_writer = real_writer_handle(ctx)?;
     let write_id = WriteId::from_request(
         brain_core::RequestId::from(req.request_id),
         ctx.executor.caller_space,
@@ -312,7 +335,7 @@ pub async fn handle_encode(
             detail: format!("lsn={}", ack.lsn_first.raw()),
             artifact: Some(EncodeStageArtifact {
                 record: Some(EncodeStageRecord {
-                    memory_id: memory_id.to_be_bytes(),
+                    memory_id: memory_id.raw(),
                     kind: kind_byte,
                     salience,
                     created_at_unix_nanos: created_at,
@@ -719,7 +742,12 @@ fn build_encode_artifacts(
                 ctx.executor.caller_namespace,
                 ctx.executor.caller_space,
             );
-            match crate::handlers::recall::fetch_enrichment_for(&[memory_id], scope, None, &rtxn) {
+            match crate::handlers::graph_enrichment::fetch_enrichment_for(
+                &[memory_id],
+                scope,
+                None,
+                &rtxn,
+            ) {
                 Ok(mut enr) => {
                     let g = enr.pop().unwrap_or_else(|| {
                         brain_protocol::envelope::response::GraphEnrichment {
@@ -797,7 +825,7 @@ fn build_encode_artifacts(
         indexes,
         dedup: EncodeTraceDedup {
             was_deduplicated,
-            matched_memory_id: matched_memory_id.map(|m| m.to_be_bytes()),
+            matched_memory_id: matched_memory_id.map(|m| m.raw()),
         },
     }
 }
@@ -854,10 +882,6 @@ fn encode_request_hash(
         space_id: space,
     };
     crate::state::idempotency::hash_encode_request(&op)
-}
-
-fn now_unix_nanos() -> u64 {
-    crate::clock::now_unix_nanos()
 }
 
 /// Build the response for an idempotency-replay hit. The cached
@@ -1032,7 +1056,7 @@ async fn handle_encode_in_txn(
         .reserve_memory_id()
         .await
         .map_err(|e| OpError::ExecError(brain_planner::ExecError::WriterFailed(e)))?;
-    let created_at = crate::txn::now_unix_nanos_pub();
+    let created_at = now_unix_nanos();
 
     // 7. ENCODE carries no client edges — the auto/temporal-edge
     //    workers derive edges post-commit. The buffer therefore stores

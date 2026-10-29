@@ -18,6 +18,7 @@
 //! These handlers do NOT yet handle cross-shard relation reads
 //! or the relation embedding worker — both deferred.
 
+use crate::clock::now_unix_nanos;
 use brain_core::Relation;
 use brain_core::{Cardinality, EntityId, RelationId, RelationTypeId, RequestId};
 use brain_metadata::relation::ops::{
@@ -46,8 +47,8 @@ use redb::ReadableTable;
 
 use crate::context::OpsContext;
 use crate::error::OpError;
-use crate::handlers::entity::emit_graph_event;
-use crate::handlers::link::downcast_writer_pub;
+use crate::handlers::events::emit_graph_event;
+use crate::handlers::writer_handle::real_writer_handle;
 use crate::write::{
     Phase, PhaseAck, SupersedeReplacement, SupersedeReplacementId, SupersedeTarget,
     TombstoneTarget, Write, WriteId,
@@ -100,7 +101,7 @@ pub async fn handle_relation_create(
             "confidence must be in [0, 1] and not NaN".into(),
         ));
     }
-    let now = crate::txn::now_unix_nanos_pub();
+    let now = now_unix_nanos();
     let (namespace, name) = split_qname(&req.relation_type)?;
 
     // Resolve the relation-type qname (strict vs schemaless dispatch).
@@ -182,7 +183,7 @@ pub async fn handle_relation_create(
         now
     };
 
-    let real_writer = downcast_writer_pub(ctx)?;
+    let real_writer = real_writer_handle(ctx)?;
     let write_id =
         WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_relation_create_request(&req);
@@ -305,7 +306,7 @@ pub async fn handle_relation_supersede(
     }
 
     let old_id = RelationId::from(req.old_relation_id);
-    let now = crate::txn::now_unix_nanos_pub();
+    let now = now_unix_nanos();
     let (namespace, name) = split_qname(&req.new_relation.relation_type)?;
 
     // Resolve the relation-type qname (strict vs schemaless dispatch)
@@ -369,7 +370,7 @@ pub async fn handle_relation_supersede(
 
     let new_relation = build_relation_from_create(&req.new_relation, &rt, now)?;
 
-    let real_writer = downcast_writer_pub(ctx)?;
+    let real_writer = real_writer_handle(ctx)?;
     let write_id =
         WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_relation_supersede_request(&req);
@@ -439,7 +440,7 @@ pub async fn handle_relation_tombstone(
         return Err(OpError::InvalidRequest("reason exceeds 4 KiB".into()));
     }
     let id = RelationId::from(req.relation_id);
-    let now = crate::txn::now_unix_nanos_pub();
+    let now = now_unix_nanos();
 
     // Pre-submit existence + ownership check — submit-path failures
     // collapse into WriterError::Internal, so check first to keep the
@@ -453,7 +454,7 @@ pub async fn handle_relation_tombstone(
         });
     }
 
-    let real_writer = downcast_writer_pub(ctx)?;
+    let real_writer = real_writer_handle(ctx)?;
     let write_id =
         WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_relation_tombstone_request(&req);

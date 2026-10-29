@@ -55,7 +55,22 @@ use redb::{Database, ReadableDatabase, TableDefinition};
 ///
 /// Both change the rkyv row layout, and the new index has no rows in an
 /// older file. No migration tool — pre-user, fresh-start on bump.
-pub const CURRENT_SCHEMA_VERSION: u32 = 4;
+///
+/// v5 unifies the memory-id encoding. `memory_artifacts` stores an
+/// `EncodeStageArtifact` as JSON, and that type is also the MEMORY_INSPECT
+/// payload, so its `memory_id` fields are the `u128` every other memory id
+/// uses and the stored JSON carries a number where a v4 file carries a
+/// 16-element array.
+///
+/// The version gate is what makes that safe. The reader in
+/// `memory_artifact.rs` is `serde_json::from_str(..).ok().unwrap_or_default()`,
+/// so a v4 bundle under a v5 binary would not error — it would come back
+/// EMPTY, blanking the inspect view of every memory already stored with
+/// nothing in a log to say so. Refusing the file outright is the honest
+/// failure.
+///
+/// No migration tool — pre-user, fresh-start on bump, as with v3 and v4.
+pub const CURRENT_SCHEMA_VERSION: u32 = 5;
 
 /// Singleton key inside [`SCHEMA_META_TABLE`].
 pub const SCHEMA_VERSION_KEY: &str = "schema_version";
@@ -282,7 +297,6 @@ mod tests {
             SchemaError::SchemaTooOld { found, current } => {
                 assert_eq!(found, 1);
                 assert_eq!(current, CURRENT_SCHEMA_VERSION);
-                assert_eq!(current, 4);
             }
             other => panic!("expected SchemaTooOld, got {other:?}"),
         }

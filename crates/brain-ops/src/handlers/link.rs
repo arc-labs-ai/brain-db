@@ -1,6 +1,7 @@
 //! LINK / UNLINK handlers — submit Link / Unlink phases through the
 //! unified writer; in-TXN ops buffer for later commit.
 
+use crate::clock::now_unix_nanos;
 use brain_core::{EdgeKind, EdgeKindRef, MemoryId, NodeRef, RequestId};
 use brain_planner::{LinkOp, UnlinkOp, WriterError};
 use brain_protocol::envelope::request::{EdgeKindWire, LinkRequest, UnlinkRequest};
@@ -8,10 +9,10 @@ use brain_protocol::envelope::response::{LinkResponse, UnlinkResponse};
 
 use crate::context::OpsContext;
 use crate::error::OpError;
+use crate::handlers::writer_handle::real_writer_handle;
 use crate::state::idempotency::{hash_link_request, hash_unlink_request};
 use crate::txn::{BufferedLink, BufferedReplay, BufferedUnlink};
 use crate::write::{Phase, PhaseAck, Write, WriteId};
-use crate::writer::RealWriterHandle;
 
 pub async fn handle_link(req: LinkRequest, ctx: &OpsContext) -> Result<LinkResponse, OpError> {
     validate_weight(req.weight, EdgeKind::from(req.kind))?;
@@ -24,7 +25,7 @@ pub async fn handle_link(req: LinkRequest, ctx: &OpsContext) -> Result<LinkRespo
     let target = MemoryId::from(req.target);
     let kind = EdgeKind::from(req.kind);
 
-    let real_writer = downcast_writer(ctx)?;
+    let real_writer = real_writer_handle(ctx)?;
     let write_id =
         WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_link_request(&LinkOp {
@@ -165,27 +166,6 @@ fn peek_link_state(
     Ok((src_exists, tgt_exists, already_existed))
 }
 
-/// Downcast `ctx.executor.writer` to the concrete [`RealWriterHandle`]
-/// so we can call its `submit(Write)` method. Wire handlers that
-/// migrate to the unified path go through this helper.
-fn downcast_writer(ctx: &OpsContext) -> Result<&RealWriterHandle, OpError> {
-    downcast_writer_pub(ctx)
-}
-
-/// pub(crate) version of [`downcast_writer`] for other handler
-/// modules to use as they migrate to submit(Write).
-pub(crate) fn downcast_writer_pub(ctx: &OpsContext) -> Result<&RealWriterHandle, OpError> {
-    ctx.executor
-        .writer
-        .as_any()
-        .downcast_ref::<RealWriterHandle>()
-        .ok_or_else(|| OpError::Internal("unified path requires RealWriterHandle".into()))
-}
-
-fn now_unix_nanos() -> u64 {
-    crate::clock::now_unix_nanos()
-}
-
 pub async fn handle_unlink(
     req: UnlinkRequest,
     ctx: &OpsContext,
@@ -197,7 +177,7 @@ pub async fn handle_unlink(
     let target = MemoryId::from(req.target);
     let kind = EdgeKind::from(req.kind);
 
-    let real_writer = downcast_writer(ctx)?;
+    let real_writer = real_writer_handle(ctx)?;
     let write_id =
         WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_unlink_request(&UnlinkOp {
@@ -440,7 +420,7 @@ async fn handle_link_in_txn(
         (committed_has || pending_has) && !pending_unlinked
     };
 
-    let created_at = crate::txn::now_unix_nanos_pub();
+    let created_at = now_unix_nanos();
     let buffered = BufferedLink {
         source,
         target,
@@ -584,7 +564,7 @@ async fn handle_unlink_in_txn(
 
     let removed = (committed_has || pending_has) && !already_unlinked;
 
-    let created_at = crate::txn::now_unix_nanos_pub();
+    let created_at = now_unix_nanos();
     let buffered = BufferedUnlink {
         source,
         target,

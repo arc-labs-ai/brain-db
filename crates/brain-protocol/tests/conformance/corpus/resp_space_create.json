@@ -1,5 +1,5 @@
 {
-  "space_id": "support-bot:user123",
+  "space": "support-bot:user123",
   "created": true,
   "created_at_unix_nanos": 1700000000000000000,
   "last_active_unix_nanos": 1700000000000000000,

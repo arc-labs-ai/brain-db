@@ -331,7 +331,7 @@ fn sample_encode_act_as() -> EncodeRequest {
         occurred_at_unix_nanos: None,
         act_as: Some(ActAs {
             namespace: "tenant-acme".into(),
-            space_id: SPACE_STR.into(),
+            space: SPACE_STR.into(),
             grant: 0,
         }),
         wait: brain_protocol::WaitMode::Ack,
@@ -351,6 +351,7 @@ fn sample_encode_vector_direct() -> EncodeVectorDirectRequest {
         request_id: RID,
         txn_id: None,
         deduplicate: false,
+        act_as: None,
     }
 }
 
@@ -411,7 +412,7 @@ fn sample_encode_response_trace() -> EncodeResponse {
                 detail: "lsn=42".into(),
                 artifact: Some(EncodeStageArtifact {
                     record: Some(EncodeStageRecord {
-                        memory_id: mid().to_be_bytes(),
+                        memory_id: mid(),
                         kind: 0,
                         salience: 0.5,
                         created_at_unix_nanos: 1_700_000_000_000_000_000,
@@ -844,20 +845,19 @@ fn sample_extractor_list() -> ExtractorListResponseFrame {
 
 fn sample_memory_inspect_request() -> MemoryInspectRequest {
     MemoryInspectRequest {
-        memory_id: mid().to_be_bytes(),
+        memory_id: mid(),
         act_as: None,
     }
 }
 
 fn sample_memory_inspect_response() -> MemoryInspectResponse {
     MemoryInspectResponse {
-        found: true,
-        memory_id: mid().to_be_bytes(),
+        memory_id: mid(),
         text: "niraj works on brain".into(),
         artifact: EncodeStageArtifact {
             vector: vec![0.1, -0.2, 0.3, 0.4],
             record: Some(EncodeStageRecord {
-                memory_id: mid().to_be_bytes(),
+                memory_id: mid(),
                 kind: 0,
                 salience: 0.5,
                 created_at_unix_nanos: 1_700_000_000_000_000_000,
@@ -941,7 +941,7 @@ fn sample_memory_list_request() -> MemoryListRequest {
 fn sample_memory_list_response() -> MemoryListResponseFrame {
     MemoryListResponseFrame {
         items: vec![MemoryListItem {
-            memory_id: EID,
+            memory_id: u128::from_be_bytes(EID),
             space_id: SPACE,
             session_id: 1,
             text: "the sky is blue".into(),
@@ -1165,7 +1165,7 @@ fn corpus() -> Vec<Case> {
         txn_id: None,
         act_as: Some(ActAs {
             namespace: "tenant-acme".into(),
-            space_id: SPACE_STR.into(),
+            space: SPACE_STR.into(),
             grant: 0,
         }),
     };
@@ -1193,7 +1193,7 @@ fn corpus() -> Vec<Case> {
         txn_id: None,
         act_as: Some(ActAs {
             namespace: "tenant-acme".into(),
-            space_id: SPACE_STR.into(),
+            space: SPACE_STR.into(),
             grant: 0,
         }),
     };
@@ -1224,7 +1224,7 @@ fn corpus() -> Vec<Case> {
         trace: true,
         act_as: Some(ActAs {
             namespace: "tenant-acme".into(),
-            space_id: SPACE_STR.into(),
+            space: SPACE_STR.into(),
             grant: 0,
         }),
     };
@@ -1246,7 +1246,7 @@ fn corpus() -> Vec<Case> {
         trace: true,
         act_as: Some(ActAs {
             namespace: "tenant-acme".into(),
-            space_id: SPACE_STR.into(),
+            space: SPACE_STR.into(),
             grant: 0,
         }),
     };
@@ -1282,7 +1282,7 @@ fn corpus() -> Vec<Case> {
         request_id: RID,
         act_as: Some(ActAs {
             namespace: "tenant-acme".into(),
-            space_id: SPACE_STR.into(),
+            space: SPACE_STR.into(),
             grant: 0,
         }),
     };
@@ -1320,6 +1320,7 @@ fn corpus() -> Vec<Case> {
         min_confidence: 0.5,
         categories: vec!["tone".into()],
         request_id: RID,
+        act_as: None,
     };
     cases.push(req_case(
         "req_materialize_procedural",
@@ -1370,6 +1371,7 @@ fn corpus() -> Vec<Case> {
     };
     let query_explain = QueryExplainRequest {
         query: query.clone(),
+        act_as: None,
     };
     cases.push(req_case(
         "req_query_explain",
@@ -1378,6 +1380,7 @@ fn corpus() -> Vec<Case> {
     ));
     let query_trace = QueryTraceRequest {
         query: query.clone(),
+        act_as: None,
     };
     cases.push(req_case(
         "req_query_trace",
@@ -1741,10 +1744,10 @@ fn corpus() -> Vec<Case> {
     ));
 
     // ---- Extractor introspection ----
-    let extractor_list_req = ExtractorListRequest {};
+    let extractor_list_req = ExtractorListRequest { act_as: None };
     cases.push(req_case(
         "req_extractor_list",
-        RequestBody::ExtractorList(extractor_list_req),
+        RequestBody::ExtractorList(extractor_list_req.clone()),
         &extractor_list_req,
     ));
     cases.push(resp_case(
@@ -1765,7 +1768,7 @@ fn corpus() -> Vec<Case> {
         &space_create_req,
     ));
     let space_create_resp = SpaceCreateResponse {
-        space_id: SPACE_STR.into(),
+        space: SPACE_STR.into(),
         created: true,
         created_at_unix_nanos: 1_700_000_000_000_000_000,
         last_active_unix_nanos: 1_700_000_000_000_000_000,
@@ -1788,7 +1791,7 @@ fn corpus() -> Vec<Case> {
     ));
     let space_list_resp = SpaceListResponse {
         spaces: vec![SpaceView {
-            space_id: SPACE_STR.into(),
+            space: SPACE_STR.into(),
             created_at_unix_nanos: 1_700_000_000_000_000_000,
             last_active_unix_nanos: 1_700_000_000_500_000_000,
             memory_count: 42,
@@ -1811,7 +1814,7 @@ fn corpus() -> Vec<Case> {
         &space_delete_req,
     ));
     let space_delete_resp = SpaceDeleteResponse {
-        space_id: SPACE_STR.into(),
+        space: SPACE_STR.into(),
         existed: true,
         memories_forgotten: 42,
     };
@@ -2078,7 +2081,7 @@ fn corpus() -> Vec<Case> {
         entity_id: EID,
         act_as: Some(ActAs {
             namespace: "tenant-acme".into(),
-            space_id: SPACE_STR.into(),
+            space: SPACE_STR.into(),
             grant: 0,
         }),
     };
@@ -2105,6 +2108,7 @@ fn corpus() -> Vec<Case> {
         ],
         attributes_blob: b"role=mathematician;team=analytical-engine".to_vec(),
         request_id: RID,
+        act_as: None,
     };
     cases.push(req_case(
         "req_entity_update",
@@ -2123,6 +2127,7 @@ fn corpus() -> Vec<Case> {
         new_canonical_name: "Augusta Ada King".into(),
         move_to_alias: true,
         request_id: RID,
+        act_as: None,
     };
     cases.push(req_case(
         "req_entity_rename",
@@ -2141,6 +2146,7 @@ fn corpus() -> Vec<Case> {
         confidence: 0.87,
         reason: "same github handle and work email domain".into(),
         request_id: RID,
+        act_as: None,
     };
     cases.push(req_case(
         "req_entity_merge",
@@ -2154,10 +2160,11 @@ fn corpus() -> Vec<Case> {
     let entity_unmerge = EntityUnmergeRequest {
         merged_entity: ENT_DUP,
         request_id: RID,
+        act_as: None,
     };
     cases.push(req_case(
         "req_entity_unmerge",
-        RequestBody::EntityUnmerge(entity_unmerge),
+        RequestBody::EntityUnmerge(entity_unmerge.clone()),
         &entity_unmerge,
     ));
 
@@ -2176,7 +2183,7 @@ fn corpus() -> Vec<Case> {
         request_id: RID,
         act_as: Some(ActAs {
             namespace: "tenant-acme".into(),
-            space_id: SPACE_STR.into(),
+            space: SPACE_STR.into(),
             grant: 0,
         }),
     };
@@ -2211,7 +2218,7 @@ fn corpus() -> Vec<Case> {
         cursor: b"page:2:ada-lovelace".to_vec(),
         act_as: Some(ActAs {
             namespace: "tenant-acme".into(),
-            space_id: SPACE_STR.into(),
+            space: SPACE_STR.into(),
             grant: 0,
         }),
     };
@@ -2230,6 +2237,7 @@ fn corpus() -> Vec<Case> {
         entity_id: ENT_STALE,
         reason: "bad extraction: matched a product name, not a person".into(),
         request_id: RID,
+        act_as: None,
     };
     cases.push(req_case(
         "req_entity_tombstone",
@@ -2414,7 +2422,7 @@ fn corpus() -> Vec<Case> {
     // Shared `act_as` for the relation/statement ops that route it.
     let graph_act_as = ActAs {
         namespace: "tenant-acme".into(),
-        space_id: SPACE_STR.into(),
+        space: SPACE_STR.into(),
         grant: 0,
     };
 
@@ -2463,6 +2471,7 @@ fn corpus() -> Vec<Case> {
             act_as: Some(graph_act_as.clone()),
         },
         request_id: RID,
+        act_as: None,
     };
     cases.push(req_case(
         "req_relation_supersede",
@@ -2478,6 +2487,7 @@ fn corpus() -> Vec<Case> {
         relation_id: REL_ID,
         reason: "superseded by a corrected extraction run".into(),
         request_id: RID,
+        act_as: None,
     };
     cases.push(req_case(
         "req_relation_tombstone",
@@ -2772,6 +2782,7 @@ fn corpus() -> Vec<Case> {
             act_as: Some(graph_act_as.clone()),
         },
         request_id: RID,
+        act_as: None,
     };
     cases.push(req_case(
         "req_statement_supersede",
@@ -2788,6 +2799,7 @@ fn corpus() -> Vec<Case> {
         reason: 3,
         reason_message: "predicate org:works_on removed in schema v4".into(),
         request_id: RID,
+        act_as: None,
     };
     cases.push(req_case(
         "req_statement_tombstone",
@@ -2806,6 +2818,7 @@ fn corpus() -> Vec<Case> {
         reason: 2,
         reason_message: "user asked to delete the dietary-preference statement".into(),
         request_id: RID,
+        act_as: None,
     };
     cases.push(req_case(
         "req_statement_retract",
@@ -2822,6 +2835,7 @@ fn corpus() -> Vec<Case> {
         include_tombstoned: true,
         limit: 100,
         cursor: Vec::new(),
+        act_as: None,
     };
     cases.push(req_case(
         "req_statement_history",
@@ -3135,7 +3149,7 @@ fn corpus() -> Vec<Case> {
     let tenant = |grant: u32| {
         Some(ActAs {
             namespace: "org".into(),
-            space_id: SPACE_STR.into(),
+            space: SPACE_STR.into(),
             grant,
         })
     };
@@ -3362,7 +3376,7 @@ fn corpus() -> Vec<Case> {
         max_inflight: 64,
         act_as: Some(ActAs {
             namespace: "tenant-acme".into(),
-            space_id: SPACE_STR.into(),
+            space: SPACE_STR.into(),
             grant: 0,
         }),
     };
@@ -3453,7 +3467,7 @@ fn corpus() -> Vec<Case> {
     let get_capabilities_act_as = GetCapabilitiesRequest {
         act_as: Some(ActAs {
             namespace: "tenant-acme".into(),
-            space_id: SPACE_STR.into(),
+            space: SPACE_STR.into(),
             grant: 0,
         }),
     };
@@ -3480,7 +3494,7 @@ fn corpus() -> Vec<Case> {
         txn_id: Some(TXN_ID),
         act_as: Some(ActAs {
             namespace: "tenant-acme".into(),
-            space_id: SPACE_STR.into(),
+            space: SPACE_STR.into(),
             grant: 0,
         }),
     };
@@ -3500,7 +3514,7 @@ fn corpus() -> Vec<Case> {
         txn_id: Some(TXN_ID),
         act_as: Some(ActAs {
             namespace: "tenant-acme".into(),
-            space_id: SPACE_STR.into(),
+            space: SPACE_STR.into(),
             grant: 0,
         }),
     };

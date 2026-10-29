@@ -17,7 +17,8 @@ use brain_metadata::extractor::ops::extractor_drop_namespace;
 use brain_metadata::relation::types::{relation_type_drop_one, relation_type_drop_schema_declared};
 use brain_metadata::schema::predicate::{predicate_drop_one, predicate_drop_schema_declared};
 use brain_metadata::schema::store::{declared_context_wtxn, schema_upload_with_mode, SourceMode};
-use brain_protocol::schema::{parse_schema, validate_with, DeclaredContext};
+use brain_metadata::system_schema::SYSTEM_SCHEMA_NAMESPACE;
+use brain_protocol::schema::{parse_schema, validate_with};
 use brain_protocol::schema_drop_target;
 use redb::WriteTransaction;
 
@@ -69,24 +70,41 @@ pub fn apply_upsert_schema(
             ))
         })?
     };
-    // A destructive phase (REPLACE / DROP) carries the namespace's whole new
-    // schema and overwrites the stored source, so it validates standalone. A
-    // plain UPLOAD is additive: it may reference types the active schema
-    // already declares, so it re-validates against the same merge target the
+    // Both phases re-validate, against different contexts, and neither is the
+    // empty one.
+    //
+    // A plain UPLOAD is additive: it may reference types the active schema
+    // already declares, so it validates against the same merge target the
     // handler used — otherwise WAL replay would reject a document the server
     // accepted.
+    //
+    // A destructive phase (REPLACE / DROP) carries the namespace's whole new
+    // schema and overwrites the stored source, so it must NOT see the active
+    // schema: resolving against the document being replaced would hide a
+    // reference the new document leaves dangling, which is the one thing this
+    // check exists to catch.
+    //
+    // It must still see the system schema. That was the bug: `Person`,
+    // `Organization`, `Place` and the rest are declared once in the `brain`
+    // namespace and referenced by every tenant document without being
+    // re-declared, so validating "standalone" reported all of them as
+    // undeclared. Every SCHEMA_DROP and every SCHEMA_REPLACE whose document
+    // named a system entity type failed here as an `Invariant` — surfacing to
+    // the caller as a 502 with the detail withheld, after the handler had
+    // already accepted the request.
     let destructive = *replace_all || !drops.is_empty();
     let mode = if destructive {
         SourceMode::Replace
     } else {
         SourceMode::Merge
     };
-    let ctx = if destructive {
-        DeclaredContext::default()
+    let context_namespace = if destructive {
+        SYSTEM_SCHEMA_NAMESPACE
     } else {
-        declared_context_wtxn(wtxn, &parsed.namespace)
-            .map_err(|e| ApplyError::Metadata(format!("declared context: {e}")))?
+        parsed.namespace.as_str()
     };
+    let ctx = declared_context_wtxn(wtxn, context_namespace)
+        .map_err(|e| ApplyError::Metadata(format!("declared context: {e}")))?;
     let validated = validate_with(&parsed, &ctx).map_err(|errs| {
         ApplyError::Invariant(format!("UpsertSchema re-validate failed: {errs:?}"))
     })?;

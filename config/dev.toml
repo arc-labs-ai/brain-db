@@ -247,45 +247,37 @@ openai_model = "gpt-4o-mini"
 [llm]
 # REQUIRED. An LLM is mandatory: write-time HyPE hypothetical-question
 # generation is always-on and cannot be disabled, and the write path
-# depends on it. The server refuses to boot without a provider key —
-# there is no substrate-only / HyPE-less mode.
+# depends on it.
 #
-# Single provider-agnostic credential + model, shared by every LLM
-# consumer (HyPE, extraction, disambiguator, summarizer). The provider is
-# derived from the model id (claude* → Anthropic, else OpenAI). Override
-# at deploy time with the generic env parser:
+# The serving credential is resolved PER NAMESPACE from `[llm.broker]`.
+# Brain holds a namespace-scoped GRANT, never the tenant's provider key, so
+# customer keys stay out of this process's WAL, snapshots and backups. A
+# keyless boot is therefore correct: the credential is not known until a
+# write names its namespace.
+#
+# A namespace with no registered key still writes. The pattern and
+# classifier tiers run; the LLM tier reports that it could not run, so you
+# get entities without statements rather than a failed write or a silent
+# bill against someone else's key.
+#
+# api_key is NOT the serving credential. It builds the one client that is
+# still shard-wide — the entity disambiguator — and setting it does not
+# make a keyless namespace work. The provider is derived from the model id
+# (claude* → Anthropic, else OpenAI).
 #   BRAIN__LLM__API_KEY=sk-...   BRAIN__LLM__MODEL=gpt-4o-mini
 api_key = ""   # operator sets at deploy time — never commit a real key
 # model = "gpt-4o-mini"  # default when unset
-#
-# ── Credential mode ─────────────────────────────────────────────────────────
-# mode = "static"   # the default, and what the key above is for
-#
-# "static"  One credential, every namespace. `api_key` is mandatory: HyPE is
-#           always-on, so a keyless server cannot run.
-#
-# "broker"  BYOK. Per-namespace credentials resolved from an Arc Labs LLM
-#           broker. Brain holds a namespace-scoped GRANT, never the tenant's
-#           provider key, so customer keys stay out of this process's WAL,
-#           snapshots and backups. `api_key` is ignored. A keyless boot is
-#           legal here and ONLY here, because the credential is not known
-#           until a write names its namespace.
-#
-#           A namespace with no registered key fails its writes with
-#           `llm_credential.missing` instead of silently billing a house key —
-#           which is the point, and also the thing to know before flipping it
-#           on an existing deployment.
-#
-# [llm.broker]                        # required when mode = "broker"
-# url = "http://brain-edge:8080"      # the broker's base URL
-# service_key = ""                    # Brain's identity to the broker. NOT a
-#                                     # provider key: it authenticates Brain so
-#                                     # the broker will swap a grant for the
-#                                     # tenant's real key on the way upstream.
-#                                     # Override: BRAIN__LLM__BROKER__SERVICE_KEY
-# ttl_secs = 300                      # how long a resolved credential is
-#                                     # cached; bounds how long a revoked key
-#                                     # keeps working.
+
+[llm.broker]                          # required
+url = "http://brain-edge:8080"        # the broker's base URL
+service_key = ""                      # Brain's identity to the broker. NOT a
+                                      # provider key: it authenticates Brain so
+                                      # the broker will swap a grant for the
+                                      # tenant's real key on the way upstream.
+                                      # Override: BRAIN__LLM__BROKER__SERVICE_KEY
+ttl_secs = 300                        # how long a resolved credential is
+                                      # cached; bounds how long a revoked key
+                                      # keeps working.
 
 [rerank]
 # Off by default: rerank only reorders already-retrieved candidates and

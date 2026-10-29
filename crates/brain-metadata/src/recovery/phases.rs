@@ -40,10 +40,11 @@ use crate::schema::store::{
     declared_context_wtxn, schema_get, schema_upload_with_mode, SourceMode,
 };
 use crate::statement::{statement_create, statement_supersede, statement_tombstone};
+use crate::system_schema::SYSTEM_SCHEMA_NAMESPACE;
 use crate::tables::statement::{
     statement_flags, statement_from_metadata, StatementMetadata, STATEMENTS_TABLE,
 };
-use brain_protocol::schema::{parse_schema, validate_with, DeclaredContext};
+use brain_protocol::schema::{parse_schema, validate_with};
 
 use super::transient;
 
@@ -216,23 +217,39 @@ impl MetadataDb {
             })?
         };
         let wtxn = self.db.begin_write().map_err(transient)?;
-        // Mirror the live apply path: a destructive phase (REPLACE / DROP)
-        // carries the whole new schema and validates standalone, while a plain
-        // UPLOAD is additive and re-validates against the schema it merges
-        // into. Resolved from this same wtxn so replay sees exactly the state
-        // the original write did.
+        // Mirror the live apply path exactly, including which context each
+        // phase validates against — a divergence here does not fail a
+        // request, it refuses to start the server.
+        //
+        // A plain UPLOAD is additive and resolves against the schema it
+        // merges into. A destructive phase (REPLACE / DROP) carries the whole
+        // new schema, so it must not see the namespace's active schema — but
+        // it must still see the system one, which declares the shared entity
+        // types (`Person`, `Organization`, …) that tenant documents reference
+        // without re-declaring.
+        //
+        // Validating destructive phases against an empty context was the bug,
+        // and this is where it was most expensive: the write was accepted and
+        // journalled, and the record only became unreplayable afterwards. The
+        // next restart failed WAL recovery with `corruption: schema
+        // re-validate` and the server would not boot — a durable record the
+        // server itself had written, which it then refused to read back.
+        //
+        // Resolved from this same wtxn so replay sees exactly the state the
+        // original write did.
         let destructive = b.replace_all || !b.drops.is_empty();
         let mode = if destructive {
             SourceMode::Replace
         } else {
             SourceMode::Merge
         };
-        let declared = if destructive {
-            DeclaredContext::default()
+        let context_namespace = if destructive {
+            SYSTEM_SCHEMA_NAMESPACE
         } else {
-            declared_context_wtxn(&wtxn, &b.namespace)
-                .map_err(|e| MetadataSinkError::Corruption(format!("declared context: {e}")))?
+            b.namespace.as_str()
         };
+        let declared = declared_context_wtxn(&wtxn, context_namespace)
+            .map_err(|e| MetadataSinkError::Corruption(format!("declared context: {e}")))?;
         let validated = validate_with(&parsed, &declared).map_err(|errs| {
             MetadataSinkError::Corruption(format!("schema re-validate: {errs:?}"))
         })?;

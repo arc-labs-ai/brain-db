@@ -69,6 +69,29 @@ pub const DEFAULT_TTL: Duration = Duration::from_secs(300);
 /// they fixed the problem.
 pub const DEFAULT_NEGATIVE_TTL: Duration = Duration::from_secs(10);
 
+/// How long the synchronous ENCODE gate keeps REFUSING a namespace it has
+/// seen as missing.
+///
+/// Separate from [`DEFAULT_NEGATIVE_TTL`], and much longer, because the two
+/// consumers want opposite things. `client_for` wants the negative entry to
+/// expire fast so a derivation re-fetches and notices a key the moment it is
+/// registered. The gate wants it to persist, or it only ever fires for writes
+/// arriving within 10s of each other — which is to say never, on the sparse
+/// traffic of a sandbox or a demo, and a keyless namespace then degrades in
+/// silence exactly as the gate exists to prevent.
+pub const DEFAULT_NEGATIVE_GATE_TTL: Duration = Duration::from_secs(300);
+
+/// How often one write is admitted anyway while the gate is refusing.
+///
+/// The gate runs BEFORE any derivation, so a namespace it refuses issues no
+/// `client_for` and therefore never fetches the `Ready` that would clear it:
+/// a long negative window with no escape is self-sustaining, and a tenant who
+/// registers a key stays rejected with nothing able to unstick them. Letting
+/// one write through per interval is that escape. It pays one silently
+/// degraded write per interval to keep the namespace recoverable without the
+/// gate having to perform I/O it is forbidden from performing.
+pub const DEFAULT_NEGATIVE_PROBE_INTERVAL: Duration = Duration::from_secs(30);
+
 /// What the edge said about a namespace, and when.
 #[derive(Clone)]
 enum Cached {
@@ -81,6 +104,12 @@ enum Cached {
 struct Entry {
     value: Cached,
     fetched_at: Instant,
+    /// When the gate last let a write through to re-probe this namespace.
+    ///
+    /// Only meaningful for [`Cached::Missing`]. Starts at `fetched_at` so the
+    /// write that discovered the miss counts as the first probe, and the next
+    /// one is a full interval away rather than immediate.
+    last_gate_probe: Instant,
 }
 
 /// `GET /llm/ns/{namespace}/resolve` response. Carries no key material.
@@ -190,6 +219,8 @@ pub struct BrokerResolver {
     service_token: String,
     ttl: Duration,
     negative_ttl: Duration,
+    negative_gate_ttl: Duration,
+    negative_probe_interval: Duration,
     http: reqwest::Client,
     cache: RwLock<HashMap<String, Entry>>,
 }
@@ -217,6 +248,8 @@ impl BrokerResolver {
             service_token: service_token.into(),
             ttl: DEFAULT_TTL,
             negative_ttl: DEFAULT_NEGATIVE_TTL,
+            negative_gate_ttl: DEFAULT_NEGATIVE_GATE_TTL,
+            negative_probe_interval: DEFAULT_NEGATIVE_PROBE_INTERVAL,
             http: reqwest::Client::new(),
             cache: RwLock::new(HashMap::new()),
         }
@@ -233,6 +266,21 @@ impl BrokerResolver {
     #[must_use]
     pub fn with_negative_ttl(mut self, ttl: Duration) -> Self {
         self.negative_ttl = ttl;
+        self
+    }
+
+    /// Override how long the sync ENCODE gate keeps refusing a missing
+    /// namespace.
+    #[must_use]
+    pub fn with_negative_gate_ttl(mut self, ttl: Duration) -> Self {
+        self.negative_gate_ttl = ttl;
+        self
+    }
+
+    /// Override how often the gate admits one write to re-probe.
+    #[must_use]
+    pub fn with_negative_probe_interval(mut self, interval: Duration) -> Self {
+        self.negative_probe_interval = interval;
         self
     }
 
@@ -256,13 +304,67 @@ impl BrokerResolver {
     }
 
     fn store(&self, namespace: &str, value: Cached) {
+        let now = Instant::now();
         self.cache.write().insert(
             namespace.to_string(),
             Entry {
                 value,
-                fetched_at: Instant::now(),
+                fetched_at: now,
+                last_gate_probe: now,
             },
         );
+    }
+
+    /// The gate's view of a namespace: should the synchronous ENCODE path
+    /// admit this write?
+    ///
+    /// Deliberately NOT [`Self::cached`]. That one answers `client_for`, which
+    /// wants a missing entry to expire quickly so the next derivation
+    /// re-fetches; this one wants it to persist so the gate actually fires.
+    /// Reading both off one TTL is what made the gate a no-op on sparse
+    /// traffic.
+    ///
+    /// Takes a write lock on the `Missing` path because admitting a probe has
+    /// to be recorded — otherwise every concurrent write in the interval
+    /// reads "probe due" and they are all admitted, which is the thundering
+    /// herd the stamp exists to prevent.
+    fn gate_decision(&self, namespace: &str) -> Option<bool> {
+        {
+            let guard = self.cache.read();
+            let entry = guard.get(namespace)?;
+            match entry.value {
+                // A positive answer still obeys the ordinary TTL: a revoked
+                // key must stop admitting writes on the same schedule it
+                // stops serving them.
+                Cached::Ready { .. } => {
+                    return (entry.fetched_at.elapsed() < self.ttl).then_some(true);
+                }
+                Cached::Missing => {
+                    // Older than the gate window: no longer evidence. Unknown,
+                    // so admit — same rule as a cold cache.
+                    if entry.fetched_at.elapsed() >= self.negative_gate_ttl {
+                        return None;
+                    }
+                    if entry.last_gate_probe.elapsed() < self.negative_probe_interval {
+                        return Some(false);
+                    }
+                }
+            }
+        }
+        // A probe is due. Re-check under the write lock: another thread may
+        // have taken it between dropping the read lock and taking this one.
+        let mut guard = self.cache.write();
+        let entry = guard.get_mut(namespace)?;
+        if !matches!(entry.value, Cached::Missing) {
+            return None;
+        }
+        if entry.last_gate_probe.elapsed() < self.negative_probe_interval {
+            return Some(false);
+        }
+        entry.last_gate_probe = Instant::now();
+        // Admitted on purpose: this write runs derivation, which re-fetches
+        // and either re-stores `Missing` or heals the namespace to `Ready`.
+        None
     }
 
     /// Build the provider client for a resolved namespace.
@@ -428,11 +530,12 @@ impl LlmCredentialResolver for BrokerResolver {
         // Cache-only by contract: this is called from the synchronous ENCODE
         // path, which must not block on the network. `None` means "unknown
         // without I/O" and admits the write.
-        match self.cached(namespace) {
-            Some(Cached::Ready { .. }) => Some(true),
-            Some(Cached::Missing) => Some(false),
-            None => None,
-        }
+        //
+        // `gate_decision`, not `cached`: the gate keeps a missing namespace
+        // refused for far longer than `client_for` keeps it cached, and lets
+        // one write through per probe interval so the namespace can heal
+        // itself without this call doing any I/O.
+        self.gate_decision(namespace)
     }
 
     fn missing_reason(&self, namespace: &str) -> String {
@@ -487,6 +590,93 @@ mod tests {
         assert!(resolver().build_client("acme", "cohere", "m").is_none());
     }
 
+    /// The defect this gate was reported for: on sparse traffic every write
+    /// was admitted, so a keyless namespace degraded silently forever.
+    #[test]
+    fn the_gate_keeps_refusing_long_after_the_client_cache_has_expired() {
+        let r = resolver()
+            .with_negative_ttl(Duration::from_millis(1))
+            .with_negative_gate_ttl(Duration::from_secs(300))
+            .with_negative_probe_interval(Duration::from_secs(300));
+        r.store("acme", Cached::Missing);
+        std::thread::sleep(Duration::from_millis(5));
+
+        // `client_for`'s view has expired — it will re-fetch, which is what
+        // lets a newly registered key be noticed.
+        assert!(r.cached("acme").is_none());
+        // The gate's has not. Before this split, both read one TTL and the
+        // gate answered `None` here, admitting the write.
+        assert_eq!(r.can_serve("acme", None), Some(false));
+    }
+
+    /// The escape hatch. Without it a long gate window is self-sustaining:
+    /// refused writes run no derivation, so nothing ever fetches the `Ready`
+    /// that would clear the entry.
+    #[test]
+    fn the_gate_admits_one_write_per_probe_interval_so_a_namespace_can_heal() {
+        let r = resolver()
+            .with_negative_gate_ttl(Duration::from_secs(300))
+            .with_negative_probe_interval(Duration::from_millis(20));
+        r.store("acme", Cached::Missing);
+
+        // Inside the interval: refused, and repeatedly so — one probe does not
+        // open the gate for everyone behind it.
+        assert_eq!(r.can_serve("acme", None), Some(false));
+        assert_eq!(r.can_serve("acme", None), Some(false));
+
+        std::thread::sleep(Duration::from_millis(25));
+        // Probe due: exactly one write is admitted...
+        assert_eq!(r.can_serve("acme", None), None);
+        // ...and the next is refused again, because the probe was recorded.
+        assert_eq!(r.can_serve("acme", None), Some(false));
+    }
+
+    /// Healing actually sticks: once a key is registered the probe write's
+    /// derivation stores `Ready`, and the gate stops refusing.
+    #[test]
+    fn a_namespace_that_gains_a_key_stops_being_refused() {
+        let r = resolver().with_negative_probe_interval(Duration::from_millis(1));
+        r.store("acme", Cached::Missing);
+        assert_eq!(r.can_serve("acme", None), Some(false));
+
+        r.store(
+            "acme",
+            Cached::Ready {
+                provider: "anthropic".into(),
+                model: "claude-opus-5-5".into(),
+            },
+        );
+        assert_eq!(r.can_serve("acme", None), Some(true));
+    }
+
+    /// A stale negative is not evidence. Past the gate window the answer goes
+    /// back to "unknown", which admits — same rule as a cold cache.
+    #[test]
+    fn a_negative_older_than_the_gate_window_is_unknown_again() {
+        let r = resolver().with_negative_gate_ttl(Duration::from_millis(5));
+        r.store("acme", Cached::Missing);
+        assert_eq!(r.can_serve("acme", None), Some(false));
+        std::thread::sleep(Duration::from_millis(10));
+        assert_eq!(r.can_serve("acme", None), None);
+    }
+
+    /// A revoked key must stop admitting writes on the ordinary TTL — the
+    /// gate's longer window applies to negatives only.
+    #[test]
+    fn a_positive_still_expires_on_the_ordinary_ttl() {
+        let r = resolver().with_ttl(Duration::from_millis(5));
+        r.store(
+            "acme",
+            Cached::Ready {
+                provider: "anthropic".into(),
+                model: "m".into(),
+            },
+        );
+        assert_eq!(r.can_serve("acme", None), Some(true));
+        std::thread::sleep(Duration::from_millis(10));
+        assert_eq!(r.can_serve("acme", None), None);
+    }
+
     #[test]
     fn a_cold_cache_is_unknown_rather_than_missing() {
         // The sync ENCODE probe must admit the write on an unknown, not reject
@@ -518,15 +708,32 @@ mod tests {
             DEFAULT_NEGATIVE_TTL < DEFAULT_TTL,
             "negative caching must be the shorter of the two"
         );
+        // The gate holds a negative far longer than `client_for` does, so the
+        // bound on a tenant's recovery is no longer the negative TTL — it is
+        // the probe interval, which still has to beat the positive TTL or
+        // registering a key would appear not to work.
+        assert!(
+            DEFAULT_NEGATIVE_PROBE_INTERVAL < DEFAULT_TTL,
+            "a tenant who registers a key must get a probe through well \
+             before a positive entry would have expired anyway"
+        );
 
         let r = resolver()
             .with_ttl(Duration::from_secs(60))
             .with_negative_ttl(Duration::ZERO);
         r.store("globex", Cached::Missing);
+        assert!(
+            r.cached("globex").is_none(),
+            "a zero negative TTL expires immediately, so `client_for` re-asks"
+        );
+        // `can_serve` deliberately does NOT follow it any more: reading both
+        // off one TTL is what made the gate a no-op between sparse writes.
+        // Recovery is the probe interval's job, covered by
+        // `the_gate_admits_one_write_per_probe_interval_so_a_namespace_can_heal`.
         assert_eq!(
             r.can_serve("globex", None),
-            None,
-            "a zero negative TTL expires immediately and re-asks"
+            Some(false),
+            "the gate keeps refusing regardless of the client-side TTL"
         );
 
         r.store(

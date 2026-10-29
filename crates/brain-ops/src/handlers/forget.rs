@@ -1,6 +1,7 @@
 //! FORGET handler — non-TXN path submits a Tombstone phase through
 //! the unified writer; in-TXN ops buffer for later commit.
 
+use crate::clock::now_unix_nanos;
 use brain_core::MemoryId;
 use brain_planner::{plan_forget_inner, ForgetOp, ForgetOutcome};
 use brain_protocol::envelope::request::{ForgetMode, ForgetRequest};
@@ -8,7 +9,8 @@ use brain_protocol::envelope::response::ForgetResponse;
 
 use crate::context::OpsContext;
 use crate::error::OpError;
-use crate::handlers::link::downcast_writer_pub;
+use crate::handlers::hype_vectors::delete_hype_vectors;
+use crate::handlers::writer_handle::real_writer_handle;
 use crate::index::text_indexer::MemoryTextOp;
 use crate::state::idempotency::hash_forget_request;
 use crate::txn::{BufferedForget, BufferedReplay};
@@ -28,7 +30,7 @@ pub async fn handle_forget(
     let _ = plan_forget_inner(&req, &ctx.planner_ctx)?;
 
     let memory_id = MemoryId::from(memory_id_wire);
-    let real_writer = downcast_writer_pub(ctx)?;
+    let real_writer = real_writer_handle(ctx)?;
     let write_id = WriteId::from_request(
         brain_core::RequestId::from(req.request_id),
         ctx.executor.caller_space,
@@ -132,54 +134,6 @@ pub async fn handle_forget(
     })
 }
 
-/// Remove every HyPE question-vector row owned by `memory_id` in a
-/// dedicated write transaction. Idempotent: `hype_vectors_delete_memory`
-/// returns 0 when the memory owns none, so a double-forget (or the
-/// slot-reclaim backstop) is a harmless no-op. Best-effort: a redb error
-/// is logged, not propagated — FORGET is lenient and the reclaim worker
-/// re-runs this at grace.
-pub(crate) fn delete_hype_vectors(ctx: &OpsContext, memory_id: MemoryId) {
-    let wtxn = match ctx.executor.metadata.write_txn() {
-        Ok(w) => w,
-        Err(e) => {
-            tracing::warn!(
-                target: "brain_ops::forget",
-                memory_id = ?memory_id,
-                error = %e,
-                "forget: HyPE vector delete write_txn failed; leaving rows for reclaim",
-            );
-            return;
-        }
-    };
-    match brain_metadata::hype_vectors_delete_memory(&wtxn, memory_id) {
-        Ok(removed) => {
-            if let Err(e) = wtxn.commit() {
-                tracing::warn!(
-                    target: "brain_ops::forget",
-                    memory_id = ?memory_id,
-                    error = %e,
-                    "forget: HyPE vector delete commit failed; leaving rows for reclaim",
-                );
-            } else if removed > 0 {
-                tracing::debug!(
-                    target: "brain_ops::forget",
-                    memory_id = ?memory_id,
-                    removed,
-                    "forget: removed HyPE question-vectors",
-                );
-            }
-        }
-        Err(e) => {
-            tracing::warn!(
-                target: "brain_ops::forget",
-                memory_id = ?memory_id,
-                error = %e,
-                "forget: HyPE vector delete failed; leaving rows for reclaim",
-            );
-        }
-    }
-}
-
 fn hex_short(bytes: &[u8; 16]) -> String {
     let mut s = String::with_capacity(8);
     for b in &bytes[..4] {
@@ -227,10 +181,6 @@ fn map_mode(mode: ForgetMode) -> PhaseTombstoneMode {
         ForgetMode::Soft => PhaseTombstoneMode::Soft,
         ForgetMode::Hard => PhaseTombstoneMode::Hard,
     }
-}
-
-fn now_unix_nanos() -> u64 {
-    crate::clock::now_unix_nanos()
 }
 
 async fn handle_forget_in_txn(
@@ -341,7 +291,7 @@ async fn handle_forget_in_txn(
         mode: req.mode,
         request_id: req.request_id,
         request_hash,
-        created_at_unix_nanos: crate::txn::now_unix_nanos_pub(),
+        created_at_unix_nanos: now_unix_nanos(),
         space_id: ctx.executor.caller_space,
     };
     ctx.txn_store

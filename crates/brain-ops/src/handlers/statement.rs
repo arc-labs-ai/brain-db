@@ -18,10 +18,11 @@
 //! These handlers do **not** touch the statement HNSW; the embedding
 //! worker that populates it lives elsewhere.
 
+use crate::clock::now_unix_nanos;
 use crate::context::OpsContext;
 use crate::error::OpError;
-use crate::handlers::entity::emit_graph_event;
-use crate::handlers::link::downcast_writer_pub;
+use crate::handlers::events::emit_graph_event;
+use crate::handlers::writer_handle::real_writer_handle;
 use crate::index::text_indexer::StatementTextOp;
 use crate::write::{
     EvidenceRefPhase, Phase, PhaseAck, SupersedeReplacement, SupersedeReplacementId,
@@ -94,7 +95,7 @@ pub async fn handle_statement_create(
     }
     let kind = statement_kind_from_wire(req.kind);
 
-    let now = crate::txn::now_unix_nanos_pub();
+    let now = now_unix_nanos();
     let (namespace, name) = split_qname(&req.predicate)?;
 
     // Pre-submit validation in rtxn. Schema vocabulary check and
@@ -168,7 +169,7 @@ pub async fn handle_statement_create(
     // Submit the UpsertStatement phase through the unified writer. The
     // apply function runs (optional) predicate intern + statement_create
     // + (optional) IMPLICIT_PREDICATE flag stamp in one wtxn.
-    let real_writer = downcast_writer_pub(ctx)?;
+    let real_writer = real_writer_handle(ctx)?;
     let write_id =
         WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_statement_create_request(&req);
@@ -339,7 +340,7 @@ pub async fn handle_statement_supersede(
     let kind = statement_kind_from_wire(req.new_statement.kind);
 
     let old_id = StatementId::from(req.old_statement_id);
-    let now = crate::txn::now_unix_nanos_pub();
+    let now = now_unix_nanos();
     // Tenant wall (early): a caller may only supersede a statement it
     // owns. A foreign / absent id reads as NotFound before any predicate
     // intern work. The apply-layer wall re-checks atomically.
@@ -413,7 +414,7 @@ pub async fn handle_statement_supersede(
     // call statement_supersede inside one wtxn.
     let new_statement = build_statement_from_create(&req.new_statement, predicate_id, now, kind)?;
 
-    let real_writer = downcast_writer_pub(ctx)?;
+    let real_writer = real_writer_handle(ctx)?;
     let write_id =
         WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_statement_supersede_request(&req);
@@ -495,7 +496,7 @@ pub async fn handle_statement_tombstone(
     }
     let reason = decode_tombstone_reason(req.reason)?;
     let id = StatementId::from(req.statement_id);
-    let now = crate::txn::now_unix_nanos_pub();
+    let now = now_unix_nanos();
 
     // Tenant wall (early): a foreign / absent id reads as NotFound before
     // the write is built. The apply-layer wall re-checks atomically.
@@ -506,7 +507,7 @@ pub async fn handle_statement_tombstone(
         });
     }
 
-    let real_writer = downcast_writer_pub(ctx)?;
+    let real_writer = real_writer_handle(ctx)?;
     let write_id =
         WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_statement_tombstone_request(&req);
@@ -574,7 +575,7 @@ pub async fn handle_statement_retract(
     // superseded rows.
     decode_tombstone_reason(req.reason)?;
     let id = StatementId::from(req.statement_id);
-    let now = crate::txn::now_unix_nanos_pub();
+    let now = now_unix_nanos();
 
     // Tenant wall (early): a foreign / absent id reads as NotFound before
     // the write is built. The apply-layer wall re-checks atomically.
@@ -590,7 +591,7 @@ pub async fn handle_statement_retract(
     // immediately, hidden from STATEMENT_HISTORY) plus the durable
     // `Retract` reason byte that lets the GC worker reclaim the row
     // after the grace period.
-    let real_writer = downcast_writer_pub(ctx)?;
+    let real_writer = real_writer_handle(ctx)?;
     let write_id =
         WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_statement_retract_request(&req);

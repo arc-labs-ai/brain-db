@@ -7,9 +7,9 @@ use crate::shared::primitives::{
 };
 
 /// Per-request effective-identity selector carried on data-plane op
-/// requests. When present, the op runs as this `(namespace, space_id)`
-/// on behalf of the authenticated connection principal; when the field
-/// is absent the op runs as the connection's own key-bound identity.
+/// requests. When present, the op runs as this `(namespace, space)` on
+/// behalf of the authenticated connection principal; when the field is
+/// absent the op runs as the connection's own key-bound identity.
 ///
 /// Honored only when the connection principal holds `can_act_as` and
 /// `namespace` lies within its granted `may_act` allowlist — otherwise
@@ -23,10 +23,15 @@ pub struct ActAs {
     pub namespace: String,
     /// Structured, opaque effective-space selector (e.g.
     /// `"support-bot:user123"`). The server derives the 16-byte storage
-    /// `SpaceId = UUIDv5(namespace, space_id)` at request ingress; it is
+    /// `SpaceId = UUIDv5(namespace, space)` at request ingress; it is
     /// never parsed for sub-scopes. An empty string selects the
     /// connection's key-bound space (single-space keys, zero ceremony).
-    pub space_id: String,
+    ///
+    /// Named `space`, not `space_id`: `space_id` is the derived 16-byte id
+    /// everywhere else in this protocol, and calling the input string by the
+    /// same name meant the one sentence above had to say both. Two values,
+    /// two names.
+    pub space: String,
     /// Extra permission bits the delegating principal grants this one
     /// delegated op, on top of the fixed `STANDARD_SPACE` mask the
     /// effective identity always receives. Only the delegable bits —
@@ -197,6 +202,12 @@ pub struct EncodeVectorDirectRequest {
     #[serde(with = "crate::codec::cbor::opt_byte_array16")]
     pub txn_id: Option<WireUuid>,
     pub deduplicate: bool,
+    /// Effective identity this direct-vector encode runs as, on behalf of the
+    /// authenticated connection principal. `None` (the common case, and
+    /// omitted on the wire) means the op runs as the connection's own
+    /// key-bound identity.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
 }
 
 /// Edge attached to an `ENCODE_REQ`.
@@ -456,8 +467,7 @@ pub struct MemoryListRequest {
 /// row can show link counts without a second call.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MemoryListItem {
-    #[serde(with = "serde_bytes")]
-    pub memory_id: [u8; 16],
+    pub memory_id: WireMemoryId,
     /// Owner space (16-byte storage key) the row belongs to.
     #[serde(with = "serde_bytes")]
     pub space_id: [u8; 16],
@@ -510,8 +520,7 @@ impl MemoryListResponseFrame {
 /// memory. Single-shot (not paginated): the reply carries the whole bundle.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MemoryInspectRequest {
-    #[serde(with = "serde_bytes")]
-    pub memory_id: [u8; 16],
+    pub memory_id: WireMemoryId,
     /// Effective identity for the read, on behalf of the connection principal.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub act_as: Option<ActAs>,
@@ -521,13 +530,20 @@ pub struct MemoryInspectRequest {
 /// write stage produced (embedding vector, redb record, analyzed keyword terms,
 /// write-time HyPE questions, the extracted knowledge graph), plus the memory
 /// text. Reuses [`EncodeStageArtifact`] as the bundle shape so the live ENCODE
-/// trace and the stored inspection view are one type. `found = false` (with an
-/// empty `artifact`) when no memory / no bundle exists for the id.
+/// trace and the stored inspection view are one type.
+///
+/// There is no `found` flag. An id with no memory behind it — or one owned by
+/// another `(namespace, space)`, which is deliberately indistinguishable — is
+/// answered with `MemoryNotFound` in the `NotFound` category, as every sibling
+/// read already does. It was the only `found`-style flag in the protocol, and
+/// a client needing a second mechanism for one verb is what was wrong with it.
+///
+/// A memory that exists but whose bundle has not been written yet is still a
+/// success, with an empty `artifact`. That is a different condition from the
+/// memory being absent, and keeping the two apart is the point.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MemoryInspectResponse {
-    pub found: bool,
-    #[serde(with = "serde_bytes")]
-    pub memory_id: [u8; 16],
+    pub memory_id: WireMemoryId,
     pub text: String,
     pub artifact: EncodeStageArtifact,
     /// Memory↔memory edges anchored at this memory, both directions.
@@ -735,8 +751,7 @@ pub struct EncodeStageArtifact {
 /// The redb metadata row a `persist` stage wrote — the durable record fields.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EncodeStageRecord {
-    #[serde(with = "serde_bytes")]
-    pub memory_id: [u8; 16],
+    pub memory_id: WireMemoryId,
     /// Memory kind discriminant (as stored).
     pub kind: u8,
     /// Salience the write assigned.
@@ -918,8 +933,7 @@ pub struct EncodeTraceDedup {
     pub was_deduplicated: bool,
     /// The memory the write deduplicated against, when
     /// `was_deduplicated`; `None` for a fresh write.
-    #[serde(with = "crate::codec::cbor::opt_byte_array16")]
-    pub matched_memory_id: Option<[u8; 16]>,
+    pub matched_memory_id: Option<WireMemoryId>,
 }
 
 /// The shape of a RECALL answer — pure cardinality, decided by the server's
@@ -1658,7 +1672,7 @@ mod memory_list_tests {
         let mut req = sample_request();
         req.act_as = Some(ActAs {
             namespace: "acme".into(),
-            space_id: "acme:space".into(),
+            space: "acme:space".into(),
             grant: 0,
         });
         req.cursor = Vec::new();
@@ -1672,7 +1686,7 @@ mod memory_list_tests {
     fn memory_list_response_round_trips() {
         let frame = MemoryListResponseFrame {
             items: vec![MemoryListItem {
-                memory_id: [0x11; 16],
+                memory_id: u128::from_be_bytes([0x11; 16]),
                 space_id: [0x33; 16],
                 session_id: 0,
                 text: "the sky is blue".into(),
@@ -1745,6 +1759,7 @@ mod serde_smoke {
             request_id: [3u8; 16],
             txn_id: None,
             deduplicate: false,
+            act_as: None,
         };
 
         // Same struct, different vector. Because `vector` is skipped from

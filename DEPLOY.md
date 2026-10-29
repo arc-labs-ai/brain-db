@@ -43,7 +43,8 @@ you run is exactly what we run.
 docker run -d --name brain \
   --security-opt seccomp=unconfined \
   -p 8080:8080 -p 9091:9091 \
-  -e BRAIN__LLM__API_KEY=sk-... \
+  -e BRAIN__LLM__BROKER__URL=http://brain-edge:8080 \
+  -e BRAIN__LLM__BROKER__SERVICE_KEY=... \
   -e BRAIN__LLM__MODEL=gpt-4o-mini \
   -e BRAIN__ADMIN__TOKEN="$(openssl rand -hex 32)" \
   -v brain-data:/var/lib/brain/data \
@@ -107,7 +108,7 @@ name and refuses to load without them. See
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/arc-labs-ai/brain-db/main/docker-compose.yml
 curl -fsSLO https://raw.githubusercontent.com/arc-labs-ai/brain-db/main/.env.example
-cp .env.example .env          # then set BRAIN__LLM__API_KEY + BRAIN__ADMIN__TOKEN
+cp .env.example .env          # then set BRAIN__LLM__BROKER__URL + BRAIN__ADMIN__TOKEN
 docker compose up -d
 docker compose ps             # HEALTHCHECK status shows here
 docker compose logs -f brain
@@ -149,7 +150,9 @@ The image bakes defaults at `/etc/brain/config.toml`. Two override paths:
 
    | Env var | Effect |
    |---|---|
-   | `BRAIN__LLM__API_KEY` | provider key (**required**) |
+   | `BRAIN__LLM__BROKER__URL` | where namespace credentials resolve (**required**) |
+   | `BRAIN__LLM__BROKER__SERVICE_KEY` | Brain's identity to the broker — not a provider key |
+   | `BRAIN__LLM__API_KEY` | shard-wide client for the entity disambiguator only; not the serving credential |
    | `BRAIN__LLM__MODEL` | model id → derives provider (default `gpt-4o-mini`) |
    | `BRAIN__ADMIN__TOKEN` | operator admin secret (**required**) |
    | `BRAIN__STORAGE__SHARD_COUNT` | shards; one shard pins one core |

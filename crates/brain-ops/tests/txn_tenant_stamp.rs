@@ -228,7 +228,7 @@ fn txn_committed_memory_is_stamped_with_caller_namespace() {
             other => panic!("expected MemoryList, got {other:?}"),
         };
         assert!(
-            list.items.iter().any(|it| it.memory_id == id_bytes),
+            list.items.iter().any(|it| it.memory_id == memory_id),
             "same-tenant MEMORY_LIST must find the txn-committed memory"
         );
     });

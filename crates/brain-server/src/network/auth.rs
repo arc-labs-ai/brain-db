@@ -132,10 +132,10 @@ impl RequestScope {
         // different namespaces diverge at the id level. An empty selector
         // means "use the connection's key-bound space" (single-space keys,
         // zero ceremony) — there is no human string for that space.
-        let space_id = if act_as.space_id.is_empty() {
+        let space_id = if act_as.space.is_empty() {
             self.space_id
         } else {
-            SpaceId::derive_from_string(&act_as.namespace, &act_as.space_id)
+            SpaceId::derive_from_string(&act_as.namespace, &act_as.space)
         };
         brain_ops::RequestCaller::from_scope(
             space_id,
@@ -145,7 +145,7 @@ impl RequestScope {
             delegated_permissions(self.permissions, act_as.grant),
         )
         .with_session_id(connection_id)
-        .with_space_string(act_as.space_id.clone())
+        .with_space_string(act_as.space.clone())
     }
 }
 
@@ -603,7 +603,7 @@ mod tests {
     fn selector(grant: u32) -> brain_protocol::ActAs {
         brain_protocol::ActAs {
             namespace: "acme".into(),
-            space_id: "acme:u1".into(),
+            space: "acme:u1".into(),
             grant,
         }
     }

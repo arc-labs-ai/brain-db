@@ -212,7 +212,7 @@ pub struct StageTemporalEdgePayload {
     pub edges_written: u32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StageHypePayload {
     /// How many hypothetical questions were embedded, persisted, and
     /// inserted into the memory HNSW index.
@@ -220,6 +220,19 @@ pub struct StageHypePayload {
     /// LLM micro-USD spent generating the questions (`0` on a cache
     /// hit).
     pub cost_micro_usd: u64,
+    /// Why the stage failed. Populated whenever the parent outcome is
+    /// [`StageOutcome::Failed`], empty otherwise. HyPE either produced
+    /// questions or could not run, so it has no partial state of the kind
+    /// [`StageExtractorPayload::error_message`] also reports on.
+    ///
+    /// Without this a failed HyPE stage could not explain itself. The
+    /// outcome byte said `Failed` and the two counters said zero, which is
+    /// also what a namespace with no provider key, a budget too small for a
+    /// reasoning model, and a dead embedder all look like. The reason
+    /// existed — every failure path logs it — but it reached only the
+    /// server's own stdout, so an operator reading the stage record saw
+    /// that something broke and had nothing to act on.
+    pub error_message: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -228,7 +241,15 @@ pub struct StageExtractorPayload {
     pub statement_count: u32,
     pub relation_count: u32,
     pub audit_status: StageAuditStatus,
-    /// Populated only when `audit_status == Failed`. Empty otherwise.
+    /// Why extraction failed, or partly failed. Populated whenever
+    /// `audit_status` is `Failed` or `PartiallyApplied`, empty on
+    /// `Succeeded` and `Skipped`.
+    ///
+    /// `PartiallyApplied` is included deliberately. It is the common
+    /// failure — one tier of three fell over and the rest still wrote a
+    /// graph — and it reaches a caller as `StageOutcome::Ok`, so the
+    /// counts alone look like an ordinary small extraction. `audit_status`
+    /// distinguishes the two cases; this says which tier and why.
     pub error_message: String,
 }
 

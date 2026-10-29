@@ -14,6 +14,7 @@
 //! These handlers do **not** touch the entity HNSW or emit
 //! subscription events. Both wire in later.
 
+use crate::clock::now_unix_nanos;
 use std::sync::Arc;
 
 use brain_core::{Entity, EntityAttributes, EntityId, EntityTypeId, RequestId};
@@ -40,7 +41,8 @@ use brain_protocol::{
 
 use crate::context::OpsContext;
 use crate::error::OpError;
-use crate::handlers::link::downcast_writer_pub;
+use crate::handlers::events::emit_graph_event;
+use crate::handlers::writer_handle::real_writer_handle;
 use crate::write::{Phase, PhaseAck, TombstoneTarget, Write, WriteId};
 
 // Default grace window for ENTITY_MERGE — 7 days.
@@ -129,7 +131,7 @@ pub async fn handle_entity_create(
     }
 
     let entity_type = EntityTypeId(req.entity_type_id);
-    let now = crate::txn::now_unix_nanos_pub();
+    let now = now_unix_nanos();
     // Pre-allocate the id here so the request hash + cached replay both
     // see the same value across retries. (Replays still hit the writer's
     // idempotency cache and recover the *original* id via the ack — see
@@ -138,7 +140,7 @@ pub async fn handle_entity_create(
     let normalized = normalize_name(&req.canonical_name);
     let attributes = EntityAttributes::from(req.attributes_blob.clone());
 
-    let real_writer = downcast_writer_pub(ctx)?;
+    let real_writer = real_writer_handle(ctx)?;
     let write_id =
         WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_entity_create_request(&req);
@@ -248,7 +250,7 @@ pub async fn handle_entity_update(
         )));
     }
     let id = EntityId::from(req.entity_id);
-    let now = crate::txn::now_unix_nanos_pub();
+    let now = now_unix_nanos();
 
     // Tenant wall (early): a foreign / absent id reads as NotFound before
     // the write is built. The apply-layer wall re-checks atomically.
@@ -259,7 +261,7 @@ pub async fn handle_entity_update(
         });
     }
 
-    let real_writer = downcast_writer_pub(ctx)?;
+    let real_writer = real_writer_handle(ctx)?;
     let write_id =
         WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_entity_update_request(&req, id);
@@ -324,7 +326,7 @@ pub async fn handle_entity_rename(
         ));
     }
     let id = EntityId::from(req.entity_id);
-    let now = crate::txn::now_unix_nanos_pub();
+    let now = now_unix_nanos();
 
     // Tenant wall (early): a foreign / absent id reads as NotFound before
     // the write is built. The apply-layer wall re-checks atomically.
@@ -335,7 +337,7 @@ pub async fn handle_entity_rename(
         });
     }
 
-    let real_writer = downcast_writer_pub(ctx)?;
+    let real_writer = real_writer_handle(ctx)?;
     let write_id =
         WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_entity_rename_request(&req, id);
@@ -393,7 +395,7 @@ pub async fn handle_entity_merge(
     }
     let survivor = EntityId::from(req.survivor);
     let merged = EntityId::from(req.merged);
-    let now = crate::txn::now_unix_nanos_pub();
+    let now = now_unix_nanos();
 
     // Tenant wall (early): the caller must own both endpoints. A foreign /
     // absent endpoint reads as NotFound before the write is built. The
@@ -405,7 +407,7 @@ pub async fn handle_entity_merge(
         });
     }
 
-    let real_writer = downcast_writer_pub(ctx)?;
+    let real_writer = real_writer_handle(ctx)?;
     let write_id =
         WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_entity_merge_request(&req);
@@ -474,7 +476,7 @@ pub async fn handle_entity_unmerge(
     ctx: &OpsContext,
 ) -> Result<EntityUnmergeResponse, OpError> {
     let merged = EntityId::from(req.merged_entity);
-    let now = crate::txn::now_unix_nanos_pub();
+    let now = now_unix_nanos();
 
     // Tenant wall (early): a foreign / absent id reads as NotFound before
     // the write is built. The apply-layer wall re-checks atomically.
@@ -485,7 +487,7 @@ pub async fn handle_entity_unmerge(
         });
     }
 
-    let real_writer = downcast_writer_pub(ctx)?;
+    let real_writer = real_writer_handle(ctx)?;
     let write_id =
         WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_entity_unmerge_request(&req, merged);
@@ -542,9 +544,9 @@ pub async fn handle_entity_tombstone(
         return Err(OpError::InvalidRequest("reason exceeds 4 KiB".into()));
     }
     let id = EntityId::from(req.entity_id);
-    let now = crate::txn::now_unix_nanos_pub();
+    let now = now_unix_nanos();
 
-    let real_writer = downcast_writer_pub(ctx)?;
+    let real_writer = real_writer_handle(ctx)?;
     let write_id =
         WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let request_hash = hash_entity_tombstone_request(&req, id);
@@ -982,12 +984,12 @@ async fn create_fallback_entity(
     ctx: &OpsContext,
     req: &EntityResolveRequest,
 ) -> Result<EntityId, OpError> {
-    let now = crate::txn::now_unix_nanos_pub();
+    let now = now_unix_nanos();
     let id = EntityId::new();
     let entity_type = EntityTypeId(req.entity_type_hint);
     let normalized = normalize_name(&req.candidate_name);
 
-    let real_writer = downcast_writer_pub(ctx)?;
+    let real_writer = real_writer_handle(ctx)?;
     let write_id =
         WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
     let phase = Phase::UpsertEntity {
@@ -1160,10 +1162,3 @@ fn entity_to_view(e: &Entity) -> EntityView {
 
 // Entity error classification lives in `OpError`'s `From<EntityOpError>`
 // impl (crate::error) — handlers use `OpError::from`.
-
-// `emit_graph_event` + `wal_kind_for_event` moved to
-// `crate::handlers::events`. Re-exported so other typed-graph handler
-// modules that still import via `crate::handlers::entity::emit_graph_event`
-// keep compiling; once those imports flip to the new path the
-// re-export can drop too.
-pub(crate) use crate::handlers::events::emit_graph_event;

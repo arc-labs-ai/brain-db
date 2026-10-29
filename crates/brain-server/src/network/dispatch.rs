@@ -516,10 +516,10 @@ pub(crate) fn dispatch_frame(frame: Frame, state: &mut ConnState, topology: &Top
                     // the structured string selector (namespace folded into the
                     // seed). An empty selector means the connection's key-bound
                     // space. Must match `RequestScope::to_effective_caller`.
-                    let eff = if a.space_id.is_empty() {
+                    let eff = if a.space.is_empty() {
                         scope.space_id
                     } else {
-                        SpaceId::derive_from_string(&a.namespace, &a.space_id)
+                        SpaceId::derive_from_string(&a.namespace, &a.space)
                     };
                     (eff, routing.shard_for_space(eff))
                 }
@@ -1269,9 +1269,9 @@ fn pick_target_shard(
         // A non-empty selector routes to the derived target space's shard;
         // an empty selector (key-bound space) falls through to the
         // memory/space routing below. Must match `to_effective_caller`.
-        if !a.space_id.is_empty() {
+        if !a.space.is_empty() {
             return Some(
-                routing.shard_for_space(SpaceId::derive_from_string(&a.namespace, &a.space_id)),
+                routing.shard_for_space(SpaceId::derive_from_string(&a.namespace, &a.space)),
             );
         }
     }
@@ -1814,7 +1814,7 @@ mod tests {
         let txn_id = [0x5a; 16];
         let act_as = brain_protocol::ActAs {
             namespace: namespace.to_owned(),
-            space_id: space_sel,
+            space: space_sel,
             grant: 0,
         };
 

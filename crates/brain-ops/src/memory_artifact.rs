@@ -44,7 +44,7 @@ use redb::{ReadTransaction, ReadableTable, WriteTransaction};
 
 /// Edge kinds the extractor stage owns. It always recomputes the *full*
 /// current committed entity/statement/relation graph on every call (via
-/// [`crate::handlers::recall::fetch_enrichment_for`]), so its merge fully
+/// [`crate::handlers::graph_enrichment::fetch_enrichment_for`]), so its merge fully
 /// replaces edges of these kinds — but must leave edges of every other kind
 /// (the `auto_edge` / `temporal_edge` derived edges, which share the same
 /// bundle field) untouched.
@@ -214,8 +214,13 @@ pub fn merge_graph_from_committed(
             // nothing to enrich, and the bundle was purged with the row.
             return Ok(0);
         };
-        let enr = crate::handlers::recall::fetch_enrichment_for(&[memory_id], scope, None, &rtxn)
-            .map_err(|e| format!("graph enrichment: {e}"))?;
+        let enr = crate::handlers::graph_enrichment::fetch_enrichment_for(
+            &[memory_id],
+            scope,
+            None,
+            &rtxn,
+        )
+        .map_err(|e| format!("graph enrichment: {e}"))?;
         enrichment_to_graph_counted(enr.into_iter().next())
     };
 
@@ -705,7 +710,9 @@ pub fn sync_record(
     text_len: u32,
 ) -> EncodeStageRecord {
     EncodeStageRecord {
-        memory_id,
+        // The parameter is the redb key (big-endian bytes); the wire carries
+        // the id itself.
+        memory_id: u128::from_be_bytes(memory_id),
         kind: kind_byte,
         salience,
         created_at_unix_nanos,

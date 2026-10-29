@@ -9,7 +9,7 @@
 
 use crate::context::OpsContext;
 use crate::error::OpError;
-use crate::handlers::link::downcast_writer_pub;
+use crate::handlers::writer_handle::real_writer_handle;
 use crate::write::phase::TombstoneMode;
 use crate::write::{Phase, TombstoneTarget, Write, WriteId};
 use brain_core::MemoryId;
@@ -83,7 +83,7 @@ pub(super) async fn tombstone_space_memories(
     } else {
         TombstoneMode::Soft
     };
-    let writer = downcast_writer_pub(ctx)?;
+    let writer = real_writer_handle(ctx)?;
     let now = crate::clock::now_unix_nanos();
     let mut count = 0u64;
     for id in ids {
