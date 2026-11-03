@@ -36,11 +36,28 @@
 # ("pickle (.bin) weights are refused"). No request path, tenant input or
 # operator config can reach an `extract()` call.
 #
-# Revisit when candle moves to zip >= 9, and delete these three then.
+# ---------------------------------------------------------------------------
+# RUSTSEC-2026-0429 — zip 1.1.4
+#
+# The fourth in the same family, published 2026-10-22:
+# `ZipArchive::extract` aborts the process on a symlink entry whose declared
+# size is large. Same crate, same version, same function, same fix line
+# (zip >= 9.0.0) as -0367/-0368/-0369 above — so the reasoning there applies
+# unchanged, and it is listed separately only because RustSec assigned it its
+# own id.
+#
+# Not upgradable for the reason given above: no published candle release
+# accepts zip 9. Not reachable for the reason given above: the advisory is in
+# `extract()`, and Brain never calls it — both model loaders go through
+# `candle_core::safetensors::load` and refuse pickle weights outright.
+#
+# ---------------------------------------------------------------------------
+# Revisit when candle moves to zip >= 9, and delete all four then.
 [advisories]
 ignore = [
     "RUSTSEC-2026-0291",
     "RUSTSEC-2026-0367",
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
+    "RUSTSEC-2026-0429",
 ]
