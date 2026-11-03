@@ -14,7 +14,7 @@
 
 ## What this spec defines
 
-The retrieval surface activated when a schema is declared. Three retrievers (semantic, lexical, graph) run in parallel; their ranked outputs are fused with weighted Reciprocal Rank Fusion (RRF, k=60). A cross-encoder reranker (bge-reranker-base) then reorders the top-K — always-on whenever the model is loaded, gated only by the deploy-time `config.rerank.enabled` switch, with no per-request flag. A rule-based query router decides per-query which retrievers to invoke and with what weights.
+The retrieval surface. It is wired on every shard from byte zero — declaring a schema does not activate it, and does not change the fan-out, fusion or filter chain; it only widens the predicate vocabulary writes may use. Three retrievers (semantic, lexical, graph) run in parallel; their ranked outputs are fused with weighted Reciprocal Rank Fusion (RRF, k=60). A cross-encoder reranker (bge-reranker-base) can then reorder the top-50 — **off by default and not in the current release**, gated by the deploy-time `[rerank] enabled` switch, with no per-request flag. A rule-based query router decides per-query which retrievers to invoke and with what weights.
 
 `RECALL` — Brain's sole client read verb — runs this engine on every request. It
 does not return the raw fused ranking; it shapes the fused-and-filtered pool into
@@ -106,7 +106,7 @@ Returns: ranked items with cosine scores.
 Uses tantivy for BM25.
 
 Two indexes:
-- **Memory text index**: every memory's text is indexed. Fields: `text`, `agent_id`, `kind`, `created_at`.
+- **Memory text index**: every memory's text is indexed. Fields: `text`, `space_id`, `kind`, `created_at`.
 - **Statement text index**: statements' textual representation indexed (predicate + object value + subject canonical_name). Fields: `predicate`, `object_text`, `subject_name`, `kind`.
 
 BM25 parameters: `k1 = 1.2`, `b = 0.75` (tantivy defaults; configurable).

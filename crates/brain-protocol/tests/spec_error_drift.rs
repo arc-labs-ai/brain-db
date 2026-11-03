@@ -30,38 +30,31 @@ use std::path::PathBuf;
 
 /// Named in the spec's error tables, absent from `ErrorCodeWire`.
 ///
-/// Two distinct causes, kept apart because they want different fixes.
+/// The list is empty, and that is the point: the spec was reconciled against
+/// this enum, so every code it names is one a caller can actually receive.
 ///
-/// **The spec names one condition twice.** Its §3.x tables use a
-/// `*LimitExceeded` family and its limits table (§ "Validation also enforces
-/// resource limits") uses a `TooMany*` family for the same conditions. The
-/// implementation follows the first — `StreamLimitExceeded = 0x0074`,
-/// `TransactionLimitExceeded = 0x0076` — and enforces both caps. The duplicate
-/// names below are therefore NOT missing behaviour; they are a spec that says
-/// the same thing two ways, like `ADMIN_BACKFILL` appearing at two opcodes.
-/// `spec/` is read-only, so this is recorded rather than resolved.
+/// The entries that used to live here fell into two groups, and both were
+/// fixed in the spec rather than excused here.
 ///
-/// **Genuinely unimplemented.** The rest have no counterpart under any name.
-/// `NamespaceRequired` and `WriteToSystemNamespace` are the interesting pair:
-/// `brain-ops/dispatch.rs` DOES fail closed on an empty namespace and DOES
-/// reject a write resolving to the reserved system namespace, but both surface
-/// as the generic `Unauthorized`, so a caller cannot tell either from an
-/// ordinary permission denial. §3.3 argues that exact point at length for
-/// `ActAsDenied`, and §3.2 states it outright for `NamespaceUnknown`: it is
-/// that code "not `Unauthenticated`".
-const UNIMPLEMENTED: &[&str] = &[
-    // -- the spec's duplicate naming; implemented under the other name -----
-    "TooManyStreams",      // = StreamLimitExceeded (0x0074), enforced
-    "TooManyTransactions", // = TransactionLimitExceeded (0x0076), enforced
-    // -- no counterpart under any name -------------------------------------
-    "TooManyEdges",           // limits table: max 64 edges per ENCODE
-    "TooManyContexts",        // limits table: max 65,535 contexts per agent
-    "SchemaNotDeclared",      // §3.10.2, reserved for SCHEMA_GET on a namespace with none
-    "NamespaceRequired",      // §3.3 — behaviour implemented, reported as Unauthorized
-    "NamespaceUnknown",       // §3.3 — §3.2 says explicitly "not Unauthenticated"
-    "WriteToSystemNamespace", // §3.3 — behaviour implemented, reported as Unauthorized
-    "BadContextId",           // §3.4
-];
+/// **The spec named one condition twice.** Its §3.x tables used a
+/// `*LimitExceeded` family and its limits table used a `TooMany*` family for
+/// the same conditions. The implementation follows the first —
+/// `StreamLimitExceeded = 0x0074`, `TransactionLimitExceeded = 0x0076` — and
+/// the limits table now says so, with one code per limit.
+///
+/// **The rest described behaviour that surfaces under another code.**
+/// `NamespaceRequired`, `NamespaceUnknown` and `WriteToSystemNamespace` are
+/// real, enforced invariants, but all three are denials of access to a
+/// namespace and all three report `PermissionDenied` — deliberately, since a
+/// distinct code per cause would tell a prober which namespaces exist.
+/// `BadContextId` was the pre-rename spelling of `BadSessionId`; `TooManyEdges`
+/// and `TooManyContexts` capped request shapes that no longer exist (`ENCODE`
+/// carries no edges, and `session_id` is a client-chosen `u64` out of no
+/// bounded table); and `SchemaNotDeclared` was removed with the per-namespace
+/// schema gate it belonged to.
+///
+/// A future gap goes here with its reason, not without one.
+const UNIMPLEMENTED: &[&str] = &[];
 
 fn spec_file() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

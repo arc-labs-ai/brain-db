@@ -38,9 +38,10 @@ All payloads follow the CBOR field-schema conventions in [`./08_typed_graph_fram
 ```rust
 pub struct SchemaUploadRequest {
     pub schema_document: String,       // DSL source text per §21
-    pub allow_breaking: bool,          // false = reject if migration would be required
     pub dry_run: bool,                 // identical to SCHEMA_VALIDATE when true
+    pub allow_breaking: bool,          // false = reject if migration would be required
     pub request_id: WireUuid,
+    pub act_as: Option<ActAs>,         // effective identity; the namespace checks bind to it
 }
 ```
 
@@ -56,28 +57,28 @@ Semantics:
 
 ```rust
 pub struct SchemaUploadResponse {
-    pub schema_version: u32,           // 0 if dry_run rejected the upload
+    pub namespace: String,             // the namespace the upload resolved to
+    pub schema_version: u32,           // 0 if the upload was rejected
     pub validation_errors: Vec<SchemaValidationError>,
-    pub migration_summary: Option<SchemaMigrationSummary>,
+    pub backward_compatible: bool,
+    pub migration_summary_blob: Vec<u8>,   // JSON-encoded migration summary; empty when there is none
 }
 
 pub struct SchemaValidationError {
+    pub code: String,                  // the stable ValidationErrorCode name, e.g. "UnresolvedTypeRef"
+    pub message: String,
     pub line: u32,
     pub column: u32,
-    pub message: String,
+    pub length: u32,                   // span length, so a client can underline the offending token
     pub severity: u8,                  // 0=info, 1=warning, 2=error
 }
-
-pub struct SchemaMigrationSummary {
-    pub entity_types_added: Vec<String>,
-    pub entity_types_removed: Vec<String>,
-    pub predicates_added: Vec<String>,
-    pub predicates_removed: Vec<String>,
-    pub relation_types_added: Vec<String>,
-    pub relation_types_removed: Vec<String>,
-    pub estimated_rows_to_revalidate: u64,
-}
 ```
+
+Every schema response carries `namespace`, because under `act_as` the namespace a request resolved to is not the one the connection is bound to, and a client that cannot see which namespace it just wrote has no way to confirm the delegation landed where it meant.
+
+`SchemaValidationError` carries a stable `code` alongside the human `message`: the message is for an operator, the code is what a client branches on. The codes are the `ValidationErrorCode` set — `NamespaceMissing`, `NamespaceInvalidIdentifier`, `DuplicateDefinition`, `UnresolvedTypeRef`, `PredicateKindObjectMismatch`, `RelationCardinalitySymmetricInvalid`, `ExtractorMissingRequired`, `ExtractorDuplicateField`, `ExtractorInvalidConfig`, `AttributeUniqueOnRefType`, `DefaultIncompatibleWithType`, `NameInvalidIdentifier`, `NameTooLong`.
+
+The migration summary travels as an opaque JSON **blob** rather than a typed field set. It is diagnostic output for an operator, its shape follows the diff rather than a fixed schema, and freezing it into wire types would mean a protocol change every time the diff gains a category.
 
 #### Errors
 
@@ -91,7 +92,9 @@ pub struct SchemaMigrationSummary {
 
 ```rust
 pub struct SchemaGetRequest {
-    pub version_id: u32,               // 0 = latest
+    pub namespace: String,             // empty = the effective caller's own namespace
+    pub version: u32,                  // 0 = latest
+    pub act_as: Option<ActAs>,
 }
 ```
 
@@ -99,14 +102,18 @@ pub struct SchemaGetRequest {
 
 ```rust
 pub struct SchemaGetResponse {
+    pub namespace: String,
     pub schema_version: u32,
-    pub schema_document: String,       // canonicalized DSL form
-    pub created_at_unix_nanos: u64,
-    pub uploaded_by_agent_id: WireUuid,
+    pub schema_document: String,       // verbatim DSL text as uploaded; empty for a programmatic upload
+    pub source_blob: Vec<u8>,          // JSON encoding of the parsed Schema AST
+    pub uploaded_at_unix_nanos: u64,
+    pub validator_version: u32,
 }
 ```
 
-`schema_document` is the **canonicalized** form — comments removed, whitespace normalized — not the original upload text. Clients that want the original can read the audit table via `ADMIN_GET_AUDIT` (see §"Admin frames" below).
+`schema_document` is the **verbatim** upload text, not a canonicalized re-render. A schema uploaded programmatically (as an AST rather than DSL text) has no source text, and the field is then empty — `source_blob` is the authoritative form in both cases, and is always present.
+
+`validator_version` records which validator admitted the document, so a re-validation under a newer validator can be told apart from the original acceptance.
 
 #### Errors
 
@@ -118,27 +125,35 @@ pub struct SchemaGetResponse {
 
 ```rust
 pub struct SchemaListRequest {
+    pub namespace: String,             // empty = the effective caller's own namespace
     pub limit: u32,                    // 1..=100
-    pub cursor: Vec<u8>,               // opaque
+    pub cursor: Vec<u8>,               // opaque keyset cursor
+    pub act_as: Option<ActAs>,
 }
 ```
 
 #### Response — streaming, per-item `SchemaListItem`
 
 ```rust
-pub struct SchemaListItem {
-    pub schema_version: u32,
-    pub created_at_unix_nanos: u64,
-    pub change_summary: String,        // human-readable, ≤ 4 KiB
+pub struct SchemaListResponseFrame {
+    pub namespace: String,
+    pub items: Vec<SchemaListItem>,
+    pub total: u32,
+    pub next_cursor: Vec<u8>,          // empty when the listing is exhausted
+    pub is_final: bool,
 }
 
-pub struct SchemaListResponseTail {
-    pub next_cursor: Vec<u8>,
-    pub total_returned: u32,
+pub struct SchemaListItem {
+    pub schema_version: u32,
+    pub uploaded_at_unix_nanos: u64,
+    pub validator_version: u32,
+    pub has_source_text: bool,         // whether SCHEMA_GET can return verbatim DSL for this version
 }
 ```
 
-Stream contract: same as `ENTITY_LIST` ([`./08_typed_graph_frames.md`](./08_typed_graph_frames.md)) — substrate streaming with EOS on the tail frame.
+Stream contract: same as `ENTITY_LIST` ([`./08_typed_graph_frames.md`](./08_typed_graph_frames.md)) — streaming with EOS on the final frame, `is_final` mirroring the EOS flag.
+
+There is no per-version `change_summary`. A listing is an index, not a changelog: the summary a version carries is the migration blob on the upload that created it, and re-deriving a prose diff at list time would mean re-parsing every stored version on every page.
 
 ### SCHEMA_VALIDATE (0x0123)
 
@@ -147,12 +162,21 @@ Stream contract: same as `ENTITY_LIST` ([`./08_typed_graph_frames.md`](./08_type
 ```rust
 pub struct SchemaValidateRequest {
     pub schema_document: String,
+    pub act_as: Option<ActAs>,
 }
 ```
 
 #### Response — `SchemaValidateResponse`
 
-Same shape as `SchemaUploadResponse`, but `schema_version` is always 0 (no commit).
+```rust
+pub struct SchemaValidateResponse {
+    pub namespace: String,
+    pub would_be_version: u32,         // the version an upload of this document would allocate
+    pub validation_errors: Vec<SchemaValidationError>,
+}
+```
+
+The version field is named `would_be_version`, not `schema_version` set to 0. A validate commits nothing, so reporting "version 0" would be a sentinel the caller has to know to special-case; reporting the version an upload *would* allocate is the answer the caller actually wants, and its name says the upload did not happen.
 
 #### Errors
 
@@ -163,26 +187,31 @@ Same shape as `SchemaUploadResponse`, but `schema_version` is always 0 (no commi
 #### Request — `ExtractorListRequest`
 
 ```rust
-pub struct ExtractorListRequest {}   // no arguments — extractors are always-on
+pub struct ExtractorListRequest {
+    pub act_as: Option<ActAs>,         // extractors are listed for the effective namespace
+}
 ```
 
 #### Response — streaming, per-item `ExtractorListItem`
 
 ```rust
-pub struct ExtractorListItem {
-    pub extractor_id: u32,
-    pub name: String,                  // e.g. "pattern:role-assignment"
-    pub tier: u8,                      // 1=pattern, 2=classifier, 3=llm
-    pub schema_version: u32,           // version this extractor binds to
-    pub last_run_unix_nanos: u64,
-    pub statements_produced_lifetime: u64,
-    pub failures_lifetime: u64,
+pub struct ExtractorListResponseFrame {
+    pub items: Vec<ExtractorListItem>,
+    pub total: u32,
+    pub is_final: bool,
 }
 
-pub struct ExtractorListResponseTail {
-    pub total_returned: u32,
+pub struct ExtractorListItem {
+    pub extractor_id: u32,
+    pub namespace: String,             // the namespace this extractor was declared in
+    pub name: String,                  // e.g. "pattern:role-assignment"
+    pub kind: u8,                      // the extractor kind discriminant
+    pub schema_version: u32,           // version this extractor binds to
+    pub created_at_unix_nanos: u64,
 }
 ```
+
+The listing is registry metadata, not run statistics: there are no lifetime counters or last-run timestamps on it. Per-run outcomes are reported where they happen — on the `StageCompleted` event and in the extraction audit rows — rather than accumulated into a row that a listing would have to keep hot.
 
 Cross-ref: [`../11_extractors/00_purpose.md`](../11_extractors/00_purpose.md) defines the tier model.
 
@@ -194,7 +223,7 @@ runtime (no wire op). `EXTRACTOR_LIST` remains for read-only introspection.
 
 ### Schema authorization
 
-All schema-namespace opcodes (`0x0120–0x0123`) require **admin** permissions in the agent's `AgentPermissions` (see [`04_handshake.md`](./04_handshake.md)). `SCHEMA_GET`, `SCHEMA_LIST`, `EXTRACTOR_LIST` are readable by any authenticated agent. `SCHEMA_REPLACE` (`0x0127`) is admin-only and destructive; the handler rejects the call unless `force_drop_existing` is exactly `true` (see [`./03_opcodes.md`](./03_opcodes.md) §2.1).
+All schema-namespace opcodes (`0x0120–0x0123`) require **admin** permissions in the agent's `SpacePermissions` (see [`04_handshake.md`](./04_handshake.md)). `SCHEMA_GET`, `SCHEMA_LIST`, `EXTRACTOR_LIST` are readable by any authenticated agent. `SCHEMA_REPLACE` (`0x0127`) is admin-only and destructive; the handler rejects the call unless `force_drop_existing` is exactly `true` (see [`./03_opcodes.md`](./03_opcodes.md) §2.1).
 
 Unauthorized requests return substrate `ErrorCategory::Authorization` with code `AdminPermissionRequired`.
 
@@ -230,9 +259,12 @@ Cross-references:
 | `STATEMENT_TOMBSTONED` | `STATEMENT_TOMBSTONE` (0x0143) | Statement |
 | `RELATION_CREATED` | `RELATION_CREATE` (0x0150) | Relation |
 | `RELATION_SUPERSEDED` | `RELATION_SUPERSEDE` (0x0152) | Relation |
-| `EXTRACTION_COMPLETED` | extractor worker | Extractor |
-| `EXTRACTION_FAILED` | extractor worker | Extractor |
-| `SCHEMA_UPDATED` | `SCHEMA_UPLOAD` (0x0120) | Schema |
+| `RELATION_TOMBSTONED` | `RELATION_TOMBSTONE` (0x0153) | Relation |
+| `SCHEMA_UPDATED` | `SCHEMA_UPLOAD` (0x0120) / `SCHEMA_REPLACE` (0x0127) / `SCHEMA_DROP` (0x0125) | Schema |
+| `STAGE_COMPLETED` | each async write-derivation worker | Write pipeline |
+| `EDGE_ADDED` / `EDGE_REMOVED` / `EDGE_SUPERSEDED` | `LINK` / `UNLINK` and the relation ops | Edges |
+
+Extraction does **not** emit its own event pair. It reports through `STAGE_COMPLETED` with `stage_kind = Extractor`, carrying entity/statement/relation counts, a `StageAuditStatus`, and a `StageOutcome` that separates *ran and found nothing* (`Empty`) from *could not run* (`Failed`) — a distinction a completed/failed event pair could not express, since both of those cases produce zero counts.
 
 Substrate event types (`ENCODED`, `FORGOTTEN`, `LINKED`, etc.) remain as defined in [`./05_frame_layouts.md`](./05_frame_layouts.md) and are not duplicated here.
 
@@ -242,24 +274,28 @@ Every event rides as a `SUBSCRIBE_EVENT` frame (opcode `0x00B0`) with body shape
 
 ```rust
 pub struct SubscriptionEvent {
-    pub event_type: EventTypeWire,
-    pub memory_id: WireMemoryId,        // [0;16] when not memory-scoped
-    pub context_id: u64,                // 0 = no context
+    pub event_type: EventType,
+    pub memory_id: WireMemoryId,        // 0 when not memory-scoped
+    pub session_id: u64,                // 0 = the default session
     pub text: String,                   // human-readable summary; may be empty
-    pub kind: MemoryKindWire,           // for substrate events; ignored for typed-graph
-    pub salience: f32,                  // for substrate; 0.0 for typed-graph
+    pub kind: MemoryKindWire,           // for cognitive events; ignored for typed-graph
+    pub salience: f32,                  // for cognitive events; 0.0 for typed-graph
     pub timestamp_unix_nanos: u64,      // server clock at emission
     pub lsn: u64,                       // monotonic per-shard LSN; subscriber resumes by LSN
-    pub knowledge_payload: Option<KnowledgeEventPayload>,  // see below
+    pub graph_payload: Option<GraphEventPayload>,  // see below
+    pub edge_payload: Option<EdgeEventPayload>,    // EdgeAdded / EdgeRemoved / EdgeSuperseded
+    pub stage_kind: Option<StageKind>,             // StageCompleted only
+    pub stage_outcome: Option<StageOutcome>,       // StageCompleted only
+    pub stage_payload: Option<StagePayload>,       // StageCompleted only
 }
 ```
 
-Brain's `SubscriptionEvent` (defined in [`./05_frame_layouts.md`](./05_frame_layouts.md)) carries an optional `knowledge_payload`. For substrate-emitted events the field is `None`; for typed-graph-emitted events it carries the typed body. Brain's `EventType` enum includes the typed-graph event variants (`EntityCreated` … `SchemaUpdated`) defined in the same section.
+One envelope carries every event family; the four optional sidecars are populated per family and omitted otherwise. For cognitive events all four are `None` and the standard fields carry the data. The envelope and the full `EventType` discriminant table are defined in [`./05_frame_layouts.md`](./05_frame_layouts.md) §43.
 
-### `KnowledgeEventPayload` union
+### `GraphEventPayload` union
 
 ```rust
-pub enum KnowledgeEventPayload {
+pub enum GraphEventPayload {
     EntityCreated(EntityCreatedEvent),
     EntityUpdated(EntityUpdatedEvent),
     EntityRenamed(EntityRenamedEvent),
@@ -271,13 +307,12 @@ pub enum KnowledgeEventPayload {
     StatementTombstoned(StatementTombstonedEvent),
     RelationCreated(RelationCreatedEvent),
     RelationSuperseded(RelationSupersededEvent),
-    ExtractionCompleted(ExtractionCompletedEvent),
-    ExtractionFailed(ExtractionFailedEvent),
+    RelationTombstoned(RelationTombstonedEvent),
     SchemaUpdated(SchemaUpdatedEvent),
 }
 ```
 
-Each variant is a CBOR map. Variants for ops not yet implemented carry typed shells; only the entity variants land first (in parallel with the merge / tombstone / etc. opcodes).
+Each variant is a CBOR map. The union is named for the layer it describes — the typed graph — and carries no extraction variants; extraction reports through `StageCompleted` (see the event type table above).
 
 #### Entity events
 
@@ -362,25 +397,6 @@ pub struct RelationSupersededEvent {
 }
 ```
 
-#### Extractor events (spec-only)
-
-```rust
-pub struct ExtractionCompletedEvent {
-    pub extractor_id: u32,
-    pub memory_id: WireMemoryId,
-    pub statements_produced: u32,
-    pub entities_referenced: u32,
-    pub wall_time_ms: u32,
-}
-
-pub struct ExtractionFailedEvent {
-    pub extractor_id: u32,
-    pub memory_id: WireMemoryId,
-    pub error_code: u8,                 // §03 error code from §10
-    pub error_message: String,
-}
-```
-
 #### Schema events
 
 ```rust
@@ -437,7 +453,7 @@ The server applies the filter at emission time — non-matching events are disca
 
 All entity event variants are emitted post-commit:
 
-- Substrate `EventEnvelope` carries an optional `knowledge_payload: Option<KnowledgeEventPayload>` field.
+- The shared `SubscriptionEvent` envelope carries an optional `graph_payload: Option<GraphEventPayload>` field.
 - `ENTITY_CREATE` / `_UPDATE` / `_RENAME` handlers emit `EntityCreated` / `EntityUpdated` / `EntityRenamed` events post-commit.
 - `ENTITY_MERGE` / `_UNMERGE` / `_TOMBSTONE` handlers emit their respective events.
 
@@ -445,7 +461,7 @@ Events are forward-only from their introduction; there is **no retroactive emiss
 
 ### Memory layer ↔ typed graph event correlation
 
-When an extractor processes a freshly encoded memory and emits `EXTRACTION_COMPLETED`, the event's `memory_id` field correlates back to the substrate `ENCODED` event for the same memory. Subscribers that want the chain "memory encoded → extractor ran → entities created" subscribe to both event families and join on `memory_id`.
+When an extractor processes a freshly encoded memory it emits `STAGE_COMPLETED` with `stage_kind = Extractor`, whose `memory_id` correlates back to the `ENCODED` event for the same memory. Subscribers that want the chain "memory encoded → extractor ran → entities created" subscribe to both event families and join on `memory_id`. A subscription scoped with `filter.memory_ids = [that id]` narrows the stream to exactly one write's derivation.
 
 Brain's `lsn` is shared across substrate and typed-graph events on the same shard, so the chain is replayable in causal order.
 
@@ -454,7 +470,7 @@ Brain's `lsn` is shared across substrate and typed-graph events on the same shar
 Notably:
 
 - Whether `SubscriptionEvent` should be a sum type per family (substrate / typed-graph) rather than a struct-with-optional-payload. Currently flat-with-optional to keep one event envelope on the wire.
-- Whether `min_confidence` filter should apply to entity events too (not just statements / extractions). Currently no.
+- Whether the `min_confidence` filter should apply to entity events too (not just statements). Currently no.
 
 ## Schema-optional mode
 
@@ -602,57 +618,56 @@ Responses live at `0x01E1–0x01E2`.
 
 ```rust
 pub struct QueryRequest {
-    pub query_dsl: String,                  // structured query DSL
-    pub top_k: u32,                         // 1..=1000
-    pub filters: QueryFilters,
-    pub retriever_selection: RetrieverSelection,
-    pub budget_wall_time_ms: u32,           // 1..=60000
-    pub include_provenance: bool,
-    pub include_trace: bool,                // used by QUERY_TRACE only
-    pub schema_version: u32,                // 0 = current
-    pub request_id: WireUuid,               // [0;16] = no idempotency cache
-    pub txn_id: WireUuid,                   // [0;16] = no transaction
-}
-
-pub struct QueryFilters {
-    pub entity_type_id: u32,                // 0 = no filter
-    /// Predicate filter as canonical `"namespace:name"` qnames.
-    /// Empty vec = no filter. The planner resolves each qname through
-    /// the predicate registry per request — unknown qnames produce an
-    /// empty result set in open-vocabulary mode and `PredicateNotInSchema`
-    /// (0x004B) when a schema is active for the namespace.
+    pub text: String,
+    pub entity_anchor: Option<EntityId>,         // anchor the graph lane on one entity
+    pub kind_filter: Vec<u8>,                    // StatementKind bytes (0 = Fact, 1 = Preference, 2 = Event); empty = no filter
+    /// Predicate filter as canonical `"namespace:name"` qnames. Empty = no
+    /// filter. The planner resolves each qname through the predicate
+    /// registry per request — an unknown qname yields an empty result set
+    /// in open-vocabulary mode and `PredicateNotInSchema` (0x004B) when a
+    /// schema is active for the namespace.
     pub predicate_filter: Vec<String>,
-    pub time_range_start_unix_nanos: u64,
-    pub time_range_end_unix_nanos: u64,
-    /// Bi-temporal time-travel anchor (record-time). 0 = current state.
-    /// When non-zero, results are resolved against the substrate's
-    /// believed state at this record-time, and it is the reference point
-    /// for recency ranking.
-    pub as_of_record_time_unix_nanos: u64,
-    pub min_confidence: f32,
-    pub context_ids: Vec<u64>,              // empty = no filter
-    pub kind_filter: Vec<StatementKindWire>, // empty = no filter
-    pub min_salience: f32,                  // for substrate-side filter
+    pub session_filter: Option<Vec<SessionId>>,  // None/empty = all sessions in the caller's space
+    pub time_filter: Option<TimeRange>,          // { from_unix_ms, to_unix_ms }, each optional
+    /// Bi-temporal time-travel anchor (record-time). When `Some(t)`,
+    /// statement/relation results are filtered to the state the substrate
+    /// believed at `t`, and `t` is the reference point for recency ranking.
+    pub as_of_record_time_unix_nanos: Option<u64>,
+    pub confidence_min: Option<f32>,
+    pub include_tombstoned: bool,
+    pub include_superseded: bool,
+    pub limit: u32,
+    pub retrievers: RetrieverSelection,
+    pub fusion_config: Option<FusionConfig>,
+    pub request_id: RequestId,
 }
 
-pub struct RetrieverSelection {
-    pub use_semantic: bool,                 // default true
-    pub use_lexical: bool,                  // default true
-    pub use_graph: bool,                    // default true
-    pub semantic_top_k: u32,                // per-retriever top-K; 0 = retriever default
-    pub lexical_top_k: u32,
-    pub graph_top_k: u32,
-    pub rrf_k_constant: u32,                // RRF k parameter; 0 = default 60 per §23
+pub enum RetrieverSelection {
+    Auto,                                        // the planner picks the lanes
+    Explicit(Vec<Retriever>),                    // Semantic = 0 | Lexical = 1 | Graph = 2
+}
+
+pub struct FusionConfig {
+    pub k: u32,                                  // the RRF k constant
+    pub semantic_weight: f32,
+    pub lexical_weight: f32,
+    pub graph_weight: f32,
 }
 ```
 
-Semantics (this request is the introspection input to `QUERY_EXPLAIN` /
-`QUERY_TRACE`, never a client read):
+`QueryRequest` is carried inside `QueryExplainRequest` / `QueryTraceRequest`, each of which adds the shared `act_as` field:
 
-- The query DSL is structured — combinations of entity / predicate / time / confidence conditions. The operator building a trace supplies it directly.
-- `RetrieverSelection` lets the operator disable retrievers or override per-retriever depth to isolate a lane's behaviour. Setting all three to false → `INVALID_ARGUMENT`.
-- `top_k` is the **final fused** top-K of the trace output. Per-retriever `top_k`s are typically larger to give RRF a useful candidate pool (default: `4 * top_k`). `QUERY_EXPLAIN` ignores it (no execution).
-- `budget_wall_time_ms` is a soft budget on `QUERY_TRACE` execution. The server returns whatever it has when exceeded with `QUERY_TIMEOUT` on the final frame.
+```rust
+pub struct QueryExplainRequest { pub query: QueryRequest, pub act_as: Option<ActAs> }
+pub struct QueryTraceRequest   { pub query: QueryRequest, pub act_as: Option<ActAs> }
+```
+
+Semantics (this request is the introspection input to `QUERY_EXPLAIN` / `QUERY_TRACE`, never a client read):
+
+- There is **no query DSL**. The input is the same structured filter set the read pipeline already takes — text cue plus entity / predicate / kind / time / confidence conditions — so EXPLAIN and TRACE describe the real planner rather than a parallel language.
+- `retrievers` is a sum type, not three booleans: `Auto` lets the planner choose the lanes, `Explicit` pins them. An empty `Explicit` list is `InvalidArgument` — disabling every lane is not a query.
+- `fusion_config` overrides the RRF constant and the per-lane weights, for isolating one lane's contribution to the ranking. `None` uses the deployment's configured fusion settings.
+- `limit` is the **final fused** cap. Per-retriever depth is derived from it by the planner; `QUERY_EXPLAIN` ignores it (no execution).
 
 #### `QueryResult` — streamed per-frame item
 
@@ -829,7 +844,7 @@ A `QUERY_TRACE` typically fans out to **all** shards unless filters scope it to
 a specific shard (e.g. `filters.entity_type_id` + a subject filter the planner
 can route).
 
-Per-shard results are streamed to the coordinator (the agent's bound shard); the
+Per-shard results are streamed to the coordinator (the caller's bound shard); the
 coordinator runs RRF fusion across the union and streams the final fused result.
 The per-shard streaming back-pressure handling applies — if one shard is slow,
 the coordinator buffers within its budget. `QUERY_TRACE`'s
@@ -856,19 +871,13 @@ Cross-references:
 
 ### Admin opcode index
 
-| Opcode | Name | Section | Status |
-|---|---|---|---|
-| `0x0170` | `ADMIN_REBUILD_INDEX` | "ADMIN_REBUILD_INDEX" | spec-only |
-| `0x0171` | `ADMIN_REINDEX_TANTIVY` | "ADMIN_REINDEX_TANTIVY" | spec-only |
-| `0x0172` | `ADMIN_LIST_PENDING_RESOLUTIONS` | "ADMIN_LIST_PENDING_RESOLUTIONS" | spec-only |
-| `0x0173` | `ADMIN_RESOLVE_AMBIGUITY` | "ADMIN_RESOLVE_AMBIGUITY" | spec-only |
-| `0x0174` | `ADMIN_GET_AUDIT` | "ADMIN_GET_AUDIT" | spec-only |
-| `0x0175` | `ADMIN_LIST_STALE_STATEMENTS` | "ADMIN_LIST_STALE_STATEMENTS" | spec-only |
-| `0x0176` | `ADMIN_BACKFILL` | "ADMIN_BACKFILL" | spec-only |
-| `0x0177` | `ADMIN_JOB_STATUS` | "ADMIN_JOB_STATUS" | spec-only |
-| `0x0178` | `ADMIN_LIST_PENDING_CONTRADICTIONS` | "ADMIN_LIST_PENDING_CONTRADICTIONS" | implemented |
+| Opcode | Name | Section |
+|---|---|---|
+| `0x0178` | `ADMIN_LIST_PENDING_CONTRADICTIONS` | "ADMIN_LIST_PENDING_CONTRADICTIONS" |
 
-Responses live at `0x01F0–0x01F8`.
+Responses live at `0x01F0–0x01FF`; this one's is `0x01F8`. `0x0170`–`0x0177` are unallocated.
+
+The typed-graph admin range holds exactly one operation. The operator surface that exists alongside it lives in the **substrate** admin range (`0x00xx`), not here: backfill is `ADMIN_BACKFILL` (`0x006E`) with `ADMIN_BACKFILL_CANCEL` (`0x006F`), and snapshots, restore, integrity check and embedding migration are `0x0061`–`0x0064`. See [`03_opcodes.md`](03_opcodes.md) §1.6 and [`05_frame_layouts.md`](05_frame_layouts.md) §35.
 
 ### ADMIN_LIST_PENDING_CONTRADICTIONS (0x0178)
 
@@ -900,302 +909,25 @@ The server re-checks liveness against `statements` on each call and
 lazily resolves rows that no longer hold, so the list reflects only
 currently-live contradictions.
 
-### ADMIN_REBUILD_INDEX (0x0170)
+### Backfill runs
 
-Asynchronously rebuilds one of the per-shard typed-graph indexes (entity HNSW, statement HNSW, entity trigrams, etc.). Returns a `job_id` immediately; client polls via `ADMIN_JOB_STATUS`.
+`ADMIN_BACKFILL` (`0x006E`) is the one long-running admin operation, and it does not use a generic "job" surface. The request names a `BackfillScope` (`All`, or an inclusive `MemoryId` range) and a list of `extractor_ids`, and the response returns a `backfill_id` plus an immediate `BackfillProgress` snapshot. `ADMIN_BACKFILL_CANCEL` (`0x006F`) stops an in-flight run by that id and returns the final snapshot.
 
-#### Request — `AdminRebuildIndexRequest`
-
-```rust
-pub struct AdminRebuildIndexRequest {
-    pub index_name: String,            // "entity_hnsw", "statement_hnsw", "entity_trigrams", ...
-    pub shard_id: u16,                 // 0..=N-1
-    pub request_id: WireUuid,
+```
+BackfillProgress {
+    running:                            bool,
+    completed:                          u64,
+    failed:                             u64,
+    skipped_already_completed:          u64,
+    last_processed_memory_id_present:   bool,
+    last_processed_memory_id:           MemoryId,
 }
 ```
 
-#### Response — `AdminRebuildIndexResponse`
-
-```rust
-pub struct AdminRebuildIndexResponse {
-    pub job_id: WireUuid,              // poll via ADMIN_JOB_STATUS
-    pub started_at_unix_nanos: u64,
-    pub estimated_wall_time_ms: u32,
-}
-```
-
-#### Errors
-
-- `INVALID_ARGUMENT` — unknown `index_name`, shard out of range.
-
-### ADMIN_REINDEX_TANTIVY (0x0171)
-
-Rebuilds the tantivy BM25 text index for a shard (memories + statements). Same async pattern as `ADMIN_REBUILD_INDEX`.
-
-#### Request — `AdminReindexTantivyRequest`
-
-```rust
-pub struct AdminReindexTantivyRequest {
-    pub shard_id: u16,
-    pub include_memory_text: bool,
-    pub include_statement_text: bool,
-    pub request_id: WireUuid,
-}
-```
-
-#### Response
-
-```rust
-pub struct AdminReindexTantivyResponse {
-    pub job_id: WireUuid,
-    pub started_at_unix_nanos: u64,
-    pub estimated_wall_time_ms: u32,
-}
-```
-
-### ADMIN_LIST_PENDING_RESOLUTIONS (0x0172)
-
-Streams entity-resolution audit rows where `outcome = Pending` — i.e. ambiguous extractions that need operator decision.
-
-#### Request — `AdminListPendingResolutionsRequest`
-
-```rust
-pub struct AdminListPendingResolutionsRequest {
-    pub limit: u32,                    // 1..=1000
-    pub cursor: Vec<u8>,
-    pub older_than_unix_nanos: u64,    // 0 = no filter
-}
-```
-
-#### Response — streaming `PendingResolutionItem`
-
-```rust
-pub struct PendingResolutionItem {
-    pub audit_id: WireUuid,
-    pub candidate_name: String,
-    pub context: String,
-    pub created_at_unix_nanos: u64,
-    pub top_k_candidates: Vec<ResolutionCandidate>,
-}
-
-pub struct ResolutionCandidate {
-    pub entity_id: WireUuid,
-    pub canonical_name: String,
-    pub confidence: f32,
-    pub tier: u8,                      // which tier ranked this candidate
-}
-
-pub struct AdminListPendingResolutionsTail {
-    pub next_cursor: Vec<u8>,
-    pub total_returned: u32,
-    pub total_pending: u32,            // unrelated to pagination; cluster-wide count
-}
-```
-
-### ADMIN_RESOLVE_AMBIGUITY (0x0173)
-
-Operator decides one pending resolution. Either binds the audit's pending subject to an existing entity, or creates a new one.
-
-#### Request — `AdminResolveAmbiguityRequest`
-
-```rust
-pub struct AdminResolveAmbiguityRequest {
-    pub audit_id: WireUuid,
-    pub action: u8,                    // 1=bind_to_existing, 2=create_new, 3=discard
-    pub chosen_entity_id: WireUuid,    // [0;16] unless action=1
-    pub new_entity_canonical_name: String,   // empty unless action=2
-    pub new_entity_type_id: u32,       // 0 unless action=2
-    pub note: String,                  // operator note; logged
-    pub request_id: WireUuid,
-}
-```
-
-#### Response — `AdminResolveAmbiguityResponse`
-
-```rust
-pub struct AdminResolveAmbiguityResponse {
-    pub resolved_at_unix_nanos: u64,
-    pub bound_entity_id: WireUuid,     // the entity statements now point to
-    pub statements_rerouted: u32,      // how many pending-subject statements were re-routed
-}
-```
-
-#### Errors
-
-- `INVALID_ARGUMENT` — bad `action`, missing required field for the action, unknown `chosen_entity_id`.
-- `ENTITY_AMBIGUOUS` if a race made the audit already-resolved.
-
-### ADMIN_GET_AUDIT (0x0174)
-
-Read a single audit row (resolution audit, merge audit, schema audit) by id.
-
-#### Request — `AdminGetAuditRequest`
-
-```rust
-pub struct AdminGetAuditRequest {
-    pub audit_id: WireUuid,
-}
-```
-
-#### Response — `AdminGetAuditResponse`
-
-```rust
-pub struct AdminGetAuditResponse {
-    pub audit_kind: u8,                // 1=entity_resolution, 2=entity_merge, 3=schema_upload, 4=extractor_governance
-    pub created_at_unix_nanos: u64,
-    pub actor_agent_id: WireUuid,
-    pub payload: AuditPayload,
-}
-
-pub enum AuditPayload {
-    EntityResolution(ResolutionAuditView),
-    EntityMerge(MergeAuditView),
-    SchemaUpload(SchemaAuditView),
-    ExtractorGovernance(ExtractorAuditView),
-}
-
-pub struct ResolutionAuditView {
-    pub candidate_name: String,
-    pub context: String,
-    pub top_k_candidates: Vec<ResolutionCandidate>,
-    pub outcome: u8,                   // 0=Pending, 1=Resolved, 2=Created, 3=Ambiguous_decided, 4=Discarded
-    pub bound_entity_id: WireUuid,
-    pub resolved_by_agent_id: WireUuid,
-}
-
-pub struct MergeAuditView {
-    pub survivor: WireUuid,
-    pub merged: WireUuid,
-    pub confidence: f32,
-    pub reason: String,
-    pub statements_rerouted: u32,
-    pub relations_rerouted: u32,
-    pub grace_period_expires_at_unix_nanos: u64,
-    pub unmerged_at_unix_nanos: u64,   // 0 if not unmerged
-}
-
-pub struct SchemaAuditView {
-    pub schema_version: u32,
-    pub uploaded_at_unix_nanos: u64,
-    pub migration_summary: SchemaMigrationSummary,
-}
-
-pub struct ExtractorAuditView {
-    pub extractor_id: u32,
-    pub event: u8,                     // 1=enabled, 2=disabled, 3=registered, 4=deregistered
-    pub reason: String,
-}
-```
-
-#### Errors
-
-- `INVALID_ARGUMENT` — `audit_id` not found.
-
-### ADMIN_LIST_STALE_STATEMENTS (0x0175)
-
-Streams statements whose source memory has been forgotten / tombstoned but the statement itself is still active. Operator decides whether to tombstone or retract.
-
-#### Request — `AdminListStaleStatementsRequest`
-
-```rust
-pub struct AdminListStaleStatementsRequest {
-    pub older_than_unix_nanos: u64,    // 0 = no filter
-    pub kind_filter: Vec<StatementKindWire>, // empty = all
-    pub limit: u32,                    // 1..=1000
-    pub cursor: Vec<u8>,
-}
-```
-
-#### Response — streaming `StatementView`
-
-Same shape as `STATEMENT_LIST` ([`./08_typed_graph_frames.md`](./08_typed_graph_frames.md)). Filter is "statement.evidence references a tombstoned / forgotten memory".
-
-### ADMIN_BACKFILL (0x0176)
-
-Re-runs one or more extractors over a memory range. Used after schema migration or extractor improvements.
-
-#### Request — `AdminBackfillRequest`
-
-```rust
-pub struct AdminBackfillRequest {
-    pub extractor_ids: Vec<u32>,       // empty = all enabled extractors
-    pub memory_range_start_unix_nanos: u64,
-    pub memory_range_end_unix_nanos: u64,
-    pub dry_run: bool,                 // report estimated work without dispatching
-    pub max_parallelism: u32,          // 1..=16; default 4
-    pub request_id: WireUuid,
-}
-```
-
-#### Response — `AdminBackfillResponse`
-
-```rust
-pub struct AdminBackfillResponse {
-    pub job_id: WireUuid,
-    pub memories_in_range: u64,
-    pub extractors_dispatched: u32,
-    pub estimated_wall_time_ms: u64,
-}
-```
-
-#### Errors
-
-- `INVALID_ARGUMENT` — unknown `extractor_ids`, `memory_range_start > end`, `max_parallelism > 16`.
-- `EXTRACTOR_BUDGET_EXCEEDED` (substrate `ResourceExhausted`) — backfill would exceed configured per-extractor budgets.
-
-### ADMIN_JOB_STATUS (0x0177)
-
-Polls the status of an async job started by `ADMIN_REBUILD_INDEX` / `ADMIN_REINDEX_TANTIVY` / `ADMIN_BACKFILL`.
-
-#### Request — `AdminJobStatusRequest`
-
-```rust
-pub struct AdminJobStatusRequest {
-    pub job_id: WireUuid,
-}
-```
-
-#### Response — `AdminJobStatusResponse`
-
-```rust
-pub struct AdminJobStatusResponse {
-    pub job_id: WireUuid,
-    pub state: u8,                     // 1=pending, 2=running, 3=completed, 4=failed, 5=cancelled
-    pub started_at_unix_nanos: u64,
-    pub updated_at_unix_nanos: u64,
-    pub completed_at_unix_nanos: u64,  // 0 if not completed
-    pub progress_percent: f32,         // 0.0..=100.0
-    pub eta_ms: u32,                   // estimated remaining wall time
-    pub error_message: String,         // populated when state=failed
-    pub kind: u8,                      // 1=rebuild_index, 2=reindex_tantivy, 3=backfill
-    pub stats: JobStats,
-}
-
-pub struct JobStats {
-    pub items_processed: u64,
-    pub items_total: u64,
-    pub items_failed: u64,
-    pub throughput_per_sec: f32,
-}
-```
-
-#### Errors
-
-- `INVALID_ARGUMENT` — `job_id` not found.
-
-### Job retention
-
-Job records are kept in a `jobs` redb table for 7 days after `completed_at`. After that they're garbage-collected. Polling an expired job returns `INVALID_ARGUMENT`.
-
-### Cancellation
-
-There is no `ADMIN_CANCEL_JOB` opcode currently. Jobs that need cancellation use:
-
-- For index rebuilds: the underlying worker is interrupt-tolerant. A subsequent `ADMIN_REBUILD_INDEX` for the same index supersedes the prior one (the worker re-checks every chunk).
-- For backfill: re-issue with a narrower range, then let the wider one complete or expire.
-
-### Concurrent admin jobs
-
-Per-shard, only **one** index rebuild may run at a time. Concurrent `ADMIN_REBUILD_INDEX` requests for the same index queue behind the first; the response returns the queued `job_id` immediately. The job order is reflected in `ADMIN_JOB_STATUS.state` (`pending` until prior jobs complete).
-
-Per-shard, multiple backfills may run concurrently up to `max_parallelism`. Across shards, jobs are independent.
+Semantics worth knowing:
+
+- **Resumable by construction.** Every `(memory, extractor)` pair has its own row in the shared `worker_checkpoints` table, so a restart mid-run resumes rather than re-extracting what already completed. `skipped_already_completed` is counted apart from `completed` so a re-run over a finished range reports honestly instead of looking like fresh work.
+- **Per-item resilience.** An item that fails is retried up to three times and then counted in `failed`; it never aborts the run. One bad memory does not cost the operator the whole backfill.
+- **Re-extraction goes through the live path.** Memory text is durable in the `texts` table, so a backfill does not need the original `ENCODE` frame. Each live item is re-enqueued on the same durable `extraction_queue` the write path uses, inside the same write txn as its checkpoint; the per-shard `ExtractorWorker` drains it on its next cycle and re-derived rows flow through the normal supersession path. Backfill itself never deletes prior derivations.
+- **`dry_run`** marks items complete without enqueueing — plan validation only.
+- A memory already extracted under the current schema is re-run only when the operator clears the `ExtractorWorker`'s `skip_already_extracted` gate. That gate, not backfill, is the forced-re-extraction knob.

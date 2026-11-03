@@ -22,7 +22,7 @@ Entities are distinct from:
 struct Entity {
     id: EntityId,                       // UUIDv7
     namespace_id: NamespaceId,          // owning tenant; 0 = reserved `brain` system namespace
-    agent_id: AgentId,                  // owning agent
+    space_id: SpaceId,                  // owning agent
     entity_type_id: EntityTypeId,       // interned u32; "Person", "Organization", ...
     canonical_name: String,             // normalized display name
     aliases: Vec<String>,               // alternative surface forms
@@ -36,7 +36,7 @@ struct Entity {
 
 The `entity_type_id` is interned from the schema's entity-type declarations. Built-in types (`Person`, `Organization`, `Project`, `Place`, `Concept`, `Event`) are seeded in the system schema; user schemas add deployment-specific types.
 
-**Owner scope (`namespace_id` + `agent_id`).** Every entity is owned by exactly one `(namespace, agent)` tenant pair, stamped from the caller's authenticated scope at create time (fail-closed by construction). This owner namespace is **distinct** from the qname namespace of `entity_type_id` — an entity owned by `acme` may have the shared `brain:Person` type. The reserved `brain` system namespace (id `0`) owns only seeded rows and is never a valid owner of user-written entities.
+**Owner scope (`namespace_id` + `space_id`).** Every entity is owned by exactly one `(namespace, space)` tenant pair, stamped from the caller's authenticated scope at create time (fail-closed by construction). This owner namespace is **distinct** from the qname namespace of `entity_type_id` — an entity owned by `acme` may have the shared `brain:Person` type. The reserved `brain` system namespace (id `0`) owns only seeded rows and is never a valid owner of user-written entities.
 
 ### Identity
 
@@ -48,7 +48,7 @@ The `entity_type_id` is interned from the schema's entity-type declarations. Bui
 
 `EntityId` changes only via merge (the merged-away entity's id becomes a redirect — see §"Entity merge" below).
 
-**Resolution is per `(namespace, agent)`.** The resolver's exact-name, alias, and trigram indexes are all keyed under a leading `(namespace_id, agent_id)` scope prefix, so a surface form resolves only against entities the caller's own tenant owns. The same name resolves to **distinct** `EntityId`s under different scopes: `"Priya Patel"` in tenant `acme` and `"Priya Patel"` in tenant `globex` are two separate entities with two separate ids — one tenant's resolution can never reach another's rows.
+**Resolution is per `(namespace, space)`.** The resolver's exact-name, alias, and trigram indexes are all keyed under a leading `(namespace_id, space_id)` scope prefix, so a surface form resolves only against entities the caller's own tenant owns. The same name resolves to **distinct** `EntityId`s under different scopes: `"Priya Patel"` in tenant `acme` and `"Priya Patel"` in tenant `globex` are two separate entities with two separate ids — one tenant's resolution can never reach another's rows.
 
 ## Entity merge
 
@@ -81,7 +81,7 @@ pub struct MergeInputs {
 }
 ```
 
-`Actor::Agent(AgentId)` for human-initiated merges (via `ENTITY_MERGE` opcode). `Actor::System` for resolver-initiated merges (when the auto-merge threshold passes — see §"Confidence-banded behavior").
+`Actor::Agent(SpaceId)` for human-initiated merges (via `ENTITY_MERGE` opcode). `Actor::System` for resolver-initiated merges (when the auto-merge threshold passes — see §"Confidence-banded behavior").
 
 ### Pre-conditions
 
@@ -131,7 +131,7 @@ pub struct MergeReviewProposal {
     pub created_at_unix_nanos: u64,
     pub last_revisited_at_unix_nanos: u64,
     pub reason: String,
-    pub evidence_summary: Vec<u8>,  // rkyv-archived blob with surrounding context
+    pub evidence_summary: Vec<u8>,  // rkyv-archived blob with surrounding session
 }
 ```
 
@@ -139,7 +139,7 @@ The `confidence_band` is a coarse bucket the admin UI uses to surface the highes
 
 #### Ambiguity resolver worker
 
-A periodic `ambiguity_resolver` worker re-runs entity resolution against every active proposal as new context arrives — additional statements citing one or the other entity, additional aliases, new mentions in fresh memories. When the re-run produces a confidence outcome that crosses a band boundary:
+A periodic `ambiguity_resolver` worker re-runs entity resolution against every active proposal as new session arrives — additional statements citing one or the other entity, additional aliases, new mentions in fresh memories. When the re-run produces a confidence outcome that crosses a band boundary:
 
 - New confidence ≥ 0.95 → auto-merge promoted; proposal dequeued; `MERGED` event emitted.
 - New confidence < 0.7 → proposal dequeued as "no longer a candidate"; both entities remain separate.

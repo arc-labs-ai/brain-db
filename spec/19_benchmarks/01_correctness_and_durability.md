@@ -27,7 +27,7 @@ Tests:
 **MUST**: ENCODE creates a memory satisfying:
 
 - The vector matches `embed(text, model_version)` (deterministic for a given model).
-- The metadata fields match the request (agent, context, salience, kind, etc.).
+- The metadata fields match the request (agent, session, salience, kind, etc.).
 - A new MemoryId is generated and returned.
 - The memory is queryable in subsequent RECALLs.
 
@@ -39,7 +39,7 @@ Tests:
 **MUST**: RECALL returns memories ranked by relevance.
 
 - The top-1 result is the closest in cosine similarity (modulo HNSW's approximation).
-- Filters (agent, context, kind, salience, age) are honored.
+- Filters (agent, session, kind, salience, age) are honored.
 - The result count ≤ K (the requested limit).
 - Tombstoned memories don't appear unless `include_tombstoned=true`.
 
@@ -122,14 +122,14 @@ Tests:
 
 **MUST**: filters in RECALL / PLAN / REASON are honored.
 
-- Agent ID filter: only that agent's memories.
-- Context filter: only that context's memories.
+- Space ID filter: only that space's memories.
+- Session filter: only that session's memories.
 - Kind filter: only that kind.
 - Salience filter: only memories ≥ threshold.
 - Time filter: only memories within window.
 
 Tests:
-- Encode memories across different agents. RECALL with agent filter. Verify only the requested agent's memories appear.
+- Encode memories across different agents. RECALL with space filter. Verify only the requested space's memories appear.
 
 ## 11. Edge-traversal correctness
 

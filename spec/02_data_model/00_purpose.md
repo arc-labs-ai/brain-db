@@ -1,6 +1,6 @@
 # 02. Data Model
 
-> **TL;DR.** The four record types Brain stores and how they relate. Memory (raw text + 384-d embedding, identified by packed `MemoryId`), Entity (canonical noun, UUIDv7), Statement (typed claim — Fact, Preference, or Event — with confidence, evidence, and bi-temporal validity), Relation (typed binary edge between entities with cardinality and provenance). Statements and Relations cite Memories as evidence. Identifiers, contexts, salience, edges, memory kinds, lifecycle, and the property-graph choice live here.
+> **TL;DR.** The four record types Brain stores and how they relate. Memory (raw text + 384-d embedding, identified by packed `MemoryId`), Entity (canonical noun, UUIDv7), Statement (typed claim — Fact, Preference, or Event — with confidence, evidence, and bi-temporal validity), Relation (typed binary edge between entities with cardinality and provenance). Statements and Relations cite Memories as evidence. Identifiers, sessions, salience, edges, memory kinds, lifecycle, and the property-graph choice live here.
 
 ## Status
 
@@ -14,7 +14,7 @@
 
 ## What this spec defines
 
-The entities Brain stores and the relationships between them. This is the spec that defines what a "memory" is, what an "edge" is, what a "context" is, what identifiers look like, and how all of these evolve over time.
+The entities Brain stores and the relationships between them. This is the spec that defines what a "memory" is, what an "edge" is, what a "session" is, what identifiers look like, and how all of these evolve over time.
 
 Every other spec depends on this one. The wire protocol carries the entities defined here; the storage layer persists them; the operations manipulate them.
 
@@ -43,7 +43,7 @@ A typical flow:
 
 - The vocabulary Brain chose (memory, recall, salience, decay, consolidation, edge) and the alternatives that were rejected. ([`01_cognitive_vocabulary.md`](01_cognitive_vocabulary.md))
 - The `Memory` record — fields, identifiers, kinds (Episodic / Semantic / Consolidated), and lifecycle (Active → Tombstoned → Reclaimed). ([`02_memory.md`](02_memory.md))
-- The `Context` — agent-scoped logical groupings. ([`03_context.md`](03_context.md))
+- The `Session` — soft groupings of memories within a space. ([`03_sessions.md`](03_sessions.md))
 - The salience model — the formula that drives ranking and decay. ([`04_salience.md`](04_salience.md))
 - The eight typed edges between memories. ([`05_edges.md`](05_edges.md))
 - Entity lifecycle, resolution, and merge. ([`06_entity_lifecycle.md`](06_entity_lifecycle.md))
@@ -82,5 +82,5 @@ This is spec 02, immediately after [01. System Architecture](../01_architecture/
 01 (System Architecture) → 02 (Data Model) → 03..24 (everything else)
 ```
 
-If you came here without reading 01 first, you might be missing the context for *why* the data model is shaped this way. Consider [`../01_architecture/03_primitives.md`](../01_architecture/03_primitives.md) for the cognitive primitives this data model exists to serve.
+If you came here without reading 01 first, you might be missing the session for *why* the data model is shaped this way. Consider [`../01_architecture/03_primitives.md`](../01_architecture/03_primitives.md) for the cognitive primitives this data model exists to serve.
 

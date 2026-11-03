@@ -23,7 +23,7 @@ The supporting operations:
 
 ## 1. ENCODE
 
-**Form:** `ENCODE(text, context, salience_hint?, request_id) → memory_id`
+**Form:** `ENCODE(text, session, salience_hint?, request_id) → memory_id`
 
 The agent commits a piece of content to memory.
 
@@ -34,7 +34,7 @@ The agent commits a piece of content to memory.
 3. Allocates a slot in the vector arena.
 4. Writes a WAL record (the durability barrier).
 5. Inserts the vector into the HNSW index.
-6. Stores metadata (context, timestamp, initial salience, edges).
+6. Stores metadata (session, timestamp, initial salience, edges).
 7. Returns the `memory_id`.
 
 ### 1.2 Idempotency
@@ -69,7 +69,7 @@ This is intentional: by concentrating mutations into one well-defined primitive,
 
 ## 2. RECALL
 
-**Form:** `RECALL(cue_text, context?, top_k, confidence?, age_bound?, filters?) → [(memory_id, content, score, metadata)]`
+**Form:** `RECALL(cue_text, session?, top_k, confidence?, age_bound?, filters?) → [(memory_id, content, score, metadata)]`
 
 The agent asks for memories relevant to a cue.
 
@@ -80,7 +80,7 @@ The agent asks for memories relevant to a cue.
    - **Retrieval** (default) — ANN + lexical + memory-edge graph fused via RRF.
    - **Schemaless** — fast vector-only similarity.
 3. Executes the strategy.
-4. Filters by context, age, kind, and other criteria.
+4. Filters by session, age, kind, and other criteria.
 5. Computes confidence scores.
 6. Returns the top-k results, ranked.
 7. Asynchronously updates salience for accessed memories (fire-and-forget).
@@ -280,7 +280,7 @@ These operations manage the client-server connection. They're not cognitive prim
 - **`HELLO`** (client → server) — first frame after TCP and TLS. Declares client identity, protocol version range, requested features.
 - **`WELCOME`** (server → client) — confirms the session, returns server identity, negotiated protocol version, session_id.
 - **`AUTH`** (client → server) — authentication credentials (token, mTLS, etc.).
-- **`AUTH_OK`** (server → client) — confirms auth, binds the session to an `agent_id`.
+- **`AUTH_OK`** (server → client) — confirms auth, binds the session to an `space_id`.
 - **`PING` / `PONG`** (bidirectional) — liveness check, RTT measurement, keepalive against load balancers.
 - **`BYE`** (bidirectional) — graceful close.
 
@@ -305,7 +305,7 @@ The agent registers interest in events matching a filter; Brain pushes notificat
 
 A subscription's filter can specify:
 
-- Contexts to include.
+- Sessions to include.
 - Memory kinds (Episodic / Semantic / Consolidated).
 - Similarity threshold to a reference memory.
 - Specific memory ids to include — the narrowest dimension, useful for watching a single write's derivation (see §7.1).

@@ -72,7 +72,7 @@ It is depended on by:
 - [05. Operations](../05_operations/00_purpose.md) — operations are sent over this protocol.
 - [06. Client Interface](../06_sdk/00_purpose.md) — which is a stub pointing back here: clients implement this protocol directly.
 
-A reader who hasn't read 01 or 02 will find some terms unfamiliar (MemoryId, AgentId, RequestId). This spec uses them as defined there.
+A reader who hasn't read 01 or 02 will find some terms unfamiliar (MemoryId, SpaceId, RequestId). This spec uses them as defined there.
 
 ---
 

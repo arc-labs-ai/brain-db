@@ -45,11 +45,11 @@ never widens ENCODE's p99.
 | 1 | Exact match on `normalized_name` OR registered alias | trivial | scoped by entity-type when `type_constraint = Strict` |
 | 2 | Trigram + Jaccard ≥ threshold (default 0.85) | cheap | catches typos and minor surface variation |
 | 3 | Embedding HNSW similarity ≥ threshold (default 0.78) | medium | catches semantically equivalent surface forms ("Acme Inc" ≈ "Acme, Inc.") |
-| 4 | LLM resolution (opt-in per extractor; default off) | expensive | last-resort tie-break with surrounding context |
+| 4 | LLM resolution (opt-in per extractor; default off) | expensive | last-resort tie-break with surrounding text |
 
 When all four tiers miss with no ambiguity, the resolver falls back to **creating a new entity** (see §4 below). Detailed algorithm with thresholds and configuration is in §9.
 
-Extractor outputs feed the gauntlet with the `EntityMention.text` field plus the surrounding context. Resolver returns one of:
+Extractor outputs feed the gauntlet with the `EntityMention.text` field plus the surrounding text. Resolver returns one of:
 
 ```rust
 pub enum ResolutionOutcome {
@@ -160,7 +160,7 @@ The resolver runs a four-tier gauntlet (Exact, Fuzzy, Embedding, LLM), each more
 ```rust
 fn resolve_entity(
     candidate: &str,                  // raw string from extraction
-    context: &str,                    // surrounding text, ≤ 200 chars
+    resolution_context: &str,         // surrounding text, ≤ 200 chars
     entity_type_hint: Option<EntityTypeId>,
     config: &ResolverConfig,
 ) -> ResolutionOutcome
@@ -200,7 +200,7 @@ struct ResolverConfig {
 ### 9.3 Algorithm
 
 ```rust
-fn resolve_entity(candidate, context, hint, config) -> ResolutionOutcome {
+fn resolve_entity(candidate, resolution_context, hint, config) -> ResolutionOutcome {
     let normalized = normalize(candidate);  // trim, lowercase, collapse whitespace
 
     // Tier 1: Exact match
@@ -239,7 +239,7 @@ fn resolve_entity(candidate, context, hint, config) -> ResolutionOutcome {
 
     // Tier 3: Embedding similarity
     let emb_candidates = if config.enable_embedding {
-        let candidate_emb = embed(&format!("{} {}", candidate, &context[..min(100, context.len())]));
+        let candidate_emb = embed(&format!("{} {}", candidate, &resolution_context[..min(100, resolution_context.len())]));
         let hits = entity_hnsw.search(
             &candidate_emb,
             config.embedding_top_k,
@@ -262,7 +262,7 @@ fn resolve_entity(candidate, context, hint, config) -> ResolutionOutcome {
     if config.enable_llm {
         let llm_result = llm_resolve(
             candidate,
-            context,
+            resolution_context,
             &emb_candidates,
             config.llm_model.unwrap(),
         );
@@ -280,15 +280,15 @@ fn resolve_entity(candidate, context, hint, config) -> ResolutionOutcome {
     // Check for ambiguity: multiple high-confidence candidates from any tier?
     let all_candidates = collect_candidates(...);  // top-K with score >= threshold/2
     if all_candidates.len() >= 2 && top_two_close(&all_candidates) {
-        let audit_id = write_audit(candidate, context, &all_candidates);
+        let audit_id = write_audit(candidate, resolution_context, &all_candidates);
         return Ambiguous { audit_id, candidates: all_candidates };
     }
 
     // Fallback: Create new entity (no resolution tier matched and no ambiguity)
     let new_entity = create_entity(
         candidate,
-        hint.unwrap_or_else(|| infer_type_from_context(context)),
-        embed_for_storage(candidate, context),
+        hint.unwrap_or_else(|| infer_type_from_context(resolution_context)),
+        embed_for_storage(candidate, resolution_context),
     );
     Created { entity: new_entity }
 }
@@ -353,8 +353,8 @@ Operators can inspect audits via `ADMIN_GET_RESOLUTION_AUDIT`.
 When a resolution is `Ambiguous`, the system writes the statement with a `Pending(audit_id)` subject. A background `ambiguity_resolver` worker periodically:
 
 1. Lists pending audits.
-2. For each, checks if more context has accumulated (the same audit might have been written multiple times for the same candidate).
-3. Re-runs resolution with the accumulated context (more signal).
+2. For each, checks if more evidence has accumulated (the same audit might have been written multiple times for the same candidate).
+3. Re-runs resolution with the accumulated evidence (more signal).
 4. If still ambiguous: queues for human review (admin interface lists pending audits).
 5. If resolved: updates all pending statements with the resolved EntityId.
 

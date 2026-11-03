@@ -28,7 +28,7 @@ The client-side concerns a thick SDK would own — connection pooling, retry/bac
 
 - Connection lifecycle, keepalive, TLS — [§04.01 Design and Transport](../04_wire_protocol/01_design.md).
 - Which errors are retryable, and how the server signals back-off — [§04.07 Error Handling](../04_wire_protocol/07_error_handling.md) and [§05 Operations](../05_operations/00_purpose.md).
-- Idempotency (per-agent `RequestId`, 24 h TTL) — [§05 Operations](../05_operations/00_purpose.md) and [§10 Metadata](../10_metadata/00_purpose.md).
+- Idempotency (per-space `RequestId`, 24 h TTL) — [§05 Operations](../05_operations/00_purpose.md) and [§10 Metadata](../10_metadata/00_purpose.md).
 - Streaming framing (per-frame EOS, stream IDs, cancellation) — [§04.06 Streaming](../04_wire_protocol/06_streaming.md).
 
 There is nothing else in this section. A client author reads §04 (the bytes) and §05 (the meaning).

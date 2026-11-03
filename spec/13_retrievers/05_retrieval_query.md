@@ -7,7 +7,7 @@ It plans and executes queries over Memories, Statements, Relations,
 and Entities through one stack: validate → embed cue → fan out to
 the three always-wired retrievers (semantic + lexical + graph) →
 RRF fusion → cross-encoder rerank (always-on when the model is
-loaded; gated only by the deploy-time `config.rerank.enabled`
+loaded; gated by the deploy-time `[rerank] enabled` switch, which defaults to `false`
 switch) → filter chain → wire response. The Query Router classifies each incoming query to pick
 weights and adjust top-K hints, **not** to switch between modes —
 every retriever lane is available every time.

@@ -16,7 +16,7 @@ Tasks include:
 - The writer task.
 - Background workers (decay, consolidation).
 
-Glommio multiplexes them via cooperative async scheduling. No OS-level context switches; just future-state machine resumption.
+Glommio multiplexes them via cooperative async scheduling. No OS-level session switches; just future-state machine resumption.
 
 ## 2. The single-writer pattern
 
@@ -252,7 +252,7 @@ What can go wrong at the planner/executor level and how Brain responds.
 
 ## 2. Plan-time error: agent quota exceeded
 
-**Failure mode.** Agent has too many memories, contexts, or in-flight requests.
+**Failure mode.** Agent has too many memories, sessions, or in-flight requests.
 
 **Detection.** Planner checks quotas.
 

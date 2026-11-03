@@ -6,7 +6,7 @@ Error handling spans two layers: error codes / frame layout / propagation (cover
 
 ### 1. The ERROR frame
 
-Every error is delivered as an `ERROR` frame (opcode `0xFF`). The error frame layout is in [`05_frame_layouts.md`](05_frame_layouts.md) §50.
+Every error is delivered as an `ERROR` frame (opcode `0xFF`). The error frame layout is in [`05_frame_layouts.md`](05_frame_layouts.md) §72.
 
 An error frame has the same `stream_id` as the operation that errored — except for connection-level errors (during handshake, on stream_id 0), which use stream_id 0.
 
@@ -67,7 +67,7 @@ Authentication is mandatory on every data-plane connection — there is no anony
 - **Unknown key** (credential resolves to no minted key) → `Unauthenticated`.
 - **Revoked key** (credential names a key that was revoked via the admin surface) → `Unauthenticated`.
 - **Anonymous not allowed** (a client attempts to skip AUTH or asserts identity without a credential) → `Unauthenticated`; an operation sent before `AUTH_OK` is the separate `NotAuthenticated`.
-- A credential that authenticates but resolves to no provisioned namespace → `NamespaceUnknown` (§3.3), not `Unauthenticated`.
+- A credential that authenticates but resolves to no provisioned namespace → `PermissionDenied` (§3.3), not `Unauthenticated`. The credential was valid; the namespace it names is not one this caller may act in.
 
 The error `message` MAY distinguish these for the operator but the code is the same — clients treat any `Unauthenticated` as "refresh the credential and reconnect".
 
@@ -75,13 +75,12 @@ The error `message` MAY distinguish these for the operator but the code is the s
 
 | Code | Meaning |
 |---|---|
-| `PermissionDenied` | Agent lacks permission for this operation (incl. any attempt to read/write across the connection's namespace boundary — cross-namespace access is never permitted) |
-| `AdminPermissionRequired` | Operation requires `can_admin` |
-| `WrongShard` | Operation tried to address a different shard than the connection's |
-| `NamespaceRequired` | A write resolved to no owning namespace — fail-closed; namespace is required and there is no implicit/default namespace |
-| `NamespaceUnknown` | The connection's key (or a referenced namespace) names a namespace that has not been provisioned |
-| `WriteToSystemNamespace` | Attempt to own/modify data in the reserved read-only `brain` system namespace |
-| `ActAsDenied` | A request carried an `act_as` field the connection principal is not entitled to honor — either the principal lacks the `can_act_as` grant (invariant R1) or `act_as.namespace` is outside its `may_act` allowlist (invariant R2) |
+| `PermissionDenied` (0x0030) | The caller lacks permission for this operation. This is also the code for the namespace invariants the dispatcher enforces: a request that resolves to no owning namespace (fail-closed — there is no implicit or default namespace), a request naming a namespace that has not been provisioned, a write that resolves to the reserved read-only `brain` system namespace, and any attempt to read or write across the connection's namespace boundary. |
+| `AdminPermissionRequired` (0x0031) | Operation requires the `ADMIN` permission bit |
+| `WrongShard` (0x0032) | Operation tried to address a different shard than the connection's |
+| `ActAsDenied` (0x0033) | A request carried an `act_as` field the connection principal is not entitled to honor — either the principal lacks the `can_act_as` grant (invariant R1), `act_as.namespace` is outside its `may_act` allowlist (invariant R2), or `act_as.grant` named a bit that is not delegable or that the principal does not itself hold |
+
+The namespace failures above are deliberately **not** separately coded. Each one is a denial of access to a namespace, and a caller's recovery is the same in every case: it is not allowed to write there. A distinct code per cause would also be an information leak — "that namespace exists but is not yours" and "that namespace does not exist" are exactly the pair a prober wants told apart. `ErrorDetails.field` names which input was at fault for an operator reading a log.
 
 `ActAsDenied` is the dedicated code for a per-request-identity denial (see [`04_handshake.md`](04_handshake.md) §10a). It is distinct from `PermissionDenied` so that "this principal may not impersonate / may not act for that namespace" is never confused with "the effective agent lacks permission for this op" — the latter is resolved against the effective identity and surfaces as ordinary `PermissionDenied` (invariant R4). Per R1, an `act_as` the principal cannot honor is **hard-rejected** with `ActAsDenied`; the server never silently downgrades the op to the connection's own identity. Like every `Authorization`-category error it is **not** retryable. The transport precondition (R6 — `act_as` honored only over mTLS / a trusted network) is a deployment guarantee, not a per-request error code.
 
@@ -93,7 +92,7 @@ The error `message` MAY distinguish these for the operator but the code is the s
 | `MissingRequiredField` | A required field was absent |
 | `TextTooLarge` | Encoded text exceeds max |
 | `TextEmpty` | Encoded text was empty |
-| `BadContextId` | Context ID isn't valid for this agent |
+| `BadSessionId` | Session ID isn't valid for this space |
 | `BadMemoryKind` | Invalid memory kind (e.g., client-supplied `Consolidated`) |
 | `BadEdgeKind` | Unknown edge kind |
 | `BadStrategyHint` | Strategy hint not valid for this operation |
@@ -108,7 +107,7 @@ The error `message` MAY distinguish these for the operator but the code is the s
 | Code | Meaning |
 |---|---|
 | `MemoryNotFound` | MemoryId references a memory that doesn't exist or is forgotten/reclaimed |
-| `ContextNotFound` | ContextId not in the agent's namespace |
+| `ContextNotFound` (0x0051) | A referenced session has no registry row in the caller's space. The code name predates the session → session rename and is kept because the wire value is what clients branch on; the condition it reports is a missing **session**. |
 | `SubscriptionNotFound` | Stream isn't an active subscription |
 | `SnapshotNotFound` | Snapshot name doesn't exist |
 | `TxnNotFound` | Transaction id not active |
@@ -123,6 +122,7 @@ The error `message` MAY distinguish these for the operator but the code is the s
 | `StreamIdInUse` | Tried to open a stream with an already-active stream_id |
 | `SubscriptionLsnTooOld` | Subscription resumption LSN is past WAL retention |
 | `CardinalityViolation` (0x0065) | RELATION_CREATE would violate the declared cardinality (`one_to_one` / `many_to_one` / `one_to_many`). The existing edge must be explicitly `RELATION_SUPERSEDE`d first. |
+| `LlmCredentialMissing` (0x0066) | The write's namespace is **known** to have no usable LLM provider credential, so the write is refused up front rather than acked. See the note below. |
 
 #### 3.7 Resource exhausted (Category: `ResourceExhausted`)
 
@@ -131,10 +131,11 @@ The error `message` MAY distinguish these for the operator but the code is the s
 | `OutOfSlots` | Arena has no free slots |
 | `OutOfDisk` | Disk full |
 | `OutOfMemory` | Process memory exhausted |
-| `RateLimited` | Per-connection or per-agent rate limit exceeded |
+| `RateLimited` | Per-connection or per-space rate limit exceeded |
 | `StreamLimitExceeded` | Per-connection concurrent stream limit |
 | `ConnectionLimitExceeded` | Per-agent or per-IP connection limit |
-| `TransactionLimitExceeded` | Per-agent active-transaction limit |
+| `TransactionLimitExceeded` (0x0076) | Per-space active-transaction limit |
+| `TransactionTooLarge` (0x0077) | A transaction exceeded the per-transaction operation cap |
 
 #### 3.8 Internal (Category: `Internal`)
 
@@ -155,7 +156,17 @@ The error `message` MAY distinguish these for the operator but the code is the s
 | `Overloaded` (0x0091) | Server temporarily overloaded |
 | `Restarting` (0x0092) | Server is restarting (drain mode) |
 | `Maintenance` (0x0093) | Server is in maintenance mode |
-| `RetrieverDegraded` (0x0094) | Reserved for admin and diagnostic surfaces (`/health`, `ADMIN_STATUS`) when a shard reports a degraded retriever set — e.g. a tantivy segment corruption or a graph-store `pwritev2` failure observed after spawn. Never returned to a normal RECALL: shards refuse to spawn if a required retriever is unwired, so a wired retriever failing at query time propagates as an internal error rather than a downgrade signal. There is no client-visible recovery action; the remedy is operator intervention. |
+| `RetrieverDegraded` (0x0094) | Reserved for admin and diagnostic surfaces (`/health`, `ADMIN_STATS`) when a shard reports a degraded retriever set — e.g. a tantivy segment corruption or a graph-store `pwritev2` failure observed after spawn. Never returned to a normal RECALL: shards refuse to spawn if a required retriever is unwired, so a wired retriever failing at query time propagates as an internal error rather than a downgrade signal. There is no client-visible recovery action; the remedy is operator intervention. |
+| `LlmCredentialUnavailable` (0x0095) | The per-namespace credential could not be resolved right now — the broker was unreachable, timed out, or returned a transient failure. Retryable, unlike `LlmCredentialMissing`. |
+
+##### 3.9a The two LLM-credential codes
+
+Brain resolves the serving LLM credential **per namespace**, through the broker, at the moment a request names its namespace (see [`../11_extractors/01_extractor_tiers.md`](../11_extractors/01_extractor_tiers.md)). Two different things can go wrong, and they are coded apart because the caller's recovery differs:
+
+- `LlmCredentialMissing` (`0x0066`, **Conflict**, terminal) — the broker answered definitively that this namespace has **no** registered key. The tenant fixes this by registering one; retrying changes nothing. On the write path a definitive miss **rejects the write** rather than acking it: HyPE and extraction are mandatory, so an admitted write would land as text with no questions, entities or statements, and recall would quietly degrade with nothing telling the caller why.
+- `LlmCredentialUnavailable` (`0x0095`, **Unavailable**, retryable) — the credential could not be resolved *right now*. A cold cache or a broker blip is not evidence of a missing key, so an unresolved credential **admits** the write and lets the derivation stages resolve and retry; rejecting here would fail every write for the first request after a restart.
+
+The write-path gate that returns `LlmCredentialMissing` is cache-only — it never performs I/O, because the synchronous write path must not block on the broker — and the negative cache entry it reads is short-lived by design. It is therefore an optimisation, not a guarantee: under sparse traffic the entry has usually expired and the write is admitted. The authoritative signal for a degraded write is not this error but the per-stage outcome on the write trace and the `StageCompleted` event, where a HyPE stage that could not run reports `StageOutcome::Failed` with the reason (see [`05_frame_layouts.md`](05_frame_layouts.md) §43.2).
 
 #### 3.10 Typed-graph errors
 
@@ -185,20 +196,20 @@ Cardinality violations on RELATION_CREATE surface as the substrate-wide `Cardina
 ##### 3.10.1 Retry consequences for typed-graph codes
 
 - `QueryTimeout` (Unavailable) and `ExtractorBudgetExceeded` (ResourceExhausted) are retryable — clients should back off and retry, possibly with reduced top_k / depth.
-- `EntityAmbiguous` and `EntityMergeConflict` (Conflict) are **not** retryable on their own; resolution is a human / admin action via `ADMIN_RESOLVE_AMBIGUITY`.
+- `EntityAmbiguous` and `EntityMergeConflict` (Conflict) are **not** retryable on their own. Resolution is an out-of-band action: an operator re-points the mention with `ENTITY_MERGE` / `ENTITY_UNMERGE`, or the ambiguity-resolver sweeper re-checks the banded resolution as the entity index grows.
 - `ExtractionFailed` (Internal) is retryable; the extractor cache (§22) keeps the same body / model fingerprint so a retry usually hits cached results.
 
 ##### 3.10.2 Schema-not-declared mode
 
-When no schema has been declared for a namespace, typed-graph writes (`STATEMENT_CREATE`, `RELATION_CREATE`) and reads (`RECALL`, `STATEMENT_LIST`, the `QUERY_TRACE` introspection op, etc.) accept any predicate / relation-type qname — the registry interns it on first use with `SchemaOrigin::ImplicitFromWrite` / `RelationTypeOrigin::ImplicitFromWrite`. No `SchemaNotDeclared` error is returned for these opcodes.
+When no schema has been declared for a namespace, typed-graph writes (`STATEMENT_CREATE`, `RELATION_CREATE`) and reads (`RECALL`, `STATEMENT_LIST`, the `QUERY_TRACE` introspection op, etc.) accept any predicate / relation-type qname — the registry interns it on first use with `SchemaOrigin::ImplicitFromWrite` / `RelationTypeOrigin::ImplicitFromWrite`.
 
-`SchemaNotDeclared` remains reserved for explicit schema-introspection opcodes (e.g. `SCHEMA_GET` against a namespace that has never had one), where there is nothing to return. Its category is `Conflict`.
+There is **no `SchemaNotDeclared` code.** The gate is per-type, not per-namespace: a request naming an undeclared predicate gets `PredicateNotInSchema` in strict mode and an interned qname otherwise, and `SCHEMA_GET` against a namespace that has never had a schema is `SchemaInvalid`. Every shard also ships with the seeded `brain:` system namespace, so "no schema at all" is not a state the server can be in.
 
-The substrate cognitive primitives (the `0x00xx` namespace) are unaffected and continue to work normally in both modes.
+The cognitive primitives (the `0x00xx` namespace) are unaffected and work the same regardless of which user namespaces are declared.
 
 ### 4. ErrorDetails
 
-The optional `ErrorDetails` carries per-error context:
+The optional `ErrorDetails` carries per-error session:
 
 ```rust
 struct ErrorDetails {
@@ -442,7 +453,7 @@ Per-opcode validation, after the payload has decoded successfully.
 - `text.len()` MUST be ≤ `max_text_bytes` (default 1 MiB, configurable).
 - `request_id` MUST NOT be the all-zero `RequestId`.
 - `salience_hint`, if present, MUST be in [-1.0, +1.0]. NaN/Inf rejected.
-- `context_id` MUST exist for the agent's namespace (or the operation specifies a context name to lazy-create).
+- `session_id` is the client's own opaque `u64`; `0` is the default session and any value is acceptable.
 - `kind`, if explicitly set, MUST be a valid `MemoryKind`. Server may reject `kind = Consolidated` since clients are forbidden from creating consolidated memories.
 - Outgoing edges in the same payload MUST reference existing memories of the same agent. Cross-agent or non-existent targets return `InvalidArgument`.
 
@@ -460,7 +471,7 @@ All ENCODE rules plus:
 - `top_k` MUST be in `[1, 1000]`. Higher values capped to 1000.
 - `confidence_min`, if present, MUST be in [0.0, 1.0]. NaN/Inf rejected.
 - `age_bound`, if present, MUST be a non-negative duration.
-- `context_filter`, if present, MUST reference contexts that exist for the agent. Unknown contexts return `InvalidContext`.
+- `session_filter`, if present, MUST reference sessions that exist for the agent. Unknown sessions return `InvalidContext`.
 - `kind_filter`, if present, MUST contain only valid `MemoryKind` values.
 
 #### 16.4 PLAN, REASON
@@ -479,7 +490,7 @@ All ENCODE rules plus:
 
 - `filter` parameters validated per their types.
 - `from_lsn`, if present, MUST be ≤ the server's current LSN. Future LSNs return `InvalidArgument`.
-- `from_lsn` older than the WAL retention horizon returns `LsnTooOld`.
+- `from_lsn` older than the WAL retention horizon returns `SubscriptionLsnTooOld`.
 
 #### 16.7 TXN_*
 
@@ -504,7 +515,7 @@ Applied to every string / blob field across the `0x01xx` namespace. Limits balan
 | Field shape | Max size |
 |---|---|
 | Identifier-ish string (e.g. `canonical_name`, `predicate_name`, `schema_version`) | 256 bytes UTF-8 |
-| Free-form text (e.g. `reason`, `context`, `message`) | 4096 bytes UTF-8 |
+| Free-form text (e.g. `reason`, `session`, `message`) | 4096 bytes UTF-8 |
 | Opaque blob (e.g. `attributes_blob`, `evidence_blob`) | 64 KiB |
 | Collection (e.g. `aliases`, `candidate_ids`) | 256 elements |
 | Cursor / pagination token | 1 KiB |
@@ -569,9 +580,9 @@ Aliases are deduplicated server-side on the normalized form before insertion. A 
 | Field | Rule | Error code |
 |---|---|---|
 | `candidate_name` | non-empty after `.trim()`; ≤ 256 bytes | `InvalidArgument` |
-| `context` | ≤ 4096 bytes; handler truncates to first 100 chars before passing to resolver | `InvalidArgument` |
+| `session` | ≤ 4096 bytes; handler truncates to first 100 chars before passing to resolver | `InvalidArgument` |
 | `entity_type_hint` | `0` allowed (no hint); otherwise must be registered | `EntityTypeMismatch` |
-| schema declared? | required | `SchemaNotDeclared` |
+| schema declared? | per-type gate | `PredicateNotInSchema` / `RelationTypeNotInSchema` |
 
 **`ENTITY_LIST` (0x0137).**
 
@@ -617,7 +628,7 @@ Validation of the `QueryRequest` accepted by `QUERY_EXPLAIN` / `QUERY_TRACE`:
 - `budget_wall_time_ms`: 1 ≤ budget ≤ 60000 (60 s ceiling).
 - empty filter clauses are allowed (no-op).
 
-##### 16.9.7 Admin opcodes (`0x0170–0x0177`)
+##### 16.9.7 Admin opcodes (`0x0178`)
 
 - `audit_id`, `job_id`: non-zero UUIDv7; existence checked at handler.
 - `extractor_ids` (for `ADMIN_BACKFILL`): non-empty; all must be registered.
@@ -673,7 +684,7 @@ Operations requiring authentication are rejected with `NotAuthenticated` until A
 
 #### 17.3 Idempotency consistency
 
-If the same `RequestId` is reused with different parameters (different `text`, different `context_id`, etc.), the server returns `IdempotencyConflict`.
+If the same `RequestId` is reused with different parameters (different `text`, different `session_id`, etc.), the server returns `IdempotencyConflict`.
 
 If the same `RequestId` is reused with identical parameters, the server replays the original response.
 
@@ -689,13 +700,19 @@ Validation also enforces resource limits (server-side configurable):
 
 | Limit | Default | Error code |
 |---|---|---|
-| Max in-flight streams per connection | 256 | `TooManyStreams` |
-| Max concurrent transactions per session | 16 | `TooManyTransactions` |
-| Max operations per transaction | 1000 | `TransactionTooLarge` |
-| Max transaction wall time | 60 s | `TransactionTimeout` |
-| Max edges per ENCODE | 64 | `TooManyEdges` |
-| Max contexts per agent | 65,535 | `TooManyContexts` |
-| Frames per second per connection | 10,000 | `RateLimited` |
+| Max in-flight streams per connection | 256 | `StreamLimitExceeded` (0x0074) |
+| Max concurrent transactions per space | 16 | `TransactionLimitExceeded` (0x0076) |
+| Max operations per transaction | 1000 | `TransactionTooLarge` (0x0077) |
+| Max transaction timeout | 300 s (default 60 s) | `TransactionTimeout` (0x0062) |
+| Max results per RECALL | 1000 | `TopKOutOfRange` (0x0048) |
+| Max filter entries per RECALL / SUBSCRIBE | 1024 | `InvalidArgument` (0x0040) |
+| Max schema document size | 1 MiB | `InvalidArgument` (0x0040) |
+| Max payload bytes per frame | 16 MiB − 1 | `OversizePayload` (0x0007) |
+| Frames per second per connection | 10,000 | `RateLimited` (0x0073) |
+
+Each limit has exactly **one** code. There is no parallel `TooMany*` family: a stream-count overrun is `StreamLimitExceeded`, not `TooManyStreams`, and a transaction-count overrun is `TransactionLimitExceeded`. The two naming schemes described the same conditions, and a client that branched on the second one would never match a real error frame.
+
+Two limits that earlier revisions listed no longer exist. There is no edge cap on `ENCODE`, because `ENCODE` no longer carries edges — explicit edges are written one at a time with `LINK`, and derived edges are the write pipeline's business. There is no per-space session cap: `session_id` is an opaque client-chosen `u64`, not a server-allocated handle out of a bounded table.
 
 These are not strict invariants of the protocol; servers MAY configure higher or lower values. Clients SHOULD treat the error codes as recoverable and back off.
 

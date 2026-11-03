@@ -84,7 +84,7 @@ pub struct Config {
     /// While disabled, an opt-in rerank request hard-fails with
     /// `CapabilityNotEnabled` rather than silently falling back to RRF, so a
     /// caller is told the capability is off instead of quietly getting
-    /// different results. `GET /v1/capabilities` reports `rerank: false`.
+    /// different results. `GET_CAPABILITIES` reports `rerank: false`.
     ///
     /// Not part of the current release. The published image carries no
     /// cross-encoder model, and `enabled = true` without one is a fatal

@@ -192,7 +192,7 @@ When the queue is at capacity:
 
 ### MemoryTextIndexer
 
-Input: `IndexableMemory { id: MemoryId, text: String, agent_id: AgentId, kind: MemoryKind, created_at_unix_ms: u64 }`.
+Input: `IndexableMemory { id: MemoryId, text: String, space_id: SpaceId, kind: MemoryKind, created_at_unix_ms: u64 }`.
 
 Loop:
 
@@ -202,7 +202,7 @@ while let Some(item) = queue.recv().await {
     writer.add_document(doc! {
         memory_id => item.id.as_u64(),
         text => item.text,
-        agent_id => item.agent_id.as_bytes(),
+        space_id => item.space_id.as_bytes(),
         kind => item.kind as u64,
         created_at => item.created_at_unix_ms,
     })?;

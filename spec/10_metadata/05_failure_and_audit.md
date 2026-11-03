@@ -142,7 +142,7 @@ What can go wrong with the metadata store and how Brain responds.
 **Detection.** Edge listing finds the orphan; verification queries flag it.
 
 **Response.** A maintenance worker periodically scrubs orphan edges:
-- For each edge in `edges_out`, verify both endpoints exist.
+- For each edge in `edges`, verify both endpoints exist.
 - If an endpoint is missing, delete the edge.
 
 **Operator action.** None; the worker handles it.
@@ -376,7 +376,7 @@ proper filtering + pagination over the wire.
 
 Every audit row that attributes an operation to an actor records **who
 acted**. Ordinarily that is a single identity: the connection's
-key-derived `(namespace, agent)` plus the non-authoritative `user` tag
+key-derived `(namespace, space)` plus the non-authoritative `user` tag
 ([`../17_observability/04_admin_ops.md`](../17_observability/04_admin_ops.md)
 §12.1). Under the per-request `act_as` field — a trusted service
 principal running an op on behalf of a tenant agent, defined in
@@ -388,7 +388,7 @@ The audit provenance MUST record **both** principals:
 - the **acting service principal** — the connection's own key-derived
   identity (the `can_act_as` holder), taken from the authenticated
   session, never from the request payload; and
-- the **effective identity** — the `(namespace, agent_id)` named in
+- the **effective identity** — the `(namespace, space_id)` named in
   `act_as`, under which the op actually ran.
 
 This is delegation for audit (RFC 8693): impersonation collapses the two

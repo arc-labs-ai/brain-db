@@ -44,7 +44,7 @@ relies on the exact field set for filters.
 |---|---|---|
 | `memory_id` | bytes | `INDEXED | STORED` — 16 big-endian bytes of the packed u128 `MemoryId`. Indexed so the text-indexer worker can `delete_term` by id (idempotent upsert + FORGET); stored so the lexical retriever surfaces it in `RankedItem.id`. |
 | `text` | text | `TEXT` (tokenized + stemmed + indexed for BM25). Uses the custom analyzer from [`../13_retrievers/02_lexical_retriever.md`](../13_retrievers/02_lexical_retriever.md). |
-| `agent_id` | bytes | `INDEXED | STORED` (16-byte UUID; indexed for exact-match filter; not tokenized). |
+| `space_id` | bytes | `INDEXED | STORED` (16-byte UUID; indexed for exact-match filter; not tokenized). |
 | `kind` | u64 | `INT` indexed for filter (memory kind enum). |
 | `created_at` | u64 | `INT` indexed; unix-ms epoch. Range queries supported. |
 
@@ -122,7 +122,7 @@ Algorithm:
 2. Open a fresh `Index` in that directory with the schema from §2.
 3. Iterate the authoritative redb source for the scope:
    - Memory text scope: redb `MEMORIES_TABLE`, project `text`
-     column + metadata fields (`agent_id`, `kind`, `created_at`).
+     column + metadata fields (`space_id`, `kind`, `created_at`).
    - Statement text scope: redb `STATEMENTS_TABLE` joined with
      `ENTITIES_TABLE.canonical_name` (for `subject_name`) and
      `PREDICATES_TABLE.name` (for `predicate_name`). Compute the

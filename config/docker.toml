@@ -59,8 +59,11 @@ ef_search      = 64
 # ef_factor = 1
 
 [embedder]
-# BGE-small-en-v1.5 (384-dim). Cached under /var/lib/brain/models
-# after first download (HuggingFace).
+# BGE-small-en-v1.5 (384-dim). Ships inside the image at
+# /opt/brain/models/bge-small-en-v1.5, which the image's
+# BRAIN_EMBED_MODEL_DIR already points at. There is no download path and
+# no egress at boot; to run a different BERT-shaped model, mount it and
+# override that variable.
 model            = "bge-small-en-v1.5"
 cache_size       = 10000
 batch_size       = 32

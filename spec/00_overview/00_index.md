@@ -18,7 +18,7 @@
 |---|---|---|
 | **00** | [Overview](./00_index.md) | This document. Series structure, glossary, doc map, versioning, open-questions archive, external references. |
 | **01** | [System Architecture](../01_architecture/00_purpose.md) | The conceptual whole: cognitive primitives, the seven internal layers, hardware envelope, capacity targets, design wedges, scope and comparison, glossary. |
-| **02** | [Data Model](../02_data_model/00_purpose.md) | The four record types — Memory, Entity, Statement, Relation. Identifiers, edges, contexts, salience, kinds, lifecycle, composition, property-graph rationale, failure modes. |
+| **02** | [Data Model](../02_data_model/00_purpose.md) | The four record types — Memory, Entity, Statement, Relation. Identifiers, edges, sessions, salience, kinds, lifecycle, composition, property-graph rationale, failure modes. |
 | **03** | [Schema DSL](../03_schema/00_purpose.md) | The `.brain` schema format. Grammar, AST, validator, namespaces, versioning, system schema. |
 | **04** | [Wire Protocol](../04_wire_protocol/00_purpose.md) | Binary protocol over TCP. Unified opcode space (substrate `0x00xx` + typed-graph `0x01xx`), 32-byte fixed header, CBOR payloads, handshake, streaming, error handling. |
 | **05** | [Operations](../05_operations/00_purpose.md) | Write pipeline (`ENCODE`, `FORGET`, `LINK/UNLINK`, `MATERIALIZE_PROCEDURAL`) and read pipeline (`RECALL`, `PLAN`, `REASON`). `SUBSCRIBE`, `TXN_*`, `ADMIN_*` semantics. |

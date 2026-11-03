@@ -52,7 +52,7 @@ When an extractor mentions "Priya," the entity resolver checks (in order):
 
 1. Exact match on canonical name or alias in the entity table.
 2. Fuzzy match (trigram similarity above threshold) on canonical names.
-3. Embedding similarity (the candidate name + context embedded; nearest entity in the entity HNSW above threshold).
+3. Embedding similarity (the candidate name + session embedded; nearest entity in the entity HNSW above threshold).
 4. (Optional, configurable) LLM resolution against top-K candidates.
 
 If no match above threshold: a new Entity is created.

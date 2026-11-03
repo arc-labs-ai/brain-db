@@ -74,7 +74,7 @@ This is similar to SQL vs. low-level B-tree manipulation. Brain provides primiti
 A primitive should be callable in a single line of agent code. For example:
 
 ```
-memory_id = brain.encode(text="The user said hi", context="conversation_42")
+memory_id = brain.encode(text="The user said hi", session="conversation_42")
 results = brain.recall("user greeting")
 brain.forget(memory_id)
 ```
@@ -108,7 +108,7 @@ For each operation, Brain promises:
 Each primitive has clear semantic boundaries. Brain doesn't:
 
 - Magically infer what the agent meant beyond what was specified.
-- Apply context-aware modifications (e.g., automatic translation).
+- Apply session-aware modifications (e.g., automatic translation).
 - Filter results based on undocumented criteria.
 
 Determinism and explicitness are preferred over cleverness.
@@ -142,7 +142,7 @@ SUBSCRIBE delivers changes:
 
 - Each change is a record (memory created/updated/forgotten, edge added/removed).
 - Records arrive in WAL order.
-- Filters can narrow the stream (per agent, per context, etc.).
+- Filters can narrow the stream (per space, per session, etc.).
 
 Useful for: live agent dashboards, downstream consumers, audit logs.
 

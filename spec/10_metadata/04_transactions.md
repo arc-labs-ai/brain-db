@@ -21,7 +21,7 @@ Brain uses both.
 Used for:
 
 - Lookups during request handling.
-- Iterations over tables (e.g., listing context memories).
+- Iterations over tables (e.g., listing session memories).
 - Snapshot views for SUBSCRIBE.
 
 A read transaction sees the database as-of when it began. Modifications by concurrent write transactions are invisible until the read transaction is dropped and a new one is begun.
@@ -61,8 +61,8 @@ let mut wtxn = db.begin_write()?;
     let mut memories = wtxn.open_table(MEMORIES)?;
     let mut texts = wtxn.open_table(TEXTS)?;
     let mut idem = wtxn.open_table(IDEMPOTENCY)?;
-    let mut edges_out = wtxn.open_table(EDGES_OUT)?;
-    let mut edges_in = wtxn.open_table(EDGES_IN)?;
+    let mut edges = wtxn.open_table(EDGES_TABLE)?;
+    let mut edges_reverse = wtxn.open_table(EDGES_REVERSE_TABLE)?;
     let mut model_fps = wtxn.open_table(MODEL_FINGERPRINTS)?;
 
     memories.insert(&memory_id, &metadata)?;
@@ -70,8 +70,8 @@ let mut wtxn = db.begin_write()?;
     idem.insert(&request_id, &idem_entry)?;
 
     for edge in &edges {
-        edges_out.insert(&edge.out_key(), &edge.data())?;
-        edges_in.insert(&edge.in_key(), &edge.data())?;
+        edges.insert(&edge.out_key(), &edge.data())?;
+        edges_reverse.insert(&edge.in_key(), &edge.data())?;
     }
 
     if !model_fps.contains(&fingerprint)? {
@@ -160,7 +160,7 @@ A single write transaction can update multiple tables atomically:
 
 - The `memories` table.
 - The `texts` table.
-- The `edges_out` and `edges_in` tables.
+- The `edges` and `edges_reverse` tables.
 - The `idempotency` table.
 
 After commit, all tables reflect the changes. Before commit, none do (from a read transaction's perspective).
@@ -335,7 +335,7 @@ In practice, this should rarely happen — reclamation happens after FORGET + gr
 
 Different shards have independent metadata stores. No cross-shard transactions.
 
-For operations that span shards (very rare, e.g., a hypothetical cross-agent edge), Brain doesn't support them. Each shard's writes are independent.
+For operations that span shards (very rare, e.g., a hypothetical cross-space edge), Brain doesn't support them. Each shard's writes are independent.
 
 ## 11. The reader-cache pattern
 
@@ -355,7 +355,7 @@ Brain sometimes caches results across multiple read transactions for the same re
 
 ## 12. The "writer pause" pattern
 
-A long maintenance operation (e.g., context deletion of a large context) might want to pause normal writes briefly. Brain doesn't have a built-in mechanism for this; instead, the maintenance worker does the work in chunks:
+A long maintenance operation (e.g., session deletion of a large session) might want to pause normal writes briefly. Brain doesn't have a built-in mechanism for this; instead, the maintenance worker does the work in chunks:
 
 - Open a write transaction.
 - Process N records.

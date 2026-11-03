@@ -1,6 +1,6 @@
 # 10.03 Substrate Tables
 
-The substrate-layer redb tables: memory metadata, edges, contexts, idempotency, and text. These are the tables that exist for every shard regardless of whether a typed-graph schema has been declared.
+The substrate-layer redb tables: memory metadata, edges, sessions, idempotency, and text. These are the tables that exist for every shard regardless of whether a typed-graph schema has been declared.
 
 ## Memory Metadata Table
 
@@ -13,8 +13,8 @@ struct MemoryMetadata {
     // Identity (owner scope)
     memory_id: MemoryId,                  // 16 bytes (also the key)
     namespace_id: NamespaceId,            // 4 bytes; owning tenant. 0 = reserved `brain` system namespace
-    agent_id: AgentId,                    // 16 bytes; owning agent
-    context_id: ContextId,                // 8 bytes
+    space_id: SpaceId,                    // 16 bytes; owning space
+    session_id: SessionId,                // 8 bytes
     slot_id: u64,                         // 8 bytes (effective 48-bit)
     slot_version: u32,                    // 4 bytes
 
@@ -28,6 +28,7 @@ struct MemoryMetadata {
     forgot_at: Option<u64>,               // 8+1 bytes
     tombstoned_at: Option<u64>,           // 8+1 bytes
     consolidated_at: Option<u64>,         // 8+1 bytes (when promoted to Consolidated)
+    occurred_at: Option<u64>,             // 8+1 bytes; client EVENT time, distinct from created_at
 
     // Salience
     salience: f32,                        // 4 bytes (current)
@@ -43,10 +44,22 @@ struct MemoryMetadata {
     // Counters
     edges_out_count: u32,                 // 4 bytes (denormalized; updated on edge changes)
     edges_in_count: u32,                  // 4 bytes
+
+    // Dedup index back-reference
+    content_hash: Option<[u8; 32]>,       // Some(BLAKE3(text)) iff the write deduplicated
+
+    // Provenance
+    encoded_at_lsn: u64,                  // WAL position of the ENCODE that wrote this row; 0 = unknown
 }
 ```
 
-Total: ~140 bytes per row. With redb's per-row overhead, ~150 bytes effective.
+Three fields are worth more than their byte count:
+
+- **`occurred_at`** is the client-supplied **event** time — when the memory's content actually happened — and is deliberately a separate field from `created_at` (the server's write time). Collapsing the two would make "what happened last Tuesday" unanswerable for anything ingested later, and it is `occurred_at` that drives the recency ranking term.
+- **`content_hash`** is `Some` only when the write took the dedup path. It exists so a FORGET or a slot reclamation can evict the matching `fingerprints` row **in the same write transaction as the tombstone**, rather than leaving a dedup entry pointing at a memory that no longer exists. It is `None` on the dedup-off path so that path does not pay 32 bytes per row.
+- **`encoded_at_lsn`** is the WAL position of the ENCODE that created the row, surfaced to clients as `MemoryResult.lsn`. It is what lets a caller chain `recall → subscribe --from-lsn lsn+1` and follow one memory's downstream events from the moment it was written. `0` means unknown — a deployment with no WAL sink.
+
+Total: ~180 bytes per row. With redb's per-row overhead, ~190 bytes effective.
 
 For 1M memories: ~150 MB.
 
@@ -55,11 +68,11 @@ For 1M memories: ~150 MB.
 #### 2.1 Identity
 
 - `memory_id` — primary key. Repeated as a row field for convenience (rkyv decoders can return the row including the key).
-- `namespace_id` — owning tenant (the outer half of the `(namespace, agent)` owner scope). `0` is the reserved `brain` system namespace, which owns only seeded rows. Stamped by the writer from the authenticated connection's scope (fail-closed by construction). Distinct from the qname namespace of any *type* the memory's downstream typed-graph rows reference.
-- `agent_id` — owning agent (the inner half of the owner scope). Searches typically filter by agent.
-- `context_id` — bucket the memory belongs to (one of an agent's contexts).
+- `namespace_id` — owning tenant (the outer half of the `(namespace, space)` owner scope). `0` is the reserved `brain` system namespace, which owns only seeded rows. Stamped by the writer from the authenticated connection's scope (fail-closed by construction). Distinct from the qname namespace of any *type* the memory's downstream typed-graph rows reference.
+- `space_id` — owning agent (the inner half of the owner scope). Searches typically filter by agent.
+- `session_id` — bucket the memory belongs to (one of an space's sessions).
 
-The `memories` primary table is `MemoryId`-keyed; the `(namespace_id, agent_id)` owner scope lives on the row value and is the leading prefix of the per-tenant `memories_by_agent_timeline` index ([`02_table_layout.md`](02_table_layout.md) §4), so a timeline scan for one `(namespace, agent)` can never traverse another tenant's rows.
+The `memories` primary table is `MemoryId`-keyed; the `(namespace_id, space_id)` owner scope lives on the row value and is the leading prefix of the per-tenant `memories_by_agent_timeline` index ([`02_table_layout.md`](02_table_layout.md) §4), so a timeline scan for one `(namespace, space)` can never traverse another tenant's rows.
 - `slot_id` and `slot_version` — locate the vector in the arena. Version disambiguates reused slots.
 
 #### 2.2 Kind
@@ -116,19 +129,19 @@ The most common access. O(log N) lookup.
 
 #### 3.2 By agent
 
-To list an agent's memories: a range scan of `memories` by MemoryId range corresponding to the agent. Since MemoryIds are agent-clustered (the high bits encode agent), this is a tight range.
+To list an space's memories: a range scan of `memories` by MemoryId range corresponding to the agent. Since MemoryIds encode their shard in the high bits, this is a tight range.
 
-Note — looking at the MemoryId layout ([02.02 Memory](../02_data_model/02_memory.md)) — MemoryIds are not strictly agent-clustered. The shard_id_runtime is in the high bits, then slot_id, then slot_version. So MemoryIds within a shard are slot-id-ordered (which is roughly creation-time-ordered).
+Note — looking at the MemoryId layout ([02.02 Memory](../02_data_model/02_memory.md)) — MemoryIds are not strictly space-clustered. The shard_id_runtime is in the high bits, then slot_id, then slot_version. So MemoryIds within a shard are slot-id-ordered (which is roughly creation-time-ordered).
 
-To list an agent's memories, an auxiliary index would be required. Brain does not currently have one in the table layout above; an `(AgentId, MemoryId) → ()` index table would need to be added. This is a [`../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md) item.
+To list an space's memories, an auxiliary index would be required. Brain does not currently have one in the table layout above; an `(SpaceId, MemoryId) → ()` index table would need to be added. This is a [`../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md) item.
 
-In v1, listing an agent's memories means scanning all memories in the shard and filtering by agent_id. For shards with thousands of agents, this is wasteful. For shards with one or few agents per shard, it's fine.
+In v1, listing an space's memories means scanning all memories in the shard and filtering by space_id. For shards with thousands of spaces, this is wasteful. For shards with one or few spaces per shard, it's fine.
 
-#### 3.3 By context
+#### 3.3 By session
 
-`(AgentId, ContextId, MemoryId) → ()` index would enable this efficiently. Same open question as agent index.
+`(SpaceId, SessionId, MemoryId) → ()` index would enable this efficiently. Same open question as agent index.
 
-For v1, `RECALL` with a context filter applies the filter post-search; no metadata-side index is used for it.
+For v1, `RECALL` with a session filter applies the filter post-search; no metadata-side index is used for it.
 
 #### 3.4 Range scans by time
 
@@ -181,7 +194,7 @@ When a slot is reclaimed:
 
 1. The row is deleted from `memories`.
 2. The text is deleted from `texts`.
-3. Edges referencing the memory are deleted from `edges_out` and `edges_in`.
+3. Edges referencing the memory are deleted from `edges` and `edges_reverse`.
 4. The slot's version in `slot_versions` is incremented.
 
 This is a single redb transaction. After commit, the memory is fully gone.
@@ -241,10 +254,10 @@ From [02.05 Edges](../02_data_model/05_edges.md):
 
 Brain maintains two index tables:
 
-- `edges_out: (source, kind, target) → EdgeData`
-- `edges_in: (target, kind, source) → EdgeData`
+- `edges: (from, kind, to, disambiguator) → EdgeData`
+- `edges_reverse: (to, kind, from, disambiguator) → EdgeData`
 
-Same data, two indexes. Forward queries use `edges_out`; reverse queries use `edges_in`.
+Same data, two indexes. Forward queries use `edges`; reverse queries use `edges_reverse`.
 
 The duplication doubles edge storage but enables both directions to be answered with a single B-tree range scan.
 
@@ -289,11 +302,11 @@ fn link(txn: &mut WriteTxn, edge: Edge) -> Result<()> {
     let key_in = (edge.target, edge.kind, edge.source);
     let value = EdgeData { weight: edge.weight, ... };
 
-    let edges_out = txn.open_table(EDGES_OUT)?;
-    let edges_in = txn.open_table(EDGES_IN)?;
+    let edges = txn.open_table(EDGES_TABLE)?;
+    let edges_reverse = txn.open_table(EDGES_REVERSE_TABLE)?;
 
-    edges_out.insert(&key_out, &value)?;
-    edges_in.insert(&key_in, &value)?;
+    edges.insert(&key_out, &value)?;
+    edges_reverse.insert(&key_in, &value)?;
 
     // Update edge counts in memories table
     update_count(txn, edge.source, "edges_out_count", +1)?;
@@ -312,8 +325,8 @@ fn unlink(txn: &mut WriteTxn, edge: EdgeKey) -> Result<()> {
     let key_out = (edge.source, edge.kind, edge.target);
     let key_in = (edge.target, edge.kind, edge.source);
 
-    edges_out.remove(&key_out)?;
-    edges_in.remove(&key_in)?;
+    edges.remove(&key_out)?;
+    edges_reverse.remove(&key_in)?;
 
     update_count(txn, edge.source, "edges_out_count", -1)?;
     update_count(txn, edge.target, "edges_in_count", -1)?;
@@ -324,24 +337,24 @@ fn unlink(txn: &mut WriteTxn, edge: EdgeKey) -> Result<()> {
 
 ### 7. Forward queries
 
-"What does memory X cause?" → range scan of `edges_out`:
+"What does memory X cause?" → range scan of `edges`:
 
 ```rust
 let range_start = (X, EdgeKind::Caused, MemoryId::MIN);
 let range_end = (X, EdgeKind::Caused, MemoryId::MAX);
-let results: Vec<_> = edges_out.range(range_start..range_end)?.collect();
+let results: Vec<_> = edges.range(range_start..range_end)?.collect();
 ```
 
 The B-tree's range scan returns results in target-id order, with cost proportional to the number of returned edges.
 
 ### 8. Reverse queries
 
-"What was caused by X?" → range scan of `edges_in`:
+"What was caused by X?" → range scan of `edges_reverse`:
 
 ```rust
 let range_start = (X, EdgeKind::Caused, MemoryId::MIN);
 let range_end = (X, EdgeKind::Caused, MemoryId::MAX);
-let results: Vec<_> = edges_in.range(range_start..range_end)?.collect();
+let results: Vec<_> = edges_reverse.range(range_start..range_end)?.collect();
 ```
 
 Symmetric to forward query, just on the other table.
@@ -353,7 +366,7 @@ Symmetric to forward query, just on the other table.
 ```rust
 let range_start = (X, EdgeKind::MIN, MemoryId::MIN);
 let range_end = (X+1, EdgeKind::MIN, MemoryId::MIN);  // next source
-let results: Vec<_> = edges_out.range(range_start..range_end)?.collect();
+let results: Vec<_> = edges.range(range_start..range_end)?.collect();
 ```
 
 Returns all 8 edge kinds for source X. Sorted by kind, then target.
@@ -390,8 +403,8 @@ For applications that want multi-edges (e.g., multiple instances of REFERENCES w
 
 When a memory is reclaimed, all its edges (incoming and outgoing) must be removed. The procedure:
 
-1. Range-scan `edges_out` for the memory: delete all matches.
-2. Range-scan `edges_in` for the memory: delete all matches.
+1. Range-scan `edges` for the memory: delete all matches.
+2. Range-scan `edges_reverse` for the memory: delete all matches.
 3. For each edge deleted, decrement the edge counts on the other endpoint.
 
 This is a single transaction. For memories with many edges, the transaction is large.
@@ -431,179 +444,134 @@ The query planner ([12. Query Optimizer](../12_query_optimizer/00_purpose.md)) c
 
 Brain is well-suited for narrow, common patterns (one or two hops); not for arbitrary graph traversal queries.
 
-## Contexts Table
+## Space & Session Registry Tables
 
-Contexts are named buckets that memories belong to (one per memory). They scope queries and shape access patterns. This section specifies their storage.
+Spaces and sessions are **registries**: derived, recomputable view state that summarizes data which stays authoritative in the memory and graph tables. Nothing correctness-bearing reads them. This section specifies their storage.
 
 ### 1. The model
 
-From [02.03 Context](../02_data_model/03_context.md):
+From [`../02_data_model/03_sessions.md`](../02_data_model/03_sessions.md) and [`../20_tenancy/00_purpose.md`](../20_tenancy/00_purpose.md):
 
-- A context belongs to an agent.
-- A context has a unique-within-agent name (e.g., "project_alpha", "personal_journal").
-- A context has a `ContextId` (8 bytes).
-- A memory belongs to exactly one context.
+- A **space** is the isolation unit within a namespace. Its 16-byte `space_id` is `UUIDv5(namespace, space_string)` — a non-invertible derivation, so the registry row is the only place the original string survives.
+- A **session** is a grouping within a space. Its `session_id` is a client-chosen opaque `u64`; `0` is the default session.
+- A memory belongs to exactly one `(space, session)`.
 
 ### 2. Three tables
 
-#### 2.1 `contexts: ContextId → ContextMetadata`
+#### 2.1 `spaces: (namespace_id, space_id) → SpaceMetadata`
 
-The full context records.
+20-byte key: `[namespace_id (4, BE) | space_id (16)]`. The leading namespace bytes make one namespace's spaces a contiguous keyspace, so `SPACE_LIST` is a range scan over a 4-byte prefix.
 
 ```rust
-struct ContextMetadata {
-    context_id: ContextId,
-    agent_id: AgentId,
-    name: String,                  // Human-readable name, scoped to agent
-    created_at: u64,
-    last_active_at: u64,
-    memory_count: u32,             // Denormalized; updated periodically
-    description: Option<String>,
-    tags: Vec<String>,
+struct SpaceMetadata {
+    space_string: String,          // the structured selector, e.g. "support-bot:user123"
+    created_at_unix_nanos: u64,
+    last_active_unix_nanos: u64,
+    memory_count: u64,             // denormalized; display-only
+    session_count: u32,            // denormalized; display-only
+    metadata: Option<Vec<u8>>,     // opaque caller blob (quota hints, labels)
 }
 ```
 
-Lookup by ContextId.
+`space_string` is empty when a space was first seen without one — a raw key-bound space that was never named by an `act_as` selector.
 
-#### 2.2 `context_names: (AgentId, &str) → ContextId`
+#### 2.2 `sessions: (namespace_id, space_id, session_id) → SessionMetadata`
 
-The name → ID index, scoped to agent.
-
-Lookup: "in agent A, what's the ContextId of context named 'foo'?" → range query.
-
-#### 2.3 `agent_contexts: (AgentId, ContextId) → ()`
-
-The membership index. Lists all contexts an agent has.
-
-Lookup: "what contexts does agent A have?" → range query for prefix `(A, ...)`.
-
-### 3. Why three tables
-
-Each enables a different access pattern:
-
-- By ID: `contexts`.
-- By name: `context_names`.
-- By agent: `agent_contexts`.
-
-A single denormalized table couldn't efficiently support all three. Three small tables are cheaper than one big one with multiple indexes.
-
-### 4. ContextId allocation
-
-A ContextId is an 8-byte UUIDv7-derived identifier:
-
-```
-ContextId = pack(timestamp_ms_high48, random_low16)
-```
-
-This gives:
-- ~2^48 contexts globally addressable.
-- Time-ordered prefix for ergonomic listing.
-
-Allocated when a context is created (first memory in a new context, or explicit `ADMIN_CONTEXT_CREATE`).
-
-### 5. Lazy creation
-
-When ENCODE specifies a context name that doesn't exist:
-
-1. Try lookup `(agent_id, name)` in `context_names`.
-2. If found, use the ContextId.
-3. If not found, allocate a new ContextId and insert into all three tables.
-
-This is done within the ENCODE transaction. The context creation is atomic with the memory creation.
-
-### 6. Implicit context
-
-If ENCODE doesn't specify a context, Brain uses a special "default" context per agent. The default is created on first memory:
-
-- Lookup `(agent_id, "_default")` in `context_names`.
-- If not found, create.
-
-The leading underscore distinguishes implicit contexts from user-named ones. Brain refuses creation of contexts with names starting with `_` from clients (reserved namespace).
-
-### 7. Per-agent context limits
-
-Brain enforces:
-
-- Soft limit: 1000 contexts per agent.
-- Hard limit: 65,535 contexts per agent (matches a 16-bit count field).
-
-Beyond the soft limit, ENCODE logs a warning. Beyond the hard limit, ENCODE fails with `TooManyContexts`.
-
-These limits are configurable. Most agents have 1-10 contexts; a few have hundreds. Operationally, agents with thousands of contexts are unusual and may indicate misuse.
-
-### 8. Context renaming
-
-`ADMIN_CONTEXT_RENAME` can rename a context:
-
-1. Look up the old `(agent_id, old_name)` in `context_names`.
-2. Verify the new `(agent_id, new_name)` doesn't exist.
-3. Delete the old name entry.
-4. Insert the new name entry.
-5. Update the `name` field in `contexts`.
-
-Rename is atomic. Memories' `context_id` references are unchanged (they don't include the name).
-
-### 9. Context deletion
-
-`ADMIN_CONTEXT_DELETE` is heavy:
-
-1. Verify all memories in the context are forgotten or moved out.
-2. Delete from `contexts`, `context_names`, `agent_contexts`.
-
-If the context still has memories, the operation fails. The operator must FORGET the memories or move them first.
-
-### 10. Memories per context
-
-The `memory_count` field in `ContextMetadata` is denormalized. Updated by:
-
-- Periodic recount by a maintenance worker (true count from `memories` table).
-- Incremental updates on ENCODE / FORGET (best-effort; may drift).
-
-For exact counts (rare in practice), the count is recomputed from `memories`. For UI displays, the denormalized count is fine.
-
-### 11. Context iteration
-
-For "list contexts for agent A":
+28-byte key: `[namespace_id (4, BE) | space_id (16) | session_id (8, BE)]`.
 
 ```rust
-let contexts: Vec<ContextId> = agent_contexts
-    .range((A, ContextId::MIN)..(A_next, ContextId::MIN))?
-    .map(|(k, _)| k.1)
-    .collect();
+struct SessionMetadata {
+    created_at_unix_nanos: u64,
+    last_active_unix_nanos: u64,
+    title: Option<String>,         // optional caller-supplied display title
+    memory_count: u32,             // denormalized; display-only
+}
 ```
 
-Returns ContextIds in time-order (earliest first). Pagination is straightforward.
+The scope lives in the **key**, not the value. That is what makes isolation structural: a range scan for one `(namespace, space)` physically cannot walk into another's rows, with no filter to forget to apply.
 
-### 12. Context membership lookup
+#### 2.3 `session_by_scope: (namespace_id, space_id, last_active, session_id) → ()`
 
-"Is context C in agent A?":
+36-byte key. The ordering index: a reverse range scan over the 20-byte `(namespace, space)` prefix yields `SESSION_LIST`'s newest-first-by-activity order directly.
+
+### 3. Why these three
+
+Each answers a question the system actually asks:
+
+- *"What are this namespace's spaces?"* → `spaces`, range scan.
+- *"What is this session's state?"* → `sessions`, point lookup.
+- *"What are my recent conversations?"* → `session_by_scope`, reverse range scan.
+
+There is **no name → id table and no membership table**. Both existed in a design where the server allocated session ids behind client-supplied names; with a client-chosen `u64` there is no name to resolve and nothing to intern, and membership is implied by the key prefix — `(namespace, space)` already bounds the scan. Paying for an ordering index at write time is cheaper than sorting a scope's sessions on every read, which is why that one remains.
+
+### 4. Id derivation and allocation
+
+Brain allocates **neither** id.
+
+- `space_id` is derived: `UUIDv5(namespace, space_string)`, computed at request ingress. The same string always derives the same id, so a client never has to store a handle.
+- `session_id` is the client's own `u64`. There is no allocator, no monotonic counter to exhaust, and no gap-free guarantee to maintain.
+
+### 5. Creation — implicit and explicit
+
+Both rows are created two ways, and both are first-class:
+
+1. **Implicitly, on first write.** The apply path upserts the space and session rows in the *same* redb write transaction as the memory, stamping `created_at` on first sight and bumping `last_active` and the counts thereafter. Because it is one transaction, the registry cannot drift from the data on a crash: either both landed or neither did. WAL recovery replays the same helper, so a recovered shard rebuilds the registry rather than inheriting a stale one.
+2. **Explicitly**, via `SPACE_CREATE` / `SESSION_CREATE`. Idempotent — a create for an existing row returns it with `created = false`. This is for attaching metadata or a title ahead of the first write, never a precondition for writing.
+
+### 6. The default session
+
+`session_id = 0` is the default. It is implicit for every space — no row needs to exist for it to be writable — and memories encoded without an explicit session land there. It is never deletable.
+
+There is no reserved-name convention (`_default` or otherwise), because there are no server-side session names to reserve.
+
+### 7. Limits
+
+There is no per-space session cap. `session_id` is the client's `u64`, not a server-allocated handle out of a bounded table, so there is nothing to exhaust and no `TooManyContexts`-style error. A space with an implausible number of sessions is an operational signal, not a protocol condition.
+
+### 8. Renaming
+
+Nothing in these tables is renameable. A space's string is the input its id was derived from — changing it would derive a different space, which is a different space. A session's `title` is display metadata set at create time.
+
+The admin ops `ADMIN_CREATE_SESSION` / `ADMIN_RENAME_SESSION` are a separate operator surface that carries a `name`; they are admin-gated and not part of the tenant-facing registry.
+
+### 9. Deletion
+
+`SESSION_DELETE` and `SPACE_DELETE` are **cascades**, not unlinks, and they share one implementation:
+
+1. Range-scan the `(namespace, space)` memory timeline — optionally narrowed to one session — to collect the live memory ids.
+2. Tombstone each through the single `submit(Write)` path.
+3. Each tombstone fans out post-commit to the FORGET cascade, which tears down the backing entity / statement / relation rows.
+
+So a scope delete reuses the forget machinery rather than re-implementing graph teardown. `SESSION_DELETE` defaults to a soft tombstone (`hard = true` zeroes immediately); `SPACE_DELETE` is GDPR erasure and is always hard. Deleting a scope with no registry row is a lenient success with `existed = false`.
+
+The v1 cascade is synchronous — it tombstones every matching memory in one pass. A very large delete should eventually chunk behind a resumable cursor.
+
+### 10. Denormalized counts
+
+`memory_count` and `session_count` are **display-only**. They are updated incrementally on write and corrected by the counter-reconciliation maintenance worker, which recomputes the true values from the authoritative tables. Nothing branches on them; an exact count comes from the data, not the registry.
+
+### 11. Listing
+
+`SESSION_LIST` for one `(namespace, space)`:
 
 ```rust
-let exists = agent_contexts.get(&(A, C))?.is_some();
+let (lo, hi) = session_scope_range_bounds(namespace_id, space_id);
+let sessions = session_by_scope.range(lo..=hi)?.rev();   // newest-first by last_active
 ```
 
-O(log N) lookup.
+`SPACE_LIST` for one namespace is the analogous forward scan over `spaces`. In v1 it covers only the caller-shard's spaces, which is why the response carries `cross_shard_complete` — a client treats `false` as "this listing is partial", not as an error.
 
-### 13. Cross-agent context separation
+### 12. Cross-space separation
 
-Two agents can each have a context named "personal":
+Two namespaces can each have a space string `"personal"`. Their derived `space_id`s differ, because the derivation takes the namespace as the UUIDv5 namespace argument. Their rows sit under different key prefixes and their memories are separate; there is no global space namespace and nothing for tenants to coordinate.
 
-- Agent A's "personal" → ContextId X.
-- Agent B's "personal" → ContextId Y.
+### 13. Total table sizes
 
-These are distinct contexts. Their memories are separate. There's no global namespace.
+For typical workloads, all three are small relative to memories and edges:
 
-This makes context naming intuitive — agents don't have to coordinate names.
-
-### 14. Total table sizes
-
-For typical workloads:
-
-- `contexts`: hundreds to tens of thousands per shard. < 10 MB.
-- `context_names`: same. < 10 MB.
-- `agent_contexts`: same. < 5 MB.
-
-These tables are small relative to memories and edges. Their performance overhead is negligible.
+- `spaces`: up to ~10⁶ rows per namespace at the tenancy target; tens of MB.
+- `sessions`: proportional to conversations; tens of MB.
+- `session_by_scope`: 36 bytes per session plus B-tree overhead; a few MB.
 
 ## Idempotency Table
 
@@ -678,7 +646,7 @@ The lookup is in a read transaction (cheap, MVCC). The act is in a write transac
 
 The lookup above shows a bare-`RequestId` key, which is correct **only** because a connection's identity is fixed for its whole life. When a request carries the `act_as` field — a trusted service principal running the op on behalf of a tenant agent, defined in [`../04_wire_protocol/04_handshake.md`](../04_wire_protocol/04_handshake.md) §"Per-request identity (`act_as`)" — that assumption no longer holds: one service principal issues ops for many effective identities over one shared connection.
 
-Therefore, under `act_as`, the idempotency key MUST be scoped by the **effective** `(namespace_id, agent_id)` named in `act_as`, not by the connection principal — the key is the composite `(namespace_id, agent_id, RequestId)`, and shard routing likewise keys on the effective agent (see §12). Consistent with [`../05_operations/02_write_pipeline.md`](../05_operations/02_write_pipeline.md) §4. This is a load-bearing safety rule: with a bare-RequestId key, a service principal that reuses a RequestId across two tenants would **collide**, replaying tenant A's cached response to tenant B — a cross-tenant data leak, invisible because the pool and the idempotency table are shared. Scoping the key by the effective identity makes the collision impossible; the two tenants land on disjoint keys.
+Therefore, under `act_as`, the idempotency key MUST be scoped by the **effective** `(namespace_id, space_id)` named in `act_as`, not by the connection principal — the key is the composite `(namespace_id, space_id, RequestId)`, and shard routing likewise keys on the effective agent (see §12). Consistent with [`../05_operations/02_write_pipeline.md`](../05_operations/02_write_pipeline.md) §4. This is a load-bearing safety rule: with a bare-RequestId key, a service principal that reuses a RequestId across two tenants would **collide**, replaying tenant A's cached response to tenant B — a cross-tenant data leak, invisible because the pool and the idempotency table are shared. Scoping the key by the effective identity makes the collision impossible; the two tenants land on disjoint keys.
 
 ### 4. The replay safety
 
@@ -808,7 +776,7 @@ Currently, Brain enforces idempotency-required for:
 - FORGET
 - LINK
 - UNLINK
-- UPDATE_KIND, UPDATE_CONTEXT
+- UPDATE_KIND, UPDATE_SESSION
 - TXN_BEGIN, TXN_COMMIT
 
 For these operations, RequestId is mandatory. The wire protocol's validation checks for it.
@@ -879,13 +847,13 @@ Brain supports **opt-in fingerprint deduplication** at ENCODE time. When the cal
 
 #### 6.1. Scope
 
-Fingerprint dedup is scoped per `(shard, agent_id, context_id)`. The same text encoded by:
+Fingerprint dedup is scoped per `(shard, space_id, session_id)`. The same text encoded by:
 
-- the same agent in the same context → **dedup hit** (returns existing `MemoryId`).
-- the same agent in a *different* context → **no hit** (different memory, allocated fresh). This preserves the spec's original observation that the same utterance in different episodic contexts is semantically different.
-- a different agent → **no hit**. The fingerprint table is partitioned by `agent_id` for both privacy (one agent's encoded text never matches against another's index) and ownership clarity (each agent owns its own dedup index).
+- the same agent in the same session → **dedup hit** (returns existing `MemoryId`).
+- the same agent in a *different* session → **no hit** (different memory, allocated fresh). This preserves the spec's original observation that the same utterance in different episodic sessions is semantically different.
+- a different space → **no hit**. The fingerprint table is partitioned by `space_id` for both privacy (one space's encoded text never matches against another's index) and ownership clarity (each agent owns its own dedup index).
 
-Cross-shard dedup is not supported. The fingerprint table is per-shard, and routing already hashes the agent to a single shard, so all of that agent's memories live in one shard's table.
+Cross-shard dedup is not supported. The fingerprint table is per-shard, and routing already hashes the space to a single shard, so all of that space's memories live in one shard's table.
 
 #### 6.2. Hash
 
@@ -898,7 +866,7 @@ Dedup only hits **Active** memories. If the matching memory has been tombstoned 
 (a) check the memory's state on every lookup (simpler), or
 (b) evict the fingerprint entry on every FORGET / reclamation (faster lookup, more write paths to maintain).
 
-v1 chooses **(b)** — eviction on FORGET / reclamation — because the read path is the hot path. `do_forget` removes the matching `(agent_id, context_id, content_hash)` entry in the same write transaction as the tombstone.
+v1 chooses **(b)** — eviction on FORGET / reclamation — because the read path is the hot path. `do_forget` removes the matching `(space_id, session_id, content_hash)` entry in the same write transaction as the tombstone.
 
 #### 6.4. Default
 
@@ -906,7 +874,7 @@ Dedup is **off by default**. Callers that want it must opt in explicitly. The de
 
 #### 6.5. Storage cost
 
-The fingerprint table adds, per Active memory under dedup, one row of `agent_id(16) + context_id(8) + content_hash(32) + memory_id(16) = 72 bytes`. At 1M Active memories per shard with 100% dedup-on, this is ~72 MiB of additional redb storage — comfortably within the spec's metadata-budget envelope.
+The fingerprint table adds, per Active memory under dedup, one row of `space_id(16) + session_id(8) + content_hash(32) + memory_id(16) = 72 bytes`. At 1M Active memories per shard with 100% dedup-on, this is ~72 MiB of additional redb storage — comfortably within the spec's metadata-budget envelope.
 
 #### 6.6. Refcount?
 

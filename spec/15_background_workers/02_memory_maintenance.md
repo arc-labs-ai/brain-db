@@ -15,7 +15,7 @@ Decay over time:
 - Semantic memories lose salience slower (default half-life: 365 days).
 - Consolidated memories: 90-day half-life.
 
-Memories below a salience threshold are candidates for soft auto-FORGET (off by default; opt-in per agent).
+Memories below a salience threshold are candidates for soft auto-FORGET (off by default; opt-in per space).
 
 ### 2. The decay formula
 
@@ -244,21 +244,21 @@ In the system:
 ### 19. Why consolidate
 
 Without consolidation:
-- The agent's memory is a flat collection of episodic events.
+- The space's memory is a flat collection of episodic events.
 - RECALL returns relevant episodes one at a time.
 - The agent has to re-aggregate insights itself.
 
 With consolidation:
 - Higher-level summaries are first-class memories.
 - RECALL can return the consolidated memory plus its sources.
-- The agent gets pre-aggregated context.
+- The agent gets pre-aggregated session.
 
 ### 20. The cycle
 
 Every 5 minutes (configurable):
 
-1. The worker iterates per-context.
-2. For each context, find clusters of memories that warrant consolidation.
+1. The worker iterates per-session.
+2. For each session, find clusters of memories that warrant consolidation.
 3. For each cluster, generate a summary (via an LLM call, see "The summarization" below).
 4. Encode the summary as a Consolidated memory.
 5. Add DERIVED_FROM edges to source memories.
@@ -267,14 +267,14 @@ Every 5 minutes (configurable):
 
 A cluster is a group of memories that:
 
-- Share a context.
+- Share a session.
 - Are episodic.
 - Are temporally close (e.g., within a 24-hour window).
 - Are similar in vector space (cosine similarity > 0.6 within the cluster).
 
 Algorithms:
 
-- Pull recent episodic memories from the context.
+- Pull recent episodic memories from the session.
 - Group by vector similarity using a simple density-based clustering (DBSCAN-style).
 - A cluster needs at least 5 memories (configurable threshold).
 
@@ -284,8 +284,8 @@ The clustering runs on the metadata of memories (no need to load text yet).
 
 The consolidation worker also has a threshold trigger:
 
-- When a context exceeds 50 episodic memories (configurable), schedule consolidation immediately rather than waiting for the next cycle.
-- This prevents large contexts from being unrepresented in semantic memory.
+- When a session exceeds 50 episodic memories (configurable), schedule consolidation immediately rather than waiting for the next cycle.
+- This prevents large sessions from being unrepresented in semantic memory.
 
 ### 23. The summarization
 
@@ -299,7 +299,7 @@ async fn summarize(memories: &[MemoryText]) -> Result<String> {
 }
 ```
 
-Configuration specifies the LLM service URL and credentials. Llama, GPT, or any specific model are not bundled — the integration is pluggable.
+Configuration specifies the broker, not a credential: the summarizer resolves per namespace like every other LLM consumer, so a consolidation run is paid for by the tenant whose memories it consolidates. Llama, GPT, or any specific model are not bundled — the integration is pluggable.
 
 For deployments without an LLM, consolidation is disabled. The system works fine without it; clients just don't get Consolidated memories.
 
@@ -308,7 +308,7 @@ For deployments without an LLM, consolidation is disabled. The system works fine
 The default prompt:
 
 ```
-You are a memory consolidation system. Below are several memories from the same context.
+You are a memory consolidation system. Below are several memories from the same session.
 Summarize them into a single, concise paragraph that captures the key information.
 
 Memories:
@@ -353,7 +353,7 @@ Per cluster:
 
 Total per cluster: ~1-2 seconds dominated by the LLM call.
 
-For a typical context's growth rate, consolidation runs occasionally (every few minutes) and produces a few new Consolidated memories per cycle.
+For a typical session's growth rate, consolidation runs occasionally (every few minutes) and produces a few new Consolidated memories per cycle.
 
 ### 28. The "skip" cases
 
@@ -371,13 +371,13 @@ A Consolidated memory is a memory like any other. It can itself be part of a clu
 
 In practice, this is rare — the second-order summaries are at a high abstraction level. Recursive consolidation is capped at 2-3 levels.
 
-### 30. The "context boundary"
+### 30. The "session boundary"
 
-Consolidation respects context boundaries:
-- Episodic memories from one context don't get consolidated with those from another.
-- Each context's consolidation is independent.
+Consolidation respects session boundaries:
+- Episodic memories from one session don't get consolidated with those from another.
+- Each session's consolidation is independent.
 
-This matches the agent-data-model expectation: contexts are bounded scopes.
+This matches the agent-data-model expectation: sessions are bounded scopes.
 
 ### 31. The "active" filter
 
@@ -398,7 +398,7 @@ Some applications want human approval of consolidations before they're stored. A
 - A client (a UI, presumably) reviews and approves.
 - On approval, the system encodes the memory.
 
-This is an opt-in mode, configured per-context. By default, consolidation is fully automatic.
+This is an opt-in mode, configured per-session. By default, consolidation is fully automatic.
 
 ### 33. The disabled state
 
@@ -427,7 +427,7 @@ Auto-generated summary quality depends on the LLM. Brain doesn't validate qualit
 
 If summaries are poor (bad LLM, bad prompt), consolidation can produce noise. Operators may disable consolidation until the quality is acceptable.
 
-For high-quality summaries, the value-add is significant: the agent gets pre-aggregated context.
+For high-quality summaries, the value-add is significant: the agent gets pre-aggregated session.
 
 ## HNSW Maintenance Worker
 

@@ -192,7 +192,7 @@ Migration path detailed in [`07_error_handling.md`](07_error_handling.md) §3.10
 ### Alternatives
 
 (a) Typed-graph events use a separate opcode (`KNOWLEDGE_EVENT = 0x01B0`-ish) and parallel SUBSCRIBE channel.
-(b) Typed-graph events extend Brain's `SubscriptionEvent` body with an optional `knowledge_payload` field.
+(b) Typed-graph events extend Brain's `SubscriptionEvent` body with an optional `graph_payload` field, alongside the `edge_payload` and the three `stage_*` sidecars.
 
 ### Choice: (b).
 
@@ -266,9 +266,9 @@ The cost is later error reporting on malformed attribute bags; tracked in [`../0
 
 ### Choice
 
-`(agent_id, opcode_u16, request_id, blake3(payload_bytes))` — the typed-graph opcode takes the same slot as any other opcode in the keying scheme. 24h TTL. See [`08_typed_graph_frames.md`](08_typed_graph_frames.md).
+`(space_id, opcode_u16, request_id, blake3(payload_bytes))` — the typed-graph opcode takes the same slot as any other opcode in the keying scheme. 24h TTL. See [`08_typed_graph_frames.md`](08_typed_graph_frames.md).
 
-### Why not just `(agent_id, request_id)`?
+### Why not just `(space_id, request_id)`?
 
 Defends against a client recycling a `request_id` for a different operation. The `blake3(payload_bytes)` digest catches the "same id, different params" case as a structured `Conflict` rather than silently returning the stale cached response.
 
@@ -341,7 +341,7 @@ Clients SHOULD set:
 
 A single TCP connection can carry many concurrent operations, identified by stream IDs (see [`06_streaming.md`](06_streaming.md)). Clients SHOULD reuse connections rather than creating one per operation.
 
-The server limits connections per agent (default: 100) and per-IP (default: 1000) to prevent abuse. Limits are configurable.
+The server limits connections per space (default: 100) and per-IP (default: 1000) to prevent abuse. Limits are configurable.
 
 ### 1.4 Connection lifecycle
 
@@ -502,7 +502,7 @@ This is the only path on emergency shutdown or panic conditions; otherwise, the 
 
 Clients SHOULD reconnect automatically on connection loss, with reasonable backoff (exponential, capped at ~30 seconds).
 
-Reconnection re-establishes the connection from scratch: TCP, TLS, handshake. Cached connection state (session_id, agent context) is lost; the client must recreate it.
+Reconnection re-establishes the connection from scratch: TCP, TLS, handshake. Cached connection state (session_id, agent session) is lost; the client must recreate it.
 
 ### 8.2 Stream resumption
 

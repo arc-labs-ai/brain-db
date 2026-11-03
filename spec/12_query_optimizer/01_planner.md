@@ -68,14 +68,14 @@ These functions:
 
 Each function is straightforward; no global optimizer.
 
-## 4. The planner context
+## 4. The planner session
 
 The planner has access to:
 
 - The request itself.
 - Per-shard statistics (memory count, tombstone ratio, last-rebuild-at).
 - Configuration (default ef_search, max-results, etc.).
-- The agent's metadata (quotas, configuration overrides).
+- The space's registry row (quotas, configuration overrides).
 
 It doesn't have access to the actual storage layer. Planning is computation only; no I/O.
 
@@ -85,7 +85,7 @@ For every request:
 
 - Plan time < 100 µs.
 - Plan size < 4 KB (in memory).
-- Deterministic given the same input + context (no randomness).
+- Deterministic given the same input + session (no randomness).
 
 These let the planner be invoked synchronously without yielding the executor's task.
 
@@ -109,7 +109,7 @@ No ML, no probing, no cost minimization across alternatives. Just rules that hav
 
 For the most common request shapes, the planner has a fast path that bypasses the general logic:
 
-- Single-shard agent-scoped RECALL with default params: just pick ef=64, route to the agent's shard, search.
+- Single-shard space-scoped RECALL with default params: just pick ef=64, route to the space's shard, search.
 - Single ENCODE on a healthy shard: just route, embed, store.
 
 The fast path is ~10 µs. The general planner is ~50-100 µs. Most requests hit the fast path.
@@ -151,7 +151,7 @@ impl Planner {
 }
 ```
 
-Synchronous. Pure given input and context. Easy to unit-test.
+Synchronous. Pure given input and session. Easy to unit-test.
 
 ## 11. The planner doesn't know about networks
 
@@ -161,7 +161,7 @@ The executor maps shard references to actual destinations: same-machine (direct 
 
 ## 12. Static vs dynamic planning
 
-The planner does **static** planning: it decides everything based on the request and pre-computed context. It doesn't:
+The planner does **static** planning: it decides everything based on the request and pre-computed session. It doesn't:
 
 - Issue test queries to the storage to gauge cost.
 - Run a small portion of the work and decide based on early results.
@@ -253,12 +253,12 @@ If decoding fails (malformed payload), an error response is sent.
 Brain enforces:
 
 - Per-agent quotas (memory count, requests per second).
-- Per-context quotas.
+- Per-session quotas.
 - Global limits (concurrent requests, memory pressure).
 
 If a quota is exceeded, an error response (`QuotaExceeded`) is sent.
 
-Quota checks consult per-shard or per-agent counters; very fast.
+Quota checks consult per-shard or per-space counters; very fast.
 
 ## 6. Phase 5: Plan
 

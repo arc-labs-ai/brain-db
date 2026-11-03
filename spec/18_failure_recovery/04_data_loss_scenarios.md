@@ -49,7 +49,7 @@ For deployments without these, the loss is catastrophic.
 
 `agent delete` removes an agent. Confirmed; intended to delete.
 
-Loss: all of that agent's data.
+Loss: all of that space's data.
 
 Recovery:
 - Restore from snapshot if available (RPO bounded by snapshot age).
@@ -164,7 +164,7 @@ The restore brings back this consistent point.
 
 Brain stores data; clients write to Brain. Data loss has cascading effects:
 
-- Lost memories = lost agent context = degraded user experience.
+- Lost memories = lost agent session = degraded user experience.
 - Lost edges = broken reasoning chains.
 
 Operators understand this. Backups, monitoring, and careful operations are essential.

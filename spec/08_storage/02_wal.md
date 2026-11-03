@@ -82,7 +82,7 @@ The record header includes:
 - record_type (1 byte) — encode, forget, link, etc.
 - payload_length (4 bytes)
 - timestamp (8 bytes, unix nanoseconds)
-- agent_id (16 bytes; for routing-aware filtering during SUBSCRIBE)
+- space_id (16 bytes; for routing-aware filtering during SUBSCRIBE)
 - ...
 
 Detailed format is in § Record formats below.
@@ -235,9 +235,9 @@ Each record starts with a 32-byte header:
 | 10 | 2 | reserved | zero |
 | 12 | 4 | payload_length | u32 LE |
 | 16 | 8 | timestamp | u64 LE, unix nanoseconds |
-| 24 | 8 | agent_id_lo64 | u64 LE (low 8 bytes of agent UUID) |
+| 24 | 8 | space_id_lo64 | u64 LE (low 8 bytes of the space UUID) |
 
-The full agent UUID is 16 bytes; only the low 64 bits are stored in the header for filtering. The full UUID is in the payload when needed.
+The full `space_id` is 16 bytes; only the low 64 bits sit in the header, for cheap filtering during a scan. The full id is in the payload where it is needed. The header deliberately carries no `namespace_id`: the namespace is implied by the shard's own scope, and a 16-byte key in a 32-byte header would leave no room for the LSN and length fields a scan needs first.
 
 After the record header comes the payload (variable length, exactly `payload_length` bytes), followed by an 8-byte footer:
 
@@ -263,14 +263,14 @@ The `record_type` byte:
 | 6 | RECLAIM | A tombstoned slot was reclaimed |
 | 7 | CONSOLIDATE | The consolidation worker created a Consolidated memory |
 | 8 | UPDATE_KIND | A memory's kind was changed |
-| 9 | UPDATE_CONTEXT | A memory's context was changed |
+| 9 | UPDATE_SESSION | A memory's session was changed |
 | 10 | CHECKPOINT_BEGIN | A checkpoint started |
 | 11 | CHECKPOINT_END | A checkpoint completed |
 | 12 | TXN_BEGIN | A transaction started |
 | 13 | TXN_COMMIT | A transaction committed |
 | 14 | TXN_ABORT | A transaction was aborted |
 | 15 | MIGRATE_EMBEDDING | A memory was re-embedded with a new model |
-| 16-127 | Reserved for future record types | |
+| 16-127 | Typed-graph, registry and lifecycle records (§21) | |
 | 128-255 | Reserved for future major version | |
 
 Each type's payload format is specified below.
@@ -292,8 +292,8 @@ The `flags` byte:
 struct EncodeRecord {
     memory_id: MemoryId,             // 16 bytes (slot_id + version assigned by allocator)
     request_id: RequestId,           // 16 bytes (UUIDv7)
-    agent_id: AgentId,               // 16 bytes (full UUID; matches header low64)
-    context_id: ContextId,           // 8 bytes
+    space_id: SpaceId,               // 16 bytes (full UUID; matches header low64)
+    session_id: SessionId,           // 8 bytes
     kind: u8,                        // 1 byte (Episodic/Semantic/Consolidated)
     salience_initial: f32,           // 4 bytes
     embedding_model_fp: [u8; 16],    // 16 bytes
@@ -398,12 +398,12 @@ struct UpdateKindRecord {
 }
 ```
 
-### 13. UPDATE_CONTEXT record payload
+### 13. UPDATE_SESSION record payload
 
 ```
-struct UpdateContextRecord {
+struct UpdateSessionRecord {
     memory_id: MemoryId,
-    new_context_id: ContextId,
+    new_session_id: SessionId,
 }
 ```
 
@@ -496,26 +496,40 @@ Within a segment, records are scanned linearly. There's no per-record index; for
 
 For random-access patterns (recovery only needs sequential), no index is needed.
 
-### 21. Record types added when a schema is declared
+### 21. Typed-graph record types
 
-A shard with a declared schema also persists entity / statement / relation / schema / audit mutations through the same WAL. These slot into the reserved range (16–127) of the `record_type` byte; the segment header, 32-byte record header, footer CRC, and transaction bracketing rules in §1–§4 and §10 are unchanged. The frame body selects its parser by `record_type`:
+Entity / statement / relation / schema / audit mutations go through the same WAL. These occupy the reserved range above `0x0F`; the segment header, 32-byte record header, footer CRC, and transaction bracketing rules in §1–§4 and §10 are unchanged. The frame body selects its parser by `record_type`:
 
-| Record type | Body |
-|---|---|
-| ENTITY_CREATE | entity record |
-| ENTITY_UPDATE | entity delta |
-| ENTITY_MERGE | merge record |
-| ENTITY_TOMBSTONE | tombstone mark |
-| STATEMENT_CREATE | statement record |
-| STATEMENT_SUPERSEDE | (old, new) supersession |
-| STATEMENT_TOMBSTONE | tombstone |
-| RELATION_CREATE | relation record |
-| RELATION_SUPERSEDE | supersession |
-| RELATION_TOMBSTONE | tombstone |
-| SCHEMA_UPDATE | schema document |
-| AUDIT | audit entry (for replay) |
+| Value | Record type | Body |
+|---|---|---|
+| 0x10 | ENTITY_CREATE | entity record |
+| 0x11 | ENTITY_UPDATE | entity attribute / alias delta |
+| 0x12 | ENTITY_MERGE | merge of one entity into another |
+| 0x13 | ENTITY_TOMBSTONE | tombstone mark |
+| 0x14 | ENTITY_RENAME | canonical-name rename (alias-trail policy) |
+| 0x15 | ENTITY_UNMERGE | reverse of a prior merge |
+| 0x20 | STATEMENT_CREATE | statement record |
+| 0x21 | STATEMENT_SUPERSEDE | (old, new) supersession |
+| 0x22 | STATEMENT_TOMBSTONE | tombstone |
+| 0x30 | RELATION_CREATE | relation record |
+| 0x31 | RELATION_SUPERSEDE | supersession |
+| 0x32 | RELATION_TOMBSTONE | tombstone |
+| 0x40 | SCHEMA_UPDATE | schema document |
+| 0x50 | AUDIT | extractor / resolution audit entry |
+| 0x51 | STAGE_COMPLETED | background-stage completion — **change feed only**, see below |
+| 0x60 | SPACE_CREATE | space registry row provisioned |
+| 0x61 | SPACE_DELETE | space scope-prefix delete (registry + cascade) |
+| 0x62 | SESSION_CREATE | session registry row provisioned |
+| 0x63 | SESSION_DELETE | session registry row deleted |
+| 0x64 | RESTORE_MEMORY | un-tombstone a soft-forgotten memory |
 
-Recovery: on startup, the WAL is replayed. Memory frames (§3) hydrate memory state; entity/statement/relation frames hydrate the schema-activated state. Derived indexes (tantivy, entity/statement HNSW) are rebuilt from the authoritative redb tables (see [`../10_metadata/02_table_layout.md`](../10_metadata/02_table_layout.md) §14) if missing or corrupt.
+Most of these travel as an **opaque body**: the framing layer transports the bytes unchanged and the typed schema is layered above. Three do not, and are first-class typed payloads instead — relation create / supersede / tombstone, so recovery can rebuild the unified edge row and its sidecar atomically, and `RESTORE_MEMORY`, which is the exact mirror of `FORGET` and re-activates the row, clears `tombstoned_at`, re-inserts the timeline entry and restores the dedup fingerprint, idempotently.
+
+**`STAGE_COMPLETED` (0x51) is not state.** It is a subscribe-replay change-feed record — the durable backing for a `StageCompleted` event — and there is no table it hydrates, unlike every typed-graph write which has a durable counterpart. It is always flagged `FLAG_SUBSCRIBE_EVENT` and **recovery skips it**, exactly like the flagged typed-graph event records. A replay that applied it would be replaying a notification.
+
+Recovery: on startup, the WAL is replayed. Memory frames (§3) hydrate memory state; entity / statement / relation / registry frames hydrate the rest. Derived indexes (tantivy, entity / statement HNSW) are rebuilt from the authoritative redb tables (see [`../10_metadata/02_table_layout.md`](../10_metadata/02_table_layout.md) §14) if missing or corrupt.
+
+A replay failure caused by the **record's own illegality** — a create the API already refused — is a skip, not corruption; see [`04_recovery.md`](04_recovery.md) §5a. The distinction is what keeps one legitimately-refused request from making a shard permanently unbootable.
 
 ## Durability
 

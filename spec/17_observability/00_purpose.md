@@ -165,7 +165,7 @@ When something goes wrong:
 
 - Detailed logs from the affected time.
 - Traces showing the request path.
-- Metrics showing context (load, errors elsewhere).
+- Metrics showing session (load, errors elsewhere).
 
 These three together usually identify the issue. Brain exposes them readily.
 
@@ -174,7 +174,7 @@ These three together usually identify the issue. Brain exposes them readily.
 Clients contribute observability:
 
 - Per-request client-side metrics (latency from client perspective).
-- Trace propagation (so server-side traces include client context).
+- Trace propagation (so server-side traces include client session).
 - Errors visible to applications.
 
 End-to-end observability spans client-and-server.

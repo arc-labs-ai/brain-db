@@ -62,7 +62,7 @@ This file presents the layers in summary, with cross-references to the detail sp
                                    │
 ┌──────────────────────────────────▼──────────────────────────────────┐
 │  L7 │ SHARDING + CLUSTERING                                           │
-│     │   • Hash(agent_id) → shard. Per-shard isolation.               │
+│     │   • Hash(space_id) → shard. Per-shard isolation.               │
 │     │   • Stateless router for cross-node queries.                   │
 │     │   • Horizontal scaling = add nodes, rebalance shards.          │
 └─────────────────────────────────────────────────────────────────────┘
@@ -252,7 +252,7 @@ The WAL is the source of truth for crash recovery. Every other store (arena, met
 
 #### Metadata + graph
 
-[redb](https://github.com/cberner/redb), a "simple, portable, high-performance, ACID, embedded key-value store" with copy-on-write B-trees. Holds salience, context, timestamps, edge lists.
+[redb](https://github.com/cberner/redb), a "simple, portable, high-performance, ACID, embedded key-value store" with copy-on-write B-trees. Holds salience, session, timestamps, edge lists.
 
 redb gives us:
 
@@ -325,7 +325,7 @@ The discipline: foreground (request-serving) cores never call into background wo
 
 ### Shard model
 
-Horizontal scaling is shard-based. Each agent's memory is owned by exactly one shard, identified by `hash(agent_id) % shard_count`. Within a shard, all the agent's data — vectors, metadata, edges, WAL — is colocated.
+Horizontal scaling is shard-based. Each space's memory is owned by exactly one shard, identified by `hash(space_id) % shard_count`. Within a shard, all the space's data — vectors, metadata, edges, WAL — is colocated.
 
 Shards are the unit of:
 
@@ -353,7 +353,7 @@ Specified in [16. Sharding & Clustering](../16_sharding/00_purpose.md).
 
 ### What's deferred
 
-**Replication** is intentionally deferred from v1. The first version assumes a single replica per shard; loss of a node means loss of its agents until restored from snapshot. This is documented as a known limitation, with replication slated for a future revision (see [`../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md) OQ-2).
+**Replication** is intentionally deferred from v1. The first version assumes a single replica per shard; loss of a node means loss of its spaces until restored from snapshot. This is documented as a known limitation, with replication slated for a future revision (see [`../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md) OQ-2).
 
 **Cross-region active-active** is out of scope. The architecture supports cross-region disaster recovery via snapshot replication, but not active-active across regions.
 
@@ -377,7 +377,7 @@ These rules are enforced socially (code review) rather than by the compiler. The
 
 Three things conspicuously absent from the layer diagram:
 
-**Authentication and authorization.** These cut across layers — auth is established at L_1, but every layer respects the authenticated `agent_id`. They're documented in [17. Observability](../17_observability/00_purpose.md).
+**Authentication and authorization.** These cut across layers — auth is established at L_1, but every layer respects the authenticated `space_id`. They're documented in [17. Observability](../17_observability/00_purpose.md).
 
 **Observability (metrics, tracing, logs).** Every layer emits its own observability data; there's no central observability layer. Conventions are in [17. Observability](../17_observability/00_purpose.md).
 

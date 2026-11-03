@@ -9,7 +9,7 @@ The ENCODE primitive: store a memory.
 ### 1. Semantic contract
 
 ```
-ENCODE(text, agent_id, context, kind, metadata, edges, request_id)
+ENCODE(text, space_id, session, kind, metadata, edges, request_id)
   → MemoryId
 ```
 
@@ -31,19 +31,19 @@ The content to encode. UTF-8. 1 byte to ~1 MB (configurable upper bound).
 
 The text is what's embedded; it determines the vector and thus where the memory sits in the similarity space.
 
-For very long text (> the model's context, typically ~2000 chars), the embedder truncates. The full text is still stored; only the embedding is truncated.
+For very long text (> the model's session, typically ~2000 chars), the embedder truncates. The full text is still stored; only the embedding is truncated.
 
-#### agent_id
+#### space_id
 
-The owning agent. Authentication ensures the caller can encode under this agent_id.
+The owning agent. Authentication ensures the caller can encode under this space_id.
 
-#### context
+#### session
 
-A `ContextRef` — either a name (resolved to a ContextId) or an explicit ContextId.
+A `ContextRef` — either a name (resolved to a SessionId) or an explicit SessionId.
 
-If unspecified: the agent's default context is used.
+If unspecified: the space's default session is used.
 
-If a name doesn't exist: Brain creates the context.
+If a name doesn't exist: Brain creates the session.
 
 #### kind
 
@@ -75,7 +75,7 @@ Required. A `RequestId` for idempotency. The same RequestId returns the original
 
 #### Content deduplication (text ENCODE)
 
-Text `ENCODE` deduplicates by content as a **DB policy — always on**, not a client flag. Before allocating a slot, Brain consults a per-`(shard, agent_id, context_id)` fingerprint index keyed on `BLAKE3(text)` (see [`../10_metadata/03_substrate_tables.md`](../10_metadata/03_substrate_tables.md) §"Fingerprint deduplication"). On a hit, the existing `MemoryId` is returned and no new slot, WAL record, or HNSW node is created; `EncodeResponse.was_deduplicated = true`. So re-saving byte-identical text under the same identity and context yields one memory, never a pile of identical rows.
+Text `ENCODE` deduplicates by content as a **DB policy — always on**, not a client flag. Before allocating a slot, Brain consults a per-`(shard, space_id, session_id)` fingerprint index keyed on `BLAKE3(text)` (see [`../10_metadata/03_substrate_tables.md`](../10_metadata/03_substrate_tables.md) §"Fingerprint deduplication"). On a hit, the existing `MemoryId` is returned and no new slot, WAL record, or HNSW node is created; `EncodeResponse.was_deduplicated = true`. So re-saving byte-identical text under the same identity and session yields one memory, never a pile of identical rows.
 
 This is distinct from `request_id` idempotency (§4), which dedupes exact *replays* by request identity; content dedup dedupes by *content identity*. Genuine near-duplicates that are **not** byte-identical (paraphrases, the same fact re-stated) are not collapsed here — they are reconciled asynchronously by the near-dup consolidation worker. `ENCODE_VECTOR_DIRECT` keeps an explicit opt-in `deduplicate` field (default `false`) because a caller supplying raw vectors owns the "is this a duplicate" decision.
 
@@ -111,11 +111,11 @@ If the same RequestId is sent twice (e.g., due to network retry):
 
 This is Brain's commitment: at-most-once execution per RequestId, with replay-safe responses. Idempotency replay is **transparent** — `was_deduplicated` reports whatever the original response carried, not whether the wire-level replay occurred.
 
-**Under `act_as` the key is the effective identity, not the connection principal.** When a request carries the `act_as` field (a trusted service principal running the op on behalf of a tenant agent; defined in [`../04_wire_protocol/04_handshake.md`](../04_wire_protocol/04_handshake.md) §"Per-request identity (`act_as`)"), both the idempotency key **and** the shard-routing key MUST be scoped by the **effective** `(namespace, agent_id)` — the identity named in `act_as` — never by the connection principal. This is a load-bearing safety rule, not an optimization. The idempotency key is otherwise the bare 16-byte RequestId: a single service principal issuing ops for many tenants over one shared connection could reuse a RequestId across distinct effective identities, and a bare-RequestId key would then **collide across tenants** — serving one tenant's cached acknowledgement to another. Because the idempotency pool and the connection are shared, the leak is invisible at the wire. Keying on the effective `(namespace_id, agent_id)` + RequestId, and routing to the shard by the effective agent, makes the collision impossible: two tenants reusing one RequestId land on disjoint keys.
+**Under `act_as` the key is the effective identity, not the connection principal.** When a request carries the `act_as` field (a trusted service principal running the op on behalf of a tenant agent; defined in [`../04_wire_protocol/04_handshake.md`](../04_wire_protocol/04_handshake.md) §"Per-request identity (`act_as`)"), both the idempotency key **and** the shard-routing key MUST be scoped by the **effective** `(namespace, space_id)` — the identity named in `act_as` — never by the connection principal. This is a load-bearing safety rule, not an optimization. The idempotency key is otherwise the bare 16-byte RequestId: a single service principal issuing ops for many tenants over one shared connection could reuse a RequestId across distinct effective identities, and a bare-RequestId key would then **collide across tenants** — serving one tenant's cached acknowledgement to another. Because the idempotency pool and the connection are shared, the leak is invisible at the wire. Keying on the effective `(namespace_id, space_id)` + RequestId, and routing to the shard by the effective agent, makes the collision impossible: two tenants reusing one RequestId land on disjoint keys.
 
 ### 4a. Fingerprint deduplication
 
-A distinct mechanism from §4 idempotency. Idempotency dedupes by *request identity* (same `RequestId`); fingerprint dedup dedupes by *content identity* (same `BLAKE3(text)` under the same `agent_id` + `context_id`).
+A distinct mechanism from §4 idempotency. Idempotency dedupes by *request identity* (same `RequestId`); fingerprint dedup dedupes by *content identity* (same `BLAKE3(text)` under the same `space_id` + `session_id`).
 
 Opt-in via `EncodeRequest.deduplicate = true`. On a hit:
 
@@ -123,7 +123,7 @@ Opt-in via `EncodeRequest.deduplicate = true`. On a hit:
 - No new slot is allocated, no WAL record is written, no HNSW node is inserted.
 - `EncodeResponse.was_deduplicated = true`.
 
-On a miss (or `deduplicate = false`): the normal allocation path runs, the new memory's fingerprint is inserted into the per-`(shard, agent_id, context_id)` index, and `was_deduplicated = false`.
+On a miss (or `deduplicate = false`): the normal allocation path runs, the new memory's fingerprint is inserted into the per-`(shard, space_id, session_id)` index, and `was_deduplicated = false`.
 
 Only **Active** memories can dedup. Tombstoned and reclaimed memories are evicted from the fingerprint index in the same write transaction as the FORGET / reclamation, so a dedup lookup never returns a memory that RECALL would not find.
 
@@ -143,9 +143,9 @@ The text and vector together let Brain serve future queries. The metadata descri
 
 ### 6. The "what gets searched" question
 
-After ENCODE, RECALL finds the new memory if its vector is close to a cue's vector. Brain's HNSW publishes the new node typically within 10 ms after the ENCODE response.
+After ENCODE, RECALL finds the new memory if its vector is close to a cue's vector — **immediately**, with no publication lag and nothing to opt into. The HNSW insert runs inside the write submission, before the metadata commit and before the ack, and the index serves the fresh vector out of a pending buffer at exact cosine until a later flush folds it into the main graph.
 
-For read-after-write: a recall with `consistency=ReadAfterWrite` waits until the new memory is in the searchable HNSW.
+What is *not* immediately searchable is what the write **derives**: the lexical index entry (group-committed), and the auto-edge / temporal-edge / extractor / HyPE stages. Those announce themselves — see §17e and [`07_consistency.md`](07_consistency.md) §3.
 
 ### 7. Failure modes
 
@@ -157,13 +157,13 @@ The encode fails; no memory is created.
 
 #### QuotaExceeded
 
-The agent has too many memories or contexts.
+The agent has too many memories or sessions.
 
 The encode fails; no memory is created.
 
 #### ContextLimitReached
 
-The context has too many memories (configurable per-context limit).
+The session has too many memories (configurable per-session limit).
 
 The encode fails.
 
@@ -179,19 +179,19 @@ The encode specifies more than 64 edges.
 
 The encode fails entirely; the agent should split into multiple operations.
 
-### 8. The "context-derived inheritance"
+### 8. The "session-derived inheritance"
 
-A context can have default settings (kind, metadata defaults). When ENCODE doesn't specify these, they're inherited from the context.
+A session can have default settings (kind, metadata defaults). When ENCODE doesn't specify these, they're inherited from the session.
 
 This isn't currently implemented. Each ENCODE specifies its own kind explicitly (or uses the global default of Episodic).
 
-### 9. The "create new context" semantic
+### 9. The "create new session" semantic
 
-If the context name doesn't exist, ENCODE creates it. The new context inherits default settings.
+If the session name doesn't exist, ENCODE creates it. The new session inherits default settings.
 
-This makes the agent's first ENCODE in a new context "just work" — no separate context-creation step.
+This makes the first ENCODE in a new session "just work" — no separate session-creation step.
 
-If the agent wants to ensure a context's settings (kind defaults, etc.) before encoding, it can use `ADMIN_CONTEXT_CREATE` first.
+If the agent wants to ensure a session's settings (kind defaults, etc.) before encoding, it can use `ADMIN_CONTEXT_CREATE` first.
 
 ### 10. The "small text" case
 
@@ -217,18 +217,18 @@ A common pattern:
 ```
 brain.encode("first thing", request_id=1)
 brain.encode("second thing", request_id=2)
-results = brain.recall("things", consistency=ReadAfterWrite)
+results = brain.recall("things")
 ```
 
-Without `consistency=ReadAfterWrite`, the recall might miss the just-encoded memories (HNSW publication lag). With it, the recall waits.
+The recall sees both memories. There is no consistency argument to pass and no window to lose a write in.
 
-Most workloads don't need this; Brain's eventual consistency is fine for typical agent behaviors.
+If the recall depends on what those writes *derived* — the entities extracted from them, or the edges between them — wait for the stages instead: `wait: derived` on the encode, or a `memory_ids`-scoped SUBSCRIBE (§17e).
 
-### 13. The "agent's context" semantics
+### 13. Space and session ownership
 
-A memory belongs to exactly one agent and one context. Cross-agent or cross-context relationships need explicit edges (which can span contexts within an agent, but not across agents).
+A memory belongs to exactly one space and one session. Cross-space relationships are not expressible at all — a space is a hard wall. Cross-session relationships within one space need explicit edges, which may span sessions freely.
 
-This means a memory can't be "shared" between agents — each agent has its own memory store. If a single piece of text is relevant to multiple agents, each encodes its own copy.
+This means a memory can't be "shared" between spaces — each agent has its own memory store. If a single piece of text is relevant to multiple agents, each encodes its own copy.
 
 This is a deliberate design. Cross-agent memory sharing has complex semantics (who can update what, who can forget) and isn't a use case Brain optimizes for.
 
@@ -321,10 +321,54 @@ isn't captured as a stage artifact.
 Note the question *text* in `hype_questions` is not otherwise persisted (only
 its embedding is), so it is available only through the trace or
 `MEMORY_INSPECT` (§17d) — the live `StageCompleted` event for `Hype` carries
-only a compact summary (`questions_written`, `cost_micro_usd`), not the text
-itself. See [04. Wire Protocol](../04_wire_protocol/05_frame_layouts.md)
-§32.2 for the wire payload shapes and §17e below for the live-progress
-pattern built on top of them.
+only a compact summary (`questions_written`, `cost_micro_usd`, and an
+`error_message` when it failed), not the text itself. See
+[04. Wire Protocol](../04_wire_protocol/05_frame_layouts.md) §43.2 for the
+wire payload shapes and §17e below for the live-progress pattern built on top
+of them.
+
+**Every stage reports an outcome, and `Empty` is not `Failed`.** A stage that
+ran and found nothing to write, and a stage that could not run at all, both
+produce zero counts; the counts alone cannot tell them apart, and the
+difference is the whole story — the first is a property of this memory's
+content, the second is a broken or unconfigured deployment. Each
+`StageCompleted` therefore carries a `StageOutcome` (`Ok` / `Empty` /
+`Failed`) alongside its payload, and a failed stage carries the reason in
+`error_message`. This is how a client learns that HyPE was skipped because the
+namespace has no registered LLM credential rather than because the text
+yielded no questions.
+
+#### 17a-i. The `hype` stage
+
+HyPE (Hypothetical Prompt Embeddings) is **mandatory and always-on**. There is
+no flag to disable it, and it is why an LLM credential is a write-path
+dependency at all.
+
+For each freshly-encoded memory the generator asks an LLM for several diverse
+questions whose answer is that memory, embeds each **locally** with the same
+BGE model the rest of the write path uses, and both persists the vectors
+(`hype_question_vectors`) and inserts them into the live per-shard HyPE HNSW
+index. At read time the caller's query vector probes that pool; a hit on a
+stored question maps back to the owning memory.
+
+The point is the phrasing gap. A memory is written as a statement and queried
+as a question, and the direct passage embedding sits on the statement side of
+that gap. Indexing the questions a memory *answers* puts a vector on the query
+side of it.
+
+Properties worth stating:
+
+- **Cost lands at write time, once.** The generation call is cached on the
+  memory text with a 30-day TTL, so a re-ingest of the same text is free. It
+  also respects the extractor worker's per-cycle LLM budget.
+- **The credential is the owning tenant's.** HyPE runs on every write, making
+  it the largest LLM cost on the write path and the one most visibly mis-billed
+  if it resolved to a shard-wide key. It resolves per namespace, like the
+  extractor's LLM tier.
+- **Questions per memory are clamped** (16) so a runaway reply cannot overflow
+  the storage key's index byte.
+- **A namespace with no key still writes.** The stage reports `Failed` with a
+  reason; the memory, its vector and its lexical index are unaffected.
 
 #### 17b. The per-stage artifact contract
 
@@ -402,7 +446,7 @@ combines two calls instead of leaning on `wait` alone:
 2. Immediately `SUBSCRIBE` with `filter.memory_ids: [that memory_id]` (no
    other filter dimension is needed — the stream only ever concerns this one
    write). Each of the four async stages (`auto_edge`, `temporal_edge`,
-   `extractor`, `hype`) publishes its own `StageCompleted` event (§32.2 of
+   `extractor`, `hype`) publishes its own `StageCompleted` event (§43.2 of
    [04. Wire Protocol](../04_wire_protocol/05_frame_layouts.md)) onto the
    same event bus the instant it commits; the client renders each as it
    arrives instead of waiting for all of them. Because the four stages are
@@ -419,7 +463,7 @@ If the connection is a shared service-principal pool (one credential, many
 tenants), scope the SUBSCRIBE the same way any other op does: pass `act_as`
 (see [04. Wire Protocol](../04_wire_protocol/04_handshake.md) §10a and
 [05_subscribe.md](05_subscribe.md) §22) naming the effective
-`(namespace, agent_id)` the subscription should observe.
+`(namespace, space_id)` the subscription should observe.
 
 This is a general-purpose pattern, not tied to any particular client — any
 caller that wants live write-pipeline observability without the blocking
@@ -432,7 +476,7 @@ The FORGET primitive: delete a memory.
 ### 1. Semantic contract
 
 ```
-FORGET(target, agent_id, mode, request_id) → ForgetResponse
+FORGET(target, space_id, mode, request_id) → ForgetResponse
 ```
 
 Brain:
@@ -551,7 +595,7 @@ Consolidated memories aren't auto-forgotten when their sources are. The Consolid
 ```rust
 brain.forget(
     target = Filter(ForgetFilter {
-        context: Some(ctx_id),
+        session: Some(ctx_id),
         max_salience: Some(0.1),
     })
 )
@@ -564,26 +608,26 @@ Brain:
 
 Limited to 100,000 memories per call. For larger bulk operations, the agent splits into multiple calls.
 
-### 9. The "context delete" pattern
+### 9. The "session delete" pattern
 
-To delete an entire context:
+To delete an entire session:
 
 ```
-brain.forget(target = Filter(ForgetFilter { context: Some(ctx_id) }))
+brain.forget(target = Filter(ForgetFilter { session: Some(ctx_id) }))
 brain.admin_context_delete(ctx_id)
 ```
 
-Or use `ADMIN_CONTEXT_DELETE` directly (which combines the steps and handles paging for very large contexts).
+Or use `ADMIN_CONTEXT_DELETE` directly (which combines the steps and handles paging for very large sessions).
 
 ### 10. The "agent delete" pattern
 
 To delete all memories for an agent:
 
 ```
-brain.admin_agent_delete(agent_id)
+brain.admin_agent_delete(space_id)
 ```
 
-This is heavy — potentially millions of forgets. Brain processes in batches, may take minutes for large agents.
+This is heavy — potentially millions of forgets. Brain processes in batches, may take minutes for large spaces.
 
 ### 11. Latency
 
@@ -705,7 +749,7 @@ LINK(source, target, kind, weight, metadata, request_id) → LinkResponse
 Brain:
 
 1. Validates that source and target exist.
-2. Inserts the edge into `edges_out` and `edges_in`.
+2. Inserts the edge into `edges` and `edges_reverse`.
 3. Updates edge counts on both endpoints.
 4. Writes a WAL record.
 
@@ -771,7 +815,7 @@ UNLINK(source, target, kind, request_id) → UnlinkResponse
 
 Brain:
 
-1. Removes the edge from `edges_out` and `edges_in`.
+1. Removes the edge from `edges` and `edges_reverse`.
 2. Decrements edge counts.
 3. Writes a WAL record.
 
@@ -875,7 +919,7 @@ Either memory belongs to a different agent. Error.
 
 #### CrossAgent
 
-Source and target belong to different agents. Error — edges are agent-scoped.
+Source and target belong to different agents. Error — edges are space-scoped.
 
 ### 11. Edge counts and observability
 
@@ -989,7 +1033,7 @@ The MATERIALIZE_PROCEDURAL primitive: render an agent's procedural memory into a
 ### 1. Semantic contract
 
 ```
-MATERIALIZE_PROCEDURAL(agent_id, target_predicates, request_id)
+MATERIALIZE_PROCEDURAL(space_id, target_predicates, request_id)
   → ProceduralBlock {
       block_text: String,            // rendered system prompt
       sourced_statements: u32,       // count of Preferences materialised
@@ -1002,9 +1046,9 @@ Procedural memory in Brain is not a separate data type — it is the set of `Sta
 
 ### 2. The arguments
 
-#### agent_id
+#### space_id
 
-The agent whose procedural memory is being materialised. The op reads only Preferences with `subject = agent_id` and a `behavior_*` predicate.
+The agent whose procedural memory is being materialised. The op reads only Preferences with `subject = space_id` and a `behavior_*` predicate.
 
 #### target_predicates
 
@@ -1040,8 +1084,8 @@ Hard constraints:
 
 ### 4. Code path
 
-1. Validate agent_id; check the connection has read scope for this agent.
-2. Load active Preferences for `(subject = agent_id, predicate in behavior_*)` via `STATEMENTS_BY_SUBJECT_TABLE`.
+1. Validate space_id; check the connection has read scope for this agent.
+2. Load active Preferences for `(subject = space_id, predicate in behavior_*)` via `STATEMENTS_BY_SUBJECT_TABLE`.
 3. Apply `target_predicates` filter if non-empty.
 4. Sort by predicate then by `extracted_at_unix_nanos` ascending.
 5. Render the canonical block.
@@ -1054,17 +1098,17 @@ The op is a structured read — no WAL record, no idempotency-table write. The `
 
 A client could do this themselves by issuing a `STATEMENT_LIST` with the right filters and rendering the result. MATERIALIZE_PROCEDURAL exists because:
 
-1. **The renderer is opinionated.** Brain's renderer encodes the canonical phrasing for each `behavior_*` predicate, so the system block is consistent across agents and across clients.
+1. **The renderer is opinionated.** Brain's renderer encodes the canonical phrasing for each `behavior_*` predicate, so the system block is consistent across spaces and across clients.
 2. **The fingerprint is stable.** Clients that build their own renderer get a different hash on every re-render; the server-side renderer pins canonical ordering.
 3. **Future evolution.** A future version may add learning hooks (e.g., "agent updates its own preferences after a failed task") that go through the same op for auditability.
 
 ### 6. Latency promise
 
-This is a read against a typically-small statement set (few dozen preferences per agent). p99 target: ~5 ms.
+This is a read against a typically-small statement set (few dozen preferences per space). p99 target: ~5 ms.
 
 ### 7. Consistency
 
-Returns whatever the current statement set says at op time. No `ReadAfterWrite` mode — procedural memory is the agent's standing context and tolerates eventual consistency.
+Returns whatever the current statement set says at op time. Procedural memory is the agent's standing instructions: a preference extracted moments ago may not be in the block yet, because extraction is asynchronous, and that is tolerable here in a way it would not be for a direct read.
 
 If an ENCODE that produces a new `behavior_*` Preference is in flight, the materialised block may not include it until the next call. This is acceptable; procedural memory is consulted at conversation start, not on every turn.
 
@@ -1091,11 +1135,11 @@ The agent re-injects `block_text` at the start of its next conversation; the mod
 
 #### AgentNotFound
 
-`agent_id` doesn't exist on this shard. Returns `AgentNotFound`.
+`space_id` doesn't exist on this shard. Returns `AgentNotFound`.
 
 #### SchemaNotDeclared
 
-The agent's namespace has no schema; `behavior_*` predicates aren't available. Returns `SchemaNotDeclared`.
+The space's namespace has no schema; `behavior_*` predicates aren't available. Returns `SchemaNotDeclared`.
 
 #### EmptyResult
 

@@ -139,7 +139,7 @@ The reserved space provides room for future additions:
 
 - More flags.
 - Per-frame priority indicators.
-- Tracing IDs (alternatives to OpenTelemetry's W3C trace context).
+- Tracing IDs (alternatives to OpenTelemetry's W3C trace session).
 
 The exact use is intentionally open; the framing keeps flexibility while remaining stable.
 
@@ -310,7 +310,7 @@ The CBOR map includes fields giving the offset (relative to the start of the pay
   "cue_vector_dim":      <u16: 0 if no vector; 384 if present>,
   "top_k":               <u32>,
   "confidence_threshold":<f32>,
-  "context_filter":      <array of u64, or absent>,
+  "session_filter":      <array of u64, or absent>,
   ...
 }
 ```
@@ -412,7 +412,7 @@ The split: structured data goes through CBOR (portable, self-describing), bulk v
   "vector_offset":     <u32: offset to the vector in the raw section>,
   "vector_dim":        <u16: expected 384>,
   "model_fingerprint": <16-byte string>,
-  "context_id":        <u64>,
+  "session_id":        <u64>,
   "salience_hint":     <f32>,
   "request_id":        <16-byte string>
 }
@@ -441,7 +441,7 @@ Each response frame carries a batch of results as a CBOR map:
       "confidence":       <f32>,
       "salience":         <f32>,
       "kind":             <u8 enum>,
-      "context_id":       <u64>,
+      "session_id":       <u64>,
       "created_at":       <u64>,
       "vector_offset":    <u32: offset into raw section if vector included, else 0>,
       "vector_dim":       <u16: 384 if included, else 0>

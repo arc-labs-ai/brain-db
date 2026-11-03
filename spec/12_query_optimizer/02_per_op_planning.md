@@ -8,33 +8,47 @@ How the planner builds an execution plan for a RECALL request.
 
 ### 1. The RECALL request shape
 
-```rust
-struct RecallRequest {
-    cue_text: String,             // Required; gets embedded
-    agent_id: AgentId,
-    k: usize,                     // Default 10; max 1000
-    filter: AnnFilter,            // Per [09. Filtering]
-    confidence_min: Option<f32>,  // Filter by similarity score
-    include_text: bool,           // Whether to return full memory text
-    include_metadata: bool,       // Whether to include extra metadata fields
-    consistency: Consistency,     // Eventual / ReadAfterWrite
-    request_id: Option<RequestId>,
-}
-```
+The planner consumes the wire request as-is; the authoritative field list is in
+[04. Wire Protocol](../04_wire_protocol/05_frame_layouts.md) §3. The inputs that
+change the plan are:
+
+| Input | Effect on the plan |
+|---|---|
+| `cue_text` | the embedding step; also mined for subject candidates and temporal expressions |
+| `subject_name` | adds an explicit subject candidate to the grounded overlay |
+| `scope` | `Space` → one shard; `Namespace` → fan out across every shard |
+| `txn_id` | selects the txn path (read-your-writes over the pending buffer) instead of the retrieval path |
+| `max_results` | caps the member count; also sizes the candidate pool and therefore the beam |
+| `kind_filter` / `session_filter` / `salience_floor` / `age_bound` / `confidence_threshold` | the filter chain; selectivity feeds the beam choice |
+| `as_of_record_time_unix_nanos` | the bi-temporal resolution point, and the recency reference |
+| `include_text` / `include_edges` / `include_graph` | post-ranking fetch steps; no effect on retrieval |
+| `trace` | retains the per-stage data the pipeline computes anyway |
+
+There is no `consistency` input and no `k` separate from `max_results`: a read is
+either inside a transaction or it is not, and the member count is capped by one
+field.
 
 ### 2. Routing
 
-A RECALL is agent-scoped: search within an agent's memories. The agent's data lives on a specific shard (or, for very large agents, multiple shards).
+Routing depends on the request's `scope`:
+
+- **`Space` (the default)** — one shard, resolved by `shard_for_space`: an
+  operator override pin if one exists, otherwise `BLAKE3(space_id) % shard_count`.
+  A space's data lives on exactly one shard; multi-shard spaces are deferred
+  past v1, so there is no extras list to chain.
+- **`Namespace`** — fan out to **every** shard. Each shard widens its scope
+  filter from `(namespace, space)` to `namespace_id` alone, and the merged pool
+  is shaped once rather than per shard. The fan-out spans every space in the
+  caller's own namespace and never another tenant's.
 
 ```rust
-fn resolve_shards(agent_id: AgentId) -> Vec<ShardId> {
-    let primary = router.shard_for(agent_id);
-    let extras = router.extras_for(agent_id);  // Empty for typical agents
-    [primary].into_iter().chain(extras).collect()
+fn resolve_shards(scope: RecallScope, space_id: SpaceId) -> Vec<ShardId> {
+    match scope {
+        RecallScope::Space     => vec![routing.shard_for_space(space_id)],
+        RecallScope::Namespace => (0..shard_count).collect(),
+    }
 }
 ```
-
-For most agents, this returns one shard. Cross-shard agents are rare and require fan-out.
 
 ### 3. Per-shard sub-plan
 
@@ -80,7 +94,7 @@ fn pick_ef(req: &RecallRequest, shard_stats: &ShardStats) -> usize {
 }
 ```
 
-For a typical agent-scoped RECALL with K=10 and no filter: ef=64.
+For a typical space-scoped RECALL with K=10 and no filter: ef=64.
 
 For a RECALL with a selective filter (only 10% of memories match): ef = 64 / 0.1 = 640, capped to 500.
 
@@ -153,20 +167,24 @@ But Brain does not know in advance which shard has the global top K. So each sha
 For 2 shards: ask each for K * 1.4 ≈ 1.5K.
 For 10 shards: ask each for K * 3.2.
 
-This is conservative and adequate. More elaborate sampling-based approaches exist but aren't worth the complexity for typical N (1-3 shards per agent).
+This is conservative and adequate. More elaborate sampling-based approaches exist but aren't worth the complexity for typical N (1 shard per space in v1).
 
-### 10. Read-after-write
+### 10. Read-your-writes
 
-If `consistency = ReadAfterWrite`, the planner adds a wait step:
+There is no `consistency` input and no wait-for-LSN step. Read-your-writes is a
+property of being **inside a transaction**: a RECALL carrying a `txn_id` runs
+the txn path, which overlays the transaction's pending buffer on the committed
+snapshot.
 
-```rust
-struct ReadAfterWriteStep {
-    wait_for_lsn: u64,    // The agent's last write LSN
-    timeout_ms: u32,
-}
-```
+That overlay is also why the txn path is a different plan rather than a flag on
+the normal one: the lexical and graph retrievers do not see the pending buffer,
+so a request that must observe uncommitted writes cannot be served by the fused
+retrieval path at all.
 
-The executor waits for the shard's HNSW to catch up to the LSN before searching. Detailed in [09. Concurrency](../09_indexing/04_concurrency.md) §Read-after-write.
+Outside a transaction, a write is visible to a subsequent read once its ack has
+landed; the derivation stages that follow it (edges, extraction, HyPE) settle
+asynchronously and are observable through `SUBSCRIBE`, not by blocking the
+read.
 
 ### 11. The text-include decision
 
@@ -192,15 +210,13 @@ RecallPlan {
         cache_lookup: true,
     },
     shards: vec![ShardSearchStep {
-        shard_id: agent's shard,
+        shard_id: the space's shard,
         ann_search: AnnSearchStep {
             ef: 64,
             k: 80,         // K * over_factor
             filter: PreFilter { fingerprint, tombstone },
         },
-        metadata_lookup: MetadataLookupStep {
-            include_extra: req.include_metadata,
-        },
+        metadata_lookup: MetadataLookupStep {},
         filter_apply: FilterStep {
             stage: PostFilter,
             rules: req.filter.post_rules(),
@@ -212,9 +228,11 @@ RecallPlan {
         confidence_min: req.confidence_min,
     },
     text_fetch: if req.include_text { Some(...) } else { None },
+    graph_fetch: if req.include_graph { Some(...) } else { None },
     response: ResponseStep {
         include_text: req.include_text,
-        include_metadata: req.include_metadata,
+        include_edges: req.include_edges,
+        include_graph: req.include_graph,
     },
 }
 ```
@@ -232,7 +250,7 @@ If invalid, the planner returns an error (not the planner's fault; user-supplied
 
 ### 14. Plan caching
 
-For very-hot RECALL patterns (e.g., a chatbot's "recent context" RECALL), plan caching could amortize the planning cost.
+For very-hot RECALL patterns (e.g., a chatbot's "recent session" RECALL), plan caching could amortize the planning cost.
 
 Not implemented. Plan time is < 50 µs; caching would save tens of microseconds. Not worth the complexity.
 
@@ -254,8 +272,8 @@ How the planner builds an execution plan for an ENCODE request.
 ```rust
 struct EncodeRequest {
     text: String,                // The content to encode
-    agent_id: AgentId,
-    context: ContextRef,         // ContextId or context name
+    space_id: SpaceId,
+    session: ContextRef,         // SessionId or session name
     kind: MemoryKind,            // Episodic / Semantic
     salience_initial: f32,       // [0, 1], default 1.0
     metadata: ExtraMetadata,     // User-defined key-values; small
@@ -266,15 +284,15 @@ struct EncodeRequest {
 
 ### 2. Routing
 
-ENCODE is agent-scoped: the new memory belongs to the requesting agent's primary shard.
+ENCODE is space-scoped: the new memory belongs to the requesting space's shard.
 
 ```rust
-fn resolve_shard(agent_id: AgentId) -> ShardId {
-    router.shard_for(agent_id)
+fn resolve_shard(space_id: SpaceId) -> ShardId {
+    router.shard_for(space_id)
 }
 ```
 
-For agents whose data is split across shards (very large agents), a routing rule selects which shard hosts new encodes (typically the agent's primary shard).
+Multi-shard spaces are deferred past v1: a space's data lives on exactly one shard, so there is no per-encode shard selection.
 
 ### 3. The encode plan structure
 
@@ -325,23 +343,23 @@ struct EmbeddingStep {
 
 The embedder ([07. Embedding Layer](../07_embedding/00_purpose.md)) is called. May hit the cache (~10% hit rate) or compute fresh (~5-10 ms).
 
-### 6. Phase 3: Context resolution
+### 6. Phase 3: Session resolution
 
-If the request specifies a context by name, resolve to a ContextId:
+If the request specifies a session by name, resolve to a SessionId:
 
 ```rust
-fn resolve_context(req: &EncodeRequest) -> ContextId {
-    match req.context {
+fn resolve_context(req: &EncodeRequest) -> SessionId {
+    match req.session {
         ContextRef::Id(id) => id,
         ContextRef::Name(name) => {
-            metadata.get_context_by_name(req.agent_id, name)
-                .or_else(|| create_new_context(req.agent_id, name))
+            metadata.get_context_by_name(req.space_id, name)
+                .or_else(|| create_new_session(req.space_id, name))
         }
     }
 }
 ```
 
-If the context doesn't exist, it's created (in the same write transaction as the encode).
+If the session doesn't exist, it's created (in the same write transaction as the encode).
 
 ### 7. Phase 4: Slot allocation
 
@@ -363,8 +381,8 @@ Append the encode record to the WAL:
 struct WalAppendStep {
     record: EncodeRecord {
         memory_id: MemoryId,    // Constructed from slot_id + version
-        agent_id: AgentId,
-        context_id: ContextId,
+        space_id: SpaceId,
+        session_id: SessionId,
         text_bytes: Vec<u8>,
         vector: [f32; 384],     // 1.5 KB
         kind: MemoryKind,
@@ -403,7 +421,7 @@ For each edge in the request:
 ```rust
 struct EdgeStep {
     edge: EdgeSpec,
-    insert_in_metadata: true,    // Insert in edges_out and edges_in tables
+    insert_in_metadata: true,    // Insert in edges and edges_reverse tables
 }
 ```
 
@@ -464,15 +482,15 @@ For high-throughput bulk imports, the wire protocol's `ENCODE_BATCH` opcode (a l
 
 Latency per memory drops to ~1-2 ms when batched.
 
-#### 14.3 Implicit context
+#### 14.3 Implicit session
 
-If `context` is unspecified:
+If `session` is unspecified:
 
 ```rust
-let context_id = metadata.get_or_create_context(agent_id, "_default");
+let session_id = metadata.get_or_create_context(space_id, "_default");
 ```
 
-Default contexts are reserved for this purpose ([10. Substrate Tables](../10_metadata/03_substrate_tables.md) § Contexts Table).
+Default sessions are reserved for this purpose ([10. Substrate Tables](../10_metadata/03_substrate_tables.md) § Sessions Table).
 
 ### 15. Plan validation
 
@@ -482,7 +500,7 @@ The planner ensures:
 - The kind is valid (not Consolidated; that's worker-only).
 - The salience is in [0, 1].
 - Edges have valid kinds and weights.
-- The agent's quotas allow another memory.
+- The space's quotas allow another memory.
 
 Invalid plans return errors immediately; no work is done.
 
@@ -495,7 +513,7 @@ For a typical encode (no batching):
 | Idempotency check | 5-10 µs |
 | Embedding (cache hit) | 5 µs |
 | Embedding (cache miss) | 5-10 ms |
-| Context resolution | 5 µs |
+| Session resolution | 5 µs |
 | Slot allocation | 1 µs |
 | WAL append + fsync | 0.5 ms (group commit) |
 | Apply (arena, metadata, HNSW) | 1-2 ms |
@@ -530,7 +548,7 @@ These don't introduce new primitive types of work; they orchestrate RECALL and g
 ```rust
 struct PlanRequest {
     goal_text: String,           // What to plan toward
-    agent_id: AgentId,
+    space_id: SpaceId,
     starting_state: Option<String>,  // Current state
     max_depth: usize,            // How many graph hops
     max_results: usize,          // Total plan elements
@@ -597,7 +615,7 @@ fn traverse(
 }
 ```
 
-The traversal uses the metadata store's `edges_out` and `edges_in` tables for graph queries.
+The traversal uses the metadata store's `edges` and `edges_reverse` tables for graph queries.
 
 ### 5. Bidirectional BFS
 
@@ -636,7 +654,7 @@ The planner orchestrates the alternation: vector similarity at the boundaries, g
 ```rust
 struct ReasonRequest {
     query_text: String,
-    agent_id: AgentId,
+    space_id: SpaceId,
     max_supporting: usize,       // Default 5
     max_contradicting: usize,    // Default 5
     request_id: Option<RequestId>,
@@ -745,7 +763,7 @@ How the planner builds an execution plan for a FORGET request.
 ```rust
 struct ForgetRequest {
     target: ForgetTarget,         // What to forget
-    agent_id: AgentId,
+    space_id: SpaceId,
     mode: ForgetMode,             // Soft / Hard
     request_id: RequestId,
 }
@@ -753,7 +771,7 @@ struct ForgetRequest {
 enum ForgetTarget {
     Memory(MemoryId),
     Memories(Vec<MemoryId>),
-    Filter(ForgetFilter),         // E.g., all memories in a context with salience < 0.1
+    Filter(ForgetFilter),         // E.g., all memories in a session with salience < 0.1
 }
 
 enum ForgetMode {
@@ -989,7 +1007,7 @@ A typical FORGET plan is ~200 bytes for a single ID; ~10 KB for 1000 IDs (mostly
 The planner checks:
 
 - Memory IDs are well-formed.
-- The agent owns the memories (from the agent_id in the IDs vs the request).
+- The caller's space owns the memories (the `space_id` on the row must match the request's effective space).
 - The request's RequestId is set.
 - For filter mode: the filter is well-formed.
 

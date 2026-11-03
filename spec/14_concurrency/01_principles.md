@@ -27,7 +27,7 @@ Within a shard, all tasks share one thread. They cooperate via async-await:
 - Tasks yield at await points.
 - Long-running synchronous work is rare; when needed, explicit yields keep things fair.
 
-No OS-level context switches. No preemption. Just "I'm done with my chunk, take the thread."
+No OS-level session switches. No preemption. Just "I'm done with my chunk, take the thread."
 
 ## 4. Immutable views from reader's perspective
 
@@ -167,11 +167,11 @@ This is a hard architectural rule. Violating it would create cross-shard content
 
 ## 17. The "agents-as-shard-units" framing
 
-For typical deployments, an agent's data lives in one shard. Agents are the natural unit of locality:
+For typical deployments, an space's data lives in one shard. Spaces are the natural unit of locality:
 
-- An agent's encodes go to its shard.
-- An agent's recalls happen on its shard.
-- An agent's edges are within its shard.
+- A space's encodes go to its shard.
+- A space's recalls happen on its shard.
+- A space's edges are within its shard.
 
 This means most operations don't cross shard boundaries. The cross-shard concurrency model is rarely exercised; per-shard concurrency dominates.
 

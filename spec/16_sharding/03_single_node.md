@@ -116,7 +116,7 @@ For a request that needs cross-shard data:
 
 ```rust
 async fn cross_shard_recall(req: RecallRequest) -> Vec<RecallResult> {
-    let shards = self.router.shards_for_agent(&req.agent_id);
+    let shards = self.router.shards_for_agent(&req.space_id);
     let mut futures = Vec::new();
     for shard_id in shards {
         let shard_handle = self.shards.get(shard_id).clone();
@@ -241,7 +241,7 @@ Prometheus-style metrics on `/metrics` endpoint:
 
 ```
 brain_request_total{shard="...",op="encode",status="success"} 12345
-brain_memory_count{shard="..."} 1000000
+brain_arena_slots_used{shard="..."} 1000000
 ```
 
 Plus Glommio runtime metrics, Rust process metrics. Standard Prometheus + Grafana setup gives full observability.

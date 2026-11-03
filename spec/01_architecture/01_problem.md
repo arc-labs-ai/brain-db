@@ -60,7 +60,7 @@ These systems are excellent at vector similarity search — and that's what they
 
 ### 4.1 The query model is wrong
 
-Vector databases expose `search(vector, k, filter)`. The cognitive layer needs `recall(cue, context, confidence_threshold)`, `plan(start, goal)`, `reason(observation)`. These aren't translatable to vector-search-plus-filter without losing structure. A `RECALL` with confidence calibration depends on knowing the salience distribution and the embedding model's calibration — internal facts the vector database doesn't expose.
+Vector databases expose `search(vector, k, filter)`. The cognitive layer needs `recall(cue, session, confidence_threshold)`, `plan(start, goal)`, `reason(observation)`. These aren't translatable to vector-search-plus-filter without losing structure. A `RECALL` with confidence calibration depends on knowing the salience distribution and the embedding model's calibration — internal facts the vector database doesn't expose.
 
 ### 4.2 The write model is wrong
 
@@ -68,11 +68,11 @@ Vector databases assume the application has already produced vectors. We argue e
 
 ### 4.3 The consistency model is wrong
 
-Vector databases treat metadata as a sidecar. Brain requires metadata, graph edges, and vectors to be co-managed under one consistent transaction model. A memory's vector, its salience, its context, and its outgoing edges should be written and read atomically; otherwise the agent observes incoherent intermediate states.
+Vector databases treat metadata as a sidecar. Brain requires metadata, graph edges, and vectors to be co-managed under one consistent transaction model. A memory's vector, its salience, its session, and its outgoing edges should be written and read atomically; otherwise the agent observes incoherent intermediate states.
 
 ### 4.4 The performance model is wrong
 
-Vector databases optimize for batch ingestion and analytical queries: build a corpus, search it, occasionally refresh. Agents do single-item writes and single-cue reads on the hot path, hundreds of times per second per agent. Different optimization target, different working-set characteristics, different durability requirements.
+Vector databases optimize for batch ingestion and analytical queries: build a corpus, search it, occasionally refresh. Agents do single-item writes and single-cue reads on the hot path, hundreds of times per second per space. Different optimization target, different working-set characteristics, different durability requirements.
 
 ### 4.5 The conclusion
 

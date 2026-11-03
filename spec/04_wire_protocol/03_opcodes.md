@@ -11,9 +11,9 @@ The opcode is a big-endian `u16` in the frame header (bytes 5–6). The high byt
 | Opcode | Name | Direction | Purpose |
 |---|---|---|---|
 | 0x0001 | `HELLO` | C → S | Initial frame; client identity and supported versions |
-| 0x0081 | `WELCOME` | S → C | Reply to HELLO; server identity, negotiated version, session_id |
+| 0x0081 | `WELCOME` | S → C | Reply to HELLO; server identity, negotiated version, connection_id, server features |
 | 0x0002 | `AUTH` | C → S | Authentication credentials |
-| 0x0082 | `AUTH_OK` | S → C | Authentication success; bind to agent_id |
+| 0x0082 | `AUTH_OK` | S → C | Authentication success; binds the connection to a `(namespace, space_id)` and returns its permissions |
 | 0x0010 | `PING` | C → S | Keepalive |
 | 0x0090 | `PONG` | S → C | Response to PING |
 | 0x0091 | `SERVER_PING` | S → C | Server-initiated keepalive |
@@ -95,28 +95,51 @@ The opcode is a big-endian `u16` in the frame header (bytes 5–6). The high byt
 | 0x00E3 | `ADMIN_INTEGRITY_CHECK_RESP` | S → C | Integrity result |
 | 0x0064 | `ADMIN_MIGRATE_EMBEDDINGS_REQ` | C → S | Re-embed all memories |
 | 0x00E4 | `ADMIN_MIGRATE_EMBEDDINGS_RESP` | S → C | Migration progress (streaming) |
-| 0x0065 | `ADMIN_CREATE_CONTEXT_REQ` | C → S | Create a context with metadata |
-| 0x00E5 | `ADMIN_CREATE_CONTEXT_RESP` | S → C | Context creation ack |
-| 0x0066 | `ADMIN_RENAME_CONTEXT_REQ` | C → S | Rename a context |
-| 0x00E6 | `ADMIN_RENAME_CONTEXT_RESP` | S → C | Rename ack |
-| 0x0067 | `ADMIN_MOVE_MEMORY_REQ` | C → S | Move a memory between contexts |
+| 0x0065 | `ADMIN_CREATE_SESSION_REQ` | C → S | Create a named session with metadata |
+| 0x00E5 | `ADMIN_CREATE_SESSION_RESP` | S → C | Session creation ack |
+| 0x0066 | `ADMIN_RENAME_SESSION_REQ` | C → S | Rename a session |
+| 0x00E6 | `ADMIN_RENAME_SESSION_RESP` | S → C | Rename ack |
+| 0x0067 | `ADMIN_MOVE_MEMORY_REQ` | C → S | Move a memory between sessions |
 | 0x00E7 | `ADMIN_MOVE_MEMORY_RESP` | S → C | Move ack |
 | 0x0068 | `ADMIN_RECLASSIFY_REQ` | C → S | Change a memory's kind |
 | 0x00E8 | `ADMIN_RECLASSIFY_RESP` | S → C | Reclassify ack |
 | 0x0069 | `ADMIN_LIST_TOMBSTONED_REQ` | C → S | List tombstoned memories (debug) |
 | 0x00E9 | `ADMIN_LIST_TOMBSTONED_RESP` | S → C | List response (streaming) |
-| 0x006A | `ADMIN_TOKENIZE_REQ` | C → S | Tokenize text for inspection (returns token IDs and surface forms) |
+| 0x006A | `ADMIN_TOKENIZE_REQ` | C → S | Tokenize text for inspection (returns token IDs and surface forms) — **opcode allocated only** |
 | 0x00EA | `ADMIN_TOKENIZE_RESP` | S → C | Tokenizer output |
 | 0x006B | `ADMIN_REGISTER_MODEL_REQ` | C → S | Register an additional embedding-model fingerprint |
 | 0x00EB | `ADMIN_REGISTER_MODEL_RESP` | S → C | Registration ack |
 | 0x006C | `ADMIN_ABORT_MIGRATION_REQ` | C → S | Abort an in-progress `ADMIN_MIGRATE_EMBEDDINGS` run |
 | 0x00EC | `ADMIN_ABORT_MIGRATION_RESP` | S → C | Abort ack |
-| 0x006D | `ADMIN_RETIRE_FINGERPRINT_REQ` | C → S | Retire a model fingerprint after a completed migration |
+| 0x006D | `ADMIN_RETIRE_FINGERPRINT_REQ` | C → S | Retire a model fingerprint after a completed migration — **opcode allocated only** |
 | 0x00ED | `ADMIN_RETIRE_FINGERPRINT_RESP` | S → C | Retire ack |
+
+The four embedding-layer admin opcodes `0x006A`–`0x006D` (`ADMIN_TOKENIZE`, `ADMIN_REGISTER_MODEL`, `ADMIN_ABORT_MIGRATION`, `ADMIN_RETIRE_FINGERPRINT`) are **allocated in the opcode enum and nothing more**: no request or response body is defined for them and the dispatcher has no arm. A frame carrying one decodes its header and is then refused. They hold their values so a later implementation does not have to renumber the admin range.
 | 0x006E | `ADMIN_BACKFILL_REQ` | C → S | Submit a backfill run (re-run extractors over a memory range); returns a `BackfillId` |
 | 0x00EE | `ADMIN_BACKFILL_RESP` | S → C | Backfill submission ack (id + initial progress) |
 | 0x006F | `ADMIN_BACKFILL_CANCEL_REQ` | C → S | Cancel an in-flight backfill run by id |
 | 0x00EF | `ADMIN_BACKFILL_CANCEL_RESP` | S → C | Cancel ack (final progress snapshot) |
+
+### 1.6a Space & session registry
+
+Non-admin registry ops, scoped to the caller's `(namespace, space)` and `act_as`-aware. Allocated from the previously-reserved `0x70–0x75` / `0xF0–0xF5` low-byte range.
+
+| Opcode | Name | Direction | Purpose |
+|---|---|---|---|
+| 0x0070 | `SPACE_CREATE_REQ` | C → S | Provision the caller's effective space explicitly (idempotent) |
+| 0x00F0 | `SPACE_CREATE_RESP` | S → C | Space row (echoes the space string, `created` flag, counts) |
+| 0x0071 | `SPACE_LIST_REQ` | C → S | List the caller's namespace's spaces |
+| 0x00F1 | `SPACE_LIST_RESP` | S → C | Space rows + `cross_shard_complete` |
+| 0x0072 | `SPACE_DELETE_REQ` | C → S | GDPR erasure of the caller's effective space |
+| 0x00F2 | `SPACE_DELETE_RESP` | S → C | Delete ack (`existed`, `memories_forgotten`) |
+| 0x0073 | `SESSION_CREATE_REQ` | C → S | Provision a session under the effective space (idempotent) |
+| 0x00F3 | `SESSION_CREATE_RESP` | S → C | Session row |
+| 0x0074 | `SESSION_LIST_REQ` | C → S | List one space's sessions, newest-first by `last_active` |
+| 0x00F4 | `SESSION_LIST_RESP` | S → C | Session rows |
+| 0x0075 | `SESSION_DELETE_REQ` | C → S | Remove a session's memories + graph rows (soft by default) |
+| 0x00F5 | `SESSION_DELETE_RESP` | S → C | Delete ack (`existed`, `memories_forgotten`) |
+
+These are the **tenant-facing** registry. `ADMIN_CREATE_SESSION` / `ADMIN_RENAME_SESSION` (§1.6) are a separate, admin-gated operator surface that names sessions and is not `act_as`-aware. Spaces and sessions are also created lazily by the first write that names one, so an explicit create is for provisioning metadata ahead of time, not a precondition for writing.
 
 ### 1.7 Errors
 
@@ -170,7 +193,7 @@ The low byte's high bit selects direction within this namespace, mirroring the s
 | 0x0133 | `ENTITY_RENAME` | EntityId, new_name, move_to_alias | confirmation |
 | 0x0134 | `ENTITY_MERGE` | survivor, merged, confidence | merge audit_id |
 | 0x0135 | `ENTITY_UNMERGE` | merged_entity | restored EntityId |
-| 0x0136 | `ENTITY_RESOLVE` | candidate_name, context, hint | ResolutionOutcome |
+| 0x0136 | `ENTITY_RESOLVE` | candidate_name, session, hint | ResolutionOutcome |
 | 0x0137 | `ENTITY_LIST` | filter (type, name_prefix, mention_count_min) | EntityIds |
 | 0x0138 | `ENTITY_TOMBSTONE` | EntityId, reason | confirmation |
 
@@ -204,21 +227,26 @@ The low byte's high bit selects direction within this namespace, mirroring the s
 |---|---|---|---|
 | 0x0161 | `QUERY_EXPLAIN` | QueryRequest | QueryPlan (no execution) |
 | 0x0162 | `QUERY_TRACE` | QueryRequest | QueryResult + per-retriever debug |
-| 0x0163 | `GRAPH_FETCH` | cursor, layer toggles, page size | Typed-graph nodes + edges page + keyset cursor |
-| 0x00E3 → 0x01E3 | `GRAPH_FETCH_RESP` | S → C | nodes[], edges[], next_cursor |
-| 0x0164 | `MATERIALIZE_PROCEDURAL` | agent_id, target_predicates | ProceduralBlock (rendered system prompt) |
+| 0x0163 | `GRAPH_FETCH` | cursor, layer toggles, page size | Typed-graph nodes + edges page + keyset cursor (resp `0x01E3`) |
+| 0x0164 | `MATERIALIZE_PROCEDURAL` | space_id, session_filter, top_k, min_confidence, categories | ProceduralBlock (rendered system prompt) + the statement ids it was rendered from (resp `0x01E4`) |
 
 `GRAPH_FETCH` (`0x0163` / resp `0x01E3`) is a paginated export of the caller's
-whole `(namespace, agent)` typed graph as a node/edge set — the read that
+whole `(namespace, space)` typed graph as a node/edge set — the read that
 backs a graph-explorer UI. It is not `RECALL`: no cue, no ranking. It paginates
 over the subject-anchored statement index (the one typed-graph index that is
-`(namespace, agent)`-prefixed) and derives the entity set from traversal, so a
+`(namespace, space)`-prefixed) and derives the entity set from traversal, so a
 fully-isolated entity (never a statement subject/object and with no relation to
 a statemented entity) does not surface. Nodes are entities (always), plus
 value-object statement nodes when `include_statements` and source-memory nodes
 when `include_memories`; edges are `Relation` (entity↔entity, relations table),
 `Fact` (entity↔entity, from an entity-object statement), `HasStatement`
-(entity→value statement), and `Mentions` (memory→entity). The cursor is opaque
+(entity→value statement), and `Mentions` (memory→entity). With
+`include_memory_edges`, the cognitive edge kinds (`Caused`, `FollowedBy`,
+`DerivedFrom`, `SimilarTo`, `Contradicts`, `Supports`, `References`, `PartOf`)
+are carried in the same edge vocabulary, so one export covers both layers.
+An entity reached only through a statement is still emitted as a node even
+when no statement *names* it — otherwise the edge that references it would
+dangle. The cursor is opaque
 and signed over the layer toggles; the response contract is **completeness, not
 disjointness** — every node/edge appears in ≥1 page and may repeat across
 pages, each carrying a stable 16-byte id for client-side dedup.
@@ -235,7 +263,7 @@ read path. Structured typed-graph lookup ("list every statement with predicate
 X on entity Y") is served by the LIST ops (`STATEMENT_LIST`, `RELATION_LIST_*`,
 `ENTITY_RESOLVE` / `ENTITY_LIST`), not a fused ranked list.
 
-`MATERIALIZE_PROCEDURAL` (`0x0164` request, `0x01E4` response) renders the agent's procedural-memory predicates (`brain:behavior_*` — see [`../03_schema/06_system_schema.md`](../03_schema/06_system_schema.md)) into a single system-prompt block the agent can re-inject at conversation start. Semantically a read-only structured query under the hood; conceptually a memory primitive because the agent treats the materialised block as a separate handle.
+`MATERIALIZE_PROCEDURAL` (`0x0164` request, `0x01E4` response) renders the space's procedural-memory predicates (`brain:behavior_*` — see [`../03_schema/06_system_schema.md`](../03_schema/06_system_schema.md)) into a single system-prompt block the agent can re-inject at conversation start. The response carries the `statement_ids` it was rendered from, so every line traces back to a stored statement. Semantically a read-only structured query under the hood; conceptually a memory primitive because the agent treats the materialised block as a separate handle.
 
 The substrate `RECALL` opcode (`0x0021`) is the primary vector recall. The pipeline (semantic + lexical + memory-edge graph fused by RRF) is the **only** `RECALL` path; every shard runs it on every request. The response always carries `contributing_retrievers` and `fused_score`. Declaring a user schema does not toggle a different retrieval path — it makes typed entity-anchored graph traversal and predicate-vocabulary checking available to callers, and lets extracted typed rows persist; the fan-out, fusion, and filter chain are the same shape regardless.
 
@@ -243,30 +271,26 @@ The substrate `RECALL` opcode (`0x0021`) is the primary vector recall. The pipel
 
 | Opcode | Name | Body | Response |
 |---|---|---|---|
-| 0x0170 | `ADMIN_REBUILD_INDEX` | index_name, shard_id | job_id |
-| 0x0171 | `ADMIN_REINDEX_TANTIVY` | shard_id | job_id |
-| 0x0172 | `ADMIN_LIST_PENDING_RESOLUTIONS` | (none) | list of ambiguity audits |
-| 0x0173 | `ADMIN_RESOLVE_AMBIGUITY` | audit_id, chosen_entity | confirmation |
-| 0x0174 | `ADMIN_GET_AUDIT` | audit_id | AuditEntry |
-| 0x0175 | `ADMIN_LIST_STALE_STATEMENTS` | filter | StatementIds |
-| 0x0176 | `ADMIN_BACKFILL` | extractor_ids, memory_range | job_id |
-| 0x0177 | `ADMIN_JOB_STATUS` | job_id | status, progress, ETA |
 | 0x0178 | `ADMIN_LIST_PENDING_CONTRADICTIONS` | limit | list of open Fact-vs-Fact contradictions |
 
-Responses live at `0x01F0–0x01FF` (e.g. `ADMIN_LIST_PENDING_CONTRADICTIONS_RESP` = `0x01F8`).
+Responses live at `0x01F0–0x01FF`; `ADMIN_LIST_PENDING_CONTRADICTIONS_RESP` is `0x01F8`.
+
+`0x0170`–`0x0177` are **unallocated**. Backfill is not among them: it is a substrate admin op at `0x006E` / `0x006F` (§1.6), where it is implemented with a scope selector, extractor-id list, dry-run flag and a cancel verb — see [`05_frame_layouts.md`](05_frame_layouts.md) §35.
 
 ### 2.7 SUBSCRIBE event types (typed graph)
 
 The SUBSCRIBE primitive (§1.3) carries event types for the typed graph:
 
-- `ENTITY_CREATED`, `ENTITY_UPDATED`, `ENTITY_MERGED`, `ENTITY_UNMERGED`, `ENTITY_RENAMED`, `ENTITY_TOMBSTONED`
-- `STATEMENT_CREATED`, `STATEMENT_SUPERSEDED`, `STATEMENT_TOMBSTONED`
-- `RELATION_CREATED`, `RELATION_SUPERSEDED`
-- `EXTRACTION_COMPLETED` (with extractor_id, memory_id, output_count)
-- `EXTRACTION_FAILED` (with extractor_id, memory_id, error)
-- `SCHEMA_UPDATED` (with from_version, to_version)
+- `ENTITY_CREATED` (16), `ENTITY_UPDATED` (17), `ENTITY_RENAMED` (18), `ENTITY_MERGED` (19), `ENTITY_UNMERGED` (20), `ENTITY_TOMBSTONED` (21)
+- `STATEMENT_CREATED` (22), `STATEMENT_SUPERSEDED` (23), `STATEMENT_TOMBSTONED` (24)
+- `RELATION_CREATED` (25), `RELATION_SUPERSEDED` (26), `RELATION_TOMBSTONED` (30)
+- `SCHEMA_UPDATED` (29, with from_version / to_version / backward_compatible)
+- `STAGE_COMPLETED` (27) — one async write-derivation stage finished; see [`05_frame_layouts.md`](05_frame_layouts.md) §43.2
+- `EDGE_ADDED` (31), `EDGE_REMOVED` (32), `EDGE_SUPERSEDED` (33) — the unified edge change feed; see §43.3 there
 
-Subscribers filter by event type, entity_id, predicate, etc. Event-payload schemas and emission semantics are part of the streaming surface defined in [`06_streaming.md`](06_streaming.md).
+There is no `EXTRACTION_COMPLETED` / `EXTRACTION_FAILED` pair. Extraction reports through `STAGE_COMPLETED` with `stage_kind = Extractor`, whose `stage_outcome` separates *ran and produced nothing* (`Empty`) from *could not run* (`Failed`) — a distinction two boolean event types could not carry.
+
+Discriminants are explicit and stable; `28` is unassigned and `RELATION_TOMBSTONED` sits at `30` because both were appended after the earlier variants shipped. Subscribers filter by event type, entity_id, predicate, etc. Event-payload schemas and emission semantics are part of the streaming surface defined in [`06_streaming.md`](06_streaming.md).
 
 ### 2.8 Schema as a per-type gate
 
@@ -286,13 +310,16 @@ There is no `SCHEMA_NOT_DECLARED` error any more — the gate is per-type, not p
 
 Within the substrate namespace (`0x00xx`), the following low-byte ranges are reserved:
 
-- 0x70–0x7F (server-bound, `0x0070–0x007F`) — reserved for future C → S substrate operations.
-- 0xF0–0xFE (client-bound, `0x00F0–0x00FE`) — reserved for future S → C substrate operations.
+- 0x70–0x75 / 0xF0–0xF5 — **allocated** to the space & session registry (§1.6a).
+- 0x76–0x7F (server-bound, `0x0076–0x007F`) — reserved for future C → S substrate operations.
+- 0xF6–0xFE (client-bound, `0x00F6–0x00FE`) — reserved for future S → C substrate operations.
 
 Within the typed-graph namespace (`0x01xx`):
 
 - 0x0100–0x010F — reserved.
 - 0x0110–0x011F — reserved future.
+- 0x0126 — reserved (the schema range allocates `0x0125` `SCHEMA_DROP` and `0x0127` `SCHEMA_REPLACE` around it).
+- 0x0170–0x0177 — reserved future (the admin range's only allocated opcode is `0x0178`).
 - 0x0180–0x018F — reserved future.
 
 Receivers MUST treat unknown opcodes as protocol errors (sending `ERROR` with `BadOpcode`) — no silent discarding.
@@ -386,7 +413,7 @@ Each operation in a transaction is its own stream. The transaction lifecycle has
 [connection established, AUTH_OK received]
 
 C → S: ENCODE_REQ(stream_id=1, EOS)
-       payload: {text: "Hello world", context_id: 0, request_id: <uuid>}
+       payload: {text: "Hello world", session_id: 0, request_id: <uuid>}
 S → C: ENCODE_RESP(stream_id=1, EOS)
        payload: {memory_id: <id>, status: ok}
 ```

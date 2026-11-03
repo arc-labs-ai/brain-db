@@ -91,7 +91,7 @@ The tradeoff parameters are:
 Brain uses HNSW because:
 
 - It's the best-in-class ANN algorithm by recall-vs-latency Pareto frontier on dense vectors, validated across benchmarks like [ann-benchmarks](https://github.com/erikbern/ann-benchmarks).
-- It supports incremental insertion — important because an agent's memory grows continuously, not in batches.
+- It supports incremental insertion — important because a space's memory grows continuously, not in batches.
 - It has well-understood failure modes (especially around deletion and high-dim "hubness" effects).
 - Mature implementations exist in Rust ([`hnsw_rs`](https://github.com/jean-pierreBoth/hnswlib-rs)).
 

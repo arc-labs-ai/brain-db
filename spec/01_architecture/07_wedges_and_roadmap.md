@@ -17,7 +17,7 @@ Brain stores four record types — Memory, Entity, Statement, Relation — with 
 
 **What it buys.** Time-travel queries (`what did I believe about Alice on date X?`), structured filters (`WHERE kind = 'preference' AND confidence ≥ 0.7`), entity-anchored retrieval (`tell me everything about Alice`), supersession that's distinguishable from contradiction, and provenance back to source memories on every claim.
 
-**Competitive context.** Pure vector stores (Pinecone, Weaviate, Chroma) can't express any of this — they treat "Alice prefers dark mode" as a string and rely on similarity search. Mem0 stores text but no typed graph. Zep has a graph layer but needs Neo4j as a dependency. Brain stores the typed graph natively.
+**Competitive session.** Pure vector stores (Pinecone, Weaviate, Chroma) can't express any of this — they treat "Alice prefers dark mode" as a string and rely on similarity search. Mem0 stores text but no typed graph. Zep has a graph layer but needs Neo4j as a dependency. Brain stores the typed graph natively.
 
 ---
 
@@ -29,7 +29,7 @@ Brain runs the embedding model itself (BGE-small via candle, 384-dim). Clients s
 
 **What it buys.** Latency under operator control — no network hop to OpenAI/Anthropic embedding APIs. Determinism — the same text always produces the same vector (modulo dtype). No per-call cost. Privacy — text never leaves the deployment for embedding purposes. No vendor lock — switching the embedding model is a config change + re-embed pass, not a contract negotiation.
 
-**Competitive context.** Most cloud vector DBs offload embedding to OpenAI by default. Mem0 calls OpenAI per-write. Brain owns the embedding step end-to-end.
+**Competitive session.** Most cloud vector DBs offload embedding to OpenAI by default. Mem0 calls OpenAI per-write. Brain owns the embedding step end-to-end.
 
 ---
 
@@ -41,7 +41,7 @@ Every write goes to the per-shard write-ahead log with `pwritev2(RWF_DSYNC)` gro
 
 **What it buys.** No "eventually consistent" cliff edges. A successful ack means the write is durable. Recovery is replay from the WAL — deterministic, observable, fast (gigabytes per minute). No silent corruption: every CRC failure halts and alerts; the system never returns wrong data.
 
-**Competitive context.** Most modern vector DBs are eventually-consistent under the hood (segment files commit at intervals; queries between commits miss recent writes). Brain treats durability as a first-class contract.
+**Competitive session.** Most modern vector DBs are eventually-consistent under the hood (segment files commit at intervals; queries between commits miss recent writes). Brain treats durability as a first-class contract.
 
 ---
 
@@ -53,7 +53,7 @@ Brain ships the same Rust crates whether the deployment is embedded (in-process,
 
 **What it buys.** Operators can prototype embedded, deploy self-hosted, and grow to cluster without rewriting application code. Bug fixes propagate to all three. Tests against embedded validate self-hosted. No "the cloud product has graph features the open-source product doesn't" trap — every feature lives in the open Apache 2.0 crates.
 
-**Competitive context.** Mem0 gates its graph features behind a $249/mo cloud tier. Pinecone serverless is cloud-only. Zep's enterprise tier has features the open-source server doesn't. Brain refuses this split.
+**Competitive session.** Mem0 gates its graph features behind a $249/mo cloud tier. Pinecone serverless is cloud-only. Zep's enterprise tier has features the open-source server doesn't. Brain refuses this split.
 
 ---
 
@@ -65,7 +65,7 @@ Brain — the typed graph, the extractor pipeline, the reranker, the schema DSL 
 
 **What it buys.** Adoption velocity — agent developers can prototype in `cargo run` without provisioning anything. Long-term trust — no rug pulls, no "open core" license switch. Source available for audit at every layer.
 
-**Competitive context.** Several established memory systems (Mem0, Zep) operate the source on cloud-only tiers + restricted self-host. Brain's stance: the data layer should be open, period.
+**Competitive session.** Several established memory systems (Mem0, Zep) operate the source on cloud-only tiers + restricted self-host. Brain's stance: the data layer should be open, period.
 
 ---
 
@@ -161,7 +161,7 @@ The patterns below are the ones with the clearest fit. The design wedges above c
 
 **What it enables.** Big tenants scale horizontally instead of being capped at single-shard throughput. Replication closes the data-loss window when a node fails (today: single-replica per shard, restore from snapshot).
 
-**Deferred because.** Brain shards by fixed `hash(agent_id) mod N`. A tenant accumulating 100× more memories than peers stays on one shard. Switching to range-based sharding requires a range descriptor table, per-range Raft groups, a rebalancer, and a cluster control plane — all out of scope for v1.
+**Deferred because.** Brain shards by fixed `hash(space_id) mod N`. A tenant accumulating 100× more memories than peers stays on one shard. Switching to range-based sharding requires a range descriptor table, per-range Raft groups, a rebalancer, and a cluster control plane — all out of scope for v1.
 
 **Path.** Range-based sharding behind range descriptors, Raft per range, a rebalancer that responds to size and load metrics. Major release; gated by a customer hitting the single-shard ceiling, not by an internal target.
 

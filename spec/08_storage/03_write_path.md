@@ -13,7 +13,7 @@ Client --[ENCODE]--> Connection layer
                    Embedding layer (text → vector)
                           |
                           v
-                   Routing layer (agent_id → shard)
+                   Routing layer (space_id → shard)
                           |
                           v
                    Per-shard writer task
@@ -67,13 +67,13 @@ WalRecord {
         flags: 0,
         payload_length: ...,
         timestamp: now(),
-        agent_id_lo64: agent_id.low64(),
+        agent_id_lo64: space_id.low64(),
     },
     payload: EncodeRecord {
         memory_id: allocated_id,
         request_id: request.request_id,
-        agent_id: request.agent_id,
-        context_id: resolved_context_id,
+        space_id: request.space_id,
+        session_id: resolved_session_id,
         kind: request.kind,
         salience_initial: computed_initial_salience,
         embedding_model_fp: current_fingerprint,
@@ -152,8 +152,8 @@ let txn = metadata_db.begin_write()?;
     memories.insert(
         memory_id,
         MemoryMetadata {
-            agent_id: ...,
-            context_id: ...,
+            space_id: ...,
+            session_id: ...,
             kind: ...,
             text_offset: ...,
             text_length: ...,

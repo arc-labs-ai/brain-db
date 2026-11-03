@@ -6,45 +6,74 @@ The tables in the metadata store. Each table is a typed B-tree maintained by red
 
 | Table name | Key | Value | Purpose |
 |---|---|---|---|
-| `memories` | `MemoryId` | `MemoryMetadata` | Per-memory metadata |
+| `memories` | `MemoryId` (16 B, BE) | `MemoryMetadata` | Per-memory metadata |
 | `texts` | `MemoryId` | `Vec<u8>` | Memory text content (UTF-8) |
+| `memory_vectors` | `MemoryId` | vector bytes | Durable copy of the memory's embedding |
 | `memory_artifacts` | `MemoryId` | `&str` (JSON) | Durable per-memory write-artifact bundle for `MEMORY_INSPECT` (§9a) |
-| `edges_out` | `(MemoryId, EdgeKind, MemoryId)` | `EdgeData` | Outgoing edges, indexed by (source, kind, target) |
-| `edges_in` | `(MemoryId, EdgeKind, MemoryId)` | `EdgeData` | Incoming edges, indexed by (target, kind, source) |
-| `contexts` | `ContextId` | `ContextMetadata` | Context records |
-| `context_names` | `(AgentId, &str)` | `ContextId` | Context name → ID lookup per agent |
-| `agent_contexts` | `(AgentId, ContextId)` | `()` | Membership of contexts in agents |
-| `idempotency` | `RequestId` | `IdempotencyEntry` | Replay protection for ENCODE/FORGET |
-| `agents` | `AgentId` | `AgentMetadata` | Per-agent metadata |
+| `edges` | `(from, kind, to, disambiguator)` (§3) | `EdgeData` | Forward edges — every edge in Brain, not just memory→memory |
+| `edges_reverse` | `(to, kind, from, disambiguator)` | `EdgeData` | The same edges keyed by target |
+| `memories_by_space_timeline` | scope-prefixed composite (§4) | `()` | Per-tenant memory timeline for temporal-edge derivation |
+| `spaces` | `(namespace_id, space_id)` (20 B) | `SpaceMetadata` | Space registry |
+| `sessions` | `(namespace_id, space_id, session_id)` (28 B) | `SessionMetadata` | Session registry |
+| `session_by_scope` | `(namespace_id, space_id, last_active, session_id)` (36 B) | `()` | Activity ordering index for `SESSION_LIST` |
+| `idempotency` | `RequestId` | `IdempotencyEntry` | Replay protection for ENCODE / FORGET and the other idempotent verbs |
+| `forget_undo_log` | `MemoryId` | undo record | What a soft FORGET must restore if it is reverted |
+| `api_keys` | key hash | key record | Minted credentials: bound `(namespace, space)`, permissions, `may_act` |
+| `api_keys_by_space` | `(namespace_id, space_id, key hash)` | `()` | Per-space key listing |
+| `namespaces` | `u32` (NamespaceId) | `NamespaceDefinition` | Interned tenant (company) registry; the `brain` system namespace is seeded at id `0` |
+| `namespace_by_name` | `&str` | `u32` (NamespaceId) | Namespace name → id reverse lookup (hit once per connection at AUTH) |
 | `model_fingerprints` | `ModelFingerprint` | `ModelInfo` | Registry of seen model fingerprints |
+| `fingerprints` | content hash | `MemoryId` | Content-dedup index for `ENCODE` |
+| `kinds` / `kinds_by_byte` | — | — | Memory-kind registry and its reverse lookup |
 | `checkpoints` | `u64` | `CheckpointInfo` | Checkpoint records |
 | `next_lsn` | `()` | `u64` | The next WAL LSN (singleton) |
 | `slot_versions` | `u64` (slot_id) | `u32` (version) | Per-slot versions, for lazy reclaim |
-| `namespaces` | `u32` (NamespaceId) | `NamespaceDefinition` | Interned tenant (company) registry; the `brain` system namespace is seeded at id `0` |
-| `namespace_by_name` | `&str` | `u32` (NamespaceId) | Namespace name → id reverse lookup (hit once per connection at AUTH) |
-| `memories_by_agent_timeline` | scope-prefixed composite (§4) | `()` | Per-tenant memory timeline for temporal-edge derivation |
+| `worker_checkpoints` | `(worker_id, item)` | checkpoint | Per-item resume state for backfill and the sweepers |
+| `extraction_queue` | `MemoryId` | queue entry | Durable trigger the ExtractorWorker drains |
+| `hype_question_vectors` | `MemoryId` | vectors | Write-time hypothetical-question embeddings |
+| `hype_neighborhood_hash` | `MemoryId` | hash | Guards redundant HyPE regeneration |
+| `__schema_meta` | `()` | storage version | On-disk format version; refuses a too-new database |
+
+The typed-graph tables (entities, statements, relations, predicates, entity types, relation types, extractors, schema versions and their secondary indexes and audit tables) are catalogued in [`03_substrate_tables.md`](03_substrate_tables.md) and the sections that follow it. Together the database holds roughly seventy-five tables.
 
 The table count is intentional: each table has a single, focused purpose. Brain does not pack multiple types into one table.
 
-The `namespaces` / `namespace_by_name` registry is always present (the `brain` system namespace is interned at id `0` at seed); user `SCHEMA_UPLOAD` interns further namespaces starting at `1`. Every owner of data — memory rows and typed-graph rows alike — carries a `(namespace_id, agent_id)` owner scope (§4a).
+There is **no `agents` table.** The thing a credential binds to is a `(namespace, space)` pair, and what persists about it is the `spaces` registry row plus the key record in `api_keys` — there is no third "agent" entity in between.
+
+The `namespaces` / `namespace_by_name` registry is always present (the `brain` system namespace is interned at id `0` at seed); user `SCHEMA_UPLOAD` interns further namespaces starting at `1`. Every owner of data — memory rows and typed-graph rows alike — carries a `(namespace_id, space_id)` owner scope (§4a).
 
 ## 2. Memory ID as primary key
 
 Most tables key by `MemoryId`. The 16-byte identifier is:
 
 - Time-ordered (UUIDv7 prefix), so iterating gives chronological order.
-- Cluster-friendly (same agent's memories share a high-bit prefix).
+- Cluster-friendly (same space's memories share a high-bit prefix).
 
 Range queries by MemoryId are common: "all memories created in the last hour", "all memories in this agent".
 
-## 3. Edge tables: two for two directions
+## 3. Edge tables: one logical relation, two physical directions
 
-Edges are stored twice: once keyed by source (in `edges_out`) and once by target (in `edges_in`). This duplication enables:
+**One pair of tables holds every edge in Brain.** Cognitive edges (`Memory → Memory`), mention edges (`Memory → Entity`) and typed relations (`Entity → Entity`) are not three storage schemes — both endpoints are keyed as a `NodeRef` and the label as an `EdgeKindRef`, so graph traversal is one BFS and recovery, the change feed and the FORGET cascade each work over one structure. Mention edges previously had no home at all; unifying gave them one.
 
-- Forward queries ("what does memory X causally lead to?") via `edges_out`.
-- Reverse queries ("what supports memory X?") via `edges_in`.
+Edges are stored twice, once in each direction:
 
-The duplication doubles edge storage but is essential for query performance. Without it, a reverse query would require scanning all edges.
+- `edges` keyed `(from, kind, to, disambiguator)` → `EdgeData` — forward queries ("what does memory X causally lead to?").
+- `edges_reverse` keyed `(to, kind, from, disambiguator)` → `EdgeData` — reverse queries ("what supports memory X?").
+
+The reverse table stores the full `EdgeData` rather than `()`. Storing `()` would make every incoming-edge hit a point lookup back into the forward table; duplicating the value makes an incoming scan a single contiguous range read. The redundancy is under 64 bytes per edge and buys roughly a 2× latency improvement on `walk_incoming` against a high-fan-in node.
+
+The key layout is 51–55 bytes:
+
+```text
+  from        NodeRef        17 bytes
+  kind        EdgeKindRef    1..5 bytes
+  to          NodeRef        17 bytes
+  disambig    [u8; 16]       16 bytes  (RelationId for a typed edge; zeros otherwise)
+```
+
+The **disambiguator** exists because two typed relations of the same type between the same `(from, to)` pair would otherwise collide on one key. It is `[0; 16]` for builtin and mention edges and the `RelationId` for typed ones, which keeps the prefix scans `edges[(from, *, *)]` and `edges[(from, Typed(rt_id), *)]` cheap while preserving per-relation identity.
+
+**Symmetric builtin kinds auto-mirror.** A logical symmetric edge `A↔B` writes four physical rows — `(A, K, B)` and `(B, K, A)` forward, each mirrored into the reverse table. A self-edge (`A == A`) skips the mirror, since the row is already its own reverse. Auto-mirroring applies **only** to builtin cognitive kinds; typed-relation symmetry is a sidecar property handled a layer up, where the canonicalised endpoint pair is known.
 
 For 1M memories with avg 8 edges each, 8M edges, doubled to 16M index entries. At ~30 bytes per entry, ~500 MB. Significant but bounded.
 
@@ -52,18 +81,22 @@ For 1M memories with avg 8 edges each, 8M edges, doubled to 16M index entries. A
 
 Several tables use composite keys for efficient range queries:
 
-- `edges_out: (source, kind, target)` — listing all edges of a kind from a source is a tight range scan.
-- `context_names: (agent_id, name)` — listing context names per agent is a range scan.
-- `memories_by_agent_timeline: (namespace_id, agent_id, created_at, context_id, memory_id)` — the per-tenant memory timeline. The key is **52 bytes** (`namespace_id(4) || agent_id(16) || created_at(8) || context_id(8) || memory_id(16)`); `created_at` is big-endian so a lexicographic range scan yields chronological order, and the trailing `memory_id` disambiguates same-nanosecond writes. The leading `(namespace_id, agent_id)` makes each tenant's timeline a contiguous keyspace, so a scan for one `(namespace, agent)` can never traverse another tenant's rows.
+- `edges: (from, kind, to, disambiguator)` — listing all edges of a kind from a source is a tight range scan.
+- `sessions: (namespace_id, space_id, session_id)` — 28 bytes; one scope's sessions are contiguous.
+- `session_by_scope: (namespace_id, space_id, last_active, session_id)` — 36 bytes; a reverse range scan over the 20-byte `(namespace, space)` prefix yields `SESSION_LIST`'s newest-first order without sorting at read time.
+- `spaces: (namespace_id, space_id)` — 20 bytes; one namespace's spaces are contiguous, so `SPACE_LIST` is a range scan over the 4-byte namespace prefix.
+- `memories_by_space_timeline: (namespace_id, space_id, created_at, session_id, memory_id)` — the per-tenant memory timeline. The key is **52 bytes** (`namespace_id(4) || space_id(16) || created_at(8) || session_id(8) || memory_id(16)`); `created_at` is big-endian so a lexicographic range scan yields chronological order, and the trailing `memory_id` disambiguates same-nanosecond writes. The leading `(namespace_id, space_id)` makes each tenant's timeline a contiguous keyspace, so a scan for one `(namespace, space)` can never traverse another tenant's rows.
 
-The composite key encoding is little-endian concatenation; redb sorts keys lexicographically, and the encoding makes that order match logical order (e.g., all edges from source X come before edges from source Y).
+Scalar key components are encoded **big-endian** precisely so that redb's lexicographic byte order matches logical order — a timestamp written little-endian would sort by its least significant byte and make the range scans above meaningless.
+
+A tombstone must delete the timeline row as well as the memory row, or a forgotten memory keeps surfacing as a temporal predecessor to the next write.
 
 ## 4a. Tenant scoping
 
-Every owner of data — memory rows and typed-graph rows (entity, statement, relation) alike — carries a `(namespace_id: u32, agent_id: [u8; 16])` owner scope. Two consequences for table layout:
+Every owner of data — memory rows and typed-graph rows (entity, statement, relation) alike — carries a `(namespace_id: u32, space_id: [u8; 16])` owner scope. Two consequences for table layout:
 
-- **Primary tables stay id-keyed.** `memories`, `entities`, `statements`, `relation_metadata` remain keyed by their (globally-unique) id; the owner scope lives on the row **value**. An id-keyed `*_get` therefore does **not** scope-check — the handler filters by the row's stored `namespace_id` / `agent_id`.
-- **Secondary indexes carry a leading scope prefix.** Every secondary index below is re-keyed with a leading `(namespace_id, agent_id)` tuple so a range scan for one `(namespace, agent)` can physically never traverse another tenant's rows. The one exception is the shared relation directional edge table, which is not re-keyed (see §20.2/§20.3).
+- **Primary tables stay id-keyed.** `memories`, `entities`, `statements`, `relation_metadata` remain keyed by their (globally-unique) id; the owner scope lives on the row **value**. An id-keyed `*_get` therefore does **not** scope-check — the handler filters by the row's stored `namespace_id` / `space_id`.
+- **Secondary indexes carry a leading scope prefix.** Every secondary index below is re-keyed with a leading `(namespace_id, space_id)` tuple so a range scan for one `(namespace, space)` can physically never traverse another tenant's rows. The one exception is the shared relation directional edge table, which is not re-keyed (see §20.2/§20.3).
 
 ## 5. Value encoding
 
@@ -102,9 +135,9 @@ Brain uses redb's `()` key type for singletons. Reading is `table.get(&())`, wri
 
 ## 8. Index-only tables
 
-`agent_contexts` is an index — its key is `(AgentId, ContextId)` and its value is `()`. This is a simple "is this context in this agent?" check.
+Several tables carry `()` as their value: they exist purely so that an ordering or a membership question is a range scan rather than a filter. `session_by_scope` (activity order within a space) and `memories_by_space_timeline` (chronological order within a space) are the substrate examples; the typed-graph layer adds `statements_by_subject`, `entity_by_type` and the rest.
 
-Could Brain uses a HashSet in memory? Yes, but persistence matters; Brain may need to re-look-up after restart.
+These could be in-memory structures, and are not, for two reasons: they must survive restart without a rebuild pass, and keeping them in the same redb write transaction as the row they index is what makes the index and the data impossible to desynchronise on a crash.
 
 ## 9. The texts table
 
@@ -159,16 +192,18 @@ grace). `record.lsn` is `0` in the durable bundle (the WAL position isn't
 assigned until the ENCODE `submit` append); the live ENCODE trace's `persist`
 stage carries the real LSN.
 
-## 10. Context lookup
+## 10. Session and space lookup
 
-Two tables together make context lookup efficient:
+Two tables serve sessions, and they answer two different questions:
 
-- `contexts`: `ContextId → ContextMetadata`. Lookup by ID.
-- `context_names`: `(AgentId, &str) → ContextId`. Lookup by name within an agent.
+- `sessions`: `(namespace_id, space_id, session_id) → SessionMetadata`. The record, looked up by id.
+- `session_by_scope`: `(namespace_id, space_id, last_active, session_id) → ()`. The ordering index, so `SESSION_LIST` is a reverse range scan over the `(namespace, space)` prefix and returns newest-first without sorting at read time.
 
-A context's name is typed scoped to its agent. Different agents can have contexts with the same name, but they're distinct contexts (different ContextIds).
+There is **no name → id lookup table**, because `session_id` is a client-chosen opaque `u64` rather than a server-allocated handle behind a name (see [`../02_data_model/03_sessions.md`](../02_data_model/03_sessions.md) §3). A session's optional `title` is display metadata on the record; nothing resolves through it.
 
-The context's full record (with stats, timestamps, etc.) lives in `contexts`. The name table is the index.
+`spaces` is the matching registry one tier up: `(namespace_id, space_id) → SpaceMetadata`, so one namespace's spaces are contiguous and `SPACE_LIST` is a range scan over the 4-byte namespace prefix. The row carries the original structured space string — the 16-byte `space_id` is a non-invertible `UUIDv5` of it, so the registry row is the only place the string survives.
+
+Both registries are **derived, recomputable view state**: every row summarizes memory and graph data that stays authoritative. A write upserts the space and session rows in the *same* redb transaction as the memory, so the registry cannot drift from the data on a crash, and WAL recovery replays the same helper. The denormalized counts are display-only and are corrected by the counter-reconciliation worker.
 
 ## 11. Idempotency table TTL
 
@@ -176,17 +211,14 @@ The `idempotency` table grows with every ENCODE/FORGET. It's pruned on a TTL —
 
 Pruning is a periodic batch operation, not per-row. The worker scans for expired entries and deletes them in a single transaction. See [15. Background Workers](../15_background_workers/00_purpose.md) §Idempotency Cleanup.
 
-## 12. The agents table
+## 12. The api_keys tables
 
-`agents` carries per-agent metadata:
+Credentials are persisted, because identity is derived from them on every connection and must survive restart:
 
-- AgentId.
-- Display name (optional).
-- Created at.
-- Stats (memory count, contexts count, etc. — updated periodically).
-- Configuration overrides (per-agent quotas, etc.).
+- `api_keys`: keyed by the key's hash → the bound `(namespace, space)`, the permission bitfield, the `may_act` allowlist, and the non-authoritative `user` tag stamped onto audit rows.
+- `api_keys_by_space`: `(namespace_id, space_id, key hash) → ()` — the listing index, so "which keys exist for this space?" is a range scan rather than a full table walk.
 
-Looking up an agent by ID is O(log N) where N is the number of agents in the shard. Typical: a few thousand to a few million agents per shard.
+AUTH is one point lookup in `api_keys` plus one in `namespace_by_name`; nothing else on the connection path touches these tables.
 
 ## 13. The slot_versions table
 
@@ -201,34 +233,33 @@ The table maps `slot_id → current_version`. Looked up:
 
 In the v1 spec:
 
-- 17 always-present tables (the 13 original substrate tables + the two namespace-registry tables + the per-tenant memory timeline index + the `memory_artifacts` inspection bundle).
+Around seventy-five tables live in one `metadata.redb`, split roughly into the substrate set catalogued in §1 and the typed-graph set in §15.
 
-Adding a table is a schema change — it requires a format version bump in the metadata store. Tables are not added lightly.
+Adding a table is a schema change — it requires a format version bump recorded in `__schema_meta`. Tables are not added lightly.
 
-## 15. Tables added when a schema is declared
+## 15. Typed-graph tables
 
-Declaring a schema (via `SCHEMA_UPLOAD`) activates entity / statement / relation persistence. The following tables are added to the same `metadata.redb` file:
+These are **always present**, not conditionally created. Every shard ships with the seeded `brain:` system namespace, so there is always an active schema; declaring a user schema widens the *vocabulary* a write may use, it does not bring storage into existence. The same is true of the derived indexes in §16 — the HNSW corpora and tantivy directories exist from byte zero. Nothing in the storage layer keys off "has a schema been uploaded".
 
-Each primary table stays id-keyed with the owner scope on the row value; each secondary index carries a leading `(namespace_id, agent_id)` scope prefix (§4a). The keys below show the prefix explicitly.
+Each primary table stays id-keyed with the owner scope on the row value; each secondary index carries a leading `(namespace_id, space_id)` scope prefix (§4a). The keys below show the prefix explicitly.
 
 | Table | Key | Value | Purpose |
 |---|---|---|---|
 | `entities` | EntityId | Entity record (rkyv) | Primary entity table (scope on value) |
-| `entity_by_canonical_name` | (namespace_id, agent_id, entity_type_id, normalized_name) | EntityId | Exact-match resolution |
-| `entity_aliases` | (namespace_id, agent_id, entity_type_id, normalized_alias, EntityId) | () | Alias resolution |
-| `entity_trigrams` | (namespace_id, agent_id, entity_type_id, trigram, EntityId) | () | Fuzzy resolution |
-| `entity_mentions` | (namespace_id, agent_id, EntityId, MemoryId) | MentionMetadata | Reverse: memories mentioning entity |
+| `entity_by_canonical_name` | (namespace_id, space_id, entity_type_id, normalized_name) | EntityId | Exact-match resolution |
+| `entity_aliases` | (namespace_id, space_id, entity_type_id, normalized_alias, EntityId) | () | Alias resolution |
+| `entity_trigrams` | (namespace_id, space_id, entity_type_id, trigram, EntityId) | () | Fuzzy resolution |
+| `entity_mentions` | (namespace_id, space_id, EntityId, MemoryId) | MentionMetadata | Reverse: memories mentioning entity |
 | `statements` | StatementId | Statement record (rkyv) | Primary statement table (scope on value) |
-| `statements_by_subject` | (namespace_id, agent_id, EntityId, kind, predicate, is_current, StatementId) | StatementId | Subject-anchored queries |
-| `statements_by_predicate` | (namespace_id, agent_id, PredicateId, kind, confidence_bucket, StatementId) | StatementId | Predicate-anchored queries |
-| `statements_by_object_entity` | (namespace_id, agent_id, EntityId, kind, StatementId) | StatementId | Reverse: who has X as object |
-| `statements_by_event_time` | (namespace_id, agent_id, event_at, EntityId, StatementId) | StatementId | Time-range Event queries |
-| `statements_by_evidence` | (namespace_id, agent_id, MemoryId, StatementId) | () | Reverse: statements from memory |
-| `statement_chain` | (namespace_id, agent_id, chain_root, version) | StatementId | Supersession chain traversal |
+| `statements_by_subject` | (namespace_id, space_id, EntityId, kind, predicate, is_current, StatementId) | StatementId | Subject-anchored queries |
+| `statements_by_predicate` | (namespace_id, space_id, PredicateId, kind, confidence_bucket, StatementId) | StatementId | Predicate-anchored queries |
+| `statements_by_object_entity` | (namespace_id, space_id, EntityId, kind, StatementId) | StatementId | Reverse: who has X as object |
+| `statements_by_event_time` | (namespace_id, space_id, event_at, EntityId, StatementId) | StatementId | Time-range Event queries |
+| `statements_by_evidence` | (namespace_id, space_id, MemoryId, StatementId) | () | Reverse: statements from memory |
+| `statement_chain` | (namespace_id, space_id, chain_root, version) | StatementId | Supersession chain traversal |
 | `evidence_overflow` | EvidenceOverflowId | Vec<MemoryId> (rkyv) | Long evidence lists |
 | `relation_metadata` | RelationId | Relation sidecar (rkyv) | Primary relation table (scope on value) |
-| `relations_by_from` / `relations_by_to` | (EntityId, relation_type, is_current) | RelationId | Directional edges — shared edge table, **not** scope-prefixed (§20.2/§20.3) |
-| `relation_by_evidence` | (namespace_id, agent_id, MemoryId, RelationId) | () | Reverse: relations from memory |
+| `relation_by_evidence` | (namespace_id, space_id, MemoryId, RelationId) | () | Reverse: relations from memory |
 | `predicates` | PredicateId | Predicate definition | Interned predicates |
 | `entity_types` | EntityTypeId | EntityType definition | Interned entity types |
 | `relation_types` | RelationTypeId | RelationType definition | Interned relation types |
@@ -238,12 +269,33 @@ Each primary table stays id-keyed with the owner scope on the row value; each se
 | `entity_resolution_audit` | AuditId | ResolutionAudit | Per-resolution audit |
 | `statement_contradiction_audit` | (subject, predicate_id) | ContradictionAudit | Open Fact-vs-Fact contradictions |
 | `merge_log` | (timestamp, merge_id) | MergeRecord | Entity merges |
+| `entity_merge_audit_overflow` | AuditId | rerouted-id list | Overflow for a merge that moved many rows |
+| `merge_review_queue` / `merge_review_by_status` | (scope, EntityId) / (status, …) | ReviewItem / () | Ambiguous-band resolutions awaiting re-check |
+| `entity_by_type` | (namespace_id, space_id, entity_type_id, EntityId) | () | Type-filtered `ENTITY_LIST` |
+| `entity_vectors` | EntityId | vector bytes | Durable entity embeddings for tier-3 resolution |
+| `entity_types_by_scope` | (namespace_id, name) | EntityTypeId | Type name → id within a namespace |
+| `statements_by_subject_id` / `statements_by_predicate_id` | id-keyed variants | StatementId | Lookups that have the interned id rather than the qname |
+| `statement_embed_queue` | StatementId | queue entry | Pending statement embeddings |
+| `statement_question_vectors` | StatementId | vectors | Per-statement question embeddings |
+| `predicates_by_qname` | (namespace_id, qname) | PredicateId | Qname → id resolution per request |
+| `predicate_embeddings` | PredicateId | vector bytes | Predicate similarity for the supersession ladder |
+| `predicate_review_queue` | PredicateId | review item | Open-vocabulary predicates awaiting curation |
+| `relation_types_by_qname` | (namespace_id, qname) | RelationTypeId | Qname → id resolution |
+| `relation_type_embeddings` | RelationTypeId | vector bytes | Relation-type similarity |
+| `extractors_by_qname` | (namespace_id, qname) | ExtractorId | Extractor lookup by name |
+| `extractor_audit_by_memory` / `_by_extractor` / `_by_time` | scope-prefixed composites | AuditId | The three axes an operator queries the audit on |
+| `extractor_pipeline_audit` | MemoryId | PipelineAudit | Per-memory record of which tiers ran and what they produced |
+| `schema_active_versions` | (namespace_id) | u32 | Which stored version is live for a namespace |
+
+There are no `relations_by_from` / `relations_by_to` tables. A typed relation is an edge, and every edge in Brain lives in the unified `edges` / `edges_reverse` pair (§3) — directional relation queries are prefix scans there, disambiguated by the trailing `RelationId`. The relation's non-edge fields (properties, evidence, validity window, supersession chain) live in `relation_metadata`.
 
 The same composite-key + rkyv-value conventions apply (§4, §5).
 
 ## 16. Per-shard non-redb storage
 
-A shard with a declared schema also maintains derived indexes outside `metadata.redb`: two tantivy directories, two HNSW files, and a separate redb file for the LLM extractor cache.
+Every shard maintains derived indexes outside `metadata.redb`: two tantivy directories (memory text, statement text), three HNSW corpora (memory, entity, statement), and a separate redb file for the LLM response cache (`llm_responses` + `llm_response_ttl`). These are present from byte zero, not activated by a schema upload.
+
+The LLM cache is **not** migrated across a BYOK boundary. Its key includes a credential-scope component, and rows written before that component existed cannot say which credential paid for them — serving them under per-namespace credentials would be exactly the cross-tenant reuse the scope exists to prevent. A pre-BYOK cache file is refused rather than adopted.
 
 ### 16.1 Tantivy indexes
 
@@ -253,7 +305,7 @@ Two tantivy indexes per shard.
 
 Indexes memory text. Fields:
 - `text` (TEXT, tokenized, stemmed, indexed for BM25)
-- `agent_id` (STRING, indexed for filter)
+- `space_id` (STRING, indexed for filter)
 - `kind` (STRING, indexed for filter)
 - `created_at` (DATE, indexed for range queries)
 - `memory_id` (STORED only, not indexed)
@@ -332,24 +384,24 @@ The entity tables introduced in §14 carry additional structure for the resolver
 
 ```
 key:   EntityId (16 bytes)
-value: rkyv-serialized Entity (namespace_id, agent_id, canonical_name, aliases, type, attributes, mention_count, timestamps, merged_into, embedding_version)
+value: rkyv-serialized Entity (namespace_id, space_id, canonical_name, aliases, type, attributes, mention_count, timestamps, merged_into, embedding_version)
 ```
 
-The owner `(namespace_id, agent_id)` scope is stored on the row value; the primary lookup is id-keyed and does not scope-check (the handler filters by the row's scope).
+The owner `(namespace_id, space_id)` scope is stored on the row value; the primary lookup is id-keyed and does not scope-check (the handler filters by the row's scope).
 
 ### 18.2 `entity_by_canonical_name`
 
 ```
-key:   (namespace_id: u32, agent_id: [u8; 16], entity_type_id: u32, normalized_name: String)
+key:   (namespace_id: u32, space_id: [u8; 16], entity_type_id: u32, normalized_name: String)
 value: EntityId
 ```
 
-Secondary index for tier-1 exact resolution. The leading `(namespace_id, agent_id)` makes each tenant's exact-name space private — the same canonical name under two scopes maps to two distinct entity ids.
+Secondary index for tier-1 exact resolution. The leading `(namespace_id, space_id)` makes each tenant's exact-name space private — the same canonical name under two scopes maps to two distinct entity ids.
 
 ### 18.3 `entity_aliases`
 
 ```
-key:   (namespace_id: u32, agent_id: [u8; 16], entity_type_id: u32, normalized_alias: String, entity_id: EntityId)
+key:   (namespace_id: u32, space_id: [u8; 16], entity_type_id: u32, normalized_alias: String, entity_id: EntityId)
 value: () (membership only)
 ```
 
@@ -358,7 +410,7 @@ Aliases index for tier-1 resolution. Composite key allows the same alias to map 
 ### 18.4 `entity_trigrams`
 
 ```
-key:   (namespace_id: u32, agent_id: [u8; 16], entity_type_id: u32, trigram: [u8; 3], entity_id: EntityId)
+key:   (namespace_id: u32, space_id: [u8; 16], entity_type_id: u32, trigram: [u8; 3], entity_id: EntityId)
 value: ()
 ```
 
@@ -367,7 +419,7 @@ Trigram index for tier-2 fuzzy resolution. Each entity's canonical_name contribu
 ### 18.5 `entity_mentions`
 
 ```
-key:   (namespace_id: u32, agent_id: [u8; 16], entity_id: EntityId, memory_id: MemoryId)
+key:   (namespace_id: u32, space_id: [u8; 16], entity_id: EntityId, memory_id: MemoryId)
 value: MentionMetadata (offset in memory text, confidence, extractor_id)
 ```
 
@@ -538,7 +590,7 @@ key:   StatementId.to_bytes() ([u8; 16])
 value: StatementMetadata
 ```
 
-Primary lookup. `StatementMetadata` is the rkyv-archived row carrying every statement field, including the owner `(namespace_id, agent_id)` scope. The primary lookup is id-keyed and does not scope-check; the handler filters by the row's scope.
+Primary lookup. `StatementMetadata` is the rkyv-archived row carrying every statement field, including the owner `(namespace_id, space_id)` scope. The primary lookup is id-keyed and does not scope-check; the handler filters by the row's scope.
 
 #### The four-timestamp model
 
@@ -558,27 +610,27 @@ Object time (`valid_from`/`valid_to`) is "what was true in the world"; record ti
 ### 19.2 `statements_by_subject`
 
 ```
-key:   (namespace_id: u32, agent_id: [u8; 16], subject_entity_bytes: [u8; 16], kind: u8, predicate_id: u32, is_current: u8, statement_id_bytes: [u8; 16])
+key:   (namespace_id: u32, space_id: [u8; 16], subject_entity_bytes: [u8; 16], kind: u8, predicate_id: u32, is_current: u8, statement_id_bytes: [u8; 16])
 value: StatementId.to_bytes()
 ```
 
-Compound key lets "what's Priya's current role?" be a point lookup at `(ns, agent, priya_id, Fact, role_predicate_id, 1, *)`. The trailing `statement_id` keeps the index multi-value (two Set-valued statements sharing `(subject, kind, predicate, is_current)` each get a distinct row instead of colliding); the leading `(namespace_id, agent_id)` keeps the scan within one tenant.
+Compound key lets "what's Priya's current role?" be a point lookup at `(ns, agent, priya_id, Fact, role_predicate_id, 1, *)`. The trailing `statement_id` keeps the index multi-value (two Set-valued statements sharing `(subject, kind, predicate, is_current)` each get a distinct row instead of colliding); the leading `(namespace_id, space_id)` keeps the scan within one tenant.
 
 `is_current = 1` iff `superseded_by.is_none() && !tombstoned && valid_at(now)`. The bit is **derived** — supersession / tombstone / validity-time-out flips it; the underlying StatementMetadata also has the source-of-truth fields.
 
 ### 19.3 `statements_by_predicate`
 
 ```
-key:   (namespace_id: u32, agent_id: [u8; 16], predicate_id: u32, kind: u8, confidence_bucket: u8, statement_id_bytes: [u8; 16])
+key:   (namespace_id: u32, space_id: [u8; 16], predicate_id: u32, kind: u8, confidence_bucket: u8, statement_id_bytes: [u8; 16])
 value: StatementId.to_bytes()
 ```
 
-`confidence_bucket = floor(confidence * 10).clamp(0, 10)`. The trailing `statement_id` keeps the index multi-value; the leading `(namespace_id, agent_id)` keeps the scan within one tenant. Coarse quantisation so the index is dense (11 buckets) but still useful for "all high-confidence Facts with predicate `manages`".
+`confidence_bucket = floor(confidence * 10).clamp(0, 10)`. The trailing `statement_id` keeps the index multi-value; the leading `(namespace_id, space_id)` keeps the scan within one tenant. Coarse quantisation so the index is dense (11 buckets) but still useful for "all high-confidence Facts with predicate `manages`".
 
 ### 19.4 `statements_by_object_entity`
 
 ```
-key:   (namespace_id: u32, agent_id: [u8; 16], object_entity_bytes: [u8; 16], kind: u8, statement_id_bytes: [u8; 16])
+key:   (namespace_id: u32, space_id: [u8; 16], object_entity_bytes: [u8; 16], kind: u8, statement_id_bytes: [u8; 16])
 value: StatementId.to_bytes()
 ```
 
@@ -587,16 +639,16 @@ Reverse index for "what statements have X as their object?". Trailing `statement
 ### 19.5 `statements_by_event_time`
 
 ```
-key:   (namespace_id: u32, agent_id: [u8; 16], event_at_unix_nanos: u64, subject_entity_bytes: [u8; 16], statement_id_bytes: [u8; 16])
+key:   (namespace_id: u32, space_id: [u8; 16], event_at_unix_nanos: u64, subject_entity_bytes: [u8; 16], statement_id_bytes: [u8; 16])
 value: StatementId.to_bytes()
 ```
 
-Time-range queries for Events, scoped per tenant by the leading `(namespace_id, agent_id)`. `event_at` only — populated only for `kind == Event`. The compound second-component (subject) disambiguates same-time events about the same subject.
+Time-range queries for Events, scoped per tenant by the leading `(namespace_id, space_id)`. `event_at` only — populated only for `kind == Event`. The compound second-component (subject) disambiguates same-time events about the same subject.
 
 ### 19.6 `statements_by_evidence`
 
 ```
-key:   (namespace_id: u32, agent_id: [u8; 16], memory_id_bytes: [u8; 16], statement_id_bytes: [u8; 16])
+key:   (namespace_id: u32, space_id: [u8; 16], memory_id_bytes: [u8; 16], statement_id_bytes: [u8; 16])
 value: ()
 ```
 
@@ -607,7 +659,7 @@ Population: one row per `(MemoryId, StatementId)` pair in `evidence.inline` (or 
 ### 19.7 `statement_chain`
 
 ```
-key:   (namespace_id: u32, agent_id: [u8; 16], chain_root_bytes: [u8; 16], version: u32)
+key:   (namespace_id: u32, space_id: [u8; 16], chain_root_bytes: [u8; 16], version: u32)
 value: StatementId.to_bytes()
 ```
 
@@ -742,7 +794,7 @@ key:   RelationId.to_bytes() ([u8; 16])
 value: RelationMetadata
 ```
 
-Primary lookup. `RelationMetadata` is the rkyv-archived sidecar carrying every relation field, including the owner `(namespace_id, agent_id)` scope. The primary lookup is id-keyed and does not scope-check; the relation read path filters by the sidecar's scope.
+Primary lookup. `RelationMetadata` is the rkyv-archived sidecar carrying every relation field, including the owner `(namespace_id, space_id)` scope. The primary lookup is id-keyed and does not scope-check; the relation read path filters by the sidecar's scope.
 
 ### 20.2 `relations_by_from`
 
@@ -755,7 +807,7 @@ Outgoing-edges index. For asymmetric relations, populated only with the row's ac
 
 `is_current = 1` iff `superseded_by.is_none() && !tombstoned`. Derived bit; the `RelationMetadata` carries the source-of-truth fields.
 
-**Not scope-prefixed.** The relation directional index is the shared unified edge table, which is **not** re-keyed with the `(namespace_id, agent_id)` prefix. Tenant isolation on the directional read path comes from filtering each candidate by its sidecar's owner scope after the edge-table scan — not from a scoped key. (The relation evidence index §20.4 *is* scope-prefixed, like the other secondary indexes.)
+**Not scope-prefixed.** The relation directional index is the shared unified edge table, which is **not** re-keyed with the `(namespace_id, space_id)` prefix. Tenant isolation on the directional read path comes from filtering each candidate by its sidecar's owner scope after the edge-table scan — not from a scoped key. (The relation evidence index §20.4 *is* scope-prefixed, like the other secondary indexes.)
 
 ### 20.3 `relations_by_to`
 
@@ -769,11 +821,11 @@ Incoming-edges index. For asymmetric relations, populated with `to`. For symmetr
 ### 20.4 `relations_by_evidence`
 
 ```
-key:   (namespace_id: u32, agent_id: [u8; 16], memory_id_bytes: [u8; 16], relation_id_bytes: [u8; 16])
+key:   (namespace_id: u32, space_id: [u8; 16], memory_id_bytes: [u8; 16], relation_id_bytes: [u8; 16])
 value: ()
 ```
 
-Reverse index for the FORGET cascade, scoped per tenant by the leading `(namespace_id, agent_id)`. One row per `(MemoryId, RelationId)` pair in `RelationMetadata.evidence_inline`. When a memory is forgotten, this index finds all relations that referenced it; the FORGET worker decides per-cardinality whether to tombstone, supersede with reduced evidence, or just record provenance loss.
+Reverse index for the FORGET cascade, scoped per tenant by the leading `(namespace_id, space_id)`. One row per `(MemoryId, RelationId)` pair in `RelationMetadata.evidence_inline`. When a memory is forgotten, this index finds all relations that referenced it; the FORGET worker decides per-cardinality whether to tombstone, supersede with reduced evidence, or just record provenance loss.
 
 ### 20.5 Deferred: `relations_by_type`
 
@@ -875,4 +927,4 @@ Relations are sharded by `canonical_from` (or `from` for asymmetric) EntityId. C
 
 ---
 
-*Continue to [`03_substrate_tables.md`](03_substrate_tables.md) for memory metadata, edge, context, idempotency, and text storage details.*
+*Continue to [`03_substrate_tables.md`](03_substrate_tables.md) for memory metadata, edge, session, idempotency, and text storage details.*

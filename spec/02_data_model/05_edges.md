@@ -280,7 +280,7 @@ The trade-off: more `SIMILAR_TO` edges accelerate graph-aware traversal but incr
 
 ### 9.2 FOLLOWED_BY derivation
 
-Episodic memories within a small temporal window (default: 30 minutes) and the same context are linked by `FOLLOWED_BY` edges. Done by the consolidation worker as part of episode identification.
+Episodic memories within a small temporal window (default: 30 minutes) and the same session are linked by `FOLLOWED_BY` edges. Done by the consolidation worker as part of episode identification.
 
 ### 9.3 DERIVED_FROM derivation
 

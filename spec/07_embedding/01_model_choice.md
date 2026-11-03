@@ -151,13 +151,23 @@ While `bge-small-en-v1.5` is the default, the embedding layer's interface lets o
 - A multilingual model for non-English deployments.
 - A custom model for specialized domains.
 
-The configuration knob:
+The configuration knob is `[embedder] model`, and it takes a **model name**, not a path:
 
+```toml
+[embedder]
+model = "bge-small-en-v1.5"
 ```
-[embedding]
-model_path = "/var/brain/models/bge-small-en-v1.5"   # default
-# model_path = "/var/brain/models/bge-large-en-v1.5"  # alternative
-```
+
+The on-disk directory — the one holding `config.json`, `tokenizer.json` and `model.safetensors` — is resolved through a four-step cascade, first match wins:
+
+1. `BRAIN_EMBED_MODEL_DIR`, if set. Must be absolute; a relative value is a configuration error rather than a path resolved against an unpredictable cwd.
+2. `[embedder] model` itself, if it starts with `/` — an absolute path literal.
+3. `$XDG_DATA_HOME/brain/models/<model>`.
+4. `~/.local/share/brain/models/<model>`.
+
+The env override exists so a developer can point at a local checkout without editing TOML; the XDG default is what makes a first run work with no configuration at all. The published container image sets the env var to the bundled copy at `/opt/brain/models/bge-small-en-v1.5` — the model ships **in the image**, so there is no download, no volume and no egress at startup. The GLiNER classifier model ships the same way.
+
+Resolution is path-only: whether the directory exists is the loader's business, which is why a missing model is a clear load failure rather than a config parse error.
 
 The model is loaded at startup. Different configurations produce different fingerprints; existing data must be re-embedded if the model changes. See [`06_migration.md`](06_migration.md).
 

@@ -5,7 +5,7 @@ The SUBSCRIBE primitive: stream changes to memories.
 ## 1. Semantic contract
 
 ```
-SUBSCRIBE(filter, agent_id, start_lsn, options) → ChangeStream
+SUBSCRIBE(filter, include_history, from_lsn, max_inflight, act_as?) → event stream
 ```
 
 Brain opens a long-lived stream that delivers change events as they happen.
@@ -17,30 +17,36 @@ Brain opens a long-lived stream that delivers change events as they happen.
 What changes to deliver:
 
 ```rust
-struct SubscribeFilter {
-    agent_id: AgentId,
-    contexts: Option<Vec<ContextId>>,    // Limit to specific contexts
-    kinds: Option<Vec<MemoryKind>>,      // Limit to specific kinds
-    event_types: Option<Vec<EventType>>, // Encode, forget, link, etc.
-    min_salience: Option<f32>,
-    memory_ids: Option<Vec<MemoryId>>,   // Limit to specific memories (e.g. watching one write's derivation)
-}
-
-enum EventType {
-    MemoryEncoded,
-    MemoryForgotten,
-    MemoryUpdated,         // Salience, kind change, etc.
-    EdgeAdded,
-    EdgeRemoved,
-    StageCompleted,        // one async ENCODE derivation stage finished (auto_edge / temporal_edge / extractor / hype)
+struct SubscriptionFilter {
+    session_filter: Option<Vec<SessionId>>,  // limit to specific sessions
+    kinds: Option<Vec<MemoryKind>>,          // limit to specific kinds
+    similar_to: Option<SimilarityFilter>,    // { reference_memory_id, threshold }
+    spaces: Option<Vec<SpaceId>>,            // must resolve to the caller's own effective space
+    memory_ids: Option<Vec<MemoryId>>,       // limit to specific memories
 }
 ```
 
-All conditions are AND-combined. If a filter is None, that dimension is unrestricted.
+All conditions are AND-combined. If a dimension is `None`, it is unrestricted.
+The full `EventType` set the stream can deliver is defined once, on the wire —
+see [04. Wire Protocol](../04_wire_protocol/05_frame_layouts.md) §43 — and is
+not re-declared here.
+
+Two dimensions are not filters in the ordinary sense:
+
+- **`spaces` is an authorization boundary.** The server requires it to resolve
+  to exactly the caller's own effective space — the connection principal's, or
+  the one named by `act_as`. Subscribing across spaces is not supported, so
+  this field narrows *within* what the caller may already see; it never widens.
+- **There is no `event_types` filter and no `min_salience`.** A subscriber
+  switches on `event_type` in its own handler, which costs nothing, whereas a
+  server-side type filter is one more thing that can silently drop an event a
+  consumer needed. Salience is a decaying value, so a salience-filtered stream
+  would deliver and then stop delivering the same memory for reasons unrelated
+  to any change.
 
 `memory_ids` is the narrowest filter dimension: scoping a subscription to one
 or a handful of memory ids turns SUBSCRIBE into a point-observer for those
-specific writes, rather than a stream over an agent's whole activity. This is
+specific writes, rather than a stream over a space's whole activity. This is
 the mechanism behind the write-pipeline-progress pattern documented in
 [02_write_pipeline.md](02_write_pipeline.md) §17e: `ENCODE` with `wait: ack`,
 then `SUBSCRIBE` with `memory_ids: [that memory_id]`, to watch that one
@@ -48,60 +54,96 @@ write's `StageCompleted` events arrive live. On the wire this field is named
 `memory_ids` on `SubscriptionFilter` — see
 [04. Wire Protocol](../04_wire_protocol/05_frame_layouts.md) §7.
 
-### start_lsn
+### include_history / from_lsn
 
-Where to start delivery:
-
-- `LatestOnly`: deliver new events only (ignore history).
-- `FromLsn(lsn)`: deliver events with LSN >= lsn.
-- `FromTimestamp(t)`: deliver events from time t (mapped to LSN).
-
-For `FromLsn`, Brain checks if the LSN is still in the WAL (not yet checkpointed-out). If too old, returns `LsnTooOld`.
-
-### options
+Where to start delivery. The request carries two fields rather than one
+enum:
 
 ```rust
-struct SubscribeOptions {
-    batch_size: usize,            // How many events per delivery (default 100)
-    timeout_ms: u32,              // Idle timeout (default 30000)
-    include_text: bool,
-    include_metadata: bool,
-    ack_required: bool,           // Default false; true = client acks each batch
-}
+include_history: bool,        // replay matching history before going live
+from_lsn: Option<u64>,        // resume point; None = start at the tail
 ```
+
+- `include_history = false`, `from_lsn = None` — the default: deliver new
+  events only.
+- `from_lsn = Some(lsn)` — deliver events with LSN ≥ `lsn`. Brain checks the
+  LSN is still in the WAL (not checkpointed out); if it is too old the
+  subscription is refused with `SubscriptionLsnTooOld` (§17).
+
+There is no `FromTimestamp`. A timestamp does not identify a WAL position —
+two writes in the same nanosecond share one, and a clock that moved backwards
+maps to a position the stream already passed. Resumption is by LSN, which is
+the thing that is actually monotonic per shard.
+
+### max_inflight
+
+Per-subscription rate control: the server stops sending once this many events
+are unacknowledged. It is the whole flow-control surface — there is no batch
+size, no idle timeout and no `ack_required` toggle, because a subscription that
+does not apply back-pressure is not useful to bound and one that does needs
+only this number.
+
+### Per-event payload
+
+Events carry the memory's text and standard fields inline; there are no
+`include_text` option on a subscription. A change feed
+whose events omit what changed forces a read per event, which is the thing the
+feed exists to avoid.
 
 ## 3. The stream protocol
 
-Brain sends batches:
+The subscription's `stream_id` is the one the client allocated for the
+`SUBSCRIBE_REQ` frame; every `SUBSCRIBE_EVENT` uses the same `stream_id`. Each
+event is **one frame**, not a batch:
 
 ```rust
-struct SubscribeBatch {
-    events: Vec<ChangeEvent>,
-    batch_lsn: u64,                // LSN at the end of this batch
-    has_more: bool,
-}
-
-enum ChangeEvent {
-    MemoryEncoded { memory_id, agent_id, context_id, kind, text?, metadata?, lsn },
-    MemoryForgotten { memory_id, lsn },
-    MemoryUpdated { memory_id, fields, lsn },
-    EdgeAdded { source, target, kind, weight, lsn },
-    EdgeRemoved { source, target, kind, lsn },
+struct SubscriptionEvent {
+    event_type: EventType,
+    memory_id: MemoryId,
+    session_id: SessionId,
+    text: String,
+    kind: MemoryKind,
+    salience: f32,
+    timestamp_unix_nanos: u64,
+    lsn: u64,
+    graph_payload: Option<GraphEventPayload>,   // typed-graph events
+    edge_payload: Option<EdgeEventPayload>,     // EdgeAdded / Removed / Superseded
+    stage_kind: Option<StageKind>,              // StageCompleted only
+    stage_outcome: Option<StageOutcome>,        // StageCompleted only
+    stage_payload: Option<StagePayload>,        // StageCompleted only
 }
 ```
 
-The client reads batches as they arrive. Standard streaming-RPC pattern.
+**One envelope carries every event family.** Cognitive events
+(`Encoded`, `Forgotten`, `Reclaimed`, `KindChanged`), typed-graph events,
+write-pipeline `StageCompleted` events, and the unified edge feed
+(`EdgeAdded` / `EdgeRemoved` / `EdgeSuperseded`) all arrive in this shape, with
+the four optional sidecars populated per family and omitted otherwise. A
+subscriber switches on `event_type`; it does not need a parallel decoder per
+family. The full discriminant table and payload shapes are in
+[04. Wire Protocol](../04_wire_protocol/05_frame_layouts.md) §43.
+
+Two consequences worth stating:
+
+- **Edges have one feed.** A cognitive `LINK` and a typed `RELATION_CREATE`
+  both surface as `EdgeAdded`; a subscriber watching "what edges exist" writes
+  one handler, not two.
+- **Extraction has no event pair of its own.** It reports through
+  `StageCompleted` with `stage_kind = Extractor`, whose `stage_outcome`
+  separates *ran and found nothing* (`Empty`) from *could not run* (`Failed`).
+  A completed/failed pair could not carry that difference, because both cases
+  produce zero counts.
 
 ## 4. Event delivery guarantees
 
 - Events are delivered in WAL order (per shard).
 - Each event is delivered at-least-once.
 - For at-most-once, clients can dedupe by LSN (each event has a unique LSN).
-- If Brain restarts mid-stream, the stream is broken; the client reconnects with `start_lsn` set to the last received batch_lsn.
+- If Brain restarts mid-stream, the stream is broken; the client reconnects with `from_lsn` set to one past the last `lsn` it received.
 
 ## 5. Cross-shard subscribers
 
-If `agent_id` spans multiple shards, Brain orchestrates:
+If `space_id` spans multiple shards, Brain orchestrates:
 
 - Open one substream per shard.
 - Merge events into a single client-facing stream.
@@ -113,7 +155,7 @@ For most agents (single shard), this is irrelevant.
 
 SUBSCRIBE is essentially "tail the WAL with a filter applied". Brain:
 
-1. For `start_lsn` history: replays existing WAL records.
+1. For `from_lsn` history: replays existing WAL records.
 2. For new events: pushes them as they're appended to the WAL.
 
 The boundary between historical and live is invisible to the client; the stream feels continuous.
@@ -136,7 +178,7 @@ If the client disconnects:
 
 - Brain cleans up the subscription's state.
 - The client's filter and position are NOT remembered.
-- On reconnect, the client provides `start_lsn` again to resume.
+- On reconnect, the client provides `from_lsn` again to resume.
 
 This is by design — server-side subscription state is expensive. Clients track their position.
 
@@ -160,20 +202,26 @@ A SUBSCRIBE stream can deliver:
 
 Per-shard event generation is bounded by encode/forget rates (~5K/sec sustained per shard). So SUBSCRIBE keeps up easily.
 
-## 11. The "include_text" option
+## 11. Event size
 
-If `include_text: true`, MemoryEncoded events include the full memory text. This is heavy:
+`Encoded` events carry the memory text inline, so a stream's bandwidth tracks
+the text being written: at 1 KB texts, roughly 1 MB per 1000 events. There is
+no toggle to suppress it — a change feed whose events omit what changed makes
+every consumer issue a read per event, which costs more than the bytes saved.
 
-- Per-event size: text bytes.
-- For 1 KB texts: 1 MB per 1000 events.
-
-Useful for applications that need to mirror the data to another store. Most applications don't enable text.
+A consumer that genuinely wants ids only should filter harder (§12), not
+subscribe to everything and discard the payload.
 
 ## 12. Filter selectivity
 
-If the filter is selective (e.g., min_salience=0.9), most events are filtered out. Brain still scans the WAL but discards non-matching events; the client only sees the matches.
+A selective filter (a narrow `kinds` set, a single-memory `memory_ids` scope)
+discards most events. The filter is applied **at emission**, before broadcast,
+not at the subscriber's edge — so a selective filter costs the shard little and
+does not amplify high-volume events to uninterested subscribers.
 
-For very selective filters (< 1% pass rate), Brain logs a warning — the WAL scan is doing wasted work.
+For a historical replay (`from_lsn`), Brain still scans the WAL and discards
+non-matching records; a very selective replay filter does wasted scan work and
+is logged as such.
 
 ## 13. The "live + replay" pattern
 
@@ -181,7 +229,7 @@ A common pattern for a downstream consumer:
 
 1. Take a snapshot of the current state via `ADMIN_SNAPSHOT_CREATE`.
 2. Note the snapshot's LSN.
-3. SUBSCRIBE with `start_lsn = snapshot_lsn + 1`.
+3. SUBSCRIBE with `from_lsn = snapshot_lsn + 1`.
 
 The downstream consumer thus has the full state plus a live update stream.
 
@@ -189,7 +237,7 @@ This is the recommended pattern for replication-like use cases.
 
 ## 14. Use cases
 
-- **Live agent dashboards**: show the agent's recent activity in a UI.
+- **Live agent dashboards**: show the space's recent activity in a UI.
 - **Audit logs**: stream every event to an external log.
 - **Replication**: keep a hot standby in sync.
 - **Reactive workflows**: trigger external systems on specific events.
@@ -198,13 +246,13 @@ This is the recommended pattern for replication-like use cases.
 
 ## 15. The "no historical" mode
 
-For applications that just want live events (not history), use `start_lsn: LatestOnly`. Brain skips WAL replay and only delivers events from "now" onward.
+For applications that just want live events (not history), leave `from_lsn` unset and `include_history = false`. Brain skips WAL replay and only delivers events from "now" onward.
 
 This is the common case for live dashboards.
 
 ## 16. The "checkpointed out" issue
 
-WAL segments older than the checkpoint are eligible for deletion. If the client requests `start_lsn` from a deleted segment, Brain returns `LsnTooOld`.
+WAL segments older than the checkpoint are eligible for deletion. If the client requests a `from_lsn` inside a deleted segment, Brain refuses the subscription with `SubscriptionLsnTooOld`.
 
 The client should:
 1. Use a snapshot to get the historical state.
@@ -212,13 +260,13 @@ The client should:
 
 ## 17. Failure modes
 
-### LsnTooOld
+### SubscriptionLsnTooOld
 
-The requested start_lsn is in a deleted WAL segment.
+The requested `from_lsn` is in a deleted WAL segment.
 
 ### Unauthorized
 
-The client doesn't have permission for the requested agent's data.
+The client doesn't have permission for the requested space's data.
 
 ### ActAsDenied
 
@@ -292,7 +340,7 @@ section) are authoritative.
 data-plane op does — see [04. Wire Protocol](../04_wire_protocol/04_handshake.md)
 §10a for the full mechanism (the connection-principal-vs-effective-identity
 model, the `can_act_as` grant, and invariants R1–R6). When present, the
-subscription observes the effective `(namespace, agent_id)` named by `act_as`
+subscription observes the effective `(namespace, space_id)` named by `act_as`
 rather than the connection principal's own identity, subject to the same R1
 (`can_act_as` gate) and R2 (`may_act` allowlist) checks as every other op.
 This is what lets a shared service-principal connection pool — one
@@ -308,7 +356,7 @@ structurally separate from the normal `act_as`-aware dispatch path:
 op-dispatch / `act_as_of` resolution entirely, and the wire
 `SubscribeRequest` carried no `act_as` field at all — a genuine wire-schema
 gap, not just a server-logic one. The permission check that gates a
-subscription's agent scope hardcoded the caller's own raw connection
+subscription's space scope hardcoded the caller's own raw connection
 identity, with no `act_as` concept reachable from that branch. This is why
 SUBSCRIBE needed a dedicated fix rather than "just working" the way a normal
 op picks up `act_as` support — the security machinery itself (the R1/R2

@@ -170,7 +170,9 @@ The three HNSW knobs and their defaults.
 |---|---|---|---|
 | `M` | 16 | 4–64 | Max edges per node per layer (except bottom, which is 2M) |
 | `ef_construction` | 200 | 50–500 | Search width during insertion |
-| `ef_search` | 64 | 10–500 | Search width during query (per-call override possible) |
+| `ef_search` | 64 | 10–500 | Default search width per query |
+| `ef_search_max` | 500 | ≥ `ef_search` | Ceiling on any derived or overridden beam |
+| `ef_factor` | 1 | 1–16 | Multiplier deriving the beam from the requested `k` when no explicit `ef` is given |
 
 ### 16. M = 16
 
@@ -209,16 +211,57 @@ Higher ef_construction produces a better-quality graph. The trade-off:
 
 These numbers assume a 1M-vector index. For smaller indexes, recall is higher at any given ef_search.
 
-ef_search is overridable per query in `RECALL`, letting the agent trade latency for recall on demand.
+`RECALL` carries no per-query `ef`. The beam is a deployment-tuned property
+(`ef_search`, `ef_factor`, `ef_search_max`), not a knob a client turns: a caller
+cannot know the corpus size or the index's occupancy, which are what decide
+whether a wider beam buys anything, and exposing it would make the same cue
+return different results depending on which client sent it. The planner derives
+the beam from `k` and the configured factor.
 
-### 19. The relationship to K
+### 19. The relationship to K, and `ef_factor`
 
-If a query asks for K results:
+HNSW recall depends on the beam being meaningfully **wider** than the result
+set, not merely as wide. At Brain's shipped defaults `ef_search` and the default
+top-K are **both 64**, so `ef == k` exactly — the degenerate configuration where
+the search barely explores past the results it is about to return.
 
-- `ef_search` must be >= K for HNSW to return K results.
-- The convention is `ef_search = max(K, default_ef_search)`.
+`ef_factor` exists to fix that, by deriving the beam from the requested `k` when
+a query gives no explicit `ef`:
 
-For K=100 with default ef_search=64, ef_search=100 is used for that query.
+```text
+ef = clamp(max(ef_search, k * ef_factor), k, ef_search_max)
+```
+
+**The default is `1`, which reproduces the prior behaviour exactly** — the beam
+is whatever `ef_search` says and `k` does not widen it. It is a knob first and a
+default change second: the factor raises read cost in proportion to `k`, so the
+recall it buys has to be measured on a real corpus before the default moves. A
+small-corpus A/B moved one hand-authored set by two supporting contexts out of
+twelve and did nothing for a larger generated one, which is not enough to
+justify changing it.
+
+#### Most of the accepted range does nothing at the shipped defaults
+
+The derived beam is clamped to `ef_search_max` (500), so the factor stops having
+any effect once `k × ef_factor` crosses it. At the default `k = 64` that happens
+at **8**:
+
+```text
+  k=64, ef_factor=7  ->  448   distinct
+  k=64, ef_factor=8  ->  512 -> clamped to 500
+  k=64, ef_factor=16 ->       clamped to 500   (identical to 8)
+```
+
+Validation nevertheless accepts `1..=16`, because the useful range depends on
+`k` — a per-query value the validator cannot see, and at `k = 10` every factor
+up to 16 is still distinct. The consequence is worth stating rather than
+narrowing away: **at the default `k`, nine of the sixteen accepted values are
+the same setting**, and raising the factor from 8 to 16 reads as a tuning change
+while changing nothing. A narrower validated range would be wrong for small-`k`
+callers; silently flattening half the range is the part worth knowing.
+
+The floor still holds in every case: `ef >= k`, or HNSW cannot return `k`
+results at all.
 
 ### 20. ef_construction and ef_search interaction
 
@@ -226,19 +269,27 @@ The two parameters are somewhat independent. A graph built with high ef_construc
 
 ### 21. Tuning
 
-Tune ef_search per query for query-time quality. Tune ef_construction at deployment-config time for graph quality.
+Tune `ef_search` and `ef_factor` at deployment-config time for query-time
+quality, and `ef_construction` for graph quality. Measure on your own corpus
+before moving either: the published recall/latency curve is an ordering, not a
+promise about your data.
 
 `M` is set at index creation and isn't easily changed; changing M requires rebuilding the entire index.
 
 ### 22. Configuration
 
-```
-[ann]
+```toml
+[hnsw]
 m = 16
 ef_construction = 200
 ef_search = 64
-ef_search_max = 500           # cap on per-query overrides
+# ef_factor = 1               # derive the beam from k: max(ef_search, k * ef_factor)
 ```
+
+The section is named `[hnsw]`, not `[ann]`. `ef_search_max` (500) is fixed in
+the binary rather than exposed: it is the ceiling the derived beam clamps to,
+and letting a deployment raise it would let a large `k` turn one read into an
+unbounded scan.
 
 ### 23. Per-shard parameters
 
@@ -273,7 +324,7 @@ The bottom layer uses 2M edges per node by convention. This is the convention fr
 
 ### 25. Per-corpus parameters
 
-Brain runs three HNSW corpora per shard once a schema is declared: memory, entity, and statement. Each corpus has different size, query frequency, and recall sensitivity, so the parameters differ by design rather than sharing a single default.
+Brain runs three HNSW corpora per shard — memory, entity, and statement — from byte zero, not on schema upload. Each corpus has different size, query frequency, and recall sensitivity, so the parameters differ by design rather than sharing a single default.
 
 | Corpus | M | ef_construction | ef_search | Rationale |
 |---|---|---|---|---|

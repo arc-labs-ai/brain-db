@@ -111,9 +111,9 @@ for segment in wal_segments() {
 }
 ```
 
-## 7. The retention horizon and LsnTooOld
+## 7. The retention horizon and SubscriptionLsnTooOld
 
-When a SUBSCRIBE client requests `from_lsn` older than the retention horizon, the server returns `LsnTooOld`. The client must either:
+When a SUBSCRIBE client requests `from_lsn` older than the retention horizon, the server returns `SubscriptionLsnTooOld`. The client must either:
 
 - Restart from the current LSN (losing the gap).
 - Restore from a snapshot at an older point and replay forward.

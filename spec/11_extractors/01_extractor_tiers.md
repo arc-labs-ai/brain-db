@@ -388,40 +388,62 @@ model_id)`. The wiring just reads + writes through it.
 ### 19. Provider routing
 
 Two transports ship in v1:
-- `AnthropicClient` (claude-* models) — POST
-  `https://api.anthropic.com/v1/messages`.
-- `OpenAIClient` (gpt-*, o1-*, o3-*) — POST
-  `https://api.openai.com/v1/chat/completions` with JSON-schema
-  structured output mode.
+- `AnthropicClient` (claude-* models).
+- `OpenAIClient` (gpt-*, o1-*, o3-*), with JSON-schema structured output mode.
 
-A `ModelRouter` maps the schema-declared `model:` field to one
-of these clients via prefix matching:
+Neither addresses the provider directly. Both are constructed against the
+broker's base URL, so their requests go to the edge and are re-signed there;
+the upstream endpoint is the broker's concern, not Brain's.
+
+The provider is chosen by model-id prefix:
 
 | Prefix | Provider |
 |---|---|
 | `claude-*`, `anthropic/*` | Anthropic |
 | `gpt-*`, `o1-*`, `o3-*`, `openai/*` | OpenAI |
 
-Unknown patterns fail at `LlmExtractor` construction (the
-materializer logs a warn-level diagnostic and registers the
-extractor in degraded mode).
+The schema-declared `model:` field is a **preference, not a command**. It is
+passed to the resolver as `preferred_model`, and the broker serves whatever
+model the namespace's registered key actually covers — which may be a different
+one. That is not a limitation to work around: a tenant's key can only pay for
+what it is a key for, so honouring an extractor's declared model over the
+tenant's registration would mean issuing a call that cannot be billed to anyone.
 
-API keys via env vars at shard startup:
-- `ANTHROPIC_API_KEY` — enables Anthropic.
-- `OPENAI_API_KEY` — enables OpenAI.
+Unknown patterns fail at `LlmExtractor` construction (the materializer logs a
+warn-level diagnostic and registers the extractor in degraded mode).
 
-Missing keys produce a `None` for that provider; extractors
-configured against an unconfigured provider register as degraded.
+#### 19.1 The credential is per namespace, and there is no other kind
+
+A tier that needs an LLM asks an `LlmCredentialResolver` for the client belonging to a **namespace**. There is no global router to fall back to, no shard-startup provider key, and therefore no `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` env-var gate on which providers are "enabled": the provider is whatever the broker names for that namespace, decided when a request arrives.
+
+This is the only path. Brain holds no provider credential and no configuration can give it one — the full invariant is in [`./00_purpose.md`](00_purpose.md) §"The LLM tier's credential", along with the cache TTLs and the `Missing`-vs-`Unavailable` split.
+
+Two consequences for this tier specifically:
+
+- **The client's base URL carries the namespace.** It is built as `{edge}/llm/ns/{namespace}/{provider}`, and the bearer token is the broker grant rather than a provider key. The two client implementations are reused verbatim; neither knows a broker exists.
+- **A namespace with no key does not fail the write.** The tier reports that it could not run — `StageOutcome::Failed` with a reason, surfaced on the `StageCompleted` event and in the encode trace — and the pattern and classifier tiers still contribute. The caller gets entities without statements, and is told why.
+
+#### 19.2 Reasoning models need a budget that covers reasoning
+
+A completion budget sized for the visible answer is not large enough for a model that spends tokens thinking first. On such a model a small `max_tokens` is consumed entirely by reasoning, the response comes back **empty**, and — because an empty response looks like a transient failure — the call is retried and billed again, indefinitely. The tier therefore sizes the completion budget to include reasoning headroom for reasoning models, and when it cannot, it says so in the stage's failure reason rather than returning an empty extraction.
+
+Some models also refuse an explicitly-set `temperature`. The tier retries once without the parameter rather than treating the refusal as a provider failure.
+
+Provider completions run on a Tokio runtime, **not** on the shard executor. The shard's executor is a thread-per-core Glommio runtime with no business blocking on a multi-second HTTP round trip.
+
 Local LLM backends (llama.cpp / vLLM) are post-v1.
 
 ### 20. Cache integration
 
 Per [`./05_idempotency.md`](./05_idempotency.md) § 1: `IdempotencyKey { memory_id, text_hash,
 extractor_id, extractor_version, schema_version }`. The LLM cache
-adds the `model_id` byte to the key (see
-[`../10_metadata/02_table_layout.md`](../10_metadata/02_table_layout.md)
-§ 16.3 — `LlmCacheKey =
-(input_hash, extractor_id, extractor_version, model_id)`).
+adds the model and a **credential scope** to the key:
+
+```text
+LlmCacheKey = (input_hash, extractor_id, extractor_version, model_id, credential_scope)
+```
+
+The credential scope is what keeps one tenant's paid completion from being served to another tenant that hashes to the same input. It is derived from the grant or the tenant id, never from key material — which no part of this process has, so the rule is enforced by what is available rather than by remembering to follow it. The scope is **last** in the key so the TTL sweeper can still resolve a hint back to a prefix range.
 
 `predict` flow:
 
@@ -627,10 +649,10 @@ injected into the registry — CI does not hit live providers.
 
 ### 29. Bounded context
 
-The LLM tier receives a **bounded** context window — not the agent's full history. Two constraints define it:
+The LLM tier receives a **bounded** context window — not the space's full history. Two constraints define it:
 
 - `top_m_neighbors = 10` — the ten semantically nearest memories surfaced by the SemanticRetriever at extraction time. The neighbors carry whatever entities and statements the prior extraction passes resolved, so the LLM has anchors to reuse instead of resolving from scratch.
-- **Rolling summary** — a single condensed paragraph produced by the summarizer worker. The summary covers the agent's recent activity at a much higher compression ratio than the raw memories.
+- **Rolling summary** — a single condensed paragraph produced by the summarizer worker. The summary covers the space's recent activity at a much higher compression ratio than the raw memories.
 
 Combined input cap: ~2k tokens median. Hard cap before the prompt is sent: 4k tokens — over-cap inputs trigger summary trimming + neighbor pruning until the cap is met.
 

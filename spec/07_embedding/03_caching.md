@@ -160,9 +160,9 @@ The cache could be poisoned if, for example, two requests with the same text has
 
 - The text hash is the input to the model's inference; the model is deterministic.
 - The cache key is the text, not any per-request state.
-- Different agents querying the same text get the same vector — that's by design, since vectors are per-text, not per-agent.
+- Different agents querying the same text get the same vector — that's by design, since vectors are per-text, not per-space.
 
-The cache is shared across agents' queries within a shard. There's no privacy concern because the cache holds vectors, not text — and an attacker who could read the cache could already read agent state through Brain's normal access controls.
+The cache is shared across spaces' queries within a shard. There's no privacy concern because the cache holds vectors, not text — and an attacker who could read the cache could already read shard state through Brain's normal access controls.
 
 ## 13. The case against caching
 

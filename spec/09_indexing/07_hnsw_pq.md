@@ -156,7 +156,7 @@ adc_distance(LUT, code: &[u8; m]) -> f32
 
 ### 6.2 Symmetric Distance Computation (SDC)
 
-For graph construction: both endpoints are PQ codes (the inserter doesn't have full-precision query context). Pre-computation (once per epoch, at codebook build):
+For graph construction: both endpoints are PQ codes (the inserter doesn't have a full-precision query vector). Pre-computation (once per epoch, at codebook build):
 
 ```
 build_sdc_table(codebook) -> [[[f32; 2^bits]; 2^bits]; m]

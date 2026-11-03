@@ -1,6 +1,6 @@
 # 16.02 Routing and Shard Assignment
 
-> **TL;DR.** How Brain routes a request to the right shard (MemoryId-based bit extraction or AgentId hash) and how an agent is durably assigned to a shard at first contact (`hash(agent_id) % shard_count`, override table for VIPs, persistence so the assignment survives restart). The router is stateless and consults no peer node on the request path.
+> **TL;DR.** How Brain routes a request to the right shard (MemoryId-based bit extraction or SpaceId hash) and how a space is durably assigned to a shard at first contact (`hash(space_id) % shard_count`, override table for VIPs, persistence so the assignment survives restart). The router is stateless and consults no peer node on the request path.
 
 ## Routing
 
@@ -8,7 +8,7 @@
 
 For each request, Brain must determine which shard handles it.
 
-For agent-scoped requests (most): route by agent_id.
+For space-scoped requests (most): route by space_id.
 For memory-scoped requests: route by memory_id (which encodes the shard).
 For cross-shard requests: fan out.
 For admin requests: targeted at a specific shard.
@@ -19,14 +19,14 @@ Brain maintains a routing table:
 
 ```rust
 struct RoutingTable {
-    shard_count: usize,                              // Total shards
-    shard_for_agent: HashMap<AgentId, ShardId>,      // Overrides
-    shard_for_memory: fn(MemoryId) -> ShardId,       // Direct extraction
-    default_hash_function: HashFunction,             // For agents not in overrides
+    shard_count: u16,                       // total shards; must be >= 1
+    overrides: HashMap<SpaceId, ShardId>,   // startup-time pins for VIP / extra-large spaces
 }
 ```
 
-The table is loaded at startup; updates require explicit triggers (configuration reload or cluster events).
+The table is **immutable after construction** and validated there: a `shard_count` of `0` is rejected, and so is any override whose target shard is `>= shard_count` — a pin to a shard that does not exist is a configuration error, not something to discover at the first request that hashes to it. v1 has no dynamic shard reconfiguration; updates require a restart.
+
+The memory-based route is a free function rather than a table field, because it is pure bit extraction and depends on nothing the table holds.
 
 ## 3. Memory-based routing
 
@@ -47,23 +47,27 @@ fn shard_for_memory(memory_id: &MemoryId) -> ShardId {
 
 O(1), no lookup. Brain uses this for FORGET, LINK (to a known target), etc.
 
-## 4. Agent-based routing
+## 4. Space-based routing
 
-For an agent_id, the routing computes:
+For a space_id, the routing computes:
 
 ```rust
-fn shard_for_agent(agent_id: &AgentId) -> ShardId {
-    if let Some(&override_) = self.shard_for_agent.get(agent_id) {
-        return override_;
+fn shard_for_space(&self, space: SpaceId) -> ShardId {
+    if let Some(&s) = self.overrides.get(&space) {
+        return s;
     }
-    let hash = blake3::hash(agent_id.bytes());
-    let shard_idx = (hash.as_u64() % (self.shard_count as u64)) as ShardId;
-    shard_idx
+    hash_space_to_shard(space, self.shard_count)
+}
+
+fn hash_space_to_shard(space: SpaceId, shard_count: u16) -> ShardId {
+    let h = blake3::hash(space.as_bytes());              // the 16 UUID bytes
+    let hi = u64::from_le_bytes(h.as_bytes()[..8]);      // first 8 bytes, little-endian
+    (hi % u64::from(shard_count)) as ShardId
 }
 ```
 
-- Check the overrides map first (for VIP agents).
-- Otherwise, `hash(agent_id) % shard_count`.
+- Check the overrides map first (for VIP spaces).
+- Otherwise, `hash(space_id) % shard_count`.
 
 ## 5. The hash choice
 
@@ -77,62 +81,62 @@ The hash is not security-critical here (it is not protecting against adversarial
 
 ## 6. The "shard count change" problem
 
-When the shard count changes (operator adds shards), the modulo formula gives different shard assignments for many agents. Their data would need to migrate to new shards.
+When the shard count changes (operator adds shards), the modulo formula gives different shard assignments for many spaces. Their data would need to migrate to new shards.
 
 Brain doesn't support transparent shard count changes in v1. The shard count is fixed at deployment.
 
 In a future major version, **consistent hashing** would minimize migration:
 - Each shard owns a range of hash values.
 - Adding a shard just moves a portion of one shard's range.
-- Most agents' assignments are unchanged.
+- Most spaces' assignments are unchanged.
 
 In v1, the simple modulo is sufficient because Brain does not change shard count.
 
 ## 7. The override map
 
-The override map is for agents needing specific assignments:
+The override map is for spaces needing specific assignments:
 
 ```toml
 [shards.routing.overrides]
-"agent-uuid-VIP" = 0       # The VIP agent is on shard 0
-"agent-uuid-XL" = 5        # An extra-large agent has its own shard
+"space-uuid-VIP" = 0       # The VIP space is on shard 0
+"space-uuid-XL" = 5        # An extra-large space has its own shard
 ```
 
 Overrides are checked before the hash. They give operators fine control without disrupting general routing.
 
-## 8. Multi-shard agents
+## 8. Multi-shard spaces
 
-For agents whose data exceeds one shard, the routing splits:
+For spaces whose data exceeds one shard, the routing splits:
 
 ```toml
 [shards.routing.multi_shard]
-"agent-uuid-XL" = [3, 4, 5]    # Spans shards 3, 4, 5
+"space-uuid-XL" = [3, 4, 5]    # Spans shards 3, 4, 5
 ```
 
-For these agents:
-- ENCODE picks one of the assigned shards (round-robin or sticky-by-context).
+For these spaces:
+- ENCODE picks one of the assigned shards (round-robin or sticky-by-session).
 - RECALL fans out to all assigned shards.
 
 This is operator-configured; not auto-detected. A future version may add auto-spreading.
 
-## 9. The "shard for memory, but the agent is multi-shard" case
+## 9. The "shard for memory, but the space is multi-shard" case
 
 When an existing memory is referenced (e.g., by FORGET memory_id), the MemoryId already encodes its shard. Multi-shard configuration doesn't change that.
 
-For a multi-shard agent, the agent's recent encodes are on one shard, older ones on other shards (depending on when each was assigned). Memory operations always go to the encoded shard.
+For a multi-shard space, the space's recent encodes are on one shard, older ones on other shards (depending on when each was assigned). Memory operations always go to the encoded shard.
 
-## 10. Routing for new agents
+## 10. Routing for new spaces
 
-When an ENCODE arrives for an agent with no prior memories:
+When an ENCODE arrives for a space with no prior memories:
 
 ```
 1. Check overrides; if found, use that shard.
 2. Check multi-shard config; if found, pick one (round-robin).
-3. Hash the agent_id.
+3. Hash the space_id.
 4. Use the resulting shard.
 ```
 
-The first ENCODE establishes which shard the agent uses (until reconfigured).
+The first ENCODE establishes which shard the space uses (until reconfigured).
 
 ## 11. The router in single-node mode
 
@@ -181,7 +185,7 @@ For most users, routing is invisible. The client abstracts it away.
 Some operations target all shards:
 
 - `ADMIN_STATS` (gathers stats from all).
-- Cross-agent queries (rare).
+- Cross-space queries (rare).
 
 For these, Brain iterates the routing table and calls each shard:
 
@@ -198,7 +202,7 @@ In single-node, all shards are in-process; the calls are fast. In clustered mode
 
 Once a deployment is configured, routing is stable:
 
-- Same agent → same shard (assuming overrides don't change).
+- Same space → same shard (assuming overrides don't change).
 - Same memory → same shard (encoded in the ID).
 
 This stability matters for clients (caching) and for application correctness (no surprise migrations).
@@ -207,109 +211,109 @@ This stability matters for clients (caching) and for application correctness (no
 
 ## Shard Assignment
 
-How agents are durably assigned to shards — the mapping that determines which shard hosts which agent's data.
+How spaces are durably assigned to shards — the mapping that determines which shard hosts which space's data.
 
 ## 18. The assignment problem
 
-Given a fixed set of shards and an arriving agent, which shard hosts the agent?
+Given a fixed set of shards and an arriving space, which shard hosts the space?
 
 The assignment must be:
 
-- **Deterministic** — given the same agent_id and same shard count, return the same shard.
-- **Stable** — once assigned, the agent stays assigned until explicit reconfiguration.
-- **Well-distributed** — agents spread roughly evenly across shards.
+- **Deterministic** — given the same space_id and same shard count, return the same shard.
+- **Stable** — once assigned, the space stays assigned until explicit reconfiguration.
+- **Well-distributed** — spaces spread roughly evenly across shards.
 
 ## 19. The default: hash-based
 
 The default assignment uses BLAKE3:
 
 ```rust
-fn shard_for_agent(agent_id: AgentId, shard_count: usize) -> ShardId {
-    let hash = blake3::hash(agent_id.as_bytes());
+fn shard_for_space(space_id: SpaceId, shard_count: usize) -> ShardId {
+    let hash = blake3::hash(space_id.as_bytes());
     let value = u64::from_le_bytes(hash.as_bytes()[0..8].try_into().unwrap());
     (value % shard_count as u64) as ShardId
 }
 ```
 
-For UUIDv7 agent IDs, this gives roughly uniform distribution. With 16 shards and 1000 agents, each shard gets ~62-63 agents.
+For UUIDv7 space IDs, this gives roughly uniform distribution. With 16 shards and 1000 spaces, each shard gets ~62-63 spaces.
 
 ## 20. The override map
 
-For specific agents, operators can override the default:
+For specific spaces, operators can override the default:
 
 ```toml
 [shards.routing.overrides]
-"agent-vip-001" = 0      # VIP agent on dedicated shard 0
-"agent-large-002" = 5    # Large agent on shard with most capacity
+"space-vip-001" = 0      # VIP space on dedicated shard 0
+"space-large-002" = 5    # Large space on shard with most capacity
 ```
 
 Overrides are checked first; the hash is the fallback.
 
 Override use cases:
 - VIP/dedicated capacity for premium tenants.
-- Co-locating related agents on the same shard.
-- Routing test agents to a specific shard.
+- Co-locating related spaces on the same shard.
+- Routing test spaces to a specific shard.
 
 ## 21. The multi-shard case
 
-For agents needing more capacity than one shard:
+For spaces needing more capacity than one shard:
 
 ```toml
 [shards.routing.multi_shard]
-"agent-huge-003" = { shards = [3, 4, 5], strategy = "round_robin" }
+"space-huge-003" = { shards = [3, 4, 5], strategy = "round_robin" }
 ```
 
-For multi-shard agents:
+For multi-shard spaces:
 
 - ENCODE picks one shard per the strategy.
 - RECALL fans out to all assigned shards.
-- The agent's data is split.
+- The space's data is split.
 
 Strategies:
 - `round_robin`: cycle through shards.
-- `sticky_by_context`: each context lives on one shard (chosen via context_id hash).
+- `sticky_by_context`: each session lives on one shard (chosen via session_id hash).
 - `weighted`: based on shard load (advanced; not in v1).
 
 ## 22. The persistent assignment record
 
-For agents whose assignment shouldn't change (even if shard count changes), the assignment is persisted:
+For spaces whose assignment shouldn't change (even if shard count changes), the assignment is persisted:
 
 ```
-agents table:
-  agent_id → ShardId
+spaces table:
+  space_id → ShardId
 ```
 
-This is checked at agent creation. Once recorded, it's the source of truth.
+This is checked at space creation. Once recorded, it's the source of truth.
 
 For deployments that don't need this stability, the hash-based dynamic assignment is sufficient. Persistent assignment is opt-in.
 
 ## 23. The "first-encode wins" semantics
 
-When an agent's first ENCODE arrives:
+When a space's first ENCODE arrives:
 
 ```
 1. Compute the candidate shard (hash or override).
-2. Record the assignment in the agents table on that shard.
+2. Record the assignment in the spaces table on that shard.
 3. Process the encode.
 ```
 
-Subsequent encodes for the same agent route to the recorded shard, regardless of hash changes.
+Subsequent encodes for the same space route to the recorded shard, regardless of hash changes.
 
 ## 24. The shard-count-change scenario
 
 If the operator changes shard count (very rare in v1):
 
-- New agents (no recorded assignment) use the new hash → new shard.
-- Existing agents (with records) stay where they are.
-- Distribution may become uneven (since old agents are on old shards).
+- New spaces (no recorded assignment) use the new hash → new shard.
+- Existing spaces (with records) stay where they are.
+- Distribution may become uneven (since old spaces are on old shards).
 
 A future enhancement: rebalance to redistribute. v1 doesn't auto-rebalance.
 
-## 25. The agent's "primary" shard
+## 25. The space's "primary" shard
 
-For multi-shard agents, one shard is "primary":
+For multi-shard spaces, one shard is "primary":
 
-- Holds the agent's metadata (config, quotas).
+- Holds the space's metadata (config, quotas).
 - Initially gets new encodes (until full).
 - Coordinates fan-out queries.
 
@@ -319,11 +323,11 @@ The primary is set at first-encode; it doesn't change unless the operator forcib
 
 ## 26. The assignment metadata
 
-Per-agent metadata in the `agents` table (see [10. Metadata + Graph Store](../10_metadata/03_substrate_tables.md)):
+Per-space metadata in the `spaces` table (see [10. Metadata + Graph Store](../10_metadata/03_substrate_tables.md)):
 
 ```rust
-struct AgentMetadata {
-    agent_id: AgentId,
+struct SpaceMetadata {
+    space_id: SpaceId,
     primary_shard: ShardId,
     extra_shards: Vec<ShardId>,
     created_at: Timestamp,
@@ -337,43 +341,43 @@ This is the durable record of the assignment.
 
 ## 27. The "wrong shard" detection
 
-If a request arrives at the wrong shard for an agent:
+If a request arrives at the wrong shard for a space:
 
-- The shard checks the agents table; finds no record (the agent isn't here).
+- The shard checks the spaces table; finds no record (the space isn't here).
 - Returns a `WrongShard` error with the correct shard's ID.
 - The client retries on the correct shard.
 
 This handles routing-table staleness gracefully. The client refreshes its routing and retries.
 
-## 28. The "agent doesn't exist" case
+## 28. The "space doesn't exist" case
 
-For ENCODE on an unknown agent:
+For ENCODE on an unknown space:
 
-- The shard's agents table doesn't have the agent.
-- Brain creates an agent record (using the hash to determine the shard).
+- The shard's spaces table doesn't have the space.
+- Brain creates a space record (using the hash to determine the shard).
 - The encode proceeds.
 
-For RECALL/FORGET/etc. on an unknown agent:
+For RECALL/FORGET/etc. on an unknown space:
 
 - Returns `AgentNotFound`.
-- No data exists for the agent.
+- No data exists for the space.
 
-## 29. The "delete agent" operation
+## 29. The "delete space" operation
 
-`ADMIN_AGENT_DELETE <agent_id>` removes an agent and all its data:
+`ADMIN_AGENT_DELETE <space_id>` removes a space and all its data:
 
-- Tombstones all the agent's memories.
-- Removes the agent's metadata.
-- Removes context records.
+- Tombstones all the space's memories.
+- Removes the space's metadata.
+- Removes session records.
 - Schedules edge cleanup.
 
 This is irreversible. Brain logs the operation for audit.
 
-## 30. The "transfer agent" operation (future)
+## 30. The "transfer space" operation (future)
 
-In a future major version, an admin could transfer an agent between shards:
+In a future major version, an admin could transfer a space between shards:
 
-- Mark the agent for transfer.
+- Mark the space for transfer.
 - Copy its data to the new shard.
 - Update the assignment record.
 - Tombstone the old data.
@@ -382,37 +386,37 @@ Not implemented in v1. Operators can simulate via export-import.
 
 ## 31. The reseeding scenario
 
-If the agents table is lost or corrupted, Brain can reseed:
+If the spaces table is lost or corrupted, Brain can reseed:
 
 - Iterate all memories on the shard.
-- Reconstruct the agent metadata from memory rows (memories carry agent_id).
-- Rebuild the agents table.
+- Reconstruct the space metadata from memory rows (memories carry space_id).
+- Rebuild the spaces table.
 
 This is a recovery path, not a routine operation.
 
-## 32. The cross-shard agent uniqueness
+## 32. The cross-shard space uniqueness
 
-An agent's ID must be unique across Brain. Brain doesn't enforce this rigorously — there's no global registry of agent IDs.
+A space's ID must be unique across Brain. Brain doesn't enforce this rigorously — there's no global registry of space IDs.
 
-If two clients use the same agent_id, they'll write to the same shard (same hash). Their writes mix.
+If two clients use the same space_id, they'll write to the same shard (same hash). Their writes mix.
 
-For operators wanting strict uniqueness, the application layer must enforce it. Brain trusts the agent_id.
+For operators wanting strict uniqueness, the application layer must enforce it. Brain trusts the space_id.
 
 ## 33. The tenancy model
 
-A tenant is a **namespace** (company); an application within it is an **agent**. The data-isolation scope of every record is the pair `(namespace, agent)` — namespace the outer wall (companies never see each other), agent the inner wall (apps within a company are separate). See [`../03_schema/04_namespaces.md`](../03_schema/04_namespaces.md) for the operational contract and [`../04_wire_protocol/04_handshake.md`](../04_wire_protocol/04_handshake.md) §10 for how the `(namespace, agent, permissions)` scope is derived from the authenticated API key.
+A tenant is a **namespace** (company); an application within it is an **space**. The data-isolation scope of every record is the pair `(namespace, space)` — namespace the outer wall (companies never see each other), space the inner wall (apps within a company are separate). See [`../03_schema/04_namespaces.md`](../03_schema/04_namespaces.md) for the operational contract and [`../04_wire_protocol/04_handshake.md`](../04_wire_protocol/04_handshake.md) §10 for how the `(namespace, space, permissions)` scope is derived from the authenticated API key.
 
-- Company A is namespace `acme`; its chatbot and research apps are agents within `acme`.
+- Company A is namespace `acme`; its chatbot and research apps are spaces within `acme`.
 - Company B is namespace `globex`; it cannot see `acme`'s data under any request or flag.
-- The boundary is enforced logically on every read/write (owner `namespace_id` + `agent_id` on every row, folded into index key prefixes), not by physical shard separation — a single deployment safely hosts many tenants.
+- The boundary is enforced logically on every read/write (owner `namespace_id` + `space_id` on every row, folded into index key prefixes), not by physical shard separation — a single deployment safely hosts many tenants.
 
-The earlier "tenant = agent by convention" framing is superseded: namespace is now the committed tenant boundary (open-question `OQ-V2-4`, resolved). Identity is server-derived from the key, so a client cannot name another tenant's namespace or agent; cross-namespace access is rejected at the boundary.
+The earlier "tenant = space by convention" framing is superseded: namespace is now the committed tenant boundary (open-question `OQ-V2-4`, resolved). Identity is server-derived from the key, so a client cannot name another tenant's namespace or space; cross-namespace access is rejected at the boundary.
 
 ## 34. The auto-spread (future)
 
-When an agent grows to dominate its shard, Brain could auto-spread:
+When a space grows to dominate its shard, Brain could auto-spread:
 
-- Detect the agent is using > 50% of its shard's resources.
+- Detect the space is using > 50% of its shard's resources.
 - Move some of its data to a less-busy shard.
 - Update the multi-shard config.
 

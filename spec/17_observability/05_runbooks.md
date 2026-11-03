@@ -84,9 +84,9 @@ Issue not resolved by above steps. Capture full logs and pre/post state for engi
 
 5. Check for hot agent:
    ```
-   topk(5, sum(rate(brain_request_total{shard="<id>"}[5m])) by (agent_id))
+   topk(5, sum(rate(brain_request_total{shard="<id>"}[5m])) by (space_id))
    ```
-   (requires per-agent metrics, which Brain doesn't emit by default — use audit logs instead)
+   (requires per-space metrics, which Brain doesn't emit by default — use audit logs instead)
 
 6. If still unresolved: capture profile:
    ```bash
@@ -164,9 +164,9 @@ Memory growth is unexplained. Likely a Brain bug worth investigation.
    ```
    See [§17.04](04_admin_ops.md) for the generic `POST /v1/workers/<name>/run-now` control plane.
 
-3. Check for large agents:
+3. Check for large spaces:
    ```bash
-   curl -s http://127.0.0.1:9092/v1/agents | jq 'sort_by(-.memory_count)'
+   curl -s http://127.0.0.1:9092/v1/spaces | jq 'sort_by(-.memory_count)'
    ```
 
 4. Mitigations:

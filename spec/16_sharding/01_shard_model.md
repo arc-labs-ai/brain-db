@@ -97,7 +97,7 @@ A v1 shard's targets:
 - Up to 10M memories.
 - Up to 100M edges.
 - Up to 100K agents (rare; typically 1-100).
-- Up to 100K contexts per agent.
+- Up to 100K sessions per space.
 
 Beyond these, the shard should be split.
 
@@ -174,8 +174,8 @@ Clean shutdown takes a few seconds. If Brain is killed (SIGKILL), recovery on ne
 All metrics are tagged with the shard's UUID:
 
 ```
-brain_memory_count{shard="<shard_uuid>"} 12345
-brain_request_latency_p99{shard="<shard_uuid>", op="recall"} 0.012
+brain_arena_slots_used{shard="<shard_uuid>"} 12345
+brain_request_duration_ms_bucket{shard="<shard_uuid>",op="recall",le="25"} 9876
 ```
 
 Aggregation across shards is done at the metrics tooling layer (Prometheus, etc.).

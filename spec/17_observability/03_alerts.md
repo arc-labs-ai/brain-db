@@ -10,7 +10,7 @@ Brain ships Prometheus alert rules. Operators consume them via Alertmanager (or 
 - A condition (PromQL).
 - A duration (how long the condition must hold before firing).
 - A severity.
-- Labels and annotations (for context).
+- Labels and annotations (for session).
 
 ## 2. Severity levels
 

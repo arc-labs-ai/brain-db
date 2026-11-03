@@ -227,10 +227,10 @@ async fn reclaim_one(state: &ShardState, memory_id: MemoryId) -> Result<()> {
     let mut texts = wtxn.open_table(TEXTS)?;
     texts.remove(&memory_id)?;
     
-    // 4. Delete edges (in both edges_out and edges_in)
-    let mut edges_out = wtxn.open_table(EDGES_OUT)?;
-    let mut edges_in = wtxn.open_table(EDGES_IN)?;
-    delete_all_edges_for(memory_id, &mut edges_out, &mut edges_in)?;
+    // 4. Delete edges (in both edges and edges_reverse)
+    let mut edges = wtxn.open_table(EDGES_TABLE)?;
+    let mut edges_reverse = wtxn.open_table(EDGES_REVERSE_TABLE)?;
+    delete_all_edges_for(memory_id, &mut edges, &mut edges_reverse)?;
     
     // 5. Increment slot version
     let mut versions = wtxn.open_table(SLOT_VERSIONS)?;
@@ -282,16 +282,16 @@ The data is already gone (zeroed at FORGET); reclamation just frees the slot for
 When a memory is reclaimed, its edges are deleted. This means edges that pointed to the reclaimed memory are dangling.
 
 Edges are bidirectional in the metadata (see [10. Metadata + Graph Store — substrate tables](../10_metadata/03_substrate_tables.md)). For each `(source, kind, target)` edge:
-- It exists in `edges_out[source, kind, target]`.
-- It exists in `edges_in[target, kind, source]`.
+- It exists in `edges[source, kind, target]`.
+- It exists in `edges_reverse[target, kind, source]`.
 
 Reclamation of memory M removes:
-- All entries in `edges_out` where source=M.
-- All entries in `edges_in` where target=M.
+- All entries in `edges` where source=M.
+- All entries in `edges_reverse` where target=M.
 
 It does NOT remove:
-- Entries in `edges_out` where target=M (the source's outgoing edges to M).
-- Entries in `edges_in` where source=M (the target's incoming edges from M).
+- Entries in `edges` where target=M (the source's outgoing edges to M).
+- Entries in `edges_reverse` where source=M (the target's incoming edges from M).
 
 These dangling references are cleaned up by the edge scrub worker (see [`04_misc_workers.md`](04_misc_workers.md)).
 

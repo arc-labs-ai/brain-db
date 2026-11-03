@@ -20,7 +20,7 @@ Brain calls the unit of storage a **memory**. Rejected alternatives:
 - The thing is *remembered* — has time, has decay, can be forgotten.
 - The thing has *content* — text, structure.
 - The thing is *recallable* — by similarity, by reference, by association.
-- The thing is *agent-owned* — agents have memories; memories belong to agents.
+- The thing is *space-owned* — agents have memories; memories belong to agents.
 
 Brain uses the word in its everyday sense, not in any specific cognitive-science technical sense. There's no intent to claim biological correspondence; the word is chosen for its connotations.
 
@@ -71,7 +71,7 @@ This term is the closest fit. Alternatives:
 - **Summarization** — close, but consolidation includes more than summarization (clustering, pattern extraction).
 - **Aggregation** — too data-warehouse-y.
 
-## 4. The structural words: edge, kind, context
+## 4. The structural words: edge, kind, session
 
 ### Edge
 
@@ -87,24 +87,24 @@ A typed link between two memories. Standard graph-theory term. Alternatives:
 
 The classification of a memory: episodic, semantic, consolidated. Rejected alternatives:
 
-- **Type** — overloaded in programming contexts.
+- **Type** — overloaded in programming sessions.
 - **Class** — programming overload + sociological overload.
 - **Category** — generic; doesn't carry the trichotomy Brain means.
 
 **Kind** is intentionally simple and unique to this vocabulary. Three kinds, fixed enum, easy to reason about.
 
-### Context
+### Session
 
-A logical scope within an agent's memory. Rejected alternatives:
+A logical scope within a space's memory. Rejected alternatives:
 
 - **Namespace** — too database-flavored.
-- **Topic** — too topical; contexts can be cross-topic.
-- **Tag** — multi-attach; Brain places each memory in exactly one context (in v1).
+- **Topic** — too topical; sessions can be cross-topic.
+- **Tag** — multi-attach; Brain places each memory in exactly one session (in v1).
 - **Project** — too application-specific.
 - **Folder** — too filesystem-flavored.
 - **Collection** — generic.
 
-**Context** matches what cognitive scientists mean by "the situational context of a memory". It's the right level of abstraction for "this memory is from work, that one is from home".
+**Session** matches what cognitive scientists mean by "the situational session of a memory". It's the right level of abstraction for "this memory is from work, that one is from home".
 
 ## 5. The metadata words
 
@@ -159,7 +159,7 @@ These are intentionally absent from Brain's vocabulary. Brain provides operation
 
 ## 8. Summary
 
-The vocabulary in one sentence: an **agent** has **memories** with **salience** that **decay** over time, organized by **context** and connected by typed **edges** of various **kinds**, and the agent uses cognitive primitives — **encode**, **recall**, **plan**, **reason**, **forget** — to interact with them.
+The vocabulary in one sentence: an **agent** has **memories** with **salience** that **decay** over time, organized by **session** and connected by typed **edges** of various **kinds**, and the agent uses cognitive primitives — **encode**, **recall**, **plan**, **reason**, **forget** — to interact with them.
 
 If a future spec uses different words for the same concepts, this vocabulary wins; the offending spec is wrong.
 

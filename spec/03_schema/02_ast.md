@@ -233,7 +233,7 @@ project to their own representation:
 
 This indirection keeps the AST flexible (fields may be added without
 breaking on-disk format) and lets the persisted row carry
-constraint context the live rows don't (e.g., the source DSL
+constraint session the live rows don't (e.g., the source DSL
 text).
 
 ## 7. Field-order semantics

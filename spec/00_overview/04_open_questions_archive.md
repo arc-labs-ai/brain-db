@@ -2243,9 +2243,9 @@ c) **Group shards by agent.** Each shard hosts a single agent (or a small group)
 
 a) **Scan and filter (status quo).**
 
-b) **Add a `(ContextId, MemoryId) → ()` index.** ~25 bytes per memory.
+b) **Add a `(SessionId, MemoryId) → ()` index.** ~25 bytes per memory.
 
-c) **Combined `(AgentId, ContextId, MemoryId) → ()` index.** Slightly more compact; serves both agent-listing and context-listing.
+c) **Combined `(AgentId, SessionId, MemoryId) → ()` index.** Slightly more compact; serves both agent-listing and context-listing.
 
 **Recommendation.** Add index (c) in v1.1 if usage patterns show frequent context-scoped enumeration.
 
