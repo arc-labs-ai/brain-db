@@ -132,9 +132,9 @@ struct Statement {
     id: StatementId,                 // UUIDv7
     kind: StatementKind,             // Fact | Preference | Event
 
-    // Owner scope — stamped from the caller's authenticated (namespace, agent)
+    // Owner scope — stamped from the caller's authenticated (namespace, space)
     namespace_id: NamespaceId,       // owning tenant; 0 = reserved `brain` system namespace
-    agent_id: AgentId,               // owning agent
+    space_id: SpaceId,               // owning agent
 
     // Subject + predicate are required for all kinds
     subject: SubjectRef,             // EntityId or Pending(AuditId)
@@ -193,7 +193,7 @@ enum TombstoneReason {
 
 The unified row averages ~256 bytes (fixed fields ~160, object tagged union typically 16–64, inline evidence 0–128). For deployments with very large evidence lists, the `evidence_overflow` table absorbs the size.
 
-**Owner scope (`namespace_id` + `agent_id`).** Every statement is owned by exactly one `(namespace, agent)` tenant pair, stamped from the caller's authenticated scope at create time (fail-closed by construction). This owner namespace is **distinct** from the qname namespace of the statement's `predicate` — a statement owned by `acme` may use the shared `brain:role` predicate. The reserved `brain` system namespace (id `0`) owns only seeded rows and is never a valid owner of user-written statements. The scope is the leading prefix of every statement secondary index, so a range scan for one tenant can never traverse another's rows.
+**Owner scope (`namespace_id` + `space_id`).** Every statement is owned by exactly one `(namespace, space)` tenant pair, stamped from the caller's authenticated scope at create time (fail-closed by construction). This owner namespace is **distinct** from the qname namespace of the statement's `predicate` — a statement owned by `acme` may use the shared `brain:role` predicate. The reserved `brain` system namespace (id `0`) owns only seeded rows and is never a valid owner of user-written statements. The scope is the leading prefix of every statement secondary index, so a range scan for one tenant can never traverse another's rows.
 
 ## Kind-specific contracts
 

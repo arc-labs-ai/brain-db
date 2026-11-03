@@ -10,6 +10,14 @@ Cross-references:
 - [`../02_data_model/08_relation.md`](../02_data_model/08_relation.md) — relation record semantics, cardinality, symmetry, evidence.
 - [`./07_error_handling.md`](./07_error_handling.md) — error code mapping into the ERROR frame and per-field validation rules.
 
+## Conventions that hold across this file
+
+Two things apply to every frame below and are therefore stated once rather than repeated per struct.
+
+**Every request in this file carries `act_as: Option<ActAs>`.** The typed-graph noun opcodes are all tenant-scoped, so each one takes the shared effective-identity selector defined in [`./05_frame_layouts.md`](./05_frame_layouts.md) §"Shared request field: `act_as`". It is omitted from the per-struct listings below to keep them readable; its absence from a listing does not mean the frame lacks it.
+
+**Streaming responses are a sequence of one frame shape, not a head plus a typed tail.** A paginated or streamed response emits repeated frames of the same struct, each carrying its own items plus `is_final` (mirroring the EOS flag), with `next_cursor` and the running totals on the frame rather than in a separate terminator message. There are no `*ResponseTail` types.
+
 ## Entity frames
 
 Request/response body schemas for every opcode in the `0x0130–0x013F` entity range.
@@ -60,6 +68,7 @@ pub struct EntityCreateRequest {
     pub canonical_name: String,     // primary display name (pre-normalization)
     pub aliases: Vec<String>,       // initial aliases (may be empty)
     pub attributes_blob: Vec<u8>,   // opaque attributes; may be empty
+    pub session_id: u64,            // the session this row is attributed to; 0 = default session
     pub request_id: WireUuid,       // idempotency key for retry-safe writes
 }
 ```
@@ -125,6 +134,7 @@ pub struct EntityGetRequest {
 ```rust
 pub struct EntityGetResponse {
     pub entity: EntityView,
+    pub resolved_from: Vec<WireUuid>,  // ids that now redirect here, i.e. entities merged into this one
 }
 ```
 
@@ -283,7 +293,7 @@ Exposes the entity resolver over the wire so clients can run resolution without 
 ```rust
 pub struct EntityResolveRequest {
     pub candidate_name: String,
-    pub context: String,            // surrounding text (≤ 100 chars consumed)
+    pub resolution_context: String, // surrounding text (≤ 100 chars consumed)
     pub entity_type_hint: u32,      // 0 = no hint; otherwise an EntityTypeId
     pub allow_create: bool,         // if true, tier 5 creates a fresh entity
     pub request_id: WireUuid,
@@ -297,6 +307,7 @@ pub struct EntityResolveResponse {
     pub outcome: ResolutionOutcome,
     pub tier: u8,                   // which tier resolved (1..=5, 0 if unresolved)
     pub confidence: f32,
+    pub resolved_entity: WireUuid,  // the resolved/created entity; [0;16] when outcome is Ambiguous or NotFound
     pub candidate_ids: Vec<WireUuid>, // present when outcome=Ambiguous; ranked
     pub audit_id: WireUuid,         // [0;16] unless an ambiguity audit was written
 }
@@ -312,7 +323,7 @@ pub enum ResolutionOutcome {
 
 #### Error responses
 
-- `INVALID_ARGUMENT` — empty `candidate_name`, oversized `context`.
+- `INVALID_ARGUMENT` — empty `candidate_name`, oversized `session`.
 - `SCHEMA_NOT_DECLARED` (substrate `0x21` for now; §03-specific code possible) — if no schema declared (resolver currently requires the entity_type registry seeded).
 
 ### ENTITY_LIST (0x0137)
@@ -342,9 +353,11 @@ pub struct EntityListItem {
     pub entity: EntityView,
 }
 
-pub struct EntityListResponseTail {
+pub struct EntityListResponseFrame {
+    pub items: Vec<EntityListItem>, // { entity: EntityView }
     pub next_cursor: Vec<u8>,       // empty if exhausted
-    pub total_returned: u32,
+    pub cumulative_count: u32,      // items emitted so far across this stream
+    pub is_final: bool,
 }
 ```
 
@@ -417,7 +430,7 @@ Field semantics mirror `brain_core::Entity`. One projection used by `GET`, `UPDA
 For every opcode in this section that carries a `request_id`, Brain's idempotency layer keys on:
 
 ```
-(agent_id, opcode_u16, request_id, blake3(payload_bytes))
+(space_id, opcode_u16, request_id, blake3(payload_bytes))
 ```
 
 (Same shape as substrate, with the typed-graph opcode taking the same `Opcode` slot.) TTL is 24h. Stored responses include the full frame bytes so a duplicate hit is byte-identical, EOS-flag and all.
@@ -514,6 +527,7 @@ pub struct StatementView {
     pub tombstoned_at_unix_nanos: u64,
     pub tombstone_reason: u8,          // 0=none, 1=SourceMemoryForgotten, 2=UserRequest, 3=SchemaInvalidation, 4=ExtractorRetraction
     pub flags: u32,                    // bit 0 = subject_pending
+    pub is_stateful: bool,             // whether this predicate holds a current value that a later statement supersedes
 }
 ```
 
@@ -536,6 +550,7 @@ pub struct StatementCreateRequest {
     pub valid_to_unix_nanos: u64,      // 0 = open-ended
     pub event_at_unix_nanos: u64,      // required for Event kind; 0 for others
     pub schema_version: u32,           // 0 = current
+    pub session_id: u64,               // the session this row is attributed to; 0 = default session
     pub request_id: WireUuid,
 }
 ```
@@ -698,14 +713,12 @@ pub struct StatementHistoryRequest {
 #### Response — streaming, per-item
 
 ```rust
-pub struct StatementHistoryItem {
-    pub statement: StatementView,
-}
-
-pub struct StatementHistoryTail {
+pub struct StatementHistoryResponseFrame {
+    pub items: Vec<StatementView>,
     pub chain_root: WireUuid,
     pub total_versions: u32,           // full chain length, not the page size
     pub next_cursor: Vec<u8>,          // empty when the chain is exhausted
+    pub is_final: bool,
 }
 ```
 
@@ -796,6 +809,7 @@ Opaque rkyv-encoded `BTreeMap<String, StatementValueWire>`. Schema enforces the 
 ```rust
 pub struct RelationView {
     pub relation_id: WireUuid,
+    pub chain_root: WireUuid,          // the first version in this relation's supersession chain
     pub relation_type: String,         // canonical "namespace:name"
     pub from_entity: WireUuid,
     pub to_entity: WireUuid,
@@ -807,11 +821,14 @@ pub struct RelationView {
     pub valid_from_unix_nanos: u64,    // 0 = None
     pub valid_to_unix_nanos: u64,      // 0 = None
     pub version: u32,
-    pub superseded_by: WireUuid,
+    pub superseded_by: WireUuid,       // [0;16] if not superseded
+    pub supersedes: WireUuid,          // [0;16] if root of chain
     pub tombstoned: bool,
     pub tombstoned_at_unix_nanos: u64,
     pub flags: u32,
 }
+
+Relations carry the same `chain_root` / `supersedes` / `superseded_by` triple as statements, so a relation's version chain is walkable in both directions from any member — the same shape, for the same reason.
 ```
 
 ### RELATION_CREATE (0x0150)
@@ -829,6 +846,7 @@ pub struct RelationCreateRequest {
     pub confidence: f32,
     pub valid_from_unix_nanos: u64,    // 0 = use extracted_at
     pub valid_to_unix_nanos: u64,      // 0 = open-ended
+    pub session_id: u64,               // the session this row is attributed to; 0 = default session
     pub request_id: WireUuid,
 }
 ```
@@ -959,16 +977,23 @@ pub struct RelationTraverseRequest {
 #### Response — streaming per-frame `RelationTraverseFrame`
 
 ```rust
-pub struct RelationTraverseFrame {
-    pub entity: EntityView,            // node visited
-    pub depth: u32,                    // 0 = start, 1 = direct neighbour, ...
-    pub via_relation: RelationView,    // [0;16]-id when entity is the start node
+pub struct RelationTraverseResponseFrame {
+    pub paths: Vec<TraversalPath>,
+    pub total_paths: u32,
+    pub truncated: bool,               // true if max_depth or max_nodes capped output
+    pub is_final: bool,
 }
 
-pub struct RelationTraverseTail {
-    pub nodes_visited: u32,
-    pub edges_visited: u32,
-    pub truncated: bool,               // true if max_depth or max_nodes capped output
+pub struct TraversalPath {
+    pub steps: Vec<TraversalStep>,
+}
+
+pub struct TraversalStep {
+    pub relation_id: WireUuid,
+    pub from: WireUuid,
+    pub to: WireUuid,
+    pub relation_type: String,
+    pub depth: u32,                    // 1 = direct neighbour of the start entity
 }
 ```
 

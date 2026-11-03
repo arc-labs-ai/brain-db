@@ -130,7 +130,7 @@ These don't affect correctness — exact counts are recomputable. They affect wh
 Operations fail with structured errors:
 
 - `InvalidRequest` — the request is malformed.
-- `NotFound` — referenced memory or context doesn't exist.
+- `NotFound` — referenced memory or session doesn't exist.
 - `QuotaExceeded` — agent limits exceeded.
 - `Unauthorized` — credentials don't allow this operation.
 - `Conflict` — idempotency mismatch.
@@ -178,7 +178,7 @@ Brain stores text and vectors. Both are recoverable:
 
 So agents using Brain aren't locked in. The data is plain-text and portable.
 
-The MemoryIds, contexts, and edges are Brain-specific, but they map directly to the underlying memories. An export-import flow can preserve them in a different system.
+The MemoryIds, sessions, and edges are Brain-specific, but they map directly to the underlying memories. An export-import flow can preserve them in a different system.
 
 ---
 

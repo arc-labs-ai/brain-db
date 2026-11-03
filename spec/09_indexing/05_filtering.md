@@ -1,6 +1,6 @@
 # 09.05 Filtering
 
-How Brain restricts ANN search to a subset of memories — by model fingerprint, kind, context, salience range, etc.
+How Brain restricts ANN search to a subset of memories — by model fingerprint, kind, session, salience range, etc.
 
 ## 1. The need for filtering
 
@@ -8,7 +8,7 @@ Most queries don't want to search all memories. Common filters:
 
 - **Model fingerprint** — only memories embedded with the current model. Required for cross-model exclusion ([07.05 Fingerprinting](../07_embedding/05_fingerprinting.md)).
 - **Kind** — episodic, semantic, or consolidated.
-- **Context** — only memories in a specific context (or set of contexts).
+- **Session** — only memories in a specific session (or set of sessions).
 - **Salience** — only memories above a threshold.
 - **Recency** — only memories from the last N days.
 - **Tombstone** — exclude tombstoned memories (always applied).
@@ -35,7 +35,7 @@ fn filtered_search(query, k, filters) -> Vec<Result> {
 struct AnnFilter {
     model_fingerprint: Option<ModelFingerprint>,
     kind: Option<MemoryKind>,
-    context_ids: Option<Vec<ContextId>>,
+    session_ids: Option<Vec<SessionId>>,
     salience_min: Option<f32>,
     salience_max: Option<f32>,
     age_max: Option<Duration>,
@@ -72,7 +72,7 @@ Cost: ~10 ns. Fingerprint filter on every search candidate is essentially free.
 
 ## 5. Other filters require metadata lookup
 
-Kind, context, salience, age — these live in the metadata store (redb). Filtering by them means:
+Kind, session, salience, age — these live in the metadata store (redb). Filtering by them means:
 
 ```rust
 fn metadata_for_filter(memory_id: MemoryId) -> Option<MemoryMetadata> {
@@ -94,7 +94,7 @@ Brain estimates filter selectivity to set `over_factor`:
 | Kind = Episodic | ~80% | 1.3 |
 | Kind = Semantic | ~15% | 7 |
 | Kind = Consolidated | ~5% | 20 |
-| Context (specific) | varies | varies |
+| Session (specific) | varies | varies |
 | Salience > 0.5 | ~30% | 4 |
 | Combined (AND) | product | product |
 
@@ -119,19 +119,19 @@ return results;
 
 The `ef_max` is configurable (default 500). Beyond that, Brain gives up and returns whatever it found, even if fewer than K.
 
-## 8. Context filter via inverted index
+## 8. Session filter via inverted index
 
-For very selective context filters (memory in a specific small context), Brain maintains an inverted index:
+For very selective session filters (memory in a specific small session), Brain maintains an inverted index:
 
 ```
-context_index[context_id] -> Set<MemoryId>
+context_index[session_id] -> Set<MemoryId>
 ```
 
-For these filters, Brain intersects the HNSW search results with the context's set:
+For these filters, Brain intersects the HNSW search results with the session's set:
 
 ```rust
-fn search_with_context_filter(query, k, context_id) -> Vec<Result> {
-    let context_set = context_index[context_id];
+fn search_with_session_filter(query, k, session_id) -> Vec<Result> {
+    let context_set = context_index[session_id];
     let candidates = hnsw.search(query, k * 2, ef);
     candidates.into_iter()
         .filter(|c| context_set.contains(&c.memory_id))
@@ -140,13 +140,13 @@ fn search_with_context_filter(query, k, context_id) -> Vec<Result> {
 }
 ```
 
-For very selective filters where the candidate set is much larger than the context set, Brain could iterate the context set instead — compute distance from query to each member, return top K. This is a brute-force fallback; useful when the context has < 10K memories.
+For very selective filters where the candidate set is much larger than the session set, Brain could iterate the session set instead — compute distance from query to each member, return top K. This is a brute-force fallback; useful when the session has < 10K memories.
 
-## 9. The agent_id filter
+## 9. The space_id filter
 
-Every memory belongs to an agent. ANN searches are inherently agent-scoped — Brain routes the query to the agent's shard ([16. Sharding & Clustering](../16_sharding/00_purpose.md)).
+Every memory belongs to a space. ANN searches are inherently space-scoped — Brain routes the query to the space's shard ([16. Sharding & Clustering](../16_sharding/00_purpose.md)).
 
-Within a shard, multiple agents may share the shard. Brain filters by agent_id implicitly — every search includes an agent_id filter.
+Within a shard, many spaces coexist. Brain filters by `space_id` implicitly — every search carries a scope filter, and it is never the caller's to omit.
 
 ## 10. Composed filters
 
@@ -179,7 +179,7 @@ Per-result filtering cost:
 - Fingerprint (slot metadata): ~10 ns.
 - Kind, salience (metadata-store cached): ~50 ns.
 - Kind, salience (metadata-store cold): ~5 µs.
-- Context (set membership): ~50 ns.
+- Session (set membership): ~50 ns.
 
 For typical searches returning 100 candidates with 3-4 filters: ~1-10 µs total, dominated by metadata-store lookups.
 
@@ -204,7 +204,7 @@ Cost: ~10 ns. Useful for "recent memories" queries.
 
 ## 14. The "no filter" fast path
 
-For agent_id-only queries (no other filters), Brain skips post-filter logic entirely:
+For space_id-only queries (no other filters), Brain skips post-filter logic entirely:
 
 ```rust
 if filter.is_minimal() {
@@ -212,7 +212,7 @@ if filter.is_minimal() {
 }
 ```
 
-This shaves ~10 µs off the search latency. Most agent-scoped queries with default settings hit this fast path.
+This shaves ~10 µs off the search latency. Most space-scoped queries with default settings hit this fast path.
 
 ---
 

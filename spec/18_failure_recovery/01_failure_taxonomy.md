@@ -200,7 +200,7 @@ A duplicate request with different parameters.
 
 ### Read-after-write violation
 
-A read doesn't see a recent committed write (when ReadAfterWrite was requested).
+A read doesn't see a recent committed write, although the write acked.
 
 - Detection: Application-side check (rare; would be a Brain bug).
 - Response: Brain's design prevents this.

@@ -1,6 +1,6 @@
 # 09. ANN Index (HNSW)
 
-> **TL;DR.** HNSW per shard, via the `hnsw_rs` crate. Memory HNSW defaults `M=16, ef_construction=200, ef_search=64`; entity and statement HNSWs use per-corpus parameters documented in [`01_hnsw_basics.md`](01_hnsw_basics.md) § 25. Every shard owns three HNSW corpora (memory, entity, statement) and two tantivy indexes (memory text, statement text) from byte zero — none of them activate on schema upload. The HNSW indexes reference slots in the arena rather than copying vectors. Single-writer-per-shard inserts, lock-free reads through ArcSwap + crossbeam-epoch, inline filtering by model fingerprint, kind, and context. p99 search 5-10 ms; recall@10 95-98% at default ef_search.
+> **TL;DR.** HNSW per shard, via the `hnsw_rs` crate. Memory HNSW defaults `M=16, ef_construction=200, ef_search=64`; entity and statement HNSWs use per-corpus parameters documented in [`01_hnsw_basics.md`](01_hnsw_basics.md) § 25. Every shard owns three HNSW corpora (memory, entity, statement) and two tantivy indexes (memory text, statement text) from byte zero — none of them activate on schema upload. The HNSW indexes reference slots in the arena rather than copying vectors. Single-writer-per-shard inserts, lock-free reads through ArcSwap + crossbeam-epoch, inline filtering by model fingerprint, kind, and session. p99 search 5-10 ms; recall@10 95-98% at default ef_search.
 
 ## Status
 
@@ -33,7 +33,7 @@ This document specifies the vector index — the data structure that makes simil
 - The lack of dedicated persistence and the rebuild path on startup.
 - The maintenance worker that detects and repairs topology degradation.
 - The concurrency model: lock-free reads, single-writer writes, epoch-managed reclamation.
-- Inline filtering by model fingerprint, kind, context.
+- Inline filtering by model fingerprint, kind, session.
 
 ## What this document does not cover
 
@@ -88,7 +88,7 @@ What Brain adds on top:
 
 - The single-writer-per-shard discipline ([`04_concurrency.md`](04_concurrency.md)).
 - Lock-free reads via epoch-based reclamation.
-- Inline filters for fingerprint / kind / context.
+- Inline filters for fingerprint / kind / session.
 - The maintenance worker for topology drift.
 - Integration with Brain's arena and metadata.
 

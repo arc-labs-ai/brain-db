@@ -16,19 +16,19 @@ They're separate from cognitive primitives because their failure modes, latency,
 
 | Operation | Purpose |
 |---|---|
-| ADMIN_STATS | Get per-shard or per-agent statistics |
+| ADMIN_STATS | Get per-shard or per-space statistics |
 | ADMIN_SNAPSHOT_CREATE | Create a point-in-time backup |
 | ADMIN_SNAPSHOT_RESTORE | Restore from a snapshot |
 | ADMIN_SNAPSHOT_LIST | List available snapshots |
 | ADMIN_SNAPSHOT_DELETE | Remove a snapshot |
 | ADMIN_REBUILD_ANN | Trigger immediate HNSW rebuild |
 | ADMIN_RECOVER_METADATA | Rebuild metadata from WAL |
-| ADMIN_CONTEXT_CREATE | Create a context with explicit settings |
-| ADMIN_CONTEXT_DELETE | Delete a context (and its memories) |
-| ADMIN_CONTEXT_RENAME | Rename a context |
+| ADMIN_CONTEXT_CREATE | Create a session with explicit settings |
+| ADMIN_CONTEXT_DELETE | Delete a session (and its memories) |
+| ADMIN_CONTEXT_RENAME | Rename a session |
 | ADMIN_AGENT_CREATE | Create an agent |
 | ADMIN_AGENT_DELETE | Delete all data for an agent |
-| ADMIN_AGENT_QUOTA_SET | Set per-agent quotas |
+| ADMIN_AGENT_QUOTA_SET | Set per-space quotas |
 | ADMIN_RESTORE_FORGOTTEN | Undo a soft-FORGET within grace |
 | ADMIN_EXPLAIN_PLAN | Get the planner's plan for a request |
 | ADMIN_HEALTH_CHECK | Detailed health report |
@@ -45,8 +45,8 @@ Where scope is one of:
 
 - `Substrate`: global stats for the running substrate.
 - `Shard`: per-shard stats (requires shard_id).
-- `Agent`: per-agent stats.
-- `Context`: per-context stats.
+- `Agent`: per-space stats.
+- `Session`: per-session stats.
 
 Returns:
 
@@ -160,30 +160,30 @@ The shard is offline during recovery. For a 1M-memory shard: ~30 sec to a few mi
 ## 9. ADMIN_CONTEXT_*
 
 ```
-ADMIN_CONTEXT_CREATE(agent_id, name, settings) → ContextResponse
-ADMIN_CONTEXT_DELETE(context_id, force?) → DeleteResponse
-ADMIN_CONTEXT_RENAME(context_id, new_name) → RenameResponse
+ADMIN_CONTEXT_CREATE(space_id, name, settings) → ContextResponse
+ADMIN_CONTEXT_DELETE(session_id, force?) → DeleteResponse
+ADMIN_CONTEXT_RENAME(session_id, new_name) → RenameResponse
 ```
 
-CREATE: explicit context creation with settings (rather than the implicit creation at first ENCODE).
+CREATE: explicit session creation with settings (rather than the implicit creation at first ENCODE).
 
-DELETE: removes a context and (optionally) all its memories. With `force: true`, all memories in the context are FORGOTTEN as part of the delete. Without force, the delete fails if the context has memories.
+DELETE: removes a session and (optionally) all its memories. With `force: true`, all memories in the session are FORGOTTEN as part of the delete. Without force, the delete fails if the session has memories.
 
-RENAME: change the context's name. The ContextId is unchanged.
+RENAME: change the session's name. The SessionId is unchanged.
 
 ## 10. ADMIN_AGENT_*
 
 ```
 ADMIN_AGENT_CREATE(name, settings) → AgentResponse
-ADMIN_AGENT_DELETE(agent_id, mode) → DeleteResponse
-ADMIN_AGENT_QUOTA_SET(agent_id, quotas) → QuotaResponse
+ADMIN_AGENT_DELETE(space_id, mode) → DeleteResponse
+ADMIN_AGENT_QUOTA_SET(space_id, quotas) → QuotaResponse
 ```
 
-CREATE: creates a new agent. Returns the AgentId.
+CREATE: creates a new agent. Returns the SpaceId.
 
-DELETE: removes the agent and all its memories, contexts, edges. Heavy. With `mode: HardDelete`, vectors and texts are zeroed immediately.
+DELETE: removes the agent and all its memories, sessions, edges. Heavy. With `mode: HardDelete`, vectors and texts are zeroed immediately.
 
-QUOTA_SET: configures per-agent limits (max memories, max contexts, max RPS).
+QUOTA_SET: configures per-space limits (max memories, max sessions, max RPS).
 
 ## 11. ADMIN_RESTORE_FORGOTTEN
 
@@ -272,7 +272,7 @@ Used to mark a memory as a "summary of others" for organizational purposes. Does
 
 Every credential (API key) binds a `(namespace, agent, permissions)` scope plus a non-authoritative `user` audit tag (see [`../04_wire_protocol/04_handshake.md`](../04_wire_protocol/04_handshake.md) §10). Namespace is the tenant boundary; agent is the application within it.
 
-- Agent credentials: scoped to one `(namespace, agent)`; can only act within that namespace and agent.
+- Agent credentials: scoped to one `(namespace, space)`; can only act within that namespace and agent.
 - Admin credentials: may act cross-**agent** *within their own namespace* (operational work). **No credential — admin or otherwise — can act across namespaces**; cross-namespace access is rejected at the boundary. Cross-tenant operations require separate provisioning, not a wider key.
 
 **Namespace-scoped operations.** Key-mint provisions a tenant: minting a key for a namespace interns that namespace (creating the tenant). `SCHEMA_UPLOAD` / `SCHEMA_REPLACE` may target only the caller's own namespace; the reserved `brain` namespace is immutable (read-only system vocabulary). `GET_CAPABILITIES.schema_namespaces` returns only the caller's namespace (plus `brain`).
@@ -312,7 +312,7 @@ Admin operations vary widely:
 - ADMIN_SNAPSHOT_CREATE: 1-10 sec (depending on shard size).
 - ADMIN_SNAPSHOT_RESTORE: 1-30 sec (depending on shard size).
 - ADMIN_REBUILD_ANN: minutes (background; the call returns immediately).
-- ADMIN_AGENT_DELETE: minutes for large agents (background).
+- ADMIN_AGENT_DELETE: minutes for large spaces (background).
 
 For long-running admin operations, Brain returns a job ID; the client polls for completion.
 
@@ -332,7 +332,7 @@ Disabled operations return `OperationDisabled`.
 
 The admin set will grow over time as new operational needs emerge. The naming convention (`ADMIN_*` prefix) makes them clearly distinct from cognitive primitives.
 
-Brain avoids putting agent-facing semantics in admin (e.g., Brain does not have `ADMIN_RECALL_FROM_OTHER_AGENT`). Admin is about substrate operation, not about cognition.
+Brain avoids putting agent-facing semantics in admin (e.g., Brain does not have `ADMIN_RECALL_FROM_OTHER_SPACE`). Admin is about substrate operation, not about cognition.
 
 ---
 

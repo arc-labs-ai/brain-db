@@ -1,6 +1,6 @@
 # 16. Sharding & Clustering
 
-> **TL;DR.** The shard is Brain's unit of partitioning and parallelism. Each shard owns an arena, WAL, metadata store, HNSW, writer task, executor, and workers, and pins to one CPU core. Agents map to shards by `hash(agent_id) % shard_count`; MemoryIds carry a 16-bit runtime `shard_id` in the high bits so `shard_for_memory` is bit extraction; storage records the durable `shard_uuid` (UUIDv7). v1 is single-node, multi-shard; the wire protocol and identifiers leave room for clustered deployment with networked cross-shard calls in a future major version.
+> **TL;DR.** The shard is Brain's unit of partitioning and parallelism. Each shard owns an arena, WAL, metadata store, HNSW, writer task, executor, and workers, and pins to one CPU core. Agents map to shards by `hash(space_id) % shard_count`; MemoryIds carry a 16-bit runtime `shard_id` in the high bits so `shard_for_memory` is bit extraction; storage records the durable `shard_uuid` (UUIDv7). v1 is single-node, multi-shard; the wire protocol and identifiers leave room for clustered deployment with networked cross-shard calls in a future major version.
 
 ## Status
 
@@ -47,7 +47,7 @@ This makes shards good failure boundaries (one shard's issues don't cascade), go
 
 Within Brain, almost everything is per-shard:
 
-- Identifiers (MemoryId, ContextId) are per-shard (the shard is encoded in the high bits).
+- Identifiers (MemoryId, SessionId) are per-shard (the shard is encoded in the high bits).
 - Storage files are per-shard.
 - Metrics are per-shard (with aggregation at higher levels).
 - Workers are per-shard.
@@ -78,13 +78,13 @@ In a future major version, Brain may run as a cluster:
 
 V1's design accommodates this future direction (the wire protocol is network-ready, etc.) but doesn't implement it.
 
-## 5. The agent-shard mapping
+## 5. The space-shard mapping
 
-In the simplest case, all of an agent's data is on one shard. The shard hosts the agent.
+In the simplest case, all of an space's data is on one shard. The shard hosts the agent.
 
-For very large agents (millions of memories), data may span multiple shards. The agent's data is split.
+For very large spaces (millions of memories), data may span multiple shards. The space's data is split.
 
-The mapping (agent → shard) is deterministic — given the agent's ID, Brain computes which shard owns it.
+The mapping (space → shard) is deterministic — given the `space_id`, Brain computes which shard owns it.
 
 ## 6. Why shard-per-core
 
@@ -137,7 +137,7 @@ Shards also have a 16-bit runtime `shard_id` — a small integer (0, 1, ..., up 
 
 ## 11. The agent ID
 
-An agent has an AgentId — also a UUID. Routing maps AgentId to the runtime `shard_id`.
+An agent has an SpaceId — also a UUID. Routing maps SpaceId to the runtime `shard_id`.
 
 ## 12. The "router" entity
 
@@ -145,7 +145,7 @@ Brain has a stateless router component:
 
 ```rust
 trait Router {
-    fn shard_for_agent(&self, agent_id: AgentId) -> ShardId;
+    fn shard_for_agent(&self, space_id: SpaceId) -> ShardId;
     fn shard_for_memory(&self, memory_id: MemoryId) -> ShardId;
 }
 ```
@@ -166,13 +166,13 @@ fn shard_for_memory(memory_id: &MemoryId) -> ShardId {
 
 This is O(1), no router lookup needed.
 
-## 14. The agent-to-shard hash
+## 14. The space-to-shard hash
 
 For agents, the mapping uses a hash:
 
 ```rust
-fn shard_for_agent(agent_id: AgentId) -> ShardId {
-    let hash = blake3::hash(&agent_id.bytes());
+fn shard_for_agent(space_id: SpaceId) -> ShardId {
+    let hash = blake3::hash(&space_id.bytes());
     let shard_idx = (hash.as_u64() % shard_count) as ShardId;
     shard_idx
 }

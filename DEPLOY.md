@@ -26,9 +26,13 @@ you run is exactly what we run.
 ## Prerequisites
 
 - **Docker** (or any OCI runtime / Kubernetes).
-- **An LLM provider key.** Brain refuses to boot without one: write-time HyPE
-  and extraction are always-on and depend on the LLM. The provider is derived
-  from the model id (`gpt-4o-mini` → OpenAI, `claude-haiku-4-5` → Anthropic).
+- **A credential broker.** Write-time HyPE and extraction are always-on and
+  depend on an LLM, but Brain never holds a provider key: it resolves a
+  namespace-scoped grant from the broker ([`brain-edge`](https://github.com/arc-labs-ai/brain-edge)
+  serves that endpoint). `[llm.broker] url` must be *set* for the server to
+  boot — not reachable — so Brain starts before its broker does. A namespace
+  with no registered key still writes; its LLM tier reports that it could not
+  run. You do **not** need a provider key of your own.
 - **`seccomp=unconfined`** (or a profile permitting `io_uring_*`). Brain's
   shards use io_uring via Glommio; the default Docker seccomp profile blocks the
   syscalls.
@@ -78,7 +82,7 @@ under one model are not comparable with another. Re-embed rather than mixing.
 
 `[rerank]` ships `enabled = false` and the image carries no cross-encoder model.
 Opt-in rerank requests return `CapabilityNotEnabled`, and
-`GET /v1/capabilities` reports `rerank: false`. Retrieval fuses with RRF.
+the `GET_CAPABILITIES` wire op reports `rerank: false`. Retrieval fuses with RRF.
 
 The GLiNER NER model (`gliner-small-v2.1`) also ships in the image, at
 `/opt/brain/models/gliner-small-v2.1`. It is the classifier tier of the
@@ -108,13 +112,19 @@ name and refuses to load without them. See
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/arc-labs-ai/brain-db/main/docker-compose.yml
 curl -fsSLO https://raw.githubusercontent.com/arc-labs-ai/brain-db/main/.env.example
-cp .env.example .env          # then set BRAIN__LLM__BROKER__URL + BRAIN__ADMIN__TOKEN
+cp .env.example .env          # then set the three required values (see below)
 docker compose up -d
 docker compose ps             # HEALTHCHECK status shows here
 docker compose logs -f brain
 ```
 
-Pin a version in `.env`: `BRAIN_VERSION=0.1.0`.
+Three values are required and `docker compose up` refuses to start without
+them: `BRAIN__LLM__BROKER__URL`, `BRAIN__LLM__BROKER__SERVICE_KEY` and
+`BRAIN__ADMIN__TOKEN`. `BRAIN__LLM__API_KEY` is **not** one of them — leave it
+empty. It is deprecated, it is not the serving credential, and Brain resolves
+a namespace-scoped grant from the broker for every LLM call.
+
+Pin a version in `.env`: `BRAIN_VERSION=0.4.0`.
 
 ---
 
@@ -152,12 +162,12 @@ The image bakes defaults at `/etc/brain/config.toml`. Two override paths:
    |---|---|
    | `BRAIN__LLM__BROKER__URL` | where namespace credentials resolve (**required**) |
    | `BRAIN__LLM__BROKER__SERVICE_KEY` | Brain's identity to the broker — not a provider key |
-   | `BRAIN__LLM__API_KEY` | shard-wide client for the entity disambiguator only; not the serving credential |
+   | `BRAIN__LLM__API_KEY` | **deprecated, leave empty** — builds the two remaining shard-wide clients (entity disambiguator, summarizer); never the serving credential |
    | `BRAIN__LLM__MODEL` | model id → derives provider (default `gpt-4o-mini`) |
    | `BRAIN__ADMIN__TOKEN` | operator admin secret (**required**) |
    | `BRAIN__STORAGE__SHARD_COUNT` | shards; one shard pins one core |
    | `BRAIN__SHARD__ARENA_CAPACITY_BYTES` | per-shard vector arena (e.g. `4GiB`) |
-   | `BRAIN__RERANK__ENABLED` | load the cross-encoder reranker (default off) |
+   | `BRAIN__RERANK__ENABLED` | load the cross-encoder reranker (default off — **fatal at boot on the stock image**, which carries no model) |
    | `BRAIN__MONITORING__TRACING__ENABLED` + `__ENDPOINT` | OTLP tracing |
 
 2. **Whole file** — bind-mount your own:
@@ -178,11 +188,11 @@ Roll by tag — the image is immutable, so a version is a version:
 
 ```bash
 # Upgrade
-sed -i 's/^BRAIN_VERSION=.*/BRAIN_VERSION=0.2.0/' .env
+sed -i 's/^BRAIN_VERSION=.*/BRAIN_VERSION=0.4.0/' .env
 docker compose pull && docker compose up -d
 
 # Rollback — just pin the old tag and re-up
-sed -i 's/^BRAIN_VERSION=.*/BRAIN_VERSION=0.1.0/' .env
+sed -i 's/^BRAIN_VERSION=.*/BRAIN_VERSION=0.3.0/' .env
 docker compose pull && docker compose up -d
 ```
 

@@ -40,7 +40,7 @@ pub enum SemanticScope {
 }
 
 pub struct SemanticFilters {
-    pub agent_id: Option<AgentId>,
+    pub space_id: Option<SpaceId>,
     pub memory_kind: Option<MemoryKind>,
     pub statement_kind: Option<StatementKind>,
     pub predicate_id: Option<PredicateId>,
@@ -129,7 +129,7 @@ Push-down per filter:
 
 | Filter | Push-down mechanism |
 |---|---|
-| `agent_id` | HNSW filter callback (cheap metadata lookup). |
+| `space_id` | HNSW filter callback (cheap metadata lookup). |
 | `memory_kind` / `statement_kind` | HNSW filter callback. |
 | `predicate_id` | HNSW filter callback (statement scope only). |
 | `confidence_bucket` range | Post-search filter (range cardinality is typically large; cheaper than per-candidate callback). |

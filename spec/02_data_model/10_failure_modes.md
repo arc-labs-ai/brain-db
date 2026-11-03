@@ -10,7 +10,7 @@ This file lists the things that can go wrong at the data-model level — corrupt
 
 - The slot is tombstoned with the same version: the original memory was forgotten but slot not yet reclaimed. Return `MemoryNotFound`.
 - The slot's version differs from the `MemoryId`'s version: the slot has been reclaimed; the memory is gone. Return `MemoryNotFound`.
-- The slot's agent_id differs from the requesting agent: an authorization bug or a stale `MemoryId` from a different agent. Return `Unauthorized`.
+- The slot's space_id differs from the requesting agent: an authorization bug or a stale `MemoryId` from a different agent. Return `Unauthorized`.
 
 **Response.** Return an explicit error rather than silently returning a different memory. The version field exists exactly to prevent silent re-targeting.
 
@@ -30,21 +30,21 @@ This file lists the things that can go wrong at the data-model level — corrupt
 
 **Failure mode.** An operation in agent A's session references a `MemoryId` belonging to agent B.
 
-**Detection.** Each operation validates that the `MemoryId`'s agent matches the session's agent. The validation happens at the routing layer (the agent owns a shard; the memory's shard ID is in the `MemoryId`).
+**Detection.** Each operation validates that the `MemoryId`'s agent matches the session's space. The validation happens at the routing layer (the space owns a shard; the memory's shard ID is in the `MemoryId`).
 
-**Response.** `Unauthorized`. Brain does not leak the existence of the cross-agent memory; the error is the same as if the memory didn't exist.
+**Response.** `Unauthorized`. Brain does not leak the existence of the cross-space memory; the error is the same as if the memory didn't exist.
 
-**Implication for clients.** Don't share `MemoryId`s across agents. They are agent-scoped.
+**Implication for clients.** Don't share `MemoryId`s across spaces. They are space-scoped.
 
-## 4. Invalid context reference
+## 4. Invalid session reference
 
-**Failure mode.** An operation references a `ContextId` that doesn't exist in the agent's namespace.
+**Failure mode.** An operation references a `SessionId` that doesn't exist in the space's namespace.
 
-**Detection.** Brain validates the context reference against the agent's context table.
+**Detection.** Brain validates the session reference against the space's session registry.
 
-**Response.** `InvalidContext`. Different from `Unauthorized` — the context doesn't exist (whereas in the cross-agent case, the memory might exist but isn't accessible).
+**Response.** `InvalidContext`. Different from `Unauthorized` — the session doesn't exist (whereas in the cross-space case, the memory might exist but isn't accessible).
 
-**Implication for clients.** Use context names rather than `ContextId`s when uncertain; the lazy-creation behavior creates contexts on first use of their names.
+**Implication for clients.** Use session names rather than `SessionId`s when uncertain; the lazy-creation behavior creates sessions on first use of their names.
 
 ## 5. Vector corruption
 
@@ -151,7 +151,7 @@ A clean abort path exists: if the operator wants to revert the model change, swi
 
 ## 15. Validation failures at ingest
 
-**Failure mode.** A client submits an `ENCODE` with invalid parameters: empty text, invalid context, malformed `RequestId`, oversize text, etc.
+**Failure mode.** A client submits an `ENCODE` with invalid parameters: empty text, invalid session, malformed `RequestId`, oversize text, etc.
 
 **Detection.** Validation at the protocol layer ([04. Wire Protocol](../04_wire_protocol/00_purpose.md) §11).
 

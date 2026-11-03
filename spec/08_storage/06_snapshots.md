@@ -179,7 +179,20 @@ Brain's snapshots are byte-for-byte the same regardless of encryption, because e
 
 ### 13.1 Reflink not supported
 
-If the underlying filesystem doesn't support reflinks (e.g., ext4), the snapshot operation falls back to full-copy. The operation logs a warning. Operators should consider btrfs or xfs.
+If the underlying filesystem doesn't support reflinks (e.g. ext4), the snapshot operation falls back to full-copy. The copy behaviour is correct either way; only the cost differs. Operators should consider btrfs or xfs.
+
+**The warning is latched per `errno`, not emitted per file.** On a filesystem with no reflink support the `FICLONE` ioctl can never succeed, so warning on each call emits the same unactionable line for every file of every snapshot, forever — an hourly snapshot of four files is ~96 `WARN` lines a day whose only effect is to teach operators that `WARN` on this service means nothing.
+
+Latching on `errno` rather than on a plain "already warned" flag matters, because the two failures are different problems:
+
+| `errno` | Meaning | Operator action |
+|---|---|---|
+| `EOPNOTSUPP` | the filesystem has no reflinks at all | expected on ext4; switch filesystem, or accept full copies |
+| `EXDEV` | source and destination are on different mounts | a real misconfiguration — the snapshot target should be on the same filesystem |
+
+A single flag would hide whichever arrived second, and `EXDEV` is the one worth seeing.
+
+The response's `used_reflink` field reports what actually happened for that snapshot, so an operator does not have to infer it from log volume.
 
 ### 13.2 Disk full during reflink
 

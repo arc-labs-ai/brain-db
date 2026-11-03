@@ -106,7 +106,7 @@ The failure modes are classified along axes:
 When something goes wrong, Brain:
 
 - Detects (via invariants, error codes).
-- Logs the issue (structured, with context).
+- Logs the issue (structured, with session).
 - Acts within its capability (auto-recover, fail-fast).
 - Surfaces to operators (metrics, alerts).
 

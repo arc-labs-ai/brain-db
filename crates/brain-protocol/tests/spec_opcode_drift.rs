@@ -32,32 +32,26 @@ use std::path::PathBuf;
 
 use brain_protocol::codec::opcode::Opcode;
 
-/// Specified, tabulated, and deliberately not implemented yet.
+/// Tabulated in the spec and deliberately not implemented.
 ///
-/// `spec/04_wire_protocol/03_opcodes.md` §2.6 tabulates nine typed-graph admin
-/// opcodes at `0x0170–0x0178`. Exactly one of them — `0x0178`
-/// `ADMIN_LIST_PENDING_CONTRADICTIONS` — exists. The other eight are listed
-/// here so the gap is counted rather than merely absent, and so a *ninth*
-/// unimplemented opcode is a test failure instead of a silent addition.
+/// Empty, and that is the point: the spec was reconciled against this enum, so
+/// every opcode it tabulates is one the server can actually be sent.
 ///
-/// `README.md`'s "Future scope" tracks one of these conceptually, as
-/// "ADMIN_TANTIVY_REBUILD" — a different name from the spec's
-/// `ADMIN_REINDEX_TANTIVY`, which is why searching for it finds nothing. The
-/// other seven are not tracked anywhere.
-const UNIMPLEMENTED: &[(u16, &str)] = &[
-    (0x0170, "ADMIN_REBUILD_INDEX"),
-    (0x0171, "ADMIN_REINDEX_TANTIVY"),
-    (0x0172, "ADMIN_LIST_PENDING_RESOLUTIONS"),
-    (0x0173, "ADMIN_RESOLVE_AMBIGUITY"),
-    (0x0174, "ADMIN_GET_AUDIT"),
-    (0x0175, "ADMIN_LIST_STALE_STATEMENTS"),
-    // Also tabulated at 0x006E in the substrate admin range (§1), where it IS
-    // implemented, with the same body and the same response. The spec declares
-    // one operation at two opcodes; the duplicate is recorded here rather than
-    // resolved, because `spec/` is read-only.
-    (0x0176, "ADMIN_BACKFILL"),
-    (0x0177, "ADMIN_JOB_STATUS"),
-];
+/// What used to live here was the typed-graph admin range. `spec/` declared
+/// nine opcodes at `0x0170–0x0178` and exactly one of them —
+/// `ADMIN_LIST_PENDING_CONTRADICTIONS` (`0x0178`) — existed. The other eight
+/// have been removed from the spec rather than excused here; `0x0170–0x0177`
+/// are now documented as unallocated.
+///
+/// One of the eight was not missing at all. `ADMIN_BACKFILL` was tabulated
+/// twice — at `0x0176` in the typed-graph admin range, where nothing
+/// implemented it, and at `0x006E` in the substrate admin range, where it is
+/// implemented with a scope selector, an extractor-id list, a dry-run flag and
+/// a cancel verb at `0x006F`. The spec declared one operation at two opcodes;
+/// it now declares it at the one that exists.
+///
+/// A future gap goes here with its reason, not without one.
+const UNIMPLEMENTED: &[(u16, &str)] = &[];
 
 fn spec_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../spec")

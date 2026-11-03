@@ -80,13 +80,13 @@ Detailed epoch protocol in [14. Concurrency](../14_concurrency/00_purpose.md).
 
 ## 6. The "see new memory" timing
 
-For a read to see a newly-encoded memory, the encode must:
-1. Complete the writer's HNSW insert.
-2. Trigger an epoch advance.
+For a read to see a newly-encoded memory, the encode must complete the writer's insert — and nothing more. **There is no epoch to wait for on the read path.**
 
-The epoch advances on a regular cadence (every few milliseconds), or when the writer explicitly requests it.
+The index is served as two parts merged at search time: the published main graph, swapped via `ArcSwap`, and a **pending buffer** of full-precision vectors the writer appends to directly. A search scores the main graph, brute-forces the pending buffer at exact cosine, and merges the two, preferring the pending entry on a collision because its vector is the later write. A tombstone goes into the pending tombstone set and filters the very next search.
 
-For typical workloads, the read-after-write delay is < 10 ms. For latency-sensitive workloads where read-after-write must be immediate, Brain provides a hint: pass `consistency=ReadAfterWrite` to the read; Brain forces an epoch advance and waits for it before processing the read.
+So the read-after-write delay is **zero**, and there is no hint to pass. The epoch advance still happens, on its own cadence, but what it does is fold pending entries into the main graph — a cost-and-structure concern, not a visibility one. A client never has to know it exists.
+
+The brute-force scan over pending is what makes this affordable: its size is bounded by how often the flush runs, not by corpus size, so the cost stays with the writer instead of leaking into every reader's mental model.
 
 ## 7. Concurrent reads of the same HNSW
 
@@ -138,15 +138,13 @@ Searches use the published state (without the pending) until the next flush.
 
 This means most searches see slightly-stale state. The lag is bounded by the flush thresholds.
 
-## 11. The read-after-write hint
+## 11. Read-after-write needs no hint
 
-When a client encodes and immediately recalls (expecting to find the encoded memory), Brain may need to flush pending inserts before the recall.
+When a client encodes and immediately recalls, the memory is there. The insert happens inside the write submission — before the metadata commit and before the ack — and the search merges the pending buffer, so there is nothing to flush and nothing to wait for.
 
-The mechanism:
-- The encode response carries the encode's "publication LSN" (after this LSN is published, the new memory is searchable).
-- A subsequent recall with `consistency=ReadAfterWrite` causes Brain to wait for the publication LSN to be reached before searching.
+The encode response still carries an `lsn`, but it is for **chaining a subscription** (`encode → subscribe --from-lsn lsn+1`), not for gating a read. There is no per-query wait and no opt-in.
 
-This is a per-query opt-in. By default, recalls don't wait — they accept the eventual-consistency model.
+What a client may genuinely need to wait for is the write's *derived* state — its edges, its extracted entities, its HyPE questions — and that is observed through `StageCompleted` events or `ENCODE(wait: derived)`, which name the stage being waited on. See [`../05_operations/07_consistency.md`](../05_operations/07_consistency.md) §3.
 
 ## 12. The single-shard execution model
 

@@ -83,7 +83,7 @@ Connection pooling, retries, timeouts handled at this layer.
 
 Cross-node call latency: ~0.1-1 ms intra-datacenter, ~1-50 ms cross-region.
 
-For agent-scoped operations (most), a single shard handles them; the cross-node hop only happens once per request.
+For space-scoped operations (most), a single shard handles them; the cross-node hop only happens once per request.
 
 For multi-shard operations, multiple cross-node hops; can become noticeable.
 

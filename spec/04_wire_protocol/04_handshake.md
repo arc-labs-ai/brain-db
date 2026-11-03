@@ -1,6 +1,6 @@
 # 04.04 Handshake
 
-The connection handshake establishes the protocol version, the session, and the authenticated scope. Authentication is **mandatory**: every data-plane connection must present a valid credential, and the connection's identity `(namespace, agent, permissions)` is derived entirely from that credential. There is no anonymous mode, no default agent, and no default namespace. This file specifies the four frames involved: `HELLO`, `WELCOME`, `AUTH`, `AUTH_OK`.
+The connection handshake establishes the protocol version, the session, and the authenticated scope. Authentication is **mandatory**: every data-plane connection must present a valid credential, and the connection's identity `(namespace, space, permissions)` is derived entirely from that credential. There is no anonymous mode, no default space, and no default namespace. This file specifies the four frames involved: `HELLO`, `WELCOME`, `AUTH`, `AUTH_OK`.
 
 ## 1. The handshake sequence
 
@@ -35,7 +35,7 @@ struct HelloPayload {
     client_id: String,              // human-readable; e.g., "my-app/1.0"
     supported_versions: Vec<u8>,    // protocol versions the client supports, e.g., [1]
     capabilities: HelloCapabilities,
-    client_session_token: Option<[u8; 32]>,  // for resumption (not currently used)
+    client_connection_token: Option<[u8; 32]>,  // for resumption (not currently used)
 }
 
 struct HelloCapabilities {
@@ -82,7 +82,7 @@ The server's response to `HELLO`. Contains:
 struct WelcomePayload {
     server_id: String,              // human-readable; e.g., "brain-server/0.5.0"
     chosen_version: u8,             // protocol version for this connection
-    session_id: [u8; 16],           // server-allocated, unique to this session
+    connection_id: [u8; 16],        // server-allocated, unique to this connection
     capabilities: HelloCapabilities, // mutually-supported
     server_features: ServerFeatures,
 }
@@ -173,14 +173,14 @@ The auth method the client is using. Must be one of those declared in `WELCOME.a
 
 ### 4.2 No client-asserted identity
 
-The client carries no `agent_id`, `namespace`, or other identity field in `AUTH`. Identity is resolved server-side from the credential — the API key (or mTLS-bound subject) names exactly one `(namespace, agent, permissions)` scope, set when the key was minted (see [`../05_operations/06_admin.md`](../05_operations/06_admin.md)). A connection cannot claim to be an agent; it proves possession of a key, and the key *is* the agent.
+The client carries no `space_id`, `namespace`, or other identity field in `AUTH`. Identity is resolved server-side from the credential — the API key (or mTLS-bound subject) names exactly one `(namespace, space, permissions)` scope, set when the key was minted (see [`../05_operations/06_admin.md`](../05_operations/06_admin.md)). A connection cannot claim a space; it proves possession of a key, and the key *is* the space.
 
 ### 4.3 Token authentication
 
 For `method = Token`:
 
 - The token is the API key the operator minted out-of-band via the admin HTTP surface.
-- The server looks the key up in its key store and reads off the bound `(namespace, agent, permissions)`.
+- The server looks the key up in its key store and reads off the bound `(namespace, space, permissions)`.
 - A token that resolves to no key, or to a revoked key, is rejected — see §6.2.
 
 ### 4.4 mTLS authentication
@@ -189,28 +189,28 @@ For `method = Mtls`:
 
 - The server already received the client's certificate during the TLS handshake.
 - The `MtlsClaim` confirms the client's expected cert fingerprint and asserted subject.
-- The server matches the cert/subject against the minted key store and reads off the bound `(namespace, agent, permissions)`. An unmatched or revoked subject is rejected — see §6.2.
+- The server matches the cert/subject against the minted key store and reads off the bound `(namespace, space, permissions)`. An unmatched or revoked subject is rejected — see §6.2.
 
 ## 5. AUTH_OK
 
-The server's acknowledgment of successful authentication. Its payload carries the server-resolved scope — `(agent_id, namespace, permissions)` — and that scope is the **only** source of the connection's identity. The client did not supply it; the server derived it from the credential and returns it so the client knows who it is acting as.
+The server's acknowledgment of successful authentication. Its payload carries the server-resolved scope — `(space_id, namespace, permissions)` — and that scope is the **only** source of the connection's identity. The client did not supply it; the server derived it from the credential and returns it so the client knows who it is acting as.
 
 ```rust
 struct AuthOkPayload {
-    agent_id: AgentId,                       // resolved from the credential
-    namespace: NamespaceId,                  // resolved from the credential (tenant boundary)
-    bound_shard_id: u16,                     // runtime shard ID for this agent
-    permissions: AgentPermissions,
+    space_id: [u8; 16],                      // the key-bound space, resolved from the credential
+    bound_shard_id: u16,                     // runtime shard ID for this space
+    permissions: SpacePermissions,
+    namespace: String,                       // resolved from the credential (tenant boundary)
     server_time_unix_nanos: u64,             // server's current time, for clock-skew check
 }
 
-struct AgentPermissions {
+struct SpacePermissions {
     can_encode: bool,
     can_recall: bool,
     can_plan: bool,
     can_reason: bool,
     can_forget: bool,
-    can_admin: bool,                         // typically false for normal agents
+    can_admin: bool,                         // typically false for an ordinary key
     can_act_as: bool,                        // run an op under another identity; held only by a trusted edge/gateway
 }
 ```
@@ -224,15 +224,15 @@ Frame layout:
 
 ### 5.1 bound_shard_id
 
-The shard ID this agent is bound to. The client uses it for routing optimizations (knowing which shard owner serves the connection).
+The shard ID this space is bound to. The client uses it for routing optimizations (knowing which shard owner serves the connection).
 
 ### 5.2 permissions
 
-The agent's permitted operations. Typically all operations are allowed; admin operations require elevated permissions.
+The key's permitted operations. Typically all data-plane operations are allowed; admin operations require elevated permissions.
 
-If the agent attempts an operation outside its permissions (e.g., calling `ADMIN_SNAPSHOT` without `can_admin`), the server returns `ERROR(PermissionDenied)`.
+If the caller attempts an operation outside its permissions (e.g., calling `ADMIN_SNAPSHOT` without `can_admin`), the server returns `ERROR(PermissionDenied)`.
 
-`can_act_as` is a distinct grant: it does not widen what the connection's own agent may do, it authorizes the connection to run an op *on behalf of another identity* via the per-request `act_as` field (§10a "Per-request identity (`act_as`)"). It is backed by the permission bit `ACT_AS = 1 << 6` in the minted-key bitfield and is held only by a trusted service principal (an edge or gateway); a normal agent's key never carries it. The bit is granted at key-mint over the admin HTTP surface, together with a `may_act` namespace allowlist that bounds which namespaces the principal may act for (both defined in [`../17_observability/04_admin_ops.md`](../17_observability/04_admin_ops.md)); no data-plane opcode mints or elevates it.
+`can_act_as` is a distinct grant: it does not widen what the connection's own space may do, it authorizes the connection to run an op *on behalf of another identity* via the per-request `act_as` field (§10a "Per-request identity (`act_as`)"). It is backed by the permission bit `ACT_AS = 1 << 6` in the minted-key bitfield and is held only by a trusted service principal (an edge or gateway); an ordinary tenant key never carries it. The bit is granted at key-mint over the admin HTTP surface, together with a `may_act` namespace allowlist that bounds which namespaces the principal may act for (both defined in [`../17_observability/04_admin_ops.md`](../17_observability/04_admin_ops.md)); no data-plane opcode mints or elevates it.
 
 ### 5.3 server_time_unix_nanos
 
@@ -294,11 +294,11 @@ For a multi-tenant edge or gateway, the supported pattern is **not** re-AUTH but
 
 ## 10. Identity is bound to the API key, not carried in requests
 
-Brain derives the caller's identity from the authenticated API key, not from per-request fields. Because authentication is mandatory, this scope is **always present** on an established connection and is **always key-derived** — there is no anonymous connection that lacks one, and no default scope to fall back to. The AUTH step issues a scope binding whose **authoritative claims are `(namespace, agent, permissions)`**: `namespace` is the tenant (company) data boundary, `agent` is the application within it, and the two together (`(namespace, agent)`) scope every operation on the connection. The key additionally carries a **non-authoritative `user` tag** — a human/service-account identity stamped onto audit rows for traceability ("who did it"); it is never an isolation boundary and never gates access. (The earlier `org` claim is removed: namespace *is* the company boundary.) Clients never construct or send a scope object; the server fills it from the key and resolves the namespace name to its interned `NamespaceId` once at AUTH.
+Brain derives the caller's identity from the authenticated API key, not from per-request fields. Because authentication is mandatory, this scope is **always present** on an established connection and is **always key-derived** — there is no anonymous connection that lacks one, and no default scope to fall back to. The AUTH step issues a scope binding whose **authoritative claims are `(namespace, space, permissions)`**: `namespace` is the tenant (company) data boundary, `space` is the isolation unit within it — one end-user, or one purpose — and the two together (`(namespace, space)`) scope every operation on the connection. The key additionally carries a **non-authoritative `user` tag** — a human/service-account identity stamped onto audit rows for traceability ("who did it"); it is never an isolation boundary and never gates access. (The earlier `org` claim is removed: namespace *is* the company boundary.) Clients never construct or send a scope object; the server fills it from the key and resolves the namespace name to its interned `NamespaceId` once at AUTH.
 
-This closes a class of impersonation bugs at the wire boundary. With identity carried in the request, a client that constructs the wrong `agent_id` or `namespace` could write into another tenant's space; with identity bound to the key, the same request is rejected at the handshake. Operations that legitimately act across agents *within a namespace* (admin migration, snapshot scope) require an admin key with explicit permissions; **no key can act across namespaces** — cross-tenant isolation is absolute.
+This closes a class of impersonation bugs at the wire boundary. With identity carried in the request, a client that constructs the wrong `space_id` or `namespace` could write into another tenant's space; with identity bound to the key, the same request is rejected at the handshake. Operations that legitimately act across spaces *within a namespace* (admin migration, snapshot scope) require an admin key with explicit permissions; **no key can act across namespaces** — cross-tenant isolation is absolute.
 
-Neither `agent_id` nor `namespace` is carried on client-facing requests; both are derived server-side from the authenticated connection key. The server rejects any request that carries a redundant `agent_id` or `namespace` field. A connection whose key resolves to no provisioned namespace is rejected (fail-closed; see [`./07_error_handling.md`](./07_error_handling.md) `NamespaceUnknown`) — there is no implicit/default namespace.
+Neither `space_id` nor `namespace` is carried on client-facing requests as a *self*-identification; both are derived server-side from the authenticated connection key. The one exception is the privilege-gated `act_as` selector (§10a), which names a *different* identity rather than restating the connection's own. A connection whose key resolves to no provisioned namespace is rejected, fail-closed, as `PermissionDenied` (see [`./07_error_handling.md`](./07_error_handling.md) §3.3) — there is no implicit or default namespace.
 
 ## 10a. Per-request identity (`act_as`)
 
@@ -309,9 +309,9 @@ Neither `agent_id` nor `namespace` is carried on client-facing requests; both ar
 Every `act_as` op has two identities, and the distinction is load-bearing:
 
 - The **connection principal** is the identity bound at AUTH from the credential (§10) — the edge's own service account. It authenticates the connection and answers *"may this connection impersonate?"*
-- The **effective identity** is the `(namespace, agent_id)` the op actually runs as. It answers *"whose data, whose permissions, whose idempotency, whose audit attribution?"*
+- The **effective identity** is the `(namespace, space_id)` the op actually runs as. It answers *"whose data, whose permissions, whose idempotency, whose audit attribution?"*
 
-The connection principal never changes within a connection; the effective identity varies per op. When `act_as` is absent, the two are the same — the op runs as the connection principal's own agent, exactly as before. This mirrors the recognized impersonation precedents, expressed as a wire-frame field rather than an HTTP header:
+The connection principal never changes within a connection; the effective identity varies per op. When `act_as` is absent, the two are the same — the op runs as the connection principal's own space. This mirrors the recognized impersonation precedents, expressed as a wire-frame field rather than an HTTP header:
 
 - **Kubernetes API user impersonation** — the caller presents its own credentials *plus* `Impersonate-User`/`Impersonate-Group` headers; the server authenticates the caller, checks the RBAC `impersonate` verb, then evaluates the request as the impersonated user.
 - **OAuth 2.0 Token Exchange (RFC 8693)** — the `act` (actor) claim "identifies the acting party to whom authority has been delegated"; `may_act` "makes a statement that one party is authorized to become the actor and act on behalf of another." `act_as` / `can_act_as` echo this vocabulary directly.
@@ -327,13 +327,14 @@ act_as: Option<ActAs>                        // absent = run as the connection's
 
 struct ActAs {
     namespace: String,                       // effective namespace (must be within the principal's may_act allowlist)
-    agent_id: WireUuid,                       // 16-byte effective agent id
+    space: String,                           // structured effective-space selector; "" = the key-bound space
+    grant: u32,                              // optional (omitted when 0): delegable bits added for this op
 }
 ```
 
-Absent (`None`) is the normal case: the op runs as the connection principal's own agent. Present, it selects the effective identity for that one op only.
+Absent (`None`) is the normal case: the op runs as the connection principal's own space. Present, it selects the effective identity for that one op only.
 
-`act_as` **never appears in the AUTH frame.** Identity at AUTH is still key-derived and non-negotiable (§10); putting an identity *selector* in AUTH would re-introduce client-claimed identity, which §10 forbids. `act_as` is not a claim of who the caller *is* — the caller has already proven that as the service principal — it is a privileged request to run *as someone else*, honored only because the proven principal holds `can_act_as`. For the same reason, the §10 rule that rejects a redundant self-`agent_id`/`namespace` on a request is unaffected: `act_as` is not a redundant restatement of the connection's own identity, it is a distinct, privilege-gated impersonation selector.
+`act_as` **never appears in the AUTH frame.** Identity at AUTH is still key-derived and non-negotiable (§10); putting an identity *selector* in AUTH would re-introduce client-claimed identity, which §10 forbids. `act_as` is not a claim of who the caller *is* — the caller has already proven that as the service principal — it is a privileged request to run *as someone else*, honored only because the proven principal holds `can_act_as`. For the same reason, the §10 rule that rejects a redundant self-`space_id`/`namespace` on a request is unaffected: `act_as` is not a redundant restatement of the connection's own identity, it is a distinct, privilege-gated impersonation selector.
 
 **A structural note on `SUBSCRIBE`.** Unlike the other nine ops in this list, `SUBSCRIBE` (along with `UNSUBSCRIBE` and `CANCEL_STREAM`) historically dispatched through a code path separate from the normal `act_as`-aware dispatch — a genuine architectural quirk of how streaming ops were wired, not a deliberate design choice — so `act_as` support for `SUBSCRIBE` required a dedicated fix rather than falling out of this general mechanism for free. See [`../05_operations/05_subscribe.md`](../05_operations/05_subscribe.md) §22 for the detail. `act_as` support for `TXN_BEGIN`/`TXN_COMMIT`/`TXN_ABORT` remains a known, smaller gap (those already go through normal dispatch) — not yet implemented.
 
@@ -342,9 +343,9 @@ Absent (`None`) is the normal case: the op runs as the connection principal's ow
 An `act_as` op MUST satisfy all six of the following. They are the normative contract; the read/write pipelines, metadata audit, and admin mint enforce and reference them.
 
 - **R1 — privilege gate before the switch.** `act_as` is honored **only** if the authenticated connection principal holds `can_act_as`. A principal lacking it that sends `act_as` is **hard-rejected** (`ErrorCategory::Authorization` — see [`07_error_handling.md`](07_error_handling.md) `ActAsDenied`); it is **never** silently run under the connection's own identity. Silent downgrade would be a reverse confused-deputy. Mirrors the K8s "403 on unprivileged impersonation" rule.
-- **R2 — namespace-bounded.** `act_as.namespace` MUST lie within the principal's granted `may_act` namespace allowlist (defined in §17). Anything outside it is rejected (`ActAsDenied`). A single `"*"` entry in `may_act` is the **wildcard grant** — the principal may act as any namespace (the trusted multi-tenant front-door case, where the tenant set grows at runtime and can't be enumerated at mint time). The wildcard widens *reach*, not *isolation*: each op still runs strictly under its own effective `(namespace, agent_id)` (R3), and the dual-principal audit (R5) still records the acting service principal. Cross-namespace access without the grant remains absolutely forbidden (`OQ-V2-4`, [`../03_schema/04_namespaces.md`](../03_schema/04_namespaces.md)): `act_as` moves the *agent*, and — only within the allowlist (or under `"*"`) — the *namespace*; it can never breach tenant isolation.
-- **R3 — effective identity everywhere.** When honored, the op runs under `(act_as.namespace, act_as.agent_id)` for **all** identity-derived behavior: write attribution (row `agent_id`/`namespace_id` stamps), read `agent_filter` isolation, permission checks (R4), the idempotency key and shard routing (see [`../05_operations/02_write_pipeline.md`](../05_operations/02_write_pipeline.md) §4), rate/quota, and audit (R5). No per-identity subsystem may key on the connection principal once `act_as` is honored.
-- **R4 — no escalation.** The op receives **exactly** the effective agent's permissions, resolved server-side from the target agent — never the service principal's, never the union of the two, never the principal's admin rights. `can_act_as` is itself not inheritable by the impersonated op: an op run under `act_as` cannot in turn impersonate a third identity. *Implementation note:* Brain has no per-space permission store, so the effective permissions are the fixed `STANDARD_SPACE` mask, optionally widened by an explicit per-request `act_as.grant` of the delegable bits (`SCHEMA_UPLOAD`, `ADMIN`) — and only by bits the service principal itself holds; `ACT_AS` is never delegable. A grant outside those bounds is `ActAsDenied`. See [`05_frame_layouts.md`](05_frame_layouts.md) "Shared request field: `act_as`".
+- **R2 — namespace-bounded.** `act_as.namespace` MUST lie within the principal's granted `may_act` namespace allowlist (defined in §17). Anything outside it is rejected (`ActAsDenied`). A single `"*"` entry in `may_act` is the **wildcard grant** — the principal may act as any namespace (the trusted multi-tenant front-door case, where the tenant set grows at runtime and can't be enumerated at mint time). The wildcard widens *reach*, not *isolation*: each op still runs strictly under its own effective `(namespace, space_id)` (R3), and the dual-principal audit (R5) still records the acting service principal. Cross-namespace access without the grant remains absolutely forbidden (`OQ-V2-4`, [`../03_schema/04_namespaces.md`](../03_schema/04_namespaces.md)): `act_as` moves the *space*, and — only within the allowlist (or under `"*"`) — the *namespace*; it can never breach tenant isolation.
+- **R3 — effective identity everywhere.** When honored, the op runs under `(act_as.namespace, derived space_id)` for **all** identity-derived behavior: write attribution (row `space_id`/`namespace_id` stamps), read space-scope isolation, permission checks (R4), the idempotency key and shard routing (see [`../05_operations/02_write_pipeline.md`](../05_operations/02_write_pipeline.md) §4), rate/quota, and audit (R5). No per-identity subsystem may key on the connection principal once `act_as` is honored.
+- **R4 — no escalation.** The op receives **exactly** the effective identity's permissions — never the service principal's, never the union of the two, never the principal's admin rights. `can_act_as` is itself not inheritable by the impersonated op: an op run under `act_as` cannot in turn impersonate a third identity. *Implementation note:* Brain has no per-space permission store, so the effective permissions are the fixed `STANDARD_SPACE` mask, optionally widened by an explicit per-request `act_as.grant` of the delegable bits (`SCHEMA_UPLOAD`, `ADMIN`) — and only by bits the service principal itself holds; `ACT_AS` is never delegable. A grant outside those bounds is `ActAsDenied`. See [`05_frame_layouts.md`](05_frame_layouts.md) "Shared request field: `act_as`".
 - **R5 — dual-principal audit.** Every `act_as` op records **both** the acting service principal and the effective identity — the acting party is never erased (RFC 8693 delegation-for-audit). Row shape is defined in [`../10_metadata/03_substrate_tables.md`](../10_metadata/03_substrate_tables.md).
 - **R6 — trusted transport.** `act_as` is honored **only** over mTLS or a trusted private network between the edge and Brain. A spoofable `act_as` arriving over an untrusted network is a total compromise of tenant isolation, so this is a hard deployment precondition, not a per-request check.
 

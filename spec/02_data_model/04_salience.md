@@ -37,7 +37,7 @@ S_0(M) = clip( w_hint * H + w_surprise * U + w_kind * K + S_base,  0, 1 )
 Where:
 
 - `H` is the agent-supplied salience hint, in [-1, +1]. Default 0.
-- `U` is the surprise score: distance from the centroid of recently-encoded memories in the same context. Higher distance = more surprising. Normalized to [0, 1].
+- `U` is the surprise score: distance from the centroid of recently-encoded memories in the same session. Higher distance = more surprising. Normalized to [0, 1].
 - `K` is the kind weight: 0.5 for `Episodic`, 0.7 for `Semantic`, 0.6 for `Consolidated` (consolidated memories start somewhat above episodic but below semantic — they represent learned patterns but aren't core knowledge).
 - `S_base` is a baseline (default 0.4) — every memory starts at least somewhat salient.
 - The weights `w_hint`, `w_surprise`, `w_kind` are configuration-tunable; defaults are 0.4, 0.2, 0.4.
@@ -55,10 +55,10 @@ The initial salience is bounded to [0, 1]; clipping happens at the end of the fo
 The surprise score U is computed as:
 
 ```
-U = clip( 1 - cos_sim(vector(M), centroid_recent(context)),  0, 1 )
+U = clip( 1 - cos_sim(vector(M), centroid_recent(session)),  0, 1 )
 ```
 
-Where `centroid_recent(context)` is the mean of the last K vectors encoded in the same context (K = 100 by default; configurable).
+Where `centroid_recent(session)` is the mean of the last K vectors encoded in the same session (K = 100 by default; configurable).
 
 A memory whose vector is far from the recent centroid is "surprising" and gets a higher U; a memory that's similar to many recent ones is "expected" and gets a lower U.
 

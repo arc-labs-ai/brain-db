@@ -532,7 +532,7 @@ For deployments that *can* bypass embedding (using `ENCODE_VECTOR_DIRECT` with p
 
 ### 5.2 Petabyte-scale single-shard
 
-A single shard tops out at ~10⁷ memories. Very-large-scale agents shard at the application level (e.g., one Brain shard per agent's project, or per time window). The architecture doesn't support a single shard at petabyte scale, and we're not planning to add it.
+A single shard tops out at ~10⁷ memories. Very-large-scale tenants shard at the application level (e.g., one Brain shard per space's project, or per time window). The architecture doesn't support a single shard at petabyte scale, and we're not planning to add it.
 
 ### 5.3 Multi-region active-active
 
@@ -544,7 +544,7 @@ Each shard is internally linearizable. Cross-shard operations (the rare admin mi
 
 ### 5.5 Broad multi-tenancy isolation
 
-Each agent is isolated by shard, but Brain doesn't enforce strict resource quotas across tenants on shared infrastructure. A heavy-load agent on shard A doesn't directly affect agent B on shard B (different cores, different storage), but they share NIC bandwidth, page cache, and disk capacity. For hard isolation, run separate Brain clusters.
+Each space is isolated by shard, but Brain doesn't enforce strict resource quotas across tenants on shared infrastructure. A heavy-load space on shard A doesn't directly affect a space on shard B (different cores, different storage), but they share NIC bandwidth, page cache, and disk capacity. For hard isolation, run separate Brain clusters.
 
 ### 5.6 Browser-side / client-side embedded use
 

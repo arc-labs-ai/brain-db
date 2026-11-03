@@ -13,7 +13,7 @@ second client read verb; RECALL returns the answer as a membership shape
 ### 1. Semantic contract
 
 ```
-RECALL(cue_text, agent_id, filter, max_results, ...) → RecallAnswer
+RECALL(cue_text, space_id, filter, max_results, ...) → RecallAnswer
 ```
 
 Brain runs a single pipeline on every request:
@@ -22,7 +22,7 @@ Brain runs a single pipeline on every request:
 RECALL → validate → embed cue → fan out to three retrievers
        (semantic / lexical / graph, all always-wired)
        → RRF fusion (k=60)
-       → filter chain (tombstone, kind, context, temporal,
+       → filter chain (tombstone, kind, session, temporal,
          confidence, salience, supersession)
        → metadata enrichment from redb
        → cross-encoder rerank (always-on when the model is loaded)
@@ -33,9 +33,11 @@ RECALL → validate → embed cue → fan out to three retrievers
 
 The three retrievers are mandatory shard wiring — they are never `None`. The
 cross-encoder rerank runs on every read whenever the model is loaded; there is
-no request flag. The only control is the deploy-time `config.rerank.enabled`
-load gate — when the operator opts out, no model loads and the pipeline returns
-RRF-only ordering (no error). Schema declarations do not gate any stage of this
+no request flag. The only control is the deploy-time `[rerank] enabled`
+load gate, which **defaults to `false`** — the shipped pipeline is RRF-only, and
+the published image carries no cross-encoder. An opt-in rerank request against a
+shard that has it off fails with `CapabilityNotEnabled` rather than silently
+returning differently-ordered results. Schema declarations do not gate any stage of this
 pipeline. They only narrow what `STATEMENT_CREATE` / `RELATION_CREATE` and
 predicate-aware filters accept.
 
@@ -79,7 +81,7 @@ proportional to one shard's work, not the whole corpus.
 ### MEMORY_LIST — enumeration, not search
 
 `MEMORY_LIST` (`0x0027`) is a distinct read *kind*: a non-ranked, paginated
-enumeration of the caller's `(namespace, agent)` memories in a stable order. It
+enumeration of the caller's `(namespace, space)` memories in a stable order. It
 does **not** run the retrieval pipeline — no cue, no embedding, no RRF, no
 rerank, no relevance suppression. Where RECALL answers *"what is relevant to this
 query"*, MEMORY_LIST answers *"what is stored here"*: it walks the tenant-scoped
@@ -88,18 +90,18 @@ cursor (seek pagination, never offset — page N costs the same as page 1 and pa
 are stable under concurrent writes). Filters (kind, tombstone state, created-time
 range, salience range) are applied during the scan; changing any filter or the
 sort invalidates an in-flight cursor (`stale_cursor`). It never crosses the
-`(namespace, agent)` boundary and never aggregates or counts the whole pool.
+`(namespace, space)` boundary and never aggregates or counts the whole pool.
 
 ### GRAPH_FETCH — typed-graph export, not search
 
 `GRAPH_FETCH` (`0x0163`) is the enumeration analogue for the *typed graph*: a
-non-ranked, paginated export of the caller's `(namespace, agent)` entities and
+non-ranked, paginated export of the caller's `(namespace, space)` entities and
 the edges between them, shaped as a node/edge set a graph-explorer UI renders
 directly. Like MEMORY_LIST it does **not** run the retrieval pipeline. It
 paginates over the subject-anchored statement index — the one typed-graph index
-that is `(namespace, agent)`-prefixed — and *derives* the entity set from
+that is `(namespace, space)`-prefixed — and *derives* the entity set from
 traversal (statement subjects/objects, plus the relation and mention neighbours
-of those entities) rather than a dedicated per-agent entity index; a
+of those entities) rather than a dedicated per-space entity index; a
 fully-isolated entity therefore does not surface. The default layer is the
 concept map (entity nodes + `Relation`/`Fact` edges); `include_statements` adds
 value-object statement nodes and `include_memories` adds source-memory nodes
@@ -107,7 +109,7 @@ with `Mentions` edges. The cursor is opaque and signed over the layer toggles.
 Because an entity can be reached on more than one page, the response guarantees
 **completeness, not disjointness**: every node/edge appears in at least one page,
 may repeat across pages, and carries a stable 16-byte id so the client dedups by
-id. It never crosses the `(namespace, agent)` boundary.
+id. It never crosses the `(namespace, space)` boundary.
 
 ### MEMORY_INSPECT — one memory's write story, not search
 
@@ -131,7 +133,7 @@ have not yet run therefore returns `found = true` with those fields still empty
 — the same "how far along is this write" signal the ENCODE trace's drain window
 exposes, but readable for any memory at any later time.
 
-Scope is enforced by the memory's own `(namespace, agent)` owner: a
+Scope is enforced by the memory's own `(namespace, space)` owner: a
 `memory_id` owned by another tenant reads as `found = false`, indistinguishable
 from a missing one — an id never leaks cross-tenant. Requires the `RECALL`
 capability bit. A hard-forgotten or reclaimed memory returns `found = false`;
@@ -155,11 +157,11 @@ The query. Embedded with the same model used for stored memories.
 
 The cue can be a single word, a sentence, a longer document — whatever the agent thinks is a useful query. Note that very short cues may be ambiguous and produce broad results; very long cues are truncated by the embedder.
 
-#### agent_id
+#### space_id
 
-The owning agent. Returns are scoped to this agent's memories.
+The owning space. Returns are scoped to this space's memories.
 
-**Under `act_as` the scope is the effective agent.** When the request carries the `act_as` field (a trusted service principal reading on behalf of a tenant agent; defined in [`../04_wire_protocol/04_handshake.md`](../04_wire_protocol/04_handshake.md) §"Per-request identity (`act_as`)"), the `agent_filter` isolation scopes to the **effective** `(namespace, agent_id)` named in `act_as`, never to the connection principal. A `RECALL` under `act_as` therefore returns the **effective identity's** memories only — never the service principal's own, and never any other tenant's. The isolation boundary follows the effective identity for every read, exactly as the write path stamps rows with it.
+**Under `act_as` the scope is the effective agent.** When the request carries the `act_as` field (a trusted service principal reading on behalf of a tenant agent; defined in [`../04_wire_protocol/04_handshake.md`](../04_wire_protocol/04_handshake.md) §"Per-request identity (`act_as`)"), the `space_filter` isolation scopes to the **effective** `(namespace, space_id)` named in `act_as`, never to the connection principal. A `RECALL` under `act_as` therefore returns the **effective identity's** memories only — never the service principal's own, and never any other tenant's. The isolation boundary follows the effective identity for every read, exactly as the write path stamps rows with it.
 
 #### max_results
 
@@ -171,37 +173,80 @@ pool (§3), never from this number.
 
 #### filter
 
-A `RecallFilter`:
+The filter is not a nested struct on the wire — the request carries each
+dimension as its own field, so a client sets only what it means and the server
+never has to tell an absent filter from an empty one:
 
-```rust
-struct RecallFilter {
-    kind: Option<MemoryKind>,         // Episodic / Semantic / Consolidated
-    contexts: Option<Vec<ContextRef>>,// Limit to specific contexts
-    min_salience: Option<f32>,
-    max_age: Option<Duration>,
-    fingerprint_match: bool,          // Default true; same model only
-    tags: Option<Vec<String>>,        // Custom tags from metadata
-    custom: Vec<FilterRule>,          // Arbitrary metadata filters
-}
-```
+| Field | Default | Meaning |
+|---|---|---|
+| `kind_filter: Option<Vec<MemoryKind>>` | `None` | restrict to specific kinds |
+| `session_filter: Option<Vec<SessionId>>` | `None` | restrict to specific sessions; `None` spans the space |
+| `salience_floor: f32` | `0.0` | minimum salience |
+| `age_bound_unix_nanos: Option<u64>` | `None` | event-time lower bound |
+| `as_of_record_time_unix_nanos: Option<u64>` | `None` | bi-temporal record-time anchor (§"time travel") |
+| `confidence_threshold: f32` | `0.0` | drop results below this calibrated confidence |
 
-Most filters are optional; defaults are permissive.
+Each list is capped at 1024 entries. There are **no `tags` and no `custom`
+filter rules**: memories carry no client-defined tag set and no arbitrary
+metadata map, so there is nothing for such a filter to match. Structured
+attributes belong on entities and statements, which the typed-graph LIST ops
+query directly.
+
+There is likewise no `fingerprint_match` toggle. A shard serves one embedding
+model; a memory stamped with a different fingerprint is not comparable against
+the current query vector at all, so excluding it is not a filter the caller
+opts into.
+
+#### subject_name
+
+An optional explicit subject hint for the precise grounded overlay, by name,
+resolved server-side across types. When empty (the default) the server mines
+subjects from the cue itself.
+
+This is **not a mode switch**. RECALL always runs the episodic associative path
+and overlays a precise grounded value when one is named exactly; this field only
+adds an explicit subject candidate to that overlay.
 
 #### include_text
 
-Whether to return the memory text in the response. Default false.
+Whether to return the memory text in the response. Default false. When unset,
+`MemoryResult.text` is the empty string.
 
-If true, Brain fetches text from the metadata store. Adds ~50 µs per result.
+If true, Brain fetches text from the metadata store in one batched read against
+the `texts` table. Adds ~50 µs per result.
 
-#### include_metadata
+#### include_edges
 
-Whether to include extra metadata fields. Default false.
+Whether each result carries its memory edges. Default false.
 
-#### consistency
+#### include_graph
 
-Either `Eventual` (default) or `ReadAfterWrite`.
+Whether each result carries a typed-graph side-channel: the entities the memory
+mentions, the statements sourced from it, and the relations incident to those
+entities. Default false.
 
-With ReadAfterWrite, the recall waits for the most recent writes to be searchable.
+If the memory was never extracted — no matching predicates declared, or a
+mention-less memory — the field stays absent even with the flag set. An empty
+enrichment and an un-requested one are therefore the same observation from the
+client's side, which is why the flag is explicit rather than inferred.
+
+#### trace
+
+Opt-in structured observability (§21). When `true`, the **final** response frame
+carries a populated `RecallTrace`. Zero-cost when false: the pipeline computes
+the data either way but discards it unless asked.
+
+#### txn_id
+
+When set, RECALL reads against a snapshot that includes the transaction's
+pending writes — read-your-writes.
+
+This is also the **only** path selector in RECALL, and it is not a mode the
+client chooses on relevance grounds: a request carrying a `txn_id` runs the txn
+path because read-your-writes requires the per-txn buffer overlay, which the
+lexical and graph retrievers do not see. Every other request runs the full
+retrieval path. There is no `consistency` argument — a read is either inside a
+transaction or it is not.
 
 #### confidence_min
 
@@ -232,11 +277,21 @@ enum AnswerKind {
 
 struct RecallResult {
     memory_id: MemoryId,
-    score: f32,                       // [-1, 1]; higher = more similar (provenance)
-    text: Option<String>,             // If include_text
-    metadata: Option<MemoryMetadata>, // If include_metadata
-    context_id: ContextId,
+    text: String,                     // empty unless include_text
+    similarity_score: f32,            // raw cosine (provenance)
+    fused_score: f32,                 // the post-fusion score it was ranked on
+    rerank_score: Option<f32>,        // None when rerank is disabled (the default)
+    confidence: f32,                  // calibrated, [0, 1]
+    salience: f32,
     kind: MemoryKind,
+    space_id: SpaceId,
+    session_id: SessionId,
+    created_at_unix_nanos: u64,
+    occurred_at_unix_nanos: Option<u64>,
+    last_accessed_at_unix_nanos: u64,
+    contributing_retrievers: Vec<RetrieverName>,  // which lanes surfaced it
+    edges: Option<Vec<EdgeView>>,     // if include_edges
+    graph: Option<GraphEnrichment>,   // if include_graph, and the memory was extracted
 }
 ```
 
@@ -278,14 +333,14 @@ hijacked the answer with no episodic fallback to catch it).
 The caller-facing contract is therefore:
 
 - **`Single`**: `memories[0]` is the committed answer. Any further entries
-  (`memories[1..]`) are retained relevance-band context, not part of the
+  (`memories[1..]`) are retained relevance-band session, not part of the
   answer — present for provenance/fallback, not for display as additional
   results. A client that wants "the answer, nothing else" reads only index 0.
 - **`Many` via an uncommitted band** (no grounded commit fired): every entry in
   `memories` is part of the answer, per the pure-cardinality rule above — this
   is the common case and matches the original contract.
 - **`Many` via a committed enumerated set**: the committed set leads (in
-  committed/recency order); anything appended after it is retained context,
+  committed/recency order); anything appended after it is retained session,
   not part of the enumerated answer. The wire does not currently carry an
   explicit boundary count between the committed set and the retained tail — a
   client that needs to draw that line precisely should treat this case the
@@ -341,39 +396,66 @@ Filters are AND-combined:
 ```
 result matches filter ⇔
   (filter.kind is None or result.kind == filter.kind)
-  AND (filter.contexts is None or result.context in filter.contexts)
+  AND (filter.sessions is None or result.session in filter.sessions)
   AND (filter.min_salience is None or result.salience >= filter.min_salience)
   AND ... 
 ```
 
 For OR semantics (e.g., "Episodic or Semantic"), use multiple filters and merge in the agent.
 
-### 8. The "fingerprint_match" default
+### 8. Embedding-fingerprint scoping
 
-By default, RECALL returns memories with the current model's fingerprint. Memories from older models are excluded.
-
-This is a safety feature: cross-model similarity isn't meaningful.
-
-To search across models (rarely useful, mostly for debugging or migration), set `fingerprint_match: false`.
+RECALL only ever compares memories carrying the shard's current model
+fingerprint. Cross-model cosine is not meaningful, so this is not a filter the
+caller opts into and there is no flag to relax it. Memories stamped with a
+retired fingerprint become searchable again by migrating them
+(`ADMIN_MIGRATE_EMBEDDINGS`), not by widening the query.
 
 ### 9. The "salience" effect
 
-Currently, RECALL returns purely by similarity score. Salience is filtered (if `min_salience` is set) but doesn't directly affect ranking.
+Salience is a **filter**, not a ranking term. `salience_floor` excludes
+memories below the threshold; above it, a more-salient memory does not outrank
+a less-salient one.
 
-A future option (open question): blend salience and similarity in ranking. Not currently implemented.
+Keeping it out of ranking is deliberate. Salience decays on a schedule the
+caller does not control, so folding it into relevance would make the same cue
+return a different order tomorrow for reasons unrelated to the cue.
 
 ### 10. The "recency" effect
 
-Similar: recency (age) is filterable but doesn't affect ranking. Brain doesn't auto-favor recent memories.
+Recency **is** a ranking term, but a deliberately small and conditional one.
+
+- **Additive, at RRF scale.** One top-rank retriever contributes `w / (k + 1)`
+  to `fused_score` (≈ 0.0164 at the default `k = 60`). The recency term is
+  `temporal_weight · (1 / (k + 1)) · decay`, so at the default
+  `temporal_weight = 0.5` the freshest possible memory earns at most *half of
+  one* top-rank vote. It is a tie-breaker, never a signal that overrides
+  genuine relevance.
+- **Exponential decay on event time.** `decay = 0.5^(age / half_life)` with a
+  90-day half-life, where `age` is measured from the **event** time
+  (`occurred_at`, falling back to `created_at`) — not write time. A memory
+  dated in the future saturates at full freshness rather than going negative.
+  Ninety days is chosen for episodic memory, where "recent" means
+  weeks-to-months: gentle within a conversation's lifetime, steep enough that
+  a year-old memory stops competing on recency alone.
+- **Gated on a temporal signal.** It is applied only when the query actually
+  cares about time — a temporal expression in the cue, an explicit time filter,
+  or an `as_of` anchor. Applying it unconditionally would quietly penalise
+  timeless facts; "what is my wife's name" has no recent answer.
+- **Folded in after the filter chain and before rerank**, so a fresh memory both
+  enters the rerank window and carries its recency into the rerank blend.
+
+Memory hits only. Statements and relations carry their own bi-temporal
+validity, which the filter chain already resolves, and are left untouched. Brain doesn't auto-favor recent memories.
 
 If the agent wants recent-favoring, it can:
 - Use `max_age` to filter.
 - Re-rank results in the agent layer.
 
-### 11. The "context boost" effect
+### 11. The "session boost" effect
 
-The agent might want to restrict the answer to the current context. Use a single
-RECALL with explicit `contexts: Some([current])` — the filter chain scopes the
+The agent might want to restrict the answer to the current session. Use a single
+RECALL with explicit `sessions: Some([current])` — the filter chain scopes the
 candidate pool before membership runs. The agent does not merge or re-rank result
 lists in its own layer; the DB returns the answer.
 
@@ -419,25 +501,27 @@ Including text fetches each result's text from the metadata store:
 
 For very large texts (~MB each), the response size grows correspondingly.
 
-### 16. The "include_metadata=true" cost
+### 16. The "include_graph=true" cost
 
-Similar to text, but for the extra metadata fields. Usually small (~tens of bytes per memory).
+Including the typed-graph side-channel runs server-side lookups per result:
+the entities the memory mentions, the statements sourced from it, and the
+relations incident to those entities. It is the alternative to the client
+issuing `ENTITY_GET` / `STATEMENT_LIST` / `RELATION_LIST` per hit, which is
+strictly more round trips for the same data.
 
-### 17. The "tags" filter
+Cost scales with the memory's graph fan-out, not with its text size. A
+mention-less memory costs nothing extra and comes back with the field absent.
 
-Tags are agent-defined strings stored in the memory's metadata. Filter:
+### 17. The "include_edges=true" cost
 
-```
-filter.tags = Some(vec!["urgent".to_string(), "personal".to_string()])
-```
+One edge-table range scan per result, in both directions. Cheap for ordinary
+memories; proportional to fan-out for a heavily-linked one.
 
-Returns memories that have ALL the specified tags (intersection). For "any of these tags" (union), make multiple recalls.
+### 18. The "ids-only" default
 
-Tags are filtered post-search; selective tag filters need higher ef_search (the planner adjusts automatically).
-
-### 18. The "score-only" mode
-
-For agents that want just IDs and scores (no text, no metadata), the default is fine — text and metadata are off by default. The response is small and fast.
+A client that wants just ids and scores does nothing: `include_text`,
+`include_edges` and `include_graph` all default to false, so the default
+response is small and fast. Every payload the response can carry is opt-in.
 
 ### 19. The `None` semantics
 
@@ -659,7 +743,7 @@ The PLAN primitive: find paths through the memory graph from a starting state to
 ### 1. Semantic contract
 
 ```
-PLAN(goal_text, starting_state, agent_id, max_depth, edge_kinds, ...) → Vec<Path>
+PLAN(goal_text, starting_state, space_id, max_depth, edge_kinds, ...) → Vec<Path>
 ```
 
 Brain:
@@ -683,9 +767,9 @@ What the agent is currently doing or thinking. A description of the present stat
 
 If unspecified, Brain uses recent high-salience memories as starting points (defaulting to the agent's "implicit current state").
 
-#### agent_id
+#### space_id
 
-The owning agent. Plans are scoped to this agent's memories and edges.
+The owning space. Plans are scoped to this space's memories and edges.
 
 #### max_depth
 
@@ -779,7 +863,7 @@ When starting_state is unspecified, Brain uses:
 top-K most salient recent memories (default K=5, recency window 24h)
 ```
 
-This is "what's on the agent's mind right now" — a soft proxy for the agent's current context.
+This is "what's on the agent's mind right now" — a soft proxy for the agent's current session.
 
 For agents that want explicit control, always pass `starting_state`.
 
@@ -869,7 +953,7 @@ For exploratory queries (e.g., "what's related to my goal?"), use REASON instead
 
 A PLAN's results reflect the current state of the graph. If the agent encodes new memories or links between calls, subsequent PLANs may give different results.
 
-Brain doesn't cache PLAN results. Each call sees the current graph (eventual consistency, ~10 ms publication lag).
+Brain doesn't cache PLAN results. Each call sees the current graph. A memory is in it as soon as its encode acks; an edge derived by a background worker appears once that worker commits.
 
 ### 16. The "self-loop" guard
 
@@ -976,7 +1060,7 @@ The REASON primitive: find supporting and contradicting memories for a query.
 ### 1. Semantic contract
 
 ```
-REASON(query_text, agent_id, max_supporting, max_contradicting, ...) → ReasonResponse
+REASON(query_text, space_id, max_supporting, max_contradicting, ...) → ReasonResponse
 ```
 
 Brain:
@@ -993,9 +1077,9 @@ Brain:
 
 The claim or question. Brain doesn't parse it as a logical proposition — it's just text to embed and lookup.
 
-#### agent_id
+#### space_id
 
-The owning agent. Reasoning is scoped to this agent's memories.
+The owning space. Reasoning is scoped to this space's memories.
 
 #### max_supporting
 

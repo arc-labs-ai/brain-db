@@ -116,12 +116,19 @@ Brain's metrics include enough history (Prometheus retention) for trend analysis
 ## 9. Forecast tools
 
 ```promql
-# Memory count in 30 days, linear extrapolation
-predict_linear(brain_memory_count[30d], 30 * 86400)
+# Allocated slots in 30 days, linear extrapolation
+predict_linear(brain_arena_slots_used[30d], 30 * 86400)
 
 # Disk usage in 30 days
 predict_linear(brain_arena_used_bytes[30d], 30 * 86400)
 ```
+
+There is no live-memory-count gauge. `brain_arena_slots_used` counts allocated
+slots, **tombstoned ones included**, which is the right basis for a capacity
+forecast anyway: a tombstoned slot occupies arena space until reclamation runs.
+A live count — for a space, a session or a shard — comes from `ADMIN_STATS` or
+`GET /v1/spaces`, where it can be scoped without putting a tenant id on a
+metric series.
 
 These projections help plan ahead. Validate by looking at the actual rate vs forecast.
 

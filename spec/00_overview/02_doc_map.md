@@ -14,7 +14,7 @@ For each section, this file gives a one-paragraph summary, key dependencies, and
 
 ## 02. Data Model
 
-**Summary.** The four record types Brain stores — Memory, Entity, Statement, Relation. Identifiers, edges, contexts, salience, memory kinds, lifecycle. The three Statement kinds (Fact / Preference / Event) with their mutation rules. Entity merge / unmerge. Statement supersession, contradiction, confidence (noisy-OR + decay), evidence. Relation cardinality, symmetry, traversal. Composition (how Statements / Relations cite Memories as evidence). Property-graph rationale.
+**Summary.** The four record types Brain stores — Memory, Entity, Statement, Relation. Identifiers, edges, sessions, salience, memory kinds, lifecycle. The three Statement kinds (Fact / Preference / Event) with their mutation rules. Entity merge / unmerge. Statement supersession, contradiction, confidence (noisy-OR + decay), evidence. Relation cardinality, symmetry, traversal. Composition (how Statements / Relations cite Memories as evidence). Property-graph rationale.
 
 **Depends on.** [01](../01_architecture/00_purpose.md). **Depended on by.** Every other section.
 
@@ -78,7 +78,7 @@ For each section, this file gives a one-paragraph summary, key dependencies, and
 
 ## 10. Metadata + Graph Store
 
-**Summary.** All per-shard durable state in a single redb database: memory tables (memories, texts, edges, contexts, idempotency, model fingerprints, checkpoints, agents) and — when a schema is declared — typed-graph tables (entities + secondary indexes, statements + secondary indexes, relations + secondary indexes, predicates, entity types, relation types, extractors, schema versions, audit tables). Per-shard tantivy indexes. LLM extractor cache. Memory / entity / statement HNSW co-located on disk. Subscription state is in-memory only, not durable.
+**Summary.** All per-shard durable state in a single redb database: substrate tables (memories, texts, memory vectors, edges, spaces, sessions, idempotency, model fingerprints, checkpoints, api_keys) plus the typed-graph tables (entities + secondary indexes, statements + secondary indexes, relations + secondary indexes, predicates, entity types, relation types, extractors, schema versions, audit tables). Per-shard tantivy indexes. LLM response cache (credential-scoped). Memory / entity / statement HNSW co-located on disk. Subscription state is in-memory only, not durable.
 
 **Depends on.** [01](../01_architecture/00_purpose.md), [02](../02_data_model/00_purpose.md), [08](../08_storage/00_purpose.md). **Depended on by.** [12](../12_query_optimizer/00_purpose.md), [05](../05_operations/00_purpose.md), [11](../11_extractors/00_purpose.md), [13](../13_retrievers/00_purpose.md), [15](../15_background_workers/00_purpose.md).
 

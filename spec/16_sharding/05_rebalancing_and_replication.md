@@ -26,7 +26,7 @@ The procedure:
 
 ```
 1. Quiesce the shard (no new writes).
-2. Pick a split point (e.g., agent-id range).
+2. Pick a split point (e.g., a `space_id` range).
 3. Create two new shard directories.
 4. For each memory:
    a. Determine which new shard it belongs to.
@@ -156,7 +156,7 @@ Solutions:
 - Move the agent to a less-loaded shard.
 - Add more shards (and re-shard).
 
-Brain exposes per-agent load metrics for operators to identify hot agents.
+Brain exposes per-space load metrics for operators to identify hot agents.
 
 ## 13. The migration ordering
 

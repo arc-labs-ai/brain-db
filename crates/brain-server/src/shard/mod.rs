@@ -3264,7 +3264,7 @@ pub fn spawn_shard(
                     // with the pattern tier alone. That is the failure mode that
                     // shipped in v0.1.0: the published image carried no GLiNER
                     // weights, every ENCODE ran a weaker extractor, the server
-                    // reported itself healthy, and GET /v1/capabilities said
+                    // reported itself healthy, and GET_CAPABILITIES said
                     // `classifier_extractor: true` because the tier exists in the
                     // build. Nothing distinguished "running correctly" from
                     // "running degraded" except one INFO line at boot.

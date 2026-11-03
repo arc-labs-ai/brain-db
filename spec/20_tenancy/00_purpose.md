@@ -3,8 +3,9 @@
 *Normative home for Brain's multi-tenant memory model — the contract the other sections
 reference. Design rationale: `.claude/plans/tenancy_industry_scale.md`.*
 
-> **Decision status.** A few choices are still OWNER-OPEN and are marked `[OPEN]` inline. They
-> do not change the isolation guarantees (§3), only vocabulary or a policy default.
+> **Decision status.** Settled. The vocabulary is `namespace → space → session`, and the
+> connection-lifetime concept is named **connection** so that `session` is free for the memory
+> tier. Nothing below is provisional.
 
 ## 1. Purpose — the two isolation axes
 
@@ -27,7 +28,7 @@ Three nested tiers, plus the records:
 |---|---|---|---|
 | `namespace` | organization / product / environment | resolved from the API key at AUTH | **hard wall** |
 | `space` | the isolation unit — one end-user, or one purpose | a per-request selector (the `act_as` slot) | **hard wall** |
-| `session` | a conversation / run within a space | optional per-request grouping | **soft grouping, not a wall** `[OPEN: "session" vs "thread"; the connection-lifetime concept uses a distinct term, "connection"]` |
+| `session` | a conversation / run within a space | optional per-request grouping | **soft grouping, not a wall** |
 
 - **MUST:** Every stored row (memory, entity, statement, relation) carries an owner scope
   `RowScope = (namespace_id: u32, space_id: [u8;16])`, immutable for the row's life.
@@ -62,6 +63,33 @@ Three nested tiers, plus the records:
 - **MUST:** A per-request `space` selector naming a namespace outside the principal's `may_act`
   allowlist is hard-rejected (`ActAsDenied`), never silently downgraded.
 
+### 3.1 Credential isolation
+
+Isolation covers what a tenant's data costs as well as where it lives. The two fail together: a
+system that keeps one tenant's rows apart but pays for their LLM calls out of another tenant's key
+has not isolated them.
+
+- **MUST:** Every LLM call resolves its authority **per namespace**, from the broker, as a
+  namespace-scoped grant. There is no shard-wide, deployment-wide or fallback credential, and no
+  privileged consumer exempt from this — HyPE, the extractor's LLM tier, the entity disambiguator
+  and the summarizer all resolve the same way.
+- **MUST NOT:** Brain accept or construct a client from a provider API key, from any source.
+  There is no configuration that supplies one.
+- **MUST NOT:** anything credential-shaped be persisted — not to the WAL, the metadata store, a
+  snapshot, a backup, the response cache, a log line or a diagnostic. This holds **structurally**:
+  a provider key cannot leak from data at rest because one never arrives.
+- **MUST:** The LLM response cache carry a credential scope in its key, so a completion one
+  tenant paid for is never served to another. The scope is derived from the grant or tenant id,
+  never from key material.
+- **MUST NOT:** a namespace with no registered credential be served out of any other namespace's.
+  The write lands, the stages that need an LLM report that they could not run, and the caller is
+  told why (`LlmCredentialMissing`, or a `Failed` stage outcome with a reason).
+
+Brain's own minted client keys are a separate object and are unaffected: they authenticate a
+connection to Brain, they cannot spend anything upstream, and the database stores only
+`BLAKE3(secret)`. See [`../11_extractors/00_purpose.md`](../11_extractors/00_purpose.md)
+§"The LLM tier's credential".
+
 ## 4. Space registry & CRUD
 
 - Registry table `spaces`: `(namespace_id, space_id) → { space_string, created_at, last_active,
@@ -72,17 +100,26 @@ Three nested tiers, plus the records:
 - **Opcodes** (cognitive namespace, non-admin, scoped to the caller's namespace):
   `SPACE_CREATE 0x0070` · `SPACE_LIST 0x0071` · `SPACE_DELETE 0x0072` (resp `0x00F0–F2`).
 - **MUST:** `SPACE_LIST` returns only the caller's namespace's spaces.
-- **MUST:** `SPACE_DELETE` is an efficient scope-prefix **range delete** — `O(that space's data)`,
-  never a full scan — auditable, and (for GDPR erasure) it MAY zero immediately, a sanctioned
-  deviation from the default 7-day tombstone grace `[OPEN: confirm GDPR-immediate]`. A large-space
-  delete uses one WAL record with a resumable cursor so recovery replays it atomically/idempotently.
+- **MUST:** `SPACE_DELETE` is scope-prefix bounded — `O(that space's data)`, never a full scan.
+  It range-scans the `(namespace, space)` memory timeline and tombstones each memory through the
+  single `submit(Write)` path; each tombstone fans out post-commit to the FORGET cascade, which
+  tears down the backing entity / statement / relation rows. Reusing FORGET's machinery rather
+  than writing a second graph teardown is what keeps one code path correct instead of two.
+- **MUST:** For GDPR erasure `SPACE_DELETE` zeroes **immediately** — it is always hard, a
+  sanctioned deviation from the default 7-day tombstone grace. There is no soft mode: a deletion
+  request that leaves the data recoverable for a week has not satisfied the request.
+- The v1 cascade is **synchronous**, tombstoning every matching memory in one pass. A very large
+  space delete should chunk behind a resumable cursor; until it does, the call's duration scales
+  with the space's size.
 
 ## 5. Session registry & CRUD
 
 - **MUST:** `session` reaches the typed graph — statement/relation rows extracted from a session's
   memories carry that `session_id`, so a listed session is coherent across memory **and** graph.
-  Entities carry `session_id` as first-mention provenance only (entity identity is session-agnostic)
-  `[OPEN: entity/session semantics — confirm]`.
+  Entities carry `session_id` as first-mention provenance only — entity identity is
+  session-agnostic, and `EntityView` therefore exposes no session at all. An entity first mentioned
+  in one conversation and again in another is one entity; recording otherwise would fragment
+  identity along a boundary that is explicitly not a wall.
 - Registry table `sessions`: `(namespace_id, space_id, session_id) → { created_at, last_active,
   title?, memory_count }`, id-addressed (`session_id` is the client's opaque `u64`), listed
   newest-first via a `last_active`-keyed scope index.
@@ -92,7 +129,8 @@ Three nested tiers, plus the records:
   space's sessions.
 - **MUST:** The default session (`session_id = 0`) is non-deletable; memories encoded without an
   explicit session land there.
-- **MUST:** `SESSION_DELETE` defaults to soft (7-day grace) with a hard mode, mirroring FORGET.
+- **MUST:** `SESSION_DELETE` defaults to soft (7-day grace) with a `hard` mode, mirroring FORGET.
+  It is the same cascade as `SPACE_DELETE`, narrowed to one session.
 
 ## 6. Per-space index partitioning (requirement; mechanism in §08/§09)
 

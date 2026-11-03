@@ -80,7 +80,7 @@ If your application needs a real property graph, use [Neo4j](https://neo4j.com/)
 
 ## 7. Time-series database
 
-Memories are timestamped, but Brain is not optimized for time-series aggregation queries — "average salience over the last 24 hours grouped by context" or similar analytical operations.
+Memories are timestamped, but Brain is not optimized for time-series aggregation queries — "average salience over the last 24 hours grouped by session" or similar analytical operations.
 
 The metadata store has time-bounded queries (range scans by timestamp), but they're for operations like "memories from the last day", not for analytical reporting.
 
@@ -96,18 +96,18 @@ For analytical queries, export to a real analytical store. This separation is si
 
 ## 9. Multi-tenancy in the strong sense
 
-Each agent is isolated by shard. Within a shard, the agent's data is fully separated from other agents'. Across shards, agents share infrastructure.
+Each space is isolated by shard. Within a shard, a space's data is fully separated from every other space's. Across shards, spaces share infrastructure.
 
 Brain does **not** enforce:
 
-- CPU quotas across agents on shared cores.
-- Memory quotas across agents on shared physical RAM.
-- I/O quotas across agents on shared NVMe.
-- Network quotas across agents on shared NIC.
+- CPU quotas across spaces on shared cores.
+- Memory quotas across spaces on shared physical RAM.
+- I/O quotas across spaces on shared NVMe.
+- Network quotas across spaces on shared NIC.
 
 This is not multi-tenancy in the cloud-provider sense. For hard isolation between mutually-distrusting tenants, run separate Brain clusters.
 
-For cooperative multi-tenancy (multiple agents from the same organization, all trusted), Brain's per-agent shard isolation is sufficient.
+For cooperative multi-tenancy (multiple agents from the same organization, all trusted), Brain's per-space shard isolation is sufficient.
 
 ## 10. Strong cross-shard consistency
 
@@ -133,7 +133,7 @@ Real agent applications use both. SQL holds the structured operational data; Bra
 
 ## 13. Replication in v1
 
-Replication is *intentionally deferred* from v1. Single-replica per shard means loss of a node's storage means loss of its agents until restored from snapshot.
+Replication is *intentionally deferred* from v1. Single-replica per shard means loss of a node's storage means loss of its spaces until restored from snapshot.
 
 This is not a permanent design choice — it's a v1 simplification. Replication options range from synchronous WAL streaming (best durability, latency cost) to asynchronous follower replication (best performance, eventual durability). Each has design choices that warrant their own spec.
 
@@ -153,7 +153,7 @@ Upgrades use `brainctl migrate` to bring on-disk files to the current format ([`
 
 ## 15. Fine-grained access control
 
-Brain has authentication (who is connecting?) and shard-level authorization (does this connection's agent_id own this shard?). It does **not** have:
+Brain has authentication (who is connecting?) and shard-level authorization (does this connection's space_id own this shard?). It does **not** have:
 
 - Per-memory access control lists.
 - Field-level security (e.g., "this agent can read text but not vectors").
@@ -220,7 +220,7 @@ A real agent application typically uses both:
 
 The two communicate via the application layer. Brain doesn't need to know about SQL; SQL doesn't need to know about Brain. The agent code stitches them together.
 
-A common pattern: store user-facing structured records in SQL, encode the agent's private observations and reasoning into Brain. When the agent needs to act on structured data (place an order, update a setting), it consults Brain for context and executes the action against SQL.
+A common pattern: store user-facing structured records in SQL, encode the agent's private observations and reasoning into Brain. When the agent needs to act on structured data (place an order, update a setting), it consults Brain for session and executes the action against SQL.
 
 ## 2. vs. vector databases (Qdrant, Milvus, Weaviate, Chroma, LanceDB)
 
@@ -245,7 +245,7 @@ Vector databases provide a `search(vector, k, filter) → top_k_with_metadata` A
 ### When to use Brain
 
 - Your application needs operations beyond vector search.
-- Examples: agent memory with decay, planning over remembered structure, causal reasoning, salience-aware ranking, agent-scoped isolation.
+- Examples: agent memory with decay, planning over remembered structure, causal reasoning, salience-aware ranking, space-scoped isolation.
 - Writes are continuous, single-item, latency-sensitive (an agent encoding observations as it processes turns).
 - You want Brain to own embedding so deduplication, model migration, and caching are first-class.
 
@@ -329,7 +329,7 @@ Caches store opaque values keyed by strings, with a TTL. KV stores like RocksDB 
 
 ### When to use Brain
 
-- Persistent, similarity-queryable, agent-scoped state.
+- Persistent, similarity-queryable, space-scoped state.
 - Memory that should accumulate, decay, and consolidate rather than expire on TTL.
 - Queries beyond key lookup: "what's similar to this?"
 
@@ -384,7 +384,7 @@ Retrieval-Augmented Generation (RAG) systems combine a vector store with an LLM 
 
 ### The combination
 
-An agent might use both: RAG over the company's documentation (a static corpus), and Brain for the agent's own working memory (dynamic, agent-specific). Both are queried during a conversation; the agent's prompt gets context from both.
+An agent might use both: RAG over the company's documentation (a static corpus), and Brain for the agent's own working memory (dynamic, agent-specific). Both are queried during a conversation; the agent's prompt gets session from both.
 
 ## 8. vs. SQLite (the embedded option)
 

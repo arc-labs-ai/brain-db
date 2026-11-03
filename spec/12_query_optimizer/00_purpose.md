@@ -45,7 +45,7 @@ A request like "RECALL with this cue, K=10, kind=Episodic" can be satisfied many
 
 - Use exact (brute-force) search? Or HNSW?
 - ef_search = 64 (fast) or 128 (more recall)?
-- Fan out to all shards or just the agent's shard?
+- Fan out to all shards or just the space's shard?
 - Pre-filter on metadata or post-filter?
 - Return text inline or just IDs?
 
@@ -157,7 +157,7 @@ A request can fail at many stages: validation, embedding, search, storage. The e
 - Catch the error.
 - Map it to a wire-protocol error code.
 - Build an error response.
-- Log details (with trace context).
+- Log details (with trace session).
 
 The error response is sent on the same stream as the request. The client sees a structured error.
 

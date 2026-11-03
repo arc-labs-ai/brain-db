@@ -165,7 +165,7 @@ Each execution produces a log entry:
 
 ```
 {
-    request_id, request_kind, agent_id,
+    request_id, request_kind, space_id,
     plan: {...},
     steps: [{name, latency_ms, ...}, ...],
     total_latency_ms, success/error,

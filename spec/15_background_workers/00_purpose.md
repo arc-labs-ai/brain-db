@@ -1,6 +1,6 @@
 # 15. Background Workers
 
-> **TL;DR.** Per-shard async tasks that maintain state outside the request path. Memory workers handle decay, consolidation, HNSW maintenance, idempotency sweep, slot reclamation, WAL retention. Typed-graph workers (active once a schema is declared) handle pattern/classifier/LLM extraction, entity resolution, entity and statement embedding, tantivy indexing, FORGET cascade, supersession sweep, schema migration, entity GC. Bounded queues with explicit overflow policy, four priority lanes, cooperative yielding, idempotent on restart. Workers are lower-priority than request handlers.
+> **TL;DR.** Per-shard async tasks that maintain state outside the request path. Thirty-one workers in five families: substrate maintenance (decay, access boost, consolidation, HNSW maintenance, idempotency cleanup, slot reclamation, WAL retention, edge scrub, counter reconciliation, statistics, embedder-cache eviction, snapshot), **write-derivation** (auto-edge, temporal-edge, causal-edge, extractor, HyPE — the four that emit `StageCompleted`, plus causal-edge downstream of the extractor), typed-graph maintenance (statement embed, forget cascade, schema migration, supersession sweeper, confidence sweep, ambiguity resolver, entity GC, predicate GC, statement reclaim, stale-extraction detector), operator-triggered (backfill), and housekeeping (audit-log sweeper, LLM-cache sweeper). Bounded queues with explicit overflow policy, cooperative yielding, idempotent on restart. Workers are lower-priority than request handlers.
 
 ## Status
 
@@ -16,20 +16,53 @@
 
 Brain's background work — the periodic tasks that maintain state, decay, consolidate, and clean up. These run alongside the request-handling pipeline but at lower priority.
 
-### Workers in this spec
+### The worker roster
 
-- **Decay** — applies time-based decay to memory salience.
-- **Access boost** — applies salience boost from recent accesses.
-- **Consolidation** — promotes Episodic memories to Consolidated when criteria met.
-- **Index maintenance** — rebuilds the index when degraded.
-- **Idempotency cleanup** — prunes expired idempotency records.
-- **Slot reclamation** — reclaims tombstoned slots after grace period.
-- **WAL retention** — deletes old WAL segments after checkpoint.
-- **Edge scrub** — removes orphan edges.
-- **Counter reconciliation** — verifies denormalized counters.
-- **Statistics update** — refreshes per-shard stats.
+**Substrate maintenance**
 
-Typed-graph workers (active once a schema is declared): pattern / classifier / LLM extractors, entity resolver, entity + statement embedding, tantivy indexers, FORGET cascade, supersession sweeper, schema migration, entity GC, audit sweeper.
+| Worker | Role |
+|---|---|
+| Decay | applies time-based decay to memory salience |
+| Access boost | applies salience boost from recent accesses |
+| Consolidation | promotes Episodic memories to Consolidated when criteria are met |
+| HNSW maintenance | folds the pending buffer into the main graph; rebuilds when tombstone ratio degrades it |
+| Idempotency cleanup | prunes expired idempotency records |
+| Slot reclamation | reclaims tombstoned arena slots after the grace period |
+| WAL retention | deletes WAL segments older than the checkpoint |
+| Edge scrub | removes orphan edges |
+| Counter reconciliation | recomputes the denormalized space / session counts from authoritative data |
+| Statistics | refreshes per-shard stats |
+| Embedder cache eviction | bounds the embedding cache |
+| Snapshot | takes scheduled snapshots |
+
+**Write derivation** — these run after each `ENCODE` and are what `pending_stages` on the encode response refers to. The first four emit `StageCompleted` events; causal-edge runs downstream of the extractor rather than off the encode directly.
+
+| Worker | Role |
+|---|---|
+| Auto-edge | HNSW k-NN of the new vector → `SimilarTo` edges |
+| Temporal-edge | per-space timeline walk → `FollowedBy` edges, weighted by the gap, within a session |
+| Extractor | the three-tier pipeline (pattern → classifier → LLM) → entities / statements / relations / mention edges |
+| HyPE | hypothetical questions generated, embedded locally, inserted into the HyPE HNSW |
+| Causal-edge | extractor-produced causal statements → memory→memory `Caused` edges; no-ops where the predicate whitelist resolves empty |
+
+**Typed-graph maintenance**
+
+| Worker | Role |
+|---|---|
+| Statement embed | drains the statement embed queue into the statement HNSW — without it that corpus stays empty and statement retrieval degenerates to BM25 + graph |
+| FORGET cascade | tears down a tombstoned memory's backing graph rows |
+| Schema migration | re-validates and migrates rows after a schema change |
+| Supersession sweeper | settles supersession chains |
+| Confidence sweep | re-aggregates stored statement confidence (noisy-OR with kind decay) so aged evidence stops over-ranking |
+| Ambiguity resolver | re-checks `[0.7, 0.78)`-band merge proposals as the entity index grows; promotes, rejects, or expires them |
+| Entity GC | reclaims unreferenced entities |
+| Predicate GC *(off by default)* | reclaims coined (`ImplicitFromWrite`) predicates no live statement references |
+| Statement reclaim *(off by default)* | physically deletes retracted statement rows after the grace window |
+| Stale-extraction detector | flags extractions left incomplete |
+
+**Operator-triggered and housekeeping:** backfill (§"Backfill runs"), audit-log sweeper, LLM-cache sweeper.
+
+There are no separate "entity resolver" or "tantivy indexer" workers: resolution happens inside the extractor's own pipeline, and text indexing is a dispatcher on the write path rather than a scheduled worker.
 
 This document specifies Brain's background workers — the asynchronous tasks that maintain state without being directly triggered by client requests.
 
@@ -190,37 +223,42 @@ Workers are documented across these files:
 
 ## 15. Typed-graph workers
 
-When a schema is declared, the same shard runs additional workers that maintain
-the typed graph. They share Brain's worker scheduling discipline
-above: cooperative yielding, bounded queues with explicit overflow handling,
-priority lanes (foreground / near-foreground / background / low), per-shard
-executor with no cross-shard scheduling, and a shared I/O budget no single
-worker can monopolize.
+Every shard runs these — declaring a schema widens the vocabulary they may
+write, it does not bring them into existence. They share Brain's worker
+scheduling discipline: cooperative yielding, bounded queues with explicit
+overflow handling, a per-shard executor with no cross-shard scheduling, and a
+shared I/O budget no single worker can monopolize.
 
 ### 15.1. Worker inventory
 
-| Worker | Trigger | Priority | Backpressure |
-|---|---|---|---|
-| **Extractor worker** (pattern → classifier → LLM) | On ENCODE | Background | Single bounded queue (1000), drops on overflow with metric |
-| **Entity resolver** | On extractor output mentioning entities | Near-foreground | Bounded queue |
-| **Entity embedding** | On entity create/rename | Background | Bounded queue |
-| **Statement embedding** | On statement create/update | Background | Bounded queue |
-| **Statement indexer (tantivy)** | On statement create/update/tombstone | Near-foreground | Bounded queue |
-| **Memory text indexer (tantivy)** | On ENCODE | Near-foreground | Bounded queue |
-| **FORGET cascade** | On Memory FORGET | Background | None (rare events) |
-| **Supersession sweeper** | Periodic | Low | None |
-| **Cache sweeper (LLM)** | Periodic | Low | None |
-| **Schema migration** | On schema update | Background | None |
-| **Entity GC** | Periodic (off by default) | Low | None |
-| **Ambiguity resolver** | Periodic | Low | None |
-| **Audit log sweeper** | Periodic (daily) | Low | None |
-| **Entity merge** | On manual/admin trigger | Foreground (sync) | None |
-| **Stale extraction detection** | Periodic | Low | None |
+| Worker | Trigger | Backpressure |
+|---|---|---|
+| **Extractor worker** (pattern → classifier → LLM, with resolution inline) | on ENCODE | bounded queue (1024), drops on overflow with a metric |
+| **HyPE** | on ENCODE | shares the extractor worker's cycle and LLM budget |
+| **Auto-edge** | on ENCODE | bounded queue (1024), drops with a metric |
+| **Temporal-edge** | on ENCODE | bounded queue (1024), drops with a metric |
+| **Causal-edge** | on extractor commit | bounded queue (1024), drops with a metric |
+| **Statement embed** | durable `statement_embed_queue` table | the queue is a redb table, so it survives restart rather than overflowing |
+| **FORGET cascade** | on memory tombstone | none (rare events) |
+| **Supersession sweeper** | periodic | none |
+| **Confidence sweep** | periodic (1 h) | none |
+| **LLM cache sweeper** | periodic (1 h) | none |
+| **Schema migration** | on schema update | none |
+| **Entity GC** | periodic | none |
+| **Predicate GC** | periodic (off by default) | none |
+| **Statement reclaim** | periodic (off by default) | none |
+| **Ambiguity resolver** | periodic (1 h) | none |
+| **Audit log sweeper** | periodic (daily) | none |
+| **Stale-extraction detector** | periodic | none |
+
+**There is no separate entity-resolver, entity-embedding or tantivy-indexer worker.** Resolution runs inside the extractor's own pipeline, against the resolver gauntlet; entity vectors are written by the same path that creates the entity; and text indexing is a dispatcher on the write path with its own group-commit cadence (`tantivy_commit_n` / `tantivy_commit_ms`), not a scheduled worker. Entity merge is a synchronous admin operation, not a worker at all.
+
+The **drop counters are the ones that matter**. An enqueue dropped because a channel was full means the write succeeded and its derivation silently did not happen — `brain_*_drops_total` should be flat at zero. The `*_skipped_total` counters are the benign counterpart (an enqueue that legitimately produced no edge) and carry a `reason` label.
 
 Detailed mechanics:
 
-- The **three extractor workers** (pattern / classifier / LLM), the **entity / statement / embedding workers**, the **two text indexer workers** (memory + statement → tantivy), and the **state-carrying workers** (backfill, FORGET cascade, schema migration) are documented in [`./06_typed_graph_workers.md`](./06_typed_graph_workers.md).
-- The **periodic sweepers** (supersession sweeper, audit log sweeper, cache sweeper (LLM), entity GC, stale extraction detection) are documented in [`./03_substrate_sweepers.md`](./03_substrate_sweepers.md).
+- The **extractor pipeline**, the **statement embed worker**, and the **state-carrying workers** (backfill, FORGET cascade, schema migration) are documented in [`./06_typed_graph_workers.md`](./06_typed_graph_workers.md).
+- The **periodic sweepers** (supersession sweeper, audit log sweeper, LLM cache sweeper, entity GC, stale-extraction detection) are documented in [`./03_substrate_sweepers.md`](./03_substrate_sweepers.md).
 
 ### 15.2. Pattern extractor
 

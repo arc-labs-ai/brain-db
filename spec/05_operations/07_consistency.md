@@ -2,62 +2,43 @@
 
 The consistency guarantees Brain provides for its operations.
 
-## 1. The default: per-shard linearizable writes, eventual reads
+## 1. The model: per-shard linearizable writes, immediately-visible semantic reads
 
-Brain's default consistency model:
+- **Writes within a shard** are linearizable. There is a clear order; later writes see earlier ones.
+- **A write's own memory is searchable the moment its ack returns.** The HNSW insert happens inside the write submission, before the metadata commit and before the ack, and the index serves a freshly-inserted vector from a pending buffer at exact cosine until a later flush folds it into the main graph. There is no publication lag to wait out and nothing to opt into.
+- **What *is* eventual is everything derived from the write**, not the write: the lexical index's group commit, and the four async derivation stages (auto-edge, temporal-edge, extractor, HyPE).
 
-- **Writes within a shard** are linearizable. There's a clear order; later writes see earlier writes.
-- **Reads** are eventually consistent. They see writes that have been "published" — typically within ~10 ms of the write's WAL fsync.
-- **Read-after-write** is opt-in via a request flag.
+There is **no `consistency` parameter and no `ReadAfterWrite` mode.** It would have nothing to wait for on the path it was designed for, and it could not deliver what it promised on the paths that really are asynchronous — a flag that blocked until extraction finished would turn every read into a write-latency read.
 
-This balances performance (eventual reads are fast) with usability (writes are clearly ordered).
+## 2. Why the semantic index is synchronous
 
-## 2. Why eventual by default
+The alternative — insert into the index from a background worker and let reads see an epoch-old snapshot — buys a shorter write path and pays for it with a class of bug the caller cannot work around: `encode` returns success, the immediately following `recall` misses, and nothing in either response says why. Every client then grows a sleep or a retry loop.
 
-The publication step (advancing the epoch) is asynchronous from the WAL fsync. If reads always waited for the latest publication:
+Inserting on the write path costs the encode a buffer append, which is cheap because the pending buffer is a flat vector searched by brute force. The brute-force scan is bounded by how often the flush runs, not by corpus size, so the cost stays with the writer instead of leaking into every reader's mental model.
 
-- Read latency would include the publication interval (~10 ms).
-- Reads would be coupled to writes (a busy writer slows down reads).
+A tombstone is visible on the same terms: `FORGET` marks the id in the pending tombstone set, and the very next search filters it out.
 
-By making reads see "as-of last publication" by default, reads run lock-free against a stable snapshot. Latency is just the search/lookup cost.
+## 3. What remains eventual, and for how long
 
-For workloads that need fresher reads, the opt-in flag pays the cost only when needed.
+| Derived state | Visible after | Observable via |
+|---|---|---|
+| Lexical (tantivy) index entry | the group commit — whichever of `tantivy_commit_n` (256 writes) or `tantivy_commit_ms` (1 s) trips first | the lexical lane of a later RECALL |
+| `SimilarTo` auto-edges | the auto-edge worker's next cycle (~100 ms) | `StageCompleted(AutoEdge)` |
+| `FollowedBy` temporal edges | the temporal-edge worker's next cycle (~100 ms) | `StageCompleted(TemporalEdge)` |
+| Entities / statements / relations | the extractor worker's next cycle (~1 s) plus LLM latency | `StageCompleted(Extractor)` |
+| HyPE question vectors | the HyPE stage's completion | `StageCompleted(Hype)` |
 
-## 3. The "read-after-write" guarantee
-
-When a request specifies `consistency: ReadAfterWrite`:
-
-- Brain ensures the read sees all writes durably committed before the request was issued.
-- Specifically: the read waits until the per-shard publication LSN ≥ the latest committed LSN.
-
-The wait is typically a few milliseconds. Bounded by the publication interval.
-
-For reads with `consistency: ReadAfterWrite` after a specific write:
-
-- If the request includes the write's `last_lsn` (returned in the encode response), Brain waits exactly until that LSN is published.
-- This is more precise than the "wait for latest" mode.
+Each of these announces itself. A client that needs to act when a derivation lands subscribes to that write's `StageCompleted` events — `ENCODE` with `wait: ack`, then `SUBSCRIBE` scoped to `memory_ids: [the id]` — or sets `wait: derived` on the encode and takes the whole timeline in the response. Both are explicit, bounded, and tell the caller *which* stage it is waiting for; a generic consistency flag could do none of those things.
 
 ## 4. The "per-shard" qualifier
 
 Linearizability is per-shard, not global.
 
-For a single agent on a single shard: clear ordering of all operations.
-
-For an agent spanning multiple shards (rare): each shard has its own ordering; cross-shard ordering isn't enforced.
-
-For cross-agent operations: similar — each agent's shard is its own world.
+A space's data lives on exactly one shard, so for one space there is a clear order over all its operations. Across shards — a namespace-scoped RECALL fanning out, or two spaces that hash differently — each shard has its own ordering and cross-shard ordering is not enforced.
 
 ## 5. Why not global linearizability
 
-Global linearizability across shards would require:
-
-- Distributed consensus on operation order.
-- Coordinated commits.
-- Or a global clock.
-
-Each adds latency and complexity. Brain's per-shard linearizability + agent-typically-on-one-shard architecture sidesteps these.
-
-For the rare cross-shard agent, ordering is best-effort. The agent should design for this.
+Global linearizability across shards would require distributed consensus on operation order, coordinated commits, or a global clock. Each adds latency and complexity to every write. Brain's per-shard linearizability plus the space-always-on-one-shard rule sidesteps all three: the only operations that could observe a cross-shard ordering gap are namespace-wide reads, which are rank-merged anyway and have no ordering semantics to violate.
 
 ## 6. The transactional consistency
 
@@ -75,7 +56,7 @@ Brain does not provide stronger isolation (snapshot isolation, serializable). Br
 
 SUBSCRIBE delivers events in WAL order per shard. The client sees:
 
-- All events from the requested start_lsn onward.
+- All events from the requested from_lsn onward.
 - In WAL order (per shard).
 - At-least-once.
 
@@ -83,76 +64,61 @@ For a client that wants exactly-once: dedupe by LSN.
 
 For cross-shard SUBSCRIBE: events from each shard arrive in their respective WAL orders; cross-shard order isn't strict.
 
-## 8. The "stale read" examples
+## 8. What a client actually observes
 
-Examples of staleness in the default eventual model:
-
-### Example 1: encode then recall
+### encode then recall — sees it
 
 ```
-brain.encode("hello world")    # returns successfully
-brain.recall("hello world")    # may not include the just-encoded memory
+r = brain.encode("hello world")   # returns on the durable ack
+brain.recall("hello world")       # includes the memory
 ```
 
-Without `ReadAfterWrite`, the recall might miss it. Within ~10 ms, future recalls will include it.
+The memory's vector is in the index before `encode` returns. No wait, no flag.
 
-### Example 2: link then plan
+What the second call does *not* yet see is the memory's **derived** state: the entities extracted from it, the `SimilarTo` edges to its neighbours, or its HyPE questions. A recall that depends on those should follow the write's `StageCompleted` events rather than retry blindly.
+
+### link then plan — may not see it yet
 
 ```
-brain.link(A, B, CAUSED)
-brain.plan(start, goal)        # may not include the just-added edge
+brain.link(A, B, Caused)
+brain.plan(start, goal)           # may traverse the pre-edge graph
 ```
 
-Similar — the edge exists durably, but PLAN's traversal may use the pre-edge graph state if the publication hasn't happened.
+`LINK` is durable on return, and the edge row is committed; what lags is the graph retriever's view of it. Use the edge feed (`EdgeAdded`) if the next step depends on the edge being traversable.
 
-### Example 3: forget then recall
+### forget then recall — does not see it
 
 ```
 brain.forget(memory_id)
-brain.recall("...", ...)       # may include the forgotten memory briefly
+brain.recall("...")               # excludes the forgotten memory
 ```
 
-The tombstone is set durably, but RECALL may have a stale view.
+`FORGET` marks the id in the index's tombstone set synchronously, so the very next search filters it. The cascade that tears down the memory's graph rows is asynchronous, so a statement sourced from it may linger for one worker cycle.
 
-## 9. The fix for staleness
+## 9. The "wait for my write" pattern
 
-In each example, adding `consistency: ReadAfterWrite` to the read fixes it:
-
-```
-brain.recall("hello world", consistency=ReadAfterWrite)
-```
-
-The cost: ~10 ms of waiting (until publication catches up).
-
-## 10. The "read your most recent write" pattern
-
-A common need: the client wants to confirm its own write is visible. Pattern:
+There is no consistency flag to add, because the thing worth waiting for is a named stage, not a generic watermark. Two supported shapes:
 
 ```
-result = brain.encode("...")
-# result.lsn is the LSN of the encode
+# Take the whole derivation timeline in the response.
+r = brain.encode(text, wait="derived")
+r.trace.stages   # per-stage status, latency and artifacts
 
-confirmation = brain.recall(
-    "...",
-    consistency=ReadAfterWrite(after_lsn=result.lsn)
-)
+# Or stay non-blocking and watch it land.
+r = brain.encode(text)                      # wait: ack, the default
+brain.subscribe(filter={"memory_ids": [r.memory_id]})
+#   → StageCompleted(AutoEdge) / (TemporalEdge) / (Extractor) / (Hype)
 ```
 
-The recall waits exactly until the encode's LSN is published. Precise.
+`wait: derived` is bounded by the shard's trace drain window, so a stalled worker cannot hang the call; a straggler is reported as `Timeout` and still lands in `MEMORY_INSPECT` later.
 
-A client can implement a "wait for write" helper over this.
+## 10. Idempotency, not re-reads
 
-## 11. The "consistency" parameter precedence
+A client confirming its own write does not need to read at all: `ENCODE` and `FORGET` are idempotent on `request_id`, and the response carries `memory_id` and `lsn`. Re-issuing the same request returns the same answer rather than writing twice.
 
-The consistency parameter is per-request. Different requests on the same connection can have different consistency:
+## 11. Per-request choice
 
-```
-brain.encode(text)                                      # write
-brain.recall(cue, consistency=Eventual)                 # fast eventual read
-brain.recall(cue2, consistency=ReadAfterWrite)          # waits for catchup
-```
-
-This lets the client choose per-call based on the workflow.
+There is nothing per-request to choose on the read side. The one request-level knob that changes read semantics is `txn_id`, which selects read-your-writes over a transaction's pending buffer — and that is a consequence of being in a transaction, not a consistency preference.
 
 ## 12. The "no global timestamps" rule
 
@@ -164,8 +130,8 @@ For cross-shard ordering questions ("did A on shard X happen before B on shard Y
 
 For an agent on a single shard:
 
-- The agent's writes are seen in order.
-- The agent's reads (from this same agent) see a monotonically-advancing view.
+- The caller's writes are seen in order.
+- The caller's reads see a monotonically-advancing view.
 
 In particular: a recall that sees memory X means future recalls will also see X (until X is forgotten).
 
@@ -173,11 +139,11 @@ This is **monotonic reads** for a single client on a single shard. For multi-cli
 
 ## 14. The "session consistency" question
 
-Some systems offer "session consistency" — within a session (typically a connection), reads always see the session's writes.
+Some systems offer "session consistency" — within a connection, reads always see that connection's own writes.
 
-Brain provides this via the `ReadAfterWrite` opt-in. The session itself doesn't carry consistency state; each request explicitly opts in if needed.
+Brain gives this unconditionally for the memory itself, and to every reader, not just the writing connection: the index insert happens before the ack, so there is no window in which a committed memory is unsearchable. Nothing about the connection has to carry consistency state, because there is no weaker mode to upgrade from.
 
-Brain could make ReadAfterWrite the connection default — but this would slow down most reads (which don't need it). The per-request flag is more flexible.
+What a connection does **not** automatically see is the derived state of its own write. That is a property of the derivation being asynchronous, not of session scoping, and a per-connection flag could not change it.
 
 ## 15. The "async" propagation
 
@@ -206,21 +172,20 @@ For recovery scenarios (after restart, partial failure), eventual may briefly st
 
 For workloads that don't need read-your-writes:
 
-- Use Eventual (default).
-- Save the ~10 ms wait per read.
+- Nothing to configure: the memory is searchable on ack.
 
-For workloads where the agent immediately checks its writes:
+For workloads where the client immediately checks its own write:
 
-- Use ReadAfterWrite for the post-write reads.
-- Other reads can be Eventual.
+- Read normally. The memory is there.
+- If the check depends on extraction or edges, subscribe to that write's `StageCompleted` events instead of re-reading.
 
 For workloads that are mostly reads with rare writes:
 
-- Eventual is fine. The lag is invisible.
+- Nothing changes. There is no per-read wait to avoid.
 
 ## 18. The "SUBSCRIBE" alternative
 
-For applications that need to react to writes immediately (rather than poll), SUBSCRIBE is the right tool. The latency from write to delivered event is similar (~10 ms), but it's push-based.
+For applications that need to react to writes — and in particular to the *derived* state of a write, which a read cannot wait for — SUBSCRIBE is the right tool. It is push-based and it names which stage completed, so a consumer reacts to the thing it actually depends on rather than to a timer.
 
 A common architecture:
 
@@ -230,21 +195,21 @@ A common architecture:
 
 This avoids the read-after-write coordination — the consumer is always near-real-time.
 
-## 19. The cross-agent consistency
+## 19. The cross-space consistency
 
-Operations across agents (rare) have weak consistency. Brain doesn't coordinate.
+Operations across spaces are not expressible; a space is a hard wall. Brain doesn't coordinate.
 
-For applications that need cross-agent coordination, layer logic on top: an external coordination mechanism (a queue, a lock service) ensures order.
+For applications that need cross-space coordination, layer logic on top: an external coordination mechanism (a queue, a lock service) ensures order.
 
 ## 20. The "future stronger consistency" question
 
 A future enhancement could add stronger consistency modes:
 
 - Snapshot isolation.
-- Linearizable reads (waiting for global publication).
-- Causal consistency (track happens-before).
+- Linearizable reads across shards.
+- Causal consistency (tracked happens-before).
 
-Currently, the eventual + opt-in ReadAfterWrite is the simplest model that meets typical agent needs. Stronger modes are open questions.
+None is needed today. Within a space — which is one shard — writes are ordered and immediately visible, and the only genuinely asynchronous state announces its own completion. The open questions are all cross-shard, and cross-shard reads are rank-merged, which has no ordering semantics to strengthen.
 
 ---
 

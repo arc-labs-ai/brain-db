@@ -20,9 +20,9 @@ struct Relation {
     id: RelationId,                  // UUIDv7
     relation_type: RelationTypeId,   // user-declared type
 
-    // Owner scope — stamped from the caller's authenticated (namespace, agent)
+    // Owner scope — stamped from the caller's authenticated (namespace, space)
     namespace_id: NamespaceId,       // owning tenant; 0 = reserved `brain` system namespace
-    agent_id: AgentId,               // owning agent
+    space_id: SpaceId,               // owning agent
 
     from_entity: EntityId,
     to_entity: EntityId,
@@ -84,7 +84,7 @@ define relation_type owns {
 }
 ```
 
-**Owner scope (`namespace_id` + `agent_id`).** Every relation is owned by exactly one `(namespace, agent)` tenant pair, carried on the relation sidecar and stamped from the caller's authenticated scope at create time (fail-closed by construction). This owner namespace is **distinct** from the qname namespace of `relation_type` — a relation owned by `acme` may use a `brain:`-namespaced type. The reserved `brain` system namespace (id `0`) owns only seeded rows and is never a valid owner of user-written relations.
+**Owner scope (`namespace_id` + `space_id`).** Every relation is owned by exactly one `(namespace, space)` tenant pair, carried on the relation sidecar and stamped from the caller's authenticated scope at create time (fail-closed by construction). This owner namespace is **distinct** from the qname namespace of `relation_type` — a relation owned by `acme` may use a `brain:`-namespaced type. The reserved `brain` system namespace (id `0`) owns only seeded rows and is never a valid owner of user-written relations.
 
 Properties:
 - **`from`, `to`**: entity type constraints. Enforced on write.

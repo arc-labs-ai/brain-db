@@ -1,6 +1,6 @@
 # 13.06 Post-Processing (Enrichment, Rerank, Traversal)
 
-> **TL;DR.** Three post-processing stages applied after RRF fusion and before final response: per-hit enrichment (attach entities / statements / relations to each hit via the include_graph side-channel, opt-in via the request flag), always-on cross-encoder rerank (bge-reranker-base, 110M params) for the top-K whenever the model is loaded — gated only by the deploy-time `config.rerank.enabled` load switch, with no per-request toggle — and multi-hop relation traversal with depth caps and cycle detection.
+> **TL;DR.** Three post-processing stages applied after RRF fusion and before final response: per-hit enrichment (attach entities / statements / relations to each hit via the include_graph side-channel, opt-in via the request flag), cross-encoder rerank (bge-reranker-base, 110M params) over the top-50, **off by default and not part of the current release** — gated by the deploy-time `[rerank] enabled` load switch, with no per-request toggle — and multi-hop relation traversal with depth caps and cycle detection.
 
 ## Per-Hit Enrichment
 
@@ -106,7 +106,14 @@ Clients sensitive to RECALL latency leave `include_graph` off and issue targeted
 
 ## Rerank
 
-A first-class, always-on post-fusion stage that re-ranks the top of the RRF-fused list with a cross-encoder model. Whenever the cross-encoder is loaded on a shard, every RECALL (and the `QUERY_TRACE` debug op) reranks automatically — there is no per-request flag. The only control is the deploy-time `config.rerank.enabled` load gate: when the operator turns it off, no model loads and the pipeline returns RRF-only ordering (no error).
+A post-fusion stage that re-ranks the top of the RRF-fused list with a cross-encoder model. When the cross-encoder is loaded on a shard, every RECALL (and the `QUERY_TRACE` debug op) reranks automatically — there is no per-request flag.
+
+**It ships disabled.** `[rerank] enabled` defaults to `false`, and the published image carries no cross-encoder model. The reason is a correctness one, not a cost one: rerank only reorders candidates that retrieval already surfaced, so it cannot recover a memory the retrieval and grounding stages missed. Solving recall upstream is the work that matters; turning rerank on is how you A/B the ordering once that work is done.
+
+Two consequences of being off by default:
+
+- **Enabled-but-unloadable is a boot failure, not a degradation.** `enabled = true` without a cross-encoder model on disk is `ShardError::CrossEncoderInitFailed` at spawn. Turning it on in the stock image stops the server starting, which is the intended outcome — a silently-degraded reranker would make two shards with the same config return different orderings.
+- **An opt-in rerank request against a disabled shard hard-fails** with `CapabilityNotEnabled` rather than quietly falling back to RRF. The caller is told the capability is off instead of receiving different results without explanation. `GET_CAPABILITIES` reports `rerank: false`.
 
 Where it sits in the pipeline:
 
@@ -163,7 +170,7 @@ let response = brain.recall()
     .await?;
 ```
 
-The only control is the deploy-time load gate `config.rerank.enabled`. When it is on (the default) and the model loads cleanly, the executor inserts a rerank step into the execution DAG between fusion and the filter chain for every query. When the operator sets `config.rerank.enabled = false`, no model loads, the step is never inserted, and the pipeline matches the RRF-only path exactly. Clients read the `rerank` bit from `GET_CAPABILITIES` purely to know whether the results they get back are reranked.
+The only control is the deploy-time load gate `[rerank] enabled`, which is `false` by default. When an operator turns it on and the model loads cleanly, the executor inserts a rerank step into the execution DAG between fusion and the filter chain for every query. With it off — the shipped state — no model loads, the step is never inserted, and the pipeline is RRF-only. Clients read the `rerank` bit from `GET_CAPABILITIES` to know whether the results they get back are reranked.
 
 ## Operation
 
@@ -179,7 +186,7 @@ Step 3 is the cost driver. On CPU, 50 pairs through bge-reranker-base land at ~6
 
 ## Latency budget
 
-A rerank-enabled shard widens the RECALL p99 target from 20 ms to ~30 ms — the entire cost added by the rerank lands in that delta. Because rerank is always-on, that wider budget is the default budget for any shard with the model loaded. Operators who cannot afford the tail set `config.rerank.enabled = false` at spawn, which returns the shard to the 20 ms RRF-only path.
+A rerank-enabled shard widens the RECALL p99 target from 20 ms to ~30 ms — the entire cost added by the rerank lands in that delta. The shipped default is the 20 ms RRF-only path; an operator who enables rerank is accepting the wider budget for every read on that shard.
 
 ## Why a cross-encoder and not a bi-encoder
 
@@ -191,15 +198,15 @@ For the rerank position — small candidate set, latency budget already widened 
 
 The rerank is **gated** in two senses:
 
-1. **Deploy-time load gate.** `config.rerank.enabled` decides whether the cross-encoder loads at shard spawn. When it loads, every query reranks; when the operator opts out, no model loads and recall is RRF-only. There is no per-request toggle.
+1. **Deploy-time load gate.** `[rerank] enabled` (default `false`) decides whether the cross-encoder loads at shard spawn. When it loads, every query reranks; in the shipped default no model loads and recall is RRF-only. There is no per-request toggle.
 2. **Top-50 cut.** Only the top of the fused list pays the rerank cost — the rest of the corpus is unaffected.
 
-The load gate plus the top-50 cut are what bound the always-on rerank's cost: operators who need the tighter latency target turn the load gate off; everyone else pays only for re-scoring the head of the list.
+The load gate plus the top-50 cut are what bound rerank's cost: the default deployment pays nothing, and an operator who enables it pays only for re-scoring the head of the list.
 
 ## Configuration
 
 ```
-[recall.rerank]
+[rerank]
 model = "bge-reranker-base"
 top_n_in = 50           # candidates fed into the reranker
 rerank_head = 10        # size of the re-ordered head the reranker promotes

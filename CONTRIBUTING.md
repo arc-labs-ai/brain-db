@@ -41,9 +41,9 @@ three-tier extractor pipeline.
 - [`README.md`](README.md) — what Brain is + capability tour.
 - [`spec/00_overview/`](spec/00_overview/00_index.md) — design
   start.
-- [`CLAUDE.md`](CLAUDE.md) — operating rules + invariants.
-- [`AUTONOMY.md`](.claude/AUTONOMY.md) — contributor workflow + commit
-  conventions.
+- [`ROADMAP.md`](ROADMAP.md) — what is still outstanding.
+- [`AUTONOMY.md`](.claude/AUTONOMY.md) — operating rules, contributor
+  workflow + commit conventions.
 
 ## Core invariants — DO NOT violate
 
@@ -78,9 +78,9 @@ Code that violates these is wrong regardless of test results:
 
 ### 1. Pick a sub-task
 
-A task from [`README.md`](README.md#future-scope)'s "Future scope"
-section, or an open issue. The numbered implementation phases are
-complete; remaining work is convergence.
+A task from [`ROADMAP.md`](ROADMAP.md), or an open issue. The
+numbered implementation phases are complete; remaining work is
+convergence.
 
 ### 2. Read the spec
 

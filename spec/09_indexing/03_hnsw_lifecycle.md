@@ -43,7 +43,7 @@ For 1M memories on commodity hardware:
 - 4-thread: ~10 seconds.
 - 16-thread: ~5 seconds.
 
-Up to `nproc` parallelism is used by default; configurable via `[ann] rebuild_threads`.
+Up to `nproc` parallelism is used by default.
 
 ### 3. Active memories only
 

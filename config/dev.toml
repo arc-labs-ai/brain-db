@@ -204,7 +204,9 @@ max_related_statements_per_entity = 5
 
 # [extractors.hype]
 # HyPE is mandatory and always-on — there is no enable/disable flag.
-# It requires the LLM configured under [llm] (a keyless server won't boot).
+# Its credential resolves per namespace from [llm.broker], like the LLM
+# extractor tier. A server with no registered key for a namespace still
+# boots and still writes; HyPE reports that it could not run.
 # num_questions = 6         # hypothetical questions generated per memory
 
 # Index pipeline tuning. Tantivy group-commit cadence (whichever of the
@@ -238,7 +240,9 @@ backend = "disabled"
 request_timeout_sec = 30
 max_summary_chars = 4096
 # OpenAI knobs — only used when backend = "openai". The credential is
-# NOT here: the summarizer shares the single [llm] api_key below.
+# NOT here: the summarizer currently shares the shard-wide [llm] api_key
+# below, which is the last consumer of that field and is slated to move
+# onto the per-namespace broker resolver like every other LLM caller.
 openai_model = "gpt-4o-mini"
 # Ollama knobs — only used when backend = "ollama".
 # ollama_base = "http://localhost:11434"
@@ -260,12 +264,17 @@ openai_model = "gpt-4o-mini"
 # get entities without statements rather than a failed write or a silent
 # bill against someone else's key.
 #
-# api_key is NOT the serving credential. It builds the one client that is
-# still shard-wide — the entity disambiguator — and setting it does not
-# make a keyless namespace work. The provider is derived from the model id
+# api_key is NOT the serving credential, and it is DEPRECATED: BYOK through
+# the broker is meant to be the only way an LLM call is paid for, and the
+# spec already states that Brain holds no provider credential at all. The
+# field survives only because two shard-wide consumers have not moved onto
+# the resolver yet — the entity disambiguator and the (off-by-default)
+# consolidation summarizer. Setting it does NOT make a keyless namespace
+# work, and leaving it empty costs only the disambiguator's second opinion
+# on ambiguous partial matches. The provider is derived from the model id
 # (claude* → Anthropic, else OpenAI).
 #   BRAIN__LLM__API_KEY=sk-...   BRAIN__LLM__MODEL=gpt-4o-mini
-api_key = ""   # operator sets at deploy time — never commit a real key
+api_key = ""   # leave empty; never commit a real key
 # model = "gpt-4o-mini"  # default when unset
 
 [llm.broker]                          # required

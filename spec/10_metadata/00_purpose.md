@@ -1,6 +1,6 @@
 # 10. Metadata + Graph Store
 
-> **TL;DR.** Per-shard redb B-tree holding memory metadata, edges, contexts, idempotency, text, entities, statements, relations, predicates, and audit tables. Plus two tantivy indexes (memory text, statement text) and a separate LLM extractor cache, both active once a schema is declared. Provides random access, ACID transactions, MVCC isolation. The WAL is the source of truth; the metadata store is a derived representation maintained for fast lookups. Cascading FORGET, confidence aggregation across evidence, supersession chains, and re-extraction live here.
+> **TL;DR.** Per-shard redb B-tree holding memory metadata, edges, sessions, idempotency, text, entities, statements, relations, predicates, and audit tables. Plus two tantivy indexes (memory text, statement text) and a separate LLM response cache. All of it is present from byte zero; declaring a schema does not create storage. Provides random access, ACID transactions, MVCC isolation. The WAL is the source of truth; the metadata store is a derived representation maintained for fast lookups. Cascading FORGET, confidence aggregation across evidence, supersession chains, and re-extraction live here.
 
 ## Status
 
@@ -14,7 +14,7 @@
 
 ## What this spec defines
 
-The metadata store: the persistent home for everything that isn't a vector. Memory metadata, edges between memories, contexts, idempotency records, and bookkeeping for sharding.
+The metadata store: the persistent home for everything that isn't a vector. Memory metadata, edges between memories, sessions, idempotency records, and bookkeeping for sharding.
 
 The store is built on **redb**, a pure-Rust embedded ACID key-value store.
 
@@ -24,7 +24,7 @@ This document specifies the metadata + graph store. Together with the vector are
 
 - The role of the metadata store in the architecture.
 - The choice of redb as the embedded engine.
-- The table layout: memories, edges, contexts, idempotency, contexts.
+- The table layout: memories, edges, sessions, idempotency, sessions.
 - How variable-length data (text) is stored.
 - Transaction semantics within the metadata store.
 - Concurrency between metadata operations and the rest of Brain.
@@ -39,9 +39,9 @@ This document specifies the metadata + graph store. Together with the vector are
 
 The metadata store holds:
 
-- **Memory metadata** — for each memory, its kind, context, salience, model fingerprint, slot ID, timestamps, etc.
+- **Memory metadata** — for each memory, its kind, session, salience, model fingerprint, slot ID, timestamps, etc.
 - **Edges** — relationships between memories: CAUSED, FOLLOWED_BY, DERIVED_FROM, SIMILAR_TO, CONTRADICTS, SUPPORTS, REFERENCES, PART_OF.
-- **Contexts** — named buckets memories belong to.
+- **Sessions** — named buckets memories belong to.
 - **Idempotency** — for replay protection: maps RequestId to the resulting MemoryId.
 - **Text** — memory text content (for ENCODE) and consolidated content.
 - **Bookkeeping** — checkpoints, model fingerprints registry, agent metadata.
@@ -87,7 +87,7 @@ Brain uses redb over alternatives in [`01_redb_choice.md`](01_redb_choice.md).
 
 ## 5. Per-shard deployment
 
-Each shard's metadata store is a single redb file. The full per-shard directory holds the arena, WAL, primary metadata redb, memory HNSW, plus the on-disk artifacts that activate once a schema is declared:
+Each shard's metadata store is a single redb file. The full per-shard directory holds the arena, WAL, primary metadata redb, memory HNSW, plus the rest of the on-disk artifacts, all present from byte zero:
 
 ```
 data/
@@ -97,7 +97,7 @@ data/
     metadata.redb          ── all redb tables (this section)
     memory.hnsw            ── memory vectors ([09. Indexing](../09_indexing/00_purpose.md))
 
-    # active once a schema is declared
+    # present from byte zero, not created on schema upload
     statements.tantivy/    ── full-text index over statements
     memory_text.tantivy/   ── full-text index over memory text
     entity.hnsw            ── entity-embedding HNSW
@@ -105,7 +105,7 @@ data/
     llm_cache.redb         ── LLM extractor result cache
 ```
 
-`metadata.redb` holds every table described in this spec — memory metadata, edges, contexts, idempotency, and (once a schema is declared) entities, statements, relations, predicates, audit. Different shards have different files; no cross-file or cross-shard queries.
+`metadata.redb` holds every table described in this spec — memory metadata, edges, sessions, idempotency, plus entities, statements, relations, predicates and audit. Different shards have different files; no cross-file or cross-shard queries.
 
 ## 6. Latency targets
 
@@ -125,7 +125,7 @@ For a typical 1M-memory shard:
 | memories | ~150 MB (150 bytes × 1M) |
 | edges | ~200 MB (8 edges/memory × 25 bytes/edge) |
 | text | ~1 GB (1 KB/memory) |
-| contexts | < 1 MB (few thousand contexts max) |
+| sessions | < 1 MB (few thousand sessions max) |
 | idempotency | ~50 MB (50 bytes × 1M, with TTL) |
 | **Total** | **~1.4 GB per 1M memories** |
 
@@ -239,7 +239,7 @@ A separate, append-only log records every derivation, supersession, tombstone, a
 struct AuditEntry {
     id: AuditId,                       // UUIDv7, ordered
     timestamp: u64,
-    actor: Actor,                      // System(extractor) | User(agent_id) | Admin
+    actor: Actor,                      // System(extractor) | User(space_id) | Admin
     operation: AuditOp,
 }
 

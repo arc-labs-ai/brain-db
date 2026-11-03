@@ -25,13 +25,13 @@ Atomicity across multiple operations.
 ## 2. TXN_BEGIN
 
 ```
-TXN_BEGIN(agent_id, request_id) → TxnHandle
+TXN_BEGIN(space_id, request_id) → TxnHandle
 ```
 
 Brain:
 
 1. Allocates a TransactionId.
-2. Creates a transaction context on the shard.
+2. Creates a transaction session on the shard.
 3. Returns a handle that subsequent operations carry.
 
 ```rust
@@ -245,7 +245,7 @@ with brain.transaction() as txn:
     m1 = txn.encode("...")
     m2 = txn.encode("...")
     txn.link(m1, m2, FOLLOWED_BY)
-    # Auto-commit on context exit; auto-abort on exception
+    # Auto-commit on session exit; auto-abort on exception
 ```
 
 ## 18. Idempotency within transactions
@@ -258,7 +258,7 @@ If the client retries TXN_COMMIT (e.g., network drop after commit but before ack
 
 After TXN_COMMIT succeeds:
 
-- Future RECALL within the same shard sees the committed memories (subject to publication lag, ~10 ms).
+- Future RECALL within the same shard sees the committed memories immediately; the commit inserts them into the index before it returns.
 - Cross-shard RECALL is unaffected (the transaction was single-shard).
 - SUBSCRIBE clients receive the WAL records.
 

@@ -1,6 +1,6 @@
 # 02.02 Memory
 
-> **TL;DR.** The Memory record (Brain's central entity), its identifier formats (MemoryId, AgentId, ContextId, RequestId, ShardId), its three kinds (Episodic / Semantic / Consolidated), and its lifecycle (Active → Tombstoned → Reclaimed). One consolidated chapter for everything about an individual Memory.
+> **TL;DR.** The Memory record (Brain's central entity), its identifier formats (MemoryId, SpaceId, SessionId, RequestId, ShardId), its three kinds (Episodic / Semantic / Consolidated), and its lifecycle (Active → Tombstoned → Reclaimed). One consolidated chapter for everything about an individual Memory.
 
 The **memory** is Brain's central entity. Every operation is in service of creating, recalling, modifying, or removing memories. This file specifies what a memory *is*, how it is identified, what kinds exist, and how it moves through its lifecycle.
 
@@ -8,7 +8,7 @@ The **memory** is Brain's central entity. Every operation is in service of creat
 
 A memory is a single piece of agent-observed or agent-derived content, stored with enough metadata to be retrievable by similarity, by reference, or by traversal of its relationships.
 
-The metaphor: a memory is what an agent would call to mind. Brain stores enough that recall is meaningful — not just the content, but its context, importance, time, relationships, and history.
+The metaphor: a memory is what an agent would call to mind. Brain stores enough that recall is meaningful — not just the content, but its session, importance, time, relationships, and history.
 
 ## 2. The Memory record
 
@@ -19,7 +19,7 @@ struct Memory {
     // Identity (owner scope)
     id: MemoryId,               // 16 bytes; opaque to clients
     namespace_id: NamespaceId,  // 4 bytes; owning tenant. 0 = reserved `brain` system namespace
-    agent_id: AgentId,          // 16 bytes; UUIDv7
+    space_id: SpaceId,          // 16 bytes; UUIDv7
 
     // Core content
     text: String,               // The raw text; persisted alongside
@@ -27,7 +27,7 @@ struct Memory {
 
     // Classification
     kind: MemoryKind,           // Episodic | Semantic | Consolidated
-    context_id: ContextId,      // 8 bytes; agent-scoped
+    session_id: SessionId,      // 8 bytes; space-scoped
 
     // Lifecycle
     state: LifecycleState,      // Active | Tombstoned | Reclaimed
@@ -52,7 +52,7 @@ struct Memory {
 
 The fields are detailed in subsequent sections of this spec. This file describes the entity as a whole and its core invariants.
 
-**Owner scope (`namespace_id` + `agent_id`).** Every memory is owned by exactly one `(namespace, agent)` tenant pair. `namespace_id` is the outer wall (the company-level tenant); `agent_id` is the inner wall (the app). Both are stamped by the writer from the authenticated connection's scope — a row can never be built without naming its owner. This owner namespace is **distinct** from the qname namespace of any *type* the memory's downstream typed-graph rows reference (a memory owned by `acme` may still drive statements against the shared `brain:Person` type). The reserved `brain` system namespace (`NamespaceId::SYSTEM`, id `0`) owns only seeded system rows; it is read-only to users and is **never** a valid owner of user-written data.
+**Owner scope (`namespace_id` + `space_id`).** Every memory is owned by exactly one `(namespace, space)` tenant pair. `namespace_id` is the outer wall (the company-level tenant); `space_id` is the inner wall (the app). Both are stamped by the writer from the authenticated connection's scope — a row can never be built without naming its owner. This owner namespace is **distinct** from the qname namespace of any *type* the memory's downstream typed-graph rows reference (a memory owned by `acme` may still drive statements against the shared `brain:Person` type). The reserved `brain` system namespace (`NamespaceId::SYSTEM`, id `0`) owns only seeded system rows; it is read-only to users and is **never** a valid owner of user-written data.
 
 **`created_at` vs `occurred_at`.** `created_at` is the *write time* — when the server durably committed the memory — and is always stamped. `occurred_at` is the optional *event time* — when the memory's content actually happened in the world — supplied by the client on `ENCODE` (`occurred_at_unix_nanos`). They are distinct axes: a memory written today about an event in 2020 has `created_at ≈ now` and `occurred_at ≈ 2020`. `occurred_at` is `None` when the client doesn't supply one; it is stored verbatim, carried durably through the WAL (survives recovery), and echoed back on `RECALL`. It lets time-aware clients keep the real timeline instead of cramming dates into the text. `ENCODE_VECTOR_DIRECT` carries no event-time field — those writes default the timeline to write time.
 
@@ -101,10 +101,10 @@ The text is stored separately from the vector. The arena holds vectors; the text
 A memory has these identity fields:
 
 - **`id` (`MemoryId`)** — the opaque, public identifier. 16 bytes. Used in all client-facing operations. Encodes shard, slot, and version (§7 below).
-- **`namespace_id` (`NamespaceId`)** — the owning tenant. 4 bytes. The outer half of the `(namespace, agent)` owner scope; `0` is the reserved `brain` system namespace.
-- **`agent_id` (`AgentId`)** — the owning agent. 16 bytes (UUIDv7). The inner half of the owner scope; determines which shard the memory lives in.
+- **`namespace_id` (`NamespaceId`)** — the owning tenant. 4 bytes. The outer half of the `(namespace, space)` owner scope; `0` is the reserved `brain` system namespace.
+- **`space_id` (`SpaceId`)** — the owning agent. 16 bytes (UUIDv7). The inner half of the owner scope; determines which shard the memory lives in.
 
-**INVARIANT:** A memory's `agent_id` is immutable for the memory's lifetime. To "move" a memory between agents, encode a new memory under the destination agent's id and forget the original.
+**INVARIANT:** A memory's `space_id` is immutable for the memory's lifetime. To "move" a memory between spaces, encode a new memory under the destination space's id and forget the original.
 
 **INVARIANT:** A memory's `id` is unique within the cluster — no two memories ever share an id, even if one has been forgotten and reclaimed. The version field in the id ensures this.
 
@@ -116,8 +116,8 @@ Brain uses several identifier types, each with specific format and stability pro
 |---|---|---|---|---|
 | `MemoryId` | 16 bytes | Encoded shard + slot + version + reserved | Cluster | Stable until forgotten + reclaimed |
 | `NamespaceId` | 4 bytes | Server-interned u32 | Cluster | Permanent (`0` = reserved `brain` system namespace) |
-| `AgentId` | 16 bytes | UUIDv7 | Cluster | Permanent |
-| `ContextId` | 8 bytes | Server-assigned u64 | Per-agent | Permanent within agent |
+| `SpaceId` | 16 bytes | UUIDv7 | Cluster | Permanent |
+| `SessionId` | 8 bytes | Server-assigned u64 | Per-agent | Permanent within agent |
 | `RequestId` | 16 bytes | Client-supplied UUIDv7 | Per-agent within idempotency horizon | Bounded TTL |
 | `ShardId` (storage) | 16 bytes | UUIDv7 | Cluster | Permanent |
 | `ShardId` (runtime) | 2 bytes | u16, mapping table → storage UUID | Cluster | Subject to remapping during cluster ops |
@@ -162,7 +162,7 @@ This is what the version field is *for*. Without versions, slot reuse would sile
 
 **The zero MemoryId.** The all-zero `MemoryId` (16 bytes of zero) is reserved as the "null" value. It MUST NOT be returned by any operation; clients MAY use it as a sentinel for "no memory".
 
-### 7.2 AgentId
+### 7.2 SpaceId
 
 The identifier for an agent. [UUIDv7](https://datatracker.ietf.org/doc/rfc9562/), 16 bytes.
 
@@ -170,27 +170,27 @@ UUIDv7 encodes a 48-bit Unix-millisecond timestamp followed by random bits, with
 
 - Time-ordered: agents created later have lexicographically-greater UUIDs.
 - Unique: collision probability vanishingly small.
-- Sortable: indexes by `AgentId` cluster the most recently created agents at the end.
+- Sortable: indexes by `SpaceId` cluster the most recently created agents at the end.
 
 **Properties:**
 
-- **Permanent.** An agent's `AgentId` never changes.
+- **Permanent.** A memory's `SpaceId` never changes.
 - **Cluster-scoped.** Unique across the entire cluster.
 - **Client-generated.** The agent generates its own UUIDv7 at creation. Brain doesn't issue agent ids; an external identity system or the client does.
 
-**The zero AgentId.** The all-zero `AgentId` is reserved. Operations referencing the zero `AgentId` MUST be refused with `INVALID_ARGUMENT`.
+**The zero SpaceId.** The all-zero `SpaceId` is reserved. Operations referencing the zero `SpaceId` MUST be refused with `INVALID_ARGUMENT`.
 
-### 7.3 ContextId
+### 7.3 SessionId
 
-A logical scope within an agent's memory. A 64-bit unsigned integer.
+A logical scope within a space's memory. A 64-bit unsigned integer.
 
 **Properties:**
 
-- **Agent-scoped.** Two different agents can both have `context_id = 1`; they are unrelated.
-- **Server-assigned.** When an agent first references a context name (a string), the server assigns a `context_id` and persists the name → id mapping.
-- **Permanent within an agent.** Once a `context_id` is assigned, it never changes; if a context is "deleted" (out of scope for v1), the id is retired, not reused.
+- **Agent-scoped.** Two different agents can both have `session_id = 1`; they are unrelated.
+- **Server-assigned.** When an agent first references a session name (a string), the server assigns a `session_id` and persists the name → id mapping.
+- **Permanent within a space.** Once a `session_id` is assigned, it never changes; if a session is "deleted" (out of scope for v1), the id is retired, not reused.
 
-**The default context.** `context_id = 0` is reserved for the default context. Every agent automatically has a context with id 0 named "default". Memories encoded without an explicit context land in the default.
+**The default session.** `session_id = 0` is reserved for the default session. Every agent automatically has a session with id 0 named "default". Memories encoded without an explicit session land in the default.
 
 ### 7.4 RequestId
 
@@ -198,7 +198,7 @@ The client-supplied idempotency token for `ENCODE` and `FORGET`. [UUIDv7](https:
 
 **Properties:**
 
-- **Agent-scoped.** Idempotency is checked within a single agent's namespace.
+- **Agent-scoped.** Idempotency is checked within a single space's namespace.
 - **Bounded TTL.** Stored in the idempotency table for a configurable window (default: 5 minutes). After the TTL, the same `RequestId` may be treated as a new operation.
 - **Single-use semantically.** Within the TTL, a duplicate `RequestId` results in the original operation's response being replayed. Different operations submitted with the same `RequestId` is an error.
 
@@ -238,7 +238,7 @@ The `epoch` field tracks generation; a node sees the table as of some epoch and 
 
 **Why two senses.** The runtime id is small (16 bits) so MemoryIds fit in 16 bytes. The storage UUID is permanent so backups and disaster recovery aren't broken by cluster reorganization.
 
-Mapping between them is a control-plane concern. Clients see only `MemoryId` (which embeds the runtime id at the time the memory was created) and `AgentId` (from which routing computes the runtime id). They never see the storage UUID directly.
+Mapping between them is a control-plane concern. Clients see only `MemoryId` (which embeds the runtime id at the time the memory was created) and `SpaceId` (from which routing computes the runtime id). They never see the storage UUID directly.
 
 **Implication for stale MemoryIds.** A `MemoryId` was created when its memory's shard had runtime id S. If the shard is later renumbered (due to cluster reorganization), the `MemoryId` still encodes S in its high 16 bits — but S now maps to a different storage UUID.
 
@@ -250,7 +250,7 @@ This is rare in practice (cluster reorganization is infrequent), but the mechani
 
 By construction, no two memories share a `MemoryId`. The combination of (shard_id, slot_id, version) is unique within the shard, and shard_id is unique within the cluster.
 
-UUIDv7 collision probability (for `AgentId`, `RequestId`, storage UUID): ~1 in 2^62 within a millisecond, vanishingly small in practice. Even an organization creating a billion agents per day has effectively zero collision probability.
+UUIDv7 collision probability (for `SpaceId`, `RequestId`, storage UUID): ~1 in 2^62 within a millisecond, vanishingly small in practice. Even an organization creating a billion agents per day has effectively zero collision probability.
 
 Runtime shard id is bounded at 65,535 shards per cluster. This is a soft cap; if you need more, add a separate cluster.
 
@@ -260,8 +260,8 @@ Runtime shard id is bounded at 65,535 shards per cluster. This is a soft cap; if
 |---|---|---|
 | `MemoryId` | 16, fixed | 16, fixed |
 | `NamespaceId` | 4, fixed | 4, fixed (host endianness) |
-| `AgentId` | 16, fixed | 16, fixed |
-| `ContextId` | 8, fixed | 8, fixed (host endianness) |
+| `SpaceId` | 16, fixed | 16, fixed |
+| `SessionId` | 8, fixed | 8, fixed (host endianness) |
 | `RequestId` | 16, fixed | 16, fixed |
 | `ShardId` (storage) | 16, fixed | 16, fixed |
 | `ShardId` (runtime) | 2, fixed | 2, fixed (host endianness) |
@@ -283,13 +283,13 @@ A single number in [0, 1]. The full model — initial computation, update on acc
 
 The high-level summary: high-salience memories are returned earlier in `RECALL` results and decay more slowly. Low-salience memories rank lower and decay faster. Salience updates happen on access (raise) and via the background decay worker (lower).
 
-## 10. Context
+## 10. Session
 
-Every memory belongs to exactly one context. The `context_id` field references a context defined in [`03_context.md`](03_context.md). Contexts are agent-scoped — `context_id` 1 in agent A is unrelated to `context_id` 1 in agent B.
+Every memory belongs to exactly one session. The `session_id` field names a session as defined in [`03_sessions.md`](03_sessions.md). Sessions are space-scoped — `session_id` 1 in space A is unrelated to `session_id` 1 in space B, and neither is resolved through any global table.
 
-The default context (`context_id = 0`) is automatically present in every agent. Memories without an explicit context belong to the default.
+The default session (`session_id = 0`) is automatically present in every agent. Memories without an explicit session belong to the default.
 
-**INVARIANT:** A memory's `context_id` is mutable via an admin operation, but not by the agent on the hot path. Once encoded into a context, the memory stays there unless explicitly migrated.
+**INVARIANT:** A memory's `session_id` is mutable via an admin operation, but not by the agent on the hot path. Once encoded into a session, the memory stays there unless explicitly migrated.
 
 ## 11. Memory kinds
 
@@ -442,7 +442,7 @@ The chosen three are well-grounded: two from classical theory plus one operation
 
 ### 11.8 Wire and storage representation
 
-| Context | Representation |
+| Session | Representation |
 |---|---|
 | Wire (CBOR-encoded) | u8 (0=Episodic, 1=Semantic, 2=Consolidated) |
 | Storage (redb) | u8 |
@@ -673,10 +673,10 @@ A memory's fields are mutable in different degrees:
 
 | Field | Mutability | When |
 |---|---|---|
-| `id`, `agent_id` | Immutable | Set at encode |
+| `id`, `space_id` | Immutable | Set at encode |
 | `text`, `vector` | Immutable | Set at encode (re-embedded only on model migration) |
 | `kind` | Mutable | By agent operation; consolidation may also change it |
-| `context_id` | Mutable | By admin operation |
+| `session_id` | Mutable | By admin operation |
 | `state` | Mutable | By forget, by reclamation |
 | `salience` | Mutable | By access, by background decay |
 | `last_accessed_at`, `access_count` | Mutable | On every access |
@@ -693,7 +693,7 @@ Most mutations happen via specific operations (`ENCODE` updates several fields a
 
 Two memories are equal iff they have the same `MemoryId`. Other fields can differ — for instance, after consolidation, a memory may have updated `kind` and `salience`, but it's still the same memory.
 
-There is **no** "content equality" notion in the data model. Two memories with identical text but different ids are different memories. (They might have been encoded by different agents, in different contexts, or at different times.)
+There is **no** "content equality" notion in the data model. Two memories with identical text but different ids are different memories. (They might have been encoded by different agents, in different sessions, or at different times.)
 
 Deduplication of identical content is handled at encode time, not by data-model equality. See [05. Operations](../05_operations/00_purpose.md) §ENCODE.
 
@@ -703,11 +703,11 @@ What makes a memory record valid:
 
 - `id` non-zero, with valid shard/slot/version components.
 - `namespace_id` references a registered namespace; user-written memories are never owned by the `brain` system namespace (`0`).
-- `agent_id` non-zero, valid UUIDv7.
+- `space_id` non-zero, valid UUIDv7.
 - `text` valid UTF-8, length within configured cap.
 - `vector` exactly 384 elements; L2 norm in `[1.0 - epsilon, 1.0 + epsilon]` (epsilon = 1e-4).
 - `kind` is one of the three valid values.
-- `context_id` references an existing context for `agent_id`.
+- `session_id` references an existing session for `space_id`.
 - `state` is one of the three valid values.
 - `created_at` ≤ `updated_at`.
 - If `state == Tombstoned`, `forgot_at` is `Some` and ≤ current time.

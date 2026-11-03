@@ -52,105 +52,187 @@ Operations: encode, recall, plan, reason, forget, link, unlink, txn_begin, txn_c
 
 Status: success, error_<code>, timeout.
 
-## 4. Memory metrics
-
-Per-shard counts:
+## 4. Server and shard metrics
 
 ```
-brain_memory_count{shard=}                    # Active
-brain_memory_count_tombstoned{shard=}         # Tombstoned
-brain_memory_count_total{shard=}              # Active + tombstoned
-brain_memory_kind{shard=, kind=episodic}
-brain_memory_kind{shard=, kind=semantic}
-brain_memory_kind{shard=, kind=consolidated}
+brain_up                                      # 1 if accepting requests
+brain_build_info{version=, commit=}
+brain_config_info{shard_count=, arena_capacity_bytes=, hnsw_m=, embedder_model=}
+brain_shards_total
 ```
 
-These are gauges, sampled periodically (every 30s by default).
+`brain_up` is liveness only. `brain_build_info` and `brain_config_info` are
+info-style gauges whose value is always `1`; the labels carry the payload, which
+is what lets an operator join "this behaviour" to "this build and this config"
+in a query.
 
 ## 5. Storage metrics
 
 ```
-brain_arena_used_bytes{shard=}
+brain_arena_used_bytes{shard=}        # bytes backing allocated slots (occupied + tombstoned)
 brain_arena_capacity_bytes{shard=}
-brain_arena_slots_used{shard=}
-brain_arena_slots_free{shard=}
+brain_arena_slots_used{shard=}        # allocated (occupied + tombstoned)
+brain_arena_slots_free{shard=}        # reclaimed, on the free list
 brain_wal_size_bytes{shard=}
 brain_wal_segments{shard=}
 brain_metadata_size_bytes{shard=}
 ```
 
-Storage utilization. Operators monitor for "approaching capacity".
+Note that `used` and `slots_used` both **include tombstoned** slots: they
+measure what is allocated, not what is live. The difference between them and
+the live memory count is the reclamation backlog, which is the thing worth
+alerting on.
 
 ## 6. HNSW metrics
 
 ```
-brain_hnsw_node_count{shard=}                 # Active nodes
-brain_hnsw_tombstone_count{shard=}            # Stale nodes
-brain_hnsw_tombstone_ratio{shard=}            # tombstone / total
-brain_hnsw_search_visits{shard=, quantile=}   # Nodes visited per search
-brain_hnsw_recall_estimate{shard=}            # Estimated recall (0-1)
-brain_hnsw_rebuild_in_progress{shard=}        # 0 or 1
-brain_hnsw_rebuild_progress_pct{shard=}
-brain_hnsw_rebuild_count_total{shard=}        # Lifetime rebuilds
-brain_hnsw_rebuild_duration_sec{shard=, quantile=}
+brain_hnsw_node_count{shard=}                 # active nodes
+brain_hnsw_tombstone_count{shard=}            # tombstoned nodes
+brain_hnsw_tombstone_ratio{shard=}            # tombstoned / (active + tombstoned), 0..1
 ```
 
-For monitoring the index's health.
+The ratio is exposed as its own gauge rather than left to PromQL because it is
+the alert threshold operators actually use, and computing it from two gauges
+sampled at different instants produces spurious spikes.
 
-## 7. Embedder metrics
+## 7. Query and retrieval metrics
 
 ```
-brain_embedder_calls_total{model=}            # Embeddings produced
-brain_embedder_cache_hits_total{model=}
-brain_embedder_cache_misses_total{model=}
-brain_embedder_duration_ms{model=, quantile=}
-brain_embedder_queue_depth{model=}
-brain_embedder_workers_active{model=}
+brain_query_total{shard=}                             # recalls served
+brain_query_latency_ms{shard=}                        # end-to-end recall latency (histogram)
+brain_query_outcome_total{shard=, outcome=}           # single | many | none
+brain_query_rerank_invoked_total{shard=}              # recalls the rerank stage reordered
+brain_query_fusion_k{shard=}                          # effective adaptive fusion-k, per served recall (histogram)
+
+brain_retriever_invocations_total{shard=, retriever=} # semantic | lexical | graph
+brain_retriever_candidates_total{shard=, retriever=}
+brain_retriever_latency_ms{shard=, retriever=}        # per-lane wall-clock (histogram)
 ```
 
-The embedder is often a bottleneck; these metrics surface it.
+`brain_query_outcome_total` is the one to watch for retrieval quality: a rising
+`none` share is the signal that reads are degrading, and it is visible without
+any per-query inspection. `rerank_invoked_total` stays at zero on a default
+deployment, since rerank ships disabled.
 
-## 8. Worker metrics
+## 8. Extractor and derivation metrics
 
-Per worker:
+```
+brain_extractor_drops_total{shard=}                      # encode-side enqueues dropped (channel full)
+brain_extractor_cycle_duration_seconds{shard=}           # histogram
+brain_extractor_tier_runs_total{shard=, tier=, outcome=} # per-tier outcome per memory
+brain_extractor_items_written_total{shard=, kind=}       # typed-graph rows persisted, by item kind
+brain_extractor_schema_filtered_total{shard=, reason=}   # dropped: predicate/relation_type not in an active schema
+brain_extractor_apply_dropped_total{shard=, reason=}     # real items the apply pass could not persist
+brain_extractor_predicate_consolidated_total{shard=}     # open-vocab surface forms folded onto a near neighbour
+brain_extractor_resolver_outcome_total{shard=, tier=}    # which resolver tier satisfied each mention
+brain_extractor_llm_micro_usd_spent_total{shard=}        # LLM-tier spend, in 1e-6 USD
+```
+
+Two of these are easy to confuse and are deliberately separate:
+`schema_filtered_total` counts candidates dropped **by policy** (their type is
+not declared), which is normal and expected; `apply_dropped_total` counts real
+items the apply pass **could not persist**, which is not. A nonzero rate on the
+second deserves investigation.
+
+`llm_micro_usd_spent_total` is the cost surface. It is a counter in dollar-micro
+units, so a spend rate is `rate(...)/1e6` dollars per second.
+
+```
+brain_auto_edge_edges_written_total{shard=}              # logical SimilarTo edges persisted
+brain_auto_edge_neighbours_found_per_cycle{shard=}       # above-threshold neighbours per cycle (histogram)
+brain_auto_edge_cycle_duration_seconds{shard=}
+brain_auto_edge_drops_total{shard=}
+
+brain_temporal_edge_edges_written_total{shard=}          # logical FollowedBy edges persisted
+brain_temporal_edge_gap_seconds{shard=}                  # predecessor→memory gap distribution (histogram)
+brain_temporal_edge_skipped_total{shard=, reason=}       # enqueues that produced no edge
+brain_temporal_edge_cycle_duration_seconds{shard=}
+brain_temporal_edge_drops_total{shard=}
+
+brain_causal_edge_edges_written_total{shard=}            # logical Caused edges persisted
+brain_causal_edge_skipped_total{shard=, reason=}
+brain_causal_edge_predicate_whitelist_resolved{shard=}   # causal predicates resolved against the active schema
+brain_causal_edge_cycle_duration_seconds{shard=}
+brain_causal_edge_drops_total{shard=}
+
+brain_statement_embed_cycles_total{shard=}
+brain_statement_embed_rows_embedded_total{shard=}        # statements inserted into the statement HNSW
+brain_statement_embed_rows_skipped_total{shard=}         # dropped without embedding (tombstoned, superseded)
+brain_statement_embed_errors_total{shard=}               # embedder batch failures
+brain_statement_embed_batch_duration_seconds{shard=}
+```
+
+Each derivation worker exposes the same four shapes — written, skipped, cycle
+duration, and **drops**. `drops_total` is the one that matters structurally: it
+counts enqueues lost because the worker's channel was full, which means the
+write succeeded and its derivation silently did not happen. It should be zero.
+
+`*_skipped_total` is the benign counterpart — an enqueue that legitimately
+produced no edge — and carries a `reason` label so the two never have to be told
+apart by guesswork.
+
+## 9. Worker metrics
+
+Every worker, whatever it does, exposes the same set:
 
 ```
 brain_worker_cycles_total{shard=, worker=}
 brain_worker_processed_total{shard=, worker=}
 brain_worker_errors_total{shard=, worker=}
-brain_worker_cycle_duration_ms{shard=, worker=, quantile=}
-brain_worker_last_run_unixtime{shard=, worker=}
-brain_worker_pending_work{shard=, worker=}
+brain_worker_panics_total{shard=, worker=}      # a subset of errors_total
+brain_worker_cycle_duration_ms{shard=, worker=} # most recent successful cycle
+brain_worker_last_run_unixtime{shard=, worker=} # last attempted cycle: success, error, or caught panic
+brain_worker_pending_work{shard=, worker=}      # last-observed estimate of outstanding work
 ```
 
-Workers: decay, access_boost, consolidation, hnsw_maintenance, idempotency_cleanup, slot_reclamation, wal_retention, edge_scrub, counter_reconciliation, statistics_update, embedder_cache_eviction.
+`brain_worker_panics_total` is broken out of `errors_total` rather than folded
+into it because the two call for different responses: an error is a cycle that
+failed and will retry, a panic is a bug. **Nonzero is worth alerting on.**
 
-## 9. Connection metrics
+`last_run_unixtime` advances on a *failed* cycle too. A worker that is erroring
+every cycle still looks alive on this gauge, which is intentional — the gauge
+answers "is the scheduler running it", and `errors_total` answers "is it
+working". A stalled worker is the one where this timestamp stops moving.
+
+## 9a. Connection and frame metrics
 
 ```
-brain_connections_active                      # Active client connections
-brain_connections_total                       # Lifetime opens
+brain_connections_active                        # currently in flight
+brain_connections_total                         # lifetime accepts
 brain_connections_closed_total{reason=}
-brain_streams_active                          # Active multiplexed streams
-brain_frame_send_total{op=}
-brain_frame_recv_total{op=}
-brain_frame_size_bytes{op=, direction=, quantile=}
+brain_connections_rejected_total{reason=}       # shed at accept by the admission gate (global or per-IP cap)
+brain_frame_recv_total
+brain_frame_send_total
+brain_frame_size_bytes{direction=}              # recv | send (histogram)
 ```
 
-Network-level metrics for diagnosing connectivity / protocol issues.
+`connections_rejected_total` counts connections refused *before* they became
+connections, which is why it is separate from `closed_total` — a shed connection
+never opened and would otherwise be invisible.
+
+## 9b. Tracing metrics
+
+```
+brain_tracing_spans_dropped_total               # export buffer was full
+brain_tracing_export_errors_total               # OTLP export failed or timed out
+```
+
+The observability pipeline reports its own failures. A dropped span is a hole in
+the trace that nothing else would reveal.
 
 ## 10. Resource metrics
 
-Standard Linux process metrics, plus Brain-specific:
+Standard Linux process metrics, read from `/proc/self`:
 
 ```
-process_cpu_seconds_total
-process_memory_resident_bytes
-process_memory_virtual_bytes
-process_open_fds
-brain_executor_latency_ms{shard=, quantile=}  # Glommio latency
-brain_executor_tasks_active{shard=}
+process_cpu_seconds_total          # from /proc/self/stat
+process_memory_resident_bytes      # VmRSS
+process_memory_virtual_bytes       # VmSize
+process_open_fds                   # entries in /proc/self/fd
 ```
+
+These are read on scrape rather than tracked continuously, which is why they are
+standard-named and unprefixed: they describe the process, not Brain.
 
 ## 11. The "rate" derivations
 
@@ -165,23 +247,35 @@ The dashboards (next file) show these.
 
 ## 12. Histogram buckets
 
-Default histogram buckets (in ms):
+Default histogram bucket boundaries, in milliseconds:
 
 ```
 1, 2.5, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, +Inf
 ```
 
-Covers ~1ms (fast ops) to 10s (slow ones). Tunable per-deployment if specific buckets are wanted.
+Thirteen bounds plus the `+Inf` overflow bucket, so fourteen counts per
+histogram. The bounds are **fixed in the binary**, not configurable: histogram
+bounds that differ between deployments cannot be aggregated across them, and the
+whole point of exposing a histogram rather than a quantile is that it aggregates.
+
+Observations are stored scaled by 1000 so a sub-millisecond measurement does not
+quantise to zero before it reaches its bucket.
 
 ## 13. Cardinality
 
-Labels with high cardinality (per-agent, per-context) create explosion. Brain avoids them in metrics:
+Labels with high cardinality (per-space, per-session) create explosion. Brain avoids them in metrics:
 
 - ✓ Shard label: low cardinality (~16 values).
 - ✓ Operation label: low cardinality (~10 values).
-- ✗ Agent ID: high cardinality (millions); not in metrics.
+- ✓ Retriever / tier / worker / reason labels: low cardinality, fixed sets.
+- ✗ `space_id`: high cardinality (up to 10⁶ per namespace); **never** a metric label.
+- ✗ `session_id`: unbounded, client-chosen; never a metric label.
+- ✗ `namespace`: bounded but tenant-identifying; not a metric label.
 
-Per-agent observability uses logs, not metrics.
+Per-space observability uses logs and the audit trail, not metrics. This is the
+one rule in this file that is not a preference: a `space_id` label on a counter
+multiplies every series by the tenant count, and on a shard serving a million
+spaces that is a metrics-system outage, not a slow dashboard.
 
 ## 14. Sampling
 
@@ -197,13 +291,13 @@ This bounds metric volume.
 The `shard` label uses the UUID:
 
 ```
-brain_memory_count{shard="abc123-uuid"} 1234
+brain_arena_slots_used{shard="abc123-uuid"} 1234
 ```
 
 For dashboards, operators may add a friendly name via metric relabeling:
 
 ```
-brain_memory_count{shard="abc123-uuid", shard_name="prod-shard-0"} 1234
+brain_arena_slots_used{shard="abc123-uuid", shard_name="prod-shard-0"} 1234
 ```
 
 ## 16. The `up` metric
@@ -274,7 +368,7 @@ JSON-structured logs:
   "logger": "brain.executor",
   "shard": "<uuid>",
   "operation": "encode",
-  "agent_id": "agent-001",
+  "space_id": "agent-001",
   "request_id": "...",
   "duration_ms": 8,
   "msg": "encode completed"
@@ -323,7 +417,7 @@ Operation-specific fields:
 
 - `operation`: encode, recall, etc.
 - `shard`: shard UUID.
-- `agent_id`: agent (when applicable).
+- `space_id`: agent (when applicable).
 - `request_id`: request UUID.
 - `duration_ms`: latency.
 
@@ -409,8 +503,8 @@ brain-audit.log:
   "actor": "agent-001",
   "operation": "encode",
   "memory_id": "...",
-  "agent_id": "...",
-  "context": "...",
+  "space_id": "...",
+  "session": "...",
   "auth_method": "token",
   "hash": "sha256:...",
   "prev_hash": "sha256:..."
@@ -443,7 +537,7 @@ Default is no sampling (full fidelity). Sampling is opt-in for cost-conscious de
 Each request, by default, emits one INFO log at completion:
 
 ```json
-{"ts":"...","level":"info","operation":"encode","shard":"<uuid>","agent_id":"...","request_id":"...","duration_ms":8,"status":"success","msg":"encode completed"}
+{"ts":"...","level":"info","operation":"encode","shard":"<uuid>","space_id":"...","request_id":"...","duration_ms":8,"status":"success","msg":"encode completed"}
 ```
 
 For DEBUG, additional logs at start, mid-points, end.
@@ -467,14 +561,14 @@ Messages should be:
 
 Bad:
 ```
-"msg": "Encoded memory abc-123 in context xyz at 12:34:56 with salience 0.8"
+"msg": "Encoded memory abc-123 in session xyz at 12:34:56 with salience 0.8"
 ```
 
 Good:
 ```
 "msg": "encode completed",
 "memory_id": "abc-123",
-"context_id": "xyz",
+"session_id": "xyz",
 "salience": 0.8
 ```
 
@@ -499,7 +593,7 @@ Errors include structured fields:
   "level": "error",
   "msg": "encode failed",
   "operation": "encode",
-  "agent_id": "...",
+  "space_id": "...",
   "error": {
     "code": "QuotaExceeded",
     "message": "Agent has reached its memory quota",
@@ -638,7 +732,7 @@ Common attributes:
 
 - `brain.shard`: shard UUID.
 - `brain.operation`: operation name.
-- `brain.agent_id`: agent.
+- `brain.space_id`: agent.
 - `brain.request_id`: request ID.
 - `brain.duration_ms`: duration.
 - `brain.status`: success/error.
@@ -648,7 +742,7 @@ These follow OpenTelemetry semantic conventions where applicable.
 
 ## 46. The propagation
 
-Trace context propagates from the client to Brain:
+Trace session propagates from the client to Brain:
 
 ```
 Client request:
@@ -663,11 +757,11 @@ Standard W3C traceparent format. Most tracing libraries support it.
 
 ## 47. The cross-shard propagation (future)
 
-In a future clustered release, a cross-node call propagates trace context:
+In a future clustered release, a cross-node call propagates trace session:
 
 ```
 Node A's span (parent)
-  Cross-node call carries trace context
+  Cross-node call carries trace session
     Node B's span (child, on different node)
 ```
 
@@ -731,7 +825,7 @@ exclude = ["brain.memory_id", "brain.request_id"]
 
 ## 53. The async runtime tracing
 
-Glommio's async tasks each have their own context. Brain ensures spans are properly attached to tasks.
+Glommio's async tasks each have their own session. Brain ensures spans are properly attached to tasks.
 
 Specific concern: spans don't accidentally cross task boundaries. The Rust `tracing` crate handles this if used correctly.
 
@@ -743,7 +837,7 @@ Logs include the trace ID:
 {"ts":"...","level":"info","trace_id":"abc...","span_id":"def..."}
 ```
 
-Operators can pivot from a trace to logs (in Tempo / Loki / etc.) by trace ID. This is the "logs in context" pattern.
+Operators can pivot from a trace to logs (in Tempo / Loki / etc.) by trace ID. This is the "logs in session" pattern.
 
 ## 55. The "no trace" fallback
 

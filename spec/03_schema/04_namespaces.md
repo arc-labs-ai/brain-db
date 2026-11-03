@@ -3,7 +3,7 @@
 A namespace is the **tenant (company) data boundary** *and* the
 schema/type-declaration scope. One company → one namespace. Within a
 namespace, applications are distinguished by `agent`; the effective
-isolation scope of every record is the pair **`(namespace, agent)`** —
+isolation scope of every record is the pair **`(namespace, space)`** —
 namespace the outer wall (company), agent the inner wall (application).
 [`./00_purpose.md`](./00_purpose.md) §"Multiple schemas (namespaces)" sketches the intent; this
 file is the operational contract.
@@ -30,10 +30,10 @@ namespaces are fully independent — uploading `acme` v2 doesn't affect
 statement, and relation is *owned by exactly one namespace*, recorded as
 an interned `namespace_id` on the record and folded into the prefix of
 every secondary index key. Combined with the owning `agent`, the
-`(namespace, agent)` pair scopes every read and write.
+`(namespace, space)` pair scopes every read and write.
 
 **Cross-namespace access is forbidden.** No read returns another
-namespace's data; no request flag (`agent_filter`, `include_other_agents`)
+namespace's data; no request flag (`space_filter`, `include_other_agents`)
 widens past the caller's namespace — they only widen *within* it. A
 request that names another namespace, or a redundant namespace at all, is
 rejected (the namespace is taken from the authenticated key, see §3).
@@ -123,15 +123,15 @@ atomically inside one redb txn, only for the caller's own namespace.
 
 ## 5. Reads are namespace-scoped
 
-Every read path filters to the caller's `(namespace, agent)` scope:
+Every read path filters to the caller's `(namespace, space)` scope:
 
 - `RECALL` returns only rows owned by the caller's namespace;
-  `agent_filter` / `include_other_agents` widen only *within* it.
+  `space_filter` / `include_other_agents` widen only *within* it.
 - `STATEMENT_LIST` / `RELATION_LIST` by subject/entity return only rows
   in the caller's scope — the by-subject/by-entity indexes are
   namespace-prefixed.
 - `ENTITY_RESOLVE` and entity resolution generally are scoped to
-  `(namespace, agent)`: `acme/chatbot`'s "John" never resolves to
+  `(namespace, space)`: `acme/chatbot`'s "John" never resolves to
   `acme/research`'s or `globex`'s "John".
 - `GET_CAPABILITIES.schema_namespaces` returns only the caller's
   namespace (plus the always-present `brain`), not a shard-wide list.
@@ -173,6 +173,6 @@ This section verifies:
 - **Cross-namespace isolation:** two namespaces on one shard; no
   RECALL / STATEMENT_LIST / RELATION_LIST / ENTITY_RESOLVE /
   capabilities result crosses the namespace boundary; the same entity
-  name resolves to distinct entities per `(namespace, agent)`.
+  name resolves to distinct entities per `(namespace, space)`.
 - A write whose namespace can't be resolved is rejected
   (`NamespaceRequired` / `NamespaceUnknown`), never bucketed.

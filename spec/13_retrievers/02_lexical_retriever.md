@@ -114,7 +114,7 @@ Binding for §10/06 field set. Filters are AND-ed against the
 BM25 query.
 
 `LexicalFilters` (memory scope):
-- `agent_id: Option<AgentId>` — exact match.
+- `space_id: Option<SpaceId>` — exact match.
 - `kind: Option<MemoryKind>` — exact match.
 - `created_at: Option<RangeInclusive<u64>>` — unix-ms range.
 

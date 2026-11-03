@@ -15,7 +15,7 @@ This file collects external sources (academic papers, RFC documents, library doc
 - **bge-reranker-base** — BAAI (2023). 110M parameters, MIT-licensed. Model card: https://huggingface.co/BAAI/bge-reranker-base
 - **CRC32C** — Castagnoli et al. (1993). Used in Brain's frame headers and WAL records.
 - **BLAKE3** — O'Connor, Aumasson, Neves, Wilcox-O'Hearn (2020). Used for content-hash fingerprints. https://github.com/BLAKE3-team/BLAKE3
-- **UUIDv7** — RFC 9562. Time-ordered UUIDs used for `AgentId`, `RequestId`, `EntityId`, `StatementId`, `RelationId`, `AuditId`.
+- **UUIDv7** — RFC 9562. Time-ordered UUIDs used for `SpaceId`, `RequestId`, `EntityId`, `StatementId`, `RelationId`, `AuditId`.
 
 ## Memory-layer evaluations
 

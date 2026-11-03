@@ -3,7 +3,7 @@
 # This is the same artifact our own launch pins: `image:` points at a
 # released GHCR tag, never a local source build. Self-hosters run:
 #
-#   cp .env.example .env      # then set BRAIN__LLM__API_KEY
+#   cp .env.example .env      # then set the broker URL + admin token
 #   docker compose up -d
 #
 # Pin a real version in production — `latest` is a moving target. Better
@@ -25,15 +25,29 @@ services:
     ports:
       # Data plane — the binary wire protocol (CBOR). SDKs connect here.
       - "${BRAIN_WIRE_PORT:-8080}:8080"
-      # Public HTTP — /healthz + /metrics only. The /v1/* admin plane stays
-      # loopback-inside-the-container (reach it via `docker compose exec`).
+      # Public HTTP — /healthz, /readyz and /metrics only. The /v1/* admin
+      # plane stays loopback-inside-the-container (reach it via
+      # `docker compose exec`).
       - "${BRAIN_HTTP_PORT:-9091}:9091"
     environment:
-      # REQUIRED — Brain refuses to boot without a valid provider key.
-      # Provider is derived from BRAIN__LLM__MODEL (default gpt-4o-mini →
-      # OpenAI). Set both in .env.
-      BRAIN__LLM__API_KEY: ${BRAIN__LLM__API_KEY:?set BRAIN__LLM__API_KEY in .env}
+      # REQUIRED — the credential broker. Brain never holds a provider key:
+      # it resolves a namespace-scoped grant per call, so the serving
+      # credential is not known until a write names its namespace. The boot
+      # gate is configuration-only (the URL must be set, not reachable), so
+      # a brain-db container starts before its broker does.
+      BRAIN__LLM__BROKER__URL: ${BRAIN__LLM__BROKER__URL:?set BRAIN__LLM__BROKER__URL in .env}
+      # Brain's own identity to the broker — NOT a provider key. It
+      # authenticates Brain so the broker will swap a grant for the tenant's
+      # real key on the way upstream.
+      BRAIN__LLM__BROKER__SERVICE_KEY: ${BRAIN__LLM__BROKER__SERVICE_KEY:?set BRAIN__LLM__BROKER__SERVICE_KEY in .env}
+      # Preferred model. The broker serves whatever the namespace's own key
+      # can pay for, so this is a preference, not a command.
       BRAIN__LLM__MODEL: ${BRAIN__LLM__MODEL:-gpt-4o-mini}
+      # DEPRECATED and optional — empty is the right value. Builds the two
+      # remaining shard-wide clients (entity disambiguator, off-by-default
+      # summarizer); it is not the serving credential and setting it does
+      # not make a keyless namespace work.
+      BRAIN__LLM__API_KEY: ${BRAIN__LLM__API_KEY:-}
       # Operator admin secret gating the /v1/* admin plane (key mint,
       # stats). The admin listener refuses to start without it — override
       # the image placeholder here.
@@ -41,9 +55,10 @@ services:
     volumes:
       # Durable state (WAL, arena, redb). Never bind this to a tmpfs.
       - brain-data:/var/lib/brain/data
-      # The embedding model ships inside the image at /opt/brain/models and is
-      # never written at runtime, so it needs no volume. To use a different
-      # model, mount it here and set BRAIN_EMBED_MODEL_DIR to its path.
+      # Both models (BGE-small embedder, GLiNER classifier) ship inside the
+      # image at /opt/brain/models and are never written at runtime, so they
+      # need no volume. To use a different embedder, mount it here and set
+      # BRAIN_EMBED_MODEL_DIR to its path.
     restart: unless-stopped
     # The image ships its own HEALTHCHECK (curl /healthz on 9091); compose
     # surfaces it in `docker compose ps`. Stopping is graceful: tini

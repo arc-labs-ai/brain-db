@@ -183,7 +183,7 @@ Each stream is observable in the server's telemetry:
 - Metrics: per-opcode latency, stream duration, payload sizes, error rates.
 - Logs: stream open/close events at info level.
 
-The stream's `stream_id` is part of trace/log context, allowing correlation between client and server logs.
+The stream's `stream_id` is part of trace/log session, allowing correlation between client and server logs.
 
 ## 10. Why stream-based multiplexing
 

@@ -10,15 +10,15 @@ Removes orphaned edges — edges whose source or target memory no longer exists.
 
 ### 1.1 The problem
 
-When a memory is reclaimed (after FORGET + grace), its edges in `edges_out` and `edges_in` are deleted. But edges from other memories that pointed to it (in `edges_in`) and edges from it to others (in `edges_out`) — wait, let me re-read.
+When a memory is reclaimed (after FORGET + grace), its edges in `edges` and `edges_reverse` are deleted. But edges from other memories that pointed to it (in `edges_reverse`) and edges from it to others (in `edges`) — wait, let me re-read.
 
 Actually, edges are stored bidirectionally. When memory M is reclaimed:
-- Entries in `edges_out[M, *, *]` are deleted (M's outgoing edges).
-- Entries in `edges_in[M, *, *]` are deleted (M's incoming edges).
+- Entries in `edges[M, *, *]` are deleted (M's outgoing edges).
+- Entries in `edges_reverse[M, *, *]` are deleted (M's incoming edges).
 
 But the *paired* entries (where M is mentioned but isn't the indexing key) need separate cleanup:
-- `edges_in[X, kind, M]` — X had an incoming edge from M; not deleted by M's reclamation.
-- `edges_out[X, kind, M]` — X had an outgoing edge to M; not deleted by M's reclamation.
+- `edges_reverse[X, kind, M]` — X had an incoming edge from M; not deleted by M's reclamation.
+- `edges[X, kind, M]` — X had an outgoing edge to M; not deleted by M's reclamation.
 
 These dangling references are what the edge scrub worker handles.
 
@@ -26,7 +26,7 @@ These dangling references are what the edge scrub worker handles.
 
 Every 30 minutes:
 
-1. Iterate `edges_out` (and `edges_in`) in batches.
+1. Iterate `edges` (and `edges_reverse`) in batches.
 2. For each edge, check both endpoints exist (in the `memories` table).
 3. If an endpoint doesn't exist, the edge is orphaned — delete it.
 
@@ -51,7 +51,7 @@ Verifies and corrects denormalized counters.
 Brain has denormalized counts in some places:
 
 - `MemoryMetadata.edges_out_count`, `edges_in_count` — per-memory edge counts.
-- `ContextMetadata.memory_count` — per-context memory count.
+- `SessionMetadata.memory_count` — per-session memory count.
 - Per-shard total counts (in cluster metadata).
 
 These are updated by mutations. Bugs or partial recoveries might cause drift.
@@ -62,7 +62,7 @@ Daily (configurable):
 
 1. For a sample of memories, recompute edges_out_count and edges_in_count from the edge tables.
 2. Compare to stored count; correct if different.
-3. Same for context counts.
+3. Same for session counts.
 4. Same for shard-wide totals.
 
 The worker doesn't iterate all memories — that would be expensive. Instead it samples (e.g., 1000 memories per day) and corrects discrepancies.

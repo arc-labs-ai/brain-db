@@ -36,7 +36,7 @@ Database-wide counters are exposed via `GET /metrics` on the metrics listener (P
 curl -s http://127.0.0.1:9091/metrics | grep '^brain_'
 ```
 
-The exposition includes `brain_shards_total`, `brain_wal_size_bytes`, `brain_hnsw_node_count`, `brain_hnsw_tombstone_count` / `brain_hnsw_tombstone_ratio`, and the `brain_request_*` request counters and histograms, among others. For per-shard or per-agent detail, use the real `GET /v1/shards` and `GET /v1/agents` routes (see §11 and §10).
+The exposition includes `brain_shards_total`, `brain_wal_size_bytes`, `brain_hnsw_node_count`, `brain_hnsw_tombstone_count` / `brain_hnsw_tombstone_ratio`, and the `brain_request_*` request counters and histograms, among others. For per-shard or per-space detail, use the `GET /v1/shards` and `GET /v1/spaces` routes (see §11 and §10).
 
 ### Health
 
@@ -182,9 +182,11 @@ Returns the current configuration. With a `key` parameter, returns just that key
 ### Set configuration
 
 ```bash
-curl -s -X POST http://127.0.0.1:9092/v1/config/set \
+curl -s -X POST http://127.0.0.1:9092/v1/config \
   -d '{"key":"workers.decay.interval","value":"30m"}'
 ```
+
+The route is `POST /v1/config` — the same path as the `GET`, distinguished by method. There is no `/v1/config/set`. `POST /v1/config/reload` is a separate route that re-reads the configuration file.
 
 Updates a setting. Live reload if supported; otherwise persisted for next restart.
 
@@ -198,7 +200,7 @@ Not all settings are runtime-tunable. Brain logs which take effect immediately v
 curl -s -G http://127.0.0.1:9092/v1/audit \
   --data-urlencode 'since=2026-05-01' \
   --data-urlencode 'until=2026-05-07' \
-  --data-urlencode 'agent=agent-001'
+  --data-urlencode 'space=<space-id>'
 ```
 
 Returns audit log entries matching the filter.
@@ -240,42 +242,76 @@ Captures a detailed runtime snapshot:
 
 For deep debugging.
 
-## 10. Agent operations
+## 10. Space operations
 
-### List agents
-
-```bash
-curl -s http://127.0.0.1:9092/v1/agents
-# Per-shard: curl -s 'http://127.0.0.1:9092/v1/agents?shard=<uuid>'
-```
-
-Lists agents on the shard.
-
-### Agent stats
+### List spaces
 
 ```bash
-curl -s http://127.0.0.1:9092/v1/agents/<agent-id>
+curl -s http://127.0.0.1:9092/v1/spaces
+# Per-shard: curl -s 'http://127.0.0.1:9092/v1/spaces?shard=<uuid>'
 ```
 
-Per-agent stats:
+Lists the spaces on the shard.
+
+### Space stats
+
+```bash
+curl -s http://127.0.0.1:9092/v1/spaces/<space-id>
+```
+
+Per-space stats:
 
 ```json
 {
-  "agent_id": "...",
+  "space_id": "...",
+  "space": "support-bot:user123",
   "shard": "...",
   "memory_count": 12345,
-  "context_count": 5,
+  "session_count": 5,
   "oldest_memory_age": "30d"
 }
 ```
 
-### Delete an agent
+`space` is the structured string the registry stored; `space_id` is the `UUIDv5` derived from it, which is what routing and every table key use. The derivation is one-way, so the registry row is the only place the string survives.
+
+### Delete a space
 
 ```bash
-curl -s -X DELETE http://127.0.0.1:9092/v1/agents/<agent-id> -d '{"confirm":true}'
+curl -s -X DELETE http://127.0.0.1:9092/v1/spaces/<space-id> -d '{"confirm":true}'
 ```
 
-Deletes all of an agent's data. Destructive; the server requires the confirmation field.
+Deletes every row under that space — the GDPR-erasure path. Destructive; the server requires the confirmation field. The tenant-facing equivalent is the `SPACE_DELETE` opcode (`0x0072`), which acts on the caller's *own* effective space and needs no admin secret.
+
+There is no agent-level admin surface. "Agent" names the client application, not a storage scope; the thing an operator lists, inspects and deletes is a **space**.
+
+## 10a. Extraction and backfill operations
+
+Two distinct routes, easy to confuse:
+
+```bash
+# One-shot re-enqueue: push a selector's memories back onto the extraction queue.
+curl -s -X POST http://127.0.0.1:9092/v1/extract/backfill -d '{"selector":{"all":{}}}'
+
+# The durable, checkpointed, cancellable BackfillWorker.
+curl -s -X POST   http://127.0.0.1:9092/v1/backfill -d '{"scope":{"all":{}},"extractor_ids":[],"dry_run":false}'
+curl -s           http://127.0.0.1:9092/v1/backfill
+curl -s -X DELETE http://127.0.0.1:9092/v1/backfill/<backfill-id>
+```
+
+`POST /v1/extract/backfill` is fire-and-forget: it reports how many memories it enqueued and skipped, and then the normal ExtractorWorker drains them. `POST /v1/backfill` drives the resumable worker — per-`(memory, extractor)` checkpoints, progress accounting, and a cancel verb. Use the first for a small nudge, the second for a real re-extraction run. Both are also reachable over the wire protocol as `ADMIN_BACKFILL` (`0x006E`) / `ADMIN_BACKFILL_CANCEL` (`0x006F`).
+
+Related single-record repair:
+
+```bash
+# Un-tombstone a soft-forgotten memory (reverts the FORGET cascade).
+curl -s -X POST http://127.0.0.1:9092/v1/memories/<memory-id>/restore
+
+# Open-vocabulary predicates awaiting curation.
+curl -s http://127.0.0.1:9092/v1/schema/review
+
+# Rebuild a named index (distinct from /v1/rebuild-ann, which rebuilds the HNSW).
+curl -s -X POST http://127.0.0.1:9092/v1/rebuild -d '{"index":"memory_text","shard":"<uuid>"}'
+```
 
 ## 11. Shard operations
 
@@ -351,7 +387,7 @@ with each new signup, so it holds `["*"]` and Brain admits any target namespace
 wildcard compose: `["*"]` grants all, `["acme", "globex"]` grants those two.
 The wildcard is the deliberate, auditable escape hatch for a front-door
 principal; it does **not** relax the per-request effective-identity isolation —
-each `act_as` op still runs strictly as its own `(namespace, agent)`, and the
+each `act_as` op still runs strictly as its own `(namespace, space)`, and the
 dual-principal audit records that a `"*"` service key performed it. Grant `"*"`
 only to a genuinely trusted service principal (mTLS/private transport, per
 `R6`), never to a tenant key.
@@ -382,7 +418,7 @@ analogue of Kubernetes impersonation auditing.
 
 ### 12.1 Scope-bound API keys
 
-Authentication is **mandatory** on every data-plane connection, and identity is derived 100% from the key. There is no anonymous mode, no default agent, and no default namespace. The server reads the connection's effective `(namespace, agent, permissions)` — plus a non-authoritative `user` audit tag — from the key resolved at AUTH; it never trusts a client-supplied `agent_id` or `namespace` on the wire. A connection with no key, an unresolvable key, or a revoked key is rejected at AUTH (`Unauthenticated`).
+Authentication is **mandatory** on every data-plane connection, and identity is derived 100% from the key. There is no anonymous mode, no default agent, and no default namespace. The server reads the connection's effective `(namespace, agent, permissions)` — plus a non-authoritative `user` audit tag — from the key resolved at AUTH; it never trusts a client-supplied `space_id` or `namespace` on the wire. A connection with no key, an unresolvable key, or a revoked key is rejected at AUTH (`Unauthenticated`).
 
 Minting binds the scope to the key at issuance time:
 
@@ -407,8 +443,8 @@ The key-issuance flow + the `api_keys` redb table live under `crates/brain-serve
 For destructive operations, pass a `dry_run` field:
 
 ```bash
-curl -s -X DELETE http://127.0.0.1:9092/v1/agents/<agent-id> -d '{"dry_run":true}'
-# Would delete: 12345 memories, 5 contexts, 67890 edges
+curl -s -X DELETE http://127.0.0.1:9092/v1/spaces/<space-id> -d '{"dry_run":true}'
+# Would delete: 12345 memories, 5 sessions, 67890 edges
 ```
 
 Shows what would happen without doing it.
@@ -427,9 +463,9 @@ curl -s http://127.0.0.1:9092/v1/shards | jq -r '.[] | [.shard, .memory_count] |
 The admin API composes with standard Unix tools:
 
 ```bash
-curl -s http://127.0.0.1:9092/v1/agents \
-  | jq -r '.[].agent_id' \
-  | xargs -I{} curl -s http://127.0.0.1:9092/v1/agents/{}
+curl -s http://127.0.0.1:9092/v1/spaces \
+  | jq -r '.[].space_id' \
+  | xargs -I{} curl -s http://127.0.0.1:9092/v1/spaces/{}
 ```
 
 Standard Unix tool composition.
@@ -447,7 +483,7 @@ Job progress for rebuilds is exposed through the `brain_hnsw_rebuild_progress_pc
 
 ## 16.5. Identity binding for admin keys
 
-Admin operations authenticate with admin keys, which are separate from client agent keys. Each admin key carries explicit scope claims — which agents it may inspect, which shards it may rebuild, whether it may snapshot, whether it may restore. The server derives the operator's permissions from the key at AUTH time; admin calls do not accept an arbitrary `agent_id` or `shard_id` override that bypasses the claims.
+Admin operations authenticate with admin keys, which are separate from client agent keys. Each admin key carries explicit scope claims — which agents it may inspect, which shards it may rebuild, whether it may snapshot, whether it may restore. The server derives the operator's permissions from the key at AUTH time; admin calls do not accept an arbitrary `space_id` or `shard_id` override that bypasses the claims.
 
 This means an admin key issued for "inspect agent A only" cannot rebuild agent B's HNSW even if the request syntactically allows it; the server rejects the operation at dispatch with an authorization error. Audit logs record the key's claims alongside the operation, so post-incident review can verify that an action was authorized at the moment it ran, not just that the operator had access at some point.
 

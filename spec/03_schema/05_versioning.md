@@ -416,6 +416,30 @@ global (§1c) and never dropped.
    (the removed item is dropped so the re-apply can't re-create it), re-validate,
    and upload it as a new version — then a post-commit `OUTSIDE_ACTIVE_SCHEMA`
    flag sweep re-marks statements on the dropped declaration stale.
+5. **Re-validation failure is a refusal, not a fault.** Dropping a predicate
+   that a relation type still references leaves the narrowed document invalid.
+   That answers `dropped = false` with the validator's findings in
+   `validation_errors` — the same shape the not-declared case uses — and
+   mutates nothing. It is emphatically **not** an internal error: the caller's
+   request caused it, the response field exists to carry the reasons, and
+   returning a generic engine fault instead sends whoever debugs it hunting a
+   fault that is not there. (This was the observed behaviour until it was
+   fixed: all three SDKs reported an opaque `502`, and only the gateway's log
+   carried the real message.)
+
+### Re-validating a narrowed document
+
+Re-validation runs against the narrowed document plus the **shared** entity
+types, not against the namespace's own declarations alone. Entity types are
+global (§1c), so a narrowed document that still references `Person` is valid
+even though its own text never declares it. Validating the narrowed document in
+isolation reports every shared type as an unresolved reference and refuses a
+drop that was perfectly legal.
+
+Span information is honestly absent for a narrowed document: there is no source
+text the removed item was cut from, so the re-validated errors carry zeroed
+line/column/length rather than positions pointing into a document that no longer
+exists.
 
 ### Durability + idempotency
 
@@ -438,9 +462,14 @@ SchemaDropResponse {
     target_name:      String,
     dropped:          bool,  // false = nothing to drop (idempotent no-op)
     live_rows:        u32,   // orphaned rows the drop left, when forced
-    validation_errors: Vec<SchemaValidationErrorWire>,
+    validation_errors: Vec<SchemaValidationError>,  // populated when re-validation refused the drop
 }
 ```
+
+`validation_errors` is populated on exactly one path — a drop that would leave
+the document invalid — and empty on every other outcome. Each error carries a
+stable `code` alongside its human `message`, so a client branches on the code
+rather than on prose.
 
 ## 10. Open questions
 

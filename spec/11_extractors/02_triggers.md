@@ -50,7 +50,7 @@ Evaluator surface area:
 | `memory.text` | The text body of the memory. | `Memory::text`. |
 | `memory.kind` | Memory kind: `episodic` / `semantic` / `procedural`. | `Memory::kind`. |
 | `memory.salience` | f32 in `[0, 1]`. | `Memory::salience`. |
-| `memory.agent_id` | The agent that encoded the memory. | `Memory::agent_id` (hex string). |
+| `memory.space_id` | The agent that encoded the memory. | `Memory::space_id` (hex string). |
 | `entity.type` | Set on resolver outputs only. Out of scope for `OnEncode` / `OnEncodeWhere` triggers (resolver tier 2+). | n/a |
 
 Operators (`=` / `!=` / `<` / `<=` / `>` / `>=` / `in`) apply

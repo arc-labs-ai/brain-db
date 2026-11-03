@@ -240,7 +240,7 @@ The cost is the price of resilience. Skipping it risks a much larger cost later.
 If the only snapshot is days old:
 
 - Lots of data loss.
-- The agent's recent context is gone.
+- The space's recent history is gone.
 - Application-level recovery: re-encode missing data if available.
 
 For chatbot scenarios, this is recoverable (re-summarize recent conversations). For knowledge bases, it may be a permanent gap.

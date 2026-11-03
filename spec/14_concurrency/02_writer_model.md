@@ -705,24 +705,17 @@ Publication doesn't have a "stop-the-world" pause. Readers continue running duri
 
 This contrasts with traditional GC pauses in some systems. Brain doesn't have GC pauses.
 
-## 17. The role in the read-after-write hint
+## 17. Publication is not on the read path
 
-When a client requests `consistency: ReadAfterWrite`, Brain ensures the read sees the latest publications:
+Publication folds the writer's pending entries into the published main graph. It is **not** what makes a write visible: a search merges the pending buffer with the published main, so a freshly-inserted vector is found before any publication happens.
 
-- Wait for the writer to publish all pending writes.
-- Then proceed with the read.
-
-The wait is on the publication, not on the writer's overall state. The client sees any publication ≥ the LSN of its previous write.
+That is why there is no read-after-write wait and no `consistency` request parameter. Publication is a structure-and-cost concern — it keeps the brute-forced pending set small and the main graph current — and a reader never has to know its cadence.
 
 ## 18. The publication LSN
 
-Each publication has an associated LSN — the WAL LSN at the time of publication. Readers can:
+Each publication has an associated LSN — the WAL LSN at the time of publication. Brain tracks a per-shard "published LSN" as an atomic.
 
-- Check the published LSN.
-- Compare to their requirement (e.g., "I want at least LSN X").
-- Wait if needed.
-
-Brain tracks per-shard "published LSN" as an atomic. Readers check it cheaply.
+It is operational and replay state, not a read gate: checkpointing uses it to know what is safely folded, and subscribe-replay uses LSNs to resume. No read consults it to decide whether it may proceed.
 
 ## 19. The "publish nothing" case
 

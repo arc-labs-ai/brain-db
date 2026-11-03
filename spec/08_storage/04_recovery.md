@@ -91,7 +91,7 @@ For each valid record, recovery applies its effect:
 | RECLAIM | Mark slot as free, increment version |
 | CONSOLIDATE | Allocate slot for new memory, write vector and metadata, add DERIVED_FROM edges |
 | UPDATE_KIND | Update kind field in metadata |
-| UPDATE_CONTEXT | Update context_id in metadata |
+| UPDATE_SESSION | Update session_id in metadata |
 | MIGRATE_EMBEDDING | Update slot's vector and fingerprint |
 | TXN_BEGIN | Note the txn_id; queue subsequent records |
 | TXN_COMMIT | Apply queued records atomically |
@@ -114,6 +114,20 @@ fn apply_encode(record: EncodeRecord) {
     // ... otherwise apply
 }
 ```
+
+### 5a. The WAL logs attempts, not only outcomes
+
+A record is appended before the apply decides whether it is legal. The log therefore contains **operations the API refused**, and replay must reproduce the refusal rather than the write.
+
+The concrete case: an `ENTITY_CREATE` whose canonical name was already taken by a different entity. A fresh id was minted for the attempt and journalled; the apply rejected it, and the caller got a conflict at the time. The row never existed.
+
+Replaying that record must not write it — and must not treat it as corruption either. Treating it as corruption makes the shard **permanently unbootable**: the record replays on every subsequent boot, there is no repair path, and the trigger is a request the API handled correctly. One refused duplicate costs the whole dataset.
+
+Skipping is safe precisely *because* the name is taken: the invariant the apply protects is already held by the row that legitimately owns it. Recovery logs the skip with the record's LSN and continues.
+
+The general rule: **a replay failure whose cause is the record's own illegality is a skip; a replay failure whose cause is damaged or unreadable state is corruption.** The two are not interchangeable, because only the second is something an operator can repair.
+
+The same rule covers re-validation during replay. A journalled schema record must re-validate under the same context the live path used — for a narrowing operation, the shared system entity types (see [`../03_schema/05_versioning.md`](../03_schema/05_versioning.md) §9a). Re-validating it in isolation reports every shared type as undeclared, and recovery then refuses to read back a durable record the server itself wrote.
 
 ## 6. Transactional record handling
 

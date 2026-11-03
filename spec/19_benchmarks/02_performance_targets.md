@@ -784,14 +784,14 @@ Brain uses minimal threads:
 
 Total: ~20-30 threads for a 16-shard node. Light.
 
-## 13. The "context switch" rate
+## 13. The "session switch" rate
 
 With Glommio:
 
-- No thread context switches under normal operation (each shard is one thread).
+- No thread session switches under normal operation (each shard is one thread).
 - Async task switches are user-space (no kernel involvement).
 
-Context switch rate stays low: ~1000-10000/sec total. Vs traditional thread-per-request: ~100K-1M/sec.
+Session switch rate stays low: ~1000-10000/sec total. Vs traditional thread-per-request: ~100K-1M/sec.
 
 This contributes to predictable latency.
 
