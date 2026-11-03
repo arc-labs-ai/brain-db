@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.5.0](https://github.com/arc-labs-ai/brain-db/compare/v0.4.0...v0.5.0) (2026-11-03)
+
+
+### Features
+
+* fixed spec's ([4eefcee](https://github.com/arc-labs-ai/brain-db/commit/4eefceef28407fea94ef766cb9511d3a9af9665e))
+
+
+### Bug Fixes
+
+* **storage:** report each reflink failure once, not once per file ([a8d299e](https://github.com/arc-labs-ai/brain-db/commit/a8d299e928a65643c7a5c8182566b550caf8c7d2))
+
 ## [0.4.0](https://github.com/arc-labs-ai/brain-db/compare/v0.3.1...v0.4.0) (2026-10-29)
 
 
