@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.1](https://github.com/arc-labs-ai/brain-db/compare/v0.4.0...v0.4.1) (2026-11-03)
+
+
+### Bug Fixes
+
+* **config:** resolve LLM credentials through the per-namespace broker ([5640b9f](https://github.com/arc-labs-ai/brain-db/commit/5640b9f3752d2dee980ff1dc174650cf97c96f18))
+* **storage:** report each reflink failure once, not once per file ([a8d299e](https://github.com/arc-labs-ai/brain-db/commit/a8d299e928a65643c7a5c8182566b550caf8c7d2))
+
 ## [0.4.0](https://github.com/arc-labs-ai/brain-db/compare/v0.3.1...v0.4.0) (2026-10-29)
 
 
