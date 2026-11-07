@@ -260,17 +260,22 @@ fn collect_into(schema: &Schema, ctx: &mut DeclaredContext) {
 pub fn schema_upload(
     wtxn: &WriteTransaction,
     validated: &ValidatedSchema,
+    space: [u8; 16],
     now_unix_nanos: u64,
 ) -> Result<u32, SchemaStoreError> {
-    schema_upload_with_mode(wtxn, validated, now_unix_nanos, SourceMode::Merge)
+    schema_upload_with_mode(wtxn, validated, space, now_unix_nanos, SourceMode::Merge)
 }
 
 /// [`schema_upload`] with an explicit [`SourceMode`]. `Merge` is the additive
 /// `SCHEMA_UPLOAD` contract; `Replace` is for `SCHEMA_REPLACE` and
 /// `SCHEMA_DROP`, which deliberately narrow the namespace.
+/// `space` is the scope this document is uploaded AT: [`SPACE_BASE`] for
+/// the tenant's namespace-wide schema, or a real space for an overlay
+/// only that space sees. See [`apply_schema_definitions`].
 pub fn schema_upload_with_mode(
     wtxn: &WriteTransaction,
     validated: &ValidatedSchema,
+    space: [u8; 16],
     now_unix_nanos: u64,
     mode: SourceMode,
 ) -> Result<u32, SchemaStoreError> {
@@ -314,7 +319,7 @@ pub fn schema_upload_with_mode(
 
     // Fan out new + changed definitions into the existing
     // entity_type / predicate / relation_type intern paths.
-    apply_schema_definitions(wtxn, validated, new_version, now_unix_nanos)?;
+    apply_schema_definitions(wtxn, validated, space, new_version, now_unix_nanos)?;
 
     // The OUTSIDE_ACTIVE_SCHEMA flag-sweep runs **outside** this
     // wtxn — the writer's post-commit fan-out enqueues a
@@ -472,7 +477,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = open_db(&dir);
         let wtxn = db.begin_write().unwrap();
-        let v = schema_upload(&wtxn, &acme_schema_v1(), 1_700_000_000_000_000_000).unwrap();
+        let v = schema_upload(
+            &wtxn,
+            &acme_schema_v1(),
+            crate::tables::entity_type::SPACE_BASE,
+            1_700_000_000_000_000_000,
+        )
+        .unwrap();
         assert_eq!(v, 1);
         wtxn.commit().unwrap();
 
@@ -487,12 +498,24 @@ mod tests {
         let db = open_db(&dir);
         {
             let wtxn = db.begin_write().unwrap();
-            schema_upload(&wtxn, &acme_schema_v1(), 1).unwrap();
+            schema_upload(
+                &wtxn,
+                &acme_schema_v1(),
+                crate::tables::entity_type::SPACE_BASE,
+                1,
+            )
+            .unwrap();
             wtxn.commit().unwrap();
         }
         let v2 = {
             let wtxn = db.begin_write().unwrap();
-            let v = schema_upload(&wtxn, &acme_schema_v2(), 2).unwrap();
+            let v = schema_upload(
+                &wtxn,
+                &acme_schema_v2(),
+                crate::tables::entity_type::SPACE_BASE,
+                2,
+            )
+            .unwrap();
             wtxn.commit().unwrap();
             v
         };
@@ -520,7 +543,7 @@ mod tests {
         let db = open_db(&dir);
         for (i, s) in [acme_schema_v1(), acme_schema_v2()].iter().enumerate() {
             let wtxn = db.begin_write().unwrap();
-            schema_upload(&wtxn, s, i as u64).unwrap();
+            schema_upload(&wtxn, s, crate::tables::entity_type::SPACE_BASE, i as u64).unwrap();
             wtxn.commit().unwrap();
         }
         let rtxn = db.begin_read().unwrap();
@@ -536,7 +559,7 @@ mod tests {
         let db = open_db(&dir);
         for s in [acme_schema_v1(), acme_schema_v2(), crm_schema()] {
             let wtxn = db.begin_write().unwrap();
-            schema_upload(&wtxn, &s, 1).unwrap();
+            schema_upload(&wtxn, &s, crate::tables::entity_type::SPACE_BASE, 1).unwrap();
             wtxn.commit().unwrap();
         }
         let rtxn = db.begin_read().unwrap();
@@ -553,7 +576,13 @@ mod tests {
         {
             let db = open_db(&dir);
             let wtxn = db.begin_write().unwrap();
-            schema_upload(&wtxn, &acme_schema_v1(), 1).unwrap();
+            schema_upload(
+                &wtxn,
+                &acme_schema_v1(),
+                crate::tables::entity_type::SPACE_BASE,
+                1,
+            )
+            .unwrap();
             wtxn.commit().unwrap();
         }
         let db = Database::open(dir.path().join("test.redb")).unwrap();
@@ -658,7 +687,13 @@ mod tests {
         // hasn't run yet.
         {
             let wtxn = db.begin_write().unwrap();
-            schema_upload(&wtxn, &acme_schema_v2(), 0).unwrap();
+            schema_upload(
+                &wtxn,
+                &acme_schema_v2(),
+                crate::tables::entity_type::SPACE_BASE,
+                0,
+            )
+            .unwrap();
             wtxn.commit().unwrap();
         }
         {
@@ -712,7 +747,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = open_db(&dir);
         let wtxn = db.begin_write().unwrap();
-        schema_upload(&wtxn, &acme_schema_v2(), 42).unwrap();
+        schema_upload(
+            &wtxn,
+            &acme_schema_v2(),
+            crate::tables::entity_type::SPACE_BASE,
+            42,
+        )
+        .unwrap();
         wtxn.commit().unwrap();
 
         let rtxn = db.begin_read().unwrap();
@@ -749,7 +790,9 @@ mod additive_merge_tests {
 
     fn upload(db: &Database, v: &ValidatedSchema, mode: SourceMode) -> u32 {
         let wtxn = db.begin_write().unwrap();
-        let ver = schema_upload_with_mode(&wtxn, v, 1, mode).expect("upload");
+        let ver =
+            schema_upload_with_mode(&wtxn, v, crate::tables::entity_type::SPACE_BASE, 1, mode)
+                .expect("upload");
         wtxn.commit().unwrap();
         ver
     }

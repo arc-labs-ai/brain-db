@@ -114,6 +114,7 @@ async fn upload(
             allow_breaking: false,
             request_id: [rid; 16],
             act_as: act_as(&ns, grant),
+            scope: brain_protocol::SchemaScope::Namespace,
         }),
         caller,
         ctx,

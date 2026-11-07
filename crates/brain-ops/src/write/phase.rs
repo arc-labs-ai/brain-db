@@ -165,6 +165,25 @@ pub enum Phase {
     UpsertSchema {
         namespace: String,
         version: u32,
+        /// The scope the declarations land at:
+        /// `brain_metadata::tables::entity_type::SPACE_BASE` (all-zero) for
+        /// the tenant's namespace-wide schema, a real space for an overlay
+        /// only that space resolves.
+        ///
+        /// Carried on the phase rather than taken from `Write.space_id`
+        /// because the two answer different questions. `Write.space_id` is
+        /// *who is writing* — set on nearly every request, since that is
+        /// how a tenant addresses its own data. This is *where the
+        /// declaration belongs*, which the caller has to ask for: deriving
+        /// it from the writer's space would turn every ordinary namespace
+        /// upload into a per-space overlay invisible to the tenant's other
+        /// spaces.
+        ///
+        /// It also has to be on the phase for replay to be correct. The WAL
+        /// body is built from this field, and recovery re-applies at the
+        /// space it finds there — so the scope must be recorded by the
+        /// write that chose it, never re-derived at replay time.
+        space: [u8; 16],
         /// Opaque rkyv-encoded schema blob (parsed validation already
         /// happened in the handler).
         blob: Vec<u8>,

@@ -162,6 +162,7 @@ fn upload_request(source: &str) -> RequestBody {
         allow_breaking: false,
         request_id: *uuid::Uuid::now_v7().as_bytes(),
         act_as: None,
+        scope: brain_protocol::SchemaScope::Namespace,
     })
 }
 

@@ -14,14 +14,52 @@
 
 use brain_metadata::schema::store::{declared_context, schema_active, SchemaStoreError};
 use brain_metadata::system_schema::SYSTEM_SCHEMA_NAMESPACE;
+use brain_metadata::tables::entity_type::SPACE_BASE;
 use brain_planner::WriterError;
 use brain_protocol::schema::DeclaredContext;
+use brain_protocol::SchemaScope;
 
 use crate::context::OpsContext;
 use crate::error::OpError;
 
 /// 1 MiB cap on an uploaded schema document.
 pub const MAX_SCHEMA_DOCUMENT_BYTES: usize = 1024 * 1024;
+
+/// Resolve the scope a `SCHEMA_UPLOAD` declares at into the 16-byte space
+/// the entity-type registry is keyed on.
+///
+/// `SchemaScope::Namespace` is [`SPACE_BASE`] — the namespace-wide base every
+/// space in the tenant resolves, and what every upload meant before the field
+/// existed.
+///
+/// `SchemaScope::Space` is the caller's **own** effective space, taken from
+/// the request context. The wire field is a two-state selector and never a
+/// space id, so a caller cannot name a space it is not acting as: the only
+/// space reachable from here is the one dispatch already authorized for this
+/// request. Widening this to a caller-supplied id would hand any key with
+/// `SCHEMA_UPLOAD` the ability to plant declarations in a sibling space.
+///
+/// A `Space` scope with no effective space is a refusal, not a silent
+/// downgrade. `SpaceId::NIL` is byte-equal to `SPACE_BASE`, so resolving it
+/// would write the caller's "private overlay" straight into the namespace
+/// base, visible to every other space — the precise outcome the caller asked
+/// to avoid. Better to reject the request than to honour it inside out.
+pub fn declaration_space(ctx: &OpsContext, scope: SchemaScope) -> Result<[u8; 16], OpError> {
+    match scope {
+        SchemaScope::Namespace => Ok(SPACE_BASE),
+        SchemaScope::Space => {
+            let space: [u8; 16] = ctx.executor.caller_space.into();
+            if space == SPACE_BASE {
+                return Err(OpError::InvalidRequest(
+                    "schema_upload: scope=space needs an effective space; this connection has \
+                     none (pass act_as.space, or omit scope to declare at the namespace base)"
+                        .into(),
+                ));
+            }
+            Ok(space)
+        }
+    }
+}
 
 /// Resolve the authenticated caller's namespace id to its registered name,
 /// for comparison against a client-supplied namespace string.

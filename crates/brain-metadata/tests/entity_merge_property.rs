@@ -182,6 +182,7 @@ fn build(spec: &GraphSpec) -> (MetadataDb, tempfile::TempDir, BuiltGraph) {
         let id = entity_type_intern(
             &wtxn,
             brain_core::NamespaceId::SYSTEM.raw(),
+            brain_metadata::tables::entity_type::SPACE_BASE,
             "Org",
             Vec::new(),
             NOW,

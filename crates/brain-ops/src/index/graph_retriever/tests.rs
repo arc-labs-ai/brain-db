@@ -28,6 +28,7 @@ fn ensure_person_type(metadata: &MetadataDb) -> EntityTypeId {
     let id = entity_type_intern(
         &wtxn,
         brain_core::NamespaceId::SYSTEM.raw(),
+        brain_metadata::tables::entity_type::SPACE_BASE,
         PERSON_TYPE,
         Vec::new(),
         0,
@@ -108,6 +109,7 @@ fn current_person_type(metadata: &Arc<MetadataDb>) -> EntityTypeId {
     let id = entity_type_intern(
         &wtxn,
         brain_core::NamespaceId::SYSTEM.raw(),
+        brain_metadata::tables::entity_type::SPACE_BASE,
         PERSON_TYPE,
         Vec::new(),
         0,

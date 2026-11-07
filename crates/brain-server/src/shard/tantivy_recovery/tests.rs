@@ -107,6 +107,7 @@ fn recover_rebuilds_statements_with_join() {
         let id = entity_type_intern(
             &wtxn,
             brain_core::NamespaceId::SYSTEM.raw(),
+            brain_metadata::tables::entity_type::SPACE_BASE,
             "brain:Person",
             Vec::new(),
             0,

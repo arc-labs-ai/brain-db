@@ -967,6 +967,7 @@ async fn schema_upload_as(
             allow_breaking: false,
             request_id: *uuid::Uuid::now_v7().as_bytes(),
             act_as,
+            scope: brain_protocol::SchemaScope::Namespace,
         }),
     )
     .await

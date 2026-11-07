@@ -49,9 +49,15 @@ pub enum SchemaApplyError {
 
 /// Walk `validated.items` in source order and intern each
 /// definition. Extractors are skipped.
+/// `space` is the scope the document is being applied AT:
+/// [`SPACE_BASE`] for the tenant's namespace-wide schema, or a real space
+/// for an overlay that only that space sees. Every definition in one
+/// document lands at one scope — a document is the unit of declaration,
+/// so it cannot be half base and half overlay.
 pub fn apply_schema_definitions(
     wtxn: &WriteTransaction,
     validated: &ValidatedSchema,
+    space: [u8; 16],
     schema_version: u32,
     now_unix_nanos: u64,
 ) -> Result<(), SchemaApplyError> {
@@ -70,7 +76,14 @@ pub fn apply_schema_definitions(
             SchemaItem::EntityType(e) => {
                 // `schema_blob` left empty — typed accessors will own
                 // the encoding.
-                entity_type_intern(wtxn, namespace_id, &e.name, Vec::new(), now_unix_nanos)?;
+                entity_type_intern(
+                    wtxn,
+                    namespace_id,
+                    space,
+                    &e.name,
+                    Vec::new(),
+                    now_unix_nanos,
+                )?;
             }
             SchemaItem::Predicate(p) => {
                 // A declared `Entity<Type>` range is carried through to
@@ -80,7 +93,7 @@ pub fn apply_schema_definitions(
                 // upload, matching `resolve_entity_type`'s leniency on
                 // the relation path.
                 let object_entity_type = match declared_object_entity_type(&p.object) {
-                    Some(name) => resolve_entity_type(wtxn, namespace_id, name)?,
+                    Some(name) => resolve_entity_type(wtxn, namespace_id, space, name)?,
                     None => None,
                 };
                 let object_constraint = ObjectConstraint {
@@ -95,7 +108,7 @@ pub fn apply_schema_definitions(
                 // the object side.
                 let subject_entity_type_id = match &p.subject {
                     Some(SubjectTypeDecl::Entity { entity_type }) => {
-                        resolve_entity_type(wtxn, namespace_id, entity_type)?
+                        resolve_entity_type(wtxn, namespace_id, space, entity_type)?
                             .map_or(0, EntityTypeId::raw)
                     }
                     Some(SubjectTypeDecl::Any) | None => 0,
@@ -117,8 +130,8 @@ pub fn apply_schema_definitions(
                 predicate_set_retention(wtxn, pred_id, p.retention.map_or(0, |d| d.to_seconds()))?;
             }
             SchemaItem::RelationType(r) => {
-                let from = resolve_entity_type(wtxn, namespace_id, &r.from_type)?;
-                let to = resolve_entity_type(wtxn, namespace_id, &r.to_type)?;
+                let from = resolve_entity_type(wtxn, namespace_id, space, &r.from_type)?;
+                let to = resolve_entity_type(wtxn, namespace_id, space, &r.to_type)?;
                 relation_type_intern(
                     wtxn,
                     namespace,
@@ -317,15 +330,22 @@ pub(crate) fn map_extractor_kind(k: ExtractorKindAst) -> ExtractorKind {
 /// `"Any"` → `None`; otherwise looks up the entity type by name.
 /// Missing lookups fall through as `None`, preserving the "no
 /// constraint" semantics for unknown / Any targets.
+/// Resolve a declared type NAME to an id, through the full overlay chain.
+///
+/// A document applied at a space may legitimately reference a type its
+/// NAMESPACE declares — that is the point of a base schema — so this
+/// resolves at `(namespace, space)` and lets the chain fall back. It is
+/// not restricted to the scope being written.
 fn resolve_entity_type(
     wtxn: &WriteTransaction,
     namespace_id: u32,
+    space: [u8; 16],
     name: &str,
 ) -> Result<Option<EntityTypeId>, EntityTypeOpError> {
     if name == "Any" {
         return Ok(None);
     }
-    Ok(entity_type_lookup(wtxn, namespace_id, name)?.map(|d| d.id()))
+    Ok(entity_type_lookup(wtxn, namespace_id, space, name)?.map(|d| d.id()))
 }
 
 // ---------------------------------------------------------------------------
@@ -362,7 +382,14 @@ mod tests {
         let db = open_db(&dir);
         {
             let wtxn = db.begin_write().unwrap();
-            apply_schema_definitions(&wtxn, &validated, 1, 1_700_000_000_000_000_000).unwrap();
+            apply_schema_definitions(
+                &wtxn,
+                &validated,
+                crate::tables::entity_type::SPACE_BASE,
+                1,
+                1_700_000_000_000_000_000,
+            )
+            .unwrap();
             wtxn.commit().unwrap();
         }
 
@@ -405,7 +432,14 @@ mod tests {
         let db = open_db(&dir);
         {
             let wtxn = db.begin_write().unwrap();
-            apply_schema_definitions(&wtxn, &validated, 1, 1_700_000_000_000_000_000).unwrap();
+            apply_schema_definitions(
+                &wtxn,
+                &validated,
+                crate::tables::entity_type::SPACE_BASE,
+                1,
+                1_700_000_000_000_000_000,
+            )
+            .unwrap();
             wtxn.commit().unwrap();
         }
 
@@ -417,10 +451,15 @@ mod tests {
             .unwrap()
             .expect("acme registered by apply")
             .raw();
-        let org_id = crate::entity::types::entity_type_lookup_rtxn(&rtxn, acme, "Organization")
-            .unwrap()
-            .expect("Organization interned")
-            .id();
+        let org_id = crate::entity::types::entity_type_lookup_rtxn(
+            &rtxn,
+            acme,
+            crate::tables::entity_type::SPACE_BASE,
+            "Organization",
+        )
+        .unwrap()
+        .expect("Organization interned")
+        .id();
         let works_at =
             crate::schema::predicate::predicate_lookup_by_qname(&rtxn, "acme", "works_at")
                 .unwrap()
@@ -488,9 +527,23 @@ mod tests {
         let db = open_db(&dir);
 
         let wtxn = db.begin_write().unwrap();
-        apply_schema_definitions(&wtxn, &validated, 1, 0).unwrap();
+        apply_schema_definitions(
+            &wtxn,
+            &validated,
+            crate::tables::entity_type::SPACE_BASE,
+            1,
+            0,
+        )
+        .unwrap();
         // Second apply must succeed (idempotent).
-        apply_schema_definitions(&wtxn, &validated, 1, 0).unwrap();
+        apply_schema_definitions(
+            &wtxn,
+            &validated,
+            crate::tables::entity_type::SPACE_BASE,
+            1,
+            0,
+        )
+        .unwrap();
         wtxn.commit().unwrap();
 
         let rtxn = db.begin_read().unwrap();

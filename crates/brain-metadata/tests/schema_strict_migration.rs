@@ -163,7 +163,13 @@ fn schemaless_to_strict_flags_only_out_of_vocabulary_rows() {
     // Upload a schema that declares only `prefers`.
     {
         let wtxn = db.begin_write().unwrap();
-        let v = schema_upload(&wtxn, &schema_with_predicates("acme", &["prefers"]), T0).unwrap();
+        let v = schema_upload(
+            &wtxn,
+            &schema_with_predicates("acme", &["prefers"]),
+            brain_metadata::tables::entity_type::SPACE_BASE,
+            T0,
+        )
+        .unwrap();
         assert_eq!(v, 1);
         wtxn.commit().unwrap();
     }
@@ -212,7 +218,13 @@ fn statement_in_unrelated_namespace_is_not_touched() {
     {
         let wtxn = db.begin_write().unwrap();
         // Declare only `acme` namespace with `prefers`.
-        schema_upload(&wtxn, &schema_with_predicates("acme", &["prefers"]), T0).unwrap();
+        schema_upload(
+            &wtxn,
+            &schema_with_predicates("acme", &["prefers"]),
+            brain_metadata::tables::entity_type::SPACE_BASE,
+            T0,
+        )
+        .unwrap();
         wtxn.commit().unwrap();
     }
     drive_flag_sweep(db, "acme", 1);
@@ -251,7 +263,13 @@ fn schema_upload_adopts_implicit_predicate_and_keeps_rows_clean() {
     // Now declare a schema that *includes* `prefers` (adoption path).
     {
         let wtxn = db.begin_write().unwrap();
-        schema_upload(&wtxn, &schema_with_predicates("acme", &["prefers"]), T0).unwrap();
+        schema_upload(
+            &wtxn,
+            &schema_with_predicates("acme", &["prefers"]),
+            brain_metadata::tables::entity_type::SPACE_BASE,
+            T0,
+        )
+        .unwrap();
         wtxn.commit().unwrap();
     }
     drive_flag_sweep(db, "acme", 1);

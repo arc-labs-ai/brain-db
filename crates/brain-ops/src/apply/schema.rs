@@ -41,6 +41,7 @@ pub fn apply_upsert_schema(
     _write: &Write,
 ) -> Result<PhaseAck, ApplyError> {
     let Phase::UpsertSchema {
+        space,
         blob,
         created_at_unix_nanos,
         replace_all,
@@ -116,7 +117,18 @@ pub fn apply_upsert_schema(
     // identical state. UPLOAD carries an empty delta and skips both branches.
     let dropped = apply_schema_delta(wtxn, &namespace, *replace_all, drops)?;
 
-    let version = schema_upload_with_mode(wtxn, &validated, *created_at_unix_nanos, mode)
+    // The scope comes off the phase, not off the `Write` and not off any
+    // state read in here. The entity-type registry is keyed
+    // `(namespace, space, name)` and resolves `(ns, space) → (ns, base) →
+    // (system, base)`, so where a definition lands decides who can ever see
+    // it — and that decision belongs to the handler that accepted the
+    // request, which is the only place the caller's explicit opt-in exists.
+    //
+    // This function is also the WAL-replay path's twin: recovery re-applies
+    // from `SchemaUpdateBody.space`, which `wal_map` copies from this same
+    // field. Reading the scope from anything but the phase would let replay
+    // reach a different answer than the apply it has to reproduce.
+    let version = schema_upload_with_mode(wtxn, &validated, *space, *created_at_unix_nanos, mode)
         .map_err(|e| ApplyError::Metadata(format!("schema_upload: {e}")))?;
 
     Ok(PhaseAck::UpsertedSchema {
@@ -179,33 +191,69 @@ fn apply_schema_delta(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brain_metadata::entity::types::entity_type_lookup_rtxn;
+    use brain_metadata::tables::entity_type::SPACE_BASE;
     use brain_metadata::MetadataDb;
     use tempfile::TempDir;
 
     use crate::write::{Phase, Write, WriteId};
 
-    #[test]
-    fn upsert_schema_round_trips_and_increments_version() {
-        let dir = TempDir::new().unwrap();
-        let db = MetadataDb::open(dir.path().join("meta.redb")).unwrap();
-
-        let source = r#"
+    /// The declared type is `Widget` and deliberately NOT one of the system
+    /// schema's built-ins (`Person`, `Organization`, `Project`, `Event`,
+    /// `Place`, `Concept`). Those resolve from every scope through the
+    /// chain's last rung, `(SYSTEM, SPACE_BASE)`, so naming one here would
+    /// make "does the base resolve this?" answer yes whatever the upload did
+    /// — a scope assertion that can never fail.
+    const SOURCE: &str = r#"
 namespace acme
 
-define entity_type Project {
+define entity_type Widget {
 }
 "#;
-        let phase = Phase::UpsertSchema {
+
+    /// A space that is NOT the base, and a sibling of it, for the
+    /// overlay-visibility assertions.
+    fn space_a() -> [u8; 16] {
+        brain_core::SpaceId::derive_from_string("acme", "tenant:user-a").into()
+    }
+    fn space_b() -> [u8; 16] {
+        brain_core::SpaceId::derive_from_string("acme", "tenant:user-b").into()
+    }
+
+    fn upload_phase(space: [u8; 16]) -> Phase {
+        Phase::UpsertSchema {
             namespace: "acme".into(),
             version: 1,
-            blob: source.as_bytes().to_vec(),
+            space,
+            blob: SOURCE.as_bytes().to_vec(),
             declared_predicates: Vec::new(),
             declared_relation_types: Vec::new(),
             declared_entity_types: Vec::new(),
             created_at_unix_nanos: 1_700_000_000_000,
             replace_all: false,
             drops: Vec::new(),
-        };
+        }
+    }
+
+    /// Does `name` resolve for a reader at `space`? Walks the real
+    /// `(ns, space) → (ns, base) → (system, base)` chain, so this is the
+    /// question a reader actually asks — not a scope-exact probe.
+    fn resolves_at(db: &MetadataDb, space: [u8; 16], name: &str) -> bool {
+        let rtxn = db.read_txn().unwrap();
+        let ns = brain_metadata::namespace::namespace_lookup_by_name(&rtxn, "acme")
+            .unwrap()
+            .expect("the upload interns its namespace");
+        entity_type_lookup_rtxn(&rtxn, ns.raw(), space, name)
+            .unwrap()
+            .is_some()
+    }
+
+    #[test]
+    fn upsert_schema_round_trips_and_increments_version() {
+        let dir = TempDir::new().unwrap();
+        let db = MetadataDb::open(dir.path().join("meta.redb")).unwrap();
+
+        let phase = upload_phase(SPACE_BASE);
         let write = Write::single(
             WriteId::new(),
             brain_core::SpaceId::default(),
@@ -229,5 +277,100 @@ define entity_type Project {
         let rtxn = db.read_txn().unwrap();
         let active = brain_metadata::schema::store::schema_active(&rtxn, "acme").unwrap();
         assert_eq!(active, Some(1));
+    }
+
+    /// Apply a space-scoped phase and the WAL record built from that same
+    /// phase into two separate databases, and require the two to agree about
+    /// WHERE the declaration landed.
+    ///
+    /// This is the invariant that matters most about the scope living on the
+    /// phase: replay has to reproduce the original apply, never decide a
+    /// scope of its own. If `wal_map` dropped the space (as it did while the
+    /// phase had no field to carry it) the replayed database would resolve
+    /// `Widget` from the namespace base — visible to every sibling space —
+    /// and the two sides of this assertion would diverge on the first
+    /// restart, silently, long after the write was acked.
+    #[test]
+    fn wal_replay_of_a_space_scoped_upload_lands_in_the_same_space_as_the_live_apply() {
+        use brain_metadata::recovery::phase_bodies::decode_schema_update;
+        use brain_storage::recovery::MetadataSink;
+        use brain_storage::wal::payload::WalPayload;
+
+        let dir = TempDir::new().unwrap();
+        let space = space_a();
+        let phase = upload_phase(space);
+        let write = Write::single(
+            WriteId::new(),
+            brain_core::SpaceId::default(),
+            phase.clone(),
+        );
+
+        // Live apply.
+        let live = MetadataDb::open(dir.path().join("live.redb")).unwrap();
+        {
+            let wtxn = live.write_txn().unwrap();
+            apply_upsert_schema(&wtxn, &phase, &write).unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        // The WAL record the same phase journals, and the scope it carries.
+        let payload = crate::writer::wal_map::phase_to_wal_payload(&phase, &write)
+            .expect("UpsertSchema is WAL-mapped");
+        let WalPayload::PhaseBody(record) = &payload else {
+            panic!("expected a PhaseBody payload");
+        };
+        let body = decode_schema_update(&record.body).unwrap();
+        assert_eq!(
+            body.space, space,
+            "the WAL body must record the scope the phase chose, verbatim"
+        );
+
+        // Replay into a fresh database, through the real recovery sink.
+        let mut replayed = MetadataDb::open(dir.path().join("replayed.redb")).unwrap();
+        replayed.apply(1, 1_700_000_000_000, &payload).unwrap();
+
+        for (label, db) in [("live apply", &live), ("wal replay", &replayed)] {
+            assert!(
+                resolves_at(db, space, "Widget"),
+                "{label}: the declaring space must resolve its own overlay"
+            );
+            assert!(
+                !resolves_at(db, SPACE_BASE, "Widget"),
+                "{label}: an overlay must not become the namespace base"
+            );
+            assert!(
+                !resolves_at(db, space_b(), "Widget"),
+                "{label}: a sibling space must not see another space's overlay"
+            );
+        }
+    }
+
+    /// The base-scoped counterpart, so the test above is pinning the scope
+    /// and not just the fact that two code paths run the same function: the
+    /// same document at `SPACE_BASE` is visible from every space, which is
+    /// the opposite outcome from the same assertions.
+    #[test]
+    fn wal_replay_of_a_base_scoped_upload_stays_visible_from_every_space() {
+        use brain_storage::recovery::MetadataSink;
+
+        let dir = TempDir::new().unwrap();
+        let phase = upload_phase(SPACE_BASE);
+        let write = Write::single(
+            WriteId::new(),
+            brain_core::SpaceId::default(),
+            phase.clone(),
+        );
+        let payload = crate::writer::wal_map::phase_to_wal_payload(&phase, &write)
+            .expect("UpsertSchema is WAL-mapped");
+
+        let mut replayed = MetadataDb::open(dir.path().join("replayed.redb")).unwrap();
+        replayed.apply(1, 1_700_000_000_000, &payload).unwrap();
+
+        assert!(resolves_at(&replayed, SPACE_BASE, "Widget"));
+        assert!(
+            resolves_at(&replayed, space_a(), "Widget"),
+            "a namespace-base declaration resolves from any space in the namespace"
+        );
+        assert!(resolves_at(&replayed, space_b(), "Widget"));
     }
 }

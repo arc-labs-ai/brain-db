@@ -383,6 +383,7 @@ fn is_iso_date_token(tok: &str) -> bool {
 fn resolve_entity_type(
     wtxn: &WriteTransaction,
     namespace_id: u32,
+    space: [u8; 16],
     qname: &str,
     now_unix_nanos: u64,
 ) -> Result<EntityTypeId, ResolverError> {
@@ -391,12 +392,28 @@ fn resolve_entity_type(
     // built-ins. A type minted here belongs to the caller's namespace, not
     // to everyone: two tenants whose corpora both coin `Builder` get two
     // rows, and neither can make the other's schema upload fail.
-    if let Some(def) = entity_type_lookup(wtxn, namespace_id, name)? {
+    //
+    // READ THROUGH THE OVERLAY, WRITE TO THE BASE. The lookup passes the
+    // writing space, so a space that deliberately declared `Builder` gets
+    // ITS row — an overlay would be pointless if the write path ignored
+    // it. The intern below deliberately does NOT: a type coined here was
+    // never declared by anyone, it is a side effect of one sentence, and
+    // spaces are not always applications. A tenant that gives every
+    // end-user their own space (which is how a consumer product isolates
+    // users, since the wire has no user dimension) would otherwise mint a
+    // private copy of every incidental type per user, and the registry
+    // would grow with the user table instead of with the domain.
+    //
+    // So auto-discovery lands at SPACE_BASE, exactly where it landed
+    // before spaces entered this key, and only a deliberate SCHEMA_UPLOAD
+    // can create an overlay row.
+    if let Some(def) = entity_type_lookup(wtxn, namespace_id, space, name)? {
         return Ok(def.id());
     }
     Ok(entity_type_intern(
         wtxn,
         namespace_id,
+        brain_metadata::tables::entity_type::SPACE_BASE,
         name,
         Vec::new(),
         now_unix_nanos,
@@ -993,7 +1010,13 @@ pub fn resolve_or_create_with_deps(
     if normalized.is_empty() {
         return Err(ResolverError::EmptyNormalizedName);
     }
-    let type_id = resolve_entity_type(wtxn, scope.namespace_id, entity_type_qname, now_unix_nanos)?;
+    let type_id = resolve_entity_type(
+        wtxn,
+        scope.namespace_id,
+        scope.space_id_bytes,
+        entity_type_qname,
+        now_unix_nanos,
+    )?;
 
     // Tier 1 — exact canonical-name lookup.
     if let Some(id) = lookup_canonical_wtxn(wtxn, scope, type_id, &normalized)? {
@@ -2700,8 +2723,13 @@ mod tests {
         // The new type lives in the registry now.
         let d = d;
         let wtxn = d.write_txn().unwrap();
-        let def = entity_type_lookup(&wtxn, brain_core::NamespaceId::SYSTEM.raw(), "Organization")
-            .unwrap();
+        let def = entity_type_lookup(
+            &wtxn,
+            brain_core::NamespaceId::SYSTEM.raw(),
+            brain_metadata::tables::entity_type::SPACE_BASE,
+            "Organization",
+        )
+        .unwrap();
         assert!(def.is_some());
         wtxn.commit().unwrap();
     }
@@ -2974,6 +3002,7 @@ mod tests {
             let id = entity_type_intern(
                 &wtxn,
                 brain_core::NamespaceId::SYSTEM.raw(),
+                brain_metadata::tables::entity_type::SPACE_BASE,
                 "Organization",
                 Vec::new(),
                 NOW,

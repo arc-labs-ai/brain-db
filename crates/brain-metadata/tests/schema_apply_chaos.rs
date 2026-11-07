@@ -88,7 +88,13 @@ fn dropped_txn_leaves_no_version_row_and_no_active_pointer() {
     // Step 1: run schema_upload inside a wtxn, then drop without commit.
     {
         let wtxn = db.begin_write().unwrap();
-        let v = schema_upload(&wtxn, &acme_v1(), T0).expect("upload runs");
+        let v = schema_upload(
+            &wtxn,
+            &acme_v1(),
+            brain_metadata::tables::entity_type::SPACE_BASE,
+            T0,
+        )
+        .expect("upload runs");
         assert_eq!(v, 1, "first upload allocates v1 in-txn");
         // Intentional: no commit. `wtxn` drops here.
     }
@@ -127,7 +133,13 @@ fn dropped_txn_leaves_no_interned_predicates() {
 
     {
         let wtxn = db.begin_write().unwrap();
-        let v = schema_upload(&wtxn, &acme_v1(), T0).unwrap();
+        let v = schema_upload(
+            &wtxn,
+            &acme_v1(),
+            brain_metadata::tables::entity_type::SPACE_BASE,
+            T0,
+        )
+        .unwrap();
         assert_eq!(v, 1);
         // Drop without commit.
     }
@@ -172,20 +184,38 @@ fn replay_after_abort_lands_at_v1_not_v2() {
     // Aborted attempt 1.
     {
         let wtxn = db.begin_write().unwrap();
-        let _ = schema_upload(&wtxn, &acme_v1(), T0).unwrap();
+        let _ = schema_upload(
+            &wtxn,
+            &acme_v1(),
+            brain_metadata::tables::entity_type::SPACE_BASE,
+            T0,
+        )
+        .unwrap();
         // Drop.
     }
     // Aborted attempt 2.
     {
         let wtxn = db.begin_write().unwrap();
-        let _ = schema_upload(&wtxn, &acme_v1(), T0 + 1).unwrap();
+        let _ = schema_upload(
+            &wtxn,
+            &acme_v1(),
+            brain_metadata::tables::entity_type::SPACE_BASE,
+            T0 + 1,
+        )
+        .unwrap();
         // Drop.
     }
 
     // Successful third attempt.
     {
         let wtxn = db.begin_write().unwrap();
-        let v = schema_upload(&wtxn, &acme_v1(), T0 + 2).unwrap();
+        let v = schema_upload(
+            &wtxn,
+            &acme_v1(),
+            brain_metadata::tables::entity_type::SPACE_BASE,
+            T0 + 2,
+        )
+        .unwrap();
         assert_eq!(v, 1, "first *committed* upload must be v1");
         wtxn.commit().unwrap();
     }
@@ -206,7 +236,13 @@ fn committed_v1_then_aborted_v2_leaves_active_at_v1() {
 
     {
         let wtxn = db.begin_write().unwrap();
-        schema_upload(&wtxn, &acme_v1(), T0).unwrap();
+        schema_upload(
+            &wtxn,
+            &acme_v1(),
+            brain_metadata::tables::entity_type::SPACE_BASE,
+            T0,
+        )
+        .unwrap();
         wtxn.commit().unwrap();
     }
 
@@ -218,7 +254,12 @@ fn committed_v1_then_aborted_v2_leaves_active_at_v1() {
     // before commit — atomicity must ensure nothing persists.
     {
         let wtxn = db.begin_write().unwrap();
-        let _ = schema_upload(&wtxn, &acme_v2_extends_v1(), T0 + 1);
+        let _ = schema_upload(
+            &wtxn,
+            &acme_v2_extends_v1(),
+            brain_metadata::tables::entity_type::SPACE_BASE,
+            T0 + 1,
+        );
         // Drop without commit.
     }
 
@@ -259,7 +300,13 @@ fn caller_writes_share_atomicity_with_schema_upload() {
 
     {
         let wtxn = db.begin_write().unwrap();
-        schema_upload(&wtxn, &acme_v1(), T0).unwrap();
+        schema_upload(
+            &wtxn,
+            &acme_v1(),
+            brain_metadata::tables::entity_type::SPACE_BASE,
+            T0,
+        )
+        .unwrap();
         // Caller writes an unrelated predicate in the same txn.
         predicate_intern_or_get(&wtxn, "other", "noted", 0, T0).unwrap();
         // Drop without commit.
@@ -296,7 +343,13 @@ fn committed_upload_is_fully_observable() {
     let db = fresh_db(&dir);
     {
         let wtxn = db.begin_write().unwrap();
-        let v = schema_upload(&wtxn, &acme_v1(), T0).unwrap();
+        let v = schema_upload(
+            &wtxn,
+            &acme_v1(),
+            brain_metadata::tables::entity_type::SPACE_BASE,
+            T0,
+        )
+        .unwrap();
         assert_eq!(v, 1);
         wtxn.commit().unwrap();
     }

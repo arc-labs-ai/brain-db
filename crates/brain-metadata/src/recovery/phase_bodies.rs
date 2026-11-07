@@ -189,6 +189,16 @@ pub struct SchemaUpdateBody {
     /// re-replay.
     pub namespace: String,
     pub version: u32,
+    /// The SCOPE the upload applied at: all-zero
+    /// ([`crate::tables::entity_type::SPACE_BASE`]) for the tenant's
+    /// namespace-wide schema, a real space for an overlay.
+    ///
+    /// Carried because replay must land the definitions where the live
+    /// apply landed them. Without it every replayed upload would be
+    /// re-applied at the base, and a space's overlay would silently
+    /// become its tenant's schema on the next restart — visible to every
+    /// other space, which is the one thing an overlay exists to prevent.
+    pub space: [u8; 16],
     /// Schema DSL source text, as UTF-8 bytes. Recovery re-parses +
     /// re-validates + re-uploads (the version it recomputes matches
     /// `version` because replay reconstructs schema state in LSN order).
@@ -533,6 +543,7 @@ mod tests {
         let body = SchemaUpdateBody {
             namespace: "acme".into(),
             version: 3,
+            space: crate::tables::entity_type::SPACE_BASE,
             blob: b"entity Person { name: text }".to_vec(),
             created_at_unix_nanos: 1_700_000_000_000_000_777,
             replace_all: false,
@@ -615,6 +626,7 @@ mod tests {
         let body = SchemaUpdateBody {
             namespace: "acme".into(),
             version: 3,
+            space: crate::tables::entity_type::SPACE_BASE,
             blob: b"entity Person { name: text }".to_vec(),
             created_at_unix_nanos: 1_700_000_000_000_000_777,
             replace_all: false,

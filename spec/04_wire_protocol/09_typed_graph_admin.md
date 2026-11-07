@@ -42,8 +42,27 @@ pub struct SchemaUploadRequest {
     pub allow_breaking: bool,          // false = reject if migration would be required
     pub request_id: WireUuid,
     pub act_as: Option<ActAs>,         // effective identity; the namespace checks bind to it
+    pub scope: SchemaScope,            // WHERE the declarations land; default Namespace
+}
+
+pub enum SchemaScope {
+    Namespace = 0,                     // the tenant's base: every space resolves it
+    Space = 1,                         // an overlay at the CALLER'S effective space
 }
 ```
+
+`scope` is a two-state selector, **never a space id** — a caller may only
+declare an overlay at the space it is already acting as. `Space` with no
+effective space is `INVALID_REQUEST`, not a silent downgrade: `SpaceId::NIL`
+is byte-equal to the base key, so honouring it would write a declaration
+meant to be private straight into the namespace base.
+
+It is `Namespace` by default and omitted from the CBOR map when it holds that
+value, so a base upload encodes byte-identically to the pre-field form and
+every already-encoded request keeps its meaning. **A request that names a
+space in `act_as` but omits `scope` still declares at the base** — the common
+case, and the reason the opt-in is explicit rather than inferred from
+`act_as`.
 
 Semantics:
 
@@ -51,6 +70,18 @@ Semantics:
 2. Diff against current schema. If breaking changes are present and `allow_breaking = false`, return `SCHEMA_MIGRATION_REQUIRED`.
 3. If `dry_run`, return validation result without persisting.
 4. Otherwise commit the new schema version inside a redb transaction: writes to the `schemas` table, allocates a fresh `schema_version`, increments the registry, fires `SCHEMA_UPDATED` event (see §"SUBSCRIBE events" below).
+
+<!-- Scope of the overlay, stated precisely so nobody reads more into it. -->
+**What `scope: Space` does and does not isolate.** Today the overlay is an
+ENTITY-TYPE overlay: only the entity-type registry is space-keyed, so entity
+type *resolution* is what a sibling space cannot see. A space-scoped upload
+still bumps the **namespace's** `schema_version`, still merges its document
+into the namespace's stored source (so `SCHEMA_GET` and other spaces'
+validation contexts see its declarations), and still interns its predicates,
+relation types and extractors namespace-wide. `SCHEMA_REPLACE` and
+`SCHEMA_DROP` carry no `scope` field for the same reason: their destructive
+deltas are keyed by namespace with no space component, so a "space-scoped"
+drop would remove vocabulary every sibling space depends on.
 5. Existing entities / statements / relations remain valid against the *old* schema version until a migration pass re-validates them. Migration policy is in [`../03_schema/`](../03_schema/00_purpose.md).
 
 #### Response — `SchemaUploadResponse`

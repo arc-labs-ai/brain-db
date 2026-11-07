@@ -246,6 +246,14 @@ pub async fn handle_schema_drop(
     let phase = Phase::UpsertSchema {
         namespace: namespace.clone(),
         version: current_version.saturating_add(1),
+        // The namespace base, always — DROP has no space-overlay form and
+        // `SchemaDropRequest` deliberately offers no scope to ask for one.
+        // The only droppable targets are predicates and relation types, both
+        // keyed by namespace with no space in the key, so there is no
+        // per-space row a space-scoped drop could remove: it would delete the
+        // namespace's row while claiming to touch one space. See
+        // `schema_replace`, which declines a scope for the same reason.
+        space: brain_metadata::tables::entity_type::SPACE_BASE,
         blob: narrowed_json,
         declared_predicates: Vec::new(),
         declared_relation_types: Vec::new(),
@@ -537,7 +545,13 @@ mod tests {
         // system entity types.
         let validated = brain_protocol::schema::validate(&parsed).unwrap();
         let wtxn = metadata.write_txn().unwrap();
-        store_schema_upload(&wtxn, &validated, 1).unwrap();
+        store_schema_upload(
+            &wtxn,
+            &validated,
+            brain_metadata::tables::entity_type::SPACE_BASE,
+            1,
+        )
+        .unwrap();
         wtxn.commit().unwrap();
     }
 

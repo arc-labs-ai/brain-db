@@ -102,7 +102,14 @@ pub fn seed_system_schema(db: &Database) -> Result<(), SystemSchemaError> {
     crate::namespace::seed_system_namespace(&wtxn, now)?;
     match active {
         None => {
-            schema_upload(&wtxn, &validated, now)?;
+            // SPACE_BASE: the built-ins are the whole deployment's, not any
+            // one space's. See the note on the other apply call below.
+            schema_upload(
+                &wtxn,
+                &validated,
+                crate::tables::entity_type::SPACE_BASE,
+                now,
+            )?;
         }
         Some(version) => {
             reconcile_system_schema(&wtxn, &validated, version, now)?;
@@ -133,7 +140,16 @@ fn reconcile_system_schema(
     now_unix_nanos: u64,
 ) -> Result<(), SystemSchemaError> {
     upgrade_system_extractors(wtxn, validated, schema_version)?;
-    apply_schema_definitions(wtxn, validated, schema_version, now_unix_nanos)?;
+    // SPACE_BASE, always: the built-ins belong to the system namespace as a
+    // whole and must be visible from every space in every tenant. An
+    // overlay row for them would be unreachable by anyone else.
+    apply_schema_definitions(
+        wtxn,
+        validated,
+        crate::tables::entity_type::SPACE_BASE,
+        schema_version,
+        now_unix_nanos,
+    )?;
     Ok(())
 }
 

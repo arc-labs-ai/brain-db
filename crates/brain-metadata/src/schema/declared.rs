@@ -442,7 +442,13 @@ mod tests {
         let parsed = brain_protocol::schema::parse_schema(src).expect("parse");
         let validated = brain_protocol::schema::validate(&parsed).expect("validate");
         let wtxn = db.begin_write().unwrap();
-        schema_upload(&wtxn, &validated, NOW).unwrap();
+        schema_upload(
+            &wtxn,
+            &validated,
+            crate::tables::entity_type::SPACE_BASE,
+            NOW,
+        )
+        .unwrap();
         wtxn.commit().unwrap();
     }
 

@@ -156,6 +156,7 @@ fn submit_upload(writer: &RealWriterHandle, source: &str) {
     let phase = Phase::UpsertSchema {
         namespace: "acme".into(),
         version: 1,
+        space: brain_metadata::tables::entity_type::SPACE_BASE,
         blob: source.as_bytes().to_vec(),
         declared_predicates: Vec::new(),
         declared_relation_types: Vec::new(),

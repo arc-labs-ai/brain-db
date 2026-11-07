@@ -82,7 +82,13 @@ fn build_uploaded_fixture() -> UploadedFixture {
     let parsed = parse_schema(&text).expect("parse fixture");
     let validated = validate(&parsed).expect("validate fixture");
     let wtxn = db.write_txn().expect("wtxn");
-    schema_upload(&wtxn, &validated, 0).expect("upload");
+    schema_upload(
+        &wtxn,
+        &validated,
+        brain_metadata::tables::entity_type::SPACE_BASE,
+        0,
+    )
+    .expect("upload");
     wtxn.commit().expect("commit");
     UploadedFixture {
         _dir: dir,
@@ -120,7 +126,13 @@ fn bench_upload(c: &mut Criterion) {
                 let parsed = parse_schema(black_box(&text)).expect("parse");
                 let validated = validate(&parsed).expect("validate");
                 let wtxn = db.write_txn().expect("wtxn");
-                let _ = schema_upload(&wtxn, &validated, 0).expect("upload");
+                let _ = schema_upload(
+                    &wtxn,
+                    &validated,
+                    brain_metadata::tables::entity_type::SPACE_BASE,
+                    0,
+                )
+                .expect("upload");
                 wtxn.commit().expect("commit");
                 drop(dir);
             },

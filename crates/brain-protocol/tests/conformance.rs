@@ -80,20 +80,20 @@ use brain_protocol::{
     RelationView, RequestBody, ResolutionOutcomeWire, ResponseBody, RetrieverNameWire,
     SchemaDropRequest, SchemaDropResponse, SchemaGetRequest, SchemaGetResponse, SchemaListItemWire,
     SchemaListRequest, SchemaListResponseFrame, SchemaReplaceRequest, SchemaReplaceResponse,
-    SchemaUploadRequest, SchemaUploadResponse, SchemaValidateRequest, SchemaValidateResponse,
-    SchemaValidationErrorWire, ServerPingResponse, SessionCreateRequest, SessionCreateResponse,
-    SessionDeleteRequest, SessionDeleteResponse, SessionListRequest, SessionListResponse,
-    SessionView, SimilarityFilter, SpaceCreateRequest, SpaceCreateResponse, SpaceDeleteRequest,
-    SpaceDeleteResponse, SpaceListRequest, SpaceListResponse, SpaceView, StageKind,
-    StatementCreateRequest, StatementCreateResponse, StatementGetRequest, StatementGetResponse,
-    StatementHistoryRequest, StatementHistoryResponseFrame, StatementKindWire,
-    StatementListRequest, StatementListResponseFrame, StatementObjectWire, StatementRetractRequest,
-    StatementRetractResponse, StatementSupersedeRequest, StatementSupersedeResponse,
-    StatementTombstoneRequest, StatementTombstoneResponse, StatementValueWire, StatementView,
-    SubscribeRequest, SubscriptionEvent, SubscriptionFilter, TransitionKind, TraversalPathWire,
-    TraversalStepWire, TxnAbortRequest, TxnAbortResponse, TxnBeginRequest, TxnBeginResponse,
-    TxnCommitRequest, TxnCommitResponse, UnlinkRequest, UnlinkResponse, UnsubscribeRequest,
-    UnsubscribeResponse,
+    SchemaScope, SchemaUploadRequest, SchemaUploadResponse, SchemaValidateRequest,
+    SchemaValidateResponse, SchemaValidationErrorWire, ServerPingResponse, SessionCreateRequest,
+    SessionCreateResponse, SessionDeleteRequest, SessionDeleteResponse, SessionListRequest,
+    SessionListResponse, SessionView, SimilarityFilter, SpaceCreateRequest, SpaceCreateResponse,
+    SpaceDeleteRequest, SpaceDeleteResponse, SpaceListRequest, SpaceListResponse, SpaceView,
+    StageKind, StatementCreateRequest, StatementCreateResponse, StatementGetRequest,
+    StatementGetResponse, StatementHistoryRequest, StatementHistoryResponseFrame,
+    StatementKindWire, StatementListRequest, StatementListResponseFrame, StatementObjectWire,
+    StatementRetractRequest, StatementRetractResponse, StatementSupersedeRequest,
+    StatementSupersedeResponse, StatementTombstoneRequest, StatementTombstoneResponse,
+    StatementValueWire, StatementView, SubscribeRequest, SubscriptionEvent, SubscriptionFilter,
+    TransitionKind, TraversalPathWire, TraversalStepWire, TxnAbortRequest, TxnAbortResponse,
+    TxnBeginRequest, TxnBeginResponse, TxnCommitRequest, TxnCommitResponse, UnlinkRequest,
+    UnlinkResponse, UnsubscribeRequest, UnsubscribeResponse,
 };
 
 // Fixed byte patterns. No clock, no randomness — fixtures are reproducible.
@@ -1307,6 +1307,7 @@ fn corpus() -> Vec<Case> {
         allow_breaking: false,
         request_id: RID,
         act_as: None,
+        scope: SchemaScope::Namespace,
     };
     cases.push(req_case(
         "req_schema_upload",
@@ -3186,11 +3187,27 @@ fn corpus() -> Vec<Case> {
         allow_breaking: false,
         request_id: RID,
         act_as: tenant(1 << 4),
+        scope: SchemaScope::Namespace,
     };
     cases.push(req_case(
         "req_schema_upload_act_as_grant",
         RequestBody::SchemaUpload(schema_upload_act_as.clone()),
         &schema_upload_act_as,
+    ));
+    // The space-overlay scope, pinned on its own. `act_as` names a space on
+    // this fixture AND on `req_schema_upload_act_as_grant` above, but only
+    // this one declares at that space — the two differ by the `scope` key
+    // alone, which is the contract: a client that reads the scope off
+    // `act_as` instead of sending it would encode these two identically and
+    // silently make every namespace upload an overlay.
+    let schema_upload_space_scope = SchemaUploadRequest {
+        scope: SchemaScope::Space,
+        ..schema_upload_act_as.clone()
+    };
+    cases.push(req_case(
+        "req_schema_upload_space_scope",
+        RequestBody::SchemaUpload(schema_upload_space_scope.clone()),
+        &schema_upload_space_scope,
     ));
     let schema_replace_act_as = SchemaReplaceRequest {
         act_as: tenant(1 << 5),

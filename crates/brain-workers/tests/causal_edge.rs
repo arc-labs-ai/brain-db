@@ -156,6 +156,7 @@ fn seed_causal_statement(
     let entity_type: EntityTypeId = entity_type_intern(
         &wtxn,
         brain_core::NamespaceId::SYSTEM.raw(),
+        brain_metadata::tables::entity_type::SPACE_BASE,
         "Thing",
         Vec::new(),
         now,

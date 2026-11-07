@@ -608,7 +608,13 @@ mod tests {
 
     fn upload_schema(metadata: &SharedMetadataDb, schema: &ValidatedSchema) -> u32 {
         let wtxn = metadata.write_txn().unwrap();
-        let v = schema_upload(&wtxn, schema, NOW).unwrap();
+        let v = schema_upload(
+            &wtxn,
+            schema,
+            brain_metadata::tables::entity_type::SPACE_BASE,
+            NOW,
+        )
+        .unwrap();
         wtxn.commit().unwrap();
         v
     }

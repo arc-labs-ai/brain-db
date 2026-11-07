@@ -245,6 +245,7 @@ mod tests {
             let org_type = entity_type_intern(
                 &wtxn,
                 brain_core::NamespaceId::SYSTEM.raw(),
+                brain_metadata::tables::entity_type::SPACE_BASE,
                 "Organization",
                 Vec::new(),
                 NOW,

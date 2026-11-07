@@ -273,7 +273,7 @@ Each primary table stays id-keyed with the owner scope on the row value; each se
 | `merge_review_queue` / `merge_review_by_status` | (scope, EntityId) / (status, …) | ReviewItem / () | Ambiguous-band resolutions awaiting re-check |
 | `entity_by_type` | (namespace_id, space_id, entity_type_id, EntityId) | () | Type-filtered `ENTITY_LIST` |
 | `entity_vectors` | EntityId | vector bytes | Durable entity embeddings for tier-3 resolution |
-| `entity_types_by_scope` | (namespace_id, name) | EntityTypeId | Type name → id within a namespace |
+| `entity_types_by_scope` | (namespace_id, space_id, name) | EntityTypeId | Type name → id. `space_id` all-zero is the namespace-wide base; a non-zero space is an overlay only that space resolves. Lookup walks `(ns, space) → (ns, base) → (SYSTEM, base)`, narrowest first |
 | `statements_by_subject_id` / `statements_by_predicate_id` | id-keyed variants | StatementId | Lookups that have the interned id rather than the qname |
 | `statement_embed_queue` | StatementId | queue entry | Pending statement embeddings |
 | `statement_question_vectors` | StatementId | vectors | Per-statement question embeddings |

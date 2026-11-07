@@ -142,6 +142,17 @@ pub async fn handle_schema_replace(
         // next version so the WAL body carries the value recovery's
         // skip-if-(namespace,version)-exists check compares against.
         version: from_version.saturating_add(1),
+        // The namespace base, always — REPLACE has no space-overlay form and
+        // `SchemaReplaceRequest` deliberately offers no scope to ask for one.
+        // Its destructive half (`replace_all` below) drops the namespace's
+        // declared predicates, relation types and extractors, all of which
+        // are keyed by namespace with no space in the key. A replace that
+        // claimed to be scoped to one space would therefore wipe the
+        // vocabulary every sibling space depends on and re-declare it in only
+        // one of them — reach wider than the scope it names, so the scope
+        // would be a lie. Narrowing an overlay is a SCHEMA_UPLOAD at that
+        // space, which re-declares without dropping anything.
+        space: brain_metadata::tables::entity_type::SPACE_BASE,
         blob: req.schema_document.as_bytes().to_vec(),
         declared_predicates: Vec::new(),
         declared_relation_types: Vec::new(),
@@ -302,7 +313,13 @@ mod tests {
         let parsed = parse_schema(doc).unwrap();
         let validated = brain_protocol::schema::validate(&parsed).unwrap();
         let wtxn = metadata.write_txn().unwrap();
-        schema_upload(&wtxn, &validated, 1).unwrap();
+        schema_upload(
+            &wtxn,
+            &validated,
+            brain_metadata::tables::entity_type::SPACE_BASE,
+            1,
+        )
+        .unwrap();
         wtxn.commit().unwrap();
     }
 

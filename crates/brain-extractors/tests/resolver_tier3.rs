@@ -275,6 +275,7 @@ fn tier_embedding_respects_entity_type() {
         let id = brain_metadata::entity::types::entity_type_intern(
             &wtxn,
             brain_core::NamespaceId::SYSTEM.raw(),
+            brain_metadata::tables::entity_type::SPACE_BASE,
             "Organization",
             Vec::new(),
             NOW,

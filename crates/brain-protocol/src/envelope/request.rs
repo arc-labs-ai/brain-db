@@ -1034,6 +1034,7 @@ mod tests {
                 allow_breaking: false,
                 request_id: sample_uuid(4),
                 act_as: Some(sel.clone()),
+                scope: crate::SchemaScope::Namespace,
             }),
             RequestBody::SchemaGet(SchemaGetRequest {
                 namespace: "acme".into(),

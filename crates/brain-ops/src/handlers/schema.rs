@@ -92,6 +92,15 @@ pub async fn handle_schema_upload(
         )));
     }
 
+    // 2d. Resolve the scope this document declares at — the namespace base by
+    //     default, or an overlay at the caller's own effective space when the
+    //     request explicitly asks for one. Resolved here, straight after the
+    //     tenant binding and before any state-dependent step: the merge
+    //     pre-flight below has to ask its questions from the scope the upload
+    //     will land at, and a scope the caller has no space for is a refusal
+    //     that should cost nothing.
+    let space = schema_scope::declaration_space(ctx, req.scope)?;
+
     // 2a. Validate against what this document will MERGE INTO, not against
     //     the document alone. UPLOAD is additive, so naming a type an earlier
     //     upload (or the system schema) declared is legitimate — validating in
@@ -122,7 +131,7 @@ pub async fn handle_schema_upload(
     //    Runs BEFORE the dry-run exit: a dry run must predict the real
     //    upload, conflicts included. It used to return early here and
     //    report a conflicting document as an accepted next version.
-    let merge_summary = classify_schema_merge(ctx, &validated)?;
+    let merge_summary = classify_schema_merge(ctx, &validated, space)?;
 
     // 3a. A document is only a no-op if the stored SOURCE already carries it
     //     too. `all_idempotent` is judged against the interned definitions
@@ -174,6 +183,10 @@ pub async fn handle_schema_upload(
         // (which calls next_version_in). Kept on the Phase for trace /
         // metric labels.
         version: from_version.saturating_add(1),
+        // Where the declarations land. Carried on the phase so the apply and
+        // the WAL body it feeds both read one value chosen here — see
+        // `Phase::UpsertSchema::space`.
+        space,
         // Source text — apply re-parses + re-validates. We deliberately
         // don't ship an rkyv-encoded ValidatedSchema through the Phase
         // because brain-ops doesn't carry the serde infrastructure;
@@ -461,12 +474,24 @@ pub async fn handle_schema_validate(
 /// writer). `allow_breaking` folds in because flipping it counts as a
 /// different operator intent and should surface as `Conflict` on
 /// matching-request_id reuse.
+///
+/// `scope` folds in for the same reason, and more sharply: the same document
+/// declared at the namespace base and declared as a space overlay are two
+/// different writes landing in two different places. Leaving it out would let
+/// a retried request_id replay the first one's ack for the second one's
+/// intent, so the caller would be told its overlay landed when the base
+/// upload is what exists.
+///
+/// The hash takes the wire `scope`, not the resolved 16-byte space: the space
+/// is already pinned by the `WriteId`, which is keyed on
+/// `(request_id, caller_space)`.
 fn hash_schema_upload_request(req: &SchemaUploadRequest) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(b"schema_upload:");
     h.update(req.schema_document.as_bytes());
     h.update(b"\0");
     h.update(&[u8::from(req.allow_breaking)]);
+    h.update(&[req.scope as u8]);
     *h.finalize().as_bytes()
 }
 
@@ -541,21 +566,31 @@ struct MergeSummary {
 /// Pre-flight entity-type lookup for a namespace that may not be
 /// registered yet. `None` namespace → no rows of its own; fall back to the
 /// shared system namespace so built-ins still classify as existing.
+///
+/// `space` is the scope the upload will land at, not a filter: the lookup
+/// walks `(ns, space) → (ns, base) → (system, base)` exactly as a reader
+/// will. The pre-flight exists to predict the real upload, so it has to ask
+/// the question from where the declaration is going — asking from the base
+/// while the document lands in a space would classify an existing overlay as
+/// absent and bump the namespace version on every re-upload of an unchanged
+/// overlay.
 fn lookup_entity_type(
     rtxn: &redb::ReadTransaction,
     namespace_id: Option<brain_core::NamespaceId>,
+    space: [u8; 16],
     name: &str,
 ) -> Result<Option<brain_metadata::tables::entity_type::EntityTypeDefinition>, OpError> {
     let ns = namespace_id
         .unwrap_or(brain_core::NamespaceId::SYSTEM)
         .raw();
-    entity_type_lookup_rtxn(rtxn, ns, name)
+    entity_type_lookup_rtxn(rtxn, ns, space, name)
         .map_err(|err| OpError::Internal(format!("entity_type lookup: {err}")))
 }
 
 fn classify_schema_merge(
     ctx: &OpsContext,
     validated: &ValidatedSchema,
+    space: [u8; 16],
 ) -> Result<MergeSummary, OpError> {
     let schema = validated.as_schema();
     let namespace = schema.namespace.as_str();
@@ -581,7 +616,7 @@ fn classify_schema_merge(
     for item in &schema.items {
         match item {
             SchemaItem::EntityType(e) => {
-                let existing = lookup_entity_type(&rtxn, namespace_id, &e.name)
+                let existing = lookup_entity_type(&rtxn, namespace_id, space, &e.name)
                     .map_err(|err| OpError::Internal(format!("entity_type lookup: {err}")))?;
                 match existing {
                     None => all_idempotent = false,
@@ -614,7 +649,7 @@ fn classify_schema_merge(
                         // resolves to `0` there too, so the comparison
                         // stays exact.
                         let new_object_entity_type = match declared_object_entity_type(&p.object) {
-                            Some(name) => lookup_entity_type(&rtxn, namespace_id, name)
+                            Some(name) => lookup_entity_type(&rtxn, namespace_id, space, name)
                                 .map_err(|err| {
                                     OpError::Internal(format!("entity_type lookup: {err}"))
                                 })?
@@ -631,7 +666,7 @@ fn classify_schema_merge(
                         // silently discarded.
                         let new_subject_entity_type = match &p.subject {
                             Some(SubjectTypeDecl::Entity { entity_type }) => {
-                                lookup_entity_type(&rtxn, namespace_id, entity_type)
+                                lookup_entity_type(&rtxn, namespace_id, space, entity_type)
                                     .map_err(|err| {
                                         OpError::Internal(format!("entity_type lookup: {err}"))
                                     })?
@@ -831,7 +866,8 @@ mod tests {
         use brain_metadata::MetadataDb;
         use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
         use brain_protocol::{
-            SchemaGetRequest, SchemaListRequest, SchemaUploadRequest, SchemaValidateRequest,
+            SchemaGetRequest, SchemaListRequest, SchemaScope, SchemaUploadRequest,
+            SchemaValidateRequest,
         };
         use std::sync::Arc;
 
@@ -891,7 +927,13 @@ mod tests {
             let parsed = parse_schema(doc).unwrap();
             let validated = brain_protocol::schema::validate(&parsed).unwrap();
             let wtxn = metadata.write_txn().unwrap();
-            schema_upload(&wtxn, &validated, 1).unwrap();
+            schema_upload(
+                &wtxn,
+                &validated,
+                brain_metadata::tables::entity_type::SPACE_BASE,
+                1,
+            )
+            .unwrap();
             wtxn.commit().unwrap();
         }
 
@@ -902,6 +944,7 @@ mod tests {
                 dry_run: false,
                 request_id: [1u8; 16],
                 act_as: None,
+                scope: SchemaScope::Namespace,
             }
         }
 
@@ -914,6 +957,45 @@ mod tests {
             assert!(resp.validation_errors.is_empty());
             assert_eq!(resp.namespace, "acme");
             assert!(resp.schema_version >= 1);
+        }
+
+        /// `scope: Space` from a caller with no effective space is refused,
+        /// and nothing is written.
+        ///
+        /// The tempting alternative is to fall back to the base, which is
+        /// what the caller's space would do on its own: an absent space is
+        /// `SpaceId::NIL`, byte-equal to `SPACE_BASE`, so the "private
+        /// overlay" would land where every space in the namespace reads it.
+        /// Refusing is the only answer that cannot be mistaken for the one
+        /// the caller asked for.
+        ///
+        /// Driven against the handler rather than through `dispatch`, because
+        /// `SpaceId::NIL` is dispatch's anonymous-request marker: a caller
+        /// with no space never reaches a tenant-bound schema handler, so the
+        /// refusal has no reachable path there to test.
+        #[tokio::test]
+        async fn space_scope_without_an_effective_space_is_refused() {
+            let (_dir, ctx, md) = build_ctx_for("acme");
+            let req = SchemaUploadRequest {
+                scope: SchemaScope::Space,
+                ..upload_req(ACME_V1)
+            };
+            let err = handle_schema_upload(req, &ctx)
+                .await
+                .expect_err("an overlay with no space to put it in");
+            match err {
+                OpError::InvalidRequest(msg) => assert!(
+                    msg.contains("effective space"),
+                    "the refusal should name what is missing, got {msg:?}"
+                ),
+                other => panic!("expected InvalidRequest, got {other:?}"),
+            }
+            let rtxn = md.read_txn().unwrap();
+            assert_eq!(
+                schema_active(&rtxn, "acme").unwrap(),
+                None,
+                "a refused upload must not bump the namespace's schema version"
+            );
         }
 
         const ACME_TYPED_V1: &str = "namespace acme\n\

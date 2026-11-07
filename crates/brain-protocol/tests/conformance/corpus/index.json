@@ -105,7 +105,7 @@
     "name": "req_schema_upload",
     "opcode": "0x0120",
     "kind": "request",
-    "payload_len": 130
+    "payload_len": 137
   },
   {
     "name": "req_materialize_procedural",
@@ -801,7 +801,13 @@
     "name": "req_schema_upload_act_as_grant",
     "opcode": "0x0120",
     "kind": "request",
-    "payload_len": 167
+    "payload_len": 174
+  },
+  {
+    "name": "req_schema_upload_space_scope",
+    "opcode": "0x0120",
+    "kind": "request",
+    "payload_len": 174
   },
   {
     "name": "req_schema_replace_act_as_grant",

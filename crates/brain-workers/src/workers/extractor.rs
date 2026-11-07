@@ -9961,7 +9961,13 @@ mod tests {
         let validated = validate(&parse_schema(src).expect("parse")).expect("validate");
         let wtxn = metadata.write_txn().unwrap();
         let ns_id = brain_metadata::namespace::namespace_intern_or_get(&wtxn, ns, 1).unwrap();
-        brain_metadata::schema::store::schema_upload(&wtxn, &validated, 1).expect("upload");
+        brain_metadata::schema::store::schema_upload(
+            &wtxn,
+            &validated,
+            brain_metadata::tables::entity_type::SPACE_BASE,
+            1,
+        )
+        .expect("upload");
         wtxn.commit().unwrap();
         brain_metadata::RowScope::from_bytes(ns_id.raw(), [0xA1; 16])
     }
@@ -10980,8 +10986,13 @@ mod registry_refresh_tests {
         let validated = validate(&parse_schema(src).expect("parse")).expect("validate");
         {
             let wtxn = metadata.write_txn().unwrap();
-            brain_metadata::schema::store::schema_upload(&wtxn, &validated, 1_700_000_000_000)
-                .expect("schema_upload");
+            brain_metadata::schema::store::schema_upload(
+                &wtxn,
+                &validated,
+                brain_metadata::tables::entity_type::SPACE_BASE,
+                1_700_000_000_000,
+            )
+            .expect("schema_upload");
             wtxn.commit().unwrap();
         }
         let expected_id = brain_metadata::extractor::ops::extractor_lookup_by_qname(
@@ -11050,8 +11061,13 @@ mod registry_refresh_tests {
         let validated = validate(&parse_schema(src).expect("parse")).expect("validate");
         {
             let wtxn = metadata.write_txn().unwrap();
-            brain_metadata::schema::store::schema_upload(&wtxn, &validated, 1_700_000_000_000)
-                .expect("schema_upload");
+            brain_metadata::schema::store::schema_upload(
+                &wtxn,
+                &validated,
+                brain_metadata::tables::entity_type::SPACE_BASE,
+                1_700_000_000_000,
+            )
+            .expect("schema_upload");
             wtxn.commit().unwrap();
         }
 
