@@ -3,9 +3,12 @@
   "bootstrap-sha": "e3aec43dbea10fef82216f3e5a8957ae06043f92",
   "include-component-in-tag": false,
   "bump-minor-pre-major": true,
+  "bump-patch-for-minor-pre-major": true,
   "packages": {
     ".": {
       "release-type": "simple",
+      "release-as": "0.4.1",
+      "_comment_release_as": "TEMPORARY -- delete this line once v0.4.1 is tagged. The project stays on 0.4.x, and release-please would otherwise compute 0.5.0: `bump-minor-pre-major` moves the MINOR for a breaking change even pre-1.0, and the BYOK work carries a BREAKING CHANGE footer. `bump-patch-for-minor-pre-major` above keeps an ordinary `feat` on the patch, which is the standing behaviour; this pin is only for the one release that already has the breaking marker in range. Leaving it in would force every later release to 0.4.1 as well, which release-please reports as 'already released' and then cuts nothing.",
       "changelog-path": "CHANGELOG.md",
       "extra-files": [
         "Cargo.toml",
