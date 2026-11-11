@@ -276,9 +276,15 @@ fn commit_by_time_flushes_below_n() {
             })
             .await;
 
-        // Wait > interval so the worker times out and commits.
-        sleep(Duration::from_millis(200)).await;
-        assert_eq!(count_hits(&handle.index, "timeout"), 1);
+        // The worker commits on its interval, not on a count. Poll rather
+        // than sleep a fixed window: see `wait_for_count`.
+        let got = wait_for_count(
+            || count_hits(&handle.index, "timeout"),
+            1,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(got, 1, "the interval commit never landed within 5s");
 
         drop(dispatcher);
         task.await;
@@ -825,4 +831,27 @@ fn resume_writer_rebuild_failure_drops_ack_instead_of_faking_success() {
         drop(lock_hog);
         drop(dispatcher);
     })
+}
+
+/// Wait for `probe` to reach `want`, up to `budget`.
+///
+/// These tests assert that a *time*-triggered commit fires without the count
+/// threshold being reached. A fixed `sleep` past the interval expresses that
+/// badly: it asserts the drain task was also *scheduled* within that window,
+/// which is a property of the machine, not of the commit policy. Under CPU
+/// contention it is not, and the test failed while the behaviour it checks
+/// was correct.
+///
+/// Polling keeps the real assertion — nothing committed by count — and drops
+/// the accidental one. A run that would have passed still passes in about the
+/// same time; one that would have flaked now waits instead.
+async fn wait_for_count(mut probe: impl FnMut() -> usize, want: usize, budget: Duration) -> usize {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        let got = probe();
+        if got >= want || std::time::Instant::now() >= deadline {
+            return got;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
 }
