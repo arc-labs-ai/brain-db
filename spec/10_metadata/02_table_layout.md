@@ -298,6 +298,8 @@ The same composite-key + rkyv-value conventions apply (§4, §5).
 
 Every shard maintains derived indexes outside `metadata.redb`: two tantivy directories (memory text, statement text), three HNSW corpora (memory, entity, statement), and a separate redb file for the LLM response cache (`llm_responses` + `llm_response_ttl`). These are present from byte zero, not activated by a schema upload.
 
+One piece of durable state is **not** per shard. `llm_credentials.redb`, at the data-directory root, holds every tenant's sealed LLM provider key keyed `(namespace, space)`: there is one answer per scope and every shard has to resolve the same one. Its sealing key is `llm_credential_kek` in the same directory unless `[llm.credentials] kek` supplies one. A backup that captures the store without the key file restores nothing usable, and one that captures both together carries the plaintext-equivalent — so they are worth separating deliberately rather than by accident.
+
 The LLM cache is **not** migrated across a BYOK boundary. Its key includes a credential-scope component, and rows written before that component existed cannot say which credential paid for them — serving them under per-namespace credentials would be exactly the cross-tenant reuse the scope exists to prevent. A pre-BYOK cache file is refused rather than adopted.
 
 ### 16.1 Tantivy indexes

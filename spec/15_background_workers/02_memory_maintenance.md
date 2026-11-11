@@ -299,7 +299,7 @@ async fn summarize(memories: &[MemoryText]) -> Result<String> {
 }
 ```
 
-Configuration specifies the broker, not a credential: the summarizer resolves per namespace like every other LLM consumer, so a consolidation run is paid for by the tenant whose memories it consolidates. Llama, GPT, or any specific model are not bundled — the integration is pluggable.
+Configuration selects a backend, not a credential: the LLM backend resolves per namespace like every other model-backed stage, so a consolidation run is paid for by the tenant whose memories it consolidates. A consumer that cannot name a namespace cannot make the call, and the worker clusters strictly within one `(namespace, space, session)` so every call has exactly one owner. Llama, GPT, or any specific model are not bundled — the integration is pluggable.
 
 For deployments without an LLM, consolidation is disabled. The system works fine without it; clients just don't get Consolidated memories.
 

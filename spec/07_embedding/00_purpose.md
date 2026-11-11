@@ -54,7 +54,7 @@ The pipeline:
 text → tokenizer → token_ids → model → raw_vector → L2 normalize → vector
 ```
 
-Every memory's vector goes through this pipeline. Every cue for `RECALL`/`PLAN`/`REASON` goes through it too. The layer is on the hot path for nearly every operation.
+Every memory that is admitted goes through this pipeline — ENCODE refuses a namespace with no registered LLM provider credential before the embed runs, so the embedding layer is never reached for those writes. Every cue for `RECALL`/`PLAN`/`REASON` goes through it too. The layer is on the hot path for nearly every operation.
 
 ## 2. Latency budget
 

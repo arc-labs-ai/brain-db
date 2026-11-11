@@ -101,6 +101,7 @@ The list:
 - LINK / UNLINK: 6 tests.
 - TXN_*: 6 tests.
 - SUBSCRIBE: 5 tests.
+- LLM_CREDENTIAL_*: 13 tests (put / get / delete / verify, scope targeting, permission-bit refusal, transport refusal, non-delegability).
 - ADMIN_*: 10 tests.
 
 Total: ~80 feature tests.

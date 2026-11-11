@@ -236,7 +236,7 @@ The version field is named `would_be_version`, not `schema_version` set to 0. A 
 
 ```rust
 pub struct ExtractorListRequest {
-    pub act_as: Option<ActAs>,         // extractors are listed for the effective namespace
+    pub act_as: Option<ActAs>,         // extractors are listed for the effective namespace and space
 }
 ```
 

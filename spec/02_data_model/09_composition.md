@@ -106,7 +106,7 @@ A user can deploy Brain and never declare a schema. In this case:
 
 This is the open-vocabulary mode. It is a first-class deployment posture, not a degraded one.
 
-When the user declares their first schema, extractors gain a typed vocabulary and may optionally trigger a backfill over existing memories. Declaring a schema activates **strict validation** for statements, relations, and predicate filters within that namespace — unknown qnames produce `PredicateNotInSchema` / `RelationTypeNotInSchema`, and declared cardinalities are enforced. It does NOT activate retrieval; the retrieval pipeline (semantic + lexical + memory-edge graph) is already the default. What schema adds is typed entity-anchored graph traversal and predicate-vocabulary checking.
+When the user declares their first schema, extractors gain a typed vocabulary and may optionally trigger a backfill over existing memories. Declaring a schema activates **strict validation** for statements, relations, and predicate filters within that declaration scope — the space the schema was uploaded at, or the namespace base if it was uploaded there — unknown qnames produce `PredicateNotInSchema` / `RelationTypeNotInSchema`, and declared cardinalities are enforced. It does NOT activate retrieval; the retrieval pipeline (semantic + lexical + memory-edge graph) is already the default. What schema adds is typed entity-anchored graph traversal and predicate-vocabulary checking.
 
 ## What gets stored where: summary
 

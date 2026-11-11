@@ -178,6 +178,11 @@ If this document doesn't list a scenario, it's because:
 - It's a bug to fix.
 - It's a known external limitation (e.g., the operator's responsibility).
 
+One scenario this file does not enumerate above, because it is a configuration
+loss rather than a data loss: a deployment that used a *generated* sealing key
+and restored its credential store without that key holds ciphertext nothing can
+open. See [`06_disaster_recovery.md`](06_disaster_recovery.md) §3a.
+
 If you find an unlisted scenario in production, it's a bug or doc gap. Either way, file an issue.
 
 ## 18. The recovery time tradeoff
@@ -201,6 +206,7 @@ After a recovery from snapshot:
 - Caches are cold.
 - HNSW may need rebuild.
 - Embedder cache empty.
+- Tenant LLM provider credentials are present only if the backup carried `llm_credentials.redb` *and* its sealing key was recovered separately. Without the key, Brain refuses to start rather than serving writes it can never ground.
 
 First few hours have higher latency. Then it recovers to steady state.
 

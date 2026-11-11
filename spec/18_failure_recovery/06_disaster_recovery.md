@@ -43,6 +43,37 @@ Off-site snapshots (different region/DC):
 
 Both should be in place for production.
 
+### 3a. Tenant LLM credentials are backed up, their sealing key is not
+
+A snapshot is a per-shard thing — arena, metadata store, WAL segments. Tenant
+LLM provider credentials are neither: `llm_credentials.redb` sits at the
+data-directory root, because there is one answer per scope and every shard has
+to resolve the same one. A DR backup must therefore pick it up explicitly; a
+restore without it comes up refusing every ENCODE for every namespace.
+
+Its sealing key, `llm_credential_kek`, is deliberately **excluded**. Shipping
+it alongside the rows it seals makes the backup plaintext-equivalent and
+defeats the sealing entirely — a stolen backup archive would then yield every
+tenant's provider key, which is the single outcome the encryption exists to
+prevent.
+
+The consequence is worth stating plainly rather than discovering during a
+restore: **a generated sealing key is not a backup-safe configuration.** Left
+unset, Brain generates one into the data directory on first boot, which is
+right for a fresh install and wrong for anything with a DR plan — the backup
+cannot carry it, so the restore cannot read what it restored. An operator who
+needs DR sets `[llm.credentials] kek` from their own secret manager, and
+recovers it from there rather than from the backup.
+
+Restoring the store under a *different* sealing key is handled rather than
+left to be discovered: every row is ciphertext the new key cannot open, so
+Brain refuses to start and names the cause. That is deliberate. Resolution
+reports an unopenable credential as "could not find out right now", which
+**admits** writes — correct in general, since a storage fault is not evidence
+of a missing key — so a server that started anyway would accept every write
+and fail derivation on all of them, permanently, with nothing a tenant or
+operator would notice.
+
 ## 4. Snapshot shipping
 
 After a snapshot is created:
@@ -129,13 +160,27 @@ For full real-time replication, a future major version's replication will be nee
 Sometimes only data needs DR; Brain code can be redeployed quickly:
 
 - Data files (arena, WAL, metadata) are backed up.
+- The tenant-credential store (`llm_credentials.redb`, at the data-directory
+  root) is backed up with them. No shard snapshot contains it.
+- Its sealing key (`llm_credential_kek`, same directory) is backed up
+  **separately**, somewhere the data backup is not. Together in one archive
+  they are plaintext-equivalent for every tenant's provider key; apart,
+  neither half is useful alone.
 - Brain binary is in version control / artifact storage.
 
 In a disaster:
 - Spin up new infrastructure.
 - Deploy Brain version.
-- Restore data.
+- Restore data, including `llm_credentials.redb`.
+- Restore `llm_credential_kek` from its separate location, or set
+  `[llm.credentials] kek` to the same value.
 - Resume.
+
+Restoring the store without its key does not degrade quietly — Brain audits the
+store at boot and **refuses to start** when it holds credentials that the loaded
+sealing key cannot open. That is deliberate: the alternative is a server that
+comes up healthy, admits every write, and fails every derivation stage forever
+with nothing a tenant or operator would notice.
 
 Total time: a few hours typically.
 
@@ -252,6 +297,11 @@ Even with good DR:
 - Data created between last backup and disaster: lost.
 - In-flight operations at the moment of disaster: lost.
 - Data that was specifically deleted before the disaster: stays gone (which is correct).
+- Tenant LLM provider credentials, when the deployment used a generated
+  sealing key: lost, and unrecoverably so. The backup carries the sealed rows
+  but never the key (§3a), so the restore holds ciphertext nothing can open.
+  Each namespace registers again. Setting `[llm.credentials] kek` ahead of
+  time is what moves this out of this list.
 
 Brain's design pushes the "lost" category to be small, but it's not zero. Operators should set expectations accordingly.
 

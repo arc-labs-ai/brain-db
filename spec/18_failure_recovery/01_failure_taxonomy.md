@@ -104,6 +104,16 @@ A misconfigured value causes errors.
 - Response: Log; for fatal misconfigs, refuse to start.
 - Recovery: Fix config; restart.
 
+### Sealing key lost or replaced
+
+The `llm_credential_kek` file (or the `[llm.credentials] kek` value) no longer
+matches the key that sealed the stored credentials — typically a data directory
+restored without it, or a regenerated one.
+
+- Detection: at startup. Brain audits the credential store and counts how many rows open under the loaded key ring.
+- Response: when the store holds credentials and **none** open, Brain refuses to start and names the cause. When only some fail, it warns and those namespaces report their credential unavailable.
+- Recovery: restore the original sealing key, or set `[llm.credentials] kek` to it. There is no re-derivation path; without it, each namespace registers again with `LLM_CREDENTIAL_PUT`.
+
 ### Disk full
 
 The disk fills.

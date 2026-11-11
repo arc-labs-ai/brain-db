@@ -136,6 +136,8 @@ Latency: ~10-100 µs per shard message (includes channel send + executor wakeup 
 /var/lib/brain/
 ├── config.toml
 ├── data/
+│   ├── llm_credentials.redb    # tenant provider keys, sealed; shared by all shards
+│   ├── llm_credential_kek      # generated sealing key, unless [llm.credentials] kek is set
 │   ├── <shard_uuid_1>/
 │   │   ├── arena.bin
 │   │   ├── wal/

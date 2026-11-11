@@ -79,7 +79,7 @@ rejects; never half-merges.
 | Predicate | `kind_constraint`, `object_type_constraint_byte`, `description`, `is_stateful` |
 | Relation type | `cardinality`, `is_symmetric`, `description` (`from` / `to` entity-type ids re-resolve at apply time; divergent type names trip there) |
 | Extractor | `kind` byte (pattern / classifier / llm); the encoded `ExtractorDef` blob is compared at apply time |
-| Entity type | the stored `schema_blob` (empty in v1, so the check is "no prior non-empty blob"). Entity types are global — see §1c |
+| Entity type | the stored `schema_blob` (empty in v1, so the check is "no prior non-empty blob"). Scoped like every other declaration — see §1c |
 
 ### Idempotent re-upload
 
@@ -119,23 +119,26 @@ SchemaConflict {
 A conflict aborts the upload before any writer txn opens; nothing
 commits.
 
-## 1c. Entity-type scope in v1
+## 1c. Entity-type scope
 
-Entity types are **global** in the v1 storage model — they live
-in a single shard-wide table without a namespace key. Two
-consequences flow from this:
+Entity types are scoped exactly as every other declaration is: the
+registry index `entity_types_by_scope` is keyed
+`(namespace_id, space, name)`, and lookup walks
+`(ns, space) → (ns, base) → (SYSTEM, base)`, narrowest first.
 
-- A user upload to namespace `acme` that declares an entity type
-  `Person` shares the same row as a later upload to namespace
-  `crm` declaring `Person`. The merge predicate is "is there an
-  existing row with this name?", not "is there an existing row
-  with this name in this namespace?".
-- `SCHEMA_REPLACE` (§9) does **not** drop entity types. Dropping
-  them would race with rows in other namespaces that reference
-  the same shared type.
+- A user upload to namespace `acme` declaring `Person` gets its own
+  row, independent of a later `crm` upload declaring the same name.
+  The merge predicate is "is there an existing row with this name
+  **in this scope**?". The built-ins (`Person`, `Organization`, …)
+  live under the system namespace at the base, so every scope still
+  resolves them.
+- `SCHEMA_REPLACE` (§9) and `SCHEMA_DROP` (§9a) still do **not**
+  remove entity types. The reason is no longer sharing: entity types
+  have no tombstone path, and their interned ids are referenced by
+  live entity rows, so dropping one would orphan them.
 
-This is a documented v1 limitation; namespacing entity types is
-tracked in [`./04_namespaces.md`](./04_namespaces.md) §8.
+Removing entity types is tracked in
+[`./04_namespaces.md`](./04_namespaces.md) §8.
 
 ## 2. The redb rows
 
@@ -143,7 +146,7 @@ tracked in [`./04_namespaces.md`](./04_namespaces.md) §8.
 
 ```rust
 pub const SCHEMA_VERSIONS_TABLE:
-    TableDefinition<'static, (&str, u32), SchemaVersionRow>;
+    TableDefinition<'static, (&str, [u8; 16], u32), SchemaVersionRow>;
 
 pub struct SchemaVersionRow {
     pub namespace: String,
@@ -155,8 +158,8 @@ pub struct SchemaVersionRow {
 }
 ```
 
-The `source` field carries the **parsed** AST — readers
-deserialise to `Schema` via the same rkyv path used by other rows.
+The `source` field carries the **parsed** AST as JSON
+(`serde_json::to_vec(&Schema)`); only the row envelope is rkyv.
 `source_text` is verbatim DSL source for round-trips back through
 the validator (e.g., re-validate under a newer validator version).
 
@@ -164,11 +167,13 @@ the validator (e.g., re-validate under a newer validator version).
 
 ```rust
 pub const SCHEMA_ACTIVE_VERSIONS_TABLE:
-    TableDefinition<'static, &str, u32>;
+    TableDefinition<'static, (&str, [u8; 16]), u32>;
 ```
 
-Single-row-per-namespace lookup. `schema_active(rtxn, ns)` reads
-this directly; no scan.
+Single-row-per-scope lookup, keyed `(namespace, space_id)`. The all-zero
+`space_id` is the namespace base; a non-zero space is an overlay with its own
+version counter, so a space's first upload is version 1 even when the base is
+at 7. `schema_active(rtxn, ns, space)` reads this directly; no scan.
 
 ### 2.3 Existing rows carry `schema_version`
 
@@ -317,7 +322,7 @@ Per [`../04_wire_protocol/09_typed_graph_admin.md`](../04_wire_protocol/09_typed
 
 This section verifies:
 
-- First upload to a fresh namespace → version 1.
+- First upload to a fresh scope (namespace base, or a space overlay) → version 1.
 - Second upload → version 2.
 - Upload that fails validation → no version bump.
 - Active version persists across reopen.
@@ -358,8 +363,8 @@ What is **not** dropped:
   interned by prior `STATEMENT_CREATE` / `RELATION_CREATE` with
   origin `ImplicitFromWrite` stay put — they are not part of the
   declared vocabulary.
-- **Entity types.** They are global in v1 (see §1c). Dropping them
-  would race with rows in other namespaces.
+- **Entity types.** They have no drop path (see §1c). Dropping one
+  would orphan the live entity rows holding its interned id.
 - **Existing statements / relations rows.** Rows that referenced a
   now-dropped predicate / relation_type remain in storage. Reads
   still return them; the post-upload flag sweep (§3.5) marks them
@@ -397,8 +402,8 @@ Parse / validate errors ride in `validation_errors` (mirroring the
 
 Where `SCHEMA_REPLACE` wipes a namespace's whole declared vocabulary,
 `SCHEMA_DROP` (`0x0125`) removes exactly **one** declared item — a predicate
-or a relation_type — and re-versions the narrowed document. Entity types are
-global (§1c) and never dropped.
+or a relation_type — and re-versions the narrowed document. Entity types have
+no drop path (§1c) and are never removed.
 
 ### Semantics
 
@@ -429,9 +434,9 @@ global (§1c) and never dropped.
 
 ### Re-validating a narrowed document
 
-Re-validation runs against the narrowed document plus the **shared** entity
-types, not against the namespace's own declarations alone. Entity types are
-global (§1c), so a narrowed document that still references `Person` is valid
+Re-validation runs against the narrowed document plus the entity types the
+scope resolves, not against the namespace's own declarations alone. Entity
+types survive a drop (§1c), so a narrowed document that still references `Person` is valid
 even though its own text never declares it. Validating the narrowed document in
 isolation reports every shared type as an unresolved reference and refuses a
 drop that was perfectly legal.
