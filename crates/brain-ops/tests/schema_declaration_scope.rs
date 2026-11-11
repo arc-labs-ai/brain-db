@@ -31,7 +31,7 @@ use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
 use brain_metadata::api_keys::bits;
 use brain_metadata::entity::types::entity_type_lookup_rtxn;
-use brain_metadata::tables::entity_type::SPACE_BASE;
+use brain_metadata::tables::scope::SPACE_BASE;
 use brain_metadata::MetadataDb;
 use brain_ops::test_support::{run_in_glommio, single_body};
 use brain_ops::{dispatch, OpError, OpsContext, RealWriterHandle, RequestCaller};
@@ -135,9 +135,13 @@ fn resolves_in(metadata: &SharedMetadataDb, space: [u8; 16], name: &str) -> bool
     let ns = brain_metadata::namespace::namespace_lookup_by_name(&rtxn, NS)
         .unwrap()
         .expect("the upload interns its namespace");
-    entity_type_lookup_rtxn(&rtxn, ns.raw(), space, name)
-        .unwrap()
-        .is_some()
+    entity_type_lookup_rtxn(
+        &rtxn,
+        brain_metadata::TypeScope::space(ns.raw(), space),
+        name,
+    )
+    .unwrap()
+    .is_some()
 }
 
 fn space_bytes(selector: &str) -> [u8; 16] {

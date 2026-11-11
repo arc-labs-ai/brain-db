@@ -1148,7 +1148,7 @@ mod tests {
         let wtxn = db.write_txn().unwrap();
         let id = predicate_intern(
             &wtxn,
-            "test",
+            crate::tables::scope::DeclScope::base("test"),
             name,
             Some(StatementKind::Fact),
             /* object: Entity */ 1,
@@ -1166,7 +1166,7 @@ mod tests {
         let wtxn = db.write_txn().unwrap();
         let id = predicate_intern(
             &wtxn,
-            "test",
+            crate::tables::scope::DeclScope::base("test"),
             name,
             Some(StatementKind::Preference),
             /* object: Value */ 2,
@@ -1186,7 +1186,7 @@ mod tests {
         let wtxn = db.write_txn().unwrap();
         let id = predicate_intern(
             &wtxn,
-            "test",
+            crate::tables::scope::DeclScope::base("test"),
             name,
             Some(StatementKind::Attribute),
             /* object: Value */ 2,
@@ -1204,7 +1204,7 @@ mod tests {
         let wtxn = db.write_txn().unwrap();
         let id = predicate_intern(
             &wtxn,
-            "test",
+            crate::tables::scope::DeclScope::base("test"),
             name,
             Some(StatementKind::Event),
             /* object: any */ 0,
@@ -1802,7 +1802,7 @@ mod tests {
         let wtxn = db.write_txn().unwrap();
         let id = predicate_intern(
             &wtxn,
-            "test",
+            crate::tables::scope::DeclScope::base("test"),
             name,
             Some(StatementKind::Fact),
             ObjectConstraint::entity(entity_type.raw()),
@@ -2568,7 +2568,7 @@ mod tests {
         let wtxn = db.write_txn().unwrap();
         let id = crate::schema::predicate::predicate_intern_with_subject(
             &wtxn,
-            "test",
+            crate::tables::scope::DeclScope::base("test"),
             name,
             Some(StatementKind::Fact),
             ObjectConstraint::ANY,
@@ -2651,7 +2651,8 @@ mod tests {
     #[test]
     fn predicate_gc_spares_a_coined_predicate_that_statements_still_use() {
         use crate::schema::predicate::predicate_reclaim_orphans;
-        use crate::tables::predicate::PREDICATES_BY_QNAME_TABLE;
+        use crate::tables::predicate::PREDICATES_BY_SCOPE_TABLE;
+        use crate::tables::scope::SPACE_BASE;
 
         const DAY: u64 = 24 * 60 * 60 * 1_000_000_000;
         let (_dir, mut db) = open_db();
@@ -2661,9 +2662,14 @@ mod tests {
         // Coin it the way a write does, not via the declared path.
         let pred = {
             let wtxn = db.write_txn().unwrap();
-            let id =
-                crate::schema::predicate::predicate_intern_or_get(&wtxn, "test", "mentors", 1, 0)
-                    .unwrap();
+            let id = crate::schema::predicate::predicate_intern_or_get(
+                &wtxn,
+                crate::tables::scope::DeclScope::base("test"),
+                "mentors",
+                1,
+                0,
+            )
+            .unwrap();
             wtxn.commit().unwrap();
             id
         };
@@ -2688,9 +2694,9 @@ mod tests {
         assert_eq!(summary.still_referenced, 1);
 
         let rtxn = db.read_txn().unwrap();
-        let idx = rtxn.open_table(PREDICATES_BY_QNAME_TABLE).unwrap();
+        let idx = rtxn.open_table(PREDICATES_BY_SCOPE_TABLE).unwrap();
         assert!(
-            idx.get("test:mentors").unwrap().is_some(),
+            idx.get(&("test:mentors", SPACE_BASE)).unwrap().is_some(),
             "the predicate row survives"
         );
     }

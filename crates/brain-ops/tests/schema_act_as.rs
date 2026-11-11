@@ -35,7 +35,8 @@ use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_protocol::envelope::request::RequestBody;
 use brain_protocol::envelope::response::{GetCapabilitiesRequest, ResponseBody};
 use brain_protocol::{
-    ActAs, SchemaGetRequest, SchemaReplaceRequest, SchemaUploadRequest, SchemaValidateRequest,
+    ActAs, SchemaGetRequest, SchemaReplaceRequest, SchemaScope, SchemaUploadRequest,
+    SchemaValidateRequest,
 };
 
 struct NopDispatcher;
@@ -195,6 +196,7 @@ fn delegated_schema_ops_without_grant_keep_standard_rights() {
                 force_drop_existing: true,
                 request_id: [2; 16],
                 act_as: act_as("acme", 0),
+                scope: SchemaScope::Namespace,
             }),
             delegated("acme", 0),
             &ctx,
@@ -208,6 +210,7 @@ fn delegated_schema_ops_without_grant_keep_standard_rights() {
             RequestBody::SchemaValidate(SchemaValidateRequest {
                 schema_document: ACME_V1.into(),
                 act_as: act_as("acme", 0),
+                scope: SchemaScope::Namespace,
             }),
             delegated("acme", 0),
             &ctx,
@@ -259,6 +262,7 @@ fn delegated_schema_ops_with_grant_are_scoped_to_the_tenant() {
             RequestBody::SchemaValidate(SchemaValidateRequest {
                 schema_document: GLOBEX_V1.into(),
                 act_as: act_as("acme", 0),
+                scope: SchemaScope::Namespace,
             }),
             delegated("acme", 0),
             &ctx,
@@ -274,6 +278,7 @@ fn delegated_schema_ops_with_grant_are_scoped_to_the_tenant() {
                     force_drop_existing: true,
                     request_id: [rid; 16],
                     act_as: act_as("acme", grant),
+                    scope: SchemaScope::Namespace,
                 }),
                 delegated("acme", grant),
                 &ctx,

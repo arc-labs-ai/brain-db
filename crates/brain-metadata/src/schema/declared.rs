@@ -29,6 +29,7 @@ use crate::system_schema::SYSTEM_SCHEMA_NAMESPACE;
 use crate::tables::schema_version::{
     SchemaVersionRow, SCHEMA_ACTIVE_VERSIONS_TABLE, SCHEMA_VERSIONS_TABLE,
 };
+use crate::tables::scope::DeclScope;
 
 /// The predicates and relation types a namespace's ACTIVE user schema
 /// declares, each list sorted by local name (so lookups can binary-search
@@ -273,48 +274,66 @@ fn decode_row(namespace: &str, row: &SchemaVersionRow) -> Option<DeclaredVocabul
     }
 }
 
-/// The declared vocabulary of `namespace`'s ACTIVE user schema, or `None`
-/// when the namespace is the system `brain` namespace, has no active
-/// schema, or its schema declares no predicates / relation types.
+/// The vocabulary one scope declares, resolved narrowest-first: the space's
+/// own document, then the namespace-wide one.
+///
+/// A space that uploaded no document of its own sees the tenant's, which is
+/// what keeps an overlay additive rather than isolating.
+///
+/// # Errors
+/// Propagates a schema-store read failure.
 pub fn declared_vocabulary(
     rtxn: &ReadTransaction,
-    namespace: &str,
+    scope: DeclScope<'_>,
 ) -> Result<Option<DeclaredVocabulary>, SchemaStoreError> {
+    let (namespace, space) = (scope.namespace(), scope.space_id());
     if namespace == SYSTEM_SCHEMA_NAMESPACE {
         return Ok(None);
     }
     let active = rtxn.open_table(SCHEMA_ACTIVE_VERSIONS_TABLE)?;
-    let Some(version) = active.get(&namespace)?.map(|g| g.value()) else {
-        return Ok(None);
-    };
     let versions = rtxn.open_table(SCHEMA_VERSIONS_TABLE)?;
-    let Some(row) = versions.get(&(namespace, version))?.map(|g| g.value()) else {
+    let mut found: Option<SchemaVersionRow> = None;
+    for sp in crate::tables::scope::space_chain(space) {
+        let Some(version) = active.get(&(namespace, sp))?.map(|g| g.value()) else {
+            continue;
+        };
+        if let Some(row) = versions.get(&(namespace, sp, version))?.map(|g| g.value()) {
+            found = Some(row);
+            break;
+        }
+    }
+    let Some(row) = found else {
         return Ok(None);
     };
     Ok(decode_row(namespace, &row).filter(|v| !v.is_empty()))
 }
 
-/// Write-transaction counterpart to [`declared_vocabulary`], for the
-/// extractor's apply pass (which resolves predicates inside its wtxn).
+/// Write-transaction counterpart to [`declared_vocabulary`].
+///
+/// # Errors
+/// Propagates a schema-store read failure.
 pub fn declared_vocabulary_wtxn(
     wtxn: &WriteTransaction,
-    namespace: &str,
+    scope: DeclScope<'_>,
 ) -> Result<Option<DeclaredVocabulary>, SchemaStoreError> {
+    let (namespace, space) = (scope.namespace(), scope.space_id());
     if namespace == SYSTEM_SCHEMA_NAMESPACE {
         return Ok(None);
     }
-    let version = {
-        let active = wtxn.open_table(SCHEMA_ACTIVE_VERSIONS_TABLE)?;
-        let v = active.get(&namespace)?.map(|g| g.value());
-        v
-    };
-    let Some(version) = version else {
-        return Ok(None);
-    };
     let row = {
+        let active = wtxn.open_table(SCHEMA_ACTIVE_VERSIONS_TABLE)?;
         let versions = wtxn.open_table(SCHEMA_VERSIONS_TABLE)?;
-        let r = versions.get(&(namespace, version))?.map(|g| g.value());
-        r
+        let mut found: Option<SchemaVersionRow> = None;
+        for sp in crate::tables::scope::space_chain(space) {
+            let Some(version) = active.get(&(namespace, sp))?.map(|g| g.value()) else {
+                continue;
+            };
+            if let Some(r) = versions.get(&(namespace, sp, version))?.map(|g| g.value()) {
+                found = Some(r);
+                break;
+            }
+        }
+        found
     };
     let Some(row) = row else {
         return Ok(None);
@@ -347,9 +366,17 @@ fn declared_entity_types_by_namespace(
     let versions = rtxn.open_table(SCHEMA_VERSIONS_TABLE)?;
     for entry in active.iter()? {
         let (k, v) = entry?;
-        let ns = k.value().to_string();
+        // The key carries the scope. A namespace's declared set is the UNION
+        // across its scopes: a type one of its spaces declared is still that
+        // tenant's, and treating it as foreign would hide a space's own
+        // vocabulary from its extractor.
+        let (ns, space) = k.value();
+        let ns = ns.to_string();
         let version = v.value();
-        let Some(row) = versions.get(&(ns.as_str(), version))?.map(|g| g.value()) else {
+        let Some(row) = versions
+            .get(&(ns.as_str(), space, version))?
+            .map(|g| g.value())
+        else {
             continue;
         };
         let Ok(schema) = serde_json::from_slice::<Schema>(&row.source) else {
@@ -364,6 +391,87 @@ fn declared_entity_types_by_namespace(
             })
             .collect();
         out.insert(ns, names);
+    }
+    Ok(out)
+}
+
+/// Write-transaction counterpart to [`declared_entity_type_names`], for the
+/// extractor's apply pass, which resolves entity types inside its wtxn.
+///
+/// # Errors
+/// Propagates a schema-store read failure.
+pub fn declared_entity_type_names_wtxn(
+    wtxn: &WriteTransaction,
+    namespace: &str,
+) -> Result<std::collections::HashSet<String>, SchemaStoreError> {
+    let mut out = std::collections::HashSet::new();
+    let rows: Vec<(String, [u8; 16], u32)> = {
+        let active = wtxn.open_table(SCHEMA_ACTIVE_VERSIONS_TABLE)?;
+        let mut v = Vec::new();
+        for entry in active.iter()? {
+            let (k, val) = entry?;
+            let (ns, space) = k.value();
+            let ns = ns.to_string();
+            // Every scope of the system namespace and of this one. A type a
+            // space declared counts as declared for its tenant.
+            if ns == SYSTEM_SCHEMA_NAMESPACE || ns == namespace {
+                v.push((ns, space, val.value()));
+            }
+        }
+        v
+    };
+    let versions = wtxn.open_table(SCHEMA_VERSIONS_TABLE)?;
+    for (ns, space, version) in rows {
+        let Some(row) = versions
+            .get(&(ns.as_str(), space, version))?
+            .map(|g| g.value())
+        else {
+            continue;
+        };
+        let Ok(schema) = serde_json::from_slice::<Schema>(&row.source) else {
+            continue;
+        };
+        out.extend(schema.items.iter().filter_map(|i| match i {
+            SchemaItem::EntityType(e) => Some(e.name.clone()),
+            _ => None,
+        }));
+    }
+    Ok(out)
+}
+
+/// Entity-type names a namespace's extraction may legitimately produce: the
+/// system schema's built-ins plus the namespace's own declarations.
+///
+/// An extracted entity whose type is in neither set was asked for by nobody.
+/// The extractor coins such a type from a single sentence and
+/// `resolver::resolve_entity_type` interns it into the tenant's namespace
+/// instead of discarding the candidate, so it never appears in a drop count
+/// and the registry carries a row for it from then on. Counting entities
+/// against this set is what makes that noise measurable.
+///
+/// Distinct from the "visible" set [`entity_type_labels_for_namespaces`]
+/// computes: that one deliberately includes types no schema claims, because
+/// it tells the classifier what it may emit.
+///
+/// A namespace with no active schema gets the built-ins alone — everything
+/// else its extraction produces is unprompted. The system namespace gets the
+/// built-ins and nothing more.
+///
+/// # Errors
+/// Propagates a schema-store read failure.
+pub fn declared_entity_type_names(
+    rtxn: &ReadTransaction,
+    namespace: &str,
+) -> Result<std::collections::HashSet<String>, SchemaStoreError> {
+    let by_ns = declared_entity_types_by_namespace(rtxn)?;
+    let mut out = by_ns
+        .get(SYSTEM_SCHEMA_NAMESPACE)
+        .cloned()
+        .unwrap_or_default();
+    if namespace != SYSTEM_SCHEMA_NAMESPACE {
+        if let Some(own) = by_ns.get(namespace) {
+            out.extend(own.iter().cloned());
+        }
     }
     Ok(out)
 }
@@ -442,13 +550,7 @@ mod tests {
         let parsed = brain_protocol::schema::parse_schema(src).expect("parse");
         let validated = brain_protocol::schema::validate(&parsed).expect("validate");
         let wtxn = db.begin_write().unwrap();
-        schema_upload(
-            &wtxn,
-            &validated,
-            crate::tables::entity_type::SPACE_BASE,
-            NOW,
-        )
-        .unwrap();
+        schema_upload(&wtxn, &validated, crate::tables::scope::SPACE_BASE, NOW).unwrap();
         wtxn.commit().unwrap();
     }
 
@@ -481,7 +583,7 @@ define relation_type clones {
         let db = fresh_db(&dir);
         upload(&db, ACME);
         let rtxn = db.begin_read().unwrap();
-        let v = declared_vocabulary(&rtxn, "acme")
+        let v = declared_vocabulary(&rtxn, DeclScope::base("acme"))
             .unwrap()
             .expect("declared");
         assert_eq!(v.namespace, "acme");
@@ -501,14 +603,22 @@ define relation_type clones {
         let rtxn = db.begin_read().unwrap();
         // Another namespace, the system namespace, and an unknown one all
         // see nothing of acme's vocabulary.
-        assert!(declared_vocabulary(&rtxn, "globex").unwrap().is_none());
-        assert!(declared_vocabulary(&rtxn, SYSTEM_SCHEMA_NAMESPACE)
+        assert!(declared_vocabulary(&rtxn, DeclScope::base("globex"))
             .unwrap()
             .is_none());
+        assert!(
+            declared_vocabulary(&rtxn, DeclScope::base(SYSTEM_SCHEMA_NAMESPACE))
+                .unwrap()
+                .is_none()
+        );
         drop(rtxn);
         let wtxn = db.begin_write().unwrap();
-        assert!(declared_vocabulary_wtxn(&wtxn, "globex").unwrap().is_none());
-        assert!(declared_vocabulary_wtxn(&wtxn, "acme").unwrap().is_some());
+        assert!(declared_vocabulary_wtxn(&wtxn, DeclScope::base("globex"))
+            .unwrap()
+            .is_none());
+        assert!(declared_vocabulary_wtxn(&wtxn, DeclScope::base("acme"))
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -517,7 +627,9 @@ define relation_type clones {
         let db = fresh_db(&dir);
         upload(&db, ACME);
         let rtxn = db.begin_read().unwrap();
-        let v = declared_vocabulary(&rtxn, "acme").unwrap().unwrap();
+        let v = declared_vocabulary(&rtxn, DeclScope::base("acme"))
+            .unwrap()
+            .unwrap();
         let block = v.render_prompt_block();
         assert_eq!(block, v.render_prompt_block(), "stable across calls");
         assert!(

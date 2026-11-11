@@ -1,5 +1,6 @@
 //! Unit tests for the tantivy rebuild worker.
 
+use brain_metadata::DeclScope;
 use std::fs;
 use std::path::Path;
 
@@ -37,8 +38,7 @@ fn ensure_person_type(metadata: &mut MetadataDb) -> EntityTypeId {
     let wtxn = metadata.write_txn().expect("wtxn");
     let id = entity_type_intern(
         &wtxn,
-        brain_core::NamespaceId::SYSTEM.raw(),
-        brain_metadata::tables::entity_type::SPACE_BASE,
+        brain_metadata::TypeScope::base(brain_core::NamespaceId::SYSTEM.raw()),
         PERSON_TYPE,
         Vec::new(),
         0,
@@ -91,7 +91,8 @@ fn intern_predicate(metadata: &mut MetadataDb, namespace: &str, name: &str) -> P
     // the rebuild tests reuse declared predicates like `brain:speaks`
     // and `brain:current_role` which already exist post-seed.
     let wtxn = metadata.write_txn().expect("wtxn");
-    let id = predicate_intern_or_get(&wtxn, namespace, name, 0, 0).expect("predicate");
+    let id =
+        predicate_intern_or_get(&wtxn, DeclScope::base(namespace), name, 0, 0).expect("predicate");
     wtxn.commit().expect("commit");
     id
 }

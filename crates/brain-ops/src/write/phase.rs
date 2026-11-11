@@ -166,7 +166,7 @@ pub enum Phase {
         namespace: String,
         version: u32,
         /// The scope the declarations land at:
-        /// `brain_metadata::tables::entity_type::SPACE_BASE` (all-zero) for
+        /// `brain_metadata::tables::scope::SPACE_BASE` (all-zero) for
         /// the tenant's namespace-wide schema, a real space for an overlay
         /// only that space resolves.
         ///

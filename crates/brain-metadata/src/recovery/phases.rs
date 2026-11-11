@@ -25,7 +25,7 @@ use crate::entity::ops::{
     entity_get_inside_wtxn, entity_put, entity_rename, entity_tombstone, entity_update,
     normalize_name, EntityOpError,
 };
-use crate::extractor::ops::extractor_drop_namespace;
+use crate::extractor::ops::extractor_drop_declared;
 use crate::recovery::phase_bodies::{
     decode_entity_create, decode_entity_merge, decode_entity_rename, decode_entity_tombstone,
     decode_entity_unmerge, decode_entity_update, decode_schema_update, decode_session_create,
@@ -43,6 +43,7 @@ use crate::statement::{
     statement_create, statement_supersede, statement_tombstone, StatementOpError,
 };
 use crate::system_schema::SYSTEM_SCHEMA_NAMESPACE;
+use crate::tables::scope::DeclScope;
 use crate::tables::statement::{
     statement_flags, statement_from_metadata, StatementMetadata, STATEMENTS_TABLE,
 };
@@ -227,9 +228,15 @@ impl MetadataDb {
     }
 
     /// Replay a `SchemaUpdate` body: re-parse + re-validate the DSL blob,
-    /// then `schema_upload`. Idempotent: skips when (namespace, version)
-    /// already exists (otherwise `schema_upload`'s auto-increment would
-    /// mint a duplicate version on re-replay).
+    /// then `schema_upload`. Idempotent: skips when this scope already holds
+    /// the version (otherwise `schema_upload`'s auto-increment would mint a
+    /// duplicate on re-replay).
+    ///
+    /// The scope is part of the key. Versions count per `(namespace, space)`,
+    /// so a space's first document is version 1 just as the namespace base's
+    /// was — checking `(namespace, version)` alone would find the base's row
+    /// and skip the space's replay, and that space's schema would never be
+    /// applied.
     pub(super) fn apply_schema_update(
         &self,
         lsn: u64,
@@ -239,7 +246,7 @@ impl MetadataDb {
             .map_err(|e| MetadataSinkError::Corruption(format!("schema_update decode: {e}")))?;
         let already = {
             let rtxn = self.read_txn().map_err(transient)?;
-            schema_get(&rtxn, &b.namespace, b.version)
+            schema_get(&rtxn, DeclScope::space(&b.namespace, b.space), b.version)
                 .map_err(|e| MetadataSinkError::Corruption(format!("schema_get: {e}")))?
                 .is_some()
         };
@@ -287,12 +294,12 @@ impl MetadataDb {
         } else {
             SourceMode::Merge
         };
-        let context_namespace = if destructive {
-            SYSTEM_SCHEMA_NAMESPACE
+        let context_scope = if destructive {
+            DeclScope::base(SYSTEM_SCHEMA_NAMESPACE)
         } else {
-            b.namespace.as_str()
+            DeclScope::space(b.namespace.as_str(), b.space)
         };
-        let declared = declared_context_wtxn(&wtxn, context_namespace)
+        let declared = declared_context_wtxn(&wtxn, context_scope)
             .map_err(|e| MetadataSinkError::Corruption(format!("declared context: {e}")))?;
         let validated = validate_with(&parsed, &declared).map_err(|errs| {
             MetadataSinkError::Corruption(format!("schema re-validate: {errs:?}"))
@@ -302,25 +309,37 @@ impl MetadataDb {
             // the same order the live apply path uses, so replay converges on
             // identical state. A plain UPLOAD carries an empty delta.
             if b.replace_all {
-                predicate_drop_schema_declared(&wtxn, &b.namespace).map_err(|e| {
-                    MetadataSinkError::Corruption(format!("predicate drop-all: {e}"))
-                })?;
-                relation_type_drop_schema_declared(&wtxn, &b.namespace).map_err(|e| {
-                    MetadataSinkError::Corruption(format!("relation_type drop-all: {e}"))
-                })?;
-                extractor_drop_namespace(&wtxn, &b.namespace).map_err(|e| {
-                    MetadataSinkError::Corruption(format!("extractor drop-all: {e}"))
-                })?;
+                predicate_drop_schema_declared(&wtxn, DeclScope::space(&b.namespace, b.space))
+                    .map_err(|e| {
+                        MetadataSinkError::Corruption(format!("predicate drop-all: {e}"))
+                    })?;
+                relation_type_drop_schema_declared(&wtxn, DeclScope::space(&b.namespace, b.space))
+                    .map_err(|e| {
+                        MetadataSinkError::Corruption(format!("relation_type drop-all: {e}"))
+                    })?;
+                extractor_drop_declared(&wtxn, DeclScope::space(&b.namespace, b.space)).map_err(
+                    |e| MetadataSinkError::Corruption(format!("extractor drop-all: {e}")),
+                )?;
             }
             for drop in &b.drops {
                 match drop.kind {
                     brain_protocol::schema_drop_target::PREDICATE => {
-                        predicate_drop_one(&wtxn, &b.namespace, &drop.name).map_err(|e| {
+                        predicate_drop_one(
+                            &wtxn,
+                            DeclScope::space(&b.namespace, b.space),
+                            &drop.name,
+                        )
+                        .map_err(|e| {
                             MetadataSinkError::Corruption(format!("predicate drop: {e}"))
                         })?;
                     }
                     brain_protocol::schema_drop_target::RELATION_TYPE => {
-                        relation_type_drop_one(&wtxn, &b.namespace, &drop.name).map_err(|e| {
+                        relation_type_drop_one(
+                            &wtxn,
+                            DeclScope::space(&b.namespace, b.space),
+                            &drop.name,
+                        )
+                        .map_err(|e| {
                             MetadataSinkError::Corruption(format!("relation_type drop: {e}"))
                         })?;
                     }
@@ -470,9 +489,13 @@ impl MetadataDb {
             };
             if !already {
                 if let Some((namespace, name)) = &b.predicate_intern_hint {
+                    // The statement row carries the scope the create ran
+                    // under, so replay re-interns there. Re-interning at the
+                    // namespace base would plant a space's own vocabulary
+                    // where every sibling space resolves it.
                     let pid = predicate_intern_or_get(
                         &wtxn,
-                        namespace,
+                        DeclScope::space(namespace, scope.space_id_bytes),
                         name,
                         /* first_seen_lsn */ 0,
                         s.extracted_at_unix_nanos,
@@ -743,6 +766,7 @@ impl MetadataDb {
 
 #[cfg(all(test, not(miri)))]
 mod tests {
+    use crate::tables::scope::DeclScope;
     use brain_core::{Entity, EntityId, EntityType};
     use tempfile::TempDir;
 
@@ -1118,7 +1142,7 @@ mod tests {
         let body = encode_schema_update(&SchemaUpdateBody {
             namespace: "acme".into(),
             version: 1,
-            space: crate::tables::entity_type::SPACE_BASE,
+            space: crate::tables::scope::SPACE_BASE,
             blob: src.as_bytes().to_vec(),
             created_at_unix_nanos: NOW + 200,
             replace_all: false,
@@ -1129,7 +1153,10 @@ mod tests {
         db.apply_schema_update(15, &body).unwrap();
 
         let rtxn = db.read_txn().unwrap();
-        assert_eq!(schema_active(&rtxn, "acme").unwrap(), Some(1));
+        assert_eq!(
+            schema_active(&rtxn, DeclScope::base("acme")).unwrap(),
+            Some(1)
+        );
     }
 
     #[test]
@@ -1161,7 +1188,7 @@ define predicate dislikes {
         let v1 = encode_schema_update(&SchemaUpdateBody {
             namespace: "acme".into(),
             version: 1,
-            space: crate::tables::entity_type::SPACE_BASE,
+            space: crate::tables::scope::SPACE_BASE,
             blob: v1_src.as_bytes().to_vec(),
             created_at_unix_nanos: NOW,
             replace_all: false,
@@ -1170,13 +1197,20 @@ define predicate dislikes {
         db.apply_schema_update(10, &v1).unwrap();
         {
             let rtxn = db.read_txn().unwrap();
-            assert_eq!(schema_active(&rtxn, "acme").unwrap(), Some(1));
-            assert!(predicate_lookup_by_qname(&rtxn, "acme", "likes")
-                .unwrap()
-                .is_some());
-            assert!(predicate_lookup_by_qname(&rtxn, "acme", "dislikes")
-                .unwrap()
-                .is_some());
+            assert_eq!(
+                schema_active(&rtxn, DeclScope::base("acme")).unwrap(),
+                Some(1)
+            );
+            assert!(
+                predicate_lookup_by_qname(&rtxn, DeclScope::base("acme"), "likes")
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                predicate_lookup_by_qname(&rtxn, DeclScope::base("acme"), "dislikes")
+                    .unwrap()
+                    .is_some()
+            );
         }
 
         // v2 — DROP predicate `likes`. The narrowed document (item removed,
@@ -1191,7 +1225,7 @@ define predicate dislikes {
         let v2 = encode_schema_update(&SchemaUpdateBody {
             namespace: "acme".into(),
             version: 2,
-            space: crate::tables::entity_type::SPACE_BASE,
+            space: crate::tables::scope::SPACE_BASE,
             blob: serde_json::to_vec(&narrowed).unwrap(),
             created_at_unix_nanos: NOW + 1,
             replace_all: false,
@@ -1203,15 +1237,18 @@ define predicate dislikes {
         db.apply_schema_update(11, &v2).unwrap();
         {
             let rtxn = db.read_txn().unwrap();
-            assert_eq!(schema_active(&rtxn, "acme").unwrap(), Some(2));
+            assert_eq!(
+                schema_active(&rtxn, DeclScope::base("acme")).unwrap(),
+                Some(2)
+            );
             assert!(
-                predicate_lookup_by_qname(&rtxn, "acme", "likes")
+                predicate_lookup_by_qname(&rtxn, DeclScope::base("acme"), "likes")
                     .unwrap()
                     .is_none(),
                 "dropped predicate must be gone after replay"
             );
             assert!(
-                predicate_lookup_by_qname(&rtxn, "acme", "dislikes")
+                predicate_lookup_by_qname(&rtxn, DeclScope::base("acme"), "dislikes")
                     .unwrap()
                     .is_some(),
                 "sibling predicate must survive a targeted drop"
@@ -1230,7 +1267,7 @@ define predicate admires {
         let v3 = encode_schema_update(&SchemaUpdateBody {
             namespace: "acme".into(),
             version: 3,
-            space: crate::tables::entity_type::SPACE_BASE,
+            space: crate::tables::scope::SPACE_BASE,
             blob: v3_src.as_bytes().to_vec(),
             created_at_unix_nanos: NOW + 2,
             replace_all: true,
@@ -1239,15 +1276,18 @@ define predicate admires {
         db.apply_schema_update(12, &v3).unwrap();
         {
             let rtxn = db.read_txn().unwrap();
-            assert_eq!(schema_active(&rtxn, "acme").unwrap(), Some(3));
+            assert_eq!(
+                schema_active(&rtxn, DeclScope::base("acme")).unwrap(),
+                Some(3)
+            );
             assert!(
-                predicate_lookup_by_qname(&rtxn, "acme", "admires")
+                predicate_lookup_by_qname(&rtxn, DeclScope::base("acme"), "admires")
                     .unwrap()
                     .is_some(),
                 "replacement predicate must be present"
             );
             assert!(
-                predicate_lookup_by_qname(&rtxn, "acme", "dislikes")
+                predicate_lookup_by_qname(&rtxn, DeclScope::base("acme"), "dislikes")
                     .unwrap()
                     .is_none(),
                 "replace_all must have dropped every prior declared predicate"
@@ -1261,16 +1301,25 @@ define predicate admires {
             db.apply_schema_update(lsn, body).unwrap();
         }
         let rtxn = db.read_txn().unwrap();
-        assert_eq!(schema_active(&rtxn, "acme").unwrap(), Some(3));
-        assert!(predicate_lookup_by_qname(&rtxn, "acme", "admires")
-            .unwrap()
-            .is_some());
-        assert!(predicate_lookup_by_qname(&rtxn, "acme", "likes")
-            .unwrap()
-            .is_none());
-        assert!(predicate_lookup_by_qname(&rtxn, "acme", "dislikes")
-            .unwrap()
-            .is_none());
+        assert_eq!(
+            schema_active(&rtxn, DeclScope::base("acme")).unwrap(),
+            Some(3)
+        );
+        assert!(
+            predicate_lookup_by_qname(&rtxn, DeclScope::base("acme"), "admires")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            predicate_lookup_by_qname(&rtxn, DeclScope::base("acme"), "likes")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            predicate_lookup_by_qname(&rtxn, DeclScope::base("acme"), "dislikes")
+                .unwrap()
+                .is_none()
+        );
     }
 
     // ----- statement create / tombstone ---------------------------------

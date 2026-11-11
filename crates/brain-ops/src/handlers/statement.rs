@@ -38,6 +38,7 @@ use brain_metadata::statement::{
     evidence_overflow_load, statement_get, statement_history_page, statement_list_page,
     StatementListCursor, StatementListFilter, StatementPageExtra,
 };
+use brain_metadata::DeclScope;
 use brain_planner::WriterError;
 use brain_protocol::envelope::response::EventType;
 use brain_protocol::{
@@ -110,25 +111,38 @@ pub async fn handle_statement_create(
     // hint and apply does the work inside the main submit wtxn,
     // collapsing what used to be three commits (intern, statement,
     // flag stamp) into one.
+    // Vocabulary resolves in the scope the caller writes into: the space's
+    // own declarations when it has them, otherwise the namespace's. Asking
+    // the namespace base instead would reject a predicate the caller's own
+    // space declares.
+    let caller_space: [u8; 16] = ctx.executor.caller_space.into();
     let (predicate_id_opt, schemaless) = {
         let rtxn = ctx
             .executor
             .metadata
             .read_txn()
             .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
-        let active_version = schema_active(&rtxn, namespace)
+        let active_version = schema_active(&rtxn, DeclScope::space(namespace, caller_space))
             .map_err(|e| OpError::Internal(format!("schema_active: {e}")))?;
         let predicate_id_opt: Option<PredicateId> = match active_version {
             Some(version) => {
-                let pred = predicate_lookup_by_qname(&rtxn, namespace, name)
-                    .map_err(OpError::from)?
-                    .ok_or_else(|| OpError::PredicateNotInSchema {
-                        predicate: req.predicate.clone(),
-                        namespace: namespace.to_string(),
-                        version,
-                    })?;
-                let active = predicates_active_for_schema(&rtxn, namespace, version)
-                    .map_err(OpError::from)?;
+                let pred = predicate_lookup_by_qname(
+                    &rtxn,
+                    DeclScope::space(namespace, caller_space),
+                    name,
+                )
+                .map_err(OpError::from)?
+                .ok_or_else(|| OpError::PredicateNotInSchema {
+                    predicate: req.predicate.clone(),
+                    namespace: namespace.to_string(),
+                    version,
+                })?;
+                let active = predicates_active_for_schema(
+                    &rtxn,
+                    DeclScope::space(namespace, caller_space),
+                    version,
+                )
+                .map_err(OpError::from)?;
                 if !active.contains(&pred.id) {
                     return Err(OpError::PredicateNotInSchema {
                         predicate: req.predicate.clone(),
@@ -138,9 +152,11 @@ pub async fn handle_statement_create(
                 }
                 Some(pred.id)
             }
-            None => predicate_lookup_by_qname(&rtxn, namespace, name)
-                .map_err(OpError::from)?
-                .map(|p| p.id),
+            None => {
+                predicate_lookup_by_qname(&rtxn, DeclScope::space(namespace, caller_space), name)
+                    .map_err(OpError::from)?
+                    .map(|p| p.id)
+            }
         };
         let schemaless = active_version.is_none();
         (predicate_id_opt, schemaless)
@@ -352,26 +368,36 @@ pub async fn handle_statement_supersede(
     }
     let (namespace, name) = split_qname(&req.new_statement.predicate)?;
 
-    // Step A — pre-submit predicate resolution mirror of CREATE.
+    // Step A — pre-submit predicate resolution mirror of CREATE, resolved in
+    // the same scope.
+    let caller_space: [u8; 16] = ctx.executor.caller_space.into();
     let (predicate_id_opt, schemaless) = {
         let rtxn = ctx
             .executor
             .metadata
             .read_txn()
             .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
-        let active_version = schema_active(&rtxn, namespace)
+        let active_version = schema_active(&rtxn, DeclScope::space(namespace, caller_space))
             .map_err(|e| OpError::Internal(format!("schema_active: {e}")))?;
         let pid = match active_version {
             Some(version) => {
-                let pred = predicate_lookup_by_qname(&rtxn, namespace, name)
-                    .map_err(OpError::from)?
-                    .ok_or_else(|| OpError::PredicateNotInSchema {
-                        predicate: req.new_statement.predicate.clone(),
-                        namespace: namespace.to_string(),
-                        version,
-                    })?;
-                let active = predicates_active_for_schema(&rtxn, namespace, version)
-                    .map_err(OpError::from)?;
+                let pred = predicate_lookup_by_qname(
+                    &rtxn,
+                    DeclScope::space(namespace, caller_space),
+                    name,
+                )
+                .map_err(OpError::from)?
+                .ok_or_else(|| OpError::PredicateNotInSchema {
+                    predicate: req.new_statement.predicate.clone(),
+                    namespace: namespace.to_string(),
+                    version,
+                })?;
+                let active = predicates_active_for_schema(
+                    &rtxn,
+                    DeclScope::space(namespace, caller_space),
+                    version,
+                )
+                .map_err(OpError::from)?;
                 if !active.contains(&pred.id) {
                     return Err(OpError::PredicateNotInSchema {
                         predicate: req.new_statement.predicate.clone(),
@@ -381,9 +407,11 @@ pub async fn handle_statement_supersede(
                 }
                 Some(pred.id)
             }
-            None => predicate_lookup_by_qname(&rtxn, namespace, name)
-                .map_err(OpError::from)?
-                .map(|p| p.id),
+            None => {
+                predicate_lookup_by_qname(&rtxn, DeclScope::space(namespace, caller_space), name)
+                    .map_err(OpError::from)?
+                    .map(|p| p.id)
+            }
         };
         (pid, active_version.is_none())
     };
@@ -401,8 +429,8 @@ pub async fn handle_statement_supersede(
                 .metadata
                 .write_txn()
                 .map_err(|e| OpError::Internal(format!("write_txn: {e}")))?;
-            let pid =
-                predicate_intern_or_get(&wtxn, namespace, name, 0, now).map_err(OpError::from)?;
+            let pid = predicate_intern_or_get(&wtxn, DeclScope::base(namespace), name, 0, now)
+                .map_err(OpError::from)?;
             wtxn.commit()
                 .map_err(|e| OpError::Internal(format!("commit: {e}")))?;
             pid
@@ -799,6 +827,8 @@ pub async fn handle_statement_list(
         brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_space);
     let filter_sig = statement_list_filter_signature(&req);
     let resume_after = decode_statement_cursor(&req.cursor, scope, &filter_sig)?;
+    // The predicate filter resolves in the scope the caller reads in.
+    let caller_space: [u8; 16] = ctx.executor.caller_space.into();
     // Wire filter byte: `0` = no filter; any non-zero byte is the
     // `brain_core` kind byte + 1 (so `1=Fact … 6=Directive`, `7+ = Custom`).
     let kind = match req.kind {
@@ -829,9 +859,11 @@ pub async fn handle_statement_list(
         } else {
             validate_predicate_qname(&req.predicate)?;
             let (ns, name) = split_qname(&req.predicate)?;
-            let active_version = schema_active(&rtxn, ns)
+            let active_version = schema_active(&rtxn, DeclScope::space(ns, caller_space))
                 .map_err(|e| OpError::Internal(format!("schema_active: {e}")))?;
-            match predicate_lookup_by_qname(&rtxn, ns, name).map_err(OpError::from)? {
+            match predicate_lookup_by_qname(&rtxn, DeclScope::space(ns, caller_space), name)
+                .map_err(OpError::from)?
+            {
                 Some(p) => Some(p.id),
                 None => {
                     if let Some(version) = active_version {

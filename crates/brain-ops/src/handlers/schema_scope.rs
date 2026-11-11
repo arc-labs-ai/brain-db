@@ -14,7 +14,8 @@
 
 use brain_metadata::schema::store::{declared_context, schema_active, SchemaStoreError};
 use brain_metadata::system_schema::SYSTEM_SCHEMA_NAMESPACE;
-use brain_metadata::tables::entity_type::SPACE_BASE;
+use brain_metadata::tables::scope::SPACE_BASE;
+use brain_metadata::DeclScope;
 use brain_planner::WriterError;
 use brain_protocol::schema::DeclaredContext;
 use brain_protocol::SchemaScope;
@@ -86,15 +87,24 @@ pub fn caller_namespace_name(ctx: &OpsContext) -> Result<String, OpError> {
         })
 }
 
-/// The namespace's active schema version, or `None` when it has never
-/// declared one.
-pub fn current_active(ctx: &OpsContext, namespace: &str) -> Result<Option<u32>, OpError> {
+/// The active schema version `space` resolves to — its own document's when
+/// it declares one, otherwise the namespace's — or `None` when neither has.
+///
+/// `space` is the scope the caller is acting in, not a filter. Answering
+/// from the namespace base alone would report an overlay's version as the
+/// tenant's, so a dry-run inside a space would quote a version that space
+/// is not on.
+pub fn current_active(
+    ctx: &OpsContext,
+    namespace: &str,
+    space: [u8; 16],
+) -> Result<Option<u32>, OpError> {
     let rtxn = ctx
         .executor
         .metadata
         .read_txn()
         .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
-    schema_active(&rtxn, namespace).map_err(map_schema_store_error)
+    schema_active(&rtxn, DeclScope::space(namespace, space)).map_err(map_schema_store_error)
 }
 
 /// Type names an **additive** upload to `namespace` may reference without
@@ -105,13 +115,14 @@ pub fn current_active(ctx: &OpsContext, namespace: &str) -> Result<Option<u32>, 
 pub fn merge_declared_context(
     ctx: &OpsContext,
     namespace: &str,
+    space: [u8; 16],
 ) -> Result<DeclaredContext, OpError> {
     let rtxn = ctx
         .executor
         .metadata
         .read_txn()
         .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
-    declared_context(&rtxn, namespace).map_err(map_schema_store_error)
+    declared_context(&rtxn, DeclScope::space(namespace, space)).map_err(map_schema_store_error)
 }
 
 /// Type names the **system** schema declares, and nothing else.
@@ -139,7 +150,9 @@ pub fn system_declared_context(ctx: &OpsContext) -> Result<DeclaredContext, OpEr
         .metadata
         .read_txn()
         .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
-    declared_context(&rtxn, SYSTEM_SCHEMA_NAMESPACE).map_err(map_schema_store_error)
+    // Built-ins belong to the deployment, so they are always read at the base.
+    declared_context(&rtxn, DeclScope::base(SYSTEM_SCHEMA_NAMESPACE))
+        .map_err(map_schema_store_error)
 }
 
 /// Map a schema-store fault to the status the caller should see.

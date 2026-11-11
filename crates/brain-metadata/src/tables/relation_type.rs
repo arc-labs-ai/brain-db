@@ -16,15 +16,29 @@ use redb::TableDefinition;
 pub const RELATION_TYPES_TABLE: TableDefinition<'static, u32, RelationTypeDefinition> =
     TableDefinition::new("relation_types");
 
-/// `relation_types_by_qname` — secondary index for
-/// `(namespace, name) → RelationTypeId`. Key is the canonical
-/// `"namespace:name"` string; value is the type id.
-pub const RELATION_TYPES_BY_QNAME_TABLE: TableDefinition<'static, &str, u32> =
-    TableDefinition::new("relation_types_by_qname");
+/// `relation_types_by_scope` — secondary index for `(qname, space) →
+/// RelationTypeId`. Key is the canonical `"namespace:name"` paired with the
+/// space the declaration belongs to; value is the type id.
+///
+/// The qname already carries the namespace, so a relation type needs no
+/// system-namespace rung — `brain:reports_to` is addressed as itself.
+/// `space` adds the dimension the key lacked: two applications inside a
+/// tenant can mean different things by the same relation, and before this
+/// they shared one row.
+///
+/// `SPACE_BASE` is the namespace-wide declaration, and a lookup consults the
+/// caller's space before falling back to it, so a space that declares
+/// nothing of its own behaves exactly as it did when this index was keyed on
+/// qname alone.
+///
+/// `qname` leads the key so one relation type's copies across spaces are a
+/// contiguous range.
+pub const RELATION_TYPES_BY_SCOPE_TABLE: TableDefinition<'static, (&str, [u8; 16]), u32> =
+    TableDefinition::new("relation_types_by_scope");
 
 /// A registered relation type. The `(namespace, name)` pair is
 /// logically unique within a deployment; uniqueness is enforced by
-/// [`RELATION_TYPES_BY_QNAME_TABLE`] writes inside
+/// [`RELATION_TYPES_BY_SCOPE_TABLE`] writes inside
 /// `relation_type_intern`.
 ///
 /// `from_entity_type_id` / `to_entity_type_id`: `0` means "any
@@ -194,6 +208,7 @@ impl_redb_rkyv_value!(
 mod tests {
     use super::*;
     use crate::tables::fresh_db;
+    use crate::tables::scope::SPACE_BASE;
     use redb::ReadableDatabase;
 
     #[test]
@@ -217,8 +232,9 @@ mod tests {
         {
             let mut t = wtxn.open_table(RELATION_TYPES_TABLE).unwrap();
             t.insert(&row.relation_type_id, &row).unwrap();
-            let mut q = wtxn.open_table(RELATION_TYPES_BY_QNAME_TABLE).unwrap();
-            q.insert("acme:reports_to", &row.relation_type_id).unwrap();
+            let mut q = wtxn.open_table(RELATION_TYPES_BY_SCOPE_TABLE).unwrap();
+            q.insert(&("acme:reports_to", SPACE_BASE), &row.relation_type_id)
+                .unwrap();
         }
         wtxn.commit().unwrap();
 
@@ -230,9 +246,13 @@ mod tests {
         assert_eq!(got.cardinality(), Some(Cardinality::ManyToOne));
         assert!(!got.is_symmetric());
 
-        let q = rtxn.open_table(RELATION_TYPES_BY_QNAME_TABLE).unwrap();
-        let by_qname = q.get("acme:reports_to").unwrap().unwrap().value();
-        assert_eq!(by_qname, row.relation_type_id);
+        let q = rtxn.open_table(RELATION_TYPES_BY_SCOPE_TABLE).unwrap();
+        let at_base = q
+            .get(&("acme:reports_to", SPACE_BASE))
+            .unwrap()
+            .unwrap()
+            .value();
+        assert_eq!(at_base, row.relation_type_id);
     }
 
     #[test]

@@ -3796,6 +3796,7 @@ fn retriever_to_wire_name(r: brain_planner::retrieval::router::Retriever) -> Ret
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brain_metadata::DeclScope;
     use brain_planner::retrieval::router::Retriever;
 
     /// Minimal `MemoryResult` for merge tests — only `memory_id` matters to the
@@ -4976,11 +4977,19 @@ mod tests {
             .unwrap();
         }
         let p_plays = brain_metadata::schema::predicate::predicate_intern_or_get(
-            &wtxn, "test", "plays", 0, 1,
+            &wtxn,
+            DeclScope::base("test"),
+            "plays",
+            0,
+            1,
         )
         .unwrap();
         let p_enjoys = brain_metadata::schema::predicate::predicate_intern_or_get(
-            &wtxn, "test", "enjoys", 0, 1,
+            &wtxn,
+            DeclScope::base("test"),
+            "enjoys",
+            0,
+            1,
         )
         .unwrap();
         let mk = |subject: EntityId, pid, obj: &str| {
@@ -5124,7 +5133,11 @@ mod tests {
             .unwrap();
         }
         let pid = brain_metadata::schema::predicate::predicate_intern_or_get(
-            &wtxn, "test", "plays", 0, 1,
+            &wtxn,
+            DeclScope::base("test"),
+            "plays",
+            0,
+            1,
         )
         .unwrap();
         let mk = |subject: EntityId, obj: &str| {
@@ -5256,11 +5269,19 @@ mod tests {
             .unwrap();
         }
         let pid = brain_metadata::schema::predicate::predicate_intern_or_get(
-            &wtxn, "test", "plays", 0, 1,
+            &wtxn,
+            DeclScope::base("test"),
+            "plays",
+            0,
+            1,
         )
         .unwrap();
         let rtid = brain_metadata::relation::types::relation_type_intern_or_get(
-            &wtxn, "test", "knows", 0, 1,
+            &wtxn,
+            DeclScope::base("test"),
+            "knows",
+            0,
+            1,
         )
         .unwrap();
         let mk_stmt = |subject: EntityId, obj: &str| {

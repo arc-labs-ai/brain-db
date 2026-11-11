@@ -909,6 +909,7 @@ fn best_relation_answer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brain_metadata::DeclScope;
 
     #[test]
     fn meaningful_object_rejects_blank_values() {
@@ -1064,9 +1065,14 @@ mod tests {
             ),
         )
         .unwrap();
-        let pid =
-            brain_metadata::schema::predicate::predicate_intern_or_get(&wtxn, "test", "ran", 0, 1)
-                .unwrap();
+        let pid = brain_metadata::schema::predicate::predicate_intern_or_get(
+            &wtxn,
+            DeclScope::base("test"),
+            "ran",
+            0,
+            1,
+        )
+        .unwrap();
         wtxn.commit().unwrap();
         (dir, db, scope, subject, pid)
     }
@@ -1470,7 +1476,11 @@ mod tests {
         // The friend predicate is ORTHOGONAL to the cue (cosine 0): it is a
         // walkable edge but never itself an answer, so the anchor produces none.
         let p_friend = brain_metadata::schema::predicate::predicate_intern_or_get(
-            &wtxn, "test", "friend", 0, 1,
+            &wtxn,
+            DeclScope::base("test"),
+            "friend",
+            0,
+            1,
         )
         .unwrap();
         brain_metadata::schema::predicate::predicate_embedding_put(&wtxn, p_friend, &unit_at(1))
@@ -1479,7 +1489,7 @@ mod tests {
         // at Y that only the walk can reach.
         let p_occ = brain_metadata::schema::predicate::predicate_intern_or_get(
             &wtxn,
-            "test",
+            DeclScope::base("test"),
             "occupation",
             0,
             1,
@@ -1554,9 +1564,14 @@ mod tests {
             &Entity::new_active(x, EntityType::PERSON_ID, "X".into(), "x".into(), 1),
         )
         .unwrap();
-        let p_city =
-            brain_metadata::schema::predicate::predicate_intern_or_get(&wtxn, "test", "city", 0, 1)
-                .unwrap();
+        let p_city = brain_metadata::schema::predicate::predicate_intern_or_get(
+            &wtxn,
+            DeclScope::base("test"),
+            "city",
+            0,
+            1,
+        )
+        .unwrap();
         brain_metadata::schema::predicate::predicate_embedding_put(&wtxn, p_city, &cue).unwrap();
         let s_city = statement_with(
             x,

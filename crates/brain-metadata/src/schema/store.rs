@@ -21,6 +21,7 @@ use crate::system_schema::SYSTEM_SCHEMA_NAMESPACE;
 use crate::tables::schema_version::{
     SchemaVersionRow, SCHEMA_ACTIVE_VERSIONS_TABLE, SCHEMA_VERSIONS_TABLE, VALIDATOR_VERSION,
 };
+use crate::tables::scope::{space_chain, DeclScope};
 
 // ---------------------------------------------------------------------------
 // Errors.
@@ -123,22 +124,21 @@ fn merge_schema_items(active: &Schema, incoming: &Schema) -> Vec<SchemaItem> {
     out
 }
 
-/// Whether `namespace`'s active source already declares every item in
-/// `schema`.
+/// Whether the document `space` currently resolves to already names every
+/// item in `schema` — the test for "this upload would change nothing".
 ///
-/// The upload pre-flight classifies a document against the INTERNED
-/// definitions, so a document can be entirely "idempotent" while the stored
-/// source is missing those declarations — which is how a narrowed source
-/// became unrecoverable: re-uploading the full schema was classified as a
-/// no-op and never rewrote the source. Gating the no-op on this check as well
-/// means a re-upload heals the source instead of being skipped, while an
-/// unchanged re-upload still costs nothing.
+/// The comparison must be made against the scope the upload will land at. A
+/// space that inherits the tenant's document and re-uploads it unchanged is
+/// still a no-op; one that uploads a different document is not.
+///
+/// # Errors
+/// Propagates a schema-store read failure.
 pub fn active_source_covers(
     rtxn: &ReadTransaction,
-    namespace: &str,
+    scope: DeclScope<'_>,
     schema: &Schema,
 ) -> Result<bool, SchemaStoreError> {
-    let Some(active) = active_schema_ast(rtxn, namespace)? else {
+    let Some(active) = active_schema_ast(rtxn, scope)? else {
         return Ok(schema.items.is_empty());
     };
     let have: std::collections::HashSet<(u8, String)> = active
@@ -155,35 +155,51 @@ pub fn active_source_covers(
     }))
 }
 
-/// Decode the active schema AST for `namespace`, or `None` when it has no
-/// active version or the row fails to decode.
+/// Decode the schema AST `space` resolves to: its own active document when
+/// it has one, otherwise the namespace-wide one.
+///
+/// # Errors
+/// Propagates a schema-store read failure.
 pub fn active_schema_ast(
     rtxn: &ReadTransaction,
-    namespace: &str,
+    scope: DeclScope<'_>,
 ) -> Result<Option<Schema>, SchemaStoreError> {
-    Ok(schema_active_row(rtxn, namespace)?.and_then(|row| decode_source(namespace, &row)))
+    let namespace = scope.namespace();
+    Ok(schema_active_row(rtxn, scope)?.and_then(|row| decode_source(namespace, &row)))
 }
 
-/// Write-transaction counterpart to [`active_schema_ast`], for the apply and
-/// recovery paths that read inside their own wtxn.
+/// The active schema AST for one scope, resolved narrowest-first.
+///
+/// A space with its own document gets that document; a space that uploaded
+/// none gets the tenant's. Without the fallback a space would appear to have
+/// no schema at all the moment the dimension existed.
+///
+/// # Errors
+/// Propagates a schema-store read failure.
 pub fn active_schema_ast_wtxn(
     wtxn: &WriteTransaction,
-    namespace: &str,
+    scope: DeclScope<'_>,
 ) -> Result<Option<Schema>, SchemaStoreError> {
-    let version = {
-        let active = wtxn.open_table(SCHEMA_ACTIVE_VERSIONS_TABLE)?;
-        let v = active.get(&namespace)?.map(|g| g.value());
-        v
-    };
-    let Some(version) = version else {
-        return Ok(None);
-    };
-    let row = {
-        let versions = wtxn.open_table(SCHEMA_VERSIONS_TABLE)?;
-        let r = versions.get(&(namespace, version))?.map(|g| g.value());
-        r
-    };
-    Ok(row.and_then(|row| decode_source(namespace, &row)))
+    let (namespace, space) = (scope.namespace(), scope.space_id());
+    for sp in space_chain(space) {
+        let version = {
+            let active = wtxn.open_table(SCHEMA_ACTIVE_VERSIONS_TABLE)?;
+            let v = active.get(&(namespace, sp))?.map(|g| g.value());
+            v
+        };
+        let Some(version) = version else {
+            continue;
+        };
+        let row = {
+            let versions = wtxn.open_table(SCHEMA_VERSIONS_TABLE)?;
+            let r = versions.get(&(namespace, sp, version))?.map(|g| g.value());
+            r
+        };
+        if let Some(schema) = row.and_then(|row| decode_source(namespace, &row)) {
+            return Ok(Some(schema));
+        }
+    }
+    Ok(None)
 }
 
 fn decode_source(namespace: &str, row: &SchemaVersionRow) -> Option<Schema> {
@@ -205,16 +221,22 @@ fn decode_source(namespace: &str, row: &SchemaVersionRow) -> Option<Schema> {
     }
 }
 
-/// Type names an additive upload to `namespace` may reference without
-/// re-declaring: the namespace's own active schema plus the system `brain`
-/// schema.
+/// The names `space` may reference without re-declaring them.
+///
+/// The system schema is always consulted at the base: built-ins belong to
+/// the deployment, not to any one space.
+///
+/// # Errors
+/// Propagates a schema-store read failure.
 pub fn declared_context_wtxn(
     wtxn: &WriteTransaction,
-    namespace: &str,
+    scope: DeclScope<'_>,
 ) -> Result<DeclaredContext, SchemaStoreError> {
     let mut ctx = DeclaredContext::default();
-    for ns in [namespace, SYSTEM_SCHEMA_NAMESPACE] {
-        if let Some(schema) = active_schema_ast_wtxn(wtxn, ns)? {
+    // The system namespace is always read at the base: built-ins belong to
+    // the deployment, not to any one space.
+    for sc in [scope, DeclScope::base(SYSTEM_SCHEMA_NAMESPACE)] {
+        if let Some(schema) = active_schema_ast_wtxn(wtxn, sc)? {
             collect_into(&schema, &mut ctx);
         }
     }
@@ -222,13 +244,18 @@ pub fn declared_context_wtxn(
 }
 
 /// Read-transaction counterpart to [`declared_context_wtxn`].
+///
+/// # Errors
+/// Propagates a schema-store read failure.
 pub fn declared_context(
     rtxn: &ReadTransaction,
-    namespace: &str,
+    scope: DeclScope<'_>,
 ) -> Result<DeclaredContext, SchemaStoreError> {
     let mut ctx = DeclaredContext::default();
-    for ns in [namespace, SYSTEM_SCHEMA_NAMESPACE] {
-        if let Some(schema) = active_schema_ast(rtxn, ns)? {
+    // The system namespace is always read at the base: built-ins belong to
+    // the deployment, not to any one space.
+    for sc in [scope, DeclScope::base(SYSTEM_SCHEMA_NAMESPACE)] {
+        if let Some(schema) = active_schema_ast(rtxn, sc)? {
             collect_into(&schema, &mut ctx);
         }
     }
@@ -269,7 +296,7 @@ pub fn schema_upload(
 /// [`schema_upload`] with an explicit [`SourceMode`]. `Merge` is the additive
 /// `SCHEMA_UPLOAD` contract; `Replace` is for `SCHEMA_REPLACE` and
 /// `SCHEMA_DROP`, which deliberately narrow the namespace.
-/// `space` is the scope this document is uploaded AT: [`SPACE_BASE`] for
+/// `space` is the scope this document is uploaded AT: the all-zero base for
 /// the tenant's namespace-wide schema, or a real space for an overlay
 /// only that space sees. See [`apply_schema_definitions`].
 pub fn schema_upload_with_mode(
@@ -281,20 +308,22 @@ pub fn schema_upload_with_mode(
 ) -> Result<u32, SchemaStoreError> {
     let schema = validated.as_schema();
     let namespace = schema.namespace.clone();
-    let new_version = next_version_in(wtxn, &namespace)?;
+    let new_version = next_version_in(wtxn, &namespace, space)?;
 
     // What gets PERSISTED is the merged document; what gets APPLIED below is
     // the uploaded one. Applying the merge too would re-intern every
     // already-declared item on every upload for no gain.
     let stored: Schema = match mode {
         SourceMode::Replace => schema.clone(),
-        SourceMode::Merge => match active_schema_ast_wtxn(wtxn, &namespace)? {
-            Some(active) => Schema {
-                items: merge_schema_items(&active, schema),
-                ..schema.clone()
-            },
-            None => schema.clone(),
-        },
+        SourceMode::Merge => {
+            match active_schema_ast_wtxn(wtxn, DeclScope::space(&namespace, space))? {
+                Some(active) => Schema {
+                    items: merge_schema_items(&active, schema),
+                    ..schema.clone()
+                },
+                None => schema.clone(),
+            }
+        }
     };
 
     let source =
@@ -310,11 +339,11 @@ pub fn schema_upload_with_mode(
 
     {
         let mut versions = wtxn.open_table(SCHEMA_VERSIONS_TABLE)?;
-        versions.insert(&(namespace.as_str(), new_version), &row)?;
+        versions.insert(&(namespace.as_str(), space, new_version), &row)?;
     }
     {
         let mut active = wtxn.open_table(SCHEMA_ACTIVE_VERSIONS_TABLE)?;
-        active.insert(&namespace.as_str(), &new_version)?;
+        active.insert(&(namespace.as_str(), space), &new_version)?;
     }
 
     // Fan out new + changed definitions into the existing
@@ -336,9 +365,20 @@ pub fn schema_upload_with_mode(
     Ok(new_version)
 }
 
-fn next_version_in(wtxn: &WriteTransaction, namespace: &str) -> Result<u32, SchemaStoreError> {
+/// The next version number for one declaration scope.
+///
+/// Counted per `(namespace, space)`, so a space's first upload is version 1
+/// even when the namespace base is already at 7. Sharing one counter would
+/// make a space's version numbers jump whenever the tenant uploaded, and the
+/// WAL's `(namespace, space, version)` idempotency key is only meaningful if
+/// the number identifies a document within its own scope.
+fn next_version_in(
+    wtxn: &WriteTransaction,
+    namespace: &str,
+    space: [u8; 16],
+) -> Result<u32, SchemaStoreError> {
     let active = wtxn.open_table(SCHEMA_ACTIVE_VERSIONS_TABLE)?;
-    let guard = active.get(&namespace)?;
+    let guard = active.get(&(namespace, space))?;
     let current: Option<u32> = guard.map(|g| g.value());
     drop(active);
     match current {
@@ -355,47 +395,167 @@ fn next_version_in(wtxn: &WriteTransaction, namespace: &str) -> Result<u32, Sche
 // Reads.
 // ---------------------------------------------------------------------------
 
-/// Fetch a specific version of a namespace's schema. Returns
-/// `Ok(None)` if the row doesn't exist.
+/// One exact `(namespace, space, version)` row.
+///
+/// Exact, not chained: this answers "does this scope already hold this
+/// version", which is the WAL's idempotency question. Chaining would let a
+/// space-scoped replay be skipped because the namespace base happened to
+/// hold the same version number, and the space's schema would silently never
+/// apply.
+///
+/// # Errors
+/// Propagates a schema-store read failure.
 pub fn schema_get(
     rtxn: &ReadTransaction,
-    namespace: &str,
+    scope: DeclScope<'_>,
     version: u32,
 ) -> Result<Option<SchemaVersionRow>, SchemaStoreError> {
+    let (namespace, space) = (scope.namespace(), scope.space_id());
     let versions = rtxn.open_table(SCHEMA_VERSIONS_TABLE)?;
-    let guard = versions.get(&(namespace, version))?;
+    let guard = versions.get(&(namespace, space, version))?;
     Ok(guard.map(|g| g.value()))
 }
 
-/// Fetch the active version number for a namespace.
+/// Write-transaction counterpart to [`schema_active`].
+///
+/// A write path has to ask inside its own txn: resolving the version from a
+/// separate read txn would read a snapshot taken before the write, so an
+/// upload and a statement in the same transaction could disagree about
+/// which document is active.
+///
+/// # Errors
+/// Propagates a schema-store read failure.
+pub fn schema_active_wtxn(
+    wtxn: &WriteTransaction,
+    scope: DeclScope<'_>,
+) -> Result<Option<u32>, SchemaStoreError> {
+    let (namespace, space) = (scope.namespace(), scope.space_id());
+    let active = wtxn.open_table(SCHEMA_ACTIVE_VERSIONS_TABLE)?;
+    for sp in space_chain(space) {
+        if let Some(v) = active.get(&(namespace, sp))?.map(|g| g.value()) {
+            return Ok(Some(v));
+        }
+    }
+    Ok(None)
+}
+
+/// The active version declared by exactly one scope.
+///
+/// Distinct from [`schema_active`]: a caller that needs to know WHICH
+/// scope supplied a version cannot use the chained read, because it hands
+/// back a number without saying where it came from.
+///
+/// # Errors
+/// Propagates a schema-store read failure.
+pub fn schema_active_exact(
+    rtxn: &ReadTransaction,
+    scope: DeclScope<'_>,
+) -> Result<Option<u32>, SchemaStoreError> {
+    let (namespace, space) = (scope.namespace(), scope.space_id());
+    let active = rtxn.open_table(SCHEMA_ACTIVE_VERSIONS_TABLE)?;
+    let got = active.get(&(namespace, space))?.map(|g| g.value());
+    Ok(got)
+}
+
+/// Which scope a reader at `space` takes its declarations from: its own,
+/// when it declares a document, otherwise the namespace base.
+///
+/// Every read that reports a scope's schema as a whole — its active version,
+/// its row, its version history — must resolve this once and then stay in
+/// that scope. Resolving each question independently is how a space ends up
+/// told its active version is its own while its version list is the
+/// tenant's.
+///
+/// `None` when neither scope declares anything.
+///
+/// # Errors
+/// Propagates a schema-store read failure.
+pub fn declaring_scope(
+    rtxn: &ReadTransaction,
+    scope: DeclScope<'_>,
+) -> Result<Option<[u8; 16]>, SchemaStoreError> {
+    let (namespace, space) = (scope.namespace(), scope.space_id());
+    for sp in space_chain(space) {
+        if schema_active_exact(rtxn, DeclScope::space(namespace, sp))?.is_some() {
+            return Ok(Some(sp));
+        }
+    }
+    Ok(None)
+}
+
+/// Version history of the scope `space` reads its declarations from,
+/// **newest first** — empty when neither scope declares anything.
+///
+/// # Errors
+/// Propagates a schema-store read failure.
+pub fn schema_list_resolved(
+    rtxn: &ReadTransaction,
+    scope: DeclScope<'_>,
+) -> Result<Vec<SchemaVersionRow>, SchemaStoreError> {
+    let namespace = scope.namespace();
+    match declaring_scope(rtxn, scope)? {
+        Some(sp) => schema_list(rtxn, DeclScope::space(namespace, sp)),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// The active version for one scope, resolved narrowest-first.
+///
+/// # Errors
+/// Propagates a schema-store read failure.
 pub fn schema_active(
     rtxn: &ReadTransaction,
-    namespace: &str,
+    scope: DeclScope<'_>,
 ) -> Result<Option<u32>, SchemaStoreError> {
+    let (namespace, space) = (scope.namespace(), scope.space_id());
     let active = rtxn.open_table(SCHEMA_ACTIVE_VERSIONS_TABLE)?;
-    let guard = active.get(&namespace)?;
-    Ok(guard.map(|g| g.value()))
+    for sp in space_chain(space) {
+        if let Some(v) = active.get(&(namespace, sp))?.map(|g| g.value()) {
+            return Ok(Some(v));
+        }
+    }
+    Ok(None)
 }
 
-/// Fetch the active version's row in a single call.
+/// The active version row `space` resolves to.
+///
+/// The version number is resolved through the scope chain, and the row is
+/// then read from the scope that supplied it — reading it back at `space`
+/// would miss the row whenever the version came from the namespace base.
+///
+/// # Errors
+/// Propagates a schema-store read failure.
 pub fn schema_active_row(
     rtxn: &ReadTransaction,
-    namespace: &str,
+    scope: DeclScope<'_>,
 ) -> Result<Option<SchemaVersionRow>, SchemaStoreError> {
-    let Some(v) = schema_active(rtxn, namespace)? else {
+    let namespace = scope.namespace();
+    let Some(sp) = declaring_scope(rtxn, scope)? else {
         return Ok(None);
     };
-    schema_get(rtxn, namespace, v)
+    let declaring = DeclScope::space(namespace, sp);
+    let Some(v) = schema_active_exact(rtxn, declaring)? else {
+        return Ok(None);
+    };
+    schema_get(rtxn, declaring, v)
 }
 
-/// All versions for a namespace, **newest first**.
+/// All versions for one `(namespace, space)` scope, **newest first**.
+///
+/// Scoped rather than chained: this is a history listing, and splicing the
+/// tenant's versions into a space's history would present documents the space
+/// never uploaded as its own.
+///
+/// # Errors
+/// Propagates a schema-store read failure.
 pub fn schema_list(
     rtxn: &ReadTransaction,
-    namespace: &str,
+    scope: DeclScope<'_>,
 ) -> Result<Vec<SchemaVersionRow>, SchemaStoreError> {
+    let (namespace, space) = (scope.namespace(), scope.space_id());
     let versions = rtxn.open_table(SCHEMA_VERSIONS_TABLE)?;
-    let lo = (namespace, 0u32);
-    let hi = (namespace, u32::MAX);
+    let lo = (namespace, space, 0u32);
+    let hi = (namespace, space, u32::MAX);
     let mut out = Vec::new();
     for entry in versions.range(lo..=hi)? {
         let (_k, v) = entry?;
@@ -405,14 +565,21 @@ pub fn schema_list(
     Ok(out)
 }
 
-/// All namespaces with at least one active schema.
+/// All namespaces with at least one active schema, in any scope.
+///
+/// De-duplicated: a namespace whose base and two spaces each have a document
+/// is one namespace, and callers use this to enumerate tenants.
 pub fn schema_namespaces(rtxn: &ReadTransaction) -> Result<Vec<String>, SchemaStoreError> {
     let active = rtxn.open_table(SCHEMA_ACTIVE_VERSIONS_TABLE)?;
-    let mut out = Vec::new();
+    let mut out: Vec<String> = Vec::new();
     for entry in active.iter()? {
         let (k, _v) = entry?;
-        out.push(k.value().to_string());
+        let (ns, _space) = k.value();
+        if out.last().map(String::as_str) != Some(ns) {
+            out.push(ns.to_string());
+        }
     }
+    out.dedup();
     Ok(out)
 }
 
@@ -423,7 +590,7 @@ pub fn schema_namespaces(rtxn: &ReadTransaction) -> Result<Vec<String>, SchemaSt
 #[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
-    use crate::tables::scope::RowScope;
+    use crate::tables::scope::{RowScope, SPACE_BASE};
     use brain_protocol::schema::{parse_schema, validate};
     use redb::{Database, ReadableDatabase};
 
@@ -442,6 +609,137 @@ mod tests {
     fn validated(src: &str) -> ValidatedSchema {
         let schema = parse_schema(src).expect("parse");
         validate(&schema).expect("validate")
+    }
+
+    // ── Per-scope schema versions ─────────────────────────────────────────
+    //
+    // A document is uploaded AT a scope. Keyed by namespace alone, two
+    // spaces' uploads overwrote each other's active pointer while their
+    // registry rows stayed separate, so the document and the registry
+    // disagreed about what a space had declared.
+
+    const SP_A: [u8; 16] = [0xA1; 16];
+    const SP_B: [u8; 16] = [0xB2; 16];
+
+    fn up_at(db: &Database, v: &ValidatedSchema, space: [u8; 16]) -> u32 {
+        let wtxn = db.begin_write().unwrap();
+        let ver = schema_upload(&wtxn, v, space, 1).unwrap();
+        wtxn.commit().unwrap();
+        ver
+    }
+
+    #[test]
+    fn versions_count_per_scope_not_per_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(&dir);
+        assert_eq!(up_at(&db, &acme_schema_v1(), SPACE_BASE), 1);
+        assert_eq!(up_at(&db, &acme_schema_v1(), SPACE_BASE), 2);
+        // A space's first document is version 1, not 3: the number has to
+        // identify a document within its own scope for the WAL's
+        // (namespace, space, version) key to mean anything.
+        assert_eq!(up_at(&db, &acme_schema_v1(), SP_A), 1);
+        assert_eq!(up_at(&db, &acme_schema_v1(), SP_A), 2);
+        assert_eq!(up_at(&db, &acme_schema_v1(), SP_B), 1);
+    }
+
+    #[test]
+    fn two_spaces_do_not_overwrite_each_others_active_pointer() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(&dir);
+        up_at(&db, &acme_schema_v1(), SPACE_BASE);
+        up_at(&db, &acme_schema_v1(), SP_A);
+        up_at(&db, &acme_schema_v1(), SP_A);
+
+        let rtxn = db.begin_read().unwrap();
+        assert_eq!(
+            schema_active(&rtxn, DeclScope::base("acme")).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            schema_active(&rtxn, DeclScope::space("acme", SP_A)).unwrap(),
+            Some(2)
+        );
+    }
+
+    /// A space that uploaded nothing sees the tenant's document, which is
+    /// what keeps an overlay additive rather than isolating.
+    #[test]
+    fn a_space_without_a_document_falls_back_to_the_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(&dir);
+        up_at(&db, &acme_schema_v1(), SPACE_BASE);
+        let rtxn = db.begin_read().unwrap();
+        assert_eq!(
+            schema_active(&rtxn, DeclScope::space("acme", SP_B)).unwrap(),
+            Some(1)
+        );
+    }
+
+    /// The WAL's idempotency check asks whether THIS scope already holds the
+    /// version. Chained, it would find the namespace base's version 1 and
+    /// skip a space's replay, and that space's schema would never apply.
+    #[test]
+    fn an_exact_get_does_not_confuse_a_spaces_version_with_the_bases() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(&dir);
+        up_at(&db, &acme_schema_v1(), SPACE_BASE);
+
+        let rtxn = db.begin_read().unwrap();
+        assert!(
+            schema_get(&rtxn, DeclScope::base("acme"), 1)
+                .unwrap()
+                .is_some(),
+            "the base holds version 1"
+        );
+        assert!(
+            schema_get(&rtxn, DeclScope::space("acme", SP_A), 1)
+                .unwrap()
+                .is_none(),
+            "the space does not, and must not inherit the base's row — a \
+             replay for the space would otherwise be skipped"
+        );
+    }
+
+    /// A history listing is per scope: splicing the tenant's versions into a
+    /// space's history would present documents it never uploaded as its own.
+    #[test]
+    fn a_history_listing_stays_within_its_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(&dir);
+        up_at(&db, &acme_schema_v1(), SPACE_BASE);
+        up_at(&db, &acme_schema_v1(), SPACE_BASE);
+        up_at(&db, &acme_schema_v1(), SP_A);
+
+        let rtxn = db.begin_read().unwrap();
+        assert_eq!(
+            schema_list(&rtxn, DeclScope::base("acme")).unwrap().len(),
+            2
+        );
+        assert_eq!(
+            schema_list(&rtxn, DeclScope::space("acme", SP_A))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            schema_list(&rtxn, DeclScope::space("acme", SP_B))
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    /// One tenant with documents in several scopes is still one namespace.
+    #[test]
+    fn namespaces_are_listed_once_however_many_scopes_they_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(&dir);
+        up_at(&db, &acme_schema_v1(), SPACE_BASE);
+        up_at(&db, &acme_schema_v1(), SP_A);
+        up_at(&db, &acme_schema_v1(), SP_B);
+
+        let rtxn = db.begin_read().unwrap();
+        assert_eq!(schema_namespaces(&rtxn).unwrap(), vec!["acme".to_string()]);
     }
 
     fn acme_schema_v1() -> ValidatedSchema {
@@ -480,7 +778,7 @@ mod tests {
         let v = schema_upload(
             &wtxn,
             &acme_schema_v1(),
-            crate::tables::entity_type::SPACE_BASE,
+            crate::tables::scope::SPACE_BASE,
             1_700_000_000_000_000_000,
         )
         .unwrap();
@@ -488,8 +786,13 @@ mod tests {
         wtxn.commit().unwrap();
 
         let rtxn = db.begin_read().unwrap();
-        assert_eq!(schema_active(&rtxn, "acme").unwrap(), Some(1));
-        assert!(schema_get(&rtxn, "acme", 1).unwrap().is_some());
+        assert_eq!(
+            schema_active(&rtxn, DeclScope::base("acme")).unwrap(),
+            Some(1)
+        );
+        assert!(schema_get(&rtxn, DeclScope::base("acme"), 1)
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -501,7 +804,7 @@ mod tests {
             schema_upload(
                 &wtxn,
                 &acme_schema_v1(),
-                crate::tables::entity_type::SPACE_BASE,
+                crate::tables::scope::SPACE_BASE,
                 1,
             )
             .unwrap();
@@ -512,7 +815,7 @@ mod tests {
             let v = schema_upload(
                 &wtxn,
                 &acme_schema_v2(),
-                crate::tables::entity_type::SPACE_BASE,
+                crate::tables::scope::SPACE_BASE,
                 2,
             )
             .unwrap();
@@ -522,10 +825,17 @@ mod tests {
         assert_eq!(v2, 2);
 
         let rtxn = db.begin_read().unwrap();
-        assert_eq!(schema_active(&rtxn, "acme").unwrap(), Some(2));
+        assert_eq!(
+            schema_active(&rtxn, DeclScope::base("acme")).unwrap(),
+            Some(2)
+        );
         // v1 still readable.
-        assert!(schema_get(&rtxn, "acme", 1).unwrap().is_some());
-        assert!(schema_get(&rtxn, "acme", 2).unwrap().is_some());
+        assert!(schema_get(&rtxn, DeclScope::base("acme"), 1)
+            .unwrap()
+            .is_some());
+        assert!(schema_get(&rtxn, DeclScope::base("acme"), 2)
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -533,8 +843,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = open_db(&dir);
         let rtxn = db.begin_read().unwrap();
-        assert!(schema_get(&rtxn, "acme", 7).unwrap().is_none());
-        assert_eq!(schema_active(&rtxn, "acme").unwrap(), None);
+        assert!(schema_get(&rtxn, DeclScope::base("acme"), 7)
+            .unwrap()
+            .is_none());
+        assert_eq!(schema_active(&rtxn, DeclScope::base("acme")).unwrap(), None);
     }
 
     #[test]
@@ -543,11 +855,11 @@ mod tests {
         let db = open_db(&dir);
         for (i, s) in [acme_schema_v1(), acme_schema_v2()].iter().enumerate() {
             let wtxn = db.begin_write().unwrap();
-            schema_upload(&wtxn, s, crate::tables::entity_type::SPACE_BASE, i as u64).unwrap();
+            schema_upload(&wtxn, s, crate::tables::scope::SPACE_BASE, i as u64).unwrap();
             wtxn.commit().unwrap();
         }
         let rtxn = db.begin_read().unwrap();
-        let list = schema_list(&rtxn, "acme").unwrap();
+        let list = schema_list(&rtxn, DeclScope::base("acme")).unwrap();
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].version, 2);
         assert_eq!(list[1].version, 1);
@@ -559,12 +871,18 @@ mod tests {
         let db = open_db(&dir);
         for s in [acme_schema_v1(), acme_schema_v2(), crm_schema()] {
             let wtxn = db.begin_write().unwrap();
-            schema_upload(&wtxn, &s, crate::tables::entity_type::SPACE_BASE, 1).unwrap();
+            schema_upload(&wtxn, &s, crate::tables::scope::SPACE_BASE, 1).unwrap();
             wtxn.commit().unwrap();
         }
         let rtxn = db.begin_read().unwrap();
-        assert_eq!(schema_active(&rtxn, "acme").unwrap(), Some(2));
-        assert_eq!(schema_active(&rtxn, "crm").unwrap(), Some(1));
+        assert_eq!(
+            schema_active(&rtxn, DeclScope::base("acme")).unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            schema_active(&rtxn, DeclScope::base("crm")).unwrap(),
+            Some(1)
+        );
         let nss = schema_namespaces(&rtxn).unwrap();
         assert!(nss.contains(&"acme".to_string()));
         assert!(nss.contains(&"crm".to_string()));
@@ -579,7 +897,7 @@ mod tests {
             schema_upload(
                 &wtxn,
                 &acme_schema_v1(),
-                crate::tables::entity_type::SPACE_BASE,
+                crate::tables::scope::SPACE_BASE,
                 1,
             )
             .unwrap();
@@ -587,7 +905,10 @@ mod tests {
         }
         let db = Database::open(dir.path().join("test.redb")).unwrap();
         let rtxn = db.begin_read().unwrap();
-        assert_eq!(schema_active(&rtxn, "acme").unwrap(), Some(1));
+        assert_eq!(
+            schema_active(&rtxn, DeclScope::base("acme")).unwrap(),
+            Some(1)
+        );
     }
 
     #[test]
@@ -637,8 +958,10 @@ mod tests {
             )
             .unwrap();
 
-            let p_in = predicate_intern_or_get(&wtxn, "acme", "prefers", 0, 0).unwrap();
-            let p_out = predicate_intern_or_get(&wtxn, "acme", "ghost", 0, 0).unwrap();
+            let p_in =
+                predicate_intern_or_get(&wtxn, DeclScope::base("acme"), "prefers", 0, 0).unwrap();
+            let p_out =
+                predicate_intern_or_get(&wtxn, DeclScope::base("acme"), "ghost", 0, 0).unwrap();
             let mk_stmt = |pid| {
                 let id = StatementId::new();
                 let evidence_entry = EvidenceEntry::from_parts(
@@ -690,7 +1013,7 @@ mod tests {
             schema_upload(
                 &wtxn,
                 &acme_schema_v2(),
-                crate::tables::entity_type::SPACE_BASE,
+                crate::tables::scope::SPACE_BASE,
                 0,
             )
             .unwrap();
@@ -718,7 +1041,7 @@ mod tests {
         // out-of-vocab gains the flag.
         let active = {
             let rtxn = db.begin_read().unwrap();
-            predicates_active_for_schema(&rtxn, "acme", 1).unwrap()
+            predicates_active_for_schema(&rtxn, DeclScope::base("acme"), 1).unwrap()
         };
         {
             let wtxn = db.begin_write().unwrap();
@@ -750,14 +1073,16 @@ mod tests {
         schema_upload(
             &wtxn,
             &acme_schema_v2(),
-            crate::tables::entity_type::SPACE_BASE,
+            crate::tables::scope::SPACE_BASE,
             42,
         )
         .unwrap();
         wtxn.commit().unwrap();
 
         let rtxn = db.begin_read().unwrap();
-        let row = schema_active_row(&rtxn, "acme").unwrap().unwrap();
+        let row = schema_active_row(&rtxn, DeclScope::base("acme"))
+            .unwrap()
+            .unwrap();
         assert_eq!(row.version, 1);
         assert_eq!(row.namespace, "acme");
         assert_eq!(row.uploaded_at_unix_nanos, 42);
@@ -790,16 +1115,15 @@ mod additive_merge_tests {
 
     fn upload(db: &Database, v: &ValidatedSchema, mode: SourceMode) -> u32 {
         let wtxn = db.begin_write().unwrap();
-        let ver =
-            schema_upload_with_mode(&wtxn, v, crate::tables::entity_type::SPACE_BASE, 1, mode)
-                .expect("upload");
+        let ver = schema_upload_with_mode(&wtxn, v, crate::tables::scope::SPACE_BASE, 1, mode)
+            .expect("upload");
         wtxn.commit().unwrap();
         ver
     }
 
     fn stored_item_names(db: &Database, namespace: &str) -> Vec<String> {
         let rtxn = db.begin_read().unwrap();
-        let schema = active_schema_ast(&rtxn, namespace)
+        let schema = active_schema_ast(&rtxn, DeclScope::base(namespace))
             .expect("read")
             .expect("active schema");
         let mut names: Vec<String> = schema
@@ -873,11 +1197,12 @@ mod additive_merge_tests {
 
         let rtxn = db.begin_read().unwrap();
         assert!(
-            active_source_covers(&rtxn, "acme", two_types().as_schema()).unwrap(),
+            active_source_covers(&rtxn, DeclScope::base("acme"), two_types().as_schema()).unwrap(),
             "an unchanged re-upload is a true no-op"
         );
         assert!(
-            !active_source_covers(&rtxn, "acme", one_other_type().as_schema()).unwrap(),
+            !active_source_covers(&rtxn, DeclScope::base("acme"), one_other_type().as_schema())
+                .unwrap(),
             "a document carrying a new declaration is not covered"
         );
     }
@@ -895,7 +1220,7 @@ mod additive_merge_tests {
 
         let rtxn = db.begin_read().unwrap();
         assert!(
-            !active_source_covers(&rtxn, "acme", two_types().as_schema()).unwrap(),
+            !active_source_covers(&rtxn, DeclScope::base("acme"), two_types().as_schema()).unwrap(),
             "the full schema is NOT covered by the narrowed source, so re-uploading it writes"
         );
     }
@@ -922,7 +1247,7 @@ mod additive_merge_tests {
         );
 
         let rtxn = db.begin_read().unwrap();
-        let ctx = declared_context(&rtxn, "acme").expect("context");
+        let ctx = declared_context(&rtxn, DeclScope::base("acme")).expect("context");
         assert!(
             validate_with(&incremental, &ctx).is_ok(),
             "validated against the schema it merges into, the reference resolves"
@@ -937,7 +1262,7 @@ mod additive_merge_tests {
         upload(&db, &two_types(), SourceMode::Merge);
 
         let rtxn = db.begin_read().unwrap();
-        let other = declared_context(&rtxn, "crm").expect("context");
+        let other = declared_context(&rtxn, DeclScope::base("crm")).expect("context");
         assert!(
             !other.entity_types.iter().any(|n| n == "Person"),
             "acme's declarations must not be visible to crm"

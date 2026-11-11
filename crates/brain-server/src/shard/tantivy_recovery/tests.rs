@@ -1,5 +1,6 @@
 //! Unit tests for tantivy recovery.
 
+use brain_metadata::DeclScope;
 use std::fs;
 
 use brain_core::{Entity, EntityId, EntityTypeId};
@@ -106,8 +107,7 @@ fn recover_rebuilds_statements_with_join() {
         let wtxn = metadata.write_txn().expect("wtxn");
         let id = entity_type_intern(
             &wtxn,
-            brain_core::NamespaceId::SYSTEM.raw(),
-            brain_metadata::tables::entity_type::SPACE_BASE,
+            brain_metadata::TypeScope::base(brain_core::NamespaceId::SYSTEM.raw()),
             "brain:Person",
             Vec::new(),
             0,
@@ -126,7 +126,8 @@ fn recover_rebuilds_statements_with_join() {
     }
     let pred: PredicateId = {
         let wtxn = metadata.write_txn().expect("wtxn");
-        let id = predicate_intern_or_get(&wtxn, "brain", "knows", 0, 0).expect("predicate");
+        let id = predicate_intern_or_get(&wtxn, DeclScope::base("brain"), "knows", 0, 0)
+            .expect("predicate");
         wtxn.commit().expect("commit");
         id
     };

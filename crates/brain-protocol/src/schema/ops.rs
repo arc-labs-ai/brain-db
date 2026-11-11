@@ -125,6 +125,18 @@ pub struct SchemaValidateRequest {
     /// connection's own key-bound identity. See [`ActAs`].
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub act_as: Option<ActAs>,
+    /// Which scope the document would be validated against: the namespace
+    /// base, or an overlay at the caller's effective space.
+    ///
+    /// VALIDATE exists to predict UPLOAD, and an upload resolves its
+    /// references against the scope it lands in. Validating a space's
+    /// document against the namespace base reports references to the
+    /// space's own types as undeclared and predicts the wrong next version,
+    /// so the selector has to be the same one UPLOAD takes.
+    ///
+    /// ALWAYS ON THE WIRE, for the reason stated on
+    /// [`SchemaUploadRequest::scope`].
+    pub scope: SchemaScope,
 }
 
 /// `SCHEMA_REPLACE` (`0x0127`). Destructive counterpart to
@@ -165,12 +177,23 @@ pub struct SchemaReplaceRequest {
     /// connection's own key-bound identity. See [`ActAs`].
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub act_as: Option<ActAs>,
+    /// Which scope this operation narrows: the namespace base, or an
+    /// overlay at the caller's effective space.
+    ///
+    /// A narrowing reaches exactly the declarations the named scope made.
+    /// Dropping at the base leaves every space's own overlay standing;
+    /// dropping in a space leaves the tenant's base standing, because a
+    /// space may not narrow vocabulary its siblings resolve.
+    ///
+    /// ALWAYS ON THE WIRE, for the reason stated on
+    /// [`SchemaUploadRequest::scope`].
+    pub scope: SchemaScope,
 }
 
 /// Target kind for a `SCHEMA_DROP` request.
 ///
-/// Entity types are deliberately absent: they are global in the v1
-/// storage model (no namespace key), so dropping one would race rows in
+/// Entity types are deliberately absent: they are shared built-ins plus
+/// per-tenant overrides, so dropping one would race rows in
 /// other namespaces that reference the same shared type — the same
 /// reason `SCHEMA_REPLACE` never drops them. The handler rejects any
 /// other discriminant with `InvalidRequest`.
@@ -222,6 +245,17 @@ pub struct SchemaDropRequest {
     /// connection's own key-bound identity. See [`ActAs`].
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub act_as: Option<ActAs>,
+    /// Which scope this operation narrows: the namespace base, or an
+    /// overlay at the caller's effective space.
+    ///
+    /// A narrowing reaches exactly the declarations the named scope made.
+    /// Dropping at the base leaves every space's own overlay standing;
+    /// dropping in a space leaves the tenant's base standing, because a
+    /// space may not narrow vocabulary its siblings resolve.
+    ///
+    /// ALWAYS ON THE WIRE, for the reason stated on
+    /// [`SchemaUploadRequest::scope`].
+    pub scope: SchemaScope,
 }
 
 // ============================================================

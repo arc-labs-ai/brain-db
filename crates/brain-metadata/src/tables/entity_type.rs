@@ -44,14 +44,6 @@ pub const ENTITY_TYPES_BY_SCOPE_TABLE: TableDefinition<
     u32,
 > = TableDefinition::new("entity_types_by_scope");
 
-/// The all-zero space: "this declaration belongs to the whole namespace".
-///
-/// Not a real [`brain_core::SpaceId`] — `SpaceId::NIL` is the anonymous
-/// caller, and a declaration is never owned by a caller. The two values
-/// coincide numerically and must not be conflated in reasoning: this one
-/// means *unscoped by space*, which is why it is named for what it is.
-pub const SPACE_BASE: [u8; 16] = [0u8; 16];
-
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
 pub struct EntityTypeDefinition {
     pub entity_type_id: u32,

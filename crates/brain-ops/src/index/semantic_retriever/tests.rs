@@ -1,5 +1,6 @@
 //! Unit tests for `BrainSemanticRetriever`.
 
+use brain_metadata::DeclScope;
 use std::sync::Arc;
 
 use brain_core::{MemoryId, MemoryKind, SessionId, SpaceId};
@@ -1122,9 +1123,14 @@ fn statement_wall_fixture() -> (
     ];
 
     let wtxn = metadata.write_txn().unwrap();
-    let pid =
-        brain_metadata::schema::predicate::predicate_intern_or_get(&wtxn, "test", "joined", 0, 1)
-            .unwrap();
+    let pid = brain_metadata::schema::predicate::predicate_intern_or_get(
+        &wtxn,
+        DeclScope::base("test"),
+        "joined",
+        0,
+        1,
+    )
+    .unwrap();
     let mut ids = Vec::new();
     for scope in scopes {
         let subject = EntityId::new();

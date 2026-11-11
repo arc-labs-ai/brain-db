@@ -25,6 +25,7 @@ use crate::entity::types::{entity_type_intern, entity_type_lookup, EntityTypeOpE
 use crate::extractor::ops::{extractor_intern, ExtractorOpError};
 use crate::relation::types::{relation_type_intern, RelationTypeOpError};
 use crate::tables::predicate::{PredicateDefinition, PREDICATES_TABLE};
+use crate::tables::scope::{DeclScope, TypeScope};
 use crate::tables::statement::{statement_flags, StatementMetadata, STATEMENTS_TABLE};
 
 #[derive(thiserror::Error, Debug)]
@@ -70,6 +71,9 @@ pub fn apply_schema_definitions(
     let namespace_id = crate::namespace::namespace_intern_or_get(wtxn, namespace, now_unix_nanos)
         .map_err(|e| SchemaApplyError::ExtractorEncode(format!("namespace resolve: {e}")))?
         .raw();
+    // Entity types are keyed on the interned namespace id, so the scope is
+    // built once here rather than reassembled at each declaration.
+    let type_scope = TypeScope::space(namespace_id, space);
 
     for item in &schema.items {
         match item {
@@ -78,8 +82,7 @@ pub fn apply_schema_definitions(
                 // the encoding.
                 entity_type_intern(
                     wtxn,
-                    namespace_id,
-                    space,
+                    TypeScope::space(namespace_id, space),
                     &e.name,
                     Vec::new(),
                     now_unix_nanos,
@@ -93,7 +96,7 @@ pub fn apply_schema_definitions(
                 // upload, matching `resolve_entity_type`'s leniency on
                 // the relation path.
                 let object_entity_type = match declared_object_entity_type(&p.object) {
-                    Some(name) => resolve_entity_type(wtxn, namespace_id, space, name)?,
+                    Some(name) => resolve_entity_type(wtxn, type_scope, name)?,
                     None => None,
                 };
                 let object_constraint = ObjectConstraint {
@@ -108,14 +111,14 @@ pub fn apply_schema_definitions(
                 // the object side.
                 let subject_entity_type_id = match &p.subject {
                     Some(SubjectTypeDecl::Entity { entity_type }) => {
-                        resolve_entity_type(wtxn, namespace_id, space, entity_type)?
+                        resolve_entity_type(wtxn, type_scope, entity_type)?
                             .map_or(0, EntityTypeId::raw)
                     }
                     Some(SubjectTypeDecl::Any) | None => 0,
                 };
                 let pred_id = predicate_intern_with_subject(
                     wtxn,
-                    namespace,
+                    DeclScope::space(namespace, space),
                     &p.name,
                     map_statement_kind(p.kind),
                     object_constraint,
@@ -130,11 +133,11 @@ pub fn apply_schema_definitions(
                 predicate_set_retention(wtxn, pred_id, p.retention.map_or(0, |d| d.to_seconds()))?;
             }
             SchemaItem::RelationType(r) => {
-                let from = resolve_entity_type(wtxn, namespace_id, space, &r.from_type)?;
-                let to = resolve_entity_type(wtxn, namespace_id, space, &r.to_type)?;
+                let from = resolve_entity_type(wtxn, type_scope, &r.from_type)?;
+                let to = resolve_entity_type(wtxn, type_scope, &r.to_type)?;
                 relation_type_intern(
                     wtxn,
-                    namespace,
+                    DeclScope::space(namespace, space),
                     &r.name,
                     from,
                     to,
@@ -151,7 +154,7 @@ pub fn apply_schema_definitions(
                     .map_err(|err| SchemaApplyError::ExtractorEncode(err.to_string()))?;
                 extractor_intern(
                     wtxn,
-                    namespace,
+                    DeclScope::space(namespace, space),
                     &e.name,
                     kind,
                     schema_version,
@@ -338,14 +341,13 @@ pub(crate) fn map_extractor_kind(k: ExtractorKindAst) -> ExtractorKind {
 /// not restricted to the scope being written.
 fn resolve_entity_type(
     wtxn: &WriteTransaction,
-    namespace_id: u32,
-    space: [u8; 16],
+    scope: TypeScope,
     name: &str,
 ) -> Result<Option<EntityTypeId>, EntityTypeOpError> {
     if name == "Any" {
         return Ok(None);
     }
-    Ok(entity_type_lookup(wtxn, namespace_id, space, name)?.map(|d| d.id()))
+    Ok(entity_type_lookup(wtxn, scope, name)?.map(|d| d.id()))
 }
 
 // ---------------------------------------------------------------------------
@@ -385,7 +387,7 @@ mod tests {
             apply_schema_definitions(
                 &wtxn,
                 &validated,
-                crate::tables::entity_type::SPACE_BASE,
+                crate::tables::scope::SPACE_BASE,
                 1,
                 1_700_000_000_000_000_000,
             )
@@ -394,7 +396,7 @@ mod tests {
         }
 
         let rtxn = db.begin_read().unwrap();
-        let row = extractor_lookup_by_qname(&rtxn, "acme", "person_mentions")
+        let row = extractor_lookup_by_qname(&rtxn, DeclScope::base("acme"), "person_mentions")
             .unwrap()
             .expect("row exists");
         assert_eq!(row.namespace, "acme");
@@ -435,7 +437,7 @@ mod tests {
             apply_schema_definitions(
                 &wtxn,
                 &validated,
-                crate::tables::entity_type::SPACE_BASE,
+                crate::tables::scope::SPACE_BASE,
                 1,
                 1_700_000_000_000_000_000,
             )
@@ -453,17 +455,19 @@ mod tests {
             .raw();
         let org_id = crate::entity::types::entity_type_lookup_rtxn(
             &rtxn,
-            acme,
-            crate::tables::entity_type::SPACE_BASE,
+            TypeScope::base(acme),
             "Organization",
         )
         .unwrap()
         .expect("Organization interned")
         .id();
-        let works_at =
-            crate::schema::predicate::predicate_lookup_by_qname(&rtxn, "acme", "works_at")
-                .unwrap()
-                .expect("works_at interned");
+        let works_at = crate::schema::predicate::predicate_lookup_by_qname(
+            &rtxn,
+            DeclScope::base("acme"),
+            "works_at",
+        )
+        .unwrap()
+        .expect("works_at interned");
         assert_eq!(works_at.object_type_constraint_byte, 1, "Entity variant");
         assert_eq!(
             works_at.object_entity_type_id,
@@ -472,9 +476,13 @@ mod tests {
         );
 
         // `Entity<Any>` pins the variant but narrows no type.
-        let knows = crate::schema::predicate::predicate_lookup_by_qname(&rtxn, "acme", "knows")
-            .unwrap()
-            .expect("knows interned");
+        let knows = crate::schema::predicate::predicate_lookup_by_qname(
+            &rtxn,
+            DeclScope::base("acme"),
+            "knows",
+        )
+        .unwrap()
+        .expect("knows interned");
         assert_eq!(knows.object_type_constraint_byte, 1);
         assert_eq!(knows.object_entity_type_id, 0);
     }
@@ -527,27 +535,15 @@ mod tests {
         let db = open_db(&dir);
 
         let wtxn = db.begin_write().unwrap();
-        apply_schema_definitions(
-            &wtxn,
-            &validated,
-            crate::tables::entity_type::SPACE_BASE,
-            1,
-            0,
-        )
-        .unwrap();
+        apply_schema_definitions(&wtxn, &validated, crate::tables::scope::SPACE_BASE, 1, 0)
+            .unwrap();
         // Second apply must succeed (idempotent).
-        apply_schema_definitions(
-            &wtxn,
-            &validated,
-            crate::tables::entity_type::SPACE_BASE,
-            1,
-            0,
-        )
-        .unwrap();
+        apply_schema_definitions(&wtxn, &validated, crate::tables::scope::SPACE_BASE, 1, 0)
+            .unwrap();
         wtxn.commit().unwrap();
 
         let rtxn = db.begin_read().unwrap();
-        let row = extractor_lookup_by_qname(&rtxn, "acme", "person_mentions")
+        let row = extractor_lookup_by_qname(&rtxn, DeclScope::base("acme"), "person_mentions")
             .unwrap()
             .unwrap();
         assert_eq!(row.id().raw(), 1, "id stable across idempotent applies");

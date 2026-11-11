@@ -37,7 +37,6 @@
 //! HNSW is dropped from the queue with no re-embed. A crash between
 //! HNSW insert and queue delete just costs an idempotent re-embed on
 //! restart.
-
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -849,7 +848,14 @@ mod tests {
         // takes when a brain:fact wildcard predicate lands; the
         // resulting row is `is_stateful=false` so each seeded
         // statement is its own current row (no auto-supersede).
-        let pred_id = predicate_intern_or_get(&wtxn, "test", &format!("p_{n}"), 0, now()).unwrap();
+        let pred_id = predicate_intern_or_get(
+            &wtxn,
+            brain_metadata::DeclScope::base("test"),
+            &format!("p_{n}"),
+            0,
+            now(),
+        )
+        .unwrap();
 
         let stmt_id = StatementId::new();
         let evidence = EvidenceRef::inline_from_slice(&[EvidenceEntry::from_parts(
@@ -952,7 +958,14 @@ mod tests {
             ),
         )
         .unwrap();
-        let pred_id = predicate_intern_or_get(&wtxn, "test", "ran", 0, now()).unwrap();
+        let pred_id = predicate_intern_or_get(
+            &wtxn,
+            brain_metadata::DeclScope::base("test"),
+            "ran",
+            0,
+            now(),
+        )
+        .unwrap();
         let stmt_id = StatementId::new();
         let evidence = EvidenceRef::inline_from_slice(&[EvidenceEntry::from_parts(
             MemoryId::pack(1, SessionId::DEFAULT.into(), 0),
@@ -1067,7 +1080,14 @@ mod tests {
                 ),
             )
             .unwrap();
-            pred_id = predicate_intern_or_get(&wtxn, "test", "participated_in", 0, now()).unwrap();
+            pred_id = predicate_intern_or_get(
+                &wtxn,
+                brain_metadata::DeclScope::base("test"),
+                "participated_in",
+                0,
+                now(),
+            )
+            .unwrap();
             wtxn.commit().unwrap();
         }
         let evidence = EvidenceRef::inline_from_slice(&[EvidenceEntry::from_parts(

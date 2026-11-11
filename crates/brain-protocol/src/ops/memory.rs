@@ -880,8 +880,15 @@ pub struct EncodeTraceEntity {
     #[serde(with = "serde_bytes")]
     pub id: [u8; 16],
     pub name: String,
-    /// Human-readable `"namespace:typename"` (or bare `"typename"` for the
-    /// default namespace).
+    /// Human-readable `"namespace:typename"` — `"brain:Person"` for a
+    /// built-in, `"acme:Cart"` for a type the tenant declared.
+    ///
+    /// Always qualified. The registry lets a tenant declare a name the system
+    /// schema owns, so the prefix is the only thing separating the two and a
+    /// bare name here would be unattributable. Produced via
+    /// `brain_metadata::EntityTypeQnames`.
+    ///
+    /// Empty only when no type is known (a literal or minted node).
     pub type_qname: String,
 }
 
@@ -1276,9 +1283,16 @@ pub struct EnrichedEntity {
     #[serde(with = "serde_bytes")]
     pub id: [u8; 16],
     pub name: String,
-    /// Human-readable `"namespace:typename"` (or bare `"typename"` for
-    /// the default namespace). The renderer prints this inline beside
-    /// the entity name.
+    /// Human-readable `"namespace:typename"` — `"brain:Person"` for a
+    /// built-in, `"acme:Cart"` for a type the tenant declared. The renderer
+    /// prints this inline beside the entity name.
+    ///
+    /// Always qualified, and the prefix is load-bearing: the registry lets a
+    /// tenant declare a name the system schema owns, so without it two
+    /// different types render identically and no consumer can attribute the
+    /// extraction. Produced via `brain_metadata::EntityTypeQnames`.
+    ///
+    /// Empty only when no type is known (a literal or minted node).
     pub type_qname: String,
 }
 

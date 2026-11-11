@@ -47,6 +47,7 @@ use brain_core::{
     StatementId, StatementKind, StatementObject, SubjectRef,
 };
 use brain_metadata::entity::merge::{merge_entity, unmerge_entity, EntityMergeOpError, MergeActor};
+use brain_metadata::DeclScope;
 use brain_metadata::{
     entity_get, entity_get_resolved, entity_lookup_by_canonical_name, entity_put,
     entity_type_intern, normalize_name, predicate_intern, relation_create, relation_get,
@@ -181,8 +182,7 @@ fn build(spec: &GraphSpec) -> (MetadataDb, tempfile::TempDir, BuiltGraph) {
         let wtxn = db.write_txn().unwrap();
         let id = entity_type_intern(
             &wtxn,
-            brain_core::NamespaceId::SYSTEM.raw(),
-            brain_metadata::tables::entity_type::SPACE_BASE,
+            brain_metadata::TypeScope::base(brain_core::NamespaceId::SYSTEM.raw()),
             "Org",
             Vec::new(),
             NOW,
@@ -232,7 +232,7 @@ fn build(spec: &GraphSpec) -> (MetadataDb, tempfile::TempDir, BuiltGraph) {
             let wtxn = db.write_txn().unwrap();
             let id = predicate_intern(
                 &wtxn,
-                "test",
+                DeclScope::base("test"),
                 &format!("pred{k}"),
                 Some(StatementKind::Fact),
                 1u8, // object: Entity
@@ -275,7 +275,7 @@ fn build(spec: &GraphSpec) -> (MetadataDb, tempfile::TempDir, BuiltGraph) {
             let wtxn = db.write_txn().unwrap();
             let id = relation_type_intern(
                 &wtxn,
-                "test",
+                DeclScope::base("test"),
                 &format!("rel{k}"),
                 None,
                 None,

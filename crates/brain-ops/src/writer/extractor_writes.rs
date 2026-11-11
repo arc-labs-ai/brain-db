@@ -203,7 +203,14 @@ mod tests {
 
         let (predicate_id, statement_id) = {
             let wtxn = db.write_txn().unwrap();
-            let pid = predicate_intern_or_get(&wtxn, "brain", "current_role", 0, NOW).unwrap();
+            let pid = predicate_intern_or_get(
+                &wtxn,
+                brain_metadata::DeclScope::base("brain"),
+                "current_role",
+                0,
+                NOW,
+            )
+            .unwrap();
             let payload = StatementCreatePayload {
                 kind: StatementKind::Fact,
                 subject: SubjectRef::Entity(subject),
@@ -244,8 +251,7 @@ mod tests {
             let wtxn = db.write_txn().unwrap();
             let org_type = entity_type_intern(
                 &wtxn,
-                brain_core::NamespaceId::SYSTEM.raw(),
-                brain_metadata::tables::entity_type::SPACE_BASE,
+                brain_metadata::TypeScope::base(brain_core::NamespaceId::SYSTEM.raw()),
                 "Organization",
                 Vec::new(),
                 NOW,
@@ -265,7 +271,14 @@ mod tests {
         };
         let relation_id = {
             let wtxn = db.write_txn().unwrap();
-            let rt = relation_type_intern_or_get(&wtxn, "brain", "works_at", 0, NOW).unwrap();
+            let rt = relation_type_intern_or_get(
+                &wtxn,
+                brain_metadata::DeclScope::base("brain"),
+                "works_at",
+                0,
+                NOW,
+            )
+            .unwrap();
             let payload = RelationCreatePayload {
                 relation_type: rt,
                 from_entity: from,

@@ -432,6 +432,12 @@
     "payload_len": 193
   },
   {
+    "name": "resp_subscribe_event_stage",
+    "opcode": "0x00B0",
+    "kind": "response",
+    "payload_len": 346
+  },
+  {
     "name": "resp_pong",
     "opcode": "0x0090",
     "kind": "response",
@@ -765,19 +771,19 @@
     "name": "req_schema_validate",
     "opcode": "0x0123",
     "kind": "request",
-    "payload_len": 88
+    "payload_len": 95
   },
   {
     "name": "req_schema_replace",
     "opcode": "0x0127",
     "kind": "request",
-    "payload_len": 148
+    "payload_len": 155
   },
   {
     "name": "req_schema_drop",
     "opcode": "0x0125",
     "kind": "request",
-    "payload_len": 83
+    "payload_len": 90
   },
   {
     "name": "req_schema_get_act_as",
@@ -795,7 +801,7 @@
     "name": "req_schema_validate_act_as",
     "opcode": "0x0123",
     "kind": "request",
-    "payload_len": 136
+    "payload_len": 143
   },
   {
     "name": "req_schema_upload_act_as_grant",
@@ -813,13 +819,13 @@
     "name": "req_schema_replace_act_as_grant",
     "opcode": "0x0127",
     "kind": "request",
-    "payload_len": 204
+    "payload_len": 211
   },
   {
     "name": "req_schema_drop_act_as_grant",
     "opcode": "0x0125",
     "kind": "request",
-    "payload_len": 139
+    "payload_len": 146
   },
   {
     "name": "resp_schema_get",

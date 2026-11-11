@@ -16,6 +16,7 @@ use brain_metadata::relation::types::relation_type_intern;
 use brain_metadata::schema::predicate::predicate_intern_or_get;
 use brain_metadata::statement::{statement_create, statement_tombstone};
 use brain_metadata::tables::memory::{flags as memory_flags, MemoryMetadata, MEMORIES_TABLE};
+use brain_metadata::DeclScope;
 use brain_metadata::MetadataDb;
 use tempfile::TempDir;
 
@@ -40,8 +41,7 @@ fn ensure_person_type(metadata: &mut MetadataDb) -> EntityTypeId {
     let wtxn = metadata.write_txn().expect("wtxn");
     let id = entity_type_intern(
         &wtxn,
-        brain_core::NamespaceId::SYSTEM.raw(),
-        brain_metadata::tables::entity_type::SPACE_BASE,
+        brain_metadata::TypeScope::base(brain_core::NamespaceId::SYSTEM.raw()),
         PERSON_TYPE,
         Vec::new(),
         0,
@@ -64,7 +64,8 @@ fn intern_predicate(metadata: &mut MetadataDb, namespace: &str, name: &str) -> P
     // Use intern_or_get so tests tolerate predicates already seeded by the
     // default brain: schema (e.g. brain:lives_in, brain:works_at).
     let wtxn = metadata.write_txn().expect("wtxn");
-    let id = predicate_intern_or_get(&wtxn, namespace, name, 0, 0).expect("predicate");
+    let id =
+        predicate_intern_or_get(&wtxn, DeclScope::base(namespace), name, 0, 0).expect("predicate");
     wtxn.commit().expect("commit");
     id
 }
@@ -173,7 +174,7 @@ fn create_relation(
         let wtxn = metadata.write_txn().expect("wtxn");
         let id = relation_type_intern(
             &wtxn,
-            "brain",
+            DeclScope::base("brain"),
             rt_name,
             None,
             None,

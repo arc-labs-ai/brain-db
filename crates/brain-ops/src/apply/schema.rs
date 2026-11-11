@@ -13,11 +13,12 @@
 //! wtxn. Recovery runs the identical sequence, so replay converges on the
 //! same state the live write produced.
 
-use brain_metadata::extractor::ops::extractor_drop_namespace;
+use brain_metadata::extractor::ops::extractor_drop_declared;
 use brain_metadata::relation::types::{relation_type_drop_one, relation_type_drop_schema_declared};
 use brain_metadata::schema::predicate::{predicate_drop_one, predicate_drop_schema_declared};
 use brain_metadata::schema::store::{declared_context_wtxn, schema_upload_with_mode, SourceMode};
 use brain_metadata::system_schema::SYSTEM_SCHEMA_NAMESPACE;
+use brain_metadata::DeclScope;
 use brain_protocol::schema::{parse_schema, validate_with};
 use brain_protocol::schema_drop_target;
 use redb::WriteTransaction;
@@ -99,12 +100,12 @@ pub fn apply_upsert_schema(
     } else {
         SourceMode::Merge
     };
-    let context_namespace = if destructive {
-        SYSTEM_SCHEMA_NAMESPACE
+    let context_scope = if destructive {
+        DeclScope::base(SYSTEM_SCHEMA_NAMESPACE)
     } else {
-        parsed.namespace.as_str()
+        DeclScope::space(parsed.namespace.as_str(), *space)
     };
-    let ctx = declared_context_wtxn(wtxn, context_namespace)
+    let ctx = declared_context_wtxn(wtxn, context_scope)
         .map_err(|e| ApplyError::Metadata(format!("declared context: {e}")))?;
     let validated = validate_with(&parsed, &ctx).map_err(|errs| {
         ApplyError::Invariant(format!("UpsertSchema re-validate failed: {errs:?}"))
@@ -115,7 +116,12 @@ pub fn apply_upsert_schema(
     // Destructive delta first, then the (additive) upload — the same order the
     // REPLACE / DROP handlers use, so live apply and WAL replay converge on
     // identical state. UPLOAD carries an empty delta and skips both branches.
-    let dropped = apply_schema_delta(wtxn, &namespace, *replace_all, drops)?;
+    let dropped = apply_schema_delta(
+        wtxn,
+        DeclScope::space(&namespace, *space),
+        *replace_all,
+        drops,
+    )?;
 
     // The scope comes off the phase, not off the `Write` and not off any
     // state read in here. The entity-type registry is keyed
@@ -147,23 +153,23 @@ pub fn apply_upsert_schema(
 /// recovery so the two never diverge.
 fn apply_schema_delta(
     wtxn: &WriteTransaction,
-    namespace: &str,
+    scope: DeclScope<'_>,
     replace_all: bool,
     drops: &[(u8, String)],
 ) -> Result<usize, ApplyError> {
     let mut dropped = 0usize;
     if replace_all {
-        dropped += predicate_drop_schema_declared(wtxn, namespace)
+        dropped += predicate_drop_schema_declared(wtxn, scope)
             .map_err(|e| ApplyError::Metadata(format!("predicate drop-all: {e}")))?;
-        dropped += relation_type_drop_schema_declared(wtxn, namespace)
+        dropped += relation_type_drop_schema_declared(wtxn, scope)
             .map_err(|e| ApplyError::Metadata(format!("relation_type drop-all: {e}")))?;
-        dropped += extractor_drop_namespace(wtxn, namespace)
+        dropped += extractor_drop_declared(wtxn, scope)
             .map_err(|e| ApplyError::Metadata(format!("extractor drop-all: {e}")))?;
     }
     for (kind, name) in drops {
         match *kind {
             schema_drop_target::PREDICATE => {
-                if predicate_drop_one(wtxn, namespace, name)
+                if predicate_drop_one(wtxn, scope, name)
                     .map_err(|e| ApplyError::Metadata(format!("predicate drop {name:?}: {e}")))?
                     .is_some()
                 {
@@ -171,7 +177,7 @@ fn apply_schema_delta(
                 }
             }
             schema_drop_target::RELATION_TYPE => {
-                if relation_type_drop_one(wtxn, namespace, name)
+                if relation_type_drop_one(wtxn, scope, name)
                     .map_err(|e| ApplyError::Metadata(format!("relation_type drop {name:?}: {e}")))?
                     .is_some()
                 {
@@ -192,7 +198,7 @@ fn apply_schema_delta(
 mod tests {
     use super::*;
     use brain_metadata::entity::types::entity_type_lookup_rtxn;
-    use brain_metadata::tables::entity_type::SPACE_BASE;
+    use brain_metadata::tables::scope::SPACE_BASE;
     use brain_metadata::MetadataDb;
     use tempfile::TempDir;
 
@@ -243,9 +249,13 @@ define entity_type Widget {
         let ns = brain_metadata::namespace::namespace_lookup_by_name(&rtxn, "acme")
             .unwrap()
             .expect("the upload interns its namespace");
-        entity_type_lookup_rtxn(&rtxn, ns.raw(), space, name)
-            .unwrap()
-            .is_some()
+        entity_type_lookup_rtxn(
+            &rtxn,
+            brain_metadata::TypeScope::space(ns.raw(), space),
+            name,
+        )
+        .unwrap()
+        .is_some()
     }
 
     #[test]
@@ -275,7 +285,8 @@ define entity_type Widget {
         }
 
         let rtxn = db.read_txn().unwrap();
-        let active = brain_metadata::schema::store::schema_active(&rtxn, "acme").unwrap();
+        let active =
+            brain_metadata::schema::store::schema_active(&rtxn, DeclScope::base("acme")).unwrap();
         assert_eq!(active, Some(1));
     }
 

@@ -1,7 +1,7 @@
 //! Typed CRUD + interning over the relation-type registry.
 //! Mirrors [`crate::schema::predicate`].
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use brain_core::RelationType;
 use brain_core::{Cardinality, EntityTypeId, RelationTypeId};
@@ -10,8 +10,9 @@ use redb::{ReadTransaction, ReadableTable, WriteTransaction};
 use crate::tables::relation::RELATION_TYPE_EMBEDDINGS_TABLE;
 use crate::tables::relation_type::{
     encode_entity_type_id, RelationTypeDefinition, RelationTypeOrigin,
-    RELATION_TYPES_BY_QNAME_TABLE, RELATION_TYPES_TABLE,
+    RELATION_TYPES_BY_SCOPE_TABLE, RELATION_TYPES_TABLE,
 };
+use crate::tables::scope::{space_chain, DeclScope, SPACE_BASE};
 
 // ---------------------------------------------------------------------------
 // Errors.
@@ -120,21 +121,111 @@ pub fn relation_type_get(
     Ok(row.as_ref().map(RelationTypeDefinition::to_relation_type))
 }
 
-/// Look up a relation type by qname. Identifier validation is
-/// enforced — invalid namespace/name yields `InvalidIdentifier`
-/// instead of `Ok(None)`.
+/// Resolve `qname` through the scope chain, read txn.
+fn scope_get_rtxn(
+    rtxn: &ReadTransaction,
+    qname: &str,
+    space: [u8; 16],
+) -> Result<Option<u32>, RelationTypeOpError> {
+    let idx = rtxn.open_table(RELATION_TYPES_BY_SCOPE_TABLE)?;
+    for sp in space_chain(space) {
+        if let Some(id) = idx.get(&(qname, sp))?.map(|g| g.value()) {
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
+}
+
+/// Resolve `qname` through the scope chain, write txn.
+fn scope_get_wtxn(
+    wtxn: &WriteTransaction,
+    qname: &str,
+    space: [u8; 16],
+) -> Result<Option<u32>, RelationTypeOpError> {
+    let idx = wtxn.open_table(RELATION_TYPES_BY_SCOPE_TABLE)?;
+    for sp in space_chain(space) {
+        if let Some(id) = idx.get(&(qname, sp))?.map(|g| g.value()) {
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
+}
+
+/// Resolve `qname` in exactly one scope, write txn.
+///
+/// Writes probe exactly; only reads chain. A write that chained would find
+/// the namespace base and hand it back, so declaring an overlay would
+/// silently return the base row and no space could ever have its own.
+fn scope_get_exact_wtxn(
+    wtxn: &WriteTransaction,
+    qname: &str,
+    space: [u8; 16],
+) -> Result<Option<u32>, RelationTypeOpError> {
+    let idx = wtxn.open_table(RELATION_TYPES_BY_SCOPE_TABLE)?;
+    let got = idx.get(&(qname, space))?.map(|g| g.value());
+    Ok(got)
+}
+
+/// Remove one scope's entry for `qname` — a targeted drop takes away
+/// exactly the declaration it names.
+fn scope_remove(
+    wtxn: &WriteTransaction,
+    qname: &str,
+    space: [u8; 16],
+) -> Result<(), RelationTypeOpError> {
+    let mut idx = wtxn.open_table(RELATION_TYPES_BY_SCOPE_TABLE)?;
+    idx.remove(&(qname, space))?;
+    Ok(())
+}
+
+/// Remove every scope's entry for `qname` — the row itself is gone, so an
+/// Remove the index entry that points at `id`.
+///
+/// The row is gone, so the entry naming it must go — and ONLY that entry.
+/// One qname can have SEVERAL rows, one per scope that declared it, so
+/// clearing every `(qname, *)` entry would orphan a sibling scope's row: the
+/// row would survive with nothing resolving to it, and that scope's
+/// declaration would silently disappear.
+fn scope_remove_entry(
+    wtxn: &WriteTransaction,
+    qname: &str,
+    id: u32,
+) -> Result<(), RelationTypeOpError> {
+    let owned: Vec<[u8; 16]> = {
+        let idx = wtxn.open_table(RELATION_TYPES_BY_SCOPE_TABLE)?;
+        let mut out = Vec::new();
+        for entry in idx.range((qname, [0u8; 16])..=(qname, [0xFFu8; 16]))? {
+            let (k, v) = entry?;
+            if v.value() == id {
+                out.push(k.value().1);
+            }
+        }
+        out
+    };
+    let mut idx = wtxn.open_table(RELATION_TYPES_BY_SCOPE_TABLE)?;
+    for sp in owned {
+        idx.remove(&(qname, sp))?;
+    }
+    Ok(())
+}
+
+/// Resolve a relation type as `space` sees it: the space's own declaration
+/// when it has one, otherwise the namespace-wide one.
+///
+/// # Errors
+/// `InvalidIdentifier` for a malformed namespace/name, and redb storage
+/// failures.
 pub fn relation_type_lookup_by_qname(
     rtxn: &ReadTransaction,
-    namespace: &str,
+    scope: DeclScope<'_>,
     name: &str,
 ) -> Result<Option<RelationType>, RelationTypeOpError> {
+    let (namespace, space) = (scope.namespace(), scope.space_id());
     validate_namespace(namespace)?;
     validate_name(name)?;
 
     let q = qname(namespace, name);
-    let idx = rtxn.open_table(RELATION_TYPES_BY_QNAME_TABLE)?;
-    let id_raw: Option<u32> = idx.get(q.as_str())?.map(|g| g.value());
-    let Some(id_raw) = id_raw else {
+    let Some(id_raw) = scope_get_rtxn(rtxn, q.as_str(), space)? else {
         return Ok(None);
     };
 
@@ -143,20 +234,65 @@ pub fn relation_type_lookup_by_qname(
     Ok(row.as_ref().map(RelationTypeDefinition::to_relation_type))
 }
 
-/// Set of `RelationTypeId`s the active schema version of `namespace`
-/// declares. Companion to
-/// [`crate::schema::predicate::predicates_active_for_schema`].
-pub fn relation_types_active_for_schema(
-    rtxn: &ReadTransaction,
-    namespace: &str,
+/// Write-transaction counterpart to [`relation_type_lookup_by_qname`].
+///
+/// A write path resolves vocabulary inside its own txn so the resolution
+/// and the row it gates cannot straddle two snapshots.
+///
+/// # Errors
+/// `InvalidIdentifier` for a malformed namespace/name, and redb storage
+/// failures.
+pub fn relation_type_lookup_by_qname_wtxn(
+    wtxn: &WriteTransaction,
+    scope: DeclScope<'_>,
+    name: &str,
+) -> Result<Option<RelationType>, RelationTypeOpError> {
+    let (namespace, space) = (scope.namespace(), scope.space_id());
+    validate_namespace(namespace)?;
+    validate_name(name)?;
+
+    let q = qname(namespace, name);
+    let Some(id_raw) = scope_get_wtxn(wtxn, q.as_str(), space)? else {
+        return Ok(None);
+    };
+
+    let t = wtxn.open_table(RELATION_TYPES_TABLE)?;
+    let row: Option<RelationTypeDefinition> = t.get(&id_raw)?.map(|g| g.value());
+    Ok(row.as_ref().map(RelationTypeDefinition::to_relation_type))
+}
+
+/// Write-transaction counterpart to
+/// [`relation_types_active_for_schema`].
+///
+/// # Errors
+/// `InvalidIdentifier` for a malformed namespace, and redb storage failures.
+pub fn relation_types_active_for_schema_wtxn(
+    wtxn: &WriteTransaction,
+    scope: DeclScope<'_>,
     version: u32,
 ) -> Result<HashSet<RelationTypeId>, RelationTypeOpError> {
+    let (namespace, space) = (scope.namespace(), scope.space_id());
     validate_namespace(namespace)?;
-    let t = rtxn.open_table(RELATION_TYPES_TABLE)?;
+    let resolved = {
+        let idx = wtxn.open_table(RELATION_TYPES_BY_SCOPE_TABLE)?;
+        let mut out: HashMap<String, u32> = HashMap::new();
+        for entry in idx.iter()? {
+            let (k, v) = entry?;
+            let (qname, sp) = k.value();
+            if sp == space {
+                out.insert(qname.to_string(), v.value());
+            } else if sp == SPACE_BASE {
+                out.entry(qname.to_string()).or_insert(v.value());
+            }
+        }
+        out
+    };
+    let t = wtxn.open_table(RELATION_TYPES_TABLE)?;
     let mut out = HashSet::new();
-    for entry in t.iter()? {
-        let (_, v) = entry?;
-        let row = v.value();
+    for id in resolved.into_values() {
+        let Some(row) = t.get(&id)?.map(|g| g.value()) else {
+            continue;
+        };
         if row.namespace != namespace {
             continue;
         }
@@ -164,6 +300,60 @@ pub fn relation_types_active_for_schema(
             if v_decl == version {
                 out.insert(RelationTypeId::from(row.relation_type_id));
             }
+        }
+    }
+    Ok(out)
+}
+
+/// The relation-type ids `space` resolves that version `version` declares.
+///
+/// Membership is judged over what the scope RESOLVES, for the reason given
+/// on [`crate::schema::predicate::predicates_active_for_schema`].
+///
+/// # Errors
+/// `InvalidIdentifier` for a malformed namespace, and redb storage failures.
+pub fn relation_types_active_for_schema(
+    rtxn: &ReadTransaction,
+    scope: DeclScope<'_>,
+    version: u32,
+) -> Result<HashSet<RelationTypeId>, RelationTypeOpError> {
+    let (namespace, space) = (scope.namespace(), scope.space_id());
+    validate_namespace(namespace)?;
+    let resolved = resolved_relation_type_ids(rtxn, space)?;
+    let t = rtxn.open_table(RELATION_TYPES_TABLE)?;
+    let mut out = HashSet::new();
+    for id in resolved.into_values() {
+        let Some(row) = t.get(&id)?.map(|g| g.value()) else {
+            continue;
+        };
+        if row.namespace != namespace {
+            continue;
+        }
+        if let RelationTypeOrigin::SchemaDeclared { version: v_decl } = row.origin() {
+            if v_decl == version {
+                out.insert(RelationTypeId::from(row.relation_type_id));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Every qname `space` resolves, mapped to the id it resolves to. Base
+/// before overlay, for the key-order reason given on
+/// [`crate::schema::predicate::predicates_active_for_schema`]'s helper.
+fn resolved_relation_type_ids(
+    rtxn: &ReadTransaction,
+    space: [u8; 16],
+) -> Result<HashMap<String, u32>, RelationTypeOpError> {
+    let idx = rtxn.open_table(RELATION_TYPES_BY_SCOPE_TABLE)?;
+    let mut out: HashMap<String, u32> = HashMap::new();
+    for entry in idx.iter()? {
+        let (k, v) = entry?;
+        let (qname, sp) = k.value();
+        if sp == space {
+            out.insert(qname.to_string(), v.value());
+        } else if sp == SPACE_BASE {
+            out.entry(qname.to_string()).or_insert(v.value());
         }
     }
     Ok(out)
@@ -196,16 +386,24 @@ pub fn relation_type_list(
 // Write path.
 // ---------------------------------------------------------------------------
 
-/// Intern (or look up) a relation type by its qname.
+/// Intern (or look up) a relation type by its qname, in `scope`.
+///
+/// [`DeclScope::base`] is the namespace-wide declaration; any other space is
+/// an overlay a lookup from that space prefers over the base.
 ///
 /// Semantics mirror `predicate_intern`:
-/// - No prior row: allocate fresh id, write row + qname index entry.
+///
+/// - No prior row: allocate fresh id, write row + scope index entry.
 /// - Prior row with identical constraints: return existing id.
 /// - Prior row with diverging constraints: error.
+///
+/// # Errors
+/// Propagates validation and storage failures, and `AlreadyExists` when the
+/// scope holds a diverging definition of the same name.
 #[allow(clippy::too_many_arguments)]
 pub fn relation_type_intern(
     wtxn: &WriteTransaction,
-    namespace: &str,
+    scope: DeclScope<'_>,
     name: &str,
     from_type: Option<EntityTypeId>,
     to_type: Option<EntityTypeId>,
@@ -215,6 +413,7 @@ pub fn relation_type_intern(
     description: &str,
     now_unix_nanos: u64,
 ) -> Result<RelationTypeId, RelationTypeOpError> {
+    let (namespace, space) = (scope.namespace(), scope.space_id());
     validate_namespace(namespace)?;
     validate_name(name)?;
 
@@ -226,8 +425,7 @@ pub fn relation_type_intern(
     // schema_version, schema-declared row with diverging constraints
     // errors.
     let probed: Option<(u32, RelationTypeDefinition)> = {
-        let idx = wtxn.open_table(RELATION_TYPES_BY_QNAME_TABLE)?;
-        let id_raw: Option<u32> = idx.get(q.as_str())?.map(|g| g.value());
+        let id_raw: Option<u32> = scope_get_exact_wtxn(wtxn, q.as_str(), space)?;
         match id_raw {
             None => None,
             Some(id_raw) => {
@@ -342,37 +540,34 @@ pub fn relation_type_intern(
         t.insert(&row.relation_type_id, &row)?;
     }
     {
-        let mut idx = wtxn.open_table(RELATION_TYPES_BY_QNAME_TABLE)?;
-        idx.insert(q.as_str(), &row.relation_type_id)?;
+        let mut idx = wtxn.open_table(RELATION_TYPES_BY_SCOPE_TABLE)?;
+        idx.insert(&(q.as_str(), space), &row.relation_type_id)?;
     }
 
     Ok(RelationTypeId::from(next_id_raw))
 }
 
-/// Open-vocabulary intern: look up `(namespace, name)` and return its
-/// `RelationTypeId` if present, else allocate a fresh row with
-/// [`RelationTypeOrigin::ImplicitFromWrite`] and
-/// [`Cardinality::ManyToMany`] (no constraint — schemaless callers
-/// have no cardinality contract).
+/// Resolve a relation type in `scope`, coining it if nothing resolves.
 ///
-/// Counterpart to
+/// The open-vocabulary path. COINING ADOPTS, IT DOES NOT OVERRIDE — the
+/// chain is walked for the reason given on
 /// [`crate::schema::predicate::predicate_intern_or_get`].
+///
+/// # Errors
+/// Propagates validation and storage failures.
 pub fn relation_type_intern_or_get(
     wtxn: &WriteTransaction,
-    namespace: &str,
+    scope: DeclScope<'_>,
     name: &str,
     first_seen_lsn: u64,
     now_unix_nanos: u64,
 ) -> Result<RelationTypeId, RelationTypeOpError> {
+    let (namespace, space) = (scope.namespace(), scope.space_id());
     validate_namespace(namespace)?;
     validate_name(name)?;
     let q = qname(namespace, name);
 
-    let existing_id: Option<u32> = {
-        let idx = wtxn.open_table(RELATION_TYPES_BY_QNAME_TABLE)?;
-        let got = idx.get(q.as_str())?.map(|g| g.value());
-        got
-    };
+    let existing_id: Option<u32> = scope_get_wtxn(wtxn, q.as_str(), space)?;
     if let Some(id_raw) = existing_id {
         return Ok(RelationTypeId::from(id_raw));
     }
@@ -416,8 +611,8 @@ pub fn relation_type_intern_or_get(
         t.insert(&row.relation_type_id, &row)?;
     }
     {
-        let mut idx = wtxn.open_table(RELATION_TYPES_BY_QNAME_TABLE)?;
-        idx.insert(q.as_str(), &row.relation_type_id)?;
+        let mut idx = wtxn.open_table(RELATION_TYPES_BY_SCOPE_TABLE)?;
+        idx.insert(&(q.as_str(), space), &row.relation_type_id)?;
     }
     Ok(RelationTypeId::from(next_id_raw))
 }
@@ -429,18 +624,29 @@ pub fn relation_type_intern_or_get(
 /// before re-running apply.
 pub fn relation_type_drop_schema_declared(
     wtxn: &WriteTransaction,
-    namespace: &str,
+    scope: DeclScope<'_>,
 ) -> Result<usize, RelationTypeOpError> {
+    let (namespace, space) = (scope.namespace(), scope.space_id());
     validate_namespace(namespace)?;
 
+    // Victims are the declarations THIS SCOPE made, for the reason given on
+    // [`crate::schema::predicate::predicate_drop_schema_declared`].
     let victims: Vec<(u32, String)> = {
+        let idx = wtxn.open_table(RELATION_TYPES_BY_SCOPE_TABLE)?;
         let t = wtxn.open_table(RELATION_TYPES_TABLE)?;
         let mut out = Vec::new();
-        for entry in t.iter()? {
+        for entry in idx.iter()? {
             let (k, v) = entry?;
-            let row: RelationTypeDefinition = v.value();
+            let (q, sp) = k.value();
+            if sp != space {
+                continue;
+            }
+            let id = v.value();
+            let Some(row) = t.get(&id)?.map(|g| g.value()) else {
+                continue;
+            };
             if row.namespace == namespace && row.origin().is_schema_declared() {
-                out.push((k.value(), qname(&row.namespace, &row.name)));
+                out.push((id, q.to_string()));
             }
         }
         out
@@ -453,9 +659,8 @@ pub fn relation_type_drop_schema_declared(
         }
     }
     {
-        let mut idx = wtxn.open_table(RELATION_TYPES_BY_QNAME_TABLE)?;
-        for (_, q) in &victims {
-            idx.remove(q.as_str())?;
+        for (id, q) in &victims {
+            scope_remove_entry(wtxn, q.as_str(), *id)?;
         }
     }
     Ok(count)
@@ -467,16 +672,14 @@ pub fn relation_type_drop_schema_declared(
 /// composing handler resolve the id and mutate in one transaction.
 pub fn relation_type_id_by_qname(
     wtxn: &WriteTransaction,
-    namespace: &str,
+    scope: DeclScope<'_>,
     name: &str,
 ) -> Result<Option<RelationTypeId>, RelationTypeOpError> {
+    let (namespace, space) = (scope.namespace(), scope.space_id());
     validate_namespace(namespace)?;
     validate_name(name)?;
     let q = qname(namespace, name);
-    let idx = wtxn.open_table(RELATION_TYPES_BY_QNAME_TABLE)?;
-    let found = idx
-        .get(q.as_str())?
-        .map(|g| RelationTypeId::from(g.value()));
+    let found = scope_get_wtxn(wtxn, q.as_str(), space)?.map(RelationTypeId::from);
     Ok(found)
 }
 
@@ -490,17 +693,18 @@ pub fn relation_type_id_by_qname(
 /// implicit-from-write row sharing the qname is left untouched.
 pub fn relation_type_drop_one(
     wtxn: &WriteTransaction,
-    namespace: &str,
+    scope: DeclScope<'_>,
     name: &str,
 ) -> Result<Option<RelationTypeId>, RelationTypeOpError> {
+    let (namespace, space) = (scope.namespace(), scope.space_id());
     validate_namespace(namespace)?;
     validate_name(name)?;
 
     let q = qname(namespace, name);
     let victim: Option<u32> = {
-        let idx = wtxn.open_table(RELATION_TYPES_BY_QNAME_TABLE)?;
-        let id = idx.get(q.as_str())?.map(|g| g.value());
-        drop(idx);
+        // Exact, for the reason given on
+        // [`crate::schema::predicate::predicate_drop_one`].
+        let id = scope_get_exact_wtxn(wtxn, q.as_str(), space)?;
         match id {
             Some(id) => {
                 let t = wtxn.open_table(RELATION_TYPES_TABLE)?;
@@ -518,10 +722,7 @@ pub fn relation_type_drop_one(
             let mut t = wtxn.open_table(RELATION_TYPES_TABLE)?;
             t.remove(&id)?;
         }
-        {
-            let mut idx = wtxn.open_table(RELATION_TYPES_BY_QNAME_TABLE)?;
-            idx.remove(q.as_str())?;
-        }
+        scope_remove(wtxn, q.as_str(), space)?;
     }
     Ok(victim.map(RelationTypeId::from))
 }
@@ -586,13 +787,166 @@ mod tests {
         (dir, db)
     }
 
+    // ── The space overlay ─────────────────────────────────────────────────
+    //
+    // Same shape as predicates: the qname carries the namespace, so `space`
+    // is the one dimension the index lacked. Two applications inside a
+    // tenant can mean different things by the same relation.
+
+    const RT_NOW: u64 = 1_700_000_000_000_000_000;
+    const SP_A: [u8; 16] = [0xA1; 16];
+    const SP_B: [u8; 16] = [0xB2; 16];
+
+    fn rt_at(db: &redb::Database, space: [u8; 16], ns: &str, name: &str) -> RelationTypeId {
+        let wtxn = db.begin_write().unwrap();
+        let id = relation_type_intern(
+            &wtxn,
+            DeclScope::space(ns, space),
+            name,
+            None,
+            None,
+            Cardinality::ManyToMany,
+            false,
+            1,
+            "",
+            RT_NOW,
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+        id
+    }
+
+    fn rt_resolve(db: &redb::Database, space: [u8; 16], ns: &str, name: &str) -> Option<u32> {
+        let wtxn = db.begin_write().unwrap();
+        let got = scope_get_wtxn(&wtxn, qname(ns, name).as_str(), space).unwrap();
+        wtxn.commit().unwrap();
+        got
+    }
+
+    /// Resolution CHAINS, so `rt_resolve` cannot prove a row is gone — it
+    /// would report the declaration the scope inherits. This asks the exact
+    /// question: does THIS scope declare the name itself?
+    fn rt_declares_exactly(
+        db: &redb::Database,
+        space: [u8; 16],
+        ns: &str,
+        name: &str,
+    ) -> Option<u32> {
+        let wtxn = db.begin_write().unwrap();
+        let got = scope_get_exact_wtxn(&wtxn, qname(ns, name).as_str(), space).unwrap();
+        wtxn.commit().unwrap();
+        got
+    }
+
+    #[test]
+    fn a_spaces_relation_type_wins_over_the_namespace_base() {
+        let (_dir, db) = open_db();
+        let base = rt_at(&db, SPACE_BASE, "acme", "owns");
+        let overlay = rt_at(&db, SP_A, "acme", "owns");
+
+        assert_ne!(base, overlay, "an overlay is its own row");
+        assert_eq!(rt_resolve(&db, SP_A, "acme", "owns"), Some(overlay.raw()));
+        assert_eq!(
+            rt_resolve(&db, SPACE_BASE, "acme", "owns"),
+            Some(base.raw())
+        );
+    }
+
+    #[test]
+    fn a_space_without_its_own_relation_type_falls_back_to_the_base() {
+        let (_dir, db) = open_db();
+        let base = rt_at(&db, SPACE_BASE, "acme", "owns");
+        assert_eq!(rt_resolve(&db, SP_B, "acme", "owns"), Some(base.raw()));
+    }
+
+    /// Sibling spaces stay isolated — the reason the dimension exists.
+    #[test]
+    fn one_space_cannot_see_anothers_relation_type() {
+        let (_dir, db) = open_db();
+        let only_a = rt_at(&db, SP_A, "acme", "escalates_to");
+        assert_eq!(
+            rt_resolve(&db, SP_A, "acme", "escalates_to"),
+            Some(only_a.raw())
+        );
+        assert_eq!(rt_resolve(&db, SP_B, "acme", "escalates_to"), None);
+        assert_eq!(rt_resolve(&db, SPACE_BASE, "acme", "escalates_to"), None);
+    }
+
+    /// A targeted drop takes away the declaration it names and no other.
+    #[test]
+    fn dropping_the_base_leaves_a_spaces_relation_type_standing() {
+        let (_dir, db) = open_db();
+        rt_at(&db, SPACE_BASE, "acme", "owns");
+        let overlay = rt_at(&db, SP_A, "acme", "owns");
+
+        let wtxn = db.begin_write().unwrap();
+        scope_remove(&wtxn, qname("acme", "owns").as_str(), SPACE_BASE).unwrap();
+        wtxn.commit().unwrap();
+
+        assert_eq!(rt_resolve(&db, SPACE_BASE, "acme", "owns"), None);
+        assert_eq!(rt_resolve(&db, SP_A, "acme", "owns"), Some(overlay.raw()));
+    }
+
+    /// When a ROW goes, the entry naming it goes — and no other.
+    ///
+    /// This replaced an assertion that every space's entry went with it.
+    /// That premise held only while a qname meant one row; a relation type now has
+    /// one row PER SCOPE that declared it, so clearing them all orphaned the
+    /// sibling scopes' rows — each survived with nothing resolving to it, and
+    /// the declaration silently vanished.
+    #[test]
+    fn removing_a_row_clears_only_its_own_entry() {
+        let (_dir, db) = open_db();
+        let base = rt_at(&db, SPACE_BASE, "acme", "owns");
+        let in_a = rt_at(&db, SP_A, "acme", "owns");
+        let in_b = rt_at(&db, SP_B, "acme", "owns");
+        assert_ne!(base, in_a, "each scope declared its own row");
+        assert_ne!(in_a, in_b);
+
+        let wtxn = db.begin_write().unwrap();
+        scope_remove_entry(&wtxn, qname("acme", "owns").as_str(), in_a.raw()).unwrap();
+        wtxn.commit().unwrap();
+
+        assert_eq!(
+            rt_declares_exactly(&db, SP_A, "acme", "owns"),
+            None,
+            "the removed row's entry is gone"
+        );
+        assert_eq!(
+            rt_declares_exactly(&db, SPACE_BASE, "acme", "owns"),
+            Some(base.raw()),
+            "the base's entry is untouched"
+        );
+        assert_eq!(
+            rt_declares_exactly(&db, SP_B, "acme", "owns"),
+            Some(in_b.raw()),
+            "and the sibling space's entry is untouched"
+        );
+    }
+
+    /// The base entry point means `SPACE_BASE`, so existing callers resolve
+    /// exactly as they did before the dimension existed.
+    #[test]
+    fn the_base_relation_type_entry_point_declares_at_the_base() {
+        let (_dir, db) = open_db();
+        let wtxn = db.begin_write().unwrap();
+        let id = relation_type_intern_or_get(&wtxn, DeclScope::base("acme"), "coined", 5, RT_NOW)
+            .unwrap();
+        wtxn.commit().unwrap();
+        assert_eq!(
+            rt_resolve(&db, SPACE_BASE, "acme", "coined"),
+            Some(id.raw())
+        );
+        assert_eq!(rt_resolve(&db, SP_A, "acme", "coined"), Some(id.raw()));
+    }
+
     #[test]
     fn intern_fresh_allocates_id_one() {
         let (_dir, db) = open_db();
         let wtxn = db.begin_write().unwrap();
         let id = relation_type_intern(
             &wtxn,
-            "brain",
+            DeclScope::base("brain"),
             "related_to",
             None,
             None,
@@ -612,7 +966,7 @@ mod tests {
         assert_eq!(got.cardinality, Cardinality::ManyToMany);
         assert!(!got.is_symmetric);
 
-        let by_qname = relation_type_lookup_by_qname(&rtxn, "brain", "related_to")
+        let by_qname = relation_type_lookup_by_qname(&rtxn, DeclScope::base("brain"), "related_to")
             .unwrap()
             .unwrap();
         assert_eq!(by_qname.id, id);
@@ -624,7 +978,7 @@ mod tests {
         let wtxn = db.begin_write().unwrap();
         let id1 = relation_type_intern(
             &wtxn,
-            "brain",
+            DeclScope::base("brain"),
             "related_to",
             None,
             None,
@@ -637,7 +991,7 @@ mod tests {
         .unwrap();
         let id2 = relation_type_intern(
             &wtxn,
-            "brain",
+            DeclScope::base("brain"),
             "related_to",
             None,
             None,
@@ -662,7 +1016,7 @@ mod tests {
         let wtxn = db.begin_write().unwrap();
         let _ = relation_type_intern(
             &wtxn,
-            "brain",
+            DeclScope::base("brain"),
             "related_to",
             None,
             None,
@@ -675,7 +1029,7 @@ mod tests {
         .unwrap();
         let err = relation_type_intern(
             &wtxn,
-            "brain",
+            DeclScope::base("brain"),
             "related_to",
             None,
             None,
@@ -697,7 +1051,7 @@ mod tests {
         let wtxn = db.begin_write().unwrap();
         let _ = relation_type_intern(
             &wtxn,
-            "brain",
+            DeclScope::base("brain"),
             "discussed_with",
             None,
             None,
@@ -710,7 +1064,7 @@ mod tests {
         .unwrap();
         let err = relation_type_intern(
             &wtxn,
-            "brain",
+            DeclScope::base("brain"),
             "discussed_with",
             None,
             None,
@@ -732,7 +1086,7 @@ mod tests {
         let wtxn = db.begin_write().unwrap();
         let _ = relation_type_intern(
             &wtxn,
-            "brain",
+            DeclScope::base("brain"),
             "related_to",
             None,
             None,
@@ -745,7 +1099,7 @@ mod tests {
         .unwrap();
         let _ = relation_type_intern(
             &wtxn,
-            "acme",
+            DeclScope::base("acme"),
             "reports_to",
             Some(EntityTypeId(1)),
             Some(EntityTypeId(1)),
@@ -772,11 +1126,11 @@ mod tests {
         let (_dir, db) = open_db();
         let wtxn = db.begin_write().unwrap();
         let _ = wtxn.open_table(RELATION_TYPES_TABLE).unwrap();
-        let _ = wtxn.open_table(RELATION_TYPES_BY_QNAME_TABLE).unwrap();
+        let _ = wtxn.open_table(RELATION_TYPES_BY_SCOPE_TABLE).unwrap();
         wtxn.commit().unwrap();
 
         let rtxn = db.begin_read().unwrap();
-        let got = relation_type_lookup_by_qname(&rtxn, "brain", "nope").unwrap();
+        let got = relation_type_lookup_by_qname(&rtxn, DeclScope::base("brain"), "nope").unwrap();
         assert!(got.is_none());
     }
 
@@ -786,7 +1140,7 @@ mod tests {
         let wtxn = db.begin_write().unwrap();
         let id = relation_type_intern(
             &wtxn,
-            "acme",
+            DeclScope::base("acme"),
             "reports_to",
             Some(EntityTypeId(1)),
             Some(EntityTypeId(1)),
@@ -811,8 +1165,8 @@ mod tests {
     fn relation_type_intern_or_get_allocates_then_returns_same_id() {
         let (_dir, db) = open_db();
         let wtxn = db.begin_write().unwrap();
-        let a = relation_type_intern_or_get(&wtxn, "acme", "knows", 0, 0).unwrap();
-        let b = relation_type_intern_or_get(&wtxn, "acme", "knows", 0, 0).unwrap();
+        let a = relation_type_intern_or_get(&wtxn, DeclScope::base("acme"), "knows", 0, 0).unwrap();
+        let b = relation_type_intern_or_get(&wtxn, DeclScope::base("acme"), "knows", 0, 0).unwrap();
         wtxn.commit().unwrap();
         assert_eq!(a, b);
 
@@ -829,7 +1183,7 @@ mod tests {
     fn relation_type_intern_or_get_marks_origin_implicit() {
         let (_dir, db) = open_db();
         let wtxn = db.begin_write().unwrap();
-        let id = relation_type_intern_or_get(&wtxn, "acme", "y", 42, 0).unwrap();
+        let id = relation_type_intern_or_get(&wtxn, DeclScope::base("acme"), "y", 42, 0).unwrap();
         wtxn.commit().unwrap();
 
         let rtxn = db.begin_read().unwrap();
@@ -845,7 +1199,7 @@ mod tests {
         let wtxn = db.begin_write().unwrap();
         let v1_id = relation_type_intern(
             &wtxn,
-            "acme",
+            DeclScope::base("acme"),
             "reports_to",
             Some(EntityTypeId(1)),
             Some(EntityTypeId(1)),
@@ -858,7 +1212,7 @@ mod tests {
         .unwrap();
         let v2_id = relation_type_intern(
             &wtxn,
-            "acme",
+            DeclScope::base("acme"),
             "reports_to",
             Some(EntityTypeId(1)),
             Some(EntityTypeId(1)),
@@ -891,7 +1245,7 @@ mod tests {
         let wtxn = db.begin_write().unwrap();
         let _ = relation_type_intern(
             &wtxn,
-            "acme",
+            DeclScope::base("acme"),
             "reports_to",
             Some(EntityTypeId(1)),
             Some(EntityTypeId(1)),
@@ -904,7 +1258,7 @@ mod tests {
         .unwrap();
         let err = relation_type_intern(
             &wtxn,
-            "acme",
+            DeclScope::base("acme"),
             "reports_to",
             Some(EntityTypeId(1)),
             Some(EntityTypeId(1)),
@@ -926,7 +1280,7 @@ mod tests {
         let wtxn = db.begin_write().unwrap();
         let declared = relation_type_intern(
             &wtxn,
-            "acme",
+            DeclScope::base("acme"),
             "in_schema",
             None,
             None,
@@ -937,11 +1291,12 @@ mod tests {
             0,
         )
         .unwrap();
-        let implicit = relation_type_intern_or_get(&wtxn, "acme", "implicit", 0, 0).unwrap();
+        let implicit =
+            relation_type_intern_or_get(&wtxn, DeclScope::base("acme"), "implicit", 0, 0).unwrap();
         wtxn.commit().unwrap();
 
         let rtxn = db.begin_read().unwrap();
-        let active = relation_types_active_for_schema(&rtxn, "acme", 5).unwrap();
+        let active = relation_types_active_for_schema(&rtxn, DeclScope::base("acme"), 5).unwrap();
         assert!(active.contains(&declared));
         assert!(!active.contains(&implicit));
     }

@@ -21,6 +21,7 @@ use brain_core::StatementKind;
 use brain_core::{EntityId, PredicateId};
 use brain_metadata::schema::predicate::predicate_lookup_by_qname;
 use brain_metadata::schema::store::schema_active;
+use brain_metadata::DeclScope;
 use brain_planner::retrieval::executor::{execute, ExecutionError, RetrievalExecutorContext};
 use brain_planner::retrieval::explain::{render_plan, render_trace};
 use brain_planner::retrieval::planner::{plan, PlanError};
@@ -149,6 +150,9 @@ fn resolve_predicate_filter(
             qnames.len()
         )));
     }
+    // The filter resolves in the scope the caller reads in: its space's own
+    // declarations when it has them, otherwise the namespace's.
+    let caller_space: [u8; 16] = ctx.executor.caller_space.into();
     let rtxn = ctx
         .executor
         .metadata
@@ -164,9 +168,9 @@ fn resolve_predicate_filter(
         let (ns, name) = q
             .split_once(':')
             .ok_or_else(|| OpError::InvalidRequest("predicate qname missing ':'".into()))?;
-        let active_version = schema_active(&rtxn, ns)
+        let active_version = schema_active(&rtxn, DeclScope::space(ns, caller_space))
             .map_err(|e| OpError::Internal(format!("schema_active: {e}")))?;
-        match predicate_lookup_by_qname(&rtxn, ns, name)
+        match predicate_lookup_by_qname(&rtxn, DeclScope::space(ns, caller_space), name)
             .map_err(|e| OpError::InvalidRequest(format!("predicate lookup ({q:?}): {e}")))?
         {
             Some(p) => out.push(p.id),

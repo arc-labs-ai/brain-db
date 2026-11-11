@@ -728,7 +728,7 @@ mod tests {
         let phase = Phase::UpsertSchema {
             namespace: "acme".into(),
             version: 1,
-            space: brain_metadata::tables::entity_type::SPACE_BASE,
+            space: brain_metadata::tables::scope::SPACE_BASE,
             blob: b"namespace acme".to_vec(),
             declared_predicates: vec![],
             declared_relation_types: vec![],

@@ -18,6 +18,7 @@ use brain_core::{
 use brain_metadata::entity::ops::entity_put;
 use brain_metadata::schema::predicate::predicate_intern_or_get;
 use brain_metadata::statement::{statement_create, statement_get};
+use brain_metadata::DeclScope;
 use brain_metadata::MetadataDb;
 use brain_metadata::RowScope;
 use proptest::prelude::*;
@@ -116,7 +117,7 @@ proptest! {
         // predicate_get check finds something.
         let pid = {
             let wtxn = db.begin_write().unwrap();
-            let pid = predicate_intern_or_get(&wtxn, "test", "rel", 0, T0).unwrap();
+            let pid = predicate_intern_or_get(&wtxn, DeclScope::base("test"), "rel", 0, T0).unwrap();
             wtxn.commit().unwrap();
             pid
         };
@@ -206,7 +207,7 @@ fn known_text_value_roundtrips() {
 
     let pid = {
         let wtxn = db.begin_write().unwrap();
-        let pid = predicate_intern_or_get(&wtxn, "test", "rel", 0, T0).unwrap();
+        let pid = predicate_intern_or_get(&wtxn, DeclScope::base("test"), "rel", 0, T0).unwrap();
         wtxn.commit().unwrap();
         pid
     };

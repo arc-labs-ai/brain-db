@@ -16,6 +16,170 @@
 
 use brain_core::{NamespaceId, SpaceId};
 
+/// The all-zero space: "this declaration belongs to the whole namespace".
+///
+/// Not a real [`brain_core::SpaceId`] — `SpaceId::NIL` is the anonymous
+/// caller, and a declaration is never owned by a caller. The two values
+/// coincide numerically and must not be conflated in reasoning: this one
+/// means *unscoped by space*, which is why it is named for what it is.
+pub const SPACE_BASE: [u8; 16] = [0u8; 16];
+
+/// The scope a DECLARATION is read or written in: a tenant namespace, and
+/// either one space inside it or the namespace-wide base.
+///
+/// Sibling of [`RowScope`], and the distinction is the point. `RowScope`
+/// scopes DATA — the entities, statements and relations a tenant owns, keyed
+/// by interned ids. `DeclScope` scopes VOCABULARY — the entity types,
+/// predicates, relation types, extractors and schema documents that say what
+/// data may exist, keyed by the namespace NAME the qname carries.
+///
+/// The namespace and the space travel together because neither answers a
+/// lookup alone, and passing them as two loose arguments made two mistakes
+/// representable that this type makes unstateable: omitting the space (which
+/// silently meant the tenant-wide base, so a space read another scope's
+/// vocabulary) and transposing a namespace against the wrong space.
+///
+/// Construct it by naming which kind of scope it is — [`DeclScope::base`] or
+/// [`DeclScope::space`] — so a call site that means the namespace base says
+/// so instead of passing an all-zero array.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeclScope<'a> {
+    namespace: &'a str,
+    space: [u8; 16],
+}
+
+impl<'a> DeclScope<'a> {
+    /// The namespace-wide base: the declarations every space in the tenant
+    /// resolves, and the only scope that existed before spaces could
+    /// declare.
+    ///
+    /// Reserved for declarations that genuinely belong to the whole tenant
+    /// (or, for the system namespace, the whole deployment). A read on
+    /// behalf of a caller acting in a space uses [`DeclScope::space`], which
+    /// falls back here on its own.
+    #[must_use]
+    pub const fn base(namespace: &'a str) -> Self {
+        Self {
+            namespace,
+            space: SPACE_BASE,
+        }
+    }
+
+    /// One space's scope. Reads fall back to the namespace base; writes land
+    /// in this space alone.
+    ///
+    /// Passing [`SPACE_BASE`] is the same scope [`DeclScope::base`] names —
+    /// this constructor takes a space id that came from a caller's identity,
+    /// where the base is a legitimate value meaning "no effective space".
+    #[must_use]
+    pub const fn space(namespace: &'a str, space: [u8; 16]) -> Self {
+        Self { namespace, space }
+    }
+
+    /// The tenant namespace name.
+    #[must_use]
+    pub const fn namespace(&self) -> &'a str {
+        self.namespace
+    }
+
+    /// The space id, [`SPACE_BASE`] for the namespace-wide base.
+    #[must_use]
+    pub const fn space_id(&self) -> [u8; 16] {
+        self.space
+    }
+}
+
+/// The scope an ENTITY TYPE is read or written in: a tenant namespace by id,
+/// and either one space inside it or the namespace-wide base.
+///
+/// Sibling of [`DeclScope`], and the difference is what the key is made of.
+/// A predicate, relation type or extractor is addressed by a QNAME, which
+/// carries its namespace as text. An entity type is addressed by a BARE name
+/// against an interned [`NamespaceId`], because the label surface offers the
+/// classifier `brain:<Name>` for every type whatever its owner — scoping is
+/// a registry concern, not a prompt one.
+///
+/// So this scope names the namespace by id, and its ladder carries a third
+/// rung the qname registries have no use for: the shared system namespace,
+/// whose built-ins every tenant resolves after its own declarations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TypeScope {
+    namespace_id: u32,
+    space: [u8; 16],
+}
+
+impl TypeScope {
+    /// A tenant's namespace-wide base: the declarations every space in the
+    /// namespace resolves.
+    #[must_use]
+    pub const fn base(namespace_id: u32) -> Self {
+        Self {
+            namespace_id,
+            space: SPACE_BASE,
+        }
+    }
+
+    /// One space's scope. Reads fall back to the namespace base and then to
+    /// the built-ins; writes land in this space alone.
+    #[must_use]
+    pub const fn space(namespace_id: u32, space: [u8; 16]) -> Self {
+        Self {
+            namespace_id,
+            space,
+        }
+    }
+
+    /// The owning tenant's interned namespace id.
+    #[must_use]
+    pub const fn namespace_id(&self) -> u32 {
+        self.namespace_id
+    }
+
+    /// The space id, [`SPACE_BASE`] for the namespace-wide base.
+    #[must_use]
+    pub const fn space_id(&self) -> [u8; 16] {
+        self.space
+    }
+
+    /// The scopes a lookup consults, narrowest first:
+    ///
+    /// 1. `(namespace, space)` — the space's own overlay. Absent when the
+    ///    caller asked the namespace-wide question, so the common path is
+    ///    exactly the two lookups it always was.
+    /// 2. `(namespace, base)` — the tenant's own declarations.
+    /// 3. `(system, base)` — the shared built-ins. A system-namespace caller
+    ///    consults them once, not twice.
+    ///
+    /// THE ORDER IS THE WHOLE POINT. Each rung may shadow the one after it:
+    /// a tenant that declares `Person` gets THEIR `Person` rather than the
+    /// built-in; a space that declares `Person` gets ITS `Person` rather
+    /// than the tenant's. Consulting a broader rung earlier would let a more
+    /// general declaration shadow a more specific one, which is backwards —
+    /// the narrower scope is the one that was chosen deliberately.
+    ///
+    /// READS CHAIN, WRITES PROBE EXACTLY, as for [`DeclScope`]: a write that
+    /// chained would find the tenant's or the built-in row and hand it back,
+    /// so declaring an override would silently return the shadowed row.
+    pub fn chain(&self) -> impl Iterator<Item = (u32, [u8; 16])> {
+        let system = NamespaceId::SYSTEM.raw();
+        let overlay = (self.space != SPACE_BASE).then_some((self.namespace_id, self.space));
+        let base = std::iter::once((self.namespace_id, SPACE_BASE));
+        let builtins = (self.namespace_id != system).then_some((system, SPACE_BASE));
+        overlay.into_iter().chain(base).chain(builtins)
+    }
+}
+
+/// The space ladder a scoped lookup walks, narrowest first.
+///
+/// A registry's index helpers take the ladder directly rather than a
+/// [`DeclScope`], because their key is `(qname, space)` and the qname already
+/// carries the namespace — a scope there would name it twice and let the two
+/// disagree.
+pub fn space_chain(space: [u8; 16]) -> impl Iterator<Item = [u8; 16]> {
+    let overlay = (space != SPACE_BASE).then_some(space);
+    overlay.into_iter().chain(std::iter::once(SPACE_BASE))
+}
+
 /// How widely a scope admits rows on the read path.
 ///
 /// The namespace is always the tenant wall — no mode ever relaxes it.

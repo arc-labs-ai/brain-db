@@ -1050,12 +1050,14 @@ mod tests {
             RequestBody::SchemaValidate(SchemaValidateRequest {
                 schema_document: "namespace acme\n".into(),
                 act_as: Some(sel.clone()),
+                scope: SchemaScope::Namespace,
             }),
             RequestBody::SchemaReplace(SchemaReplaceRequest {
                 schema_document: "namespace acme\n".into(),
                 force_drop_existing: true,
                 request_id: sample_uuid(5),
                 act_as: Some(sel.clone()),
+                scope: SchemaScope::Namespace,
             }),
             RequestBody::SchemaDrop(SchemaDropRequest {
                 namespace: "acme".into(),
@@ -1064,6 +1066,7 @@ mod tests {
                 force: false,
                 request_id: sample_uuid(6),
                 act_as: Some(sel.clone()),
+                scope: SchemaScope::Namespace,
             }),
         ];
         for body in bodies {
@@ -1638,6 +1641,7 @@ mod tests {
             force_drop_existing: true,
             request_id: [0xAB; 16],
             act_as: None,
+            scope: SchemaScope::Namespace,
         }));
     }
 

@@ -21,6 +21,7 @@
 //!
 //! Run: `cargo bench -p brain-planner --bench relation_traverse`.
 
+use brain_metadata::DeclScope;
 use std::time::{Duration, Instant};
 
 use brain_core::{
@@ -73,7 +74,7 @@ fn build_entity_fixture() -> EntityFixture {
     // Use the seeded `brain:related_to` plus two ad-hoc types.
     let related_to: RelationTypeId = {
         let rtxn = db.read_txn().expect("read_txn");
-        brain_metadata::relation_type_lookup_by_qname(&rtxn, "brain", "related_to")
+        brain_metadata::relation_type_lookup_by_qname(&rtxn, DeclScope::base("brain"), "related_to")
             .expect("lookup")
             .expect("seeded")
             .id
@@ -84,8 +85,10 @@ fn build_entity_fixture() -> EntityFixture {
     use brain_metadata::relation::types::relation_type_intern_or_get;
     let (rt_b, rt_c) = {
         let wtxn = db.write_txn().expect("write_txn");
-        let b = relation_type_intern_or_get(&wtxn, "brain", "follows", 0, T0).expect("intern_b");
-        let c = relation_type_intern_or_get(&wtxn, "brain", "cites", 0, T0).expect("intern_c");
+        let b = relation_type_intern_or_get(&wtxn, DeclScope::base("brain"), "follows", 0, T0)
+            .expect("intern_b");
+        let c = relation_type_intern_or_get(&wtxn, DeclScope::base("brain"), "cites", 0, T0)
+            .expect("intern_c");
         wtxn.commit().expect("commit");
         (b, c)
     };

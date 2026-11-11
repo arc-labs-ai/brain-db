@@ -407,13 +407,16 @@ fn resolve_entity_type(
     // So auto-discovery lands at SPACE_BASE, exactly where it landed
     // before spaces entered this key, and only a deliberate SCHEMA_UPLOAD
     // can create an overlay row.
-    if let Some(def) = entity_type_lookup(wtxn, namespace_id, space, name)? {
+    if let Some(def) = entity_type_lookup(
+        wtxn,
+        brain_metadata::TypeScope::space(namespace_id, space),
+        name,
+    )? {
         return Ok(def.id());
     }
     Ok(entity_type_intern(
         wtxn,
-        namespace_id,
-        brain_metadata::tables::entity_type::SPACE_BASE,
+        brain_metadata::TypeScope::base(namespace_id),
         name,
         Vec::new(),
         now_unix_nanos,
@@ -2725,8 +2728,7 @@ mod tests {
         let wtxn = d.write_txn().unwrap();
         let def = entity_type_lookup(
             &wtxn,
-            brain_core::NamespaceId::SYSTEM.raw(),
-            brain_metadata::tables::entity_type::SPACE_BASE,
+            brain_metadata::TypeScope::base(brain_core::NamespaceId::SYSTEM.raw()),
             "Organization",
         )
         .unwrap();
@@ -3001,8 +3003,7 @@ mod tests {
             let wtxn = d.write_txn().unwrap();
             let id = entity_type_intern(
                 &wtxn,
-                brain_core::NamespaceId::SYSTEM.raw(),
-                brain_metadata::tables::entity_type::SPACE_BASE,
+                brain_metadata::TypeScope::base(brain_core::NamespaceId::SYSTEM.raw()),
                 "Organization",
                 Vec::new(),
                 NOW,

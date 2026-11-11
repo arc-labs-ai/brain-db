@@ -34,7 +34,6 @@
 //! the 7-day grace window. The slot-reclamation worker is a separate
 //! sweep that operates against the eventual byte-zero; it does NOT
 //! enqueue the cascade today (a known gap; see plan W1.5).
-
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -390,7 +389,7 @@ mod tests {
         let wtxn = db.write_txn().unwrap();
         let id = predicate_intern(
             &wtxn,
-            "test",
+            brain_metadata::DeclScope::base("test"),
             name,
             Some(StatementKind::Fact),
             /* object: Value */ 2,

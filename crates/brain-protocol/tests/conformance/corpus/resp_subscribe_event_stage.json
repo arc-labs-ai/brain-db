@@ -1,0 +1,27 @@
+{
+  "event_type": 27,
+  "memory_id": 33059591799037110662230,
+  "session_id": 1,
+  "text": "",
+  "kind": 0,
+  "salience": 0.0,
+  "timestamp_unix_nanos": 1700000000000000000,
+  "lsn": 43,
+  "graph_payload": null,
+  "edge_payload": null,
+  "stage_kind": 2,
+  "stage_outcome": 0,
+  "stage_payload": {
+    "Extractor": {
+      "entity_count": 2,
+      "statement_count": 3,
+      "relation_count": 1,
+      "dropped_count": 4,
+      "contradiction_count": 1,
+      "undeclared_entity_count": 2,
+      "has_active_schema": true,
+      "audit_status": 0,
+      "error_message": ""
+    }
+  }
+}

@@ -46,6 +46,7 @@
 //! Each case opens a fresh redb tempfile and batches its inserts into one
 //! write txn, so case counts stay modest.
 
+use brain_metadata::DeclScope;
 use std::collections::BTreeSet;
 
 use brain_core::{
@@ -114,7 +115,7 @@ fn intern_fact_pred(db: &MetadataDb, name: &str) -> PredicateId {
     let wtxn = db.write_txn().unwrap();
     let id = predicate_intern(
         &wtxn,
-        "test",
+        DeclScope::base("test"),
         name,
         Some(StatementKind::Fact),
         /* object: Value */ 2u8,
@@ -578,7 +579,7 @@ proptest! {
         let rtype = {
             let wtxn = db.write_txn().unwrap();
             let id = relation_type_intern(
-                &wtxn, "test", "linked", None, None, Cardinality::ManyToMany, false, 1, "", T0,
+                &wtxn, DeclScope::base("test"), "linked", None, None, Cardinality::ManyToMany, false, 1, "", T0,
             )
             .unwrap();
             wtxn.commit().unwrap();
@@ -652,7 +653,7 @@ proptest! {
         let rtype = {
             let wtxn = db.write_txn().unwrap();
             let id = relation_type_intern(
-                &wtxn, "test", "linked", None, None, Cardinality::ManyToMany, false, 1, "", T0,
+                &wtxn, DeclScope::base("test"), "linked", None, None, Cardinality::ManyToMany, false, 1, "", T0,
             )
             .unwrap();
             wtxn.commit().unwrap();

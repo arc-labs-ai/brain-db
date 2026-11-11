@@ -7,6 +7,7 @@
 //! the wiring, the grace plumbing (`with_grace_seconds`), the
 //! off-by-default safety, and re-run idempotency.
 
+use brain_metadata::DeclScope;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -122,7 +123,7 @@ fn intern_predicate(metadata: &SharedMetadataDb, name: &str, created: u64) -> Pr
     let wtxn = metadata.write_txn().unwrap();
     let id = predicate_intern(
         &wtxn,
-        "test",
+        DeclScope::base("test"),
         name,
         Some(StatementKind::Fact),
         /* object: Value */ 2,

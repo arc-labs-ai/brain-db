@@ -3,5 +3,6 @@
   "act_as": {
     "namespace": "org",
     "space": "support-bot:user123"
-  }
+  },
+  "scope": 1
 }

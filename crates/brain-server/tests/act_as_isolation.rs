@@ -1142,6 +1142,7 @@ async fn act_as_grant_beyond_delegator_is_denied() {
         force_drop_existing: true,
         request_id: *uuid::Uuid::now_v7().as_bytes(),
         act_as: Some(act_as_granting("tenant_a", "space-a", bits::ADMIN)),
+        scope: brain_protocol::SchemaScope::Namespace,
     });
     let (op, body) = round_trip(&mut svc, 1, replace).await;
     expect_error(

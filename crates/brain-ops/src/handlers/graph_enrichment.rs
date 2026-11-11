@@ -50,7 +50,6 @@ pub(crate) fn fetch_enrichment_for(
     use brain_metadata::relation::types::relation_type_get;
     use brain_metadata::schema::predicate::predicate_get;
     use brain_metadata::tables::edge::{walk_incoming, walk_outgoing};
-    use brain_metadata::tables::entity_type::ENTITY_TYPES_TABLE;
     use brain_metadata::tables::relation::{RelationMetadata, RELATION_METADATA_TABLE};
     use brain_metadata::tables::statement::{
         statement_from_metadata, StatementMetadata, STATEMENTS_BY_EVIDENCE_TABLE, STATEMENTS_TABLE,
@@ -62,7 +61,13 @@ pub(crate) fn fetch_enrichment_for(
     const ENTITY_CAP: usize = 16;
     const STATEMENT_CAP: usize = 5;
     const RELATION_CAP: usize = 5;
-    let entity_types = rtxn.open_table(ENTITY_TYPES_TABLE).ok();
+    // Entity types are projected through the shared resolver, which turns an
+    // id into the canonical `"<namespace>:<Name>"`. This path used to open
+    // ENTITY_TYPES_TABLE here and read `name` off the row, which dropped
+    // `namespace_id` — the one field that distinguishes a tenant's `Person`
+    // from the built-in it is allowed to override. One resolver for the whole
+    // batch, so its two caches span every memory in the call.
+    let mut qnames = brain_metadata::EntityTypeQnames::new();
     let evidence_table = rtxn.open_table(STATEMENTS_BY_EVIDENCE_TABLE).map_err(|e| {
         OpError::Internal(format!(
             "include_graph: open STATEMENTS_BY_EVIDENCE_TABLE: {e}"
@@ -104,15 +109,11 @@ pub(crate) fn fetch_enrichment_for(
             else {
                 continue;
             };
-            let type_name = entity_types
-                .as_ref()
-                .and_then(|t| t.get(&ent.entity_type.raw()).ok().flatten())
-                .map(|g| g.value().name)
-                .unwrap_or_default();
+            let type_qname = qnames.resolve(rtxn, ent.entity_type.raw());
             enriched_entities.push(EnrichedEntity {
                 id: eid.to_bytes(),
                 name: ent.canonical_name,
-                type_qname: type_name,
+                type_qname,
             });
         }
 
@@ -416,6 +417,118 @@ mod tests {
 
     fn is_empty(g: &GraphEnrichment) -> bool {
         g.entities.is_empty() && g.statements.is_empty() && g.relations.is_empty()
+    }
+
+    /// Like [`mention`] but with a CHOSEN entity type, so a test can put a
+    /// tenant's own type behind the mention instead of the built-in `Person`.
+    fn mention_typed(
+        db: &MetadataDb,
+        memory_id: MemoryId,
+        name: &str,
+        entity_type: brain_core::EntityTypeId,
+    ) -> EntityId {
+        let entity = Entity::new_active(
+            EntityId::new(),
+            entity_type,
+            name.to_owned(),
+            name.to_lowercase(),
+            NOW,
+        );
+        let id = entity.id;
+        let wtxn = db.write_txn().expect("write txn");
+        entity_put(&wtxn, scope(), SessionId::DEFAULT, &entity).expect("entity_put");
+        {
+            let mut e = wtxn.open_table(EDGES_TABLE).expect("edges");
+            let mut r = wtxn.open_table(EDGES_REVERSE_TABLE).expect("edges_reverse");
+            let data = EdgeData::new(
+                1.0,
+                brain_metadata::tables::edge::origin::AUTO_DERIVED,
+                brain_metadata::tables::edge::derived_by::SIMILARITY_WORKER,
+                NOW,
+            );
+            link(
+                &mut e,
+                &mut r,
+                NodeRef::Memory(memory_id),
+                brain_core::EdgeKindRef::Mentions,
+                NodeRef::Entity(id),
+                zero_disambiguator(),
+                &data,
+            )
+            .expect("link");
+        }
+        wtxn.commit().expect("commit");
+        id
+    }
+
+    /// Intern an entity type under a named namespace, writing the namespace
+    /// row first so the projection can resolve its name.
+    fn tenant_type(db: &MetadataDb, namespace: &str, name: &str) -> brain_core::EntityTypeId {
+        let wtxn = db.write_txn().expect("write txn");
+        let ns = brain_metadata::namespace::namespace_intern_or_get(&wtxn, namespace, NOW)
+            .expect("intern namespace");
+        let id = brain_metadata::entity_type_intern(
+            &wtxn,
+            brain_metadata::TypeScope::base(ns.raw()),
+            name,
+            Vec::new(),
+            NOW,
+        )
+        .expect("intern entity type");
+        wtxn.commit().expect("commit");
+        id
+    }
+
+    // ── What `type_qname` actually carries ─────────────────────────────────
+    //
+    // THE FIELD IS NAMED FOR A QNAME AND USED TO CARRY A BARE NAME. This
+    // projection read `EntityTypeDefinition.name` and dropped `namespace_id`,
+    // so a client could not tell a built-in extraction from a tenant's own —
+    // the registry deliberately allows both to exist under one name. The unit
+    // tests for `EntityTypeQnames` pin the rendering; these two pin that the
+    // RESPONSE carries it, which is the half no resolver test can cover.
+
+    #[test]
+    fn a_built_in_type_reaches_the_response_as_a_qname() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = fresh_db(&dir);
+        mention(&db, mem(1), "Lina");
+
+        let got = fetch(&db, &[mem(1)]);
+        let types: Vec<&str> = got[0]
+            .entities
+            .iter()
+            .map(|e| e.type_qname.as_str())
+            .collect();
+        assert_eq!(types, vec!["brain:Person"], "not the bare \"Person\"");
+    }
+
+    /// A tenant's own type and the built-in it shadows, in ONE enrichment.
+    /// Both rows say `Person`; only the prefix separates them, and before the
+    /// fix this response carried `["Person", "Person"]` — two extractions a
+    /// consumer had no way to attribute.
+    #[test]
+    fn an_override_and_its_built_in_are_distinguishable_in_one_response() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = fresh_db(&dir);
+        let acme_person = tenant_type(&db, "acme", "Person");
+        assert_ne!(
+            acme_person,
+            EntityType::PERSON_ID,
+            "the override must be its own type row"
+        );
+
+        mention(&db, mem(1), "Lina");
+        mention_typed(&db, mem(1), "Mira", acme_person);
+
+        let got = fetch(&db, &[mem(1)]);
+        let mut types: Vec<&str> = got[0]
+            .entities
+            .iter()
+            .map(|e| e.type_qname.as_str())
+            .collect();
+        types.sort_unstable();
+        assert_eq!(types, vec!["acme:Person", "brain:Person"]);
     }
 
     /// No ids is not an error. The helper still opens its three tables, so

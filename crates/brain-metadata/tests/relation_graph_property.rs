@@ -18,6 +18,7 @@
 //! so the check never assumes a particular canonicalisation or
 //! dedup outcome — it compares traversal against the graph as stored.
 
+use brain_metadata::DeclScope;
 use std::collections::{HashMap, HashSet};
 
 use brain_core::{
@@ -72,7 +73,7 @@ fn intern_type(
     let wtxn = db.write_txn().unwrap();
     let id = relation_type_intern(
         &wtxn,
-        "test",
+        DeclScope::base("test"),
         name,
         None,
         None,

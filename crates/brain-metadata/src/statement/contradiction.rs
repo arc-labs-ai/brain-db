@@ -64,6 +64,42 @@ pub fn contradiction_audit_record(
     Ok(())
 }
 
+/// Whether `statement` is party to an open contradiction on its
+/// `(subject, predicate)`.
+///
+/// Lets the extractor count contradictions per memory. The write path cannot
+/// infer this: a contradicting `statement_create` returns `Ok`, because
+/// coexisting Facts are legal and the conflict is filed rather than refused,
+/// so the audit row is the only evidence.
+///
+/// Requires the row to name THIS statement, not merely that the pair has an
+/// open row. The row outlives the write that opened it, so a later write on
+/// the same subject and predicate would otherwise inherit a contradiction it
+/// did not cause.
+///
+/// One point read on a `(subject, predicate_id)`-keyed table, in the caller's
+/// existing write txn.
+pub fn contradiction_audit_names(
+    wtxn: &WriteTransaction,
+    subject: EntityId,
+    predicate: PredicateId,
+    statement: StatementId,
+) -> Result<bool, StatementOpError> {
+    let t = wtxn.open_table(STATEMENT_CONTRADICTION_AUDIT_TABLE)?;
+    let Some(row) = t
+        .get(&(subject.to_bytes(), predicate.raw()))?
+        .map(|g| g.value())
+    else {
+        return Ok(false);
+    };
+    if row.outcome != contradiction_outcome::PENDING {
+        return Ok(false);
+    }
+    Ok(row
+        .contradicting_statement_ids
+        .contains(&statement.to_bytes()))
+}
+
 /// List open contradictions, up to `limit`. Each candidate row is
 /// re-checked against the primary `statements` table: ids that are no
 /// longer current/untombstoned are pruned, and a row that drops to ≤1
@@ -178,7 +214,7 @@ mod tests {
         let wtxn = db.write_txn().unwrap();
         let id = predicate_intern(
             &wtxn,
-            "test",
+            crate::tables::scope::DeclScope::base("test"),
             name,
             Some(StatementKind::Fact),
             2,
@@ -205,6 +241,111 @@ mod tests {
             T0,
             1,
         )
+    }
+
+    // ── `contradiction_audit_names` ───────────────────────────────────────
+    //
+    // A contradicting `statement_create` returns `Ok` by design, so the
+    // caller cannot infer a contradiction from the write. These cases fix
+    // what the audit row does and does not license it to claim.
+
+    #[test]
+    fn names_is_false_when_nothing_contradicts() {
+        let (_dir, db) = open_db();
+        let subj = make_entity(&db, "ada");
+        let pred = intern_fact(&db, "favorite_color");
+        let a = fact(subj, pred, "blue");
+
+        let wtxn = db.write_txn().unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &a, T0).unwrap();
+        assert!(!contradiction_audit_names(&wtxn, subj, pred, a.id).unwrap());
+        wtxn.commit().unwrap();
+    }
+
+    #[test]
+    fn names_is_true_for_both_sides_of_a_live_contradiction() {
+        let (_dir, db) = open_db();
+        let subj = make_entity(&db, "ada");
+        let pred = intern_fact(&db, "favorite_color");
+        let a = fact(subj, pred, "blue");
+        let b = fact(subj, pred, "green");
+
+        let wtxn = db.write_txn().unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &a, T0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &b, T0).unwrap();
+        // The row names the pre-existing fact as well as the new one; both
+        // are party to it. The extractor asks only about the statement it
+        // just wrote.
+        assert!(contradiction_audit_names(&wtxn, subj, pred, b.id).unwrap());
+        assert!(contradiction_audit_names(&wtxn, subj, pred, a.id).unwrap());
+        wtxn.commit().unwrap();
+    }
+
+    /// The audit row is keyed `(subject, predicate)` and outlives the write
+    /// that opened it, so "a row exists for this pair" is a different
+    /// question from "this write contradicted something". A later agreeing
+    /// statement must not be charged with the open contradiction.
+    #[test]
+    fn names_is_false_for_a_later_write_the_open_row_does_not_name() {
+        let (_dir, db) = open_db();
+        let subj = make_entity(&db, "ada");
+        let pred = intern_fact(&db, "favorite_color");
+        let a = fact(subj, pred, "blue");
+        let b = fact(subj, pred, "green");
+
+        let wtxn = db.write_txn().unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &a, T0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &b, T0).unwrap();
+        wtxn.commit().unwrap();
+
+        // A third statement that AGREES with `b`, so it adds no conflict of
+        // its own. The pair's contradiction is still open.
+        let c = fact(subj, pred, "green");
+        let wtxn = db.write_txn().unwrap();
+        statement_create(
+            &wtxn,
+            test_scope(),
+            brain_core::SessionId::DEFAULT,
+            &c,
+            T0 + 1,
+        )
+        .unwrap();
+        let open = contradiction_audit_names(&wtxn, subj, pred, a.id).unwrap();
+        let charged = contradiction_audit_names(&wtxn, subj, pred, c.id).unwrap();
+        wtxn.commit().unwrap();
+
+        assert!(open, "the pair's contradiction is still open");
+        assert!(
+            !charged,
+            "an agreeing write must not inherit the open row's contradiction"
+        );
+    }
+
+    #[test]
+    fn names_is_false_once_the_contradiction_resolves() {
+        let (_dir, db) = open_db();
+        let subj = make_entity(&db, "ada");
+        let pred = intern_fact(&db, "favorite_color");
+        let a = fact(subj, pred, "blue");
+        let b = fact(subj, pred, "green");
+
+        let wtxn = db.write_txn().unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &a, T0).unwrap();
+        statement_create(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &b, T0).unwrap();
+        wtxn.commit().unwrap();
+
+        // Tombstone one side, then let the lazy resolver flip the row.
+        let wtxn = db.write_txn().unwrap();
+        statement_tombstone(&wtxn, a.id, TombstoneReason::UserRequest, T0 + 2).unwrap();
+        wtxn.commit().unwrap();
+        let wtxn = db.write_txn().unwrap();
+        contradiction_audit_list_pending(&wtxn, 16, T0 + 3).unwrap();
+        wtxn.commit().unwrap();
+
+        let wtxn = db.write_txn().unwrap();
+        let still = contradiction_audit_names(&wtxn, subj, pred, b.id).unwrap();
+        wtxn.commit().unwrap();
+        assert!(!still, "a RESOLVED row must not be counted");
     }
 
     #[test]

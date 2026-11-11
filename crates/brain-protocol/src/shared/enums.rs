@@ -212,6 +212,66 @@ pub struct StageTemporalEdgePayload {
     pub edges_written: u32,
 }
 
+#[cfg(test)]
+mod stage_extractor_payload_wire_keys {
+    use super::{StageAuditStatus, StageExtractorPayload};
+
+    /// The keys this struct emits are a cross-repo contract: `brain-db-sdk`
+    /// carries its own copy, nothing compiles both, and each derives its
+    /// serde keys from its field names. A spelling that drifts in either
+    /// copy compiles and passes clippy.
+    ///
+    /// This asserts the spellings the engine emits; the SDK decodes the same
+    /// keys written longhand in `brain-sdk/rust/tests/stage_payload/main.rs`.
+    /// Both ends are needed to pin the name.
+    #[test]
+    fn the_yield_counts_are_emitted_under_their_documented_keys() {
+        let p = StageExtractorPayload {
+            entity_count: 11,
+            statement_count: 22,
+            relation_count: 33,
+            dropped_count: 44,
+            contradiction_count: 55,
+            undeclared_entity_count: 66,
+            has_active_schema: true,
+            audit_status: StageAuditStatus::Succeeded,
+            error_message: String::new(),
+        };
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&p, &mut bytes).expect("encode");
+        let decoded: ciborium::value::Value =
+            ciborium::de::from_reader(bytes.as_slice()).expect("decode");
+        let ciborium::value::Value::Map(entries) = decoded else {
+            panic!("the payload must encode as a CBOR map, not {decoded:?}");
+        };
+        let keys: Vec<String> = entries
+            .iter()
+            .filter_map(|(k, _)| match k {
+                ciborium::value::Value::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+
+        for want in [
+            "entity_count",
+            "statement_count",
+            "relation_count",
+            "dropped_count",
+            "contradiction_count",
+            "undeclared_entity_count",
+            "has_active_schema",
+            "audit_status",
+            "error_message",
+        ] {
+            assert!(
+                keys.iter().any(|k| k == want),
+                "`{want}` is not on the wire; keys were {keys:?}"
+            );
+        }
+        assert_eq!(keys.len(), 9, "an unlisted key appeared: {keys:?}");
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StageHypePayload {
     /// How many hypothetical questions were embedded, persisted, and
@@ -240,6 +300,46 @@ pub struct StageExtractorPayload {
     pub entity_count: u32,
     pub statement_count: u32,
     pub relation_count: u32,
+    /// Candidates the apply pass discarded before commit.
+    ///
+    /// The three counts above are survivors, so this is the denominator a
+    /// yield rate needs: two statements out of two candidates and two out of
+    /// nine are different outcomes. A total rather than a per-reason
+    /// breakdown — the worker's fourteen discard reasons stay in the
+    /// shard-level metrics, which is where an operator debugging one shard
+    /// wants them.
+    pub dropped_count: u32,
+    /// Committed statements that landed in a Fact-vs-Fact contradiction.
+    ///
+    /// Read from the durable `statement_contradiction_audit` row rather than
+    /// inferred from the write: a contradicting insert proceeds, because
+    /// coexisting Facts are legal and the conflict is filed for
+    /// reconciliation, so a committed statement is no evidence either way.
+    ///
+    /// `0` means "no contradiction", not "not measured" — the audit lookup
+    /// runs for every entity-subject Fact the apply commits.
+    pub contradiction_count: u32,
+    /// Entities whose type no schema declares — neither the system's nor the
+    /// writing namespace's.
+    ///
+    /// Not a discard: the resolver interns an undeclared type into the
+    /// tenant's namespace, so the entity commits and `dropped_count` never
+    /// sees it. This is the entity half of a junk rate, where
+    /// `dropped_count` is the triple half.
+    ///
+    /// Only meaningful alongside `has_active_schema`. A schema is an optional
+    /// add-on: with none declared there is no vocabulary to be outside of,
+    /// every coined type is ordinary discovery, and a rate built from this
+    /// would report a schemaless tenant as entirely junk.
+    pub undeclared_entity_count: u32,
+    /// Whether the writing namespace had an active schema when the apply ran.
+    ///
+    /// The denominator for `undeclared_entity_count`. Without it the two
+    /// states that produce a high undeclared count are indistinguishable:
+    /// a tenant whose schema the extractor went outside of, which is worth
+    /// acting on, and a tenant who declared no schema at all, which is the
+    /// product working as intended.
+    pub has_active_schema: bool,
     pub audit_status: StageAuditStatus,
     /// Why extraction failed, or partly failed. Populated whenever
     /// `audit_status` is `Failed` or `PartiallyApplied`, empty on

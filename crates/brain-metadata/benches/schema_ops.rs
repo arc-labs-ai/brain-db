@@ -14,6 +14,7 @@
 //! Run: `cargo bench -p brain-metadata --bench schema_ops`.
 
 use brain_metadata::schema::store::{schema_get, schema_list, schema_upload};
+use brain_metadata::DeclScope;
 use brain_metadata::MetadataDb;
 use brain_protocol::schema::{parse_schema, validate, ValidatedSchema};
 use criterion::{black_box, criterion_group, Criterion};
@@ -85,7 +86,7 @@ fn build_uploaded_fixture() -> UploadedFixture {
     schema_upload(
         &wtxn,
         &validated,
-        brain_metadata::tables::entity_type::SPACE_BASE,
+        brain_metadata::tables::scope::SPACE_BASE,
         0,
     )
     .expect("upload");
@@ -129,7 +130,7 @@ fn bench_upload(c: &mut Criterion) {
                 let _ = schema_upload(
                     &wtxn,
                     &validated,
-                    brain_metadata::tables::entity_type::SPACE_BASE,
+                    brain_metadata::tables::scope::SPACE_BASE,
                     0,
                 )
                 .expect("upload");
@@ -145,7 +146,7 @@ fn bench_get(c: &mut Criterion) {
     c.bench_function("schema_get by version", |b| {
         b.iter(|| {
             let rtxn = f.db.read_txn().expect("read_txn");
-            let row = schema_get(&rtxn, "bench", 1).expect("get");
+            let row = schema_get(&rtxn, DeclScope::base("bench"), 1).expect("get");
             black_box(row);
         });
     });
@@ -156,7 +157,7 @@ fn bench_list(c: &mut Criterion) {
     c.bench_function("schema_list per-namespace", |b| {
         b.iter(|| {
             let rtxn = f.db.read_txn().expect("read_txn");
-            let rows = schema_list(&rtxn, "bench").expect("list");
+            let rows = schema_list(&rtxn, DeclScope::base("bench")).expect("list");
             black_box(rows);
         });
     });

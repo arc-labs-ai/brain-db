@@ -190,7 +190,7 @@ pub struct SchemaUpdateBody {
     pub namespace: String,
     pub version: u32,
     /// The SCOPE the upload applied at: all-zero
-    /// ([`crate::tables::entity_type::SPACE_BASE`]) for the tenant's
+    /// ([`crate::tables::scope::SPACE_BASE`]) for the tenant's
     /// namespace-wide schema, a real space for an overlay.
     ///
     /// Carried because replay must land the definitions where the live
@@ -543,7 +543,7 @@ mod tests {
         let body = SchemaUpdateBody {
             namespace: "acme".into(),
             version: 3,
-            space: crate::tables::entity_type::SPACE_BASE,
+            space: crate::tables::scope::SPACE_BASE,
             blob: b"entity Person { name: text }".to_vec(),
             created_at_unix_nanos: 1_700_000_000_000_000_777,
             replace_all: false,
@@ -626,7 +626,7 @@ mod tests {
         let body = SchemaUpdateBody {
             namespace: "acme".into(),
             version: 3,
-            space: crate::tables::entity_type::SPACE_BASE,
+            space: crate::tables::scope::SPACE_BASE,
             blob: b"entity Person { name: text }".to_vec(),
             created_at_unix_nanos: 1_700_000_000_000_000_777,
             replace_all: false,

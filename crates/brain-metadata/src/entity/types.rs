@@ -4,7 +4,8 @@
 //! [`crate::relation::types`]; every entity-type registration flows
 //! through the shared apply path.
 //!
-//! Entity types are scoped by `(namespace_id, name)`.
+//! Entity types are scoped by [`TypeScope`] — `(namespace_id, space)` —
+//! and addressed by a bare name within it.
 //!
 //! They used to be keyed on bare `name` alone, globally, which made the
 //! registry a shared space every tenant wrote into: two namespaces
@@ -20,12 +21,17 @@
 //! is the format the classifier was tuned against. Scoping is a registry
 //! concern, not a prompt one.
 
-use brain_core::EntityTypeId;
+use std::collections::HashMap;
+
+use brain_core::{EntityTypeId, NamespaceId};
 use redb::{ReadTransaction, ReadableTable, WriteTransaction};
 
+use crate::system_schema::SYSTEM_SCHEMA_NAMESPACE;
 use crate::tables::entity_type::{
-    EntityTypeDefinition, ENTITY_TYPES_BY_SCOPE_TABLE, ENTITY_TYPES_TABLE, SPACE_BASE,
+    EntityTypeDefinition, ENTITY_TYPES_BY_SCOPE_TABLE, ENTITY_TYPES_TABLE,
 };
+use crate::tables::namespace::NAMESPACES_TABLE;
+use crate::tables::scope::TypeScope;
 
 #[derive(thiserror::Error, Debug)]
 pub enum EntityTypeOpError {
@@ -44,9 +50,6 @@ pub enum EntityTypeOpError {
     },
 }
 
-/// The system namespace that owns the built-in entity types.
-const SYSTEM_NS: u32 = brain_core::NamespaceId::SYSTEM.raw();
-
 /// Look up an entity_type visible to `(namespace_id, space)`: the space's
 /// own overlay first, then the namespace's base declaration, then the
 /// shared system built-in.
@@ -62,11 +65,10 @@ const SYSTEM_NS: u32 = brain_core::NamespaceId::SYSTEM.raw();
 /// every caller that has no space in hand should do.
 pub fn entity_type_lookup(
     wtxn: &WriteTransaction,
-    namespace_id: u32,
-    space: [u8; 16],
+    scope: TypeScope,
     name: &str,
 ) -> Result<Option<EntityTypeDefinition>, EntityTypeOpError> {
-    for (ns, sp) in scope_chain(namespace_id, space) {
+    for (ns, sp) in scope.chain() {
         if let Some(id) = scope_index_get(wtxn, ns, sp, name)? {
             let t = wtxn.open_table(ENTITY_TYPES_TABLE)?;
             // Bind before testing so the get-guard's borrow of `t` drops at
@@ -85,13 +87,12 @@ pub fn entity_type_lookup(
 /// new/idempotent/conflict without opening a write transaction.
 pub fn entity_type_lookup_rtxn(
     rtxn: &ReadTransaction,
-    namespace_id: u32,
-    space: [u8; 16],
+    scope: TypeScope,
     name: &str,
 ) -> Result<Option<EntityTypeDefinition>, EntityTypeOpError> {
     let idx = rtxn.open_table(ENTITY_TYPES_BY_SCOPE_TABLE)?;
     let types = rtxn.open_table(ENTITY_TYPES_TABLE)?;
-    for (ns, sp) in scope_chain(namespace_id, space) {
+    for (ns, sp) in scope.chain() {
         let id = idx.get(&(ns, sp, name))?.map(|g| g.value());
         if let Some(id) = id {
             let row = types.get(&id)?.map(|g| g.value());
@@ -119,22 +120,6 @@ pub fn entity_type_name_by_id(
     Ok(name)
 }
 
-/// The scopes a lookup consults, narrowest first:
-///
-/// 1. `(namespace, space)` — the space's own overlay. Skipped entirely
-///    when the caller asked the namespace-wide question
-///    (`space == SPACE_BASE`), so the common path is exactly the two
-///    lookups it always was.
-/// 2. `(namespace, SPACE_BASE)` — the tenant's base schema.
-/// 3. `(SYSTEM, SPACE_BASE)` — the shared built-ins. A system-namespace
-///    caller consults it once, not twice.
-fn scope_chain(namespace_id: u32, space: [u8; 16]) -> impl Iterator<Item = (u32, [u8; 16])> {
-    let overlay = (space != SPACE_BASE).then_some((namespace_id, space));
-    let base = std::iter::once((namespace_id, SPACE_BASE));
-    let system = (namespace_id != SYSTEM_NS).then_some((SYSTEM_NS, SPACE_BASE));
-    overlay.into_iter().chain(base).chain(system)
-}
-
 fn scope_index_get(
     wtxn: &WriteTransaction,
     namespace_id: u32,
@@ -146,17 +131,123 @@ fn scope_index_get(
     Ok(got)
 }
 
+// ---------------------------------------------------------------------------
+// The client-facing qname.
+// ---------------------------------------------------------------------------
+
+/// Resolves entity-type ids to the canonical qname a client receives:
+/// `"<namespace>:<Name>"`, the wire form [`brain_core::Predicate::canonical`]
+/// and [`brain_core::RelationType::canonical`] produce.
+///
+/// The namespace is load-bearing, not decoration. [`entity_type_intern`]
+/// lets a tenant declare a name the system schema already owns, giving the
+/// override its own id, so two rows can share a local name and only
+/// `namespace_id` separates them. Any consumer reasoning about which schema
+/// produced an extraction needs the prefix.
+///
+/// # Caching
+///
+/// One instance per read, reused across nodes. The caches bound the work to
+/// one registry lookup per distinct entity type and one namespace lookup per
+/// distinct namespace — in practice two, `brain` and the tenant's.
+///
+/// Not a [`ReadTransaction`] field: the txn outlives individual calls, and
+/// borrowing it for this type's lifetime would force every caller to order
+/// its locals around it.
+#[derive(Debug, Default)]
+pub struct EntityTypeQnames {
+    by_type: HashMap<u32, String>,
+    by_namespace: HashMap<u32, Option<String>>,
+}
+
+impl EntityTypeQnames {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The canonical qname for `entity_type_id`.
+    ///
+    /// Infallible: a descriptive label must not be able to fail a RECALL, so
+    /// an unreadable registry degrades to "untyped" rather than erroring.
+    ///
+    /// Returns the empty string when the type cannot be named — an
+    /// unreadable registry, an id with no row, or a row whose namespace has
+    /// none. Empty is this field's existing "no type known" sentinel, which
+    /// literal and minted nodes already carry, so a consumer renders it as
+    /// untyped.
+    ///
+    /// Never the bare name in those cases: an unprefixed name cannot be
+    /// attributed to a schema, and returning one would be a worse answer
+    /// than returning nothing.
+    pub fn resolve(&mut self, rtxn: &ReadTransaction, entity_type_id: u32) -> String {
+        if let Some(hit) = self.by_type.get(&entity_type_id) {
+            return hit.clone();
+        }
+        let row: Option<EntityTypeDefinition> = rtxn
+            .open_table(ENTITY_TYPES_TABLE)
+            .ok()
+            .and_then(|t| t.get(&entity_type_id).ok().flatten())
+            .map(|g| g.value());
+        let qname = match row {
+            None => String::new(),
+            Some(row) => match self.namespace_name(rtxn, row.namespace_id) {
+                Some(ns) => format!("{ns}:{}", row.name),
+                None => {
+                    // A live entity type whose owning namespace has no row is
+                    // an inconsistency inside one read txn, not a client
+                    // error. Say so and degrade to untyped.
+                    tracing::warn!(
+                        entity_type_id,
+                        namespace_id = row.namespace_id,
+                        name = %row.name,
+                        "entity type names an unknown namespace; projecting as untyped"
+                    );
+                    String::new()
+                }
+            },
+        };
+        self.by_type.insert(entity_type_id, qname.clone());
+        qname
+    }
+
+    /// `namespace_id` → name, answering [`NamespaceId::SYSTEM`] from the
+    /// constant rather than the registry.
+    ///
+    /// Every client compares a type against the built-in prefix, so that
+    /// prefix must not depend on whether `namespace::seed_system_namespace`
+    /// has run on the database being read.
+    fn namespace_name(&mut self, rtxn: &ReadTransaction, namespace_id: u32) -> Option<String> {
+        if namespace_id == NamespaceId::SYSTEM.raw() {
+            return Some(SYSTEM_SCHEMA_NAMESPACE.to_string());
+        }
+        if let Some(hit) = self.by_namespace.get(&namespace_id) {
+            return hit.clone();
+        }
+        let name = rtxn
+            .open_table(NAMESPACES_TABLE)
+            .ok()
+            .and_then(|t| t.get(&namespace_id).ok().flatten())
+            .map(|g| g.value().name);
+        self.by_namespace.insert(namespace_id, name.clone());
+        name
+    }
+}
+
 /// Snapshot the active entity-type names as zero-shot classifier labels —
 /// `brain:<Name>` in stable id-order. The GLiNER tier reads this each drain
 /// cycle so a user's `SCHEMA_UPLOAD` adding entity types reaches the classifier
 /// on the next batch without a shard restart.
 ///
-/// Entity types are a flat, namespaceless registry (see the module note), so
-/// the `brain:` prefix is a cosmetic convention the resolver strips before
-/// lookup (`resolve_entity_type`); a user-uploaded type ("Drug") is labeled
-/// `brain:Drug` and still resolves to the bare row. The prefix/format matches
-/// what the classifier was tuned against — don't change it without re-measuring
-/// GLiNER zero-shot recall.
+/// On this surface the `brain:` prefix is a fixed string, identical for every
+/// type regardless of owner, and the resolver strips it before lookup
+/// (`resolve_entity_type`) — a user-uploaded type ("Drug") is labelled
+/// `brain:Drug` and resolves to its own scoped row.
+///
+/// The uniformity is required: this is the format the GLiNER classifier was
+/// tuned against, so changing it means re-measuring zero-shot recall. It is
+/// prompt vocabulary, not provenance — use [`EntityTypeQnames`] for anything
+/// a client reads.
 pub fn entity_type_label_qnames(rtxn: &ReadTransaction) -> Result<Vec<String>, EntityTypeOpError> {
     let t = rtxn.open_table(ENTITY_TYPES_TABLE)?;
     let mut rows: Vec<(u32, String)> = Vec::new();
@@ -204,8 +295,7 @@ pub fn render_declared_entity_types_block(
 /// gets id `1` because it's the first item in the system schema
 pub fn entity_type_intern(
     wtxn: &WriteTransaction,
-    namespace_id: u32,
-    space: [u8; 16],
+    scope: TypeScope,
     name: &str,
     schema_blob: Vec<u8>,
     now_unix_nanos: u64,
@@ -217,7 +307,7 @@ pub fn entity_type_intern(
     // down: a space declaring a name its namespace already declares is an
     // override, not a collision, and gets its own id. That is what makes
     // the overlay an overlay rather than a second chance to conflict.
-    if let Some(id) = scope_index_get(wtxn, namespace_id, space, name)? {
+    if let Some(id) = scope_index_get(wtxn, scope.namespace_id(), scope.space_id(), name)? {
         let existing = {
             let t = wtxn.open_table(ENTITY_TYPES_TABLE)?;
             let row = t.get(&id)?.map(|g| g.value());
@@ -250,7 +340,7 @@ pub fn entity_type_intern(
 
     let row = EntityTypeDefinition::new(
         EntityTypeId::from(next_id_raw),
-        namespace_id,
+        scope.namespace_id(),
         name.to_string(),
         schema_blob,
         now_unix_nanos,
@@ -261,7 +351,10 @@ pub fn entity_type_intern(
     }
     {
         let mut idx = wtxn.open_table(ENTITY_TYPES_BY_SCOPE_TABLE)?;
-        idx.insert(&(namespace_id, space, name), &row.entity_type_id)?;
+        idx.insert(
+            &(scope.namespace_id(), scope.space_id(), name),
+            &row.entity_type_id,
+        )?;
     }
     Ok(EntityTypeId::from(next_id_raw))
 }
@@ -269,6 +362,10 @@ pub fn entity_type_intern(
 #[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
+    use crate::tables::scope::SPACE_BASE;
+
+    /// The system namespace that owns the built-in entity types.
+    const SYSTEM_NS: u32 = brain_core::NamespaceId::SYSTEM.raw();
     use crate::tables::fresh_db;
     use redb::ReadableDatabase;
 
@@ -278,6 +375,114 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = fresh_db(&dir);
         (dir, db)
+    }
+
+    // ── The client-facing qname ────────────────────────────────────────────
+    //
+    // The registry lets a tenant declare a name the system schema owns, so a
+    // local name alone cannot say whose type an extraction used. Each case
+    // below asks exactly that question of one shape of input.
+
+    const NS_ACME: u32 = 90;
+
+    fn seed_ns(db: &redb::Database, id: u32, name: &str) {
+        let wtxn = db.begin_write().unwrap();
+        crate::namespace::namespace_intern_or_get(&wtxn, name, NOW).unwrap();
+        wtxn.commit().unwrap();
+        // These tests need a chosen id, which `namespace_intern_or_get` does
+        // not offer, so write the row directly at the id the entity type
+        // points at.
+        let wtxn = db.begin_write().unwrap();
+        {
+            let mut t = wtxn
+                .open_table(crate::tables::namespace::NAMESPACES_TABLE)
+                .unwrap();
+            let row = crate::tables::namespace::NamespaceDefinition::new(
+                NamespaceId::from(id),
+                name.to_string(),
+                NOW,
+            );
+            t.insert(&id, &row).unwrap();
+        }
+        wtxn.commit().unwrap();
+    }
+
+    fn qname(db: &redb::Database, id: EntityTypeId) -> String {
+        let rtxn = db.begin_read().unwrap();
+        EntityTypeQnames::new().resolve(&rtxn, id.raw())
+    }
+
+    #[test]
+    fn a_built_in_type_is_prefixed_with_the_system_namespace() {
+        let (_d, db) = open_db();
+        let person = intern(&db, NamespaceId::SYSTEM.raw(), SPACE_BASE, "Person");
+        assert_eq!(qname(&db, person), "brain:Person");
+    }
+
+    #[test]
+    fn a_tenants_type_is_prefixed_with_its_own_namespace() {
+        let (_d, db) = open_db();
+        seed_ns(&db, NS_ACME, "acme");
+        let cart = intern(&db, NS_ACME, SPACE_BASE, "Cart");
+        assert_eq!(qname(&db, cart), "acme:Cart");
+    }
+
+    /// A tenant's `Person` and the built-in it shadows are different types
+    /// with different ids, and the qname is what tells them apart.
+    #[test]
+    fn an_override_is_distinguishable_from_the_built_in_it_shadows() {
+        let (_d, db) = open_db();
+        seed_ns(&db, NS_ACME, "acme");
+        let built_in = intern(&db, NamespaceId::SYSTEM.raw(), SPACE_BASE, "Person");
+        let own = intern(&db, NS_ACME, SPACE_BASE, "Person");
+
+        assert_ne!(built_in, own, "an override gets its own id");
+        assert_eq!(qname(&db, built_in), "brain:Person");
+        assert_eq!(qname(&db, own), "acme:Person");
+    }
+
+    #[test]
+    fn an_unknown_type_id_is_untyped_rather_than_a_guess() {
+        let (_d, db) = open_db();
+        assert_eq!(qname(&db, EntityTypeId::from(4242)), "");
+    }
+
+    /// A row whose namespace has none is a corrupt database. The answer is
+    /// the empty "untyped" sentinel rather than the bare name, which no
+    /// consumer could attribute to a schema.
+    #[test]
+    fn a_type_whose_namespace_is_missing_is_untyped_not_bare() {
+        let (_d, db) = open_db();
+        let orphan = intern(&db, 777, SPACE_BASE, "Cart");
+        assert_eq!(qname(&db, orphan), "");
+    }
+
+    /// Clients compare every type against the built-in prefix, so it must
+    /// hold whether or not the system namespace row has been seeded.
+    #[test]
+    fn the_system_prefix_does_not_depend_on_the_seeded_row() {
+        let (_d, db) = open_db();
+        let rtxn = db.begin_read().unwrap();
+        let seeded = crate::namespace::namespace_name(&rtxn, NamespaceId::SYSTEM).unwrap();
+        drop(rtxn);
+        assert_eq!(seeded, None, "no system row was written by this fixture");
+
+        let person = intern(&db, NamespaceId::SYSTEM.raw(), SPACE_BASE, "Person");
+        assert_eq!(qname(&db, person), "brain:Person");
+    }
+
+    /// The cache is an optimisation, so a hit answers identically to a miss.
+    #[test]
+    fn the_cache_returns_the_same_answer_on_a_hit() {
+        let (_d, db) = open_db();
+        seed_ns(&db, NS_ACME, "acme");
+        let cart = intern(&db, NS_ACME, SPACE_BASE, "Cart");
+        let rtxn = db.begin_read().unwrap();
+        let mut r = EntityTypeQnames::new();
+        let first = r.resolve(&rtxn, cart.raw());
+        let second = r.resolve(&rtxn, cart.raw());
+        assert_eq!(first, "acme:Cart");
+        assert_eq!(first, second);
     }
 
     // ── Space overlay ──────────────────────────────────────────────────────
@@ -292,14 +497,15 @@ mod tests {
 
     fn intern(db: &redb::Database, ns: u32, space: [u8; 16], name: &str) -> EntityTypeId {
         let wtxn = db.begin_write().unwrap();
-        let id = entity_type_intern(&wtxn, ns, space, name, Vec::new(), NOW).unwrap();
+        let id =
+            entity_type_intern(&wtxn, TypeScope::space(ns, space), name, Vec::new(), NOW).unwrap();
         wtxn.commit().unwrap();
         id
     }
 
     fn lookup(db: &redb::Database, ns: u32, space: [u8; 16], name: &str) -> Option<EntityTypeId> {
         let wtxn = db.begin_write().unwrap();
-        let got = entity_type_lookup(&wtxn, ns, space, name)
+        let got = entity_type_lookup(&wtxn, TypeScope::space(ns, space), name)
             .unwrap()
             .map(|d| d.id());
         wtxn.commit().unwrap();
@@ -406,23 +612,23 @@ mod tests {
 
     #[test]
     fn a_system_caller_does_not_consult_the_chain_twice() {
-        // `scope_chain` drops the system rung for a system caller. Exercised
+        // `TypeScope::chain` drops the system rung for a system caller. Exercised
         // because the dedupe is a `then_some` that is easy to lose.
         let (_d, db) = open_db();
         let builtin = intern(&db, SYSTEM_NS, SPACE_BASE, "Person");
         assert_eq!(lookup(&db, SYSTEM_NS, SPACE_BASE, "Person"), Some(builtin));
-        assert_eq!(scope_chain(SYSTEM_NS, SPACE_BASE).count(), 1);
+        assert_eq!(TypeScope::base(SYSTEM_NS).chain().count(), 1);
         // A non-system caller with no space: own base + system.
-        assert_eq!(scope_chain(TENANT_ONE, SPACE_BASE).count(), 2);
+        assert_eq!(TypeScope::base(TENANT_ONE).chain().count(), 2);
         // With a space: overlay + own base + system.
-        assert_eq!(scope_chain(TENANT_ONE, SPACE_A).count(), 3);
+        assert_eq!(TypeScope::space(TENANT_ONE, SPACE_A).chain().count(), 3);
     }
 
     #[test]
     fn scope_chain_is_ordered_narrowest_first() {
         // Order IS the shadowing rule, so it is asserted rather than implied
         // by the lookup tests above.
-        let chain: Vec<_> = scope_chain(TENANT_ONE, SPACE_A).collect();
+        let chain: Vec<_> = TypeScope::space(TENANT_ONE, SPACE_A).chain().collect();
         assert_eq!(
             chain,
             vec![
@@ -442,8 +648,7 @@ mod tests {
             // Intern out of lexical order so the sort is exercised.
             entity_type_intern(
                 &wtxn,
-                brain_core::NamespaceId::SYSTEM.raw(),
-                SPACE_BASE,
+                TypeScope::base(brain_core::NamespaceId::SYSTEM.raw()),
                 "Person",
                 Vec::new(),
                 NOW,
@@ -451,8 +656,7 @@ mod tests {
             .unwrap();
             entity_type_intern(
                 &wtxn,
-                brain_core::NamespaceId::SYSTEM.raw(),
-                SPACE_BASE,
+                TypeScope::base(brain_core::NamespaceId::SYSTEM.raw()),
                 "Drug",
                 Vec::new(),
                 NOW,
@@ -460,8 +664,7 @@ mod tests {
             .unwrap();
             entity_type_intern(
                 &wtxn,
-                brain_core::NamespaceId::SYSTEM.raw(),
-                SPACE_BASE,
+                TypeScope::base(brain_core::NamespaceId::SYSTEM.raw()),
                 "Organization",
                 Vec::new(),
                 NOW,
@@ -513,9 +716,10 @@ mod tests {
         // Globex had never written.
         let (_dir, db) = open_db();
         let wtxn = db.begin_write().unwrap();
-        let acme_id = entity_type_intern(&wtxn, ACME, SPACE_BASE, "Builder", vec![1], NOW).unwrap();
+        let acme_id =
+            entity_type_intern(&wtxn, TypeScope::base(ACME), "Builder", vec![1], NOW).unwrap();
         let globex_id =
-            entity_type_intern(&wtxn, GLOBEX, SPACE_BASE, "Builder", vec![2, 2], NOW).unwrap();
+            entity_type_intern(&wtxn, TypeScope::base(GLOBEX), "Builder", vec![2, 2], NOW).unwrap();
         wtxn.commit().unwrap();
 
         assert_ne!(
@@ -525,14 +729,14 @@ mod tests {
 
         let wtxn = db.begin_write().unwrap();
         assert_eq!(
-            entity_type_lookup(&wtxn, ACME, SPACE_BASE, "Builder")
+            entity_type_lookup(&wtxn, TypeScope::base(ACME), "Builder")
                 .unwrap()
                 .unwrap()
                 .schema_blob,
             vec![1]
         );
         assert_eq!(
-            entity_type_lookup(&wtxn, GLOBEX, SPACE_BASE, "Builder")
+            entity_type_lookup(&wtxn, TypeScope::base(GLOBEX), "Builder")
                 .unwrap()
                 .unwrap()
                 .schema_blob,
@@ -544,8 +748,10 @@ mod tests {
     fn re_declaring_your_own_type_identically_is_idempotent() {
         let (_dir, db) = open_db();
         let wtxn = db.begin_write().unwrap();
-        let first = entity_type_intern(&wtxn, ACME, SPACE_BASE, "Builder", vec![1], NOW).unwrap();
-        let again = entity_type_intern(&wtxn, ACME, SPACE_BASE, "Builder", vec![1], NOW).unwrap();
+        let first =
+            entity_type_intern(&wtxn, TypeScope::base(ACME), "Builder", vec![1], NOW).unwrap();
+        let again =
+            entity_type_intern(&wtxn, TypeScope::base(ACME), "Builder", vec![1], NOW).unwrap();
         wtxn.commit().unwrap();
         assert_eq!(
             first, again,
@@ -561,8 +767,9 @@ mod tests {
         // cause.
         let (_dir, db) = open_db();
         let wtxn = db.begin_write().unwrap();
-        entity_type_intern(&wtxn, ACME, SPACE_BASE, "Builder", vec![1], NOW).unwrap();
-        let err = entity_type_intern(&wtxn, ACME, SPACE_BASE, "Builder", vec![9], NOW).unwrap_err();
+        entity_type_intern(&wtxn, TypeScope::base(ACME), "Builder", vec![1], NOW).unwrap();
+        let err =
+            entity_type_intern(&wtxn, TypeScope::base(ACME), "Builder", vec![9], NOW).unwrap_err();
         assert!(
             matches!(err, EntityTypeOpError::AlreadyExists { .. }),
             "{err:?}"
@@ -574,13 +781,14 @@ mod tests {
         let (_dir, db) = open_db();
         let wtxn = db.begin_write().unwrap();
         let person =
-            entity_type_intern(&wtxn, SYSTEM_NS, SPACE_BASE, "Person", Vec::new(), NOW).unwrap();
+            entity_type_intern(&wtxn, TypeScope::base(SYSTEM_NS), "Person", Vec::new(), NOW)
+                .unwrap();
         wtxn.commit().unwrap();
 
         let wtxn = db.begin_write().unwrap();
         for ns in [ACME, GLOBEX] {
             assert_eq!(
-                entity_type_lookup(&wtxn, ns, SPACE_BASE, "Person")
+                entity_type_lookup(&wtxn, TypeScope::base(ns), "Person")
                     .unwrap()
                     .unwrap()
                     .id(),
@@ -598,21 +806,23 @@ mod tests {
         let (_dir, db) = open_db();
         let wtxn = db.begin_write().unwrap();
         let builtin =
-            entity_type_intern(&wtxn, SYSTEM_NS, SPACE_BASE, "Person", Vec::new(), NOW).unwrap();
-        let own = entity_type_intern(&wtxn, ACME, SPACE_BASE, "Person", vec![42], NOW).unwrap();
+            entity_type_intern(&wtxn, TypeScope::base(SYSTEM_NS), "Person", Vec::new(), NOW)
+                .unwrap();
+        let own =
+            entity_type_intern(&wtxn, TypeScope::base(ACME), "Person", vec![42], NOW).unwrap();
         wtxn.commit().unwrap();
         assert_ne!(builtin, own);
 
         let wtxn = db.begin_write().unwrap();
         assert_eq!(
-            entity_type_lookup(&wtxn, ACME, SPACE_BASE, "Person")
+            entity_type_lookup(&wtxn, TypeScope::base(ACME), "Person")
                 .unwrap()
                 .unwrap()
                 .id(),
             own
         );
         assert_eq!(
-            entity_type_lookup(&wtxn, GLOBEX, SPACE_BASE, "Person")
+            entity_type_lookup(&wtxn, TypeScope::base(GLOBEX), "Person")
                 .unwrap()
                 .unwrap()
                 .id(),
@@ -626,25 +836,28 @@ mod tests {
         // disagreed, an upload could pass pre-flight and then conflict.
         let (_dir, db) = open_db();
         let wtxn = db.begin_write().unwrap();
-        entity_type_intern(&wtxn, SYSTEM_NS, SPACE_BASE, "Person", Vec::new(), NOW).unwrap();
-        let own = entity_type_intern(&wtxn, ACME, SPACE_BASE, "Builder", vec![1], NOW).unwrap();
+        entity_type_intern(&wtxn, TypeScope::base(SYSTEM_NS), "Person", Vec::new(), NOW).unwrap();
+        let own =
+            entity_type_intern(&wtxn, TypeScope::base(ACME), "Builder", vec![1], NOW).unwrap();
         wtxn.commit().unwrap();
 
         let rtxn = db.begin_read().unwrap();
         assert_eq!(
-            entity_type_lookup_rtxn(&rtxn, ACME, SPACE_BASE, "Builder")
+            entity_type_lookup_rtxn(&rtxn, TypeScope::base(ACME), "Builder")
                 .unwrap()
                 .unwrap()
                 .id(),
             own
         );
         assert!(
-            entity_type_lookup_rtxn(&rtxn, GLOBEX, SPACE_BASE, "Builder")
+            entity_type_lookup_rtxn(&rtxn, TypeScope::base(GLOBEX), "Builder")
                 .unwrap()
                 .is_none()
         );
-        assert!(entity_type_lookup_rtxn(&rtxn, GLOBEX, SPACE_BASE, "Person")
-            .unwrap()
-            .is_some());
+        assert!(
+            entity_type_lookup_rtxn(&rtxn, TypeScope::base(GLOBEX), "Person")
+                .unwrap()
+                .is_some()
+        );
     }
 }

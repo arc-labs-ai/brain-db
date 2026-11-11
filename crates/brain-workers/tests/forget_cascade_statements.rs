@@ -6,6 +6,7 @@
 //! worker's drive_one_batch consumes it and rewrites every statement
 //! whose `evidence_inline` cited the forgotten memory.
 
+use brain_metadata::DeclScope;
 use std::sync::Arc;
 
 use brain_core::{
@@ -111,7 +112,7 @@ fn intern_predicate(metadata: &SharedMetadataDb, name: &str) -> PredicateId {
     let wtxn = metadata.write_txn().unwrap();
     let id = predicate_intern(
         &wtxn,
-        "test",
+        DeclScope::base("test"),
         name,
         Some(StatementKind::Fact),
         /* object: Value */ 2,

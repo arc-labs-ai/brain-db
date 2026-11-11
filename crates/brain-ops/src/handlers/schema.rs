@@ -20,11 +20,14 @@ use brain_core::{Cardinality, RequestId, StatementKind};
 use brain_metadata::entity::types::entity_type_lookup_rtxn;
 use brain_metadata::extractor::ops::extractor_lookup_by_qname;
 use brain_metadata::relation::types::relation_type_lookup_by_qname;
+use brain_metadata::DeclScope;
 // One encoding of an object declaration, shared with the apply path, so
 // the pre-flight can't classify a re-upload differently than apply does.
 use brain_metadata::schema::apply::{declared_object_entity_type, object_type_constraint_byte};
 use brain_metadata::schema::predicate::predicate_lookup_by_qname;
-use brain_metadata::schema::store::{active_source_covers, schema_active, schema_get, schema_list};
+use brain_metadata::schema::store::{
+    active_source_covers, declaring_scope, schema_active, schema_get, schema_list_resolved,
+};
 use brain_metadata::system_schema::SYSTEM_SCHEMA_NAMESPACE;
 use brain_protocol::envelope::response::EventType;
 use brain_protocol::schema::render::render_schema_verified;
@@ -105,7 +108,7 @@ pub async fn handle_schema_upload(
     //     the document alone. UPLOAD is additive, so naming a type an earlier
     //     upload (or the system schema) declared is legitimate — validating in
     //     isolation rejected it as "not a declared entity_type".
-    let declared = schema_scope::merge_declared_context(ctx, &namespace)?;
+    let declared = schema_scope::merge_declared_context(ctx, &namespace, space)?;
 
     // 2b. Validate.
     let validated = match validate_located_with(&req.schema_document, &schema, &declared) {
@@ -138,13 +141,13 @@ pub async fn handle_schema_upload(
     //     alone, so without this a namespace whose source had been narrowed
     //     stayed narrowed forever: re-uploading the full schema was classified
     //     idempotent and skipped. An unchanged re-upload still short-circuits.
-    let source_covers = active_source_covers_for(ctx, &namespace, validated.as_schema())?;
+    let source_covers = active_source_covers_for(ctx, &namespace, space, validated.as_schema())?;
     let is_no_op = merge_summary.all_idempotent && source_covers;
 
     // 4. Dry-run → don't persist. An all-idempotent document would not
     //    bump the version, so report the current one.
     if req.dry_run {
-        let current = schema_scope::current_active(ctx, &namespace)?;
+        let current = schema_scope::current_active(ctx, &namespace, space)?;
         let would_be = match (is_no_op, current) {
             (true, Some(version)) => version,
             _ => current.unwrap_or(0).saturating_add(1),
@@ -170,7 +173,7 @@ pub async fn handle_schema_upload(
 
     // 5. Persist via the unified submit(Write) path.
     let now = now_unix_nanos();
-    let from_version = schema_scope::current_active(ctx, &namespace)?.unwrap_or(0);
+    let from_version = schema_scope::current_active(ctx, &namespace, space)?.unwrap_or(0);
 
     let real_writer = real_writer_handle(ctx)?;
     let write_id =
@@ -288,8 +291,18 @@ pub async fn handle_schema_get(
         .read_txn()
         .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
 
+    // The caller reads the schema it is operating under: its own space's
+    // document when that space declares one, otherwise the namespace's.
+    // Resolve the scope once and read both the version and the row from it,
+    // or an explicit version would be looked up in a scope that never
+    // declared it.
+    let caller_space: [u8; 16] = ctx.executor.caller_space.into();
+    let read_space = declaring_scope(&rtxn, DeclScope::space(&req.namespace, caller_space))
+        .map_err(schema_scope::map_schema_store_error)?
+        .unwrap_or(caller_space);
+
     let resolved_version = if req.version == 0 {
-        schema_active(&rtxn, &req.namespace)
+        schema_active(&rtxn, DeclScope::space(&req.namespace, read_space))
             .map_err(schema_scope::map_schema_store_error)?
             .ok_or_else(|| OpError::NotFound {
                 what: "schema",
@@ -299,12 +312,16 @@ pub async fn handle_schema_get(
         req.version
     };
 
-    let row = schema_get(&rtxn, &req.namespace, resolved_version)
-        .map_err(schema_scope::map_schema_store_error)?
-        .ok_or_else(|| OpError::NotFound {
-            what: "schema",
-            detail: format!("namespace={:?} version={resolved_version}", req.namespace),
-        })?;
+    let row = schema_get(
+        &rtxn,
+        DeclScope::space(&req.namespace, read_space),
+        resolved_version,
+    )
+    .map_err(schema_scope::map_schema_store_error)?
+    .ok_or_else(|| OpError::NotFound {
+        what: "schema",
+        detail: format!("namespace={:?} version={resolved_version}", req.namespace),
+    })?;
 
     // `source_text` is the single document uploaded for this version. Since
     // UPLOAD became additive, that document is only a fragment of what the
@@ -368,7 +385,9 @@ pub async fn handle_schema_list(
             .metadata
             .read_txn()
             .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
-        schema_list(&rtxn, &req.namespace).map_err(schema_scope::map_schema_store_error)?
+        let caller_space: [u8; 16] = ctx.executor.caller_space.into();
+        schema_list_resolved(&rtxn, DeclScope::space(&req.namespace, caller_space))
+            .map_err(schema_scope::map_schema_store_error)?
     };
     let items: Vec<SchemaListItemWire> = if req.limit == 0 {
         rows.iter()
@@ -443,12 +462,13 @@ pub async fn handle_schema_validate(
     }
     // VALIDATE must predict UPLOAD, so it resolves references against the
     // same merge target.
-    let declared = schema_scope::merge_declared_context(ctx, &namespace)?;
+    let space = schema_scope::declaration_space(ctx, req.scope)?;
+    let declared = schema_scope::merge_declared_context(ctx, &namespace, space)?;
 
     match validate_located_with(&req.schema_document, &schema, &declared) {
         Ok(v) => {
             let namespace = v.as_schema().namespace.clone();
-            let would_be = schema_scope::current_active(ctx, &namespace)?
+            let would_be = schema_scope::current_active(ctx, &namespace, space)?
                 .unwrap_or(0)
                 .saturating_add(1);
             Ok(SchemaValidateResponse {
@@ -522,6 +542,7 @@ fn caller_may_read_namespace(caller_name: &str, requested: &str) -> bool {
 fn active_source_covers_for(
     ctx: &OpsContext,
     namespace: &str,
+    space: [u8; 16],
     schema: &brain_protocol::schema::Schema,
 ) -> Result<bool, OpError> {
     let rtxn = ctx
@@ -529,7 +550,8 @@ fn active_source_covers_for(
         .metadata
         .read_txn()
         .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
-    active_source_covers(&rtxn, namespace, schema).map_err(schema_scope::map_schema_store_error)
+    active_source_covers(&rtxn, DeclScope::space(namespace, space), schema)
+        .map_err(schema_scope::map_schema_store_error)
 }
 
 fn parse_failed_upload_response(e: ParseError) -> SchemaUploadResponse {
@@ -583,7 +605,7 @@ fn lookup_entity_type(
     let ns = namespace_id
         .unwrap_or(brain_core::NamespaceId::SYSTEM)
         .raw();
-    entity_type_lookup_rtxn(rtxn, ns, space, name)
+    entity_type_lookup_rtxn(rtxn, brain_metadata::TypeScope::space(ns, space), name)
         .map_err(|err| OpError::Internal(format!("entity_type lookup: {err}")))
 }
 
@@ -601,8 +623,8 @@ fn classify_schema_merge(
         .read_txn()
         .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
 
-    let current_version =
-        schema_active(&rtxn, namespace).map_err(schema_scope::map_schema_store_error)?;
+    let current_version = schema_active(&rtxn, DeclScope::space(namespace, space))
+        .map_err(schema_scope::map_schema_store_error)?;
 
     // Entity types are scoped per tenant, so the pre-flight must classify
     // against THIS namespace's registry. An unregistered namespace (a
@@ -637,8 +659,9 @@ fn classify_schema_merge(
                 }
             }
             SchemaItem::Predicate(p) => {
-                let existing = predicate_lookup_by_qname(&rtxn, namespace, &p.name)
-                    .map_err(|err| OpError::Internal(format!("predicate lookup: {err}")))?;
+                let existing =
+                    predicate_lookup_by_qname(&rtxn, DeclScope::space(namespace, space), &p.name)
+                        .map_err(|err| OpError::Internal(format!("predicate lookup: {err}")))?;
                 match existing {
                     None => all_idempotent = false,
                     Some(row) => {
@@ -728,8 +751,12 @@ fn classify_schema_merge(
                 }
             }
             SchemaItem::RelationType(r) => {
-                let existing = relation_type_lookup_by_qname(&rtxn, namespace, &r.name)
-                    .map_err(|err| OpError::Internal(format!("relation_type lookup: {err}")))?;
+                let existing = relation_type_lookup_by_qname(
+                    &rtxn,
+                    DeclScope::space(namespace, space),
+                    &r.name,
+                )
+                .map_err(|err| OpError::Internal(format!("relation_type lookup: {err}")))?;
                 match existing {
                     None => all_idempotent = false,
                     Some(row) => {
@@ -773,8 +800,9 @@ fn classify_schema_merge(
                 }
             }
             SchemaItem::Extractor(e) => {
-                let existing = extractor_lookup_by_qname(&rtxn, namespace, &e.name)
-                    .map_err(|err| OpError::Internal(format!("extractor lookup: {err}")))?;
+                let existing =
+                    extractor_lookup_by_qname(&rtxn, DeclScope::space(namespace, space), &e.name)
+                        .map_err(|err| OpError::Internal(format!("extractor lookup: {err}")))?;
                 match existing {
                     None => all_idempotent = false,
                     Some(row) => {
@@ -930,7 +958,7 @@ mod tests {
             schema_upload(
                 &wtxn,
                 &validated,
-                brain_metadata::tables::entity_type::SPACE_BASE,
+                brain_metadata::tables::scope::SPACE_BASE,
                 1,
             )
             .unwrap();
@@ -992,7 +1020,7 @@ mod tests {
             }
             let rtxn = md.read_txn().unwrap();
             assert_eq!(
-                schema_active(&rtxn, "acme").unwrap(),
+                schema_active(&rtxn, DeclScope::base("acme")).unwrap(),
                 None,
                 "a refused upload must not bump the namespace's schema version"
             );
@@ -1132,7 +1160,7 @@ mod tests {
             // No schema landed for the foreign namespace.
             let rtxn = metadata.read_txn().unwrap();
             assert_eq!(
-                schema_active(&rtxn, "other").unwrap(),
+                schema_active(&rtxn, DeclScope::base("other")).unwrap(),
                 None,
                 "a rejected cross-namespace upload must not create foreign schema"
             );
@@ -1263,6 +1291,7 @@ mod tests {
                 SchemaValidateRequest {
                     schema_document: OTHER_V1.into(),
                     act_as: None,
+                    scope: SchemaScope::Namespace,
                 },
                 &ctx,
             )
@@ -1281,6 +1310,7 @@ mod tests {
                 SchemaValidateRequest {
                     schema_document: ACME_V1.into(),
                     act_as: None,
+                    scope: SchemaScope::Namespace,
                 },
                 &ctx,
             )

@@ -1049,6 +1049,45 @@ fn sample_graph_fetch_response() -> GraphFetchResponseFrame {
     }
 }
 
+/// A `StageCompleted` event carrying the extractor's full detail.
+///
+/// The all-`None` event above covers a cognitive event, where the three stage
+/// fields are absent. This covers the populated form, so the extractor
+/// payload's own key order and value encoding are pinned across languages —
+/// otherwise each SDK's copy of `StageExtractorPayload` is checked only
+/// against itself.
+fn sample_subscribe_event_stage() -> SubscriptionEvent {
+    SubscriptionEvent {
+        event_type: EventType::StageCompleted,
+        memory_id: mid(),
+        session_id: 1,
+        text: String::new(),
+        kind: MemoryKindWire::Episodic,
+        salience: 0.0,
+        timestamp_unix_nanos: 1_700_000_000_000_000_000,
+        lsn: 43,
+        graph_payload: None,
+        edge_payload: None,
+        stage_kind: Some(brain_protocol::shared::enums::StageKind::Extractor),
+        stage_outcome: Some(brain_protocol::shared::enums::StageOutcome::Ok),
+        stage_payload: Some(brain_protocol::shared::enums::StagePayload::Extractor(
+            brain_protocol::shared::enums::StageExtractorPayload {
+                entity_count: 2,
+                statement_count: 3,
+                relation_count: 1,
+                // Non-zero so every count is pinned to a distinct value; a
+                // field pair swapped on the way out cannot look right.
+                dropped_count: 4,
+                contradiction_count: 1,
+                undeclared_entity_count: 2,
+                has_active_schema: true,
+                audit_status: brain_protocol::shared::enums::StageAuditStatus::Succeeded,
+                error_message: String::new(),
+            },
+        )),
+    }
+}
+
 fn sample_subscribe_event() -> SubscriptionEvent {
     SubscriptionEvent {
         event_type: EventType::Encoded,
@@ -1905,6 +1944,11 @@ fn corpus() -> Vec<Case> {
         "resp_subscribe_event",
         ResponseBody::SubscribeEvent(sample_subscribe_event()),
         &sample_subscribe_event(),
+    ));
+    cases.push(resp_case(
+        "resp_subscribe_event_stage",
+        ResponseBody::SubscribeEvent(sample_subscribe_event_stage()),
+        &sample_subscribe_event_stage(),
     ));
 
     // ---- Keepalive responses ----
@@ -3092,12 +3136,13 @@ fn corpus() -> Vec<Case> {
         RequestBody::SchemaList(schema_list_req.clone()),
         &schema_list_req,
     ));
-    // Single-field request. The document text differs from `req_schema_upload`'s
-    // so a fixture that cross-wires the two schema-document verbs is visible.
+    // The document text differs from `req_schema_upload`'s so a fixture that
+    // cross-wires the two schema-document verbs is visible.
     let schema_validate_req = SchemaValidateRequest {
         schema_document: "namespace org\ndefine relation_type mentors { from Person to Person }\n"
             .into(),
         act_as: None,
+        scope: SchemaScope::Namespace,
     };
     cases.push(req_case(
         "req_schema_validate",
@@ -3115,6 +3160,7 @@ fn corpus() -> Vec<Case> {
         force_drop_existing: true,
         request_id: RID,
         act_as: None,
+        scope: SchemaScope::Namespace,
     };
     cases.push(req_case(
         "req_schema_replace",
@@ -3132,6 +3178,7 @@ fn corpus() -> Vec<Case> {
         force: true,
         request_id: RID,
         act_as: None,
+        scope: SchemaScope::Namespace,
     };
     cases.push(req_case(
         "req_schema_drop",
@@ -3174,6 +3221,7 @@ fn corpus() -> Vec<Case> {
     ));
     let schema_validate_act_as = SchemaValidateRequest {
         act_as: tenant(0),
+        scope: SchemaScope::Space,
         ..schema_validate_req.clone()
     };
     cases.push(req_case(
@@ -3211,6 +3259,7 @@ fn corpus() -> Vec<Case> {
     ));
     let schema_replace_act_as = SchemaReplaceRequest {
         act_as: tenant(1 << 5),
+        scope: SchemaScope::Space,
         ..schema_replace_req.clone()
     };
     cases.push(req_case(
@@ -3220,6 +3269,7 @@ fn corpus() -> Vec<Case> {
     ));
     let schema_drop_act_as = SchemaDropRequest {
         act_as: tenant(1 << 5),
+        scope: SchemaScope::Space,
         ..schema_drop_req.clone()
     };
     cases.push(req_case(

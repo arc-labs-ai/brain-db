@@ -13,14 +13,24 @@ use redb::TableDefinition;
 pub const EXTRACTORS_TABLE: TableDefinition<'static, u32, ExtractorDefinition> =
     TableDefinition::new("extractors");
 
-/// `extractors_by_qname` — secondary index for `"namespace:name"
-/// → ExtractorId`. Mirrors `predicates_by_qname`.
-pub const EXTRACTORS_BY_QNAME_TABLE: TableDefinition<'static, &str, u32> =
-    TableDefinition::new("extractors_by_qname");
+/// `extractors_by_scope` — secondary index for `("namespace:name", space)
+/// → ExtractorId`.
+///
+/// An extractor is a rule about how text becomes structure, and two
+/// applications inside one tenant can want different rules under the same
+/// name: a support product's `person_mentions` is not a billing product's.
+/// `space` is the dimension that lets each declare its own; the all-zero
+/// [`crate::tables::scope::SPACE_BASE`] is the tenant-wide declaration every
+/// space falls back to.
+///
+/// Keyed qname-first so every space's entry for one name is a contiguous
+/// range, which is what makes removing a row's whole index cheap.
+pub const EXTRACTORS_BY_SCOPE_TABLE: TableDefinition<'static, (&str, [u8; 16]), u32> =
+    TableDefinition::new("extractors_by_scope");
 
 /// A registered extractor. `(namespace, name)` is unique within a
 /// deployment; uniqueness is enforced by
-/// [`EXTRACTORS_BY_QNAME_TABLE`] writes inside `extractor_intern`.
+/// [`EXTRACTORS_BY_SCOPE_TABLE`] writes inside `extractor_intern`.
 ///
 /// `kind`: `0` pattern, `1` classifier, `2` llm — matches
 /// [`brain_core::ExtractorKind::as_u8`].
@@ -108,8 +118,12 @@ mod tests {
             t.insert(&ex.extractor_id, &ex).unwrap();
         }
         {
-            let mut t = wtxn.open_table(EXTRACTORS_BY_QNAME_TABLE).unwrap();
-            t.insert(&ex.qname().as_str(), &ex.extractor_id).unwrap();
+            let mut t = wtxn.open_table(EXTRACTORS_BY_SCOPE_TABLE).unwrap();
+            t.insert(
+                &(ex.qname().as_str(), crate::tables::scope::SPACE_BASE),
+                &ex.extractor_id,
+            )
+            .unwrap();
         }
         wtxn.commit().unwrap();
 
@@ -120,8 +134,12 @@ mod tests {
         assert_eq!(got.kind(), Some(ExtractorKind::Pattern));
         assert_eq!(got.qname(), "acme:person_mentions");
 
-        let idx = rtxn.open_table(EXTRACTORS_BY_QNAME_TABLE).unwrap();
-        let id_from_idx = idx.get(&"acme:person_mentions").unwrap().unwrap().value();
+        let idx = rtxn.open_table(EXTRACTORS_BY_SCOPE_TABLE).unwrap();
+        let id_from_idx = idx
+            .get(&("acme:person_mentions", crate::tables::scope::SPACE_BASE))
+            .unwrap()
+            .unwrap()
+            .value();
         assert_eq!(id_from_idx, ex.extractor_id);
     }
 }

@@ -34,7 +34,6 @@
 //! pathological row from yanking its bucket on `STATEMENTS_BY_PREDICATE`
 //! mid-cycle. Set to `0.0` to disable clamping (each row jumps directly
 //! to the target).
-
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -827,8 +826,14 @@ mod tests {
             ),
         )
         .unwrap();
-        let pred =
-            predicate_intern_or_get(&wtxn, "test", &format!("p_{n}"), 0, extracted_at).unwrap();
+        let pred = predicate_intern_or_get(
+            &wtxn,
+            brain_metadata::DeclScope::base("test"),
+            &format!("p_{n}"),
+            0,
+            extracted_at,
+        )
+        .unwrap();
 
         let stmt_id = StatementId::new();
         // Evidence timestamp = extracted_at - offset (so the evidence
@@ -1149,8 +1154,14 @@ mod tests {
                 ),
             )
             .unwrap();
-            let pred =
-                predicate_intern_or_get(&wtxn, "test", "p_overflow", 0, extracted_at).unwrap();
+            let pred = predicate_intern_or_get(
+                &wtxn,
+                brain_metadata::DeclScope::base("test"),
+                "p_overflow",
+                0,
+                extracted_at,
+            )
+            .unwrap();
 
             // 12 evidence rows — overflow.
             let entries: Vec<EvidenceEntry> = (0..12)

@@ -62,6 +62,7 @@ use brain_metadata::tables::relation::{
 use brain_metadata::tables::statement::{
     tombstone_reason, StatementMetadata, STATEMENTS_BY_EVIDENCE_TABLE, STATEMENTS_TABLE,
 };
+use brain_metadata::DeclScope;
 use brain_metadata::{
     entity_put, normalize_name, pack_evidence_ids, predicate_intern, relation_create,
     relation_type_intern, statement_create, MetadataDb, RowScope,
@@ -126,7 +127,7 @@ fn intern_fact_pred(db: &MetadataDb, name: &str) -> brain_core::PredicateId {
     let wtxn = db.write_txn().unwrap();
     let id = predicate_intern(
         &wtxn,
-        "test",
+        DeclScope::base("test"),
         name,
         Some(StatementKind::Fact),
         /* object: Value */ 2u8,
@@ -146,7 +147,7 @@ fn intern_rel_type(db: &MetadataDb, name: &str) -> RelationTypeId {
     let wtxn = db.write_txn().unwrap();
     let id = relation_type_intern(
         &wtxn,
-        "test",
+        DeclScope::base("test"),
         name,
         None,
         None,
