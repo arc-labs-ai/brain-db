@@ -41,6 +41,13 @@ pub mod permissions {
     /// gateway) — never a normal space key, and never part of a default
     /// bundle; it is always explicitly granted.
     pub const ACT_AS: u32 = 1 << 6;
+    /// May register, inspect and remove the namespace's own LLM provider
+    /// credential. Separate from [`ADMIN`] because a tenant who runs their
+    /// own extraction budget needs it, and separate from the write bundle
+    /// because handing it out with ordinary write access would let any key
+    /// that can store a memory also replace the key that pays for
+    /// processing it.
+    pub const LLM_CREDENTIAL: u32 = 1 << 7;
 
     /// Common bundles. A standard space gets read + write + link.
     pub const STANDARD_SPACE: u32 = ENCODE | RECALL | FORGET | LINK;
@@ -49,7 +56,7 @@ pub mod permissions {
     /// Everything but admin.
     pub const READ_WRITE: u32 = ENCODE | RECALL | FORGET | LINK | SCHEMA_UPLOAD;
     /// Full powers including admin.
-    pub const FULL: u32 = ENCODE | RECALL | FORGET | LINK | SCHEMA_UPLOAD | ADMIN;
+    pub const FULL: u32 = ENCODE | RECALL | FORGET | LINK | SCHEMA_UPLOAD | ADMIN | LLM_CREDENTIAL;
 
     /// Bits a delegating (`ACT_AS`) principal may add to a delegated op via
     /// `act_as.grant`, on top of the fixed [`STANDARD_SPACE`] mask the

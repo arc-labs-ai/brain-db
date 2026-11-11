@@ -182,3 +182,124 @@ fn every_unimplemented_entry_is_actually_tabulated() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// The reverse direction, narrowed to where it can be asserted cleanly
+// ---------------------------------------------------------------------------
+
+/// `(lo, hi)` for every range the spec declares **reserved** or
+/// **unallocated**, from the one shape that is unambiguous to parse: a bullet
+/// naming a 4-hex-digit range in backticks.
+///
+/// A full enum → spec check is not worth asserting (see the module docs: the
+/// spec declares opcodes in three shapes and only tables parse cleanly, so the
+/// reverse direction reports every prose-declared opcode as missing). This is
+/// the subset that has no false positives: the spec states these ranges hold
+/// nothing, so an implemented opcode inside one is drift by the spec's own
+/// words, with no interpretation needed.
+fn reserved_ranges() -> Vec<(u16, u16, String)> {
+    let mut out = Vec::new();
+    let mut stack = vec![spec_dir()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().is_none_or(|e| e != "md") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            for line in text.lines() {
+                let trimmed = line.trim();
+                if !trimmed.starts_with('-') {
+                    continue;
+                }
+                let lowered = trimmed.to_ascii_lowercase();
+                if !lowered.contains("reserved") && !lowered.contains("unallocated") {
+                    continue;
+                }
+                if let Some(range) = parse_backticked_range(trimmed) {
+                    out.push((range.0, range.1, trimmed.to_string()));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Pulls `` `0x007A–0x007F` `` out of a bullet. Accepts an en dash or a
+/// hyphen, and requires both ends to be 4 hex digits so a prose mention of a
+/// single opcode is not read as a range.
+fn parse_backticked_range(line: &str) -> Option<(u16, u16)> {
+    // Every `?` here must stay inside a helper: used directly in the loop it
+    // returns from the whole function on the first chunk that does not parse,
+    // so a bullet's leading "- " would abort before the backticked range was
+    // ever reached. The floor test above is what caught that.
+    fn range_of(chunk: &str) -> Option<(u16, u16)> {
+        let normalized = chunk.replace(['\u{2013}', '\u{2014}'], "-");
+        let (lo, hi) = normalized.split_once('-')?;
+        let lo = lo.trim().strip_prefix("0x")?;
+        let hi = hi.trim().strip_prefix("0x")?;
+        if lo.len() != 4 || hi.len() != 4 {
+            return None;
+        }
+        let lo = u16::from_str_radix(lo, 16).ok()?;
+        let hi = u16::from_str_radix(hi, 16).ok()?;
+        (lo <= hi).then_some((lo, hi))
+    }
+
+    // Odd indices are the backticked spans.
+    line.split('`').skip(1).step_by(2).find_map(range_of)
+}
+
+#[test]
+fn the_spec_declares_reserved_ranges_we_can_read() {
+    // The same floor as above: without this, the assertion below passes
+    // against an empty set.
+    let ranges = reserved_ranges();
+    assert!(
+        ranges.len() >= 2,
+        "only {} reserved ranges parsed out of the spec (expected >=2). The \
+         bullet format changed, so the check below is vacuous.",
+        ranges.len()
+    );
+}
+
+#[test]
+fn no_implemented_opcode_sits_in_a_range_the_spec_calls_reserved() {
+    // This is the check whose absence let eight LLM_CREDENTIAL opcodes be
+    // allocated out of `0x0076-0x007F` while the spec still described that
+    // whole range as reserved for future use. The spec and the enum each
+    // said something true about themselves and contradicted each other, and
+    // nothing compared them in this direction.
+    let ranges = reserved_ranges();
+    let mut violations = Vec::new();
+    // The enum has no public enumeration, so decode the space: every value
+    // `from_u16` accepts is an implemented opcode.
+    for value in 0u16..=u16::MAX {
+        let Ok(op) = Opcode::from_u16(value) else {
+            continue;
+        };
+        for (lo, hi, source) in &ranges {
+            if value >= *lo && value <= *hi {
+                violations.push(format!(
+                    "{op:?} ({value:#06x}) is implemented but the spec says:\n    {source}"
+                ));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "implemented opcodes inside spec-reserved ranges:\n{}\n\nEither allocate \
+         the range in the spec (and narrow the reserved bullet) or remove the \
+         opcode.",
+        violations.join("\n")
+    );
+}

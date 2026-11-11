@@ -1,7 +1,7 @@
 //! OpenAI Chat Completions client.
 //!
 //! POST `https://api.openai.com/v1/chat/completions`. Constructed with
-//! the single resolved credential (`[llm] api_key` / `BRAIN__LLM__API_KEY`).
+//! the credential the caller's namespace registered.
 //!
 //! ## Wire shape (request)
 //!
@@ -86,7 +86,7 @@ impl std::fmt::Debug for OpenAIClient {
 impl OpenAIClient {
     /// Construct with an explicit API key against the default endpoint.
     /// The key comes from the single resolved credential (`[llm] api_key`
-    /// / `BRAIN__LLM__API_KEY`). Returns `None` for an empty key so
+    /// from the credential store). Returns `None` for an empty key so
     /// callers can fall back uniformly.
     pub fn with_key(model: impl Into<String>, api_key: impl Into<String>) -> Option<Self> {
         let key = api_key.into();
@@ -759,9 +759,8 @@ mod tests {
 
     #[test]
     fn completing_without_a_tokio_reactor_does_not_panic() {
-        // The sibling of `broker::resolving_without_a_tokio_reactor_does_not_panic`,
-        // one layer further on. Every other provider test is `#[tokio::test]`,
-        // which hands the client a reactor that production does NOT have:
+        // Every other provider test is `#[tokio::test]`, which hands the
+        // client a reactor that production does NOT have:
         // `complete` is awaited from the extractor tier and the HyPE generator
         // on a glommio shard executor.
         //

@@ -127,7 +127,7 @@ pub struct Config {
     /// Single provider credential + model id for every LLM consumer
     /// (write-time HyPE, the extractor's LLM tier, the entity
     /// disambiguator, the summarizer). Section may be omitted; the
-    /// generic env override `BRAIN__LLM__API_KEY` / `BRAIN__LLM__MODEL`
+    /// generic env override `BRAIN__LLM__MODEL`
     /// folds into these fields before validation, so a deployment's
     /// env-provided secret wins over a committed config.
     #[serde(default)]
@@ -139,75 +139,49 @@ pub struct Config {
 /// model id. The provider (OpenAI / Anthropic) is derived from the model
 /// id prefix, so adding a provider is a routing-table entry, not a new
 /// config key. Both fields are optional; the generic env override
-/// (`BRAIN__LLM__API_KEY` / `BRAIN__LLM__MODEL`) wins when present.
+/// (`BRAIN__LLM__MODEL`) wins when present.
 /// Prefer the environment for production secrets — values committed to
 /// TOML leak into version control.
-#[derive(Clone, Default, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct LlmConfig {
-    /// API key for the configured model's provider. Override with
-    /// `BRAIN__LLM__API_KEY`.
+    /// Model id a tenant's extraction runs on when their registered
+    /// credential does not name one. Override with `BRAIN__LLM__MODEL`.
     ///
-    /// Not the serving credential: every namespace resolves its own key
-    /// through `[llm.broker]`. This one is read only by the shard-wide
-    /// consumers that still hold a process-wide client. Setting it does not
-    /// make a keyless namespace work.
-    #[serde(default)]
-    pub api_key: Option<String>,
-    /// Model id (e.g. `gpt-4o-mini`, `claude-haiku-4-5`). The provider
-    /// is derived from this id. Override with `BRAIN__LLM__MODEL`;
-    /// falls back to the built-in default when unset.
+    /// There is deliberately no key here. A deployment holds no provider
+    /// credential of its own: each namespace registers one and Brain's
+    /// model-backed stages bill to it.
     #[serde(default)]
     pub model: Option<String>,
-    /// `[llm.broker]` — required. Credentials are resolved per namespace.
+    /// `[llm.credentials]` — how stored tenant credentials are sealed.
     #[serde(default)]
-    pub broker: Option<LlmBrokerConfig>,
+    pub credentials: LlmCredentialsConfig,
 }
 
-/// `[llm.broker]` — where Brain resolves per-namespace credentials.
-#[derive(Clone, Deserialize, Serialize, PartialEq)]
+/// `[llm.credentials]` — where the key that seals stored tenant credentials
+/// comes from.
+#[derive(Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct LlmBrokerConfig {
-    /// Base URL of the LLM broker.
-    pub url: String,
-    /// Brain's own identity to the broker. This is NOT a provider key — it
-    /// authenticates Brain so the broker will mint namespace grants for it.
-    /// Override with `BRAIN__LLM__BROKER__SERVICE_KEY`.
+pub struct LlmCredentialsConfig {
+    /// The sealing key, as 64 hex characters. Override with
+    /// `BRAIN__LLM__CREDENTIALS__KEK`.
+    ///
+    /// Unset, Brain generates one into the data directory on first boot, so a
+    /// fresh install seals tenant keys with no operator configuration. That
+    /// protects a copied volume or a backup archive, because neither carries
+    /// the key file; it does not protect against someone holding the whole
+    /// data directory. Supplying a key here is what keeps the sealing key
+    /// somewhere Brain's disk is not.
     #[serde(default)]
-    pub service_key: Option<String>,
-    /// How long a resolved namespace credential stays cached before being
-    /// re-fetched. Bounds how long a revoked key keeps working.
-    #[serde(default = "default_broker_ttl_secs")]
-    pub ttl_secs: u64,
+    pub kek: Option<String>,
 }
 
-const fn default_broker_ttl_secs() -> u64 {
-    300
-}
-
-/// Redact the broker service key, same rule as the provider key.
-impl std::fmt::Debug for LlmBrokerConfig {
+/// Redact the sealing key from `Debug` output: it is what makes every stored
+/// tenant credential readable.
+impl std::fmt::Debug for LlmCredentialsConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LlmBrokerConfig")
-            .field("url", &self.url)
-            .field(
-                "service_key",
-                &self.service_key.as_ref().map(|_| "[redacted]"),
-            )
-            .field("ttl_secs", &self.ttl_secs)
-            .finish()
-    }
-}
-
-// Redact the provider key from `Debug` output. A future `debug!(?cfg)` must
-// never leak the LLM credential; the model id is safe to show. `Serialize`
-// (GET /v1/config) redacts separately and is left untouched.
-impl std::fmt::Debug for LlmConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LlmConfig")
-            .field("api_key", &self.api_key.as_ref().map(|_| "[redacted]"))
-            .field("model", &self.model)
-            .field("broker", &self.broker)
+        f.debug_struct("LlmCredentialsConfig")
+            .field("kek", &self.kek.as_ref().map(|_| "[redacted]"))
             .finish()
     }
 }
@@ -507,9 +481,9 @@ fn default_resolver_embed_threshold() -> f32 {
 
 /// `[extractors.hype]` TOML sub-section. Write-time hypothetical-
 /// question generation tuning. HyPE is **mandatory and always-on** —
-/// there is no flag to disable it, and the LLM it depends on is a hard
-/// startup requirement (see `Config::validate_llm_broker`). The only
-/// tunable is the question count.
+/// there is no flag to disable it, and the credential it depends on is
+/// resolved per namespace rather than configured here. The only tunable
+/// is the question count.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct HypeExtractorConfig {
@@ -1355,14 +1329,16 @@ impl std::fmt::Debug for AdminConfig {
 pub enum SummarizerBackend {
     /// default: consolidation worker is a no-op.
     Disabled,
-    /// Chat Completions over HTTPS. Requires `summarizer-openai` feature.
-    Openai,
+    /// Summarize through the namespace's own registered LLM credential, so a
+    /// consolidation run is paid for by the tenant whose memories it
+    /// consolidates. Requires the `summarizer-llm` feature.
+    Llm,
     /// Ollama's `/api/generate` over plain HTTP. Requires
     /// `summarizer-ollama` feature.
     Ollama,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct SummarizerConfig {
     /// Which backend to use. Defaults to `disabled`.
@@ -1377,16 +1353,13 @@ pub struct SummarizerConfig {
     #[serde(default = "default_max_summary_chars")]
     pub max_summary_chars: u32,
 
-    // OpenAI-specific knobs. Read only when `backend == Openai`. The
-    // credential is NOT here — the summarizer shares the single
-    // `[llm] api_key` (override `BRAIN__LLM__API_KEY`) like every other
-    // LLM consumer.
-    #[serde(default = "default_openai_api_base")]
-    pub openai_api_base: String,
-    #[serde(default = "default_openai_model")]
-    pub openai_model: String,
+    // Sampling temperature for the summary. Read by both backends.
+    //
+    // There is no credential and no model id here: the LLM backend resolves
+    // the namespace's own registered credential, and the model is the one
+    // that credential can pay for.
     #[serde(default = "default_temperature")]
-    pub openai_temperature: f32,
+    pub temperature: f32,
 
     // Ollama-specific knobs.
     #[serde(default = "default_ollama_base")]
@@ -1395,15 +1368,24 @@ pub struct SummarizerConfig {
     pub ollama_model: String,
 }
 
+/// Hand-written only to keep the rendering short; this section holds no
+/// secret now that the summarizer resolves a tenant's credential.
+impl std::fmt::Debug for SummarizerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SummarizerConfig")
+            .field("backend", &self.backend)
+            .field("temperature", &self.temperature)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Default for SummarizerConfig {
     fn default() -> Self {
         Self {
             backend: default_backend(),
             request_timeout_sec: default_request_timeout_sec(),
             max_summary_chars: default_max_summary_chars(),
-            openai_api_base: default_openai_api_base(),
-            openai_model: default_openai_model(),
-            openai_temperature: default_temperature(),
+            temperature: default_temperature(),
             ollama_base: default_ollama_base(),
             ollama_model: default_ollama_model(),
         }
@@ -1418,12 +1400,6 @@ fn default_request_timeout_sec() -> u32 {
 }
 fn default_max_summary_chars() -> u32 {
     4096
-}
-fn default_openai_api_base() -> String {
-    "https://api.openai.com/v1".to_owned()
-}
-fn default_openai_model() -> String {
-    "gpt-4o-mini".to_owned()
 }
 fn default_temperature() -> f32 {
     0.3
@@ -1566,8 +1542,8 @@ fn coercion_reference() -> toml::Value {
     let mut cfg = Config::for_tests();
     // Populate the `None`-by-default string-typed options so their `String`
     // type is visible in the serialized oracle.
-    cfg.llm.api_key = Some(String::new());
     cfg.llm.model = Some(String::new());
+    cfg.llm.credentials.kek = Some(String::new());
     cfg.extractors.classifier.model_path = Some(String::new());
     cfg.server.tls.cert = Some(PathBuf::from("x"));
     cfg.server.tls.key = Some(PathBuf::from("x"));
@@ -1677,7 +1653,6 @@ impl Config {
             source,
         })?;
         cfg.validate_post()?;
-        cfg.validate_llm_broker()?;
         Ok(cfg)
     }
 
@@ -1917,42 +1892,6 @@ impl Config {
 
         Ok(())
     }
-
-    /// Hard, unconditional startup gate on the credential broker.
-    ///
-    /// An LLM is a mandatory dependency of every Brain shard — it is not a
-    /// tier the operator can opt out of. Write-time HyPE hypothetical-question
-    /// generation is always-on, and without it there are no question vectors
-    /// and the read-side question-vector bridge is empty.
-    ///
-    /// What the shard needs at boot is therefore the broker, not a key: the
-    /// serving credential belongs to a namespace and is not known until a
-    /// write names one. A shard with no broker can never resolve a credential
-    /// for any namespace, which is the failure this refuses to start with.
-    ///
-    /// A namespace that has no registered key is a different matter and not a
-    /// boot-time concern: its writes still land, with the LLM tier reporting
-    /// that it could not run.
-    fn validate_llm_broker(&self) -> Result<(), ConfigError> {
-        let Some(broker) = self.llm.broker.as_ref() else {
-            return Err(ConfigError::Invariant(
-                "`[llm.broker]` is missing. Brain resolves an LLM credential per \
-                 namespace: the serving key is not known until a write names its \
-                 namespace, so there is nothing for a process-wide key to serve. \
-                 `[llm] api_key` is not a substitute. Set `[llm.broker] url` (and \
-                 `service_key`) to the broker that mints namespace grants."
-                    .into(),
-            ));
-        };
-        if broker.url.trim().is_empty() {
-            return Err(ConfigError::Invariant(
-                "`[llm.broker] url` is empty. Without it no namespace can resolve a \
-                 credential and every write would fail at derivation time."
-                    .into(),
-            ));
-        }
-        Ok(())
-    }
 }
 
 // ----------------------------------------------------------------------------
@@ -2006,38 +1945,6 @@ mod tests {
         assert_eq!(parse_human_bytes("256MiB").unwrap(), 256 * (1u64 << 20));
         assert_eq!(parse_human_bytes("4KiB").unwrap(), 4096);
         assert_eq!(parse_human_bytes("1TiB").unwrap(), 1u64 << 40);
-    }
-
-    #[test]
-    fn llm_gate_requires_a_broker_and_ignores_the_api_key() {
-        let mut cfg = Config::for_tests();
-
-        // A provider key is not a substitute for the broker. A process-wide
-        // key cannot serve a namespace, so it cannot satisfy the gate.
-        cfg.llm.api_key = Some("sk-cfg".to_string());
-        cfg.llm.broker = None;
-        assert!(
-            cfg.validate_llm_broker().is_err(),
-            "an api_key must not satisfy the gate — credentials are per namespace"
-        );
-
-        // The broker alone satisfies it, with no provider key at all: the
-        // serving credential is not known until a write names its namespace.
-        cfg.llm.api_key = None;
-        cfg.llm.broker = Some(LlmBrokerConfig {
-            url: "http://127.0.0.1:9900".to_string(),
-            service_key: None,
-            ttl_secs: default_broker_ttl_secs(),
-        });
-        assert!(cfg.validate_llm_broker().is_ok());
-
-        // A declared-but-empty url is the same failure as no broker.
-        cfg.llm.broker = Some(LlmBrokerConfig {
-            url: "   ".to_string(),
-            service_key: None,
-            ttl_secs: default_broker_ttl_secs(),
-        });
-        assert!(cfg.validate_llm_broker().is_err());
     }
 
     #[test]
@@ -2124,9 +2031,12 @@ mod tests {
             &reference,
             &["admin".into(), "token".into()]
         ));
+        // A hex sealing key is the strongest case for this guard: it can
+        // consist entirely of digits, and re-typing it to an integer would
+        // make the server refuse to boot on a valid key.
         assert!(reference_leaf_is_string(
             &reference,
-            &["llm".into(), "api_key".into()]
+            &["llm".into(), "credentials".into(), "kek".into()]
         ));
         assert!(reference_leaf_is_string(
             &reference,
@@ -2194,7 +2104,7 @@ mod tests {
     #[test]
     fn debug_redacts_secrets() {
         let mut cfg = Config::for_tests();
-        cfg.llm.api_key = Some("sk-supersecret-value".to_string());
+        cfg.llm.credentials.kek = Some("sk-supersecret-value".to_string());
         cfg.admin.token = Some("operator-token-value".to_string());
         let rendered = format!("{cfg:?}");
         assert!(

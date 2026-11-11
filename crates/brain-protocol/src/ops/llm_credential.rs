@@ -1,0 +1,229 @@
+//! LLM_CREDENTIAL_PUT / GET / DELETE / VERIFY — a tenant's own provider key.
+//!
+//! Brain's extraction and HyPE stages call an LLM, and the call bills to the
+//! key registered here. A deployment holds no key of its own: until a tenant
+//! registers one, writes still land and the non-model derivation stages still
+//! run, and the model stages report that the namespace has no credential.
+//!
+//! # The asymmetry is the contract
+//!
+//! A plaintext key goes **in** exactly once, on [`LlmCredentialPutRequest`].
+//! Nothing that comes back out can reconstruct it: a read answers with the
+//! provider, the model and a display fingerprint, because once sealed the key
+//! is only ever opened to sign an outbound provider call.
+//!
+//! # Where a credential lands
+//!
+//! [`CredentialScope`] selects the namespace base or the caller's own space,
+//! the same two-state selector schema declarations use. Writes land exactly
+//! where they say; reads walk narrowest-first, so a space without its own key
+//! uses the tenant's and a space with one shadows the base for itself alone.
+
+use crate::envelope::request::WireUuid;
+use crate::ops::memory::ActAs;
+
+/// The scope a credential is registered AT, or read FROM.
+///
+/// Deliberately a two-state selector and not a space identifier: the scope is
+/// the caller's own effective space, already resolved for this request, so
+/// there is nothing here for a caller to point at someone else's space with.
+///
+/// It is also deliberately separate from `act_as`. Nearly every request names
+/// a space, so reading the scope off `act_as.space` would turn every ordinary
+/// tenant-wide registration into a per-space override that the tenant's other
+/// spaces cannot see.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    Hash,
+    PartialEq,
+    serde_repr::Serialize_repr,
+    serde_repr::Deserialize_repr,
+)]
+#[repr(u8)]
+pub enum CredentialScope {
+    /// The tenant's namespace-wide key: every space in the namespace
+    /// resolves it unless it has one of its own. The default.
+    #[default]
+    Namespace = 0,
+    /// A key for the caller's effective space alone. Sibling spaces keep
+    /// resolving the namespace's.
+    Space = 1,
+}
+
+/// What a read reports about an installed credential.
+///
+/// Carries no key material. The fingerprint is a display-safe tail, enough to
+/// tell which key is installed and too little to narrow a search for the rest.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LlmCredentialView {
+    /// `"openai"` or `"anthropic"`.
+    pub provider: String,
+    /// The model extraction and HyPE run on, so the work is always billed to
+    /// something this key can pay for.
+    pub model: String,
+    /// Display-safe tail of the key (e.g. `…4f2a`).
+    pub fingerprint: String,
+    pub created_at_unix_nanos: u64,
+    /// `true` when a space-scoped read resolved the namespace's key rather
+    /// than one of its own. A caller needs this before removing a key:
+    /// deleting at the space would do nothing, and deleting at the namespace
+    /// would affect every sibling space.
+    pub inherited: bool,
+}
+
+// ============================================================
+// LLM_CREDENTIAL_PUT
+// ============================================================
+
+/// `LLM_CREDENTIAL_PUT_REQ`. Registers or replaces the key at `scope`.
+///
+/// The only wire shape that carries a plaintext provider key. Brain seals it
+/// on arrival, bound to the namespace and provider, and the plaintext is not
+/// retained.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LlmCredentialPutRequest {
+    /// `"openai"` or `"anthropic"`.
+    pub provider: String,
+    /// Model this key should serve (e.g. `gpt-4.1-mini`, `claude-haiku-4-5`).
+    pub model: String,
+    /// The provider key. Sealed on arrival and never returned.
+    pub api_key: String,
+    #[serde(with = "serde_bytes")]
+    pub request_id: WireUuid,
+    /// Optional effective identity, on behalf of the authenticated
+    /// connection principal. See [`ActAs`].
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
+    /// Where the key lands. Always on the wire.
+    pub scope: CredentialScope,
+}
+
+/// Redacting `Debug`, written by hand rather than derived.
+///
+/// A derived `Debug` on this type is one tracing call away from putting a live
+/// provider key in a log file, and request logging is exactly the kind of
+/// thing added later by someone who has not read this file.
+impl std::fmt::Debug for LlmCredentialPutRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LlmCredentialPutRequest")
+            .field("provider", &self.provider)
+            .field("model", &self.model)
+            .field("api_key", &"[redacted]")
+            .field("scope", &self.scope)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LlmCredentialPutResponse {
+    pub provider: String,
+    pub model: String,
+    pub fingerprint: String,
+    pub created_at_unix_nanos: u64,
+    /// `true` when this displaced a key already registered at the same scope,
+    /// so a caller can tell a first registration from a rotation.
+    pub replaced: bool,
+}
+
+// ============================================================
+// LLM_CREDENTIAL_GET
+// ============================================================
+
+/// `LLM_CREDENTIAL_GET_REQ`. Reports the credential the caller resolves from
+/// `scope`, walking narrowest-first.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LlmCredentialGetRequest {
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
+    /// The vantage point to resolve from. Always on the wire.
+    pub scope: CredentialScope,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LlmCredentialGetResponse {
+    /// `None` when the namespace has registered nothing. The model
+    /// derivation stages are degraded in that state; the rest of Brain is
+    /// unaffected.
+    pub credential: Option<LlmCredentialView>,
+}
+
+// ============================================================
+// LLM_CREDENTIAL_DELETE
+// ============================================================
+
+/// `LLM_CREDENTIAL_DELETE_REQ`. Removes the key at exactly `scope`.
+///
+/// Exact rather than resolved: a space revoking its own key must not be able
+/// to remove the tenant's by accident.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LlmCredentialDeleteRequest {
+    #[serde(with = "serde_bytes")]
+    pub request_id: WireUuid,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
+    /// Which scope's key to remove. Always on the wire.
+    pub scope: CredentialScope,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LlmCredentialDeleteResponse {
+    /// `false` when that scope had no key of its own. Reported rather than
+    /// always succeeding, because a caller revoking during an incident needs
+    /// to tell "revoked" from "there was nothing there".
+    pub existed: bool,
+}
+
+// ============================================================
+// LLM_CREDENTIAL_VERIFY
+// ============================================================
+
+/// How a registered key fared against its provider.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerifyOutcome {
+    /// The provider accepted the key and serves the registered model.
+    Ok,
+    /// The namespace has no credential to verify.
+    NoCredential,
+    /// The provider rejected the key. The tenant must register a new one.
+    Unauthorized,
+    /// The key authenticated but the registered model is not available to
+    /// it, which would otherwise surface only as failed extractions.
+    ModelUnavailable,
+    /// The provider could not be reached. Says nothing about the key.
+    Unreachable,
+}
+
+/// `LLM_CREDENTIAL_VERIFY_REQ`. Exercises the registered key against its
+/// provider with the cheapest call that proves it works.
+///
+/// This exists because the alternative first signal of a bad key is thin
+/// recall, several derivation stages downstream, where nobody is looking.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LlmCredentialVerifyRequest {
+    #[serde(with = "serde_bytes")]
+    pub request_id: WireUuid,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
+    /// The vantage point to resolve the key from. Always on the wire.
+    pub scope: CredentialScope,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LlmCredentialVerifyResponse {
+    pub outcome: VerifyOutcome,
+    /// The provider and model that were exercised. `None` when there was no
+    /// credential to verify.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub model: Option<String>,
+    /// The provider's own message on a failure, for an operator to act on.
+    /// Never carries key material.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub detail: Option<String>,
+}

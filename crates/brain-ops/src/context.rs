@@ -176,6 +176,13 @@ pub struct OpsContext {
     /// "unknown without I/O" and **admits** the write; a cold cache is not
     /// evidence of a missing key.
     pub llm_credential_resolver: Option<Arc<dyn LlmCredentialResolver>>,
+    /// Brain's own credential store, where a tenant's provider key lives.
+    ///
+    /// The resolver above reads through this same store; this field is the
+    /// write side, used by the LLM_CREDENTIAL ops. `None` on a deployment
+    /// with no store wired, which refuses those ops rather than pretending
+    /// to accept a key it cannot persist.
+    pub llm_credentials: Option<Arc<brain_metadata::llm_credential::LlmCredentialAccess>>,
     /// Per-shard tantivy index handle. `None` until
     /// the server's shard-spawn path wires it via
     /// [`OpsContext::with_tantivy`]. The retriever and
@@ -285,6 +292,7 @@ impl OpsContext {
             classifier_config: Arc::new(ClassifierConfig::unloaded()),
             llm_cache: None,
             llm_credential_resolver: None,
+            llm_credentials: None,
             tantivy: None,
             memory_text_dispatcher: None,
             statement_text_dispatcher: None,
@@ -419,6 +427,18 @@ impl OpsContext {
         resolver: Option<Arc<dyn LlmCredentialResolver>>,
     ) -> Self {
         self.llm_credential_resolver = resolver;
+        self
+    }
+
+    /// Install (or clear) the credential store the LLM_CREDENTIAL ops write
+    /// through. `None` refuses those ops: a deployment with no store cannot
+    /// persist a key a tenant registers.
+    #[must_use]
+    pub fn with_llm_credentials(
+        mut self,
+        credentials: Option<Arc<brain_metadata::llm_credential::LlmCredentialAccess>>,
+    ) -> Self {
+        self.llm_credentials = credentials;
         self
     }
 

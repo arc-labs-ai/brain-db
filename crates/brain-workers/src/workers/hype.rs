@@ -2,8 +2,7 @@
 //!
 //! HyPE is **mandatory and always-on**. There is no config flag to
 //! disable it: every shard runs it, and the credential it depends on is
-//! resolved per namespace from `[llm.broker]`, which config load requires
-//! (see `brain_server::config::Config::validate_llm_broker`). The generator
+//! resolved per namespace from Brain's own credential store. The generator
 //! is unconditionally wired into the extractor worker at shard spawn. A
 //! namespace with no registered key still writes — the LLM tier reports
 //! that it could not run, rather than the write failing.
@@ -63,8 +62,6 @@ pub struct HypeGenerator {
     /// mandatory and runs on every write, so it is the largest LLM cost on the
     /// write path and the one most visibly mis-billed if it is wrong.
     resolver: Arc<dyn LlmCredentialResolver>,
-    /// Declared model preference, passed to the resolver.
-    model: String,
     embedder: Arc<dyn Dispatcher>,
     index: Arc<RwLock<HypeHnswIndex>>,
     metadata: Arc<MetadataDb>,
@@ -116,7 +113,6 @@ impl HypeGenOutcome {
 impl HypeGenerator {
     pub fn new(
         resolver: Arc<dyn LlmCredentialResolver>,
-        model: String,
         embedder: Arc<dyn Dispatcher>,
         index: Arc<RwLock<HypeHnswIndex>>,
         metadata: Arc<MetadataDb>,
@@ -125,7 +121,6 @@ impl HypeGenerator {
     ) -> Self {
         Self {
             resolver,
-            model,
             embedder,
             index,
             metadata,
@@ -411,7 +406,7 @@ impl HypeGenerator {
         // Resolve before touching the cache: the credential scope is part of
         // the cache key, so a lookup without it could serve a row another
         // tenant's key paid for.
-        let credential = match self.resolver.client_for(namespace, Some(&self.model)).await {
+        let credential = match self.resolver.client_for(namespace, None).await {
             CredentialOutcome::Ready(c) => c,
             CredentialOutcome::Missing => {
                 return Err(format!("hype: {}", self.resolver.missing_reason(namespace)));

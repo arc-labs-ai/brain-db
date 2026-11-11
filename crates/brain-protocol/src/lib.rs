@@ -72,6 +72,7 @@ pub use ops::admin::*;
 pub use ops::entity::*;
 pub use ops::extractor::*;
 pub use ops::graph::*;
+pub use ops::llm_credential::*;
 pub use ops::memory::*;
 pub use ops::procedural::*;
 pub use ops::query::*;

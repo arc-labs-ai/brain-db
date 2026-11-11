@@ -69,19 +69,19 @@ cache_size       = 10000
 batch_size       = 32
 batch_window_ms  = 5
 
-# No [llm] api_key here on purpose: the image carries no key, and the
-# operator supplies one at run time if they want the entity disambiguator.
+# There is no [llm] provider key, here or anywhere: each namespace registers
+# its own at run time through LLM_CREDENTIAL_PUT and Brain seals it in the
+# credential store, so the model-backed stages bill the tenant that owns the
+# memory being processed.
 #
-# The serving credential is resolved per namespace from the broker, which
-# every deployment must configure:
+# The sealing key is generated into the data directory on first boot. Supply
+# your own to keep it off Brain's disk:
 #
-#   -e BRAIN__LLM__BROKER__URL=http://brain-edge:8080
-#   -e BRAIN__LLM__BROKER__SERVICE_KEY=...   # Brain's identity to the broker,
-#                                            # NOT a provider key
+#   -e BRAIN__LLM__CREDENTIALS__KEK=<64 hex chars>
 #
-# A namespace with no registered key still writes — the LLM tier reports that
-# it could not run, so you get entities without statements. See config/dev.toml's
-# [llm] block for the full explanation.
+# A namespace with no registered key has its writes refused until it registers
+# one: HyPE and extraction both need it, so storing the memory would leave it
+# ungrounded. See config/dev.toml's [llm] block for the full explanation.
 
 [admin]
 # Operator admin secret gating the /v1/* admin HTTP plane (key mint /
@@ -173,8 +173,9 @@ channel_capacity                         = 1024
 enabled = false
 
 [summarizer]
-# Consolidation worker is a no-op until an LLM backend is wired.
-# Set to openai / ollama at build time to enable summarization.
+# Consolidation worker is a no-op until a backend is wired. Build with
+# --features summarizer-llm (bills each tenant's own registered credential)
+# or summarizer-ollama (a locally hosted model) and set this accordingly.
 backend = "disabled"
 
 # Extractor pipeline — per-tier tuning. Extraction itself is always-on;

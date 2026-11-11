@@ -21,6 +21,7 @@ pub mod extraction;
 pub mod extractor;
 pub mod hype;
 pub mod llm_cache;
+pub mod llm_credential;
 pub mod namespace;
 pub mod recovery;
 pub mod registry;

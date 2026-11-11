@@ -276,7 +276,7 @@ compose-down *ARGS:
 # `docker-serve` inside the dev container to satisfy the mandatory [llm] api_key
 # (write-time HyPE). The key never touches argv or stdout — piped into the file.
 eval-env:
-    @umask 077 && printf 'BRAIN__LLM__API_KEY=%s\nBRAIN__LLM__MODEL=gpt-4o-mini\n' "$(cat ${HOME}/.brain_llm_key | tr -d '[:space:]')" > config/.env.eval && chmod 600 config/.env.eval
+    @umask 077 && printf 'BRAIN_LIVE_LLM_API_KEY=%s\nBRAIN__LLM__MODEL=gpt-4o-mini\n' "$(cat ${HOME}/.brain_llm_key | tr -d '[:space:]')" > config/.env.eval && chmod 600 config/.env.eval
     @echo "wrote config/.env.eval (0600) from ~/.brain_llm_key"
 
 # ONE container, native logs, ONE source of truth for models + data:

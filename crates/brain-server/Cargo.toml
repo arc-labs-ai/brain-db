@@ -17,7 +17,9 @@ default = []
 # Sub-task 9.15 — feature-gated LLM summarizers. Both pull `reqwest`
 # (with rustls-tls, reusing 9.9's vendored stack). Default off: the
 # substrate works without consolidation.
-summarizer-openai = ["reqwest"]
+# The LLM-backed summarizer reuses brain-llm's provider clients, so it
+# needs no HTTP stack of its own.
+summarizer-llm = []
 summarizer-ollama = ["reqwest"]
 
 [dependencies]
@@ -25,6 +27,7 @@ summarizer-ollama = ["reqwest"]
 # is wired in (e.g. 9.4 shards → brain-storage; 9.5 metadata → brain-metadata,
 # ...). Keeping the import set minimal so this crate compiles on non-Linux
 # hosts during the pure-rust sub-tasks.
+brain-crypto = { path = "../brain-crypto" }
 brain-core = { path = "../brain-core" }
 
 anyhow.workspace = true

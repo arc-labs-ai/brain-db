@@ -5,7 +5,8 @@
 //! Brain doesn't bundle an LLM; this module hosts two feature-gated
 //! HTTP adapters:
 //!
-//! - `openai::OpenAiSummarizer` (feature `summarizer-openai`)
+//! - `resolved::ResolvedSummarizer` (feature `summarizer-llm`) — bills the
+//!   namespace whose memories it consolidates
 //! - `ollama::OllamaSummarizer` (feature `summarizer-ollama`)
 //!
 //! Both call out to an external HTTPS endpoint. To avoid running
@@ -22,11 +23,14 @@
 
 pub(crate) mod prompt;
 
-#[cfg(any(feature = "summarizer-openai", feature = "summarizer-ollama"))]
+// Ollama speaks its own HTTP and is not a brain-llm provider, so it keeps
+// its own cross-runtime bridge. The resolved summarizer needs none: its
+// client arrives already bridged from the resolver.
+#[cfg(feature = "summarizer-ollama")]
 pub(crate) mod bridge;
 
-#[cfg(feature = "summarizer-openai")]
-pub(crate) mod openai;
+#[cfg(feature = "summarizer-llm")]
+pub(crate) mod resolved;
 
 #[cfg(feature = "summarizer-ollama")]
 pub(crate) mod ollama;

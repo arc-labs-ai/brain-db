@@ -302,9 +302,9 @@ async fn do_consolidation_cycle(
         return Ok(0);
     }
 
-    // Probe the summarizer once. If it's disabled, the worker is a
-    // no-op. We swallow Disabled silently.
-    if let Err(SummarizerError::Disabled) = worker.summarizer.summarize(&[]).await {
+    // A deployment with no summarization backend does no clustering work
+    // at all, rather than discovering it one summarize call in.
+    if !worker.summarizer.enabled() {
         return Ok(0);
     }
 
@@ -320,6 +320,10 @@ async fn do_consolidation_cycle(
 
     for (bucket, candidates) in by_context {
         let session_id = bucket.session;
+        // A consolidation is paid for by the tenant whose memories it
+        // consolidates. Resolved once per bucket because a bucket is one
+        // `(namespace, space, session)` by construction.
+        let bucket_namespace = namespace_name_for(ctx, bucket.namespace());
         if started.elapsed() >= cfg.max_runtime {
             break;
         }
@@ -378,7 +382,11 @@ async fn do_consolidation_cycle(
             };
             // Summarize.
             let summary_texts: Vec<&str> = texts.iter().map(String::as_str).collect();
-            let summary = match worker.summarizer.summarize(&summary_texts).await {
+            let summary = match worker
+                .summarizer
+                .summarize(&bucket_namespace, &summary_texts)
+                .await
+            {
                 Ok(s) => s,
                 Err(SummarizerError::Disabled) => return Ok(consolidations),
                 Err(SummarizerError::Failed(e)) => {
@@ -626,6 +634,24 @@ fn stamp_sources(
     wtxn.commit()
         .map_err(|e| WorkerError::Ops(format!("stamp commit: {e:?}")))?;
     Ok(())
+}
+
+/// The namespace name a consolidation bills to.
+///
+/// Falls back to the system namespace so an unresolvable id degrades to "no
+/// credential for this namespace" rather than panicking a worker cycle.
+fn namespace_name_for(ctx: &WorkerContext, namespace: NamespaceId) -> String {
+    ctx.ops
+        .executor
+        .metadata
+        .read_txn()
+        .ok()
+        .and_then(|rtxn| {
+            brain_metadata::namespace::namespace_name(&rtxn, namespace)
+                .ok()
+                .flatten()
+        })
+        .unwrap_or_else(|| brain_extractors::SYSTEM_NAMESPACE.to_string())
 }
 
 fn now_unix_nanos() -> u64 {

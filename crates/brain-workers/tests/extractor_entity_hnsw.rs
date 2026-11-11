@@ -408,10 +408,9 @@ fn build_fixture_full(embedder: Arc<dyn Dispatcher>, extractor: Arc<dyn Extracto
             embedder,
             embed_threshold: EMBED_RESOLVE_THRESHOLD,
         })
-        .with_entity_disambiguator(Arc::new(EntityDisambiguator::new(
-            Arc::new(AlwaysYesLlm) as Arc<dyn LlmClient>,
-            "fake-disambiguator",
-        )));
+        .with_entity_disambiguator(Arc::new(EntityDisambiguator::new(Arc::new(
+            brain_llm::FixedResolver::new(Arc::new(AlwaysYesLlm) as Arc<dyn LlmClient>),
+        ))));
 
     let ctx = WorkerContext {
         ops: ops.clone(),

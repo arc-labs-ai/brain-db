@@ -296,7 +296,8 @@ fn two_phase_resolve(
         }
         let mut v = PrecomputedVerdicts::new();
         for p in pending {
-            let verdict = futures_lite::future::block_on(dis.confirm(&p.view, &p.raw_surface));
+            let verdict =
+                futures_lite::future::block_on(dis.confirm("acme", &p.view, &p.raw_surface));
             v.insert(p.norm_surface, p.candidate, verdict);
         }
         v
@@ -344,7 +345,9 @@ fn auto_alias_rejected_by_disambiguator_creates_distinct_entity() {
     let seed_id = auto_alias_band_scenario(&mut db, &hnsw, &embedder);
 
     let backend = FakeDisambiguator::rejecting();
-    let disambiguator = Arc::new(EntityDisambiguator::new(backend.clone(), "fake-model"));
+    let disambiguator = Arc::new(EntityDisambiguator::new(Arc::new(
+        brain_llm::FixedResolver::new(backend.clone()),
+    )));
     let embed_deps = embed_deps_for(embedder, hnsw);
 
     let res = two_phase_resolve(&db, &embed_deps, Some(disambiguator.as_ref()), "Japan");
@@ -398,7 +401,9 @@ fn auto_alias_confirmed_by_disambiguator_still_merges() {
     let seed_id = auto_alias_band_scenario(&mut db, &hnsw, &embedder);
 
     let backend = FakeDisambiguator::confirming();
-    let disambiguator = Arc::new(EntityDisambiguator::new(backend.clone(), "fake-model"));
+    let disambiguator = Arc::new(EntityDisambiguator::new(Arc::new(
+        brain_llm::FixedResolver::new(backend.clone()),
+    )));
     let embed_deps = embed_deps_for(embedder, hnsw);
 
     let res = two_phase_resolve(&db, &embed_deps, Some(disambiguator.as_ref()), "Japan");
@@ -441,7 +446,9 @@ fn confirmed_verdict_aliases_onto_existing_entity() {
     let closer_id = ambiguous_band_scenario(&mut db, &hnsw, &embedder);
 
     let backend = FakeDisambiguator::confirming();
-    let disambiguator = Arc::new(EntityDisambiguator::new(backend.clone(), "fake-model"));
+    let disambiguator = Arc::new(EntityDisambiguator::new(Arc::new(
+        brain_llm::FixedResolver::new(backend.clone()),
+    )));
     let embed_deps = embed_deps_for(embedder, hnsw);
 
     let res = two_phase_resolve(
@@ -486,7 +493,9 @@ fn rejected_verdict_creates_fresh_entity_without_merge_proposal() {
     let closer_id = ambiguous_band_scenario(&mut db, &hnsw, &embedder);
 
     let backend = FakeDisambiguator::rejecting();
-    let disambiguator = Arc::new(EntityDisambiguator::new(backend.clone(), "fake-model"));
+    let disambiguator = Arc::new(EntityDisambiguator::new(Arc::new(
+        brain_llm::FixedResolver::new(backend.clone()),
+    )));
     let embed_deps = embed_deps_for(embedder, hnsw);
 
     let res = two_phase_resolve(
@@ -528,7 +537,9 @@ fn uncertain_verdict_falls_through_to_create_plus_merge_proposal() {
     let closer_id = ambiguous_band_scenario(&mut db, &hnsw, &embedder);
 
     let backend = FakeDisambiguator::uncertain();
-    let disambiguator = Arc::new(EntityDisambiguator::new(backend.clone(), "fake-model"));
+    let disambiguator = Arc::new(EntityDisambiguator::new(Arc::new(
+        brain_llm::FixedResolver::new(backend.clone()),
+    )));
     let embed_deps = embed_deps_for(embedder, hnsw);
 
     let res = two_phase_resolve(

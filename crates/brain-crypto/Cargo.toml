@@ -1,0 +1,18 @@
+[package]
+name = "brain-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+# Brain's TLS stack already installs aws-lc-rs as its rustls crypto provider,
+# so sealing tenant secrets with it adds no second cryptographic
+# implementation to the binary or to the audit surface.
+aws-lc-rs = { workspace = true }
+zeroize = { workspace = true }
+thiserror = { workspace = true }
+rkyv = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -44,6 +44,7 @@ pub use crate::ops::capabilities::*;
 pub use crate::ops::entity::*;
 pub use crate::ops::extractor::*;
 pub use crate::ops::graph::*;
+pub use crate::ops::llm_credential::*;
 pub use crate::ops::memory::*;
 pub use crate::ops::procedural::*;
 pub use crate::ops::query::*;
@@ -174,6 +175,12 @@ pub enum ResponseBody {
     SessionList(SessionListResponse),
     SessionDelete(SessionDeleteResponse),
 
+    // A tenant's own LLM provider key.
+    LlmCredentialPut(LlmCredentialPutResponse),
+    LlmCredentialGet(LlmCredentialGetResponse),
+    LlmCredentialDelete(LlmCredentialDeleteResponse),
+    LlmCredentialVerify(LlmCredentialVerifyResponse),
+
     Error(ErrorResponse),
 }
 
@@ -256,6 +263,10 @@ impl ResponseBody {
             Self::SessionCreate(_) => Opcode::SessionCreateResp,
             Self::SessionList(_) => Opcode::SessionListResp,
             Self::SessionDelete(_) => Opcode::SessionDeleteResp,
+            Self::LlmCredentialPut(_) => Opcode::LlmCredentialPutResp,
+            Self::LlmCredentialGet(_) => Opcode::LlmCredentialGetResp,
+            Self::LlmCredentialDelete(_) => Opcode::LlmCredentialDeleteResp,
+            Self::LlmCredentialVerify(_) => Opcode::LlmCredentialVerifyResp,
             Self::Error(_) => Opcode::Error,
         }
     }
@@ -364,6 +375,10 @@ impl ResponseBody {
             Self::SessionCreate(r) => to_cbor_bytes(r),
             Self::SessionList(r) => to_cbor_bytes(r),
             Self::SessionDelete(r) => to_cbor_bytes(r),
+            Self::LlmCredentialPut(r) => to_cbor_bytes(r),
+            Self::LlmCredentialGet(r) => to_cbor_bytes(r),
+            Self::LlmCredentialDelete(r) => to_cbor_bytes(r),
+            Self::LlmCredentialVerify(r) => to_cbor_bytes(r),
             Self::Error(r) => to_cbor_bytes(r),
         }
     }
@@ -453,6 +468,10 @@ impl ResponseBody {
             Opcode::SessionCreateResp => Self::SessionCreate(from_cbor_bytes(bytes)?),
             Opcode::SessionListResp => Self::SessionList(from_cbor_bytes(bytes)?),
             Opcode::SessionDeleteResp => Self::SessionDelete(from_cbor_bytes(bytes)?),
+            Opcode::LlmCredentialPutResp => Self::LlmCredentialPut(from_cbor_bytes(bytes)?),
+            Opcode::LlmCredentialGetResp => Self::LlmCredentialGet(from_cbor_bytes(bytes)?),
+            Opcode::LlmCredentialDeleteResp => Self::LlmCredentialDelete(from_cbor_bytes(bytes)?),
+            Opcode::LlmCredentialVerifyResp => Self::LlmCredentialVerify(from_cbor_bytes(bytes)?),
             Opcode::Error => Self::Error(from_cbor_bytes(bytes)?),
             other => return Err(ProtocolError::UnknownOpcode(other.as_u16())),
         })

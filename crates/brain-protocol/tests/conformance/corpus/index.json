@@ -420,6 +420,60 @@
     "payload_len": 68
   },
   {
+    "name": "req_llm_credential_put",
+    "opcode": "0x0076",
+    "kind": "request",
+    "payload_len": 102
+  },
+  {
+    "name": "resp_llm_credential_put",
+    "opcode": "0x00F6",
+    "kind": "response",
+    "payload_len": 97
+  },
+  {
+    "name": "req_llm_credential_get",
+    "opcode": "0x0077",
+    "kind": "request",
+    "payload_len": 8
+  },
+  {
+    "name": "resp_llm_credential_get",
+    "opcode": "0x00F7",
+    "kind": "response",
+    "payload_len": 110
+  },
+  {
+    "name": "resp_llm_credential_get_absent",
+    "opcode": "0x00F7",
+    "kind": "response",
+    "payload_len": 13
+  },
+  {
+    "name": "req_llm_credential_delete",
+    "opcode": "0x0078",
+    "kind": "request",
+    "payload_len": 36
+  },
+  {
+    "name": "resp_llm_credential_delete",
+    "opcode": "0x00F8",
+    "kind": "response",
+    "payload_len": 10
+  },
+  {
+    "name": "req_llm_credential_verify",
+    "opcode": "0x0079",
+    "kind": "request",
+    "payload_len": 36
+  },
+  {
+    "name": "resp_llm_credential_verify",
+    "opcode": "0x00F9",
+    "kind": "response",
+    "payload_len": 100
+  },
+  {
     "name": "resp_get_capabilities",
     "opcode": "0x00B2",
     "kind": "response",

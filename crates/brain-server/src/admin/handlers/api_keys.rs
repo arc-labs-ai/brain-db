@@ -83,6 +83,7 @@ impl PermissionsSpec {
                         "SCHEMA_UPLOAD" => bits::SCHEMA_UPLOAD,
                         "ADMIN" => bits::ADMIN,
                         "ACT_AS" => bits::ACT_AS,
+                        "LLM_CREDENTIAL" => bits::LLM_CREDENTIAL,
                         "STANDARD_SPACE" => bits::STANDARD_SPACE,
                         "READ_ONLY" => bits::READ_ONLY,
                         "READ_WRITE" => bits::READ_WRITE,
@@ -431,5 +432,73 @@ mod tests {
         let body = Full::new(Bytes::from(vec![0u8; 64]));
         let bytes = read_bounded_body(body).await.expect("small body accepted");
         assert_eq!(bytes.len(), 64);
+    }
+
+    // -----------------------------------------------------------------
+    // The permission-name table
+    // -----------------------------------------------------------------
+
+    /// Every single-bit permission, paired with the name the mint must accept.
+    ///
+    /// Adding a bit to `brain_metadata::api_keys::bits` without adding it here
+    /// makes the bit unreachable through the documented mint route — it can
+    /// then only be granted by `FULL` (which also grants `ADMIN`) or by the
+    /// undocumented raw-`u32` form. `LLM_CREDENTIAL` shipped in exactly that
+    /// state, so the pairing is asserted rather than assumed.
+    const NAMED_BITS: &[(&str, u32)] = &[
+        ("ENCODE", bits::ENCODE),
+        ("RECALL", bits::RECALL),
+        ("FORGET", bits::FORGET),
+        ("LINK", bits::LINK),
+        ("SCHEMA_UPLOAD", bits::SCHEMA_UPLOAD),
+        ("ADMIN", bits::ADMIN),
+        ("ACT_AS", bits::ACT_AS),
+        ("LLM_CREDENTIAL", bits::LLM_CREDENTIAL),
+    ];
+
+    #[test]
+    fn every_named_permission_resolves_to_its_bit() {
+        for (name, bit) in NAMED_BITS {
+            let spec = PermissionsSpec::Names(vec![(*name).to_string()]);
+            assert_eq!(
+                spec.resolve().ok(),
+                Some(*bit),
+                "`{name}` must mint to {bit:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_permission_bit_is_reachable_by_name() {
+        // Walks the bit space rather than a hand-kept list: a bit added to
+        // `bits` but not to the mint cannot hide behind this test.
+        let named: u32 = NAMED_BITS.iter().fold(0, |acc, (_, b)| acc | b);
+        let coverable = bits::FULL | bits::ACT_AS | bits::LLM_CREDENTIAL;
+        let unreachable = coverable & !named;
+        assert_eq!(
+            unreachable, 0,
+            "permission bits in no bundle and reachable by no name: {unreachable:#x}. \
+             Add the name to `PermissionsSpec::resolve` and to NAMED_BITS."
+        );
+    }
+
+    #[test]
+    fn an_unknown_permission_name_is_refused() {
+        let spec = PermissionsSpec::Names(vec!["TELEPORT".to_string()]);
+        let err = spec.resolve().expect_err("unknown names must not mint");
+        assert!(err.contains("TELEPORT"), "{err}");
+    }
+
+    #[test]
+    fn the_credential_bit_is_grantable_without_admin() {
+        // The separation the whole permission exists for: a tenant running
+        // their own extraction budget must not need operator powers.
+        let spec = PermissionsSpec::Names(vec![
+            "STANDARD_SPACE".to_string(),
+            "LLM_CREDENTIAL".to_string(),
+        ]);
+        let resolved = spec.resolve().expect("mints");
+        assert_ne!(resolved & bits::LLM_CREDENTIAL, 0);
+        assert_eq!(resolved & bits::ADMIN, 0, "must not drag in ADMIN");
     }
 }

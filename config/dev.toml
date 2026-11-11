@@ -204,9 +204,9 @@ max_related_statements_per_entity = 5
 
 # [extractors.hype]
 # HyPE is mandatory and always-on — there is no enable/disable flag.
-# Its credential resolves per namespace from [llm.broker], like the LLM
-# extractor tier. A server with no registered key for a namespace still
-# boots and still writes; HyPE reports that it could not run.
+# Its credential resolves per namespace from Brain's credential store, like
+# the LLM extractor tier. A server with no registered key still boots; that
+# namespace's writes are refused until one is registered.
 # num_questions = 6         # hypothetical questions generated per memory
 
 # Index pipeline tuning. Tantivy group-commit cadence (whichever of the
@@ -233,60 +233,46 @@ sample_ratio = 0.01
 token = "dev-admin-token"
 
 [summarizer]
-# Sub-task 9.15. Consolidation worker stays a no-op until an LLM
-# backend is wired. Set to "openai" (build with --features
-# summarizer-openai) or "ollama" (--features summarizer-ollama).
+# The consolidation worker stays a no-op until a backend is wired:
+#
+#   "llm"    (build with --features summarizer-llm) summarizes through the
+#            namespace's own registered credential, so a consolidation run is
+#            paid for by the tenant whose memories it consolidates. There is
+#            no key to configure here.
+#   "ollama" (--features summarizer-ollama) summarizes with a locally hosted
+#            model, which bills no one.
 backend = "disabled"
 request_timeout_sec = 30
 max_summary_chars = 4096
-# OpenAI knobs — only used when backend = "openai". The credential is
-# NOT here: the summarizer currently shares the shard-wide [llm] api_key
-# below, which is the last consumer of that field and is slated to move
-# onto the per-namespace broker resolver like every other LLM caller.
-openai_model = "gpt-4o-mini"
+# Sampling temperature, read by both backends.
+# temperature = 0.3
 # Ollama knobs — only used when backend = "ollama".
 # ollama_base = "http://localhost:11434"
 # ollama_model = "llama3.1:8b"
 
 [llm]
-# REQUIRED. An LLM is mandatory: write-time HyPE hypothetical-question
-# generation is always-on and cannot be disabled, and the write path
-# depends on it.
+# An LLM is mandatory: write-time HyPE hypothetical-question generation is
+# always-on and cannot be disabled, and the write path depends on it.
 #
-# The serving credential is resolved PER NAMESPACE from `[llm.broker]`.
-# Brain holds a namespace-scoped GRANT, never the tenant's provider key, so
-# customer keys stay out of this process's WAL, snapshots and backups. A
-# keyless boot is therefore correct: the credential is not known until a
-# write names its namespace.
+# There is no provider key here, and no way to set one. Each namespace
+# registers its own through LLM_CREDENTIAL_PUT and Brain seals it in the
+# credential store; the model-backed stages bill to the tenant that owns the
+# memory being processed.
 #
-# A namespace with no registered key still writes. The pattern and
-# classifier tiers run; the LLM tier reports that it could not run, so you
-# get entities without statements rather than a failed write or a silent
-# bill against someone else's key.
+# A keyless boot is therefore correct. A keyless namespace is a different
+# matter: HyPE and extraction both need the key, so its writes are refused
+# with `LlmCredentialMissing` rather than stored ungrounded. Register a
+# credential before writing. A key that is merely unreachable is the softer
+# case — the write lands and the stage reports why it could not run.
 #
-# api_key is NOT the serving credential, and it is DEPRECATED: BYOK through
-# the broker is meant to be the only way an LLM call is paid for, and the
-# spec already states that Brain holds no provider credential at all. The
-# field survives only because two shard-wide consumers have not moved onto
-# the resolver yet — the entity disambiguator and the (off-by-default)
-# consolidation summarizer. Setting it does NOT make a keyless namespace
-# work, and leaving it empty costs only the disambiguator's second opinion
-# on ambiguous partial matches. The provider is derived from the model id
-# (claude* → Anthropic, else OpenAI).
-#   BRAIN__LLM__API_KEY=sk-...   BRAIN__LLM__MODEL=gpt-4o-mini
-api_key = ""   # leave empty; never commit a real key
-# model = "gpt-4o-mini"  # default when unset
-
-[llm.broker]                          # required
-url = "http://brain-edge:8080"        # the broker's base URL
-service_key = ""                      # Brain's identity to the broker. NOT a
-                                      # provider key: it authenticates Brain so
-                                      # the broker will swap a grant for the
-                                      # tenant's real key on the way upstream.
-                                      # Override: BRAIN__LLM__BROKER__SERVICE_KEY
-ttl_secs = 300                        # how long a resolved credential is
-                                      # cached; bounds how long a revoked key
-                                      # keeps working.
+# The sealing key is generated into the data directory on first boot. Supply
+# your own to keep it off Brain's disk:
+#   BRAIN__LLM__CREDENTIALS__KEK=<64 hex chars>
+#
+# model is the id extraction falls back to when a registered credential does
+# not name one.
+# model = "gpt-4o-mini"
+#   BRAIN__LLM__MODEL=gpt-4o-mini
 
 [rerank]
 # Off by default: rerank only reorders already-retrieved candidates and

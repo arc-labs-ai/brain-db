@@ -96,10 +96,13 @@ pub(crate) struct ConnState {
     /// per-shard, so a txn's whole lifecycle must land on one shard. This
     /// router records the begin-time shard and pins the commit/abort to it.
     pub(crate) txn_shards: TxnShardRouter,
+    /// Whether this connection's transport protects its contents (TLS, mTLS,
+    /// or a loopback peer). Set once at accept and never changed.
+    pub(crate) transport_confidential: bool,
 }
 
 impl ConnState {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(transport_confidential: bool) -> Self {
         Self {
             phase: ConnPhase::AwaitingHello,
             connection_id: [0u8; 16],
@@ -107,6 +110,7 @@ impl ConnState {
             last_revocation_check: Instant::now(),
             opened_txn: false,
             txn_shards: TxnShardRouter::new(),
+            transport_confidential,
         }
     }
 }
@@ -351,6 +355,10 @@ pub(crate) struct OpDispatch {
     /// the originating connection — drives the connection-drop
     /// auto-abort sweep.
     pub(crate) connection_id: [u8; 16],
+    /// Whether the connection this op arrived on protects its contents.
+    /// Carried through to the `RequestCaller` so an op that accepts a secret
+    /// can refuse a transport that would expose it.
+    pub(crate) transport_confidential: bool,
     /// Effective-identity selector, present iff the request carried an
     /// `act_as` field that passed the R1/R2 authorization checks in
     /// `dispatch_frame`. When `Some`, `run_op_dispatch` builds the
@@ -646,6 +654,7 @@ pub(crate) fn dispatch_frame(frame: Frame, state: &mut ConnState, topology: &Top
         // on the new entry; the connection-drop sweep needs it to
         // find buffered work owned by a dying connection.
         connection_id: state.connection_id,
+        transport_confidential: state.transport_confidential,
         act_as,
     })
 }
@@ -852,6 +861,13 @@ pub(crate) async fn run_op_dispatch(
     let caller = match &op.act_as {
         Some(a) => op.scope.to_effective_caller(a, op.connection_id),
         None => op.scope.to_caller(op.connection_id),
+    };
+    // A delegated caller can never hold LLM_CREDENTIAL (it is not delegable),
+    // so this only ever matters for the principal's own identity.
+    let caller = if op.transport_confidential {
+        caller.with_confidential_transport()
+    } else {
+        caller
     };
     // Root of the per-request trace. Held open for the whole op; the shard
     // re-enters a clone via `.instrument()` so `brain.encode` nests under it
@@ -1516,7 +1532,7 @@ mod tests {
 
     #[test]
     fn hello_transitions_to_awaiting_auth_and_emits_welcome() {
-        let mut state = ConnState::new();
+        let mut state = ConnState::new(true);
         let topo = test_topology();
         let action = dispatch_frame(build_hello_frame(), &mut state, &topo);
         match action {
@@ -1532,7 +1548,7 @@ mod tests {
 
     #[test]
     fn op_before_auth_returns_not_authenticated() {
-        let mut state = ConnState::new();
+        let mut state = ConnState::new(true);
         let topo = test_topology();
         let _ = dispatch_frame(build_hello_frame(), &mut state, &topo);
         // Try an ENCODE while still AwaitingAuth.
@@ -1558,7 +1574,7 @@ mod tests {
 
     #[test]
     fn hello_with_unsupported_version_closes() {
-        let mut state = ConnState::new();
+        let mut state = ConnState::new(true);
         let topo = test_topology();
         let bad = HelloPayload {
             client_id: "tester".into(),
@@ -1584,7 +1600,7 @@ mod tests {
         };
         let body = RequestBody::Ping(payload);
         let frame = Frame::new(Opcode::Ping.as_u16(), FLAG_EOS, 0, body.encode());
-        let mut state = ConnState::new();
+        let mut state = ConnState::new(true);
         let topo = test_topology();
         match dispatch_frame(frame, &mut state, &topo) {
             Action::Inline(f) => assert_eq!(f.header.opcode_u16(), Opcode::Pong.as_u16()),
@@ -1599,7 +1615,7 @@ mod tests {
         // HELLO payload is valid; the only violation is stream_id=1.
         let hello = build_hello_frame();
         let frame = Frame::new(Opcode::Hello.as_u16(), FLAG_EOS, 1, hello.payload);
-        let mut state = ConnState::new();
+        let mut state = ConnState::new(true);
         let topo = test_topology();
         match dispatch_frame(frame, &mut state, &topo) {
             Action::Inline(reply) => {
@@ -1616,7 +1632,7 @@ mod tests {
         // EncodeReq on stream_id = 2 (even). The op is client-bound
         // (`is_request() == true`, `is_connection_level() == false`).
         let frame = Frame::new(Opcode::EncodeReq.as_u16(), FLAG_EOS, 2, Vec::new());
-        let mut state = ConnState::new();
+        let mut state = ConnState::new(true);
         let topo = test_topology();
         match dispatch_frame(frame, &mut state, &topo) {
             Action::Inline(reply) => {
@@ -1645,7 +1661,7 @@ mod tests {
     #[test]
     fn op_stream_must_be_nonzero() {
         let frame = Frame::new(Opcode::EncodeReq.as_u16(), FLAG_EOS, 0, Vec::new());
-        let mut state = ConnState::new();
+        let mut state = ConnState::new(true);
         let topo = test_topology();
         match dispatch_frame(frame, &mut state, &topo) {
             Action::Inline(reply) => {
@@ -1677,7 +1693,7 @@ mod tests {
 
     /// Drive HELLO + AUTH with `secret` and return the established state.
     fn establish(topo: &Topology, secret: Vec<u8>) -> ConnState {
-        let mut state = ConnState::new();
+        let mut state = ConnState::new(true);
         let _ = dispatch_frame(build_hello_frame(), &mut state, topo);
         let auth = AuthPayload {
             method: AuthMethod::Token,
@@ -2195,7 +2211,7 @@ mod tests {
     fn unknown_opcode_stays_open() {
         // 0xAA is not in the Opcode enum.
         let frame = Frame::new(0xAA, 0, 7, Vec::new());
-        let mut state = ConnState::new();
+        let mut state = ConnState::new(true);
         let topo = test_topology();
         match dispatch_frame(frame, &mut state, &topo) {
             Action::Inline(reply) => {
@@ -2305,6 +2321,7 @@ mod tests {
             target_shard: 0,
             scope: test_scope(),
             connection_id: [0u8; 16],
+            transport_confidential: true,
             act_as: None,
         };
         // Empty shard vec → target shard 0 is out of range → ShardUnavailable,

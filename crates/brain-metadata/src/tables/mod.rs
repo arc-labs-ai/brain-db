@@ -18,6 +18,7 @@ pub mod forget_undo;
 pub mod hype;
 pub mod idempotency;
 pub mod kind;
+pub mod llm_credential;
 pub mod memory;
 pub mod memory_artifacts;
 pub mod memory_vector;

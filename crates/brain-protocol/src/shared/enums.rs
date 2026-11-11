@@ -735,8 +735,8 @@ mod tests {
     /// `LlmCredentialMissing` must be a NON-retryable category and
     /// `LlmCredentialUnavailable` a retryable one. Every published SDK decides
     /// whether to retry from this classification, so swapping them would make
-    /// a tenant with no provider key retry forever (or a transient broker blip
-    /// fail a write permanently).
+    /// a tenant with no provider key retry forever (or an unreadable
+    /// credential store fail a write permanently).
     #[test]
     fn byok_credential_codes_carry_the_right_retry_semantics() {
         use crate::error::ErrorCategory;
@@ -748,7 +748,7 @@ mod tests {
         assert_eq!(
             ErrorCode::LlmCredentialUnavailable.category(),
             ErrorCategory::Unavailable,
-            "an unreachable credential broker is transient — it must be retried"
+            "an unreadable credential store is transient — it must be retried"
         );
         assert_ne!(
             ErrorCode::LlmCredentialMissing.category(),

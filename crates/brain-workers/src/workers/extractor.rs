@@ -246,7 +246,7 @@ pub struct ExtractorWorker {
     /// existing behaviour (Create + enqueue merge proposal) for every
     /// partial match. Production shards stamp this with the
     /// `EntityDisambiguator` built from the shared LLM client when the
-    /// single credential (`[llm] api_key` / `BRAIN__LLM__API_KEY`) is
+    /// credential the memory's namespace registered is
     /// present at startup.
     entity_disambiguator: Option<Arc<EntityDisambiguator>>,
     /// Optional write-time HyPE generator. `None` (the default) skips
@@ -926,6 +926,33 @@ fn resolve_namespace_names(
             name
         })
         .collect()
+}
+
+/// The namespace name a memory belongs to.
+///
+/// Resolved per memory rather than from the worker's context: derivation runs
+/// after the write is acknowledged and a batch can hold memories from
+/// different tenants, so the owning namespace is a property of the row.
+/// Falls back to the system namespace, matching how the LLM tier names a
+/// memory whose namespace cannot be resolved — the two must agree or the
+/// disambiguation call and the extraction would bill different tenants.
+fn namespace_name_for(ctx: &WorkerContext, memory_id: MemoryId) -> String {
+    use brain_metadata::tables::memory::MEMORIES_TABLE;
+    let fallback = || brain_extractors::SYSTEM_NAMESPACE.to_string();
+    let Ok(rtxn) = ctx.ops.executor.metadata.read_txn() else {
+        return fallback();
+    };
+    let Ok(t) = rtxn.open_table(MEMORIES_TABLE) else {
+        return fallback();
+    };
+    let Ok(Some(g)) = t.get(&memory_id.to_be_bytes()) else {
+        return fallback();
+    };
+    let ns_id = g.value().namespace_id;
+    brain_metadata::namespace::namespace_name(&rtxn, brain_core::NamespaceId::from(ns_id))
+        .ok()
+        .flatten()
+        .unwrap_or_else(fallback)
 }
 
 fn load_row_facts(
@@ -3073,8 +3100,9 @@ async fn apply_outcome(
         } else {
             drop(plan_txn); // roll back the plan pass; re-run with verdicts
             let mut verdicts = PrecomputedVerdicts::new();
+            let namespace = namespace_name_for(ctx, memory_id);
             for p in pending {
-                let verdict = dis.confirm(&p.view, &p.raw_surface).await;
+                let verdict = dis.confirm(&namespace, &p.view, &p.raw_surface).await;
                 verdicts.insert(p.norm_surface, p.candidate, verdict);
             }
             let wtxn = db_guard

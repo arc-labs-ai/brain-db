@@ -13,10 +13,10 @@ use crate::client::LlmClient;
 /// Canonical wire name for OpenAI.
 ///
 /// A named constant, not a literal at each use: this string is the provider
-/// field in stored BYOK credentials, a segment in the broker's URL path, and
-/// part of the AEAD binding those credentials are sealed under. A typo in any
-/// one of those places produces a decrypt failure at runtime rather than a
-/// compile error, so there is exactly one spelling.
+/// field in a stored BYOK credential and part of the AEAD binding that
+/// credential is sealed under. A typo in either place produces a decrypt
+/// failure at runtime rather than a compile error, so there is exactly one
+/// spelling.
 pub const PROVIDER_OPENAI: &str = "openai";
 
 /// Canonical wire name for Anthropic. See [`PROVIDER_OPENAI`].
@@ -79,7 +79,7 @@ impl Provider {
 /// Routes a `model` field to one of the configured clients.
 ///
 /// Built at shard startup from the single resolved credential
-/// (`[llm] api_key` / `BRAIN__LLM__API_KEY`); the provider is derived
+/// (a test double's single client); the provider is derived
 /// from the model id, so exactly one client slot is populated and a
 /// missing key produces all-`None` slots. The extractor materializer
 /// asks the router for a client at `materialize_llm_extractor` time.

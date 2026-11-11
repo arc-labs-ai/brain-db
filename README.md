@@ -22,7 +22,7 @@ Brain stores four record types — **Memory**, **Entity**, **Statement**, **Rela
 $ brain-server --config config/dev.toml
 ─────────────────────────────────────────────────────────────────────────────
   ◉ brain-server  v0.4.0  ·  listening 127.0.0.1:9090 (wire) · :9092 (admin)
-  ◉ shard 0 ready  ·  WAL synced  ·  HNSW warm  ·  broker reachable
+  ◉ shard 0 ready  ·  WAL synced  ·  HNSW warm  ·  credential store open
   ◉ schema: brain:core + acme:sales (2 namespaces, 14 types)
 ─────────────────────────────────────────────────────────────────────────────
 ```
@@ -100,8 +100,6 @@ No checkout, no build, no model download — both models are baked into the imag
 docker run -d --name brain \
   -p 8080:8080 -p 9091:9091 \
   --security-opt seccomp=unconfined --ulimit memlock=-1 \
-  -e BRAIN__LLM__BROKER__URL=http://brain-edge:8080 \
-  -e BRAIN__LLM__BROKER__SERVICE_KEY=... \
   -e BRAIN__ADMIN__TOKEN="$(openssl rand -hex 32)" \
   -v brain-data:/var/lib/brain/data \
   ghcr.io/arc-labs-ai/brain-db:0.4.0
@@ -112,9 +110,9 @@ curl -fsS http://127.0.0.1:9091/healthz   # liveness
 curl -fsS http://127.0.0.1:9091/readyz    # 200 once every shard serves
 ```
 
-The broker URL has to be **set**, not reachable — the boot check is
-configuration-only, so Brain comes up before `brain-edge` does. You do not need
-a provider key of your own; see [BYOK only](#credentials-byok-only).
+Nothing about an LLM is required to boot: `brain-db` starts standalone with an
+empty credential store, and a namespace registers its own provider key when it
+has one. See [BYOK only](#credentials-byok-only).
 
 | Port | Surface | Expose? |
 |---|---|---|
@@ -165,9 +163,7 @@ Inside the container:
 
 ```bash
 just verify                                            # fmt + build + clippy -D warnings + test
-export BRAIN__LLM__BROKER__URL=http://127.0.0.1:8080   # required — the credential broker
-export BRAIN__LLM__BROKER__SERVICE_KEY=...             # Brain's identity to the broker
-cargo run --bin brain-server -- --config config/dev.toml
+cargo run --bin brain-server -- --config config/dev.toml  # no provider key needed
 
 curl -s http://127.0.0.1:9091/healthz                  # liveness (public, no auth)
 curl -s http://127.0.0.1:9091/readyz                   # 200 when all shards serve, 503 otherwise
@@ -308,24 +304,28 @@ define extractor preferences {
 
 ## Credentials: BYOK only
 
-**Brain never holds a provider credential.** Bring-your-own-key through the
-broker is the only way an LLM call is paid for, and there is no second path.
+**A deployment holds no provider credential of its own.** A key registered by
+a namespace is the only way an LLM call is paid for, and there is no second
+path — no `[llm] api_key`, no `OPENAI_API_KEY` gate, nothing to set.
 
-- Brain resolves a **namespace-scoped grant** from the broker at call time. It
-  never receives, stores or forwards a tenant's provider key.
-- Nothing credential-shaped is ever persisted — so a provider key cannot leak
-  from Brain's WAL, snapshots or backups, because one never arrives there. The
-  guarantee is structural, not a redaction rule somebody has to get right.
-- The configured surface is `[llm.broker]`: `url`, `service_key` (**Brain's own
-  identity to the broker** — it buys no provider access), and `ttl_secs`, which
-  bounds how long a revoked key keeps working.
+- A namespace registers its own key over the wire (`LLM_CREDENTIAL_PUT`). Brain
+  seals it and opens it only for the duration of an outbound provider call, so
+  extraction, HyPE and entity disambiguation all bill the tenant that owns the
+  memory being processed.
+- The sealing key is generated into the data directory on first boot, so a
+  fresh install seals with no configuration. That protects a copied volume or a
+  backup archive, because neither carries the key file — it does **not** protect
+  someone holding the whole data directory. Set
+  `BRAIN__LLM__CREDENTIALS__KEK` to keep the sealing key off Brain's disk.
+- A plaintext key only travels a TLS, mTLS or loopback connection; a
+  registration over anything else is refused.
 
-A shard gates on the broker at boot — the URL must be *set*, not reachable — so
-`brain-db` starts standalone. A namespace with no registered key is a separate,
-non-fatal matter: its writes still land, the pattern and classifier tiers run,
-and the LLM tier reports that it could not run. You get entities without
-statements rather than a failed write or a silent bill against someone else's
-key.
+Nothing gates boot on a credential, so `brain-db` starts standalone with an
+empty store. **Registering a key is the first thing a tenant does**, though:
+HyPE and extraction both need one, so a namespace with no key has its writes
+refused with `LlmCredentialMissing` rather than storing text Brain cannot
+ground. A key that is merely unreachable is the softer case — the write lands
+and the stage reports why it could not run.
 
 Brain's own minted API keys are a different object entirely: they authenticate
 clients *to* Brain, and the database stores only `BLAKE3(secret)` — never the
@@ -536,7 +536,7 @@ Scope boundaries, listed so they aren't mistaken for bugs.
 - **English text only.** `bge-small-en-v1.5` is an English model; multilingual support needs a different embedder and a full re-embed.
 - **One embedding model per deployment, pinned at creation.** There is no in-place migration — `ADMIN_MIGRATE_EMBEDDINGS` is a reserved opcode with no handler. Changing models means a fresh deployment and a re-ingest.
 - **Cross-encoder rerank is not available in this release.** `[rerank]` ships `enabled = false` and the image carries no cross-encoder model; opt-in rerank requests return `CapabilityNotEnabled` and `GET_CAPABILITIES` reports `rerank: false`. Retrieval fuses with RRF alone.
-- **The consolidation summarizer is off by default.** `[summarizer] backend = "disabled"`; a real backend needs the `summarizer-openai` or `summarizer-ollama` build feature.
+- **The consolidation summarizer is off by default.** `[summarizer] backend = "disabled"`; a real backend needs the `summarizer-llm` build feature (which bills each tenant's own registered credential) or `summarizer-ollama` (a locally hosted model).
 - **No query language.** The wire protocol is typed RPC. A SQL-like text language would be a separate, much larger effort.
 - **No client in this repo.** Brain's public interface is the §04 wire protocol. Clients ship separately: [`brain-sdk`](https://github.com/arc-labs-ai/brain-sdk) (Rust / Python / TypeScript), [`brain-shell`](https://github.com/arc-labs-ai/brain-shell) (REPL), [`brain-edge`](https://github.com/arc-labs-ai/brain-edge) (HTTP/JSON).
 - **Fine-grained access control is out of scope.** Brain has authentication and space-level authorization; per-memory ACLs, field-level security and time-bounded permissions are not built.

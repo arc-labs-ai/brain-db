@@ -63,14 +63,9 @@ cache_size = 10000
 batch_size = 32
 batch_window_ms = 5
 
-# Dummy provider key so these config-parser fixtures clear the hard
-# LLM-provider startup gate (the LLM extractor tier is on by default and
-# requires a provider). These tests exercise the parser, not the LLM.
+# No provider credential: a deployment holds none, and each namespace
+# registers its own at runtime. These tests exercise the parser.
 [llm]
-api_key = "sk-test-config-parser"
-
-[llm.broker]
-url = "http://127.0.0.1:9900"
 "#;
 
 // ---------------------------------------------------------------------------
@@ -81,12 +76,9 @@ url = "http://127.0.0.1:9900"
 fn dev_toml_round_trips_cleanly() {
     let path = dev_toml_path();
     assert!(path.exists(), "expected dev.toml at {}", path.display());
-    // dev.toml leaves the LLM provider key to the environment; supply one
-    // via the generic override so the hard provider gate is satisfied and
-    // the parse round-trip can be checked.
-    let mut env: HashMap<String, String> = HashMap::new();
-    env.insert("BRAIN__LLM__API_KEY".into(), "sk-test".into());
-    let cfg = Config::load_with_env(&path, &env).expect("dev.toml must load");
+    // dev.toml carries no provider credential, because there is none to
+    // carry: a namespace registers its own at run time.
+    let cfg = Config::load_with_env(&path, &HashMap::new()).expect("dev.toml must load");
 
     assert_eq!(cfg.server.listen_addr.to_string(), "127.0.0.1:9090");
     assert_eq!(cfg.storage.shard_count, 1);
@@ -104,16 +96,13 @@ fn dev_toml_round_trips_cleanly() {
 
 #[test]
 fn dev_toml_boots_without_a_provider_key() {
-    // dev.toml configures `[llm.broker]` and leaves `api_key` empty. That is
-    // a correct boot: the serving credential belongs to the namespace and is
-    // not known until a write names one.
+    // A correct boot carries no provider credential: it belongs to the
+    // namespace and is not known until a tenant registers one.
     let path = dev_toml_path();
     let cfg = Config::load_with_env(&path, &HashMap::new())
-        .expect("a broker-configured config must boot without a provider key");
-    assert!(
-        cfg.llm.broker.is_some(),
-        "dev.toml must configure the broker it boots on"
-    );
+        .expect("a config must boot without a provider key");
+    // The model id is the only LLM setting a deployment supplies.
+    let _ = cfg.llm.model;
 }
 
 // ---------------------------------------------------------------------------
@@ -125,30 +114,23 @@ fn boots_without_a_provider_key() {
     // The serving credential belongs to the tenant and is not known until a
     // write names its namespace, so a keyless boot is correct.
     let dir = tempfile::tempdir().unwrap();
-    let cfg_toml = MINIMAL_CONFIG.replace("api_key = \"sk-test-config-parser\"\n", "");
-    let path = write_tmp(&dir, &cfg_toml);
-    let cfg =
-        Config::load_with_env(&path, &HashMap::new()).expect("must boot without a provider key");
-    assert!(
-        cfg.llm.api_key.is_none(),
-        "no provider key should be required"
-    );
+    let path = write_tmp(&dir, MINIMAL_CONFIG);
+    Config::load_with_env(&path, &HashMap::new()).expect("must boot without a provider key");
 }
 
 #[test]
-fn a_config_without_a_broker_section_is_rejected() {
-    // Every namespace resolves its credential through the broker, so a config
-    // without one describes a server that can never serve a single write —
-    // and a provider key does not substitute for it.
+fn a_config_that_names_a_provider_key_is_rejected() {
+    // There is no deployment-wide credential to set. An operator who tries
+    // gets a parse failure naming the field rather than a key that is read
+    // by nothing.
     let dir = tempfile::tempdir().unwrap();
-    let cfg_toml = MINIMAL_CONFIG.replace("\n[llm.broker]\nurl = \"http://127.0.0.1:9900\"", "");
+    let cfg_toml = MINIMAL_CONFIG.replace("[llm]\n", "[llm]\napi_key = \"sk-nope\"\n");
     let path = write_tmp(&dir, &cfg_toml);
     let err = Config::load_with_env(&path, &HashMap::new())
-        .expect_err("a config without [llm.broker] must fail startup");
-    let msg = err.to_string();
+        .expect_err("`[llm] api_key` must not be accepted");
     assert!(
-        msg.contains("llm.broker"),
-        "expected a broker-section complaint, got: {msg}"
+        err.to_string().contains("api_key"),
+        "expected the rejection to name the field, got: {err}"
     );
 }
 
@@ -307,10 +289,10 @@ fn env_numeric_looking_secret_stays_string() {
     let path = write_tmp(&dir, MINIMAL_CONFIG);
     let mut env = HashMap::new();
     env.insert("BRAIN__ADMIN__TOKEN".into(), "48291057".into());
-    env.insert("BRAIN__LLM__API_KEY".into(), "99999".into());
+    env.insert("BRAIN__LLM__CREDENTIALS__KEK".into(), "99999".into());
     let cfg = Config::load_with_env(&path, &env).expect("digit secrets must load as strings");
     assert_eq!(cfg.admin.token.as_deref(), Some("48291057"));
-    assert_eq!(cfg.llm.api_key.as_deref(), Some("99999"));
+    assert_eq!(cfg.llm.credentials.kek.as_deref(), Some("99999"));
 }
 
 #[test]

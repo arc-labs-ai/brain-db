@@ -41,8 +41,16 @@ impl OllamaSummarizer {
 }
 
 impl Summarizer for OllamaSummarizer {
+    fn enabled(&self) -> bool {
+        true
+    }
+
+    /// `namespace` is accepted and ignored: a locally-hosted model has no
+    /// credential to resolve and bills no one, so there is nothing to
+    /// attribute the call to.
     fn summarize<'a>(
         &'a self,
+        _namespace: &'a str,
         memories: &'a [&'a str],
     ) -> Pin<Box<dyn Future<Output = Result<String, SummarizerError>> + 'a>> {
         let bridge = self.bridge.clone();

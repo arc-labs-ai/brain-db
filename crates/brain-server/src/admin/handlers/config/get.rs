@@ -4,12 +4,12 @@
 //! the config to a `serde_json::Value`, walk by segment, and return
 //! whatever is at that subtree (object/scalar/array).
 //!
-//! Secrets (`llm.api_key`, `admin.token`, and anything under a key named
-//! `api_key` / `token` / `secret` / `password`) are redacted before any
-//! response is built, so an admin-token holder can confirm whether a
-//! credential is *set* without ever reading its value — and no `?key=`
-//! subtree access can reach around the redaction, because it runs on the
-//! full tree first.
+//! Secrets (`admin.token`, `llm.credentials.kek`, and anything under a key
+//! named `api_key` / `token` / `secret` / `password` / `kek`, or ending in
+//! `_key`) are redacted before any response is built, so an admin-token
+//! holder can confirm whether a credential is *set* without ever reading its
+//! value — and no `?key=` subtree access can reach around the redaction,
+//! because it runs on the full tree first.
 
 use std::sync::Arc;
 
@@ -28,10 +28,13 @@ use crate::admin::AdminState;
 /// client. Matched case-insensitively, at any depth.
 ///
 /// Any key ending in `_key` is also treated as a secret — see
-/// [`is_secret_key`]. An exact-match list alone had already missed one:
-/// `llm.broker.service_key` was added to the config and served in plaintext,
-/// because it is not spelled `api_key`.
-const SECRET_KEYS: &[&str] = &["api_key", "token", "secret", "password"];
+/// [`is_secret_key`]. The list and the suffix rule are both needed: a name
+/// like `kek` carries key material without matching the suffix, and a name
+/// like `summarizer_api_key` matches the suffix without being on the list.
+///
+/// `kek` is the sealing key for every stored tenant provider credential, so
+/// serving it is equivalent to serving all of them at once.
+const SECRET_KEYS: &[&str] = &["api_key", "token", "secret", "password", "kek"];
 
 /// Suffix that marks a key-material field whatever it is prefixed with, so a
 /// newly added `*_key` secret is redacted by default rather than on the day
@@ -137,27 +140,63 @@ mod tests {
         assert_eq!(v["server"]["listen_addr"], "0.0.0.0:8080");
     }
 
-    /// `llm.broker.service_key` authenticates Brain to the credential broker.
-    /// It is not spelled `api_key`, so the exact-match list served it in
-    /// plaintext to any admin-token holder — defeating this module's whole
-    /// premise, which is that a token holder can confirm a secret is SET
-    /// without reading it.
+    /// A secret is redacted by the shape of its name, not by appearing on an
+    /// exact-match list. An unlisted `*_key` / `*_kek` served in plaintext
+    /// would defeat this module's whole premise, which is that an admin-token
+    /// holder can confirm a secret is SET without reading it.
     #[test]
-    fn redacts_a_secret_whose_name_merely_ends_in_key() {
+    fn redacts_a_secret_whose_name_merely_ends_in_a_key_suffix() {
         let mut v = json!({
             "llm": {
-                "api_key": "sk-live-abc",
-                "broker": { "url": "http://edge:8080", "service_key": "svc-live-xyz" }
+                "model": "gpt-4o-mini",
+                "credentials": { "kek": "0f1e2d3c", "kek_file": "/var/lib/brain/kek" }
             }
         });
         redact_secrets(&mut v);
-        assert_eq!(v["llm"]["api_key"], REDACTED);
         assert_eq!(
-            v["llm"]["broker"]["service_key"], REDACTED,
-            "a `*_key` secret must be redacted without being listed by name"
+            v["llm"]["credentials"]["kek"], REDACTED,
+            "a `*_kek` secret must be redacted without being listed by name"
         );
-        // Non-secret siblings stay readable.
-        assert_eq!(v["llm"]["broker"]["url"], "http://edge:8080");
+        // Non-secret siblings stay readable: an operator diagnosing a wrong
+        // path needs to see the path, and the model is not a secret.
+        assert_eq!(v["llm"]["credentials"]["kek_file"], "/var/lib/brain/kek");
+        assert_eq!(v["llm"]["model"], "gpt-4o-mini");
+    }
+
+    /// Every secret the config type redacts from its own `Debug` output must
+    /// also be redacted by this endpoint. Two independent redaction surfaces
+    /// drift apart silently: `llm.credentials.kek` was redacted in `Debug`
+    /// from the day it was added and served in plaintext here, because `kek`
+    /// matches neither the exact-match list nor the `_key` suffix.
+    ///
+    /// Driven off the real config rather than a hand-written JSON blob, so a
+    /// newly added secret field is covered without this test being edited.
+    #[test]
+    fn no_secret_the_config_redacts_from_debug_survives_serialization() {
+        const SENTINEL: &str = "SENTINEL-NEVER-SERVE-THIS";
+
+        let mut cfg = crate::config::Config::for_tests();
+        cfg.llm.credentials.kek = Some(SENTINEL.to_string());
+        cfg.admin.token = Some(SENTINEL.to_string());
+
+        // The config's own `Debug` is the reference for what counts as a
+        // secret; if it hides a value, this endpoint must too.
+        let debugged = format!("{cfg:?}");
+        assert!(
+            !debugged.contains(SENTINEL),
+            "the config's Debug impl must redact these fields for this test to \
+             mean anything; it leaked one instead"
+        );
+
+        let mut v = serde_json::to_value(&cfg).expect("config serializes");
+        redact_secrets(&mut v);
+        let rendered = v.to_string();
+        assert!(
+            !rendered.contains(SENTINEL),
+            "a secret the config redacts from Debug reached the response body: {rendered}"
+        );
+        assert_eq!(v["llm"]["credentials"]["kek"], REDACTED);
+        assert_eq!(v["admin"]["token"], REDACTED);
     }
 
     /// `tls.key` is a PATH to a key file, not key material. Operators read it

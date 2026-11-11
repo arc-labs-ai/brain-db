@@ -29,8 +29,25 @@ pub enum SummarizerError {
 /// We use the `Pin<Box<Future>>` pattern (same as `WriterHandle`) to
 /// avoid pulling in `async-trait`.
 pub trait Summarizer: Send + Sync + 'static {
+    /// Whether this deployment has a summarization backend at all.
+    ///
+    /// The consolidation worker checks this once per cycle and skips the
+    /// whole pass when it is false, so a deployment without consolidation
+    /// does no clustering work. It replaces probing with an empty slice,
+    /// which forced every backend to carry a special case for a call that
+    /// was not really a summarization request.
+    fn enabled(&self) -> bool;
+
+    /// Summarize `memories`, billing the call to `namespace`.
+    ///
+    /// The namespace is required rather than inferred: a consolidation run
+    /// is paid for by the tenant whose memories it consolidates, so a
+    /// backend that needs a credential resolves that tenant's. The
+    /// consolidation worker clusters strictly within one
+    /// `(namespace, space, session)`, so every call has exactly one owner.
     fn summarize<'a>(
         &'a self,
+        namespace: &'a str,
         memories: &'a [&'a str],
     ) -> Pin<Box<dyn Future<Output = Result<String, SummarizerError>> + 'a>>;
 }
@@ -41,8 +58,13 @@ pub trait Summarizer: Send + Sync + 'static {
 pub struct DisabledSummarizer;
 
 impl Summarizer for DisabledSummarizer {
+    fn enabled(&self) -> bool {
+        false
+    }
+
     fn summarize<'a>(
         &'a self,
+        _namespace: &'a str,
         _memories: &'a [&'a str],
     ) -> Pin<Box<dyn Future<Output = Result<String, SummarizerError>> + 'a>> {
         Box::pin(async { Err(SummarizerError::Disabled) })

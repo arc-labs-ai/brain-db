@@ -144,6 +144,20 @@ pub enum Opcode {
     SessionDeleteReq = 0x0075,
     SessionDeleteResp = 0x00F5,
 
+    // Tenant LLM provider credentials (0x0076-0x0079). A tenant brings
+    // their own provider key and Brain's extraction and HyPE stages bill
+    // to it. These sit with spaces and sessions rather than in the
+    // typed-graph namespace: a key is registered on a fresh deployment,
+    // before any schema has been declared.
+    LlmCredentialPutReq = 0x0076,
+    LlmCredentialPutResp = 0x00F6,
+    LlmCredentialGetReq = 0x0077,
+    LlmCredentialGetResp = 0x00F7,
+    LlmCredentialDeleteReq = 0x0078,
+    LlmCredentialDeleteResp = 0x00F8,
+    LlmCredentialVerifyReq = 0x0079,
+    LlmCredentialVerifyResp = 0x00F9,
+
     // Errors
     Error = 0x00FF,
 
@@ -354,6 +368,15 @@ impl Opcode {
             0x00F4 => Self::SessionListResp,
             0x0075 => Self::SessionDeleteReq,
             0x00F5 => Self::SessionDeleteResp,
+
+            0x0076 => Self::LlmCredentialPutReq,
+            0x00F6 => Self::LlmCredentialPutResp,
+            0x0077 => Self::LlmCredentialGetReq,
+            0x00F7 => Self::LlmCredentialGetResp,
+            0x0078 => Self::LlmCredentialDeleteReq,
+            0x00F8 => Self::LlmCredentialDeleteResp,
+            0x0079 => Self::LlmCredentialVerifyReq,
+            0x00F9 => Self::LlmCredentialVerifyResp,
 
             0x00FF => Self::Error,
 
@@ -644,6 +667,14 @@ mod tests {
         (0x00F4, Opcode::SessionListResp),
         (0x0075, Opcode::SessionDeleteReq),
         (0x00F5, Opcode::SessionDeleteResp),
+        (0x0076, Opcode::LlmCredentialPutReq),
+        (0x00F6, Opcode::LlmCredentialPutResp),
+        (0x0077, Opcode::LlmCredentialGetReq),
+        (0x00F7, Opcode::LlmCredentialGetResp),
+        (0x0078, Opcode::LlmCredentialDeleteReq),
+        (0x00F8, Opcode::LlmCredentialDeleteResp),
+        (0x0079, Opcode::LlmCredentialVerifyReq),
+        (0x00F9, Opcode::LlmCredentialVerifyResp),
         // Errors
         (0x00FF, Opcode::Error),
         // Typed-graph — schema
@@ -747,11 +778,12 @@ mod tests {
             Opcode::from_u16(0x0000),
             Err(ProtocolError::UnknownOpcode(0x0000))
         ));
-        // 0x0076 is still-unassigned in the server-bound range of the 0x00xx
-        // namespace (the registry ops occupy 0x70–0x75).
+        // 0x007A is still-unassigned in the server-bound range of the 0x00xx
+        // namespace (the registry ops occupy 0x70–0x75, the LLM-credential
+        // ops 0x76–0x79).
         assert!(matches!(
-            Opcode::from_u16(0x0076),
-            Err(ProtocolError::UnknownOpcode(0x0076))
+            Opcode::from_u16(0x007A),
+            Err(ProtocolError::UnknownOpcode(0x007A))
         ));
         // 0x0139 is a not-yet-assigned typed-graph entity opcode.
         assert!(matches!(

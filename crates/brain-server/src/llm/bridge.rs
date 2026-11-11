@@ -1,6 +1,10 @@
 //! Cross-runtime bridge between the per-shard Glommio executor and a
 //! Tokio runtime where `reqwest` lives.
 //!
+//! Only the Ollama backend needs this. Every other model-backed stage goes
+//! through a `brain-llm` provider client, which arrives already bridged
+//! from the credential resolver.
+//!
 //! ## Why this exists
 //!
 //! Every per-shard task runs on a Glommio
@@ -19,7 +23,7 @@
 //! `send_async` / `recv_async` are runtime-agnostic, so both ends
 //! `.await` cleanly under whichever runtime owns them.
 
-#![cfg(any(feature = "summarizer-openai", feature = "summarizer-ollama"))]
+#![cfg(feature = "summarizer-ollama")]
 
 use std::io;
 use std::sync::Arc;
@@ -30,8 +34,6 @@ use tracing::{debug, warn};
 
 #[cfg(feature = "summarizer-ollama")]
 use crate::llm::ollama::OllamaRequest;
-#[cfg(feature = "summarizer-openai")]
-use crate::llm::openai::OpenAiRequest;
 
 /// The cross-runtime bridge handle. Cloneable (the inner state is
 /// `Arc`-wrapped). One bridge per server — the consolidation worker
@@ -51,8 +53,6 @@ struct Inner {
 }
 
 pub(crate) enum BridgePayload {
-    #[cfg(feature = "summarizer-openai")]
-    OpenAi(OpenAiRequest),
     #[cfg(feature = "summarizer-ollama")]
     Ollama(OllamaRequest),
 }
@@ -108,8 +108,6 @@ async fn worker_loop(rx: flume::Receiver<BridgeRequest>, timeout: Duration) {
     };
     while let Ok(req) = rx.recv_async().await {
         let result = match req.payload {
-            #[cfg(feature = "summarizer-openai")]
-            BridgePayload::OpenAi(call) => crate::llm::openai::execute(&client, call).await,
             #[cfg(feature = "summarizer-ollama")]
             BridgePayload::Ollama(call) => crate::llm::ollama::execute(&client, call).await,
         };

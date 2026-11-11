@@ -4,7 +4,7 @@
 //! ## Invocation
 //!
 //! ```text
-//! BRAIN__LLM__API_KEY=sk-ant-... \
+//! BRAIN_LIVE_LLM_API_KEY=sk-ant-... \
 //!     cargo test -p brain-extractors --features live-llm \
 //!         --test llm_live -- --nocapture
 //! ```
@@ -12,7 +12,7 @@
 //! The tests are gated twice over:
 //!   - At compile time by `--features live-llm` (this file is opted
 //!     out of `cargo test` by `required-features` in `Cargo.toml`).
-//!   - At runtime by `BRAIN__LLM__API_KEY` (the single shared
+//!   - At runtime by `BRAIN_LIVE_LLM_API_KEY` (the single shared
 //!     credential): when the env var is absent the body prints a
 //!     `skip:` notice and returns. CI without the secret therefore
 //!     turns into a no-op pass.
@@ -163,10 +163,10 @@ fn build_extractor(
 /// prints a skip notice and returns `None`. Tests must early-return
 /// on `None` — there's no graceful "ignore" status in libtest 1.x.
 fn api_key_or_skip(label: &str) -> Option<String> {
-    match std::env::var("BRAIN__LLM__API_KEY") {
+    match std::env::var("BRAIN_LIVE_LLM_API_KEY") {
         Ok(k) if !k.is_empty() => Some(k),
         _ => {
-            println!("skip[{label}]: BRAIN__LLM__API_KEY not set");
+            println!("skip[{label}]: BRAIN_LIVE_LLM_API_KEY not set");
             None
         }
     }

@@ -15,7 +15,7 @@
 //! itself still succeeds — the LLM tier's miss never propagates
 //! to the client.
 //!
-//! Live-provider runs that set `BRAIN__LLM__API_KEY` ahead of this
+//! Live-provider runs that set `BRAIN_LIVE_LLM_API_KEY` ahead of this
 //! test would observe a wired extractor instead; we don't fence
 //! that here.
 
@@ -171,7 +171,7 @@ fn upload_request(source: &str) -> RequestBody {
 
 // User schema declaring an LLM extractor. `cost_budget` and
 // `cache_*` left off so the materializer takes the no-router
-// degraded path (CI has no `BRAIN__LLM__API_KEY`).
+// degraded path (CI has no `BRAIN_LIVE_LLM_API_KEY`).
 // The caller's own namespace ("test", the default token's namespace) — a caller
 // may only upload schema for its own namespace (tenant binding).
 const USER_LLM_SCHEMA: &str = "namespace test\n\

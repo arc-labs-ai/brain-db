@@ -458,9 +458,11 @@ impl BoundConnectionListener {
                         let result = match acceptor {
                             Some(acceptor) => match acceptor.accept(stream).await {
                                 Ok(tls_stream) => {
+                                    // TLS: the transport protects its contents,
+                                    // so this connection may carry a secret.
                                     serve_connection(
                                         tls_stream, topology, event_hub, limits, shutdown,
-                                        metrics.clone(),
+                                        metrics.clone(), true,
                                     )
                                     .await
                                 }
@@ -470,9 +472,12 @@ impl BoundConnectionListener {
                                 }
                             },
                             None => {
+                                // Cleartext TCP. Only a loopback peer is
+                                // confidential: nothing leaves the host, so
+                                // there is no network path to read it from.
                                 serve_connection(
                                     stream, topology, event_hub, limits, shutdown,
-                                    metrics.clone(),
+                                    metrics.clone(), peer.ip().is_loopback(),
                                 )
                                 .await
                             }
@@ -508,6 +513,21 @@ impl BoundConnectionListener {
 /// (which sends through a `flume::Sender<ShardRequest>`). The
 /// per-connection task is fully Tokio-side; only the shard handler
 /// runs inside Glommio.
+/// What the receiver loop needs to know about the connection's channel: the
+/// limits it enforces, and whether the transport protects its contents.
+///
+/// These travel together because both are fixed at accept time and describe
+/// the same thing — the channel this connection speaks over.
+struct Channel<'a> {
+    limits: &'a ConnectionLimits,
+    /// TLS, mTLS, or a loopback peer. Ops that accept a secret from the
+    /// client refuse when this is false.
+    confidential: bool,
+}
+
+/// `transport_confidential` says whether this connection's transport
+/// protects its contents — TLS, mTLS, or a loopback peer. Ops that accept
+/// a secret from the client refuse when it is false.
 pub(crate) async fn serve_connection<S>(
     stream: S,
     topology: Topology,
@@ -515,6 +535,7 @@ pub(crate) async fn serve_connection<S>(
     limits: ConnectionLimits,
     shutdown: ShutdownSignal,
     metrics: Arc<ConnectionMetrics>,
+    transport_confidential: bool,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
@@ -539,7 +560,10 @@ where
     let (result, connection_id, opened_txn) = receiver_loop(
         &mut read_half,
         &topology,
-        &limits,
+        Channel {
+            limits: &limits,
+            confidential: transport_confidential,
+        },
         shutdown,
         frame_tx.clone(),
         subscriptions,
@@ -650,7 +674,7 @@ async fn writer_loop<W>(
 async fn receiver_loop<R>(
     read: &mut R,
     topology: &Topology,
-    limits: &ConnectionLimits,
+    channel: Channel<'_>,
     mut shutdown: ShutdownSignal,
     frame_tx: flume::Sender<OutgoingFrame>,
     subscriptions: Arc<SubscriptionRegistry>,
@@ -659,7 +683,11 @@ async fn receiver_loop<R>(
 where
     R: AsyncRead + Unpin,
 {
-    let mut state = ConnState::new();
+    let Channel {
+        limits,
+        confidential,
+    } = channel;
+    let mut state = ConnState::new(confidential);
     let mut idle = IdleTimer::new(limits.idle_timeout, limits.ping_timeout);
     let mut handshake_deadline = Some(tokio::time::Instant::now() + limits.auth_timeout);
 

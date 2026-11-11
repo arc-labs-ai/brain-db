@@ -158,21 +158,70 @@ fn main() -> ExitCode {
 #[cfg(target_os = "linux")]
 mod linux_main {
 
-    /// Ferry `[llm.broker]` into the spawn path.
+    /// Open Brain's credential store and load the keys that open it.
     ///
-    /// `Option` only because `spawn_shard` is the lower-level API beneath the
-    /// config gate; a server that reached here without a broker has no way to
-    /// resolve a credential for any namespace, and `Config::validate_llm_broker`
-    /// has already refused to start.
-    fn broker_spawn_cfg(cfg: &Config) -> Option<crate::shard::LlmBrokerSpawnConfig> {
-        cfg.llm
-            .broker
-            .as_ref()
-            .map(|b| crate::shard::LlmBrokerSpawnConfig {
-                url: b.url.clone(),
-                service_key: b.service_key.clone(),
-                ttl_secs: b.ttl_secs,
-            })
+    /// Shared by every shard: there is one answer per namespace and all
+    /// shards must agree on it. The key-encryption key is generated into the
+    /// data directory on a deployment's first boot, so a fresh install stores
+    /// tenant provider keys sealed with no operator configuration.
+    ///
+    /// A failure here is fatal rather than degrading. The store is how every
+    /// namespace gets a serving credential, and a server that silently came
+    /// up unable to hold one would accept registrations it could not persist.
+    fn open_credential_store(
+        cfg: &Config,
+    ) -> Result<Arc<brain_metadata::llm_credential::LlmCredentialAccess>, String> {
+        let dir = &cfg.storage.data_dir;
+        // An operator-supplied key keeps the sealing key off Brain's disk;
+        // without one Brain generates and persists its own so a fresh install
+        // needs no configuration.
+        let ring = match cfg
+            .llm
+            .credentials
+            .kek
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+        {
+            Some(hex) => brain_crypto::from_supplied_hex(hex)
+                .map_err(|e| format!("`[llm.credentials] kek` is not a valid sealing key: {e}"))?,
+            None => brain_crypto::load_or_create(dir)
+                .map_err(|e| format!("loading the LLM credential sealing key: {e}"))?,
+        };
+        let store =
+            brain_metadata::llm_credential::LlmCredentialDb::open(dir.join("llm_credentials.redb"))
+                .map_err(|e| format!("opening the LLM credential store: {e}"))?;
+        let access =
+            brain_metadata::llm_credential::LlmCredentialAccess::new(store, Arc::new(ring));
+
+        // A store full of rows that none of the loaded keys can open is a
+        // restore that carried the credentials without their sealing key.
+        // Serving it would admit every write and fail derivation on all of
+        // them, silently and permanently, so it stops here instead.
+        let (total, openable) = access
+            .audit_openable()
+            .map_err(|e| format!("reading the LLM credential store: {e}"))?;
+        if total > 0 && openable == 0 {
+            return Err(format!(
+                "the LLM credential store holds {total} credential(s) and the loaded sealing \
+                 key opens none of them. This is what a restore looks like when the backup \
+                 carried `llm_credentials.redb` without `llm_credential_kek`: Brain generated \
+                 a fresh key, and every stored credential is now unreadable. Restore the \
+                 original sealing key (or set `[llm.credentials] kek` to it), or delete the \
+                 store and have each namespace register again."
+            ));
+        }
+        if openable < total {
+            tracing::warn!(
+                target: "brain_server::credentials",
+                total,
+                openable,
+                "some stored LLM credentials do not open under the loaded sealing key; \
+                 those namespaces will report their credential as unavailable",
+            );
+        }
+
+        Ok(Arc::new(access))
     }
     use std::collections::HashMap;
     use std::process::ExitCode;
@@ -253,11 +302,30 @@ mod linux_main {
         log_handle: crate::logging::LoggingHandle,
         config_path: std::path::PathBuf,
     ) -> ExitCode {
-        // Build the configured Summarizer (default
-        // `DisabledSummarizer`). Construction happens once and the
-        // resulting `Arc<dyn Summarizer>` is cloned into each shard's
-        // `ShardSpawnConfig` so all shards share one bridge runtime.
-        let summarizer = match crate::llm::factory::build_summarizer(&cfg) {
+        // Brain's credential store, shared by every shard. Opened before any
+        // shard spawns so a store that cannot be opened stops the server
+        // here, with a reason, rather than per write later.
+        let credentials = match open_credential_store(&cfg) {
+            Ok(c) => c,
+            Err(detail) => {
+                tracing::error!(detail = %detail, "refusing to start");
+                return ExitCode::FAILURE;
+            }
+        };
+
+        // Build the configured Summarizer (default `DisabledSummarizer`).
+        // Construction happens once and the resulting `Arc<dyn Summarizer>`
+        // is cloned into each shard's `ShardSpawnConfig`. The LLM backend
+        // takes the same per-namespace resolver every other model-backed
+        // stage uses, so a consolidation run is paid for by the tenant whose
+        // memories it consolidates.
+        let summarizer_resolver: Option<Arc<dyn brain_llm::LlmCredentialResolver>> =
+            Some(Arc::new(
+                crate::shard::credential_resolver::StoreCredentialResolver::new(
+                    credentials.clone(),
+                ),
+            ));
+        let summarizer = match crate::llm::factory::build_summarizer(&cfg, summarizer_resolver) {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!(error = %e, "summarizer construction failed");
@@ -265,42 +333,10 @@ mod linux_main {
             }
         };
 
-        // Cheap boot-time LLM credential probe. An LLM is mandatory (HyPE +
-        // extraction are always-on), and an EMPTY key is already rejected at
-        // config validation — but a present-but-invalid key used to boot fine
-        // and then silently extract nothing. One 1-token completion catches a
-        // rejected key here and refuses to start; a transient/network failure
-        // only warns so a correctly-configured deploy isn't bricked by a
-        // provider hiccup.
-        {
-            use crate::shard::llm_setup::{preflight_llm_auth, LlmPreflight};
-            let llm_cfg = crate::shard::LlmSpawnConfig {
-                api_key: cfg.llm.api_key.clone(),
-                model: cfg.llm.model.clone(),
-                // Preflight only checks the credential; the ceiling is
-                // irrelevant to it.
-                extractor_max_tokens: None,
-                broker: broker_spawn_cfg(&cfg),
-            };
-            match preflight_llm_auth(&llm_cfg) {
-                LlmPreflight::Ok => {
-                    tracing::info!("LLM provider credential verified (boot preflight)");
-                }
-                LlmPreflight::Skipped => {}
-                LlmPreflight::Inconclusive(msg) => {
-                    tracing::warn!(detail = %msg, "LLM credential preflight inconclusive; proceeding");
-                }
-                LlmPreflight::InvalidKey(msg) => {
-                    tracing::error!(detail = %msg, "LLM credential rejected — refusing to start");
-                    return ExitCode::FAILURE;
-                }
-            }
-        }
-
         // Spawn one Glommio shard per `cfg.storage.shard_count`,
         // then build a `Topology` (shards + `RoutingTable` + `ServerCapabilities`)
         // and feed it into the `ConnectionListener`.
-        let (shards, joiners) = match spawn_shards(&cfg, &summarizer, &dispatcher) {
+        let (shards, joiners) = match spawn_shards(&cfg, &summarizer, &dispatcher, &credentials) {
             Ok(pair) => pair,
             Err(rc) => return rc,
         };
@@ -548,6 +584,7 @@ mod linux_main {
         cfg: &Config,
         summarizer: &Arc<dyn brain_workers::Summarizer>,
         dispatcher: &Arc<dyn brain_embed::Dispatcher>,
+        credentials: &Arc<brain_metadata::llm_credential::LlmCredentialAccess>,
     ) -> Result<(Vec<ShardHandle>, Vec<ShardJoiner>), ExitCode> {
         let mut handles = Vec::with_capacity(cfg.storage.shard_count);
         let mut joiners = Vec::with_capacity(cfg.storage.shard_count);
@@ -559,14 +596,12 @@ mod linux_main {
             // section reached only a metrics label, so an operator who tuned
             // `ef_search` got no change in behaviour.
             spawn_cfg.index_params = cfg.hnsw.index_params();
-            // Ferry the operator's `[llm]` provider key / model id so the
-            // LLM extractor tier can resolve a client from config when no
-            // env var is set.
+            // Every shard resolves tenant credentials from the one shared
+            // store; nothing here carries a provider key.
             spawn_cfg.llm = crate::shard::LlmSpawnConfig {
-                api_key: cfg.llm.api_key.clone(),
                 model: cfg.llm.model.clone(),
                 extractor_max_tokens: Some(cfg.extractors.llm.max_tokens),
-                broker: broker_spawn_cfg(cfg),
+                credentials: Some(credentials.clone()),
             };
             // Ferry the operator's `[workers.auto_edge]`
             // overrides into the per-shard spawn config so the

@@ -45,7 +45,7 @@
 //!   - temporal forms: ISO date, month+year, bare year, relative phrase,
 //!   - length: one-clause directives through a multi-clause biography.
 //!
-//! Gated: runs only when `BRAIN__LLM__API_KEY` + `BRAIN_EMBED_MODEL_DIR` are set
+//! Gated: runs only when `BRAIN_LIVE_LLM_API_KEY` + `BRAIN_EMBED_MODEL_DIR` are set
 //! (CI skips). The GLiNER model is auto-discovered from the XDG model dir.
 //! Run inside the devcontainer:
 //!
@@ -358,10 +358,10 @@ async fn scrape_lines(admin_addr: std::net::SocketAddr, prefix: &str) -> Vec<Str
 }
 
 #[tokio::test]
-#[ignore = "live: requires BRAIN__LLM__API_KEY + BRAIN_EMBED_MODEL_DIR; writes a real corpus to BRAIN_CORPUS_DATA_DIR then reads it back"]
+#[ignore = "live: requires BRAIN_LIVE_LLM_API_KEY + BRAIN_EMBED_MODEL_DIR; writes a real corpus to BRAIN_CORPUS_DATA_DIR then reads it back"]
 async fn corpus_write_then_read_is_accurate() {
-    let Ok(openai_key) = std::env::var("BRAIN__LLM__API_KEY") else {
-        eprintln!("skip: BRAIN__LLM__API_KEY unset");
+    let Ok(openai_key) = std::env::var("BRAIN_LIVE_LLM_API_KEY") else {
+        eprintln!("skip: BRAIN_LIVE_LLM_API_KEY unset");
         return;
     };
     let Ok(model_dir) = std::env::var("BRAIN_EMBED_MODEL_DIR") else {
@@ -377,7 +377,19 @@ async fn corpus_write_then_read_is_accurate() {
 
     println!("== booting real-tier server (BGE + GLiNER + gpt-4o-mini) ==");
     let dispatcher = build_real_dispatcher(PathBuf::from(model_dir));
-    let server = start_full_pipeline_in(&data_dir, dispatcher, Some(openai_key)).await;
+    // Registered the way a tenant would, for the namespace this test mints
+    // its key under.
+    let server = start_full_pipeline_in(
+        &data_dir,
+        dispatcher,
+        Some((
+            "test".to_string(),
+            "openai".to_string(),
+            "gpt-4o-mini".to_string(),
+            openai_key,
+        )),
+    )
+    .await;
     println!(
         "   data_plane={}  admin={}",
         server.data_plane_addr, server.admin_addr

@@ -154,8 +154,8 @@ pub enum ErrorCode {
     /// namespace's configuration state that cannot satisfy it.
     ///
     /// Distinct from [`Self::LlmCredentialUnavailable`], which is transient.
-    /// Collapsing the two would make a credential-broker blip look like a
-    /// permanently unconfigured tenant and reject writes that should retry.
+    /// Collapsing the two would make an unreadable credential store look like
+    /// a permanently unconfigured tenant and reject writes that should retry.
     LlmCredentialMissing,
 
     // Resource exhausted
@@ -197,9 +197,9 @@ pub enum ErrorCode {
     /// spawn if a required retriever is unwired.
     RetrieverDegraded,
     /// The namespace's LLM credential could not be resolved right now — the
-    /// credential broker is unreachable, timed out, or returned a transient
-    /// error. **Retryable.** See [`Self::LlmCredentialMissing`] for the
-    /// terminal counterpart.
+    /// credential store could not be read, or opening the sealed secret
+    /// failed transiently. **Retryable.** See [`Self::LlmCredentialMissing`]
+    /// for the terminal counterpart.
     LlmCredentialUnavailable,
 
     // Typed-graph error codes (`0x01xx` namespace). Low-byte family

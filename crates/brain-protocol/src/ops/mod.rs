@@ -1,8 +1,8 @@
 //! Per-domain wire ops: one file per capability, each holding the
 //! request, response, and per-op view types together. The grouping is
 //! by business noun (memory, entity, statement, relation, query,
-//! procedural, txn, subscribe, admin, extractor), not by wire
-//! direction. Schema-DSL ops live under `crate::schema::ops`;
+//! procedural, txn, subscribe, admin, extractor, llm_credential), not by
+//! wire direction. Schema-DSL ops live under `crate::schema::ops`;
 //! connection-lifecycle ops live under `crate::connection`.
 
 pub mod admin;
@@ -10,6 +10,7 @@ pub mod capabilities;
 pub mod entity;
 pub mod extractor;
 pub mod graph;
+pub mod llm_credential;
 pub mod memory;
 pub mod procedural;
 pub mod query;

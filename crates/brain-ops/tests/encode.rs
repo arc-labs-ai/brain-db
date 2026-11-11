@@ -332,12 +332,11 @@ fn encode_without_an_llm_credential_is_rejected_at_the_door() {
 
 #[test]
 fn encode_is_admitted_when_credential_state_is_unknown() {
-    // `can_serve` returning `None` means "unknown without I/O". The
-    // synchronous write path must not block on a credential broker, and a
-    // cold cache is not evidence of a missing key — so the write is ADMITTED
-    // and the derivation stages resolve properly (and retry) when they run.
-    // Rejecting here would fail every write for the first request after a
-    // restart.
+    // `can_serve` returning `None` means "unknown" — the resolver could not
+    // read its own store. That is not evidence of a missing key, so the write
+    // is ADMITTED and the derivation stages resolve (and retry) when they run.
+    // Rejecting here would turn a transient storage fault into a tenant-facing
+    // refusal for a namespace whose credential is perfectly good.
     run_in_glommio(|| async {
         let mut fix = build_fixture();
         fix.ctx = fix

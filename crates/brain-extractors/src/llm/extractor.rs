@@ -95,16 +95,14 @@ pub struct LlmExtractor {
 pub struct LlmExtractorInner {
     /// Resolves which credential serves a given namespace.
     ///
-    /// Pre-BYOK this was a single `Arc<dyn LlmClient>` baked in at shard
-    /// startup. It cannot stay that way: under BYOK the credential depends on
-    /// whose memory is being extracted, which is not known until dispatch. A
-    /// single-key deployment wires a `StaticResolver` here and behaves exactly
-    /// as before.
+    /// A resolver rather than a client, because the credential depends on
+    /// whose memory is being extracted and that is not known until dispatch.
+    /// A test wires a `RouterResolver` here to pin one client.
     pub resolver: Arc<dyn LlmCredentialResolver>,
     /// The `model:` field declared on the extractor definition, passed to the
-    /// resolver as a preference. A static resolver honours it exactly; a
-    /// broker-backed one serves whatever model the namespace's key can pay
-    /// for.
+    /// resolver as a preference. A resolver holding one fixed router honours
+    /// it exactly; a store-backed one serves whatever model the namespace's
+    /// own credential declares.
     pub model: String,
     pub cache: Option<Arc<Mutex<LlmCacheDb>>>,
     pub prompt: String,
