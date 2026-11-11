@@ -673,7 +673,7 @@ mod reclaim_tests {
         let wtxn = db.write_txn().unwrap();
         let id = predicate_intern(
             &wtxn,
-            "test",
+            crate::tables::scope::DeclScope::base("test"),
             name,
             Some(StatementKind::Fact),
             1, // object: Entity
@@ -1138,7 +1138,7 @@ mod supersession_sweep_tests {
         let wtxn = db.write_txn().unwrap();
         let id = predicate_intern(
             &wtxn,
-            "test",
+            crate::tables::scope::DeclScope::base("test"),
             name,
             Some(StatementKind::Fact),
             1, // object: Entity

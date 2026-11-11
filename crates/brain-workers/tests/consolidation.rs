@@ -152,8 +152,13 @@ async fn run_cycle(
 /// Deterministic stub summarizer: returns "[{join("|")}]".
 struct EchoSummarizer;
 impl Summarizer for EchoSummarizer {
+    fn enabled(&self) -> bool {
+        true
+    }
+
     fn summarize<'a>(
         &'a self,
+        _namespace: &'a str,
         memories: &'a [&'a str],
     ) -> Pin<Box<dyn Future<Output = Result<String, SummarizerError>> + 'a>> {
         Box::pin(async move { Ok(format!("[{}]", memories.join("|"))) })
@@ -168,7 +173,8 @@ impl Summarizer for EchoSummarizer {
 fn disabled_summarizer_returns_disabled_error() {
     glommio_run(|| async {
         let s = DisabledSummarizer;
-        let r = s.summarize(&["a", "b"]).await;
+        assert!(!s.enabled(), "the default backend is not enabled");
+        let r = s.summarize("acme", &["a", "b"]).await;
         assert!(matches!(r, Err(SummarizerError::Disabled)));
     });
 }
@@ -177,7 +183,7 @@ fn disabled_summarizer_returns_disabled_error() {
 fn echo_summarizer_returns_joined_input() {
     glommio_run(|| async {
         let s = EchoSummarizer;
-        let r = s.summarize(&["one", "two"]).await.unwrap();
+        let r = s.summarize("acme", &["one", "two"]).await.unwrap();
         assert_eq!(r, "[one|two]");
     });
 }

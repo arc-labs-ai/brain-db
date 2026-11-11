@@ -7,7 +7,8 @@
 use brain_core::{ExtractorId, ExtractorKind};
 use redb::{ReadTransaction, ReadableTable, WriteTransaction};
 
-use crate::tables::extractor::{ExtractorDefinition, EXTRACTORS_BY_QNAME_TABLE, EXTRACTORS_TABLE};
+use crate::tables::extractor::{ExtractorDefinition, EXTRACTORS_BY_SCOPE_TABLE, EXTRACTORS_TABLE};
+use crate::tables::scope::{space_chain, DeclScope, SPACE_BASE};
 
 #[derive(thiserror::Error, Debug)]
 pub enum ExtractorOpError {
@@ -36,39 +37,104 @@ pub enum ExtractorOpError {
 }
 
 // ---------------------------------------------------------------------------
+// Scope resolution.
+// ---------------------------------------------------------------------------
+
+/// Resolve `qname` through the scope chain, read txn.
+fn scope_get_rtxn(
+    rtxn: &ReadTransaction,
+    qname: &str,
+    space: [u8; 16],
+) -> Result<Option<u32>, ExtractorOpError> {
+    let idx = rtxn.open_table(EXTRACTORS_BY_SCOPE_TABLE)?;
+    for sp in space_chain(space) {
+        if let Some(id) = idx.get(&(qname, sp))?.map(|g| g.value()) {
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
+}
+
+/// Resolve `qname` in exactly one scope, write txn.
+///
+/// Writes probe exactly; only reads chain. A write that chained would find
+/// the tenant-wide declaration and hand it back, so declaring a space's own
+/// extractor would silently return the shared row and no space could ever
+/// override anything.
+fn scope_get_exact_wtxn(
+    wtxn: &WriteTransaction,
+    qname: &str,
+    space: [u8; 16],
+) -> Result<Option<u32>, ExtractorOpError> {
+    let idx = wtxn.open_table(EXTRACTORS_BY_SCOPE_TABLE)?;
+    let got = idx.get(&(qname, space))?.map(|g| g.value());
+    Ok(got)
+}
+
+/// Remove every scope's entry for `qname` — the row itself is gone, so an
+/// Remove the index entry that points at `id`.
+///
+/// The row is gone, so the entry naming it must go — and ONLY that entry.
+/// One qname can have SEVERAL rows, one per scope that declared it, so
+/// clearing every `(qname, *)` entry would orphan a sibling scope's row: the
+/// row would survive with nothing resolving to it, and that scope's
+/// declaration would silently disappear.
+fn scope_remove_entry(
+    wtxn: &WriteTransaction,
+    qname: &str,
+    id: u32,
+) -> Result<(), ExtractorOpError> {
+    let owned: Vec<[u8; 16]> = {
+        let idx = wtxn.open_table(EXTRACTORS_BY_SCOPE_TABLE)?;
+        let mut out = Vec::new();
+        for entry in idx.range((qname, [0u8; 16])..=(qname, [0xFFu8; 16]))? {
+            let (k, v) = entry?;
+            if v.value() == id {
+                out.push(k.value().1);
+            }
+        }
+        out
+    };
+    let mut idx = wtxn.open_table(EXTRACTORS_BY_SCOPE_TABLE)?;
+    for sp in owned {
+        idx.remove(&(qname, sp))?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Writes.
 // ---------------------------------------------------------------------------
 
-/// Intern (or look up) an extractor by its `(namespace, name)`
-/// qname.
+/// Intern (or look up) an extractor in one space.
 ///
-/// - No prior row: allocate fresh id, write row + qname index.
-/// - Prior row with identical kind + schema_version +
-///   definition_blob: return the existing id (idempotent).
-/// - Prior row with diverging kind / definition_blob /
-///   schema_version: `AlreadyExists` (caller decides whether to
-///   evict + re-intern).
+/// `SPACE_BASE` declares it tenant-wide; any other space declares an
+/// override that only that space resolves. Idempotency is judged against
+/// that one space's row, not an inherited one — otherwise a space could
+/// never adopt its own rule for a name the tenant already defines.
+///
+/// # Errors
+/// `InvalidIdentifier` for a malformed namespace/name, `AlreadyExists` when
+/// this space already declares the name with a diverging definition, and
+/// redb storage failures.
 #[allow(clippy::too_many_arguments)]
 pub fn extractor_intern(
     wtxn: &WriteTransaction,
-    namespace: &str,
+    scope: DeclScope<'_>,
     name: &str,
     kind: ExtractorKind,
     schema_version: u32,
     definition_blob: Vec<u8>,
     now_unix_nanos: u64,
 ) -> Result<ExtractorId, ExtractorOpError> {
+    let (namespace, space) = (scope.namespace(), scope.space_id());
     validate_namespace(namespace)?;
     validate_name(name)?;
 
     let q = qname(namespace, name);
 
-    // Idempotency probe.
-    let existing_id: Option<u32> = {
-        let idx = wtxn.open_table(EXTRACTORS_BY_QNAME_TABLE)?;
-        let guard = idx.get(q.as_str())?;
-        guard.map(|g| g.value())
-    };
+    // Idempotency probe, this space only.
+    let existing_id: Option<u32> = scope_get_exact_wtxn(wtxn, q.as_str(), space)?;
     if let Some(id_raw) = existing_id {
         let row = {
             let t = wtxn.open_table(EXTRACTORS_TABLE)?;
@@ -118,8 +184,8 @@ pub fn extractor_intern(
         t.insert(&next_id_raw, &row)?;
     }
     {
-        let mut idx = wtxn.open_table(EXTRACTORS_BY_QNAME_TABLE)?;
-        idx.insert(&q.as_str(), &next_id_raw)?;
+        let mut idx = wtxn.open_table(EXTRACTORS_BY_SCOPE_TABLE)?;
+        idx.insert(&(q.as_str(), space), &next_id_raw)?;
     }
     Ok(ExtractorId::from(next_id_raw))
 }
@@ -145,11 +211,9 @@ pub fn extractor_replace_system_definition(
         return Err(ExtractorOpError::NotSystemNamespace(namespace.to_string()));
     }
     let q = format!("{namespace}:{name}");
-    let id_raw = {
-        let idx = wtxn.open_table(EXTRACTORS_BY_QNAME_TABLE)?;
-        let got = idx.get(q.as_str())?.map(|g| g.value());
-        got
-    };
+    // Built-ins are declared once for the whole deployment, so the row to
+    // upgrade is the tenant-wide one.
+    let id_raw = scope_get_exact_wtxn(wtxn, q.as_str(), SPACE_BASE)?;
     let Some(id_raw) = id_raw else {
         return Ok(false);
     };
@@ -184,16 +248,19 @@ pub fn extractor_get(
     Ok(guard.map(|g| g.value()))
 }
 
+/// Resolve an extractor as `space` sees it: its own declaration when it has
+/// one, otherwise the tenant-wide one.
+///
+/// # Errors
+/// redb storage failures.
 pub fn extractor_lookup_by_qname(
     rtxn: &ReadTransaction,
-    namespace: &str,
+    scope: DeclScope<'_>,
     name: &str,
 ) -> Result<Option<ExtractorDefinition>, ExtractorOpError> {
+    let (namespace, space) = (scope.namespace(), scope.space_id());
     let q = qname(namespace, name);
-    let idx = rtxn.open_table(EXTRACTORS_BY_QNAME_TABLE)?;
-    let id_raw: Option<u32> = idx.get(q.as_str())?.map(|g| g.value());
-    drop(idx);
-    let Some(id_raw) = id_raw else {
+    let Some(id_raw) = scope_get_rtxn(rtxn, q.as_str(), space)? else {
         return Ok(None);
     };
     let t = rtxn.open_table(EXTRACTORS_TABLE)?;
@@ -201,7 +268,16 @@ pub fn extractor_lookup_by_qname(
     Ok(guard.map(|g| g.value()))
 }
 
-/// All registered extractors. Order is by `extractor_id` ascending.
+/// Every registered extractor on this shard, across all namespaces and
+/// spaces. Order is by `extractor_id` ascending.
+///
+/// **Not for a tenant-facing surface.** One shard serves many tenants, so
+/// this is deliberately unscoped and exists for the paths that must see all
+/// of them: building the per-shard extractor registry at startup, rebuilding
+/// it after a schema change, and materializing definitions. A wire or HTTP
+/// op that returned this would hand every tenant every other tenant's
+/// declarations — use [`extractor_list_resolved`], which takes the caller's
+/// namespaces and effective space.
 pub fn extractor_list(
     rtxn: &ReadTransaction,
 ) -> Result<Vec<ExtractorDefinition>, ExtractorOpError> {
@@ -214,26 +290,100 @@ pub fn extractor_list(
     Ok(out)
 }
 
-/// Drop every extractor row in `namespace`. Extractors don't track an
-/// implicit-vs-declared origin (every row is schema-declared in v1),
-/// so this is an unconditional namespace sweep. Counterpart to
+/// Every extractor a caller in `space` resolves, among those declared in one
+/// of `namespaces`.
+///
+/// Two boundaries, and a listing has to respect both:
+///
+/// - **Namespace.** An extractor belongs to the tenant that declared it.
+///   `namespaces` is the caller's own namespace plus the system namespace,
+///   whose built-ins serve every tenant; the caller supplies them because
+///   this layer has no opinion about which namespace is the system one.
+/// - **Space.** Declarations resolve narrowest-first, so a space sees its own
+///   overlays plus the namespace base, and a sibling space's overlay is not
+///   something it resolves. Listing by namespace alone would surface it.
+///
+/// Returns definitions sorted by id so a listing is stable across calls.
+///
+/// # Errors
+/// [`ExtractorOpError`] on a storage failure.
+pub fn extractor_list_resolved(
+    rtxn: &ReadTransaction,
+    space: [u8; 16],
+    namespaces: &[&str],
+) -> Result<Vec<ExtractorDefinition>, ExtractorOpError> {
+    // Candidate qnames first, from the scope index: the index is one row per
+    // (declaration, scope) and is small, while resolving each candidate needs
+    // the space chain rather than a single lookup.
+    let mut candidates: Vec<String> = Vec::new();
+    {
+        let idx = rtxn.open_table(EXTRACTORS_BY_SCOPE_TABLE)?;
+        for entry in idx.iter()? {
+            let (k, _) = entry?;
+            let (qname, _) = k.value();
+            // A qname is `<namespace>:<name>`, so the part before the first
+            // colon is the declaring tenant.
+            let Some((declaring, _)) = qname.split_once(':') else {
+                continue;
+            };
+            if namespaces.contains(&declaring) && !candidates.iter().any(|q| q == qname) {
+                candidates.push(qname.to_string());
+            }
+        }
+    }
+
+    let mut ids: Vec<u32> = Vec::with_capacity(candidates.len());
+    for qname in &candidates {
+        // Narrowest-first: this is what keeps a sibling space's overlay out,
+        // and what lets a space's own override shadow the namespace base.
+        if let Some(id) = scope_get_rtxn(rtxn, qname, space)? {
+            ids.push(id);
+        }
+    }
+    ids.sort_unstable();
+    ids.dedup();
+
+    let t = rtxn.open_table(EXTRACTORS_TABLE)?;
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        if let Some(row) = t.get(&id)? {
+            out.push(row.value());
+        }
+    }
+    Ok(out)
+}
+
+/// Drop every extractor `scope` declared. Extractors don't track an
+/// implicit-vs-declared origin (every row is schema-declared in v1), so this
+/// is an unconditional sweep of the scope. Counterpart to
 /// [`crate::schema::predicate::predicate_drop_schema_declared`] and
 /// [`crate::relation::types::relation_type_drop_schema_declared`];
 /// used by `SCHEMA_REPLACE`.
-pub fn extractor_drop_namespace(
+pub fn extractor_drop_declared(
     wtxn: &WriteTransaction,
-    namespace: &str,
+    scope: DeclScope<'_>,
 ) -> Result<usize, ExtractorOpError> {
+    let (namespace, space) = (scope.namespace(), scope.space_id());
     validate_namespace(namespace)?;
 
+    // Victims are the declarations THIS SCOPE made, for the reason given on
+    // [`crate::schema::predicate::predicate_drop_schema_declared`].
     let victims: Vec<(u32, String)> = {
+        let idx = wtxn.open_table(EXTRACTORS_BY_SCOPE_TABLE)?;
         let t = wtxn.open_table(EXTRACTORS_TABLE)?;
         let mut out = Vec::new();
-        for entry in t.iter()? {
+        for entry in idx.iter()? {
             let (k, v) = entry?;
-            let row: ExtractorDefinition = v.value();
+            let (q, sp) = k.value();
+            if sp != space {
+                continue;
+            }
+            let id = v.value();
+            let Some(row) = t.get(&id)?.map(|g| g.value()) else {
+                continue;
+            };
             if row.namespace == namespace {
-                out.push((k.value(), qname(&row.namespace, &row.name)));
+                out.push((id, q.to_string()));
             }
         }
         out
@@ -245,11 +395,8 @@ pub fn extractor_drop_namespace(
             t.remove(id)?;
         }
     }
-    {
-        let mut idx = wtxn.open_table(EXTRACTORS_BY_QNAME_TABLE)?;
-        for (_, q) in &victims {
-            idx.remove(q.as_str())?;
-        }
+    for (id, q) in &victims {
+        scope_remove_entry(wtxn, q.as_str(), *id)?;
     }
     Ok(count)
 }
@@ -319,7 +466,15 @@ mod tests {
         name: &str,
         blob: &[u8],
     ) -> Result<ExtractorId, ExtractorOpError> {
-        extractor_intern(wtxn, ns, name, ExtractorKind::Pattern, 1, blob.to_vec(), 0)
+        extractor_intern(
+            wtxn,
+            DeclScope::base(ns),
+            name,
+            ExtractorKind::Pattern,
+            1,
+            blob.to_vec(),
+            0,
+        )
     }
 
     #[test]
@@ -387,7 +542,7 @@ mod tests {
             wtxn.commit().unwrap();
         }
         let rtxn = db.begin_read().unwrap();
-        let got = extractor_lookup_by_qname(&rtxn, "acme", "p1")
+        let got = extractor_lookup_by_qname(&rtxn, DeclScope::base("acme"), "p1")
             .unwrap()
             .unwrap();
         assert_eq!(got.namespace, "acme");
@@ -400,9 +555,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = open_db(&dir);
         let rtxn = db.begin_read().unwrap();
-        assert!(extractor_lookup_by_qname(&rtxn, "acme", "missing")
-            .unwrap()
-            .is_none());
+        assert!(
+            extractor_lookup_by_qname(&rtxn, DeclScope::base("acme"), "missing")
+                .unwrap()
+                .is_none()
+        );
         assert!(extractor_get(&rtxn, ExtractorId::from(99))
             .unwrap()
             .is_none());
@@ -433,5 +590,161 @@ mod tests {
         let err = intern_pattern(&wtxn, "acme", "", b"x").unwrap_err();
         assert!(matches!(err, ExtractorOpError::InvalidIdentifier { .. }));
         wtxn.commit().unwrap();
+    }
+
+    // -----------------------------------------------------------------
+    // Scoped listing — the tenancy boundary
+    // -----------------------------------------------------------------
+
+    const SYSTEM: &str = "brain";
+    const TEAM: [u8; 16] = [7u8; 16];
+    const OTHER_TEAM: [u8; 16] = [9u8; 16];
+
+    fn names_in(db: &Database, space: [u8; 16], namespaces: &[&str]) -> Vec<String> {
+        let rtxn = db.begin_read().unwrap();
+        let mut out: Vec<String> = extractor_list_resolved(&rtxn, space, namespaces)
+            .unwrap()
+            .into_iter()
+            .map(|d| qname(&d.namespace, &d.name))
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn a_listing_shows_only_the_callers_namespace_and_the_system_builtins() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(&dir);
+        let wtxn = db.begin_write().unwrap();
+        intern_pattern(&wtxn, "acme", "invoices", b"a").unwrap();
+        intern_pattern(&wtxn, "globex", "tickets", b"b").unwrap();
+        intern_pattern(&wtxn, SYSTEM, "builtin", b"s").unwrap();
+        wtxn.commit().unwrap();
+
+        assert_eq!(
+            names_in(&db, SPACE_BASE, &["acme", SYSTEM]),
+            vec!["acme:invoices".to_string(), "brain:builtin".to_string()],
+            "another tenant's extractor must not appear"
+        );
+        assert_eq!(
+            names_in(&db, SPACE_BASE, &["globex", SYSTEM]),
+            vec!["brain:builtin".to_string(), "globex:tickets".to_string()],
+        );
+    }
+
+    #[test]
+    fn a_space_does_not_resolve_a_sibling_spaces_overlay() {
+        // The leak a namespace-only filter would leave: two spaces of the
+        // same tenant, each with its own extractor.
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(&dir);
+        let wtxn = db.begin_write().unwrap();
+        extractor_intern(
+            &wtxn,
+            DeclScope::space("acme", TEAM),
+            "team_only",
+            ExtractorKind::Pattern,
+            1,
+            b"t".to_vec(),
+            0,
+        )
+        .unwrap();
+        extractor_intern(
+            &wtxn,
+            DeclScope::space("acme", OTHER_TEAM),
+            "sibling_only",
+            ExtractorKind::Pattern,
+            1,
+            b"o".to_vec(),
+            0,
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+
+        assert_eq!(
+            names_in(&db, TEAM, &["acme"]),
+            vec!["acme:team_only".to_string()],
+            "a space must not see a sibling space's overlay"
+        );
+        assert_eq!(
+            names_in(&db, OTHER_TEAM, &["acme"]),
+            vec!["acme:sibling_only".to_string()],
+        );
+        assert!(
+            names_in(&db, SPACE_BASE, &["acme"]).is_empty(),
+            "the namespace base declared nothing of its own"
+        );
+    }
+
+    #[test]
+    fn a_space_resolves_the_namespace_base_as_well_as_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(&dir);
+        let wtxn = db.begin_write().unwrap();
+        intern_pattern(&wtxn, "acme", "tenant_wide", b"b").unwrap();
+        extractor_intern(
+            &wtxn,
+            DeclScope::space("acme", TEAM),
+            "team_only",
+            ExtractorKind::Pattern,
+            1,
+            b"t".to_vec(),
+            0,
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+
+        assert_eq!(
+            names_in(&db, TEAM, &["acme"]),
+            vec!["acme:team_only".to_string(), "acme:tenant_wide".to_string()],
+        );
+        assert_eq!(
+            names_in(&db, OTHER_TEAM, &["acme"]),
+            vec!["acme:tenant_wide".to_string()],
+            "a sibling space inherits the base and nothing else"
+        );
+    }
+
+    #[test]
+    fn a_spaces_own_declaration_shadows_the_base_for_that_space_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(&dir);
+        let wtxn = db.begin_write().unwrap();
+        let base = intern_pattern(&wtxn, "acme", "shared", b"base").unwrap();
+        let overlay = extractor_intern(
+            &wtxn,
+            DeclScope::space("acme", TEAM),
+            "shared",
+            ExtractorKind::Pattern,
+            1,
+            b"overlay".to_vec(),
+            0,
+        )
+        .unwrap();
+        wtxn.commit().unwrap();
+        assert_ne!(base.raw(), overlay.raw(), "the overlay is its own row");
+
+        // One name, and each scope resolves exactly one of them.
+        let rtxn = db.begin_read().unwrap();
+        let in_team = extractor_list_resolved(&rtxn, TEAM, &["acme"]).unwrap();
+        assert_eq!(in_team.len(), 1);
+        assert_eq!(in_team[0].extractor_id, overlay.raw());
+
+        let at_base = extractor_list_resolved(&rtxn, SPACE_BASE, &["acme"]).unwrap();
+        assert_eq!(at_base.len(), 1);
+        assert_eq!(at_base[0].extractor_id, base.raw());
+    }
+
+    #[test]
+    fn an_empty_namespace_list_resolves_nothing() {
+        // Fail-closed: a caller whose namespaces could not be determined
+        // sees nothing, rather than everything.
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(&dir);
+        let wtxn = db.begin_write().unwrap();
+        intern_pattern(&wtxn, "acme", "invoices", b"a").unwrap();
+        wtxn.commit().unwrap();
+
+        assert!(names_in(&db, SPACE_BASE, &[]).is_empty());
     }
 }

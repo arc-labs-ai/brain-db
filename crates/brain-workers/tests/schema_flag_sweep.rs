@@ -12,6 +12,7 @@
 //! immediately after upload commit, and gains the bit only after the
 //! worker drains the post-commit enqueue.
 
+use brain_metadata::DeclScope;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -120,7 +121,8 @@ fn write_statement(
     predicate_name: &str,
 ) -> StatementId {
     let wtxn = metadata.write_txn().unwrap();
-    let pid = predicate_intern_or_get(&wtxn, namespace, predicate_name, 0, NOW).unwrap();
+    let pid =
+        predicate_intern_or_get(&wtxn, DeclScope::base(namespace), predicate_name, 0, NOW).unwrap();
     let evidence_entry = EvidenceEntry::from_parts(
         MemoryId::pack(1, SessionId::DEFAULT.into(), 0),
         1.0,
@@ -156,6 +158,7 @@ fn submit_upload(writer: &RealWriterHandle, source: &str) {
     let phase = Phase::UpsertSchema {
         namespace: "acme".into(),
         version: 1,
+        space: brain_metadata::tables::scope::SPACE_BASE,
         blob: source.as_bytes().to_vec(),
         declared_predicates: Vec::new(),
         declared_relation_types: Vec::new(),

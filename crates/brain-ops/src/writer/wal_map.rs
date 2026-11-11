@@ -465,6 +465,7 @@ pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> 
         Phase::UpsertSchema {
             namespace,
             version,
+            space,
             blob,
             created_at_unix_nanos,
             replace_all,
@@ -474,6 +475,15 @@ pub fn phase_to_wal_payload(phase: &Phase, write: &Write) -> Option<WalPayload> 
             let body = encode_schema_update(&SchemaUpdateBody {
                 namespace: namespace.clone(),
                 version: *version,
+                // Copied verbatim from the phase, like every other field
+                // here. The scope is what makes an overlay an overlay, so
+                // recording it is the whole reason the body carries a space:
+                // replay re-applies at `SchemaUpdateBody.space`, and a body
+                // that dropped it would re-declare a space's private types at
+                // the namespace base on the next restart — visible to every
+                // sibling space, which is the one thing the overlay exists to
+                // prevent.
+                space: *space,
                 blob: blob.clone(),
                 created_at_unix_nanos: *created_at_unix_nanos,
                 replace_all: *replace_all,
@@ -718,6 +728,7 @@ mod tests {
         let phase = Phase::UpsertSchema {
             namespace: "acme".into(),
             version: 1,
+            space: brain_metadata::tables::scope::SPACE_BASE,
             blob: b"namespace acme".to_vec(),
             declared_predicates: vec![],
             declared_relation_types: vec![],

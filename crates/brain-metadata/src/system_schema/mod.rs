@@ -23,6 +23,7 @@ use redb::{Database, ReadableDatabase, WriteTransaction};
 
 use crate::schema::apply::{apply_schema_definitions, SchemaApplyError};
 use crate::schema::store::{schema_active, schema_upload, SchemaStoreError};
+use crate::tables::scope::DeclScope;
 
 /// The embedded system-schema DSL source. Single source of truth
 /// for the built-in `brain:*` types.
@@ -87,7 +88,7 @@ pub fn seed_system_schema(db: &Database) -> Result<(), SystemSchemaError> {
 
     let active = {
         let rtxn = db.begin_read()?;
-        schema_active(&rtxn, SYSTEM_SCHEMA_NAMESPACE)?
+        schema_active(&rtxn, DeclScope::base(SYSTEM_SCHEMA_NAMESPACE))?
     };
 
     let now = std::time::SystemTime::now()
@@ -102,7 +103,9 @@ pub fn seed_system_schema(db: &Database) -> Result<(), SystemSchemaError> {
     crate::namespace::seed_system_namespace(&wtxn, now)?;
     match active {
         None => {
-            schema_upload(&wtxn, &validated, now)?;
+            // SPACE_BASE: the built-ins are the whole deployment's, not any
+            // one space's. See the note on the other apply call below.
+            schema_upload(&wtxn, &validated, crate::tables::scope::SPACE_BASE, now)?;
         }
         Some(version) => {
             reconcile_system_schema(&wtxn, &validated, version, now)?;
@@ -133,7 +136,16 @@ fn reconcile_system_schema(
     now_unix_nanos: u64,
 ) -> Result<(), SystemSchemaError> {
     upgrade_system_extractors(wtxn, validated, schema_version)?;
-    apply_schema_definitions(wtxn, validated, schema_version, now_unix_nanos)?;
+    // SPACE_BASE, always: the built-ins belong to the system namespace as a
+    // whole and must be visible from every space in every tenant. An
+    // overlay row for them would be unreachable by anyone else.
+    apply_schema_definitions(
+        wtxn,
+        validated,
+        crate::tables::scope::SPACE_BASE,
+        schema_version,
+        now_unix_nanos,
+    )?;
     Ok(())
 }
 
@@ -204,8 +216,13 @@ mod tests {
         seed_system_schema(&db).unwrap();
 
         let rtxn = db.begin_read().unwrap();
-        assert_eq!(schema_active(&rtxn, "brain").unwrap(), Some(1));
-        let row = schema_get(&rtxn, "brain", 1).unwrap().unwrap();
+        assert_eq!(
+            schema_active(&rtxn, DeclScope::base("brain")).unwrap(),
+            Some(1)
+        );
+        let row = schema_get(&rtxn, DeclScope::base("brain"), 1)
+            .unwrap()
+            .unwrap();
         assert_eq!(row.namespace, "brain");
         assert_eq!(row.version, 1);
         assert_eq!(row.validator_version, 1);
@@ -224,7 +241,7 @@ mod tests {
             seed_system_schema(&db).unwrap();
 
             let rtxn = db.begin_read().unwrap();
-            let list = schema_list(&rtxn, "brain").unwrap();
+            let list = schema_list(&rtxn, DeclScope::base("brain")).unwrap();
             assert_eq!(list.len(), 1, "reopen must not create v2");
             assert_eq!(list[0].version, 1);
         }
@@ -276,17 +293,27 @@ mod tests {
         seed_system_schema(&db).unwrap();
 
         let rtxn = db.begin_read().unwrap();
-        let entity_mentions =
-            crate::extractor::ops::extractor_lookup_by_qname(&rtxn, "brain", "entity_mentions")
-                .unwrap()
-                .expect("entity_mentions registered");
-        let gliner = crate::extractor::ops::extractor_lookup_by_qname(&rtxn, "brain", "gliner")
-            .unwrap()
-            .expect("gliner registered");
-        let llm_predicate =
-            crate::extractor::ops::extractor_lookup_by_qname(&rtxn, "brain", "llm_predicate")
-                .unwrap()
-                .expect("llm_predicate registered");
+        let entity_mentions = crate::extractor::ops::extractor_lookup_by_qname(
+            &rtxn,
+            DeclScope::base("brain"),
+            "entity_mentions",
+        )
+        .unwrap()
+        .expect("entity_mentions registered");
+        let gliner = crate::extractor::ops::extractor_lookup_by_qname(
+            &rtxn,
+            DeclScope::base("brain"),
+            "gliner",
+        )
+        .unwrap()
+        .expect("gliner registered");
+        let llm_predicate = crate::extractor::ops::extractor_lookup_by_qname(
+            &rtxn,
+            DeclScope::base("brain"),
+            "llm_predicate",
+        )
+        .unwrap()
+        .expect("llm_predicate registered");
         assert_eq!(entity_mentions.id().raw(), 1);
         assert_eq!(gliner.id().raw(), 2);
         assert_eq!(llm_predicate.id().raw(), 3);
@@ -341,7 +368,7 @@ mod tests {
             (4, "behavior_prefers"),
             (5, "behavior_constraint"),
         ] {
-            let row = predicate_lookup_by_qname(&rtxn, "brain", name)
+            let row = predicate_lookup_by_qname(&rtxn, DeclScope::base("brain"), name)
                 .unwrap()
                 .unwrap_or_else(|| panic!("brain:{name} predicate missing"));
             assert_eq!(row.id.raw(), expected_id, "brain:{name}");
@@ -349,7 +376,7 @@ mod tests {
 
         // A removed domain predicate must NOT be pre-seeded.
         assert!(
-            predicate_lookup_by_qname(&rtxn, "brain", "works_at")
+            predicate_lookup_by_qname(&rtxn, DeclScope::base("brain"), "works_at")
                 .unwrap()
                 .is_none(),
             "brain:works_at must not be seeded — predicates are open-vocab"
@@ -364,10 +391,13 @@ mod tests {
         seed_system_schema(&db).unwrap();
 
         let rtxn = db.begin_read().unwrap();
-        let row =
-            crate::extractor::ops::extractor_lookup_by_qname(&rtxn, "brain", "entity_mentions")
-                .unwrap()
-                .unwrap();
+        let row = crate::extractor::ops::extractor_lookup_by_qname(
+            &rtxn,
+            DeclScope::base("brain"),
+            "entity_mentions",
+        )
+        .unwrap()
+        .unwrap();
         let ast: brain_protocol::schema::ExtractorDef =
             serde_json::from_slice(&row.definition_blob).expect("decode AST");
         assert_eq!(ast.name, "entity_mentions");
@@ -407,7 +437,8 @@ mod tests {
     /// it up.
     #[test]
     fn reconciliation_backfills_missing_extractor() {
-        use crate::tables::extractor::{EXTRACTORS_BY_QNAME_TABLE, EXTRACTORS_TABLE};
+        use crate::tables::extractor::{EXTRACTORS_BY_SCOPE_TABLE, EXTRACTORS_TABLE};
+        use crate::tables::scope::SPACE_BASE;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.redb");
@@ -422,8 +453,8 @@ mod tests {
             // reopen.
             let wtxn = db.begin_write().unwrap();
             let removed_id = {
-                let mut idx = wtxn.open_table(EXTRACTORS_BY_QNAME_TABLE).unwrap();
-                let guard = idx.remove(&"brain:gliner").unwrap().unwrap();
+                let mut idx = wtxn.open_table(EXTRACTORS_BY_SCOPE_TABLE).unwrap();
+                let guard = idx.remove(&("brain:gliner", SPACE_BASE)).unwrap().unwrap();
                 guard.value()
             };
             {
@@ -438,9 +469,13 @@ mod tests {
         seed_system_schema(&db).unwrap();
 
         let rtxn = db.begin_read().unwrap();
-        let restored = crate::extractor::ops::extractor_lookup_by_qname(&rtxn, "brain", "gliner")
-            .unwrap()
-            .expect("gliner restored by reconciliation");
+        let restored = crate::extractor::ops::extractor_lookup_by_qname(
+            &rtxn,
+            DeclScope::base("brain"),
+            "gliner",
+        )
+        .unwrap()
+        .expect("gliner restored by reconciliation");
         assert_eq!(restored.namespace, "brain");
         assert_eq!(restored.name, "gliner");
     }

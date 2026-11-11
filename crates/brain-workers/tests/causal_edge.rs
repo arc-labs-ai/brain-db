@@ -6,6 +6,7 @@
 //! worker emits a `Phase::Link` per derived edge via `submit(Write)`
 //! with WAL coverage + bus events.
 
+use brain_metadata::DeclScope;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -155,7 +156,7 @@ fn seed_causal_statement(
     //    requires existence).
     let entity_type: EntityTypeId = entity_type_intern(
         &wtxn,
-        brain_core::NamespaceId::SYSTEM.raw(),
+        brain_metadata::TypeScope::base(brain_core::NamespaceId::SYSTEM.raw()),
         "Thing",
         Vec::new(),
         now,
@@ -172,8 +173,8 @@ fn seed_causal_statement(
     );
     entity_put(&wtxn, __ts(), brain_core::SessionId::DEFAULT, &entity).expect("entity_put");
     // 3. Predicate `brain:caused_by` — matches the default whitelist.
-    let predicate =
-        predicate_intern_or_get(&wtxn, "brain", "caused_by", 1, now).expect("predicate_intern");
+    let predicate = predicate_intern_or_get(&wtxn, DeclScope::base("brain"), "caused_by", 1, now)
+        .expect("predicate_intern");
     // 4. Statement: subject=outage_entity, predicate=caused_by,
     //    object=Memory(cause_mem), evidence=[effect_mem]. The worker's
     //    short-circuit emits one Phase::Link(cause_mem → effect_mem).

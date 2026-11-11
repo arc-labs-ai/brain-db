@@ -53,6 +53,15 @@ snapshots/
         └── ...
 ```
 
+A snapshot is **per shard**, and that is the whole of what it covers. Two
+pieces of durable state sit at the data-directory root instead, shared by
+every shard, and neither is reflinked here:
+
+| File | In a snapshot? |
+|---|---|
+| `llm_credentials.redb` | **No.** Tenant LLM provider keys, sealed. A DR backup must pick it up explicitly — see [`../18_failure_recovery/06_disaster_recovery.md`](../18_failure_recovery/06_disaster_recovery.md) §3a. |
+| `llm_credential_kek` | **No, deliberately.** Shipping the sealing key beside the rows it seals would make the copy plaintext-equivalent. |
+
 The directory name encodes the snapshot ID (sequential) and timestamp (ISO 8601). The manifest:
 
 ```json

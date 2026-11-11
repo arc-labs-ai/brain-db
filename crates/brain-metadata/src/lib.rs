@@ -21,6 +21,7 @@ pub mod extraction;
 pub mod extractor;
 pub mod hype;
 pub mod llm_cache;
+pub mod llm_credential;
 pub mod namespace;
 pub mod recovery;
 pub mod registry;
@@ -65,6 +66,7 @@ pub use entity::trigram::{
 pub use entity::types::{
     entity_type_intern, entity_type_label_qnames, entity_type_lookup, entity_type_lookup_rtxn,
     entity_type_name_by_id, render_declared_entity_types_block, EntityTypeOpError,
+    EntityTypeQnames,
 };
 pub use extraction::queue::{
     extraction_queue_drain, extraction_queue_enqueue, extraction_queue_len,
@@ -101,8 +103,9 @@ pub use relation::types::{
 };
 pub use schema::apply::{apply_schema_definitions, SchemaApplyError};
 pub use schema::declared::{
-    declared_vocabulary, declared_vocabulary_wtxn, entity_type_labels_for_namespaces,
-    render_entity_type_labels_block, DeclaredVocabulary,
+    declared_entity_type_names, declared_entity_type_names_wtxn, declared_vocabulary,
+    declared_vocabulary_wtxn, entity_type_labels_for_namespaces, render_entity_type_labels_block,
+    DeclaredVocabulary,
 };
 pub use schema::kind::{
     kind_behavior, kind_intern, kind_list, render_declared_kinds_block, KindOpError,
@@ -141,4 +144,4 @@ pub use tables::memory::{
 pub use tables::schema_version::{
     SchemaVersionRow, SCHEMA_ACTIVE_VERSIONS_TABLE, SCHEMA_VERSIONS_TABLE, VALIDATOR_VERSION,
 };
-pub use tables::scope::{RowScope, ScopeMode};
+pub use tables::scope::{DeclScope, RowScope, ScopeMode, TypeScope};

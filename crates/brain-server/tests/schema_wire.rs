@@ -25,7 +25,7 @@ use brain_protocol::envelope::request::RequestBody;
 use brain_protocol::envelope::response::ResponseBody;
 use brain_protocol::Frame;
 use brain_protocol::{
-    SchemaGetRequest, SchemaListRequest, SchemaUploadRequest, SchemaValidateRequest,
+    SchemaGetRequest, SchemaListRequest, SchemaScope, SchemaUploadRequest, SchemaValidateRequest,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -162,6 +162,7 @@ fn upload_request(source: &str) -> RequestBody {
         allow_breaking: false,
         request_id: *uuid::Uuid::now_v7().as_bytes(),
         act_as: None,
+        scope: brain_protocol::SchemaScope::Namespace,
     })
 }
 
@@ -373,6 +374,7 @@ async fn validate_dry_run_returns_would_be_version() {
         RequestBody::SchemaValidate(SchemaValidateRequest {
             schema_document: ACME_V1.into(),
             act_as: None,
+            scope: SchemaScope::Namespace,
         }),
     )
     .await;
@@ -393,6 +395,7 @@ async fn validate_dry_run_returns_would_be_version() {
         RequestBody::SchemaValidate(SchemaValidateRequest {
             schema_document: ACME_V1.into(),
             act_as: None,
+            scope: SchemaScope::Namespace,
         }),
     )
     .await;

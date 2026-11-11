@@ -10,15 +10,15 @@ description = "LLM transport clients (Anthropic, OpenAI) for Brain's LLM extract
 
 [dependencies]
 blake3 = { workspace = true }
-# Cache guard for the broker resolver's per-namespace entries. Workspace-wide
+# Cache guard for the resolver's per-namespace client entries. Workspace-wide
 # already; no new download.
 parking_lot = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror.workspace = true
-# `rt-multi-thread` + `net`: the broker resolver owns a small runtime so its
-# hyper-based HTTP has a reactor, because its caller runs on glommio (#34).
+# `rt-multi-thread` + `net`: provider HTTP owns a small runtime so its
+# hyper-based client has a reactor, because its caller runs on glommio.
 tokio = { workspace = true, features = ["time", "rt-multi-thread", "net"] }
 tracing.workspace = true
 

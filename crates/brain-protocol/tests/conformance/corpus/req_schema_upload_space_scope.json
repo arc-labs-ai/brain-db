@@ -1,0 +1,29 @@
+{
+  "schema_document": "namespace org\ndefine entity_type Person\n",
+  "dry_run": false,
+  "allow_breaking": false,
+  "request_id": [
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17,
+    17
+  ],
+  "act_as": {
+    "namespace": "org",
+    "space": "support-bot:user123",
+    "grant": 16
+  },
+  "scope": 1
+}

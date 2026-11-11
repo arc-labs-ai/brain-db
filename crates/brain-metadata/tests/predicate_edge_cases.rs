@@ -16,6 +16,7 @@ use brain_metadata::schema::predicate::{
     predicate_intern_or_get, predicate_lookup_by_qname, PredicateOpError, NAMESPACE_MAX_LEN,
     NAME_MAX_LEN,
 };
+use brain_metadata::DeclScope;
 use redb::ReadableDatabase;
 
 fn fresh_db(dir: &tempfile::TempDir) -> redb::Database {
@@ -42,12 +43,13 @@ fn name_at_max_len_is_accepted() {
     // First char must be [a-z]; pad with 'a' to reach exactly 64.
     let name: String = "a".repeat(NAME_MAX_LEN);
     assert_eq!(name.len(), 64);
-    let id = predicate_intern_or_get(&wtxn, "acme", &name, 0, 0).expect("64 chars accepted");
+    let id = predicate_intern_or_get(&wtxn, DeclScope::base("acme"), &name, 0, 0)
+        .expect("64 chars accepted");
     wtxn.commit().unwrap();
     assert_eq!(id.raw(), 1);
 
     let rtxn = db.begin_read().unwrap();
-    let got = predicate_lookup_by_qname(&rtxn, "acme", &name)
+    let got = predicate_lookup_by_qname(&rtxn, DeclScope::base("acme"), &name)
         .unwrap()
         .expect("row found");
     assert_eq!(got.name, name);
@@ -61,7 +63,7 @@ fn name_one_over_max_len_is_rejected() {
 
     let name: String = "a".repeat(NAME_MAX_LEN + 1);
     assert_eq!(name.len(), 65);
-    let err = predicate_intern_or_get(&wtxn, "acme", &name, 0, 0).unwrap_err();
+    let err = predicate_intern_or_get(&wtxn, DeclScope::base("acme"), &name, 0, 0).unwrap_err();
     assert_invalid(err);
 }
 
@@ -73,7 +75,8 @@ fn namespace_at_max_len_is_accepted() {
     let wtxn = db.begin_write().unwrap();
 
     let ns: String = "a".repeat(NAMESPACE_MAX_LEN);
-    let id = predicate_intern_or_get(&wtxn, &ns, "x", 0, 0).expect("32-char namespace accepted");
+    let id = predicate_intern_or_get(&wtxn, DeclScope::base(&ns), "x", 0, 0)
+        .expect("32-char namespace accepted");
     wtxn.commit().unwrap();
     assert_eq!(id.raw(), 1);
 }
@@ -85,7 +88,7 @@ fn namespace_one_over_max_len_is_rejected() {
     let wtxn = db.begin_write().unwrap();
 
     let ns: String = "a".repeat(NAMESPACE_MAX_LEN + 1);
-    let err = predicate_intern_or_get(&wtxn, &ns, "x", 0, 0).unwrap_err();
+    let err = predicate_intern_or_get(&wtxn, DeclScope::base(&ns), "x", 0, 0).unwrap_err();
     assert_invalid(err);
 }
 
@@ -98,7 +101,7 @@ fn empty_namespace_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let db = fresh_db(&dir);
     let wtxn = db.begin_write().unwrap();
-    let err = predicate_intern_or_get(&wtxn, "", "x", 0, 0).unwrap_err();
+    let err = predicate_intern_or_get(&wtxn, DeclScope::base(""), "x", 0, 0).unwrap_err();
     assert_invalid(err);
 }
 
@@ -107,7 +110,7 @@ fn empty_name_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let db = fresh_db(&dir);
     let wtxn = db.begin_write().unwrap();
-    let err = predicate_intern_or_get(&wtxn, "acme", "", 0, 0).unwrap_err();
+    let err = predicate_intern_or_get(&wtxn, DeclScope::base("acme"), "", 0, 0).unwrap_err();
     assert_invalid(err);
 }
 
@@ -123,7 +126,7 @@ fn unicode_letter_in_name_is_accepted() {
     let db = fresh_db(&dir);
     let wtxn = db.begin_write().unwrap();
     // Cyrillic 'а' (U+0430) is a real letter — a coined predicate may use it.
-    predicate_intern_or_get(&wtxn, "acme", "loves\u{0430}", 0, 0)
+    predicate_intern_or_get(&wtxn, DeclScope::base("acme"), "loves\u{0430}", 0, 0)
         .expect("non-ASCII letter is a valid open-vocab predicate name");
 }
 
@@ -133,7 +136,7 @@ fn unicode_first_char_in_name_is_accepted() {
     let db = fresh_db(&dir);
     let wtxn = db.begin_write().unwrap();
     // German sharp s leading — a letter, so a valid name start.
-    predicate_intern_or_get(&wtxn, "acme", "\u{00DF}name", 0, 0)
+    predicate_intern_or_get(&wtxn, DeclScope::base("acme"), "\u{00DF}name", 0, 0)
         .expect("a leading non-ASCII letter is valid");
 }
 
@@ -142,7 +145,8 @@ fn unicode_in_namespace_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let db = fresh_db(&dir);
     let wtxn = db.begin_write().unwrap();
-    let err = predicate_intern_or_get(&wtxn, "ac\u{0301}me", "x", 0, 0).unwrap_err();
+    let err =
+        predicate_intern_or_get(&wtxn, DeclScope::base("ac\u{0301}me"), "x", 0, 0).unwrap_err();
     assert_invalid(err);
 }
 
@@ -151,7 +155,8 @@ fn emoji_in_name_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let db = fresh_db(&dir);
     let wtxn = db.begin_write().unwrap();
-    let err = predicate_intern_or_get(&wtxn, "acme", "love\u{1F600}", 0, 0).unwrap_err();
+    let err =
+        predicate_intern_or_get(&wtxn, DeclScope::base("acme"), "love\u{1F600}", 0, 0).unwrap_err();
     assert_invalid(err);
 }
 
@@ -166,7 +171,7 @@ fn colon_in_name_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let db = fresh_db(&dir);
     let wtxn = db.begin_write().unwrap();
-    let err = predicate_intern_or_get(&wtxn, "acme", "lo:ves", 0, 0).unwrap_err();
+    let err = predicate_intern_or_get(&wtxn, DeclScope::base("acme"), "lo:ves", 0, 0).unwrap_err();
     assert_invalid(err);
 }
 
@@ -177,7 +182,8 @@ fn hyphen_in_name_is_accepted() {
     let dir = tempfile::tempdir().unwrap();
     let db = fresh_db(&dir);
     let wtxn = db.begin_write().unwrap();
-    predicate_intern_or_get(&wtxn, "acme", "is-a", 0, 0).expect("hyphen is a valid name connector");
+    predicate_intern_or_get(&wtxn, DeclScope::base("acme"), "is-a", 0, 0)
+        .expect("hyphen is a valid name connector");
 }
 
 #[test]
@@ -185,7 +191,7 @@ fn dot_in_namespace_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let db = fresh_db(&dir);
     let wtxn = db.begin_write().unwrap();
-    let err = predicate_intern_or_get(&wtxn, "ac.me", "x", 0, 0).unwrap_err();
+    let err = predicate_intern_or_get(&wtxn, DeclScope::base("ac.me"), "x", 0, 0).unwrap_err();
     assert_invalid(err);
 }
 
@@ -194,9 +200,9 @@ fn whitespace_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let db = fresh_db(&dir);
     let wtxn = db.begin_write().unwrap();
-    let err = predicate_intern_or_get(&wtxn, "acme", "love it", 0, 0).unwrap_err();
+    let err = predicate_intern_or_get(&wtxn, DeclScope::base("acme"), "love it", 0, 0).unwrap_err();
     assert_invalid(err);
-    let err = predicate_intern_or_get(&wtxn, "ac me", "x", 0, 0).unwrap_err();
+    let err = predicate_intern_or_get(&wtxn, DeclScope::base("ac me"), "x", 0, 0).unwrap_err();
     assert_invalid(err);
 }
 
@@ -206,10 +212,11 @@ fn uppercase_first_char_namespace_rejected_name_accepted() {
     let db = fresh_db(&dir);
     let wtxn = db.begin_write().unwrap();
     // Namespace stays ASCII-lowercase-strict.
-    let err = predicate_intern_or_get(&wtxn, "Acme", "x", 0, 0).unwrap_err();
+    let err = predicate_intern_or_get(&wtxn, DeclScope::base("Acme"), "x", 0, 0).unwrap_err();
     assert_invalid(err);
     // A name is open vocabulary — case isn't a structural hazard.
-    predicate_intern_or_get(&wtxn, "acme", "Loves", 0, 0).expect("uppercase name is accepted");
+    predicate_intern_or_get(&wtxn, DeclScope::base("acme"), "Loves", 0, 0)
+        .expect("uppercase name is accepted");
 }
 
 #[test]
@@ -218,10 +225,11 @@ fn leading_digit_namespace_rejected_name_accepted() {
     let db = fresh_db(&dir);
     let wtxn = db.begin_write().unwrap();
     // Namespace must not start with a digit.
-    let err = predicate_intern_or_get(&wtxn, "1acme", "x", 0, 0).unwrap_err();
+    let err = predicate_intern_or_get(&wtxn, DeclScope::base("1acme"), "x", 0, 0).unwrap_err();
     assert_invalid(err);
     // A digit-leading name (`5ht2a_agonist`) is a real relation surface.
-    predicate_intern_or_get(&wtxn, "acme", "1loves", 0, 0).expect("digit-leading name is accepted");
+    predicate_intern_or_get(&wtxn, DeclScope::base("acme"), "1loves", 0, 0)
+        .expect("digit-leading name is accepted");
 }
 
 #[test]
@@ -232,7 +240,7 @@ fn leading_underscore_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let db = fresh_db(&dir);
     let wtxn = db.begin_write().unwrap();
-    let err = predicate_intern_or_get(&wtxn, "_acme", "x", 0, 0).unwrap_err();
+    let err = predicate_intern_or_get(&wtxn, DeclScope::base("_acme"), "x", 0, 0).unwrap_err();
     assert_invalid(err);
 }
 
@@ -246,8 +254,8 @@ fn same_name_different_namespaces_are_independent_predicates() {
     let dir = tempfile::tempdir().unwrap();
     let db = fresh_db(&dir);
     let wtxn = db.begin_write().unwrap();
-    let a = predicate_intern_or_get(&wtxn, "acme", "loves", 0, 0).unwrap();
-    let b = predicate_intern_or_get(&wtxn, "crm", "loves", 0, 0).unwrap();
+    let a = predicate_intern_or_get(&wtxn, DeclScope::base("acme"), "loves", 0, 0).unwrap();
+    let b = predicate_intern_or_get(&wtxn, DeclScope::base("crm"), "loves", 0, 0).unwrap();
     wtxn.commit().unwrap();
     assert_ne!(
         a, b,
@@ -255,10 +263,10 @@ fn same_name_different_namespaces_are_independent_predicates() {
     );
 
     let rtxn = db.begin_read().unwrap();
-    let a_row = predicate_lookup_by_qname(&rtxn, "acme", "loves")
+    let a_row = predicate_lookup_by_qname(&rtxn, DeclScope::base("acme"), "loves")
         .unwrap()
         .unwrap();
-    let b_row = predicate_lookup_by_qname(&rtxn, "crm", "loves")
+    let b_row = predicate_lookup_by_qname(&rtxn, DeclScope::base("crm"), "loves")
         .unwrap()
         .unwrap();
     assert_eq!(a_row.id, a);
@@ -275,6 +283,7 @@ fn name_containing_namespace_text_does_not_collide() {
     let dir = tempfile::tempdir().unwrap();
     let db = fresh_db(&dir);
     let wtxn = db.begin_write().unwrap();
-    let err = predicate_intern_or_get(&wtxn, "acme", "acme:loves", 0, 0).unwrap_err();
+    let err =
+        predicate_intern_or_get(&wtxn, DeclScope::base("acme"), "acme:loves", 0, 0).unwrap_err();
     assert_invalid(err);
 }

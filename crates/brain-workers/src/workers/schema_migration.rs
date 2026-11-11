@@ -30,6 +30,7 @@
 //!   decisions but it doesn't gate query correctness. A missed sweep
 //!   degrades observability, not data.
 
+use brain_metadata::DeclScope;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -269,7 +270,7 @@ impl SchemaMigrationWorker {
             let rtxn = metadata
                 .read_txn()
                 .map_err(|e| WorkerError::Internal(format!("flag_sweep rtxn: {e}")))?;
-            predicates_active_for_schema(&rtxn, &job.namespace, job.new_version)
+            predicates_active_for_schema(&rtxn, DeclScope::base(&job.namespace), job.new_version)
                 .map_err(|e| WorkerError::Internal(format!("flag_sweep active vocab: {e}")))?
         };
 
@@ -581,7 +582,9 @@ mod tests {
         predicate_name: &str,
     ) -> (StatementId, PredicateId) {
         let wtxn = metadata.write_txn().unwrap();
-        let pid = predicate_intern_or_get(&wtxn, namespace, predicate_name, 0, NOW).unwrap();
+        let pid =
+            predicate_intern_or_get(&wtxn, DeclScope::base(namespace), predicate_name, 0, NOW)
+                .unwrap();
         let evidence_entry = EvidenceEntry::from_parts(
             MemoryId::pack(1, SessionId::DEFAULT.into(), 0),
             1.0,
@@ -608,7 +611,13 @@ mod tests {
 
     fn upload_schema(metadata: &SharedMetadataDb, schema: &ValidatedSchema) -> u32 {
         let wtxn = metadata.write_txn().unwrap();
-        let v = schema_upload(&wtxn, schema, NOW).unwrap();
+        let v = schema_upload(
+            &wtxn,
+            schema,
+            brain_metadata::tables::scope::SPACE_BASE,
+            NOW,
+        )
+        .unwrap();
         wtxn.commit().unwrap();
         v
     }

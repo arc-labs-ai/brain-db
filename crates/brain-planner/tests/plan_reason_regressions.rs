@@ -14,6 +14,7 @@
 //! MetadataDb + HNSW + deterministic embedder, driven through the
 //! production planner (`plan_*_inner`) and executor entry points.
 
+use brain_metadata::DeclScope;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -208,7 +209,7 @@ fn make_predicate(metadata: &MetadataDb, name: &str) -> PredicateId {
     let wtxn = metadata.write_txn().unwrap();
     let id = predicate_intern(
         &wtxn,
-        "test",
+        DeclScope::base("test"),
         name,
         Some(StatementKind::Fact),
         1,

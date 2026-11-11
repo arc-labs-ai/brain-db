@@ -366,6 +366,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "brain-crypto"
+version = "0.4.0"
+dependencies = [
+ "aws-lc-rs",
+ "rkyv",
+ "tempfile",
+ "thiserror 1.0.69",
+ "zeroize",
+]
+
+[[package]]
 name = "brain-embed"
 version = "0.4.0"
 dependencies = [
@@ -490,6 +501,7 @@ version = "0.4.0"
 dependencies = [
  "blake3",
  "brain-core",
+ "brain-crypto",
  "brain-protocol",
  "brain-storage",
  "bytemuck",
@@ -507,6 +519,7 @@ dependencies = [
  "tracing",
  "unicode-normalization",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -516,6 +529,7 @@ dependencies = [
  "arc-swap",
  "blake3",
  "brain-core",
+ "brain-crypto",
  "brain-embed",
  "brain-extractors",
  "brain-index",
@@ -627,6 +641,7 @@ dependencies = [
  "base64 0.22.1",
  "blake3",
  "brain-core",
+ "brain-crypto",
  "brain-embed",
  "brain-extractors",
  "brain-http",

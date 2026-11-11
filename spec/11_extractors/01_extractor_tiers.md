@@ -391,21 +391,16 @@ Two transports ship in v1:
 - `AnthropicClient` (claude-* models).
 - `OpenAIClient` (gpt-*, o1-*, o3-*), with JSON-schema structured output mode.
 
-Neither addresses the provider directly. Both are constructed against the
-broker's base URL, so their requests go to the edge and are re-signed there;
-the upstream endpoint is the broker's concern, not Brain's.
+Both address the provider directly, constructed with the key the namespace
+registered and opened for the duration of the call.
 
-The provider is chosen by model-id prefix:
+The provider is the one stored with the credential, not a guess from the model
+id. A tenant on a provider-specific model name is therefore never routed to the
+wrong wire dialect.
 
-| Prefix | Provider |
-|---|---|
-| `claude-*`, `anthropic/*` | Anthropic |
-| `gpt-*`, `o1-*`, `o3-*`, `openai/*` | OpenAI |
-
-The schema-declared `model:` field is a **preference, not a command**. It is
-passed to the resolver as `preferred_model`, and the broker serves whatever
-model the namespace's registered key actually covers — which may be a different
-one. That is not a limitation to work around: a tenant's key can only pay for
+The schema-declared `model:` field is a **preference, not a command**. The
+resolver serves the model the namespace registered a key for, which may be a
+different one. That is not a limitation to work around: a tenant's key can only pay for
 what it is a key for, so honouring an extractor's declared model over the
 tenant's registration would mean issuing a call that cannot be billed to anyone.
 
@@ -414,14 +409,14 @@ warn-level diagnostic and registers the extractor in degraded mode).
 
 #### 19.1 The credential is per namespace, and there is no other kind
 
-A tier that needs an LLM asks an `LlmCredentialResolver` for the client belonging to a **namespace**. There is no global router to fall back to, no shard-startup provider key, and therefore no `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` env-var gate on which providers are "enabled": the provider is whatever the broker names for that namespace, decided when a request arrives.
+A tier that needs an LLM asks an `LlmCredentialResolver` for the client belonging to a **namespace**. There is no global router to fall back to, no shard-startup provider key, and therefore no `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` env-var gate on which providers are "enabled": the provider is whatever that namespace registered, decided when a request arrives.
 
-This is the only path. Brain holds no provider credential and no configuration can give it one — the full invariant is in [`./00_purpose.md`](00_purpose.md) §"The LLM tier's credential", along with the cache TTLs and the `Missing`-vs-`Unavailable` split.
+This is the only path. A deployment holds no provider credential of its own and no configuration can give it one — the full invariant is in [`./00_purpose.md`](00_purpose.md) §"The LLM tier's credential", along with the self-invalidating client cache and the `Missing`-vs-`Unavailable` split.
 
 Two consequences for this tier specifically:
 
-- **The client's base URL carries the namespace.** It is built as `{edge}/llm/ns/{namespace}/{provider}`, and the bearer token is the broker grant rather than a provider key. The two client implementations are reused verbatim; neither knows a broker exists.
-- **A namespace with no key does not fail the write.** The tier reports that it could not run — `StageOutcome::Failed` with a reason, surfaced on the `StageCompleted` event and in the encode trace — and the pattern and classifier tiers still contribute. The caller gets entities without statements, and is told why.
+- **The client is built from the namespace's own key**, opened from the credential store for the call and dropped after it. The two client implementations are reused verbatim.
+- **A namespace with no key never reaches this tier.** ENCODE is refused at admission with `LlmCredentialMissing`, because HyPE needs the same key. When a credential merely could not be *resolved*, the write lands and the tier reports `StageOutcome::Failed` with a reason on the `StageCompleted` event and in the encode trace, while the pattern and classifier tiers still contribute — the caller gets entities without statements, and is told why.
 
 #### 19.2 Reasoning models need a budget that covers reasoning
 
@@ -443,7 +438,7 @@ adds the model and a **credential scope** to the key:
 LlmCacheKey = (input_hash, extractor_id, extractor_version, model_id, credential_scope)
 ```
 
-The credential scope is what keeps one tenant's paid completion from being served to another tenant that hashes to the same input. It is derived from the grant or the tenant id, never from key material — which no part of this process has, so the rule is enforced by what is available rather than by remembering to follow it. The scope is **last** in the key so the TTL sweeper can still resolve a hint back to a prefix range.
+The credential scope is what keeps one tenant's paid completion from being served to another tenant that hashes to the same input. It is derived from the namespace, never from key material — a scope is hashed into persisted rows and shown in diagnostics, and neither is a place for a key. The scope is **last** in the key so the TTL sweeper can still resolve a hint back to a prefix range.
 
 `predict` flow:
 

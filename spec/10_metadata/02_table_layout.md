@@ -264,7 +264,7 @@ Each primary table stays id-keyed with the owner scope on the row value; each se
 | `entity_types` | EntityTypeId | EntityType definition | Interned entity types |
 | `relation_types` | RelationTypeId | RelationType definition | Interned relation types |
 | `extractors` | ExtractorId | ExtractorDefinition | Active extractors |
-| `schema_versions` | u32 | SchemaDocument | Schema history |
+| `schema_versions` | (namespace_id, space_id, version) | SchemaDocument | Schema history, per scope |
 | `extractor_audit` | AuditId | ExtractionAudit | Per-extraction audit |
 | `entity_resolution_audit` | AuditId | ResolutionAudit | Per-resolution audit |
 | `statement_contradiction_audit` | (subject, predicate_id) | ContradictionAudit | Open Fact-vs-Fact contradictions |
@@ -273,7 +273,10 @@ Each primary table stays id-keyed with the owner scope on the row value; each se
 | `merge_review_queue` / `merge_review_by_status` | (scope, EntityId) / (status, …) | ReviewItem / () | Ambiguous-band resolutions awaiting re-check |
 | `entity_by_type` | (namespace_id, space_id, entity_type_id, EntityId) | () | Type-filtered `ENTITY_LIST` |
 | `entity_vectors` | EntityId | vector bytes | Durable entity embeddings for tier-3 resolution |
-| `entity_types_by_scope` | (namespace_id, name) | EntityTypeId | Type name → id within a namespace |
+| `entity_types_by_scope` | (namespace_id, space_id, name) | EntityTypeId | Type name → id. `space_id` all-zero is the namespace-wide base; a non-zero space is an overlay only that space resolves. Lookup walks `(ns, space) → (ns, base) → (SYSTEM, base)`, narrowest first |
+| `predicates_by_scope` | (qname, space_id) | PredicateId | Predicate name → id, same base/overlay rule. `qname` leads because it already carries the namespace (`"namespace:name"`), and a qname-first key keeps every space's copy of one name a contiguous range, so "is this declared in any space" is a range scan |
+| `relation_types_by_scope` | (qname, space_id) | RelationTypeId | As `predicates_by_scope` |
+| `extractors_by_scope` | (qname, space_id) | ExtractorId | As `predicates_by_scope` |
 | `statements_by_subject_id` / `statements_by_predicate_id` | id-keyed variants | StatementId | Lookups that have the interned id rather than the qname |
 | `statement_embed_queue` | StatementId | queue entry | Pending statement embeddings |
 | `statement_question_vectors` | StatementId | vectors | Per-statement question embeddings |
@@ -285,7 +288,7 @@ Each primary table stays id-keyed with the owner scope on the row value; each se
 | `extractors_by_qname` | (namespace_id, qname) | ExtractorId | Extractor lookup by name |
 | `extractor_audit_by_memory` / `_by_extractor` / `_by_time` | scope-prefixed composites | AuditId | The three axes an operator queries the audit on |
 | `extractor_pipeline_audit` | MemoryId | PipelineAudit | Per-memory record of which tiers ran and what they produced |
-| `schema_active_versions` | (namespace_id) | u32 | Which stored version is live for a namespace |
+| `schema_active_versions` | (namespace_id, space_id) | u32 | Which stored version is live for a scope. `space_id` all-zero is the namespace base; versions count per scope, so a space's first upload is version 1 even when the base is at 7 |
 
 There are no `relations_by_from` / `relations_by_to` tables. A typed relation is an edge, and every edge in Brain lives in the unified `edges` / `edges_reverse` pair (§3) — directional relation queries are prefix scans there, disambiguated by the trailing `RelationId`. The relation's non-edge fields (properties, evidence, validity window, supersession chain) live in `relation_metadata`.
 
@@ -294,6 +297,8 @@ The same composite-key + rkyv-value conventions apply (§4, §5).
 ## 16. Per-shard non-redb storage
 
 Every shard maintains derived indexes outside `metadata.redb`: two tantivy directories (memory text, statement text), three HNSW corpora (memory, entity, statement), and a separate redb file for the LLM response cache (`llm_responses` + `llm_response_ttl`). These are present from byte zero, not activated by a schema upload.
+
+One piece of durable state is **not** per shard. `llm_credentials.redb`, at the data-directory root, holds every tenant's sealed LLM provider key keyed `(namespace, space)`: there is one answer per scope and every shard has to resolve the same one. Its sealing key is `llm_credential_kek` in the same directory unless `[llm.credentials] kek` supplies one. A backup that captures the store without the key file restores nothing usable, and one that captures both together carries the plaintext-equivalent — so they are worth separating deliberately rather than by accident.
 
 The LLM cache is **not** migrated across a BYOK boundary. Its key includes a credential-scope component, and rows written before that component existed cannot say which credential paid for them — serving them under per-namespace credentials would be exactly the cross-tenant reuse the scope exists to prevent. A pre-BYOK cache file is refused rather than adopted.
 

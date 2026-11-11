@@ -10,10 +10,11 @@
 //! - [`client`] — `LlmClient` trait + `LlmFuture`.
 //! - [`error`] — `LlmError` taxonomy.
 //! - [`router`] — `ModelRouter` + `Provider` (maps model id → provider).
-//! - [`broker`] — `BrokerResolver`: resolves a namespace's credential by
-//!   asking `brain-edge`, which holds the sealed provider key.
-//! - [`resolver`] — `LlmCredentialResolver` (maps namespace → credential,
-//!   the BYOK seam) + `CredentialScope` for cache-key isolation.
+//! - [`resolver`] — `LlmCredentialResolver` (maps namespace → credential),
+//!   plus `CredentialScope` for cache-key isolation. The production
+//!   implementation lives in `brain-server`, over Brain's own credential
+//!   store; the two resolvers here serve one client to every namespace and
+//!   exist for tests and for embedding a hand-built client.
 //! - [`providers`] — concrete impls (`AnthropicClient`, `OpenAIClient`).
 
 #![allow(
@@ -23,7 +24,6 @@
 )]
 #![forbid(unsafe_code)]
 
-pub mod broker;
 pub mod client;
 pub mod error;
 pub mod providers;
@@ -31,13 +31,12 @@ pub mod resolver;
 pub mod router;
 pub mod types;
 
-pub use broker::BrokerResolver;
 pub use client::LlmClient;
 pub use error::{FailureClass, LlmError};
 pub use providers::{AnthropicClient, OpenAIClient};
 pub use resolver::{
     CredentialFuture, CredentialOutcome, CredentialScope, FixedResolver, LlmCredentialResolver,
-    ResolvedCredential, StaticResolver,
+    ResolvedCredential, RouterResolver,
 };
 pub use router::{ModelRouter, Provider};
 pub use types::{LlmMessage, LlmRequest, LlmResponse, LlmRole};

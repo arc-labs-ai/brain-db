@@ -18,6 +18,7 @@ pub mod forget_undo;
 pub mod hype;
 pub mod idempotency;
 pub mod kind;
+pub mod llm_credential;
 pub mod memory;
 pub mod memory_artifacts;
 pub mod memory_vector;
@@ -111,7 +112,7 @@ pub fn materialize_all_tables(wtxn: &::redb::WriteTransaction) -> Result<(), ::r
     };
     use entity_type::ENTITY_TYPES_TABLE;
     use extraction_queue::EXTRACTION_QUEUE_TABLE;
-    use extractor::{EXTRACTORS_BY_QNAME_TABLE, EXTRACTORS_TABLE};
+    use extractor::{EXTRACTORS_BY_SCOPE_TABLE, EXTRACTORS_TABLE};
     use extractor_audit::EXTRACTOR_PIPELINE_AUDIT_TABLE;
     use fingerprint::FINGERPRINTS_TABLE;
     use forget_undo::FORGET_UNDO_LOG_TABLE;
@@ -123,11 +124,11 @@ pub fn materialize_all_tables(wtxn: &::redb::WriteTransaction) -> Result<(), ::r
     use model_fingerprint::MODEL_FINGERPRINTS_TABLE;
     use namespace::{NAMESPACES_TABLE, NAMESPACE_BY_NAME_TABLE};
     use next_lsn::NEXT_LSN_TABLE;
-    use predicate::{PREDICATES_BY_QNAME_TABLE, PREDICATES_TABLE, PREDICATE_EMBEDDINGS_TABLE};
+    use predicate::{PREDICATES_BY_SCOPE_TABLE, PREDICATES_TABLE, PREDICATE_EMBEDDINGS_TABLE};
     use relation::{
         RELATION_BY_EVIDENCE_TABLE, RELATION_METADATA_TABLE, RELATION_TYPE_EMBEDDINGS_TABLE,
     };
-    use relation_type::{RELATION_TYPES_BY_QNAME_TABLE, RELATION_TYPES_TABLE};
+    use relation_type::{RELATION_TYPES_BY_SCOPE_TABLE, RELATION_TYPES_TABLE};
     use schema_version::{SCHEMA_ACTIVE_VERSIONS_TABLE, SCHEMA_VERSIONS_TABLE};
     use session::{SESSIONS_TABLE, SESSION_BY_SCOPE_TABLE};
     use slot_version::SLOT_VERSIONS_TABLE;
@@ -164,7 +165,7 @@ pub fn materialize_all_tables(wtxn: &::redb::WriteTransaction) -> Result<(), ::r
     let _ = wtxn.open_table(ENTITY_VECTORS_TABLE)?;
     let _ = wtxn.open_table(EXTRACTION_QUEUE_TABLE)?;
     let _ = wtxn.open_table(EXTRACTORS_TABLE)?;
-    let _ = wtxn.open_table(EXTRACTORS_BY_QNAME_TABLE)?;
+    let _ = wtxn.open_table(EXTRACTORS_BY_SCOPE_TABLE)?;
     let _ = wtxn.open_table(EXTRACTOR_PIPELINE_AUDIT_TABLE)?;
     let _ = wtxn.open_table(FINGERPRINTS_TABLE)?;
     let _ = wtxn.open_table(FORGET_UNDO_LOG_TABLE)?;
@@ -182,12 +183,12 @@ pub fn materialize_all_tables(wtxn: &::redb::WriteTransaction) -> Result<(), ::r
     let _ = wtxn.open_table(NAMESPACE_BY_NAME_TABLE)?;
     let _ = wtxn.open_table(NEXT_LSN_TABLE)?;
     let _ = wtxn.open_table(PREDICATES_TABLE)?;
-    let _ = wtxn.open_table(PREDICATES_BY_QNAME_TABLE)?;
+    let _ = wtxn.open_table(PREDICATES_BY_SCOPE_TABLE)?;
     let _ = wtxn.open_table(PREDICATE_EMBEDDINGS_TABLE)?;
     let _ = wtxn.open_table(RELATION_METADATA_TABLE)?;
     let _ = wtxn.open_table(RELATION_BY_EVIDENCE_TABLE)?;
     let _ = wtxn.open_table(RELATION_TYPES_TABLE)?;
-    let _ = wtxn.open_table(RELATION_TYPES_BY_QNAME_TABLE)?;
+    let _ = wtxn.open_table(RELATION_TYPES_BY_SCOPE_TABLE)?;
     let _ = wtxn.open_table(RELATION_TYPE_EMBEDDINGS_TABLE)?;
     let _ = wtxn.open_table(SCHEMA_VERSIONS_TABLE)?;
     let _ = wtxn.open_table(SCHEMA_ACTIVE_VERSIONS_TABLE)?;

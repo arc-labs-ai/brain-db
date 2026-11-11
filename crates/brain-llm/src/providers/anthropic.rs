@@ -1,7 +1,7 @@
 //! Anthropic Messages API client.
 //!
 //! POST `https://api.anthropic.com/v1/messages`. Constructed with the
-//! single resolved credential (`[llm] api_key` / `BRAIN__LLM__API_KEY`);
+//! credential the caller's namespace registered;
 //! deployments without the key produce a `None` client that the registry
 //! materializer routes through degraded extractors.
 //!
@@ -88,7 +88,7 @@ impl std::fmt::Debug for AnthropicClient {
 impl AnthropicClient {
     /// Construct with an explicit API key against the default endpoint.
     /// The key comes from the single resolved credential (`[llm] api_key`
-    /// / `BRAIN__LLM__API_KEY`). Returns `None` for an empty key so
+    /// from the credential store). Returns `None` for an empty key so
     /// callers can fall back uniformly.
     pub fn with_key(model: impl Into<String>, api_key: impl Into<String>) -> Option<Self> {
         let key = api_key.into();

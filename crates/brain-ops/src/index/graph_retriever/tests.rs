@@ -1,5 +1,6 @@
 //! Unit tests for `BrainGraphRetriever`.
 
+use brain_metadata::DeclScope;
 use std::sync::Arc;
 
 use brain_core::{Cardinality, Relation};
@@ -27,7 +28,7 @@ fn ensure_person_type(metadata: &MetadataDb) -> EntityTypeId {
     let wtxn = metadata.write_txn().expect("wtxn");
     let id = entity_type_intern(
         &wtxn,
-        brain_core::NamespaceId::SYSTEM.raw(),
+        brain_metadata::TypeScope::base(brain_core::NamespaceId::SYSTEM.raw()),
         PERSON_TYPE,
         Vec::new(),
         0,
@@ -61,7 +62,7 @@ fn intern_relation_type(metadata: &Arc<MetadataDb>, namespace: &str, name: &str)
     let wtxn = metadata.write_txn().expect("wtxn");
     let id = relation_type_intern(
         &wtxn,
-        namespace,
+        DeclScope::base(namespace),
         name,
         None,
         None,
@@ -107,7 +108,7 @@ fn current_person_type(metadata: &Arc<MetadataDb>) -> EntityTypeId {
     let wtxn = metadata.write_txn().expect("wtxn");
     let id = entity_type_intern(
         &wtxn,
-        brain_core::NamespaceId::SYSTEM.raw(),
+        brain_metadata::TypeScope::base(brain_core::NamespaceId::SYSTEM.raw()),
         PERSON_TYPE,
         Vec::new(),
         0,
@@ -1215,8 +1216,18 @@ mod unified_walk {
         // depend on literal/value plumbing.
         let predicate_id = {
             let wtxn = metadata.write_txn().expect("wtxn");
-            let id = predicate_intern(&wtxn, "brain", "knows_about", None, 0, 1, "", false, 0)
-                .expect("predicate");
+            let id = predicate_intern(
+                &wtxn,
+                DeclScope::base("brain"),
+                "knows_about",
+                None,
+                0,
+                1,
+                "",
+                false,
+                0,
+            )
+            .expect("predicate");
             wtxn.commit().expect("commit");
             id
         };

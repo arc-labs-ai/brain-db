@@ -1,3 +1,4 @@
 {
-  "schema_document": "namespace org\ndefine relation_type mentors { from Person to Person }\n"
+  "schema_document": "namespace org\ndefine relation_type mentors { from Person to Person }\n",
+  "scope": 0
 }

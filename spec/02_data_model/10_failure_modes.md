@@ -159,3 +159,16 @@ A clean abort path exists: if the operator wants to revert the model change, swi
 
 **Implication.** Clients should validate before submitting. Clients should validate before submitting; the server also validates server-side.
 
+## 16. ENCODE refused for a missing LLM credential
+
+**Failure mode.** A namespace with no registered LLM provider credential submits an `ENCODE`.
+
+**Detection.** The ENCODE validation step probes the local credential store for the caller's namespace. The store is local, so the probe is one point read and the answer is definitive: a namespace with no registered key has **every** ENCODE refused, not an unlucky fraction of them.
+
+**Response.** `LlmCredentialMissing` (`0x0066`, category `Conflict`). **Terminal** — retrying cannot conjure a key; the tenant registers one with `LLM_CREDENTIAL_PUT`. It is `Conflict` rather than a validation error because the request itself is well-formed: it is the namespace's configuration state that cannot satisfy it.
+
+**Why refuse rather than degrade.** HyPE and the extraction tier both need a provider key. A write admitted without one lands as text with no questions, no entities and no statements — it looks stored, and recall quietly gets worse.
+
+**The distinct non-refusal case.** A credential that merely cannot be *resolved* right now — a storage fault, or a sealing key that is no longer loaded — **admits** the write, because neither is evidence that the tenant has no key. The derivation stages re-resolve and retry when they run; if they still cannot, the encode trace reports `StageOutcome::Failed` for that stage. A caller diagnosing an empty graph reads the stage statuses to tell "could not run" from "this text warranted no questions".
+
+**Implication.** Register a credential per namespace before the first write.

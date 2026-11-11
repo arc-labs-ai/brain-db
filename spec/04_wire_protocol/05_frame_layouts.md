@@ -18,12 +18,13 @@ struct ActAs {
 
 The selector field is named `space`, not `space_id`. `space_id` is the derived 16-byte storage id (`UUIDv5(namespace, space)`) everywhere else in this protocol; the input string that it is derived from is a different value and carries a different name. The server derives `space_id` at request ingress and never parses the string for sub-scopes.
 
-`act_as: Option<ActAs>` appears on **every tenant-scoped request** — all 53 of them:
+`act_as: Option<ActAs>` appears on **every tenant-scoped request** — all 57 of them:
 
 | Family | Requests carrying `act_as` |
 |---|---|
 | Cognitive | `ENCODE`, `ENCODE_VECTOR_DIRECT`, `RECALL`, `PLAN`, `REASON`, `FORGET`, `LINK`, `UNLINK`, `MEMORY_LIST`, `MEMORY_INSPECT` |
 | Registry | `SPACE_CREATE`, `SPACE_LIST`, `SPACE_DELETE`, `SESSION_CREATE`, `SESSION_LIST`, `SESSION_DELETE` |
+| LLM credential | `LLM_CREDENTIAL_PUT`, `LLM_CREDENTIAL_GET`, `LLM_CREDENTIAL_DELETE`, `LLM_CREDENTIAL_VERIFY` |
 | Schema | `SCHEMA_UPLOAD`, `SCHEMA_GET`, `SCHEMA_LIST`, `SCHEMA_VALIDATE`, `SCHEMA_REPLACE`, `SCHEMA_DROP` |
 | Entity | `ENTITY_CREATE`, `ENTITY_GET`, `ENTITY_UPDATE`, `ENTITY_RENAME`, `ENTITY_MERGE`, `ENTITY_UNMERGE`, `ENTITY_RESOLVE`, `ENTITY_LIST`, `ENTITY_TOMBSTONE` |
 | Statement | `STATEMENT_CREATE`, `STATEMENT_GET`, `STATEMENT_SUPERSEDE`, `STATEMENT_TOMBSTONE`, `STATEMENT_RETRACT`, `STATEMENT_HISTORY`, `STATEMENT_LIST` |
@@ -662,6 +663,94 @@ struct SessionDeleteRequest {
 `SESSION_CREATE` is idempotent. `SESSION_LIST` returns one space's sessions newest-first by `last_active`. The default session (`session_id = 0`) is **non-deletable**.
 
 These are the tenant-facing registry ops. The admin-gated `ADMIN_CREATE_SESSION` / `ADMIN_RENAME_SESSION` (§21, §22) are a separate operator surface: they name sessions and are not `act_as`-aware.
+
+### 33a. LLM_CREDENTIAL_PUT_REQ (0x76) / GET (0x77) / DELETE (0x78) / VERIFY (0x79)
+
+A namespace's own LLM provider key. **Non-admin**, gated on `LLM_CREDENTIAL`
+(bit 7), and keyed off the namespace the caller's API key is bound to — never
+off anything in the body, so a key can only ever act on its own tenant's
+credential.
+
+```rust
+enum CredentialScope {                       // always encoded, never omitted
+    Namespace = 0,                           // the tenant's namespace-wide key
+    Space = 1,                               // refused at the op today — see below
+}
+
+struct LlmCredentialPutRequest {
+    provider: String,                        // "openai" | "anthropic"
+    model: String,                           // what this key should serve
+    api_key: String,                         // sealed on arrival; never returned
+    request_id: RequestId,
+    act_as: Option<ActAs>,
+    scope: CredentialScope,
+}
+
+struct LlmCredentialGetRequest {
+    act_as: Option<ActAs>,
+    scope: CredentialScope,
+}
+
+struct LlmCredentialDeleteRequest {
+    request_id: RequestId,
+    act_as: Option<ActAs>,
+    scope: CredentialScope,
+}
+
+struct LlmCredentialVerifyRequest {
+    request_id: RequestId,
+    act_as: Option<ActAs>,
+    scope: CredentialScope,
+}
+```
+
+```rust
+struct LlmCredentialView {
+    provider: String,
+    model: String,
+    fingerprint: String,                     // display-safe tail, e.g. "…4f2a"
+    created_at_unix_nanos: u64,
+    inherited: bool,                         // always false today; turns true with space scope
+}
+
+struct LlmCredentialGetResponse {
+    credential: Option<LlmCredentialView>,   // absent until the tenant registers one
+}
+
+struct LlmCredentialDeleteResponse {
+    existed: bool,                           // false when that scope owned nothing
+}
+
+enum VerifyOutcome {
+    Ok,                                      // the provider accepts the key and serves the model
+    NoCredential,
+    Unauthorized,                            // the provider rejected it — register a new one
+    ModelUnavailable,                        // the key works, the registered model does not
+    Unreachable,                             // says nothing about the key
+}
+```
+
+**`api_key` is the only plaintext key anywhere in this protocol.** The op is
+refused unless the connection is TLS, mTLS, or a loopback peer. Nothing a read
+returns can reconstruct it: `fingerprint` is a tail short enough not to narrow
+a search for the rest.
+
+`PUT` reports `replaced` so a first registration is distinguishable from a
+rotation. `DELETE` reports `existed` rather than always succeeding, because a
+caller revoking during an incident needs to tell "revoked" from "there was
+nothing there". `VERIFY` reports an outcome rather than failing — a key the
+provider rejects is a *successful* verification that says the key is bad — and
+resolves through the same path derivation uses, so a pass means the path
+extraction will take actually works.
+
+Writes land at exactly the scope they name; reads walk narrowest-first in the
+storage layer. `Space` is **refused at the op** (`NOT_YET_IMPLEMENTED`) while
+derivation resolves credentials at the namespace base — a space-scoped key
+would seal successfully and then never be used, so accepting it would leave a
+tenant with a credential that silently does nothing. The asymmetry it will
+have matches schema declarations (§03/04): nearly every request names a space,
+so inferring the scope would turn every ordinary tenant-wide registration into
+a per-space override its sibling spaces cannot see.
 
 ### 34. EXTRACTOR_LIST_REQ (0x124)
 

@@ -25,6 +25,7 @@ use brain_metadata::schema::store::{schema_active, schema_get, schema_upload};
 use brain_metadata::tables::materialize_all_tables;
 use brain_metadata::tables::predicate::{PredicateDefinition, PREDICATES_TABLE};
 use brain_metadata::tables::schema_version::{SCHEMA_ACTIVE_VERSIONS_TABLE, SCHEMA_VERSIONS_TABLE};
+use brain_metadata::DeclScope;
 use brain_protocol::schema::{parse_schema, validate, ValidatedSchema};
 use redb::{Database, ReadableDatabase, ReadableTable};
 
@@ -88,7 +89,13 @@ fn dropped_txn_leaves_no_version_row_and_no_active_pointer() {
     // Step 1: run schema_upload inside a wtxn, then drop without commit.
     {
         let wtxn = db.begin_write().unwrap();
-        let v = schema_upload(&wtxn, &acme_v1(), T0).expect("upload runs");
+        let v = schema_upload(
+            &wtxn,
+            &acme_v1(),
+            brain_metadata::tables::scope::SPACE_BASE,
+            T0,
+        )
+        .expect("upload runs");
         assert_eq!(v, 1, "first upload allocates v1 in-txn");
         // Intentional: no commit. `wtxn` drops here.
     }
@@ -97,12 +104,14 @@ fn dropped_txn_leaves_no_version_row_and_no_active_pointer() {
     // active pointer.
     let rtxn = db.begin_read().unwrap();
     assert_eq!(
-        schema_active(&rtxn, "acme").unwrap(),
+        schema_active(&rtxn, DeclScope::base("acme")).unwrap(),
         None,
         "active pointer must not be observable post-drop",
     );
     assert!(
-        schema_get(&rtxn, "acme", 1).unwrap().is_none(),
+        schema_get(&rtxn, DeclScope::base("acme"), 1)
+            .unwrap()
+            .is_none(),
         "version row must not be observable post-drop",
     );
 
@@ -127,7 +136,13 @@ fn dropped_txn_leaves_no_interned_predicates() {
 
     {
         let wtxn = db.begin_write().unwrap();
-        let v = schema_upload(&wtxn, &acme_v1(), T0).unwrap();
+        let v = schema_upload(
+            &wtxn,
+            &acme_v1(),
+            brain_metadata::tables::scope::SPACE_BASE,
+            T0,
+        )
+        .unwrap();
         assert_eq!(v, 1);
         // Drop without commit.
     }
@@ -137,7 +152,7 @@ fn dropped_txn_leaves_no_interned_predicates() {
     // open-vocabulary call on a fresh raw DB: id allocation starts
     // at 1.
     let wtxn = db.begin_write().unwrap();
-    let id = predicate_intern_or_get(&wtxn, "acme", "prefers", 0, 0).unwrap();
+    let id = predicate_intern_or_get(&wtxn, DeclScope::base("acme"), "prefers", 0, 0).unwrap();
     wtxn.commit().unwrap();
     assert_eq!(
         id.raw(),
@@ -172,29 +187,54 @@ fn replay_after_abort_lands_at_v1_not_v2() {
     // Aborted attempt 1.
     {
         let wtxn = db.begin_write().unwrap();
-        let _ = schema_upload(&wtxn, &acme_v1(), T0).unwrap();
+        let _ = schema_upload(
+            &wtxn,
+            &acme_v1(),
+            brain_metadata::tables::scope::SPACE_BASE,
+            T0,
+        )
+        .unwrap();
         // Drop.
     }
     // Aborted attempt 2.
     {
         let wtxn = db.begin_write().unwrap();
-        let _ = schema_upload(&wtxn, &acme_v1(), T0 + 1).unwrap();
+        let _ = schema_upload(
+            &wtxn,
+            &acme_v1(),
+            brain_metadata::tables::scope::SPACE_BASE,
+            T0 + 1,
+        )
+        .unwrap();
         // Drop.
     }
 
     // Successful third attempt.
     {
         let wtxn = db.begin_write().unwrap();
-        let v = schema_upload(&wtxn, &acme_v1(), T0 + 2).unwrap();
+        let v = schema_upload(
+            &wtxn,
+            &acme_v1(),
+            brain_metadata::tables::scope::SPACE_BASE,
+            T0 + 2,
+        )
+        .unwrap();
         assert_eq!(v, 1, "first *committed* upload must be v1");
         wtxn.commit().unwrap();
     }
 
     let rtxn = db.begin_read().unwrap();
-    assert_eq!(schema_active(&rtxn, "acme").unwrap(), Some(1));
-    assert!(schema_get(&rtxn, "acme", 1).unwrap().is_some());
+    assert_eq!(
+        schema_active(&rtxn, DeclScope::base("acme")).unwrap(),
+        Some(1)
+    );
+    assert!(schema_get(&rtxn, DeclScope::base("acme"), 1)
+        .unwrap()
+        .is_some());
     assert!(
-        schema_get(&rtxn, "acme", 2).unwrap().is_none(),
+        schema_get(&rtxn, DeclScope::base("acme"), 2)
+            .unwrap()
+            .is_none(),
         "no ghost v2 row from aborted attempts",
     );
 }
@@ -206,7 +246,13 @@ fn committed_v1_then_aborted_v2_leaves_active_at_v1() {
 
     {
         let wtxn = db.begin_write().unwrap();
-        schema_upload(&wtxn, &acme_v1(), T0).unwrap();
+        schema_upload(
+            &wtxn,
+            &acme_v1(),
+            brain_metadata::tables::scope::SPACE_BASE,
+            T0,
+        )
+        .unwrap();
         wtxn.commit().unwrap();
     }
 
@@ -218,14 +264,24 @@ fn committed_v1_then_aborted_v2_leaves_active_at_v1() {
     // before commit — atomicity must ensure nothing persists.
     {
         let wtxn = db.begin_write().unwrap();
-        let _ = schema_upload(&wtxn, &acme_v2_extends_v1(), T0 + 1);
+        let _ = schema_upload(
+            &wtxn,
+            &acme_v2_extends_v1(),
+            brain_metadata::tables::scope::SPACE_BASE,
+            T0 + 1,
+        );
         // Drop without commit.
     }
 
     // Active pointer must still be v1; v2 row must not exist.
     let rtxn = db.begin_read().unwrap();
-    assert_eq!(schema_active(&rtxn, "acme").unwrap(), Some(1));
-    assert!(schema_get(&rtxn, "acme", 2).unwrap().is_none());
+    assert_eq!(
+        schema_active(&rtxn, DeclScope::base("acme")).unwrap(),
+        Some(1)
+    );
+    assert!(schema_get(&rtxn, DeclScope::base("acme"), 2)
+        .unwrap()
+        .is_none());
 
     // The new predicate (`dislikes`) declared only in the aborted v2
     // must not be visible in the predicate registry.
@@ -259,15 +315,21 @@ fn caller_writes_share_atomicity_with_schema_upload() {
 
     {
         let wtxn = db.begin_write().unwrap();
-        schema_upload(&wtxn, &acme_v1(), T0).unwrap();
+        schema_upload(
+            &wtxn,
+            &acme_v1(),
+            brain_metadata::tables::scope::SPACE_BASE,
+            T0,
+        )
+        .unwrap();
         // Caller writes an unrelated predicate in the same txn.
-        predicate_intern_or_get(&wtxn, "other", "noted", 0, T0).unwrap();
+        predicate_intern_or_get(&wtxn, DeclScope::base("other"), "noted", 0, T0).unwrap();
         // Drop without commit.
     }
 
     // Neither side-effect persists.
     let rtxn = db.begin_read().unwrap();
-    assert_eq!(schema_active(&rtxn, "acme").unwrap(), None);
+    assert_eq!(schema_active(&rtxn, DeclScope::base("acme")).unwrap(), None);
     if let Ok(t) = rtxn.open_table(PREDICATES_TABLE) {
         for entry in t.iter().unwrap() {
             let (_, v) = entry.unwrap();
@@ -296,13 +358,24 @@ fn committed_upload_is_fully_observable() {
     let db = fresh_db(&dir);
     {
         let wtxn = db.begin_write().unwrap();
-        let v = schema_upload(&wtxn, &acme_v1(), T0).unwrap();
+        let v = schema_upload(
+            &wtxn,
+            &acme_v1(),
+            brain_metadata::tables::scope::SPACE_BASE,
+            T0,
+        )
+        .unwrap();
         assert_eq!(v, 1);
         wtxn.commit().unwrap();
     }
     let rtxn = db.begin_read().unwrap();
-    assert_eq!(schema_active(&rtxn, "acme").unwrap(), Some(1));
-    let row = schema_get(&rtxn, "acme", 1).unwrap().expect("row exists");
+    assert_eq!(
+        schema_active(&rtxn, DeclScope::base("acme")).unwrap(),
+        Some(1)
+    );
+    let row = schema_get(&rtxn, DeclScope::base("acme"), 1)
+        .unwrap()
+        .expect("row exists");
     assert_eq!(row.namespace, "acme");
     assert_eq!(row.version, 1);
 

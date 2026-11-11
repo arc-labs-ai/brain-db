@@ -11,6 +11,7 @@
 //! alignment factor produces the expected multiplicative effect when
 //! the base set is meaningful).
 
+use brain_metadata::DeclScope;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -69,7 +70,7 @@ fn make_test_predicate(metadata: &MetadataDb, name: &str) -> PredicateId {
     let wtxn = metadata.write_txn().unwrap();
     let id = predicate_intern(
         &wtxn,
-        "test",
+        DeclScope::base("test"),
         name,
         Some(StatementKind::Fact),
         /* object: Entity */ 1,

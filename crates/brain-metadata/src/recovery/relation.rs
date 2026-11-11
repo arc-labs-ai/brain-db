@@ -23,7 +23,7 @@ use crate::tables::edge::{self, derived_by, origin, EdgeData, EDGES_REVERSE_TABL
 use crate::tables::relation::{
     RelationMetadata, RELATION_BY_EVIDENCE_TABLE, RELATION_METADATA_TABLE,
 };
-use crate::tables::scope::RowScope;
+use crate::tables::scope::{DeclScope, RowScope};
 
 use super::transient;
 
@@ -142,9 +142,13 @@ fn write_relation_link(
     // time, so re-resolve it here. Deterministic in LSN order; idempotent.
     let relation_type_id = match &p.relation_type_intern_hint {
         None => p.relation_type_id,
+        // The payload carries the space the create ran under, so replay
+        // re-interns in that scope. Re-interning at the namespace base would
+        // plant a space's own vocabulary where every sibling space resolves
+        // it.
         Some((namespace, name)) => crate::relation::types::relation_type_intern_or_get(
             wtxn,
-            namespace,
+            DeclScope::space(namespace, p.space_id.into()),
             name,
             /* first_seen_lsn */ 0,
             now_unix_nanos,

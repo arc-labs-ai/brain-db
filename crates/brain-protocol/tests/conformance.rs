@@ -50,19 +50,22 @@ use brain_protocol::ops::query::{
 };
 use brain_protocol::{
     ActAs, AnswerKindWire, ByeRequest, CancelStreamAck, CancelStreamRequest, CancellationReason,
-    ClientPongRequest, EdgeDirectionWire, EdgeKindWire, EncodeGraphEdge, EncodeGraphNode,
-    EncodeRequest, EncodeResponse, EncodeStageArtifact, EncodeStageGraph, EncodeStageKeywordField,
-    EncodeStageRecord, EncodeTrace, EncodeTraceArtifacts, EncodeTraceDedup, EncodeTraceEntity,
-    EncodeTraceIndex, EncodeTraceRelation, EncodeTraceStage, EncodeTraceStageStatus,
-    EncodeTraceStatement, EncodeVectorDirectRequest, EntityCreateRequest, EntityCreateResponse,
-    EntityGetRequest, EntityGetResponse, EntityListItem, EntityListRequest,
+    ClientPongRequest, CredentialScope, EdgeDirectionWire, EdgeKindWire, EncodeGraphEdge,
+    EncodeGraphNode, EncodeRequest, EncodeResponse, EncodeStageArtifact, EncodeStageGraph,
+    EncodeStageKeywordField, EncodeStageRecord, EncodeTrace, EncodeTraceArtifacts,
+    EncodeTraceDedup, EncodeTraceEntity, EncodeTraceIndex, EncodeTraceRelation, EncodeTraceStage,
+    EncodeTraceStageStatus, EncodeTraceStatement, EncodeVectorDirectRequest, EntityCreateRequest,
+    EntityCreateResponse, EntityGetRequest, EntityGetResponse, EntityListItem, EntityListRequest,
     EntityListResponseFrame, EntityMergeRequest, EntityMergeResponse, EntityRenameRequest,
     EntityRenameResponse, EntityResolveRequest, EntityResolveResponse, EntityTombstoneRequest,
     EntityTombstoneResponse, EntityUnmergeRequest, EntityUnmergeResponse, EntityUpdateRequest,
     EntityUpdateResponse, EntityView, EventType, EvidenceRefWire, ExtractorListItem,
     ExtractorListRequest, ExtractorListResponseFrame, ForgetMode, ForgetRequest, ForgetResponse,
     Frame, GraphEdge, GraphFetchRequest, GraphFetchResponseFrame, GraphNode, InferenceKind,
-    InferenceStep, LinkRequest, LinkResponse, MaterializeProceduralRequest,
+    InferenceStep, LinkRequest, LinkResponse, LlmCredentialDeleteRequest,
+    LlmCredentialDeleteResponse, LlmCredentialGetRequest, LlmCredentialGetResponse,
+    LlmCredentialPutRequest, LlmCredentialPutResponse, LlmCredentialVerifyRequest,
+    LlmCredentialVerifyResponse, LlmCredentialView, MaterializeProceduralRequest,
     MaterializeProceduralResponse, MemoryEdgeWire, MemoryInspectRequest, MemoryInspectResponse,
     MemoryKindWire, MemoryListDirWire, MemoryListItem, MemoryListRequest, MemoryListResponseFrame,
     MemoryListSortWire, MemoryListTimeAxisWire, ObservationInput, Opcode, PingRequest, PlanBudget,
@@ -80,20 +83,20 @@ use brain_protocol::{
     RelationView, RequestBody, ResolutionOutcomeWire, ResponseBody, RetrieverNameWire,
     SchemaDropRequest, SchemaDropResponse, SchemaGetRequest, SchemaGetResponse, SchemaListItemWire,
     SchemaListRequest, SchemaListResponseFrame, SchemaReplaceRequest, SchemaReplaceResponse,
-    SchemaUploadRequest, SchemaUploadResponse, SchemaValidateRequest, SchemaValidateResponse,
-    SchemaValidationErrorWire, ServerPingResponse, SessionCreateRequest, SessionCreateResponse,
-    SessionDeleteRequest, SessionDeleteResponse, SessionListRequest, SessionListResponse,
-    SessionView, SimilarityFilter, SpaceCreateRequest, SpaceCreateResponse, SpaceDeleteRequest,
-    SpaceDeleteResponse, SpaceListRequest, SpaceListResponse, SpaceView, StageKind,
-    StatementCreateRequest, StatementCreateResponse, StatementGetRequest, StatementGetResponse,
-    StatementHistoryRequest, StatementHistoryResponseFrame, StatementKindWire,
-    StatementListRequest, StatementListResponseFrame, StatementObjectWire, StatementRetractRequest,
-    StatementRetractResponse, StatementSupersedeRequest, StatementSupersedeResponse,
-    StatementTombstoneRequest, StatementTombstoneResponse, StatementValueWire, StatementView,
-    SubscribeRequest, SubscriptionEvent, SubscriptionFilter, TransitionKind, TraversalPathWire,
-    TraversalStepWire, TxnAbortRequest, TxnAbortResponse, TxnBeginRequest, TxnBeginResponse,
-    TxnCommitRequest, TxnCommitResponse, UnlinkRequest, UnlinkResponse, UnsubscribeRequest,
-    UnsubscribeResponse,
+    SchemaScope, SchemaUploadRequest, SchemaUploadResponse, SchemaValidateRequest,
+    SchemaValidateResponse, SchemaValidationErrorWire, ServerPingResponse, SessionCreateRequest,
+    SessionCreateResponse, SessionDeleteRequest, SessionDeleteResponse, SessionListRequest,
+    SessionListResponse, SessionView, SimilarityFilter, SpaceCreateRequest, SpaceCreateResponse,
+    SpaceDeleteRequest, SpaceDeleteResponse, SpaceListRequest, SpaceListResponse, SpaceView,
+    StageKind, StatementCreateRequest, StatementCreateResponse, StatementGetRequest,
+    StatementGetResponse, StatementHistoryRequest, StatementHistoryResponseFrame,
+    StatementKindWire, StatementListRequest, StatementListResponseFrame, StatementObjectWire,
+    StatementRetractRequest, StatementRetractResponse, StatementSupersedeRequest,
+    StatementSupersedeResponse, StatementTombstoneRequest, StatementTombstoneResponse,
+    StatementValueWire, StatementView, SubscribeRequest, SubscriptionEvent, SubscriptionFilter,
+    TransitionKind, TraversalPathWire, TraversalStepWire, TxnAbortRequest, TxnAbortResponse,
+    TxnBeginRequest, TxnBeginResponse, TxnCommitRequest, TxnCommitResponse, UnlinkRequest,
+    UnlinkResponse, UnsubscribeRequest, UnsubscribeResponse, VerifyOutcome,
 };
 
 // Fixed byte patterns. No clock, no randomness — fixtures are reproducible.
@@ -1049,6 +1052,45 @@ fn sample_graph_fetch_response() -> GraphFetchResponseFrame {
     }
 }
 
+/// A `StageCompleted` event carrying the extractor's full detail.
+///
+/// The all-`None` event above covers a cognitive event, where the three stage
+/// fields are absent. This covers the populated form, so the extractor
+/// payload's own key order and value encoding are pinned across languages —
+/// otherwise each SDK's copy of `StageExtractorPayload` is checked only
+/// against itself.
+fn sample_subscribe_event_stage() -> SubscriptionEvent {
+    SubscriptionEvent {
+        event_type: EventType::StageCompleted,
+        memory_id: mid(),
+        session_id: 1,
+        text: String::new(),
+        kind: MemoryKindWire::Episodic,
+        salience: 0.0,
+        timestamp_unix_nanos: 1_700_000_000_000_000_000,
+        lsn: 43,
+        graph_payload: None,
+        edge_payload: None,
+        stage_kind: Some(brain_protocol::shared::enums::StageKind::Extractor),
+        stage_outcome: Some(brain_protocol::shared::enums::StageOutcome::Ok),
+        stage_payload: Some(brain_protocol::shared::enums::StagePayload::Extractor(
+            brain_protocol::shared::enums::StageExtractorPayload {
+                entity_count: 2,
+                statement_count: 3,
+                relation_count: 1,
+                // Non-zero so every count is pinned to a distinct value; a
+                // field pair swapped on the way out cannot look right.
+                dropped_count: 4,
+                contradiction_count: 1,
+                undeclared_entity_count: 2,
+                has_active_schema: true,
+                audit_status: brain_protocol::shared::enums::StageAuditStatus::Succeeded,
+                error_message: String::new(),
+            },
+        )),
+    }
+}
+
 fn sample_subscribe_event() -> SubscriptionEvent {
     SubscriptionEvent {
         event_type: EventType::Encoded,
@@ -1307,6 +1349,7 @@ fn corpus() -> Vec<Case> {
         allow_breaking: false,
         request_id: RID,
         act_as: None,
+        scope: SchemaScope::Namespace,
     };
     cases.push(req_case(
         "req_schema_upload",
@@ -1894,6 +1937,115 @@ fn corpus() -> Vec<Case> {
         &session_delete_resp,
     ));
 
+    // ---- Tenant LLM provider credentials (0x0076-0x0079) ----
+    //
+    // The PUT golden pins a plaintext `api_key` field, because that is the
+    // contract: a key crosses the wire exactly once, in this one frame. The
+    // value is obviously synthetic, and pinning the field is the point — it
+    // is the reason the op refuses a connection whose transport does not
+    // protect its contents.
+    let llm_credential_put_req = LlmCredentialPutRequest {
+        provider: "openai".into(),
+        model: "gpt-4.1-mini".into(),
+        api_key: "sk-test-not-a-real-key".into(),
+        request_id: RID,
+        act_as: None,
+        scope: CredentialScope::Namespace,
+    };
+    cases.push(req_case(
+        "req_llm_credential_put",
+        RequestBody::LlmCredentialPut(llm_credential_put_req.clone()),
+        &llm_credential_put_req,
+    ));
+    let llm_credential_put_resp = LlmCredentialPutResponse {
+        provider: "openai".into(),
+        model: "gpt-4.1-mini".into(),
+        fingerprint: "\u{2026}-key".into(),
+        created_at_unix_nanos: 1_700_000_000_000_000_000,
+        replaced: false,
+    };
+    cases.push(resp_case(
+        "resp_llm_credential_put",
+        ResponseBody::LlmCredentialPut(llm_credential_put_resp.clone()),
+        &llm_credential_put_resp,
+    ));
+
+    let llm_credential_get_req = LlmCredentialGetRequest {
+        act_as: None,
+        scope: CredentialScope::Namespace,
+    };
+    cases.push(req_case(
+        "req_llm_credential_get",
+        RequestBody::LlmCredentialGet(llm_credential_get_req.clone()),
+        &llm_credential_get_req,
+    ));
+    // The populated arm: a read answers with provider, model and a display
+    // fingerprint, and never with anything a key can be rebuilt from.
+    let llm_credential_get_resp = LlmCredentialGetResponse {
+        credential: Some(LlmCredentialView {
+            provider: "openai".into(),
+            model: "gpt-4.1-mini".into(),
+            fingerprint: "\u{2026}-key".into(),
+            created_at_unix_nanos: 1_700_000_000_000_000_000,
+            inherited: false,
+        }),
+    };
+    cases.push(resp_case(
+        "resp_llm_credential_get",
+        ResponseBody::LlmCredentialGet(llm_credential_get_resp.clone()),
+        &llm_credential_get_resp,
+    ));
+    // The empty arm pinned separately: `None` is the state a namespace sits
+    // in before it registers anything, so its encoding is part of the
+    // contract rather than an edge case.
+    let llm_credential_get_resp_empty = LlmCredentialGetResponse { credential: None };
+    cases.push(resp_case(
+        "resp_llm_credential_get_absent",
+        ResponseBody::LlmCredentialGet(llm_credential_get_resp_empty.clone()),
+        &llm_credential_get_resp_empty,
+    ));
+
+    let llm_credential_delete_req = LlmCredentialDeleteRequest {
+        request_id: RID,
+        act_as: None,
+        scope: CredentialScope::Namespace,
+    };
+    cases.push(req_case(
+        "req_llm_credential_delete",
+        RequestBody::LlmCredentialDelete(llm_credential_delete_req.clone()),
+        &llm_credential_delete_req,
+    ));
+    let llm_credential_delete_resp = LlmCredentialDeleteResponse { existed: true };
+    cases.push(resp_case(
+        "resp_llm_credential_delete",
+        ResponseBody::LlmCredentialDelete(llm_credential_delete_resp.clone()),
+        &llm_credential_delete_resp,
+    ));
+
+    let llm_credential_verify_req = LlmCredentialVerifyRequest {
+        request_id: RID,
+        act_as: None,
+        scope: CredentialScope::Namespace,
+    };
+    cases.push(req_case(
+        "req_llm_credential_verify",
+        RequestBody::LlmCredentialVerify(llm_credential_verify_req.clone()),
+        &llm_credential_verify_req,
+    ));
+    // The rejected-key arm: a verification that says the key is bad is a
+    // successful verification, so this outcome is pinned rather than Ok.
+    let llm_credential_verify_resp = LlmCredentialVerifyResponse {
+        outcome: VerifyOutcome::Unauthorized,
+        provider: Some("openai".into()),
+        model: Some("gpt-4.1-mini".into()),
+        detail: Some("provider `openai` rejected the key".into()),
+    };
+    cases.push(resp_case(
+        "resp_llm_credential_verify",
+        ResponseBody::LlmCredentialVerify(llm_credential_verify_resp.clone()),
+        &llm_credential_verify_resp,
+    ));
+
     // ---- Capabilities + subscription event ----
     cases.push(resp_case(
         "resp_get_capabilities",
@@ -1904,6 +2056,11 @@ fn corpus() -> Vec<Case> {
         "resp_subscribe_event",
         ResponseBody::SubscribeEvent(sample_subscribe_event()),
         &sample_subscribe_event(),
+    ));
+    cases.push(resp_case(
+        "resp_subscribe_event_stage",
+        ResponseBody::SubscribeEvent(sample_subscribe_event_stage()),
+        &sample_subscribe_event_stage(),
     ));
 
     // ---- Keepalive responses ----
@@ -3091,12 +3248,13 @@ fn corpus() -> Vec<Case> {
         RequestBody::SchemaList(schema_list_req.clone()),
         &schema_list_req,
     ));
-    // Single-field request. The document text differs from `req_schema_upload`'s
-    // so a fixture that cross-wires the two schema-document verbs is visible.
+    // The document text differs from `req_schema_upload`'s so a fixture that
+    // cross-wires the two schema-document verbs is visible.
     let schema_validate_req = SchemaValidateRequest {
         schema_document: "namespace org\ndefine relation_type mentors { from Person to Person }\n"
             .into(),
         act_as: None,
+        scope: SchemaScope::Namespace,
     };
     cases.push(req_case(
         "req_schema_validate",
@@ -3114,6 +3272,7 @@ fn corpus() -> Vec<Case> {
         force_drop_existing: true,
         request_id: RID,
         act_as: None,
+        scope: SchemaScope::Namespace,
     };
     cases.push(req_case(
         "req_schema_replace",
@@ -3131,6 +3290,7 @@ fn corpus() -> Vec<Case> {
         force: true,
         request_id: RID,
         act_as: None,
+        scope: SchemaScope::Namespace,
     };
     cases.push(req_case(
         "req_schema_drop",
@@ -3173,6 +3333,7 @@ fn corpus() -> Vec<Case> {
     ));
     let schema_validate_act_as = SchemaValidateRequest {
         act_as: tenant(0),
+        scope: SchemaScope::Space,
         ..schema_validate_req.clone()
     };
     cases.push(req_case(
@@ -3186,14 +3347,31 @@ fn corpus() -> Vec<Case> {
         allow_breaking: false,
         request_id: RID,
         act_as: tenant(1 << 4),
+        scope: SchemaScope::Namespace,
     };
     cases.push(req_case(
         "req_schema_upload_act_as_grant",
         RequestBody::SchemaUpload(schema_upload_act_as.clone()),
         &schema_upload_act_as,
     ));
+    // The space-overlay scope, pinned on its own. `act_as` names a space on
+    // this fixture AND on `req_schema_upload_act_as_grant` above, but only
+    // this one declares at that space — the two differ by the `scope` key
+    // alone, which is the contract: a client that reads the scope off
+    // `act_as` instead of sending it would encode these two identically and
+    // silently make every namespace upload an overlay.
+    let schema_upload_space_scope = SchemaUploadRequest {
+        scope: SchemaScope::Space,
+        ..schema_upload_act_as.clone()
+    };
+    cases.push(req_case(
+        "req_schema_upload_space_scope",
+        RequestBody::SchemaUpload(schema_upload_space_scope.clone()),
+        &schema_upload_space_scope,
+    ));
     let schema_replace_act_as = SchemaReplaceRequest {
         act_as: tenant(1 << 5),
+        scope: SchemaScope::Space,
         ..schema_replace_req.clone()
     };
     cases.push(req_case(
@@ -3203,6 +3381,7 @@ fn corpus() -> Vec<Case> {
     ));
     let schema_drop_act_as = SchemaDropRequest {
         act_as: tenant(1 << 5),
+        scope: SchemaScope::Space,
         ..schema_drop_req.clone()
     };
     cases.push(req_case(

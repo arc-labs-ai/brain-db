@@ -65,7 +65,6 @@ use brain_core::{Entity, EntityId, EntityTypeId};
 use brain_embed::Dispatcher;
 use brain_index::entity_hnsw::EntityHnswIndex;
 use brain_index::VECTOR_DIM;
-use brain_llm::LlmClient;
 use brain_metadata::entity::ops::{
     entity_add_alias, entity_put, entity_resolve_canonical_all_types_wtxn, entity_vector_put,
     normalize_name, EntityOpError,
@@ -383,6 +382,7 @@ fn is_iso_date_token(tok: &str) -> bool {
 fn resolve_entity_type(
     wtxn: &WriteTransaction,
     namespace_id: u32,
+    space: [u8; 16],
     qname: &str,
     now_unix_nanos: u64,
 ) -> Result<EntityTypeId, ResolverError> {
@@ -391,12 +391,31 @@ fn resolve_entity_type(
     // built-ins. A type minted here belongs to the caller's namespace, not
     // to everyone: two tenants whose corpora both coin `Builder` get two
     // rows, and neither can make the other's schema upload fail.
-    if let Some(def) = entity_type_lookup(wtxn, namespace_id, name)? {
+    //
+    // READ THROUGH THE OVERLAY, WRITE TO THE BASE. The lookup passes the
+    // writing space, so a space that deliberately declared `Builder` gets
+    // ITS row — an overlay would be pointless if the write path ignored
+    // it. The intern below deliberately does NOT: a type coined here was
+    // never declared by anyone, it is a side effect of one sentence, and
+    // spaces are not always applications. A tenant that gives every
+    // end-user their own space (which is how a consumer product isolates
+    // users, since the wire has no user dimension) would otherwise mint a
+    // private copy of every incidental type per user, and the registry
+    // would grow with the user table instead of with the domain.
+    //
+    // So auto-discovery lands at SPACE_BASE, exactly where it landed
+    // before spaces entered this key, and only a deliberate SCHEMA_UPLOAD
+    // can create an overlay row.
+    if let Some(def) = entity_type_lookup(
+        wtxn,
+        brain_metadata::TypeScope::space(namespace_id, space),
+        name,
+    )? {
         return Ok(def.id());
     }
     Ok(entity_type_intern(
         wtxn,
-        namespace_id,
+        brain_metadata::TypeScope::base(namespace_id),
         name,
         Vec::new(),
         now_unix_nanos,
@@ -689,16 +708,16 @@ fn cosine(a: &[f32; VECTOR_DIM], b: &[f32; VECTOR_DIM]) -> f32 {
 /// to alias onto the candidate, mint a fresh entity, or fall back to
 /// the existing merge-proposal flow.
 ///
-/// The current backend is LLM-driven: the disambiguator owns an
-/// [`LlmClient`] + model identifier and issues a single yes/no/uncertain
-/// prompt per ambiguous partial match. The prompt grammar is narrower
+/// The current backend is LLM-driven: the disambiguator owns a credential
+/// resolver + model identifier and issues a single yes/no/uncertain prompt
+/// per ambiguous partial match, billed to the namespace whose memory raised
+/// the ambiguity. The prompt grammar is narrower
 /// than the multi-candidate LLM disambiguation path uses because
 /// the resolver's question is binary. Swapping in a heuristic or
 /// classifier backend later is a localised change to
 /// `confirm_partial_match`.
 pub struct EntityDisambiguator {
-    client: Arc<dyn LlmClient>,
-    model: String,
+    resolver: Arc<dyn brain_llm::LlmCredentialResolver>,
     /// Confidence floor for accepting a [`MatchVerdict::Confirmed`].
     /// Below this, the resolver treats the verdict as
     /// [`MatchVerdict::Uncertain`] and falls through to Create.
@@ -711,16 +730,20 @@ pub struct EntityDisambiguator {
 pub const DEFAULT_DISAMBIGUATOR_MIN_CONFIDENCE: f32 = 0.85;
 
 impl EntityDisambiguator {
-    /// Construct from an LLM client + model identifier. The default
-    /// [`min_confidence`](Self::min_confidence) is
+    /// Construct from a credential resolver.
+    ///
+    /// The disambiguator carries no model of its own: the call bills to the
+    /// namespace whose entities are being disambiguated, so the model is the
+    /// one that namespace registered a key for.
+    ///
+    /// The default [`min_confidence`](Self::min_confidence) is
     /// [`DEFAULT_DISAMBIGUATOR_MIN_CONFIDENCE`]; use
     /// [`with_min_confidence`](Self::with_min_confidence) to tighten or
     /// loosen.
     #[must_use]
-    pub fn new(client: Arc<dyn LlmClient>, model: impl Into<String>) -> Self {
+    pub fn new(resolver: Arc<dyn brain_llm::LlmCredentialResolver>) -> Self {
         Self {
-            client,
-            model: model.into(),
+            resolver,
             min_confidence: DEFAULT_DISAMBIGUATOR_MIN_CONFIDENCE,
         }
     }
@@ -742,9 +765,14 @@ impl EntityDisambiguator {
     /// synchronously. Any soft failure (transport error, unparseable
     /// reply) degrades to [`MatchVerdict::Skipped`], which the resolver
     /// treats as "fall through to the no-disambiguator path".
-    pub async fn confirm(&self, view: &LlmCandidateView, surface_form: &str) -> MatchVerdict {
+    pub async fn confirm(
+        &self,
+        namespace: &str,
+        view: &LlmCandidateView,
+        surface_form: &str,
+    ) -> MatchVerdict {
         let candidate = view.entity_id;
-        match ask_if_same_entity(self, view, surface_form).await {
+        match ask_if_same_entity(self, namespace, view, surface_form).await {
             Ok(SameEntityReply::Yes(confidence)) => {
                 if confidence >= self.min_confidence {
                     MatchVerdict::Confirmed {
@@ -765,7 +793,6 @@ impl EntityDisambiguator {
 impl std::fmt::Debug for EntityDisambiguator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EntityDisambiguator")
-            .field("model", &self.model)
             .field("min_confidence", &self.min_confidence)
             .finish_non_exhaustive()
     }
@@ -993,7 +1020,13 @@ pub fn resolve_or_create_with_deps(
     if normalized.is_empty() {
         return Err(ResolverError::EmptyNormalizedName);
     }
-    let type_id = resolve_entity_type(wtxn, scope.namespace_id, entity_type_qname, now_unix_nanos)?;
+    let type_id = resolve_entity_type(
+        wtxn,
+        scope.namespace_id,
+        scope.space_id_bytes,
+        entity_type_qname,
+        now_unix_nanos,
+    )?;
 
     // Tier 1 — exact canonical-name lookup.
     if let Some(id) = lookup_canonical_wtxn(wtxn, scope, type_id, &normalized)? {
@@ -1758,15 +1791,33 @@ enum SameEntityReply {
 /// [`MatchVerdict::Skipped`] (the no-disambiguator fallback).
 async fn ask_if_same_entity(
     disambiguator: &EntityDisambiguator,
+    namespace: &str,
     view: &LlmCandidateView,
     surface_form: &str,
 ) -> Result<SameEntityReply, String> {
-    use brain_llm::{LlmMessage, LlmRequest, LlmRole};
+    use brain_llm::{CredentialOutcome, LlmMessage, LlmRequest, LlmRole};
+
+    // Bill the judgement to the namespace whose entities are being
+    // disambiguated. A namespace with no provider key degrades to the
+    // no-disambiguator path rather than failing the write: the cosine-only
+    // resolution is a correct, if blunter, answer.
+    let credential = match disambiguator.resolver.client_for(namespace, None).await {
+        CredentialOutcome::Ready(c) => c,
+        CredentialOutcome::Missing => {
+            return Err(disambiguator.resolver.missing_reason(namespace));
+        }
+        CredentialOutcome::Unavailable => {
+            return Err(format!(
+                "llm credential for namespace {namespace} unavailable"
+            ));
+        }
+    };
+    let client = credential.client;
 
     let system = build_confirm_system_prompt();
     let user = build_confirm_user_prompt(view, surface_form);
     let req = LlmRequest {
-        model: disambiguator.model.clone(),
+        model: client.model().to_string(),
         system_blocks: vec![brain_llm::types::SystemBlock::cached(system)],
         messages: vec![LlmMessage {
             role: LlmRole::User,
@@ -1781,8 +1832,7 @@ async fn ask_if_same_entity(
         // merge/create fallback via the `Err` path.
         timeout: DISAMBIGUATOR_LLM_TIMEOUT,
     };
-    let resp = disambiguator
-        .client
+    let resp = client
         .complete(req)
         .await
         .map_err(|e| format!("llm transport: {e}"))?;
@@ -2700,8 +2750,12 @@ mod tests {
         // The new type lives in the registry now.
         let d = d;
         let wtxn = d.write_txn().unwrap();
-        let def = entity_type_lookup(&wtxn, brain_core::NamespaceId::SYSTEM.raw(), "Organization")
-            .unwrap();
+        let def = entity_type_lookup(
+            &wtxn,
+            brain_metadata::TypeScope::base(brain_core::NamespaceId::SYSTEM.raw()),
+            "Organization",
+        )
+        .unwrap();
         assert!(def.is_some());
         wtxn.commit().unwrap();
     }
@@ -2973,7 +3027,7 @@ mod tests {
             let wtxn = d.write_txn().unwrap();
             let id = entity_type_intern(
                 &wtxn,
-                brain_core::NamespaceId::SYSTEM.raw(),
+                brain_metadata::TypeScope::base(brain_core::NamespaceId::SYSTEM.raw()),
                 "Organization",
                 Vec::new(),
                 NOW,

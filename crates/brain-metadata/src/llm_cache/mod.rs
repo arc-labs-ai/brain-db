@@ -371,9 +371,11 @@ mod tests {
     /// safe outcome; the remedy is to delete `llm_cache.redb`, which costs
     /// nothing durable.
     #[test]
-    fn a_pre_byok_cache_file_is_refused_not_silently_adopted() {
-        // The pre-BYOK shape: same table name, key without the scope.
-        const PRE_BYOK_TABLE: TableDefinition<'static, ([u8; 32], u32, u32, u64), LlmResponse> =
+    fn a_cache_file_keyed_without_a_scope_is_refused_not_silently_adopted() {
+        // Same table name, key missing the credential scope. A cached
+        // completion is billed to whoever's key paid for it, so a row that
+        // cannot say which scope that was must never be served to anyone.
+        const UNSCOPED_TABLE: TableDefinition<'static, ([u8; 32], u32, u32, u64), LlmResponse> =
             TableDefinition::new("llm_responses");
 
         let dir = tempfile::tempdir().unwrap();
@@ -382,7 +384,7 @@ mod tests {
             let db = Database::create(&path).unwrap();
             let wtxn = db.begin_write().unwrap();
             {
-                let mut t = wtxn.open_table(PRE_BYOK_TABLE).unwrap();
+                let mut t = wtxn.open_table(UNSCOPED_TABLE).unwrap();
                 t.insert(&([7u8; 32], 1u32, 1u32, 42u64), &sample_response())
                     .unwrap();
             }
@@ -391,7 +393,7 @@ mod tests {
 
         assert!(
             LlmCacheDb::open(&path).is_err(),
-            "a pre-BYOK cache must fail the signature check, not be reused"
+            "an unscoped cache must fail the signature check, not be reused"
         );
     }
 
@@ -758,10 +760,10 @@ mod tests {
     }
 
     #[test]
-    fn house_scope_rows_are_shared_as_before() {
-        // A single-key deployment maps every namespace to HOUSE (0), so two
-        // namespaces hitting the same input still share one row — pre-BYOK
-        // cache behaviour is unchanged for anyone not using BYOK.
+    fn house_scope_rows_are_shared_across_namespaces() {
+        // HOUSE (0) is the scope for a completion the deployment itself paid
+        // for rather than a tenant, so two namespaces hitting the same input
+        // legitimately share one row: there is no per-tenant bill to split.
         let dir = tempfile::tempdir().unwrap();
         let mut db = LlmCacheDb::open(cache_path(&dir)).unwrap();
         let (h, ext_id, v, model, _) = sample_key();

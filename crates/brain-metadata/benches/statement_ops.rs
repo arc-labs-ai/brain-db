@@ -25,6 +25,7 @@ use brain_metadata::statement::{
     statement_create, statement_get, statement_list, statement_supersede, StatementListFilter,
 };
 use brain_metadata::tables::predicate::PREDICATES_TABLE;
+use brain_metadata::DeclScope;
 use brain_metadata::MetadataDb;
 use brain_metadata::RowScope;
 
@@ -59,7 +60,7 @@ fn build_fixture(n: usize) -> Fixture {
     // needs its own interned predicate.
     let related_to: PredicateId = {
         let wtxn = db.write_txn().expect("write_txn");
-        let id = predicate_intern_or_get(&wtxn, "brain", "related_to", 1, now)
+        let id = predicate_intern_or_get(&wtxn, DeclScope::base("brain"), "related_to", 1, now)
             .expect("intern predicate");
         wtxn.commit().expect("commit predicate");
         id

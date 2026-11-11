@@ -175,19 +175,44 @@ pub async fn start_in(data_dir: &Path, n_shards: usize) -> Server {
 /// auto-discovered from the XDG model dir at shard spawn. Used by the
 /// write-extraction-accuracy corpus test, which needs every tier running to
 /// exercise real entity/statement/relation extraction.
+/// Boot the full pipeline, optionally with a provider credential registered
+/// for one namespace.
+///
+/// A deployment holds no provider key of its own, so a test that wants the
+/// model-backed stages to run registers one the way a tenant would:
+/// `provider_key` is `(namespace, provider, model, api_key)`.
 pub async fn start_full_pipeline_in(
     data_dir: &Path,
     dispatcher: Arc<dyn Dispatcher>,
-    api_key: Option<String>,
+    provider_key: Option<(String, String, String, String)>,
 ) -> Server {
+    let credentials = provider_key.map(|(namespace, provider, model, api_key)| {
+        let ring = brain_crypto::load_or_create(data_dir).expect("sealing key");
+        let store = brain_metadata::llm_credential::LlmCredentialDb::open(
+            data_dir.join("llm_credentials.redb"),
+        )
+        .expect("credential store");
+        let access = Arc::new(brain_metadata::llm_credential::LlmCredentialAccess::new(
+            store,
+            Arc::new(ring),
+        ));
+        access
+            .put(
+                brain_metadata::tables::scope::DeclScope::base(&namespace),
+                &provider,
+                &model,
+                &api_key,
+                0,
+            )
+            .expect("register credential");
+        access
+    });
     start_in_with(data_dir, 1, move |dd| {
         let mut cfg = ShardSpawnConfig::new(dd, dispatcher.clone());
         cfg.llm = LlmSpawnConfig {
             extractor_max_tokens: None,
-            api_key: api_key.clone(),
             model: None,
-            // Static mode: these harnesses exercise the single-key path.
-            broker: None,
+            credentials: credentials.clone(),
         };
         cfg.rerank = RerankSpawnConfig { enabled: false };
         cfg

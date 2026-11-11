@@ -143,7 +143,7 @@ mod tests {
         let wtxn = db.write_txn().unwrap();
         let id = predicate_intern(
             &wtxn,
-            "test",
+            crate::tables::scope::DeclScope::base("test"),
             name,
             Some(StatementKind::Fact),
             2,

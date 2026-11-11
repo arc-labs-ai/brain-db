@@ -1493,7 +1493,7 @@ mod tests {
         let wtxn = db.write_txn().unwrap();
         let id = predicate_intern(
             &wtxn,
-            "test",
+            crate::tables::scope::DeclScope::base("test"),
             name,
             Some(StatementKind::Fact),
             /* object: Entity */ 1,
@@ -1536,7 +1536,7 @@ mod tests {
         let wtxn = db.write_txn().unwrap();
         let id = relation_type_intern(
             &wtxn,
-            "test",
+            crate::tables::scope::DeclScope::base("test"),
             name,
             None,
             None,

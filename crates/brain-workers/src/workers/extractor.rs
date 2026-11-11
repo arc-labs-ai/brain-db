@@ -41,7 +41,6 @@
 //!   loop on the same memory.
 //! - LLM tier unavailable: the registered LLM extractor returns
 //!   `Failure(reason)` deterministically; pattern + classifier still run.
-
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
@@ -247,7 +246,7 @@ pub struct ExtractorWorker {
     /// existing behaviour (Create + enqueue merge proposal) for every
     /// partial match. Production shards stamp this with the
     /// `EntityDisambiguator` built from the shared LLM client when the
-    /// single credential (`[llm] api_key` / `BRAIN__LLM__API_KEY`) is
+    /// credential the memory's namespace registered is
     /// present at startup.
     entity_disambiguator: Option<Arc<EntityDisambiguator>>,
     /// Optional write-time HyPE generator. `None` (the default) skips
@@ -927,6 +926,33 @@ fn resolve_namespace_names(
             name
         })
         .collect()
+}
+
+/// The namespace name a memory belongs to.
+///
+/// Resolved per memory rather than from the worker's context: derivation runs
+/// after the write is acknowledged and a batch can hold memories from
+/// different tenants, so the owning namespace is a property of the row.
+/// Falls back to the system namespace, matching how the LLM tier names a
+/// memory whose namespace cannot be resolved — the two must agree or the
+/// disambiguation call and the extraction would bill different tenants.
+fn namespace_name_for(ctx: &WorkerContext, memory_id: MemoryId) -> String {
+    use brain_metadata::tables::memory::MEMORIES_TABLE;
+    let fallback = || brain_extractors::SYSTEM_NAMESPACE.to_string();
+    let Ok(rtxn) = ctx.ops.executor.metadata.read_txn() else {
+        return fallback();
+    };
+    let Ok(t) = rtxn.open_table(MEMORIES_TABLE) else {
+        return fallback();
+    };
+    let Ok(Some(g)) = t.get(&memory_id.to_be_bytes()) else {
+        return fallback();
+    };
+    let ns_id = g.value().namespace_id;
+    brain_metadata::namespace::namespace_name(&rtxn, brain_core::NamespaceId::from(ns_id))
+        .ok()
+        .flatten()
+        .unwrap_or_else(fallback)
 }
 
 fn load_row_facts(
@@ -3074,8 +3100,9 @@ async fn apply_outcome(
         } else {
             drop(plan_txn); // roll back the plan pass; re-run with verdicts
             let mut verdicts = PrecomputedVerdicts::new();
+            let namespace = namespace_name_for(ctx, memory_id);
             for p in pending {
-                let verdict = dis.confirm(&p.view, &p.raw_surface).await;
+                let verdict = dis.confirm(&namespace, &p.view, &p.raw_surface).await;
                 verdicts.insert(p.norm_surface, p.candidate, verdict);
             }
             let wtxn = db_guard
@@ -3377,8 +3404,20 @@ fn run_apply_body(
     .ok()
     .flatten()
     .unwrap_or_else(|| SYSTEM_NAMESPACE.to_string());
+    // Entity-type names the system schema and this namespace declare. An
+    // extracted entity whose type is in neither was asked for by nobody — the
+    // resolver coins and interns such a type rather than discarding the
+    // candidate, so nothing else in this pass counts it.
+    let declared_entity_types: std::collections::HashSet<String> =
+        brain_metadata::declared_entity_type_names_wtxn(&wtxn, &mem_ns).unwrap_or_default();
+    // The vocabulary is read in the MEMORY's own scope: a memory written into
+    // a space that declares its own document resolves onto that document's
+    // vocabulary, and one written at the namespace base resolves the
+    // tenant's. Reading the base for both would make a space's declarations
+    // invisible to its own extractions.
+    let mem_scope = brain_metadata::DeclScope::space(&mem_ns, source_scope.space_id_bytes);
     let declared_vocab: Option<brain_metadata::DeclaredVocabulary> =
-        match brain_metadata::declared_vocabulary_wtxn(&wtxn, &mem_ns) {
+        match brain_metadata::declared_vocabulary_wtxn(&wtxn, mem_scope) {
             Ok(v) => v,
             Err(e) => {
                 warn!(
@@ -3390,6 +3429,10 @@ fn run_apply_body(
                 None
             }
         };
+    // A schema is an optional add-on, so the undeclared-entity count only
+    // means something when one is declared. Recorded per apply because a
+    // namespace can gain or lose a schema between writes.
+    counts.had_active_schema = declared_vocab.is_some();
     let declared_vocab = declared_vocab.as_ref();
 
     // The source memory's ANCHOR day — its client-supplied `occurred_at`, else
@@ -3588,6 +3631,9 @@ fn run_apply_body(
         // `Created` tier means a genuinely new entity row landed; the
         // other tiers matched an existing entity.
         counts.entities = counts.entities.saturating_add(1);
+        if !entity_type_is_declared(&wtxn, resolved_type_id, &declared_entity_types) {
+            counts.entities_undeclared = counts.entities_undeclared.saturating_add(1);
+        }
         if matches!(tier, ResolutionTier::Created) {
             worker
                 .metrics
@@ -3722,6 +3768,7 @@ fn run_apply_body(
                     // never aborts the whole memory.
                     let Ok((ns, name)) = split_qname(&sm.predicate_qname) else {
                         worker.metrics.inc_apply_dropped("predicate_invalid");
+                        counts.dropped = counts.dropped.saturating_add(1);
                         warn!(
                             memory_id = ?memory_id,
                             predicate = %sm.predicate_qname,
@@ -3741,6 +3788,7 @@ fn run_apply_body(
                         })
                     {
                         worker.metrics.inc_apply_dropped("relation_value_object");
+                        counts.dropped = counts.dropped.saturating_add(1);
                         debug!(
                             memory_id = ?memory_id,
                             predicate = %sm.predicate_qname,
@@ -3751,8 +3799,12 @@ fn run_apply_body(
                     // Namespace-aware: a predicate the memory's OWN namespace
                     // declares wins over the emitted `brain:` prefix and over
                     // embedding consolidation onto a `brain:` synonym.
-                    let declared_pid =
-                        declared_predicate_in_namespace(&wtxn, declared_vocab, name)?;
+                    let declared_pid = declared_predicate_in_namespace(
+                        &wtxn,
+                        declared_vocab,
+                        source_scope.space_id_bytes,
+                        name,
+                    )?;
                     // The relation type this local name resolves to, looked up
                     // before the predicate so we can tell whether a predicate is
                     // needed at all.
@@ -3795,6 +3847,7 @@ fn run_apply_body(
                                 Ok(resolved) => resolved,
                                 Err(e) => {
                                     worker.metrics.inc_apply_dropped("predicate_invalid");
+                                    counts.dropped = counts.dropped.saturating_add(1);
                                     warn!(
                                         memory_id = ?memory_id,
                                         predicate = %sm.predicate_qname,
@@ -3833,6 +3886,7 @@ fn run_apply_body(
                     )?
                     else {
                         worker.metrics.inc_apply_dropped("object_missing");
+                        counts.dropped = counts.dropped.saturating_add(1);
                         warn!(
                             memory_id = ?memory_id,
                             predicate = %sm.predicate_qname,
@@ -3871,6 +3925,7 @@ fn run_apply_body(
                             Ok(resolved) => resolved,
                             Err(e) => {
                                 worker.metrics.inc_apply_dropped("predicate_invalid");
+                                counts.dropped = counts.dropped.saturating_add(1);
                                 warn!(
                                     memory_id = ?memory_id,
                                     predicate = %sm.predicate_qname,
@@ -3895,6 +3950,7 @@ fn run_apply_body(
                                 worker
                                     .metrics
                                     .inc_apply_dropped("declared_value_type_mismatch");
+                                counts.dropped = counts.dropped.saturating_add(1);
                                 debug!(
                                     memory_id = ?memory_id,
                                     predicate = %sm.predicate_qname,
@@ -4004,6 +4060,7 @@ fn run_apply_body(
                     // subject/predicate.
                     if matches!(object, StatementObject::Entity(obj) if obj == subject) {
                         worker.metrics.inc_apply_dropped("self_reference");
+                        counts.dropped = counts.dropped.saturating_add(1);
                         warn!(
                             memory_id = ?memory_id,
                             predicate = %sm.predicate_qname,
@@ -4111,6 +4168,7 @@ fn run_apply_body(
                         // nil endpoint (a dangling edge no reader can render).
                         if subject.0.is_nil() || to_id.0.is_nil() {
                             worker.metrics.inc_apply_dropped("nil_endpoint");
+                            counts.dropped = counts.dropped.saturating_add(1);
                             warn!(
                                 memory_id = ?memory_id,
                                 predicate = %sm.predicate_qname,
@@ -4129,6 +4187,7 @@ fn run_apply_body(
                             Ok((rt, _)) => rt,
                             Err(e) => {
                                 worker.metrics.inc_apply_dropped("create_rejected");
+                                counts.dropped = counts.dropped.saturating_add(1);
                                 warn!(
                                     memory_id = ?memory_id,
                                     predicate = %sm.predicate_qname,
@@ -4159,6 +4218,7 @@ fn run_apply_body(
                             }
                             Err(e) => {
                                 worker.metrics.inc_apply_dropped("create_rejected");
+                                counts.dropped = counts.dropped.saturating_add(1);
                                 let rule = describe_endpoint_violation(&wtxn, &e);
                                 warn!(
                                     memory_id = ?memory_id,
@@ -4203,6 +4263,33 @@ fn run_apply_body(
                         Ok(sid) => {
                             counts.statements = counts.statements.saturating_add(1);
                             created_statement_ids.push(sid);
+                            // A contradicting insert returns Ok: coexisting
+                            // Facts are legal and the conflict is filed, so
+                            // the audit row is the only evidence. It must
+                            // name this statement, or an older pair's open
+                            // contradiction would be charged to every later
+                            // write on the same subject and predicate.
+                            match brain_metadata::statement::contradiction_audit_names(
+                                &wtxn,
+                                subject,
+                                payload.predicate,
+                                sid,
+                            ) {
+                                Ok(true) => {
+                                    counts.contradictions = counts.contradictions.saturating_add(1);
+                                }
+                                Ok(false) => {}
+                                Err(e) => {
+                                    // A descriptive counter must not fail a
+                                    // write that already committed.
+                                    warn!(
+                                        memory_id = ?memory_id,
+                                        ?sid,
+                                        error = %e,
+                                        "contradiction audit lookup failed; count omitted",
+                                    );
+                                }
+                            }
                             // Write-path trace: the entity-subject structured
                             // fact this extraction produced — the exact rows the
                             // grounded read matches against. Correlate a read
@@ -4226,6 +4313,7 @@ fn run_apply_body(
                         }
                         Err(e) => {
                             worker.metrics.inc_apply_dropped("create_rejected");
+                            counts.dropped = counts.dropped.saturating_add(1);
                             let rule = describe_statement_violation(&wtxn, &e);
                             warn!(
                                 memory_id = ?memory_id,
@@ -4246,6 +4334,7 @@ fn run_apply_body(
                     // unanchorable here; coreference re-ingest can recover it.
                     // Surface it as signal loss rather than swallowing silently.
                     worker.metrics.inc_apply_dropped("subject_unresolved");
+                    counts.dropped = counts.dropped.saturating_add(1);
                     warn!(
                         memory_id = ?memory_id,
                         subject = ?sm.subject_text,
@@ -4287,6 +4376,7 @@ fn run_apply_body(
                 )?;
                 let (Some(from), Some(to)) = (from, to) else {
                     worker.metrics.inc_apply_dropped("endpoint_unresolved");
+                    counts.dropped = counts.dropped.saturating_add(1);
                     warn!(
                         memory_id = ?memory_id,
                         from = ?rm.subject_text,
@@ -4300,6 +4390,7 @@ fn run_apply_body(
                 // relation only (counted), never aborts the memory.
                 let Ok((ns, name)) = split_qname(&rm.relation_type_qname) else {
                     worker.metrics.inc_apply_dropped("relation_type_invalid");
+                    counts.dropped = counts.dropped.saturating_add(1);
                     warn!(
                         memory_id = ?memory_id,
                         relation_type = %rm.relation_type_qname,
@@ -4311,6 +4402,7 @@ fn run_apply_body(
                 // nil entity (a dangling edge no reader can render).
                 if from.0.is_nil() || to.0.is_nil() {
                     worker.metrics.inc_apply_dropped("nil_endpoint");
+                    counts.dropped = counts.dropped.saturating_add(1);
                     warn!(
                         memory_id = ?memory_id,
                         relation_type = %rm.relation_type_qname,
@@ -4333,6 +4425,7 @@ fn run_apply_body(
                     Ok((rt, _)) => rt,
                     Err(e) => {
                         worker.metrics.inc_apply_dropped("relation_type_invalid");
+                        counts.dropped = counts.dropped.saturating_add(1);
                         warn!(
                             memory_id = ?memory_id,
                             relation_type = %rm.relation_type_qname,
@@ -4363,6 +4456,7 @@ fn run_apply_body(
                     }
                     Err(e) => {
                         worker.metrics.inc_apply_dropped("create_rejected");
+                        counts.dropped = counts.dropped.saturating_add(1);
                         warn!(
                             memory_id = ?memory_id,
                             error = %e,
@@ -4495,6 +4589,32 @@ fn audit_status_from_byte(byte: u8) -> StageAuditStatus {
 /// [`brain_ops::OpsContext::publish_stage_event`]) as well as
 /// bus-published, so a subscriber that registers after this event
 /// fires can still recover it through WAL-tail replay.
+/// Whether `type_id` names an entity type some schema declares.
+///
+/// `declared` holds the names the system schema and the writing namespace
+/// declare. A type outside it was coined by the extractor from one sentence,
+/// so an entity carrying it is registry noise rather than a schema match.
+///
+/// An unreadable registry counts as declared: a descriptive counter must not
+/// inflate the junk rate because a lookup failed.
+fn entity_type_is_declared(
+    wtxn: &redb::WriteTransaction,
+    type_id_raw: u32,
+    declared: &std::collections::HashSet<String>,
+) -> bool {
+    if type_id_raw == 0 {
+        // The resolver reports `0` when it could not read back the entity's
+        // type. Treat it as declared: a descriptive counter must not inflate
+        // the junk rate on a lookup it could not make.
+        return true;
+    }
+    let type_id = brain_core::EntityTypeId::from(type_id_raw);
+    match brain_metadata::entity_type_name_by_id(wtxn, type_id) {
+        Ok(Some(name)) => declared.contains(&name),
+        Ok(None) | Err(_) => true,
+    }
+}
+
 async fn publish_extracted_graph(
     ctx: &WorkerContext,
     memory_id: MemoryId,
@@ -4516,6 +4636,10 @@ async fn publish_extracted_graph(
         entities = counts.entities,
         statements = counts.statements,
         relations = counts.relations,
+        dropped = counts.dropped,
+        contradictions = counts.contradictions,
+        entities_undeclared = counts.entities_undeclared,
+        had_active_schema = counts.had_active_schema,
         bus_subscriber_count = ctx.ops.events.subscriber_count(),
         "publish_extracted_graph: emitting StageCompleted",
     );
@@ -4523,6 +4647,10 @@ async fn publish_extracted_graph(
         entity_count: counts.entities,
         statement_count: counts.statements,
         relation_count: counts.relations,
+        dropped_count: counts.dropped,
+        contradiction_count: counts.contradictions,
+        undeclared_entity_count: counts.entities_undeclared,
+        has_active_schema: counts.had_active_schema,
         audit_status,
         // Non-empty exactly when a tier failed, which `decide_status`
         // already guarantees: it returns a reason for FAILURE and
@@ -5064,7 +5192,9 @@ fn declared_vocab_blocks(
         if !seen.insert(ns.as_str()) {
             continue;
         }
-        if let Ok(Some(vocab)) = brain_metadata::declared_vocabulary(rtxn, ns) {
+        if let Ok(Some(vocab)) =
+            brain_metadata::declared_vocabulary(rtxn, brain_metadata::DeclScope::base(ns))
+        {
             let block = vocab.render_prompt_block();
             if !block.is_empty() {
                 out.insert(ns.clone(), block);
@@ -5164,7 +5294,11 @@ fn resolve_or_intern_predicate(
     now: u64,
 ) -> Result<brain_core::PredicateId, brain_metadata::schema::predicate::PredicateOpError> {
     // Exact repeat mention — unchanged fast path, no scan.
-    if let Some(pid) = brain_metadata::schema::predicate::predicate_id_by_qname(wtxn, ns, name)? {
+    if let Some(pid) = brain_metadata::schema::predicate::predicate_id_by_qname(
+        wtxn,
+        brain_metadata::DeclScope::base(ns),
+        name,
+    )? {
         embed_predicate_if_absent(wtxn, embed_deps, pid, name);
         return Ok(pid);
     }
@@ -5198,7 +5332,7 @@ fn resolve_or_intern_predicate(
     }
 
     // Fresh mint — unchanged path (intern + embed-if-absent).
-    let pid = predicate_intern_or_get(wtxn, ns, name, 0, now)?;
+    let pid = predicate_intern_or_get(wtxn, brain_metadata::DeclScope::base(ns), name, 0, now)?;
     embed_predicate_if_absent(wtxn, embed_deps, pid, name);
     Ok(pid)
 }
@@ -5249,6 +5383,7 @@ fn vocab_target_namespace<'a>(
 fn declared_predicate_in_namespace(
     wtxn: &redb::WriteTransaction,
     vocab: Option<&brain_metadata::DeclaredVocabulary>,
+    space: [u8; 16],
     name: &str,
 ) -> Result<Option<brain_core::PredicateId>, ApplyError> {
     let Some(v) = vocab else {
@@ -5257,9 +5392,13 @@ fn declared_predicate_in_namespace(
     if v.predicate(name).is_none() {
         return Ok(None);
     }
-    let Ok(Some(pid)) =
-        brain_metadata::schema::predicate::predicate_id_by_qname(wtxn, &v.namespace, name)
-    else {
+    // Resolved from the WRITING space, so a space that declared its own
+    // meaning for this predicate gets that row rather than the tenant's.
+    let Ok(Some(pid)) = brain_metadata::schema::predicate::predicate_id_by_qname(
+        wtxn,
+        brain_metadata::DeclScope::space(&v.namespace, space),
+        name,
+    ) else {
         return Ok(None);
     };
     let t = wtxn
@@ -5287,9 +5426,11 @@ fn declared_relation_type_in_namespace(
     if v.relation_type(name).is_none() {
         return Ok(None);
     }
-    let Ok(Some(rt)) =
-        brain_metadata::relation::types::relation_type_id_by_qname(wtxn, &v.namespace, name)
-    else {
+    let Ok(Some(rt)) = brain_metadata::relation::types::relation_type_id_by_qname(
+        wtxn,
+        brain_metadata::DeclScope::base(&v.namespace),
+        name,
+    ) else {
         return Ok(None);
     };
     let t = wtxn
@@ -5346,7 +5487,7 @@ fn resolve_extracted_relation_type<'a>(
         return Ok((rt, mem_ns));
     }
     let ns = vocab_target_namespace(emitted_ns, mem_ns, false);
-    let rt = relation_type_intern_or_get(wtxn, ns, name, 0, now)?;
+    let rt = relation_type_intern_or_get(wtxn, brain_metadata::DeclScope::base(ns), name, 0, now)?;
     Ok((rt, ns))
 }
 
@@ -6936,6 +7077,10 @@ mod tests {
             statements: 0,
             relations: 0,
             mention_edges: 1,
+            dropped: 0,
+            contradictions: 0,
+            entities_undeclared: 0,
+            had_active_schema: false,
         };
         let (status, reason) = decide_status(&o, counts);
         assert_eq!(
@@ -6958,6 +7103,10 @@ mod tests {
             statements: 0,
             relations: 0,
             mention_edges: 1,
+            dropped: 0,
+            contradictions: 0,
+            entities_undeclared: 0,
+            had_active_schema: false,
         };
         let (status, reason) = decide_status(&o, counts);
         assert_eq!(status, pipeline_status::PARTIAL_FAILURE);
@@ -6991,6 +7140,10 @@ mod tests {
             statements: 0,
             relations: 0,
             mention_edges: 5,
+            dropped: 0,
+            contradictions: 0,
+            entities_undeclared: 0,
+            had_active_schema: false,
         };
         let (status, reason) = decide_status(&o, counts);
         assert_eq!(
@@ -7014,6 +7167,10 @@ mod tests {
             statements: 0,
             relations: 0,
             mention_edges: 5,
+            dropped: 0,
+            contradictions: 0,
+            entities_undeclared: 0,
+            had_active_schema: false,
         };
         let (status, reason) = decide_status(&o, counts);
         assert_eq!(status, pipeline_status::PARTIAL_FAILURE);
@@ -7652,8 +7809,22 @@ mod tests {
         // idempotent by qname, so it returns the rows the apply pass produced.
         let (reports_to_pred, member_of_rt) = {
             let wtxn = metadata.write_txn().unwrap();
-            let p = predicate_intern_or_get(&wtxn, "brain", "reports_to", 0, 0).unwrap();
-            let r = relation_type_intern_or_get(&wtxn, "brain", "member_of", 0, 0).unwrap();
+            let p = predicate_intern_or_get(
+                &wtxn,
+                brain_metadata::DeclScope::base("brain"),
+                "reports_to",
+                0,
+                0,
+            )
+            .unwrap();
+            let r = relation_type_intern_or_get(
+                &wtxn,
+                brain_metadata::DeclScope::base("brain"),
+                "member_of",
+                0,
+                0,
+            )
+            .unwrap();
             wtxn.commit().unwrap();
             (p, r)
         };
@@ -7707,8 +7878,22 @@ mod tests {
         // relation_type, never as a kind=Relation statement.
         let (partner_pred, partner_rt) = {
             let wtxn = metadata.write_txn().unwrap();
-            let p = predicate_intern_or_get(&wtxn, "brain", "partner_of", 0, 0).unwrap();
-            let r = relation_type_intern_or_get(&wtxn, "brain", "partner_of", 0, 0).unwrap();
+            let p = predicate_intern_or_get(
+                &wtxn,
+                brain_metadata::DeclScope::base("brain"),
+                "partner_of",
+                0,
+                0,
+            )
+            .unwrap();
+            let r = relation_type_intern_or_get(
+                &wtxn,
+                brain_metadata::DeclScope::base("brain"),
+                "partner_of",
+                0,
+                0,
+            )
+            .unwrap();
             wtxn.commit().unwrap();
             (p, r)
         };
@@ -7748,7 +7933,14 @@ mod tests {
         // subject ("they") is rejected so junk can't pollute the graph.
         let likes_id = {
             let wtxn = metadata.write_txn().unwrap();
-            let p = predicate_intern_or_get(&wtxn, "brain", "likes", 0, 0).unwrap();
+            let p = predicate_intern_or_get(
+                &wtxn,
+                brain_metadata::DeclScope::base("brain"),
+                "likes",
+                0,
+                0,
+            )
+            .unwrap();
             wtxn.commit().unwrap();
             p
         };
@@ -7928,9 +8120,30 @@ mod tests {
 
         let (zuoyongyu, traveled_to, collaborates) = {
             let wtxn = metadata.write_txn().unwrap();
-            let a = predicate_intern_or_get(&wtxn, "brain", "作用于", 0, 0).unwrap();
-            let b = predicate_intern_or_get(&wtxn, "brain", "traveled_to", 0, 0).unwrap();
-            let c = relation_type_intern_or_get(&wtxn, "brain", "collaborates_with", 0, 0).unwrap();
+            let a = predicate_intern_or_get(
+                &wtxn,
+                brain_metadata::DeclScope::base("brain"),
+                "作用于",
+                0,
+                0,
+            )
+            .unwrap();
+            let b = predicate_intern_or_get(
+                &wtxn,
+                brain_metadata::DeclScope::base("brain"),
+                "traveled_to",
+                0,
+                0,
+            )
+            .unwrap();
+            let c = relation_type_intern_or_get(
+                &wtxn,
+                brain_metadata::DeclScope::base("brain"),
+                "collaborates_with",
+                0,
+                0,
+            )
+            .unwrap();
             wtxn.commit().unwrap();
             (a, b, c)
         };
@@ -8155,10 +8368,38 @@ mod tests {
 
         let (traveled_to, favorite_color, visited, ran) = {
             let wtxn = metadata.write_txn().unwrap();
-            let a = predicate_intern_or_get(&wtxn, "brain", "traveled_to", 0, 0).unwrap();
-            let b = predicate_intern_or_get(&wtxn, "brain", "favorite_color", 0, 0).unwrap();
-            let c = predicate_intern_or_get(&wtxn, "brain", "visited", 0, 0).unwrap();
-            let d = predicate_intern_or_get(&wtxn, "brain", "ran", 0, 0).unwrap();
+            let a = predicate_intern_or_get(
+                &wtxn,
+                brain_metadata::DeclScope::base("brain"),
+                "traveled_to",
+                0,
+                0,
+            )
+            .unwrap();
+            let b = predicate_intern_or_get(
+                &wtxn,
+                brain_metadata::DeclScope::base("brain"),
+                "favorite_color",
+                0,
+                0,
+            )
+            .unwrap();
+            let c = predicate_intern_or_get(
+                &wtxn,
+                brain_metadata::DeclScope::base("brain"),
+                "visited",
+                0,
+                0,
+            )
+            .unwrap();
+            let d = predicate_intern_or_get(
+                &wtxn,
+                brain_metadata::DeclScope::base("brain"),
+                "ran",
+                0,
+                0,
+            )
+            .unwrap();
             wtxn.commit().unwrap();
             (a, b, c, d)
         };
@@ -8428,7 +8669,14 @@ mod tests {
 
         let joined_pid = {
             let wtxn = metadata.write_txn().unwrap();
-            let p = predicate_intern_or_get(&wtxn, "brain", "joined", 0, 0).unwrap();
+            let p = predicate_intern_or_get(
+                &wtxn,
+                brain_metadata::DeclScope::base("brain"),
+                "joined",
+                0,
+                0,
+            )
+            .unwrap();
             wtxn.commit().unwrap();
             p
         };
@@ -8627,7 +8875,14 @@ mod tests {
 
         let joined_pid = {
             let wtxn = metadata.write_txn().unwrap();
-            let p = predicate_intern_or_get(&wtxn, "brain", "joined", 0, 0).unwrap();
+            let p = predicate_intern_or_get(
+                &wtxn,
+                brain_metadata::DeclScope::base("brain"),
+                "joined",
+                0,
+                0,
+            )
+            .unwrap();
             wtxn.commit().unwrap();
             p
         };
@@ -8779,7 +9034,14 @@ mod tests {
 
         let manages = {
             let wtxn = metadata.write_txn().unwrap();
-            let pid = predicate_intern_or_get(&wtxn, "brain", "manages", 0, 0).unwrap();
+            let pid = predicate_intern_or_get(
+                &wtxn,
+                brain_metadata::DeclScope::base("brain"),
+                "manages",
+                0,
+                0,
+            )
+            .unwrap();
             wtxn.commit().unwrap();
             pid
         };
@@ -9038,7 +9300,14 @@ mod tests {
 
         let role = {
             let wtxn = metadata.write_txn().unwrap();
-            let p = predicate_intern_or_get(&wtxn, "brain", "role", 0, 0).unwrap();
+            let p = predicate_intern_or_get(
+                &wtxn,
+                brain_metadata::DeclScope::base("brain"),
+                "role",
+                0,
+                0,
+            )
+            .unwrap();
             wtxn.commit().unwrap();
             p
         };
@@ -9262,7 +9531,14 @@ mod tests {
 
         let pid = {
             let wtxn = metadata.write_txn().unwrap();
-            let p = predicate_intern_or_get(&wtxn, "brain", name, 0, 0).unwrap();
+            let p = predicate_intern_or_get(
+                &wtxn,
+                brain_metadata::DeclScope::base("brain"),
+                name,
+                0,
+                0,
+            )
+            .unwrap();
             wtxn.commit().unwrap();
             p
         };
@@ -9465,8 +9741,22 @@ mod tests {
         use brain_metadata::statement::{statement_list, StatementListFilter};
         let (ran_pid, color_pid) = {
             let wtxn = metadata.write_txn().unwrap();
-            let a = predicate_intern_or_get(&wtxn, "brain", "ran", 0, 0).unwrap();
-            let b = predicate_intern_or_get(&wtxn, "brain", "favorite_color", 0, 0).unwrap();
+            let a = predicate_intern_or_get(
+                &wtxn,
+                brain_metadata::DeclScope::base("brain"),
+                "ran",
+                0,
+                0,
+            )
+            .unwrap();
+            let b = predicate_intern_or_get(
+                &wtxn,
+                brain_metadata::DeclScope::base("brain"),
+                "favorite_color",
+                0,
+                0,
+            )
+            .unwrap();
             wtxn.commit().unwrap();
             (a, b)
         };
@@ -9631,7 +9921,14 @@ mod tests {
             .expect("apply_outcome");
         let pid = {
             let wtxn = metadata.write_txn().unwrap();
-            let p = predicate_intern_or_get(&wtxn, "brain", "ran", 0, 0).unwrap();
+            let p = predicate_intern_or_get(
+                &wtxn,
+                brain_metadata::DeclScope::base("brain"),
+                "ran",
+                0,
+                0,
+            )
+            .unwrap();
             wtxn.commit().unwrap();
             p
         };
@@ -9961,7 +10258,13 @@ mod tests {
         let validated = validate(&parse_schema(src).expect("parse")).expect("validate");
         let wtxn = metadata.write_txn().unwrap();
         let ns_id = brain_metadata::namespace::namespace_intern_or_get(&wtxn, ns, 1).unwrap();
-        brain_metadata::schema::store::schema_upload(&wtxn, &validated, 1).expect("upload");
+        brain_metadata::schema::store::schema_upload(
+            &wtxn,
+            &validated,
+            brain_metadata::tables::scope::SPACE_BASE,
+            1,
+        )
+        .expect("upload");
         wtxn.commit().unwrap();
         brain_metadata::RowScope::from_bytes(ns_id.raw(), [0xA1; 16])
     }
@@ -9999,7 +10302,12 @@ mod tests {
         name: &str,
     ) -> Vec<brain_core::Statement> {
         use brain_metadata::statement::{statement_list, StatementListFilter};
-        let Some(p) = brain_metadata::predicate_lookup_by_qname(rtxn, ns, name).unwrap() else {
+        let Some(p) = brain_metadata::predicate_lookup_by_qname(
+            rtxn,
+            brain_metadata::DeclScope::base(ns),
+            name,
+        )
+        .unwrap() else {
             return Vec::new();
         };
         statement_list(
@@ -10046,9 +10354,13 @@ mod tests {
 
         let rtxn = metadata.read_txn().unwrap();
         assert!(
-            brain_metadata::predicate_lookup_by_qname(&rtxn, "mirror", "clones")
-                .unwrap()
-                .is_none(),
+            brain_metadata::predicate_lookup_by_qname(
+                &rtxn,
+                brain_metadata::DeclScope::base("mirror"),
+                "clones"
+            )
+            .unwrap()
+            .is_none(),
             "no predicate may be minted under a declared relation type's name"
         );
         let alice = __alice_in(&rtxn, scope);
@@ -10200,9 +10512,13 @@ mod tests {
 
         let rtxn = metadata.read_txn().unwrap();
         // The edge landed.
-        let rt = brain_metadata::relation_type_lookup_by_qname(&rtxn, "mirror", "clones")
-            .unwrap()
-            .expect("mirror:clones declared");
+        let rt = brain_metadata::relation_type_lookup_by_qname(
+            &rtxn,
+            brain_metadata::DeclScope::base("mirror"),
+            "clones",
+        )
+        .unwrap()
+        .expect("mirror:clones declared");
         let alice = __alice_in(&rtxn, scope);
         let edges = brain_metadata::relation::ops::relation_list_from(
             &rtxn,
@@ -10220,9 +10536,13 @@ mod tests {
         // And no predicate twin was minted on either namespace spelling.
         for ns in ["mirror", "brain"] {
             assert!(
-                brain_metadata::predicate_lookup_by_qname(&rtxn, ns, "clones")
-                    .unwrap()
-                    .is_none(),
+                brain_metadata::predicate_lookup_by_qname(
+                    &rtxn,
+                    brain_metadata::DeclScope::base(ns),
+                    "clones"
+                )
+                .unwrap()
+                .is_none(),
                 "{ns}:clones must not be minted as a predicate",
             );
         }
@@ -10261,9 +10581,13 @@ mod tests {
         // Whichever axis it landed on, the triple was not dropped on the floor.
         let alice = __alice_in(&rtxn, scope);
         let as_statement = __statements_for(&rtxn, scope, alice, "mirror", "clones");
-        let rt = brain_metadata::relation_type_lookup_by_qname(&rtxn, "mirror", "clones")
-            .unwrap()
-            .expect("declared");
+        let rt = brain_metadata::relation_type_lookup_by_qname(
+            &rtxn,
+            brain_metadata::DeclScope::base("mirror"),
+            "clones",
+        )
+        .unwrap()
+        .expect("declared");
         let as_relation = brain_metadata::relation::ops::relation_list_from(
             &rtxn,
             scope,
@@ -10399,18 +10723,26 @@ mod tests {
         // No open-vocab brain: twins were coined for the declared predicates.
         for name in ["success_rate", "blocked_by"] {
             assert!(
-                brain_metadata::predicate_lookup_by_qname(&rtxn, "brain", name)
-                    .unwrap()
-                    .is_none(),
+                brain_metadata::predicate_lookup_by_qname(
+                    &rtxn,
+                    brain_metadata::DeclScope::base("brain"),
+                    name
+                )
+                .unwrap()
+                .is_none(),
                 "brain:{name} must not be coined for a declared mirror predicate"
             );
         }
 
         // Both relations landed on the declared mirror: relation types.
         for name in ["clones", "forked_from"] {
-            let rt = relation_type_lookup_by_qname(&rtxn, "mirror", name)
-                .unwrap()
-                .expect("declared relation type");
+            let rt = relation_type_lookup_by_qname(
+                &rtxn,
+                brain_metadata::DeclScope::base("mirror"),
+                name,
+            )
+            .unwrap()
+            .expect("declared relation type");
             let rels = relation_list_from(
                 &rtxn,
                 scope,
@@ -10424,9 +10756,13 @@ mod tests {
             .unwrap();
             assert_eq!(rels.len(), 1, "one Alice --mirror:{name}--> edge");
             assert!(
-                relation_type_lookup_by_qname(&rtxn, "brain", name)
-                    .unwrap()
-                    .is_none(),
+                relation_type_lookup_by_qname(
+                    &rtxn,
+                    brain_metadata::DeclScope::base("brain"),
+                    name
+                )
+                .unwrap()
+                .is_none(),
                 "brain:{name} relation type must not be coined"
             );
         }
@@ -10470,7 +10806,14 @@ mod tests {
         // An existing open-vocab brain: near-synonym carrying a vector.
         {
             let wtxn = metadata.write_txn().unwrap();
-            let p = predicate_intern_or_get(&wtxn, "brain", "success_rates", 0, 1).unwrap();
+            let p = predicate_intern_or_get(
+                &wtxn,
+                brain_metadata::DeclScope::base("brain"),
+                "success_rates",
+                0,
+                1,
+            )
+            .unwrap();
             let mut v = vec![0.0f32; VECTOR_DIM];
             v[0] = 1.0;
             brain_metadata::predicate_embedding_put(&wtxn, p, &v).unwrap();
@@ -10980,13 +11323,18 @@ mod registry_refresh_tests {
         let validated = validate(&parse_schema(src).expect("parse")).expect("validate");
         {
             let wtxn = metadata.write_txn().unwrap();
-            brain_metadata::schema::store::schema_upload(&wtxn, &validated, 1_700_000_000_000)
-                .expect("schema_upload");
+            brain_metadata::schema::store::schema_upload(
+                &wtxn,
+                &validated,
+                brain_metadata::tables::scope::SPACE_BASE,
+                1_700_000_000_000,
+            )
+            .expect("schema_upload");
             wtxn.commit().unwrap();
         }
         let expected_id = brain_metadata::extractor::ops::extractor_lookup_by_qname(
             &metadata.read_txn().unwrap(),
-            "t",
+            brain_metadata::DeclScope::base("t"),
             "person_mentions",
         )
         .unwrap()
@@ -11050,8 +11398,13 @@ mod registry_refresh_tests {
         let validated = validate(&parse_schema(src).expect("parse")).expect("validate");
         {
             let wtxn = metadata.write_txn().unwrap();
-            brain_metadata::schema::store::schema_upload(&wtxn, &validated, 1_700_000_000_000)
-                .expect("schema_upload");
+            brain_metadata::schema::store::schema_upload(
+                &wtxn,
+                &validated,
+                brain_metadata::tables::scope::SPACE_BASE,
+                1_700_000_000_000,
+            )
+            .expect("schema_upload");
             wtxn.commit().unwrap();
         }
 

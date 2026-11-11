@@ -28,6 +28,7 @@ use brain_metadata::schema::predicate::{predicate_intern_or_get, predicates_acti
 use brain_metadata::schema::store::schema_upload;
 use brain_metadata::statement::{statement_create, statement_get};
 use brain_metadata::tables::statement::{statement_flags, STATEMENTS_TABLE};
+use brain_metadata::DeclScope;
 use brain_metadata::MetadataDb;
 use brain_metadata::RowScope;
 use brain_protocol::schema::{parse_schema, validate, ValidatedSchema};
@@ -82,7 +83,8 @@ fn write_statement(
     predicate_name: &str,
 ) -> StatementId {
     let wtxn = db.begin_write().unwrap();
-    let pid = predicate_intern_or_get(&wtxn, predicate_ns, predicate_name, 0, T0).unwrap();
+    let pid = predicate_intern_or_get(&wtxn, DeclScope::base(predicate_ns), predicate_name, 0, T0)
+        .unwrap();
     let evidence_entry = EvidenceEntry::from_parts(
         MemoryId::pack(1, SessionId::DEFAULT.into(), 0),
         1.0,
@@ -130,7 +132,7 @@ fn statement_flags_word(db: &redb::Database, sid: StatementId) -> u32 {
 fn drive_flag_sweep(db: &redb::Database, namespace: &str, version: u32) {
     let active = {
         let rtxn = db.begin_read().unwrap();
-        predicates_active_for_schema(&rtxn, namespace, version).unwrap()
+        predicates_active_for_schema(&rtxn, DeclScope::base(namespace), version).unwrap()
     };
     let wtxn = db.begin_write().unwrap();
     flag_statements_outside_schema(&wtxn, namespace, &active).unwrap();
@@ -163,7 +165,13 @@ fn schemaless_to_strict_flags_only_out_of_vocabulary_rows() {
     // Upload a schema that declares only `prefers`.
     {
         let wtxn = db.begin_write().unwrap();
-        let v = schema_upload(&wtxn, &schema_with_predicates("acme", &["prefers"]), T0).unwrap();
+        let v = schema_upload(
+            &wtxn,
+            &schema_with_predicates("acme", &["prefers"]),
+            brain_metadata::tables::scope::SPACE_BASE,
+            T0,
+        )
+        .unwrap();
         assert_eq!(v, 1);
         wtxn.commit().unwrap();
     }
@@ -212,7 +220,13 @@ fn statement_in_unrelated_namespace_is_not_touched() {
     {
         let wtxn = db.begin_write().unwrap();
         // Declare only `acme` namespace with `prefers`.
-        schema_upload(&wtxn, &schema_with_predicates("acme", &["prefers"]), T0).unwrap();
+        schema_upload(
+            &wtxn,
+            &schema_with_predicates("acme", &["prefers"]),
+            brain_metadata::tables::scope::SPACE_BASE,
+            T0,
+        )
+        .unwrap();
         wtxn.commit().unwrap();
     }
     drive_flag_sweep(db, "acme", 1);
@@ -251,7 +265,13 @@ fn schema_upload_adopts_implicit_predicate_and_keeps_rows_clean() {
     // Now declare a schema that *includes* `prefers` (adoption path).
     {
         let wtxn = db.begin_write().unwrap();
-        schema_upload(&wtxn, &schema_with_predicates("acme", &["prefers"]), T0).unwrap();
+        schema_upload(
+            &wtxn,
+            &schema_with_predicates("acme", &["prefers"]),
+            brain_metadata::tables::scope::SPACE_BASE,
+            T0,
+        )
+        .unwrap();
         wtxn.commit().unwrap();
     }
     drive_flag_sweep(db, "acme", 1);

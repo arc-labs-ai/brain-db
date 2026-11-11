@@ -7,18 +7,11 @@
 //! which run on a **glommio** shard executor, so there is no such runtime at
 //! the call site.
 //!
-//! This is the same defect as issue #34 and the same fix as
-//! [`crate::broker`]'s runtime, one layer further on. #34 was found and fixed
-//! on the *resolve* call, which is as far as a write could get while no
-//! namespace had a credential: resolution returned `Missing` and the write
-//! degraded before any provider client was built. Registering the first real
-//! credential is what let a write reach the completion call, and it aborted
-//! the shard with SIGABRT on the first one.
-//!
-//! Kept separate from the broker's runtime rather than shared, because the two
-//! are sized for different jobs: the broker carries one small JSON request per
-//! namespace per TTL and is a control path, while this carries every
-//! extraction and HyPE generation on the shard and is the traffic path.
+//! A namespace with no stored credential never reaches this far: resolution
+//! answers `Missing` and the write degrades before any provider client is
+//! built. The first namespace to register a key is therefore the first to
+//! exercise this path, which is why it carries every extraction and HyPE
+//! generation on the shard rather than a trickle.
 //!
 //! Multi-threaded rather than current-thread on purpose: a current-thread
 //! runtime only advances inside `block_on`, and nothing here calls that, so

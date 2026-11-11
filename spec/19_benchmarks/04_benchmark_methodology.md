@@ -22,6 +22,7 @@ A standardized synthetic dataset:
 - 1M memories per shard.
 - Each memory: 1 KB of text.
 - Vector embeddings: derived from the text via the production embedder.
+- A registered LLM provider credential on the benchmark namespace. ENCODE is refused without one, so the harness issues an `LLM_CREDENTIAL_PUT` during setup; mock-provider runs register a key pointed at the mock endpoint.
 - Edges: 5 per memory on average (Pareto distribution: most have few, some have many).
 
 The dataset generator is open-source and deterministic (seed-based).

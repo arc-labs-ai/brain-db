@@ -6,6 +6,49 @@
 use crate::envelope::request::WireUuid;
 use crate::ops::memory::ActAs;
 
+/// The scope a `SCHEMA_UPLOAD` declares AT.
+///
+/// Declarations resolve narrowest-first — `(namespace, space)` →
+/// `(namespace, base)` → `(system, base)` — so a space overlay adds
+/// definitions one space can see without touching what the rest of the
+/// namespace sees.
+///
+/// This is deliberately a two-state selector and **not** a space
+/// identifier. The scope is the caller's own effective space (the one
+/// `act_as` already resolved for this request), so there is nothing here
+/// for a caller to point at someone else's space with.
+///
+/// It is also deliberately separate from `act_as`. Nearly every request
+/// names a space — that is how a tenant addresses its own data — so
+/// reading the upload scope off `act_as.space` would silently convert
+/// every ordinary namespace-wide declaration into a per-space overlay
+/// invisible to the tenant's other spaces. An overlay is a different
+/// thing from a namespace schema, so it takes a different, explicit word
+/// on the request.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    Hash,
+    PartialEq,
+    serde_repr::Serialize_repr,
+    serde_repr::Deserialize_repr,
+)]
+#[repr(u8)]
+pub enum SchemaScope {
+    /// The tenant's namespace-wide base: every space in the namespace
+    /// resolves these declarations. The default, and what every
+    /// `SCHEMA_UPLOAD` meant before the field existed.
+    #[default]
+    Namespace = 0,
+    /// An overlay at the caller's effective space. Only that space
+    /// resolves these declarations; sibling spaces keep seeing the
+    /// namespace base alone.
+    Space = 1,
+}
+
 /// `SCHEMA_UPLOAD` (`0x0120`).
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SchemaUploadRequest {
@@ -26,6 +69,19 @@ pub struct SchemaUploadRequest {
     /// connection's own key-bound identity. See [`ActAs`].
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub act_as: Option<ActAs>,
+    /// Where this document declares: the namespace base, or an overlay at
+    /// the caller's effective space. See [`SchemaScope`] for why this is
+    /// an explicit choice rather than one inferred from `act_as.space`.
+    ///
+    /// ALWAYS ON THE WIRE. It first shipped as
+    /// `#[serde(default, skip_serializing_if = ...)]`, which kept a
+    /// base upload byte-identical to the pre-field encoding — a
+    /// backward-compatibility accommodation, and this project does not
+    /// carry those: there are no deployed clients to keep working, so the
+    /// only thing an optional field buys is a request whose meaning
+    /// depends on what the decoder assumes rather than on what the sender
+    /// wrote. A caller states its scope.
+    pub scope: SchemaScope,
 }
 
 /// `SCHEMA_GET` (`0x0121`). `version == 0` → active version.
@@ -69,6 +125,18 @@ pub struct SchemaValidateRequest {
     /// connection's own key-bound identity. See [`ActAs`].
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub act_as: Option<ActAs>,
+    /// Which scope the document would be validated against: the namespace
+    /// base, or an overlay at the caller's effective space.
+    ///
+    /// VALIDATE exists to predict UPLOAD, and an upload resolves its
+    /// references against the scope it lands in. Validating a space's
+    /// document against the namespace base reports references to the
+    /// space's own types as undeclared and predicts the wrong next version,
+    /// so the selector has to be the same one UPLOAD takes.
+    ///
+    /// ALWAYS ON THE WIRE, for the reason stated on
+    /// [`SchemaUploadRequest::scope`].
+    pub scope: SchemaScope,
 }
 
 /// `SCHEMA_REPLACE` (`0x0127`). Destructive counterpart to
@@ -82,6 +150,15 @@ pub struct SchemaValidateRequest {
 /// `force_drop_existing` MUST be `true`; the handler rejects a
 /// `false` value with `InvalidRequest`. The explicit flag is a
 /// confirmation step for an irreversible operation.
+///
+/// There is deliberately no [`SchemaScope`] here, unlike
+/// [`SchemaUploadRequest`]. The drop half of a replace is keyed by
+/// namespace alone — predicates, relation types and extractors have no
+/// space in their key — so a "space-scoped" replace would delete the
+/// whole namespace's declared vocabulary (every sibling space included)
+/// and then re-declare only inside one space. An op whose destructive
+/// reach is wider than the scope it names has no safe meaning, so it
+/// isn't offered: REPLACE always acts on the namespace base.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SchemaReplaceRequest {
     /// Schema DSL source text. Must declare the same namespace as
@@ -100,12 +177,23 @@ pub struct SchemaReplaceRequest {
     /// connection's own key-bound identity. See [`ActAs`].
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub act_as: Option<ActAs>,
+    /// Which scope this operation narrows: the namespace base, or an
+    /// overlay at the caller's effective space.
+    ///
+    /// A narrowing reaches exactly the declarations the named scope made.
+    /// Dropping at the base leaves every space's own overlay standing;
+    /// dropping in a space leaves the tenant's base standing, because a
+    /// space may not narrow vocabulary its siblings resolve.
+    ///
+    /// ALWAYS ON THE WIRE, for the reason stated on
+    /// [`SchemaUploadRequest::scope`].
+    pub scope: SchemaScope,
 }
 
 /// Target kind for a `SCHEMA_DROP` request.
 ///
-/// Entity types are deliberately absent: they are global in the v1
-/// storage model (no namespace key), so dropping one would race rows in
+/// Entity types are deliberately absent: they are shared built-ins plus
+/// per-tenant overrides, so dropping one would race rows in
 /// other namespaces that reference the same shared type — the same
 /// reason `SCHEMA_REPLACE` never drops them. The handler rejects any
 /// other discriminant with `InvalidRequest`.
@@ -129,6 +217,12 @@ pub mod schema_drop_target {
 /// live rows drops without `force`. Existing rows on a dropped type stay
 /// as orphans — readable as plain memories, no longer enriched from the
 /// typed-graph tables — exactly as under `SCHEMA_REPLACE`.
+///
+/// No [`SchemaScope`] here either, for the same reason as
+/// `SCHEMA_REPLACE`: the only droppable targets (predicate,
+/// relation_type) are namespace-keyed, so there is no per-space row for
+/// a space-scoped drop to remove. DROP always acts on the namespace
+/// base.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SchemaDropRequest {
     /// Namespace the target lives in. MUST equal the caller's own
@@ -151,6 +245,17 @@ pub struct SchemaDropRequest {
     /// connection's own key-bound identity. See [`ActAs`].
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub act_as: Option<ActAs>,
+    /// Which scope this operation narrows: the namespace base, or an
+    /// overlay at the caller's effective space.
+    ///
+    /// A narrowing reaches exactly the declarations the named scope made.
+    /// Dropping at the base leaves every space's own overlay standing;
+    /// dropping in a space leaves the tenant's base standing, because a
+    /// space may not narrow vocabulary its siblings resolve.
+    ///
+    /// ALWAYS ON THE WIRE, for the reason stated on
+    /// [`SchemaUploadRequest::scope`].
+    pub scope: SchemaScope,
 }
 
 // ============================================================

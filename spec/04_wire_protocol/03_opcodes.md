@@ -141,6 +141,46 @@ Non-admin registry ops, scoped to the caller's `(namespace, space)` and `act_as`
 
 These are the **tenant-facing** registry. `ADMIN_CREATE_SESSION` / `ADMIN_RENAME_SESSION` (§1.6) are a separate, admin-gated operator surface that names sessions and is not `act_as`-aware. Spaces and sessions are also created lazily by the first write that names one, so an explicit create is for provisioning metadata ahead of time, not a precondition for writing.
 
+### 1.6b Tenant LLM provider credentials
+
+| Opcode | Name | Direction | Purpose |
+|---|---|---|---|
+| 0x0076 | `LLM_CREDENTIAL_PUT_REQ` | C → S | Register (or replace) this namespace's provider key |
+| 0x00F6 | `LLM_CREDENTIAL_PUT_RESP` | S → C | Provider, model, display fingerprint, `replaced` flag |
+| 0x0077 | `LLM_CREDENTIAL_GET_REQ` | C → S | What this namespace has installed |
+| 0x00F7 | `LLM_CREDENTIAL_GET_RESP` | S → C | A credential view, or absent when none is registered |
+| 0x0078 | `LLM_CREDENTIAL_DELETE_REQ` | C → S | Revoke this namespace's key |
+| 0x00F8 | `LLM_CREDENTIAL_DELETE_RESP` | S → C | Revoke ack (`existed`) |
+| 0x0079 | `LLM_CREDENTIAL_VERIFY_REQ` | C → S | Exercise the registered key against its provider |
+| 0x00F9 | `LLM_CREDENTIAL_VERIFY_RESP` | S → C | An outcome, with the provider's own reason on a failure |
+
+**Why these are substrate ops and not typed-graph ops.** A namespace registers
+a provider key on a fresh deployment, before any schema has been declared. The
+typed-graph namespace (`0x01xx`) activates when a schema is uploaded, so a
+credential op placed there would be documented as unavailable in exactly the
+state it is first needed. They sit with spaces and sessions because they are
+tenant configuration.
+
+**Permission.** All four require `LLM_CREDENTIAL` (bit 7), which is
+deliberately neither `ADMIN` nor part of the write bundle: a tenant running
+their own extraction budget should not need operator powers, and a key that
+can store a memory must not also be able to replace the key that pays for
+processing it. The bit is **not delegable**, so an `act_as` request can never
+register a credential.
+
+**Transport.** `LLM_CREDENTIAL_PUT` is the only frame in the protocol that
+carries a plaintext provider key, and it is refused unless the connection is
+TLS, mTLS, or a loopback peer. Sealing covers the key at rest; refusing the
+request is what covers it in flight. The reads are not gated this way — they
+return a provider, a model and a display fingerprint, and nothing a key can be
+rebuilt from.
+
+**Scope.** Each request carries a `scope` selector (`Namespace` = 0, `Space` =
+1), always encoded. `Space` is accepted by the storage layer but **refused at
+the op** while derivation resolves credentials at the namespace: a space-scoped
+key would never be used, and accepting one would leave a tenant with a
+credential that silently does nothing.
+
 ### 1.7 Errors
 
 | Opcode | Name | Direction | Purpose |
@@ -179,9 +219,9 @@ The low byte's high bit selects direction within this namespace, mirroring the s
 | 0x0125 | `SCHEMA_DROP` | target_kind (0 = predicate, 1 = relation_type) + target_name + `force` | namespace, schema_version, target_kind, target_name, dropped, live_rows, validation_errors |
 | 0x0127 | `SCHEMA_REPLACE` | schema document + `force_drop_existing: true` | namespace, schema_version, dropped_count, validation_errors |
 
-`SCHEMA_REPLACE` (request `0x0127`, response `0x01A7`) is the destructive counterpart to the additive-merge `SCHEMA_UPLOAD`. It tombstones every schema-declared predicate, relation_type, and extractor row in the target namespace and re-runs the apply path against a clean slate inside a single redb wtxn. Entity types are **not** dropped (they are global in v1; see [`../03_schema/05_versioning.md`](../03_schema/05_versioning.md) §1c). Admin-only; the handler rejects the call unless `force_drop_existing` is exactly `true`. See [`../03_schema/05_versioning.md`](../03_schema/05_versioning.md) §9.
+`SCHEMA_REPLACE` (request `0x0127`, response `0x01A7`) is the destructive counterpart to the additive-merge `SCHEMA_UPLOAD`. It tombstones every schema-declared predicate, relation_type, and extractor row in the target namespace and re-runs the apply path against a clean slate inside a single redb wtxn. Entity types are **not** dropped (they have no drop path; see [`../03_schema/05_versioning.md`](../03_schema/05_versioning.md) §1c). Admin-only; the handler rejects the call unless `force_drop_existing` is exactly `true`. See [`../03_schema/05_versioning.md`](../03_schema/05_versioning.md) §9.
 
-`SCHEMA_DROP` (request `0x0125`, response `0x01A5`) is the *targeted* narrowing: it removes one declared predicate or relation_type from a namespace and re-versions the narrowed document, versus `SCHEMA_REPLACE`, which wipes the whole namespace. Entity types are global and never dropped. An in-use safety gate rejects the drop (`Conflict`) when live (non-tombstoned) rows are still keyed on the target unless `force` is set. Re-dropping an already-absent target is a lenient no-op success (`dropped = false`, version unchanged), matching FORGET's idempotency. Admin-only. Like `SCHEMA_UPLOAD` / `SCHEMA_REPLACE`, it flows through the unified `submit(Write)` path so the mutation is WAL-durable and replayed on recovery (see [`../08_storage/02_wal.md`](../08_storage/02_wal.md) §21). See [`../03_schema/05_versioning.md`](../03_schema/05_versioning.md) §9a.
+`SCHEMA_DROP` (request `0x0125`, response `0x01A5`) is the *targeted* narrowing: it removes one declared predicate or relation_type from a namespace and re-versions the narrowed document, versus `SCHEMA_REPLACE`, which wipes the whole namespace. Entity types have no drop path and are never removed. An in-use safety gate rejects the drop (`Conflict`) when live (non-tombstoned) rows are still keyed on the target unless `force` is set. Re-dropping an already-absent target is a lenient no-op success (`dropped = false`, version unchanged), matching FORGET's idempotency. Admin-only. Like `SCHEMA_UPLOAD` / `SCHEMA_REPLACE`, it flows through the unified `submit(Write)` path so the mutation is WAL-durable and replayed on recovery (see [`../08_storage/02_wal.md`](../08_storage/02_wal.md) §21). See [`../03_schema/05_versioning.md`](../03_schema/05_versioning.md) §9a.
 
 ### 2.2 Entity operations (0x0130–0x013F)
 
@@ -311,8 +351,9 @@ There is no `SCHEMA_NOT_DECLARED` error any more — the gate is per-type, not p
 Within the substrate namespace (`0x00xx`), the following low-byte ranges are reserved:
 
 - 0x70–0x75 / 0xF0–0xF5 — **allocated** to the space & session registry (§1.6a).
-- 0x76–0x7F (server-bound, `0x0076–0x007F`) — reserved for future C → S substrate operations.
-- 0xF6–0xFE (client-bound, `0x00F6–0x00FE`) — reserved for future S → C substrate operations.
+- 0x76–0x79 / 0xF6–0xF9 — **allocated** to the tenant LLM provider credential ops (§1.6b).
+- 0x7A–0x7F (server-bound, `0x007A–0x007F`) — reserved for future C → S substrate operations.
+- 0xFA–0xFE (client-bound, `0x00FA–0x00FE`) — reserved for future S → C substrate operations.
 
 Within the typed-graph namespace (`0x01xx`):
 

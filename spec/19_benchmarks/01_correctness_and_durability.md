@@ -30,6 +30,7 @@ Tests:
 - The metadata fields match the request (agent, session, salience, kind, etc.).
 - A new MemoryId is generated and returned.
 - The memory is queryable in subsequent RECALLs.
+- The caller's namespace has a registered LLM provider credential. Without one, ENCODE is refused with `LlmCredentialMissing` (0x0066) before the write lands — a correctness property in its own right, and a precondition for every test below.
 
 Tests:
 - Encode 1000 memories. Verify each is retrievable by exact-match (RECALL with the original text returns the memory with similarity ≈ 1.0).
@@ -366,7 +367,7 @@ Tested: snapshot, then verify the snapshot's contents match a consistent moment.
 
 A backup, restored to a fresh Brain node:
 - Has all the data the original had.
-- Behaves the same as the original.
+- Behaves the same as the original — which includes accepting writes. A restore that recovered the shard files but not the tenant-credential store and its sealing key comes up refusing every ENCODE, so "all the data" is not sufficient; both are part of the round-trip.
 
 Tested: backup a node with 100K memories; restore; query both for the same cues; verify identical results.
 

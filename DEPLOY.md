@@ -26,13 +26,13 @@ you run is exactly what we run.
 ## Prerequisites
 
 - **Docker** (or any OCI runtime / Kubernetes).
-- **A credential broker.** Write-time HyPE and extraction are always-on and
-  depend on an LLM, but Brain never holds a provider key: it resolves a
-  namespace-scoped grant from the broker ([`brain-edge`](https://github.com/arc-labs-ai/brain-edge)
-  serves that endpoint). `[llm.broker] url` must be *set* for the server to
-  boot — not reachable — so Brain starts before its broker does. A namespace
-  with no registered key still writes; its LLM tier reports that it could not
-  run. You do **not** need a provider key of your own.
+- **No LLM credential.** Write-time HyPE and extraction are always-on and
+  depend on an LLM, but a deployment holds no provider key: each namespace
+  registers its own over the wire and Brain seals it. Nothing gates boot on a
+  credential, so `brain-db` starts standalone. You do **not** need a provider
+  key of your own — but each namespace needs one before it can write: HyPE and
+  extraction both require it, so an ENCODE for a namespace with no registered
+  key is refused with `LlmCredentialMissing`.
 - **`seccomp=unconfined`** (or a profile permitting `io_uring_*`). Brain's
   shards use io_uring via Glommio; the default Docker seccomp profile blocks the
   syscalls.
@@ -47,8 +47,6 @@ you run is exactly what we run.
 docker run -d --name brain \
   --security-opt seccomp=unconfined \
   -p 8080:8080 -p 9091:9091 \
-  -e BRAIN__LLM__BROKER__URL=http://brain-edge:8080 \
-  -e BRAIN__LLM__BROKER__SERVICE_KEY=... \
   -e BRAIN__LLM__MODEL=gpt-4o-mini \
   -e BRAIN__ADMIN__TOKEN="$(openssl rand -hex 32)" \
   -v brain-data:/var/lib/brain/data \
@@ -118,11 +116,9 @@ docker compose ps             # HEALTHCHECK status shows here
 docker compose logs -f brain
 ```
 
-Three values are required and `docker compose up` refuses to start without
-them: `BRAIN__LLM__BROKER__URL`, `BRAIN__LLM__BROKER__SERVICE_KEY` and
-`BRAIN__ADMIN__TOKEN`. `BRAIN__LLM__API_KEY` is **not** one of them — leave it
-empty. It is deprecated, it is not the serving credential, and Brain resolves
-a namespace-scoped grant from the broker for every LLM call.
+One value is required and `docker compose up` refuses to start without it:
+`BRAIN__ADMIN__TOKEN`. There is no provider key to set — each namespace
+registers its own through `LLM_CREDENTIAL_PUT` once the server is up.
 
 Pin a version in `.env`: `BRAIN_VERSION=0.4.0`.
 
@@ -160,10 +156,8 @@ The image bakes defaults at `/etc/brain/config.toml`. Two override paths:
 
    | Env var | Effect |
    |---|---|
-   | `BRAIN__LLM__BROKER__URL` | where namespace credentials resolve (**required**) |
-   | `BRAIN__LLM__BROKER__SERVICE_KEY` | Brain's identity to the broker — not a provider key |
-   | `BRAIN__LLM__API_KEY` | **deprecated, leave empty** — builds the two remaining shard-wide clients (entity disambiguator, summarizer); never the serving credential |
-   | `BRAIN__LLM__MODEL` | model id → derives provider (default `gpt-4o-mini`) |
+   | `BRAIN__LLM__CREDENTIALS__KEK` | the key that seals stored credentials, 64 hex chars. Unset, Brain generates one into its data directory on first boot |
+   | `BRAIN__LLM__MODEL` | fallback model id when a registered credential names none (default `gpt-4o-mini`) |
    | `BRAIN__ADMIN__TOKEN` | operator admin secret (**required**) |
    | `BRAIN__STORAGE__SHARD_COUNT` | shards; one shard pins one core |
    | `BRAIN__SHARD__ARENA_CAPACITY_BYTES` | per-shard vector arena (e.g. `4GiB`) |

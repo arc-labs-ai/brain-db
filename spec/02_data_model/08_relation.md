@@ -116,7 +116,7 @@ enum RelationTypeOrigin {
 ```
 
 - `SchemaDeclared`: `from` / `to` type constraints, properties, and `cardinality` are enforced on write. Violations produce `CardinalityViolation` (0x0065) or the appropriate type-mismatch error; unknown qnames produce `RelationTypeNotInSchema` (0x004C) in strict mode.
-- `ImplicitFromWrite`: the relation type was interned the first time a `RELATION_CREATE` named it in a namespace without an active schema. Implicit types default to `cardinality: many-to-many`, have no `from` / `to` constraints, and never auto-supersede. `CardinalityViolation` is never raised for an implicit type.
+- `ImplicitFromWrite`: the relation type was interned the first time a `RELATION_CREATE` named it in a scope with no active schema. Implicit types default to `cardinality: many-to-many`, have no `from` / `to` constraints, and never auto-supersede. `CardinalityViolation` is never raised for an implicit type.
 
 When a later `SCHEMA_UPLOAD` declares a relation type whose qname already exists with `ImplicitFromWrite`, the existing `RelationTypeId` is preserved and the origin flips to `SchemaDeclared{version}`. Previously written edges keep their stored ids; the post-upload flagging sweep marks rows whose type is not in the new active schema with `OUTSIDE_ACTIVE_SCHEMA`.
 

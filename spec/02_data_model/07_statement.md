@@ -225,7 +225,16 @@ The unified row averages ~256 bytes (fixed fields ~160, object tagged union typi
 
 ## Predicate vocabulary
 
-Predicates are namespaced strings interned into a `predicates` table:
+Predicates are namespaced strings interned into a `predicates` table and
+resolved through a **space-scoped** index, `predicates_by_scope`, keyed
+`(qname, space)`. `SPACE_BASE` (all-zero) holds the tenant's namespace-wide
+declarations, which every space in it sees; a non-zero space is an overlay only
+that space sees, shadowing the base for the same qname. A lookup consults the
+caller's space first and falls back to the base, so a tenant that never uploads
+a space overlay is keyed exactly as it was before overlays existed. Entity
+types, relation types and extractors are scoped the same way, and schema
+versions count **per scope** — a space's first upload is version 1 even when the
+namespace base is already at 7:
 
 ```rust
 struct Predicate {
@@ -260,8 +269,8 @@ enum SchemaOrigin {
 }
 ```
 
-- `SchemaDeclared`: the predicate was introduced by a `SCHEMA_UPLOAD` at the given version. Its `kind_constraint`, `object_type_constraint`, and supersession contract are enforced; unknown qnames sent in this namespace are rejected with `PredicateNotInSchema` (0x004B).
-- `ImplicitFromWrite`: the predicate was interned the first time a `STATEMENT_CREATE` named it in a namespace without an active schema. Implicit predicates have no kind or object-type constraint and never enforce supersession on writes. Statements written against an implicit predicate carry the `IMPLICIT_PREDICATE` flag for tooling visibility.
+- `SchemaDeclared`: the predicate was introduced by a `SCHEMA_UPLOAD` at the given version. Its `kind_constraint`, `object_type_constraint`, and supersession contract are enforced; unknown qnames sent in this declaration scope — the caller's space if it has declared one, otherwise the namespace base — are rejected with `PredicateNotInSchema` (0x004B).
+- `ImplicitFromWrite`: the predicate was interned the first time a `STATEMENT_CREATE` named it in a scope with no active schema. Implicit predicates have no kind or object-type constraint and never enforce supersession on writes. Statements written against an implicit predicate carry the `IMPLICIT_PREDICATE` flag for tooling visibility.
 
 When a `SCHEMA_UPLOAD` declares a predicate whose qname already exists with `ImplicitFromWrite`, the existing `PredicateId` is preserved and the origin flips to `SchemaDeclared{version}`. Previously written statements keep their stored ids; the post-upload flagging sweep marks rows whose predicate is not in the new active schema with `OUTSIDE_ACTIVE_SCHEMA`.
 

@@ -8,6 +8,7 @@ use brain_metadata::relation::ops::{relation_create, relation_supersede, relatio
 use brain_metadata::relation::types::relation_type_intern_or_get;
 use brain_metadata::tables::relation::{RelationMetadata, RELATION_METADATA_TABLE};
 use brain_metadata::tables::relation_type::{RelationTypeDefinition, RELATION_TYPES_TABLE};
+use brain_metadata::DeclScope;
 use redb::{ReadableTable, WriteTransaction};
 
 use super::ApplyError;
@@ -88,7 +89,7 @@ pub fn apply_upsert_relation(
         Some((namespace, name)) => {
             relation_type_intern_or_get(
                 wtxn,
-                namespace,
+                DeclScope::base(namespace),
                 name,
                 /* first_seen_lsn */ 0,
                 *extracted_at_unix_nanos,
@@ -266,7 +267,7 @@ mod tenant_wall_tests {
         let wtxn = db.write_txn().unwrap();
         let id = relation_type_intern(
             &wtxn,
-            "test",
+            DeclScope::base("test"),
             name,
             None,
             None,

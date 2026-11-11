@@ -155,7 +155,8 @@ pub struct EntityResolveRequest {
 /// `ENTITY_LIST` (0x0137).
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EntityListRequest {
-    /// `0` = no filter; otherwise an EntityTypeId.
+    /// The EntityTypeId to enumerate. Required: listing every type at once
+    /// is not offered in v1.0, and `0` is refused as an invalid request.
     pub entity_type_id: u32,
     /// Empty = no filter.
     pub name_prefix: String,

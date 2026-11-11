@@ -22,7 +22,7 @@ The same glossary is hosted in [`../00_overview/01_glossary.md`](../00_overview/
 
 **Brain.** This system. The memory database.
 
-**Broker.** The service that resolves a namespace's LLM credential, and the **only** way an LLM call in Brain is paid for. Brain receives a namespace-scoped grant and never the tenant's provider key — not in config, not in a request, not at all — so no provider credential can reach its WAL, snapshots, backups or logs, because none ever arrives. Required configuration: a shard will not start without `[llm.broker]`.
+**Credential store.** Where a namespace's LLM provider key lives, sealed, and the **only** way an LLM call in Brain is paid for. A deployment holds no provider credential of its own — not in config, not in an environment variable, not at all — so there is no deployment-wide key that could stand in for a tenant's. A namespace registers its own over the wire; Brain seals it under a key-encryption key, and opens it only for the duration of an outbound provider call. No required configuration to start: a shard boots with an empty store. A namespace with no registered key is refused at ENCODE with `LlmCredentialMissing` rather than storing a memory Brain cannot ground, so registering one is the first thing a tenant does.
 
 **bytemuck.** A Rust crate for safe bit-cast operations between types of the same memory layout. Used for zero-copy conversion between `&[u8]` and `&[f32]` when reading vectors.
 

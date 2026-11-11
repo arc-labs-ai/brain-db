@@ -51,6 +51,7 @@ pub use crate::ops::capabilities::*;
 pub use crate::ops::entity::*;
 pub use crate::ops::extractor::*;
 pub use crate::ops::graph::*;
+pub use crate::ops::llm_credential::*;
 pub use crate::ops::memory::*;
 pub use crate::ops::procedural::*;
 pub use crate::ops::query::*;
@@ -165,6 +166,13 @@ pub enum RequestBody {
     SessionCreate(SessionCreateRequest),
     SessionList(SessionListRequest),
     SessionDelete(SessionDeleteRequest),
+
+    // A tenant's own LLM provider key, which the model derivation stages
+    // bill to.
+    LlmCredentialPut(LlmCredentialPutRequest),
+    LlmCredentialGet(LlmCredentialGetRequest),
+    LlmCredentialDelete(LlmCredentialDeleteRequest),
+    LlmCredentialVerify(LlmCredentialVerifyRequest),
 }
 
 impl RequestBody {
@@ -247,6 +255,10 @@ impl RequestBody {
             Self::SessionCreate(_) => Opcode::SessionCreateReq,
             Self::SessionList(_) => Opcode::SessionListReq,
             Self::SessionDelete(_) => Opcode::SessionDeleteReq,
+            Self::LlmCredentialPut(_) => Opcode::LlmCredentialPutReq,
+            Self::LlmCredentialGet(_) => Opcode::LlmCredentialGetReq,
+            Self::LlmCredentialDelete(_) => Opcode::LlmCredentialDeleteReq,
+            Self::LlmCredentialVerify(_) => Opcode::LlmCredentialVerifyReq,
         }
     }
 
@@ -335,6 +347,10 @@ impl RequestBody {
             Self::SessionCreate(r) => to_cbor_bytes(r),
             Self::SessionList(r) => to_cbor_bytes(r),
             Self::SessionDelete(r) => to_cbor_bytes(r),
+            Self::LlmCredentialPut(r) => to_cbor_bytes(r),
+            Self::LlmCredentialGet(r) => to_cbor_bytes(r),
+            Self::LlmCredentialDelete(r) => to_cbor_bytes(r),
+            Self::LlmCredentialVerify(r) => to_cbor_bytes(r),
         }
     }
 
@@ -430,6 +446,10 @@ impl RequestBody {
             Opcode::SessionCreateReq => Self::SessionCreate(from_cbor_bytes(bytes)?),
             Opcode::SessionListReq => Self::SessionList(from_cbor_bytes(bytes)?),
             Opcode::SessionDeleteReq => Self::SessionDelete(from_cbor_bytes(bytes)?),
+            Opcode::LlmCredentialPutReq => Self::LlmCredentialPut(from_cbor_bytes(bytes)?),
+            Opcode::LlmCredentialGetReq => Self::LlmCredentialGet(from_cbor_bytes(bytes)?),
+            Opcode::LlmCredentialDeleteReq => Self::LlmCredentialDelete(from_cbor_bytes(bytes)?),
+            Opcode::LlmCredentialVerifyReq => Self::LlmCredentialVerify(from_cbor_bytes(bytes)?),
             other => return Err(ProtocolError::UnknownOpcode(other.as_u16())),
         })
     }
@@ -507,6 +527,10 @@ pub fn act_as_of(body: &RequestBody) -> Option<&ActAs> {
         RequestBody::SessionCreate(r) => r.act_as.as_ref(),
         RequestBody::SessionList(r) => r.act_as.as_ref(),
         RequestBody::SessionDelete(r) => r.act_as.as_ref(),
+        RequestBody::LlmCredentialPut(r) => r.act_as.as_ref(),
+        RequestBody::LlmCredentialGet(r) => r.act_as.as_ref(),
+        RequestBody::LlmCredentialDelete(r) => r.act_as.as_ref(),
+        RequestBody::LlmCredentialVerify(r) => r.act_as.as_ref(),
         // Delegation is established once, at begin, and is fixed for the
         // life of the txn: TXN_BEGIN carries the `act_as` and every write
         // buffered under this txn commits as that identity. TXN_COMMIT /
@@ -1034,6 +1058,7 @@ mod tests {
                 allow_breaking: false,
                 request_id: sample_uuid(4),
                 act_as: Some(sel.clone()),
+                scope: crate::SchemaScope::Namespace,
             }),
             RequestBody::SchemaGet(SchemaGetRequest {
                 namespace: "acme".into(),
@@ -1049,12 +1074,14 @@ mod tests {
             RequestBody::SchemaValidate(SchemaValidateRequest {
                 schema_document: "namespace acme\n".into(),
                 act_as: Some(sel.clone()),
+                scope: SchemaScope::Namespace,
             }),
             RequestBody::SchemaReplace(SchemaReplaceRequest {
                 schema_document: "namespace acme\n".into(),
                 force_drop_existing: true,
                 request_id: sample_uuid(5),
                 act_as: Some(sel.clone()),
+                scope: SchemaScope::Namespace,
             }),
             RequestBody::SchemaDrop(SchemaDropRequest {
                 namespace: "acme".into(),
@@ -1063,6 +1090,7 @@ mod tests {
                 force: false,
                 request_id: sample_uuid(6),
                 act_as: Some(sel.clone()),
+                scope: SchemaScope::Namespace,
             }),
         ];
         for body in bodies {
@@ -1637,6 +1665,7 @@ mod tests {
             force_drop_existing: true,
             request_id: [0xAB; 16],
             act_as: None,
+            scope: SchemaScope::Namespace,
         }));
     }
 

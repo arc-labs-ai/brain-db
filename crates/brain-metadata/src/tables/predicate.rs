@@ -15,11 +15,29 @@ use redb::TableDefinition;
 pub const PREDICATES_TABLE: TableDefinition<'static, u32, PredicateDefinition> =
     TableDefinition::new("predicates");
 
-/// `predicates_by_qname` — secondary index for `(namespace, name) →
-/// PredicateId`. Key is the canonical `"namespace:name"` string;
-/// value is the predicate id.
-pub const PREDICATES_BY_QNAME_TABLE: TableDefinition<'static, &str, u32> =
-    TableDefinition::new("predicates_by_qname");
+/// `predicates_by_scope` — secondary index for `(qname, space) →
+/// PredicateId`. Key is the canonical `"namespace:name"` paired with the
+/// space the declaration belongs to; value is the predicate id.
+///
+/// A predicate is addressed by its full qname, so the namespace is already
+/// part of the key and needs no separate rung — `brain:owns` and `acme:owns`
+/// are different predicates and a caller names which one it means. `space`
+/// adds the one dimension the key lacked: two applications inside a tenant
+/// can mean different things by the same predicate, and before this they
+/// shared one row.
+///
+/// [`SPACE_BASE`] is the namespace-wide declaration. A lookup consults the
+/// caller's space first and falls back to the base, so a space that declares
+/// nothing of its own behaves exactly as it did when this index was keyed on
+/// qname alone.
+///
+/// `qname` leads the key so every space's copy of one predicate is a
+/// contiguous range — that is what lets "is this name declared in any space"
+/// be a range scan rather than a table walk.
+///
+/// [`SPACE_BASE`]: crate::tables::scope::SPACE_BASE
+pub const PREDICATES_BY_SCOPE_TABLE: TableDefinition<'static, (&str, [u8; 16]), u32> =
+    TableDefinition::new("predicates_by_scope");
 
 /// `predicate_review_queue` — durable record of predicate qnames the
 /// extractor coined that NO schema declared. Key is the canonical
@@ -115,7 +133,7 @@ impl SchemaOrigin {
 
 /// A registered predicate. The `(namespace, name)` pair is logically
 /// unique within a deployment; uniqueness is enforced by
-/// [`PREDICATES_BY_QNAME_TABLE`] writes inside `predicate_intern`.
+/// [`PREDICATES_BY_SCOPE_TABLE`] writes inside `predicate_intern`.
 ///
 /// `kind_constraint`: `0` means "any kind allowed", else `1=Fact /
 /// 2=Preference / 3=Event` (matching [`StatementKind::as_u8`] offset by
@@ -268,6 +286,7 @@ impl_redb_rkyv_value!(PredicateDefinition, "brain_metadata::PredicateDefinition"
 mod tests {
     use super::*;
     use crate::tables::fresh_db;
+    use crate::tables::scope::SPACE_BASE;
     use redb::ReadableDatabase;
 
     #[test]
@@ -294,8 +313,9 @@ mod tests {
         {
             let mut t = wtxn.open_table(PREDICATES_TABLE).unwrap();
             t.insert(&row.predicate_id, &row).unwrap();
-            let mut q = wtxn.open_table(PREDICATES_BY_QNAME_TABLE).unwrap();
-            q.insert("acme:reports_to", &row.predicate_id).unwrap();
+            let mut q = wtxn.open_table(PREDICATES_BY_SCOPE_TABLE).unwrap();
+            q.insert(&("acme:reports_to", SPACE_BASE), &row.predicate_id)
+                .unwrap();
         }
         wtxn.commit().unwrap();
 
@@ -305,9 +325,13 @@ mod tests {
         assert_eq!(got, row);
         assert_eq!(got.to_predicate(), pred);
 
-        let q = rtxn.open_table(PREDICATES_BY_QNAME_TABLE).unwrap();
-        let by_qname = q.get("acme:reports_to").unwrap().unwrap().value();
-        assert_eq!(by_qname, row.predicate_id);
+        let q = rtxn.open_table(PREDICATES_BY_SCOPE_TABLE).unwrap();
+        let at_base = q
+            .get(&("acme:reports_to", SPACE_BASE))
+            .unwrap()
+            .unwrap()
+            .value();
+        assert_eq!(at_base, row.predicate_id);
     }
 
     #[test]

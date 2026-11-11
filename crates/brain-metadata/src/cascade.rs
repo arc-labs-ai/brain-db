@@ -1113,7 +1113,7 @@ mod edge_cascade_tests {
         let wtxn = db.write_txn().unwrap();
         let id = relation_type_intern(
             &wtxn,
-            "test",
+            crate::tables::scope::DeclScope::base("test"),
             name,
             None,
             None,
@@ -1454,7 +1454,7 @@ mod statement_cascade_overflow_tests {
         let wtxn = db.write_txn().unwrap();
         let id = predicate_intern(
             &wtxn,
-            "test",
+            crate::tables::scope::DeclScope::base("test"),
             name,
             Some(StatementKind::Fact),
             2,

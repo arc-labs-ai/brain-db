@@ -131,7 +131,13 @@ pub async fn handle_schema_replace(
     //    post-commit OUTSIDE_ACTIVE_SCHEMA flag sweep this handler used to
     //    hand-roll.
     let now = now_unix_nanos();
-    let from_version = schema_scope::current_active(ctx, &namespace)?.unwrap_or(0);
+    // The scope this replace narrows, resolved before any state-dependent
+    // step: a scope the caller has no space for is a refusal that should
+    // cost nothing.
+    let space = schema_scope::declaration_space(ctx, req.scope)?;
+    // The version superseded is the one THIS scope is on, not the tenant's —
+    // a space on its own overlay must not be renumbered from the base.
+    let from_version = schema_scope::current_active(ctx, &namespace, space)?.unwrap_or(0);
     let real_writer = crate::handlers::writer_handle::real_writer_handle(ctx)?;
     let write_id =
         WriteId::from_request(RequestId::from(req.request_id), ctx.executor.caller_space);
@@ -142,6 +148,11 @@ pub async fn handle_schema_replace(
         // next version so the WAL body carries the value recovery's
         // skip-if-(namespace,version)-exists check compares against.
         version: from_version.saturating_add(1),
+        // The scope the caller named. Its destructive half
+        // (`replace_all` below) reaches exactly this scope's own
+        // declarations, so a space replace cannot touch the vocabulary
+        // its siblings resolve.
+        space,
         blob: req.schema_document.as_bytes().to_vec(),
         declared_predicates: Vec::new(),
         declared_relation_types: Vec::new(),
@@ -302,7 +313,13 @@ mod tests {
         let parsed = parse_schema(doc).unwrap();
         let validated = brain_protocol::schema::validate(&parsed).unwrap();
         let wtxn = metadata.write_txn().unwrap();
-        schema_upload(&wtxn, &validated, 1).unwrap();
+        schema_upload(
+            &wtxn,
+            &validated,
+            brain_metadata::tables::scope::SPACE_BASE,
+            1,
+        )
+        .unwrap();
         wtxn.commit().unwrap();
     }
 
@@ -312,12 +329,13 @@ mod tests {
             force_drop_existing: true,
             request_id: rid,
             act_as: None,
+            scope: brain_protocol::SchemaScope::Namespace,
         }
     }
 
     fn active(metadata: &SharedMetadataDb) -> Option<u32> {
         let rtxn = metadata.read_txn().unwrap();
-        schema_active(&rtxn, "acme").unwrap()
+        schema_active(&rtxn, brain_metadata::DeclScope::base("acme")).unwrap()
     }
 
     #[tokio::test]

@@ -197,6 +197,7 @@ mod tests {
     use super::*;
     use crate::storage_version::{CURRENT_SCHEMA_VERSION, SCHEMA_META_TABLE, SCHEMA_VERSION_KEY};
     use crate::tables::entity_type::{EntityTypeDefinition, ENTITY_TYPES_TABLE};
+    use crate::tables::scope::DeclScope;
     use brain_core::EntityType;
     use redb::ReadableTable;
 
@@ -369,10 +370,13 @@ mod tests {
         let db = MetadataDb::open(db_path(&dir)).unwrap();
 
         let rtxn = db.read_txn().unwrap();
-        let got =
-            crate::relation::types::relation_type_lookup_by_qname(&rtxn, "brain", "related_to")
-                .unwrap()
-                .expect("brain:related_to seeded");
+        let got = crate::relation::types::relation_type_lookup_by_qname(
+            &rtxn,
+            DeclScope::base("brain"),
+            "related_to",
+        )
+        .unwrap()
+        .expect("brain:related_to seeded");
         assert_eq!(got.canonical(), "brain:related_to");
         assert_eq!(got.cardinality, brain_core::Cardinality::ManyToMany);
         assert!(got.is_symmetric);

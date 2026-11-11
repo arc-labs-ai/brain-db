@@ -30,8 +30,11 @@ use brain_metadata::relation::traversal::{
 };
 use brain_metadata::relation::types::{
     relation_type_get, relation_type_intern_or_get, relation_type_lookup_by_qname,
+    relation_type_lookup_by_qname_wtxn, relation_types_active_for_schema,
+    relation_types_active_for_schema_wtxn,
 };
-use brain_metadata::schema::store::schema_active;
+use brain_metadata::schema::store::{schema_active, schema_active_wtxn};
+use brain_metadata::DeclScope;
 use brain_planner::WriterError;
 use brain_protocol::envelope::response::EventType;
 use brain_protocol::{
@@ -43,7 +46,6 @@ use brain_protocol::{
     RelationTraverseRequest, RelationTraverseResponseFrame, RelationView, TraversalPathWire,
     TraversalStepWire,
 };
-use redb::ReadableTable;
 
 use crate::context::OpsContext;
 use crate::error::OpError;
@@ -123,23 +125,39 @@ pub async fn handle_relation_create(
     // when exactly one existing current relation conflicts on the
     // cardinality axis, the helper internally supersedes it with the
     // pre-minted id rather than erroring.
+    // Vocabulary resolves in the scope the caller writes into: the space's
+    // own declarations when it has them, otherwise the namespace's. Asking
+    // the namespace base instead would reject a type the caller's own space
+    // declares.
+    let caller_space: [u8; 16] = ctx.executor.caller_space.into();
     let (resolved_ty, resolved_is_symmetric, intern_hint) = {
         let rtxn = ctx
             .executor
             .metadata
             .read_txn()
             .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
-        let active_version = schema_active(&rtxn, namespace)
+        let active_version = schema_active(&rtxn, DeclScope::space(namespace, caller_space))
             .map_err(|e| OpError::Internal(format!("schema_active: {e}")))?;
         if let Some(version) = active_version {
-            let rt = relation_type_lookup_by_qname(&rtxn, namespace, name)
-                .map_err(OpError::from)?
-                .ok_or_else(|| OpError::RelationTypeNotInSchema {
-                    type_name: req.relation_type.clone(),
-                    namespace: namespace.to_string(),
-                    version,
-                })?;
-            if !rt_active_for_schema_rtxn(&rtxn, namespace, version)?.contains(&rt.id) {
+            let rt = relation_type_lookup_by_qname(
+                &rtxn,
+                DeclScope::space(namespace, caller_space),
+                name,
+            )
+            .map_err(OpError::from)?
+            .ok_or_else(|| OpError::RelationTypeNotInSchema {
+                type_name: req.relation_type.clone(),
+                namespace: namespace.to_string(),
+                version,
+            })?;
+            if !relation_types_active_for_schema(
+                &rtxn,
+                DeclScope::space(namespace, caller_space),
+                version,
+            )
+            .map_err(OpError::from)?
+            .contains(&rt.id)
+            {
                 return Err(OpError::RelationTypeNotInSchema {
                     type_name: req.relation_type.clone(),
                     namespace: namespace.to_string(),
@@ -148,7 +166,13 @@ pub async fn handle_relation_create(
             }
             (rt.id, rt.is_symmetric, None)
         } else {
-            match relation_type_lookup_by_qname(&rtxn, namespace, name).map_err(OpError::from)? {
+            match relation_type_lookup_by_qname(
+                &rtxn,
+                DeclScope::space(namespace, caller_space),
+                name,
+            )
+            .map_err(OpError::from)?
+            {
                 Some(rt) => (rt.id, rt.is_symmetric, None),
                 None => (
                     // Sentinel id; apply replaces it via
@@ -308,6 +332,9 @@ pub async fn handle_relation_supersede(
     let old_id = RelationId::from(req.old_relation_id);
     let now = now_unix_nanos();
     let (namespace, name) = split_qname(&req.new_relation.relation_type)?;
+    // Vocabulary resolves in the scope the caller writes into — see
+    // `handle_relation_create`.
+    let caller_space: [u8; 16] = ctx.executor.caller_space.into();
 
     // Resolve the relation-type qname (strict vs schemaless dispatch)
     // and intern-on-demand for the schemaless case BEFORE submit, so
@@ -321,17 +348,28 @@ pub async fn handle_relation_supersede(
             .metadata
             .write_txn()
             .map_err(|e| OpError::Internal(format!("write_txn: {e}")))?;
-        let active_version = schema_active_in_wtxn_rel(&wtxn, namespace)?;
+        let active_version = schema_active_wtxn(&wtxn, DeclScope::space(namespace, caller_space))
+            .map_err(|e| OpError::Internal(format!("schema_active: {e}")))?;
         let rt = if let Some(version) = active_version {
-            let rt =
-                relation_type_lookup_by_qname_wtxn(&wtxn, namespace, name)?.ok_or_else(|| {
-                    OpError::RelationTypeNotInSchema {
-                        type_name: req.new_relation.relation_type.clone(),
-                        namespace: namespace.to_string(),
-                        version,
-                    }
-                })?;
-            if !rt_active_for_schema_wtxn(&wtxn, namespace, version)?.contains(&rt.id) {
+            let rt = relation_type_lookup_by_qname_wtxn(
+                &wtxn,
+                DeclScope::space(namespace, caller_space),
+                name,
+            )
+            .map_err(OpError::from)?
+            .ok_or_else(|| OpError::RelationTypeNotInSchema {
+                type_name: req.new_relation.relation_type.clone(),
+                namespace: namespace.to_string(),
+                version,
+            })?;
+            if !relation_types_active_for_schema_wtxn(
+                &wtxn,
+                DeclScope::space(namespace, caller_space),
+                version,
+            )
+            .map_err(OpError::from)?
+            .contains(&rt.id)
+            {
                 return Err(OpError::RelationTypeNotInSchema {
                     type_name: req.new_relation.relation_type.clone(),
                     namespace: namespace.to_string(),
@@ -340,13 +378,30 @@ pub async fn handle_relation_supersede(
             }
             rt
         } else {
-            match relation_type_lookup_by_qname_wtxn(&wtxn, namespace, name)? {
+            match relation_type_lookup_by_qname_wtxn(
+                &wtxn,
+                DeclScope::space(namespace, caller_space),
+                name,
+            )
+            .map_err(OpError::from)?
+            {
                 Some(rt) => rt,
                 None => {
-                    let _ = relation_type_intern_or_get(&wtxn, namespace, name, 0, now)
-                        .map_err(OpError::from)?;
-                    relation_type_lookup_by_qname_wtxn(&wtxn, namespace, name)?
-                        .expect("just-interned relation type vanished")
+                    let _ = relation_type_intern_or_get(
+                        &wtxn,
+                        DeclScope::base(namespace),
+                        name,
+                        0,
+                        now,
+                    )
+                    .map_err(OpError::from)?;
+                    relation_type_lookup_by_qname_wtxn(
+                        &wtxn,
+                        DeclScope::space(namespace, caller_space),
+                        name,
+                    )
+                    .map_err(OpError::from)?
+                    .expect("just-interned relation type vanished")
                 }
             }
         };
@@ -571,6 +626,7 @@ fn run_list(
         from_side,
     );
     let resume_key = decode_relation_cursor(cursor, scope, &filter_sig)?;
+    let caller_space: [u8; 16] = ctx.executor.caller_space.into();
 
     let rtxn = ctx
         .executor
@@ -586,9 +642,11 @@ fn run_list(
         // Schema-strict: unknown qname → PredicateNotInSchema-style
         // error. Schemaless: short-circuit with empty result set (no
         // matching rows are possible).
-        let active_version = schema_active(&rtxn, ns)
+        let active_version = schema_active(&rtxn, DeclScope::space(ns, caller_space))
             .map_err(|e| OpError::Internal(format!("schema_active: {e}")))?;
-        match relation_type_lookup_by_qname(&rtxn, ns, name).map_err(OpError::from)? {
+        match relation_type_lookup_by_qname(&rtxn, DeclScope::space(ns, caller_space), name)
+            .map_err(OpError::from)?
+        {
             Some(rt) => Some(rt.id),
             None => {
                 if let Some(version) = active_version {
@@ -757,6 +815,7 @@ pub async fn handle_relation_traverse(
         }
     };
 
+    let caller_space: [u8; 16] = ctx.executor.caller_space.into();
     let rtxn = ctx
         .executor
         .metadata
@@ -770,9 +829,11 @@ pub async fn handle_relation_traverse(
     for qname in &req.relation_types {
         validate_qname(qname)?;
         let (ns, name) = split_qname(qname)?;
-        let active_version = schema_active(&rtxn, ns)
+        let active_version = schema_active(&rtxn, DeclScope::space(ns, caller_space))
             .map_err(|e| OpError::Internal(format!("schema_active: {e}")))?;
-        match relation_type_lookup_by_qname(&rtxn, ns, name).map_err(OpError::from)? {
+        match relation_type_lookup_by_qname(&rtxn, DeclScope::space(ns, caller_space), name)
+            .map_err(OpError::from)?
+        {
             Some(rt) => type_ids.push(rt.id),
             None => {
                 if let Some(version) = active_version {
@@ -931,124 +992,6 @@ fn type_qname(rtxn: &redb::ReadTransaction, id: RelationTypeId) -> Result<String
             OpError::Internal(format!("relation references missing relation_type {id:?}"))
         })?;
     Ok(rt.canonical())
-}
-
-/// `relation_type_lookup_by_qname` takes `&ReadTransaction`, but our
-/// validation runs inside a `WriteTransaction`. Inline a wtxn-friendly
-/// variant — mirrors `predicate_lookup_by_qname_wtxn`.
-fn relation_type_lookup_by_qname_wtxn(
-    wtxn: &redb::WriteTransaction,
-    namespace: &str,
-    name: &str,
-) -> Result<Option<brain_core::RelationType>, OpError> {
-    use brain_metadata::tables::relation_type::{
-        RelationTypeDefinition, RELATION_TYPES_BY_QNAME_TABLE, RELATION_TYPES_TABLE,
-    };
-    let q = format!("{namespace}:{name}");
-    let id_raw: Option<u32> = {
-        let idx = wtxn
-            .open_table(RELATION_TYPES_BY_QNAME_TABLE)
-            .map_err(|e| OpError::Internal(format!("open by_qname: {e}")))?;
-        let g = idx
-            .get(q.as_str())
-            .map_err(|e| OpError::Internal(format!("by_qname lookup: {e}")))?;
-        g.map(|guard| guard.value())
-    };
-    let Some(id_raw) = id_raw else {
-        return Ok(None);
-    };
-    let t = wtxn
-        .open_table(RELATION_TYPES_TABLE)
-        .map_err(|e| OpError::Internal(format!("open relation_types: {e}")))?;
-    let row: Option<RelationTypeDefinition> = t
-        .get(&id_raw)
-        .map_err(|e| OpError::Internal(format!("relation_types lookup: {e}")))?
-        .map(|g| g.value());
-    Ok(row.as_ref().map(RelationTypeDefinition::to_relation_type))
-}
-
-/// Active schema version for `namespace` inside a write txn. Mirrors
-/// the same helper in `statement.rs` — relation handlers
-/// run a different write path so we keep the helpers local rather
-/// than re-export through a shared module.
-fn schema_active_in_wtxn_rel(
-    wtxn: &redb::WriteTransaction,
-    namespace: &str,
-) -> Result<Option<u32>, OpError> {
-    use brain_metadata::tables::schema_version::SCHEMA_ACTIVE_VERSIONS_TABLE;
-    let active = wtxn
-        .open_table(SCHEMA_ACTIVE_VERSIONS_TABLE)
-        .map_err(|e| OpError::Internal(format!("open schema_active: {e}")))?;
-    let g = active
-        .get(&namespace)
-        .map_err(|e| OpError::Internal(format!("schema_active lookup: {e}")))?;
-    Ok(g.map(|guard| guard.value()))
-}
-
-/// Set of `RelationTypeId`s the active schema version declares — used
-/// to enforce strict-mode RELATION_CREATE / SUPERSEDE.
-fn rt_active_for_schema_wtxn(
-    wtxn: &redb::WriteTransaction,
-    namespace: &str,
-    version: u32,
-) -> Result<std::collections::HashSet<RelationTypeId>, OpError> {
-    use brain_metadata::tables::relation_type::{
-        RelationTypeDefinition, RelationTypeOrigin, RELATION_TYPES_TABLE,
-    };
-    let t = wtxn
-        .open_table(RELATION_TYPES_TABLE)
-        .map_err(|e| OpError::Internal(format!("open relation_types: {e}")))?;
-    let mut out = std::collections::HashSet::new();
-    for entry in t
-        .iter()
-        .map_err(|e| OpError::Internal(format!("relation_types iter: {e}")))?
-    {
-        let (k, v) = entry.map_err(|e| OpError::Internal(format!("relation_types entry: {e}")))?;
-        let row: RelationTypeDefinition = v.value();
-        if row.namespace != namespace {
-            continue;
-        }
-        if let RelationTypeOrigin::SchemaDeclared { version: v_decl } = row.origin() {
-            if v_decl == version {
-                out.insert(RelationTypeId::from(k.value()));
-            }
-        }
-    }
-    Ok(out)
-}
-
-/// rtxn variant of `rt_active_for_schema_wtxn`. The fold of the
-/// intern micro-wtxn moved relation-type vocabulary resolution off
-/// the write-txn path; the strict-mode check still needs the active
-/// set, just now via a read txn.
-fn rt_active_for_schema_rtxn(
-    rtxn: &redb::ReadTransaction,
-    namespace: &str,
-    version: u32,
-) -> Result<std::collections::HashSet<RelationTypeId>, OpError> {
-    use brain_metadata::tables::relation_type::{
-        RelationTypeDefinition, RelationTypeOrigin, RELATION_TYPES_TABLE,
-    };
-    let t = rtxn
-        .open_table(RELATION_TYPES_TABLE)
-        .map_err(|e| OpError::Internal(format!("open relation_types: {e}")))?;
-    let mut out = std::collections::HashSet::new();
-    for entry in t
-        .iter()
-        .map_err(|e| OpError::Internal(format!("relation_types iter: {e}")))?
-    {
-        let (k, v) = entry.map_err(|e| OpError::Internal(format!("relation_types entry: {e}")))?;
-        let row: RelationTypeDefinition = v.value();
-        if row.namespace != namespace {
-            continue;
-        }
-        if let RelationTypeOrigin::SchemaDeclared { version: v_decl } = row.origin() {
-            if v_decl == version {
-                out.insert(RelationTypeId::from(k.value()));
-            }
-        }
-    }
-    Ok(out)
 }
 
 /// BLAKE3 over the canonical RELATION_CREATE request fields. Excludes

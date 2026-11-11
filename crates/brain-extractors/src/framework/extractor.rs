@@ -166,7 +166,7 @@ pub trait Extractor: Send + Sync {
     /// the `degraded` variants (missing API key, missing model
     /// files, schema compile failure, …) return false. Used by the
     /// encode response so the renderer can tell operators when 0
-    /// statements is a "set BRAIN__LLM__API_KEY" condition versus a
+    /// statements is a "register a provider key" condition versus a
     /// content-coverage condition.
     fn is_wired(&self) -> bool {
         true

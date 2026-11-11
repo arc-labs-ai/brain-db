@@ -10,8 +10,8 @@ use redb::TableDefinition;
 pub const ENTITY_TYPES_TABLE: TableDefinition<'static, u32, EntityTypeDefinition> =
     TableDefinition::new("entity_types");
 
-/// `entity_types_by_scope` — secondary index for `(namespace_id, name) →
-/// EntityTypeId`.
+/// `entity_types_by_scope` — secondary index for
+/// `(namespace_id, space, name) → EntityTypeId`.
 ///
 /// The registry used to be keyed on bare `name` alone, globally. Two
 /// tenants declaring the same type name therefore collided: identical
@@ -19,9 +19,32 @@ pub const ENTITY_TYPES_TABLE: TableDefinition<'static, u32, EntityTypeDefinition
 /// SECOND tenant's `SCHEMA_UPLOAD` fail with `AlreadyExists` over a name
 /// they could not see and did not choose. `namespace_id` is the same
 /// tenant key every other row carries (`RowScope.namespace_id`), so an
-/// entity type is now scoped exactly like the entities that use it.
-pub const ENTITY_TYPES_BY_SCOPE_TABLE: TableDefinition<'static, (u32, &'static str), u32> =
-    TableDefinition::new("entity_types_by_scope");
+/// entity type is scoped at least as tightly as the entities that use it.
+///
+/// `space` EXTENDS that one level further, for the same reason a second
+/// time. A namespace is the tenant; a space is one application inside it,
+/// and two applications in one company do not necessarily share a domain
+/// model — a sales copilot's `Stage` has nothing to do with a support
+/// bot's, and unioning them into one tenant registry pollutes both
+/// extractors with the other's vocabulary.
+///
+/// [`SPACE_BASE`] (all-zero) is the NAMESPACE-WIDE row: the tenant's own
+/// base schema, which every space in it sees. A non-zero space is an
+/// OVERLAY that only that space sees, and which shadows the base for the
+/// same name. So the resolution chain is
+/// `(ns, space) → (ns, base) → (SYSTEM, base)`, which is the existing
+/// two-step with one level added above it — see
+/// [`crate::entity::types::entity_type_lookup`].
+///
+/// A tenant that never uploads a space overlay keys every row at
+/// `SPACE_BASE`, so the common shape pays nothing for this.
+///
+/// [`SPACE_BASE`]: crate::tables::scope::SPACE_BASE
+pub const ENTITY_TYPES_BY_SCOPE_TABLE: TableDefinition<
+    'static,
+    (u32, [u8; 16], &'static str),
+    u32,
+> = TableDefinition::new("entity_types_by_scope");
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
 pub struct EntityTypeDefinition {

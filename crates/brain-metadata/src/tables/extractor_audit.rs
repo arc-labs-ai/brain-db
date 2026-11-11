@@ -113,6 +113,43 @@ pub struct ExtractorItemCounts {
     pub statements: u32,
     pub relations: u32,
     pub mention_edges: u32,
+    /// Candidates the apply pass discarded.
+    ///
+    /// Every count above is a survivor, so this is the other half of a yield
+    /// rate's denominator. A total, not a taxonomy — the worker's fourteen
+    /// discard reasons stay in the shard-level metrics.
+    ///
+    /// Appended last so the field order stays append-only.
+    pub dropped: u32,
+    /// Statements this apply committed that landed in a Fact-vs-Fact
+    /// contradiction: a new Fact disagreeing with an already-active one on
+    /// the same `(subject, predicate)` with overlapping validity.
+    ///
+    /// Counted from the durable audit row rather than inferred. The insert
+    /// proceeds — coexisting Facts are allowed — and
+    /// `contradiction_audit_record` files the conflict, so only the audit row
+    /// carries the answer.
+    ///
+    /// Appended last so the field order stays append-only.
+    pub contradictions: u32,
+    /// Entities whose type no schema declares — neither the system's nor the
+    /// writing namespace's.
+    ///
+    /// Such a type is not rejected: the resolver interns it into the tenant's
+    /// namespace, so the entity commits and `dropped` never sees it. Counting
+    /// these is what lets a junk rate account for entity noise as well as
+    /// discarded triples.
+    ///
+    /// Appended last so the field order stays append-only.
+    pub entities_undeclared: u32,
+    /// Whether the writing namespace had an active schema.
+    ///
+    /// The denominator for `entities_undeclared`. A schema is optional, so
+    /// with none declared there is no vocabulary to be outside of and a
+    /// coined type is ordinary discovery rather than noise.
+    ///
+    /// Appended last so the field order stays append-only.
+    pub had_active_schema: bool,
 }
 
 impl ExtractorItemCounts {
@@ -123,6 +160,10 @@ impl ExtractorItemCounts {
             statements: 0,
             relations: 0,
             mention_edges: 0,
+            dropped: 0,
+            contradictions: 0,
+            entities_undeclared: 0,
+            had_active_schema: false,
         }
     }
 
@@ -372,6 +413,10 @@ mod tests {
                 statements: 1,
                 relations: 0,
                 mention_edges: 2,
+                dropped: 0,
+                contradictions: 0,
+                entities_undeclared: 0,
+                had_active_schema: false,
             },
             0,
         )
@@ -554,6 +599,10 @@ mod tests {
                 statements: 2,
                 relations: 1,
                 mention_edges: 4,
+                dropped: 0,
+                contradictions: 0,
+                entities_undeclared: 0,
+                had_active_schema: false,
             },
             12_345,
         );

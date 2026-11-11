@@ -54,6 +54,7 @@
 //!   superseded the original edge persists. Tracked as a known v1
 //!   limitation; edge_scrub can be extended later.
 
+use brain_metadata::DeclScope;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
@@ -208,7 +209,7 @@ pub fn resolve_whitelist(
         .read_txn()
         .map_err(|e| WorkerError::Ops(format!("causal_edge read_txn: {e:?}")))?;
     for (ns, name) in qnames {
-        match predicate_lookup_by_qname(&rtxn, ns, name) {
+        match predicate_lookup_by_qname(&rtxn, DeclScope::base(ns), name) {
             Ok(Some(predicate)) => {
                 out.insert(predicate.id);
             }
@@ -665,8 +666,14 @@ mod tests {
         // Declare exactly one of the whitelist predicates.
         let declared_id = {
             let wtxn = db.write_txn().unwrap();
-            let id =
-                predicate_intern_or_get(&wtxn, "brain", "caused_by", 1, 1_700_000_000_000).unwrap();
+            let id = predicate_intern_or_get(
+                &wtxn,
+                DeclScope::base("brain"),
+                "caused_by",
+                1,
+                1_700_000_000_000,
+            )
+            .unwrap();
             wtxn.commit().unwrap();
             id
         };
@@ -691,8 +698,14 @@ mod tests {
         // one and assert the valid one still resolves.
         let _good_id = {
             let wtxn = db.write_txn().unwrap();
-            let id =
-                predicate_intern_or_get(&wtxn, "brain", "led_to", 1, 1_700_000_000_000).unwrap();
+            let id = predicate_intern_or_get(
+                &wtxn,
+                DeclScope::base("brain"),
+                "led_to",
+                1,
+                1_700_000_000_000,
+            )
+            .unwrap();
             wtxn.commit().unwrap();
             id
         };

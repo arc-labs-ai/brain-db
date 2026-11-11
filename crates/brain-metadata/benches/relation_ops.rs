@@ -19,6 +19,7 @@ use brain_metadata::relation::ops::{
     relation_create, relation_get, relation_list_from, RelationListFilter,
 };
 use brain_metadata::relation::traversal::{traverse, TraversalConfig, TraversalDirection};
+use brain_metadata::DeclScope;
 use brain_metadata::MetadataDb;
 use brain_metadata::RowScope;
 
@@ -50,9 +51,13 @@ fn build_fixture(n: usize) -> Fixture {
     // (seeded at MetadataDb::open in 18.3).
     let related_to: RelationTypeId = {
         let rtxn = db.read_txn().expect("read_txn");
-        let rt = brain_metadata::relation_type_lookup_by_qname(&rtxn, "brain", "related_to")
-            .expect("lookup")
-            .expect("seeded");
+        let rt = brain_metadata::relation_type_lookup_by_qname(
+            &rtxn,
+            DeclScope::base("brain"),
+            "related_to",
+        )
+        .expect("lookup")
+        .expect("seeded");
         rt.id
     };
 

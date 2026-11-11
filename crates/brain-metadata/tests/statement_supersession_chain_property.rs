@@ -38,6 +38,7 @@ use brain_core::{
     Entity, EntityId, EntityTypeId, EvidenceRef, ExtractorId, NamespaceId, PredicateId, SessionId,
     Statement, StatementId, StatementKind, StatementObject, StatementValue, SubjectRef,
 };
+use brain_metadata::DeclScope;
 use brain_metadata::{
     entity_put, normalize_name, predicate_intern, statement_create, statement_get,
     statement_history, statement_list, MetadataDb, RowScope, StatementListFilter,
@@ -84,7 +85,7 @@ fn intern_pred(db: &MetadataDb, name: &str, kind: StatementKind, stateful: bool)
     let wtxn = db.write_txn().unwrap();
     let id = predicate_intern(
         &wtxn,
-        "test",
+        DeclScope::base("test"),
         name,
         Some(kind),
         /* object: Value */ 2u8,

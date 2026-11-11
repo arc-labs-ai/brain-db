@@ -1,148 +1,33 @@
-//! LLM-tier startup wiring for the per-shard executor: provider
-//! routing and the per-shard `llm_cache.redb`.
+//! LLM-tier startup wiring for the per-shard executor: credential
+//! resolution and the per-shard `llm_cache.redb`.
 //!
 //! Builds the `MaterializeDeps` slots:
 //!
-//! - Reads the single credential + model id from `[llm] api_key` /
-//!   `[llm] model` (the generic `BRAIN__LLM__API_KEY` /
-//!   `BRAIN__LLM__MODEL` env override has already folded into these
-//!   config fields at load time). The provider (OpenAI / Anthropic) is
-//!   **derived from the model id prefix** — there is no separate
-//!   provider key.
-//! - Constructs a [`ModelRouter`] holding the one provider client.
-//! - Opens `<shard_dir>/llm_cache.redb` via [`LlmCacheDb::open`].
-//!   On failure a warning is logged and the cache slot stays `None`.
-//!   Note that HyPE is mandatory and requires this cache, so the shard
-//!   spawn path treats a `None` cache as fatal (it cannot run HyPE) —
-//!   the slot is only `None` transiently while the warning is surfaced.
+//! - A [`StoreCredentialResolver`] over Brain's own credential store, which
+//!   is how every namespace gets a serving credential. A deployment holds no
+//!   key of its own, so there is nothing else to consult.
+//! - `<shard_dir>/llm_cache.redb` via [`LlmCacheDb::open`]. HyPE is
+//!   mandatory and needs this cache, so the shard spawn path treats a `None`
+//!   cache as fatal; the slot is only `None` transiently while the warning
+//!   is surfaced.
 //!
-//! ## One credential, one model, derived provider
+//! ## No key at boot
 //!
-//! Brain takes a single provider-agnostic key + model id. The model
-//! id selects the provider via [`provider_for_model`]; adding a
-//! provider is a match-arm here, not a new config key. The router
-//! still routes by prefix, so the `model:` schema field continues to
-//! address the configured client.
-//!
-//! The default model (when none is configured) matches the embedded
-//! pricing table in `brain_extractors::Pricing::for_model`:
-//! `gpt-4o-mini` (OpenAI).
+//! Nothing here reads a provider key from configuration or the environment.
+//! A shard starts with an empty credential store and serves writes
+//! immediately; the model derivation stages report per write that the
+//! namespace has no credential until a tenant registers one.
 
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use brain_extractors::{ClassifierModel, EntityDisambiguator, MaterializeDeps};
-use brain_llm::client::LlmFuture;
-use brain_llm::{
-    AnthropicClient, BrokerResolver, LlmClient, LlmCredentialResolver, LlmError, LlmRequest,
-    ModelRouter, OpenAIClient,
-};
+use brain_llm::LlmCredentialResolver;
 use brain_metadata::LlmCacheDb;
 use parking_lot::Mutex;
 
+use super::credential_resolver::StoreCredentialResolver;
 use super::LlmSpawnConfig;
-
-/// Default model when neither env nor config supplies one. OpenAI's
-/// `gpt-4o-mini` — matches the seeded extraction path and the embedded
-/// pricing table.
-const DEFAULT_MODEL: &str = "gpt-4o-mini";
-
-/// The LLM provider a model id routes to. Derived purely from the id
-/// prefix so a single configured key/model implies its provider.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Provider {
-    Anthropic,
-    OpenAI,
-}
-
-/// Map a model id to its provider by prefix. Anthropic models begin
-/// `claude`; everything else (OpenAI `gpt-*` / `o1`-`o4` reasoning
-/// families, and unknown ids) routes to OpenAI as the default wire
-/// dialect.
-fn provider_for_model(model: &str) -> Provider {
-    if model
-        .trim_start()
-        .to_ascii_lowercase()
-        .starts_with("claude")
-    {
-        Provider::Anthropic
-    } else {
-        Provider::OpenAI
-    }
-}
-
-/// Shared Tokio runtime that backs every LLM-tier HTTP call.
-///
-/// The extractor tier runs on a per-shard **Glommio** executor, which
-/// has its own io_uring reactor and no Tokio runtime. The `brain_llm`
-/// clients use `reqwest` + `tokio::time`, which panic ("no reactor
-/// running") when polled on a Glommio task. We bridge: the actual
-/// request runs on this dedicated Tokio runtime (off the shard cores),
-/// and the result crosses back over a runtime-agnostic `flume` channel
-/// that the Glommio side awaits cleanly — the same pattern the
-/// summarizer bridge uses. One runtime for the whole process; LLM
-/// calls are I/O-bound, so a couple of worker threads serve many
-/// concurrent in-flight requests across all shards.
-fn bridge_runtime() -> &'static tokio::runtime::Runtime {
-    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    RT.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .thread_name("brain-llm-extract")
-            .enable_all()
-            .build()
-            .expect("invariant: LLM bridge Tokio runtime builds with default settings")
-    })
-}
-
-/// Wraps a `brain_llm` client so its Tokio-based HTTP runs on the
-/// shared [`bridge_runtime`] instead of the caller's executor. Lets
-/// the Glommio-resident extractor tier and resolver call the client
-/// without a Tokio reactor on the shard core.
-struct BridgedLlmClient {
-    inner: Arc<dyn LlmClient>,
-}
-
-impl LlmClient for BridgedLlmClient {
-    fn complete<'a>(&'a self, request: LlmRequest) -> LlmFuture<'a> {
-        let inner = self.inner.clone();
-        Box::pin(async move {
-            let (tx, rx) = flume::bounded(1);
-            // The spawned task owns `inner` (an `Arc`) and `request`,
-            // so the inner future is `Send + 'static` — it runs on the
-            // Tokio runtime where reqwest/tokio::time are valid.
-            bridge_runtime().spawn(async move {
-                let result = inner.complete(request).await;
-                let _ = tx.send_async(result).await;
-            });
-            // `recv_async` is runtime-agnostic, so this awaits cleanly
-            // on the Glommio shard executor.
-            rx.recv_async().await.unwrap_or_else(|_| {
-                Err(LlmError::ProviderError {
-                    status: 0,
-                    message: "LLM bridge runtime unavailable (reply channel closed)".into(),
-                })
-            })
-        })
-    }
-
-    // Routing/cache-key metadata is pure data — delegate to the inner
-    // client; no runtime involved.
-    fn model(&self) -> &str {
-        self.inner.model()
-    }
-
-    fn model_id_hash(&self) -> u64 {
-        self.inner.model_id_hash()
-    }
-}
-
-/// Wrap a freshly-built provider client so its HTTP runs on the bridge
-/// runtime. Every client handed to the router or the disambiguator
-/// goes through this — both are invoked from Glommio tasks.
-fn bridge(client: Arc<dyn LlmClient>) -> Arc<dyn LlmClient> {
-    Arc::new(BridgedLlmClient { inner: client })
-}
 
 /// LLM-tier deps assembled at shard startup. Threaded into both
 /// `MaterializeDeps` (so LLM-kind rows decode into wired
@@ -151,28 +36,20 @@ fn bridge(client: Arc<dyn LlmClient>) -> Arc<dyn LlmClient> {
 /// feeds the extractor worker so the resolver can second-opinion
 /// ambiguous-band partial matches.
 pub struct LlmDeps {
-    pub router: Option<Arc<ModelRouter>>,
-    /// Per-namespace credential resolution — the BYOK seam.
+    /// Per-namespace credential resolution.
     ///
-    /// Backed by `[llm.broker]`, which every deployment configures. `None`
-    /// when the broker is declared but unusable, which degrades the LLM tier
-    /// with a per-write reason rather than failing the shard.
+    /// Backed by Brain's own credential store. `None` when a shard is started
+    /// without one, which degrades the model derivation stages with a
+    /// per-write reason rather than failing the shard.
     pub resolver: Option<Arc<dyn LlmCredentialResolver>>,
     pub cache: Option<Arc<Mutex<LlmCacheDb>>>,
-    /// Optional partial-match disambiguator. Populated when at least
-    /// one provider client is available; the disambiguator shares
-    /// that client (Anthropic preferred, OpenAI as fallback) so
-    /// there's no duplicate API key handling.
+    /// Optional partial-match disambiguator. Resolves its credential per
+    /// namespace like every other model-backed stage, so the second-opinion
+    /// call bills the tenant whose entities it is judging.
     pub disambiguator: Option<Arc<EntityDisambiguator>>,
-    /// The primary provider client + its wire model, retained so other
-    /// write-time LLM consumers (the HyPE generator) can reuse the same
-    /// client without re-resolving credentials. `None` mirrors
-    /// `disambiguator`: no provider key was resolvable.
-    pub primary_client: Option<Arc<dyn LlmClient>>,
     /// `[extractors.llm] max_tokens` — the LLM tier's output-token
     /// ceiling. `None` leaves the extractor on its own default.
     pub max_tokens: Option<u32>,
-    pub primary_model: String,
 }
 
 impl LlmDeps {
@@ -205,191 +82,41 @@ impl LlmDeps {
 /// Always returns a value; a missing key / unopenable cache file
 /// produces `None` slots.
 ///
-/// The credential + model come from `[llm] api_key` / `[llm] model`
-/// (ferried in via [`LlmSpawnConfig`]). The generic
-/// `BRAIN__LLM__API_KEY` / `BRAIN__LLM__MODEL` env override has already
-/// folded into those config fields at load time, so this module never
-/// reads the environment directly. The model id falls back to
-/// [`DEFAULT_MODEL`]; the provider is derived from it.
+/// No credential is read here. The resolver answers per namespace from
+/// Brain's own store, and `[llm] model` (ferried in via [`LlmSpawnConfig`])
+/// only names the model a tenant's extraction runs on when their registered
+/// credential does not name one. The `BRAIN__LLM__MODEL` env override has
+/// already folded into that config field at load time, so this module never
+/// reads the environment directly.
 pub fn build_llm_deps(shard_dir: &Path, llm_cfg: &LlmSpawnConfig) -> LlmDeps {
-    let (primary_client, primary_model) = build_primary_client(llm_cfg);
-    let disambiguator = primary_client
+    let resolver = build_credential_resolver(llm_cfg);
+    // The disambiguator resolves per namespace, so it exists exactly when
+    // credential resolution does.
+    let disambiguator = resolver
         .clone()
-        .map(|c| Arc::new(EntityDisambiguator::new(c, primary_model.clone())));
-    let router = build_router(llm_cfg);
-    // The one way a namespace gets a serving credential. `[llm] api_key` is
-    // not consulted here: a process-wide key would serve every namespace on
-    // the shard, which is the opposite of what a per-tenant credential means.
-    let resolver: Option<Arc<dyn LlmCredentialResolver>> =
-        llm_cfg.broker.as_ref().and_then(build_broker_resolver);
+        .map(|r| Arc::new(EntityDisambiguator::new(r)));
     LlmDeps {
-        router,
         resolver,
         cache: open_cache(shard_dir),
         disambiguator,
-        primary_client,
-        primary_model,
         max_tokens: llm_cfg.extractor_max_tokens,
     }
 }
 
-/// Build the BYOK resolver from `[llm.broker]`.
+/// Build the resolver over Brain's own credential store.
 ///
-/// Returns `None` — which degrades the LLM tier rather than panicking — when
-/// the broker is declared but unusable. A shard that cannot resolve any
-/// credential should surface that per write, with a reason, instead of
-/// refusing to start: the tenant-facing failure is already modelled
-/// (`llm_credential.missing`), and a boot loop tells an operator far less.
-fn build_broker_resolver(
-    broker: &super::LlmBrokerSpawnConfig,
-) -> Option<Arc<dyn LlmCredentialResolver>> {
-    let url = broker.url.trim();
-    if url.is_empty() {
-        tracing::error!(
-            target: "brain_server::llm_setup",
-            "[llm.broker] url is empty; the LLM tier will be degraded",
-        );
-        return None;
-    }
-    let Some(token) = broker
-        .service_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    else {
-        tracing::error!(
-            target: "brain_server::llm_setup",
-            url,
-            "[llm.broker] service_key is unset; the LLM tier will be degraded",
-        );
-        return None;
-    };
-
-    let mut resolver = BrokerResolver::new(url, token);
-    if broker.ttl_secs > 0 {
-        resolver = resolver.with_ttl(std::time::Duration::from_secs(broker.ttl_secs));
-    }
+/// Returns `None` when a shard is started without a store or without the
+/// keys that open it — the shape a test harness uses when it never registers
+/// a credential. A `None` resolver degrades the model derivation stages with
+/// a per-write reason rather than failing the shard, because a tenant who has
+/// not added a key yet should still be able to write.
+fn build_credential_resolver(llm_cfg: &LlmSpawnConfig) -> Option<Arc<dyn LlmCredentialResolver>> {
+    let credentials = llm_cfg.credentials.clone()?;
     tracing::info!(
         target: "brain_server::llm_setup",
-        url,
-        ttl_secs = broker.ttl_secs,
-        "BYOK: resolving LLM credentials per namespace from the edge",
+        "resolving LLM credentials per namespace from Brain's credential store",
     );
-    Some(Arc::new(resolver) as Arc<dyn LlmCredentialResolver>)
-}
-
-/// Resolve the configured model id: `[llm] model` > [`DEFAULT_MODEL`].
-fn ai_model(llm_cfg: &LlmSpawnConfig) -> String {
-    llm_cfg
-        .model
-        .clone()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| DEFAULT_MODEL.to_string())
-}
-
-/// Build the single provider client if a key is resolvable. The
-/// provider is derived from the model id. Returns the `(client, model)`
-/// pair so the disambiguator can record the model.
-fn build_client(llm_cfg: &LlmSpawnConfig) -> Option<(Arc<dyn LlmClient>, String)> {
-    let key = llm_cfg.api_key.clone().filter(|s| !s.is_empty())?;
-    let model = ai_model(llm_cfg);
-    let client: Arc<dyn LlmClient> = match provider_for_model(&model) {
-        Provider::Anthropic => Arc::new(AnthropicClient::with_key(model.clone(), key)?),
-        Provider::OpenAI => Arc::new(OpenAIClient::with_key(model.clone(), key)?),
-    };
-    Some((bridge(client), model))
-}
-
-/// Outcome of the boot-time LLM credential probe.
-pub enum LlmPreflight {
-    /// No key configured. (The empty-key case is already a hard error at
-    /// config validation; this arm just means "nothing to probe".)
-    Skipped,
-    /// The provider accepted the credential — extraction/HyPE will work.
-    Ok,
-    /// The provider REJECTED the credential (401/403). The server must not
-    /// start: every write would silently produce no statements/relations
-    /// and no HyPE, leaving the graph empty and reads incoherent.
-    InvalidKey(String),
-    /// The probe could not complete for a non-auth reason (network down,
-    /// timeout, rate limit, provider 5xx). Not necessarily a bad key, so
-    /// the server proceeds with a warning rather than bricking a correctly
-    /// configured deploy over a transient provider hiccup.
-    Inconclusive(String),
-}
-
-/// Cheap boot-time check that the configured LLM credential actually works:
-/// one 1-token completion against the provider (≈free, ~sub-second). A
-/// definitively-rejected key stops the server before it ingests memories
-/// with silently-empty extraction; a transient failure only warns.
-///
-/// Runs on a throwaway current-thread Tokio runtime with the RAW provider
-/// client (not the Glommio bridge, which expects a shard executor).
-pub fn preflight_llm_auth(llm_cfg: &LlmSpawnConfig) -> LlmPreflight {
-    let Some(key) = llm_cfg.api_key.clone().filter(|s| !s.is_empty()) else {
-        return LlmPreflight::Skipped;
-    };
-    let model = ai_model(llm_cfg);
-    let client: Arc<dyn LlmClient> = match provider_for_model(&model) {
-        Provider::Anthropic => match AnthropicClient::with_key(model.clone(), key) {
-            Some(c) => Arc::new(c),
-            None => return LlmPreflight::Inconclusive("could not build Anthropic client".into()),
-        },
-        Provider::OpenAI => match OpenAIClient::with_key(model.clone(), key) {
-            Some(c) => Arc::new(c),
-            None => return LlmPreflight::Inconclusive("could not build OpenAI client".into()),
-        },
-    };
-
-    let mut req = LlmRequest::new(model.clone(), "ping");
-    req.max_tokens = 1;
-    req.timeout = std::time::Duration::from_secs(10);
-
-    let rt = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => return LlmPreflight::Inconclusive(format!("could not build probe runtime: {e}")),
-    };
-    match rt.block_on(client.complete(req)) {
-        Ok(_) => LlmPreflight::Ok,
-        Err(LlmError::Auth { provider }) => LlmPreflight::InvalidKey(format!(
-            "provider `{provider}` rejected the [llm] api_key (model={model}): the key is \
-             missing, invalid, expired, or revoked. Extraction and write-time HyPE would \
-             silently produce nothing. Set a valid BRAIN__LLM__API_KEY (or [llm] api_key) \
-             for model `{model}` and restart."
-        )),
-        Err(LlmError::ProviderError { status, message }) if status == 401 || status == 403 => {
-            LlmPreflight::InvalidKey(format!(
-                "provider returned {status} for the [llm] api_key (model={model}): {message}. \
-                 Fix BRAIN__LLM__API_KEY and restart."
-            ))
-        }
-        Err(other) => {
-            LlmPreflight::Inconclusive(format!("preflight call failed (model={model}): {other}"))
-        }
-    }
-}
-
-/// Pick the primary client for single-call surfaces (today: the
-/// partial-match disambiguator).
-///
-/// Returns `(None, String::new())` when no key is configured.
-fn build_primary_client(llm_cfg: &LlmSpawnConfig) -> (Option<Arc<dyn LlmClient>>, String) {
-    match build_client(llm_cfg) {
-        Some((client, model)) => (Some(client), model),
-        None => (None, String::new()),
-    }
-}
-
-fn build_router(llm_cfg: &LlmSpawnConfig) -> Option<Arc<ModelRouter>> {
-    let (client, model) = build_client(llm_cfg)?;
-    let router = match provider_for_model(&model) {
-        Provider::Anthropic => ModelRouter::new().with_anthropic(client),
-        Provider::OpenAI => ModelRouter::new().with_openai(client),
-    };
-    Some(Arc::new(router))
+    Some(Arc::new(StoreCredentialResolver::new(credentials)) as Arc<dyn LlmCredentialResolver>)
 }
 
 fn open_cache(shard_dir: &Path) -> Option<Arc<Mutex<LlmCacheDb>>> {
@@ -454,76 +181,12 @@ fn open_cache(shard_dir: &Path) -> Option<Arc<Mutex<LlmCacheDb>>> {
 mod tests {
     use super::*;
 
-    // Credentials and model id come purely from `LlmSpawnConfig` (the
-    // generic `BRAIN__LLM__*` env override is resolved upstream at config
-    // load, never in this module), so these tests build the config struct
-    // directly and touch no process environment.
-
-    fn cfg_with_key(key: &str) -> LlmSpawnConfig {
-        LlmSpawnConfig {
-            api_key: Some(key.into()),
-            ..LlmSpawnConfig::default()
-        }
-    }
-
     #[test]
-    fn provider_derived_from_model_prefix() {
-        assert_eq!(provider_for_model("claude-haiku-4-5"), Provider::Anthropic);
-        assert_eq!(provider_for_model("Claude-Sonnet"), Provider::Anthropic);
-        assert_eq!(provider_for_model("gpt-4o-mini"), Provider::OpenAI);
-        assert_eq!(provider_for_model("o3-mini"), Provider::OpenAI);
-        // Unknown ids default to the OpenAI wire dialect.
-        assert_eq!(provider_for_model("mystery-model"), Provider::OpenAI);
-    }
-
-    #[test]
-    fn build_router_returns_none_when_no_key() {
-        assert!(build_router(&LlmSpawnConfig::default()).is_none());
-    }
-
-    #[test]
-    fn build_router_routes_to_anthropic_for_claude_model() {
-        let cfg = LlmSpawnConfig {
-            model: Some("claude-haiku-4-5".into()),
-            ..cfg_with_key("test-key")
-        };
-        let r = build_router(&cfg).expect("router");
-        assert!(r.resolve("claude-haiku-4-5").is_some());
-        assert!(r.resolve("gpt-4o-mini").is_none());
-    }
-
-    #[test]
-    fn build_router_routes_to_openai_for_default_model() {
-        let r = build_router(&cfg_with_key("test-key")).expect("router");
-        assert!(r.resolve("gpt-4o-mini").is_some());
-        assert!(r.resolve("claude-haiku-4-5").is_none());
-    }
-
-    #[test]
-    fn model_default_matches_pricing_table() {
-        assert_eq!(ai_model(&LlmSpawnConfig::default()), "gpt-4o-mini");
-    }
-
-    #[test]
-    fn config_key_builds_router() {
-        let r = build_router(&cfg_with_key("config-key")).expect("router from config key");
-        assert!(r.resolve("gpt-4o-mini").is_some());
-        assert!(r.resolve("claude-haiku-4-5").is_none());
-    }
-
-    #[test]
-    fn empty_config_key_falls_through_to_unset() {
-        // An empty string in config is treated as unset, not a key.
-        assert!(build_router(&cfg_with_key("")).is_none());
-    }
-
-    #[test]
-    fn config_model_override_applies() {
-        let cfg = LlmSpawnConfig {
-            model: Some("claude-sonnet-4-6".into()),
-            ..LlmSpawnConfig::default()
-        };
-        assert_eq!(ai_model(&cfg), "claude-sonnet-4-6");
+    fn a_shard_without_a_credential_store_resolves_nothing() {
+        // Not an error: writes still land and the non-model derivation
+        // stages still run. The model stages report per write that the
+        // namespace has no credential.
+        assert!(build_credential_resolver(&LlmSpawnConfig::default()).is_none());
     }
 
     #[test]
@@ -558,16 +221,13 @@ mod tests {
     }
 
     #[test]
-    fn into_materialize_deps_threads_router_cache_and_labels() {
+    fn into_materialize_deps_threads_resolver_cache_and_labels() {
         let dir = tempfile::tempdir().unwrap();
         let deps = LlmDeps {
             max_tokens: None,
-            router: None,
             resolver: None,
             cache: open_cache(dir.path()),
             disambiguator: None,
-            primary_client: None,
-            primary_model: String::new(),
         };
         let labels = Arc::new(vec!["brain:Person".to_string()]);
         let materialize = deps.into_materialize_deps(None, labels.clone());
@@ -626,22 +286,16 @@ mod tests {
         let labels = Arc::new(vec!["brain:Person".to_string()]);
         let deps_a = LlmDeps {
             max_tokens: None,
-            router: None,
             resolver: None,
             cache: Some(Arc::clone(&cache_arc)),
             disambiguator: None,
-            primary_client: None,
-            primary_model: String::new(),
         }
         .into_materialize_deps(None, labels.clone());
         let deps_b = LlmDeps {
             max_tokens: None,
-            router: None,
             resolver: None,
             cache: Some(Arc::clone(&cache_arc)),
             disambiguator: None,
-            primary_client: None,
-            primary_model: String::new(),
         }
         .into_materialize_deps(None, labels.clone());
 

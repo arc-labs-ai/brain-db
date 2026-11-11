@@ -9,6 +9,7 @@ publish.workspace = true
 description = "Metadata store (redb) and graph storage for Brain."
 
 [dependencies]
+brain-crypto = { path = "../brain-crypto" }
 brain-core = { path = "../brain-core" }
 brain-storage = { path = "../brain-storage" }
 # 19.5: schema_store accepts `ValidatedSchema` (brain-protocol) and
@@ -26,6 +27,7 @@ smallvec.workspace = true
 # Phase 8.dedup: BLAKE3 over canonical UTF-8 text for the
 # `fingerprints` opt-in content-dedup index.
 blake3.workspace = true
+zeroize.workspace = true
 # Interior mutability for `MetadataDb::pending_checkpoints` — shared
 # `Arc<MetadataDb>` callers can still drive `MetadataSink::apply`
 # without an outer mutex.

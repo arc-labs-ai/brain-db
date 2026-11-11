@@ -1138,7 +1138,7 @@ mod tests {
         let wtxn = db.write_txn().unwrap();
         let id = relation_type_intern(
             &wtxn,
-            "test",
+            crate::tables::scope::DeclScope::base("test"),
             name,
             None,
             None,
@@ -1164,7 +1164,7 @@ mod tests {
         let wtxn = db.write_txn().unwrap();
         let id = relation_type_intern(
             &wtxn,
-            "test",
+            crate::tables::scope::DeclScope::base("test"),
             name,
             Some(from_type),
             Some(to_type),
@@ -1289,7 +1289,7 @@ mod tests {
         let wtxn = db.write_txn().unwrap();
         let id = relation_type_intern(
             &wtxn,
-            "test",
+            crate::tables::scope::DeclScope::base("test"),
             name,
             from_type,
             to_type,
@@ -1588,9 +1588,14 @@ mod tests {
         let person = make_entity(&mut db, "implicit-person");
         let t = {
             let wtxn = db.write_txn().unwrap();
-            let t =
-                crate::relation::types::relation_type_intern_or_get(&wtxn, "test", "coined", 0, 1)
-                    .unwrap();
+            let t = crate::relation::types::relation_type_intern_or_get(
+                &wtxn,
+                crate::tables::scope::DeclScope::base("test"),
+                "coined",
+                0,
+                1,
+            )
+            .unwrap();
             wtxn.commit().unwrap();
             t
         };
@@ -1614,14 +1619,20 @@ mod tests {
 
         let (related_to, family_of) = {
             let rtxn = db.read_txn().unwrap();
-            let related =
-                crate::relation::types::relation_type_lookup_by_qname(&rtxn, "brain", "related_to")
-                    .unwrap()
-                    .expect("brain:related_to is seeded at open");
-            let family =
-                crate::relation::types::relation_type_lookup_by_qname(&rtxn, "brain", "family_of")
-                    .unwrap()
-                    .expect("brain:family_of is seeded at open");
+            let related = crate::relation::types::relation_type_lookup_by_qname(
+                &rtxn,
+                crate::tables::scope::DeclScope::base("brain"),
+                "related_to",
+            )
+            .unwrap()
+            .expect("brain:related_to is seeded at open");
+            let family = crate::relation::types::relation_type_lookup_by_qname(
+                &rtxn,
+                crate::tables::scope::DeclScope::base("brain"),
+                "family_of",
+            )
+            .unwrap()
+            .expect("brain:family_of is seeded at open");
             (related, family)
         };
         assert_eq!(related_to.from_type, None, "seeded Any stays unconstrained");
@@ -1657,9 +1668,13 @@ mod tests {
         // the stored row proves the caller's direction survived intact.
         let reports_to = {
             let rtxn = db.read_txn().unwrap();
-            crate::relation::types::relation_type_lookup_by_qname(&rtxn, "brain", "reports_to")
-                .unwrap()
-                .expect("brain:reports_to is seeded at open")
+            crate::relation::types::relation_type_lookup_by_qname(
+                &rtxn,
+                crate::tables::scope::DeclScope::base("brain"),
+                "reports_to",
+            )
+            .unwrap()
+            .expect("brain:reports_to is seeded at open")
         };
         assert_eq!(reports_to.from_type, None);
         assert_eq!(reports_to.to_type, None);
@@ -1851,7 +1866,7 @@ mod tests {
             let wtxn = db.write_txn().unwrap();
             let t = crate::relation::types::relation_type_intern_or_get(
                 &wtxn,
-                "brain",
+                crate::tables::scope::DeclScope::base("brain"),
                 "camped_at",
                 0,
                 1,

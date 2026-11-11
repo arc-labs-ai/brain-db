@@ -66,6 +66,8 @@ For a single shard:
 
 ```
 data/
+├── llm_credentials.redb       # Tenant LLM provider keys, sealed; shared by every shard
+├── llm_credential_kek         # Generated sealing key, unless [llm.credentials] kek is set
 └── <shard_uuid>/
     ├── arena.bin              # Vector arena, mmap'd
     ├── arena.header           # Arena metadata (4096 bytes)

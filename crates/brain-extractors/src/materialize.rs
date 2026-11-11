@@ -48,10 +48,10 @@ pub struct MaterializeDeps {
     pub entity_type_qnames: Arc<Vec<String>>,
     /// Resolves the LLM credential for a namespace.
     ///
-    /// Replaces the pre-BYOK `model_router`: the credential is no longer a
-    /// single process-wide client chosen at shard startup, because under BYOK
-    /// it depends on whose memory is being extracted. A single-key deployment
-    /// passes a `StaticResolver` wrapping the same `ModelRouter` as before.
+    /// A resolver rather than a process-wide client, because the serving
+    /// credential depends on whose memory is being extracted. A deployment
+    /// that wants one fixed client passes a `RouterResolver` wrapping a
+    /// `ModelRouter`.
     pub credential_resolver: Option<Arc<dyn LlmCredentialResolver>>,
     pub llm_cache: Option<Arc<Mutex<LlmCacheDb>>>,
     /// Output-token ceiling for one LLM extraction call
@@ -214,15 +214,14 @@ fn materialize_llm_extractor_core(
 
     // Credential resolution is deferred to dispatch — the serving credential
     // depends on the namespace of the memory being extracted, which is not
-    // known here. What IS checked at startup is that a resolver exists at all,
-    // and (when the resolver can answer locally, i.e. a static single-key
-    // deployment) that it actually holds a credential. That preserves the
-    // pre-BYOK operator diagnostic: a keyless static server still reports
-    // "no llm clients configured" at startup rather than failing per write.
+    // known here. What IS checked at startup is that a resolver exists at all
+    // and, when it can answer locally, that it holds a credential — so an
+    // operator who configured no key reads it off the startup log rather than
+    // off a failed write.
     //
-    // A broker-backed resolver answers `None` here — it cannot know every
-    // namespace's state without I/O — so the extractor is wired and any
-    // missing credential surfaces per dispatch instead.
+    // A resolver that cannot read its store answers `None` here, so the
+    // extractor is wired anyway and a missing credential surfaces per
+    // dispatch rather than silencing the tier for every namespace.
     let Some(resolver) = deps.credential_resolver.as_ref() else {
         return Ok(LlmExtractor::degraded(
             id,
@@ -234,9 +233,9 @@ fn materialize_llm_extractor_core(
         ));
     };
     if resolver.can_serve(SYSTEM_NAMESPACE, Some(model)) == Some(false) {
-        // Distinguish the two operator-facing cases, as the pre-BYOK
-        // materializer did: no credential at all, versus a credential that
-        // cannot serve the model this extractor declares.
+        // Two different operator-facing cases, and the fix differs: no
+        // credential at all, versus a credential that cannot serve the model
+        // this extractor declares.
         let reason = if resolver.can_serve(SYSTEM_NAMESPACE, None) == Some(false) {
             resolver.missing_reason(SYSTEM_NAMESPACE)
         } else {
@@ -854,7 +853,7 @@ mod tests {
 
     /// Router-backed resolver with only the Anthropic slot filled.
     ///
-    /// Deliberately a `StaticResolver` rather than a `FixedResolver`: these
+    /// Deliberately a `RouterResolver` rather than a `FixedResolver`: these
     /// tests assert that an undeclarable model degrades the extractor, and a
     /// FixedResolver serves every model, which would make them vacuous.
     fn anthropic_resolver() -> Arc<dyn LlmCredentialResolver> {
@@ -862,13 +861,13 @@ mod tests {
             model: "claude-haiku-4-5".into(),
         });
         let router = Arc::new(brain_llm::ModelRouter::new().with_anthropic(client));
-        Arc::new(brain_llm::StaticResolver::new(router, "claude-haiku-4-5"))
+        Arc::new(brain_llm::RouterResolver::new(router, "claude-haiku-4-5"))
     }
 
     /// A resolver for a deployment where the operator configured no key at
-    /// all: a StaticResolver over an empty router.
+    /// all: a RouterResolver over an empty router.
     fn keyless_resolver() -> Arc<dyn LlmCredentialResolver> {
-        Arc::new(brain_llm::StaticResolver::new(
+        Arc::new(brain_llm::RouterResolver::new(
             Arc::new(brain_llm::ModelRouter::new()),
             "claude-haiku-4-5",
         ))
@@ -928,8 +927,8 @@ mod tests {
         );
         let r = row(1, ExtractorKind::Llm, blob);
         // A resolver IS wired — the shard always wires one — but the operator
-        // set no key. Startup must still say so, rather than deferring to a
-        // per-write failure, which is what the pre-BYOK materializer did.
+        // set no key. Startup must say so rather than deferring to a
+        // per-write failure the operator only sees under load.
         let deps = MaterializeDeps {
             credential_resolver: Some(keyless_resolver()),
             ..MaterializeDeps::default()

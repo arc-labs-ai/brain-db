@@ -53,6 +53,15 @@ pub struct RequestCaller {
     /// test path or pre-handshake dispatch); the auto-abort sweep
     /// treats all-zero as a no-op.
     pub connection_id: [u8; 16],
+    /// Whether this request arrived over a connection that protects its
+    /// contents: TLS, mTLS, or loopback.
+    ///
+    /// Defaults to `false` and is raised only by the connection layer, which
+    /// is the only place that knows the transport. Fail-closed on purpose:
+    /// an unconfirmed connection refuses to carry a plaintext provider key,
+    /// so a future transport that forgets to set this errs toward refusing a
+    /// registration rather than leaking one.
+    pub transport_confidential: bool,
 }
 
 impl RequestCaller {
@@ -74,7 +83,17 @@ impl RequestCaller {
             permissions,
             space_string: String::new(),
             connection_id: [0u8; 16],
+            transport_confidential: false,
         }
+    }
+
+    /// Mark this request as having arrived over a connection that protects
+    /// its contents. Called by the connection layer once it knows the
+    /// transport.
+    #[must_use]
+    pub fn with_confidential_transport(mut self) -> Self {
+        self.transport_confidential = true;
+        self
     }
 
     /// Test-only caller: a fully-scoped caller with FULL permissions and
@@ -92,6 +111,7 @@ impl RequestCaller {
             permissions: perm_bits::FULL,
             space_string: String::new(),
             connection_id: [0u8; 16],
+            transport_confidential: true,
         }
     }
 
@@ -509,7 +529,7 @@ pub async fn dispatch(
 
         // Extractor introspection (read-only).
         RequestBody::ExtractorList(r) => {
-            crate::handlers::extractor_admin::handle_extractor_list(r, ctx)
+            crate::handlers::extractor_admin::handle_extractor_list(r, &caller, ctx)
                 .await
                 .map(|b| single(ResponseBody::ExtractorList(b)))
         }
@@ -548,6 +568,33 @@ pub async fn dispatch(
         RequestBody::SessionDelete(r) => crate::handlers::session::handle_session_delete(r, ctx)
             .await
             .map(|b| single(ResponseBody::SessionDelete(b))),
+
+        // -----------------------------------------------------------
+        // A tenant's own LLM provider key. These take the caller
+        // directly: the namespace a credential belongs to is the
+        // authenticated one, and PUT also needs to know whether the
+        // connection can carry a plaintext key.
+        // -----------------------------------------------------------
+        RequestBody::LlmCredentialPut(r) => {
+            crate::handlers::llm_credential::handle_llm_credential_put(r, &caller, ctx)
+                .map(|b| single(ResponseBody::LlmCredentialPut(b)))
+        }
+
+        RequestBody::LlmCredentialGet(r) => {
+            crate::handlers::llm_credential::handle_llm_credential_get(r, &caller, ctx)
+                .map(|b| single(ResponseBody::LlmCredentialGet(b)))
+        }
+
+        RequestBody::LlmCredentialDelete(r) => {
+            crate::handlers::llm_credential::handle_llm_credential_delete(r, &caller, ctx)
+                .map(|b| single(ResponseBody::LlmCredentialDelete(b)))
+        }
+
+        RequestBody::LlmCredentialVerify(r) => {
+            crate::handlers::llm_credential::handle_llm_credential_verify(r, &caller, ctx)
+                .await
+                .map(|b| single(ResponseBody::LlmCredentialVerify(b)))
+        }
     }
 }
 
@@ -753,6 +800,15 @@ fn enforce_permission(caller: &RequestCaller, req: &RequestBody) -> Result<(), O
         RequestBody::SchemaGet(_) | RequestBody::SchemaList(_) | RequestBody::SchemaValidate(_) => {
             (perm_bits::RECALL, "SCHEMA_READ")
         }
+
+        // A tenant's provider key. Its own capability: a key that can store a
+        // memory must not also be able to replace the credential that pays
+        // for processing it, and a tenant running their own budget should not
+        // need ADMIN to do it.
+        RequestBody::LlmCredentialPut(_) => (perm_bits::LLM_CREDENTIAL, "LLM_CREDENTIAL_PUT"),
+        RequestBody::LlmCredentialGet(_) => (perm_bits::LLM_CREDENTIAL, "LLM_CREDENTIAL_GET"),
+        RequestBody::LlmCredentialDelete(_) => (perm_bits::LLM_CREDENTIAL, "LLM_CREDENTIAL_DELETE"),
+        RequestBody::LlmCredentialVerify(_) => (perm_bits::LLM_CREDENTIAL, "LLM_CREDENTIAL_VERIFY"),
 
         // typed-graph writes ride under ENCODE.
         RequestBody::EntityCreate(_)

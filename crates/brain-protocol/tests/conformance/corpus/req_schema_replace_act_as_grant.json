@@ -23,5 +23,6 @@
     "namespace": "org",
     "space": "support-bot:user123",
     "grant": 32
-  }
+  },
+  "scope": 1
 }

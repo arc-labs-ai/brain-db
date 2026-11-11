@@ -64,33 +64,30 @@ const DEFAULT_SALIENCE: f32 = 0.5;
 /// with no questions, no entities and no statements. It looks stored, and
 /// recall quietly gets worse.
 ///
-/// **Cache-only.** The probe never performs I/O: the synchronous write path
-/// must not block on a credential broker. `None` means "unknown without I/O"
-/// and **admits** the write — a cold cache is not evidence of a missing key,
-/// and the derivation stages re-resolve properly (and retry a transient
-/// failure) when they run.
+/// ## This gate is deterministic
 ///
-/// ## This is an optimisation, not a guarantee — do not read it as one
+/// The credential store is local, so the probe is one point read and the
+/// answer is definitive: a namespace with no registered key has **every**
+/// ENCODE refused, not an unlucky fraction of them. The synchronous write
+/// path still never blocks on a network round trip, because there is no
+/// longer a remote to ask.
 ///
-/// It fires only while a `Cached::Missing` entry is live, and that entry's
-/// TTL is `DEFAULT_NEGATIVE_TTL` (10s). Under sustained traffic the first
-/// write pays the silent degradation and the ones behind it are refused at
-/// the door. Under sparse traffic — a sandbox, a demo, anything with gaps
-/// longer than the TTL — the entry has always expired, every write is
-/// admitted, and NONE of them are refused. That is working as designed.
+/// `None` is reserved for "could not find out" — a storage fault, or a
+/// sealing key that is no longer loaded — and **admits** the write, because
+/// neither is evidence that the tenant has no key. The derivation stages
+/// re-resolve and retry when they run.
 ///
-/// Lengthening the negative TTL does not fix it and makes things worse: this
-/// gate runs before any derivation, so a namespace stuck on `Missing` never
-/// issues the fetch that would store `Ready`. The negative entry becomes
-/// self-sustaining, and a tenant who registers a key stays rejected with
-/// nothing able to clear it. The short TTL is what keeps that recoverable.
+/// ## What a caller sees
 ///
-/// So the honest signal for a degraded write is NOT this gate — it is the
-/// per-stage status in the encode trace. `publish_hype_completed` reports
-/// `StageOutcome::Failed` when HyPE could not run, which is what separates
-/// "no key registered" from "this text warranted no questions". A caller
-/// diagnosing an empty graph should read the stage statuses, not infer from
-/// the write having been accepted.
+/// A refusal is `LlmCredentialMissing`, terminal, naming the namespace and
+/// what to do about it. That is the signal for "no key registered".
+///
+/// It is not the signal for a write that was admitted and then degraded —
+/// the `Unavailable` case, and a deployment with no credential store at all.
+/// For those, `publish_hype_completed` reports `StageOutcome::Failed` on the
+/// encode trace, which is what separates "could not run" from "this text
+/// warranted no questions". A caller diagnosing an empty graph reads the
+/// stage statuses.
 fn reject_if_no_llm_credential(ctx: &OpsContext) -> Result<(), OpError> {
     let Some(resolver) = ctx.llm_credential_resolver.as_ref() else {
         // No resolver wired (tests, credential-free deployments): admit.

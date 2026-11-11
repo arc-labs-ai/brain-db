@@ -59,7 +59,6 @@ use brain_metadata::statement::statement_get;
 use brain_metadata::tables::edge::{walk_incoming, walk_outgoing};
 use brain_metadata::tables::entity::ENTITIES_TABLE;
 use brain_metadata::tables::entity::{ByTypeKey, ENTITY_BY_TYPE_TABLE};
-use brain_metadata::tables::entity_type::ENTITY_TYPES_TABLE;
 use brain_metadata::tables::memory::MEMORIES_TABLE;
 use brain_metadata::tables::relation::RELATION_METADATA_TABLE;
 use brain_metadata::tables::statement::STATEMENTS_BY_SUBJECT_TABLE;
@@ -426,6 +425,11 @@ struct GraphBuilder {
     /// added here, so the traversal stays one hop.
     memories_this_page: Vec<MemoryId>,
     seen_memory_seeds: HashSet<[u8; 16]>,
+    /// Entity-type id → the canonical `"<namespace>:<Name>"` clients receive.
+    ///
+    /// Held on the builder because an export pages over many nodes sharing a
+    /// handful of types, so one cache serves the whole page.
+    qnames: brain_metadata::EntityTypeQnames,
 }
 
 impl GraphBuilder {
@@ -448,6 +452,7 @@ impl GraphBuilder {
             seen_entity_seeds: HashSet::new(),
             memories_this_page: Vec::new(),
             seen_memory_seeds: HashSet::new(),
+            qnames: brain_metadata::EntityTypeQnames::new(),
         }
     }
 
@@ -497,12 +502,7 @@ impl GraphBuilder {
         if self.seen_nodes.contains(&eid.to_bytes()) {
             return Ok(());
         }
-        let type_qname = rtxn
-            .open_table(ENTITY_TYPES_TABLE)
-            .ok()
-            .and_then(|t| t.get(&meta.entity_type_id).ok().flatten())
-            .map(|g| g.value().name)
-            .unwrap_or_default();
+        let type_qname = self.qnames.resolve(rtxn, meta.entity_type_id);
         self.emit_node(GraphNode {
             id: eid.to_bytes(),
             kind: NODE_ENTITY,

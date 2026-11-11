@@ -57,6 +57,7 @@ glommio = { workspace = true }
 futures-lite = { workspace = true }
 
 [dev-dependencies]
+brain-crypto = { path = "../brain-crypto" }
 tempfile.workspace = true
 uuid.workspace = true
 # Subscribe wal-record-projection tests build the exact CBOR event body

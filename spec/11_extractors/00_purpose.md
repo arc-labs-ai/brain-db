@@ -41,24 +41,25 @@ leave graph-backed reads silently incoherent; extraction is therefore architectu
 (always-on), like the embedder and write-time HyPE, not a deploy-time toggle.
 
 - A tier that fails to load at shard spawn (pattern regex compile error, classifier model file missing / weights corrupt) is a hard spawn failure: `ShardError::ExtractorInitFailed { tier, source }`. The shard refuses to start rather than running with a quietly-missing tier. The classifier's model (GLiNER) is a hard boot requirement, exactly like the embedder, and the shipped image bundles it for that reason.
-- **The LLM tier's credential is not a boot-time concern.** It is resolved *per namespace*, from the broker, at the moment a request names its namespace — so the serving credential is not knowable at startup and a keyless boot is the correct shape. What the startup gate checks for is the **broker** (`[llm.broker]`), not a key. See §"The LLM tier's credential" below.
+- **The LLM tier's credential is not a boot-time concern.** It is resolved *per namespace*, from Brain's own credential store, at the moment a request names its namespace — so the serving credential is not knowable at startup and a keyless boot is the correct shape: no shard refuses to start over a missing tenant key. Two things do happen at startup — opening the credential store and loading its sealing key is fatal, because a server that came up unable to hold a credential would accept registrations it could not persist; and extractor materialization probes the system namespace so a deployment with no key at all still gets an operator diagnostic, registering the extractor degraded with a reason rather than failing per write. See §"The LLM tier's credential" below.
 - There is no `has_llm_extractor` planning input and no `[extractors.<tier>].enabled` config. `GET_CAPABILITIES` (§04/03) reports extraction as always-live.
 
-Extraction cannot be paused at runtime either: the former `EXTRACTOR_DISABLE` / `EXTRACTOR_ENABLE` admin wire ops were removed, so there is no deploy-time *and* no runtime way to turn extraction off (write/read coherence). `EXTRACTOR_LIST` (§04/03) remains as read-only introspection over the always-on extractors.
+Extraction cannot be paused at runtime either: the former `EXTRACTOR_DISABLE` / `EXTRACTOR_ENABLE` admin wire ops were removed, so there is no deploy-time *and* no runtime way to turn extraction off (write/read coherence). `EXTRACTOR_LIST` (§04/03) remains as read-only introspection over the extractors the caller can actually be served by: its own namespace's declarations plus the system built-ins, resolved at the caller's effective space so a space overlay shadows the namespace base for the same name.
 
 ## The LLM tier's credential
 
-**Brain never holds a provider credential. BYOK through the broker is the only way an LLM call is paid for, and there is no second path.** This is a hard invariant, not a default — there is no configuration that turns it off, no deployment shape that bypasses it, and no fallback when the broker is unreachable.
+**A deployment holds no provider credential of its own. A key registered by a namespace is the only way an LLM call is paid for, and there is no second path.** This is a hard invariant, not a default — there is no configuration that turns it off, no deployment shape that bypasses it, and no fallback when a namespace has not registered one.
 
 ### The invariant
 
 | | |
 |---|---|
-| **MUST NOT** | accept, resolve, or construct a client from a provider API key, from any source — config, environment, request field, or schema declaration |
-| **MUST NOT** | write anything credential-shaped to disk: not to the WAL, the metadata store, a snapshot, a backup, the response cache, a log line, or a diagnostic |
-| **MUST** | resolve every LLM call's authority per namespace, from `[llm.broker]`, as a namespace-scoped grant |
+| **MUST NOT** | accept, resolve, or construct a client from a deployment-wide provider API key, from any source — config, environment, request field, or schema declaration |
+| **MUST NOT** | write a provider key in plaintext anywhere: not to the WAL, the metadata store, a snapshot, a backup, the response cache, a log line, or a diagnostic |
+| **MUST** | resolve every LLM call's authority per namespace, from the credential store, keyed by the namespace of the data it is about to act on |
+| **MUST** | reject a registration that arrives over a connection whose transport does not protect its contents |
 
-The storage half of that is guaranteed structurally rather than by discipline: **a provider key cannot leak from Brain's data at rest because one never arrives there.** There is no redaction rule to get right, no field to remember to exclude from a snapshot, and no audit of what a log might have printed. An invariant enforced by absence does not have exceptions.
+The first clause is structural: there is no field to set, so there is nothing to get wrong. The second is enforced by sealing plus hand-written redaction — a key enters the store encrypted under a key-encryption key, and the types that carry one render as `[redacted]` rather than deriving `Debug`. That is a weaker guarantee than absence and is stated as such: see §"What is stored, and what that protects".
 
 ### Why there is no shard-wide key
 
@@ -68,27 +69,32 @@ That is not a tuning problem to be left as an operator's choice. It is a correct
 
 ### What is configured
 
-`[llm.broker]` is **required**, and it is the whole of the LLM credential surface. A configuration without it does not start. The section names:
+Nothing that grants provider access. There is no `[llm] api_key`, no `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` env gate, and no per-extractor key in the schema DSL. A deployment cannot supply a provider credential even if it wants to.
+
+What an operator configures is how stored credentials are sealed:
 
 | Field | What it is |
 |---|---|
-| `url` | the broker's base URL |
-| `service_key` | **Brain's own identity to the broker.** Not a provider key: it authenticates *Brain*, so the broker will mint namespace grants for it. It buys no provider access by itself. |
-| `ttl_secs` | how long a resolved grant stays cached (default 300) |
+| `[llm] model` | **inert.** A registration always names its own model and the resolver serves that one, so nothing reads this. Grants nothing. |
+| `[llm.credentials] kek` | the key-encryption key, 64 hex characters. Unset, Brain generates one into the data directory on first boot, so a fresh install seals without configuration. |
 
-There is no `[llm] api_key`, no `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` env gate, and no per-extractor key in the schema DSL. A deployment cannot supply a provider credential even if it wants to.
+### How a namespace registers one
 
-`service_key` is the one secret Brain is given, and it is given for the one thing a secret is unavoidable for: proving which service is asking. It lives in config or the environment — never in the database — and is redacted from `Debug` output and from `GET /v1/config`.
+Over the wire, through `LLM_CREDENTIAL_PUT` / `GET` / `DELETE` / `VERIFY` (§04). The ops carry their own permission bit, deliberately separate from `ADMIN` — a tenant running their own extraction budget should not need operator powers — and separate from the write bundle, because a key that can store a memory must not also be able to replace the key that pays for processing it. The bit is not delegable: an `act_as` request can never register a credential.
 
-### What Brain holds
+`PUT` is the only shape that carries a plaintext key, and it is refused unless the connection is TLS, mTLS, or loopback. Sealing protects the key at rest; refusing the request is what protects it in flight. Nothing that comes back out can reconstruct it — a read answers with the provider, the model, and a display fingerprint.
 
-A namespace-scoped **grant**, in memory, for as long as its TTL. The broker tells Brain only which provider and model to build a client for; the request is re-signed at the edge on the way upstream. The tenant's actual provider key stays sealed at the broker and is never transmitted to Brain, in any form, at any point.
+### What is stored, and what that protects
 
-The provider clients are reused verbatim. They cannot set a custom header, so both routing inputs travel in the two channels they do control: the **namespace** in `base_url`, as `{edge}/llm/ns/{namespace}/{provider}`, and the **grant** as the bearer token in place of a provider key. Nothing in the provider layer knows a broker exists — which is also why no code path in it can be handed a real key by mistake.
+The sealed key, in a redb file of its own, keyed `(namespace, space)`. Sealing is an AEAD under the key-encryption key, with the namespace and provider authenticated alongside the ciphertext. That binding is load-bearing: a stolen row moved into another tenant's slot fails to open rather than yielding a usable key, which is what keeps row-level write access to the store from becoming a way to spend someone else's provider budget.
+
+**Stated precisely, because it is easy to overclaim.** A generated key-encryption key sits in the same directory as the rows it seals. That defends against the ways credential ciphertext ordinarily escapes — a database file copied out, a backup archive, a snapshot restored elsewhere, anything that greps the store — because none of those carry the key file with them. It does **not** defend against someone holding the whole data directory. An operator who needs that supplies the key themselves, so it lives somewhere Brain's disk is not.
+
+Rotation needs no coordination: the id of the key that sealed a row travels in the clear beside its ciphertext, so a new key-encryption key can be introduced, new seals use it, and existing rows stay readable until they are re-sealed.
 
 ### Every LLM consumer resolves the same way
 
-There is no privileged consumer. Write-time HyPE, the extractor's LLM tier, the entity disambiguator's second-opinion pass, and the consolidation summarizer all resolve through the same `LlmCredentialResolver`, keyed by the namespace of the data they are about to act on.
+There is no privileged consumer of a *credential*. Write-time HyPE, the extractor's LLM tier, the entity disambiguator's second-opinion pass, and the consolidation summarizer's `llm` backend all resolve through the same `LlmCredentialResolver`, keyed by the namespace of the data they are about to act on. The summarizer's `ollama` backend is the one exception, and it is not one in substance: it calls an operator-run local endpoint that takes no key, so there is no authority to resolve and no tenant to bill.
 
 A consumer that cannot name a namespace cannot make an LLM call. That is the intended consequence: if a piece of work is not attributable to a tenant, there is no one whose key should pay for it.
 
@@ -99,35 +105,33 @@ Brain mints and stores credentials of its own — the client keys that authentic
 - They are **Brain's**, not a third party's. Revoking one costs a client its access to Brain; it cannot spend anyone's money upstream.
 - The database holds `BLAKE3(secret)`, never the secret. The plaintext exists only in the mint response and on the wire; a stolen `api_keys` table yields no usable credential.
 
-So "the database holds no credentials" is true in both directions: no provider key ever arrives, and Brain's own keys are stored only as hashes.
+So the two stores hold different kinds of thing, and neither is a usable plaintext secret: a tenant's provider key arrives once and is persisted only sealed, and Brain's own keys are persisted only as `BLAKE3(secret)`.
 
-### Caching, and why the negative TTL is shorter
+### Caching, and why a rotation needs no invalidation
 
-HyPE runs on every write, so an uncached resolve would put a request to the edge on the write path. Results are cached per namespace, and a **negative** result is cached far more briefly than a positive one:
+Resolution reads the store, which is local, so there is no TTL to tune and no window in which a revoked key keeps working. What is cached is the built provider client, so resolving does not construct an HTTP client per call.
 
-| Entry | Default TTL | What the TTL bounds |
-|---|---|---|
-| Positive (`Ready`) | 300 s | how long a *revoked* key keeps working |
-| Negative (`Missing`), for resolution | 10 s | how long a tenant who just registered a key keeps being told they have none |
-| Negative, for the synchronous write gate | 300 s, with one probe admitted every 30 s | how long the gate keeps refusing before it lets a write through to re-probe |
-
-The two negative TTLs differ because their consumers want opposite things. Resolution wants the entry to expire fast, so the next derivation notices a key the moment it is registered. The write gate wants it to persist, or it only ever fires for writes arriving within ten seconds of each other — which is to say never, on the sparse traffic of a sandbox, and a keyless namespace then degrades in silence exactly as the gate exists to prevent. The periodic probe is what keeps the long window from becoming self-sustaining: the gate runs *before* any derivation, so a namespace it refuses issues no resolve and would never fetch the `Ready` that clears it.
+That cache is keyed by the credential's registration timestamp alongside its namespace and model. Registering a new key moves the timestamp, so the previous entry becomes unreachable the moment the store changes and every shard picks up the new key on its next resolve. There is no generation counter to keep in step, and no shard can serve a key the store no longer holds.
 
 ### `Missing` is not `Unavailable`
 
-The resolver keeps "this namespace has no key" separate from "I could not find out right now", and callers must branch on both. Conflating them turns a broker blip into a permanent-looking rejection and fails writes that should have been retried.
+The resolver keeps "this namespace has no key" separate from "I could not find out right now", and callers must branch on both. Conflating them turns a transient storage fault into a permanent-looking rejection and fails writes that should have been retried.
 
 The write path is deliberately **asymmetric**:
 
 - A **definitive** miss rejects the write up front with `LlmCredentialMissing` (`0x0066`, Conflict, terminal). Acking it would store a memory Brain cannot ground — HyPE and extraction are mandatory — so it would land as text with no questions, entities or statements, and recall would quietly degrade with nothing telling the caller why.
-- An **unresolved** credential (cold cache, broker blip) **admits** the write and lets the derivation stages resolve and retry. Rejecting here would fail every write for the first request after a restart.
-- With **no broker reachable at all**, the write is admitted and the derivation stages report that they could not run. Brain does not fall back to another credential, because there is no other credential to fall back to — a write that cannot be grounded is reported as such, never paid for out of someone else's key.
+- An **unresolved** credential — the store could not answer, or the key that sealed the row is no longer loaded — **admits** the write and lets the derivation stages resolve and retry. Neither is evidence that the tenant has no key.
+- With **no credential store at all**, the write is admitted and the derivation stages report that they could not run. Brain does not fall back to another credential, because there is no other credential to fall back to — a write that cannot be grounded is reported as such, never paid for out of someone else's key.
 
-A namespace with no registered key is not a boot-time concern and not a failed write in the general case: the write lands, the pattern and classifier tiers run, and the **LLM tier reports that it could not run**. That report — `StageOutcome::Failed` with a reason on the `StageCompleted` event — is the honest signal for a degraded write, not the gate, which is a cache-only optimisation that performs no I/O and therefore cannot promise to fire.
+Because the store is local, a definitive answer costs one point read and needs no network round trip. The gate can therefore refuse a keyless namespace at the door with a reason, rather than admitting on "unknown" and discovering the problem several stages downstream.
+
+A namespace with no registered key is not a boot-time concern. It is a **refused write**: the gate reads the local store before any derivation runs, gets a definitive answer, and returns `LlmCredentialMissing` with a reason the tenant can act on. HyPE and extraction both need the key, so admitting the write would store text with no questions, entities or statements — stored-looking, and quietly degrading recall.
+
+The per-stage report — `StageOutcome::Failed` with a reason on the `StageCompleted` event — carries the *other* case: a write that was admitted and then degraded, which is an unresolvable credential or a deployment with no credential store at all.
 
 ### Cache isolation
 
-The LLM response cache is keyed by `(input_hash, extractor_id, extractor_version, model)`, a tuple with no tenant component. Sharing a row across credentials means one tenant's key pays for a completion another tenant then gets free. A **credential scope** therefore enters the cache key, derived from the grant or the tenant id.
+The LLM response cache is keyed by `(input_hash, extractor_id, extractor_version, model)`, a tuple with no tenant component. Sharing a row across credentials means one tenant's key pays for a completion another tenant then gets free. A **credential scope** therefore enters the cache key, derived from the namespace that registered the credential — never from the key itself, which is hashed into persisted rows and shown in diagnostics.
 
 It is **never derived from key material**, and under this invariant it could not be: no key material exists in the process to derive it from. The scope is hashed into persisted rows and surfaces in diagnostics, so even if a key were available it would be the wrong input — the rule and the structure agree, which is what makes it hold.
 

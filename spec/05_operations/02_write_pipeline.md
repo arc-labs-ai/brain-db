@@ -367,8 +367,11 @@ Properties worth stating:
   extractor's LLM tier.
 - **Questions per memory are clamped** (16) so a runaway reply cannot overflow
   the storage key's index byte.
-- **A namespace with no key still writes.** The stage reports `Failed` with a
-  reason; the memory, its vector and its lexical index are unaffected.
+- **A namespace with no key does not write.** HyPE is mandatory, so ENCODE is
+  refused at admission with `LlmCredentialMissing` rather than storing a memory
+  with no questions indexed. A credential that could not be *resolved* is the
+  other case: the write lands, the stage reports `Failed` with a reason, and
+  the memory, its vector and its lexical index are unaffected.
 
 #### 17b. The per-stage artifact contract
 

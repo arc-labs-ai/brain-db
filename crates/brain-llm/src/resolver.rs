@@ -9,25 +9,23 @@
 //! [`LlmCredentialResolver`] for the client belonging to a **namespace**,
 //! rather than reaching for the one global router.
 //!
-//! ## Two implementations, one mechanism
+//! ## Where the implementations live
 //!
-//! - [`StaticResolver`] — wraps the existing single-key `ModelRouter` and hands
-//!   the same client to every namespace. This is today's behaviour exactly, and
-//!   it stays the self-host default: BYOK must not make Brain require an extra
-//!   service to run standalone.
-//! - A broker-backed resolver (cloud; not in this module) returns clients
-//!   pointed at an Arc Labs LLM broker, authenticated with a namespace-scoped
-//!   **grant**. Brain never holds the tenant's provider key — the broker swaps
-//!   the grant for the real key on the way upstream. Both
-//!   [`crate::OpenAIClient`] and [`crate::AnthropicClient`] already accept a
-//!   custom base URL, so that resolver constructs them with no new client code.
+//! The production resolver is in `brain-server`, over Brain's own credential
+//! store: each namespace registers a provider key and the model-backed stages
+//! bill to it.
+//!
+//! The two resolvers in this module serve one client to **every** namespace,
+//! which is not a tenancy model — it is what a test needs, and what an
+//! embedder with a single hand-built client needs. Neither is constructed by
+//! a production path.
 //!
 //! ## `Missing` is not `Unavailable`
 //!
 //! [`CredentialOutcome`] keeps "this namespace has no key" separate from "I
-//! could not find out right now". Conflating them turns a broker blip into a
-//! permanent-looking rejection and fails writes that should have been retried.
-//! Callers must branch on both.
+//! could not find out right now". Conflating them turns a transient storage
+//! fault into a permanent-looking rejection and fails writes that should have
+//! been retried. Callers must branch on both.
 
 use std::fmt;
 use std::future::Future;
@@ -53,9 +51,11 @@ use crate::router::ModelRouter;
 pub struct CredentialScope(u64);
 
 impl CredentialScope {
-    /// The shared scope for a deployment-wide house key. Every namespace served
-    /// by [`StaticResolver`] maps here, so self-host cache behaviour is
-    /// unchanged from before BYOK existed.
+    /// The scope a resolver uses when it serves one credential to every
+    /// namespace — the test doubles in this module. No production path
+    /// produces it: a real credential always derives its scope from the
+    /// namespace that registered it, which is what keeps one tenant's key
+    /// from paying for a cache row another tenant reads.
     pub const HOUSE: Self = Self(0);
 
     /// Derive a scope from a stable credential identifier — a grant id or
@@ -119,10 +119,9 @@ pub enum CredentialOutcome {
     /// rather than retrying, and surface it as a typed error the tenant can act
     /// on ("add a provider key"), not a 500.
     Missing,
-    /// The credential could not be determined right now — the broker is
-    /// unreachable, timed out, or returned a transient error. **Retry.**
-    /// Treating this as [`Self::Missing`] rejects writes for a tenant whose key
-    /// is perfectly good.
+    /// The credential could not be determined right now — the credential
+    /// store could not be read. **Retry.** Treating this as [`Self::Missing`]
+    /// rejects writes for a tenant whose key is perfectly good.
     Unavailable,
 }
 
@@ -166,10 +165,10 @@ pub trait LlmCredentialResolver: Send + Sync {
     /// `preferred_model` is the model the caller declared — for the LLM
     /// extractor tier, the `model:` field on the extractor definition. It is a
     /// request, not a command: a resolver may serve a different model when the
-    /// namespace's credential does not cover the requested one. [`StaticResolver`]
-    /// honours it exactly (reproducing pre-BYOK routing); a broker-backed
-    /// resolver serves whatever model the tenant registered a key for, because
-    /// that is the only model their key can actually pay for.
+    /// namespace's credential does not cover the requested one.
+    /// [`RouterResolver`] honours it exactly; a store-backed resolver serves
+    /// whatever model the tenant registered a key for, because that is the
+    /// only model their key can actually pay for.
     fn client_for<'a>(
         &'a self,
         namespace: &'a str,
@@ -183,15 +182,14 @@ pub trait LlmCredentialResolver: Send + Sync {
     ///
     /// - The **synchronous ENCODE path**, which must decide whether to admit a
     ///   write without waiting on a network round trip.
-    /// - **Extractor materialization** at shard startup, which uses it to keep
-    ///   the pre-BYOK operator diagnostics: a static deployment still reports
-    ///   "no llm clients configured" or "no client configured for model X" at
-    ///   startup rather than letting every write fail later.
+    /// - **Extractor materialization** at shard startup, which reports "no
+    ///   llm clients configured" or "no client configured for model X" there
+    ///   rather than letting every write fail later.
     ///
     /// `Some(true)` / `Some(false)` answer from local knowledge. `None` means
-    /// "unknown without I/O" — callers must **admit** on `None`, never reject,
-    /// because a cold cache is not evidence of a missing key. A broker-backed
-    /// resolver answers `None` for namespaces it has not yet fetched.
+    /// "unknown" — callers must **admit** on `None`, never reject, because a
+    /// resolver that cannot read its own store has learned nothing about
+    /// whether the namespace holds a key.
     fn can_serve(&self, namespace: &str, preferred_model: Option<&str>) -> Option<bool>;
 
     /// Human-readable reason a namespace has no credential, for the audit row
@@ -202,17 +200,18 @@ pub trait LlmCredentialResolver: Send + Sync {
     }
 }
 
-/// The single-key resolver: one credential, every namespace.
+/// Serves one [`ModelRouter`] to every namespace.
 ///
-/// Reproduces pre-BYOK behaviour exactly and is the self-host default. All
-/// namespaces share [`CredentialScope::HOUSE`], so cache rows are shared
-/// exactly as they were before the scope existed.
-pub struct StaticResolver {
+/// A test double, not a tenancy model: every namespace resolves the same
+/// credential and bills to the shared [`CredentialScope::HOUSE`]. Its value
+/// over [`FixedResolver`] is that it routes by model id, so a test can still
+/// exercise "this model has no configured provider".
+pub struct RouterResolver {
     router: Arc<ModelRouter>,
     model: String,
 }
 
-impl StaticResolver {
+impl RouterResolver {
     #[must_use]
     pub fn new(router: Arc<ModelRouter>, model: impl Into<String>) -> Self {
         Self {
@@ -228,16 +227,16 @@ impl StaticResolver {
     }
 }
 
-impl fmt::Debug for StaticResolver {
+impl fmt::Debug for RouterResolver {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("StaticResolver")
+        f.debug_struct("RouterResolver")
             .field("model", &self.model)
             .field("configured", &self.router.has_any_provider())
             .finish()
     }
 }
 
-impl LlmCredentialResolver for StaticResolver {
+impl LlmCredentialResolver for RouterResolver {
     fn client_for<'a>(
         &'a self,
         _namespace: &'a str,
@@ -271,14 +270,14 @@ impl LlmCredentialResolver for StaticResolver {
     }
 
     fn missing_reason(&self, _namespace: &str) -> String {
-        "no llm clients configured (set BRAIN__LLM__API_KEY or [llm] api_key)".to_string()
+        "no llm clients configured for this resolver".to_string()
     }
 }
 
 /// A resolver that serves one client to every namespace, bypassing model
 /// routing entirely.
 ///
-/// [`StaticResolver`] routes through a [`ModelRouter`], so the client it
+/// [`RouterResolver`] routes through a [`ModelRouter`], so the client it
 /// returns depends on the model id matching a known provider prefix. That is
 /// correct for a real deployment and awkward for tests and for embedding a
 /// single hand-built client, where the caller already knows exactly which
@@ -372,8 +371,8 @@ mod tests {
 
     #[test]
     fn missing_is_terminal_and_unavailable_is_retryable() {
-        // The whole point of the two-variant split: a broker blip must not
-        // read as "this tenant has no key".
+        // The whole point of the two-variant split: an unreadable store must
+        // not read as "this tenant has no key".
         assert!(CredentialOutcome::Missing.is_missing());
         assert!(!CredentialOutcome::Missing.is_retryable());
         assert!(CredentialOutcome::Unavailable.is_retryable());
@@ -382,7 +381,7 @@ mod tests {
 
     #[tokio::test]
     async fn static_resolver_serves_every_namespace_from_one_key() {
-        let r = StaticResolver::new(configured_router(), "claude-haiku-4-5");
+        let r = RouterResolver::new(configured_router(), "claude-haiku-4-5");
         let a = r
             .client_for("tenant-a", None)
             .await
@@ -402,7 +401,7 @@ mod tests {
 
     #[tokio::test]
     async fn static_resolver_without_key_is_missing_not_unavailable() {
-        let r = StaticResolver::new(Arc::new(ModelRouter::new()), "claude-haiku-4-5");
+        let r = RouterResolver::new(Arc::new(ModelRouter::new()), "claude-haiku-4-5");
         let outcome = r.client_for("tenant-a", None).await;
         assert!(outcome.is_missing());
         assert!(
@@ -414,16 +413,16 @@ mod tests {
 
     #[test]
     fn static_resolver_answers_the_sync_probe_without_io() {
-        let r = StaticResolver::new(configured_router(), "claude-haiku-4-5");
+        let r = RouterResolver::new(configured_router(), "claude-haiku-4-5");
         assert_eq!(r.can_serve("anything", None), Some(true));
     }
 
     #[tokio::test]
     async fn static_resolver_honours_the_declared_model() {
-        // Pre-BYOK, `materialize_llm_extractor` routed the extractor's own
-        // `model:` field through the router. Passing it as `preferred_model`
-        // must reproduce that exactly.
-        let r = StaticResolver::new(configured_router(), "gpt-4o-mini");
+        // `materialize_llm_extractor` passes the extractor's own `model:`
+        // field as `preferred_model`, and a router-backed resolver must route
+        // on that rather than on its own default.
+        let r = RouterResolver::new(configured_router(), "gpt-4o-mini");
         let got = r
             .client_for("tenant-a", Some("claude-haiku-4-5"))
             .await
@@ -436,7 +435,7 @@ mod tests {
     async fn static_resolver_declared_model_without_a_client_is_missing() {
         // Anthropic configured, an OpenAI model declared: no silent fallback
         // to the wrong provider.
-        let r = StaticResolver::new(configured_router(), "claude-haiku-4-5");
+        let r = RouterResolver::new(configured_router(), "claude-haiku-4-5");
         assert!(r
             .client_for("tenant-a", Some("gpt-4o-mini"))
             .await
@@ -445,9 +444,9 @@ mod tests {
 
     #[test]
     fn missing_reason_names_the_config_keys_an_operator_sets() {
-        let r = StaticResolver::new(Arc::new(ModelRouter::new()), "gpt-4o-mini");
+        let r = RouterResolver::new(Arc::new(ModelRouter::new()), "gpt-4o-mini");
         let reason = r.missing_reason("tenant-a");
-        assert!(reason.contains("BRAIN__LLM__API_KEY"), "{reason}");
+        assert!(reason.contains("no llm clients configured"), "{reason}");
     }
 
     #[test]
@@ -455,7 +454,7 @@ mod tests {
         // Anthropic client configured, OpenAI model requested: the router has
         // no slot for it, so this is a config error rather than a silent
         // fallback to the wrong provider.
-        let r = StaticResolver::new(configured_router(), "gpt-4o-mini");
+        let r = RouterResolver::new(configured_router(), "gpt-4o-mini");
         assert_eq!(r.can_serve("tenant-a", None), Some(false));
     }
 }

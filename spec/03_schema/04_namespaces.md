@@ -1,10 +1,33 @@
 # 03.04 Namespaces
 
-A namespace is the **tenant (company) data boundary** *and* the
+A namespace is the **tenant (company) data boundary** *and* the default
 schema/type-declaration scope. One company → one namespace. Within a
 namespace, applications are distinguished by `agent`; the effective
 isolation scope of every record is the pair **`(namespace, space)`** —
 namespace the outer wall (company), agent the inner wall (application).
+
+**A space may additionally declare an entity-type OVERLAY.** The namespace
+remains the base that every space in it resolves; a space that declares a type
+of its own shadows the base for that name, and nothing else in the namespace
+sees it. Resolution runs narrowest-first — `(ns, space) → (ns, base) →
+(SYSTEM, base)` — and the first hit wins, so a more general declaration can
+never shadow a more specific one. The asymmetry is deliberate: a space may
+borrow from its namespace, but a namespace-wide lookup is never answered from
+one arbitrary space's private declaration.
+
+Overlays are opt-in per upload (`SchemaUploadRequest.scope`, default
+`Namespace`) and cover **every declaration kind** — entity types, predicates,
+relation types and extractors are each space-keyed, so a sibling space
+resolves none of a space's own declarations. Versions count per scope as well:
+a space's first upload is version 1 even when the namespace base is already at
+7. See
+[`../04_wire_protocol/09_typed_graph_admin.md`](../04_wire_protocol/09_typed_graph_admin.md)
+§SCHEMA_UPLOAD for the exact boundary.
+
+Type discovery by the EXTRACTOR always lands at the base, never in an overlay:
+a type coined from one sentence is a side effect rather than a declaration,
+and a tenant that gives every end-user their own space would otherwise grow
+its type registry with its user table.
 [`./00_purpose.md`](./00_purpose.md) §"Multiple schemas (namespaces)" sketches the intent; this
 file is the operational contract.
 

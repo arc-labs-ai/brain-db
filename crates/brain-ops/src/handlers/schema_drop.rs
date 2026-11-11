@@ -35,6 +35,7 @@ use brain_metadata::relation::types::relation_type_id_by_qname;
 use brain_metadata::schema::predicate::predicate_id_by_qname;
 use brain_metadata::schema::store::schema_active_row;
 use brain_metadata::statement::crud::statement_live_count_by_predicate;
+use brain_metadata::DeclScope;
 use brain_protocol::schema::{validate_with, Schema, SchemaItem};
 use brain_protocol::{schema_drop_target, SchemaDropRequest, SchemaDropResponse};
 
@@ -88,6 +89,8 @@ pub async fn handle_schema_drop(
         )));
     }
     let namespace = req.namespace.clone();
+    // Resolved before any state-dependent step, as in `schema_upload`.
+    let space = schema_scope::declaration_space(ctx, req.scope)?;
     let caller_ns_id = ctx.executor.caller_namespace.raw();
 
     // 3. Read-only pre-checks against committed state. The actual narrow +
@@ -105,7 +108,7 @@ pub async fn handle_schema_drop(
             .metadata
             .read_txn()
             .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
-        let Some(active_row) = schema_active_row(&rtxn, &namespace)
+        let Some(active_row) = schema_active_row(&rtxn, DeclScope::space(&namespace, space))
             .map_err(|e| OpError::Internal(format!("schema_active_row: {e}")))?
         else {
             return Ok(not_declared_response(&req, 0));
@@ -147,7 +150,7 @@ pub async fn handle_schema_drop(
             .map_err(|e| OpError::Internal(format!("write_txn: {e}")))?;
         let n = match target_kind {
             schema_drop_target::PREDICATE => {
-                match predicate_id_by_qname(&wtxn, &namespace, target_name)
+                match predicate_id_by_qname(&wtxn, DeclScope::space(&namespace, space), target_name)
                     .map_err(|e| OpError::Internal(format!("predicate_id_by_qname: {e}")))?
                 {
                     Some(pid) => statement_live_count_by_predicate(
@@ -161,8 +164,12 @@ pub async fn handle_schema_drop(
                 }
             }
             schema_drop_target::RELATION_TYPE => {
-                match relation_type_id_by_qname(&wtxn, &namespace, target_name)
-                    .map_err(|e| OpError::Internal(format!("relation_type_id_by_qname: {e}")))?
+                match relation_type_id_by_qname(
+                    &wtxn,
+                    DeclScope::space(&namespace, space),
+                    target_name,
+                )
+                .map_err(|e| OpError::Internal(format!("relation_type_id_by_qname: {e}")))?
                 {
                     Some(rid) => {
                         relation_live_count_by_type(&wtxn, caller_ns_id, rid, LIVE_ROW_SCAN_CAP)
@@ -246,6 +253,10 @@ pub async fn handle_schema_drop(
     let phase = Phase::UpsertSchema {
         namespace: namespace.clone(),
         version: current_version.saturating_add(1),
+        // The scope the caller named. The narrowing reaches exactly
+        // this scope's own declaration, so a space cannot drop a name
+        // it merely inherits from the tenant.
+        space,
         blob: narrowed_json,
         declared_predicates: Vec::new(),
         declared_relation_types: Vec::new(),
@@ -537,7 +548,13 @@ mod tests {
         // system entity types.
         let validated = brain_protocol::schema::validate(&parsed).unwrap();
         let wtxn = metadata.write_txn().unwrap();
-        store_schema_upload(&wtxn, &validated, 1).unwrap();
+        store_schema_upload(
+            &wtxn,
+            &validated,
+            brain_metadata::tables::scope::SPACE_BASE,
+            1,
+        )
+        .unwrap();
         wtxn.commit().unwrap();
     }
 
@@ -549,17 +566,18 @@ mod tests {
             force,
             request_id: rid,
             act_as: None,
+            scope: brain_protocol::SchemaScope::Namespace,
         }
     }
 
     fn active(metadata: &SharedMetadataDb) -> Option<u32> {
         let rtxn = metadata.read_txn().unwrap();
-        schema_active(&rtxn, "acme").unwrap()
+        schema_active(&rtxn, DeclScope::base("acme")).unwrap()
     }
 
     fn predicate_declared(metadata: &SharedMetadataDb, name: &str) -> bool {
         let wtxn = metadata.write_txn().unwrap();
-        let got = predicate_id_by_qname(&wtxn, "acme", name).unwrap();
+        let got = predicate_id_by_qname(&wtxn, DeclScope::base("acme"), name).unwrap();
         // read-only use of a wtxn; drop without commit
         got.is_some()
     }
@@ -594,10 +612,10 @@ mod tests {
         // it. A subsequent STATEMENT_CREATE with `acme:prefers` therefore
         // fails with `PredicateNotInSchema`.
         let rtxn = metadata.read_txn().unwrap();
-        let active_set = predicates_active_for_schema(&rtxn, "acme", 2).unwrap();
+        let active_set = predicates_active_for_schema(&rtxn, DeclScope::base("acme"), 2).unwrap();
         let dislikes_id = {
             let wtxn = metadata.write_txn().unwrap();
-            predicate_id_by_qname(&wtxn, "acme", "dislikes").unwrap()
+            predicate_id_by_qname(&wtxn, DeclScope::base("acme"), "dislikes").unwrap()
         }
         .expect("dislikes still declared");
         assert!(
@@ -608,7 +626,7 @@ mod tests {
         // gone, so it cannot appear.
         let prefers_id = {
             let wtxn = metadata.write_txn().unwrap();
-            predicate_id_by_qname(&wtxn, "acme", "prefers").unwrap()
+            predicate_id_by_qname(&wtxn, DeclScope::base("acme"), "prefers").unwrap()
         };
         assert!(
             prefers_id.is_none(),
@@ -630,7 +648,9 @@ mod tests {
 
         // The new active version's document must not declare `prefers`.
         let rtxn = metadata.read_txn().unwrap();
-        let row = schema_active_row(&rtxn, "acme").unwrap().unwrap();
+        let row = schema_active_row(&rtxn, DeclScope::base("acme"))
+            .unwrap()
+            .unwrap();
         let schema: Schema = serde_json::from_slice(&row.source).unwrap();
         let still_there = schema
             .items
@@ -665,7 +685,9 @@ mod tests {
         assert_eq!(resp.schema_version, 2);
 
         let rtxn = metadata.read_txn().unwrap();
-        let row = schema_active_row(&rtxn, "acme").unwrap().unwrap();
+        let row = schema_active_row(&rtxn, DeclScope::base("acme"))
+            .unwrap()
+            .unwrap();
         let schema: Schema = serde_json::from_slice(&row.source).unwrap();
         assert!(
             !schema
@@ -796,7 +818,7 @@ mod tests {
             1_700_000_000_000_000_000,
         );
         entity_put(&wtxn, scope, SessionId::DEFAULT, &entity).unwrap();
-        let pred = predicate_id_by_qname(&wtxn, "acme", "prefers")
+        let pred = predicate_id_by_qname(&wtxn, DeclScope::base("acme"), "prefers")
             .unwrap()
             .expect("prefers declared by seed");
         let s = Statement::new_root(

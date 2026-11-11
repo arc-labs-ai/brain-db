@@ -25,7 +25,9 @@ pub mod tombstone;
 // Flat re-exports so `brain_metadata::statement::*` covers the original
 // statement_ops API surface without consumers having to walk the
 // sub-modules.
-pub use contradiction::{contradiction_audit_list_pending, contradiction_audit_record};
+pub use contradiction::{
+    contradiction_audit_list_pending, contradiction_audit_names, contradiction_audit_record,
+};
 pub use crud::{
     add_to_predicate_index, allocate_evidence_overflow, backfill_statement_id_indexes,
     evidence_overflow_load, flip_by_subject_to_current, rekey_predicate_index,

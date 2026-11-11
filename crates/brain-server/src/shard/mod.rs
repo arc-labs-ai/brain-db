@@ -50,6 +50,8 @@
 #![allow(clippy::await_holding_refcell_ref)]
 
 pub mod adapters;
+pub mod credential_resolver;
+pub mod llm_bridge;
 pub mod llm_setup;
 pub mod rebuild;
 pub mod restore;
@@ -533,27 +535,19 @@ pub struct ShardSpawnConfig {
 /// time. The provider is derived from the model id, not configured.
 #[derive(Clone, Debug, Default)]
 pub struct LlmSpawnConfig {
-    pub api_key: Option<String>,
+    /// Model id extraction falls back to when a tenant's registered
+    /// credential does not name one.
     pub model: Option<String>,
     /// `[extractors.llm] max_tokens`. `None` leaves the LLM extractor on
     /// its own default.
     pub extractor_max_tokens: Option<u32>,
-    /// `[llm.broker]` — set when `[llm] mode = "broker"` (BYOK).
+    /// Brain's own credential store and the keys that open it, shared by
+    /// every shard.
     ///
-    /// When present the shard resolves a credential **per namespace** from the
-    /// edge instead of using one process-wide key, and `api_key` is unused.
-    pub broker: Option<LlmBrokerSpawnConfig>,
-}
-
-/// Where per-namespace credentials are resolved from, under BYOK.
-#[derive(Clone, Debug, Default)]
-pub struct LlmBrokerSpawnConfig {
-    /// Edge base URL, e.g. `http://brain-edge:8080`.
-    pub url: String,
-    /// Brain's own token to the broker. **Not** a provider key.
-    pub service_key: Option<String>,
-    /// How long a resolved namespace credential stays cached.
-    pub ttl_secs: u64,
+    /// This is where a tenant's provider key lives. `None` leaves the model
+    /// derivation stages degraded with a per-write reason, which is what a
+    /// test harness that never registers a credential wants.
+    pub credentials: Option<Arc<brain_metadata::llm_credential::LlmCredentialAccess>>,
 }
 
 /// Knobs ferried from `Config.rerank` into the spawn path.
@@ -3155,27 +3149,22 @@ pub fn spawn_shard(
             // rows (seeded by the system-schema bootstrap at
             // MetadataDb::open) into a runtime ExtractorRegistry.
             //
-            // The LLM-tier deps the materializer
-            // needs: a `ModelRouter` built from the single provider key
-            // (`[llm] api_key`, into which `BRAIN__LLM__API_KEY` folds at
-            // load) and the per-shard `llm_cache.redb`. Both slots default
-            // to `None` so shards started without an LLM cache or any key
-            // configured stay unchanged.
+            // The LLM-tier deps the materializer needs: the per-namespace
+            // credential resolver over Brain's credential store, and the
+            // per-shard `llm_cache.redb`. Both slots default to `None` so a
+            // shard started without either stays usable for writes.
             let llm_deps =
                 llm_setup::build_llm_deps(&shard_dir_for_executor, &llm_config_for_closure);
-            // `[llm] api_key` builds the one client that is still shard-wide:
-            // the entity disambiguator. Extraction and HyPE do not use it —
-            // they resolve per namespace — so its absence costs the
-            // second-opinion pass on ambiguous-band partial matches and
-            // nothing else.
-            if llm_deps.primary_client.is_none() {
+            // Every model-backed stage resolves its credential per namespace,
+            // so a shard with no credential store has none of them. Writes
+            // still land and the non-model derivation stages still run.
+            if llm_deps.resolver.is_none() {
                 tracing::warn!(
                     target: "brain_server::shard",
                     shard_id,
-                    "no shard-wide LLM client; the entity disambiguator is off and \
-                     ambiguous-band partial matches will not get a second opinion. \
-                     Extraction and HyPE are unaffected — they resolve a credential \
-                     per namespace from `[llm.broker]`",
+                    "no LLM credential store wired; extraction, HyPE and entity \
+                     disambiguation are off. Writes still land and the non-model \
+                     derivation stages still run",
                 );
             }
             let llm_cache_for_ops = llm_deps.cache.clone();
@@ -3183,6 +3172,7 @@ pub fn spawn_shard(
             // layer so ENCODE can reject a namespace with no provider key at
             // the door instead of acking a write it cannot ground.
             let llm_resolver_for_ops = llm_deps.resolver.clone();
+            let llm_credentials_for_ops = cfg.llm.credentials.clone();
             // Snapshot the disambiguator before `llm_deps` is consumed
             // by `into_materialize_deps` below — the extractor worker
             // wires it directly into the resolver path so ambiguous-
@@ -3196,7 +3186,7 @@ pub fn spawn_shard(
             // is the largest LLM cost on the write path and the one most
             // visibly mis-billed if it used a single shard-wide client.
             let hype_resolver_for_worker = llm_deps.resolver.clone();
-            let hype_model_for_worker = llm_deps.primary_model.clone();
+
             // Dedicated cache handle for the HyPE generator: `llm_cache_for_ops`
             // is moved into OpsContext below, so snapshot the Arc now.
             let hype_cache_for_worker = llm_deps.cache.clone();
@@ -3560,6 +3550,7 @@ pub fn spawn_shard(
                 .with_classifier_config(classifier_config)
                 .with_llm_cache(llm_cache_for_ops)
                 .with_llm_credential_resolver(llm_resolver_for_ops)
+                .with_llm_credentials(llm_credentials_for_ops)
                 .with_tantivy(Some(tantivy_for_ops))
                 .with_entity_vector_index(std::sync::Arc::new(
                     self::adapters::ShardEntityVectorIndex::new(entity_hnsw_for_shard.clone()),
@@ -4313,23 +4304,21 @@ pub fn spawn_shard(
                 // user's phrasing match a memory it doesn't lexically
                 // resemble, and the write path depends on them. The LLM HyPE
                 // credential HyPE needs is resolved per namespace from
-                // `[llm.broker]`, which config load requires
-                // (`Config::validate_llm_broker`). The only tunable is the
+                // Brain's own credential store. The only tunable is the
                 // number of questions per memory
                 // (`[extractors.hype] num_questions`, default 6).
                 //
-                // The `(resolver, cache)` slots are `Some` whenever the config
-                // gate was honoured (the production entry point). They can
-                // only be `None` below that gate — `spawn_shard` reached
-                // directly without a broker/cache — in which case HyPE is
-                // inoperative and we skip wiring it rather than panic the
-                // executor thread.
+                // The `(resolver, cache)` slots are `Some` whenever the
+                // production entry point wired a credential store and a
+                // cache. They are `None` when `spawn_shard` is reached
+                // directly without them, in which case HyPE is inoperative
+                // and we skip wiring it rather than panic the executor
+                // thread.
                 match (hype_resolver_for_worker.clone(), hype_cache_for_worker.clone()) {
                     (Some(resolver), Some(cache)) => {
                         let num_questions = extractor_tuning_spawn_cfg.hype_num_questions.max(1);
                         let generator = brain_workers::HypeGenerator::new(
                             resolver,
-                            hype_model_for_worker.clone(),
                             dispatcher.clone(),
                             hype_hnsw_for_shard.clone(),
                             metadata.clone(),
@@ -4346,9 +4335,8 @@ pub fn spawn_shard(
                         target: "brain_server::shard",
                         shard_id,
                         "HyPE (mandatory) is inoperative: no credential resolver or cache. \
-                         The server entry point requires `[llm.broker]` at startup \
-                         (Config::validate_llm_broker); reaching here means spawn_shard was \
-                         used below that gate without one",
+                         The server entry point wires both; reaching here means spawn_shard \
+                         was used directly without them",
                     ),
                 }
                 scheduler

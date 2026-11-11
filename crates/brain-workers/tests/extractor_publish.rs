@@ -820,7 +820,6 @@ fn build_hype_generator_inner(
     });
     HypeGenerator::new(
         Arc::new(brain_llm::FixedResolver::new(client)),
-        "fake-hype-model".to_string(),
         Arc::new(NopDispatcher) as Arc<dyn Dispatcher>,
         index,
         metadata,

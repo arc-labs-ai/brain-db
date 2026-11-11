@@ -25,7 +25,7 @@ use crate::entity::ops::{
     entity_get_inside_wtxn, entity_put, entity_rename, entity_tombstone, entity_update,
     normalize_name, EntityOpError,
 };
-use crate::extractor::ops::extractor_drop_namespace;
+use crate::extractor::ops::extractor_drop_declared;
 use crate::recovery::phase_bodies::{
     decode_entity_create, decode_entity_merge, decode_entity_rename, decode_entity_tombstone,
     decode_entity_unmerge, decode_entity_update, decode_schema_update, decode_session_create,
@@ -39,8 +39,11 @@ use crate::schema::predicate::{
 use crate::schema::store::{
     declared_context_wtxn, schema_get, schema_upload_with_mode, SourceMode,
 };
-use crate::statement::{statement_create, statement_supersede, statement_tombstone};
+use crate::statement::{
+    statement_create, statement_supersede, statement_tombstone, StatementOpError,
+};
 use crate::system_schema::SYSTEM_SCHEMA_NAMESPACE;
+use crate::tables::scope::DeclScope;
 use crate::tables::statement::{
     statement_flags, statement_from_metadata, StatementMetadata, STATEMENTS_TABLE,
 };
@@ -108,6 +111,48 @@ impl MetadataDb {
                             existing_id = ?existing,
                             canonical_name = %name,
                             "replayed entity create refused at write time; skipping",
+                        );
+                    }
+                    // The create names an entity type that is not registered.
+                    //
+                    // SAME CAUSE AS THE DUPLICATE ABOVE, different check. The
+                    // WAL logs the attempt before the apply decides whether it
+                    // is legal, so a create whose `entity_type` was never
+                    // registered is journalled too — `entity_put` refuses it
+                    // with exactly this error and the caller gets the failure.
+                    // The row never existed, so replay must not invent one.
+                    //
+                    // It is NOT a type that was later deleted: the entity-type
+                    // registry is append-only (`entity_type_intern` only ever
+                    // inserts, and no schema phase drops entity types the way
+                    // `predicate_drop_schema_declared` drops predicates). So
+                    // an id that is absent now was absent then.
+                    //
+                    // Treating it as corruption cost exactly what the
+                    // duplicate case cost, and this is the shape that actually
+                    // took a shard down:
+                    //
+                    //     metadata sink rejected record at LSN 180: corruption:
+                    //     entity_put: entity type EntityTypeId(100) is not
+                    //     registered
+                    //
+                    // Unbootable for good — the record replays on every boot
+                    // and there is no repair path — from a request the API had
+                    // already handled correctly. Reaching this arm at all
+                    // means the guard above found no row, so a create that DID
+                    // materialise is skipped before here and nothing already
+                    // durable is dropped.
+                    //
+                    // The id is logged because it is the only handle an
+                    // operator has on which write produced the record.
+                    Err(EntityOpError::UnknownEntityType(type_id)) => {
+                        tracing::warn!(
+                            target: "brain_metadata::recovery",
+                            lsn,
+                            skipped_id = ?entity.id,
+                            entity_type = ?type_id,
+                            canonical_name = %entity.canonical_name,
+                            "replayed entity create names a type the schema no longer declares; skipping",
                         );
                     }
                     Err(e) => {
@@ -183,9 +228,15 @@ impl MetadataDb {
     }
 
     /// Replay a `SchemaUpdate` body: re-parse + re-validate the DSL blob,
-    /// then `schema_upload`. Idempotent: skips when (namespace, version)
-    /// already exists (otherwise `schema_upload`'s auto-increment would
-    /// mint a duplicate version on re-replay).
+    /// then `schema_upload`. Idempotent: skips when this scope already holds
+    /// the version (otherwise `schema_upload`'s auto-increment would mint a
+    /// duplicate on re-replay).
+    ///
+    /// The scope is part of the key. Versions count per `(namespace, space)`,
+    /// so a space's first document is version 1 just as the namespace base's
+    /// was — checking `(namespace, version)` alone would find the base's row
+    /// and skip the space's replay, and that space's schema would never be
+    /// applied.
     pub(super) fn apply_schema_update(
         &self,
         lsn: u64,
@@ -195,7 +246,7 @@ impl MetadataDb {
             .map_err(|e| MetadataSinkError::Corruption(format!("schema_update decode: {e}")))?;
         let already = {
             let rtxn = self.read_txn().map_err(transient)?;
-            schema_get(&rtxn, &b.namespace, b.version)
+            schema_get(&rtxn, DeclScope::space(&b.namespace, b.space), b.version)
                 .map_err(|e| MetadataSinkError::Corruption(format!("schema_get: {e}")))?
                 .is_some()
         };
@@ -243,12 +294,12 @@ impl MetadataDb {
         } else {
             SourceMode::Merge
         };
-        let context_namespace = if destructive {
-            SYSTEM_SCHEMA_NAMESPACE
+        let context_scope = if destructive {
+            DeclScope::base(SYSTEM_SCHEMA_NAMESPACE)
         } else {
-            b.namespace.as_str()
+            DeclScope::space(b.namespace.as_str(), b.space)
         };
-        let declared = declared_context_wtxn(&wtxn, context_namespace)
+        let declared = declared_context_wtxn(&wtxn, context_scope)
             .map_err(|e| MetadataSinkError::Corruption(format!("declared context: {e}")))?;
         let validated = validate_with(&parsed, &declared).map_err(|errs| {
             MetadataSinkError::Corruption(format!("schema re-validate: {errs:?}"))
@@ -258,25 +309,37 @@ impl MetadataDb {
             // the same order the live apply path uses, so replay converges on
             // identical state. A plain UPLOAD carries an empty delta.
             if b.replace_all {
-                predicate_drop_schema_declared(&wtxn, &b.namespace).map_err(|e| {
-                    MetadataSinkError::Corruption(format!("predicate drop-all: {e}"))
-                })?;
-                relation_type_drop_schema_declared(&wtxn, &b.namespace).map_err(|e| {
-                    MetadataSinkError::Corruption(format!("relation_type drop-all: {e}"))
-                })?;
-                extractor_drop_namespace(&wtxn, &b.namespace).map_err(|e| {
-                    MetadataSinkError::Corruption(format!("extractor drop-all: {e}"))
-                })?;
+                predicate_drop_schema_declared(&wtxn, DeclScope::space(&b.namespace, b.space))
+                    .map_err(|e| {
+                        MetadataSinkError::Corruption(format!("predicate drop-all: {e}"))
+                    })?;
+                relation_type_drop_schema_declared(&wtxn, DeclScope::space(&b.namespace, b.space))
+                    .map_err(|e| {
+                        MetadataSinkError::Corruption(format!("relation_type drop-all: {e}"))
+                    })?;
+                extractor_drop_declared(&wtxn, DeclScope::space(&b.namespace, b.space)).map_err(
+                    |e| MetadataSinkError::Corruption(format!("extractor drop-all: {e}")),
+                )?;
             }
             for drop in &b.drops {
                 match drop.kind {
                     brain_protocol::schema_drop_target::PREDICATE => {
-                        predicate_drop_one(&wtxn, &b.namespace, &drop.name).map_err(|e| {
+                        predicate_drop_one(
+                            &wtxn,
+                            DeclScope::space(&b.namespace, b.space),
+                            &drop.name,
+                        )
+                        .map_err(|e| {
                             MetadataSinkError::Corruption(format!("predicate drop: {e}"))
                         })?;
                     }
                     brain_protocol::schema_drop_target::RELATION_TYPE => {
-                        relation_type_drop_one(&wtxn, &b.namespace, &drop.name).map_err(|e| {
+                        relation_type_drop_one(
+                            &wtxn,
+                            DeclScope::space(&b.namespace, b.space),
+                            &drop.name,
+                        )
+                        .map_err(|e| {
                             MetadataSinkError::Corruption(format!("relation_type drop: {e}"))
                         })?;
                     }
@@ -287,7 +350,7 @@ impl MetadataDb {
                     }
                 }
             }
-            schema_upload_with_mode(&wtxn, &validated, b.created_at_unix_nanos, mode)
+            schema_upload_with_mode(&wtxn, &validated, b.space, b.created_at_unix_nanos, mode)
                 .map_err(|e| MetadataSinkError::Corruption(format!("schema_upload: {e}")))?;
             self.bump_next_lsn_in_txn(&wtxn, lsn)?;
         }
@@ -426,9 +489,13 @@ impl MetadataDb {
             };
             if !already {
                 if let Some((namespace, name)) = &b.predicate_intern_hint {
+                    // The statement row carries the scope the create ran
+                    // under, so replay re-interns there. Re-interning at the
+                    // namespace base would plant a space's own vocabulary
+                    // where every sibling space resolves it.
                     let pid = predicate_intern_or_get(
                         &wtxn,
-                        namespace,
+                        DeclScope::space(namespace, scope.space_id_bytes),
                         name,
                         /* first_seen_lsn */ 0,
                         s.extracted_at_unix_nanos,
@@ -441,16 +508,65 @@ impl MetadataDb {
                 // The WAL body row carries the per-utterance session; replay
                 // it so the recovered statement keeps its session grouping
                 // (statement_from_metadata drops it — brain-core has no slot).
-                statement_create(
+                // DANGLING REFERENCES ARE SKIPPED, NOT FATAL.
+                //
+                // A statement points at three things it does not own: its
+                // subject entity, its object entity, and its predicate. Each
+                // can be absent on replay for a reason that is not corruption.
+                //
+                // SUBJECT / OBJECT — `apply_entity_create` above skips a
+                // create the API refused, so a subject can be absent BY OUR
+                // OWN DOING. `statement_create` then refuses with
+                // `UnknownSubject`, and mapped to `Corruption` that bricks the
+                // shard one record after the skip saved it. Making the entity
+                // skip non-fatal without this arm would move the failure, not
+                // remove it. The same applies without any skip upstream: the
+                // WAL journals attempts, so a statement about an entity whose
+                // create was refused is in the log too.
+                //
+                // PREDICATE — unlike entity types, predicates ARE dropped and
+                // re-interned by a destructive schema phase
+                // (`predicate_drop_schema_declared`), and ids come back
+                // different. Statements already in the log keep pointing at
+                // the id the predicate used to have.
+                //
+                // In every case not writing the row reproduces what the live
+                // path believes; refusing to boot does not. The guard above
+                // means a statement that DID materialise is skipped before we
+                // get here, so nothing already durable is dropped.
+                match statement_create(
                     &wtxn,
                     scope,
                     b.meta.session(),
                     &s,
                     s.extracted_at_unix_nanos,
-                )
-                .map_err(|e| MetadataSinkError::Corruption(format!("statement_create: {e}")))?;
-                if b.predicate_intern_hint.is_some() {
-                    stamp_implicit_predicate(&wtxn, s.id)?;
+                ) {
+                    // `statement_create` yields the new StatementId; the
+                    // caller already holds it as `s.id`.
+                    Ok(_) => {
+                        if b.predicate_intern_hint.is_some() {
+                            stamp_implicit_predicate(&wtxn, s.id)?;
+                        }
+                    }
+                    Err(
+                        e @ (StatementOpError::UnknownSubject(_)
+                        | StatementOpError::UnknownObjectEntity(_)
+                        | StatementOpError::UnknownPredicate(_)),
+                    ) => {
+                        tracing::warn!(
+                            target: "brain_metadata::recovery",
+                            lsn,
+                            skipped_id = ?s.id,
+                            error = %e,
+                            "replayed statement names a subject, object or predicate the \
+                             schema no longer declares; skipping",
+                        );
+                    }
+                    Err(e) => {
+                        return Err(MetadataSinkError::Corruption(format!(
+                            "statement_create: {e}"
+                        )));
+                    }
                 }
             }
             self.bump_next_lsn_in_txn(&wtxn, lsn)?;
@@ -650,6 +766,7 @@ impl MetadataDb {
 
 #[cfg(all(test, not(miri)))]
 mod tests {
+    use crate::tables::scope::DeclScope;
     use brain_core::{Entity, EntityId, EntityType};
     use tempfile::TempDir;
 
@@ -684,6 +801,63 @@ mod tests {
         );
         e.aliases = vec!["priya".into(), "p. patel".into()];
         e
+    }
+
+    /// A create naming an unregistered entity type must not brick the shard.
+    ///
+    /// This is the shape that actually took a shard down. The WAL journals a
+    /// create BEFORE the apply decides whether it is legal, so a create naming
+    /// an unregistered `entity_type` — which `entity_put` refuses and the
+    /// caller sees fail — is in the log all the same. Replay used to abort on
+    /// it as `Corruption`:
+    ///
+    ///     metadata sink rejected record at LSN 180: corruption: entity_put:
+    ///     entity type EntityTypeId(100) is not registered
+    ///
+    /// Unbootable permanently, from a request the API handled correctly —
+    /// exactly the failure `a_create_refused_at_write_time_is_skipped_not_fatal`
+    /// was written for, reached by a different door.
+    #[test]
+    fn a_create_naming_a_deleted_type_is_skipped_not_fatal() {
+        let dir = TempDir::new().unwrap();
+        let db = fresh_db(&dir);
+
+        // A type id the system-schema bootstrap never registers — the same
+        // id, 100, that the live failure named.
+        let ghost = brain_core::EntityTypeId::from(100u32);
+        let mut orphan = person_entity("Vendor Row");
+        orphan.entity_type = ghost;
+        let orphan_id = orphan.id;
+
+        let body = encode_entity_create(&EntityMetadata::from_entity(&orphan, test_scope()));
+        db.apply_entity_create(180, &body)
+            .expect("a create naming a dropped type must be skipped, not abort the shard");
+
+        let rtxn = db.read_txn().unwrap();
+        assert!(
+            entity_get(&rtxn, orphan_id).unwrap().is_none(),
+            "the row must NOT be materialised under an unregistered type",
+        );
+    }
+
+    /// The skip above must stay narrow: a create naming a type that DOES
+    /// exist still materialises. Without this, "skip on error" could quietly
+    /// become "drop every entity" and the test above would still pass.
+    #[test]
+    fn a_create_naming_a_live_type_still_materialises() {
+        let dir = TempDir::new().unwrap();
+        let db = fresh_db(&dir);
+        let e = person_entity("Priya Patel");
+        let id = e.id;
+
+        let body = encode_entity_create(&EntityMetadata::from_entity(&e, test_scope()));
+        db.apply_entity_create(181, &body).unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        assert!(
+            entity_get(&rtxn, id).unwrap().is_some(),
+            "a create with a registered type must still be written",
+        );
     }
 
     #[test]
@@ -968,6 +1142,7 @@ mod tests {
         let body = encode_schema_update(&SchemaUpdateBody {
             namespace: "acme".into(),
             version: 1,
+            space: crate::tables::scope::SPACE_BASE,
             blob: src.as_bytes().to_vec(),
             created_at_unix_nanos: NOW + 200,
             replace_all: false,
@@ -978,7 +1153,10 @@ mod tests {
         db.apply_schema_update(15, &body).unwrap();
 
         let rtxn = db.read_txn().unwrap();
-        assert_eq!(schema_active(&rtxn, "acme").unwrap(), Some(1));
+        assert_eq!(
+            schema_active(&rtxn, DeclScope::base("acme")).unwrap(),
+            Some(1)
+        );
     }
 
     #[test]
@@ -1010,6 +1188,7 @@ define predicate dislikes {
         let v1 = encode_schema_update(&SchemaUpdateBody {
             namespace: "acme".into(),
             version: 1,
+            space: crate::tables::scope::SPACE_BASE,
             blob: v1_src.as_bytes().to_vec(),
             created_at_unix_nanos: NOW,
             replace_all: false,
@@ -1018,13 +1197,20 @@ define predicate dislikes {
         db.apply_schema_update(10, &v1).unwrap();
         {
             let rtxn = db.read_txn().unwrap();
-            assert_eq!(schema_active(&rtxn, "acme").unwrap(), Some(1));
-            assert!(predicate_lookup_by_qname(&rtxn, "acme", "likes")
-                .unwrap()
-                .is_some());
-            assert!(predicate_lookup_by_qname(&rtxn, "acme", "dislikes")
-                .unwrap()
-                .is_some());
+            assert_eq!(
+                schema_active(&rtxn, DeclScope::base("acme")).unwrap(),
+                Some(1)
+            );
+            assert!(
+                predicate_lookup_by_qname(&rtxn, DeclScope::base("acme"), "likes")
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                predicate_lookup_by_qname(&rtxn, DeclScope::base("acme"), "dislikes")
+                    .unwrap()
+                    .is_some()
+            );
         }
 
         // v2 — DROP predicate `likes`. The narrowed document (item removed,
@@ -1039,6 +1225,7 @@ define predicate dislikes {
         let v2 = encode_schema_update(&SchemaUpdateBody {
             namespace: "acme".into(),
             version: 2,
+            space: crate::tables::scope::SPACE_BASE,
             blob: serde_json::to_vec(&narrowed).unwrap(),
             created_at_unix_nanos: NOW + 1,
             replace_all: false,
@@ -1050,15 +1237,18 @@ define predicate dislikes {
         db.apply_schema_update(11, &v2).unwrap();
         {
             let rtxn = db.read_txn().unwrap();
-            assert_eq!(schema_active(&rtxn, "acme").unwrap(), Some(2));
+            assert_eq!(
+                schema_active(&rtxn, DeclScope::base("acme")).unwrap(),
+                Some(2)
+            );
             assert!(
-                predicate_lookup_by_qname(&rtxn, "acme", "likes")
+                predicate_lookup_by_qname(&rtxn, DeclScope::base("acme"), "likes")
                     .unwrap()
                     .is_none(),
                 "dropped predicate must be gone after replay"
             );
             assert!(
-                predicate_lookup_by_qname(&rtxn, "acme", "dislikes")
+                predicate_lookup_by_qname(&rtxn, DeclScope::base("acme"), "dislikes")
                     .unwrap()
                     .is_some(),
                 "sibling predicate must survive a targeted drop"
@@ -1077,6 +1267,7 @@ define predicate admires {
         let v3 = encode_schema_update(&SchemaUpdateBody {
             namespace: "acme".into(),
             version: 3,
+            space: crate::tables::scope::SPACE_BASE,
             blob: v3_src.as_bytes().to_vec(),
             created_at_unix_nanos: NOW + 2,
             replace_all: true,
@@ -1085,15 +1276,18 @@ define predicate admires {
         db.apply_schema_update(12, &v3).unwrap();
         {
             let rtxn = db.read_txn().unwrap();
-            assert_eq!(schema_active(&rtxn, "acme").unwrap(), Some(3));
+            assert_eq!(
+                schema_active(&rtxn, DeclScope::base("acme")).unwrap(),
+                Some(3)
+            );
             assert!(
-                predicate_lookup_by_qname(&rtxn, "acme", "admires")
+                predicate_lookup_by_qname(&rtxn, DeclScope::base("acme"), "admires")
                     .unwrap()
                     .is_some(),
                 "replacement predicate must be present"
             );
             assert!(
-                predicate_lookup_by_qname(&rtxn, "acme", "dislikes")
+                predicate_lookup_by_qname(&rtxn, DeclScope::base("acme"), "dislikes")
                     .unwrap()
                     .is_none(),
                 "replace_all must have dropped every prior declared predicate"
@@ -1107,16 +1301,25 @@ define predicate admires {
             db.apply_schema_update(lsn, body).unwrap();
         }
         let rtxn = db.read_txn().unwrap();
-        assert_eq!(schema_active(&rtxn, "acme").unwrap(), Some(3));
-        assert!(predicate_lookup_by_qname(&rtxn, "acme", "admires")
-            .unwrap()
-            .is_some());
-        assert!(predicate_lookup_by_qname(&rtxn, "acme", "likes")
-            .unwrap()
-            .is_none());
-        assert!(predicate_lookup_by_qname(&rtxn, "acme", "dislikes")
-            .unwrap()
-            .is_none());
+        assert_eq!(
+            schema_active(&rtxn, DeclScope::base("acme")).unwrap(),
+            Some(3)
+        );
+        assert!(
+            predicate_lookup_by_qname(&rtxn, DeclScope::base("acme"), "admires")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            predicate_lookup_by_qname(&rtxn, DeclScope::base("acme"), "likes")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            predicate_lookup_by_qname(&rtxn, DeclScope::base("acme"), "dislikes")
+                .unwrap()
+                .is_none()
+        );
     }
 
     // ----- statement create / tombstone ---------------------------------
@@ -1150,6 +1353,43 @@ define predicate admires {
         entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
         wtxn.commit().unwrap();
         id
+    }
+
+    /// The cascade guard for `a_create_naming_a_deleted_type_is_skipped_not_fatal`.
+    ///
+    /// Skipping an entity create leaves later statements ABOUT that entity
+    /// pointing at a subject that is now absent. `statement_create` refuses
+    /// those with `UnknownSubject`, and mapped to `Corruption` that bricks the
+    /// shard one record after the skip saved it — the failure moved, not
+    /// removed. The same arm covers a predicate that a destructive schema
+    /// phase dropped and re-interned under a new id.
+    #[test]
+    fn a_statement_whose_subject_is_absent_is_skipped_not_fatal() {
+        use crate::recovery::phase_bodies::{encode_statement_create, StatementCreateBody};
+        use crate::statement::statement_get;
+        use crate::tables::statement::metadata_from_statement;
+
+        let dir = TempDir::new().unwrap();
+        let db = fresh_db(&dir);
+
+        // A subject that was never written — exactly the state an upstream
+        // entity skip leaves behind.
+        let absent = brain_core::EntityId::new();
+        let s = schemaless_statement(absent);
+        let sid = s.id;
+
+        let body = encode_statement_create(&StatementCreateBody {
+            meta: metadata_from_statement(&s, test_scope()),
+            predicate_intern_hint: Some(("app".into(), "knows".into())),
+        });
+        db.apply_statement_create(182, &body)
+            .expect("a statement about a skipped subject must be skipped, not abort the shard");
+
+        let rtxn = db.read_txn().unwrap();
+        assert!(
+            statement_get(&rtxn, sid).unwrap().is_none(),
+            "the statement must NOT be materialised without its subject",
+        );
     }
 
     #[test]

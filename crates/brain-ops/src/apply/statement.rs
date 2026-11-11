@@ -8,6 +8,7 @@ use brain_core::{EvidenceRef, Statement, StatementId, TombstoneReason};
 use brain_metadata::schema::predicate::predicate_intern_or_get;
 use brain_metadata::statement::{statement_create, statement_supersede, statement_tombstone};
 use brain_metadata::tables::statement::{statement_flags, StatementMetadata, STATEMENTS_TABLE};
+use brain_metadata::DeclScope;
 use redb::{ReadableTable, WriteTransaction};
 use smallvec::SmallVec;
 
@@ -46,7 +47,7 @@ pub fn apply_upsert_statement(
         None => *predicate,
         Some((namespace, name)) => predicate_intern_or_get(
             wtxn,
-            namespace,
+            DeclScope::base(namespace),
             name,
             /* first_seen_lsn */ 0,
             *extracted_at_unix_nanos,
@@ -343,7 +344,7 @@ mod tenant_wall_tests {
         let wtxn = db.write_txn().unwrap();
         let id = predicate_intern(
             &wtxn,
-            "test",
+            DeclScope::base("test"),
             name,
             Some(StatementKind::Fact),
             2,

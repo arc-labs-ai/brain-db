@@ -56,6 +56,21 @@ What "the typed graph is done" means. Concrete tests that must pass.
 
 ### Extraction
 
+### Tenant LLM credentials
+
+- [ ] `LLM_CREDENTIAL_PUT`: registers at the named scope and nowhere else; a second PUT reports `replaced = true`.
+- [ ] `LLM_CREDENTIAL_GET`: returns provider, model and fingerprint; never the key.
+- [ ] `LLM_CREDENTIAL_DELETE`: reports whether a row existed, so a revoke during an incident is distinguishable from a no-op.
+- [ ] `LLM_CREDENTIAL_VERIFY`: `Ok` / `Unauthorized` / `ModelUnavailable` / `Unreachable` / `NoCredential`, each reached.
+- [ ] A key without the `LLM_CREDENTIAL` permission bit is refused on all four ops.
+- [ ] `LLM_CREDENTIAL` is not delegable: a delegated caller never holds it.
+- [ ] A plaintext key is refused over a transport that does not protect it.
+- [ ] ENCODE into a namespace with no registered credential is refused with `LlmCredentialMissing` (0x0066), terminal, before the write lands.
+- [ ] ENCODE into a namespace whose credential cannot be *resolved* is admitted, and the HyPE stage reports `StageOutcome::Failed`.
+- [ ] A credential store whose rows none of the loaded sealing keys can open fails the boot audit rather than serving.
+
+> Every extraction item below presumes the namespace has a registered provider credential. Without one the write never reaches extraction — ENCODE is refused at admission.
+
 - [ ] Pattern extractor: runs in the extractor worker; output visible after the memory is drained (not at ENCODE-ack).
 - [ ] Classifier extractor: runs in the extractor worker after the pattern tier; output visible within one worker cycle of ENCODE.
 - [ ] LLM extractor (cache hit): returns from cache without LLM call.

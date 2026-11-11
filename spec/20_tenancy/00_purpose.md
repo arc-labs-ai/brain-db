@@ -69,21 +69,31 @@ Isolation covers what a tenant's data costs as well as where it lives. The two f
 system that keeps one tenant's rows apart but pays for their LLM calls out of another tenant's key
 has not isolated them.
 
-- **MUST:** Every LLM call resolves its authority **per namespace**, from the broker, as a
-  namespace-scoped grant. There is no shard-wide, deployment-wide or fallback credential, and no
-  privileged consumer exempt from this — HyPE, the extractor's LLM tier, the entity disambiguator
-  and the summarizer all resolve the same way.
-- **MUST NOT:** Brain accept or construct a client from a provider API key, from any source.
-  There is no configuration that supplies one.
-- **MUST NOT:** anything credential-shaped be persisted — not to the WAL, the metadata store, a
-  snapshot, a backup, the response cache, a log line or a diagnostic. This holds **structurally**:
-  a provider key cannot leak from data at rest because one never arrives.
+- **MUST:** Every LLM call resolves its authority **per namespace**, from Brain's credential
+  store, keyed by the namespace of the data it is about to act on. There is no shard-wide,
+  deployment-wide or fallback credential, and no privileged consumer exempt from this — HyPE, the
+  extractor's LLM tier and the entity disambiguator all resolve the same way. A consumer that
+  cannot name a namespace cannot make an LLM call.
+- **MUST NOT:** Brain accept or construct a client from a *deployment-wide* provider API key,
+  from any source. There is no configuration that supplies one, so there is nothing to get wrong.
+- **MUST NOT:** a provider key be persisted in plaintext, or rendered into a log line, an error
+  string or a diagnostic. A registered key is sealed under a key-encryption key before it reaches
+  storage, and the types that carry one render as `[redacted]` rather than deriving `Debug`. This
+  is a weaker guarantee than absence and is stated as such: a key-encryption key generated into
+  the data directory protects a copied volume or a backup archive, not someone holding the whole
+  directory.
+- **MUST:** A sealed key be bound to the namespace and provider it was registered for, so a row
+  moved into another tenant's slot fails to open rather than yielding a usable key. Without that
+  binding, row-level write access to the store would be a way to spend another tenant's budget.
+- **MUST:** A registration be refused over a connection whose transport does not protect its
+  contents. Sealing covers the key at rest; refusing the request covers it in flight.
 - **MUST:** The LLM response cache carry a credential scope in its key, so a completion one
-  tenant paid for is never served to another. The scope is derived from the grant or tenant id,
+  tenant paid for is never served to another. The scope is derived from the namespace,
   never from key material.
 - **MUST NOT:** a namespace with no registered credential be served out of any other namespace's.
-  The write lands, the stages that need an LLM report that they could not run, and the caller is
-  told why (`LlmCredentialMissing`, or a `Failed` stage outcome with a reason).
+  A definitive miss refuses the write up front with `LlmCredentialMissing`; a credential that
+  merely could not be resolved right now admits it, and the stages that need an LLM report
+  `Failed` with a reason. Either way the caller is told why, and no other tenant's key pays.
 
 Brain's own minted client keys are a separate object and are unaffected: they authenticate a
 connection to Brain, they cannot spend anything upstream, and the database stores only

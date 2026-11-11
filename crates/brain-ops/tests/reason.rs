@@ -494,7 +494,7 @@ fn reason_analogical_fit_populates_trace_and_can_tag_inference_kind() {
         let bob = seed_entity(&wtxn, scope, "Bob");
         let predicate_id = brain_metadata::schema::predicate::predicate_intern(
             &wtxn,
-            "test",
+            brain_metadata::DeclScope::base("test"),
             "works_at",
             Some(StatementKind::Fact),
             /* object: Value */ 2,

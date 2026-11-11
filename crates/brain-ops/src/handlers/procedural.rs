@@ -9,6 +9,7 @@
 //! and dispatches per-predicate listings through the existing
 //! `statement_list` index. No writes, no extractor calls.
 
+use brain_metadata::DeclScope;
 use std::collections::HashMap;
 
 use brain_core::{EntityId, PredicateId, SessionId, StatementKind};
@@ -148,7 +149,7 @@ pub async fn handle_materialize_procedural(
             if !category_matches(name, categories_set) {
                 continue;
             }
-            match predicate_lookup_by_qname(&rtxn, BEHAVIOR_NAMESPACE, name)
+            match predicate_lookup_by_qname(&rtxn, DeclScope::base(BEHAVIOR_NAMESPACE), name)
                 .map_err(OpError::from)?
             {
                 Some(p) => {
