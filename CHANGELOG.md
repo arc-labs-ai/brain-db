@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.4.1](https://github.com/arc-labs-ai/brain-db/compare/v0.4.0...v0.4.1) (2026-11-11)
+
+
+### ⚠ BREAKING CHANGES
+
+* `[llm] api_key` and the `[llm.broker]` block are removed. A deployment that set either must register a provider credential per namespace instead; there is no migration path, because an operator key and a tenant key are not the same money.
+
+### Features
+
+* give every tenant its own sealed provider key ([#50](https://github.com/arc-labs-ai/brain-db/issues/50)) ([0d77533](https://github.com/arc-labs-ai/brain-db/commit/0d7753334d879f00b6afbeacdf28b111e6820ee1))
+
+
+### Bug Fixes
+
+* **config:** resolve LLM credentials through the per-namespace broker ([5640b9f](https://github.com/arc-labs-ai/brain-db/commit/5640b9f3752d2dee980ff1dc174650cf97c96f18))
+* **storage:** report each reflink failure once, not once per file ([a8d299e](https://github.com/arc-labs-ai/brain-db/commit/a8d299e928a65643c7a5c8182566b550caf8c7d2))
+
 ## [0.4.0](https://github.com/arc-labs-ai/brain-db/compare/v0.3.1...v0.4.0) (2026-10-29)
 
 
