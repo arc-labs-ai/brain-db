@@ -30,8 +30,9 @@ pub const MAX_SCHEMA_DOCUMENT_BYTES: usize = 1024 * 1024;
 /// the entity-type registry is keyed on.
 ///
 /// `SchemaScope::Namespace` is [`SPACE_BASE`] — the namespace-wide base every
-/// space in the tenant resolves, and what every upload meant before the field
-/// existed.
+/// space in the tenant resolves.
+///
+/// [`SPACE_BASE`]: brain_metadata::tables::scope::SPACE_BASE
 ///
 /// `SchemaScope::Space` is the caller's **own** effective space, taken from
 /// the request context. The wire field is a two-state selector and never a

@@ -34,6 +34,8 @@ pub const PREDICATES_TABLE: TableDefinition<'static, u32, PredicateDefinition> =
 /// `qname` leads the key so every space's copy of one predicate is a
 /// contiguous range — that is what lets "is this name declared in any space"
 /// be a range scan rather than a table walk.
+///
+/// [`SPACE_BASE`]: crate::tables::scope::SPACE_BASE
 pub const PREDICATES_BY_SCOPE_TABLE: TableDefinition<'static, (&str, [u8; 16]), u32> =
     TableDefinition::new("predicates_by_scope");
 

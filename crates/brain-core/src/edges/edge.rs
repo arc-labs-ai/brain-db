@@ -16,7 +16,9 @@ pub enum EdgeKind {
     Caused = 0,
     /// `source` happened before `target`.
     FollowedBy = 1,
-    /// `target` was derived from `source` (e.g. consolidated, summarised).
+    /// `source` was derived from `target` (e.g. consolidated, summarised).
+    /// The consolidation worker links the new memory to each memory it was
+    /// built from, so the edge runs from the derived memory to its source.
     DerivedFrom = 2,
     /// Symmetric: `source` and `target` are similar.
     SimilarTo = 3,

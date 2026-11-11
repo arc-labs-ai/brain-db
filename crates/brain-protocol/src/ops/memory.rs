@@ -414,6 +414,8 @@ pub enum MemoryListDirWire {
 #[repr(u8)]
 pub enum MemoryListTimeAxisWire {
     Created = 0,
+    /// Refused in v1.0: with no index on a memory's occurred_at, a range
+    /// over it would be a full tenant scan.
     Occurred = 1,
 }
 
@@ -429,6 +431,8 @@ pub enum MemoryListTimeAxisWire {
 /// different result set.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MemoryListRequest {
+    /// Only `Created` is served in v1.0; every other order is refused,
+    /// because the cursor is a keyset over the creation index.
     pub sort: MemoryListSortWire,
     pub dir: MemoryListDirWire,
     /// Page size, validated server-side to `1..=100`.
@@ -452,6 +456,9 @@ pub struct MemoryListRequest {
     /// Inclusive salience ceiling in `[0, 1]`.
     pub salience_max: f32,
     /// Substring/token filter over memory text; empty = no filter.
+    /// Only the empty value is served in v1.0: a non-empty filter is
+    /// refused rather than answered by scanning every text body. RECALL
+    /// is the supported way to find memories by their content.
     pub text_contains: String,
     /// Effective identity this list runs as, on behalf of the
     /// authenticated connection principal. `None` (the common case, and

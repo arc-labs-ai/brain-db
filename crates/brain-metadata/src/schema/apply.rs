@@ -55,6 +55,8 @@ pub enum SchemaApplyError {
 /// for an overlay that only that space sees. Every definition in one
 /// document lands at one scope — a document is the unit of declaration,
 /// so it cannot be half base and half overlay.
+///
+/// [`SPACE_BASE`]: crate::tables::scope::SPACE_BASE
 pub fn apply_schema_definitions(
     wtxn: &WriteTransaction,
     validated: &ValidatedSchema,

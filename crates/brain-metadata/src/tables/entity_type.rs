@@ -36,8 +36,10 @@ pub const ENTITY_TYPES_TABLE: TableDefinition<'static, u32, EntityTypeDefinition
 /// two-step with one level added above it — see
 /// [`crate::entity::types::entity_type_lookup`].
 ///
-/// A tenant that never uploads a space overlay is keyed exactly as before
-/// (every row at `SPACE_BASE`), so the common shape pays nothing for this.
+/// A tenant that never uploads a space overlay keys every row at
+/// `SPACE_BASE`, so the common shape pays nothing for this.
+///
+/// [`SPACE_BASE`]: crate::tables::scope::SPACE_BASE
 pub const ENTITY_TYPES_BY_SCOPE_TABLE: TableDefinition<
     'static,
     (u32, [u8; 16], &'static str),

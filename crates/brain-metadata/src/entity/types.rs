@@ -61,7 +61,8 @@ pub enum EntityTypeOpError {
 /// declaration silently shadow a more specific one, which is backwards —
 /// the narrower scope is the one that was chosen deliberately.
 ///
-/// Pass [`SPACE_BASE`] to ask the namespace-wide question, which is what
+/// Pass [`crate::tables::scope::SPACE_BASE`] to ask the namespace-wide
+/// question, which is what
 /// every caller that has no space in hand should do.
 pub fn entity_type_lookup(
     wtxn: &WriteTransaction,
