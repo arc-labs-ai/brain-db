@@ -42,7 +42,7 @@ pub struct SchemaUploadRequest {
     pub allow_breaking: bool,          // false = reject if migration would be required
     pub request_id: WireUuid,
     pub act_as: Option<ActAs>,         // effective identity; the namespace checks bind to it
-    pub scope: SchemaScope,            // WHERE the declarations land; default Namespace
+    pub scope: SchemaScope,            // WHERE the declarations land; always encoded
 }
 
 pub enum SchemaScope {
@@ -72,16 +72,33 @@ Semantics:
 4. Otherwise commit the new schema version inside a redb transaction: writes to the `schemas` table, allocates a fresh `schema_version`, increments the registry, fires `SCHEMA_UPDATED` event (see §"SUBSCRIBE events" below).
 
 <!-- Scope of the overlay, stated precisely so nobody reads more into it. -->
-**What `scope: Space` does and does not isolate.** Today the overlay is an
-ENTITY-TYPE overlay: only the entity-type registry is space-keyed, so entity
-type *resolution* is what a sibling space cannot see. A space-scoped upload
-still bumps the **namespace's** `schema_version`, still merges its document
-into the namespace's stored source (so `SCHEMA_GET` and other spaces'
-validation contexts see its declarations), and still interns its predicates,
-relation types and extractors namespace-wide. `SCHEMA_REPLACE` and
-`SCHEMA_DROP` carry no `scope` field for the same reason: their destructive
-deltas are keyed by namespace with no space component, so a "space-scoped"
-drop would remove vocabulary every sibling space depends on.
+**What `scope: Space` does and does not isolate.** The overlay covers every
+declaration kind: entity types, predicates, relation types and extractors are
+each space-keyed, so none of a space's own declarations are resolvable by a
+sibling. Versions count per scope — a space's first upload is version 1 even
+when the namespace base is already at 7.
+
+What an overlay cannot do is narrow what its siblings resolve. A space
+declares *in addition to* the base, never over it: resolution runs
+narrowest-first and stops at the first hit, so a space shadows a name for
+itself alone and a namespace-wide lookup is never answered from one space's
+private declaration.
+
+**Which operations carry `scope`.** `SCHEMA_UPLOAD`, `SCHEMA_VALIDATE`,
+`SCHEMA_REPLACE` and `SCHEMA_DROP` all do, always on the wire. `SCHEMA_GET`
+and `SCHEMA_LIST` do not, and the asymmetry is the point: a write has to say
+where it lands, because inferring the scope from `act_as.space` would turn
+every ordinary namespace-wide upload into a per-space overlay — nearly every
+request names a space. A read needs no selector, because resolution chains
+from the caller's effective space and the first hit wins.
+
+VALIDATE carries it because it exists to predict UPLOAD, and an upload
+resolves its references against the scope it lands in; validating a space's
+document against the base reports references to the space's own types as
+undeclared and predicts the wrong next version. REPLACE and DROP carry it
+because a narrowing reaches exactly the declarations the named scope made:
+dropping at the base leaves every space's overlay standing, and dropping in a
+space leaves the tenant's base standing.
 5. Existing entities / statements / relations remain valid against the *old* schema version until a migration pass re-validates them. Migration policy is in [`../03_schema/`](../03_schema/00_purpose.md).
 
 #### Response — `SchemaUploadResponse`
@@ -513,7 +530,7 @@ Schemaless ("open-vocabulary") and schema-declared ("strict") are both **first-c
 
 ### The schema declaration trigger
 
-A schema is "declared" when a successful (`dry_run = false`) `SCHEMA_UPLOAD` (`0x0120`) commits at least one schema version. The declaration is **per-namespace**, recorded in the `schemas` redb table; it persists across server restarts.
+A schema is "declared" when a successful (`dry_run = false`) `SCHEMA_UPLOAD` (`0x0120`) commits at least one schema version. The declaration is **per-scope**, recorded in `schema_active_versions` keyed `(namespace_id, space_id)`; it persists across server restarts. A space that has uploaded no overlay of its own is not separately declared — it resolves the namespace base.
 
 State machine:
 

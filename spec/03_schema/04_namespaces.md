@@ -16,9 +16,11 @@ borrow from its namespace, but a namespace-wide lookup is never answered from
 one arbitrary space's private declaration.
 
 Overlays are opt-in per upload (`SchemaUploadRequest.scope`, default
-`Namespace`) and are **entity-type overlays only** — predicates, relation
-types and extractors remain namespace-wide, and a space-scoped upload still
-bumps the namespace's `schema_version`. See
+`Namespace`) and cover **every declaration kind** — entity types, predicates,
+relation types and extractors are each space-keyed, so a sibling space
+resolves none of a space's own declarations. Versions count per scope as well:
+a space's first upload is version 1 even when the namespace base is already at
+7. See
 [`../04_wire_protocol/09_typed_graph_admin.md`](../04_wire_protocol/09_typed_graph_admin.md)
 §SCHEMA_UPLOAD for the exact boundary.
 
