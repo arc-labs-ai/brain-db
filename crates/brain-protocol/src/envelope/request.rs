@@ -1529,7 +1529,8 @@ mod tests {
             }),
             RequestBody::RelationTombstone(RelationTombstoneRequest {
                 relation_id: sample_uuid(1),
-                reason: "gone".into(),
+                reason: 2,
+                reason_message: "gone".into(),
                 request_id: sample_uuid(2),
                 act_as: sel(),
             }),
