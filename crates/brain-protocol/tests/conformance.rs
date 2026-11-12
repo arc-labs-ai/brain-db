@@ -50,12 +50,12 @@ use brain_protocol::ops::query::{
 };
 use brain_protocol::{
     ActAs, AnswerKindWire, ByeRequest, CancelStreamAck, CancelStreamRequest, CancellationReason,
-    ClientPongRequest, CredentialScope, EdgeDirectionWire, EdgeKindWire, EncodeGraphEdge,
-    EncodeGraphNode, EncodeRequest, EncodeResponse, EncodeStageArtifact, EncodeStageGraph,
-    EncodeStageKeywordField, EncodeStageRecord, EncodeTrace, EncodeTraceArtifacts,
-    EncodeTraceDedup, EncodeTraceEntity, EncodeTraceIndex, EncodeTraceRelation, EncodeTraceStage,
-    EncodeTraceStageStatus, EncodeTraceStatement, EncodeVectorDirectRequest, EntityCreateRequest,
-    EntityCreateResponse, EntityGetRequest, EntityGetResponse, EntityListItem, EntityListRequest,
+    ClientPongRequest, EdgeDirectionWire, EdgeKindWire, EncodeGraphEdge, EncodeGraphNode,
+    EncodeRequest, EncodeResponse, EncodeStageArtifact, EncodeStageGraph, EncodeStageKeywordField,
+    EncodeStageRecord, EncodeTrace, EncodeTraceArtifacts, EncodeTraceDedup, EncodeTraceEntity,
+    EncodeTraceIndex, EncodeTraceRelation, EncodeTraceStage, EncodeTraceStageStatus,
+    EncodeTraceStatement, EncodeVectorDirectRequest, EntityCreateRequest, EntityCreateResponse,
+    EntityGetRequest, EntityGetResponse, EntityListItem, EntityListRequest,
     EntityListResponseFrame, EntityMergeRequest, EntityMergeResponse, EntityRenameRequest,
     EntityRenameResponse, EntityResolveRequest, EntityResolveResponse, EntityTombstoneRequest,
     EntityTombstoneResponse, EntityUnmergeRequest, EntityUnmergeResponse, EntityUpdateRequest,
@@ -1950,7 +1950,6 @@ fn corpus() -> Vec<Case> {
         api_key: "sk-test-not-a-real-key".into(),
         request_id: RID,
         act_as: None,
-        scope: CredentialScope::Namespace,
     };
     cases.push(req_case(
         "req_llm_credential_put",
@@ -1970,10 +1969,7 @@ fn corpus() -> Vec<Case> {
         &llm_credential_put_resp,
     ));
 
-    let llm_credential_get_req = LlmCredentialGetRequest {
-        act_as: None,
-        scope: CredentialScope::Namespace,
-    };
+    let llm_credential_get_req = LlmCredentialGetRequest { act_as: None };
     cases.push(req_case(
         "req_llm_credential_get",
         RequestBody::LlmCredentialGet(llm_credential_get_req.clone()),
@@ -2008,7 +2004,6 @@ fn corpus() -> Vec<Case> {
     let llm_credential_delete_req = LlmCredentialDeleteRequest {
         request_id: RID,
         act_as: None,
-        scope: CredentialScope::Namespace,
     };
     cases.push(req_case(
         "req_llm_credential_delete",
@@ -2025,7 +2020,6 @@ fn corpus() -> Vec<Case> {
     let llm_credential_verify_req = LlmCredentialVerifyRequest {
         request_id: RID,
         act_as: None,
-        scope: CredentialScope::Namespace,
     };
     cases.push(req_case(
         "req_llm_credential_verify",
@@ -2636,13 +2630,15 @@ fn corpus() -> Vec<Case> {
         &relation_supersede,
     ));
 
-    // RELATION_TOMBSTONE (0x0153). Pins that the relation tombstone reason is
-    // a free-text `String` — unlike STATEMENT_TOMBSTONE, which splits it into
-    // a `reason: u8` code plus a `reason_message: String`. The two families
-    // look alike enough that an SDK can easily model relation's as a code.
+    // RELATION_TOMBSTONE (0x0153). Pins that a retired relation is classified
+    // the same way a retired statement is: a `reason: u8` from the closed
+    // audit set plus a free-text `reason_message`. The two families used to
+    // disagree — relation's reason was a bare `String` — which is a shape an
+    // SDK gets wrong in whichever direction it guessed.
     let relation_tombstone = RelationTombstoneRequest {
         relation_id: REL_ID,
-        reason: "superseded by a corrected extraction run".into(),
+        reason: 2,
+        reason_message: "superseded by a corrected extraction run".into(),
         request_id: RID,
         act_as: None,
     };
