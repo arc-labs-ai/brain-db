@@ -24,7 +24,7 @@ use parking_lot::Mutex;
 use serde_json::Value;
 
 use crate::classifier::{ClassifierExtractor, ClassifierModel};
-use crate::framework::extractor::{ExtractorError, SYSTEM_NAMESPACE};
+use crate::framework::extractor::ExtractorError;
 use crate::framework::registry::ExtractorRegistry;
 use crate::llm::{CostBudget, LlmExtractor};
 use crate::pattern::extractor::PatternExtractor;
@@ -232,23 +232,15 @@ fn materialize_llm_extractor_core(
             "no llm credential resolver configured",
         ));
     };
-    if resolver.can_serve(SYSTEM_NAMESPACE, Some(model)) == Some(false) {
-        // Two different operator-facing cases, and the fix differs: no
-        // credential at all, versus a credential that cannot serve the model
-        // this extractor declares.
-        let reason = if resolver.can_serve(SYSTEM_NAMESPACE, None) == Some(false) {
-            resolver.missing_reason(SYSTEM_NAMESPACE)
-        } else {
-            let provider = brain_llm::Provider::classify(model);
-            format!(
-                "no client configured for model {model} (provider {})",
-                provider.name()
-            )
-        };
-        return Ok(LlmExtractor::degraded(
-            id, name, target, version, threshold, reason,
-        ));
-    }
+    // Credential availability is deliberately NOT checked here. Which
+    // credential serves a memory depends on the namespace that owns it, and
+    // that is only known at dispatch, so `extract` resolves per memory and
+    // reports a per-memory reason when a tenant has no key. Deciding it here
+    // could only ask about the reserved system namespace, which never holds a
+    // tenant credential — every extractor would materialise degraded and stay
+    // that way for the life of the shard, however many tenants registered a
+    // key afterwards. What remains below is static misconfiguration only:
+    // facts about the definition that no runtime credential can change.
 
     // Schema compile.
     let response_schema = extract_response_schema(&ast);
@@ -917,7 +909,7 @@ mod tests {
     }
 
     #[test]
-    fn materialize_llm_without_a_key_is_degraded_at_startup() {
+    fn materialize_llm_without_a_key_stays_wired_and_reports_per_memory() {
         let blob = llm_ast(
             "p",
             vec![
@@ -926,15 +918,21 @@ mod tests {
             ],
         );
         let r = row(1, ExtractorKind::Llm, blob);
-        // A resolver IS wired — the shard always wires one — but the operator
-        // set no key. Startup must say so rather than deferring to a
-        // per-write failure the operator only sees under load.
+        // Under BYOK no key at startup is the ordinary state, not a
+        // misconfiguration: each tenant registers its own at run time, and
+        // the reserved system namespace never holds one. Materialising
+        // degraded here would disable the tier for the life of the shard
+        // however many tenants registered a key afterwards, so the extractor
+        // stays wired and the missing credential is reported per memory.
         let deps = MaterializeDeps {
             credential_resolver: Some(keyless_resolver()),
             ..MaterializeDeps::default()
         };
         let l = materialize_llm_extractor(&r, &deps).unwrap();
-        assert!(!l.is_wired());
+        assert!(
+            l.is_wired(),
+            "a keyless shard must still wire the tier; the key arrives later"
+        );
         let reg = ExtractorRegistry::new();
         let mem = brain_core::Memory {
             id: brain_core::MemoryId::pack(0, 1, 0),
@@ -959,8 +957,16 @@ mod tests {
             prior_tier_items: None,
             extractor_context: None,
         };
+        // Dispatch is where the credential is known, so that is where the
+        // absence is reported — carrying a reason naming the namespace that
+        // needs a key.
         let r2 = futures_lite::future::block_on(l.run(&ctx, &mem));
-        assert!(r2.status_reason.contains("no llm clients configured"));
+        assert_eq!(r2.status, crate::ExtractionStatus::SkippedDisabled);
+        assert!(
+            r2.status_reason.contains("no llm clients configured"),
+            "unexpected reason: {}",
+            r2.status_reason
+        );
     }
 
     #[test]
@@ -980,7 +986,7 @@ mod tests {
     }
 
     #[test]
-    fn materialize_llm_unknown_model_is_degraded() {
+    fn materialize_llm_unknown_model_stays_wired() {
         let blob = llm_ast(
             "p",
             vec![
@@ -996,12 +1002,16 @@ mod tests {
             llm_cache: None,
             ..MaterializeDeps::default()
         };
+        // The declared `model:` is a preference, not a guarantee: a
+        // store-backed resolver serves whatever model the namespace's own
+        // credential declares, so whether this model can be served is not
+        // knowable until dispatch.
         let l = materialize_llm_extractor(&r, &deps).unwrap();
-        assert!(!l.is_wired());
+        assert!(l.is_wired());
     }
 
     #[test]
-    fn materialize_llm_unconfigured_provider_is_degraded() {
+    fn materialize_llm_unconfigured_provider_stays_wired() {
         // Router knows the prefix but the OpenAI client slot is empty.
         let blob = llm_ast(
             "p",
@@ -1018,8 +1028,10 @@ mod tests {
             llm_cache: None,
             ..MaterializeDeps::default()
         };
+        // Same reasoning as the unknown-model case: which provider actually
+        // serves this namespace is a run-time fact.
         let l = materialize_llm_extractor(&r, &deps).unwrap();
-        assert!(!l.is_wired());
+        assert!(l.is_wired());
     }
 
     #[test]
