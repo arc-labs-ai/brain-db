@@ -71,12 +71,10 @@ use crate::config::{WorkerConfig, WorkerKind};
 use crate::context::WorkerContext;
 use crate::error::WorkerError;
 use crate::worker::Worker;
-
-/// A memory's owning tenant scope: `(namespace_id, space_id_bytes)`. The
-/// worker links two memories only when their scopes are byte-equal, and
-/// submits each scope's edge batch as that scope's real space so the apply
-/// layer's Link tenant wall accepts it.
-type Scope = (u32, [u8; 16]);
+// The shared tenant scope: this worker links two memories only when their
+// scopes are byte-equal, and submits each scope's edge batch as that
+// scope's real space so the apply layer's Link tenant wall accepts it.
+use super::{load_memory_scope, Scope};
 
 /// Knobs that don't fit `WorkerConfig`'s generic shape. Defaults match
 /// the master plan's latency budget: ~0.5 ms HNSW query × 5
@@ -583,28 +581,6 @@ fn memory_space_id(ctx: &WorkerContext, memory_id: MemoryId) -> SpaceId {
                 .map(|g| g.value().space_id())
         })
         .unwrap_or_default()
-}
-
-/// Read a memory's owning `(namespace_id, space_id_bytes)` scope from
-/// `MEMORIES_TABLE`. Returns `None` when the row is absent — a memory that
-/// can't be tenant-placed never receives an auto-derived edge (the apply
-/// layer's Link tenant wall would drop it anyway).
-fn load_memory_scope(ctx: &WorkerContext, memory_id: MemoryId) -> Option<Scope> {
-    ctx.ops
-        .executor
-        .metadata
-        .as_ref()
-        .read_txn()
-        .ok()
-        .and_then(|rtxn| {
-            rtxn.open_table(MEMORIES_TABLE)
-                .ok()
-                .and_then(|t| t.get(&memory_id.to_be_bytes()).ok().flatten())
-                .map(|g| {
-                    let meta = g.value();
-                    (meta.namespace_id, meta.space_id_bytes)
-                })
-        })
 }
 
 /// Fold a 32-byte batch hash into a 16-byte [`RequestId`]. Feeds

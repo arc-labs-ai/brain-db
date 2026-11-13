@@ -43,7 +43,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use brain_core::{EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NodeRef, SessionId, SpaceId};
+use brain_core::{
+    EdgeKind, EdgeKindRef, MemoryId, MemoryKind, NamespaceId, NodeRef, SessionId, SpaceId,
+};
 use brain_metadata::tables::edge::{derived_by, origin, zero_disambiguator, EdgeKey};
 use brain_metadata::tables::memory::{
     space_timeline_prefix_space, space_timeline_prefix_space_time,
@@ -60,6 +62,7 @@ use futures_lite::FutureExt;
 use glommio::timer::sleep;
 use tracing::{trace, warn};
 
+use super::{load_memory_scope, Scope};
 use crate::config::{WorkerConfig, WorkerKind};
 use crate::context::WorkerContext;
 use crate::error::WorkerError;
@@ -397,10 +400,22 @@ async fn do_temporal_edge_cycle(
         // Memory endpoint whose row is not in `write.space_id`, so stamping
         // `SpaceId::default()` here silently discarded every FollowedBy
         // edge for real (non-default-space) tenants.
-        let mut by_space: HashMap<SpaceId, Vec<(MemoryId, MemoryId, f32)>> = HashMap::new();
+        //
+        // The namespace is the other half of that same scope key, and the
+        // enqueue payload does not carry it, so it is read from the source
+        // memory's own row. A write that names no namespace is stamped with
+        // the system one and becomes unreachable to the tenant that owns
+        // the memories the edge was derived from.
+        let mut by_space: HashMap<Scope, Vec<(MemoryId, MemoryId, f32)>> = HashMap::new();
+        let mut scope_cache: HashMap<MemoryId, Option<Scope>> = HashMap::new();
         for link in &to_link {
-            let space = source_spaces.get(&link.1).copied().unwrap_or_default();
-            by_space.entry(space).or_default().push(*link);
+            let Some(scope) = *scope_cache
+                .entry(link.1)
+                .or_insert_with(|| load_memory_scope(ctx, link.1))
+            else {
+                continue;
+            };
+            by_space.entry(scope).or_default().push(*link);
         }
         let real_writer = ctx
             .ops
@@ -411,7 +426,10 @@ async fn do_temporal_edge_cycle(
             .ok_or_else(|| {
                 WorkerError::Ops("temporal_edge: unified path requires RealWriterHandle".into())
             })?;
-        for (space, links) in by_space {
+        for (scope, links) in by_space {
+            let (namespace_id, space_id_bytes) = scope;
+            let space = SpaceId::from(space_id_bytes);
+            let namespace = NamespaceId::from(namespace_id);
             let phases: Vec<Phase> = links
                 .iter()
                 .map(|(from, to, weight)| Phase::Link {
@@ -426,8 +444,9 @@ async fn do_temporal_edge_cycle(
                 })
                 .collect();
             let request_hash = hash_temporal_batch(&links);
-            let write =
-                Write::from_phases(WriteId::new(), space, phases).with_request_hash(request_hash);
+            let write = Write::from_phases(WriteId::new(), space, phases)
+                .with_namespace(namespace)
+                .with_request_hash(request_hash);
             real_writer
                 .submit(write)
                 .await

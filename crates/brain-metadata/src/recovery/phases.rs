@@ -611,18 +611,20 @@ impl MetadataDb {
                             stamp_implicit_predicate(&wtxn, s.id)?;
                         }
                     }
-                    Err(
-                        e @ (StatementOpError::UnknownSubject(_)
-                        | StatementOpError::UnknownObjectEntity(_)
-                        | StatementOpError::UnknownPredicate(_)),
-                    ) => {
+                    Err(e) if statement_rejection_is_replayable(&e) => {
+                        // Every rejection the write path can itself produce is
+                        // replayable here. A record reaches the WAL before the
+                        // metadata apply decides on it, so a write the server
+                        // refused is still on disk and meets the same refusal on
+                        // replay. Treating that as corruption aborts recovery and
+                        // the shard never starts again — one rejected client
+                        // write would permanently prevent boot.
                         tracing::warn!(
                             target: "brain_metadata::recovery",
                             lsn,
                             skipped_id = ?s.id,
                             error = %e,
-                            "replayed statement names a subject, object or predicate the \
-                             schema no longer declares; skipping",
+                            "replayed statement create no longer applies; skipping",
                         );
                     }
                     Err(e) => {
@@ -1879,6 +1881,70 @@ define predicate admires {
         let row = t.get(&sid.to_bytes()).unwrap().map(|g| g.value()).unwrap();
         assert!(row.is_tombstoned());
         assert_eq!(row.is_current, 0);
+    }
+
+    /// A statement the write path refused on a predicate's `kind_constraint`
+    /// must be skipped on replay, not treated as corruption.
+    ///
+    /// Observed, not hypothesised: a client asserted a `Fact` against a
+    /// predicate declared `Preference`. The write reached the WAL before the
+    /// metadata apply rejected it, the caller got an error, and the record
+    /// stayed on disk — so the next boot met the same refusal during
+    /// recovery, mapped it to `Corruption`, and the shard never started
+    /// again. One refused client write permanently bricked the server.
+    ///
+    /// The create arm named three skippable errors explicitly while its
+    /// siblings already delegated to `statement_rejection_is_replayable`,
+    /// which classifies this rejection as replayable. The arm now uses it.
+    #[test]
+    fn replayed_statement_create_the_write_path_refused_is_skipped() {
+        use crate::recovery::phase_bodies::{encode_statement_create, StatementCreateBody};
+        use crate::schema::predicate::predicate_intern_with_subject;
+        use crate::tables::statement::{metadata_from_statement, STATEMENTS_TABLE};
+        use brain_core::StatementKind;
+
+        let dir = TempDir::new().unwrap();
+        let db = fresh_db(&dir);
+        let subject = put_subject(&db);
+
+        // A predicate that only accepts Preference statements.
+        let pid = {
+            let wtxn = db.write_txn().unwrap();
+            let id = predicate_intern_with_subject(
+                &wtxn,
+                DeclScope::base("app"),
+                "tone",
+                Some(StatementKind::Preference),
+                crate::schema::predicate::ObjectConstraint::default(),
+                0,
+                1,
+                "only a Preference may use this predicate",
+                true,
+                NOW,
+            )
+            .unwrap();
+            wtxn.commit().unwrap();
+            id
+        };
+
+        // `schemaless_statement` is a Fact, so this create violates the
+        // constraint exactly as the observed write did.
+        let mut s = schemaless_statement(subject);
+        s.predicate = pid;
+        let record = encode_statement_create(&StatementCreateBody {
+            meta: metadata_from_statement(&s, test_scope()),
+            predicate_intern_hint: None,
+        });
+
+        db.apply_statement_create(40, &record)
+            .expect("a create the write path refused must not fail recovery");
+
+        let rtxn = db.read_txn().unwrap();
+        let t = rtxn.open_table(STATEMENTS_TABLE).unwrap();
+        assert!(
+            t.get(&s.id.to_bytes()).unwrap().is_none(),
+            "the skip must not write the refused statement"
+        );
     }
 
     /// A retracted statement's row is physically reclaimed, so the record
