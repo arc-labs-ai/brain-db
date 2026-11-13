@@ -336,6 +336,18 @@
     "payload_len": 47
   },
   {
+    "name": "req_entity_type_list",
+    "opcode": "0x0139",
+    "kind": "request",
+    "payload_len": 1
+  },
+  {
+    "name": "resp_entity_type_list",
+    "opcode": "0x01B9",
+    "kind": "response",
+    "payload_len": 178
+  },
+  {
     "name": "req_extractor_list",
     "opcode": "0x0124",
     "kind": "request",
@@ -423,7 +435,7 @@
     "name": "req_llm_credential_put",
     "opcode": "0x0076",
     "kind": "request",
-    "payload_len": 102
+    "payload_len": 95
   },
   {
     "name": "resp_llm_credential_put",
@@ -435,7 +447,7 @@
     "name": "req_llm_credential_get",
     "opcode": "0x0077",
     "kind": "request",
-    "payload_len": 8
+    "payload_len": 1
   },
   {
     "name": "resp_llm_credential_get",
@@ -453,7 +465,7 @@
     "name": "req_llm_credential_delete",
     "opcode": "0x0078",
     "kind": "request",
-    "payload_len": 36
+    "payload_len": 29
   },
   {
     "name": "resp_llm_credential_delete",
@@ -465,7 +477,7 @@
     "name": "req_llm_credential_verify",
     "opcode": "0x0079",
     "kind": "request",
-    "payload_len": 36
+    "payload_len": 29
   },
   {
     "name": "resp_llm_credential_verify",
@@ -699,7 +711,7 @@
     "name": "req_relation_tombstone",
     "opcode": "0x0153",
     "kind": "request",
-    "payload_len": 107
+    "payload_len": 123
   },
   {
     "name": "req_relation_list_from",

@@ -187,11 +187,28 @@ define relation_type family_of {
 # Project / Event / Place / Concept) plus statements; the runtime
 # kind-routing in brain-extractors fans out per emitted item.
 
+# The run-of-capitalised-words pattern was removed here. It read any two
+# adjacent capitalised words as one name, which made a sentence-initial
+# determiner part of whatever followed it ("The Halvard orchard" became the
+# entity "The Halvard") and cut an identifier at the first character its
+# token class could not hold ("The Okonta-4 regulator" became "The Okonta").
+# Those names then stood as their own nodes, so one thing was stored under
+# two or three identities.
+#
+# It also only ever worked on Latin script with Western capitalisation, and
+# matched nothing at all in Japanese or Arabic, so it could not be part of
+# what makes this database general purpose. Measured across twelve domains,
+# dropping it moved entity recall from 89% to 97% and changed paraphrase
+# recall not at all: the classifier and the LLM already name the same things
+# better, and the pattern tier's untyped guesses were displacing them.
+#
+# The initials form stays. It requires a literal `X.` before the name, so it
+# cannot absorb a determiner, and it reads a shape the other tiers are weak
+# at.
 define extractor entity_mentions {
     kind: pattern
     target: entity_or_statement
     patterns [
-        /\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b/,
         /\b([A-Z]\.\s*[A-Z][a-z]+)\b/
     ]
     confidence: 0.7
@@ -212,8 +229,14 @@ define extractor llm_predicate {
     model: "gpt-4o-mini"
     prompt: """You extract durable, factual knowledge from one memory at a time as clean subject–predicate–object triples for a memory database. Extract only genuine, lasting facts, preferences, and relationships about the entities — NOT conversational filler, greetings, reactions, or in-the-moment feelings.
 
-The active schema declares these entity types — use them when classifying an entity (set `subject_type` / `object_type`, below):
+ENTITY TYPES ARE OPEN, exactly as predicates are. These are the types this database already knows — REUSE one whenever it genuinely fits, so entities of the same sort converge on one type instead of fragmenting across synonyms:
 {DECLARED_ENTITY_TYPES}
+When the thing you are classifying is none of them, NAME ITS REAL KIND rather than forcing it into the nearest listed type or falling back to `brain:Concept`. Emit a new type as `brain:<Name>`:
+- UpperCamelCase and SINGULAR — the name of one such thing, not of the set.
+- The KIND, never the individual: the common noun a reader would use for the category this thing belongs to, never a name that only this one thing could carry.
+- A plain identifier: a letter followed by letters, digits or underscores. A type that cannot be written in the schema language can never afterwards be declared, dropped or overridden.
+
+Coin sparingly: a type earns its existence by being a category that OTHER entities will also belong to. Prefer a listed type whenever it honestly fits, and use `brain:Concept` only when the thing has no nameable kind at all.
 
 PREDICATES ARE OPEN. Capture the real relation as a short snake_case predicate taken from the text — do NOT restrict yourself to a fixed list, and NEVER omit a genuine fact just because no predefined predicate fits. Emit each predicate as `brain:<snake_case>` (e.g. "works at" -> `brain:works_at`, "is allergic to" -> `brain:allergic_to`).
 
@@ -224,6 +247,13 @@ CANONICALIZE by MEANING so the SAME relation is always spelled the SAME way — 
 - Same meaning -> one name. Different phrasings of one relation collapse to a SINGLE simplest base form; do not mint a separate predicate per wording. Strip tense, aspect, and manner from the name — a fact that no longer holds is marked with `retract` (below), never by baking "used_to_", "will_", or an "-ing" form into the predicate.
 - Different meaning -> different name; relatedness is NOT sameness. A relation and its OPPOSITE (its negation) are different predicates, and a relation and its INVERSE (the same link read from the other participant) are different predicates. Preserve polarity and direction even when both concern the same subject.
 Choose the shortest faithful name; when a later memory expresses a relation you have named before, reuse that exact name rather than coining a near-duplicate.
+
+NAME EACH ENTITY THE SAME WAY EVERY TIME, for the reason predicates are canonicalized: every fact about one thing must land on ONE node, and a thing named three ways becomes three nodes with the facts split between them. Name the THING, never the phrase it happened to appear in:
+- Drop any leading verb or gerund the sentence applied to it: the action performed on a thing is not part of its name.
+- Drop determiners, and any trailing clause or modifier the sentence added: what the thing DID or what happened to it is never part of what it is called.
+- When a thing is introduced with both a descriptor and an identifier, the IDENTIFIER alone is the name — the descriptor is its type, which belongs in the entity's `type`, not in its name. This holds in EITHER order: the descriptor may precede the identifier or follow it, and a possessive or an owner named alongside it is a separate entity, never part of this one's name.
+- A name may not contain a verb, a preposition phrase, or a relative clause. If it does, it is a fragment of the sentence rather than the name of a thing: reduce it to the bare thing.
+Use the shortest form that still identifies the thing unambiguously, and use that exact same form for it in every triple you emit here.
 
 Classify each statement into exactly ONE kind from the list below. The kind is the *shape* of the fact, not its topic. Pick the kind whose description fits; if none truly fits, use Fact.
 
@@ -237,25 +267,52 @@ Choosing the kind — go by the fact's SHAPE, not its topic:
 - If the fact is something the subject likes, wants, or avoids, it is a Preference: keep the +/- polarity — a dislike is NOT a like.
 - Use Fact ONLY when none of the above fits — it is the fallback, never the default.
 
-Output STRICT JSON matching this shape, and nothing else:
+You produce TWO things from this memory, and they are separate jobs.
+
+FIRST, `entities`: every distinct thing the memory is about, each named once and given its kind. This is not a by-product of the statements — a thing the memory describes belongs here even if no statement ends up referring to it, and a thing named in three statements appears here ONCE, under one name and one type.
+
+  A thing counts even when the sentence never makes it the head of its own phrase. A noun used to modify another noun is still that thing: in forms like "its <X> position", "the <X> team", "an <X> reading", the memory is about <X>, and <X> belongs in this list on its own. The compound is not the entity — name the thing the modifier names, and name the head noun separately only when it is itself a thing worth knowing about.
+
+  `name`  the thing itself, never the phrase it appeared in. Drop any verb or gerund the sentence applied to it, drop determiners, and drop any trailing clause saying what it did or what happened to it. Where a descriptor is followed by an identifier, the identifier alone is the name and the descriptor is its type. A name containing a verb, a preposition phrase or a relative clause is a fragment of the sentence, not a name: reduce it to the bare thing.
+
+  `type`  the kind of thing it is, as `brain:<Name>`. REUSE one of the types listed above whenever it honestly fits, so things of one sort converge on one type. When none of them names this kind, NAME THE REAL KIND rather than flattening it to `brain:Concept`: UpperCamelCase, singular, the common noun for the category it belongs to and never a name only this one thing could carry, written as a letter followed by letters, digits or underscores. Coin sparingly — a type earns its existence by being a category other things will also belong to — and use `brain:Concept` only when the thing has no nameable kind at all.
+
+SECOND, `statements`: the triples. They refer to entities by the SAME name used in `entities`, and carry no type of their own — the type was decided once, above.
+
+Output STRICT JSON with exactly these two sections, and nothing else:
 {
+  "entities": [
+    { "name": "Alice Wong", "type": "brain:Person", "confidence": 0.95 },
+    { "name": "Acme Corp", "type": "brain:Organization", "confidence": 0.95 },
+    { "name": "Paris", "type": "brain:Place", "confidence": 0.9 },
+    { "name": "Kestrel Gambit", "type": "brain:Game", "confidence": 0.9 },
+    { "name": "Calomide", "type": "brain:Compound", "confidence": 0.92 },
+    { "name": "Harrowgate Ledger", "type": "brain:Document", "confidence": 0.9 }
+  ],
   "statements": [
-    { "subject": "Alice Wong", "subject_type": "brain:Person", "predicate": "brain:works_at", "object": "Acme Corp", "object_type": "brain:Organization", "object_is_entity": true, "kind": "Relation", "confidence": 0.92 },
-    { "subject": "Eve Adams", "subject_type": "brain:Person", "predicate": "brain:favorite_color", "object": "blue", "object_type": null, "object_is_entity": false, "kind": "Attribute", "confidence": 0.88 },
-    { "subject": "Frank Brown", "subject_type": "brain:Person", "predicate": "brain:traveled_to", "object": "Paris", "object_type": "brain:Place", "object_is_entity": true, "kind": "Event", "event_at": "2020-01-15", "confidence": 0.9 },
-    { "subject": "I", "subject_type": null, "predicate": "brain:prefers", "object": "dark roast coffee", "object_type": null, "object_is_entity": false, "subject_is_self": true, "kind": "Preference", "confidence": 0.95 },
-    { "subject": "Priya", "subject_type": "brain:Person", "predicate": "brain:works_at", "object": "Google", "object_type": "brain:Organization", "object_is_entity": true, "kind": "Relation", "retract": true, "confidence": 0.9 }
+    { "subject": "Alice Wong", "predicate": "brain:works_at", "object": "Acme Corp", "object_is_entity": true, "kind": "Relation", "confidence": 0.92 },
+    { "subject": "Eve Adams", "predicate": "brain:favorite_color", "object": "blue", "object_is_entity": false, "kind": "Attribute", "confidence": 0.88 },
+    { "subject": "Frank Brown", "predicate": "brain:traveled_to", "object": "Paris", "object_is_entity": true, "kind": "Event", "event_at": "2020-01-15", "confidence": 0.9 },
+    { "subject": "Bela Farkas", "predicate": "brain:invented", "object": "Kestrel Gambit", "object_is_entity": true, "kind": "Event", "confidence": 0.9 },
+    { "subject": "I", "predicate": "brain:prefers", "object": "dark roast coffee", "object_is_entity": false, "subject_is_self": true, "kind": "Preference", "confidence": 0.95 },
+    { "subject": "Priya", "predicate": "brain:works_at", "object": "Google", "object_is_entity": true, "kind": "Relation", "retract": true, "confidence": 0.9 },
+    { "subject": "Alice Wong", "predicate": "brain:was_given", "object": "Calomide", "object_is_entity": true, "kind": "Event", "confidence": 0.9 },
+    { "subject": "Alice Wong", "predicate": "brain:dose", "object": "10 mg each morning", "object_is_entity": false, "kind": "Attribute", "confidence": 0.9 },
+    { "subject": "Alice Wong", "predicate": "brain:signed", "object": "Harrowgate Ledger", "object_is_entity": true, "kind": "Event", "confidence": 0.9 }
   ]
 }
+
+In that example no listed type named a Kestrel Gambit, so its real kind was coined instead of being flattened into `brain:Concept`. Calomide and the Harrowgate Ledger are both OBJECTS of verbs and both still entities, because each names a particular thing another memory could name too. They take DIFFERENT types, and neither type is the lesson: the lesson is that a named thing stays a thing wherever it appears in the sentence, and that its type is whatever KIND it actually is. Do not reach for a type because an example used it, and do not reach for one of these two. The dose beside them is a value, because it is true only of this subject. The text it came from also said "the patient", and no entity was emitted for that: a bare common noun under a determiner names whoever fills a part, not a particular one.
 
 Rules:
 - EVERY TRIPLE MUST READ AS A TRUE SENTENCE ON ITS OWN. Before emitting, read "<subject> <predicate> <object>" back: if that is not a true, complete statement, the triple is WRONG — reshape it. A role, title, rank, or capacity attached to a verb ("joined X as a <job title>", "hired as <job title>", "serves as <job title>") is NOT an object of that verb — "<person> joined <job title>" is not a sentence and must never be emitted. Split it into TWO triples and emit BOTH: the verb keeps ONLY the thing it actually acts on, and you MUST ALSO emit the role as its own triple — subject, a role/occupation-shaped predicate, and the title as a VALUE (`object_is_entity: false`). Never emit one subject+predicate pair twice with two objects that mean different kinds of thing; that is the signature of a qualifier you failed to split. Splitting is mandatory: dropping the role is a LOSS of a stated fact, and only the malformed pairing is ever discarded, never the fact itself.
 - Decompose each assertion into a clean (subject, predicate, object). The predicate is the relation; the object is the entity or a short clean value it acts on — NEVER a verb phrase or sentence fragment. "Alice works at Acme" -> predicate "brain:works_at", object "Acme Corp" (NOT "works at Acme").
+- An object that NAMES A PARTICULAR THING is an entity, not a value: set `object_is_entity: true` and give it an entry under `entities`. A thing qualifies when other memories could name the same one — a substance, a product, a model, a standard, a work, a place, an organisation, a person. A value is what is true only of this subject: a quantity, a date, a measurement, a status, a descriptor. Getting this wrong does not lose the fact, but it strands the thing: a value cannot be reached from another memory that mentions it, cannot carry a type, and never appears when the things of its kind are listed.
+- A generic role or category is NOT an entity. A phrase that names whoever happens to fill a part rather than a particular one — a bare common noun under a determiner — identifies nothing another memory could match, and emitting it crowds out the specific things in the same sentence. Name the actual participant when the text gives one; when it does not, leave the subject out and keep the triple about the things it does name.
 - Objects must be ATOMIC. One fact per object: never join multiple things with "and"/"or"/commas. "interested in counseling and mental health" -> emit TWO triples, object "counseling" and object "mental health" (NOT one object "counseling and mental health"). Strip filler words so the object is the bare thing itself ("mental health jobs" -> "mental health"). The object is a single entity name or a bare value — NEVER a clause, description, or sentence fragment. If the object still reads like part of a sentence (it contains a verb, a preposition phrase, or a relative clause), reduce it to the bare thing it names, or drop the triple.
 - Locations are RELATIONS to a place, not prose. When the fact states where an entity is (lives, works, is based) or where an event happened, emit it as a Relation whose object is the place itself, with `object_is_entity: true` (e.g. predicate "brain:lives_in" object "Paris", predicate "brain:located_in" object "Paris") — never bury the place inside a longer value so "where" can be answered as the object of that relation.
 - Objects must be SPECIFIC. The object must name a particular thing. If the only object you can form is a generic placeholder or a bare category rather than a specific named thing, drop the triple — a vague object is worse than no triple.
 - `object_is_entity`: set true when the object names a thing (a person, organization, place, product, concept — something that could have its own facts), e.g. "Acme Corp", "Paris", "aspirin"; set false when the object is a literal value, e.g. "blue", "42", "Senior Engineer". When unsure, prefer false.
-- `subject_type` / `object_type`: the entity type of the subject / object, chosen from the declared entity types listed at the top. Pick the MOST SPECIFIC type that fits, and prefer a type the namespace itself declares over a generic built-in one (a sandboxed environment is its declared environment type, not a Concept; a software framework or tool is not a Person). Use `brain:Concept` only when nothing more specific fits. `object_type` is null when the object is a value (`object_is_entity: false`); `subject_type` is null when `subject_is_self` is true.
 - `event_at`: for Event-kind statements ONLY, the date it happened as an ISO date string ("YYYY-MM-DD", or just "YYYY" if only the year is known). This memory was recorded on {ANCHOR_DATE}. Set `event_at` to when the event actually happened — resolve relative expressions (yesterday, last week, last Saturday, in June) against {ANCHOR_DATE}, and attach the date only to the specific event it modifies, never to unrelated facts in the same text. Omit it for non-Events and when no date is stated or resolvable — do NOT invent one.
 - `subject_is_self`: set true when the subject is the speaker / author of this memory referring to THEMSELVES — first person in ANY language ("I", "me", "my", "yo", "私", "ich", "moi", …). Keep the original surface in `subject`; the system attributes the fact to the writing agent. Set false (or omit) for everyone else, including the person the author is addressing ("you").
 - Negation & change: when the text says a fact NO LONGER holds ("not at Google anymore", "no longer drinks coffee", "used to live in Paris but moved"), emit that former fact as a triple marked `"retract": true` (subject, predicate, and the OLD object — e.g. works_at Google with retract:true) so the database retires the prior record. If a NEW current value is also stated ("now works at OpenAI"), emit it too as a normal triple (no retract). A plain statement with no `retract` key is a normal current assertion; only set `retract` when the text explicitly denies/ends a fact.
@@ -264,7 +321,7 @@ Rules:
 - Extract assertions about possessive or implied subjects too ("Melanie's kids love dinosaurs" -> subject "Melanie's kids").
 - Every entity gets its OWN triples. When a fact is stated about an entity that appears as the object, in an apposition, or in a subordinate clause — not just the grammatical subject — emit a separate triple with THAT entity as the subject. Decompose so each entity becomes a complete, independently-queryable subject, never leaving an entity's stated attribute attached only to the sentence that introduced it. (E.g. "Ann, a lawyer at Acme" yields both "Ann -> brain:occupation -> lawyer" and "Ann -> brain:works_at -> Acme".)
 - Use the entity surface forms verbatim from the "Previously extracted entities" section below as `subject` / `object` whenever the assertion involves one of them. Do not invent new surface forms for those concepts.
-- If the text contains no durable assertion, return `{ "statements": [] }`.
+- If the text names nothing and asserts nothing, return `{ "entities": [], "statements": [] }`. A memory can legitimately yield entities and no statements — name the things even when nothing durable is claimed about them.
 {PRIOR_ENTITIES}
 Input text:
 ```
@@ -273,16 +330,37 @@ Input text:
     schema: {
         "type": "object",
         "additionalProperties": false,
-        "required": ["statements"],
+        "required": ["entities", "statements"],
         "properties": {
+            "entities": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["name", "type", "confidence"],
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "The thing itself, not the phrase it appeared in: no leading verb or gerund, no determiner, no trailing clause about what it did. Where a descriptor precedes an identifier, the identifier alone is the name. One entry per distinct thing, even when several statements mention it."
+                        },
+                        "type": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "Its kind, as brain:<Name>. Reuse a declared type whenever one honestly fits. When none names this kind, coin the real kind — UpperCamelCase, singular, the category's common noun, a letter followed by letters/digits/underscores — rather than flattening it to brain:Concept, which is the last resort and not the default for anything unlisted."
+                        },
+                        "confidence": {"type": ["number", "null"], "minimum": 0, "maximum": 1}
+                    }
+                }
+            },
             "statements": {
                 "type": "array",
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
                     "required": [
-                        "subject", "subject_type", "predicate", "object",
-                        "object_type", "object_is_entity", "kind", "confidence",
+                        "subject", "predicate", "object",
+                        "object_is_entity", "kind", "confidence",
                         "event_at", "subject_is_self", "retract", "is_stateful"
                     ],
                     "properties": {
@@ -304,14 +382,6 @@ Input text:
                         "object_is_entity": {
                             "type": "boolean",
                             "description": "A deliberate choice for every triple; never guessed. true when the object names a thing that could carry its own facts (a person, organization, place, product, concept). false when the object is a literal value — job titles, roles and ranks (senior engineer, staff architect) are values, as are colors, numbers, and free text. When unsure, false."
-                        },
-                        "subject_type": {
-                            "type": ["string", "null"],
-                            "description": "The subject's entity type from the declared list (e.g. brain:Person) — the most specific that fits. null when subject_is_self."
-                        },
-                        "object_type": {
-                            "type": ["string", "null"],
-                            "description": "The object's entity type from the declared list — the most specific that fits. null when the object is a value."
                         },
                         "kind": {"type": ["string", "null"], "minLength": 1},
                         "confidence": {"type": ["number", "null"], "minimum": 0, "maximum": 1},

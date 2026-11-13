@@ -29,7 +29,7 @@ use brain_planner::{ExecutorContext, SharedMetadataDb, WriterHandle};
 use brain_protocol::envelope::request::RequestBody;
 use brain_protocol::envelope::response::ResponseBody;
 use brain_protocol::{
-    CredentialScope, LlmCredentialDeleteRequest, LlmCredentialGetRequest, LlmCredentialPutRequest,
+    LlmCredentialDeleteRequest, LlmCredentialGetRequest, LlmCredentialPutRequest,
     LlmCredentialVerifyRequest, VerifyOutcome,
 };
 
@@ -94,29 +94,24 @@ fn caller(namespace: &str, permissions: u32) -> RequestCaller {
     .with_confidential_transport()
 }
 
-fn put_body(scope: CredentialScope, api_key: &str) -> RequestBody {
+fn put_body(api_key: &str) -> RequestBody {
     RequestBody::LlmCredentialPut(LlmCredentialPutRequest {
         provider: "openai".into(),
         model: "gpt-4.1-mini".into(),
         api_key: api_key.into(),
         request_id: [1u8; 16],
         act_as: None,
-        scope,
     })
 }
 
 fn get_body() -> RequestBody {
-    RequestBody::LlmCredentialGet(LlmCredentialGetRequest {
-        act_as: None,
-        scope: CredentialScope::Namespace,
-    })
+    RequestBody::LlmCredentialGet(LlmCredentialGetRequest { act_as: None })
 }
 
 fn delete_body() -> RequestBody {
     RequestBody::LlmCredentialDelete(LlmCredentialDeleteRequest {
         request_id: [2u8; 16],
         act_as: None,
-        scope: CredentialScope::Namespace,
     })
 }
 
@@ -124,7 +119,6 @@ fn verify_body() -> RequestBody {
     RequestBody::LlmCredentialVerify(LlmCredentialVerifyRequest {
         request_id: [3u8; 16],
         act_as: None,
-        scope: CredentialScope::Namespace,
     })
 }
 
@@ -153,7 +147,7 @@ fn every_credential_op_needs_the_llm_credential_bit() {
         // credential that pays for processing those memories.
         let without = bits::FULL & !bits::LLM_CREDENTIAL;
         for (label, body) in [
-            ("put", put_body(CredentialScope::Namespace, KEY)),
+            ("put", put_body(KEY)),
             ("get", get_body()),
             ("delete", delete_body()),
             ("verify", verify_body()),
@@ -207,7 +201,7 @@ fn a_plaintext_key_is_refused_over_an_unprotected_transport() {
             bits::FULL,
         ); // no `with_confidential_transport`
 
-        let err = send(&ctx, cleartext, put_body(CredentialScope::Namespace, KEY))
+        let err = send(&ctx, cleartext, put_body(KEY))
             .await
             .expect_err("a key must not cross an unprotected connection");
         assert!(matches!(err, OpError::Unauthorized(_)), "{err:?}");
@@ -245,13 +239,9 @@ fn a_registered_credential_reads_back_without_its_key() {
         let (_dir, ctx, metadata) = build_ctx();
         intern(&metadata, NS);
 
-        let put = send(
-            &ctx,
-            caller(NS, bits::FULL),
-            put_body(CredentialScope::Namespace, KEY),
-        )
-        .await
-        .expect("register");
+        let put = send(&ctx, caller(NS, bits::FULL), put_body(KEY))
+            .await
+            .expect("register");
         let ResponseBody::LlmCredentialPut(put) = put else {
             panic!("wrong response body");
         };
@@ -282,20 +272,12 @@ fn registering_again_reports_that_it_replaced_one() {
         let (_dir, ctx, metadata) = build_ctx();
         intern(&metadata, NS);
 
-        send(
-            &ctx,
-            caller(NS, bits::FULL),
-            put_body(CredentialScope::Namespace, KEY),
-        )
-        .await
-        .expect("first");
-        let again = send(
-            &ctx,
-            caller(NS, bits::FULL),
-            put_body(CredentialScope::Namespace, "sk-test-rotated"),
-        )
-        .await
-        .expect("rotate");
+        send(&ctx, caller(NS, bits::FULL), put_body(KEY))
+            .await
+            .expect("first");
+        let again = send(&ctx, caller(NS, bits::FULL), put_body("sk-test-rotated"))
+            .await
+            .expect("rotate");
         let ResponseBody::LlmCredentialPut(again) = again else {
             panic!("wrong response body");
         };
@@ -317,13 +299,9 @@ fn a_delete_reports_whether_anything_was_revoked() {
         };
         assert!(!nothing.existed, "nothing was there to revoke");
 
-        send(
-            &ctx,
-            caller(NS, bits::FULL),
-            put_body(CredentialScope::Namespace, KEY),
-        )
-        .await
-        .expect("register");
+        send(&ctx, caller(NS, bits::FULL), put_body(KEY))
+            .await
+            .expect("register");
         let revoked = send(&ctx, caller(NS, bits::FULL), delete_body())
             .await
             .expect("delete");
@@ -341,13 +319,9 @@ fn one_tenants_credential_is_invisible_to_another() {
         intern(&metadata, NS);
         intern(&metadata, OTHER_NS);
 
-        send(
-            &ctx,
-            caller(NS, bits::FULL),
-            put_body(CredentialScope::Namespace, KEY),
-        )
-        .await
-        .expect("register for acme");
+        send(&ctx, caller(NS, bits::FULL), put_body(KEY))
+            .await
+            .expect("register for acme");
 
         // The namespace a credential belongs to comes from the caller's key,
         // never from the request, so there is nothing for a second tenant to
@@ -368,27 +342,12 @@ fn one_tenants_credential_is_invisible_to_another() {
 // ---------------------------------------------------------------------------
 // Scope
 // ---------------------------------------------------------------------------
-
-#[test]
-fn a_space_scoped_registration_is_refused_not_ignored() {
-    // The store can key a credential per space, but derivation resolves at
-    // the namespace, so a space-scoped key would never be used. Refusing is
-    // the honest answer; accepting would leave a tenant with a key that
-    // silently does nothing.
-    brain_ops::test_support::run_in_glommio(|| async {
-        let (_dir, ctx, metadata) = build_ctx();
-        intern(&metadata, NS);
-
-        let err = send(
-            &ctx,
-            caller(NS, bits::FULL),
-            put_body(CredentialScope::Space, KEY),
-        )
-        .await
-        .expect_err("a space scope must be refused while derivation ignores it");
-        assert!(matches!(err, OpError::NotYetImplemented(_)), "{err:?}");
-    });
-}
+//
+// There is nothing left to test here. A credential belongs to a namespace and
+// there is no narrower scope to ask for: the requests carry no scope selector,
+// so the refusal this file used to assert is now unrepresentable rather than
+// merely rejected. The namespace a key lands in comes from the authenticated
+// caller, which `a_key_is_scoped_to_its_namespace` below covers.
 
 // ---------------------------------------------------------------------------
 // Verify
@@ -423,13 +382,9 @@ fn verifying_without_a_resolver_is_unreachable_not_unauthorized() {
         let (_dir, ctx, metadata) = build_ctx();
         intern(&metadata, NS);
 
-        send(
-            &ctx,
-            caller(NS, bits::FULL),
-            put_body(CredentialScope::Namespace, KEY),
-        )
-        .await
-        .expect("register");
+        send(&ctx, caller(NS, bits::FULL), put_body(KEY))
+            .await
+            .expect("register");
 
         let out = send(&ctx, caller(NS, bits::FULL), verify_body())
             .await
@@ -468,13 +423,9 @@ fn a_deployment_with_no_store_refuses_rather_than_pretending() {
         let ctx = brain_ops::test_support::ops_context_for_tests(executor, dir.path());
         intern(&metadata, NS);
 
-        let err = send(
-            &ctx,
-            caller(NS, bits::FULL),
-            put_body(CredentialScope::Namespace, KEY),
-        )
-        .await
-        .expect_err("a key that cannot be persisted must not be accepted");
+        let err = send(&ctx, caller(NS, bits::FULL), put_body(KEY))
+            .await
+            .expect_err("a key that cannot be persisted must not be accepted");
         assert!(
             matches!(err, OpError::CapabilityNotEnabled { .. }),
             "{err:?}"

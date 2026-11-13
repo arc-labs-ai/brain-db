@@ -50,10 +50,10 @@ pub use entity::ops::{
     entity_get_resolved, entity_get_resolved_with_chain, entity_inbound_reference_count,
     entity_iter_live_for_gc, entity_list_by_type, entity_list_by_type_page, entity_lookup_by_alias,
     entity_lookup_by_canonical_name, entity_put, entity_remove_alias, entity_rename,
-    entity_resolve_canonical_all_types, entity_resolve_canonical_all_types_wtxn,
-    entity_resolve_scored, entity_tombstone, entity_update, normalize_name, EntityGcCandidate,
-    EntityListFilter, EntityListPage, EntityOpError, MERGE_REDIRECT_MAX_HOPS,
-    READ_RESOLVE_TRIGRAM_FLOOR,
+    entity_resolve_alias_all_types, entity_resolve_canonical_all_types,
+    entity_resolve_canonical_all_types_wtxn, entity_resolve_scored, entity_tombstone,
+    entity_update, normalize_name, EntityGcCandidate, EntityListFilter, EntityListPage,
+    EntityOpError, MERGE_REDIRECT_MAX_HOPS, READ_RESOLVE_TRIGRAM_FLOOR,
 };
 pub use entity::review::{
     enqueue_merge_proposal, list_proposals_by_status, proposal_get, proposal_get_inside_wtxn,
@@ -64,9 +64,9 @@ pub use entity::trigram::{
     lookup_candidates_by_trigram, remove_entity_trigrams, trigrams_of_entity, TrigramOpError,
 };
 pub use entity::types::{
-    entity_type_intern, entity_type_label_qnames, entity_type_lookup, entity_type_lookup_rtxn,
-    entity_type_name_by_id, render_declared_entity_types_block, EntityTypeOpError,
-    EntityTypeQnames,
+    entity_type_exists_rtxn, entity_type_intern, entity_type_label_qnames, entity_type_list_scoped,
+    entity_type_lookup, entity_type_lookup_rtxn, entity_type_name_by_id,
+    render_declared_entity_types_block, EntityTypeOpError, EntityTypeQnames, ScopedEntityType,
 };
 pub use extraction::queue::{
     extraction_queue_drain, extraction_queue_enqueue, extraction_queue_len,

@@ -14,45 +14,15 @@
 //!
 //! # Where a credential lands
 //!
-//! [`CredentialScope`] selects the namespace base or the caller's own space,
-//! the same two-state selector schema declarations use. Writes land exactly
-//! where they say; reads walk narrowest-first, so a space without its own key
-//! uses the tenant's and a space with one shadows the base for itself alone.
+//! A credential belongs to a namespace, and there is no narrower scope to
+//! choose: derivation resolves the key for the namespace that owns the memory
+//! being processed, so a key installed against a single space could never be
+//! the one a write consults. These requests therefore carry no scope selector
+//! — one was offered briefly and could only ever be refused, which left a
+//! field whose single other value was a trap.
 
 use crate::envelope::request::WireUuid;
 use crate::ops::memory::ActAs;
-
-/// The scope a credential is registered AT, or read FROM.
-///
-/// Deliberately a two-state selector and not a space identifier: the scope is
-/// the caller's own effective space, already resolved for this request, so
-/// there is nothing here for a caller to point at someone else's space with.
-///
-/// It is also deliberately separate from `act_as`. Nearly every request names
-/// a space, so reading the scope off `act_as.space` would turn every ordinary
-/// tenant-wide registration into a per-space override that the tenant's other
-/// spaces cannot see.
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    Default,
-    Eq,
-    Hash,
-    PartialEq,
-    serde_repr::Serialize_repr,
-    serde_repr::Deserialize_repr,
-)]
-#[repr(u8)]
-pub enum CredentialScope {
-    /// The tenant's namespace-wide key: every space in the namespace
-    /// resolves it unless it has one of its own. The default.
-    #[default]
-    Namespace = 0,
-    /// A key for the caller's effective space alone. Sibling spaces keep
-    /// resolving the namespace's.
-    Space = 1,
-}
 
 /// What a read reports about an installed credential.
 ///
@@ -98,8 +68,6 @@ pub struct LlmCredentialPutRequest {
     /// connection principal. See [`ActAs`].
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub act_as: Option<ActAs>,
-    /// Where the key lands. Always on the wire.
-    pub scope: CredentialScope,
 }
 
 /// Redacting `Debug`, written by hand rather than derived.
@@ -113,7 +81,6 @@ impl std::fmt::Debug for LlmCredentialPutRequest {
             .field("provider", &self.provider)
             .field("model", &self.model)
             .field("api_key", &"[redacted]")
-            .field("scope", &self.scope)
             .finish_non_exhaustive()
     }
 }
@@ -139,8 +106,6 @@ pub struct LlmCredentialPutResponse {
 pub struct LlmCredentialGetRequest {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub act_as: Option<ActAs>,
-    /// The vantage point to resolve from. Always on the wire.
-    pub scope: CredentialScope,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -165,8 +130,6 @@ pub struct LlmCredentialDeleteRequest {
     pub request_id: WireUuid,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub act_as: Option<ActAs>,
-    /// Which scope's key to remove. Always on the wire.
-    pub scope: CredentialScope,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -209,8 +172,6 @@ pub struct LlmCredentialVerifyRequest {
     pub request_id: WireUuid,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub act_as: Option<ActAs>,
-    /// The vantage point to resolve the key from. Always on the wire.
-    pub scope: CredentialScope,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

@@ -435,6 +435,12 @@ pub async fn dispatch(
             .await
             .map(|b| single(ResponseBody::EntityList(b))),
 
+        RequestBody::EntityTypeList(r) => {
+            crate::handlers::entity::handle_entity_type_list(r, &caller, ctx)
+                .await
+                .map(|b| single(ResponseBody::EntityTypeList(b)))
+        }
+
         RequestBody::EntityTombstone(r) => crate::handlers::entity::handle_entity_tombstone(r, ctx)
             .await
             .map(|b| single(ResponseBody::EntityTombstone(b))),
@@ -570,28 +576,30 @@ pub async fn dispatch(
             .map(|b| single(ResponseBody::SessionDelete(b))),
 
         // -----------------------------------------------------------
-        // A tenant's own LLM provider key. These take the caller
-        // directly: the namespace a credential belongs to is the
-        // authenticated one, and PUT also needs to know whether the
-        // connection can carry a plaintext key.
+        // A tenant's own LLM provider key. These take the caller directly:
+        // the namespace a credential belongs to is the authenticated one, and
+        // PUT also needs to know whether the connection can carry a plaintext
+        // key. Only PUT is handed its payload — the other three read nothing
+        // from it, so the pattern discards it here rather than passing a value
+        // the handler would have to ignore.
         // -----------------------------------------------------------
         RequestBody::LlmCredentialPut(r) => {
             crate::handlers::llm_credential::handle_llm_credential_put(r, &caller, ctx)
                 .map(|b| single(ResponseBody::LlmCredentialPut(b)))
         }
 
-        RequestBody::LlmCredentialGet(r) => {
-            crate::handlers::llm_credential::handle_llm_credential_get(r, &caller, ctx)
+        RequestBody::LlmCredentialGet(_) => {
+            crate::handlers::llm_credential::handle_llm_credential_get(&caller, ctx)
                 .map(|b| single(ResponseBody::LlmCredentialGet(b)))
         }
 
-        RequestBody::LlmCredentialDelete(r) => {
-            crate::handlers::llm_credential::handle_llm_credential_delete(r, &caller, ctx)
+        RequestBody::LlmCredentialDelete(_) => {
+            crate::handlers::llm_credential::handle_llm_credential_delete(&caller, ctx)
                 .map(|b| single(ResponseBody::LlmCredentialDelete(b)))
         }
 
-        RequestBody::LlmCredentialVerify(r) => {
-            crate::handlers::llm_credential::handle_llm_credential_verify(r, &caller, ctx)
+        RequestBody::LlmCredentialVerify(_) => {
+            crate::handlers::llm_credential::handle_llm_credential_verify(&caller, ctx)
                 .await
                 .map(|b| single(ResponseBody::LlmCredentialVerify(b)))
         }
@@ -830,6 +838,7 @@ fn enforce_permission(caller: &RequestCaller, req: &RequestBody) -> Result<(), O
         // typed-graph reads.
         RequestBody::EntityGet(_)
         | RequestBody::EntityList(_)
+        | RequestBody::EntityTypeList(_)
         | RequestBody::EntityResolve(_)
         | RequestBody::StatementGet(_)
         | RequestBody::StatementHistory(_)

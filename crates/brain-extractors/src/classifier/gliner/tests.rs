@@ -14,10 +14,12 @@ use candle_nn::{Linear, VarBuilder};
 use tempfile::NamedTempFile;
 use tokenizers::Tokenizer;
 
-use super::decode::{decode_spans, sigmoid};
+use super::decode::{candidate_spans, resolve_flat, sigmoid};
 use super::head::{LabelProjection, ProjectionLayer, SpanMarkerHead};
 use super::rnn::BiLstm;
-use super::tokenizer::{split_words, tokenize, TokenizerIds};
+use super::tokenizer::{
+    assemble_window, build_prompt, encode_words, split_words, word_budget, TokenizerIds,
+};
 
 // ---------------------------------------------------------------------------
 // Synthetic tokenizer for prompt-construction tests.
@@ -111,7 +113,9 @@ fn prompt_construction_inserts_ent_tokens() {
     let labels = ["Person", "Organization"];
     let labels_ref: Vec<&str> = labels.to_vec();
     let ids = test_token_ids();
-    let out = tokenize(&tok, text, &labels_ref, &ids, 384).expect("tokenize");
+    let prompt = build_prompt(&tok, &labels_ref, &ids).expect("prompt");
+    let words = encode_words(&tok, text).expect("encode words");
+    let out = assemble_window(&prompt, &words, &ids);
 
     // [CLS] <<ENT>> Person <<ENT>> Organization <<SEP>> Alice Wong works at Acme Corp . [SEP]
     assert_eq!(
@@ -168,7 +172,13 @@ fn decode_filters_by_threshold() {
         vec![vec![0.0_f32]],  // (0, 0): kept
         vec![vec![-1.0_f32]], // (1, 0): dropped (sigmoid ~0.27 < 0.5)
     ];
-    let spans = decode_spans(&logits, 0.5, &labels_ref, &word_offsets, text);
+    let spans = resolve_flat(candidate_spans(
+        &logits,
+        0.5,
+        &labels_ref,
+        &word_offsets,
+        text,
+    ));
     assert_eq!(spans.len(), 1);
     assert_eq!(spans[0].text, "Priya");
     assert_eq!(spans[0].label, "Person");
@@ -193,7 +203,13 @@ fn decode_resolves_overlaps_greedy() {
             vec![0.0_f32], // (start=1, width=1) out of range
         ],
     ];
-    let spans = decode_spans(&logits, 0.5, &labels_ref, &word_offsets, text);
+    let spans = resolve_flat(candidate_spans(
+        &logits,
+        0.5,
+        &labels_ref,
+        &word_offsets,
+        text,
+    ));
     assert_eq!(spans.len(), 1);
     assert_eq!(spans[0].text, "Priya Sharma");
     assert_eq!(spans[0].char_start, 0);
@@ -629,4 +645,170 @@ fn real_inference_detects_person_and_organization_in_alice_works_at_acme() {
         org.score >= 0.5,
         "Organization 'Acme*' scored below 0.5: {org:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Windowing: long inputs are covered, not dropped.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_word_budget_reserves_the_prompt_and_the_trailing_sep() {
+    let tok = build_test_tokenizer();
+    let ids = test_token_ids();
+    let labels_ref: Vec<&str> = vec!["Person", "Organization"];
+    let prompt = build_prompt(&tok, &labels_ref, &ids).expect("prompt");
+
+    // [CLS] + (<<ENT>> + label) * 2 + <<SEP>> = 6 subtokens, and the
+    // window still has to close with [SEP].
+    assert_eq!(prompt.subtokens(), 6);
+    assert_eq!(word_budget(&prompt, 384).expect("budget"), 384 - 6 - 1);
+}
+
+#[test]
+fn a_prompt_that_fills_the_sequence_is_an_error_not_an_empty_result() {
+    let tok = build_test_tokenizer();
+    let ids = test_token_ids();
+    let labels_ref: Vec<&str> = vec!["Person", "Organization"];
+    let prompt = build_prompt(&tok, &labels_ref, &ids).expect("prompt");
+
+    // No windowing can make room when the labels alone fill the model's
+    // sequence, so the caller is told rather than handed nothing.
+    let err = word_budget(&prompt, prompt.subtokens()).expect_err("must reject");
+    assert!(
+        matches!(err, super::GlinerError::InputTooLong { .. }),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn every_window_of_a_long_input_fits_the_sequence_length() {
+    let tok = build_test_tokenizer();
+    let ids = test_token_ids();
+    let labels_ref: Vec<&str> = vec!["Person", "Organization"];
+    let prompt = build_prompt(&tok, &labels_ref, &ids).expect("prompt");
+
+    // Far longer than the cap this test imposes, so it must split.
+    let text = "Alice Wong works at Acme Corp . ".repeat(40);
+    let words = encode_words(&tok, &text).expect("encode words");
+    let max_len = 32;
+    let budget = word_budget(&prompt, max_len).expect("budget");
+    let lens: Vec<usize> = words.iter().map(|w| w.ids.len()).collect();
+    let plan = super::window::plan(&lens, budget, 12);
+
+    assert!(
+        plan.windows.len() > 1,
+        "input long enough to need splitting"
+    );
+    for w in &plan.windows {
+        let built = assemble_window(&prompt, &words[w.start..w.end], &ids);
+        assert!(
+            built.input_ids.len() <= max_len,
+            "window {w:?} produced {} tokens, cap {max_len}",
+            built.input_ids.len()
+        );
+        assert_eq!(built.ent_positions, vec![1, 3], "prompt repeats per window");
+    }
+}
+
+#[test]
+fn window_offsets_stay_absolute_in_the_source_text() {
+    let tok = build_test_tokenizer();
+    let ids = test_token_ids();
+    let labels_ref: Vec<&str> = vec!["Person"];
+    let prompt = build_prompt(&tok, &labels_ref, &ids).expect("prompt");
+
+    let text = "Alice Wong works at Acme Corp . ".repeat(10);
+    let words = encode_words(&tok, &text).expect("encode words");
+    let lens: Vec<usize> = words.iter().map(|w| w.ids.len()).collect();
+    let budget = word_budget(&prompt, 24).expect("budget");
+    let plan = super::window::plan(&lens, budget, 4);
+
+    // A span decoded from a later window must point at the right place
+    // in the whole input, not at an offset within its own window.
+    let last = plan.windows.last().expect("at least one window");
+    let built = assemble_window(&prompt, &words[last.start..last.end], &ids);
+    let (start, end) = built.word_offsets[0];
+    let (word_start, word_end) = words[last.start].offsets;
+    assert_eq!(&text[start..end], &text[word_start..word_end]);
+    assert!(start > 0, "the final window does not begin at byte 0");
+}
+
+// 13. Real-model regression: an input past the sequence length is
+//     windowed, so entities beyond the cap are still reported.
+
+#[test]
+#[ignore = "requires BRAIN_NER_MODEL_PATH pointing at a GLiNER pickle directory"]
+fn real_inference_finds_entities_in_text_longer_than_the_sequence_length() {
+    use std::path::PathBuf;
+
+    use super::{GlinerConfig, GlinerModel};
+
+    let path: PathBuf = std::env::var("BRAIN_NER_MODEL_PATH")
+        .expect("set BRAIN_NER_MODEL_PATH to enable this test")
+        .into();
+    let config = GlinerConfig::default();
+    let model = GlinerModel::load(&path, config).expect("model load");
+
+    // Comfortably past the 384-subtoken sequence length, with a
+    // single-token given name that only a model-backed tier can find:
+    // a capitalisation rule cannot tell "Kenji" from any other word.
+    let filler = "The team restated the sequence of events for the record. ".repeat(40);
+    let text = format!("{filler}Kenji approved the rollout. {filler}");
+    assert!(
+        text.len() > 4000,
+        "fixture must exceed the sequence length by a wide margin"
+    );
+
+    let spans = model.predict(&text, &["Person"]).expect("predict");
+    let kenji = spans
+        .iter()
+        .find(|s| s.text.contains("Kenji"))
+        .unwrap_or_else(|| panic!("entity past the sequence length was dropped: {spans:?}"));
+    assert_eq!(kenji.label, "Person");
+    assert_eq!(
+        &text[kenji.char_start..kenji.char_end],
+        kenji.text,
+        "offsets must address the whole input, not a window"
+    );
+}
+
+#[test]
+#[ignore = "requires BRAIN_NER_MODEL_PATH pointing at a GLiNER pickle directory"]
+fn real_inference_reports_an_entity_once_despite_overlapping_windows() {
+    use std::path::PathBuf;
+
+    use super::{GlinerConfig, GlinerModel};
+
+    let path: PathBuf = std::env::var("BRAIN_NER_MODEL_PATH")
+        .expect("set BRAIN_NER_MODEL_PATH to enable this test")
+        .into();
+    let model = GlinerModel::load(&path, GlinerConfig::default()).expect("model load");
+
+    let filler = "The team restated the sequence of events for the record. ".repeat(40);
+    let text = format!("{filler}Kenji approved the rollout. {filler}");
+    let spans = model.predict(&text, &["Person"]).expect("predict");
+
+    // Overlapping windows see the same words twice; the merge must not
+    // turn that into two copies of the same entity.
+    let at_same_place: Vec<_> = spans
+        .iter()
+        .filter(|s| s.text.contains("Kenji"))
+        .map(|s| (s.char_start, s.char_end))
+        .collect();
+    let mut deduped = at_same_place.clone();
+    deduped.sort_unstable();
+    deduped.dedup();
+    assert_eq!(
+        at_same_place.len(),
+        deduped.len(),
+        "the same span was reported twice: {spans:?}"
+    );
+    for pair in spans.windows(2) {
+        assert!(
+            pair[0].char_end <= pair[1].char_start,
+            "spans overlap after the merge: {:?} then {:?}",
+            pair[0],
+            pair[1]
+        );
+    }
 }

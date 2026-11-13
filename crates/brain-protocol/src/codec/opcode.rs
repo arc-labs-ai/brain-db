@@ -214,6 +214,8 @@ pub enum Opcode {
     EntityListResp = 0x01B7,
     EntityTombstoneReq = 0x0138,
     EntityTombstoneResp = 0x01B8,
+    EntityTypeListReq = 0x0139,
+    EntityTypeListResp = 0x01B9,
 
     // Statement operations (0x0140-0x014F low-byte range).
     StatementCreateReq = 0x0140,
@@ -398,7 +400,9 @@ impl Opcode {
             0x0137 => Self::EntityListReq,
             0x01B7 => Self::EntityListResp,
             0x0138 => Self::EntityTombstoneReq,
+            0x0139 => Self::EntityTypeListReq,
             0x01B8 => Self::EntityTombstoneResp,
+            0x01B9 => Self::EntityTypeListResp,
 
             // Statement operations.
             0x0140 => Self::StatementCreateReq,
@@ -714,6 +718,8 @@ mod tests {
         (0x01B7, Opcode::EntityListResp),
         (0x0138, Opcode::EntityTombstoneReq),
         (0x01B8, Opcode::EntityTombstoneResp),
+        (0x0139, Opcode::EntityTypeListReq),
+        (0x01B9, Opcode::EntityTypeListResp),
         // Typed-graph — statement
         (0x0140, Opcode::StatementCreateReq),
         (0x01C0, Opcode::StatementCreateResp),
@@ -785,10 +791,10 @@ mod tests {
             Opcode::from_u16(0x007A),
             Err(ProtocolError::UnknownOpcode(0x007A))
         ));
-        // 0x0139 is a not-yet-assigned typed-graph entity opcode.
+        // 0x013A is a not-yet-assigned typed-graph entity opcode.
         assert!(matches!(
-            Opcode::from_u16(0x0139),
-            Err(ProtocolError::UnknownOpcode(0x0139))
+            Opcode::from_u16(0x013A),
+            Err(ProtocolError::UnknownOpcode(0x013A))
         ));
         // 0x0200 is in the reserved future namespace.
         assert!(matches!(

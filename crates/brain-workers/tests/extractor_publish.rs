@@ -417,7 +417,7 @@ async fn seeded_pattern_extractor_persists_entities_end_to_end() {
     let memory_id = make_memory_id(99);
     fixture.enqueue(
         memory_id,
-        "Priya Sharma joined Stripe as a Senior Engineer in San Francisco",
+        "P. Sharma joined Stripe as a Senior Engineer in San Francisco",
     );
 
     let drained = run_cycle(&fixture).await;
@@ -506,7 +506,7 @@ async fn shard_registry_with_real_gliner_persists_entities() {
     let memory_id = make_memory_id(123);
     fixture.enqueue(
         memory_id,
-        "Priya Sharma joined Stripe as a Senior Engineer in San Francisco",
+        "P. Sharma joined Stripe as a Senior Engineer in San Francisco",
     );
 
     let drained = run_cycle(&fixture).await;

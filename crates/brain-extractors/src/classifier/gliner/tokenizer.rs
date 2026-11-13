@@ -103,15 +103,62 @@ pub struct TokenizerIds {
     pub prompt_sep: u32,
 }
 
-/// Build the full token sequence for one input.
-pub fn tokenize(
+/// One word of the input, encoded once and reused by every window it
+/// appears in.
+#[derive(Debug, Clone)]
+pub struct EncodedWord {
+    /// Subtoken ids for the word.
+    pub ids: Vec<u32>,
+    /// Character offsets of the word in the source string.
+    pub offsets: (usize, usize),
+}
+
+/// Split `text` into words and encode each one.
+///
+/// Words the tokenizer maps to nothing (whitespace-only or unpaired
+/// surrogates) are dropped rather than given a fabricated position.
+pub fn encode_words(
     tokenizer: &tokenizers::Tokenizer,
     text: &str,
+) -> Result<Vec<EncodedWord>, GlinerError> {
+    let mut out = Vec::new();
+    for word in split_words(text) {
+        let enc = tokenizer
+            .encode(word.text.as_str(), false)
+            .map_err(|e| GlinerError::Tokenizer(e.to_string()))?;
+        let ids = enc.get_ids();
+        if ids.is_empty() {
+            continue;
+        }
+        out.push(EncodedWord {
+            ids: ids.to_vec(),
+            offsets: (word.char_start, word.char_end),
+        });
+    }
+    Ok(out)
+}
+
+/// The label prompt every window carries: `[CLS] <<ENT>> label_1 ...
+/// <<ENT>> label_n <<SEP>>`, with the position of each `<<ENT>>`.
+pub struct Prompt {
+    ids: Vec<u32>,
+    ent_positions: Vec<u32>,
+}
+
+impl Prompt {
+    /// Subtokens the prompt occupies in every window.
+    pub fn subtokens(&self) -> usize {
+        self.ids.len()
+    }
+}
+
+/// Build the label prompt shared by every window of one input.
+pub fn build_prompt(
+    tokenizer: &tokenizers::Tokenizer,
     labels: &[&str],
     ids: &TokenizerIds,
-    max_len: usize,
-) -> Result<TokenizedInput, GlinerError> {
-    let mut input_ids: Vec<u32> = Vec::with_capacity(max_len);
+) -> Result<Prompt, GlinerError> {
+    let mut input_ids: Vec<u32> = Vec::new();
     let mut ent_positions: Vec<u32> = Vec::with_capacity(labels.len());
 
     // [CLS] — DeBERTa's structural sentence-start token.
@@ -131,44 +178,57 @@ pub fn tokenize(
     // is the boundary between the label prompt and the words section.
     input_ids.push(ids.prompt_sep);
 
-    // Word subtokens. Split first so we can drive per-word encoding
-    // and track the first-subtoken position of each word.
-    let words = split_words(text);
+    Ok(Prompt {
+        ids: input_ids,
+        ent_positions,
+    })
+}
+
+/// Build the token sequence for one window over `words`.
+///
+/// Word offsets stay absolute in the original text, so spans decoded
+/// from any window already refer to the whole input.
+pub fn assemble_window(
+    prompt: &Prompt,
+    words: &[EncodedWord],
+    ids: &TokenizerIds,
+) -> TokenizedInput {
+    let mut input_ids = prompt.ids.clone();
     let mut word_first_subtoken: Vec<u32> = Vec::with_capacity(words.len());
     let mut word_offsets: Vec<(usize, usize)> = Vec::with_capacity(words.len());
 
-    for word in &words {
-        let enc = tokenizer
-            .encode(word.text.as_str(), false)
-            .map_err(|e| GlinerError::Tokenizer(e.to_string()))?;
-        let subtokens = enc.get_ids();
-        if subtokens.is_empty() {
-            // Tokenizer dropped the word (whitespace-only / unknown
-            // surrogate). Skip rather than fabricate a position.
-            continue;
-        }
+    for word in words {
         word_first_subtoken.push(input_ids.len() as u32);
-        word_offsets.push((word.char_start, word.char_end));
-        input_ids.extend_from_slice(subtokens);
+        word_offsets.push(word.offsets);
+        input_ids.extend_from_slice(&word.ids);
     }
 
     // Trailing [SEP] — DeBERTa's structural sentence-end token.
     input_ids.push(ids.sep);
 
-    if input_ids.len() > max_len {
-        return Err(GlinerError::InputTooLong {
-            got: input_ids.len(),
-            max: max_len,
-        });
-    }
-
     let attention_mask = vec![1u32; input_ids.len()];
-
-    Ok(TokenizedInput {
+    TokenizedInput {
         input_ids,
         attention_mask,
-        ent_positions,
+        ent_positions: prompt.ent_positions.clone(),
         word_first_subtoken,
         word_offsets,
-    })
+    }
+}
+
+/// Room left for words in one window once the prompt and the trailing
+/// `[SEP]` are charged against `max_len`.
+///
+/// `Err(InputTooLong)` means the label prompt alone fills the model's
+/// sequence: no amount of windowing can make room, so the caller must
+/// be told rather than handed empty results.
+pub fn word_budget(prompt: &Prompt, max_len: usize) -> Result<usize, GlinerError> {
+    let fixed = prompt.subtokens() + 1;
+    max_len
+        .checked_sub(fixed)
+        .filter(|b| *b > 0)
+        .ok_or(GlinerError::InputTooLong {
+            got: fixed,
+            max: max_len,
+        })
 }

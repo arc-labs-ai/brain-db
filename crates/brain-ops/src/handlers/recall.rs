@@ -329,6 +329,21 @@ fn shape_recall(
     Ok(frame)
 }
 
+/// Reject a gate value that is not a probability.
+///
+/// `max_results` is clamped rather than refused because `0` is its documented
+/// "use the server default" sentinel and the cap is a safety bound. A
+/// threshold has no such sentinel: every value in `[0, 1]` is meaningful, so
+/// anything outside it is a mistake rather than a shorthand.
+fn validate_probability(field: &str, value: f32) -> Result<(), OpError> {
+    if value.is_nan() || !(0.0..=1.0).contains(&value) {
+        return Err(OpError::InvalidRequest(format!(
+            "recall: {field} {value} is not a probability in [0, 1]"
+        )));
+    }
+    Ok(())
+}
+
 /// Normalise a recall request in place: clamp the safety cap into
 /// `[DEFAULT, MAX]` (`0` = server default), force `include_text` on (a memory
 /// without its text is useless), and bound the filter list sizes. Shared by the
@@ -336,6 +351,14 @@ fn shape_recall(
 /// apply identical bounds. Capture `client_requested_count = req.max_results
 /// != 0` BEFORE calling this — it overwrites a `0` cap.
 fn normalize_recall_request(req: &mut RecallRequest) -> Result<(), OpError> {
+    // Both of these gate results by a probability, so a value outside [0, 1]
+    // cannot express an intent: above 1 nothing can ever pass and the caller
+    // gets an empty answer that looks exactly like "nothing matched", below 0
+    // it admits everything the floor was meant to exclude. Refusing names the
+    // caller's mistake instead of answering a question they did not ask.
+    validate_probability("confidence_threshold", req.confidence_threshold)?;
+    validate_probability("salience_floor", req.salience_floor)?;
+
     if req.max_results == 0 {
         req.max_results = DEFAULT_RECALL_RESULTS;
     }
@@ -4219,6 +4242,54 @@ mod tests {
             trace: false,
             act_as: None,
         }
+    }
+
+    #[test]
+    fn a_threshold_outside_zero_to_one_is_refused() {
+        // Above 1 nothing can pass, so the caller would get an empty answer
+        // indistinguishable from "nothing matched".
+        for field_value in [1.5_f32, -0.1_f32, f32::NAN] {
+            let mut req = req_with_max(10);
+            req.confidence_threshold = field_value;
+            let err = normalize_recall_request(&mut req).expect_err("must refuse");
+            assert!(
+                matches!(err, OpError::InvalidRequest(ref m) if m.contains("confidence_threshold")),
+                "confidence_threshold {field_value} gave {err:?}"
+            );
+
+            let mut req = req_with_max(10);
+            req.salience_floor = field_value;
+            let err = normalize_recall_request(&mut req).expect_err("must refuse");
+            assert!(
+                matches!(err, OpError::InvalidRequest(ref m) if m.contains("salience_floor")),
+                "salience_floor {field_value} gave {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_whole_probability_range_is_accepted() {
+        for field_value in [0.0_f32, 0.5_f32, 1.0_f32] {
+            let mut req = req_with_max(10);
+            req.confidence_threshold = field_value;
+            req.salience_floor = field_value;
+            normalize_recall_request(&mut req)
+                .unwrap_or_else(|e| panic!("{field_value} must be accepted: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn max_results_is_clamped_not_refused() {
+        // `0` is the documented "use the server default" sentinel and the cap
+        // is a safety bound, so neither end is an error — unlike a threshold,
+        // which has no sentinel and every valid value inside [0, 1].
+        let mut req = req_with_max(0);
+        normalize_recall_request(&mut req).expect("0 is the default sentinel");
+        assert_eq!(req.max_results, DEFAULT_RECALL_RESULTS);
+
+        let mut req = req_with_max(MAX_RECALL_RESULTS + 1);
+        normalize_recall_request(&mut req).expect("over-cap clamps");
+        assert_eq!(req.max_results, MAX_RECALL_RESULTS);
     }
 
     #[test]

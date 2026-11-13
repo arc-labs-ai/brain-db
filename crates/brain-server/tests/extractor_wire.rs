@@ -221,7 +221,7 @@ async fn encode_extraction_emits_queryable_resolution_audit() {
     complete_handshake(&mut client, &server.token).await;
 
     // Proper nouns the model-free pattern tier lifts as entity mentions.
-    encode_and_wait(&mut client, 1, "Alice Johnson works at Acme Corporation").await;
+    encode_and_wait(&mut client, 1, "A. Johnson works at Acme Corporation").await;
 
     let admin_addr = server.admin_addr.to_string();
     let (code, body) = tokio::task::spawn_blocking(move || {
@@ -238,7 +238,7 @@ async fn encode_extraction_emits_queryable_resolution_audit() {
     // At least one proper-noun mention resolved into a durable, queryable
     // derivation row.
     assert!(
-        body.contains("\"resolved_entity\"") || body.contains("Acme") || body.contains("Alice"),
+        body.contains("\"resolved_entity\"") || body.contains("Acme") || body.contains("Johnson"),
         "a resolved mention should appear; body:\n{body}",
     );
 

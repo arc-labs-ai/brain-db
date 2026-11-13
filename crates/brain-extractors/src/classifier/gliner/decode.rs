@@ -10,6 +10,11 @@
 //!    accepted span (flat-NER constraint: no nesting, no overlap).
 //! 4. Sort the accepted spans by `char_start` ascending for stable
 //!    output.
+//!
+//! Scoring and resolution are separate steps because an input split
+//! across several windows is scored once per window but must be
+//! resolved once overall: windows overlap, so the same entity is
+//! proposed by two of them and only one copy may survive.
 
 use super::Span;
 
@@ -29,7 +34,7 @@ pub(crate) fn sigmoid(x: f32) -> f32 {
 ///
 /// `word_offsets[i] = (char_start_of_word_i, char_end_of_word_i)`,
 /// already byte-exact in the original input string.
-pub fn decode_spans(
+pub fn candidate_spans(
     logits: &[Vec<Vec<f32>>],
     threshold: f32,
     labels: &[&str],
@@ -70,8 +75,15 @@ pub fn decode_spans(
         }
     }
 
-    // Greedy flat resolution: sort by score desc (stable on ties),
-    // accept if no overlap with any already-accepted span.
+    candidates
+}
+
+/// Reduce scored candidates to a flat, non-overlapping set.
+///
+/// Sorts by score descending (stable on ties) and greedily accepts a
+/// candidate when it overlaps nothing already accepted, then orders the
+/// result by `char_start`.
+pub fn resolve_flat(mut candidates: Vec<Span>) -> Vec<Span> {
     candidates.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)

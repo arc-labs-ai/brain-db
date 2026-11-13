@@ -47,7 +47,6 @@ pub const DEFAULT_SHARD_DRAIN_BUDGET: Duration = Duration::from_secs(30);
 ///
 /// Caller must run this outside any async runtime (it uses
 /// `std::thread::spawn` + `mpsc::recv_timeout`).
-#[must_use]
 pub fn graceful_shutdown_shards(
     shards: Arc<Vec<ShardHandle>>,
     joiners: Vec<ShardJoiner>,

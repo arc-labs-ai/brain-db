@@ -20,7 +20,7 @@ use brain_storage::recovery::MetadataSinkError;
 use redb::{ReadableTable, WriteTransaction};
 
 use crate::db::MetadataDb;
-use crate::entity::merge::{merge_entity, unmerge_entity, MergeActor};
+use crate::entity::merge::{merge_entity, unmerge_entity, EntityMergeOpError, MergeActor};
 use crate::entity::ops::{
     entity_get_inside_wtxn, entity_put, entity_rename, entity_tombstone, entity_update,
     normalize_name, EntityOpError,
@@ -360,6 +360,37 @@ impl MetadataDb {
 
     /// Replay an `EntityMerge` body via `merge_entity` (survivor=target,
     /// merged=source), guarded by `merged_into` for re-replay safety.
+    ///
+    /// # Why a rejection here is not corruption
+    ///
+    /// This took a shard down and kept it down:
+    ///
+    /// ```text
+    /// metadata sink rejected record at LSN 445: corruption:
+    /// merge_entity: entity EntityId(01a1d06f-…) is tombstoned
+    /// ```
+    ///
+    /// The sequence that produced it was merge → unmerge → tombstone, every
+    /// step accepted by the live engine. Metadata is durable per record (each
+    /// apply commits its own redb transaction) while `durable_lsn` only
+    /// advances at a checkpoint, so replay re-runs every record since the
+    /// last one against a store that already holds ALL of their effects —
+    /// including the tombstone written at a LATER LSN than this merge.
+    /// `merge_entity` then re-applies a WRITE-PATH rule ("neither side may be
+    /// tombstoned") to state from after the fact, and refuses.
+    ///
+    /// The `merged_into` guard above cannot catch it: after the unmerge the
+    /// row looks exactly as it did before the merge, so state alone cannot
+    /// distinguish "already applied" from "never applied". Only an LSN
+    /// watermark could, and metadata's is not usable as one here — the same
+    /// `recover()` pass rebuilds the arena, which would then skip records it
+    /// still needs.
+    ///
+    /// So the rejection is tolerated instead, exactly as the duplicate and
+    /// unknown-type cases are in `apply_entity_create`. The second cause is
+    /// the same one named there: the WAL journals the attempt BEFORE the
+    /// apply decides whether it is legal, so a merge the write path refused
+    /// is in the log too and replays forever.
     pub(super) fn apply_entity_merge(
         &self,
         lsn: u64,
@@ -383,7 +414,7 @@ impl MetadataDb {
                 .and_then(|e| e.merged_into)
                 == Some(survivor);
             if !already {
-                merge_entity(
+                match merge_entity(
                     &wtxn,
                     survivor,
                     merged,
@@ -392,8 +423,22 @@ impl MetadataDb {
                     actor,
                     b.grace_seconds,
                     b.at_unix_nanos,
-                )
-                .map_err(|e| MetadataSinkError::Corruption(format!("merge_entity: {e}")))?;
+                ) {
+                    Ok(_) => {}
+                    Err(e) if merge_rejection_is_replayable(&e) => {
+                        tracing::warn!(
+                            target: "brain_metadata::recovery",
+                            lsn,
+                            survivor = ?survivor,
+                            merged = ?merged,
+                            error = %e,
+                            "replayed entity merge no longer applies; skipping",
+                        );
+                    }
+                    Err(e) => {
+                        return Err(MetadataSinkError::Corruption(format!("merge_entity: {e}")));
+                    }
+                }
             }
             self.bump_next_lsn_in_txn(&wtxn, lsn)?;
         }
@@ -423,8 +468,26 @@ impl MetadataDb {
                 .and_then(|e| e.merged_into)
                 .is_some();
             if still_merged {
-                unmerge_entity(&wtxn, merged, actor, b.at_unix_nanos)
-                    .map_err(|e| MetadataSinkError::Corruption(format!("unmerge_entity: {e}")))?;
+                // Same reasoning as `apply_entity_merge`: a rejection here is
+                // this record meeting state that moved on, or an attempt the
+                // write path refused and the WAL journalled anyway.
+                match unmerge_entity(&wtxn, merged, actor, b.at_unix_nanos) {
+                    Ok(_) => {}
+                    Err(e) if merge_rejection_is_replayable(&e) => {
+                        tracing::warn!(
+                            target: "brain_metadata::recovery",
+                            lsn,
+                            merged = ?merged,
+                            error = %e,
+                            "replayed entity unmerge no longer applies; skipping",
+                        );
+                    }
+                    Err(e) => {
+                        return Err(MetadataSinkError::Corruption(format!(
+                            "unmerge_entity: {e}"
+                        )));
+                    }
+                }
             }
             self.bump_next_lsn_in_txn(&wtxn, lsn)?;
         }
@@ -548,18 +611,20 @@ impl MetadataDb {
                             stamp_implicit_predicate(&wtxn, s.id)?;
                         }
                     }
-                    Err(
-                        e @ (StatementOpError::UnknownSubject(_)
-                        | StatementOpError::UnknownObjectEntity(_)
-                        | StatementOpError::UnknownPredicate(_)),
-                    ) => {
+                    Err(e) if statement_rejection_is_replayable(&e) => {
+                        // Every rejection the write path can itself produce is
+                        // replayable here. A record reaches the WAL before the
+                        // metadata apply decides on it, so a write the server
+                        // refused is still on disk and meets the same refusal on
+                        // replay. Treating that as corruption aborts recovery and
+                        // the shard never starts again — one rejected client
+                        // write would permanently prevent boot.
                         tracing::warn!(
                             target: "brain_metadata::recovery",
                             lsn,
                             skipped_id = ?s.id,
                             error = %e,
-                            "replayed statement names a subject, object or predicate the \
-                             schema no longer declares; skipping",
+                            "replayed statement create no longer applies; skipping",
                         );
                     }
                     Err(e) => {
@@ -602,15 +667,31 @@ impl MetadataDb {
                 g.is_some()
             };
             if !already {
-                statement_supersede(
+                match statement_supersede(
                     &wtxn,
                     b.new.scope(),
                     b.new.session(),
                     old_id,
                     &new_s,
                     b.at_unix_nanos,
-                )
-                .map_err(|e| MetadataSinkError::Corruption(format!("statement_supersede: {e}")))?;
+                ) {
+                    Ok(_) => {}
+                    Err(e) if statement_rejection_is_replayable(&e) => {
+                        tracing::warn!(
+                            target: "brain_metadata::recovery",
+                            lsn,
+                            old = ?old_id,
+                            new = ?new_s.id,
+                            error = %e,
+                            "replayed statement supersede no longer applies; skipping",
+                        );
+                    }
+                    Err(e) => {
+                        return Err(MetadataSinkError::Corruption(format!(
+                            "statement_supersede: {e}"
+                        )));
+                    }
+                }
             }
             self.bump_next_lsn_in_txn(&wtxn, lsn)?;
         }
@@ -631,12 +712,113 @@ impl MetadataDb {
         let reason = TombstoneReason::from_u8(b.reason).unwrap_or(TombstoneReason::UserRequest);
         let wtxn = self.db.begin_write().map_err(transient)?;
         {
-            statement_tombstone(&wtxn, id, reason, b.at_unix_nanos)
-                .map_err(|e| MetadataSinkError::Corruption(format!("statement_tombstone: {e}")))?;
+            // A retracted row is physically reclaimed, so the record that
+            // retired it can outlive the row it names.
+            match statement_tombstone(&wtxn, id, reason, b.at_unix_nanos) {
+                Ok(_) => {}
+                Err(e) if statement_rejection_is_replayable(&e) => {
+                    tracing::warn!(
+                        target: "brain_metadata::recovery",
+                        lsn,
+                        statement = ?id,
+                        error = %e,
+                        "replayed statement tombstone no longer applies; skipping",
+                    );
+                }
+                Err(e) => {
+                    return Err(MetadataSinkError::Corruption(format!(
+                        "statement_tombstone: {e}"
+                    )));
+                }
+            }
             self.bump_next_lsn_in_txn(&wtxn, lsn)?;
         }
         wtxn.commit().map_err(transient)?;
         Ok(())
+    }
+}
+
+/// Whether a `merge_entity` / `unmerge_entity` rejection during replay means
+/// the record no longer applies, rather than that the store is damaged.
+///
+/// The split is business rule vs substrate. Every variant below is a rule the
+/// WRITE path enforces, and a replay can meet it for two reasons that are
+/// both normal:
+///
+///   * a later record, already durable in metadata, moved the state on — the
+///     entity was tombstoned, merged elsewhere, or unmerged since;
+///   * the write path refused the call at the time, and the WAL had already
+///     journalled the attempt (it records intent before legality is decided),
+///     so the refusal replays forever.
+///
+/// In both cases the record's effect is either already present or was never
+/// meant to land, and failing recovery over it trades the whole shard for
+/// nothing — the failure is permanent, because the record replays on every
+/// boot and there is no repair path.
+///
+/// Storage, table, trigram, edge and nested entity-op faults are deliberately
+/// NOT here. Those say the substrate is wrong rather than that the world
+/// moved on, and recovery should still refuse to come up on them.
+fn merge_rejection_is_replayable(e: &EntityMergeOpError) -> bool {
+    match e {
+        EntityMergeOpError::Tombstoned(_)
+        | EntityMergeOpError::AlreadyMerged(_, _)
+        | EntityMergeOpError::NotMerged(_)
+        | EntityMergeOpError::EntityNotFound(_)
+        | EntityMergeOpError::AuditMissing(_)
+        | EntityMergeOpError::SelfMerge
+        | EntityMergeOpError::TypeMismatch { .. }
+        | EntityMergeOpError::LowConfidence(_)
+        | EntityMergeOpError::OutOfGracePeriod => true,
+        EntityMergeOpError::Storage(_)
+        | EntityMergeOpError::Table(_)
+        | EntityMergeOpError::TrigramOp(_)
+        | EntityMergeOpError::EdgeOp(_)
+        | EntityMergeOpError::EdgeKey(_)
+        | EntityMergeOpError::EntityOp(_) => false,
+    }
+}
+
+/// Whether a statement-op rejection during replay means the record no longer
+/// applies, rather than that the store is damaged.
+///
+/// The sibling of [`merge_rejection_is_replayable`], and reachable by a
+/// route that is ordinary rather than exotic: a RETRACTED statement's row is
+/// physically removed by the reclaim sweep (`extractor::sweep`, for
+/// `RETRACT` and `RETENTION_EXPIRED` tombstones). Once it is gone, the
+/// supersede and tombstone records that still name it replay against
+/// nothing and return `NotFound`. The sweep itself already tolerates
+/// exactly that — it counts a missing row as `skipped` — and recovery has
+/// more reason to, not less: the sweep loses one row, recovery loses the
+/// shard, on every boot, with no repair path.
+///
+/// Schema movement reaches the same place. Dropping a predicate leaves
+/// every statement record naming it replaying into `UnknownPredicate`.
+///
+/// Decode, storage, table and kind-registry faults stay corruption: those
+/// say the substrate is wrong rather than that the world moved on.
+fn statement_rejection_is_replayable(e: &StatementOpError) -> bool {
+    match e {
+        StatementOpError::NotFound(_)
+        | StatementOpError::AlreadyExists(_)
+        | StatementOpError::AlreadySuperseded(_, _)
+        | StatementOpError::AlreadyTombstoned(_)
+        | StatementOpError::UnknownPredicate(_)
+        | StatementOpError::UnknownSubject(_)
+        | StatementOpError::UnknownObjectEntity(_)
+        | StatementOpError::ObjectEntityTypeMismatch { .. }
+        | StatementOpError::SubjectEntityTypeMismatch { .. }
+        | StatementOpError::EventCannotSupersede
+        | StatementOpError::KindMismatch { .. }
+        | StatementOpError::SubjectMismatch
+        | StatementOpError::PredicateMismatch
+        | StatementOpError::InvalidArgument(_) => true,
+        StatementOpError::Storage(_)
+        | StatementOpError::Table(_)
+        | StatementOpError::Kind(_)
+        | StatementOpError::DecodeFailed
+        | StatementOpError::PredicateOp(_)
+        | StatementOpError::EntityOp(_) => false,
     }
 }
 
@@ -1070,6 +1252,155 @@ mod tests {
             .unwrap()
             .expect("merged row persists");
         assert_eq!(got.merged_into, Some(survivor_id));
+    }
+
+    /// The shape that took a shard down and kept it down.
+    ///
+    /// merge → unmerge → tombstone, every step legal when it ran. On restart
+    /// metadata already holds all three effects (each apply commits its own
+    /// redb txn) while `durable_lsn` has not moved past them, so the merge
+    /// record is replayed against post-tombstone state. It used to come back
+    /// as `MetadataSinkError::Corruption` and fail recovery — on every boot,
+    /// with no repair path.
+    ///
+    /// The `merged_into` guard cannot save it: after the unmerge the row is
+    /// indistinguishable from one that was never merged.
+    #[test]
+    fn replayed_merge_survives_a_later_unmerge_and_tombstone() {
+        use crate::recovery::phase_bodies::{
+            encode_entity_merge, encode_entity_tombstone, encode_entity_unmerge, EntityMergeBody,
+            EntityTombstoneBody, EntityUnmergeBody,
+        };
+        let dir = TempDir::new().unwrap();
+        let db = fresh_db(&dir);
+        let survivor = person_entity("Nadia Rahman");
+        let merged = person_entity("N. Rahman");
+        let survivor_id = survivor.id;
+        let merged_id = merged.id;
+        {
+            let wtxn = db.write_txn().unwrap();
+            entity_put(
+                &wtxn,
+                test_scope(),
+                brain_core::SessionId::DEFAULT,
+                &survivor,
+            )
+            .unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &merged).unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        let merge_body = encode_entity_merge(&EntityMergeBody {
+            source: merged_id.to_bytes(),
+            target: survivor_id.to_bytes(),
+            retain_aliases: true,
+            retain_attributes: true,
+            at_unix_nanos: NOW + 100,
+            confidence: 0.95,
+            reason: "duplicate".into(),
+            actor_kind: 0,
+            actor_space: [0u8; 16],
+            grace_seconds: 7 * 24 * 60 * 60,
+        });
+
+        // The live sequence, in order.
+        db.apply_entity_merge(445, &merge_body).unwrap();
+        db.apply_entity_unmerge(
+            446,
+            &encode_entity_unmerge(&EntityUnmergeBody {
+                merged: merged_id.to_bytes(),
+                actor_kind: 0,
+                actor_space: [0u8; 16],
+                at_unix_nanos: NOW + 200,
+            }),
+        )
+        .unwrap();
+        for (lsn, id) in [(447, merged_id), (448, survivor_id)] {
+            db.apply_entity_tombstone(
+                lsn,
+                &encode_entity_tombstone(&EntityTombstoneBody {
+                    id: id.to_bytes(),
+                    at_unix_nanos: NOW + 300,
+                }),
+            )
+            .unwrap();
+        }
+
+        // Recovery replays from before the checkpoint — the merge record
+        // comes round again, now against tombstoned rows.
+        db.apply_entity_merge(445, &merge_body)
+            .expect("a merge that no longer applies must not fail recovery");
+
+        // Skipped, not applied: the tombstones are still the truth.
+        let rtxn = db.read_txn().unwrap();
+        let got = entity_get(&rtxn, merged_id).unwrap().expect("row persists");
+        assert_eq!(
+            got.merged_into, None,
+            "the stale merge must not resurrect the merge link"
+        );
+    }
+
+    /// A merge the write path refused is journalled too, because the WAL
+    /// records intent before legality is decided. It must not fail recovery
+    /// forever either.
+    #[test]
+    fn replayed_merge_the_write_path_refused_is_skipped() {
+        use crate::recovery::phase_bodies::{encode_entity_merge, EntityMergeBody};
+        let dir = TempDir::new().unwrap();
+        let db = fresh_db(&dir);
+        let only = person_entity("Solo Entity");
+        let only_id = only.id;
+        {
+            let wtxn = db.write_txn().unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &only).unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        // Merging an entity into itself is refused on the write path.
+        let self_merge = encode_entity_merge(&EntityMergeBody {
+            source: only_id.to_bytes(),
+            target: only_id.to_bytes(),
+            retain_aliases: true,
+            retain_attributes: true,
+            at_unix_nanos: NOW + 100,
+            confidence: 0.95,
+            reason: "bogus".into(),
+            actor_kind: 0,
+            actor_space: [0u8; 16],
+            grace_seconds: 7 * 24 * 60 * 60,
+        });
+        db.apply_entity_merge(500, &self_merge)
+            .expect("a refused merge must not fail recovery");
+
+        // And one whose confidence never cleared the threshold.
+        let other = person_entity("Other Entity");
+        let other_id = other.id;
+        {
+            let wtxn = db.write_txn().unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &other).unwrap();
+            wtxn.commit().unwrap();
+        }
+        let low_confidence = encode_entity_merge(&EntityMergeBody {
+            source: other_id.to_bytes(),
+            target: only_id.to_bytes(),
+            retain_aliases: true,
+            retain_attributes: true,
+            at_unix_nanos: NOW + 100,
+            confidence: 0.1,
+            reason: "too unsure".into(),
+            actor_kind: 0,
+            actor_space: [0u8; 16],
+            grace_seconds: 7 * 24 * 60 * 60,
+        });
+        db.apply_entity_merge(501, &low_confidence)
+            .expect("a refused merge must not fail recovery");
+
+        let rtxn = db.read_txn().unwrap();
+        assert_eq!(
+            entity_get(&rtxn, other_id).unwrap().unwrap().merged_into,
+            None,
+            "a refused merge must not land on replay either"
+        );
     }
 
     #[test]
@@ -1550,5 +1881,130 @@ define predicate admires {
         let row = t.get(&sid.to_bytes()).unwrap().map(|g| g.value()).unwrap();
         assert!(row.is_tombstoned());
         assert_eq!(row.is_current, 0);
+    }
+
+    /// A statement the write path refused on a predicate's `kind_constraint`
+    /// must be skipped on replay, not treated as corruption.
+    ///
+    /// Observed, not hypothesised: a client asserted a `Fact` against a
+    /// predicate declared `Preference`. The write reached the WAL before the
+    /// metadata apply rejected it, the caller got an error, and the record
+    /// stayed on disk — so the next boot met the same refusal during
+    /// recovery, mapped it to `Corruption`, and the shard never started
+    /// again. One refused client write permanently bricked the server.
+    ///
+    /// The create arm named three skippable errors explicitly while its
+    /// siblings already delegated to `statement_rejection_is_replayable`,
+    /// which classifies this rejection as replayable. The arm now uses it.
+    #[test]
+    fn replayed_statement_create_the_write_path_refused_is_skipped() {
+        use crate::recovery::phase_bodies::{encode_statement_create, StatementCreateBody};
+        use crate::schema::predicate::predicate_intern_with_subject;
+        use crate::tables::statement::{metadata_from_statement, STATEMENTS_TABLE};
+        use brain_core::StatementKind;
+
+        let dir = TempDir::new().unwrap();
+        let db = fresh_db(&dir);
+        let subject = put_subject(&db);
+
+        // A predicate that only accepts Preference statements.
+        let pid = {
+            let wtxn = db.write_txn().unwrap();
+            let id = predicate_intern_with_subject(
+                &wtxn,
+                DeclScope::base("app"),
+                "tone",
+                Some(StatementKind::Preference),
+                crate::schema::predicate::ObjectConstraint::default(),
+                0,
+                1,
+                "only a Preference may use this predicate",
+                true,
+                NOW,
+            )
+            .unwrap();
+            wtxn.commit().unwrap();
+            id
+        };
+
+        // `schemaless_statement` is a Fact, so this create violates the
+        // constraint exactly as the observed write did.
+        let mut s = schemaless_statement(subject);
+        s.predicate = pid;
+        let record = encode_statement_create(&StatementCreateBody {
+            meta: metadata_from_statement(&s, test_scope()),
+            predicate_intern_hint: None,
+        });
+
+        db.apply_statement_create(40, &record)
+            .expect("a create the write path refused must not fail recovery");
+
+        let rtxn = db.read_txn().unwrap();
+        let t = rtxn.open_table(STATEMENTS_TABLE).unwrap();
+        assert!(
+            t.get(&s.id.to_bytes()).unwrap().is_none(),
+            "the skip must not write the refused statement"
+        );
+    }
+
+    /// A retracted statement's row is physically reclaimed, so the record
+    /// that retired it outlives the row it names.
+    ///
+    /// Same shape as the merge case, reached by an ordinary route: retract
+    /// is the documented way to destroy a claim's content, the reclaim
+    /// sweep removes the row, and the tombstone record then replays into
+    /// `NotFound`. As corruption that is an unbootable shard; the sweep
+    /// itself already treats a missing row as merely skipped.
+    #[test]
+    fn replayed_statement_tombstone_survives_the_row_being_reclaimed() {
+        use crate::recovery::phase_bodies::{
+            encode_statement_create, encode_statement_tombstone, StatementCreateBody,
+            StatementTombstoneBody,
+        };
+        use crate::tables::statement::{
+            metadata_from_statement, tombstone_reason, STATEMENTS_TABLE,
+        };
+
+        let dir = TempDir::new().unwrap();
+        let db = fresh_db(&dir);
+        let subject = put_subject(&db);
+        let s = schemaless_statement(subject);
+        let sid = s.id;
+        db.apply_statement_create(
+            30,
+            &encode_statement_create(&StatementCreateBody {
+                meta: metadata_from_statement(&s, test_scope()),
+                predicate_intern_hint: Some(("app".into(), "knows".into())),
+            }),
+        )
+        .unwrap();
+
+        let retire = encode_statement_tombstone(&StatementTombstoneBody {
+            id: sid.to_bytes(),
+            reason: tombstone_reason::RETRACT,
+            at_unix_nanos: NOW + 5,
+        });
+        db.apply_statement_tombstone(31, &retire).unwrap();
+
+        // The reclaim sweep removes a retracted row outright.
+        {
+            let wtxn = db.write_txn().unwrap();
+            {
+                let mut t = wtxn.open_table(STATEMENTS_TABLE).unwrap();
+                t.remove(&sid.to_bytes()).unwrap();
+            }
+            wtxn.commit().unwrap();
+        }
+
+        // Recovery replays the retire record against a row that is gone.
+        db.apply_statement_tombstone(31, &retire)
+            .expect("a tombstone whose row was reclaimed must not fail recovery");
+
+        let rtxn = db.read_txn().unwrap();
+        let t = rtxn.open_table(STATEMENTS_TABLE).unwrap();
+        assert!(
+            t.get(&sid.to_bytes()).unwrap().is_none(),
+            "the skip must not resurrect the reclaimed row"
+        );
     }
 }
