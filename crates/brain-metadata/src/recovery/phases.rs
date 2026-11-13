@@ -365,8 +365,10 @@ impl MetadataDb {
     ///
     /// This took a shard down and kept it down:
     ///
-    ///     metadata sink rejected record at LSN 445: corruption:
-    ///     merge_entity: entity EntityId(01a1d06f-…) is tombstoned
+    /// ```text
+    /// metadata sink rejected record at LSN 445: corruption:
+    /// merge_entity: entity EntityId(01a1d06f-…) is tombstoned
+    /// ```
     ///
     /// The sequence that produced it was merge → unmerge → tombstone, every
     /// step accepted by the live engine. Metadata is durable per record (each

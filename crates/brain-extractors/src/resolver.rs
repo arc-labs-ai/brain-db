@@ -237,7 +237,9 @@ const UNTYPED_FALLBACK: &str = "Concept";
 /// that cannot be written in the DSL can never be promoted, so it is
 /// permanent sediment — and it is not hypothetical. This shipped:
 ///
-///     entity "Amara Okafor"  entity_type_id=9  type_qname="acme:"
+/// ```text
+/// entity "Amara Okafor"  entity_type_id=9  type_qname="acme:"
+/// ```
 ///
 /// `qname_to_type_name` returns `""` for both an empty qname (no `:`, so
 /// the whole empty string falls through) and one ending in `:`. Nothing
