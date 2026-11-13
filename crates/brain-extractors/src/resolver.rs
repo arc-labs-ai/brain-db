@@ -216,6 +216,44 @@ fn qname_to_type_name(qname: &str) -> &str {
     qname.split_once(':').map(|(_, n)| n).unwrap_or(qname)
 }
 
+/// The type a coined entity falls back to when the extractor proposed a
+/// name the schema could never declare.
+///
+/// `Concept` is the system schema's generic: "a thing worth knowing about,
+/// with nothing more specific established". Deliberately a real built-in
+/// rather than a sentinel, so the entity stays queryable and the row stays
+/// indistinguishable from any other Concept.
+const UNTYPED_FALLBACK: &str = "Concept";
+
+/// Whether a coined type name is one the schema DSL could have declared:
+/// `ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")*`, matching `identifier` in
+/// `grammar.pest`.
+///
+/// # Why auto-discovery is held to the DECLARED grammar
+///
+/// A type coined from one sentence is still a row in the tenant's registry
+/// from then on, and the only way it ever stops being noise is to be
+/// promoted into a real `define entity_type` in a schema document. A name
+/// that cannot be written in the DSL can never be promoted, so it is
+/// permanent sediment — and it is not hypothetical. This shipped:
+///
+///     entity "Amara Okafor"  entity_type_id=9  type_qname="acme:"
+///
+/// `qname_to_type_name` returns `""` for both an empty qname (no `:`, so
+/// the whole empty string falls through) and one ending in `:`. Nothing
+/// checked it, `entity_type_intern` happily allocated an id for the empty
+/// name, and a Person who should have resolved to the built-in
+/// `brain:Person` was diverted into a nameless type that no schema upload
+/// can ever name, drop, or override.
+fn is_declarable_type_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// True when the entity-type qname denotes a Person. Person is the only
 /// type the greeting-strip and diminutive-coref guards touch: both are
 /// person-name phenomena, and widening them risks mangling legitimate
@@ -386,7 +424,27 @@ fn resolve_entity_type(
     qname: &str,
     now_unix_nanos: u64,
 ) -> Result<EntityTypeId, ResolverError> {
-    let name = qname_to_type_name(qname);
+    let proposed = qname_to_type_name(qname);
+    // Auto-discovery is held to the same grammar as a declaration: a coined
+    // type the DSL could not express is one no operator can ever promote,
+    // drop or override, so it is dropped in favour of the generic built-in
+    // rather than interned. The ENTITY survives either way — losing a
+    // mention over its extractor's bad type label would be the worse trade,
+    // and a rejection here cannot be an error: the caller propagates with
+    // `?`, so one malformed mention would take every entity on the memory
+    // with it.
+    let name = if is_declarable_type_name(proposed) {
+        proposed
+    } else {
+        tracing::warn!(
+            target: "brain_extractors::resolver",
+            qname,
+            fallback = UNTYPED_FALLBACK,
+            "extractor proposed an entity type the schema could not declare; \
+             using the generic built-in instead of coining it",
+        );
+        UNTYPED_FALLBACK
+    };
     // Resolve within the caller's tenant first, falling back to the shared
     // built-ins. A type minted here belongs to the caller's namespace, not
     // to everyone: two tenants whose corpora both coin `Builder` get two
@@ -2674,6 +2732,99 @@ mod tests {
             "cross-type exact name match must reuse the existing node, not fragment"
         );
         assert_eq!(second.tier, ResolutionTier::Exact);
+        wtxn.commit().unwrap();
+    }
+
+    #[test]
+    fn declarable_type_name_matches_the_dsl_identifier_rule() {
+        // `identifier = ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")*`
+        // A sentinel word as a FRAGMENT is fine — only the whole name is a
+        // placeholder.
+        // Any word a domain uses is a legitimate type name. This asks only
+        // whether the SCHEMA LANGUAGE could write the name, never which
+        // words mean something: `Object` names a real kind in astronomy and
+        // `Type` one in typography. A denylist of English words would
+        // refuse both, and would cover no other language at all.
+        for ok in [
+            "Person",
+            "Cultivar",
+            "Alloy_Spec",
+            "Tier2",
+            "A",
+            "Object",
+            "Type",
+            "Entity",
+            "Thing",
+            "Typeface",
+        ] {
+            assert!(is_declarable_type_name(ok), "{ok} is declarable");
+        }
+        for bad in [
+            "",          // an empty qname falls through `qname_to_type_name`
+            "some-kind", // hyphen: legal in prose, not in the DSL
+            "2Fast",     // must not start with a digit
+            "my type",   // whitespace
+            "Kind!",     // punctuation
+            "_private",  // must start with a letter
+        ] {
+            assert!(!is_declarable_type_name(bad), "{bad:?} is not declarable");
+        }
+    }
+
+    /// An extractor proposing a type the DSL could not declare must not
+    /// mint a registry row for it.
+    ///
+    /// The shape that shipped: a qname of `"acme:"` (or an empty one) made
+    /// `qname_to_type_name` return `""`, which was interned as a real type,
+    /// and a Person landed under a nameless row no schema upload could ever
+    /// name, drop or override.
+    #[test]
+    fn an_undeclarable_type_falls_back_instead_of_coining_a_row() {
+        let dir = TempDir::new().unwrap();
+        let d = db(&dir);
+        for (case, qname) in [
+            ("trailing colon", "acme:"),
+            ("empty qname", ""),
+            ("hyphenated", "acme:api-gateway"),
+        ] {
+            let wtxn = d.write_txn().unwrap();
+            let r = resolve_or_create(&wtxn, test_scope(), case, qname, 0.9, NOW).unwrap();
+            // The entity survives — losing the mention would be the worse
+            // trade, and the caller propagates with `?`.
+            let got = brain_metadata::entity_get_inside_wtxn(&wtxn, r.entity_id)
+                .unwrap()
+                .expect("the mention is still stored");
+            let name = brain_metadata::entity_type_name_by_id(&wtxn, got.entity_type)
+                .unwrap()
+                .expect("its type has a name");
+            assert_eq!(
+                name, "Concept",
+                "{case}: must fall back to the generic built-in"
+            );
+            assert!(
+                is_declarable_type_name(&name),
+                "{case}: whatever it landed on must be promotable"
+            );
+            wtxn.commit().unwrap();
+        }
+    }
+
+    /// A well-formed coined type is still coined — the guard narrows junk,
+    /// it does not disable auto-discovery.
+    #[test]
+    fn a_declarable_coined_type_is_still_interned() {
+        let dir = TempDir::new().unwrap();
+        let d = db(&dir);
+        let wtxn = d.write_txn().unwrap();
+        let r = resolve_or_create(&wtxn, test_scope(), "api-gateway", "acme:Service", 0.9, NOW)
+            .unwrap();
+        let got = brain_metadata::entity_get_inside_wtxn(&wtxn, r.entity_id)
+            .unwrap()
+            .unwrap();
+        let name = brain_metadata::entity_type_name_by_id(&wtxn, got.entity_type)
+            .unwrap()
+            .unwrap();
+        assert_eq!(name, "Service", "a declarable type is coined as asked");
         wtxn.commit().unwrap();
     }
 
