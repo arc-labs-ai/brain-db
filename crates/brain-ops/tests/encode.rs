@@ -655,24 +655,39 @@ fn read_text(fix: &Fixture, memory_id: u128) -> Option<Vec<u8>> {
         .map(|g| g.value().to_vec())
 }
 
+/// Text with no content is refused before the writer — and whitespace
+/// counts as no content.
+///
+/// A single space passed the old byte-level `is_empty()` check and was
+/// embedded, persisted, indexed and auto-linked, producing a memory that
+/// occupied an id, a vector slot and graph edges while saying nothing.
+/// Asserted here at dispatch, not only in the planner's own unit test,
+/// because the guarantee that matters is that no caller can get such a row
+/// through the front door.
 #[test]
-fn encode_empty_text_is_rejected_at_planner() {
+fn encode_blank_text_is_rejected_at_planner() {
     use brain_ops::ErrorCode;
     run_in_glommio(|| async {
         let fix = build_fixture();
-        let err = dispatch(
-            RequestBody::Encode(encode_req([0x61; 16], "")),
-            brain_ops::RequestCaller::for_tests(),
-            &fix.ctx,
-        )
-        .await
-        .expect_err("empty text must be rejected upstream of the writer");
-        assert_eq!(err.error_code(), ErrorCode::InvalidRequest);
-        let msg = format!("{err:?}");
-        assert!(
-            msg.contains("text") && (msg.contains("empty") || msg.contains("non-empty")),
-            "error should mention text/empty, got: {msg}",
-        );
+        for blank in ["", " ", "   ", "\t\n", "\u{00a0}"] {
+            let err = dispatch(
+                RequestBody::Encode(encode_req([0x61; 16], blank)),
+                brain_ops::RequestCaller::for_tests(),
+                &fix.ctx,
+            )
+            .await
+            .expect_err("blank text must be rejected upstream of the writer");
+            assert_eq!(err.error_code(), ErrorCode::InvalidRequest, "{blank:?}");
+            let msg = format!("{err:?}");
+            assert!(
+                msg.contains("text"),
+                "{blank:?}: should name the field, got {msg}"
+            );
+            assert!(
+                msg.contains("non-whitespace"),
+                "{blank:?}: should state the rule, got {msg}"
+            );
+        }
     })
 }
 

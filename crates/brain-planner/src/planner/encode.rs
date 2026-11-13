@@ -100,12 +100,29 @@ pub fn plan_encode_inner(
 }
 
 /// Text-only validation shared by the text-encode and vector-direct
-/// paths: non-empty and within the size cap.
+/// paths: carries actual content, and within the size cap.
+///
+/// # Why whitespace is empty
+///
+/// The check was `text.is_empty()`, a BYTE test, so `" "` passed it. A
+/// single space then travelled the whole write path: it was embedded into a
+/// 384-dimension vector, persisted, indexed, and linked into the graph by
+/// the auto-edge router. The result is a memory that can be recalled and
+/// cannot say anything — it occupies an id, a vector slot and edges while
+/// carrying no content for any of them to be about.
+///
+/// Both paths want this. On the vector-direct path `text` is documented as
+/// the text the vector was COMPUTED FROM, so blank text with a real
+/// embedding is a contradiction rather than a placeholder: there is nothing
+/// the vector could be an embedding of.
+///
+/// `trim()` is Unicode-aware, so this also rejects the non-breaking and
+/// ideographic spaces that look like content in a terminal and are not.
 pub fn validate_text(text: &str) -> Result<(), PlanError> {
-    if text.is_empty() {
+    if text.trim().is_empty() {
         return Err(PlanError::InvalidParameters {
             field: "text",
-            reason: "must be non-empty".to_string(),
+            reason: "must contain at least one non-whitespace character".to_string(),
         });
     }
     if text.len() > MAX_TEXT_BYTES {
@@ -230,6 +247,55 @@ mod tests {
             Err(PlanError::InvalidParameters { field, .. }) => assert_eq!(field, "text"),
             other => panic!("expected InvalidParameters[text], got {other:?}"),
         }
+    }
+
+    /// Whitespace is empty, on both paths.
+    ///
+    /// A single space used to pass the byte-level `is_empty()` check and
+    /// travel the entire write path — embedded, persisted, indexed and
+    /// auto-linked — producing a memory that occupies an id, a vector slot
+    /// and graph edges while saying nothing.
+    #[test]
+    fn whitespace_only_text_is_rejected() {
+        for blank in [
+            " ", // the case that shipped
+            "   ", "\t", "\n", " \t\r\n ",
+            "\u{00a0}", // non-breaking space — looks like content
+            "\u{3000}", // ideographic space
+        ] {
+            let mut r = base_request();
+            r.text = blank.to_string();
+            match plan_encode(&r, &PlannerContext::default()) {
+                Err(PlanError::InvalidParameters { field, reason }) => {
+                    assert_eq!(field, "text", "{blank:?}");
+                    assert!(
+                        reason.contains("non-whitespace"),
+                        "{blank:?}: reason should name the real rule, got {reason:?}"
+                    );
+                }
+                other => panic!("{blank:?} must be rejected, got {other:?}"),
+            }
+            // The vector-direct path shares the rule: `text` there is the
+            // text the vector was computed from, so blank text with a real
+            // embedding is a contradiction, not a placeholder.
+            assert!(
+                validate_text(blank).is_err(),
+                "{blank:?} must be rejected on the vector-direct path too"
+            );
+        }
+    }
+
+    /// Text that merely CONTAINS whitespace is still content — the rule
+    /// trims to decide, it does not strip before storing.
+    #[test]
+    fn text_with_surrounding_whitespace_is_accepted() {
+        let mut r = base_request();
+        r.text = "  a real memory  ".to_string();
+        assert!(plan_encode(&r, &PlannerContext::default()).is_ok());
+        assert!(
+            validate_text(" x ").is_ok(),
+            "one real character is content"
+        );
     }
 
     #[test]
