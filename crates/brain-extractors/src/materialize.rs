@@ -711,13 +711,21 @@ mod tests {
 
     /// Diagnostic: the seeded system-schema `entity_mentions` pattern
     /// extractor, materialised verbatim from the DB blob, must emit an
-    /// EntityMention for the obvious "Priya Sharma" surface form. This
-    /// isolates the pattern tier from GLiNER — if this passes, an
-    /// `entities=0` ENCODE is a write-stage or label-snapshot problem,
-    /// not a pattern-tier one.
+    /// EntityMention for a surface its patterns cover. This isolates the
+    /// pattern tier from GLiNER — if this passes, an `entities=0` ENCODE is
+    /// a write-stage or label-snapshot problem, not a pattern-tier one.
+    ///
+    /// The surface is an initials form, because that is what the seed still
+    /// matches. It used to be a plain two-word name, matched by a
+    /// run-of-capitalised-words pattern that was removed: that pattern read
+    /// a sentence-initial determiner as part of the name and cut
+    /// identifiers at punctuation, and measured across twelve domains it
+    /// cost eight points of entity recall. What this test is for — that the
+    /// seeded blob materialises into an extractor that runs and emits — is
+    /// unchanged.
     #[cfg(not(miri))]
     #[test]
-    fn seeded_pattern_extractor_emits_entity_for_priya_sharma() {
+    fn seeded_pattern_extractor_emits_entity_for_an_initials_name() {
         use crate::framework::extractor::ExtractionContext;
         use crate::framework::item::ExtractedItem;
         use crate::framework::registry::ExtractorRegistry;
@@ -746,7 +754,7 @@ mod tests {
             session_id: SessionId(0),
             kind: MemoryKind::Episodic,
             salience: Salience::default(),
-            text: Some("Priya Sharma joined Stripe as a Senior Engineer in San Francisco".into()),
+            text: Some("P. Sharma joined the platform team as a senior engineer".into()),
             created_at_unix_ms: 0,
             last_accessed_at_unix_ms: 0,
             occurred_at_unix_nanos: None,
@@ -779,8 +787,8 @@ mod tests {
             result.items,
         );
         assert!(
-            entity_mentions.iter().any(|em| em.text == "Priya Sharma"),
-            "expected 'Priya Sharma' among emitted mentions; got {:?}",
+            entity_mentions.iter().any(|em| em.text == "P. Sharma"),
+            "expected 'P. Sharma' among emitted mentions; got {:?}",
             entity_mentions
                 .iter()
                 .map(|em| &em.text)

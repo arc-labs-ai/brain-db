@@ -187,11 +187,28 @@ define relation_type family_of {
 # Project / Event / Place / Concept) plus statements; the runtime
 # kind-routing in brain-extractors fans out per emitted item.
 
+# The run-of-capitalised-words pattern was removed here. It read any two
+# adjacent capitalised words as one name, which made a sentence-initial
+# determiner part of whatever followed it ("The Halvard orchard" became the
+# entity "The Halvard") and cut an identifier at the first character its
+# token class could not hold ("The Okonta-4 regulator" became "The Okonta").
+# Those names then stood as their own nodes, so one thing was stored under
+# two or three identities.
+#
+# It also only ever worked on Latin script with Western capitalisation, and
+# matched nothing at all in Japanese or Arabic, so it could not be part of
+# what makes this database general purpose. Measured across twelve domains,
+# dropping it moved entity recall from 89% to 97% and changed paraphrase
+# recall not at all: the classifier and the LLM already name the same things
+# better, and the pattern tier's untyped guesses were displacing them.
+#
+# The initials form stays. It requires a literal `X.` before the name, so it
+# cannot absorb a determiner, and it reads a shape the other tiers are weak
+# at.
 define extractor entity_mentions {
     kind: pattern
     target: entity_or_statement
     patterns [
-        /\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b/,
         /\b([A-Z]\.\s*[A-Z][a-z]+)\b/
     ]
     confidence: 0.7
@@ -268,7 +285,9 @@ Output STRICT JSON with exactly these two sections, and nothing else:
     { "name": "Alice Wong", "type": "brain:Person", "confidence": 0.95 },
     { "name": "Acme Corp", "type": "brain:Organization", "confidence": 0.95 },
     { "name": "Paris", "type": "brain:Place", "confidence": 0.9 },
-    { "name": "Kestrel Gambit", "type": "brain:Game", "confidence": 0.9 }
+    { "name": "Kestrel Gambit", "type": "brain:Game", "confidence": 0.9 },
+    { "name": "Calomide", "type": "brain:Compound", "confidence": 0.92 },
+    { "name": "Harrowgate Ledger", "type": "brain:Document", "confidence": 0.9 }
   ],
   "statements": [
     { "subject": "Alice Wong", "predicate": "brain:works_at", "object": "Acme Corp", "object_is_entity": true, "kind": "Relation", "confidence": 0.92 },
@@ -276,15 +295,20 @@ Output STRICT JSON with exactly these two sections, and nothing else:
     { "subject": "Frank Brown", "predicate": "brain:traveled_to", "object": "Paris", "object_is_entity": true, "kind": "Event", "event_at": "2020-01-15", "confidence": 0.9 },
     { "subject": "Bela Farkas", "predicate": "brain:invented", "object": "Kestrel Gambit", "object_is_entity": true, "kind": "Event", "confidence": 0.9 },
     { "subject": "I", "predicate": "brain:prefers", "object": "dark roast coffee", "object_is_entity": false, "subject_is_self": true, "kind": "Preference", "confidence": 0.95 },
-    { "subject": "Priya", "predicate": "brain:works_at", "object": "Google", "object_is_entity": true, "kind": "Relation", "retract": true, "confidence": 0.9 }
+    { "subject": "Priya", "predicate": "brain:works_at", "object": "Google", "object_is_entity": true, "kind": "Relation", "retract": true, "confidence": 0.9 },
+    { "subject": "Alice Wong", "predicate": "brain:was_given", "object": "Calomide", "object_is_entity": true, "kind": "Event", "confidence": 0.9 },
+    { "subject": "Alice Wong", "predicate": "brain:dose", "object": "10 mg each morning", "object_is_entity": false, "kind": "Attribute", "confidence": 0.9 },
+    { "subject": "Alice Wong", "predicate": "brain:signed", "object": "Harrowgate Ledger", "object_is_entity": true, "kind": "Event", "confidence": 0.9 }
   ]
 }
 
-In that example no listed type named a Kestrel Gambit, so its real kind was coined instead of being flattened into `brain:Concept`.
+In that example no listed type named a Kestrel Gambit, so its real kind was coined instead of being flattened into `brain:Concept`. Calomide and the Harrowgate Ledger are both OBJECTS of verbs and both still entities, because each names a particular thing another memory could name too. They take DIFFERENT types, and neither type is the lesson: the lesson is that a named thing stays a thing wherever it appears in the sentence, and that its type is whatever KIND it actually is. Do not reach for a type because an example used it, and do not reach for one of these two. The dose beside them is a value, because it is true only of this subject. The text it came from also said "the patient", and no entity was emitted for that: a bare common noun under a determiner names whoever fills a part, not a particular one.
 
 Rules:
 - EVERY TRIPLE MUST READ AS A TRUE SENTENCE ON ITS OWN. Before emitting, read "<subject> <predicate> <object>" back: if that is not a true, complete statement, the triple is WRONG — reshape it. A role, title, rank, or capacity attached to a verb ("joined X as a <job title>", "hired as <job title>", "serves as <job title>") is NOT an object of that verb — "<person> joined <job title>" is not a sentence and must never be emitted. Split it into TWO triples and emit BOTH: the verb keeps ONLY the thing it actually acts on, and you MUST ALSO emit the role as its own triple — subject, a role/occupation-shaped predicate, and the title as a VALUE (`object_is_entity: false`). Never emit one subject+predicate pair twice with two objects that mean different kinds of thing; that is the signature of a qualifier you failed to split. Splitting is mandatory: dropping the role is a LOSS of a stated fact, and only the malformed pairing is ever discarded, never the fact itself.
 - Decompose each assertion into a clean (subject, predicate, object). The predicate is the relation; the object is the entity or a short clean value it acts on — NEVER a verb phrase or sentence fragment. "Alice works at Acme" -> predicate "brain:works_at", object "Acme Corp" (NOT "works at Acme").
+- An object that NAMES A PARTICULAR THING is an entity, not a value: set `object_is_entity: true` and give it an entry under `entities`. A thing qualifies when other memories could name the same one — a substance, a product, a model, a standard, a work, a place, an organisation, a person. A value is what is true only of this subject: a quantity, a date, a measurement, a status, a descriptor. Getting this wrong does not lose the fact, but it strands the thing: a value cannot be reached from another memory that mentions it, cannot carry a type, and never appears when the things of its kind are listed.
+- A generic role or category is NOT an entity. A phrase that names whoever happens to fill a part rather than a particular one — a bare common noun under a determiner — identifies nothing another memory could match, and emitting it crowds out the specific things in the same sentence. Name the actual participant when the text gives one; when it does not, leave the subject out and keep the triple about the things it does name.
 - Objects must be ATOMIC. One fact per object: never join multiple things with "and"/"or"/commas. "interested in counseling and mental health" -> emit TWO triples, object "counseling" and object "mental health" (NOT one object "counseling and mental health"). Strip filler words so the object is the bare thing itself ("mental health jobs" -> "mental health"). The object is a single entity name or a bare value — NEVER a clause, description, or sentence fragment. If the object still reads like part of a sentence (it contains a verb, a preposition phrase, or a relative clause), reduce it to the bare thing it names, or drop the triple.
 - Locations are RELATIONS to a place, not prose. When the fact states where an entity is (lives, works, is based) or where an event happened, emit it as a Relation whose object is the place itself, with `object_is_entity: true` (e.g. predicate "brain:lives_in" object "Paris", predicate "brain:located_in" object "Paris") — never bury the place inside a longer value so "where" can be answered as the object of that relation.
 - Objects must be SPECIFIC. The object must name a particular thing. If the only object you can form is a generic placeholder or a bare category rather than a specific named thing, drop the triple — a vague object is worse than no triple.
