@@ -58,7 +58,8 @@ use brain_protocol::{
     EntityGetRequest, EntityGetResponse, EntityListItem, EntityListRequest,
     EntityListResponseFrame, EntityMergeRequest, EntityMergeResponse, EntityRenameRequest,
     EntityRenameResponse, EntityResolveRequest, EntityResolveResponse, EntityTombstoneRequest,
-    EntityTombstoneResponse, EntityUnmergeRequest, EntityUnmergeResponse, EntityUpdateRequest,
+    EntityTombstoneResponse, EntityTypeListItem, EntityTypeListRequest,
+    EntityTypeListResponseFrame, EntityUnmergeRequest, EntityUnmergeResponse, EntityUpdateRequest,
     EntityUpdateResponse, EntityView, EventType, EvidenceRefWire, ExtractorListItem,
     ExtractorListRequest, ExtractorListResponseFrame, ForgetMode, ForgetRequest, ForgetResponse,
     Frame, GraphEdge, GraphFetchRequest, GraphFetchResponseFrame, GraphNode, InferenceKind,
@@ -828,6 +829,26 @@ fn sample_get_capabilities() -> GetCapabilitiesResponse {
             schema_namespaces: vec!["org".into()],
             vector_dim: 384,
         },
+    }
+}
+
+fn sample_entity_type_list() -> EntityTypeListResponseFrame {
+    EntityTypeListResponseFrame {
+        items: vec![
+            EntityTypeListItem {
+                entity_type_id: 1,
+                type_qname: "brain:Person".into(),
+                declared: true,
+                created_at_unix_nanos: 1_700_000_000_000_000_000,
+            },
+            EntityTypeListItem {
+                entity_type_id: 34,
+                type_qname: "org:Device".into(),
+                declared: false,
+                created_at_unix_nanos: 1_700_000_000_000_000_001,
+            },
+        ],
+        total: 2,
     }
 }
 
@@ -1784,6 +1805,19 @@ fn corpus() -> Vec<Case> {
         "resp_txn_abort",
         ResponseBody::TxnAbort(txn_abort_resp),
         &txn_abort_resp,
+    ));
+
+    // ---- Entity type introspection ----
+    let entity_type_list_req = EntityTypeListRequest { act_as: None };
+    cases.push(req_case(
+        "req_entity_type_list",
+        RequestBody::EntityTypeList(entity_type_list_req.clone()),
+        &entity_type_list_req,
+    ));
+    cases.push(resp_case(
+        "resp_entity_type_list",
+        ResponseBody::EntityTypeList(sample_entity_type_list()),
+        &sample_entity_type_list(),
     ));
 
     // ---- Extractor introspection ----
@@ -3817,6 +3851,8 @@ fn required_families() -> Vec<(&'static str, Opcode)> {
         ("txn.commit_resp", Opcode::TxnCommitResp),
         ("txn.abort_resp", Opcode::TxnAbortResp),
         ("capabilities.get_resp", Opcode::GetCapabilitiesResp),
+        ("entity.type_list_req", Opcode::EntityTypeListReq),
+        ("entity.type_list_resp", Opcode::EntityTypeListResp),
         ("extractor.list_req", Opcode::ExtractorListReq),
         ("extractor.list_resp", Opcode::ExtractorListResp),
         ("registry.space_create", Opcode::SpaceCreateReq),

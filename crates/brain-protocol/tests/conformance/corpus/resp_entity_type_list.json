@@ -1,0 +1,17 @@
+{
+  "items": [
+    {
+      "entity_type_id": 1,
+      "type_qname": "brain:Person",
+      "declared": true,
+      "created_at_unix_nanos": 1700000000000000000
+    },
+    {
+      "entity_type_id": 34,
+      "type_qname": "org:Device",
+      "declared": false,
+      "created_at_unix_nanos": 1700000000000000001
+    }
+  ],
+  "total": 2
+}

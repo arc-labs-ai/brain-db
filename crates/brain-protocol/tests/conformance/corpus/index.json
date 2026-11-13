@@ -336,6 +336,18 @@
     "payload_len": 47
   },
   {
+    "name": "req_entity_type_list",
+    "opcode": "0x0139",
+    "kind": "request",
+    "payload_len": 1
+  },
+  {
+    "name": "resp_entity_type_list",
+    "opcode": "0x01B9",
+    "kind": "response",
+    "payload_len": 178
+  },
+  {
     "name": "req_extractor_list",
     "opcode": "0x0124",
     "kind": "request",
