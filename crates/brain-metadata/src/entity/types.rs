@@ -121,6 +121,63 @@ pub fn entity_type_name_by_id(
     Ok(name)
 }
 
+/// One row of [`entity_type_list_scoped`].
+pub struct ScopedEntityType {
+    pub entity_type_id: u32,
+    pub name: String,
+    pub namespace_id: u32,
+    pub created_at_unix_nanos: u64,
+}
+
+/// Every entity type the given scope resolves, narrowest scope first.
+///
+/// Walks the same `(ns, space) -> (ns, base) -> (SYSTEM, base)` ladder a
+/// single lookup walks, so a caller is told exactly the types their own
+/// writes would resolve against — their space's overlay, their tenant's
+/// base, and the shared built-ins. A name shadowed by a narrower scope is
+/// returned once, as the row that would win.
+pub fn entity_type_list_scoped(
+    rtxn: &ReadTransaction,
+    scope: TypeScope,
+) -> Result<Vec<ScopedEntityType>, EntityTypeOpError> {
+    let idx = rtxn.open_table(ENTITY_TYPES_BY_SCOPE_TABLE)?;
+    let types = rtxn.open_table(ENTITY_TYPES_TABLE)?;
+    let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for (ns, sp) in scope.chain() {
+        for entry in idx.range((ns, sp, "")..=(ns, sp, "\u{10FFFF}"))? {
+            let (key, id) = entry?;
+            let (_, _, name) = key.value();
+            if !seen_names.insert(name.to_string()) {
+                continue;
+            }
+            if let Some(row) = types.get(&id.value())?.map(|g| g.value()) {
+                out.push(ScopedEntityType {
+                    entity_type_id: row.entity_type_id,
+                    name: row.name,
+                    namespace_id: row.namespace_id,
+                    created_at_unix_nanos: row.created_at_unix_nanos,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Whether `id` names a registered entity type, on a read transaction.
+///
+/// The write path already refuses an unknown type, but it does so inside
+/// the writer, where the rejection is reported as an internal failure and
+/// reaches the caller as a 502. A handler that must answer "is this id
+/// real?" before submitting needs the same question answered on a read.
+pub fn entity_type_exists_rtxn(
+    rtxn: &ReadTransaction,
+    id: EntityTypeId,
+) -> Result<bool, EntityTypeOpError> {
+    let t = rtxn.open_table(ENTITY_TYPES_TABLE)?;
+    Ok(t.get(&id.raw())?.is_some())
+}
+
 fn scope_index_get(
     wtxn: &WriteTransaction,
     namespace_id: u32,

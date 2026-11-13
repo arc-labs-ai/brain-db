@@ -64,9 +64,9 @@ pub use entity::trigram::{
     lookup_candidates_by_trigram, remove_entity_trigrams, trigrams_of_entity, TrigramOpError,
 };
 pub use entity::types::{
-    entity_type_intern, entity_type_label_qnames, entity_type_lookup, entity_type_lookup_rtxn,
-    entity_type_name_by_id, render_declared_entity_types_block, EntityTypeOpError,
-    EntityTypeQnames,
+    entity_type_exists_rtxn, entity_type_intern, entity_type_label_qnames, entity_type_list_scoped,
+    entity_type_lookup, entity_type_lookup_rtxn, entity_type_name_by_id,
+    render_declared_entity_types_block, EntityTypeOpError, EntityTypeQnames, ScopedEntityType,
 };
 pub use extraction::queue::{
     extraction_queue_drain, extraction_queue_enqueue, extraction_queue_len,

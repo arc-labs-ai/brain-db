@@ -121,6 +121,7 @@ pub enum ResponseBody {
     /// Streaming response — per-item or tail. Wire opcode is the same
     /// (`0x01B7`); the body's `is_final()` discriminates.
     EntityList(EntityListResponseFrame),
+    EntityTypeList(EntityTypeListResponseFrame),
     EntityTombstone(EntityTombstoneResponse),
 
     // Statement ops.
@@ -232,6 +233,7 @@ impl ResponseBody {
             Self::EntityUnmerge(_) => Opcode::EntityUnmergeResp,
             Self::EntityResolve(_) => Opcode::EntityResolveResp,
             Self::EntityList(_) => Opcode::EntityListResp,
+            Self::EntityTypeList(_) => Opcode::EntityTypeListResp,
             Self::EntityTombstone(_) => Opcode::EntityTombstoneResp,
             Self::StatementCreate(_) => Opcode::StatementCreateResp,
             Self::StatementGet(_) => Opcode::StatementGetResp,
@@ -344,6 +346,7 @@ impl ResponseBody {
             Self::EntityUnmerge(r) => to_cbor_bytes(r),
             Self::EntityResolve(r) => to_cbor_bytes(r),
             Self::EntityList(r) => to_cbor_bytes(r),
+            Self::EntityTypeList(r) => to_cbor_bytes(r),
             Self::EntityTombstone(r) => to_cbor_bytes(r),
             Self::StatementCreate(r) => to_cbor_bytes(r),
             Self::StatementGet(r) => to_cbor_bytes(r),
@@ -435,6 +438,7 @@ impl ResponseBody {
             Opcode::EntityUnmergeResp => Self::EntityUnmerge(from_cbor_bytes(bytes)?),
             Opcode::EntityResolveResp => Self::EntityResolve(from_cbor_bytes(bytes)?),
             Opcode::EntityListResp => Self::EntityList(from_cbor_bytes(bytes)?),
+            Opcode::EntityTypeListResp => Self::EntityTypeList(from_cbor_bytes(bytes)?),
             Opcode::EntityTombstoneResp => Self::EntityTombstone(from_cbor_bytes(bytes)?),
             Opcode::StatementCreateResp => Self::StatementCreate(from_cbor_bytes(bytes)?),
             Opcode::StatementGetResp => Self::StatementGet(from_cbor_bytes(bytes)?),

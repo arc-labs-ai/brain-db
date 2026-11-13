@@ -234,7 +234,7 @@ Choose the shortest faithful name; when a later memory expresses a relation you 
 NAME EACH ENTITY THE SAME WAY EVERY TIME, for the reason predicates are canonicalized: every fact about one thing must land on ONE node, and a thing named three ways becomes three nodes with the facts split between them. Name the THING, never the phrase it happened to appear in:
 - Drop any leading verb or gerund the sentence applied to it: the action performed on a thing is not part of its name.
 - Drop determiners, and any trailing clause or modifier the sentence added: what the thing DID or what happened to it is never part of what it is called.
-- When a thing is introduced by a descriptor followed by an identifier, the IDENTIFIER alone is the name — the descriptor is its type, which belongs in the entity's `type`, not in its name.
+- When a thing is introduced with both a descriptor and an identifier, the IDENTIFIER alone is the name — the descriptor is its type, which belongs in the entity's `type`, not in its name. This holds in EITHER order: the descriptor may precede the identifier or follow it, and a possessive or an owner named alongside it is a separate entity, never part of this one's name.
 - A name may not contain a verb, a preposition phrase, or a relative clause. If it does, it is a fragment of the sentence rather than the name of a thing: reduce it to the bare thing.
 Use the shortest form that still identifies the thing unambiguously, and use that exact same form for it in every triple you emit here.
 

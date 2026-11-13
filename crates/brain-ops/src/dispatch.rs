@@ -435,6 +435,12 @@ pub async fn dispatch(
             .await
             .map(|b| single(ResponseBody::EntityList(b))),
 
+        RequestBody::EntityTypeList(r) => {
+            crate::handlers::entity::handle_entity_type_list(r, &caller, ctx)
+                .await
+                .map(|b| single(ResponseBody::EntityTypeList(b)))
+        }
+
         RequestBody::EntityTombstone(r) => crate::handlers::entity::handle_entity_tombstone(r, ctx)
             .await
             .map(|b| single(ResponseBody::EntityTombstone(b))),
@@ -832,6 +838,7 @@ fn enforce_permission(caller: &RequestCaller, req: &RequestBody) -> Result<(), O
         // typed-graph reads.
         RequestBody::EntityGet(_)
         | RequestBody::EntityList(_)
+        | RequestBody::EntityTypeList(_)
         | RequestBody::EntityResolve(_)
         | RequestBody::StatementGet(_)
         | RequestBody::StatementHistory(_)
