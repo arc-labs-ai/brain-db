@@ -271,6 +271,47 @@ pub fn entity_resolve_canonical_all_types(
     Ok(out)
 }
 
+/// Resolve a free-text candidate to entities by exact **alias** match
+/// across every registered entity type — the alias counterpart to
+/// [`entity_resolve_canonical_all_types`].
+///
+/// The alias index is keyed `(namespace, space, type_id, alias, entity_id)`,
+/// so like the canonical index it cannot be scanned without a type. Both
+/// walk the type registry for the same reason, and the registry is small.
+///
+/// Exact, not fuzzy: an alias is a declared alternate name, so matching one
+/// is the same kind of statement as matching a canonical name. That is why
+/// this belongs on the no-hint path and trigram scoring does not — a caller
+/// who knows a thing by one of its recorded names should not have to know
+/// its type as well.
+///
+/// Returns the distinct EntityIds that matched (0, 1, or more); the caller
+/// decides how to treat ambiguity.
+pub fn entity_resolve_alias_all_types(
+    rtxn: &ReadTransaction,
+    scope: RowScope,
+    candidate: &str,
+) -> Result<Vec<EntityId>, EntityOpError> {
+    let type_ids: Vec<u32> = {
+        let types_t = rtxn.open_table(ENTITY_TYPES_TABLE)?;
+        let mut v = Vec::new();
+        for entry in types_t.iter()? {
+            let (k, _) = entry?;
+            v.push(k.value());
+        }
+        v
+    };
+    let mut out: Vec<EntityId> = Vec::new();
+    for tid in type_ids {
+        for id in entity_lookup_by_alias(rtxn, scope, EntityTypeId::from(tid), candidate)? {
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Minimum trigram-Jaccard a fuzzy candidate must clear to be offered by
 /// [`entity_resolve_scored`]. Read-path resolution feeds a grounded answer,
 /// so a wrong subject yields a wrong fact — the floor is deliberately
@@ -1633,6 +1674,72 @@ mod tests {
         // A name no entity carries resolves to nothing.
         let none = entity_resolve_canonical_all_types(&rtxn, test_scope(), "Nobody Here").unwrap();
         assert!(none.is_empty());
+    }
+
+    #[test]
+    fn resolve_alias_all_types_finds_match_without_type_hint() {
+        // The alias counterpart of the canonical cross-type resolve. An
+        // alias is a declared alternate name, so a caller who knows a thing
+        // by that name should reach it without also knowing its type.
+        let dir = TempDir::new().unwrap();
+        let db = fresh_db(&dir);
+        let mut e = person_entity("Folake Adebayo");
+        e.aliases.push("Fola".into());
+        let id = e.id;
+        let wtxn = db.write_txn().unwrap();
+        entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &e).unwrap();
+        wtxn.commit().unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        assert_eq!(
+            entity_resolve_alias_all_types(&rtxn, test_scope(), "Fola").unwrap(),
+            vec![id],
+            "an alias resolves with no type hint"
+        );
+        // Normalization applies to aliases exactly as to canonical names.
+        assert_eq!(
+            entity_resolve_alias_all_types(&rtxn, test_scope(), "  fOLA ").unwrap(),
+            vec![id],
+            "alias matching folds case and trims"
+        );
+        // The canonical name is NOT an alias, and vice versa: the two
+        // indexes are separate, which is why the handler consults both.
+        assert!(
+            entity_resolve_alias_all_types(&rtxn, test_scope(), "Folake Adebayo")
+                .unwrap()
+                .is_empty(),
+            "a canonical name is not in the alias index"
+        );
+        assert!(
+            entity_resolve_alias_all_types(&rtxn, test_scope(), "Nobody")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn resolve_alias_all_types_reports_every_holder_of_a_shared_alias() {
+        // Two entities can list the same alias; the resolver reports both
+        // rather than picking, so the caller can answer "ambiguous".
+        let dir = TempDir::new().unwrap();
+        let db = fresh_db(&dir);
+        let mut a = person_entity("Alexandra Stone");
+        a.aliases.push("Alex".into());
+        let mut b = person_entity("Alexander Pike");
+        b.aliases.push("Alex".into());
+        let (aid, bid) = (a.id, b.id);
+
+        let wtxn = db.write_txn().unwrap();
+        entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &a).unwrap();
+        entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &b).unwrap();
+        wtxn.commit().unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        let mut hits = entity_resolve_alias_all_types(&rtxn, test_scope(), "Alex").unwrap();
+        hits.sort();
+        let mut want = vec![aid, bid];
+        want.sort();
+        assert_eq!(hits, want, "both holders of the alias are reported");
     }
 
     #[test]

@@ -819,12 +819,19 @@ pub async fn handle_entity_resolve(
             "candidate_name exceeds 256 bytes".into(),
         ));
     }
-    // No type hint → cross-type exact resolve across every declared
-    // entity type. This is the grounded-read default: a caller asking
-    // about "Alice" shouldn't have to know her entity type. One exact
-    // canonical-name hit → resolved; several distinct hits → ambiguous;
-    // none → not found. Typed fuzzy tiers (trigram/alias) need a specific
-    // type, so the no-hint path stays exact-only — precise and fast.
+    // No type hint → cross-type EXACT resolve across every declared entity
+    // type. This is the grounded-read default: a caller asking about "Alice"
+    // shouldn't have to know her entity type. One exact hit → resolved;
+    // several distinct hits → ambiguous; none → not found. The fuzzy tier
+    // (trigram) needs a specific type, so the no-hint path stays exact-only
+    // — precise and fast.
+    //
+    // Aliases count as exact. An alias is a declared alternate name, so
+    // matching one is the same kind of statement as matching a canonical
+    // name, and the reason a caller is spared the type applies to both: the
+    // name they know a thing by may well be the alias. Canonical is tried
+    // first and wins outright, so an entity whose CANONICAL name is the cue
+    // is never shadowed by another entity that merely lists it as an alias.
     let scope =
         brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_space);
     if req.entity_type_hint == 0 {
@@ -833,9 +840,13 @@ pub async fn handle_entity_resolve(
             .metadata
             .read_txn()
             .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
-        let ids =
+        let mut ids =
             brain_metadata::entity_resolve_canonical_all_types(&rtxn, scope, &req.candidate_name)
                 .map_err(OpError::from)?;
+        if ids.is_empty() {
+            ids = brain_metadata::entity_resolve_alias_all_types(&rtxn, scope, &req.candidate_name)
+                .map_err(OpError::from)?;
+        }
         drop(rtxn);
         return Ok(match ids.as_slice() {
             [id] => EntityResolveResponse {
