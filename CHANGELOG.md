@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.4.2](https://github.com/arc-labs-ai/brain-db/compare/v0.4.1...v0.4.2) (2026-11-13)
+
+
+### Features
+
+* **entity:** report the entity types a caller can use, with their ids ([17757c9](https://github.com/arc-labs-ai/brain-db/commit/17757c996ba6829fd169dbba233563eb8a9c6d48))
+
+
+### Bug Fixes
+
+* **core:** refuse a server-stamped tombstone reason from a caller ([75f73e9](https://github.com/arc-labs-ai/brain-db/commit/75f73e9b48c6ec807894f80f2dce2bb8b1d71729))
+* **deps:** take the quinn-udp patch for RUSTSEC-2026-0538 ([2f718e0](https://github.com/arc-labs-ai/brain-db/commit/2f718e0ff49bc42096863d83efe4a98755c3ab3a))
+* **extraction:** stop a capitalisation heuristic corrupting names, and keep a named object a thing ([f24f3ea](https://github.com/arc-labs-ai/brain-db/commit/f24f3eacf0790e27f23439a07e0a69e6882f40d0))
+* **extractors:** cover long input with overlapping GLiNER windows ([64cc46c](https://github.com/arc-labs-ai/brain-db/commit/64cc46c2ae4ef34eef4985aba652fd8fd8e7d748))
+* **extractors:** extract entities as their own section, not per statement ([8bd20c9](https://github.com/arc-labs-ai/brain-db/commit/8bd20c97c8cbe3020aa3051fef050ed5898e7045))
+* **extractors:** refuse to coin an entity type the schema cannot declare ([346d340](https://github.com/arc-labs-ai/brain-db/commit/346d340d6918b89aa8c50955c4232dfca8f7445a))
+* **extractors:** resolve the LLM extractor's credential at dispatch ([5f7ffb6](https://github.com/arc-labs-ai/brain-db/commit/5f7ffb617e9f57ed75d866bce8b6daae2e09efcd))
+* **llm:** retry a completion the model rejects over its temperature ([9027da0](https://github.com/arc-labs-ai/brain-db/commit/9027da04339854490af6c889254aeb3c517674d1))
+* **metadata:** skip a replayed record that no longer applies ([1f62931](https://github.com/arc-labs-ai/brain-db/commit/1f62931fe6387ca9eaa5d9caacc54b5ea0c1dcff))
+* **ops:** refuse an edge to itself, and a recall gate outside [0, 1] ([9773863](https://github.com/arc-labs-ai/brain-db/commit/977386391ccb2d499a1efeefa0f666dc7a4cebbe))
+* **ops:** resolve an entity by alias without a type hint ([5be6f3c](https://github.com/arc-labs-ai/brain-db/commit/5be6f3ce575866dd2f7ba61fd4020148f29f2d77))
+* **ops:** stamp the caller's namespace on a vector-direct write ([6aeaf29](https://github.com/arc-labs-ai/brain-db/commit/6aeaf29f6a257e268112c395dfb2fd005487e85a))
+* **planner:** reject text that is only whitespace ([6c94690](https://github.com/arc-labs-ai/brain-db/commit/6c94690197da1614385ef98115cc63a850ee7904))
+* **protocol:** classify a retired relation like a retired statement ([c94d927](https://github.com/arc-labs-ai/brain-db/commit/c94d92748fa0a1ed0ce85c5da273496a0190e760))
+* **protocol:** remove the LLM credential scope selector ([34e2c57](https://github.com/arc-labs-ai/brain-db/commit/34e2c573d8eba1b3e5135c08fcee3539e9a9960f))
+* **workers:** stamp the caller namespace on derived edges, and skip a refused statement on replay ([775a201](https://github.com/arc-labs-ai/brain-db/commit/775a2010809952553acb74520c4845cc9cff5ec5))
+
 ## [0.4.1](https://github.com/arc-labs-ai/brain-db/compare/v0.4.0...v0.4.1) (2026-11-11)
 
 
