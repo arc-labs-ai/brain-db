@@ -15,7 +15,6 @@ thiserror.workspace = true
 bytemuck.workspace = true
 libc.workspace = true
 tracing.workspace = true
-crossbeam-channel.workspace = true
 # WAL writer now runs on Glommio's executor via io_uring (sub-task 9.6a).
 # Both deps are Linux-only — matches the crate-level compile_error in lib.rs.
 glommio.workspace = true

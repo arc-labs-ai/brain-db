@@ -184,8 +184,12 @@ impl SlotAllocator {
             None => return Err(AllocError::SlotRetired { idx }),
         };
 
-        // 3. Set PENDING_WRITE on disk. Encoder will clear
-        //    it (and set OCCUPIED) when the slot's data is fully written.
+        // 3. Mark the slot pending-write on disk, so a crash before the
+        //    slot's bytes are durable leaves it detectable as reclaimable
+        //    rather than indistinguishable from a committed slot. The slot
+        //    reaches OCCUPIED when WAL recovery materializes its bytes
+        //    (`recovery::write_encoded_slot`), the only path that writes
+        //    arena slot contents.
         let s = arena.slot_mut(idx);
         s.set_flag(flags::PENDING_WRITE, true);
         s.refresh_crc();

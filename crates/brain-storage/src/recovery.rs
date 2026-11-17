@@ -35,7 +35,7 @@ use crate::wal::payload::{
     ConsolidatePayload, EncodePayload, ForgetMode, ForgetPayload, MigrateEmbeddingPayload,
     ReclaimPayload, WalPayload, WalPayloadError,
 };
-use crate::wal::reader::{WalReadError, WalReader};
+use crate::wal::reader::{DecodeFailure, WalReadError, WalReader};
 use crate::wal::record::{WalRecord, FLAG_SUBSCRIBE_EVENT};
 use crate::wal::segment::WAL_SEGMENT_HEADER_LEN;
 
@@ -178,6 +178,20 @@ pub enum RecoveryError {
     },
 
     #[error(
+        "WAL segment {segment_seq} has a durability hole at byte {offset} with \
+             {survivor_count} acknowledged record(s) beyond it (first LSN \
+             {first_survivor_lsn:?}, cause: {cause}); refusing to discard acknowledged writes — an \
+             operator must repair this WAL explicitly"
+    )]
+    AcknowledgedDataBehindHole {
+        segment_seq: u64,
+        offset: u64,
+        survivor_count: u64,
+        first_survivor_lsn: Option<u64>,
+        cause: DecodeFailure,
+    },
+
+    #[error(
         "transaction {txn_id:?} buffered more records ({buffered}) than its declared \
          expected_record_count ({expected}) without a commit — WAL is corrupt"
     )]
@@ -209,20 +223,41 @@ pub struct RecoveryReport {
     /// members) or never fully decoded (a torn tail). Resuming here lets
     /// new appends reuse the LSNs of the truncated-away bytes with no gap.
     pub next_lsn: u64,
-    /// Byte length the **active** (highest-`segment_seq`) segment must be
-    /// truncated to before resuming appends: the file position immediately
-    /// after the last durably-good, fully-applied record in that segment,
-    /// or `WAL_SEGMENT_HEADER_LEN` if every record in the active segment was
-    /// discarded/torn (or the active segment is empty). Everything past this
-    /// offset is torn-tail bytes or a never-committed dangling-transaction
-    /// prefix that a crash left behind; [`crate::wal::wal::Wal::open_existing`]
-    /// physically `set_len`s the segment to this length so new appends
-    /// overwrite rather than follow the garbage.
-    pub active_tail_offset: u64,
-    /// `segment_seq` of the active segment `active_tail_offset` refers to,
-    /// or `None` if the WAL had no segments. Lets the reopen path assert it
-    /// is truncating the same segment recovery validated.
-    pub active_segment_seq: Option<u64>,
+    /// Physical end of the durably-good, fully-applied prefix of the WAL: the
+    /// segment that holds the last such record and the byte position just past
+    /// it. Everything after this point is a never-committed transaction's
+    /// members or torn bytes a crash left behind, so the reopen path cuts the
+    /// WAL back to exactly here before any new append follows it.
+    /// `None` only when the WAL directory held no segments at all.
+    pub tail: Option<WalTail>,
+    /// Set when boot cuts the log back at a durability hole: a crash tears a
+    /// multi-page batch and the bytes past the hole are never acked to any
+    /// client. Operators need the exact extent, so it is reported rather than
+    /// merely logged.
+    pub hole_discard: Option<WalHoleDiscard>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalTail {
+    pub segment_seq: u64,
+    pub offset: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalHoleDiscard {
+    pub segment_seq: u64,
+    /// Byte offset of the hole in that segment.
+    pub hole_offset: u64,
+    /// Bytes from the recovered tail to the end of the segment file.
+    pub discarded_bytes: u64,
+    /// First LSN that no longer exists in the log (`next_lsn` after recovery).
+    pub first_discarded_lsn: u64,
+    /// Highest LSN still recognizable past the hole, when any record there
+    /// decoded. The LSNs lost inside the hole itself are unknowable — the
+    /// bytes are zeros — so this is a floor, not the full extent.
+    pub last_recognizable_lsn: Option<u64>,
+    /// Count of well-formed records found past the hole.
+    pub recognizable_record_count: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -239,11 +274,11 @@ pub fn recover(
 ) -> Result<(RecoveryReport, SlotAllocator), RecoveryError> {
     let durable_lsn = sink.durable_lsn();
     let mut reader = WalReader::open(wal_dir, shard_uuid)?;
-    let active_segment_seq = reader.active_segment_seq();
 
     let mut records_replayed: u64 = 0;
     let mut records_skipped: u64 = 0;
     let mut records_discarded: u64 = 0;
+    let mut hole_discard: Option<(u64, u64, u64, Option<u64>, u64)> = None;
 
     // The durably-good, fully-applied tail: the LSN + physical position
     // (segment_seq, end offset) of the last record we're certain is
@@ -262,7 +297,58 @@ pub fn recover(
     let mut txn_buffer: Vec<(WalRecord, WalPayload)> = Vec::new();
 
     while let Some(item) = reader.next() {
-        let record = item?;
+        let record = match item {
+            Ok(record) => record,
+            Err(WalReadError::MidSegmentCorruption {
+                segment_seq,
+                offset,
+                in_active_segment,
+                survivors,
+                cause,
+            }) => {
+                // The durability rule is: every byte written before an
+                // acknowledged record is durable when its ack is sent. The
+                // committer owns the file, append offsets increase strictly,
+                // and an ack follows both the full-length write_at and
+                // fdatasync; fdatasync flushes the whole file's dirty data.
+                // Therefore a record beyond a non-durable hole cannot be
+                // acknowledged. Truncating to the last good record preserves
+                // every promise made to a client. A hole in a fully-rolled-
+                // over segment is an exception because later segments can
+                // contain acked records whose fdatasync does not repair this
+                // file. A survivor at or below sink.durable_lsn() is also an
+                // exception because metadata already durably applies it.
+                if !in_active_segment || survivors.first_lsn.is_some_and(|lsn| lsn <= durable_lsn) {
+                    return Err(RecoveryError::AcknowledgedDataBehindHole {
+                        segment_seq,
+                        offset,
+                        survivor_count: survivors.count,
+                        first_survivor_lsn: survivors.first_lsn,
+                        cause,
+                    });
+                }
+
+                let segment = reader
+                    .segments()
+                    .iter()
+                    .find(|segment| segment.segment_seq == segment_seq)
+                    .expect("corruption segment is present in reader metadata");
+                let recovered_tail_offset = if good_tail_segment_seq == Some(segment_seq) {
+                    good_tail_offset.unwrap_or(WAL_SEGMENT_HEADER_LEN)
+                } else {
+                    WAL_SEGMENT_HEADER_LEN
+                } as u64;
+                hole_discard = Some((
+                    segment_seq,
+                    offset,
+                    segment.file_size.saturating_sub(recovered_tail_offset),
+                    survivors.last_lsn,
+                    survivors.count,
+                ));
+                break;
+            }
+            Err(e) => return Err(e.into()),
+        };
         let lsn = record.lsn.raw();
 
         // Records at or below the durable checkpoint are already applied
@@ -403,18 +489,48 @@ pub fn recover(
         records_discarded += txn_buffer.len() as u64;
     }
 
-    // The active segment is truncated to the tail offset iff the tail lives
-    // in that segment. Otherwise the active segment holds only discarded /
-    // torn bytes (or is an empty post-rollover segment) and is cut back to
-    // its header. New appends then resume at `last_good_lsn + 1`, reusing
+    // Reopen truncates the segment that holds the tail and removes every
+    // later segment. New appends then resume at `last_good_lsn + 1`, reusing
     // the truncated LSNs with no gap.
-    let active_tail_offset = match (good_tail_segment_seq, active_segment_seq) {
-        (Some(good_seq), Some(active_seq)) if good_seq == active_seq => {
-            good_tail_offset.unwrap_or(WAL_SEGMENT_HEADER_LEN) as u64
-        }
-        _ => WAL_SEGMENT_HEADER_LEN as u64,
+    let tail = match good_tail_segment_seq {
+        Some(segment_seq) => Some(WalTail {
+            segment_seq,
+            offset: good_tail_offset.unwrap_or(WAL_SEGMENT_HEADER_LEN) as u64,
+        }),
+        None => reader.oldest_segment_seq().map(|segment_seq| WalTail {
+            segment_seq,
+            offset: WAL_SEGMENT_HEADER_LEN as u64,
+        }),
     };
     let next_lsn = last_good_lsn + 1;
+    let hole_discard = hole_discard.map(
+        |(
+            segment_seq,
+            hole_offset,
+            discarded_bytes,
+            last_recognizable_lsn,
+            recognizable_record_count,
+        )| {
+            let report = WalHoleDiscard {
+                segment_seq,
+                hole_offset,
+                discarded_bytes,
+                first_discarded_lsn: next_lsn,
+                last_recognizable_lsn,
+                recognizable_record_count,
+            };
+            tracing::warn!(
+                segment_seq = report.segment_seq,
+                hole_offset = report.hole_offset,
+                discarded_bytes = report.discarded_bytes,
+                first_discarded_lsn = report.first_discarded_lsn,
+                last_recognizable_lsn = ?report.last_recognizable_lsn,
+                recognizable_record_count = report.recognizable_record_count,
+                "WAL durability hole discarded during recovery"
+            );
+            report
+        },
+    );
 
     let allocator = SlotAllocator::rebuild_from_arena(arena);
     Ok((
@@ -423,8 +539,8 @@ pub fn recover(
             records_skipped,
             records_discarded,
             next_lsn,
-            active_tail_offset,
-            active_segment_seq,
+            tail,
+            hole_discard,
         },
         allocator,
     ))
@@ -492,8 +608,8 @@ fn apply_to_arena(
         // A soft FORGET never zeroed the arena slot (soft keeps the
         // vector until grace), so un-tombstoning it touches redb only.
         | WalPayload::RestoreMemory(_) => Ok(()),
-        // typed-graph records: substrate apply-paths ignore these.
-        // Phases 16+ hydrate typed-graph state via their own sinks. Sub-task 15.2.
+        // Typed-graph records: the substrate apply-paths ignore these, because
+        // typed-graph state is hydrated by its own dedicated sinks.
         WalPayload::PhaseBody(r) => {
             tracing::trace!(
                 kind = ?r.kind,
@@ -674,6 +790,7 @@ mod tests {
     use crate::wal::segment::{WalSegment, WAL_SEGMENT_HEADER_LEN};
     use crate::wal::wal::{Wal, WalConfig};
     use brain_core::{MemoryId, MemoryKind, RequestId, SessionId, SpaceId, TxnId};
+    use std::io::{Seek, SeekFrom, Write};
     use std::path::{Path, PathBuf};
 
     fn uuid(byte: u8) -> [u8; 16] {
@@ -804,11 +921,15 @@ mod tests {
     /// Bypass `Wal` and write records directly into segment 0. Used for
     /// hand-crafted WALs (TXN markers, malformed payloads).
     fn write_via_segment(wal_dir: &Path, records: &[WalRecord]) {
+        write_segment(wal_dir, 0, 1, records);
+    }
+
+    fn write_segment(wal_dir: &Path, segment_seq: u64, starting_lsn: u64, records: &[WalRecord]) {
         std::fs::create_dir_all(wal_dir).unwrap();
-        let seg_path = wal_dir.join("0000000000.wal");
+        let seg_path = wal_dir.join(format!("{segment_seq:010}.wal"));
         let records: Vec<WalRecord> = records.to_vec();
         crate::wal::segment::glommio_run(move || async move {
-            let mut seg = WalSegment::create_new(&seg_path, 0, 1, uuid(1))
+            let mut seg = WalSegment::create_new(&seg_path, segment_seq, starting_lsn, uuid(1))
                 .await
                 .unwrap();
             for r in &records {
@@ -817,6 +938,13 @@ mod tests {
             seg.flush().await.unwrap();
             seg.close().await.unwrap();
         });
+    }
+
+    fn zero_record_bytes(path: &Path, offset: u64, length: usize) {
+        let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.write_all(&vec![0; length]).unwrap();
+        file.sync_all().unwrap();
     }
 
     // ----- Empty cases --------------------------------------------------
@@ -877,19 +1005,20 @@ mod tests {
         let (report, _alloc) = recover(&mut arena, &wal_dir, uuid(1), &mut sink).unwrap();
 
         assert_eq!(report.records_replayed, 12);
-        assert_eq!(report.active_segment_seq, Some(0));
+        let tail = report.tail.unwrap();
+        assert_eq!(tail.segment_seq, 0);
         assert_eq!(
-            report.active_tail_offset, file_size,
+            tail.offset, file_size,
             "clean shutdown must recover a tail at end-of-file; a shorter \
              offset would truncate committed records on reopen"
         );
-        assert!(report.active_tail_offset > WAL_SEGMENT_HEADER_LEN as u64);
+        assert!(tail.offset > WAL_SEGMENT_HEADER_LEN as u64);
 
         // And reopening with that offset performs no truncation: the file
         // keeps every byte and all records still read back.
         let wal_dir2 = wal_dir.clone();
         let next_lsn = report.next_lsn;
-        let offset = report.active_tail_offset;
+        let offset = tail;
         crate::wal::segment::glommio_run(move || async move {
             let wal =
                 Wal::open_existing(&wal_dir2, uuid(1), next_lsn, offset, WalConfig::default())
@@ -1436,17 +1565,18 @@ mod tests {
         let (report1, _a) = recover(&mut arena, &wal_dir, uuid(1), &mut sink).unwrap();
         assert_eq!(report1.records_replayed, 9);
         assert_eq!(report1.next_lsn, 10);
-        assert_eq!(report1.active_segment_seq, Some(0));
+        let tail1 = report1.tail.unwrap();
+        assert_eq!(tail1.segment_seq, 0);
         // Tail sits strictly before the torn bytes.
-        assert!(report1.active_tail_offset < torn_size);
-        assert!(report1.active_tail_offset >= WAL_SEGMENT_HEADER_LEN as u64);
+        assert!(tail1.offset < torn_size);
+        assert!(tail1.offset >= WAL_SEGMENT_HEADER_LEN as u64);
 
         // Reopen: open_existing truncates to the recovered tail, then we
         // append 5 NEW records (LSN 10..=14, slots 10..=14) and shut down
         // cleanly.
         let wal_dir2 = wal_dir.clone();
         let next_lsn1 = report1.next_lsn;
-        let offset1 = report1.active_tail_offset;
+        let offset1 = tail1;
         crate::wal::segment::glommio_run(move || async move {
             let wal =
                 Wal::open_existing(&wal_dir2, uuid(1), next_lsn1, offset1, WalConfig::default())
@@ -1522,7 +1652,7 @@ mod tests {
         // committed encodes (LSN 2,3 / slots 1,2), shut down.
         let wal_dir2 = wal_dir.clone();
         let next_lsn1 = report1.next_lsn;
-        let offset1 = report1.active_tail_offset;
+        let offset1 = report1.tail.unwrap();
         crate::wal::segment::glommio_run(move || async move {
             let wal =
                 Wal::open_existing(&wal_dir2, uuid(1), next_lsn1, offset1, WalConfig::default())
@@ -1553,6 +1683,185 @@ mod tests {
         }
         let reader = WalReader::open(&wal_dir, uuid(1)).unwrap();
         let lsns: Vec<u64> = reader.map(|r| r.unwrap().lsn.raw()).collect();
+        assert_eq!(lsns, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn hole_in_active_segment_boots_and_reports_the_discard() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = fresh_wal_dir(&dir);
+        let mut records: Vec<_> = (0..6).map(encode_record).collect();
+        for (index, record) in records.iter_mut().enumerate() {
+            record.lsn = Lsn((index + 1) as u64);
+        }
+        let rb = records[0].encoded_len();
+        write_via_segment(&wal_dir, &records);
+        let segment_path = wal_dir.join("0000000000.wal");
+        let hole_offset = WAL_SEGMENT_HEADER_LEN as u64 + 3 * rb as u64;
+        zero_record_bytes(&segment_path, hole_offset, rb);
+
+        let mut arena = fresh_arena(&dir, 16);
+        let mut sink = InMemoryMetadataSink::new();
+        let (report, _alloc) = recover(&mut arena, &wal_dir, uuid(1), &mut sink).unwrap();
+        assert_eq!(report.records_replayed, 3);
+        assert_eq!(report.next_lsn, 4);
+        assert_eq!(
+            report.tail,
+            Some(WalTail {
+                segment_seq: 0,
+                offset: hole_offset,
+            })
+        );
+        let discard = report.hole_discard.unwrap();
+        assert_eq!(discard.segment_seq, 0);
+        assert_eq!(discard.hole_offset, hole_offset);
+        assert_eq!(discard.first_discarded_lsn, 4);
+        assert_eq!(discard.last_recognizable_lsn, Some(6));
+        assert_eq!(discard.recognizable_record_count, 2);
+        assert_eq!(
+            discard.discarded_bytes,
+            std::fs::metadata(&segment_path).unwrap().len() - hole_offset
+        );
+
+        let tail = report.tail.unwrap();
+        let wal_dir2 = wal_dir.clone();
+        crate::wal::segment::glommio_run(move || async move {
+            let wal = Wal::open_existing(
+                &wal_dir2,
+                uuid(1),
+                report.next_lsn,
+                tail,
+                WalConfig::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(wal.append(encode_record(3)).await.unwrap(), Lsn(4));
+            assert_eq!(wal.append(encode_record(4)).await.unwrap(), Lsn(5));
+            wal.shutdown().await.unwrap();
+        });
+
+        let mut arena2 = fresh_arena(&dir, 16);
+        let mut sink2 = InMemoryMetadataSink::new();
+        let (report2, _alloc2) = recover(&mut arena2, &wal_dir, uuid(1), &mut sink2).unwrap();
+        assert_eq!(report2.records_replayed, 5);
+        let reader = WalReader::open(&wal_dir, uuid(1)).unwrap();
+        let lsns: Vec<_> = reader.map(|record| record.unwrap().lsn.raw()).collect();
+        assert_eq!(lsns, (1..=5).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn hole_in_rolled_over_segment_refuses_to_discard_acked_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = fresh_wal_dir(&dir);
+        let mut first: Vec<_> = (0..3).map(encode_record).collect();
+        let mut second: Vec<_> = (3..6).map(encode_record).collect();
+        for (index, record) in first.iter_mut().enumerate() {
+            record.lsn = Lsn((index + 1) as u64);
+        }
+        for (index, record) in second.iter_mut().enumerate() {
+            record.lsn = Lsn((index + 4) as u64);
+        }
+        let rb = first[0].encoded_len();
+        write_segment(&wal_dir, 0, 1, &first);
+        write_segment(&wal_dir, 1, 4, &second);
+        zero_record_bytes(
+            &wal_dir.join("0000000000.wal"),
+            WAL_SEGMENT_HEADER_LEN as u64 + rb as u64,
+            rb,
+        );
+
+        let mut arena = fresh_arena(&dir, 16);
+        let mut sink = InMemoryMetadataSink::new();
+        match recover(&mut arena, &wal_dir, uuid(1), &mut sink).unwrap_err() {
+            RecoveryError::AcknowledgedDataBehindHole { segment_seq, .. } => {
+                assert_eq!(segment_seq, 0, "the damaged segment is the rolled-over one");
+            }
+            other => panic!("expected AcknowledgedDataBehindHole, got {other:?}"),
+        }
+        // Segment 1 records are acknowledged, but its fdatasync says nothing
+        // about segment 0, so the zeros sit under acknowledged data and
+        // cutting there would drop writes a client was promised.
+    }
+
+    #[test]
+    fn hole_below_durable_lsn_in_active_segment_refuses_to_discard() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = fresh_wal_dir(&dir);
+        let mut records: Vec<_> = (0..6).map(encode_record).collect();
+        for (index, record) in records.iter_mut().enumerate() {
+            record.lsn = Lsn((index + 1) as u64);
+        }
+        let rb = records[0].encoded_len();
+        write_via_segment(&wal_dir, &records);
+        let segment_path = wal_dir.join("0000000000.wal");
+        let hole_offset = WAL_SEGMENT_HEADER_LEN as u64 + 3 * rb as u64;
+        zero_record_bytes(&segment_path, hole_offset, rb);
+
+        // Records past the hole are at or below the LSN the metadata store
+        // already durably applied, so the zeros sit under acknowledged data
+        // rather than a torn final batch and the active segment is unsafe to cut.
+        let mut arena = fresh_arena(&dir, 16);
+        let mut sink = InMemoryMetadataSink::with_durable_lsn(6);
+        match recover(&mut arena, &wal_dir, uuid(1), &mut sink).unwrap_err() {
+            RecoveryError::AcknowledgedDataBehindHole {
+                first_survivor_lsn, ..
+            } => {
+                assert_eq!(first_survivor_lsn, Some(5));
+            }
+            other => panic!("expected AcknowledgedDataBehindHole, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dangling_txn_straddling_rollover_reopens_and_boots() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = fresh_wal_dir(&dir);
+        let txn = tid(99);
+        let mut first_record = encode_record(0);
+        first_record.lsn = Lsn(1);
+        let begin = begin_record(2, txn, 2);
+        let mut member3 = encode_record(1);
+        member3.lsn = Lsn(3);
+        let mut member4 = encode_record(2);
+        member4.lsn = Lsn(4);
+        write_segment(&wal_dir, 0, 1, &[first_record.clone(), begin, member3]);
+        write_segment(&wal_dir, 1, 4, &[member4]);
+
+        let mut arena = fresh_arena(&dir, 16);
+        let mut sink = InMemoryMetadataSink::new();
+        let (report1, _alloc1) = recover(&mut arena, &wal_dir, uuid(1), &mut sink).unwrap();
+        assert_eq!(report1.records_replayed, 1);
+        assert_eq!(report1.records_discarded, 3);
+        assert_eq!(report1.next_lsn, 2);
+        let tail = report1.tail.unwrap();
+        assert_eq!(tail.segment_seq, 0);
+        assert_eq!(
+            tail.offset,
+            WAL_SEGMENT_HEADER_LEN as u64 + first_record.encoded_len() as u64
+        );
+
+        let wal_dir2 = wal_dir.clone();
+        let next_lsn = report1.next_lsn;
+        crate::wal::segment::glommio_run(move || async move {
+            let wal = Wal::open_existing(&wal_dir2, uuid(1), next_lsn, tail, WalConfig::default())
+                .await
+                .unwrap();
+            assert!(!wal_dir2.join("0000000001.wal").exists());
+            assert_eq!(wal.append(encode_record(1)).await.unwrap(), Lsn(2));
+            assert_eq!(wal.append(encode_record(2)).await.unwrap(), Lsn(3));
+            wal.shutdown().await.unwrap();
+        });
+
+        let mut arena2 = fresh_arena(&dir, 16);
+        let mut sink2 = InMemoryMetadataSink::new();
+        let (report2, _alloc2) = recover(&mut arena2, &wal_dir, uuid(1), &mut sink2).unwrap();
+        assert_eq!(report2.records_replayed, 3);
+        assert_eq!(report2.records_discarded, 0);
+        assert_eq!(report2.next_lsn, 4);
+        // Without removing the stale segment, boot resumes below LSNs still
+        // physically present and refuses to start at the boundary.
+        let reader = WalReader::open(&wal_dir, uuid(1)).unwrap();
+        let lsns: Vec<_> = reader.map(|record| record.unwrap().lsn.raw()).collect();
         assert_eq!(lsns, vec![1, 2, 3]);
     }
 

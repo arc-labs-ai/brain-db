@@ -20,10 +20,14 @@
 //! This design lives on the shard's single Glommio executor; no
 //! cross-thread synchronization on the hot path.
 //!
-//! Errors are sticky: after a failed flush the WAL is "broken"; all
-//! in-flight handles and subsequent appends receive `Err(WalBroken)` until
-//! the [`GroupCommitter`] is dropped.
+//! Errors are sticky for the process lifetime: after a failed flush the WAL is
+//! "broken"; all in-flight handles and subsequent appends receive
+//! `Err(WalBroken)` until the shard process restarts.
+//! The committer always returns its segment so shutdown can release the file
+//! descriptor; the shared fault latch carries terminal durability failure.
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::time::Duration;
 
 use flume::{Receiver, Sender};
@@ -92,6 +96,57 @@ pub enum CommitError {
     AckChannelClosed,
 }
 
+/// The shard's terminal write-ahead-log fault.
+///
+/// A durability failure means the shard can no longer prove any write
+/// reached stable storage, so it must refuse every later write rather than
+/// ack something it cannot log. The latch is shared by every committer the
+/// shard ever starts — including the one a segment rollover installs — so the
+/// refusal cannot be lost by replacing the committer task. It is never
+/// cleared: only restarting the shard process, which re-derives the WAL tail
+/// from the bytes actually on disk, clears it. No marker is written to disk:
+/// recovery derives `next_lsn` and the physical tail from those bytes, so the
+/// dangerous divergence cannot survive a restart; if the underlying cause
+/// persists, the first flush after restart latches immediately. A sticky
+/// on-disk marker would turn a transient fault into a shard that refuses to
+/// boot until an operator deletes an undocumented file.
+pub struct WalFault {
+    reason: RefCell<Option<String>>,
+}
+
+impl WalFault {
+    pub fn new() -> Self {
+        Self {
+            reason: RefCell::new(None),
+        }
+    }
+
+    pub fn latch(&self, reason: String) {
+        let mut latched = self.reason.borrow_mut();
+        if latched.is_none() {
+            tracing::error!(
+                reason = %reason,
+                "the shard refuses WAL writes until the process is restarted"
+            );
+            *latched = Some(reason);
+        }
+    }
+
+    pub fn reason(&self) -> Option<String> {
+        self.reason.borrow().clone()
+    }
+
+    pub fn is_latched(&self) -> bool {
+        self.reason.borrow().is_some()
+    }
+}
+
+impl Default for WalFault {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Per-shard group commit coordinator. Owns one [`WalSegment`] and one
 /// committer task running on the local Glommio executor.
 pub struct GroupCommitter {
@@ -110,13 +165,13 @@ pub struct GroupCommitter {
 impl GroupCommitter {
     /// Spawn the committer task on the current executor. Takes ownership
     /// of `segment`. **Must be called from inside a `glommio::LocalExecutor`.**
-    pub fn start(segment: WalSegment, config: GroupCommitConfig) -> Self {
+    pub fn start(segment: WalSegment, config: GroupCommitConfig, fault: Rc<WalFault>) -> Self {
         let (submission_tx, submission_rx) = flume::unbounded::<Submission>();
         let (shutdown_tx, shutdown_rx) = flume::bounded::<()>(1);
         let (completion_tx, completion_rx) = flume::bounded::<Result<WalSegment, CommitError>>(1);
 
         spawn_local(async move {
-            let result = committer_loop(segment, submission_rx, shutdown_rx, config).await;
+            let result = committer_loop(segment, submission_rx, shutdown_rx, config, fault).await;
             let _ = completion_tx.send(result);
         })
         .detach();
@@ -145,8 +200,9 @@ impl GroupCommitter {
     }
 
     /// Drain the queue, flush the final batch durably, and reclaim the
-    /// owned [`WalSegment`]. Consumes `self`. Returns `Err` if the task
-    /// panicked or the final flush failed.
+    /// owned [`WalSegment`]. Consumes `self`. The segment always returns so
+    /// callers can close its descriptor; terminal durability failure lives in
+    /// the shared [`WalFault`] latch.
     pub async fn shutdown(mut self) -> Result<WalSegment, CommitError> {
         // Close the submission channel so the committer sees disconnection
         // *after* it drains anything already in flight.
@@ -206,9 +262,9 @@ async fn committer_loop(
     submission_rx: Receiver<Submission>,
     shutdown_rx: Receiver<()>,
     config: GroupCommitConfig,
+    fault: Rc<WalFault>,
 ) -> Result<WalSegment, CommitError> {
     let mut pending: Vec<PendingAck> = Vec::new();
-    let mut broken: Option<String> = None;
     let mut shutdown_requested = false;
 
     loop {
@@ -238,37 +294,73 @@ async fn committer_loop(
 
         let mut got_any = false;
         if let Some(first) = first {
-            handle_submission(first, &mut segment, &mut pending, broken.as_ref());
+            handle_submission(
+                first,
+                &mut segment,
+                &mut pending,
+                fault.reason().as_ref(),
+                &fault,
+            );
             got_any = true;
         }
 
         // -----------------------------------------------------------------
         // Step 2: gather more records up to commit_window or size threshold.
         // -----------------------------------------------------------------
-        if got_any && broken.is_none() && !shutdown_requested {
-            // Race the timer against the submission stream. We re-arm the
-            // timer once per iteration relative to when we entered step 2,
-            // not per-record.
-            let timer_fut = sleep(config.commit_window);
-            futures_lite::pin!(timer_fut);
-
-            loop {
+        if got_any && fault.reason().is_none() && !shutdown_requested {
+            // Drain submissions that are already waiting before considering
+            // the timer. An empty queue is a point-in-time fact: a sender
+            // that races this check remains queued and is handled by the next
+            // loop iteration, so it cannot be lost.
+            let mut found_waiting_submission = false;
+            while let Ok(sub) = submission_rx.try_recv() {
+                found_waiting_submission = true;
+                handle_submission(
+                    sub,
+                    &mut segment,
+                    &mut pending,
+                    fault.reason().as_ref(),
+                    &fault,
+                );
                 if segment.write_buf_len() >= config.max_batch_bytes {
                     break;
                 }
-                let sub_fut = submission_rx.recv_async();
-                // futures_lite::FutureExt::or returns whichever future
-                // completes first. The unit Future returned by sleep is
-                // wrapped so its result type matches the submission recv.
-                let timer_signal = async {
-                    (&mut timer_fut).await;
-                    Err::<Submission, flume::RecvError>(flume::RecvError::Disconnected)
-                };
-                match sub_fut.or(timer_signal).await {
-                    Ok(sub) => {
-                        handle_submission(sub, &mut segment, &mut pending, broken.as_ref());
+            }
+
+            // A quiet queue means there is no overlap to wait for. When
+            // overlap is present, retain the window so later submissions can
+            // join the same durable flush.
+            if found_waiting_submission && segment.write_buf_len() < config.max_batch_bytes {
+                // Race the timer against the submission stream. We re-arm the
+                // timer once per iteration relative to when we entered step 2,
+                // not per-record.
+                let timer_fut = sleep(config.commit_window);
+                futures_lite::pin!(timer_fut);
+
+                loop {
+                    if segment.write_buf_len() >= config.max_batch_bytes {
+                        break;
                     }
-                    Err(_) => break, // timer fired or submission closed
+                    let sub_fut = submission_rx.recv_async();
+                    // futures_lite::FutureExt::or returns whichever future
+                    // completes first. The unit Future returned by sleep is
+                    // wrapped so its result type matches the submission recv.
+                    let timer_signal = async {
+                        (&mut timer_fut).await;
+                        Err::<Submission, flume::RecvError>(flume::RecvError::Disconnected)
+                    };
+                    match sub_fut.or(timer_signal).await {
+                        Ok(sub) => {
+                            handle_submission(
+                                sub,
+                                &mut segment,
+                                &mut pending,
+                                fault.reason().as_ref(),
+                                &fault,
+                            );
+                        }
+                        Err(_) => break, // timer fired or submission closed
+                    }
                 }
             }
         }
@@ -278,7 +370,13 @@ async fn committer_loop(
         // -----------------------------------------------------------------
         if shutdown_requested {
             while let Ok(sub) = submission_rx.try_recv() {
-                handle_submission(sub, &mut segment, &mut pending, broken.as_ref());
+                handle_submission(
+                    sub,
+                    &mut segment,
+                    &mut pending,
+                    fault.reason().as_ref(),
+                    &fault,
+                );
             }
         }
 
@@ -286,7 +384,7 @@ async fn committer_loop(
         // Step 4: flush + signal.
         // -----------------------------------------------------------------
         if !pending.is_empty() {
-            if let Some(reason) = broken.clone() {
+            if let Some(reason) = fault.reason() {
                 for p in pending.drain(..) {
                     let _ = p.ack_tx.send(Err(CommitError::WalBroken(reason.clone())));
                 }
@@ -299,7 +397,7 @@ async fn committer_loop(
                     }
                     Err(e) => {
                         let reason = e.to_string();
-                        broken = Some(reason.clone());
+                        fault.latch(reason.clone());
                         for p in pending.drain(..) {
                             let _ = p.ack_tx.send(Err(CommitError::WalBroken(reason.clone())));
                         }
@@ -312,6 +410,8 @@ async fn committer_loop(
         // Step 5: exit on shutdown when the queue is fully drained.
         // -----------------------------------------------------------------
         if shutdown_requested && submission_rx.is_empty() {
+            // The segment always returns so callers can close its descriptor;
+            // the shared fault latch carries terminal durability failure.
             return Ok(segment);
         }
     }
@@ -322,6 +422,7 @@ fn handle_submission(
     segment: &mut WalSegment,
     pending: &mut Vec<PendingAck>,
     broken: Option<&String>,
+    fault: &WalFault,
 ) {
     let Submission::Append { record, ack_tx } = sub;
     if let Some(reason) = broken {
@@ -334,7 +435,9 @@ fn handle_submission(
             pending.push(PendingAck { ack_tx, lsn });
         }
         Err(e) => {
-            let _ = ack_tx.send(Err(CommitError::WalBroken(e.to_string())));
+            let reason = e.to_string();
+            fault.latch(reason.clone());
+            let _ = ack_tx.send(Err(CommitError::WalBroken(reason)));
         }
     }
 }
@@ -349,7 +452,7 @@ mod tests {
     use crate::wal::kinds::WalRecordKind;
     use crate::wal::reader::WalReader;
     use crate::wal::record::Lsn;
-    use crate::wal::segment::{glommio_run, FLUSH_DURABLE_CALLS};
+    use crate::wal::segment::{glommio_run, FAIL_NEXT_FLUSH_DURABLE, FLUSH_DURABLE_CALLS};
     use std::path::PathBuf;
     use std::sync::atomic::Ordering;
 
@@ -436,7 +539,11 @@ mod tests {
         let path = segment_path(dir.path(), 0);
         glommio_run(move || async move {
             let seg = fresh_segment(path, 0, 1).await;
-            let committer = GroupCommitter::start(seg, GroupCommitConfig::default());
+            let committer = GroupCommitter::start(
+                seg,
+                GroupCommitConfig::default(),
+                std::rc::Rc::new(WalFault::new()),
+            );
             let handle = committer.append(record(1)).unwrap();
             let lsn = handle.wait().await.unwrap();
             assert_eq!(lsn, 1);
@@ -456,7 +563,11 @@ mod tests {
         let path = segment_path(dir.path(), 0);
         glommio_run(move || async move {
             let seg = fresh_segment(path, 0, 1).await;
-            let committer = GroupCommitter::start(seg, GroupCommitConfig::default());
+            let committer = GroupCommitter::start(
+                seg,
+                GroupCommitConfig::default(),
+                std::rc::Rc::new(WalFault::new()),
+            );
             for i in 1..=10u64 {
                 let h = committer.append(record(i)).unwrap();
                 assert_eq!(h.wait().await.unwrap(), i);
@@ -482,8 +593,11 @@ mod tests {
         let before = FLUSH_DURABLE_CALLS.load(Ordering::SeqCst);
         glommio_run(move || async move {
             let seg = fresh_segment(path, 0, 1).await;
-            let committer =
-                std::rc::Rc::new(GroupCommitter::start(seg, GroupCommitConfig::default()));
+            let committer = std::rc::Rc::new(GroupCommitter::start(
+                seg,
+                GroupCommitConfig::default(),
+                std::rc::Rc::new(WalFault::new()),
+            ));
 
             const N: u64 = 50;
             let mut tasks = Vec::new();
@@ -523,6 +637,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn queued_overlapping_records_share_one_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = segment_path(dir.path(), 0);
+        let before = FLUSH_DURABLE_CALLS.load(Ordering::SeqCst);
+        glommio_run(move || async move {
+            let seg = fresh_segment(path, 0, 1).await;
+            let committer = GroupCommitter::start(
+                seg,
+                GroupCommitConfig::default(),
+                std::rc::Rc::new(WalFault::new()),
+            );
+            let handles: Vec<_> = (1..=8)
+                .map(|lsn| committer.append(record(lsn)).unwrap())
+                .collect();
+            for (expected, handle) in (1..=8).zip(handles) {
+                assert_eq!(handle.wait().await.unwrap(), expected);
+            }
+            let seg = committer.shutdown().await.unwrap();
+            seg.close().await.unwrap();
+        });
+        let after = FLUSH_DURABLE_CALLS.load(Ordering::SeqCst);
+        assert_eq!(after - before, 1);
+    }
+
     // ----- Shutdown / Drop ----------------------------------------------
 
     #[test]
@@ -531,7 +670,11 @@ mod tests {
         let path = segment_path(dir.path(), 0);
         glommio_run(move || async move {
             let seg = fresh_segment(path, 0, 1).await;
-            let committer = GroupCommitter::start(seg, GroupCommitConfig::default());
+            let committer = GroupCommitter::start(
+                seg,
+                GroupCommitConfig::default(),
+                std::rc::Rc::new(WalFault::new()),
+            );
             // Enqueue without awaiting; shutdown drains.
             let _h1 = committer.append(record(1)).unwrap();
             let _h2 = committer.append(record(2)).unwrap();
@@ -545,12 +688,43 @@ mod tests {
     }
 
     #[test]
+    fn fault_latch_survives_a_fresh_committer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path0 = segment_path(dir.path(), 0);
+        let path1 = segment_path(dir.path(), 1);
+        glommio_run(move || async move {
+            let fault = std::rc::Rc::new(WalFault::new());
+            let seg0 = fresh_segment(path0, 0, 1).await;
+            let committer0 =
+                GroupCommitter::start(seg0, GroupCommitConfig::default(), fault.clone());
+            FAIL_NEXT_FLUSH_DURABLE.with(|fail| fail.set(true));
+            let first = committer0.append(record(1)).unwrap().wait().await;
+            assert!(matches!(first, Err(CommitError::WalBroken(_))));
+            let seg0 = committer0.shutdown().await.unwrap();
+            seg0.close().await.unwrap();
+
+            let seg1 = fresh_segment(path1, 1, 2).await;
+            let committer1 =
+                GroupCommitter::start(seg1, GroupCommitConfig::default(), fault.clone());
+            let second = committer1.append(record(2)).unwrap().wait().await;
+            assert!(matches!(second, Err(CommitError::WalBroken(_))));
+            assert!(fault.is_latched());
+            let seg1 = committer1.shutdown().await.unwrap();
+            seg1.close().await.unwrap();
+        });
+    }
+
+    #[test]
     fn append_after_shutdown_errors() {
         let dir = tempfile::tempdir().unwrap();
         let path = segment_path(dir.path(), 0);
         glommio_run(move || async move {
             let seg = fresh_segment(path, 0, 1).await;
-            let mut committer = GroupCommitter::start(seg, GroupCommitConfig::default());
+            let mut committer = GroupCommitter::start(
+                seg,
+                GroupCommitConfig::default(),
+                std::rc::Rc::new(WalFault::new()),
+            );
             // Manually drop the submission sender by setting to None — mimic
             // the post-shutdown state from inside append().
             committer.submission_tx = None;
