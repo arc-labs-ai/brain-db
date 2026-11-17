@@ -111,11 +111,17 @@ For typical requests, the task lives ~10 ms. Brain handles thousands of such tas
 
 The executor uses handles:
 
-- `StorageHandle`: arena, WAL, metadata, HNSW.
-- `EmbedderHandle`: embedder service.
-- `MetricsHandle`: instrumentation.
+- `metadata: SharedMetadataDb` — the shard's redb store.
+- `index: SharedHnsw` — the published HNSW generation.
+- `writer: Arc<dyn WriterHandle>` — the shard's single writer.
+- `embedder: Arc<dyn Dispatcher>` — the embedder service.
+- `vectors` — the per-shard by-slot vector source.
 
-Handles are cheap to clone (Arc-based). Each executor task gets its own handles; no contention.
+They are fields of `ExecutorContext` (§1) rather than separate handle types,
+and every one is an `Arc` or already cheap to clone. A request gets a clone of
+the shard's context with its caller namespace and space stamped on, so there
+is no contention and no handle plumbing per call. Metrics are not a handle:
+the families are process-global statics ([17.01](../17_observability/01_signals.md)).
 
 ## 8. The shared embedder
 
@@ -125,7 +131,7 @@ For a single-CPU embedder: the queue depth determines latency. For a GPU embedde
 
 ## 9. The shared storage
 
-Storage is per-shard; the executor's StorageHandle for a shard talks to that shard's writer/readers.
+Storage is per-shard; a shard's context talks only to that shard's writer and readers.
 
 For reads (RECALL), the executor opens a read transaction (or uses a pre-existing one). Lock-free, MVCC.
 

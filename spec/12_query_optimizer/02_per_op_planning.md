@@ -508,14 +508,18 @@ Detailed in [07. Migration](../07_embedding/06_migration.md).
 
 #### 14.2 Bulk encode
 
-For high-throughput bulk imports, the wire protocol's `ENCODE_BATCH` opcode (a list of ENCODE requests in one frame). The planner produces a batch plan:
+There is **no `ENCODE_BATCH` opcode**. Bulk import brackets the encodes in a
+transaction instead — `TXN_BEGIN`, *n* × `ENCODE`, `TXN_COMMIT` — which is
+where the batching the old design wanted actually happens:
 
-- Single embedding batch (efficient).
-- Single WAL group commit.
-- Single metadata write transaction.
-- Single HNSW batch insert.
+- one WAL group commit for the bracket, rather than one per memory;
+- one metadata write transaction;
+- the embedder's own per-shard window, which collects the waiting writes of
+  concurrent requests into one forward pass (it is assembled where the shard
+  can see what is in flight, not behind the dispatcher).
 
-Latency per memory drops to ~1-2 ms when batched.
+So the amortisation is real, but it comes from the writer and the embed window,
+not from a frame that carries *n* requests.
 
 #### 14.3 Implicit session
 
