@@ -1685,7 +1685,7 @@ fn writeback_memory_kind(ctx: &WorkerContext, memory_id: MemoryId) {
             return;
         }
         meta.kind = new_kind as u8;
-        if table.insert(&mid, meta).is_err() {
+        if brain_metadata::tables::agg::put_memory(&wtxn, &mut table, mid, &meta).is_err() {
             return;
         }
     }

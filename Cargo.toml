@@ -19,6 +19,7 @@ members = [
     "crates/brain-plugins",
     "crates/brain-llm",
     "crates/brain-ops",
+    "crates/brain-analytics",
     "crates/brain-workers",
     "crates/brain-server",
     "crates/brain-http",
@@ -39,6 +40,10 @@ publish = false
 
 # Centralize dependency versions here. Crates inherit with `dep.workspace = true`.
 [workspace.dependencies]
+# Columnar analytics (brain-analytics): Parquet snapshot + aggregate engine.
+# Default features off — no SQL parser, no compression codecs; arrow and
+# parquet come through datafusion's re-exports so versions always match.
+datafusion = { version = "54.0.0", default-features = false, features = ["parquet"] }
 # Async / runtime
 glommio = "0.9"
 tokio = { version = "1", features = [

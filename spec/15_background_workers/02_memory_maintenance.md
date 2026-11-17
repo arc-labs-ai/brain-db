@@ -4,7 +4,7 @@ The three workers that keep memory salience, consolidation, and the HNSW index h
 
 ## Decay Worker
 
-The decay worker applies time-based salience decay to memories. It also handles access-boost (memories accessed recently get a salience bump).
+Salience decays when read, so there is no decay worker. Access boosts are a worker (§6).
 
 ### 1. Why decay
 
@@ -35,114 +35,49 @@ salience_after_access = min(1.0, salience × 1.1)    // 10% boost
 
 The boost decays with the rest of the salience.
 
-### 3. The cycle
+### 3. Decay is computed when read
 
-Every hour (configurable), the decay worker:
-
-1. Reads the memories table in batches.
-2. For each memory, computes the new salience.
-3. Writes back the updated salience.
-
-The cycle is incremental: each cycle processes a batch (default 10,000 memories). Large shards take multiple cycles to process all memories; the worker resumes from where it left off.
-
-### 4. The batch processing
-
-```rust
-async fn decay_cycle(state: &ShardState) -> Result<()> {
-    let now = Timestamp::now();
-    let mut last_processed = state.decay_cursor.load();
-
-    let mut batch = Vec::new();
-    let rtxn = state.metadata.begin_read()?;
-    let memories = rtxn.open_table(MEMORIES)?;
-    
-    for entry in memories.range_after(&last_processed)? {
-        if batch.len() >= 10_000 { break; }
-        let (id, m) = entry?;
-        let new_salience = compute_decay(&m, now);
-        if new_salience != m.salience {
-            batch.push((id, new_salience));
-        }
-    }
-    drop(rtxn);
-
-    if !batch.is_empty() {
-        let mut wtxn = state.metadata.begin_write()?;
-        let mut memories = wtxn.open_table(MEMORIES)?;
-        for (id, new_salience) in &batch {
-            let mut m = memories.get(id)?.unwrap();
-            m.salience = *new_salience;
-            memories.insert(id, &m)?;
-        }
-        wtxn.commit()?;
-    }
-
-    state.decay_cursor.store(batch.last().map(|(id, _)| *id).unwrap_or(last_processed));
-    Ok(())
-}
-```
-
-The cursor lets multiple cycles cover all memories.
-
-### 5. The cursor
-
-The decay worker tracks a cursor (the last MemoryId processed):
+Salience is never rewritten as a memory ages. A memory stores its salience as of an *anchor time* (creation, last boost, or last explicit update), and every reader computes the current value from it:
 
 ```
-cursor at start: < first MemoryId.
-cursor after one cycle: the last ID in the batch.
-cursor at end of full pass: > last MemoryId; reset to < first.
+salience(t) = floor + (anchor − floor) × 2^(-(t - anchor_at) / h)
 ```
 
-A full pass takes (total memories / batch size) cycles. For 1M memories with batch=10K and interval=1h: 100 cycles, ~4 days for a full pass.
+So salience is exact for every memory at any scale, and aging costs no writes. (An earlier design rewrote salience in hourly batches of 10 000 per shard; a full pass over 20M memories took ~83 days, leaving most stored values far too high.)
 
-### 6. The "minor changes" optimization
+### 4. Aggregates stay exact without maintenance
 
-If a memory's computed new salience is very close to its current salience (delta < 0.001), the worker skips the write:
+The aggregate counters (`agg_counters`) keep, per bucket, the exact sum of floors and the sum of forward-decay weights `(anchor − floor) × 2^((anchor_at − L)/h)`. Both are constant over time, so the salience sum at any time is `Σfloor + Σweight × 2^(−(t − L)/h)` — no worker, no revisiting of memories. An earlier design clamped at the floor (`max(floor, …)`), which needed a per-memory "time it hits the floor" index and a sweep worker; the smooth approach to the floor removes both.
 
-```rust
-if (new_salience - m.salience).abs() < 0.001 {
-    continue;    // Not worth a write
-}
-```
+### 5. Consistency
 
-This avoids many tiny writes that don't meaningfully change anything.
+The weight sums are Neumaier-compensated, so add/subtract cycles don't accumulate rounding. The daily verify compares the counters to a recount and repairs any drift (only possible if a write bypassed `put_memory`).
 
-### 7. The access-boost worker
+### 6. The access-boost worker
 
 A separate worker (running every 10 seconds) handles access boosts:
 
 ```
 1. Drain a buffer of recently-accessed MemoryIds.
-2. For each, increment salience by 10% (capped at 1.0).
+2. For each, set salience to min(1.0, current salience × 1.1), anchored at now.
 3. Write back in a single transaction.
 ```
 
-The buffer is filled by request handlers (RECALL adds the returned memories' IDs).
+The buffer is filled by request handlers (RECALL adds the returned memories' IDs). Because the boost re-anchors the memory, it persists and then fades along the normal decay curve; there is no second writer to overwrite it.
 
-### 8. The combination of decay and boost
+### 7. Explicit updates and recovery
 
-A memory's final salience is:
-- Initial salience (set at ENCODE).
-- Modified by decay (continuous, applied each decay cycle).
-- Modified by access boosts (applied each time the memory is returned in a RECALL).
+An explicit salience update anchors at the write's timestamp, which is also its WAL record's timestamp, so WAL replay reproduces the row exactly.
 
-Both workers can update the same memory. The decay worker reads-then-writes; if a boost happened in between, the decay worker may overwrite it. The two workers' cycles don't coordinate explicitly.
+### 8. Clock steps
 
-In practice:
-- Boost cycle is faster (10s vs 1h).
-- Boosts happen per access; decay applies less frequently.
-- Net effect: boosts are visible quickly, then slowly decay.
-
-If a memory is boosted just before a decay cycle, the boost is captured. If it's boosted after a decay cycle's read, the boost is overwritten. A subsequent boost cycle re-applies it.
-
-This is acceptable: salience isn't precise; small inaccuracies are fine.
+Reading at a time before a memory's anchor (the clock stepped back) returns the anchor itself. Aggregates use the forward form, which instead extrapolates slightly above the anchor; for a step of seconds the difference is ~10⁻⁶ relative.
 
 ### 9. The auto-forget option
 
 If `agent.auto_forget_below_salience > 0` is configured, memories with salience below the threshold are soft-FORGOTTEN automatically.
 
-The decay worker, when it computes a sub-threshold salience, can issue a soft FORGET on that memory.
+Not implemented. Since salience is computed when read, an implementation would schedule the FORGET at the time the memory crosses the threshold (known when it is written).
 
 This is **off by default**. Auto-forgetting is a strong default; many users want full control over deletion.
 
@@ -166,30 +101,15 @@ Different applications may want different rates. A chat assistant may want fast 
 
 For workloads that don't want decay, set the half-life to a very large value (e.g., 100 years). Effectively no decay.
 
-Or disable the worker entirely:
-
-```toml
-[workers.decay]
-enabled = false
-```
-
-The system continues to work; salience just doesn't change over time.
+(There is no decay worker to disable: decay is computed when read.)
 
 ### 12. The cost of decay
 
-Per cycle (10K memories):
-- Read: ~50 ms (batch range scan).
-- Compute: ~10 ms.
-- Write: ~50-100 ms.
-- Total: ~150 ms.
+Reading: one `exp2` per memory read (nanoseconds). Writing: nothing beyond the write that set the anchor.
 
-Per-memory cost: ~15 µs. Negligible relative to other operations.
+### 13. No worker to fall behind
 
-### 13. The worker as a "soft real-time" task
-
-The decay worker is soft-real-time: missing a cycle is fine. Missing several cycles delays decay slightly but doesn't cause incorrectness.
-
-Operators can tolerate the worker being temporarily paused (e.g., during heavy write load).
+There is nothing to pause or tune: decay is a function of the clock.
 
 ### 14. Long-term memories
 

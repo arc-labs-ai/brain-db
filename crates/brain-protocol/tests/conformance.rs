@@ -49,27 +49,29 @@ use brain_protocol::ops::query::{
     QueryTraceResponse, RetrieverSelectionWire, RetrieverWire, TimeRangeWire,
 };
 use brain_protocol::{
-    ActAs, AnswerKindWire, ByeRequest, CancelStreamAck, CancelStreamRequest, CancellationReason,
-    ClientPongRequest, CredentialScope, EdgeDirectionWire, EdgeKindWire, EncodeGraphEdge,
-    EncodeGraphNode, EncodeRequest, EncodeResponse, EncodeStageArtifact, EncodeStageGraph,
-    EncodeStageKeywordField, EncodeStageRecord, EncodeTrace, EncodeTraceArtifacts,
-    EncodeTraceDedup, EncodeTraceEntity, EncodeTraceIndex, EncodeTraceRelation, EncodeTraceStage,
-    EncodeTraceStageStatus, EncodeTraceStatement, EncodeVectorDirectRequest, EntityCreateRequest,
-    EntityCreateResponse, EntityGetRequest, EntityGetResponse, EntityListItem, EntityListRequest,
-    EntityListResponseFrame, EntityMergeRequest, EntityMergeResponse, EntityRenameRequest,
-    EntityRenameResponse, EntityResolveRequest, EntityResolveResponse, EntityTombstoneRequest,
-    EntityTombstoneResponse, EntityUnmergeRequest, EntityUnmergeResponse, EntityUpdateRequest,
-    EntityUpdateResponse, EntityView, EventType, EvidenceRefWire, ExtractorListItem,
-    ExtractorListRequest, ExtractorListResponseFrame, ForgetMode, ForgetRequest, ForgetResponse,
-    Frame, GraphEdge, GraphFetchRequest, GraphFetchResponseFrame, GraphNode, InferenceKind,
-    InferenceStep, LinkRequest, LinkResponse, LlmCredentialDeleteRequest,
-    LlmCredentialDeleteResponse, LlmCredentialGetRequest, LlmCredentialGetResponse,
-    LlmCredentialPutRequest, LlmCredentialPutResponse, LlmCredentialVerifyRequest,
-    LlmCredentialVerifyResponse, LlmCredentialView, MaterializeProceduralRequest,
-    MaterializeProceduralResponse, MemoryEdgeWire, MemoryInspectRequest, MemoryInspectResponse,
-    MemoryKindWire, MemoryListDirWire, MemoryListItem, MemoryListRequest, MemoryListResponseFrame,
-    MemoryListSortWire, MemoryListTimeAxisWire, ObservationInput, Opcode, PingRequest, PlanBudget,
-    PlanRequest, PlanResponseFrame, PlanState, PlanStatus, PlanStep, PlanTrace, PlanTraceDirection,
+    ActAs, AggregateSourceWire, AnswerKindWire, ByeRequest, CancelStreamAck, CancelStreamRequest,
+    CancellationReason, ClientPongRequest, CredentialScope, EdgeDirectionWire, EdgeKindWire,
+    EncodeGraphEdge, EncodeGraphNode, EncodeRequest, EncodeResponse, EncodeStageArtifact,
+    EncodeStageGraph, EncodeStageKeywordField, EncodeStageRecord, EncodeTrace,
+    EncodeTraceArtifacts, EncodeTraceDedup, EncodeTraceEntity, EncodeTraceIndex,
+    EncodeTraceRelation, EncodeTraceStage, EncodeTraceStageStatus, EncodeTraceStatement,
+    EncodeVectorDirectRequest, EntityCreateRequest, EntityCreateResponse, EntityGetRequest,
+    EntityGetResponse, EntityListItem, EntityListRequest, EntityListResponseFrame,
+    EntityMergeRequest, EntityMergeResponse, EntityRenameRequest, EntityRenameResponse,
+    EntityResolveRequest, EntityResolveResponse, EntityTombstoneRequest, EntityTombstoneResponse,
+    EntityUnmergeRequest, EntityUnmergeResponse, EntityUpdateRequest, EntityUpdateResponse,
+    EntityView, EventType, EvidenceRefWire, ExtractorListItem, ExtractorListRequest,
+    ExtractorListResponseFrame, ForgetMode, ForgetRequest, ForgetResponse, Frame, GraphEdge,
+    GraphFetchRequest, GraphFetchResponseFrame, GraphNode, InferenceKind, InferenceStep,
+    LinkRequest, LinkResponse, LlmCredentialDeleteRequest, LlmCredentialDeleteResponse,
+    LlmCredentialGetRequest, LlmCredentialGetResponse, LlmCredentialPutRequest,
+    LlmCredentialPutResponse, LlmCredentialVerifyRequest, LlmCredentialVerifyResponse,
+    LlmCredentialView, MaterializeProceduralRequest, MaterializeProceduralResponse,
+    MemoryAggregateGroup, MemoryAggregateRequest, MemoryAggregateResponse, MemoryEdgeWire,
+    MemoryInspectRequest, MemoryInspectResponse, MemoryKindWire, MemoryListDirWire, MemoryListItem,
+    MemoryListRequest, MemoryListResponseFrame, MemoryListSortWire, MemoryListTimeAxisWire,
+    MemoryStatusWire, ObservationInput, Opcode, PingRequest, PlanBudget, PlanRequest,
+    PlanResponseFrame, PlanState, PlanStatus, PlanStep, PlanTrace, PlanTraceDirection,
     PlanTraceMeetingPoint, PlanTraceNode, PongResponse, RankedItemKindWire, ReasonRequest,
     ReasonResponseFrame, ReasonStatus, ReasonTrace, ReasonTraceBase, ReasonTraceCandidate,
     ReasonTraceCentroid, ReasonTraceEdgeCandidate, ReasonTraceIdWithText,
@@ -846,6 +848,40 @@ fn sample_extractor_list() -> ExtractorListResponseFrame {
     }
 }
 
+fn sample_memory_aggregate_request() -> MemoryAggregateRequest {
+    MemoryAggregateRequest {
+        kinds: vec![MemoryKindWire::Semantic],
+        statuses: vec![MemoryStatusWire::Active, MemoryStatusWire::Tombstoned],
+        group_by_kind: true,
+        group_by_status: true,
+        group_by_day: true,
+        salience_min: Some(0.25),
+        salience_max: None,
+        created_from_unix_nanos: Some(1_700_000_000_000_000_000),
+        created_to_unix_nanos: None,
+        include_min_max: true,
+        act_as: None,
+    }
+}
+
+fn sample_memory_aggregate_response() -> MemoryAggregateResponse {
+    MemoryAggregateResponse {
+        groups: vec![MemoryAggregateGroup {
+            kind: Some(MemoryKindWire::Semantic),
+            status: Some(MemoryStatusWire::Active),
+            day_start_unix_nanos: Some(1_699_920_000_000_000_000),
+            count: 3,
+            salience_sum: 1.5,
+            salience_avg: Some(0.5),
+            salience_min: Some(0.25),
+            salience_max: Some(0.75),
+            access_count_sum: 7,
+        }],
+        source: AggregateSourceWire::Snapshot,
+        as_of_unix_nanos: 1_700_000_100_000_000_000,
+    }
+}
+
 fn sample_memory_inspect_request() -> MemoryInspectRequest {
     MemoryInspectRequest {
         memory_id: mid(),
@@ -1445,6 +1481,13 @@ fn corpus() -> Vec<Case> {
         &sample_memory_inspect_request(),
     ));
 
+    // ---- Aggregate counters (MEMORY_AGGREGATE) ----
+    cases.push(req_case(
+        "req_memory_aggregate",
+        RequestBody::MemoryAggregate(sample_memory_aggregate_request()),
+        &sample_memory_aggregate_request(),
+    ));
+
     // ---- Typed-graph export (GRAPH_FETCH) ----
     cases.push(req_case(
         "req_graph_fetch",
@@ -1718,6 +1761,11 @@ fn corpus() -> Vec<Case> {
         "resp_memory_inspect",
         ResponseBody::MemoryInspect(sample_memory_inspect_response()),
         &sample_memory_inspect_response(),
+    ));
+    cases.push(resp_case(
+        "resp_memory_aggregate",
+        ResponseBody::MemoryAggregate(sample_memory_aggregate_response()),
+        &sample_memory_aggregate_response(),
     ));
 
     cases.push(resp_case(
@@ -3788,6 +3836,8 @@ fn required_families() -> Vec<(&'static str, Opcode)> {
         ("memory.forget_resp", Opcode::ForgetResp),
         ("memory.list", Opcode::MemoryListReq),
         ("memory.list_resp", Opcode::MemoryListResp),
+        ("memory.aggregate", Opcode::MemoryAggregateReq),
+        ("memory.aggregate_resp", Opcode::MemoryAggregateResp),
         ("graph.fetch", Opcode::GraphFetchReq),
         ("graph.fetch_resp", Opcode::GraphFetchResp),
         ("graph.entity_create", Opcode::EntityCreateReq),

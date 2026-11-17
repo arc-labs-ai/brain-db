@@ -4,6 +4,7 @@
 //! UpdateEmbedding, and Tombstone(Memory).
 
 use brain_core::{MemoryId, MemoryKind, SessionId, SpaceId};
+use brain_metadata::tables::agg::put_memory;
 use brain_metadata::tables::memory::{
     space_timeline_key, MemoryMetadata, MEMORIES_BY_SPACE_TIMELINE_TABLE, MEMORIES_TABLE,
 };
@@ -66,8 +67,7 @@ pub fn apply_upsert_memory(
         let mut memories_t = wtxn
             .open_table(MEMORIES_TABLE)
             .map_err(|e| ApplyError::Storage(format!("open MEMORIES: {e:?}")))?;
-        memories_t
-            .insert(&id.to_be_bytes(), row)
+        put_memory(wtxn, &mut memories_t, id.to_be_bytes(), &row)
             .map_err(|e| ApplyError::Storage(format!("MEMORIES insert: {e:?}")))?;
     }
 
@@ -256,8 +256,7 @@ pub fn apply_tombstone_memory(
         let mut memories_t = wtxn
             .open_table(MEMORIES_TABLE)
             .map_err(|e| ApplyError::Storage(format!("open MEMORIES: {e:?}")))?;
-        memories_t
-            .insert(&id.to_be_bytes(), row)
+        put_memory(wtxn, &mut memories_t, id.to_be_bytes(), &row)
             .map_err(|e| ApplyError::Storage(format!("MEMORIES insert (tombstone): {e:?}")))?;
     }
 
@@ -401,8 +400,7 @@ pub fn apply_restore_memory(
         let mut memories_t = wtxn
             .open_table(MEMORIES_TABLE)
             .map_err(|e| ApplyError::Storage(format!("open MEMORIES: {e:?}")))?;
-        memories_t
-            .insert(&id.to_be_bytes(), row)
+        put_memory(wtxn, &mut memories_t, id.to_be_bytes(), &row)
             .map_err(|e| ApplyError::Storage(format!("MEMORIES insert (restore): {e:?}")))?;
     }
 
@@ -448,13 +446,15 @@ pub fn apply_restore_memory(
 pub fn apply_update_salience(
     wtxn: &WriteTransaction,
     phase: &Phase,
-    _write: &Write,
+    write: &Write,
 ) -> Result<PhaseAck, ApplyError> {
     let Phase::UpdateSalience { id, new_salience } = phase else {
         return Err(ApplyError::PhaseMisShape("expected UpdateSalience"));
     };
     let mut row = load_memory(wtxn, *id)?;
-    row.salience = new_salience.raw();
+    // Anchored at the write's timestamp, which is also the WAL record's,
+    // so recovery replays it to the identical row.
+    row.set_salience(new_salience.raw(), write.started_at_unix_nanos);
     write_memory(wtxn, *id, row)?;
     Ok(PhaseAck::SalienceUpdated)
 }
@@ -570,7 +570,7 @@ fn write_memory(
     let mut t = wtxn
         .open_table(MEMORIES_TABLE)
         .map_err(|e| ApplyError::Storage(format!("open MEMORIES: {e:?}")))?;
-    t.insert(&id.to_be_bytes(), row)
+    put_memory(wtxn, &mut t, id.to_be_bytes(), &row)
         .map_err(|e| ApplyError::Storage(format!("MEMORIES insert: {e:?}")))?;
     Ok(())
 }
@@ -916,7 +916,7 @@ mod tests {
         let rtxn = db.read_txn().unwrap();
         let t = rtxn.open_table(MEMORIES_TABLE).unwrap();
         let row = t.get(&id.to_be_bytes()).unwrap().unwrap().value();
-        assert!((row.salience - 0.75).abs() < 1e-6);
+        assert!((row.salience_anchor() - 0.75).abs() < 1e-6);
     }
 
     #[test]

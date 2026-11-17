@@ -17,6 +17,7 @@ brain-extractors = { path = "../brain-extractors" }
 brain-index = { path = "../brain-index" }
 brain-llm = { path = "../brain-llm" }
 brain-metadata = { path = "../brain-metadata" }
+brain-analytics = { path = "../brain-analytics" }
 brain-rerank = { path = "../brain-rerank" }
 brain-storage = { path = "../brain-storage" }
 rkyv.workspace = true

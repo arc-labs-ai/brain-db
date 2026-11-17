@@ -78,17 +78,9 @@ What can go wrong with the background workers and how Brain responds.
 
 **Operator action.** Restore the LLM service. Or disable consolidation if the LLM is permanently gone.
 
-## 7. The decay worker creates database contention
+## 7. (Removed) The decay worker created database contention
 
-**Failure mode.** The decay worker's transactions occasionally block client writes (during commit).
-
-**Detection.** Increased write latency p99 during decay cycles.
-
-**Response.**
-- The decay worker uses smaller batches under load.
-- Yields more frequently.
-
-**Operator action.** Tune decay's batch size and interval.
+Salience now decays when read, so there is no decay worker and no decay writes.
 
 ## 8. The reclamation worker leaves dangling state
 

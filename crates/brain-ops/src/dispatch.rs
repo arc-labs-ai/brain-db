@@ -303,6 +303,12 @@ pub async fn dispatch(
                 .map(|b| single(ResponseBody::MemoryInspect(b)))
         }
 
+        RequestBody::MemoryAggregate(r) => {
+            crate::handlers::memory_aggregate::handle_memory_aggregate(r, ctx)
+                .await
+                .map(|b| single(ResponseBody::MemoryAggregate(b)))
+        }
+
         RequestBody::GraphFetch(r) => crate::handlers::graph_fetch::handle_graph_fetch(r, ctx)
             .map(|b| single(ResponseBody::GraphFetch(b))),
 
@@ -775,6 +781,8 @@ fn enforce_permission(caller: &RequestCaller, req: &RequestBody) -> Result<(), O
         RequestBody::MemoryList(_) => (perm_bits::RECALL, "MEMORY_LIST"),
         // Per-memory inspection — same read capability.
         RequestBody::MemoryInspect(_) => (perm_bits::RECALL, "MEMORY_INSPECT"),
+        // Aggregate counters over the caller's own memories — same read capability.
+        RequestBody::MemoryAggregate(_) => (perm_bits::RECALL, "MEMORY_AGGREGATE"),
 
         // Streaming reads.
         RequestBody::Subscribe(_) | RequestBody::Unsubscribe(_) | RequestBody::CancelStream(_) => {

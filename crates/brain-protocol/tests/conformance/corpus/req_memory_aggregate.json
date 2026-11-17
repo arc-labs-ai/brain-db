@@ -1,0 +1,15 @@
+{
+  "kinds": [
+    1
+  ],
+  "statuses": [
+    0,
+    1
+  ],
+  "group_by_kind": true,
+  "group_by_status": true,
+  "group_by_day": true,
+  "salience_min": 0.25,
+  "created_from_unix_nanos": 1700000000000000000,
+  "include_min_max": true
+}

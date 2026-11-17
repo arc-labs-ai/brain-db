@@ -71,6 +71,7 @@ pub async fn format(snap: &Snapshot<'_>) -> String {
     emit_statement_embed_metrics(&mut s, snap.shards);
     emit_retriever_metrics(&mut s, snap.shards);
     emit_query_metrics(&mut s, snap.shards);
+    emit_aggregate_metrics(&mut s, snap.shards);
     emit_tracing_metrics(&mut s);
 
     s
@@ -1316,4 +1317,139 @@ fn emit_request_metrics(out: &mut String, m: &RequestMetrics) {
         let inner = format!("op=\"{op}\"");
         emit_histogram(out, "brain_request_duration_ms", &inner, m.duration(op_idx));
     }
+}
+
+/// One per-shard metric family: header, then one line per shard that has a
+/// value (`None` = this shard doesn't report it).
+fn emit_per_shard(
+    out: &mut String,
+    shards: &[ShardHandle],
+    name: &str,
+    help: &str,
+    kind: &str,
+    value: impl Fn(&ShardHandle) -> Option<f64>,
+) {
+    emit_header(out, name, help, kind);
+    for shard in shards {
+        if let Some(v) = value(shard) {
+            let _ = writeln!(out, "{name}{{shard=\"{}\"}} {v}", shard.shard_id());
+        }
+    }
+}
+
+/// Aggregate counters (build + self-check), `MEMORY_AGGREGATE` sources,
+/// and the analytics snapshot exporter.
+#[allow(clippy::cast_precision_loss)]
+fn emit_aggregate_metrics(out: &mut String, shards: &[ShardHandle]) {
+    let maint = |f: fn(&brain_metadata::tables::agg::MaintenanceStats) -> f64| {
+        move |s: &ShardHandle| s.agg_maintenance_stats().map(|m| f(&m))
+    };
+    emit_per_shard(
+        out,
+        shards,
+        "brain_agg_counters_ready",
+        "1 when aggregate counters are complete; 0 while an online build after upgrade runs.",
+        "gauge",
+        maint(|m| f64::from(u8::from(m.counters_ready.load(Ordering::Relaxed)))),
+    );
+    emit_per_shard(
+        out,
+        shards,
+        "brain_agg_counter_build_rows_total",
+        "Memories counted by the online counter build.",
+        "counter",
+        maint(|m| m.build_rows.load(Ordering::Relaxed) as f64),
+    );
+    emit_per_shard(
+        out,
+        shards,
+        "brain_agg_counter_verify_runs_total",
+        "Full verify passes of the aggregate counters against memories.",
+        "counter",
+        maint(|m| m.verify_runs.load(Ordering::Relaxed) as f64),
+    );
+    emit_per_shard(
+        out,
+        shards,
+        "brain_agg_counter_drifted_buckets_total",
+        "Counter buckets found wrong and repaired. Should stay 0; anything else means a write path bypassed the counters.",
+        "counter",
+        maint(|m| m.drifted_buckets.load(Ordering::Relaxed) as f64),
+    );
+    for (name, help, pick) in [
+        (
+            "brain_memory_aggregate_counters_total",
+            "MEMORY_AGGREGATE requests answered from live counters.",
+            (|m: &brain_ops::AggregateMetrics| &m.counters_total)
+                as fn(&_) -> &std::sync::atomic::AtomicU64,
+        ),
+        (
+            "brain_memory_aggregate_snapshot_total",
+            "MEMORY_AGGREGATE requests answered from the analytics snapshot.",
+            |m: &brain_ops::AggregateMetrics| &m.snapshot_total,
+        ),
+        (
+            "brain_memory_aggregate_errors_total",
+            "MEMORY_AGGREGATE requests that failed.",
+            |m: &brain_ops::AggregateMetrics| &m.errors_total,
+        ),
+    ] {
+        emit_per_shard(out, shards, name, help, "counter", |s| {
+            Some(pick(&s.aggregate_metrics()).load(Ordering::Relaxed) as f64)
+        });
+    }
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos()) as f64;
+    emit_per_shard(
+        out,
+        shards,
+        "brain_analytics_exports_total",
+        "Analytics snapshot exports completed.",
+        "counter",
+        |s| s.analytics().map(|a| a.stats().exports_total as f64),
+    );
+    emit_per_shard(
+        out,
+        shards,
+        "brain_analytics_export_failures_total",
+        "Analytics snapshot exports that failed.",
+        "counter",
+        |s| {
+            s.analytics()
+                .map(|a| a.stats().export_failures_total as f64)
+        },
+    );
+    emit_per_shard(
+        out,
+        shards,
+        "brain_analytics_last_export_seconds",
+        "Duration of the most recent analytics snapshot export.",
+        "gauge",
+        |s| s.analytics().map(|a| a.stats().last_export_ms as f64 / 1e3),
+    );
+    emit_per_shard(
+        out,
+        shards,
+        "brain_analytics_snapshot_rows",
+        "Memories in the current analytics snapshot.",
+        "gauge",
+        |s| {
+            s.analytics()
+                .and_then(|a| a.current_snapshot())
+                .map(|i| i.rows as f64)
+        },
+    );
+    emit_per_shard(
+        out,
+        shards,
+        "brain_analytics_snapshot_age_seconds",
+        "Age of the current analytics snapshot (staleness of scan answers).",
+        "gauge",
+        |s| {
+            s.analytics()
+                .and_then(|a| a.current_snapshot())
+                .map(|i| (now_ns - i.taken_at_unix_nanos as f64).max(0.0) / 1e9)
+        },
+    );
 }

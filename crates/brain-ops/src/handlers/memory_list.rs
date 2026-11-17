@@ -123,7 +123,7 @@ pub async fn handle_memory_list(
             .unwrap_or_default();
         let (statement_count, entity_count, relation_count) =
             graph_counts(&rtxn, scope, row.memory_id_bytes);
-        let mut item = row_to_item(row, text);
+        let mut item = row_to_item(row, text, filter.now_unix_nanos);
         item.statement_count = statement_count;
         item.entity_count = entity_count;
         item.relation_count = relation_count;
@@ -223,10 +223,11 @@ fn build_filter(req: &MemoryListRequest) -> MemoryTimelineFilter {
         created_to: (req.to_unix_nanos != 0).then_some(req.to_unix_nanos),
         salience_min: req.salience_min,
         salience_max: req.salience_max,
+        now_unix_nanos: brain_metadata::salience::now_unix_nanos(),
     }
 }
 
-fn row_to_item(row: &MemoryMetadata, text: String) -> MemoryListItem {
+fn row_to_item(row: &MemoryMetadata, text: String, now_unix_nanos: u64) -> MemoryListItem {
     MemoryListItem {
         memory_id: u128::from_be_bytes(row.memory_id_bytes),
         space_id: row.space_id_bytes,
@@ -237,7 +238,7 @@ fn row_to_item(row: &MemoryMetadata, text: String) -> MemoryListItem {
         created_at_unix_nanos: row.created_at_unix_nanos,
         occurred_at_unix_nanos: row.occurred_at_unix_nanos.unwrap_or(0),
         last_accessed_at_unix_nanos: row.last_accessed_at_unix_nanos,
-        salience: row.salience,
+        salience: row.salience_at(now_unix_nanos),
         access_count: row.access_count,
         // v1: memory rows don't persist the originating request id, so
         // there is no cheap way to surface it here.

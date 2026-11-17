@@ -260,6 +260,12 @@ pub struct OpsContext {
     /// recall with the end-to-end latency, effective fusion `k`, rerank
     /// flag, and answer shape.
     pub query_metrics: Arc<QueryMetrics>,
+    /// Per-shard columnar snapshot + scan engine (Tier 1/2 of
+    /// `MEMORY_AGGREGATE`). `None` when `[analytics]` is disabled; requests
+    /// the counters can't answer then fail with `CapabilityNotEnabled`.
+    pub analytics: Option<Arc<brain_analytics::Analytics>>,
+    /// `MEMORY_AGGREGATE` request counters, shared with `/metrics`.
+    pub aggregate_metrics: Arc<crate::handlers::memory_aggregate::AggregateMetrics>,
 }
 
 impl OpsContext {
@@ -304,6 +310,8 @@ impl OpsContext {
             wal_sink: None,
             retriever_metrics: Arc::new(RetrieverMetrics::new()),
             query_metrics: Arc::new(QueryMetrics::new()),
+            analytics: None,
+            aggregate_metrics: Arc::default(),
         }
     }
 
@@ -513,6 +521,23 @@ impl OpsContext {
     /// publishing. The shard's spawn path wires the same sink that
     /// the writer uses, so substrate and typed-graph events share one
     /// LSN domain.
+    /// Share the `MEMORY_AGGREGATE` counters with the `/metrics` exposition.
+    #[must_use]
+    pub fn with_aggregate_metrics(
+        mut self,
+        m: Arc<crate::handlers::memory_aggregate::AggregateMetrics>,
+    ) -> Self {
+        self.aggregate_metrics = m;
+        self
+    }
+
+    /// Wire the per-shard analytics service (snapshot export + scans).
+    #[must_use]
+    pub fn with_analytics(mut self, analytics: Option<Arc<brain_analytics::Analytics>>) -> Self {
+        self.analytics = analytics;
+        self
+    }
+
     #[must_use]
     pub fn with_wal_sink(mut self, sink: Option<Arc<dyn WalSink>>) -> Self {
         self.wal_sink = sink;

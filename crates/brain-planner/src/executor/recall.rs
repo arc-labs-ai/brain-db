@@ -152,7 +152,7 @@ fn build_hit(
         score,
         kind,
         session_id: SessionId::from(meta.session_id),
-        salience: meta.salience,
+        salience: meta.salience_now(),
         created_at_unix_nanos: meta.created_at_unix_nanos,
         text: None,
         salience_initial: meta.salience_initial,

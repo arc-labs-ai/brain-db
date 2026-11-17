@@ -13,6 +13,7 @@ pub mod forget;
 pub mod graph_fetch;
 pub mod link;
 pub mod llm_credential;
+pub mod memory_aggregate;
 pub mod memory_inspect;
 pub mod memory_list;
 pub mod plan;

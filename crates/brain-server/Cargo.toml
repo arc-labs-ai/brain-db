@@ -66,6 +66,7 @@ brain-index = { path = "../brain-index" }
 brain-embed = { path = "../brain-embed" }
 brain-planner = { path = "../brain-planner" }
 brain-ops = { path = "../brain-ops" }
+brain-analytics = { path = "../brain-analytics" }
 brain-rerank = { path = "../brain-rerank" }
 brain-workers = { path = "../brain-workers" }
 # `extract --backfill` walks `memories` + `texts` redb tables directly

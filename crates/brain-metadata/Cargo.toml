@@ -67,3 +67,7 @@ harness = false
 [[bench]]
 name = "audit_ops"
 harness = false
+
+[[bench]]
+name = "agg_ops"
+harness = false

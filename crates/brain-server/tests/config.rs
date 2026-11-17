@@ -363,10 +363,14 @@ fn validate_post_rejects_zero_optional_cadence() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_tmp(&dir, MINIMAL_CONFIG);
     let mut env = HashMap::new();
-    env.insert("BRAIN__WORKERS__DECAY_INTERVAL_SEC".into(), "0".into());
-    let err = Config::load_with_env(&path, &env).expect_err("decay_interval_sec = 0 must reject");
+    env.insert(
+        "BRAIN__WORKERS__CONSOLIDATION_INTERVAL_SEC".into(),
+        "0".into(),
+    );
+    let err =
+        Config::load_with_env(&path, &env).expect_err("consolidation_interval_sec = 0 must reject");
     assert!(
-        matches!(err, ConfigError::Invariant(ref m) if m.contains("decay_interval_sec")),
+        matches!(err, ConfigError::Invariant(ref m) if m.contains("consolidation_interval_sec")),
         "got: {err:?}"
     );
 }
@@ -386,4 +390,44 @@ fn omitted_optional_sections_use_defaults() {
     assert!(!cfg.monitoring.tracing.enabled);
     assert!(cfg.admin.token.is_none());
     assert!(!cfg.server.tls.enabled);
+}
+
+#[test]
+fn analytics_timeout_not_below_export_interval_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let bad = format!(
+        "{MINIMAL_CONFIG}\n[analytics]\nenabled = true\nexport_interval_secs = 30\nquery_timeout_secs = 30\n"
+    );
+    let path = write_tmp(&dir, &bad);
+    let err = Config::load_with_env(&path, &HashMap::new()).unwrap_err();
+    assert!(
+        matches!(err, ConfigError::Invariant(ref m) if m.contains("query_timeout_secs")),
+        "got: {err:?}"
+    );
+}
+
+#[test]
+fn analytics_and_aggregates_sections_parse_with_defaults() {
+    let dir = tempfile::tempdir().unwrap();
+    let ok = format!(
+        "{MINIMAL_CONFIG}\n[analytics]\nenabled = true\n\n[aggregates]\nverify_interval_secs = 0\n"
+    );
+    let path = write_tmp(&dir, &ok);
+    let cfg = Config::load_with_env(&path, &HashMap::new()).unwrap();
+    assert!(cfg.analytics.enabled);
+    assert_eq!(cfg.analytics.export_interval_secs, 3600);
+    assert_eq!(cfg.aggregates.verify_interval_secs, 0);
+    assert_eq!(cfg.aggregates.build_batch_rows, 2_000);
+}
+
+#[test]
+fn zero_aggregate_build_batch_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let bad = format!("{MINIMAL_CONFIG}\n[aggregates]\nbuild_batch_rows = 0\n");
+    let path = write_tmp(&dir, &bad);
+    let err = Config::load_with_env(&path, &HashMap::new()).unwrap_err();
+    assert!(
+        matches!(err, ConfigError::Invariant(ref m) if m.contains("build_batch_rows")),
+        "got: {err:?}"
+    );
 }

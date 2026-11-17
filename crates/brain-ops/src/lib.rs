@@ -49,6 +49,7 @@ pub use brain_planner::PlannerContext;
 pub use context::{CrossEncoderSlot, OpsContext};
 pub use dispatch::{dispatch, DispatchOutcome, RequestCaller};
 pub use error::{ErrorCode, OpError};
+pub use handlers::memory_aggregate::AggregateMetrics;
 pub use handlers::recall::{
     merge_namespace_partials, merge_recall_pools, MergedNamespaceRecall, NamespaceRecallPartial,
 };

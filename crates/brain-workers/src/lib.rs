@@ -40,9 +40,8 @@ pub use worker::{drive_batch, Worker};
 // (`brain_workers::<worker>::<Type>`) so external callers don't churn.
 pub use workers::{
     access_boost, ambiguity_resolver, auto_edge, cache_evict, causal_edge, confidence_sweep,
-    consolidation, counter_reconcile, decay, edge_scrub, extractor, hnsw_maint,
-    idempotency_cleanup, slot_reclaim, snapshot, statement_embed, statistics, temporal_edge,
-    wal_retention,
+    consolidation, counter_reconcile, edge_scrub, extractor, hnsw_maint, idempotency_cleanup,
+    slot_reclaim, snapshot, statement_embed, statistics, temporal_edge, wal_retention,
 };
 
 pub use workers::ambiguity_resolver::{AmbiguityResolverConfig, AmbiguityResolverWorker};
@@ -50,6 +49,7 @@ pub use workers::ambiguity_resolver::{AmbiguityResolverConfig, AmbiguityResolver
 pub use workers::access_boost::{
     boosted_salience, AccessBoostWorker, DEFAULT_BOOST_FACTOR, MAX_SALIENCE,
 };
+pub use workers::agg_counters::{AggCountersKnobs, AggCountersWorker};
 pub use workers::auto_edge::{
     AutoEdgeKnobs, AutoEdgeWorker, DEFAULT_AUTO_EDGE_SIMILARITY_THRESHOLD, DEFAULT_EF_SEARCH,
     DEFAULT_TOP_K,
@@ -69,10 +69,6 @@ pub use workers::consolidation::{
     DEFAULT_RECENCY_WINDOW,
 };
 pub use workers::counter_reconcile::CounterReconcileWorker;
-pub use workers::decay::{
-    decayed_salience, half_life_days, DecayWorker, CONSOLIDATED_HALF_LIFE_DAYS,
-    EPISODIC_HALF_LIFE_DAYS, MIN_DELTA_FOR_WRITE, SALIENCE_FLOOR, SEMANTIC_HALF_LIFE_DAYS,
-};
 pub use workers::edge_scrub::EdgeScrubWorker;
 pub use workers::extractor::{
     ExtractorKnobs, ExtractorWorker, DEFAULT_EXTRACTOR_BATCH_SIZE,

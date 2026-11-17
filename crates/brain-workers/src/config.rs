@@ -9,7 +9,6 @@ use std::time::Duration;
 /// — one variant per shipped worker.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum WorkerKind {
-    Decay,
     AccessBoost,
     Consolidation,
     HnswMaintenance,
@@ -90,6 +89,9 @@ pub enum WorkerKind {
     /// the partial-match floor (default 0.7), and expires proposals
     /// older than `expire_after_secs` (default 30 days).
     AmbiguityResolver,
+    /// Builds the aggregate counters after an upgrade and periodically
+    /// verifies + repairs them. Ticks fast; an idle tick is one read.
+    AggCounters,
 }
 
 impl WorkerKind {
@@ -97,7 +99,6 @@ impl WorkerKind {
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
-            Self::Decay => "decay",
             Self::AccessBoost => "access_boost",
             Self::Consolidation => "consolidation",
             Self::HnswMaintenance => "hnsw_maintenance",
@@ -126,6 +127,7 @@ impl WorkerKind {
             Self::StatementEmbed => "statement_embed",
             Self::ConfidenceSweep => "confidence_sweep",
             Self::AmbiguityResolver => "ambiguity_resolver",
+            Self::AggCounters => "agg_counters",
         }
     }
 }
@@ -151,7 +153,6 @@ impl WorkerConfig {
     #[must_use]
     pub fn defaults_for(kind: WorkerKind) -> Self {
         let (enabled, interval, batch_size, max_runtime_ms) = match kind {
-            WorkerKind::Decay => (true, Duration::from_secs(3600), 10_000, 5_000),
             WorkerKind::AccessBoost => (true, Duration::from_secs(10), 1_000, 500),
             WorkerKind::Consolidation => (true, Duration::from_secs(300), 100, 10_000),
             WorkerKind::HnswMaintenance => (true, Duration::from_secs(300), 1, 60_000),
@@ -225,6 +226,9 @@ impl WorkerConfig {
             // ~ low seconds; max_runtime=10s defends against a stuck
             // embedder.
             WorkerKind::AmbiguityResolver => (true, Duration::from_secs(3600), 64, 10_000),
+            // 20ms tick: a build batch (2 000 rows, one commit) every tick
+            // while building after an upgrade; otherwise one cheap read.
+            WorkerKind::AggCounters => (true, Duration::from_millis(20), 2_000, 5_000),
         };
         Self {
             enabled,

@@ -220,7 +220,7 @@ fn bump_edge_count(
     let mut t = wtxn
         .open_table(MEMORIES_TABLE)
         .map_err(|e| ApplyError::Storage(format!("open MEMORIES: {e:?}")))?;
-    t.insert(key, row)
+    brain_metadata::tables::agg::put_memory(wtxn, &mut t, key, &row)
         .map_err(|e| ApplyError::Storage(format!("MEMORIES insert (edge count): {e:?}")))?;
     Ok(())
 }

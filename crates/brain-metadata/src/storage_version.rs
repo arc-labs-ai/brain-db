@@ -70,7 +70,13 @@ use redb::{Database, ReadableDatabase, TableDefinition};
 /// failure.
 ///
 /// No migration tool — pre-user, fresh-start on bump, as with v3 and v4.
-pub const CURRENT_SCHEMA_VERSION: u32 = 5;
+///
+/// v6 makes salience decay when read: `MemoryMetadata` stores the
+/// salience as of an anchor time (`salience_anchor` +
+/// `salience_anchor_at_unix_nanos`) instead of a value a worker rewrites,
+/// and `agg_counters` sums salience in forward-decay form. The row layout changed. No migration tool —
+/// pre-user, fresh-start on bump.
+pub const CURRENT_SCHEMA_VERSION: u32 = 6;
 
 /// Singleton key inside [`SCHEMA_META_TABLE`].
 pub const SCHEMA_VERSION_KEY: &str = "schema_version";
@@ -175,7 +181,14 @@ pub fn open_or_init_schema(db: &Database) -> Result<u32, SchemaError> {
     // once the index holds any row. Derived data, rebuilt like the in-RAM
     // indexes, so it is index construction, not a format migration.
     let statement_ids_backfilled = crate::statement::backfill_statement_id_indexes(&wtxn)?;
+    // Build the aggregate counters from `memories` if a pre-counter DB is
+    // being opened. Idempotent — a no-op once any counter row exists.
+    let agg_counters_built = crate::tables::agg::backfill_if_missing(&wtxn)?;
     wtxn.commit()?;
+
+    if agg_counters_built {
+        tracing::info!("built aggregate counters from memories for pre-counter DB");
+    }
 
     if backfilled > 0 {
         tracing::info!(

@@ -465,7 +465,7 @@ async fn metrics_emits_worker_counters() {
     // brain-workers ships 12 background workers per shard.
     // We assert presence of at least the headline cycle counters for
     // a couple of well-known names; counts are 0 (workers sleep).
-    for worker in ["decay", "consolidation", "hnsw_maintenance"] {
+    for worker in ["agg_counters", "consolidation", "hnsw_maintenance"] {
         let needle = format!("brain_worker_cycles_total{{shard=\"0\",worker=\"{worker}\"}}");
         assert!(body.contains(&needle), "missing {needle}; body:\n{body}");
     }
@@ -492,9 +492,9 @@ async fn metrics_emits_worker_health_series() {
     }
     // Per-worker series for a well-known worker.
     for needle in [
-        "brain_worker_panics_total{shard=\"0\",worker=\"decay\"}",
-        "brain_worker_pending_work{shard=\"0\",worker=\"decay\"}",
-        "brain_worker_cycle_duration_ms{shard=\"0\",worker=\"decay\"}",
+        "brain_worker_panics_total{shard=\"0\",worker=\"agg_counters\"}",
+        "brain_worker_pending_work{shard=\"0\",worker=\"agg_counters\"}",
+        "brain_worker_cycle_duration_ms{shard=\"0\",worker=\"agg_counters\"}",
     ] {
         assert!(body.contains(needle), "missing {needle}; body:\n{body}");
     }
@@ -510,24 +510,24 @@ async fn worker_list_reports_paused_after_stop() {
     let (code, body) = http_get_authed(server.admin_addr, "/v1/workers").await;
     assert_eq!(code, 200);
     assert!(
-        body.contains("\"name\":\"decay\"") && body.contains("\"paused\":false"),
-        "decay should start un-paused; body:\n{body}"
+        body.contains("\"name\":\"agg_counters\"") && body.contains("\"paused\":false"),
+        "agg_counters should start un-paused; body:\n{body}"
     );
 
-    let (code, body) = http_post_authed(server.admin_addr, "/v1/workers/decay/stop").await;
+    let (code, body) = http_post_authed(server.admin_addr, "/v1/workers/agg_counters/stop").await;
     assert_eq!(code, 200, "stop should succeed; body:\n{body}");
 
     let (code, body) = http_get_authed(server.admin_addr, "/v1/workers").await;
     assert_eq!(code, 200);
-    // The decay object must now carry paused=true. Parse it out to avoid
+    // The agg_counters object must now carry paused=true. Parse it out to avoid
     // matching another worker's paused flag.
-    let decay_obj = body
+    let worker_obj = body
         .split("{\"shard\"")
-        .find(|chunk| chunk.contains("\"name\":\"decay\""))
-        .expect("decay object present");
+        .find(|chunk| chunk.contains("\"name\":\"agg_counters\""))
+        .expect("agg_counters object present");
     assert!(
-        decay_obj.contains("\"paused\":true"),
-        "decay must report paused=true after stop; obj:\n{decay_obj}"
+        worker_obj.contains("\"paused\":true"),
+        "agg_counters must report paused=true after stop; obj:\n{worker_obj}"
     );
     server.stop().await;
 }
@@ -552,8 +552,8 @@ async fn worker_control_rejects_c0_and_unknown() {
     assert!(body.contains("unknown worker"), "body:\n{body}");
 
     // Registered C2 worker → 200.
-    let (code, body) = http_post_authed(server.admin_addr, "/v1/workers/decay/stop").await;
-    assert_eq!(code, 200, "decay is controllable C2; body:\n{body}");
+    let (code, body) = http_post_authed(server.admin_addr, "/v1/workers/agg_counters/stop").await;
+    assert_eq!(code, 200, "agg_counters is controllable C2; body:\n{body}");
 
     server.stop().await;
 }
@@ -1442,4 +1442,82 @@ async fn space_delete_requires_namespace() {
     let (code, body) = http_delete_authed(server.admin_addr, &path).await;
     assert_eq!(code, 400, "missing namespace must 400; body:\n{body}");
     server.stop().await;
+}
+
+/// `/v1/aggregates` sums the live counters across shards and tenants, and
+/// `/metrics` reports the counter + aggregate series.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn aggregates_route_sums_counters_across_tenants() {
+    let server = start_admin_with_shards(1).await;
+    let space_a = brain_core::SpaceId::new();
+    let space_b = brain_core::SpaceId::new();
+    for text in ["alpha one", "alpha two", "alpha three"] {
+        encode_into(&server.handles[0], full_caller(space_a, "agg-ns-a"), text).await;
+    }
+    encode_into(
+        &server.handles[0],
+        full_caller(space_b, "agg-ns-b"),
+        "beta one",
+    )
+    .await;
+
+    let (code, body) = http_get_authed(server.admin_addr, "/v1/aggregates").await;
+    assert_eq!(code, 200, "{body}");
+    assert!(
+        body.contains("\"count\":4"),
+        "grand total across tenants: {body}"
+    );
+
+    let (code, body) = http_get_authed(server.admin_addr, "/v1/aggregates?group_by=space").await;
+    assert_eq!(code, 200, "{body}");
+    let a = space_a.0.to_string();
+    let b = space_b.0.to_string();
+    assert!(body.contains(&a) && body.contains(&b), "{body}");
+    assert!(
+        body.contains("\"count\":3") && body.contains("\"count\":1"),
+        "{body}"
+    );
+
+    let (code, body) =
+        http_get_authed(server.admin_addr, &format!("/v1/aggregates?space={a}")).await;
+    assert_eq!(code, 200, "{body}");
+    assert!(body.contains("\"count\":3"), "{body}");
+
+    let (code, _) = http_get_authed(server.admin_addr, "/v1/aggregates?kind=fruit").await;
+    assert_eq!(code, 400);
+
+    // The maintenance thread marks counters ready on its first pass.
+    let mut body = String::new();
+    for _ in 0..50 {
+        body = http_get(server.admin_addr, "/metrics").await.1;
+        if body.contains("brain_agg_counters_ready{shard=\"0\"} 1") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    for series in [
+        "brain_agg_counters_ready{shard=\"0\"} 1",
+        "brain_agg_counter_drifted_buckets_total{shard=\"0\"} 0",
+        "brain_memory_aggregate_counters_total{shard=\"0\"}",
+        "# TYPE brain_analytics_snapshot_age_seconds gauge",
+    ] {
+        assert!(body.contains(series), "missing {series}; body:\n{body}");
+    }
+}
+
+/// An enabled analytics service that cannot start fails the shard spawn
+/// (like rerank), instead of leaving the capability silently off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn analytics_init_failure_fails_the_shard_spawn() {
+    let data_dir = TempDir::new().expect("tmp");
+    let mut cfg = ShardSpawnConfig::new(data_dir.path(), stub_dispatcher());
+    cfg.analytics = Some(brain_analytics::AnalyticsConfig {
+        export_interval: std::time::Duration::from_secs(5),
+        query_timeout: std::time::Duration::from_secs(5),
+        ..brain_analytics::AnalyticsConfig::default()
+    });
+    match spawn_shard(0, cfg) {
+        Err(e) => assert!(e.to_string().contains("analytics init failed"), "{e}"),
+        Ok(_) => panic!("spawn must fail when analytics cannot start"),
+    }
 }

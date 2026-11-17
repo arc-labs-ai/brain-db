@@ -707,7 +707,7 @@ fn hydrate_paths(
                 .get(id.to_be_bytes())
                 .map_err(|e| ExecError::MetadataReadFailed(e.to_string()))?;
             let (salience, is_pending) = if let Some(access) = row {
-                (access.value().salience, false)
+                (access.value().salience_now(), false)
             } else if let Some(pending) = ctx
                 .txn
                 .as_ref()

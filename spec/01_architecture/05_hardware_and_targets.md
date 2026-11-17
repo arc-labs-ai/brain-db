@@ -273,7 +273,7 @@ Recommendations:
 
 - **NTP / chrony** — keep time within ±10 ms of true time.
 - **Monotonic clocks** for measuring durations within a process; wall-clock for memory timestamps.
-- **No wall-clock time travel** — large clock jumps confuse the decay worker. If the operator must adjust system time significantly (>1 minute), pause the decay worker first and restart it after.
+- **No wall-clock time travel** — salience is computed from the wall clock when read, so a large clock jump shifts every memory's salience by the jump. A step back reads as the anchor per memory; aggregates extrapolate slightly above it (~10⁻⁶ relative for seconds). Keep NTP slewing rather than stepping.
 
 Brain does not currently support cross-shard wall-clock ordering of memories. If you need a global LSN ordering across shards, you need a coordination service (out of scope for v1).
 

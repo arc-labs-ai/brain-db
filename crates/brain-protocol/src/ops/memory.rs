@@ -567,6 +567,122 @@ pub struct MemoryInspectResponse {
     pub edges: Vec<MemoryEdgeWire>,
 }
 
+/// Lifecycle state a `MEMORY_AGGREGATE` group counts.
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, serde_repr::Serialize_repr, serde_repr::Deserialize_repr,
+)]
+#[repr(u8)]
+pub enum MemoryStatusWire {
+    Active = 0,
+    Tombstoned = 1,
+    HardForgotten = 2,
+}
+
+/// `MEMORY_AGGREGATE_REQ` (0x0029) — COUNT / SUM / AVG / MIN / MAX over the
+/// caller's `(namespace, space)` memories.
+///
+/// Served from one of two sources, reported in the response:
+/// - **Counters** — running totals the writer keeps in the same
+///   transaction as each memory row. Exact and live; cost independent of
+///   memory count. Used when the request only filters/groups by kind and
+///   status and asks for no MIN/MAX.
+/// - **Snapshot** — a periodic columnar export scanned by the analytics
+///   engine. Needed for salience / time-range filters, per-day grouping
+///   and MIN/MAX. As of the snapshot time, not live; requires the
+///   operator to enable `[analytics]`.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MemoryAggregateRequest {
+    /// Empty = all kinds; otherwise only these kinds are counted.
+    pub kinds: Vec<MemoryKindWire>,
+    /// Empty = active memories only; otherwise exactly these statuses.
+    #[serde(default)]
+    pub statuses: Vec<MemoryStatusWire>,
+    /// One group per kind (else kinds are summed together).
+    #[serde(default)]
+    pub group_by_kind: bool,
+    /// One group per status (else statuses are summed together).
+    #[serde(default)]
+    pub group_by_status: bool,
+    /// One group per UTC day of `created_at`. Snapshot only.
+    #[serde(default)]
+    pub group_by_day: bool,
+    /// Inclusive salience floor. Snapshot only.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub salience_min: Option<f32>,
+    /// Inclusive salience ceiling. Snapshot only.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub salience_max: Option<f32>,
+    /// Inclusive `created_at` lower bound, unix nanos. Snapshot only.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub created_from_unix_nanos: Option<u64>,
+    /// Inclusive `created_at` upper bound, unix nanos. Snapshot only.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub created_to_unix_nanos: Option<u64>,
+    /// Also return MIN / MAX salience per group. Snapshot only.
+    #[serde(default)]
+    pub include_min_max: bool,
+    /// Effective identity for the read, on behalf of the connection principal.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<ActAs>,
+}
+
+/// Where a `MEMORY_AGGREGATE` answer came from.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    PartialEq,
+    serde_repr::Serialize_repr,
+    serde_repr::Deserialize_repr,
+)]
+#[repr(u8)]
+pub enum AggregateSourceWire {
+    /// Live running counters; exact as of the last committed write.
+    #[default]
+    Counters = 0,
+    /// Columnar snapshot; exact as of `as_of_unix_nanos`.
+    Snapshot = 1,
+}
+
+/// One `MEMORY_AGGREGATE` result group. Grouping fields are set only when
+/// grouped by that dimension.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MemoryAggregateGroup {
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub kind: Option<MemoryKindWire>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub status: Option<MemoryStatusWire>,
+    /// Start of the UTC day, unix nanos; set only when `group_by_day`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub day_start_unix_nanos: Option<u64>,
+    pub count: u64,
+    pub salience_sum: f64,
+    /// `salience_sum / count`; `None` when `count == 0`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub salience_avg: Option<f64>,
+    /// Set only when `include_min_max` and `count > 0`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub salience_min: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub salience_max: Option<f64>,
+    pub access_count_sum: u64,
+}
+
+/// `MEMORY_AGGREGATE_RESP` (0x00A9). An ungrouped request always returns
+/// one group (zero-count when nothing matches); a grouped one returns only
+/// non-empty groups.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MemoryAggregateResponse {
+    pub groups: Vec<MemoryAggregateGroup>,
+    #[serde(default)]
+    pub source: AggregateSourceWire,
+    /// Snapshot time for `Snapshot` answers; `0` for live `Counters`.
+    #[serde(default)]
+    pub as_of_unix_nanos: u64,
+}
+
 /// One memory↔memory edge as returned by `MEMORY_INSPECT`.
 ///
 /// `direction` is relative to the inspected memory: `Outgoing` means the

@@ -57,7 +57,6 @@ ef_occupancy_scaling = false
 autocut = false
 
 [workers]
-decay_interval_sec = 3600
 snapshot_interval_sec = 21600
 edge_scrub_interval_sec = 86400
 wal_retention_interval_sec = 600
@@ -273,6 +272,26 @@ max_summary_chars = 4096
 # not name one.
 # model = "gpt-4o-mini"
 #   BRAIN__LLM__MODEL=gpt-4o-mini
+
+[analytics]
+# Columnar snapshot + DataFusion scans for MEMORY_AGGREGATE requests the live
+# counters can't answer: salience / time-range filters, per-day groups,
+# MIN / MAX. Off by default; counter-backed COUNT / SUM / AVG work either way.
+enabled = false
+# export_interval_secs = 3600   # snapshot cadence = worst-case staleness
+# memory_limit_mb = 0           # server-wide, split across shards; 0 = 1/4 of RAM
+# spill_limit_mb = 51200        # per shard, under <shard>/analytics/spill
+# query_timeout_secs = 30
+# threads = 2
+# max_concurrent_queries = 2
+# max_concurrent_exports = 2    # across all shards; ~150 MiB/thread each
+
+[aggregates]
+# Live COUNT / SUM / AVG counters (always on). These knobs only tune the
+# one-time online build after an upgrade and the periodic self-check.
+# build_batch_rows = 2000       # memories per build commit (one per 20ms tick)
+# verify_interval_secs = 86400  # full verify + repair cadence; 0 disables
+# first_verify_delay_secs = 300 # first verify after start
 
 [rerank]
 # Off by default: rerank only reorders already-retrieved candidates and
