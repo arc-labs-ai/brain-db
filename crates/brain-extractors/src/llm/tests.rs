@@ -1542,15 +1542,17 @@ fn system_schema_missing_object_fails_validation_then_retry_recovers() {
     // exists to catch. (OpenAI strict-mode shape: every declared key
     // present, "object" specifically omitted here to simulate the
     // real-world half-comply failure this schema guards against.)
-    let bad = r#"{"statements": [
+    let bad = r#"{"entities": [{"name": "Priya", "type": "brain:Person", "confidence": 0.9}],
+      "statements": [
         {"subject": "Priya", "predicate": "brain:manages", "kind": "Relation",
          "confidence": 0.9, "object_is_entity": false, "event_at": null,
          "subject_is_self": false, "retract": false, "is_stateful": false}
     ]}"#;
     // Second response (the retry): model corrects itself.
-    let good = r#"{"statements": [
-        {"subject": "Priya", "subject_type": "brain:Person", "predicate": "brain:manages",
-         "object": "the billing platform team", "object_type": null,
+    let good = r#"{"entities": [{"name": "Priya", "type": "brain:Person", "confidence": 0.9}],
+      "statements": [
+        {"subject": "Priya", "predicate": "brain:manages",
+         "object": "the billing platform team",
          "object_is_entity": false, "kind": "Relation", "confidence": 0.9, "event_at": null,
          "subject_is_self": false, "retract": false, "is_stateful": false}
     ]}"#;
@@ -1571,15 +1573,15 @@ fn system_schema_missing_object_fails_validation_then_retry_recovers() {
         "missing object must trigger exactly one retry call"
     );
     assert_eq!(r.status, ExtractionStatus::Success);
-    // The statement, plus the subject's typed mention (the object is a value).
+    // Entities project before statements, so the named entity leads.
     assert_eq!(r.items.len(), 2);
-    match &r.items[0] {
+    match &r.items[1] {
         ExtractedItem::StatementMention(m) => {
             assert_eq!(m.object_text.as_deref(), Some("the billing platform team"));
         }
         other => panic!("expected statement mention, got {other:?}"),
     }
-    match &r.items[1] {
+    match &r.items[0] {
         ExtractedItem::EntityMention(m) => {
             assert_eq!(
                 (m.text.as_str(), m.entity_type_qname.as_str()),
@@ -1774,47 +1776,98 @@ fn retract_with_explicit_high_confidence_survives() {
     }
 }
 
+/// The `entities` section IS the LLM tier's entity extraction.
+///
+/// It replaced per-statement `subject_type` / `object_type`, where an entity
+/// existed only if some triple mentioned it and two triples could give one
+/// thing two types.
 #[test]
-fn typed_endpoints_become_entity_mentions() {
+fn named_entities_become_entity_mentions() {
     use crate::framework::{EntityMention, ExtractedItem};
-    let v = serde_json::json!({
-        "subject": "linear-sandbox", "subject_type": "brain:CloneEnv",
-        "predicate": "mirror:clones", "object": "Linear", "object_type": "TargetApp",
-        "object_is_entity": true, "subject_is_self": false, "confidence": 0.9
-    });
-    let items = super::extractor::typed_endpoint_mentions(&v, 3, 1);
-    let got: Vec<(String, String)> = items
-        .iter()
-        .map(|i| match i {
+    let one = |v: serde_json::Value| -> Option<(String, String)> {
+        super::extractor::project_named_entity(&v, 3, 1).map(|i| match i {
             ExtractedItem::EntityMention(EntityMention {
                 text,
                 entity_type_qname,
                 ..
-            }) => (text.clone(), entity_type_qname.clone()),
+            }) => (text, entity_type_qname),
             other => panic!("unexpected {other:?}"),
         })
-        .collect();
+    };
     assert_eq!(
-        got,
-        vec![
-            ("linear-sandbox".to_string(), "brain:CloneEnv".to_string()),
-            ("Linear".to_string(), "brain:TargetApp".to_string()),
-        ]
+        one(
+            serde_json::json!({"name": "linear-sandbox", "type": "brain:CloneEnv", "confidence": 0.9})
+        ),
+        Some(("linear-sandbox".to_string(), "brain:CloneEnv".to_string())),
+    );
+    // A bare type name is qualified; the tenant namespace is applied later.
+    assert_eq!(
+        one(serde_json::json!({"name": "Linear", "type": "TargetApp", "confidence": 0.9})),
+        Some(("Linear".to_string(), "brain:TargetApp".to_string())),
+    );
+    // Surrounding whitespace is not part of either field.
+    assert_eq!(
+        one(serde_json::json!({"name": "  Ada  ", "type": " Person ", "confidence": 0.9})),
+        Some(("Ada".to_string(), "brain:Person".to_string())),
     );
 }
 
 #[test]
-fn typed_endpoints_skip_self_values_and_missing_types() {
-    let v = serde_json::json!({
-        "subject": "I", "subject_type": "brain:Person", "subject_is_self": true,
-        "predicate": "brain:prefers", "object": "dark roast", "object_type": "brain:Concept",
-        "object_is_entity": false, "confidence": 0.9
-    });
-    assert!(super::extractor::typed_endpoint_mentions(&v, 3, 1).is_empty());
-    let untyped = serde_json::json!({
-        "subject": "Ann", "predicate": "brain:works_at", "object": "Acme",
-        "object_is_entity": true, "subject_type": null, "object_type": "",
-        "confidence": 0.9
-    });
-    assert!(super::extractor::typed_endpoint_mentions(&untyped, 3, 1).is_empty());
+fn named_entities_without_a_usable_name_or_type_are_dropped() {
+    for bad in [
+        serde_json::json!({"type": "brain:Person", "confidence": 0.9}),
+        serde_json::json!({"name": "", "type": "brain:Person", "confidence": 0.9}),
+        serde_json::json!({"name": "   ", "type": "brain:Person", "confidence": 0.9}),
+        serde_json::json!({"name": "Ada", "confidence": 0.9}),
+        serde_json::json!({"name": "Ada", "type": "", "confidence": 0.9}),
+        // A date names no referent; left in it mints a phantom node.
+        serde_json::json!({"name": "yesterday", "type": "brain:Event", "confidence": 0.9}),
+    ] {
+        assert!(
+            super::extractor::project_named_entity(&bad, 3, 1).is_none(),
+            "{bad} must yield no entity"
+        );
+    }
+}
+
+/// A stringified JSON literal in the type field is an ABSENT type.
+///
+/// The field is a string, so a model with nothing to put in it writes the
+/// literal as one. `acme:null` reached a live registry this way and was
+/// applied to two entities.
+///
+/// Scoped to the three JSON literals, matched case-sensitively, because this
+/// is a wire-format rule and not a judgement about words.
+#[test]
+fn stringified_json_literals_are_not_types() {
+    for literal in ["null", "true", "false"] {
+        let v = serde_json::json!({"name": "Ann", "type": literal, "confidence": 0.9});
+        assert!(
+            super::extractor::project_named_entity(&v, 3, 1).is_none(),
+            "{literal:?} as a type must yield no entity"
+        );
+    }
+}
+
+/// The rule above is about the literals, not about vocabulary: a real kind
+/// that merely resembles one still works.
+#[test]
+fn words_resembling_json_literals_are_still_types() {
+    use crate::framework::{EntityMention, ExtractedItem};
+    for (name, ty, want) in [
+        ("NGC 4594", "Object", "brain:Object"),
+        ("the empty set", "Nullity", "brain:Nullity"),
+        ("Helvetica", "Type", "brain:Type"),
+    ] {
+        let v = serde_json::json!({"name": name, "type": ty, "confidence": 0.9});
+        match super::extractor::project_named_entity(&v, 3, 1) {
+            Some(ExtractedItem::EntityMention(EntityMention {
+                entity_type_qname, ..
+            })) => assert_eq!(
+                entity_type_qname, want,
+                "a denylist of English words would have refused `{ty}`"
+            ),
+            other => panic!("{ty} should type an entity, got {other:?}"),
+        }
+    }
 }

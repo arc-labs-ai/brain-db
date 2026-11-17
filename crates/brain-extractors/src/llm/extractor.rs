@@ -418,8 +418,36 @@ impl LlmExtractor {
         let mut out = Vec::new();
         match parsed {
             Value::Object(obj)
-                if obj.contains_key("statements") || obj.contains_key("relations") =>
+                if obj.contains_key("entities")
+                    || obj.contains_key("statements")
+                    || obj.contains_key("relations") =>
             {
+                // ENTITIES ARE EXTRACTED IN THEIR OWN RIGHT, not as a
+                // by-product of the triples.
+                //
+                // They used to be: each statement carried `subject_type` /
+                // `object_type`, and an entity existed only if some triple
+                // happened to mention it. Three things followed. A thing the
+                // memory was plainly about but asserted nothing durable
+                // against was never stored at all. The same thing named in
+                // two statements could be given two different types, and
+                // whichever landed first won permanently. And the typing
+                // decision sat inside a per-triple field, which is where a
+                // prompt matrix measured it being ignored — 0 of 20 novel
+                // kinds typed as anything but the generic fallback.
+                //
+                // As its own section it is one decision per thing, made once.
+                if let Some(Value::Array(arr)) = obj.get("entities") {
+                    for v in arr {
+                        if let Some(item) =
+                            project_named_entity(v, self.id.raw(), self.extractor_version)
+                        {
+                            if item.confidence() >= self.confidence_threshold {
+                                out.push(item);
+                            }
+                        }
+                    }
+                }
                 if let Some(Value::Array(arr)) = obj.get("statements") {
                     for v in arr {
                         if let Some(item) =
@@ -427,15 +455,6 @@ impl LlmExtractor {
                         {
                             if item.confidence() >= self.confidence_threshold {
                                 out.push(item);
-                                // The model's type for the statement's
-                                // endpoints — the only tier that types an
-                                // entity from the whole memory and the
-                                // namespace's schema.
-                                out.extend(typed_endpoint_mentions(
-                                    v,
-                                    self.id.raw(),
-                                    self.extractor_version,
-                                ));
                             }
                         }
                     }
@@ -1236,51 +1255,64 @@ fn read_event_at(v: &Value) -> Option<u64> {
     read_str(v, "event_at").and_then(|s| crate::pattern::temporal::parse_event_date(&s))
 }
 
-/// Typed entity mentions for a statement's subject / object, from the
-/// model's `subject_type` / `object_type`. Without these the LLM tier could
-/// not type an entity at all — every entity it contributed was minted as the
-/// generic type, so only the span classifier ever assigned real types. The
-/// subject is skipped when it is the speaker (`subject_is_self`); the object
-/// only counts when it names an entity. A bare type name is qualified as
-/// `brain:<Name>`, the label form every entity type is offered under.
-pub(crate) fn typed_endpoint_mentions(
+/// One named entity from the response's `entities` section: the thing the
+/// memory is about, with the kind it is.
+///
+/// This is the whole of the LLM tier's entity extraction. It replaced
+/// `typed_endpoint_mentions`, which derived entities from each statement's
+/// `subject_type` / `object_type` and so could only ever see things that
+/// appeared in a triple — and could give one thing two types when two
+/// triples disagreed.
+///
+/// A bare type name is qualified as `brain:<Name>`, the label form every
+/// entity type is offered under. The namespace is rewritten to the caller's
+/// own tenant downstream in `resolver::resolve_entity_type`, so `brain:` here
+/// means "unqualified", not "shared across tenants".
+pub(crate) fn project_named_entity(
     v: &Value,
     extractor_id: u32,
     extractor_version: u32,
-) -> Vec<ExtractedItem> {
-    let qualify = |t: String| {
-        let t = t.trim().to_string();
-        if t.is_empty() {
-            None
-        } else if t.contains(':') {
-            Some(t)
-        } else {
-            Some(format!("brain:{t}"))
-        }
-    };
-    let mut out = Vec::new();
-    let mut push = |text: Option<String>, ty: Option<String>| {
-        if let (Some(text), Some(ty)) = (text, ty.and_then(qualify)) {
-            if !crate::resolver::is_temporal_expression_surface(&text) {
-                out.push(ExtractedItem::EntityMention(EntityMention {
-                    entity_type_qname: ty,
-                    text,
-                    start: 0,
-                    end: 0,
-                    confidence: read_conf(v),
-                    extractor_id,
-                    extractor_version,
-                }));
-            }
-        }
-    };
-    if !read_subject_is_self(v) {
-        push(read_str(v, "subject"), read_str(v, "subject_type"));
+) -> Option<ExtractedItem> {
+    let text = read_str(v, "name")?;
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return None;
     }
-    if read_object_is_entity(v) {
-        push(read_str(v, "object"), read_str(v, "object_type"));
+    // A date or relative-time phrase names no referent. Left in, it mints a
+    // phantom node and pollutes the entity graph.
+    if crate::resolver::is_temporal_expression_surface(&text) {
+        return None;
     }
-    out
+    let ty = read_str(v, "type")?;
+    let ty = ty.trim().to_string();
+    // A STRINGIFIED JSON LITERAL IS AN ABSENT TYPE, NOT A TYPE NAMED "null".
+    //
+    // The field is specified as a string, and a model with nothing to put in
+    // it writes the literal as one. `acme:null` reached a live registry that
+    // way and was applied to two entities. This is a WIRE-FORMAT rule: those
+    // three words are JSON's own literals, spelled identically by every
+    // emitter whatever language the content is in. Matched exactly and
+    // case-sensitively, so a domain whose real kind is `Null` keeps it —
+    // nothing here judges whether a word is meaningful, and a denylist of
+    // English words would refuse `Object` to an astronomer while covering no
+    // other language at all.
+    if ty.is_empty() || matches!(ty.as_str(), "null" | "true" | "false") {
+        return None;
+    }
+    let entity_type_qname = if ty.contains(':') {
+        ty
+    } else {
+        format!("brain:{ty}")
+    };
+    Some(ExtractedItem::EntityMention(EntityMention {
+        entity_type_qname,
+        text,
+        start: 0,
+        end: 0,
+        confidence: read_conf(v),
+        extractor_id,
+        extractor_version,
+    }))
 }
 
 fn project_entity(

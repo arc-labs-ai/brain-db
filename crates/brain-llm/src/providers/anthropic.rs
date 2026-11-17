@@ -127,6 +127,45 @@ impl AnthropicClient {
     }
 }
 
+/// One POST to the messages endpoint. Separate so the temperature retry in
+/// `complete` sends a request identical to the first but for that field.
+async fn send_messages(
+    http: &reqwest::Client,
+    url: &str,
+    api_key: &str,
+    body: &AnthropicRequestBody,
+    timeout: std::time::Duration,
+) -> Result<reqwest::Response, LlmError> {
+    tokio::time::timeout(
+        timeout,
+        http.post(url)
+            .header("x-api-key", api_key)
+            .header("anthropic-version", API_VERSION)
+            .header("content-type", "application/json")
+            .json(body)
+            .send(),
+    )
+    .await
+    .map_err(|_| LlmError::Timeout)?
+    .map_err(LlmError::from)
+}
+
+/// Does this 400 say the model refuses an explicit `temperature`?
+///
+/// Anthropic reports it as an `invalid_request_error` naming the field in
+/// prose; there is no machine-readable parameter code to key on, so the
+/// message is matched. Narrow on purpose: a 400 that is not about temperature
+/// must stay an error rather than silently losing the caller's setting.
+fn rejects_temperature(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body).is_ok_and(|v| {
+        let err = &v["error"];
+        err["type"] == "invalid_request_error"
+            && err["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("temperature"))
+    })
+}
+
 impl LlmClient for AnthropicClient {
     fn complete<'a>(&'a self, request: LlmRequest) -> LlmFuture<'a> {
         // Owned clones so the task is `'static`. `reqwest::Client` is an Arc
@@ -151,18 +190,36 @@ impl LlmClient for AnthropicClient {
             // reactor. See `providers::runtime`.
             run_on_provider_runtime(
                 async move {
-                    let resp = tokio::time::timeout(
-                        timeout,
-                        http.post(&url)
-                            .header("x-api-key", &api_key)
-                            .header("anthropic-version", API_VERSION)
-                            .header("content-type", "application/json")
-                            .json(&body)
-                            .send(),
-                    )
-                    .await
-                    .map_err(|_| LlmError::Timeout)?
-                    .map_err(LlmError::from)?;
+                    let mut body = body;
+                    let mut resp = send_messages(&http, &url, &api_key, &body, timeout).await?;
+
+                    // Newer models accept only their default temperature and
+                    // reject an explicit one with a 400. Retry once without the
+                    // field rather than fail the call: the caller's temperature
+                    // is a preference, and for HyPE -- which is mandatory and
+                    // always-on -- losing the whole generation over a sampling
+                    // nudge is the wrong trade.
+                    //
+                    // Dropping it is expressible because `temperature` is
+                    // skipped when zero, which is also why every caller that
+                    // leaves it at the default already works on these models.
+                    if resp.status() == 400 && body.temperature != 0.0 {
+                        let detail = resp.text().await.unwrap_or_default();
+                        if rejects_temperature(&detail) {
+                            tracing::debug!(
+                                target: "brain_llm::anthropic",
+                                model = %body.model,
+                                "model rejected an explicit temperature; retrying with its default",
+                            );
+                            body.temperature = 0.0;
+                            resp = send_messages(&http, &url, &api_key, &body, timeout).await?;
+                        } else {
+                            return Err(LlmError::ProviderError {
+                                status: 400,
+                                message: detail,
+                            });
+                        }
+                    }
 
                     let status = resp.status();
                     if status == 401 || status == 403 {
@@ -446,6 +503,32 @@ mod tests {
         assert!(!json.contains("\"system\""));
         // temperature 0.0 is skipped.
         assert!(!json.contains("\"temperature\""));
+    }
+
+    /// A 400 naming `temperature` is the one the retry exists for. Claude 5
+    /// models answer exactly this when an explicit value is sent, and HyPE
+    /// sends 0.3, so without the retry every HyPE generation on those models
+    /// is lost and the memory is stored with no hypothetical questions.
+    #[test]
+    fn a_temperature_rejection_is_recognised() {
+        let body = r#"{"type":"error","error":{"type":"invalid_request_error",
+            "message":"`temperature` is deprecated for this model."}}"#;
+        assert!(rejects_temperature(body));
+    }
+
+    /// Narrow on purpose: any other 400 must stay an error. Treating every
+    /// invalid_request_error as a temperature problem would silently drop the
+    /// caller's setting and retry a request that was wrong for another reason.
+    #[test]
+    fn an_unrelated_400_is_not_a_temperature_rejection() {
+        for body in [
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: must be >= 1"}}"#,
+            r#"{"type":"error","error":{"type":"not_found_error","message":"model: claude-nope"}}"#,
+            r#"not json at all"#,
+            r#"{}"#,
+        ] {
+            assert!(!rejects_temperature(body), "wrongly matched: {body}");
+        }
     }
 
     #[test]

@@ -497,6 +497,136 @@ async fn resolve_exact_match_via_canonical_name() {
     server.stop().await;
 }
 
+/// An alias resolves with NO type hint.
+///
+/// The no-hint path is the grounded-read default — a caller asking about
+/// "Fola" should not have to know her entity type — and it used to consult
+/// canonical names only. Aliases were written, returned by a read, and
+/// invisible to the one operation whose job is to turn a name into an
+/// entity, so the field was effectively write-only unless the caller
+/// happened to supply a type.
+#[tokio::test(flavor = "current_thread")]
+async fn resolve_alias_without_a_type_hint() {
+    let server = start(1).await;
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
+    complete_handshake(&mut client, &server.token).await;
+
+    let fola = create_person(&mut client, 1, "Folake Adebayo", vec!["Fola".into()]).await;
+
+    let (_, body) = round_trip(
+        &mut client,
+        3,
+        RequestBody::EntityResolve(EntityResolveRequest {
+            candidate_name: "Fola".into(),
+            resolution_context: String::new(),
+            entity_type_hint: 0,
+            allow_create: false,
+            request_id: *uuid::Uuid::now_v7().as_bytes(),
+            act_as: None,
+        }),
+    )
+    .await;
+    match body {
+        ResponseBody::EntityResolve(r) => {
+            assert_eq!(r.outcome, ResolutionOutcomeWire::Resolved);
+            assert_eq!(
+                r.tier, 1,
+                "an alias is an exact match, same tier as canonical"
+            );
+            assert_eq!(r.resolved_entity, fola);
+        }
+        other => panic!("expected EntityResolve, got {other:?}"),
+    }
+
+    server.stop().await;
+}
+
+/// A canonical name outranks another entity's alias for the same string.
+///
+/// The precedence matters: if "Fola" is one person's canonical name and
+/// another's alias, the first is what the cue names. Canonical is tried
+/// first and returns outright, so adding the alias tier cannot shadow it.
+#[tokio::test(flavor = "current_thread")]
+async fn canonical_name_beats_another_entitys_alias() {
+    let server = start(1).await;
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
+    complete_handshake(&mut client, &server.token).await;
+
+    let canonical = create_person(&mut client, 1, "Fola", vec![]).await;
+    let _aliased = create_person(&mut client, 3, "Folake Adebayo", vec!["Fola".into()]).await;
+
+    let (_, body) = round_trip(
+        &mut client,
+        5,
+        RequestBody::EntityResolve(EntityResolveRequest {
+            candidate_name: "Fola".into(),
+            resolution_context: String::new(),
+            entity_type_hint: 0,
+            allow_create: false,
+            request_id: *uuid::Uuid::now_v7().as_bytes(),
+            act_as: None,
+        }),
+    )
+    .await;
+    match body {
+        ResponseBody::EntityResolve(r) => {
+            assert_eq!(r.outcome, ResolutionOutcomeWire::Resolved);
+            assert_eq!(
+                r.resolved_entity, canonical,
+                "the canonical holder wins; the alias does not shadow it"
+            );
+        }
+        other => panic!("expected EntityResolve, got {other:?}"),
+    }
+
+    server.stop().await;
+}
+
+/// Two entities carrying the same alias is ambiguous, not a silent pick.
+///
+/// The no-hint path has no fuzzy tier to break the tie — it is exact-only by
+/// design — so reporting both candidates is the honest answer, matching what
+/// it already does for two entities sharing a canonical name.
+#[tokio::test(flavor = "current_thread")]
+async fn a_shared_alias_without_a_type_hint_is_ambiguous() {
+    let server = start(1).await;
+    let mut client = TcpStream::connect(server.data_plane_addr)
+        .await
+        .expect("connect");
+    complete_handshake(&mut client, &server.token).await;
+
+    let a = create_person(&mut client, 1, "Alexandra Stone", vec!["Alex".into()]).await;
+    let b = create_person(&mut client, 3, "Alexander Pike", vec!["Alex".into()]).await;
+
+    let (_, body) = round_trip(
+        &mut client,
+        5,
+        RequestBody::EntityResolve(EntityResolveRequest {
+            candidate_name: "Alex".into(),
+            resolution_context: String::new(),
+            entity_type_hint: 0,
+            allow_create: false,
+            request_id: *uuid::Uuid::now_v7().as_bytes(),
+            act_as: None,
+        }),
+    )
+    .await;
+    match body {
+        ResponseBody::EntityResolve(r) => {
+            assert_eq!(r.outcome, ResolutionOutcomeWire::Ambiguous);
+            assert_eq!(r.candidate_ids.len(), 2);
+            assert!(r.candidate_ids.contains(&a) && r.candidate_ids.contains(&b));
+        }
+        other => panic!("expected EntityResolve, got {other:?}"),
+    }
+
+    server.stop().await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn resolve_unknown_returns_not_found() {
     let server = start(1).await;

@@ -63,7 +63,8 @@ use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use brain_core::{
-    EdgeKind, EdgeKindRef, EntityId, MemoryId, NodeRef, PredicateId, SpaceId, StatementId,
+    EdgeKind, EdgeKindRef, EntityId, MemoryId, NamespaceId, NodeRef, PredicateId, SpaceId,
+    StatementId,
 };
 use brain_core::{EvidenceRef, Statement, StatementObject};
 use brain_metadata::schema::predicate::predicate_lookup_by_qname;
@@ -79,6 +80,7 @@ use futures_lite::FutureExt;
 use glommio::timer::sleep;
 use tracing::{trace, warn};
 
+use super::Scope;
 use crate::config::{WorkerConfig, WorkerKind};
 use crate::context::WorkerContext;
 use crate::error::WorkerError;
@@ -283,9 +285,9 @@ async fn do_causal_edge_cycle(
     let whitelist = worker.resolved.get().expect("resolved set populated above");
 
     let mut pairs: Vec<(MemoryId, MemoryId, f32)> = Vec::new();
-    // Owning space of each effect memory, from its statement's row: the
-    // edge write must carry the tenant's space (see the submit below).
-    let mut spaces: HashMap<MemoryId, SpaceId> = HashMap::new();
+    // Owning tenant scope of each effect memory, from its row: the edge
+    // write must carry both halves (see the submit below).
+    let mut spaces: HashMap<MemoryId, Scope> = HashMap::new();
     let mut processed = 0usize;
     while processed < cfg.batch_size {
         if started.elapsed() >= cfg.max_runtime {
@@ -342,14 +344,14 @@ async fn do_causal_edge_cycle(
         0usize
     } else {
         let created_at = now_unix_nanos_causal();
-        // One Write per owning space. `apply_link`'s tenant wall drops any
-        // Memory endpoint whose row is not in `write.space_id`, so stamping
-        // `SpaceId::default()` here silently discarded every Caused edge for
-        // real (non-default-space) tenants.
-        let mut by_space: HashMap<SpaceId, Vec<(MemoryId, MemoryId, f32)>> = HashMap::new();
+        // One Write per owning tenant scope. `apply_link`'s tenant wall
+        // drops any Memory endpoint whose row is not in `write.space_id`,
+        // and a write that names no namespace lands under the system one,
+        // which no tenant read can reach.
+        let mut by_space: HashMap<Scope, Vec<(MemoryId, MemoryId, f32)>> = HashMap::new();
         for pair in &pairs {
-            let space = spaces.get(&pair.1).copied().unwrap_or_default();
-            by_space.entry(space).or_default().push(*pair);
+            let scope = spaces.get(&pair.1).copied().unwrap_or_default();
+            by_space.entry(scope).or_default().push(*pair);
         }
         let real_writer = ctx
             .ops
@@ -360,7 +362,10 @@ async fn do_causal_edge_cycle(
             .ok_or_else(|| {
                 WorkerError::Ops("causal_edge: unified path requires RealWriterHandle".into())
             })?;
-        for (space, links) in by_space {
+        for (scope, links) in by_space {
+            let (namespace_id, space_id_bytes) = scope;
+            let space = SpaceId::from(space_id_bytes);
+            let namespace = NamespaceId::from(namespace_id);
             let phases: Vec<Phase> = links
                 .iter()
                 .map(|(cause, effect, weight)| Phase::Link {
@@ -375,8 +380,9 @@ async fn do_causal_edge_cycle(
                 })
                 .collect();
             let request_hash = hash_causal_batch(&links);
-            let write =
-                Write::from_phases(WriteId::new(), space, phases).with_request_hash(request_hash);
+            let write = Write::from_phases(WriteId::new(), space, phases)
+                .with_namespace(namespace)
+                .with_request_hash(request_hash);
             real_writer
                 .submit(write)
                 .await
@@ -403,7 +409,7 @@ fn collect_pairs_for_statement(
     whitelist: &HashSet<PredicateId>,
     knobs: &CausalEdgeKnobs,
     pairs: &mut Vec<(MemoryId, MemoryId, f32)>,
-    spaces: &mut HashMap<MemoryId, SpaceId>,
+    spaces: &mut HashMap<MemoryId, Scope>,
 ) -> Result<Option<CausalSkipReason>, WorkerError> {
     let metadata = ctx.ops.executor.metadata.clone();
     let rtxn = metadata
@@ -445,7 +451,7 @@ fn collect_pairs_for_statement(
             for em in &effect_memories {
                 if let Ok(Some(g)) = t.get(&em.to_be_bytes()) {
                     let m: MemoryMetadata = g.value();
-                    spaces.insert(*em, SpaceId(uuid::Uuid::from_bytes(m.space_id_bytes)));
+                    spaces.insert(*em, (m.namespace_id, m.space_id_bytes));
                 }
             }
         }

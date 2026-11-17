@@ -16,6 +16,7 @@ use crate::write::{Phase, PhaseAck, Write, WriteId};
 
 pub async fn handle_link(req: LinkRequest, ctx: &OpsContext) -> Result<LinkResponse, OpError> {
     validate_weight(req.weight, EdgeKind::from(req.kind))?;
+    validate_distinct_endpoints("LINK", req.source, req.target)?;
 
     if let Some(txn_id) = req.txn_id {
         return handle_link_in_txn(req, txn_id, ctx).await;
@@ -170,6 +171,8 @@ pub async fn handle_unlink(
     req: UnlinkRequest,
     ctx: &OpsContext,
 ) -> Result<UnlinkResponse, OpError> {
+    validate_distinct_endpoints("UNLINK", req.source, req.target)?;
+
     if let Some(txn_id) = req.txn_id {
         return handle_unlink_in_txn(req, txn_id, ctx).await;
     }
@@ -601,6 +604,22 @@ async fn handle_unlink_in_txn(
     })
 }
 
+/// An edge joins two memories, so its endpoints must differ.
+///
+/// Every edge kind reads as a claim about one memory relative to another —
+/// "caused", "followed by", "contradicts" — and none of them says anything
+/// when both ends are the same row. Refusing the pair here keeps the degenerate
+/// edge out of the graph entirely rather than leaving every traversal and
+/// ranking path to recognise and skip it.
+fn validate_distinct_endpoints(op: &str, source: u128, target: u128) -> Result<(), OpError> {
+    if source == target {
+        return Err(OpError::InvalidRequest(format!(
+            "{op} source and target are the same memory ({source}); an edge joins two memories"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_weight(weight: f32, kind: EdgeKind) -> Result<(), OpError> {
     let (lo, hi) = if matches!(kind, EdgeKind::Contradicts) {
         (-1.0_f32, 1.0_f32)
@@ -627,4 +646,29 @@ fn map_writer_err_for_link(err: WriterError) -> OpError {
 
 fn map_writer_err_for_unlink(err: WriterError) -> OpError {
     OpError::ExecError(brain_planner::ExecError::WriterFailed(err))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_edge_to_the_same_memory_is_refused() {
+        // Every edge kind reads as a claim about one memory relative to
+        // another, so both ends being the same row is not a weak edge — it is
+        // not an edge.
+        for op in ["LINK", "UNLINK"] {
+            let err = validate_distinct_endpoints(op, 42, 42).expect_err("must refuse");
+            assert!(
+                matches!(err, OpError::InvalidRequest(ref m) if m.contains("same memory")),
+                "{op} gave {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn distinct_endpoints_are_accepted() {
+        validate_distinct_endpoints("LINK", 1, 2).expect("distinct ids are an edge");
+        validate_distinct_endpoints("UNLINK", 2, 1).expect("direction does not matter here");
+    }
 }

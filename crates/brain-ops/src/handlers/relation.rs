@@ -48,7 +48,7 @@ use brain_protocol::{
 };
 
 use crate::context::OpsContext;
-use crate::error::OpError;
+use crate::error::{caller_tombstone_reason, OpError};
 use crate::handlers::events::emit_graph_event;
 use crate::handlers::writer_handle::real_writer_handle;
 use crate::write::{
@@ -491,9 +491,12 @@ pub async fn handle_relation_tombstone(
     req: RelationTombstoneRequest,
     ctx: &OpsContext,
 ) -> Result<RelationTombstoneResponse, OpError> {
-    if req.reason.len() > REASON_MAX {
-        return Err(OpError::InvalidRequest("reason exceeds 4 KiB".into()));
+    if req.reason_message.len() > REASON_MAX {
+        return Err(OpError::InvalidRequest(
+            "reason_message exceeds 4 KiB".into(),
+        ));
     }
+    let reason = caller_tombstone_reason(req.reason)?;
     let id = RelationId::from(req.relation_id);
     let now = now_unix_nanos();
 
@@ -515,10 +518,12 @@ pub async fn handle_relation_tombstone(
     let request_hash = hash_relation_tombstone_request(&req);
     let phase = Phase::Tombstone {
         target: TombstoneTarget::Relation(id),
-        // brain-metadata's relation tombstone is binary: it flips bits
-        // and doesn't read this reason. The wire reason still rides on
-        // the post-commit event below.
-        reason: 0,
+        // brain-metadata's relation tombstone is binary: it flips bits and
+        // does not read this byte today. It is carried anyway so the phase
+        // records why the row was retired, the same way the statement path
+        // does, and so the reclamation pass has the classification available
+        // when it learns to read it.
+        reason: reason.as_u8(),
         at_unix_nanos: now,
     };
     let write = Write::single(write_id, ctx.executor.caller_space, phase)
@@ -544,7 +549,7 @@ pub async fn handle_relation_tombstone(
         EventType::RelationTombstoned,
         GraphEventPayload::RelationTombstoned(RelationTombstonedEvent {
             relation_id: id.to_bytes(),
-            reason: req.reason,
+            reason: req.reason_message,
         }),
         now,
     )
@@ -1031,7 +1036,9 @@ fn hash_relation_tombstone_request(req: &RelationTombstoneRequest) -> [u8; 32] {
     h.update(b"relation_tombstone:");
     h.update(&req.relation_id);
     h.update(b"\0");
-    h.update(req.reason.as_bytes());
+    h.update(&[req.reason]);
+    h.update(b"\0");
+    h.update(req.reason_message.as_bytes());
     *h.finalize().as_bytes()
 }
 

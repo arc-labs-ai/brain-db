@@ -84,11 +84,18 @@ pub struct RelationSupersedeRequest {
 }
 
 /// `RELATION_TOMBSTONE` (`0x0153`).
+///
+/// `reason` byte values: `1=SourceMemoryForgotten / 2=UserRequest /
+/// 3=SchemaInvalidation / 4=ExtractorRetraction`, the same closed set
+/// `STATEMENT_TOMBSTONE` takes, so one audit trail classifies a retired
+/// relation and a retired statement the same way. `reason_message` is the
+/// free-text note and is capped at 4 KiB by the validator.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RelationTombstoneRequest {
     #[serde(with = "serde_bytes")]
     pub relation_id: WireUuid,
-    pub reason: String,
+    pub reason: u8,
+    pub reason_message: String,
     #[serde(with = "serde_bytes")]
     pub request_id: WireUuid,
     /// Effective identity this tombstone runs as, on behalf of the

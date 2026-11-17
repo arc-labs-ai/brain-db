@@ -164,11 +164,11 @@ impl MemoryTimelineFilter {
                 return false;
             }
         }
+        // The salience band is the last predicate, written as a negation so
+        // that a score which compares to neither bound still belongs to the
+        // page rather than being dropped from it.
         let salience = row.salience_at(self.now_unix_nanos);
-        if salience < self.salience_min || salience > self.salience_max {
-            return false;
-        }
-        true
+        !(salience < self.salience_min || salience > self.salience_max)
     }
 }
 

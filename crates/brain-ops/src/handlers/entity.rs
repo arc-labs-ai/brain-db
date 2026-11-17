@@ -34,12 +34,14 @@ use brain_protocol::{
     EntityGetResponse, EntityListItem, EntityListRequest, EntityListResponseFrame,
     EntityMergeRequest, EntityMergeResponse, EntityMergedEvent, EntityRenameRequest,
     EntityRenameResponse, EntityRenamedEvent, EntityResolveRequest, EntityResolveResponse,
-    EntityTombstoneRequest, EntityTombstoneResponse, EntityTombstonedEvent, EntityUnmergeRequest,
+    EntityTombstoneRequest, EntityTombstoneResponse, EntityTombstonedEvent, EntityTypeListItem,
+    EntityTypeListRequest, EntityTypeListResponseFrame, EntityUnmergeRequest,
     EntityUnmergeResponse, EntityUnmergedEvent, EntityUpdateRequest, EntityUpdateResponse,
     EntityUpdatedEvent, EntityView, GraphEventPayload, ResolutionOutcomeWire,
 };
 
 use crate::context::OpsContext;
+use crate::dispatch::RequestCaller;
 use crate::error::OpError;
 use crate::handlers::events::emit_graph_event;
 use crate::handlers::writer_handle::real_writer_handle;
@@ -131,6 +133,25 @@ pub async fn handle_entity_create(
     }
 
     let entity_type = EntityTypeId(req.entity_type_id);
+    // An id no registry row answers to is a bad argument, not an engine
+    // fault. Left to the writer it surfaces as `writer internal error` and
+    // reaches the caller as a 502, which reads as "the database broke"
+    // rather than "that type does not exist".
+    {
+        let rtxn = ctx
+            .executor
+            .metadata
+            .read_txn()
+            .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
+        if !brain_metadata::entity_type_exists_rtxn(&rtxn, entity_type)
+            .map_err(|e| OpError::Internal(format!("entity_type_exists: {e}")))?
+        {
+            return Err(OpError::InvalidRequest(format!(
+                "unknown entity_type_id {}",
+                req.entity_type_id
+            )));
+        }
+    }
     let now = now_unix_nanos();
     // Pre-allocate the id here so the request hash + cached replay both
     // see the same value across retries. (Replays still hit the writer's
@@ -819,12 +840,19 @@ pub async fn handle_entity_resolve(
             "candidate_name exceeds 256 bytes".into(),
         ));
     }
-    // No type hint → cross-type exact resolve across every declared
-    // entity type. This is the grounded-read default: a caller asking
-    // about "Alice" shouldn't have to know her entity type. One exact
-    // canonical-name hit → resolved; several distinct hits → ambiguous;
-    // none → not found. Typed fuzzy tiers (trigram/alias) need a specific
-    // type, so the no-hint path stays exact-only — precise and fast.
+    // No type hint → cross-type EXACT resolve across every declared entity
+    // type. This is the grounded-read default: a caller asking about "Alice"
+    // shouldn't have to know her entity type. One exact hit → resolved;
+    // several distinct hits → ambiguous; none → not found. The fuzzy tier
+    // (trigram) needs a specific type, so the no-hint path stays exact-only
+    // — precise and fast.
+    //
+    // Aliases count as exact. An alias is a declared alternate name, so
+    // matching one is the same kind of statement as matching a canonical
+    // name, and the reason a caller is spared the type applies to both: the
+    // name they know a thing by may well be the alias. Canonical is tried
+    // first and wins outright, so an entity whose CANONICAL name is the cue
+    // is never shadowed by another entity that merely lists it as an alias.
     let scope =
         brain_metadata::RowScope::new(ctx.executor.caller_namespace, ctx.executor.caller_space);
     if req.entity_type_hint == 0 {
@@ -833,9 +861,13 @@ pub async fn handle_entity_resolve(
             .metadata
             .read_txn()
             .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
-        let ids =
+        let mut ids =
             brain_metadata::entity_resolve_canonical_all_types(&rtxn, scope, &req.candidate_name)
                 .map_err(OpError::from)?;
+        if ids.is_empty() {
+            ids = brain_metadata::entity_resolve_alias_all_types(&rtxn, scope, &req.candidate_name)
+                .map_err(OpError::from)?;
+        }
         drop(rtxn);
         return Ok(match ids.as_slice() {
             [id] => EntityResolveResponse {
@@ -1162,3 +1194,56 @@ fn entity_to_view(e: &Entity) -> EntityView {
 
 // Entity error classification lives in `OpError`'s `From<EntityOpError>`
 // impl (crate::error) — handlers use `OpError::from`.
+
+// ---------------------------------------------------------------------------
+// Entity type introspection
+// ---------------------------------------------------------------------------
+
+/// `ENTITY_TYPE_LIST` — the types the caller can use, with their ids.
+///
+/// Every other entity op takes `entity_type_id`, and until this op nothing
+/// reported it: a schema document names its types without ids, and a type
+/// the extractor coined appears in no document. A caller who read
+/// `acme:Device` off a recalled memory could not turn that name into the
+/// number `ENTITY_CREATE` and `ENTITY_LIST` require.
+pub async fn handle_entity_type_list(
+    _req: EntityTypeListRequest,
+    caller: &RequestCaller,
+    ctx: &OpsContext,
+) -> Result<EntityTypeListResponseFrame, OpError> {
+    let rtxn = ctx
+        .executor
+        .metadata
+        .read_txn()
+        .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
+
+    let namespace_id =
+        brain_metadata::namespace::namespace_lookup_by_name(&rtxn, &caller.namespace)
+            .map_err(|e| OpError::Internal(format!("namespace lookup: {e}")))?
+            .map_or(brain_core::NamespaceId::SYSTEM.raw(), |n| n.raw());
+
+    let scope =
+        brain_metadata::TypeScope::space(namespace_id, ctx.executor.caller_space.0.into_bytes());
+    let rows = brain_metadata::entity_type_list_scoped(&rtxn, scope)
+        .map_err(|e| OpError::Internal(format!("entity_type_list: {e}")))?;
+
+    // Declared means "named by the active schema document", which is the
+    // only thing that distinguishes a type an operator can promote or drop
+    // from one a single sentence produced. An empty attribute blob does not
+    // say it: a declared type with no attributes has one too.
+    let declared =
+        brain_metadata::declared_entity_type_names(&rtxn, &caller.namespace).unwrap_or_default();
+
+    let mut qnames = brain_metadata::EntityTypeQnames::new();
+    let items: Vec<EntityTypeListItem> = rows
+        .into_iter()
+        .map(|r| EntityTypeListItem {
+            type_qname: qnames.resolve(&rtxn, r.entity_type_id),
+            declared: declared.contains(&r.name),
+            entity_type_id: r.entity_type_id,
+            created_at_unix_nanos: r.created_at_unix_nanos,
+        })
+        .collect();
+    let total = items.len() as u32;
+    Ok(EntityTypeListResponseFrame { items, total })
+}

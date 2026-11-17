@@ -429,3 +429,48 @@ impl EntityListResponseFrame {
 pub struct EntityTombstoneResponse {
     pub tombstoned_at_unix_nanos: u64,
 }
+
+// ============================================================
+// Entity type introspection
+// ============================================================
+
+/// `ENTITY_TYPE_LIST` (`0x0139`). The entity types the caller can use,
+/// each with the numeric id the rest of this API takes.
+///
+/// Every other entity op identifies a type by `entity_type_id`, a u32 the
+/// registry assigns. Nothing else reports it: a schema document names its
+/// types without ids, and a type the extractor coined is not in any
+/// document at all. A caller who read `acme:Device` off a recalled memory
+/// had no way to turn that name into the number `ENTITY_CREATE` and
+/// `ENTITY_LIST` demand, short of guessing integers.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EntityTypeListRequest {
+    /// Effective identity this listing runs as. `None` means the
+    /// connection's own key-bound identity.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub act_as: Option<crate::ActAs>,
+}
+
+/// One row in [`EntityTypeListResponseFrame`].
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EntityTypeListItem {
+    /// What every other entity op means by `entity_type_id`.
+    pub entity_type_id: u32,
+    /// `<namespace>:<Name>` — `brain:Person` for a built-in, the caller's
+    /// own namespace for a type they declared or the extractor coined.
+    pub type_qname: String,
+    /// False when the type was coined from a write rather than declared in
+    /// a schema document. Both are usable; only a declared type survives a
+    /// schema replace.
+    pub declared: bool,
+    pub created_at_unix_nanos: u64,
+}
+
+/// `ENTITY_TYPE_LIST_RESP` (`0x01B9`). Single-frame snapshot: the registry
+/// holds the built-ins plus whatever one tenant has declared or coined,
+/// which is bounded by a domain rather than by corpus size.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EntityTypeListResponseFrame {
+    pub items: Vec<EntityTypeListItem>,
+    pub total: u32,
+}

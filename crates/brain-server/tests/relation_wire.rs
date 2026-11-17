@@ -485,7 +485,8 @@ async fn tombstone_flips_current_state() {
         7,
         RequestBody::RelationTombstone(RelationTombstoneRequest {
             relation_id: rel_id,
-            reason: "test".into(),
+            reason: 2,
+            reason_message: "test".into(),
             request_id: rid(),
             act_as: None,
         }),
@@ -708,7 +709,8 @@ async fn traverse_two_hop() {
         13,
         RequestBody::RelationTombstone(RelationTombstoneRequest {
             relation_id: ab,
-            reason: "test tombstone".into(),
+            reason: 2,
+            reason_message: "test tombstone".into(),
             request_id: rid(),
             act_as: None,
         }),

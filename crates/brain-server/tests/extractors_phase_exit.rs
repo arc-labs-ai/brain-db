@@ -201,7 +201,7 @@ async fn encode_dispatches_builtin_extractors_and_writes_audit_rows() {
     let (opcode, body) = round_trip(
         &mut client,
         1,
-        encode_request("Alice Cooper attended the planning session"),
+        encode_request("A. Cooper attended the planning session"),
     )
     .await;
     assert_eq!(opcode, Opcode::EncodeResp.as_u16());
@@ -218,7 +218,7 @@ async fn encode_dispatches_builtin_extractors_and_writes_audit_rows() {
     let (_, body) = round_trip(
         &mut client,
         3,
-        encode_request("Bob Smith showed up to the meeting"),
+        encode_request("B. Smith showed up to the meeting"),
     )
     .await;
     let memory2_bytes = match body {

@@ -435,3 +435,19 @@ impl From<brain_metadata::relation::types::RelationTypeOpError> for OpError {
         }
     }
 }
+
+/// Decode a tombstone reason byte that arrived on a request.
+///
+/// The range check lives on
+/// [`brain_core::TombstoneReason::from_caller_byte`] — the two server-stamped
+/// reasons mean "reclaim this row", so a request may not name them. This
+/// wrapper only turns the rejection into the wire error, and is shared so the
+/// statement and relation tombstone paths cannot drift into accepting
+/// different sets.
+pub fn caller_tombstone_reason(byte: u8) -> Result<brain_core::TombstoneReason, OpError> {
+    brain_core::TombstoneReason::from_caller_byte(byte).ok_or_else(|| {
+        OpError::InvalidRequest(format!(
+            "unknown tombstone_reason byte {byte}; expected 1..=4"
+        ))
+    })
+}

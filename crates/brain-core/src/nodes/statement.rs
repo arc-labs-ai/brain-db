@@ -342,6 +342,41 @@ impl TombstoneReason {
     pub const fn is_retract(self) -> bool {
         matches!(self, Self::Retract)
     }
+
+    /// True iff a caller may name this reason on a tombstone request.
+    ///
+    /// The four audit reasons describe WHY a row was retired and leave it
+    /// readable. [`Retract`](Self::Retract) and
+    /// [`RetentionExpired`](Self::RetentionExpired) mean something else
+    /// entirely — they are the markers the reclamation pass selects on to
+    /// physically remove a row once the grace period is up — and the server
+    /// stamps them itself, on the retract path and the retention sweep.
+    #[must_use]
+    pub const fn is_caller_supplied(self) -> bool {
+        matches!(
+            self,
+            Self::SourceMemoryForgotten
+                | Self::UserRequest
+                | Self::SchemaInvalidation
+                | Self::ExtractorRetraction
+        )
+    }
+
+    /// Decode a reason byte that arrived from a caller.
+    ///
+    /// Narrower than [`from_u8`](Self::from_u8) on purpose: that one decodes
+    /// any stored byte, including the two the server stamps, which is what a
+    /// read of an existing row needs. A request is not a read. Accepting a
+    /// server-stamped byte here would let a caller ask for a soft,
+    /// audit-preserving tombstone and have the row classified as a hard
+    /// delete, which the reclamation pass then removes for good.
+    #[must_use]
+    pub const fn from_caller_byte(b: u8) -> Option<Self> {
+        match Self::from_u8(b) {
+            Some(r) if r.is_caller_supplied() => Some(r),
+            _ => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -755,5 +790,49 @@ mod tests {
             is_stateful: false,
         };
         assert_eq!(p.canonical(), "brain:is_a");
+    }
+
+    // -----------------------------------------------------------------------
+    // TombstoneReason: which bytes a caller may name.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn the_four_audit_reasons_are_caller_supplied() {
+        for b in 1..=4u8 {
+            let r = TombstoneReason::from_caller_byte(b)
+                .unwrap_or_else(|| panic!("byte {b} is an audit reason"));
+            assert_eq!(r.as_u8(), b);
+            assert!(r.is_caller_supplied());
+        }
+    }
+
+    #[test]
+    fn the_server_stamped_reasons_are_refused_from_a_caller() {
+        // Retract and RetentionExpired are what the reclamation pass selects
+        // on to physically remove a row. Decoding either from a request would
+        // let a caller ask for a soft, audit-preserving tombstone and have the
+        // row deleted for good once the grace period expired.
+        for b in [
+            TombstoneReason::Retract.as_u8(),
+            TombstoneReason::RetentionExpired.as_u8(),
+        ] {
+            assert!(
+                TombstoneReason::from_u8(b).is_some(),
+                "byte {b} is still a valid STORED reason",
+            );
+            assert!(
+                TombstoneReason::from_caller_byte(b).is_none(),
+                "byte {b} must not be decodable from a request",
+            );
+            assert!(!TombstoneReason::from_u8(b).unwrap().is_caller_supplied());
+        }
+    }
+
+    #[test]
+    fn an_unknown_reason_byte_decodes_to_nothing() {
+        for b in [0u8, 7, 255] {
+            assert!(TombstoneReason::from_u8(b).is_none());
+            assert!(TombstoneReason::from_caller_byte(b).is_none());
+        }
     }
 }

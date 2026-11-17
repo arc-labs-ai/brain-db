@@ -34,6 +34,7 @@ mod decode;
 mod head;
 mod rnn;
 mod tokenizer;
+mod window;
 
 #[cfg(test)]
 mod tests;
@@ -288,97 +289,15 @@ impl GlinerModel {
     /// Run zero-shot NER over `text` with the given `labels`.
     ///
     /// - Labels are passed to the tokenizer verbatim (case-sensitive).
+    /// - Text longer than the model's sequence length is covered by
+    ///   overlapping windows; the spans are merged into one flat set.
     /// - Returns spans sorted by `char_start` ascending; overlaps are
     ///   resolved greedily by score before sort.
     pub fn predict(&self, text: &str, labels: &[&str]) -> Result<Vec<Span>, GlinerError> {
-        if labels.len() > self.config.max_labels {
-            return Err(GlinerError::TooManyLabels {
-                got: labels.len(),
-                limit: self.config.max_labels,
-            });
-        }
-        if labels.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let tokenized = tokenizer::tokenize(
-            self.tokenizer.as_ref(),
-            text,
-            labels,
-            &self.token_ids,
-            self.config.max_len,
-        )?;
-
-        if tokenized.word_first_subtoken.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let device = &self.config.device;
-        let seq_len = tokenized.input_ids.len();
-        let input_ids = Tensor::from_vec(tokenized.input_ids.clone(), (1, seq_len), device)?;
-        let attention_mask =
-            Tensor::from_vec(tokenized.attention_mask.clone(), (1, seq_len), device)?;
-
-        // Stage 1: DeBERTa over subtokens, then the 768→512 projection.
-        // Output `[1, seq_len, hidden_size]` with one row per subtoken
-        // (NOT per word — flair pools to words in upstream's path, we
-        // do that explicitly below via index_select on the recorded
-        // first-subtoken positions).
-        let subtoken_hidden = self
-            .backbone
-            .encode_subtokens(&input_ids, &attention_mask)?;
-        let subtoken_hidden = subtoken_hidden.to_dtype(self.config.dtype)?;
-        let subtoken_2d = subtoken_hidden.squeeze(0)?; // [seq_len, hidden_size]
-
-        // Label embeddings: pool the projected hidden state at every
-        // <<ENT>> marker position (one per label), then push through
-        // the label MLP. The label vectors never see the BiLSTM —
-        // upstream's `compute_score_eval` applies `prompt_rep_layer`
-        // directly to the BERT-side embedding of the markers.
-        let ent_positions = Tensor::from_vec(
-            tokenized.ent_positions.clone(),
-            tokenized.ent_positions.len(),
-            device,
-        )?;
-        let label_hidden = subtoken_2d.index_select(&ent_positions, 0)?;
-        let prompt_emb = self.label_proj.forward(&label_hidden)?;
-
-        // Word embeddings: pool to one vector per WORD (first-subtoken
-        // pooling) on the projected hidden state, then run the BiLSTM
-        // over the word-pooled sequence — matching upstream where the
-        // RNN's input length is `num_words`, not `num_subtokens`.
-        let word_indices = Tensor::from_vec(
-            tokenized.word_first_subtoken.clone(),
-            tokenized.word_first_subtoken.len(),
-            device,
-        )?;
-        let word_hidden = subtoken_2d.index_select(&word_indices, 0)?;
-        let word_hidden_3d = word_hidden.unsqueeze(0)?;
-        let word_hidden_rnn = self.backbone.run_rnn(&word_hidden_3d)?;
-
-        let span_rep = self.head.forward(
-            &word_hidden_rnn,
-            self.config.max_width,
-            self.config.hidden_size,
-        )?;
-        // span_rep: [1, num_words, max_width, hidden]
-
-        // Score: einsum BLKD, BCD -> BLKC.
-        let num_words = tokenized.word_first_subtoken.len();
-        let max_width = self
-            .config
-            .hidden_size_aware_max_width(num_words, self.config.max_width);
-        let scores = score_spans(&span_rep, &prompt_emb, num_words, max_width, labels.len())?;
-
-        let logits_3d = scores.to_dtype(DType::F32)?.to_vec3::<f32>()?;
-        let spans = decode::decode_spans(
-            &logits_3d,
-            self.config.threshold,
-            labels,
-            &tokenized.word_offsets,
-            text,
-        );
-        Ok(spans)
+        Ok(self
+            .predict_batch(&[(text, labels)])?
+            .pop()
+            .unwrap_or_default())
     }
 
     /// Run zero-shot NER over a batch of `(text, labels)` pairs in a
@@ -390,11 +309,10 @@ impl GlinerModel {
     /// invariant. Returns `Err(GlinerError::Decode)` with a descriptive
     /// message when this is violated.
     ///
-    /// Rows whose total token length exceeds `max_len` after prompt
-    /// construction produce an empty `Vec<Span>` for that slot (logged
-    /// via `tracing::warn!`); they do not abort the entire batch. The
-    /// output `Vec` has the same length as `inputs` with one
-    /// `Vec<Span>` per input, in input order.
+    /// Text longer than the model's sequence length is covered by
+    /// overlapping windows rather than refused. Every window from every
+    /// row rides in the same forward pass, and each row's windows are
+    /// merged back into one flat, non-overlapping span set.
     ///
     /// An empty `inputs` returns `Ok(vec![])` without any model work.
     pub fn predict_batch(&self, inputs: &[(&str, &[&str])]) -> Result<Vec<Vec<Span>>, GlinerError> {
@@ -404,68 +322,55 @@ impl GlinerModel {
             BatchValidation::Live => {}
         }
 
-        // Stage 1 — per-row tokenize. Rows that overflow `max_len` are
-        // recorded as `None` and slotted as empty in the output without
-        // consuming a row in the batched backbone pass.
-        let mut tokenized_rows: Vec<Option<tokenizer::TokenizedInput>> =
-            Vec::with_capacity(inputs.len());
-        for (text, labels) in inputs {
-            match tokenizer::tokenize(
-                self.tokenizer.as_ref(),
-                text,
-                labels,
-                &self.token_ids,
-                self.config.max_len,
-            ) {
-                Ok(tok) => tokenized_rows.push(Some(tok)),
-                Err(GlinerError::InputTooLong { got, max }) => {
-                    tracing::warn!(
-                        target: "brain_extractors::gliner",
-                        text_chars = text.chars().count(),
-                        subtokens = got,
-                        max = max,
-                        "input exceeds max_len; skipping in batch and returning empty spans",
-                    );
-                    tokenized_rows.push(None);
-                }
-                Err(e) => return Err(e),
+        // Every row carries the same labels, so the prompt is built once
+        // and its cost charged against each window's word budget.
+        let labels = inputs[0].1;
+        let prompt = tokenizer::build_prompt(self.tokenizer.as_ref(), labels, &self.token_ids)?;
+        let budget = tokenizer::word_budget(&prompt, self.config.max_len)?;
+
+        // Stage 1 — window each row. A row contributes as many windows
+        // as its length needs; `row_of` maps each one back to its row.
+        let mut windows: Vec<tokenizer::TokenizedInput> = Vec::with_capacity(inputs.len());
+        let mut row_of: Vec<usize> = Vec::with_capacity(inputs.len());
+        for (row_idx, (text, _)) in inputs.iter().enumerate() {
+            let words = tokenizer::encode_words(self.tokenizer.as_ref(), text)?;
+            let lens: Vec<usize> = words.iter().map(|w| w.ids.len()).collect();
+            let plan = window::plan(&lens, budget, self.config.max_width);
+            for dropped in &plan.oversized {
+                tracing::warn!(
+                    target: "brain_extractors::gliner",
+                    subtokens = dropped.subtokens,
+                    budget = budget,
+                    "single word longer than a whole window; omitted from extraction",
+                );
+            }
+            for w in &plan.windows {
+                windows.push(tokenizer::assemble_window(
+                    &prompt,
+                    &words[w.start..w.end],
+                    &self.token_ids,
+                ));
+                row_of.push(row_idx);
             }
         }
-
-        // If every row was over-long, short-circuit. Otherwise build the
-        // padded batch from just the live rows.
-        let live_indices: Vec<usize> = tokenized_rows
-            .iter()
-            .enumerate()
-            .filter_map(|(i, t)| t.as_ref().map(|_| i))
-            .collect();
-        if live_indices.is_empty() {
+        if windows.is_empty() {
             return Ok(vec![Vec::new(); inputs.len()]);
         }
 
-        let max_seq_len = live_indices
+        let max_seq_len = windows
             .iter()
-            .map(|i| {
-                tokenized_rows[*i]
-                    .as_ref()
-                    .expect("invariant: live_indices only holds indices of Some rows")
-                    .input_ids
-                    .len()
-            })
+            .map(|w| w.input_ids.len())
             .max()
-            .expect("invariant: live_indices is non-empty, checked above");
+            .expect("invariant: windows is non-empty, checked above");
 
-        // Pad live rows to max_seq_len. DeBERTa-v3 pad_token_id == 0
+        // Pad windows to max_seq_len. DeBERTa-v3 pad_token_id == 0
         // (validated against the upstream config); the attention mask
         // gates pad positions out of the backbone's attention.
         const PAD_TOKEN_ID: u32 = 0;
-        let batch_size = live_indices.len();
+        let batch_size = windows.len();
         let mut flat_ids: Vec<u32> = Vec::with_capacity(batch_size * max_seq_len);
         let mut flat_mask: Vec<u32> = Vec::with_capacity(batch_size * max_seq_len);
-        for &row_idx in &live_indices {
-            let row = tokenized_rows[row_idx]
-                .as_ref()
-                .expect("invariant: live_indices only holds indices of Some rows");
+        for row in &windows {
             flat_ids.extend_from_slice(&row.input_ids);
             flat_mask.extend_from_slice(&row.attention_mask);
             let pad = max_seq_len - row.input_ids.len();
@@ -477,26 +382,23 @@ impl GlinerModel {
         let input_ids = Tensor::from_vec(flat_ids, (batch_size, max_seq_len), device)?;
         let attention_mask = Tensor::from_vec(flat_mask, (batch_size, max_seq_len), device)?;
 
-        // Single backbone forward over the whole batch — the GEMM-heavy
+        // Single backbone forward over every window — the GEMM-heavy
         // win we're after. Output `[B, max_seq_len, hidden]`.
         let subtoken_hidden = self
             .backbone
             .encode_subtokens(&input_ids, &attention_mask)?;
         let subtoken_hidden = subtoken_hidden.to_dtype(self.config.dtype)?;
 
-        // Per-row decode. Each row has its own ent_positions / word
-        // indices / word_offsets, so we slice the [B, L, H] tensor at
-        // its row dim and run the (cheap, post-backbone) pieces per row.
-        let mut out: Vec<Vec<Span>> = (0..inputs.len()).map(|_| Vec::new()).collect();
-        for (live_pos, &row_idx) in live_indices.iter().enumerate() {
-            let row = tokenized_rows[row_idx]
-                .as_ref()
-                .expect("invariant: live_indices only holds indices of Some rows");
+        // Per-window decode into per-row candidate pools. Resolution is
+        // deferred to the row so that an entity proposed by two
+        // overlapping windows survives exactly once.
+        let mut pooled: Vec<Vec<Span>> = (0..inputs.len()).map(|_| Vec::new()).collect();
+        for (win_pos, row) in windows.iter().enumerate() {
             if row.word_first_subtoken.is_empty() {
                 continue;
             }
-            // [max_seq_len, hidden] — drop the batch axis for this row.
-            let row_hidden = subtoken_hidden.get(live_pos)?;
+            // [max_seq_len, hidden] — drop the batch axis for this window.
+            let row_hidden = subtoken_hidden.get(win_pos)?;
 
             let ent_positions =
                 Tensor::from_vec(row.ent_positions.clone(), row.ent_positions.len(), device)?;
@@ -522,21 +424,19 @@ impl GlinerModel {
             let max_width = self
                 .config
                 .hidden_size_aware_max_width(num_words, self.config.max_width);
-            let labels = inputs[row_idx].1;
             let scores = score_spans(&span_rep, &prompt_emb, num_words, max_width, labels.len())?;
             let logits_3d = scores.to_dtype(DType::F32)?.to_vec3::<f32>()?;
-            let text = inputs[row_idx].0;
-            let spans = decode::decode_spans(
+            let row_idx = row_of[win_pos];
+            pooled[row_idx].extend(decode::candidate_spans(
                 &logits_3d,
                 self.config.threshold,
                 labels,
                 &row.word_offsets,
-                text,
-            );
-            out[row_idx] = spans;
+                inputs[row_idx].0,
+            ));
         }
 
-        Ok(out)
+        Ok(pooled.into_iter().map(decode::resolve_flat).collect())
     }
 }
 

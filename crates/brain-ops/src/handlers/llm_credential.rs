@@ -19,11 +19,19 @@
 
 use brain_metadata::llm_credential::LlmCredentialError;
 use brain_metadata::tables::scope::DeclScope;
+
+// Three of these four handlers take no request payload, and that is the
+// contract rather than an omission. Which namespace a credential belongs to
+// comes from the authenticated connection: `act_as` is resolved into the
+// `RequestCaller` by the auth layer, upstream of dispatch, precisely so a
+// handler cannot re-read the selector the client claimed. That leaves GET with
+// nothing, and leaves DELETE and VERIFY with only `request_id`, which has no
+// consumer here because the credential store is not behind the writer's
+// idempotency cache. Only PUT carries values a handler acts on — the provider,
+// the model and the key itself.
 use brain_protocol::ops::llm_credential::{
-    CredentialScope, LlmCredentialDeleteRequest, LlmCredentialDeleteResponse,
-    LlmCredentialGetRequest, LlmCredentialGetResponse, LlmCredentialPutRequest,
-    LlmCredentialPutResponse, LlmCredentialVerifyRequest, LlmCredentialVerifyResponse,
-    LlmCredentialView, VerifyOutcome,
+    LlmCredentialDeleteResponse, LlmCredentialGetResponse, LlmCredentialPutRequest,
+    LlmCredentialPutResponse, LlmCredentialVerifyResponse, LlmCredentialView, VerifyOutcome,
 };
 
 use crate::context::OpsContext;
@@ -46,22 +54,6 @@ fn credentials(
         })
 }
 
-/// Resolve the request's scope to a storage scope.
-///
-/// Space-scoped credentials are storable, but derivation does not carry the
-/// space as far as credential resolution, so a key registered at a space
-/// would never be used. Refusing is the honest answer: accepting it would
-/// leave a tenant with a key that silently does nothing.
-fn decl_scope<'a>(scope: CredentialScope, namespace: &'a str) -> Result<DeclScope<'a>, OpError> {
-    match scope {
-        CredentialScope::Namespace => Ok(DeclScope::base(namespace)),
-        CredentialScope::Space => Err(OpError::NotYetImplemented(
-            "space-scoped LLM credentials: derivation resolves at the namespace, so a \
-             space-scoped key would never be used",
-        )),
-    }
-}
-
 fn storage_error(e: LlmCredentialError) -> OpError {
     OpError::Internal(format!("llm credential store: {e}"))
 }
@@ -71,7 +63,7 @@ fn storage_error(e: LlmCredentialError) -> OpError {
 /// # Errors
 /// `Unauthorized` over a non-confidential connection; `InvalidRequest` for an
 /// unsupported provider, an empty model, or an empty key; `NotYetImplemented`
-/// for a space scope; `Internal` on a storage or sealing failure.
+/// `Internal` on a storage or sealing failure.
 pub fn handle_llm_credential_put(
     req: LlmCredentialPutRequest,
     caller: &RequestCaller,
@@ -112,7 +104,7 @@ pub fn handle_llm_credential_put(
     }
 
     let namespace = caller.namespace.as_str();
-    let scope = decl_scope(req.scope, namespace)?;
+    let scope = DeclScope::base(namespace);
     let now = now_unix_nanos();
 
     let (status, replaced) = credentials(ctx)?
@@ -140,14 +132,13 @@ pub fn handle_llm_credential_put(
 /// `LLM_CREDENTIAL_GET` — what this tenant has installed.
 ///
 /// # Errors
-/// `NotYetImplemented` for a space scope; `Internal` on a storage failure.
+/// `Internal` on a storage failure.
 pub fn handle_llm_credential_get(
-    req: LlmCredentialGetRequest,
     caller: &RequestCaller,
     ctx: &OpsContext,
 ) -> Result<LlmCredentialGetResponse, OpError> {
     let namespace = caller.namespace.as_str();
-    let scope = decl_scope(req.scope, namespace)?;
+    let scope = DeclScope::base(namespace);
 
     let found = credentials(ctx)?
         .get_exact(scope)
@@ -169,14 +160,13 @@ pub fn handle_llm_credential_get(
 /// `LLM_CREDENTIAL_DELETE` — revoke this tenant's key.
 ///
 /// # Errors
-/// `NotYetImplemented` for a space scope; `Internal` on a storage failure.
+/// `Internal` on a storage failure.
 pub fn handle_llm_credential_delete(
-    req: LlmCredentialDeleteRequest,
     caller: &RequestCaller,
     ctx: &OpsContext,
 ) -> Result<LlmCredentialDeleteResponse, OpError> {
     let namespace = caller.namespace.as_str();
-    let scope = decl_scope(req.scope, namespace)?;
+    let scope = DeclScope::base(namespace);
 
     let existed = credentials(ctx)?.delete(scope).map_err(storage_error)?;
 
@@ -198,14 +188,12 @@ pub fn handle_llm_credential_delete(
 /// verification that says the key is bad.
 ///
 /// # Errors
-/// `NotYetImplemented` for a space scope; `Internal` on a storage failure.
+/// `Internal` on a storage failure.
 pub async fn handle_llm_credential_verify(
-    req: LlmCredentialVerifyRequest,
     caller: &RequestCaller,
     ctx: &OpsContext,
 ) -> Result<LlmCredentialVerifyResponse, OpError> {
     let namespace = caller.namespace.as_str();
-    let _ = decl_scope(req.scope, namespace)?;
 
     let Some(status) = credentials(ctx)?
         .resolve(namespace, brain_metadata::tables::scope::SPACE_BASE)
@@ -248,7 +236,25 @@ pub async fn handle_llm_credential_verify(
     })
 }
 
-/// The cheapest call that proves a key works: a one-token completion.
+/// Smallest output budget that can still come back as readable content.
+///
+/// Not 1. A one-token budget is spent before the model emits any text, so the
+/// provider answers 200 with an empty content list and the decode fails -- the
+/// key and the model are both fine and VERIFY reports a problem anyway. The
+/// budget has to clear whatever the model spends before its first visible
+/// token, so this is a floor, not a target: the probe stops at the budget
+/// either way and the cost difference is a few tokens.
+const PROBE_MAX_TOKENS: u32 = 16;
+
+// Enforced here rather than in a test: a budget of 1 makes VERIFY report a
+// working credential as broken, and that is a property of the constant, so it
+// should fail the build rather than a test run.
+const _: () = assert!(
+    PROBE_MAX_TOKENS > 1,
+    "a one-token probe cannot return text, so VERIFY would misreport a working key"
+);
+
+/// The cheapest call that proves a key works: one tiny completion.
 async fn probe(
     client: std::sync::Arc<dyn brain_llm::LlmClient>,
     model: &str,
@@ -256,7 +262,7 @@ async fn probe(
     use brain_llm::{LlmError, LlmRequest};
 
     let mut request = LlmRequest::new(model.to_string(), "ping");
-    request.max_tokens = 1;
+    request.max_tokens = PROBE_MAX_TOKENS;
     request.timeout = std::time::Duration::from_secs(10);
 
     match client.complete(request).await {

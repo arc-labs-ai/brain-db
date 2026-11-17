@@ -20,7 +20,7 @@
 
 use crate::clock::now_unix_nanos;
 use crate::context::OpsContext;
-use crate::error::OpError;
+use crate::error::{caller_tombstone_reason, OpError};
 use crate::handlers::events::emit_graph_event;
 use crate::handlers::writer_handle::real_writer_handle;
 use crate::index::text_indexer::StatementTextOp;
@@ -522,7 +522,7 @@ pub async fn handle_statement_tombstone(
             "reason_message exceeds 4 KiB".into(),
         ));
     }
-    let reason = decode_tombstone_reason(req.reason)?;
+    let reason = caller_tombstone_reason(req.reason)?;
     let id = StatementId::from(req.statement_id);
     let now = now_unix_nanos();
 
@@ -601,7 +601,7 @@ pub async fn handle_statement_retract(
     // reclamation GC worker keys on this byte to physically remove only
     // rows the caller asked to retract, never plain tombstones or
     // superseded rows.
-    decode_tombstone_reason(req.reason)?;
+    caller_tombstone_reason(req.reason)?;
     let id = StatementId::from(req.statement_id);
     let now = now_unix_nanos();
 
@@ -1064,14 +1064,6 @@ fn decode_statement_cursor(
     let mut id = [0u8; 16];
     id.copy_from_slice(&cursor[29..45]);
     Ok(Some(StatementListCursor { id }))
-}
-
-fn decode_tombstone_reason(byte: u8) -> Result<TombstoneReason, OpError> {
-    TombstoneReason::from_u8(byte).ok_or_else(|| {
-        OpError::InvalidRequest(format!(
-            "unknown tombstone_reason byte {byte}; expected 1..=4"
-        ))
-    })
 }
 
 /// Build a brain-core `Statement` from a wire `StatementCreateRequest`

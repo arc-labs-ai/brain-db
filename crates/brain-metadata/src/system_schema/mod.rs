@@ -408,8 +408,11 @@ mod tests {
             ),
             "entity_mentions targets the union of entity + statement kinds",
         );
+        // One pattern: the initials form. The run-of-capitalised-words
+        // pattern was removed — it read a sentence-initial determiner as
+        // part of the following name and cut identifiers at punctuation.
         let has_patterns = ast.fields.iter().any(
-            |f| matches!(f, brain_protocol::schema::ExtractorField::Patterns(p) if p.len() == 2),
+            |f| matches!(f, brain_protocol::schema::ExtractorField::Patterns(p) if p.len() == 1),
         );
         assert!(has_patterns);
     }

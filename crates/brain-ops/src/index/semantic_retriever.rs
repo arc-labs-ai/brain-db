@@ -707,10 +707,9 @@ fn memory_row_passes(
             return false;
         }
     }
-    if !session_filter.is_empty() && !session_filter.contains(&row.session_id) {
-        return false;
-    }
-    true
+    // The session filter is the last predicate: an empty filter admits every
+    // session, otherwise the row must belong to one of the sessions named.
+    session_filter.is_empty() || session_filter.contains(&row.session_id)
 }
 
 /// Union HyPE memory hits into the direct cosine hits, recall-additively

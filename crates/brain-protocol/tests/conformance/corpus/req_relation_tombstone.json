@@ -17,7 +17,8 @@
     110,
     111
   ],
-  "reason": "superseded by a corrected extraction run",
+  "reason": 2,
+  "reason_message": "superseded by a corrected extraction run",
   "request_id": [
     17,
     17,
