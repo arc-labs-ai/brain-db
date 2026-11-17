@@ -273,9 +273,8 @@ fn hard_forget_cascade_tombstones_single_evidence_statement() {
 
 #[test]
 fn soft_forget_also_enqueues_cascade() {
-    // Rule 3.1: soft FORGET also triggers re-derivation;
-    // readers must not see stale-confidence statements during the
-    // grace window.
+    // A soft FORGET also triggers re-derivation; readers must not see
+    // stale-confidence statements during the grace window.
     let fx = build_fixture();
     let m = MemoryId::pack(0, 2, 1);
     upsert_memory(&fx.writer, m);

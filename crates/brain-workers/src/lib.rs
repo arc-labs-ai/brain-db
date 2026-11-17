@@ -19,8 +19,10 @@
 )]
 #![forbid(unsafe_code)]
 
+pub mod classifier_offload;
 pub mod config;
 pub mod context;
+pub mod derivation_probe;
 pub mod error;
 pub mod metrics;
 pub mod scheduler;
@@ -28,6 +30,7 @@ pub mod summarizer;
 pub mod worker;
 pub mod workers;
 
+pub use classifier_offload::GlommioClassifierOffload;
 pub use config::{WorkerConfig, WorkerKind};
 pub use context::WorkerContext;
 pub use error::WorkerError;
@@ -77,7 +80,7 @@ pub use workers::edge_scrub::EdgeScrubWorker;
 pub use workers::extractor::{
     ExtractorKnobs, ExtractorWorker, DEFAULT_EXTRACTOR_BATCH_SIZE,
     DEFAULT_EXTRACTOR_DRAIN_PER_CYCLE, DEFAULT_EXTRACTOR_HYPE_REFRESH_PER_CYCLE,
-    DEFAULT_EXTRACTOR_LLM_BUDGET_MICRO_USD, DEFAULT_EXTRACTOR_SKIP_AUDITED,
+    DEFAULT_EXTRACTOR_SKIP_AUDITED,
 };
 pub use workers::hnsw_maint::{
     decide_action, Action, DisabledRebuildSource, HnswMaintenanceWorker, IndexStats, RebuildSource,

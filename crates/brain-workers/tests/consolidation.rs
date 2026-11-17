@@ -119,14 +119,12 @@ fn seed_memory(
         meta.tombstoned_at_unix_nanos = tombstoned_at_unix_nanos;
         table.insert(id.to_be_bytes(), meta).unwrap();
     }
-    // Consolidation resolves candidate vectors from the redb artifact
-    // store. Give every seeded memory the same unit vector so memories in
-    // one context are cosine-1.0 and cluster together (session bucketing,
-    // not the vector, keeps different sessions apart).
-    brain_ops::memory_artifact::merge_memory_artifact(&wtxn, id.to_be_bytes(), |b| {
-        b.vector = unit_vec(0).to_vec();
-    })
-    .unwrap();
+    // Consolidation resolves candidate vectors from the by-id vector table,
+    // which is where an encode writes them. Give every seeded memory the same
+    // unit vector so memories in one context are cosine-1.0 and cluster
+    // together (session bucketing, not the vector, keeps different sessions
+    // apart).
+    brain_ops::memory_artifact::put_memory_vector(&wtxn, id.to_be_bytes(), &unit_vec(0)).unwrap();
     wtxn.commit().unwrap();
     id
 }
@@ -418,9 +416,9 @@ fn consolidated_has_derived_from_edges_to_each_source() {
         // Walk outgoing DerivedFrom edges anchored at the consolidated id.
         let rtxn = fix.metadata.read_txn().unwrap();
         let rows =
-            list_memory_edges_from(&rtxn, consolidated_id, Some(EdgeKind::DerivedFrom)).unwrap();
+            list_memory_edges_from(&rtxn, consolidated_id, Some(EdgeKind::DerivedFrom), 0).unwrap();
         let found_targets: std::collections::HashSet<MemoryId> =
-            rows.into_iter().map(|(_, tgt, _)| tgt).collect();
+            rows.rows.into_iter().map(|(_, tgt, _)| tgt).collect();
         assert_eq!(found_targets.len(), 5);
         for id in &source_ids {
             assert!(found_targets.contains(id));
@@ -674,10 +672,7 @@ fn seed_packed(
         table.insert(id.to_be_bytes(), meta).unwrap();
     }
     if let Some(v) = vector {
-        brain_ops::memory_artifact::merge_memory_artifact(&wtxn, id.to_be_bytes(), |b| {
-            b.vector = v.to_vec();
-        })
-        .unwrap();
+        brain_ops::memory_artifact::put_memory_vector(&wtxn, id.to_be_bytes(), &v).unwrap();
     }
     wtxn.commit().unwrap();
     id
@@ -715,10 +710,7 @@ fn seed_scoped(
         );
         table.insert(id.to_be_bytes(), meta).unwrap();
     }
-    brain_ops::memory_artifact::merge_memory_artifact(&wtxn, id.to_be_bytes(), |b| {
-        b.vector = vector.to_vec();
-    })
-    .unwrap();
+    brain_ops::memory_artifact::put_memory_vector(&wtxn, id.to_be_bytes(), &vector).unwrap();
     wtxn.commit().unwrap();
     id
 }

@@ -230,24 +230,31 @@ async fn do_maintenance_cycle(
             match worker.rebuild_source.snapshot_vectors().await {
                 Ok(vectors) => {
                     let params = index.params();
-                    // Fold the arena snapshot together with the pending
-                    // buffer so writes that landed after the snapshot
-                    // started are preserved in the new epoch. The
-                    // flush_with_rebuild call atomically publishes the
-                    // new main and drains pending.
+                    // Fold the durable vector snapshot together with the
+                    // pending buffer so writes that landed after the
+                    // snapshot started are preserved in the new epoch;
+                    // `flush_with_rebuild` atomically publishes the new
+                    // main and drains pending.
+                    //
+                    // The snapshot source for a runtime rebuild is redb,
+                    // which holds the write-time vector for every durable
+                    // memory. The arena is authoritative only immediately
+                    // after WAL replay, so rebuilding from it mid-run
+                    // would silently publish a graph missing every memory
+                    // written during the run.
                     let flush = index
                         .flush_with_rebuild(move |pending_snapshot| {
                             let mut combined: Vec<(MemoryId, [f32; VECTOR_DIM])> = vectors;
-                            // Deduplicate against the arena snapshot:
-                            // pending entries shadow arena entries for
-                            // the same id (latest vector wins).
-                            let arena_ids: std::collections::HashSet<MemoryId> =
+                            // Deduplicate against the durable snapshot —
+                            // a pending entry shadows a snapshot entry
+                            // for the same id, so the latest vector wins.
+                            let snapshot_ids: std::collections::HashSet<MemoryId> =
                                 combined.iter().map(|(id, _)| *id).collect();
                             for entry in pending_snapshot {
                                 if entry.tombstoned {
                                     continue;
                                 }
-                                if arena_ids.contains(&entry.memory_id) {
+                                if snapshot_ids.contains(&entry.memory_id) {
                                     if let Some(slot) =
                                         combined.iter_mut().find(|(id, _)| *id == entry.memory_id)
                                     {
