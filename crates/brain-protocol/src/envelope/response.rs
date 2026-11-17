@@ -19,9 +19,9 @@
 //!
 //! The ERROR body ties to `ErrorCode` / `ErrorCategory`. Those enums
 //! live in [`crate::error`] and are intentionally `#[non_exhaustive]`
-//! for forward-compat. We mirror them here as plain closed
-//! enums so wire encoding/decoding is closed, and convert at the
-//! boundary via `From` impls.
+//! for forward-compat. ERROR classification fields are open integers so an
+//! unfamiliar value does not destroy the rest of the frame; the `*Wire`
+//! enums provide the known construction vocabulary and boundary conversions.
 
 use crate::codec::cbor::{from_cbor_bytes, to_cbor_bytes};
 use crate::codec::opcode::Opcode;
@@ -1002,8 +1002,8 @@ mod tests {
     #[test]
     fn error_response_round_trips() {
         round_trip(ResponseBody::Error(ErrorResponse {
-            code: ErrorCodeWire::InvalidArgument,
-            category: ErrorCategoryWire::Validation,
+            code: ErrorCodeWire::InvalidArgument as u16,
+            category: ErrorCategoryWire::Validation as u8,
             message: "field 'top_k' out of range".into(),
             details: Some(ErrorDetails {
                 field: Some("top_k".into()),

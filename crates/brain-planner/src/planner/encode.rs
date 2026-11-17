@@ -21,7 +21,7 @@ use crate::context::PlannerContext;
 use crate::cost;
 use crate::error::PlanError;
 use crate::plan::{
-    ApplyStep, ContextResolutionStep, EmbeddingStep, EncodePlan, EncodeResponseStep, ExecutionPlan,
+    ApplyStep, ContextResolutionStep, EmbeddingStep, EncodePlan, EncodeResponseStep,
     IdempotencyCheckStep, SlotAllocationStep, WalAppendStep,
 };
 
@@ -41,13 +41,7 @@ pub const DEFAULT_ENCODE_KIND: MemoryKind = MemoryKind::Episodic;
 /// send; the router owns it now.
 pub const DEFAULT_ENCODE_SALIENCE: f32 = 0.5;
 
-/// Build the execution plan for an ENCODE request.
-pub fn plan_encode(req: &EncodeRequest, ctx: &PlannerContext) -> Result<ExecutionPlan, PlanError> {
-    Ok(ExecutionPlan::Encode(plan_encode_inner(req, ctx)?))
-}
-
-/// Same as [`plan_encode`] but returns the inner struct directly —
-/// useful for tests that want to inspect fields without an enum match.
+/// Build the per-operation ENCODE plan struct for a request.
 ///
 /// ENCODE now carries only client *intent* (text / context / when).
 /// The mechanical decisions — kind, salience, dedup, edges — are made
@@ -201,16 +195,9 @@ mod tests {
         }
     }
 
-    fn unwrap_encode(plan: ExecutionPlan) -> EncodePlan {
-        match plan {
-            ExecutionPlan::Encode(p) => p,
-            other => panic!("expected Encode, got {other:?}"),
-        }
-    }
-
     #[test]
     fn happy_path_plan_shape() {
-        let plan = unwrap_encode(plan_encode(&base_request(), &PlannerContext::default()).unwrap());
+        let plan = plan_encode_inner(&base_request(), &PlannerContext::default()).unwrap();
         assert_eq!(plan.shard, 0);
         match plan.context_resolution {
             ContextResolutionStep::Explicit(id) => assert_eq!(id, SessionId(42)),
@@ -232,7 +219,7 @@ mod tests {
     /// the server policy, never client-supplied machinery.
     #[test]
     fn router_defaults_are_applied() {
-        let plan = unwrap_encode(plan_encode(&base_request(), &PlannerContext::default()).unwrap());
+        let plan = plan_encode_inner(&base_request(), &PlannerContext::default()).unwrap();
         assert_eq!(plan.wal_append.kind, DEFAULT_ENCODE_KIND);
         assert!((plan.wal_append.salience_initial - DEFAULT_ENCODE_SALIENCE).abs() < f32::EPSILON);
         assert!(plan.deduplicate, "text encode dedup is always on");
@@ -243,7 +230,7 @@ mod tests {
     fn empty_text_is_rejected() {
         let mut r = base_request();
         r.text = String::new();
-        match plan_encode(&r, &PlannerContext::default()) {
+        match plan_encode_inner(&r, &PlannerContext::default()) {
             Err(PlanError::InvalidParameters { field, .. }) => assert_eq!(field, "text"),
             other => panic!("expected InvalidParameters[text], got {other:?}"),
         }
@@ -265,7 +252,7 @@ mod tests {
         ] {
             let mut r = base_request();
             r.text = blank.to_string();
-            match plan_encode(&r, &PlannerContext::default()) {
+            match plan_encode_inner(&r, &PlannerContext::default()) {
                 Err(PlanError::InvalidParameters { field, reason }) => {
                     assert_eq!(field, "text", "{blank:?}");
                     assert!(
@@ -291,7 +278,7 @@ mod tests {
     fn text_with_surrounding_whitespace_is_accepted() {
         let mut r = base_request();
         r.text = "  a real memory  ".to_string();
-        assert!(plan_encode(&r, &PlannerContext::default()).is_ok());
+        assert!(plan_encode_inner(&r, &PlannerContext::default()).is_ok());
         assert!(
             validate_text(" x ").is_ok(),
             "one real character is content"
@@ -302,7 +289,7 @@ mod tests {
     fn oversize_text_is_rejected() {
         let mut r = base_request();
         r.text = "a".repeat(MAX_TEXT_BYTES + 1);
-        match plan_encode(&r, &PlannerContext::default()) {
+        match plan_encode_inner(&r, &PlannerContext::default()) {
             Err(PlanError::InvalidParameters { field, reason }) => {
                 assert_eq!(field, "text");
                 assert!(reason.contains("MAX_TEXT_BYTES"));

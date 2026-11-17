@@ -21,11 +21,21 @@ pub const LLM_TOKENS_PER_QUERY_BUCKETS: &[f64] = &[
 pub const LLM_NEIGHBORS_INCLUDED_BUCKETS: &[f64] =
     &[0.0, 1.0, 2.0, 3.0, 5.0, 7.0, 10.0, 15.0, 20.0];
 
-/// Bucket bounds for the context-fetch wall-clock histogram. Targets
-/// the 1-50 ms operating range (HNSW search + a few redb point
-/// lookups); the 1-second cap catches pathological cases.
-pub const LLM_CONTEXT_FETCH_BUCKETS_SECONDS: &[f64] =
-    &[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0];
+/// Bucket bounds for the context-fetch wall-clock histogram.
+///
+/// A batch fetches every memory's context concurrently, so one memory's
+/// observation spans its own HNSW search and redb lookups PLUS the time
+/// it spent interleaved behind its siblings on the shard's single
+/// executor lane. A batch of N therefore reports values closer to N× the
+/// solo cost even though the batch as a whole finishes sooner than it
+/// would serially.
+///
+/// The bounds reach to several seconds for that reason. The fine low end
+/// is kept because a small batch, or a single-memory cycle, still lands
+/// there and is where a genuine per-fetch regression would show.
+pub const LLM_CONTEXT_FETCH_BUCKETS_SECONDS: &[f64] = &[
+    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+];
 
 /// Resolver outcome the worker reports per resolved `EntityMention`.
 ///
@@ -313,8 +323,15 @@ impl ExtractorMetrics {
     }
 
     /// Observed once per `fetch_extractor_context` call (success or
-    /// failure). Excludes the LLM call itself — this is just the
-    /// HNSW + redb work that assembles the prompt context.
+    /// failure). Excludes the LLM call itself.
+    ///
+    /// This is the latency ONE MEMORY experiences waiting for its
+    /// context, not the cost of the work in isolation: the fetches in a
+    /// batch run concurrently on one executor lane, so each observation
+    /// includes time spent interleaved behind its siblings. Read it as
+    /// per-memory wait, and read the batch's own throughput from the
+    /// cycle duration — dividing this by the batch size does not give
+    /// the per-fetch cost.
     pub fn observe_context_fetch_duration(&self, seconds: f64) {
         self.llm_context_fetch_duration_seconds.observe(seconds);
     }

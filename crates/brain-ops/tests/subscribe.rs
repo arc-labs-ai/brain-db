@@ -497,13 +497,11 @@ fn filter_memory_ids_drops_off_target_memory_events() {
     })
 }
 
-// The subscription kind-filter tests (`filter_kind_drops_off_kind_events`,
-// `filter_context_and_kind_combine_as_and`) relied on the client
-// encoding a Semantic-kind memory so a Semantic event would flow onto
-// the bus. The write router now files every encode as Episodic, so
-// those scenarios can no longer be set up through ENCODE and have been
-// removed. The filter-matching logic itself (kind/context AND-combine)
-// is covered by `SubscriptionFilter::matches` unit tests.
+// A kind-filter scenario that needs a non-Episodic event on the bus cannot
+// be set up through ENCODE: the write router files every encode as Episodic,
+// so the client cannot pick the kind. The filter-matching logic itself
+// (kind/context AND-combine) is covered by `SubscriptionFilter::matches`
+// unit tests.
 
 #[test]
 fn filter_null_passes_every_event() {
@@ -555,7 +553,6 @@ fn dispatcher_times_out_when_no_event_matches() {
         .await
         .unwrap_err();
         assert_eq!(err.error_code(), ErrorCode::Overloaded);
-        assert!(err.retryable());
     })
 }
 

@@ -69,4 +69,11 @@ pub enum EmbedError {
     /// non-BGE-small model.
     #[error("model output dim mismatch: expected {expected}, got {got}")]
     OutputDimMismatch { expected: usize, got: usize },
+
+    /// A text shared a forward pass with others and that pass failed. The
+    /// failure belongs to the batch rather than to this text: one batch is one
+    /// fate, and this variant carries that fate to every requester in it
+    /// because the underlying error cannot be handed to more than one.
+    #[error("shared embedding batch failed: {0}")]
+    BatchFailed(String),
 }

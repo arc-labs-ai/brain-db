@@ -19,6 +19,7 @@
 
 use brain_core::StatementKind;
 use brain_core::{EntityId, PredicateId};
+use brain_index::SemanticQuery;
 use brain_metadata::schema::predicate::predicate_lookup_by_qname;
 use brain_metadata::schema::store::schema_active;
 use brain_metadata::DeclScope;
@@ -36,15 +37,11 @@ use brain_protocol::{
 
 use crate::context::OpsContext;
 use crate::error::OpError;
+use crate::handlers::limits::{check_byte_len, QUERY_TEXT_MAX_BYTES};
 
 // ---------------------------------------------------------------------------
 // Limits.
 // ---------------------------------------------------------------------------
-
-/// Max bytes of `text` accepted at handler entry. Mirrors RECALL's
-/// existing cue-text bound; keeps a single rkyv decode from
-/// amplifying into a huge backing string.
-pub const MAX_QUERY_TEXT_BYTES: usize = 16 * 1024;
 
 /// Max entries in `RetrieverSelectionWire::Explicit(_)`. Matches
 /// the router's `MAX_RETRIEVERS = 3`.
@@ -59,6 +56,12 @@ pub const MAX_PREDICATE_FILTER: usize = 256;
 /// enum, so any honest filter is tiny; the cap rejects a crafted
 /// oversized list with a clear error rather than mapping every byte.
 pub const MAX_KIND_FILTER: usize = 256;
+
+/// Max entries in a `session_filter`. The list is rescanned for every HNSW
+/// node the vector lane visits and expands into one term query per id in the
+/// lexical lane, so its length multiplies the cost of the whole read. Matches
+/// the bound RECALL applies to the same field.
+pub const MAX_SESSION_FILTER: usize = 1024;
 
 // ---------------------------------------------------------------------------
 // Handlers.
@@ -114,7 +117,28 @@ pub async fn handle_query_trace(
     };
     let planner_req = wire_to_planner_request(req.query, predicate_ids, ctx)?;
     let qp = plan(&planner_req).map_err(map_plan_error)?;
-    let exec_ctx = build_executor_context(ctx)?;
+    // Prepare the semantic lane's query vector here, off the shard executor,
+    // so the synchronous retriever trait never runs a model forward pass on
+    // the reactor.
+    //
+    // A plan can carry a semantic lane with no query text: the router adds
+    // `Semantic` on a bare entity anchor, gating only `Lexical` behind text.
+    // The executor owns that case — `invoke_semantic` reports
+    // `Skipped("no query text")` and the remaining lanes answer the query — so
+    // an absent cue leaves the slot empty rather than failing the request.
+    let plan_has_semantic_lane = qp
+        .retrievers
+        .iter()
+        .any(|r| matches!(r.retriever, Retriever::Semantic));
+    let semantic_query = match planner_req.text.as_deref() {
+        Some(text) if plan_has_semantic_lane => Some(SemanticQuery::Vector(Box::new(
+            crate::embedding::embed_query_off_reactor(&ctx.executor.embedder, text)
+                .await
+                .map_err(|e| OpError::ExecError(brain_planner::ExecError::EmbedFailed(e)))?,
+        ))),
+        _ => None,
+    };
+    let exec_ctx = build_executor_context(ctx, semantic_query)?;
     // TRACE executes the full retrieval, statement corpus included.
     // `trace_detail = false`: QUERY_TRACE renders text from the always-on
     // count/latency fields already on `QueryMetadata`; it doesn't build a
@@ -194,12 +218,7 @@ fn resolve_predicate_filter(
 // ---------------------------------------------------------------------------
 
 fn validate_text_length(text: &str) -> Result<(), OpError> {
-    if text.len() > MAX_QUERY_TEXT_BYTES {
-        return Err(OpError::InvalidRequest(format!(
-            "query text exceeds {MAX_QUERY_TEXT_BYTES} bytes",
-        )));
-    }
-    Ok(())
+    check_byte_len("query text", text.len(), QUERY_TEXT_MAX_BYTES)
 }
 
 fn wire_to_planner_request(
@@ -217,6 +236,16 @@ fn wire_to_planner_request(
         return Err(OpError::InvalidRequest(format!(
             "kind_filter has {} entries; max is {MAX_KIND_FILTER}",
             req.kind_filter.len()
+        )));
+    }
+    if req
+        .session_filter
+        .as_ref()
+        .is_some_and(|s| s.len() > MAX_SESSION_FILTER)
+    {
+        return Err(OpError::InvalidRequest(format!(
+            "session_filter has {} entries; max is {MAX_SESSION_FILTER}",
+            req.session_filter.as_ref().map_or(0, Vec::len)
         )));
     }
     let kind_filter = req
@@ -303,7 +332,10 @@ fn fusion_config_from_wire(w: FusionConfigWire) -> FusionConfig {
 // Executor context assembly.
 // ---------------------------------------------------------------------------
 
-fn build_executor_context(ctx: &OpsContext) -> Result<RetrievalExecutorContext, OpError> {
+fn build_executor_context(
+    ctx: &OpsContext,
+    semantic_query: Option<SemanticQuery>,
+) -> Result<RetrievalExecutorContext, OpError> {
     Ok(RetrievalExecutorContext {
         semantic: ctx.semantic_retriever.clone(),
         lexical: ctx.lexical_retriever.clone(),
@@ -320,6 +352,9 @@ fn build_executor_context(ctx: &OpsContext) -> Result<RetrievalExecutorContext, 
         // returns RRF-only.
         cross_encoder: ctx.cross_encoder.as_arc().cloned(),
         space_vectors: ctx.executor.space_vectors.clone(),
+        // QUERY_TRACE prepares the asymmetric query vector before execution;
+        // a missing vector leaves the semantic lane explicitly skipped.
+        semantic_query,
     })
 }
 

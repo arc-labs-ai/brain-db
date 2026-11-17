@@ -937,6 +937,11 @@ fn sample_memory_inspect_response() -> MemoryInspectResponse {
                 annotation: Some("manually asserted".into()),
             },
         ],
+        // The complete view: every anchored edge is present, so the count
+        // agrees with `edges.len()` and the flag is clear. The partial view is
+        // pinned separately by `resp_memory_inspect_truncated`.
+        edge_total_count: Some(2),
+        edges_truncated: false,
     }
 }
 
@@ -1740,6 +1745,24 @@ fn corpus() -> Vec<Case> {
         ResponseBody::MemoryInspect(sample_memory_inspect_response()),
         &sample_memory_inspect_response(),
     ));
+    // The partial view. `edges` carries the same two edges while
+    // `edge_total_count` reports the whole anchored set, so the two disagree
+    // and `edges_truncated` is set. A client that treats `edges.len()` as the
+    // edge count, or that ignores the flag, is wrong against this vector and
+    // right against `resp_memory_inspect`: the pair pins both states of the
+    // bool and both the agreeing and disagreeing count. The vector is trimmed
+    // to two edges to keep the golden small — it pins the encoding of the
+    // truncated shape, not a realistic cut point.
+    let memory_inspect_truncated = MemoryInspectResponse {
+        edge_total_count: Some(517),
+        edges_truncated: true,
+        ..sample_memory_inspect_response()
+    };
+    cases.push(resp_case(
+        "resp_memory_inspect_truncated",
+        ResponseBody::MemoryInspect(memory_inspect_truncated.clone()),
+        &memory_inspect_truncated,
+    ));
 
     cases.push(resp_case(
         "resp_graph_fetch",
@@ -2111,56 +2134,65 @@ fn corpus() -> Vec<Case> {
     ));
 
     // ---- ERROR responses: cover every category ----
-    for (name, code, category) in [
-        (
-            "resp_error_protocol",
-            ErrorCode::BadMagic,
-            ErrorCategory::Protocol,
-        ),
-        (
-            "resp_error_authentication",
-            ErrorCode::Unauthenticated,
-            ErrorCategory::Authentication,
-        ),
-        (
-            "resp_error_authorization",
-            ErrorCode::PermissionDenied,
-            ErrorCategory::Authorization,
-        ),
-        (
-            "resp_error_validation",
-            ErrorCode::InvalidArgument,
-            ErrorCategory::Validation,
-        ),
-        (
-            "resp_error_not_found",
-            ErrorCode::MemoryNotFound,
-            ErrorCategory::NotFound,
-        ),
-        (
-            "resp_error_conflict",
-            ErrorCode::IdempotencyConflict,
-            ErrorCategory::Conflict,
-        ),
-        (
-            "resp_error_resource_exhausted",
-            ErrorCode::OutOfSlots,
-            ErrorCategory::ResourceExhausted,
-        ),
-        (
-            "resp_error_internal",
-            ErrorCode::Internal,
-            ErrorCategory::Internal,
-        ),
-        (
-            "resp_error_unavailable",
-            ErrorCode::ShardUnavailable,
-            ErrorCategory::Unavailable,
-        ),
-    ] {
+    //
+    // The case list is walked out of `ErrorCategory` through two exhaustive
+    // `match`es rather than written out as an array. `ErrorCategory` is not
+    // `#[non_exhaustive]`, so a category added to the enum makes both matches
+    // below fail to compile until it is given a successor and a representative
+    // code: a missing category is a build error, not a corpus that quietly
+    // covers one fewer case than its name claims.
+    //
+    // What the matches cannot catch: a new variant wired in as an unreachable
+    // dead end (its own `return None` arm, with nothing naming it as a
+    // successor). The compiler forces the author to name it; it does not force
+    // them to put it in the chain.
+    fn next_error_category(category: ErrorCategory) -> Option<ErrorCategory> {
+        Some(match category {
+            ErrorCategory::Protocol => ErrorCategory::Authentication,
+            ErrorCategory::Authentication => ErrorCategory::Authorization,
+            ErrorCategory::Authorization => ErrorCategory::Validation,
+            ErrorCategory::Validation => ErrorCategory::NotFound,
+            ErrorCategory::NotFound => ErrorCategory::Conflict,
+            ErrorCategory::Conflict => ErrorCategory::ResourceExhausted,
+            ErrorCategory::ResourceExhausted => ErrorCategory::Internal,
+            ErrorCategory::Internal => ErrorCategory::Unavailable,
+            ErrorCategory::Unavailable => ErrorCategory::OperatorIntervention,
+            ErrorCategory::OperatorIntervention => return None,
+        })
+    }
+
+    // Fixture name and the representative code pinned for each category.
+    fn error_category_sample(category: ErrorCategory) -> (&'static str, ErrorCode) {
+        match category {
+            ErrorCategory::Protocol => ("resp_error_protocol", ErrorCode::BadMagic),
+            ErrorCategory::Authentication => {
+                ("resp_error_authentication", ErrorCode::Unauthenticated)
+            }
+            ErrorCategory::Authorization => {
+                ("resp_error_authorization", ErrorCode::PermissionDenied)
+            }
+            ErrorCategory::Validation => ("resp_error_validation", ErrorCode::InvalidArgument),
+            ErrorCategory::NotFound => ("resp_error_not_found", ErrorCode::MemoryNotFound),
+            ErrorCategory::Conflict => ("resp_error_conflict", ErrorCode::IdempotencyConflict),
+            ErrorCategory::ResourceExhausted => {
+                ("resp_error_resource_exhausted", ErrorCode::OutOfSlots)
+            }
+            ErrorCategory::Internal => ("resp_error_internal", ErrorCode::Internal),
+            ErrorCategory::Unavailable => ("resp_error_unavailable", ErrorCode::ShardUnavailable),
+            ErrorCategory::OperatorIntervention => (
+                "resp_error_operator_intervention",
+                ErrorCode::ShardStorageFaulted,
+            ),
+        }
+    }
+
+    for category in std::iter::successors(Some(ErrorCategory::Protocol), |category| {
+        next_error_category(*category)
+    }) {
+        let (name, code) = error_category_sample(category);
         let err = ErrorResponse {
-            code: ErrorCodeWire::from(code),
-            category: ErrorCategoryWire::from(category),
+            code: ErrorCodeWire::from(code) as u16,
+            category: ErrorCategoryWire::from(category) as u8,
             message: "fixed error message".into(),
             details: Some(ErrorDetails {
                 field: Some("top_k".into()),
@@ -2175,8 +2207,8 @@ fn corpus() -> Vec<Case> {
     // Dedicated ActAsDenied case: a per-request-identity denial, distinct
     // from the generic PermissionDenied authorization error above.
     let act_as_denied = ErrorResponse {
-        code: ErrorCodeWire::from(ErrorCode::ActAsDenied),
-        category: ErrorCategoryWire::from(ErrorCategory::Authorization),
+        code: ErrorCodeWire::from(ErrorCode::ActAsDenied) as u16,
+        category: ErrorCategoryWire::from(ErrorCategory::Authorization) as u8,
         message: "principal not entitled to act_as".into(),
         details: None,
         retry_after_ms: None,
@@ -2221,8 +2253,8 @@ fn corpus() -> Vec<Case> {
     ));
     // Error frame on a per-op stream.
     let err_frame_body = ResponseBody::Error(ErrorResponse {
-        code: ErrorCodeWire::from(ErrorCode::MemoryNotFound),
-        category: ErrorCategoryWire::from(ErrorCategory::NotFound),
+        code: ErrorCodeWire::from(ErrorCode::MemoryNotFound) as u16,
+        category: ErrorCategoryWire::from(ErrorCategory::NotFound) as u8,
         message: "fixed error message".into(),
         details: None,
         retry_after_ms: None,
@@ -2389,10 +2421,10 @@ fn corpus() -> Vec<Case> {
     //     the only vector in the corpus that pins an opaque continuation token,
     //     and the only one that pins it as an array rather than a byte string.
     //   - `act_as` present: ENTITY_LIST enumerates a whole tenant keyspace.
-    // NOTE: the v1 handler currently rejects a non-empty cursor
-    // ("pagination lands in phase 16.7.6"). The corpus is a wire-encoding
-    // oracle and never runs the handler, and an empty cursor would pin nothing
-    // about the field's encoding, so it is populated here on purpose.
+    // NOTE: the v1 handler currently rejects a non-empty cursor. The corpus is
+    // a wire-encoding oracle and never runs the handler, and an empty cursor
+    // would pin nothing about the field's encoding, so it is populated here on
+    // purpose.
     let entity_list = EntityListRequest {
         entity_type_id: 4,
         name_prefix: "Ada".into(),
@@ -2666,9 +2698,9 @@ fn corpus() -> Vec<Case> {
 
     // RELATION_TOMBSTONE (0x0153). Pins that a retired relation is classified
     // the same way a retired statement is: a `reason: u8` from the closed
-    // audit set plus a free-text `reason_message`. The two families used to
-    // disagree — relation's reason was a bare `String` — which is a shape an
-    // SDK gets wrong in whichever direction it guessed.
+    // audit set plus a free-text `reason_message`. Letting the two families
+    // disagree — a bare `String` reason on one side — is a shape an SDK gets
+    // wrong in whichever direction it guesses.
     let relation_tombstone = RelationTombstoneRequest {
         relation_id: REL_ID,
         reason: 2,
@@ -3422,16 +3454,13 @@ fn corpus() -> Vec<Case> {
 
     // ---- Schema responses ----
     //
-    // `source_blob` is the parsed-AST JSON and `schema_document` the verbatim
-    // DSL: two length-prefixed byte-ish fields adjacent in the map. They carry
-    // deliberately different content so an SDK that reads one into the other
-    // fails. `schema_version` (3) and `validator_version` (2) are distinct
-    // small u32s for the same reason.
+    // `schema_version` (3) and `validator_version` (2) are distinct small u32s
+    // so an SDK that reads one into the other fails against this vector
+    // instead of passing by coincidence.
     let schema_get_resp = SchemaGetResponse {
         namespace: "org".into(),
         schema_version: 3,
         schema_document: "namespace org\ndefine entity_type Person { attributes {} }\n".into(),
-        source_blob: br#"{"namespace":"org","entity_types":["Person"]}"#.to_vec(),
         uploaded_at_unix_nanos: EVENT_AT,
         validator_version: 2,
     };
@@ -3670,8 +3699,8 @@ fn corpus() -> Vec<Case> {
         RequestBody::GetCapabilities(get_capabilities_req.clone()),
         &get_capabilities_req,
     ));
-    // Delegated capabilities: the formerly fieldless map now carries one
-    // optional key. `grant` is 0 and therefore omitted — the nested `act_as`
+    // Delegated capabilities: the request map carries one optional key.
+    // `grant` is 0 and therefore omitted — the nested `act_as`
     // map is the same two-key shape every other op carries.
     let get_capabilities_act_as = GetCapabilitiesRequest {
         act_as: Some(ActAs {

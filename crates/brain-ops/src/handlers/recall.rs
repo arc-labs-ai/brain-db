@@ -18,6 +18,7 @@ use std::time::Instant;
 
 use brain_core::{EntityId, MemoryId, SessionId, Slot, SubjectRef};
 use brain_index::RankedItemId;
+use brain_index::SemanticQuery;
 use brain_metadata::tables::memory::MEMORIES_TABLE;
 use brain_metadata::tables::text::TEXTS_TABLE;
 use brain_planner::retrieval::executor::{
@@ -206,18 +207,25 @@ async fn gather_recall(req: &RecallRequest, ctx: &OpsContext) -> Result<RecallGa
     // Embed the cue once for the grounding overlay. A failed embed degrades to
     // the plain fan-out — grounding is an overlay, never a reason to fail the
     // read.
-    let cue_vec = ctx.executor.embedder.embed(&req.cue_text).ok();
+    let cue_vec = crate::embedding::embed_off_reactor(&ctx.executor.embedder, &req.cue_text)
+        .await
+        .ok();
+    let query_vec =
+        crate::embedding::embed_query_off_reactor(&ctx.executor.embedder, &req.cue_text)
+            .await
+            .ok();
     // The entity-graph traversal lane is anchored on the cue's resolved subject;
     // `retrieve_memories` cue-conditions the graph candidates so the structural
     // walk can't re-introduce the subject-dump flood.
     let anchor = resolve_graph_anchor(req, ctx);
     let (memories, trace, metric_sample) =
-        retrieve_memories(req, ctx, anchor, cue_vec.as_ref()).await?;
+        retrieve_memories(req, ctx, anchor, cue_vec.as_ref(), query_vec).await?;
     // Compute the grounding overlay + HyPE answer-lead HERE (per shard), not in
     // `shape_recall`, so a namespace-wide fan-out can gather each shard's local
     // signals and merge them — letting the grounded commit and the HyPE ordering
     // reflect the whole namespace, not just the coordinator's spaces.
-    let (grounded, hype_scores) = compute_grounding(req, ctx, cue_vec.as_ref())?;
+    let (grounded, hype_scores) =
+        compute_grounding(req, ctx, cue_vec.as_ref(), query_vec.as_ref())?;
     Ok(RecallGathered {
         memories,
         trace,
@@ -237,22 +245,19 @@ fn compute_grounding(
     req: &RecallRequest,
     ctx: &OpsContext,
     cue_vec: Option<&[f32; brain_embed::VECTOR_DIM]>,
+    query_vec: Option<&[f32; brain_embed::VECTOR_DIM]>,
 ) -> Result<(GroundedOutcome, HashMap<u128, f32>), OpError> {
     let Some(cue_vec) = cue_vec else {
         return Ok((GroundedOutcome::NoAnswer, HashMap::new()));
     };
     let grounded = best_grounded_for_cue(req, ctx, cue_vec)?;
     // HyPE questions are stored query-side (embed_query, BGE query prefix), so
-    // the cue must be embedded the SAME way for the answer-lead cosine to be
-    // in-distribution; fall back to the plain cue if the prefixed embed fails.
-    let hype_cue_vec = ctx
-        .executor
-        .embedder
-        .embed_query(&req.cue_text)
-        .unwrap_or(*cue_vec);
+    // the cue uses the same vector as the semantic index probe. If that query
+    // embedding failed, the plain grounding vector is the safe fallback.
+    let hype_cue_vec = query_vec.unwrap_or(cue_vec);
     let hype_scores: HashMap<u128, f32> = ctx
         .semantic_retriever
-        .hype_scores_for_query(&hype_cue_vec, RECALL_CANDIDATE_POOL as usize)
+        .hype_scores_for_query(hype_cue_vec, RECALL_CANDIDATE_POOL as usize)
         .into_iter()
         .map(|(id, s)| (id.raw(), s))
         .collect();
@@ -534,7 +539,9 @@ pub async fn recall_shape_namespace(
     let client_requested_count = req.max_results != 0;
     normalize_recall_request(&mut req)?;
     req.scope = RecallScopeWire::Namespace;
-    let cue_vec = ctx.executor.embedder.embed(&req.cue_text).ok();
+    let cue_vec = crate::embedding::embed_off_reactor(&ctx.executor.embedder, &req.cue_text)
+        .await
+        .ok();
     let gathered = RecallGathered {
         memories: merged.memories,
         // Per-shard trace/metrics don't compose across a fan-out; the merged
@@ -709,16 +716,16 @@ fn record_recall_metrics(
     );
 }
 
-/// Honest abstention by structural anchor — unconditional, no flag/knob (FIX C).
-/// This gate owns the NO-ANCHOR case: the cue resolved no subject entity and the
-/// grounded layer produced no answer. It drops to an empty (None) answer when NO
-/// surviving member belongs (`!any_belongs`) — i.e. no member carries a belonging
-/// signal beyond the raw passage cosine (strong HyPE / lexical / graph /
-/// grounded). When some member does, the facts ship: the read never emits an
-/// empty answer over corroborated belonging. Substrate-safe: a stored subject's
-/// own memory is confirmed by a real lane (lexical/graph/grounded), so it belongs
-/// and this never fires; it triggers only when the cue's answer is nowhere in the
-/// store and only a lone passage-cosine echo remains.
+/// Honest abstention by structural anchor — unconditional, no flag/knob (the
+/// abstention rule). This gate owns the NO-ANCHOR case: the cue resolved no
+/// subject entity and the grounded layer produced no answer. It drops to an empty
+/// (None) answer when NO surviving member belongs (`!any_belongs`) — i.e. no
+/// member carries a belonging signal beyond the raw passage cosine (strong HyPE /
+/// lexical / graph / grounded). When some member does, the facts ship: the read
+/// never emits an empty answer over corroborated belonging. Substrate-safe: a
+/// stored subject's own memory is confirmed by a real lane (lexical/graph/grounded),
+/// so it belongs and this never fires; it triggers only when the cue's answer is
+/// nowhere in the store and only a lone passage-cosine echo remains.
 fn apply_anchor_abstention(
     members: Vec<MemoryResult>,
     anchor: Option<EntityId>,
@@ -735,24 +742,23 @@ fn apply_anchor_abstention(
     }
 }
 
-/// Kind-presence abstention — the adversarial-question gate (FIX C). This gate
-/// owns the SUBJECT-RESOLVED case: the cue resolved a subject (`anchor`) but the
-/// grounded typed-graph layer produced NO fact of the matching kind/role for it
-/// (`GroundedOutcome::NoAnswer`). The honest answer is often `None`, not a
-/// loosely-related memory. Two traps this closes:
+/// Kind-presence abstention — the adversarial-question gate (the abstention
+/// rule). This gate owns the SUBJECT-RESOLVED case: the cue resolved a subject
+/// (`anchor`) but the grounded typed-graph layer produced NO fact of the matching
+/// kind/role for it (`GroundedOutcome::NoAnswer`). The honest answer is often
+/// `None`, not a loosely-related memory. Two traps this closes:
 ///   * subject-mismatch — "when did MELANIE run a race" when only Caroline did:
 ///     the topical race memory is about Caroline, never linked to Melanie.
 ///   * wrong-kind — the subject has facts, but none of the kind the cue asks
 ///     for, so its own memories don't actually answer the question.
 ///
 /// Keyed on `any_belongs`: the set is KEPT whenever some surviving member carries
-/// a belonging signal beyond the raw passage cosine (strong HyPE / lexical /
-/// graph / grounded), and ABSTAINS (→ `None`) only when none does. A truly
-/// adversarial cue — a resolved subject whose only surfaced memories are off-cue
-/// buried facts (no lexical/graph lane, no grounded source, no strong HyPE, only
-/// a lone passage cosine) — does not belong and abstains; a real episodic answer
-/// grounded simply hadn't extracted lands in some independent lane, so it belongs
-/// and is kept.
+/// a belonging signal beyond the raw passage cosine (strong HyPE / lexical / graph /
+/// grounded), and ABSTAINS (→ `None`) only when none does. A truly adversarial cue
+/// — a resolved subject whose only surfaced memories are off-cue buried facts (no
+/// lexical/graph lane, no grounded source, no strong HyPE, only a lone passage
+/// cosine) — does not belong and abstains; a real episodic answer grounded simply
+/// hadn't extracted lands in some independent lane, so it belongs and is kept.
 ///
 /// Never fires when the grounded layer DID answer (the typed graph has the
 /// fact) or when no subject resolved (that is [`apply_anchor_abstention`]'s
@@ -821,7 +827,7 @@ fn consensus_collapse(
 
 /// The support count at which a memory is CROSS-LANE CORROBORATED — two or more
 /// independent lanes agree it belongs to the cue. This is the single
-/// corroboration gate the grounded commit (FIX B) requires before a value may
+/// corroboration gate the grounded commit requires before a value may
 /// lead: grounded alone (support 1) is not enough; a second independent lane
 /// (semantic / lexical / graph / HyPE) must confirm it.
 const SUPPORT_CORROBORATED: u8 = 2;
@@ -833,10 +839,9 @@ const SUPPORT_CORROBORATED: u8 = 2;
 /// belonging). They must differ because BGE-small cosines are compressed: an
 /// off-topic cue scores ~0.45 against everything, clearing the recall floor but
 /// confirming nothing. Set at the grounded strong-match sibling (`0.6`) so a
-/// nonsense cue's ~0.45 top no longer counts as support (→ `None`) while a real
-/// cue's strong top (or its HyPE / lexical / graph lane) still does. Calibrated
-/// against the read fixtures; NOT independently tuned per corpus (see the
-/// full-eval follow-up).
+/// nonsense cue's ~0.45 top does not count as support (→ `None`) while a real
+/// cue's strong top (or its HyPE / lexical / graph lane) does. Calibrated
+/// against the read fixtures, not independently tuned per corpus.
 const STRONG_SEMANTIC_SUPPORT: f32 = 0.6;
 
 /// HyPE answer-lead floor at which the HyPE lane counts as corroborating
@@ -870,11 +875,12 @@ const STRONG_HYPE_SUPPORT: f32 = 0.6;
 /// floor, comfortably above the observed near-duplicate spread.
 const TOPICAL_COSINE_RESOLUTION: f32 = 0.05;
 
-/// Count the INDEPENDENT lanes that confirm a memory belongs to the cue — the
-/// ONE unifying corroboration signal the read path keys its belonging decisions
-/// on (FIX A/B/C). Each lane is a distinct, independently-computed source of
-/// evidence, so a memory two of them agree on is corroborated in a way no single
-/// lane (however strong) can be:
+/// Count the INDEPENDENT lanes that confirm a memory belongs to the cue — the ONE
+/// unifying corroboration signal the read path keys its belonging decisions on
+/// (the cue-scoped set rule, the corroboration gate and the abstention rule).
+/// Each lane is a distinct, independently-computed source of evidence, so a
+/// memory two of them agree on is corroborated in a way no single lane (however
+/// strong) can be:
 ///   * semantic — a STRONG semantic match (`strong_semantic`): the belonging
 ///     cosine clears `STRONG_SEMANTIC_SUPPORT`, NOT merely the membership band's
 ///     junk floor. This is deliberate. The old rule counted any band member or
@@ -924,7 +930,7 @@ fn support(
     n
 }
 
-/// Order the membership set by ANSWER RELEVANCE, unconditionally (Phase 1).
+/// Order the membership set by ANSWER RELEVANCE, unconditionally.
 ///
 /// The two signals the read conflates are distinct: `cos` (passage↔cue cosine)
 /// measures TOPICAL adjacency ("is this memory about the topic"), while `hype`
@@ -1071,15 +1077,12 @@ struct CommitLead {
 }
 
 /// Decide whether the grounded typed-graph answer should be COMMITTED as the
-/// lead (Phase 2/3), returning the ordered lead ids and the answer shape, or
-/// `None` to fall through to plain answer-relevance ordering.
+/// lead, returning the ordered lead ids and the answer shape, or `None` to fall
+/// through to plain answer-relevance ordering.
 ///
-/// The old `grounded_single_collapse` required full sem-lane consensus (the
-/// grounded and semantic lanes agreeing on the same top-belonging memory) — a
-/// deliberately conservative guard against the grounded-first regression (recall
-/// 0.75→0.10, a loose predicate-name match on the WRONG subject hijacking the
-/// answer with no episodic fallback). Two things make an aggressive commit safe
-/// now and both are preserved:
+/// The rule guards against the grounded-first regression (recall 0.75→0.10, a
+/// loose predicate-name match on the WRONG subject hijacking the answer with no
+/// episodic fallback). An aggressive commit is safe when both properties hold:
 ///   1. ANCHOR-SCOPE — the grounded answer's subject is a resolved NAMED anchor
 ///      (`GroundedOutcome::Answer(_, anchor_scoped=true)`; see the enum doc). A
 ///      wrong-subject / self-loose match is never anchor-scoped, so it can never
@@ -1089,11 +1092,11 @@ struct CommitLead {
 ///      can only MIS-ORDER; it can never drop the real answer from the set.
 ///
 /// Together with the ≥0.6 strong-match floor AND the corroboration gate below,
-/// these replace the sem-lane consensus gate: grounded commits often enough to
-/// raise crisp-answer coverage, but only for a value an independent lane also
-/// confirms, so a lone topical neighbor can never hijack the lead.
+/// this rule lets grounded commits often enough to raise crisp-answer coverage,
+/// but only for a value an independent lane also confirms, so a lone topical
+/// neighbor can never hijack the lead.
 ///
-/// FIX B — CORROBORATION-GATED COMMIT. The ≥0.6 match floor is a NECESSARY floor,
+/// CORROBORATION-GATED COMMIT. The ≥0.6 match floor is a NECESSARY floor,
 /// not the whole gate: a grounded value may lead only when its source memory is
 /// cross-lane CORROBORATED (`support >= SUPPORT_CORROBORATED`, i.e. grounded plus
 /// at least one independent lane). `support_of` is the unifying [`support`]
@@ -1134,7 +1137,7 @@ fn grounded_commit(
             if raw == 0 {
                 return None;
             }
-            // FIX B: the one source must be cross-lane corroborated to lead.
+            // The corroboration gate: the one source must be cross-lane corroborated to lead.
             if support_of(raw) < SUPPORT_CORROBORATED {
                 return None;
             }
@@ -1163,7 +1166,7 @@ fn grounded_commit(
             if ids.is_empty() {
                 return None;
             }
-            // FIX B: at least one member of the set must be cross-lane
+            // The corroboration gate: at least one member of the set must be cross-lane
             // corroborated. A whole set of grounded-only neighbors (none confirmed
             // by another lane) must not lead; a set the answer lanes agree on does.
             if !ids.iter().any(|id| support_of(*id) >= SUPPORT_CORROBORATED) {
@@ -1216,22 +1219,22 @@ fn apply_grounded_commit(
 ///   1. COMPUTE SUPPORT — for every member, count the independent lanes that
 ///      confirm it (semantic / lexical / graph / grounded / HyPE) via `support_of`
 ///      over the REAL fan-out lanes. This single count drives steps 2 and the
-///      caller's abstention (FIX C).
-///   2. GROUNDED COMMIT (FIX B): if the grounded answer is anchor-scoped, clears
-///      the strong floor, AND its source memory is cross-lane corroborated
-///      (`support >= SUPPORT_CORROBORATED`), its value(s) become the LEAD and set
-///      the answer SHAPE — Single (one source, FIX A keeps it Single) or a
-///      cue-scoped Set (FIX A: distinct on-cue objects). An uncorroborated
-///      grounded value does NOT commit; the set falls to answer-relevance
-///      ordering. The rest of the membership is RETAINED below, never cleared (the
-///      standing guardrail: a wrong commit can only mis-order, never drop the
-///      real answer).
+///      caller's abstention under the abstention rule.
+///   2. GROUNDED COMMIT (the corroboration gate): if the grounded answer is
+///      anchor-scoped, clears the strong floor, AND its source memory is cross-lane
+///      corroborated (`support >= SUPPORT_CORROBORATED`), its value(s) become the
+///      LEAD and set the answer SHAPE — Single (one source, the cue-scoped set
+///      rule keeps it Single) or a cue-scoped Set (distinct on-cue objects). An
+///      uncorroborated grounded value does NOT commit; the set falls to answer-
+///      relevance ordering. The rest of the membership is RETAINED below, never
+///      cleared (the standing guardrail: a wrong commit can only mis-order, never
+///      drop the real answer).
 ///   3. ANSWER-RELEVANCE ordering: the remaining / episodic members are ordered by
 ///      the HyPE answer-lead (PRIMARY) with passage cosine (SECONDARY) — the
 ///      answering memory leads over a topical neighbor. When no commit fires this
 ///      orders the whole set, then the lane-consensus collapse may crisp it.
 ///   4. Episodic is ALWAYS retained below the committed lead.
-///   5. ABSTENTION (FIX C, applied by the caller): abstain only when the max
+///   5. ABSTENTION (applied by the caller): abstain only when the max
 ///      support across members is 0 — hence this returns that scalar.
 ///
 /// Returns `(members, committed_shape, any_belongs)`: `committed_shape` is `Some`
@@ -1284,7 +1287,7 @@ fn build_membership(
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     // Per-member belonging cosine — the SECONDARY key for answer-relevance
-    // ordering (Phase 1). Captured before `scored` is consumed into `by_id`.
+    // ordering. Captured before `scored` is consumed into `by_id`.
     let cos_by_id: HashMap<u128, f32> = scored.iter().map(|(m, c)| (m.memory_id, *c)).collect();
 
     let top = scored.first().map(|(_, c)| *c).unwrap_or(0.0);
@@ -1434,7 +1437,7 @@ fn build_membership(
     // the REAL fan-out lanes (`by_id`) — NOT the synthetic `Graph` lane that
     // structured / anchor-direct hydration stamps on rows it fabricated — plus the
     // verified-semantic band, the grounded sources, and the HyPE answer-lead. This
-    // is the single seam FIX B (commit corroboration) and FIX C (abstention) both
+    // is the single seam the corroboration gate (commit corroboration) and the abstention rule both
     // key on. A hydrate-only row is absent from `by_id`, so its lanes are empty and
     // it is supported only by its grounded / HyPE / semantic-band signals.
     let grounded_sources = &struct_seen;
@@ -1467,7 +1470,7 @@ fn build_membership(
         let top_member_id = out.first().map(|m| m.memory_id);
         (consensus_collapse(out, top_member_id), None)
     };
-    // FIX B: `grounded_commit` now enforces corroboration internally (a lead
+    // The corroboration gate: `grounded_commit` enforces corroboration internally (a lead
     // source must clear `SUPPORT_CORROBORATED`), so an uncorroborated grounded
     // value returns `None` here and falls through to `no_commit`.
     let (mut out, committed_shape, committed_lead_count) =
@@ -1525,7 +1528,7 @@ fn build_membership(
         "recall: membership set"
     );
 
-    // FIX C: the caller abstains only when NO returned member has any cross-lane
+    // The abstention rule: the caller abstains only when NO returned member has any cross-lane
     // support. Compute the max support over the FINAL member set with the same
     // corroboration seam the commit used (real fan-out lanes, not synthetic).
     // Belonging for the abstention decision: a member belongs to the cue only
@@ -1908,10 +1911,11 @@ fn statement_in_caller_scope(
 }
 
 /// Build the cue-scoped OBJECT set for a `Slot::Object` slot-projection match
-/// (FIX A). The set is the DISTINCT objects of the statement-question bridge
-/// hits that (a) probe the Object slot, (b) clear the strong floor against THIS
-/// cue, (c) are current (not tombstoned / superseded), (d) are about a resolved
-/// anchor (see [`slot_hit_projectable`]), and (e) project to a meaningful value.
+/// (the cue-scoped set rule). The set is the DISTINCT objects of the
+/// statement-question bridge hits that (a) probe the Object slot, (b) clear the
+/// strong floor against THIS cue, (c) are current (not tombstoned / superseded),
+/// (d) are about a resolved anchor (see [`slot_hit_projectable`]), and (e) project
+/// to a meaningful value.
 ///
 /// This REPLACES `(subject, predicate)` enumeration: it is PRECISE (a member is
 /// included only when its own slot-question is cue-relevant, so unrelated
@@ -2035,7 +2039,7 @@ fn slot_projection_grounded(
             project_statement_slot(rtxn, &statement, slot, score)
                 .map_err(|e| OpError::Internal(format!("slot projection: {e}")))?;
         if let Some(value) = projected {
-            // FIX A — CUE-SCOPED SET MEMBERSHIP. For the OBJECT slot the answer's
+            // CUE-SCOPED SET MEMBERSHIP. For the OBJECT slot the answer's
             // SET is built from the SQ Object hits that themselves clear the strong
             // floor against THIS cue (see `cue_scoped_object_set`), NOT by
             // enumerating every current statement sharing the matched fact's
@@ -2354,7 +2358,7 @@ fn hydrate_memories_by_id(
                 Ok(Some(guard)) => std::str::from_utf8(guard.value())
                     .map(str::to_owned)
                     .map_err(|e| {
-                        OpError::Internal(format!(
+                        OpError::PermanentFault(format!(
                             "structured recall TEXTS_TABLE non-UTF-8 for {memory_id:?}: {e}"
                         ))
                     })?,
@@ -2584,6 +2588,7 @@ async fn retrieve_memories(
     ctx: &OpsContext,
     entity_anchor: Option<EntityId>,
     cue_vec: Option<&[f32; brain_embed::VECTOR_DIM]>,
+    query_vec: Option<[f32; brain_embed::VECTOR_DIM]>,
 ) -> Result<(Vec<MemoryResult>, Option<RecallTrace>, RecallMetricSample), OpError> {
     let planner_req = build_planner_request(req, ctx.executor.caller_space, entity_anchor);
 
@@ -2598,6 +2603,7 @@ async fn retrieve_memories(
         scope_mode: recall_scope_mode(req),
         cross_encoder: ctx.cross_encoder.as_arc().cloned(),
         space_vectors: ctx.executor.space_vectors.clone(),
+        semantic_query: query_vec.map(|v| SemanticQuery::Vector(Box::new(v))),
     };
     // The statement corpus (statement HNSW + statements.tantivy) is ALWAYS
     // searched — it is a cue-driven lane like memory semantic/lexical (it
@@ -2721,7 +2727,7 @@ async fn retrieve_memories(
     // an in-txn RECALL would never see writes the same transaction
     // has buffered but not yet committed.
     let memory_results = if let Some(txn_id) = req.txn_id {
-        overlay_txn_buffer(memory_results, txn_id, req, ctx)?
+        overlay_txn_buffer(memory_results, txn_id, req, ctx).await?
     } else {
         memory_results
     };
@@ -3197,7 +3203,7 @@ fn fetch_candidate_texts(
             Ok(Some(guard)) => std::str::from_utf8(guard.value())
                 .map(str::to_owned)
                 .map_err(|e| {
-                    OpError::Internal(format!(
+                    OpError::PermanentFault(format!(
                         "recall trace TEXTS_TABLE non-UTF-8 for {id:?}: {e}"
                     ))
                 })?,
@@ -3271,7 +3277,7 @@ fn apply_autocut(mut results: Vec<MemoryResult>) -> Vec<MemoryResult> {
 /// Drops tombstoned ids on the committed side, scores each pending
 /// encode against the cue, applies the post-filters (kind, context,
 /// salience, age), then re-sorts by score and trims to `top_k`.
-fn overlay_txn_buffer(
+async fn overlay_txn_buffer(
     committed: Vec<MemoryResult>,
     txn_id: [u8; 16],
     req: &RecallRequest,
@@ -3301,10 +3307,8 @@ fn overlay_txn_buffer(
         return Ok(merged);
     }
 
-    let cue_vec = ctx
-        .executor
-        .embedder
-        .embed_query(&req.cue_text)
+    let cue_vec = crate::embedding::embed_query_off_reactor(&ctx.executor.embedder, &req.cue_text)
+        .await
         .map_err(|e| OpError::ExecError(brain_planner::ExecError::EmbedFailed(e)))?;
 
     let kind_filter: Option<HashSet<MemoryKindWire>> = req
@@ -3642,7 +3646,7 @@ fn project_memory_results(
                 Ok(Some(guard)) => std::str::from_utf8(guard.value())
                     .map(str::to_owned)
                     .map_err(|e| {
-                        OpError::Internal(format!(
+                        OpError::PermanentFault(format!(
                             "retrieval recall TEXTS_TABLE non-UTF-8 for {memory_id:?}: {e}",
                         ))
                     })?,
@@ -4455,7 +4459,7 @@ mod tests {
     #[test]
     fn anchor_abstention_abstains_only_on_zero_support() {
         // No anchor, grounded NoAnswer, and NO member has any cross-lane support
-        // (max_support == 0) → abstain (FIX C).
+        // (max_support == 0) → abstain (the abstention rule).
         let members = vec![mr(1, &[Semantic]), mr(2, &[Semantic])];
         let kept = apply_anchor_abstention(members, None, &GroundedOutcome::NoAnswer, false);
         assert!(
@@ -4466,7 +4470,7 @@ mod tests {
 
     #[test]
     fn anchor_abstention_keeps_supported_set() {
-        // Any support (>=1) means the facts ship — FIX C never empties a set that
+        // Any support (>=1) means the facts ship — the abstention rule never empties a set that
         // has real support, even without an anchor or a grounded answer.
         let members = vec![mr(1, &[Semantic]), mr(2, &[Semantic])];
         let kept = apply_anchor_abstention(members, None, &GroundedOutcome::NoAnswer, true);
@@ -4524,7 +4528,7 @@ mod tests {
     #[test]
     fn kind_presence_keeps_supported_answer() {
         // A supported member (max_support >= 1) is a real answer grounded simply
-        // hadn't extracted → keep. FIX C never emits an empty answer over support.
+        // hadn't extracted → keep. The abstention rule never emits an empty answer over support.
         let members = vec![mr(1, &[Graph, Semantic]), mr(2, &[Semantic])];
         let kept = apply_kind_presence_abstention(
             members,
@@ -4602,7 +4606,7 @@ mod tests {
         );
     }
 
-    // ── Phase 1: answer-relevance is the PRIMARY ordering key ───────────────
+    // ── answer-relevance is the PRIMARY ordering key ────────────────────────
 
     #[test]
     fn answer_relevance_leads_over_higher_cosine_topical_neighbor() {
@@ -4796,7 +4800,7 @@ mod tests {
         );
     }
 
-    // ── Phase 2/3: grounded commit ──────────────────────────────────────────
+    // ── grounded commit ─────────────────────────────────────────────────────
 
     use crate::grounded::GroundedValue;
 
@@ -4839,7 +4843,7 @@ mod tests {
 
     #[test]
     fn grounded_commit_fires_on_corroborated_anchor_scoped_strong_single() {
-        // FIX B: anchor-scoped Single clearing the strong floor AND cross-lane
+        // The corroboration gate: anchor-scoped Single clearing the strong floor AND cross-lane
         // corroborated (support >= 2) → commit that one source memory, shape Single.
         let g = outcome(AnswerKind::Single, vec![gv("OpenAI", 7, 0.7)], true);
         let lead = grounded_commit(&g, &sup(&[7])).expect("corroborated strong single commits");
@@ -4849,7 +4853,8 @@ mod tests {
 
     #[test]
     fn grounded_commit_declines_uncorroborated_single() {
-        // FIX B: the SAME strong, anchor-scoped value but grounded-only (support 1,
+        // The corroboration gate: the SAME strong, anchor-scoped value but
+        // grounded-only (support 1,
         // no independent lane) → NO commit. A lone topical-cosine neighbor may not
         // lead; it falls to the answer-relevance-ordered list instead.
         let g = outcome(AnswerKind::Single, vec![gv("OpenAI", 7, 0.7)], true);
@@ -4905,7 +4910,7 @@ mod tests {
 
     #[test]
     fn grounded_commit_declines_uncorroborated_set() {
-        // FIX B: a whole set of grounded-only neighbors (no member confirmed by an
+        // The corroboration gate: a whole set of grounded-only neighbors (no member confirmed by an
         // independent lane) must NOT lead — it falls to answer-relevance ordering.
         let g = outcome(
             AnswerKind::Set,
@@ -5015,7 +5020,7 @@ mod tests {
 
     #[test]
     fn support_grounded_only_is_not_corroborated() {
-        // The FIX B invariant: a grounded-only source (no independent lane) is
+        // The corroboration gate invariant: a grounded-only source (no independent lane) is
         // support 1 — below the corroboration bar, so it cannot commit.
         let grounded: HashSet<u128> = [5u128].into_iter().collect();
         let no_hype: HashMap<u128, f32> = HashMap::new();
@@ -5023,7 +5028,7 @@ mod tests {
         assert!(support(5, &[], false, &grounded, &no_hype) < SUPPORT_CORROBORATED);
     }
 
-    // ── FIX A: cue-scoped object set membership ──────────────────────────────
+    // ── cue-scoped object set membership ─────────────────────────────────────
 
     #[test]
     fn cue_scoped_object_set_folds_cross_predicate_scopes_and_dedups() {

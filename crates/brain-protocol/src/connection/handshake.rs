@@ -5,14 +5,15 @@
 //! server-bound) and `ResponseBody` (WELCOME, AUTH_OK — client-bound) so
 //! Frame dispatch is uniform.
 //!
-//! [`negotiate`] picks the highest mutually-supported wire-protocol
-//! version and intersects the [`HelloCapabilities`] flags. Auth-method
-//! intersection is *not* part of negotiation — that check happens when
-//! the server validates the AUTH frame against the methods it advertised
-//! in WELCOME, owned by the connection-layer AUTH handler.
+//! [`negotiate`] picks the highest mutually-supported wire-protocol version
+//! that the frame codec decodes and intersects the
+//! [`HelloCapabilities`] flags. Auth-method intersection is *not* part of
+//! negotiation — that check happens when the server validates the AUTH frame
+//! against the methods it advertised in WELCOME, owned by the connection-layer
+//! AUTH handler.
 
 use crate::codec::cbor::{from_cbor_bytes, to_cbor_bytes};
-use crate::codec::header::VERSION;
+use crate::codec::header::{SUPPORTED_VERSIONS, VERSION};
 use crate::envelope::request::WireUuid;
 use crate::error::ProtocolError;
 
@@ -240,8 +241,11 @@ pub struct NegotiatedSession {
     pub capabilities: HelloCapabilities,
 }
 
-/// Pick the highest mutually-supported wire-protocol version and
-/// intersect the capability flags.
+/// Pick the highest mutually-supported wire-protocol version that the codec
+/// decodes and intersect the capability flags. The negotiated version is
+/// bounded by the codec's decodable versions, so a server that advertises
+/// more versions than this build implements still settles on a decodable one,
+/// or fails the handshake outright.
 ///
 /// Returns [`ProtocolError::BadVersion`] if no version overlaps. The
 /// over-the-wire failure path emits an `ERROR` frame with code
@@ -257,17 +261,17 @@ pub fn negotiate(
     let chosen_version = client
         .supported_versions
         .iter()
-        .filter(|v| server.supported_versions.contains(v))
+        .filter(|v| server.supported_versions.contains(v) && SUPPORTED_VERSIONS.contains(v))
         .copied()
         .max()
         .ok_or_else(|| {
-            // Surface the highest version each side claimed so the
-            // resulting ERROR frame can give an informative message.
-            let server_max = server.supported_versions.iter().copied().max().unwrap_or(0);
+            // Surface the client's highest claim and the codec's highest
+            // decodable version so the resulting ERROR frame names the
+            // version the server can actually accept.
             let client_max = client.supported_versions.iter().copied().max().unwrap_or(0);
             ProtocolError::BadVersion {
                 got: client_max,
-                expected: server_max,
+                expected: SUPPORTED_VERSIONS.iter().copied().max().unwrap_or(0),
             }
         })?;
 
@@ -471,8 +475,10 @@ mod tests {
 
     // ---- Negotiation: version intersection ---------------------------------
 
+    /// The mutual set is bounded by codec-decodable versions, so advertising
+    /// more does not select a version the next frame would reject.
     #[test]
-    fn negotiate_picks_highest_mutual_version() {
+    fn negotiate_bounds_the_mutual_set_by_codec_versions() {
         let client = HelloPayload {
             client_id: "c".into(),
             supported_versions: vec![1, 2, 3],
@@ -482,7 +488,7 @@ mod tests {
         let mut server = ServerCapabilities::v1_default("s", vec![AuthMethod::Token]);
         server.supported_versions = vec![1, 2];
         let session = negotiate(&client, &server).expect("overlap on 1, 2");
-        assert_eq!(session.chosen_version, 2);
+        assert_eq!(session.chosen_version, crate::VERSION);
     }
 
     #[test]
@@ -518,9 +524,59 @@ mod tests {
             err,
             ProtocolError::BadVersion {
                 got: 4,
-                expected: 2
+                expected: 1
             }
         ));
+    }
+
+    /// A handshake can never hand back a version the next frame would reject.
+    #[test]
+    fn negotiated_versions_are_accepted_by_the_codec() {
+        let combinations = [
+            (vec![1, 2, 3], vec![1, 2]),
+            (vec![1], vec![1, 4]),
+            (vec![7, 1], vec![9, 1]),
+        ];
+        for (client_versions, server_versions) in combinations {
+            let client = HelloPayload {
+                client_id: "c".into(),
+                supported_versions: client_versions,
+                capabilities: v1_caps(),
+                client_connection_token: None,
+            };
+            let mut server = ServerCapabilities::v1_default("s", vec![AuthMethod::Token]);
+            server.supported_versions = server_versions;
+            let session =
+                negotiate(&client, &server).expect("the lists overlap on a codec version");
+            let mut header = crate::codec::header::Header::new(0, 0, 0, 0);
+            header.version = session.chosen_version;
+            header.seal();
+            assert!(
+                header.validate().is_ok(),
+                "a negotiated version the header rejects would strand the connection"
+            );
+        }
+    }
+
+    /// An overlap outside the codec's versions must fail rather than establish
+    /// a connection that cannot carry a frame.
+    #[test]
+    fn negotiate_rejects_overlap_outside_codec_versions() {
+        let client = HelloPayload {
+            client_id: "c".into(),
+            supported_versions: vec![2, 3],
+            capabilities: v1_caps(),
+            client_connection_token: None,
+        };
+        let mut server = ServerCapabilities::v1_default("s", vec![AuthMethod::Token]);
+        server.supported_versions = vec![2, 3];
+        assert!(
+            matches!(
+                negotiate(&client, &server),
+                Err(ProtocolError::BadVersion { .. })
+            ),
+            "a version both peers claim but neither can frame is not a usable connection"
+        );
     }
 
     // ---- Negotiation: capabilities intersection ----------------------------

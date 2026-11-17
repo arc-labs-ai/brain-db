@@ -6,8 +6,8 @@
 //!    similarity, and similarity is not agreement: "the OAuth blocker is
 //!    fixed" sits right next to "linear-sandbox is blocked by the OAuth
 //!    login flow" in embedding space while saying the opposite. Every
-//!    base hit used to count as supporting evidence, which pinned the
-//!    aggregate confidence at `1.0` and listed the refutation as support.
+//!    base hit counted as supporting evidence pins the aggregate
+//!    confidence at `1.0` and lists the refutation as support.
 //!    [`classify`] sorts each hit into supports / contradicts / unrelated
 //!    from (a) topical overlap with the observation and (b) the state
 //!    polarity each text asserts (a blocked/failing state vs. a
@@ -15,8 +15,8 @@
 //!    evidence older than the newest opposing evidence is damped by
 //!    [`STALE_FACTOR`].
 //!
-//! 2. **Derived claims.** REASON used to echo the observation back as
-//!    its only "inference". [`derive_claims`] draws claims outward from
+//! 2. **Derived claims.** Echoing the observation back is not an
+//!    inference. [`derive_claims`] draws claims outward from
 //!    the typed graph instead: the statements the stance-bearing memories
 //!    are evidence for, plus the current statements about those
 //!    statements' subject entities. Each claim carries its own evidence,
@@ -281,7 +281,7 @@ pub(crate) fn memory_time(
 
 /// Live statements for which `memory` is evidence, via the scoped
 /// `STATEMENTS_BY_EVIDENCE_TABLE` reverse index.
-pub(crate) fn statements_for_memory(
+fn statements_for_memory(
     rtxn: &redb::ReadTransaction,
     scope: RowScope,
     memory: MemoryId,

@@ -16,12 +16,8 @@ use crate::plan::{
     recall::{
         AnnSearchStep, EmbeddingStep, FilterStep, MergeStep, MetadataLookupStep, ShardSearchStep,
     },
-    ExecutionPlan, FilterStage, SortKey,
+    FilterStage, SortKey,
 };
-
-pub fn plan_path(req: &PlanRequest, ctx: &PlannerContext) -> Result<ExecutionPlan, PlanError> {
-    Ok(ExecutionPlan::Plan(plan_path_inner(req, ctx)?))
-}
 
 pub fn plan_path_inner(req: &PlanRequest, ctx: &PlannerContext) -> Result<PathPlan, PlanError> {
     validate(req, &ctx.config)?;
@@ -91,6 +87,16 @@ fn validate(req: &PlanRequest, config: &PlannerConfig) -> Result<(), PlanError> 
             reason: "must be > 0".to_string(),
         });
     }
+    let branches = req.budget.max_branches_explored as usize;
+    if branches > config.max_branches_explored {
+        return Err(PlanError::InvalidParameters {
+            field: "budget.max_branches_explored",
+            reason: format!(
+                "{branches} exceeds max_branches_explored = {}",
+                config.max_branches_explored
+            ),
+        });
+    }
     Ok(())
 }
 
@@ -156,7 +162,7 @@ mod tests {
             budget: PlanBudget {
                 max_steps: 4,
                 max_wall_time_ms: 100,
-                max_branches_explored: 64,
+                max_branches_explored: 32,
             },
             strategy_hint: None,
             session_filter: None,
@@ -167,16 +173,9 @@ mod tests {
         }
     }
 
-    fn unwrap_path(plan: ExecutionPlan) -> PathPlan {
-        match plan {
-            ExecutionPlan::Plan(p) => p,
-            other => panic!("expected Plan, got {other:?}"),
-        }
-    }
-
     #[test]
     fn default_request_shape() {
-        let plan = unwrap_path(plan_path(&base_request(), &PlannerContext::default()).unwrap());
+        let plan = plan_path_inner(&base_request(), &PlannerContext::default()).unwrap();
         assert!(plan.starting_recall.is_some(), "ByText start → recall");
         assert!(plan.goal_recall.is_some(), "ByText goal → recall");
         assert_eq!(plan.traversal.max_depth, 4);
@@ -193,7 +192,7 @@ mod tests {
     fn by_memory_id_skips_recall() {
         let mut r = base_request();
         r.start = PlanState::ByMemoryId(MemoryId::from(7u128).raw());
-        let plan = unwrap_path(plan_path(&r, &PlannerContext::default()).unwrap());
+        let plan = plan_path_inner(&r, &PlannerContext::default()).unwrap();
         assert!(plan.starting_recall.is_none());
         assert!(plan.goal_recall.is_some(), "goal still ByText");
     }
@@ -202,7 +201,7 @@ mod tests {
     fn zero_max_steps_rejected() {
         let mut r = base_request();
         r.budget.max_steps = 0;
-        match plan_path(&r, &PlannerContext::default()) {
+        match plan_path_inner(&r, &PlannerContext::default()) {
             Err(PlanError::InvalidParameters { field, .. }) => {
                 assert_eq!(field, "budget.max_steps");
             }
@@ -214,7 +213,7 @@ mod tests {
     fn depth_over_max_rejected() {
         let mut r = base_request();
         r.budget.max_steps = 11; // cap is 10
-        match plan_path(&r, &PlannerContext::default()) {
+        match plan_path_inner(&r, &PlannerContext::default()) {
             Err(PlanError::InvalidParameters { field, reason }) => {
                 assert_eq!(field, "budget.max_steps");
                 assert!(reason.contains("max_traversal_depth"));
@@ -227,9 +226,23 @@ mod tests {
     fn zero_branches_rejected() {
         let mut r = base_request();
         r.budget.max_branches_explored = 0;
-        match plan_path(&r, &PlannerContext::default()) {
+        match plan_path_inner(&r, &PlannerContext::default()) {
             Err(PlanError::InvalidParameters { field, .. }) => {
                 assert_eq!(field, "budget.max_branches_explored");
+            }
+            other => panic!("expected InvalidParameters, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn branches_over_max_rejected() {
+        let mut r = base_request();
+        r.budget.max_branches_explored =
+            (PlannerConfig::default().max_branches_explored + 1) as u32;
+        match plan_path_inner(&r, &PlannerContext::default()) {
+            Err(PlanError::InvalidParameters { field, reason }) => {
+                assert_eq!(field, "budget.max_branches_explored");
+                assert!(reason.contains("max_branches_explored"));
             }
             other => panic!("expected InvalidParameters, got {other:?}"),
         }

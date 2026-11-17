@@ -2,9 +2,10 @@
 //!
 //! Three layers, in order of generality:
 //!
-//! - [`ErrorCategory`] — nine broad classes that drive client retry
+//! - [`ErrorCategory`] — ten broad classes that drive client retry
 //!   behavior (Protocol, Authentication, Authorization, Validation,
-//!   NotFound, Conflict, ResourceExhausted, Internal, Unavailable).
+//!   NotFound, Conflict, ResourceExhausted, Internal, Unavailable,
+//!   OperatorIntervention).
 //! - [`ErrorCode`] — one variant per named code in the wire-error table.
 //!   Used both for ERROR-frame encoding/decoding and as a stable mapping
 //!   target for [`ProtocolError`].
@@ -46,6 +47,12 @@ pub enum ErrorCategory {
     Internal,
     /// Server temporarily unavailable; retry per `retry_after_ms`.
     Unavailable,
+    /// Server-side fault that no retry can clear: the deployment itself is
+    /// broken and must be repaired by an operator before the request can
+    /// succeed. Distinct from `Internal` (a bug that may not recur) and from
+    /// `Unavailable` (a condition expected to pass on its own) — both of those
+    /// are retryable, and this one never is.
+    OperatorIntervention,
 }
 
 impl ErrorCategory {
@@ -82,9 +89,7 @@ pub enum ErrorCode {
     BadFrame,
     OversizePayload,
     ReservedFieldNonZero,
-    BadFlagCombination,
     MalformedPayload,
-    MalformedVector,
 
     // Connection / handshake
     VersionNotSupported,
@@ -109,16 +114,7 @@ pub enum ErrorCode {
 
     // Validation
     InvalidArgument,
-    MissingRequiredField,
-    TextTooLarge,
-    TextEmpty,
     BadSessionId,
-    BadMemoryKind,
-    BadEdgeKind,
-    BadStrategyHint,
-    TopKOutOfRange,
-    BudgetTooLarge,
-    BadModelFingerprint,
     /// Schema-strict mode rejected a STATEMENT_CREATE / QUERY because
     /// the requested predicate qname is not declared in the namespace's
     /// active schema version. In schemaless mode this never fires —
@@ -164,7 +160,6 @@ pub enum ErrorCode {
     OutOfMemory,
     RateLimited,
     StreamLimitExceeded,
-    ConnectionLimitExceeded,
     TransactionLimitExceeded,
     /// Transaction buffer exceeded the per-transaction op cap (1000 ops).
     /// Surfaced both at append-time (so the space
@@ -190,7 +185,7 @@ pub enum ErrorCode {
     Overloaded,
     Restarting,
     Maintenance,
-    /// Reserved for admin / diagnostic surfaces (`/health`, `ADMIN_STATUS`)
+    /// Reserved for admin / diagnostic surfaces (`/health`, `ADMIN_STATS`)
     /// when a shard reports a degraded retriever set — e.g. tantivy
     /// segment corruption or a graph-store `pwritev2` failure observed
     /// after spawn. Never returned to a normal RECALL: shards refuse to
@@ -202,10 +197,19 @@ pub enum ErrorCode {
     /// for the terminal counterpart.
     LlmCredentialUnavailable,
 
+    // Operator intervention
+    /// This shard's write-ahead log has entered its terminal broken state
+    /// after a durability failure. The state is held for the life of the
+    /// process and nothing clears it, so every subsequent write on this shard
+    /// fails identically until an operator restarts it. Classified
+    /// `OperatorIntervention` so clients stop instead of retrying a dead disk.
+    ShardStorageFaulted,
+    /// Engine state is permanently inconsistent; retrying or restarting does
+    /// not change the stored fault and the operator must investigate it.
+    UnrecoverableInternal,
+
     // Typed-graph error codes (`0x01xx` namespace). Low-byte family
     // mirrors the typed-graph opcode ranges.
-    /// Schema upload failed validation (syntax, type-ref, attribute rule, etc.).
-    SchemaInvalid,
     /// Schema upload requires a migration plan that hasn't been executed.
     SchemaMigrationRequired,
     /// `ENTITY_GET` / `ENTITY_RESOLVE` / dependent ops referenced a
@@ -259,9 +263,7 @@ impl ErrorCode {
             | Self::BadFrame
             | Self::OversizePayload
             | Self::ReservedFieldNonZero
-            | Self::BadFlagCombination
-            | Self::MalformedPayload
-            | Self::MalformedVector => ErrorCategory::Protocol,
+            | Self::MalformedPayload => ErrorCategory::Protocol,
 
             // Connection / handshake — version + auth-method failures are
             // Protocol; credential failures are Authentication.
@@ -279,16 +281,7 @@ impl ErrorCode {
 
             // Validation codes.
             Self::InvalidArgument
-            | Self::MissingRequiredField
-            | Self::TextTooLarge
-            | Self::TextEmpty
             | Self::BadSessionId
-            | Self::BadMemoryKind
-            | Self::BadEdgeKind
-            | Self::BadStrategyHint
-            | Self::TopKOutOfRange
-            | Self::BudgetTooLarge
-            | Self::BadModelFingerprint
             | Self::PredicateNotInSchema
             | Self::RelationTypeNotInSchema => ErrorCategory::Validation,
 
@@ -314,7 +307,6 @@ impl ErrorCode {
             | Self::OutOfMemory
             | Self::RateLimited
             | Self::StreamLimitExceeded
-            | Self::ConnectionLimitExceeded
             | Self::TransactionLimitExceeded
             | Self::TransactionTooLarge => ErrorCategory::ResourceExhausted,
 
@@ -336,8 +328,13 @@ impl ErrorCode {
             | Self::LlmCredentialUnavailable
             | Self::QueryTimeout => ErrorCategory::Unavailable,
 
+            // Operator-intervention codes.
+            Self::ShardStorageFaulted | Self::UnrecoverableInternal => {
+                ErrorCategory::OperatorIntervention
+            }
+
             // Typed-graph validation codes.
-            Self::SchemaInvalid | Self::EntityTypeMismatch | Self::StatementObjectTypeMismatch => {
+            Self::EntityTypeMismatch | Self::StatementObjectTypeMismatch => {
                 ErrorCategory::Validation
             }
 
@@ -398,9 +395,6 @@ pub enum ProtocolError {
     /// specific variant (maps to `BadFrame` in the wire error table).
     #[error("bad frame: {0}")]
     BadFrame(String),
-    /// Frame flags are mutually inconsistent.
-    #[error("bad flag combination: {0}")]
-    BadFlagCombination(String),
     /// Payload failed structural validation (CBOR / vector layout).
     #[error("malformed payload: {0}")]
     MalformedPayload(String),
@@ -420,7 +414,6 @@ impl ProtocolError {
             Self::UnknownOpcode(_) => ErrorCode::BadOpcode,
             Self::Truncated { .. } => ErrorCode::BadFrame,
             Self::BadFrame(_) => ErrorCode::BadFrame,
-            Self::BadFlagCombination(_) => ErrorCode::BadFlagCombination,
             Self::MalformedPayload(_) => ErrorCode::MalformedPayload,
         }
     }
@@ -507,6 +500,7 @@ mod tests {
             ErrorCategory::Validation,
             ErrorCategory::NotFound,
             ErrorCategory::Conflict,
+            ErrorCategory::OperatorIntervention,
         ] {
             assert!(!cat.is_retryable(), "{cat:?} must not be retryable");
         }
@@ -527,7 +521,6 @@ mod tests {
             ProtocolError::UnknownOpcode(0x0077),
             ProtocolError::Truncated { have: 0, need: 32 },
             ProtocolError::BadFrame("x".into()),
-            ProtocolError::BadFlagCombination("EOS+MPL".into()),
             ProtocolError::MalformedPayload("CBOR decode failed".into()),
         ];
         for e in samples {
@@ -576,10 +569,6 @@ mod tests {
             ErrorCode::BadFrame
         );
         assert_eq!(
-            ProtocolError::BadFlagCombination("y".into()).code(),
-            ErrorCode::BadFlagCombination
-        );
-        assert_eq!(
             ProtocolError::MalformedPayload("z".into()).code(),
             ErrorCode::MalformedPayload
         );
@@ -601,10 +590,6 @@ mod tests {
         );
 
         // Typed-graph codes.
-        assert_eq!(
-            ErrorCode::SchemaInvalid.category(),
-            ErrorCategory::Validation
-        );
         assert_eq!(
             ErrorCode::SchemaMigrationRequired.category(),
             ErrorCategory::Conflict

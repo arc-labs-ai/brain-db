@@ -160,7 +160,7 @@ fn plan_request_traced(
         budget: PlanBudget {
             max_steps: max_depth,
             max_wall_time_ms: 1000,
-            max_branches_explored: 256,
+            max_branches_explored: 32,
         },
         strategy_hint: None,
         session_filter: None,
@@ -424,9 +424,10 @@ fn plan_trace_true_populates_explored_and_meeting_points() {
 //
 // Live repro: a space holding just two memories, PLAN start "Priya is based
 // in Bangalore" → goal "Priya leads the EU office in Lisbon". Both memories
-// sit in the top-K of BOTH cues, so both used to seed both BFS sides; the
-// executor then reported each as a trivial start == goal "path" — two frames
-// of one step each (step_index 0, Initial, distance 0), goal memory first.
+// sit in the top-K of BOTH cues, so seeding both BFS sides from the unsplit
+// top-K makes the executor report each as a trivial start == goal "path" —
+// two frames of one step each (step_index 0, Initial, distance 0), goal
+// memory first.
 // With the endpoints split by anchor the plan is the single real path
 // start → goal, numbered from the start.
 // ---------------------------------------------------------------------------
@@ -533,7 +534,7 @@ fn plan_by_text_overlapping_endpoints_returns_start_to_goal_path() {
             budget: PlanBudget {
                 max_steps: 4,
                 max_wall_time_ms: 1000,
-                max_branches_explored: 256,
+                max_branches_explored: 32,
             },
             strategy_hint: None,
             session_filter: None,

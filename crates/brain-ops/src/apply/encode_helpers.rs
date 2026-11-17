@@ -154,7 +154,11 @@ pub async fn fetch_extractor_context(
         filters: SemanticFiltersConfigSlot(filters),
         ..cfg
     };
-    let query = SemanticQuery::Text(cue_text.to_string());
+    let query = SemanticQuery::Vector(Box::new(
+        crate::embedding::embed_query_off_reactor(&ctx.executor.embedder, cue_text)
+            .await
+            .map_err(|e| ExtractorContextError::Semantic(format!("{e}")))?,
+    ));
     let hits = retriever
         .retrieve(&query, SemanticScope::Memory, &cfg, None)
         .map_err(|e| ExtractorContextError::Semantic(format!("{e}")))?;
@@ -362,6 +366,20 @@ mod tests {
         }
     }
 
+    /// Drive one fetch on a Glommio executor. The fetch embeds its cue on the
+    /// blocking pool, which needs a reactor on this thread, and the fixture's
+    /// `OpsContext` is `!Send`, so the executor comes up here rather than on a
+    /// spawned thread.
+    fn fetch_on_executor(
+        ops: &OpsContext,
+        memory_id: MemoryId,
+        cue_text: &str,
+        config: ExtractorContextFetchConfig,
+    ) -> Result<ExtractorContext, ExtractorContextError> {
+        glommio::LocalExecutor::default()
+            .run(fetch_extractor_context(ops, memory_id, cue_text, config))
+    }
+
     #[test]
     fn fetch_extractor_context_returns_top_m_neighbors_excluding_self() {
         let (_dir, mut ops) = fresh_ctx();
@@ -389,8 +407,7 @@ mod tests {
             top_m: 10,
             same_session_only: true,
         };
-        let ec = futures_lite::future::block_on(fetch_extractor_context(&ops, self_id, "cue", cfg))
-            .expect("fetch succeeds");
+        let ec = fetch_on_executor(&ops, self_id, "cue", cfg).expect("fetch succeeds");
 
         assert_eq!(ec.neighbors.len(), 3, "self dropped, three real neighbors");
         let ids: Vec<MemoryId> = ec.neighbors.iter().map(|n| n.memory_id).collect();
@@ -425,8 +442,7 @@ mod tests {
             top_m: 10,
             same_session_only: true,
         };
-        let ec = futures_lite::future::block_on(fetch_extractor_context(&ops, self_id, "cue", cfg))
-            .expect("fetch succeeds");
+        let ec = fetch_on_executor(&ops, self_id, "cue", cfg).expect("fetch succeeds");
         assert_eq!(ec.neighbors.len(), 1, "cross-context neighbor dropped");
         assert_eq!(ec.neighbors[0].memory_id, near_ctx);
 
@@ -435,8 +451,7 @@ mod tests {
             top_m: 10,
             same_session_only: false,
         };
-        let ec = futures_lite::future::block_on(fetch_extractor_context(&ops, self_id, "cue", cfg))
-            .expect("fetch succeeds");
+        let ec = fetch_on_executor(&ops, self_id, "cue", cfg).expect("fetch succeeds");
         assert_eq!(ec.neighbors.len(), 2);
     }
 
@@ -453,8 +468,7 @@ mod tests {
         ops.semantic_retriever = stub;
 
         let cfg = ExtractorContextFetchConfig::default();
-        let ec = futures_lite::future::block_on(fetch_extractor_context(&ops, self_id, "cue", cfg))
-            .expect("fetch succeeds");
+        let ec = fetch_on_executor(&ops, self_id, "cue", cfg).expect("fetch succeeds");
         assert!(
             ec.neighbors.is_empty(),
             "first memory has no priors to anchor on",
@@ -480,8 +494,7 @@ mod tests {
             top_m: 5,
             same_session_only: true,
         };
-        let ec = futures_lite::future::block_on(fetch_extractor_context(&ops, self_id, "cue", cfg))
-            .expect("fetch succeeds");
+        let ec = fetch_on_executor(&ops, self_id, "cue", cfg).expect("fetch succeeds");
         assert_eq!(ec.neighbors.len(), 5, "top_m is the hard cap");
     }
 

@@ -139,7 +139,7 @@ pub async fn handle_admin_restore(
             ..
         } => Ok(AdminRestoreOutcome::AlreadyActive),
         PhaseAck::MemoryRestored { .. } => Ok(AdminRestoreOutcome::Restored),
-        other => Err(OpError::Internal(format!(
+        other => Err(OpError::PermanentFault(format!(
             "restore returned unexpected phase ack: {other:?}"
         ))),
     }

@@ -3,7 +3,9 @@
 //! Drives a *running* brain-server over the §04 wire protocol using the
 //! canonical `brain-protocol` codec on a blocking `std::net::TcpStream`:
 //! handshake (HELLO/AUTH) → ENCODE → RECALL, and asserts the encoded memory
-//! comes back. Connects to `$BRAIN_SMOKE_ADDR` (default `127.0.0.1:9090`).
+//! comes back. Connects to `$BRAIN_SMOKE_ADDR` (default `127.0.0.1:9090`) and
+//! authenticates with `$BRAIN_SMOKE_TOKEN`, an API-key secret minted through
+//! `POST /v1/api-keys` on the admin listener.
 //!
 //! This is dev tooling, not a client SDK — it exists to prove the data plane
 //! end-to-end without pulling in a sibling repo. Run:
@@ -26,7 +28,7 @@ use brain_protocol::{
 const FLAG_EOS: u8 = 0x80;
 
 fn main() {
-    let addr = std::env::var("BRAIN_SMOKE_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
+    let addr = std::env::var("BRAIN_SMOKE_ADDR").unwrap_or_else(|_| "127.0.0.1:9090".to_string());
     eprintln!("wire_smoke: connecting to {addr}");
     let mut stream = TcpStream::connect(&addr).expect("connect to brain-server");
     let mut buf: Vec<u8> = Vec::new();
@@ -57,9 +59,15 @@ fn main() {
         w.server_id, w.chosen_version
     );
 
+    // The secret is minted server-side by `POST /v1/api-keys`, so there is no
+    // literal that can authenticate; the caller supplies the one they minted.
+    let token = std::env::var("BRAIN_SMOKE_TOKEN").expect(
+        "set BRAIN_SMOKE_TOKEN to an API-key secret minted via POST /v1/api-keys \
+         (needs at least the ENCODE and RECALL permission bits)",
+    );
     let auth = AuthPayload {
         method: AuthMethod::Token,
-        credentials: AuthCredentials::Token(b"smoke-token".to_vec()),
+        credentials: AuthCredentials::Token(token.into_bytes()),
     };
     send(
         &mut stream,

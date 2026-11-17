@@ -15,11 +15,11 @@
 //! entity-type target with `InvalidRequest`.
 //!
 //! Safety posture (mirrors `SCHEMA_REPLACE`'s explicit-confirmation
-//! contract for an irreversible operation): dropping a type that still
-//! has live (non-tombstoned) rows requires `force: true`. With live rows
-//! present and `force` unset the handler rejects with `Conflict` and
-//! mutates nothing. A type with no live rows drops without `force`. Rows
-//! on a dropped type stay as orphans — readable as plain memories, no
+//! contract for an irreversible operation): dropping a type that still has
+//! rows naming it, tombstoned included, requires `force: true`. With such
+//! rows present and `force` unset the handler rejects with `Conflict` and
+//! mutates nothing. A type with no rows naming it drops without `force`.
+//! Rows on a dropped type stay as orphans — readable as plain memories, no
 //! longer enriched from the typed-graph tables — exactly as under
 //! `SCHEMA_REPLACE`.
 //!
@@ -30,11 +30,11 @@
 
 use crate::clock::now_unix_nanos;
 use brain_core::RequestId;
-use brain_metadata::relation::ops::relation_live_count_by_type;
+use brain_metadata::relation::ops::relation_reference_count_by_type;
 use brain_metadata::relation::types::relation_type_id_by_qname;
 use brain_metadata::schema::predicate::predicate_id_by_qname;
 use brain_metadata::schema::store::schema_active_row;
-use brain_metadata::statement::crud::statement_live_count_by_predicate;
+use brain_metadata::statement::crud::statement_reference_count_by_predicate;
 use brain_metadata::DeclScope;
 use brain_protocol::schema::{validate_with, Schema, SchemaItem};
 use brain_protocol::{schema_drop_target, SchemaDropRequest, SchemaDropResponse};
@@ -45,12 +45,10 @@ use crate::handlers::schema_scope;
 use crate::handlers::schema_wire;
 use crate::write::{Phase, PhaseAck, Write, WriteId};
 
-/// Cap on the in-use scan: the safety gate only needs to know "any live
-/// rows?", so it stops at the first hit rather than counting an entire
-/// namespace's statements. The reported `live_rows` is therefore `1` for
-/// any in-use type — enough to drive the force gate and the client
-/// message without an unbounded scan on the ack path.
-const LIVE_ROW_SCAN_CAP: usize = 1;
+/// Cap on the in-use scan: the gate asks whether any row still names the
+/// type, counting tombstoned rows because history and a soft-FORGET restore
+/// still have to name it.
+const REFERENCING_ROW_SCAN_CAP: usize = 1;
 
 /// Handle a `SCHEMA_DROP` request. Admin-only at the dispatch layer;
 /// this function trusts the caller to be authorised.
@@ -91,7 +89,6 @@ pub async fn handle_schema_drop(
     let namespace = req.namespace.clone();
     // Resolved before any state-dependent step, as in `schema_upload`.
     let space = schema_scope::declaration_space(ctx, req.scope)?;
-    let caller_ns_id = ctx.executor.caller_namespace.raw();
 
     // 3. Read-only pre-checks against committed state. The actual narrow +
     //    re-version is then applied through the unified submit(Write) path so
@@ -136,13 +133,13 @@ pub async fn handle_schema_drop(
         return Ok(not_declared_response(&req, current_version));
     };
 
-    // 3c. In-use safety gate. Count live (non-tombstoned) rows keyed on the
-    //     target; reject if any exist and `force` is unset. These helpers take
+    // 3c. In-use safety gate. Count every row that names the target, including
+    //     tombstoned rows; reject if any exist and `force` is unset. These helpers take
     //     a write txn but only read — open one for the reads and drop it
     //     (rolling back, writing nothing) before submit opens its own.
     //     Single-writer-per-shard means no other writer runs in between, so the
     //     gate can't go stale.
-    let live_rows = {
+    let referencing_rows = {
         let wtxn = ctx
             .executor
             .metadata
@@ -153,13 +150,12 @@ pub async fn handle_schema_drop(
                 match predicate_id_by_qname(&wtxn, DeclScope::space(&namespace, space), target_name)
                     .map_err(|e| OpError::Internal(format!("predicate_id_by_qname: {e}")))?
                 {
-                    Some(pid) => statement_live_count_by_predicate(
-                        &wtxn,
-                        caller_ns_id,
-                        pid,
-                        LIVE_ROW_SCAN_CAP,
-                    )
-                    .map_err(|e| OpError::Internal(format!("live statement count: {e}")))?,
+                    Some(pid) => {
+                        statement_reference_count_by_predicate(&wtxn, pid, REFERENCING_ROW_SCAN_CAP)
+                            .map_err(|e| {
+                                OpError::Internal(format!("statement reference count: {e}"))
+                            })?
+                    }
                     None => 0,
                 }
             }
@@ -172,8 +168,10 @@ pub async fn handle_schema_drop(
                 .map_err(|e| OpError::Internal(format!("relation_type_id_by_qname: {e}")))?
                 {
                     Some(rid) => {
-                        relation_live_count_by_type(&wtxn, caller_ns_id, rid, LIVE_ROW_SCAN_CAP)
-                            .map_err(|e| OpError::Internal(format!("live relation count: {e}")))?
+                        relation_reference_count_by_type(&wtxn, rid, REFERENCING_ROW_SCAN_CAP)
+                            .map_err(|e| {
+                                OpError::Internal(format!("relation reference count: {e}"))
+                            })?
                     }
                     None => 0,
                 }
@@ -184,10 +182,10 @@ pub async fn handle_schema_drop(
         drop(wtxn); // read-only: roll back, write nothing.
         n
     };
-    if live_rows > 0 && !req.force {
+    if referencing_rows > 0 && !req.force {
         return Err(OpError::Conflict(format!(
-            "schema_drop: {} {:?} still has {live_rows} live rows in namespace {namespace:?}; \
-             set force to drop it and leave those rows as orphans",
+            "schema_drop: {} {:?} still has {referencing_rows} rows naming it in \
+             namespace {namespace:?}; set force to drop it and leave those rows as orphans",
             target_kind_label(target_kind),
             target_name
         )));
@@ -238,7 +236,7 @@ pub async fn handle_schema_drop(
                 target_kind,
                 target_name: req.target_name.clone(),
                 dropped: false,
-                live_rows: live_rows as u32,
+                live_rows: referencing_rows as u32,
                 validation_errors: schema_wire::validation_errors(errs.iter()),
             });
         }
@@ -282,13 +280,19 @@ pub async fn handle_schema_drop(
         }
     };
 
+    // The extractor registry is not invalidated here, unlike SCHEMA_REPLACE.
+    // A drop reaches only a declared predicate or relation_type — the two
+    // kinds this handler accepts — and the registry is derived from the
+    // extractor rows and the entity-type snapshot, neither of which a
+    // narrow touches. Nothing the worker would rebuild has moved.
+
     Ok(SchemaDropResponse {
         namespace,
         schema_version,
         target_kind,
         target_name: req.target_name.clone(),
         dropped: dropped_n > 0,
-        live_rows: live_rows as u32,
+        live_rows: referencing_rows as u32,
         validation_errors: Vec::new(),
     })
 }
@@ -580,6 +584,42 @@ mod tests {
         let got = predicate_id_by_qname(&wtxn, DeclScope::base("acme"), name).unwrap();
         // read-only use of a wtxn; drop without commit
         got.is_some()
+    }
+
+    #[tokio::test]
+    async fn dropping_a_predicate_or_relation_type_leaves_the_extractor_registry_alone() {
+        let (_dir, ctx, metadata) = build_ctx();
+        seed(&metadata, DOC);
+
+        let predicate = handle_schema_drop(
+            drop_req(schema_drop_target::PREDICATE, "prefers", false, [22u8; 16]),
+            &ctx,
+        )
+        .await
+        .expect("drop predicate");
+        assert!(predicate.dropped, "the declared predicate must be dropped");
+
+        let relation_type = handle_schema_drop(
+            drop_req(
+                schema_drop_target::RELATION_TYPE,
+                "mentors",
+                false,
+                [23u8; 16],
+            ),
+            &ctx,
+        )
+        .await
+        .expect("drop relation_type");
+        assert!(
+            relation_type.dropped,
+            "the declared relation_type must be dropped"
+        );
+
+        assert!(
+            !ctx.extractors_dirty
+                .load(std::sync::atomic::Ordering::Acquire),
+            "neither droppable kind can change the extractor set, so a rebuild would be pure churn"
+        );
     }
 
     #[tokio::test]

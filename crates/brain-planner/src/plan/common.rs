@@ -49,7 +49,7 @@ pub struct EdgeSpec {
 
 /// A sub-RECALL embedded inside a higher-level plan (PLAN, REASON).
 /// Named `RecallSubStep` to keep it distinct from the top-level
-/// `RecallPlan` (which is the shape returned by `plan_recall`).
+/// `RecallPlan`.
 ///
 /// Mirrors the recall plan's shape but flattened to one shard (the
 /// only shape v1 needs; cross-shard fan-out arrives later).

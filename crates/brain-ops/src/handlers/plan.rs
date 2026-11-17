@@ -218,7 +218,9 @@ fn fetch_trace_texts(
             Ok(Some(guard)) => std::str::from_utf8(guard.value())
                 .map(str::to_owned)
                 .map_err(|e| {
-                    OpError::Internal(format!("plan trace TEXTS_TABLE non-UTF-8 for {id:?}: {e}"))
+                    OpError::PermanentFault(format!(
+                        "plan trace TEXTS_TABLE non-UTF-8 for {id:?}: {e}"
+                    ))
                 })?,
             Ok(None) => String::new(),
             Err(e) => {

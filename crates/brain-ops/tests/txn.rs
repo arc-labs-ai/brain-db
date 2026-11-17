@@ -182,7 +182,7 @@ fn plan_req(start: u128, goal: u128, max_depth: u32, txn: Option<[u8; 16]>) -> P
         budget: PlanBudget {
             max_steps: max_depth,
             max_wall_time_ms: 1000,
-            max_branches_explored: 256,
+            max_branches_explored: 32,
         },
         strategy_hint: None,
         session_filter: None,

@@ -61,7 +61,7 @@ const MIN_PASSAGE_BUDGET: usize = 8;
 /// entire `encode_batch` — one long candidate silently collapses rerank to
 /// RRF-only for the whole query; (b) even when it does not error, the query
 /// gets mutilated and the cross-encoder scores garbage logits.
-pub(crate) fn truncation_params(max_len: usize) -> TruncationParams {
+fn truncation_params(max_len: usize) -> TruncationParams {
     TruncationParams {
         max_length: max_len,
         strategy: tokenizers::TruncationStrategy::OnlySecond,
@@ -78,7 +78,7 @@ pub(crate) fn truncation_params(max_len: usize) -> TruncationParams {
 /// `tokenizer.json` configures no padding, so the old `0` fallback
 /// filled batches with the sentence-start token — benign only because
 /// the attention mask zeroes pad positions, but wrong on its face.
-pub(crate) fn resolve_pad_params(
+fn resolve_pad_params(
     tokenizer_padding: Option<(u32, String)>,
     config_pad_token_id: u32,
 ) -> (u32, String) {
@@ -100,11 +100,7 @@ pub(crate) fn resolve_pad_params(
 ///
 /// Normal-length queries are returned untouched (`Cow::Borrowed`), so
 /// their tokenisation is byte-identical to before this guard existed.
-pub(crate) fn clamp_query_tokens<'q>(
-    probe: &Tokenizer,
-    query: &'q str,
-    max_len: usize,
-) -> Cow<'q, str> {
+fn clamp_query_tokens<'q>(probe: &Tokenizer, query: &'q str, max_len: usize) -> Cow<'q, str> {
     let budget = max_len.saturating_sub(PAIR_SPECIAL_TOKENS + MIN_PASSAGE_BUDGET);
     if budget == 0 {
         return Cow::Borrowed(query);
@@ -129,7 +125,7 @@ pub(crate) fn clamp_query_tokens<'q>(
 /// NaN/Inf guard. A single non-finite score would corrupt the
 /// caller's re-sort (NaN compares false in every direction) and
 /// propagate through the normalized-fused / `alpha * logit` blend.
-pub(crate) fn check_finite_scores(scores: &[f32]) -> Result<(), RerankError> {
+fn check_finite_scores(scores: &[f32]) -> Result<(), RerankError> {
     if let Some(i) = scores.iter().position(|s| !s.is_finite()) {
         return Err(RerankError::NumericFailure(format!(
             "logit {i} is non-finite ({})",

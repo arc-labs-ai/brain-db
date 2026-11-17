@@ -9,6 +9,8 @@ pub mod forward;
 pub mod load;
 pub mod tokenize;
 
-pub use forward::{embed_batch, embed_text, forward_pooled, l2_normalize_in_place, VECTOR_DIM};
+pub use forward::{
+    embed_batch, embed_text, forward_pooled, l2_normalize_in_place, matmul_split_count, VECTOR_DIM,
+};
 pub use load::ModelHandle;
 pub use tokenize::{encode_batch, encode_single, Tokenized, MAX_TOKEN_LENGTH};

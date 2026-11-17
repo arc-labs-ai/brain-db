@@ -59,7 +59,8 @@ pub(super) async fn emit_graph_event(
     // miss every typed-graph event.
     let space_id = ctx.executor.writer.space_id();
     let Some(kind) = wal_kind_for_event(&payload) else {
-        // Variants without a WAL record kind: bus-only publish.
+        // Variants without a WAL record kind have no durable position, so publish
+        // them bus-only with LSN 0; consumers must not treat that as a resume point.
         let envelope = EventEnvelope {
             lsn: 0,
             event_type,
@@ -77,7 +78,7 @@ pub(super) async fn emit_graph_event(
             space_id,
             vector: None,
         };
-        let _ = ctx.events.publish(envelope);
+        ctx.events.publish_prestamped(envelope);
         return;
     };
     ctx.publish_notification(kind, payload, space_id, move |lsn, payload| EventEnvelope {
@@ -388,11 +389,14 @@ mod tests {
         assert!(env.stage_kind.is_none());
     }
 
-    /// With no WAL sink wired the helper still publishes — the bus mints
-    /// the LSN instead. A shard without a sink (every unit-test context,
-    /// and any shard before its sink is attached) must not lose events.
+    /// With no WAL sink the event has no durable position, so it publishes at
+    /// `lsn == 0` rather than at a fabricated one. `classify_live_event` in
+    /// `brain-server/src/network/subscribe.rs` delivers `lsn == 0`
+    /// unconditionally, exempt from duplicate and ordering checks, so two
+    /// events at `0` are both delivered and neither moves the resume point.
+    /// A shard without a sink must not lose events.
     #[tokio::test]
-    async fn without_a_wal_sink_the_bus_mints_the_lsn() {
+    async fn without_a_wal_sink_events_publish_at_lsn_zero() {
         let (_dir, ctx) = build_ctx(SpaceId(uuid::Uuid::from_u128(1)));
         let mut rx = ctx.events.receiver();
 
@@ -401,11 +405,15 @@ mod tests {
 
         let first = rx.try_recv().expect("first event");
         let second = rx.try_recv().expect("second event");
-        assert!(
-            second.lsn > first.lsn,
-            "bus-minted LSNs must advance: {} then {}",
-            first.lsn,
-            second.lsn,
+        assert_eq!(first.lsn, 0, "an event without a WAL sink must have LSN 0");
+        assert_eq!(second.lsn, 0, "an event without a WAL sink must have LSN 0");
+        assert_eq!(
+            first.timestamp_unix_nanos, 1,
+            "the first event must retain its distinguishing timestamp"
+        );
+        assert_eq!(
+            second.timestamp_unix_nanos, 2,
+            "the second event must retain its distinguishing timestamp"
         );
     }
 }

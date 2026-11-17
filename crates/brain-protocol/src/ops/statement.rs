@@ -42,7 +42,8 @@ impl StatementKindWire {
 
 /// Wire counterpart to `brain_core::StatementValue`.
 ///
-/// `Blob` is capped at 64 KiB by the handler.
+/// `Text` and `Blob` are capped at 64 KiB by the handler because both values
+/// occupy the same single-row response and WAL exposure.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum StatementValueWire {
     Text(String),

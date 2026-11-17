@@ -200,8 +200,6 @@ impl Default for SemanticRetrieverConfig {
 /// Error taxonomy.
 #[derive(Debug, thiserror::Error)]
 pub enum SemanticError {
-    #[error("index unavailable (rebuild in progress)")]
-    IndexUnavailable,
     #[error("query parse failed: {0}")]
     QueryParseFailed(String),
     #[error("query timed out after {0} ms")]

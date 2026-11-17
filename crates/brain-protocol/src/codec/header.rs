@@ -37,6 +37,13 @@ use crate::{MAGIC, MAX_PAYLOAD_BYTES};
 /// breaking wire changes are made in place without a version bump.
 pub const VERSION: u8 = 1;
 
+/// Wire-protocol versions this codec decodes.
+///
+/// [`Header::validate`] accepts exactly these, and a handshake may not
+/// settle on a version outside the set: every frame after it would be
+/// rejected on a connection both peers consider established.
+pub const SUPPORTED_VERSIONS: &[u8] = &[VERSION];
+
 /// 32-byte frame header. Layout matches exactly.
 ///
 /// `Eq`/`PartialEq` are implemented by hand below — deriving them on a
@@ -146,7 +153,7 @@ impl Header {
         if self.magic != MAGIC {
             return Err(ProtocolError::BadMagic);
         }
-        if self.version != VERSION {
+        if !SUPPORTED_VERSIONS.contains(&self.version) {
             return Err(ProtocolError::BadVersion {
                 got: self.version,
                 expected: VERSION,

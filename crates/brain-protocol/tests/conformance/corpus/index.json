@@ -279,7 +279,13 @@
     "name": "resp_memory_inspect",
     "opcode": "0x00A8",
     "kind": "response",
-    "payload_len": 706
+    "payload_len": 741
+  },
+  {
+    "name": "resp_memory_inspect_truncated",
+    "opcode": "0x00A8",
+    "kind": "response",
+    "payload_len": 743
   },
   {
     "name": "resp_graph_fetch",
@@ -565,6 +571,12 @@
   },
   {
     "name": "resp_error_unavailable",
+    "opcode": "0x00FF",
+    "kind": "response",
+    "payload_len": 114
+  },
+  {
+    "name": "resp_error_operator_intervention",
     "opcode": "0x00FF",
     "kind": "response",
     "payload_len": 114
@@ -897,7 +909,7 @@
     "name": "resp_schema_get",
     "opcode": "0x01A1",
     "kind": "response",
-    "payload_len": 262
+    "payload_len": 158
   },
   {
     "name": "resp_schema_list",

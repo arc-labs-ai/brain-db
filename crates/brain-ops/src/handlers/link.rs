@@ -56,7 +56,7 @@ pub async fn handle_link(req: LinkRequest, ctx: &OpsContext) -> Result<LinkRespo
             });
         }
         crate::writer::submit::CacheLookup::Conflict => {
-            return Err(map_writer_err_for_link(WriterError::Conflict(
+            return Err(map_writer_err(WriterError::Conflict(
                 "link request_id replay with different params".into(),
             )));
         }
@@ -93,10 +93,7 @@ pub async fn handle_link(req: LinkRequest, ctx: &OpsContext) -> Result<LinkRespo
     };
     let write =
         Write::single(write_id, ctx.executor.caller_space, phase).with_request_hash(request_hash);
-    let ack = real_writer
-        .submit(write)
-        .await
-        .map_err(map_writer_err_for_link)?;
+    let ack = real_writer.submit(write).await.map_err(map_writer_err)?;
 
     // Project the single PhaseAck back into the wire shape.
     debug_assert!(matches!(ack.single_phase(), PhaseAck::Linked));
@@ -206,7 +203,7 @@ pub async fn handle_unlink(
             });
         }
         crate::writer::submit::CacheLookup::Conflict => {
-            return Err(map_writer_err_for_unlink(WriterError::Conflict(
+            return Err(map_writer_err(WriterError::Conflict(
                 "unlink request_id replay with different params".into(),
             )));
         }
@@ -226,10 +223,7 @@ pub async fn handle_unlink(
     };
     let write =
         Write::single(write_id, ctx.executor.caller_space, phase).with_request_hash(request_hash);
-    let ack = real_writer
-        .submit(write)
-        .await
-        .map_err(map_writer_err_for_unlink)?;
+    let ack = real_writer.submit(write).await.map_err(map_writer_err)?;
     debug_assert!(matches!(ack.single_phase(), PhaseAck::Unlinked));
     Ok(UnlinkResponse {
         source: source.into(),
@@ -634,17 +628,9 @@ fn validate_weight(weight: f32, kind: EdgeKind) -> Result<(), OpError> {
     Ok(())
 }
 
-fn map_writer_err_for_link(err: WriterError) -> OpError {
-    match err {
-        WriterError::Internal(msg) if msg.contains("not found") => OpError::NotFound {
-            what: "memory",
-            detail: msg,
-        },
-        other => OpError::ExecError(brain_planner::ExecError::WriterFailed(other)),
-    }
-}
-
-fn map_writer_err_for_unlink(err: WriterError) -> OpError {
+/// Project a writer fault into the wire error taxonomy. The writer's own
+/// variants already carry the classification, so this forwards them intact.
+fn map_writer_err(err: WriterError) -> OpError {
     OpError::ExecError(brain_planner::ExecError::WriterFailed(err))
 }
 

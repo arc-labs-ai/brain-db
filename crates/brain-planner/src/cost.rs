@@ -22,45 +22,42 @@ use crate::plan::FilterRule;
 // Per-op coefficients (table). All in milliseconds.
 // ---------------------------------------------------------------------------
 
-pub(crate) const EMBED_CACHE_HIT_MS: f32 = 0.005;
+const EMBED_CACHE_HIT_MS: f32 = 0.005;
 /// Mid of the 5–10 ms range.
-pub(crate) const EMBED_CACHE_MISS_MS: f32 = 7.5;
-pub(crate) const ANN_SEARCH_BASELINE_MS: f32 = 0.05;
-pub(crate) const ANN_SEARCH_PER_EF_LOGN_MS: f32 = 0.001;
-pub(crate) const METADATA_POINT_LOOKUP_MS: f32 = 0.005;
+const EMBED_CACHE_MISS_MS: f32 = 7.5;
+const ANN_SEARCH_BASELINE_MS: f32 = 0.05;
+const ANN_SEARCH_PER_EF_LOGN_MS: f32 = 0.001;
+const METADATA_POINT_LOOKUP_MS: f32 = 0.005;
 /// 30–50 µs per 100 rows ⇒ ≈ 0.4 µs / row.
-pub(crate) const METADATA_RANGE_SCAN_PER_ROW_MS: f32 = 0.0004;
-pub(crate) const WAL_FSYNC_GROUP_MS: f32 = 0.3;
-pub(crate) const ARENA_IO_MS: f32 = 0.001;
+const METADATA_RANGE_SCAN_PER_ROW_MS: f32 = 0.0004;
+const WAL_FSYNC_GROUP_MS: f32 = 0.3;
+const ARENA_IO_MS: f32 = 0.001;
 /// Mid of the 0.5–2 ms range.
-pub(crate) const HNSW_INSERT_MS: f32 = 1.25;
-/// Reserved for cross-shard cost; unused at v1.
-#[allow(dead_code)]
-pub(crate) const NETWORK_INTRA_SHARD_MS: f32 = 0.1;
+const HNSW_INSERT_MS: f32 = 1.25;
 
 // Encode phase coefficients from the latency table.
-pub(crate) const ENCODE_IDEMPOTENCY_MS: f32 = 0.0075; // 5–10 µs mid
-pub(crate) const ENCODE_CONTEXT_RESOLVE_MS: f32 = 0.005;
-pub(crate) const ENCODE_SLOT_ALLOC_MS: f32 = 0.001;
-pub(crate) const ENCODE_METADATA_WRITE_MS: f32 = 0.5;
-pub(crate) const ENCODE_PER_EDGE_MS: f32 = 0.05;
-pub(crate) const ENCODE_RESPONSE_MS: f32 = 0.05;
+const ENCODE_IDEMPOTENCY_MS: f32 = 0.0075; // 5–10 µs mid
+const ENCODE_CONTEXT_RESOLVE_MS: f32 = 0.005;
+const ENCODE_SLOT_ALLOC_MS: f32 = 0.001;
+const ENCODE_METADATA_WRITE_MS: f32 = 0.5;
+const ENCODE_PER_EDGE_MS: f32 = 0.05;
+const ENCODE_RESPONSE_MS: f32 = 0.05;
 
 // Cross-shard overhead.
-pub(crate) const CROSS_SHARD_MERGE_MS: f32 = 0.05;
-pub(crate) const CROSS_SHARD_PER_SHARD_SERIALISATION_MS: f32 = 0.1;
+const CROSS_SHARD_MERGE_MS: f32 = 0.05;
+const CROSS_SHARD_PER_SHARD_SERIALISATION_MS: f32 = 0.1;
 
 // REASON's VSA analogical-fit nudge (`executor::analogical`). Per
 // Order-of-magnitude estimate: ~10 µs for the bind/unbind
 // pair that builds a triple's HRR vector, plus ~5 ms for the
 // `Codebook::cleanup` argmax cosine-rank over the call's filler
 // vocabulary. One lookup per surviving evidence item.
-pub(crate) const ANALOGICAL_BIND_UNBIND_MS: f32 = 0.01;
-pub(crate) const ANALOGICAL_COSINE_RANK_MS: f32 = 5.0;
+const ANALOGICAL_BIND_UNBIND_MS: f32 = 0.01;
+const ANALOGICAL_COSINE_RANK_MS: f32 = 5.0;
 
 // Budget thresholds.
 /// Above this, the planner logs a `tracing::warn!`.
-pub(crate) const BUDGET_WARN_MS: f32 = 100.0;
+const BUDGET_WARN_MS: f32 = 100.0;
 
 // Selectivity floor — `over_factor` needs a non-zero divisor.
 const SELECTIVITY_FLOOR: f32 = 1e-3;

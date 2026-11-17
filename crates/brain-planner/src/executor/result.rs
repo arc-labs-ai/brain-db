@@ -2,50 +2,9 @@
 //! these into the wire `ResponseBody` variants; for now they're the
 //! integration-test assertion targets.
 
-use brain_core::{EdgeKind, MemoryId, MemoryKind, SessionId};
+use brain_core::{EdgeKind, MemoryId};
 
 use super::writer::{EdgeOutcome, ForgetOutcome};
-
-#[derive(Debug, Clone)]
-pub struct RecallResult {
-    pub hits: Vec<RecallHit>,
-}
-
-#[derive(Debug, Clone)]
-pub struct RecallHit {
-    pub memory_id: MemoryId,
-    /// Similarity score (higher = better). For unit-norm vectors this
-    /// equals the dot product / cosine similarity.
-    pub score: f32,
-    pub kind: MemoryKind,
-    pub session_id: SessionId,
-    pub salience: f32,
-    pub created_at_unix_nanos: u64,
-    /// `None` until a wire-level `include_text` flag lands and the
-    /// planner builds a `TextFetchStep`.
-    pub text: Option<String>,
-    // ── Provenance + decay signals (v1 expansion) ──
-    /// Salience the row was first written with.
-    pub salience_initial: f32,
-    /// RECALL hit + explicit-get accumulator.
-    pub access_count: u32,
-    /// MemoryMetadata flags (ACTIVE / DEDUP_BACKREF / etc.).
-    pub flags: u32,
-    /// `Some(t)` for consolidation-worker-produced rows.
-    pub consolidated_at_unix_nanos: Option<u64>,
-    /// Denormalised outgoing edge count from the source row.
-    pub edges_out_count: u32,
-    /// Denormalised incoming edge count.
-    pub edges_in_count: u32,
-    /// Last-access timestamp (separate from `created_at`).
-    pub last_accessed_at_unix_nanos: u64,
-    /// WAL LSN this memory was encoded at — copied from
-    /// `MemoryMetadata.encoded_at_lsn`. `0` when unknown (test
-    /// fixtures, no-schema deployments without a WAL sink).
-    /// Surfaced as `MemoryResult.lsn` so clients can chain
-    /// `recall → subscribe --start-lsn lsn+1`.
-    pub encoded_at_lsn: u64,
-}
 
 #[derive(Debug, Clone)]
 pub struct EncodeResult {
