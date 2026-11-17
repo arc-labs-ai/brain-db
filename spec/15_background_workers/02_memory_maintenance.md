@@ -292,12 +292,24 @@ The consolidation worker also has a threshold trigger:
 Generating the summary requires an LLM. Brain doesn't ship with an LLM; it integrates with an external service:
 
 ```rust
-async fn summarize(memories: &[MemoryText]) -> Result<String> {
-    let prompt = build_consolidation_prompt(memories);
-    let response = llm_service.generate(prompt).await?;
-    Ok(response.text)
+pub trait Summarizer: Send + Sync + 'static {
+    /// Whether this deployment has a summarization backend at all. The
+    /// worker checks this once per cycle and skips the whole pass when it
+    /// is false, so a deployment without consolidation does no clustering
+    /// work rather than discovering the absence one `summarize` call in.
+    fn enabled(&self) -> bool;
+
+    /// Summarize `memories`, billing the call to `namespace`. The
+    /// namespace is required rather than inferred.
+    fn summarize<'a>(
+        &'a self,
+        namespace: &'a str,
+        memories: &'a [&'a str],
+    ) -> Pin<Box<dyn Future<Output = Result<String, SummarizerError>> + 'a>>;
 }
 ```
+
+The substrate default implementation reports `enabled() == false` and returns `SummarizerError::Disabled`, so consolidation is a no-op until a model-backed implementation is injected.
 
 Configuration selects a backend, not a credential: the LLM backend resolves per namespace like every other model-backed stage, so a consolidation run is paid for by the tenant whose memories it consolidates. A consumer that cannot name a namespace cannot make the call, and the worker clusters strictly within one `(namespace, space, session)` so every call has exactly one owner. Llama, GPT, or any specific model are not bundled — the integration is pluggable.
 
@@ -402,14 +414,9 @@ This is an opt-in mode, configured per-session. By default, consolidation is ful
 
 ### 33. The disabled state
 
-If the LLM service is unavailable or consolidation is disabled, the worker becomes a no-op:
+With no summarization backend, the worker is a no-op: `Summarizer::enabled()` reports false, the cycle returns before any clustering, and the substrate default's `SummarizerError::Disabled` ends any pass that does reach a `summarize` call. A backend that is present but failing is narrower — that one cluster is skipped and the pass continues (see [`./05_failure_modes.md`](./05_failure_modes.md) §6).
 
-```toml
-[workers.consolidation]
-enabled = false
-```
-
-The system works fine. Just no Consolidated memories.
+The system works fine either way. Just no Consolidated memories.
 
 ### 34. The consolidation latency vs freshness trade-off
 

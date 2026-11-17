@@ -136,7 +136,9 @@ Two consequences worth stating:
 
 ## 4. Event delivery guarantees
 
-- Events are delivered in WAL order (per shard).
+- **Replay is strictly ordered.** Everything from the requested `from_lsn` up to the WAL tail is walked record by record, so the client sees those events in the order the WAL holds them.
+- **The live tail is ordered with detection.** The shard WAL stamps an LSN on every record, including row writes that publish no event, so the LSNs a subscriber sees are sparse: on receiving LSN 11, a client cannot tell whether 10 is a notification still in flight or a row write that will never arrive. Nothing on the source side can decide when such a gap closes, so the stream neither buffers nor reorders. An event arriving below the highest LSN already delivered ends the subscription with `ERROR(Overloaded)` and the instruction to reconnect with a fresh `from_lsn` — the same contract a subscriber gets when it lags past the broadcast buffer. The client is told, never silently reordered.
+- **Events carrying `lsn == 0` are bus-only.** They have no WAL record, cannot be replayed, are exempt from the ordering check, and never move the subscription's resume point.
 - Each event is delivered at-least-once.
 - For at-most-once, clients can dedupe by LSN (each event has a unique LSN).
 - If Brain restarts mid-stream, the stream is broken; the client reconnects with `from_lsn` set to one past the last `lsn` it received.
@@ -147,7 +149,7 @@ If `space_id` spans multiple shards, Brain orchestrates:
 
 - Open one substream per shard.
 - Merge events into a single client-facing stream.
-- Order events by LSN within each shard; cross-shard order isn't strictly defined.
+- Each shard's substream carries the §4 guarantee on its own; cross-shard order isn't strictly defined.
 
 For most agents (single shard), this is irrelevant.
 
@@ -348,32 +350,26 @@ credential, `act_as` varying per request — subscribe on behalf of whichever
 tenant it's currently serving, the same pattern it already uses for ENCODE /
 RECALL / PLAN / REASON.
 
-### 22.1 Why this needed a dedicated fix
+### 22.1 Where the effective identity is resolved
 
-Unlike those four primitives, SUBSCRIBE's dispatch was, until this fix,
-structurally separate from the normal `act_as`-aware dispatch path:
-`SUBSCRIBE`, `UNSUBSCRIBE`, and `CANCEL_STREAM` bypassed the shared
-op-dispatch / `act_as_of` resolution entirely, and the wire
-`SubscribeRequest` carried no `act_as` field at all — a genuine wire-schema
-gap, not just a server-logic one. The permission check that gates a
-subscription's space scope hardcoded the caller's own raw connection
-identity, with no `act_as` concept reachable from that branch. This is why
-SUBSCRIBE needed a dedicated fix rather than "just working" the way a normal
-op picks up `act_as` support — the security machinery itself (the R1/R2
-checks, the effective-identity resolution) was already fully reusable; only
-the branch that reaches it needed to change.
+`SUBSCRIBE`, `UNSUBSCRIBE` and `CANCEL_STREAM` dispatch outside the shared
+op-dispatch / `act_as_of` resolution that the other primitives ride, so each
+resolves the effective identity in its own branch. The security machinery is
+the same one every other op uses — the R1/R2 checks and the effective-identity
+resolution are shared; only the branch that reaches them is subscription-local.
+The permission check that gates a subscription's space scope therefore runs
+against the effective identity, not the raw connection identity.
 
-With `act_as` absent (the common case, and the only case before this fix),
-SUBSCRIBE's behavior is unchanged: it observes the connection's own identity
-exactly as before.
+With `act_as` absent (the common case), a subscription observes the
+connection's own identity.
 
-### 22.2 Related gap, not fixed here
+### 22.2 Transaction ops
 
-`TXN_BEGIN` / `TXN_COMMIT` / `TXN_ABORT` (§8 in
-[03_primitives.md](../01_architecture/03_primitives.md)) have the same
-missing-`act_as`-field gap, but they go through normal op dispatch, not a
-structural bypass like SUBSCRIBE's. Out of scope for this fix; noted here as
-a known follow-up.
+`TXN_BEGIN` (§8 in
+[03_primitives.md](../01_architecture/03_primitives.md)) carries `act_as`;
+`TXN_COMMIT` and `TXN_ABORT` do not. Delegation is fixed at begin and governs
+the whole transaction, so every buffered write commits under the identity the
+begin established.
 
 ---
 

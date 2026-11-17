@@ -121,35 +121,32 @@ Storage is per-shard; the executor's StorageHandle for a shard talks to that sha
 
 For reads (RECALL), the executor opens a read transaction (or uses a pre-existing one). Lock-free, MVCC.
 
-For writes (ENCODE, FORGET), the executor sends the operation to the writer task. The writer batches and commits.
+For writes (ENCODE, FORGET), the executor calls the shard's writer handle on its own task. The WAL group commit batches the records; the redb transaction commits them.
 
-## 10. The writer task interaction
+## 10. The writer handle interaction
 
-The writer task is per-shard; only one. The executor sends operations to it via a channel:
+The writer handle is per-shard; only one, and every executor that mutates state calls it:
 
 ```rust
-async fn send_to_writer(&self, op: WriteOp) -> Result<WriteAck> {
-    self.writer_tx.send(op).await?;
-    self.writer_ack.recv().await?
-}
+let ack = writer.submit(write).await?;
 ```
 
-The writer task:
+One `submit` does:
 
-1. Receives operations from the channel.
-2. Batches them (for group commit).
-3. Appends WAL records, fsyncs.
-4. Applies to in-memory state (arena, metadata, HNSW).
-5. Sends acks back to executors.
+1. Idempotency lookup — a replay returns the cached ack and stops here.
+2. Appends its WAL records and awaits the group commit's fsync.
+3. Inserts into the HNSW, before the metadata transaction opens, so a failure here abandons the write with nothing committed.
+4. Opens one redb write transaction, applies every phase, stamps the idempotency row, commits — with no await in that whole region.
+5. Publishes events and enqueues the derivation stages.
 
-Multiple executors can be waiting for acks; each gets its own.
+Multiple executors can be inside `submit` at once; each awaits its own ack. Step 4 is the one they cannot share, and the executor's single thread is what keeps them out of it rather than a queue.
 
 ## 11. The cancellation behavior
 
 If a request is canceled (client disconnects), the executor:
 
 - For in-flight reads: cancels them (Glommio cancels the future).
-- For in-flight writes: doesn't cancel — the write is already in the writer task's queue, and the writer will complete it. The ack is just dropped.
+- For in-flight writes: doesn't cancel — the write's own detached task runs to completion. The ack is just dropped.
 
 This means writes can't be canceled mid-flight. They complete and become durable, even if the client gave up. Brain doesn't have an "undo" for in-flight writes.
 

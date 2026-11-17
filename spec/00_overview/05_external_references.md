@@ -31,8 +31,7 @@ This file collects external sources (academic papers, RFC documents, library doc
 - **tantivy** — Full-text search library; per-shard inverted indexes in Brain. https://github.com/quickwit-oss/tantivy
 - **Glommio** — Thread-per-core async runtime over io_uring. https://github.com/DataDog/glommio
 - **candle** — Rust ML framework; Brain runs BGE-small inference via candle. https://github.com/huggingface/candle
-- **arc-swap** — Atomic pointer swap for lock-free config + index handoff.
-- **crossbeam-epoch** — Epoch-based memory reclamation.
+- **arc-swap** — Atomic pointer swap for lock-free config + index handoff. https://github.com/vorner/arc-swap
 - **io_uring** — Linux async I/O. https://kernel.dk/io_uring.pdf
 
 ## Wire format

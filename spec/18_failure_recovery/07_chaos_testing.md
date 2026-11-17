@@ -47,6 +47,8 @@ Repeatedly:
 
 For 1000 iterations: must succeed in all.
 
+The workload must be **concurrent per shard**, not serial. A shard dispatches several requests at once, so WAL append order and commit order can differ, and the interesting crash window is exactly the one a serial workload cannot produce: a kill while an early-appending write is still uncommitted and a later-appending one has already committed. A durable watermark that published a maximum rather than a contiguous prefix would pass every serial iteration of this test and lose the early write on the concurrent one.
+
 ## 5. The "kill at every byte" exhaustion
 
 Advanced testing: kill Brain after every byte of WAL write, every metadata write, etc.
@@ -121,6 +123,11 @@ Tools:
 
 These catch races, deadlocks, ordering bugs.
 
+Two per-shard properties need direct coverage, because neither is enforced by a lock that a tool would notice:
+
+- **The commit region holds no await.** Violating it deadlocks the shard rather than corrupting anything, so the symptom is a hang under concurrent load — which a test must drive concurrently to see at all.
+- **The durable watermark is a contiguous prefix.** Exercise reservations resolving out of order (commit a later range first and check the frontier stays below the earlier one), abandonment (a failed range must not block a later commit from closing the prefix across it), and ranges that are never reserved at all (checkpoint and subscribe-event records must not hold the frontier down).
+
 ## 11. Corruption injection
 
 Programmatic:
@@ -148,8 +155,8 @@ Invariant violations indicate bugs to fix.
 ## 13. The "expected" vs "unexpected" failures
 
 Some failures are expected:
-- A killed Brain process, when restarted, should recover.
-- An OOM under heavy load, with backpressure, should shed cleanly.
+- A killed Brain process, when restarted, should recover — including a kill between a WAL fsync and the matching metadata commit, which must replay rather than vanish.
+- Heavy load should queue, not fail: a saturated shard parks its receive and serves in arrival order.
 
 Unexpected failures (panics, hangs, data loss in non-DR scenarios) are bugs.
 
@@ -240,7 +247,3 @@ But:
 Brain is well-tested but not perfect. Operational vigilance (monitoring, alerts, runbooks) is the second line of defense.
 
 Brain trusts its tests; trusts its operators more.
-
----
-
-*Continue to [`../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md) for unresolved questions.*

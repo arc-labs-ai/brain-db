@@ -14,8 +14,8 @@ HTTP-version-neutral by construction — hyper owns wire parsing, keep-alive,
 chunked encoding, body backpressure, and combinators, while this crate owns the
 pieces above the wire: a small `match`-based router, the Brain `Error` taxonomy,
 correct SSE flush-after-every-event discipline, and an explicit WebSocket close
-handshake. The transport is feature-gated so the server, client, WebSocket, SSE,
-and TLS surfaces compile only when needed.
+handshake. The transport is feature-gated so the server, WebSocket, SSE, and TLS
+surfaces compile only when needed.
 
 ## Key modules
 
@@ -24,7 +24,6 @@ and TLS surfaces compile only when needed.
 - `server` / `tcp` — accept loop, connection handling, graceful shutdown.
 - `sse` — Server-Sent Events helpers with per-event flushing.
 - `ws` — WebSocket upgrade + close handshake via `tokio-tungstenite`.
-- `client` — async HTTP client (feature `client`; not wired in-workspace).
 - `body` — streaming body types and combinators.
 - `error` — the `Error` / `Result` taxonomy.
 - `observability` — tracing integration for the transport.
@@ -32,8 +31,8 @@ and TLS surfaces compile only when needed.
 ## Where it fits
 
 Depends on `brain-core` and the `hyper` stack (`hyper`, `http`, `http-body`,
-`bytes`), with `tokio` behind the `server`/`client` features. Consumed by
-`brain-server`, which builds the admin HTTP listener on top of it.
+`bytes`), with `tokio` behind the `server`, `sse`, and `ws` features. Consumed
+by `brain-server`, which builds the admin HTTP listener on top of it.
 
 ## Spec
 

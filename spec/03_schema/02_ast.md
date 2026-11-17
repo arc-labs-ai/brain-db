@@ -166,7 +166,7 @@ pub enum ExtractorField {
     Confidence(f32),                                // pattern fixed
     ConfidenceThreshold(f32),                       // classifier / llm
     Trigger(TriggerExpr),
-    CostBudget(CostExpr),                           // llm
+    CostBudget(CostExpr),                           // llm — declarative
     DependsOn(Vec<String>),                         // extractor names
     Resolver(ResolverConfig),
 }
@@ -214,6 +214,31 @@ serialise and validate. The order in which fields appear in the
 source DSL is preserved in the `Vec<ExtractorField>`; the validator
 normalises (e.g., rejects duplicate `model:` declarations).
 
+### 5a. `CostBudget` is declarative
+
+`CostBudget` is a full citizen of the AST — parsed, rendered back to
+DSL text, and duplicate-checked like every other field — but nothing
+downstream acts on the figure it carries. The materializer reads the
+field and logs that an extractor declaring one does not get a ceiling:
+*"extractor declares cost_budget; the field is not enforced — spend is
+recorded, not capped."*
+
+That is a decision about what Brain is, not an unfinished feature. A
+per-call gate has to refuse a model call on an *estimate* of what it
+will cost, and refusing a call is rationing a key that belongs to the
+tenant, not to Brain. Under BYOK that is not Brain's to do. So the
+spend is **recorded** instead: `cost_micro_usd` on the extraction's row
+in the audit table for the extractor tiers, and the `llm_spend` ledger
+keyed `(namespace, stage)` for the model-backed stages that write no
+audit row. A declared budget is therefore documentation of intent that
+an operator can reconcile against those records.
+
+The `cost_budget_ms` in the query planner is an unrelated knob with the
+same first word: a latency estimate for one query, which *is* enforced
+— over it, the plan is refused with `QueryTooExpensive`
+([12.03](../12_query_optimizer/03_cost_estimation.md)). It budgets
+milliseconds of Brain's own CPU, not a tenant's money.
+
 ## 6. Stability + rkyv
 
 The AST is **value-typed** (no rkyv on brain-core / brain-protocol
@@ -256,12 +281,3 @@ defined in [§05](./05_versioning.md) §6).
   `CardinalityAst`, `ExtractorKindAst`.
 - `ObjectTypeDecl::Entity { entity_type: "Person" }` resolves to
   the same wire shape as `Entity<Person>`.
-
-## 9. Open questions
-
-See [`.../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md). Notably:
-
-- Q1 — should `Schema` carry a `parent_version` field for diff
-  computation? Deferred per the no-migration scope of v1.
-- Q2 — multi-document schemas (one big document vs many small
-  documents per namespace).

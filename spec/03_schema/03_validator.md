@@ -6,10 +6,8 @@ typed AST ([§02](./02_ast.md)) after the parser
 no I/O, no async.
 
 Migration-time compatibility checks (e.g., "removing a predicate
-with live statements") are **explicitly out of scope** for v1 per
-the project's no-migration directive. The validator only runs
-static structural checks. See [§07](../00_overview/04_open_questions_archive.md) Q3 for
-the deferral.
+with live statements") are **out of scope**. The validator only
+runs static structural checks.
 
 Cross-references:
 - [`./02_ast.md`](./02_ast.md) — AST shapes validation runs over.
@@ -141,9 +139,18 @@ auto-supersession path.
 - `confidence_threshold` MUST be in `[0, 1]`. → `ExtractorInvalidConfig`.
 - `confidence` (pattern) MUST be in `[0, 1]`.
 
-Triggers + cost budgets + cache configs are parsed but not
-behaviourally validated in v1 work adds the
-runtime checks.
+The validator checks these fields structurally — present at most
+once, within range, required-for-this-kind — and does not reason about
+what they will do at runtime. Where that leaves each one:
+
+- `trigger` is honoured: the extractor framework evaluates it per
+  encode, and `on demand` / `on schema_change` / `periodic` skip the
+  encode-time run.
+- `cache` and `cache_ttl` are honoured: the materializer reads both
+  into the extractor's cache configuration.
+- `cost_budget` is **not** honoured, by design. The materializer logs
+  that a declared budget is not a ceiling; spend is recorded rather
+  than capped ([`./02_ast.md`](./02_ast.md) §5a).
 
 ### 2.8 Reserved names
 
@@ -184,10 +191,6 @@ acceptance. This trades flexibility for clarity (the user sees
 "fix everything before re-upload" rather than "Brain accepted half
 of it").
 
-Warnings + advisories (e.g., "this looks like it should be a
-relation, not an attribute ref<>") are tracked for post-v1 (§07
-Q4).
-
 ## 5. Tests
 
 The validator test cases:
@@ -206,12 +209,3 @@ The validator test cases:
 - `confidence_threshold: 1.5` → invalid config.
 - Valid schema with 10 types + 5 predicates + 3 relation types →
   passes; produces `ValidatedSchema`.
-
-## 6. Open questions
-
-See [`.../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md). Notably:
-
-- Q3 — Migration-time compatibility checks (deferred per project
-  scope).
-- Q4 — Warnings vs errors split.
-- Q5 — Custom validation rules / plugins.

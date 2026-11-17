@@ -1,6 +1,6 @@
 # 17.01 Signals (Metrics, Logs, Traces)
 
-> **TL;DR.** Brain emits three observability signals: Prometheus / OpenMetrics-format metrics (counters, gauges, histograms — per-shard, per-operation, per-tenant), structured JSON logs with consistent fields, and OpenTelemetry traces with span propagation through the connection layer. All three are continuously emitted at < 5% total overhead; operators consume them via Prometheus / Loki / Tempo or equivalents.
+> **TL;DR.** Brain emits three observability signals: Prometheus / OpenMetrics-format metrics (counters, gauges, histograms — per-shard and per-operation, never per-tenant), structured logs in a compact or JSON format with consistent fields, and OpenTelemetry traces that nest the shard's spans under the connection layer's request span. Traces are server-side only: the wire carries no inbound trace context. All three are continuously emitted; operators consume them via Prometheus / Loki / Tempo or equivalents.
 
 ## Metrics
 
@@ -13,8 +13,8 @@ Brain emits metrics in OpenMetrics format (Prometheus-compatible) on the `/metri
 ```
 # HELP brain_request_total Total requests.
 # TYPE brain_request_total counter
-brain_request_total{shard="<uuid>",op="encode",status="success"} 12345
-brain_request_total{shard="<uuid>",op="recall",status="success"} 67890
+brain_request_total{op="encode",status="success"} 12345
+brain_request_total{op="recall",status="success"} 67890
 
 # HELP brain_request_duration_ms Request duration histogram.
 # TYPE brain_request_duration_ms histogram
@@ -43,20 +43,42 @@ Per the [Prometheus naming guide](https://prometheus.io/docs/practices/naming/).
 Per-operation counters and histograms:
 
 ```
-brain_request_total{op=, shard=, status=}
-brain_request_duration_ms{op=, shard=, status=}
-brain_request_active{op=, shard=}        # Currently in-flight
+brain_request_total{op=, status=}
+brain_request_duration_ms{op=}           # histogram
+brain_request_active{op=}                # currently in-flight
 ```
 
-Operations: encode, recall, plan, reason, forget, link, unlink, txn_begin, txn_commit, txn_abort, subscribe, admin_*.
+The request family is **process-wide, not per-shard**. It is recorded at the
+connection layer before the request reaches a shard, so there is no `shard`
+label on any of the three
+(`crates/brain-server/src/metrics/format.rs:1595-1635`). Per-shard read and
+write volume comes from `brain_query_*` and `brain_writer_*`, which are
+recorded inside the shard and do carry one.
 
-Status: success, error_<code>, timeout.
+`op` takes exactly ten values — the operations that travel the dispatch path
+(`crates/brain-server/src/metrics/request.rs:38-49`):
+
+```
+encode, recall, plan, reason, forget, link, unlink,
+txn_begin, txn_commit, txn_abort
+```
+
+The subscribe family, `ping`, `hello`, `auth` and `bye` are **not** on that
+path and are not counted here; they are visible through the connection and
+frame counters instead (`crates/brain-server/src/metrics/request.rs:122-125`).
+There is no `admin_*` op: admin traffic arrives on its own HTTP listener.
+
+`status` takes exactly three values — `success`, `error`, `timeout`
+(`crates/brain-server/src/metrics/request.rs:51-56`). `error` is the catch-all
+for every wire-level error response; there is no `error_<code>` form, so a
+matcher like `status=~"error.*"` buys nothing over `status="error"` and a
+per-code breakdown has to come from the logs.
 
 ## 4. Server and shard metrics
 
 ```
 brain_up                                      # 1 if accepting requests
-brain_build_info{version=, commit=}
+brain_build_info{version=, git_commit=}
 brain_config_info{shard_count=, arena_capacity_bytes=, hnsw_m=, embedder_model=}
 brain_shards_total
 ```
@@ -82,6 +104,52 @@ Note that `used` and `slots_used` both **include tombstoned** slots: they
 measure what is allocated, not what is live. The difference between them and
 the live memory count is the reclamation backlog, which is the thing worth
 alerting on.
+
+## 5a. Write-path metrics
+
+The write path publishes its own family, which is where a slow write is
+diagnosed — `brain_request_duration_ms{op="encode"}` says a write is slow, these
+say which part of it is:
+
+```
+brain_writer_stage_duration_ms{shard=,stage=}      # histogram, per write stage
+brain_writer_submit_total{shard=,phase=,outcome=}
+brain_writer_submit_duration_seconds{shard=,phase=} # histogram
+brain_writer_idempotency_total{shard=,outcome=}    # hit | miss | conflict
+brain_writer_wal_skip_total{shard=,phase=}
+brain_writer_apply_errors_total{shard=,phase=,error=}
+```
+
+`stage` takes exactly five values
+(`crates/brain-ops/src/metrics/write_stage.rs:111-117`):
+
+| `stage` | What it times |
+|---|---|
+| `wal_append` | durable WAL append through the shard's sink, including the group-commit wait |
+| `redb_apply` | every phase applied into the open write transaction, plus the idempotency stamp — all the redb work *before* the commit |
+| `redb_commit` | `WriteTransaction::commit` on the shard's metadata DB |
+| `hnsw_insert` | vector insert into the shard's HNSW graph |
+| `tantivy_index` | hand-off of the memory text to the lexical indexer queue (the queue hand-off, not the indexing) |
+
+`redb_apply` and `redb_commit` are deliberately separate. Apply is how much
+work the write asks of redb; commit is what durability costs. One combined
+`redb` timer cannot tell a wide multi-phase write from a slow disk, and those
+have different remedies.
+
+Two consequences for reading these:
+
+- `wal_append` includes the group-commit window, so under light load it sits
+  near the 100 µs window rather than near the device's latency. A rise under
+  light load is the device; a fall under heavy load is batching working.
+- `tantivy_index` is a hand-off, so it is small and flat. Lexical-index lag
+  shows up in the indexer's own worker metrics, not here.
+
+Mind the two label vocabularies: `stage` on the stage histogram takes the five
+values above, while `phase` on the submit and skip counters names the write
+phase (`upsert_memory`, `link`, …). They are different axes — a stage is a step
+every write goes through, a phase is a kind of work a particular write asks
+for — and a query that mixes them up returns nothing rather than erroring
+(`crates/brain-server/src/metrics/format.rs:1175-1292`).
 
 ## 6. HNSW metrics
 
@@ -119,14 +187,34 @@ deployment, since rerank ships disabled.
 ```
 brain_extractor_drops_total{shard=}                      # encode-side enqueues dropped (channel full)
 brain_extractor_cycle_duration_seconds{shard=}           # histogram
-brain_extractor_tier_runs_total{shard=, tier=, outcome=} # per-tier outcome per memory
-brain_extractor_items_written_total{shard=, kind=}       # typed-graph rows persisted, by item kind
-brain_extractor_schema_filtered_total{shard=, reason=}   # dropped: predicate/relation_type not in an active schema
+brain_extractor_tier_runs_total{shard=, tier=, status=} # per-tier outcome per memory
+brain_extractor_items_written_total{shard=, item_kind=}  # typed-graph rows persisted, by item kind
+brain_extractor_schema_filtered_total{shard=, predicate=} # dropped: predicate/relation_type not in an active schema
 brain_extractor_apply_dropped_total{shard=, reason=}     # real items the apply pass could not persist
 brain_extractor_predicate_consolidated_total{shard=}     # open-vocab surface forms folded onto a near neighbour
 brain_extractor_resolver_outcome_total{shard=, tier=}    # which resolver tier satisfied each mention
 brain_extractor_llm_micro_usd_spent_total{shard=}        # LLM-tier spend, in 1e-6 USD
 ```
+
+The three label vocabularies on this family are fixed sets
+(`crates/brain-ops/src/metrics/histograms.rs:37-50`):
+
+| Label | Family | Values |
+|---|---|---|
+| `tier` | `tier_runs_total` | `pattern`, `classifier`, `llm` |
+| `status` | `tier_runs_total` | `ran`, `skipped`, `failed` |
+| `item_kind` | `items_written_total` | `entity`, `statement`, `relation`, `mention`, `hype` |
+| `tier` | `resolver_outcome_total` | `exact`, `alias`, `fuzzy`, `embedding`, `disambiguated`, `create` |
+
+Note that `tier` means two different things across the two families it appears
+on: extraction tiers on `tier_runs_total`, resolution strategies on
+`resolver_outcome_total`. The second is not a subset of the first.
+
+`schema_filtered_total` is the one family here whose label value is **not** a
+fixed set: it keys on `predicate`, the qname that was rejected, so its
+cardinality follows the open predicate vocabulary a deployment actually
+produces (`crates/brain-server/src/metrics/format.rs:1391-1403`). Watch it
+with that in mind.
 
 Two of these are easy to confuse and are deliberately separate:
 `schema_filtered_total` counts candidates dropped **by policy** (their type is
@@ -171,6 +259,72 @@ write succeeded and its derivation silently did not happen. It should be zero.
 produced no edge — and carries a `reason` label so the two never have to be told
 apart by guesswork.
 
+## 8a. Derivation backlog metrics
+
+The durable extraction queue — where an acknowledged write waits to become
+statements, entities and relations:
+
+```
+brain_extraction_queue_depth{shard=}                # memories queued, awaiting the extractor
+brain_extraction_queue_oldest_age_seconds{shard=}   # how long the oldest has waited
+```
+
+This is a separate family from `brain_extractor_*` for a structural reason:
+those are worker counters, which vanish when the worker is off, while the queue
+is a table on disk that keeps growing exactly then
+(`crates/brain-server/src/metrics/format.rs:681-731`). A derivation outage is
+invisible on the worker counters and obvious here.
+
+Depth is the leading indicator, because writes arrive far faster than
+derivation drains them. Age is the one that says how far a workspace has
+already drifted from its own data: a memory that has waited an hour is a
+question the system would now answer wrongly.
+
+Both are read from shard metadata on each scrape, and a shard whose read
+failed emits **no rows rather than zeros** — a fabricated `0` is a silent
+all-clear, an absent series is a legible gap. That is why the queue has an
+alert on *missing* series as well as on the values.
+
+## 8b. Derivation admission metrics
+
+What provider calls and prepared context are holding right now, and the budget
+that bounds them (`crates/brain-server/src/metrics/format.rs:163-284`):
+
+```
+brain_llm_calls_in_flight                           # provider calls outstanding
+brain_llm_bytes_in_flight                           # request payload bytes outstanding
+brain_llm_peak_calls_in_flight                      # high-water mark since start
+brain_llm_peak_bytes_in_flight                      # high-water mark since start
+
+brain_derivation_prep_holds_in_flight               # prepared-context reservations
+brain_derivation_prep_bytes_in_flight               # neighbour texts, candidate embeddings
+brain_derivation_prep_peak_bytes_in_flight          # high-water mark since start
+
+brain_derivation_bytes_in_flight                    # payload + prep, held together
+brain_derivation_admission_budget_bytes             # what derivation may hold at once
+brain_derivation_admission_available_bytes          # still admittable right now
+```
+
+Every one is a process-global gauge with **no `shard` label**. Shards are
+share-nothing for data, but they face one provider over one connection pool, so
+this pressure belongs to the process rather than to any shard.
+
+`brain_derivation_bytes_in_flight` is the figure the budget actually bounds.
+Payload and prep are metered apart because the remedies differ — payload
+pressure is relieved by narrowing LLM fan-out, prep pressure by narrowing the
+batch or the neighbour fan-out that feeds it — but they are admitted against
+one budget, so neither pool alone tells an operator how close derivation is to
+parking.
+
+`available_bytes` sustained at zero means derivation is waiting on memory, not
+on the provider. That is the distinction this family exists to draw: a backlog
+with available budget is a slow provider, a backlog with no available budget is
+a sizing problem.
+
+The peak gauges are the sizing input. The budget is a byte bound, and the
+footprint of one call — a long text with a large response schema is not the
+same load as a one-liner at the same call count — is what the peaks measure.
+
 ## 9. Worker metrics
 
 Every worker, whatever it does, exposes the same set:
@@ -184,6 +338,22 @@ brain_worker_cycle_duration_ms{shard=, worker=} # most recent successful cycle
 brain_worker_last_run_unixtime{shard=, worker=} # last attempted cycle: success, error, or caught panic
 brain_worker_pending_work{shard=, worker=}      # last-observed estimate of outstanding work
 ```
+
+The `worker` label is the worker's registry name, a fixed snake_case set
+declared alongside the worker kinds (`crates/brain-workers/src/config.rs:96-135`)
+— `decay`, `access_boost`, `consolidation`, `hnsw_maintenance`,
+`idempotency_cleanup`, `slot_reclamation`, `wal_retention`, `edge_scrub`,
+`counter_reconcile`, `statistics`, `embedder_cache_evict`, `snapshot`,
+`backfill`, `forget_cascade`, `schema_migration`, `supersession_sweeper`,
+`statement_reclaim`, `predicate_gc`, `audit_log_sweeper`, `llm_cache_sweeper`,
+`stale_extraction_detector`, `entity_gc`, `auto_edge`, `extractor`,
+`temporal_edge`, `causal_edge`, `statement_embed`, `confidence_sweep`,
+`ambiguity_resolver`. The name is the full word: `hnsw_maintenance`, not an
+abbreviation of it.
+
+A worker contributes rows only on shards where it is registered, so a selector
+naming a worker that is disabled in a deployment returns nothing rather than
+zero.
 
 `brain_worker_panics_total` is broken out of `errors_total` rather than folded
 into it because the two call for different responses: an error is a cycle that
@@ -200,7 +370,7 @@ working". A stalled worker is the one where this timestamp stops moving.
 brain_connections_active                        # currently in flight
 brain_connections_total                         # lifetime accepts
 brain_connections_closed_total{reason=}
-brain_connections_rejected_total{reason=}       # shed at accept by the admission gate (global or per-IP cap)
+brain_connections_rejected_total                # shed at accept by the admission gate (global or per-IP cap)
 brain_frame_recv_total
 brain_frame_send_total
 brain_frame_size_bytes{direction=}              # recv | send (histogram)
@@ -208,7 +378,17 @@ brain_frame_size_bytes{direction=}              # recv | send (histogram)
 
 `connections_rejected_total` counts connections refused *before* they became
 connections, which is why it is separate from `closed_total` — a shed connection
-never opened and would otherwise be invisible.
+never opened and would otherwise be invisible. It is a single labelless series:
+the gate sheds at accept time, before the protocol has said anything that could
+classify the reason (`crates/brain-server/src/metrics/format.rs:311-321`).
+
+`closed_total` does carry `reason`, over five values — `bye`,
+`protocol_error`, `timeout`, `eof`, `fatal`
+(`crates/brain-server/src/network/connection.rs:270-271`). `bye` is an orderly
+client goodbye; the other four are not.
+
+Every family in this section is process-wide. None of them carries a `shard`
+label: connections terminate at the connection layer, which fronts all shards.
 
 ## 9b. Tracing metrics
 
@@ -229,7 +409,17 @@ process_cpu_seconds_total          # from /proc/self/stat
 process_memory_resident_bytes      # VmRSS
 process_memory_virtual_bytes       # VmSize
 process_open_fds                   # entries in /proc/self/fd
+process_uptime_seconds             # since admin-server start
+process_start_time_seconds         # unix timestamp of process start
 ```
+
+Mind the word order on the two memory gauges: resource first, then quality —
+`process_memory_resident_bytes`, not `process_resident_memory_bytes`
+(`crates/brain-server/src/metrics/format.rs:399-416`). The transposed spelling
+is the one most dashboards reach for by reflex, and it returns an empty series.
+
+A `/proc` read that fails emits **no** line rather than a zero, so these can be
+legitimately absent on a scrape without anything being wrong with the process.
 
 These are read on scrape rather than tracked continuously, which is why they are
 standard-named and unprefixed: they describe the process, not Brain.
@@ -254,19 +444,30 @@ Default histogram bucket boundaries, in milliseconds:
 ```
 
 Thirteen bounds plus the `+Inf` overflow bucket, so fourteen counts per
-histogram. The bounds are **fixed in the binary**, not configurable: histogram
-bounds that differ between deployments cannot be aggregated across them, and the
-whole point of exposing a histogram rather than a quantile is that it aggregates.
+histogram (`crates/brain-server/src/metrics/histogram.rs:31-34`). The bounds are
+**fixed in the binary**, not configurable: histogram bounds that differ between
+deployments cannot be aggregated across them, and the whole point of exposing a
+histogram rather than a quantile is that it aggregates.
 
-Observations are stored scaled by 1000 so a sub-millisecond measurement does not
-quantise to zero before it reaches its bucket.
+These are the default bounds, which the request and query latency families use.
+A family whose range is known to be narrower sets its own — the write-stage
+histogram gives each stage its own bounds, because a WAL append and a Tantivy
+hand-off do not share a useful scale. Read the `le` values on the series rather
+than assuming the defaults.
+
+A millisecond histogram accumulates its `_sum` scaled by 1000 and divides at
+exposition, which is how the rendered `_sum` carries a decimal place without an
+atomic float; byte and item histograms use a scale of 1 and their `_sum` is the
+exact integer total (`crates/brain-server/src/metrics/histogram.rs:8-19`).
+Bucketing is unaffected — only the `_sum` is scaled — so `histogram_quantile`
+needs no adjustment.
 
 ## 13. Cardinality
 
 Labels with high cardinality (per-space, per-session) create explosion. Brain avoids them in metrics:
 
-- ✓ Shard label: low cardinality (~16 values).
-- ✓ Operation label: low cardinality (~10 values).
+- ✓ Shard label: low cardinality, one series per configured shard.
+- ✓ Operation label: low cardinality, exactly ten values.
 - ✓ Retriever / tier / worker / reason labels: low cardinality, fixed sets.
 - ✗ `space_id`: high cardinality (up to 10⁶ per namespace); **never** a metric label.
 - ✗ `session_id`: unbounded, client-chosen; never a metric label.
@@ -279,47 +480,81 @@ spaces that is a metrics-system outage, not a slow dashboard.
 
 ## 14. Sampling
 
-Some metrics are sampled rather than every-event:
+Sampling is the design for two HNSW signals — search visits on every Nth
+search, a recall-quality estimate on an hourly exact-search comparison — and
+the sampling infrastructure those need does not exist yet, so neither series is
+emitted (`crates/brain-server/src/metrics/mod.rs:31-40`).
 
-- HNSW search visits: every Nth search.
-- Recall quality estimate: hourly sample.
+Everything in the families above is every-event, which is affordable because
+all of them are fixed-cardinality counters, gauges or fixed-bucket histograms
+read on scrape. Volume is bounded by the label rules in the previous section
+rather than by sampling.
 
-This bounds metric volume.
+The emitted stand-in for index quality is `brain_hnsw_tombstone_ratio`: a graph
+thick with tombstones is one whose neighbour lists point at deleted nodes,
+which is the mechanism behind most recall decay.
 
 ## 15. Labels: shard ID
 
-The `shard` label uses the UUID:
+The `shard` label is the shard's **index**, a small unsigned integer counting
+from zero (`crates/brain-core/src/ids.rs:27`). It is not a UUID:
 
 ```
-brain_arena_slots_used{shard="abc123-uuid"} 1234
+brain_arena_slots_used{shard="0"} 1234
+brain_arena_slots_used{shard="1"} 987
 ```
+
+Cardinality is therefore the configured shard count, which `brain_shards_total`
+reports and `brain_config_info{shard_count=}` carries as a label — so a query
+can check that every shard is reporting without knowing the deployment's size
+in advance.
 
 For dashboards, operators may add a friendly name via metric relabeling:
 
 ```
-brain_arena_slots_used{shard="abc123-uuid", shard_name="prod-shard-0"} 1234
+brain_arena_slots_used{shard="0", shard_name="prod-shard-0"} 1234
 ```
 
 ## 16. The `up` metric
 
-Standard Prometheus convention:
+`up` is Prometheus's own scrape-result series, not one Brain emits. It carries
+the scrape job's labels — `job` and `instance` — and never a `shard` label:
 
 ```
-up{job="brain", shard="<uuid>"} 1
+up{job="brain-server", instance="10.0.0.4:9091"} 1
 ```
 
-`up=0` means the shard isn't responding. Alerting on `up == 0` catches outages.
+`up=0` means the server did not answer the scrape. Alerting on `up == 0`
+catches outages, and because Brain halts the process on a fail-stop invariant
+violation, a hard halt surfaces here rather than in any Brain-emitted series.
+
+Brain also emits its own `brain_up`, always `1` while the `/metrics` handler is
+answering (`crates/brain-server/src/metrics/format.rs:143-151`). It is a
+liveness marker for "this body came from a live server", useful as the `and
+on()` guard in a rule about a *missing* series — it cannot itself report `0`,
+because a server that cannot answer cannot emit it.
 
 ## 17. The `_info` metrics
 
-Static information:
+Static information, value always `1`, payload in the labels
+(`crates/brain-server/src/metrics/format.rs:113-141`):
 
 ```
-brain_build_info{version="1.0.0", commit="<sha>", build_date="..."} 1
-brain_config_info{shard="<uuid>", arena_size="1Gi", hnsw_M="16"} 1
+brain_build_info{version="1.0.0", git_commit="<sha>"} 1
+brain_config_info{shard_count="16", arena_capacity_bytes="1073741824",
+                  hnsw_m="16", embedder_model="bge-small-en-v1.5"} 1
 ```
 
-These have value=1; the labels carry the info. Useful for cross-referencing.
+Both are process-wide: `brain_config_info` describes the loaded config, so it
+carries `shard_count` as a label rather than being emitted per shard. Label
+names are snake_case throughout — `git_commit`, `hnsw_m` — and every label
+value is a config knob rather than client input, which is what keeps the
+cardinality bounded.
+
+Because the value never moves, these families must be queried on their
+**labels**. A change retires one label combination and starts another; it does
+not change a value, so `changes(brain_config_info[1h])` is always zero. Count
+distinct label sets over the window instead.
 
 ## 18. Histogram vs summary
 
@@ -329,27 +564,32 @@ Histograms work better with multi-replica deployments. Summaries don't aggregate
 
 ## 19. The metrics endpoint security
 
-The `/metrics` endpoint is unauthenticated by default — typical for Prometheus scraping. For deployments wanting auth:
+`/metrics` is unauthenticated — typical for Prometheus scraping, and the
+endpoint carries no tenant-identifying labels by construction, so a scrape
+leaks operational shape rather than customer data.
 
-```toml
-[metrics]
-endpoint = "/metrics"
-auth = "basic"
-auth_users = [{name = "prom", password = "..."}]
-```
+There is no auth knob on it. Isolation is by listener: the metrics endpoint
+binds `[server] metrics_addr`, separate from both the data plane
+(`listen_addr`) and the admin plane (`admin_addr`), which has its own mandatory
+bearer token (`crates/brain-server/src/config/mod.rs:221-228`). Bind the
+metrics listener to an interface the scraper can reach and nothing else can,
+and firewall the port.
 
-Production deployments should at least restrict network access (firewall the metrics port).
+## 20. The metric catalog
 
-## 20. The metric schema document
+This file is the catalog. The authority behind it is the exposition itself:
+every series and every label value on it is written by one function, which
+walks the server state and renders the whole `/metrics` body in a stable order
+(`crates/brain-server/src/metrics/format.rs:53-81`). Reading that function is
+how a name gets settled when a dashboard disagrees with a document.
 
-Brain ships with a metrics catalog:
-
-- Every metric documented.
-- Bounds and expected ranges.
-- Linked alerts.
-- Change log across versions.
-
-Operators use this to write custom alerts and dashboards.
+The shipped alert rules are checked against it in CI: the suite parses the
+emitted names out of the exposition and rejects any rule referencing a series
+the server does not emit, so an alert cannot silently point at a metric that
+does not exist. The dashboard JSON is checked for shape and for the `brain_*` /
+`process_*` prefix taxonomy, which catches a mistyped family but **not** a
+plausible-looking name that was never emitted — dashboard panels need the names
+confirmed against the exposition by hand.
 
 ---
 
@@ -359,14 +599,22 @@ How Brain emits structured logs.
 
 ## 21. The log format
 
-JSON-structured logs:
+Two formatters, selected by `[monitoring.logging] format`
+(`crates/brain-server/src/bootstrap/logging.rs:23-28`):
+
+- `compact` — one line per event, `<ts> <LEVEL> <target>: <message>`. The dev
+  default; readable in a terminal.
+- `json` — newline-delimited JSON. What production sets; ingestible by Loki,
+  Elastic or Splunk.
+
+Under `json`:
 
 ```json
 {
   "ts": "2026-05-07T12:00:00.123Z",
   "level": "info",
   "logger": "brain.executor",
-  "shard": "<uuid>",
+  "shard": 3,
   "operation": "encode",
   "space_id": "agent-001",
   "request_id": "...",
@@ -387,22 +635,34 @@ One JSON object per line. Readable with `jq`, ingestible by Loki / Elastic / Spl
 
 Default level: INFO. Production deployments may use WARN to reduce volume.
 
+There is exactly one level knob with one override: `[monitoring.logging] level`
+is the source of truth and `BRAIN_LOG` overrides it at runtime. `RUST_LOG` is
+deliberately **not** consulted (`crates/brain-server/src/bootstrap/logging.rs:30-38`)
+— a second environment variable that silently wins over the configured level is
+the kind of surprise that costs an hour mid-incident.
+
 ## 23. The destination
 
-By default, logs go to stdout. Operators redirect to:
+Logs go to stdout. Brain writes no log files and does not rotate anything —
+redirection and retention are the deployment's job, which is what every
+container runtime already does:
 
-- A file (`brain > /var/log/brain.log`).
-- A log aggregator (via stdout capture in containers).
-- syslog.
+- A file, by shell redirection.
+- A log aggregator, via stdout capture in containers.
+- syslog, via the runtime's log driver.
 
-Config:
+Config (`crates/brain-server/src/config/mod.rs:1344-1360`):
 
 ```toml
-[logging]
-output = "stdout"            # or "file", "syslog"
-file_path = "/var/log/brain/brain.log"
-rotation = "daily"           # for file
+[monitoring.logging]
+level = "info"               # trace | debug | info | warn | error
+output = "stdout"
+format = "compact"           # or "json"
 ```
+
+The config section is `[monitoring.logging]`, grouped with
+`[monitoring.tracing]`, and it rejects unknown fields — a file naming a knob
+that does not exist fails to load rather than silently ignoring it.
 
 ## 24. The fields
 
@@ -416,7 +676,7 @@ Common fields in all entries:
 Operation-specific fields:
 
 - `operation`: encode, recall, etc.
-- `shard`: shard UUID.
+- `shard`: shard index, an integer counting from zero.
 - `space_id`: agent (when applicable).
 - `request_id`: request UUID.
 - `duration_ms`: latency.
@@ -490,37 +750,71 @@ For debugging that requires user data, use TRACE level (which can be enabled sel
 
 ## 28. The audit log
 
-Separate from regular logs, an audit stream:
+Separate from the log stream, Brain keeps an audit trail in shard metadata —
+not a file — and serves it on the admin plane at `GET /v1/audit` and
+`GET /v1/audit/export`.
 
-- Every state-mutating operation.
-- Every admin action.
-- Hash-chained for tamper evidence.
+What it records is **extraction and entity resolution**: which extractor ran
+against which memory, at which extractor and schema version, with what outcome,
+cost and outputs (`crates/brain-metadata/src/tables/audit.rs:60-96`):
 
-```
-brain-audit.log:
+```jsonc
 {
-  "ts": "...",
-  "actor": "agent-001",
-  "operation": "encode",
-  "memory_id": "...",
-  "space_id": "...",
-  "session": "...",
-  "auth_method": "token",
-  "hash": "sha256:...",
-  "prev_hash": "sha256:..."
+  "extractor_id": 3,
+  "extractor_version": 2,
+  "schema_version": 7,
+  "started_at_unix_nanos": "...",
+  "completed_at_unix_nanos": "...",
+  "status": "success",          // or failure / skipped_filter /
+                                // skipped_duplicate / skipped_disabled
+  "status_reason": "",          // free-form; empty on success
+  "outputs": [ /* entity / statement / relation ids */ ],
+  "cost_micro_usd": 1420,       // 0 for the pattern and classifier tiers
+  "input_hash": "blake3:...",   // BLAKE3 of the memory text
+  "namespace": "acme"           // the tenant this extraction is billed to
 }
 ```
 
-The hash chain lets auditors verify the log hasn't been tampered with.
+Entries are append-only and time-ordered by a UUIDv7 key, and indexed three
+ways — by memory, by extractor, by time — so an auditor can ask "what was
+derived from this memory" as cheaply as "what happened in this window".
+
+Two properties are worth stating plainly, because the trail is easy to
+over-read:
+
+- `input_hash` is there to **detect an edited memory**, which is what the
+  idempotency probe uses it for. It is not a chain: no entry references its
+  predecessor's hash, so the trail is append-only by construction and not
+  cryptographically verifiable. Tamper evidence comes from exporting to
+  append-only external storage.
+- `namespace` is the one place a tenant id is durably recorded against cost.
+  It matches the key the LLM spend ledger uses, so a namespace's model spend is
+  this field summed with that ledger — the two must name the tenant
+  identically. An unattributed row counts toward no namespace rather than
+  toward a guessed one.
+
+This is also the surface that answers the per-tenant questions metrics
+deliberately cannot.
 
 ## 29. Audit log retention
 
-Audit logs typically have stricter retention:
+Audit entries live in shard metadata, so retention is bounded by a worker
+rather than by a log-rotation policy. The `audit_log_sweeper` worker runs daily
+and hard-deletes rows past its retention window — **90 days by default**
+(`crates/brain-workers/src/workers/audit_log_sweeper.rs:22`,
+`crates/brain-workers/src/config.rs:183`). It sweeps the extraction audit with
+all three of its indexes, and the entity-resolution audit. There is no
+`[audit]` config section; the sweeper is configured like any other worker.
 
-- Production: 1-7 years (regulatory).
-- Internal: 90 days.
+Merge and unmerge audit rows are the exception: they live on a separate table
+and are **kept forever**, untouched by the sweeper. Identity decisions stay
+answerable indefinitely because a merge is not recoverable from anything else
+in the store.
 
-Configurable via `[audit]` section. Logs can be exported to external storage (S3, etc.).
+For retention longer than the sweeper's window, export: `GET /v1/audit/export`
+hands the trail out for external storage, which is also where regulatory
+retention (1–7 years) and tamper evidence belong, since neither is something a
+metadata table should be asked to guarantee.
 
 ## 30. Log sampling
 
@@ -537,7 +831,7 @@ Default is no sampling (full fidelity). Sampling is opt-in for cost-conscious de
 Each request, by default, emits one INFO log at completion:
 
 ```json
-{"ts":"...","level":"info","operation":"encode","shard":"<uuid>","space_id":"...","request_id":"...","duration_ms":8,"status":"success","msg":"encode completed"}
+{"ts":"...","level":"info","operation":"encode","shard":3,"space_id":"...","request_id":"...","duration_ms":8,"status":"success","msg":"encode completed"}
 ```
 
 For DEBUG, additional logs at start, mid-points, end.
@@ -595,11 +889,10 @@ Errors include structured fields:
   "operation": "encode",
   "space_id": "...",
   "error": {
-    "code": "QuotaExceeded",
-    "message": "Agent has reached its memory quota",
+    "code": "LlmCredentialMissing",
+    "message": "namespace has no registered LLM credential",
     "details": {
-      "current_count": 1000000,
-      "limit": 1000000
+      "namespace": "acme"
     }
   }
 }
@@ -607,27 +900,38 @@ Errors include structured fields:
 
 Code, message, and details are separate fields. Operators can alert on specific codes.
 
+The example uses a code that actually reaches clients: a namespace with no
+registered provider key has its writes refused terminally, naming the namespace
+(`crates/brain-ops/src/handlers/encode.rs:113`,
+`crates/brain-ops/src/error.rs:35`).
+
+**Do not alert on `QuotaExceeded` or `RateLimited`.** Brain enforces no
+per-space quota and no rate limit: `OpError::QuotaExceeded` is constructed only
+in a test (`crates/brain-ops/src/lib.rs:113`), so neither code is ever emitted
+and an alert on either is dead. The limits that do refuse a write are physical
+or per-field — arena capacity, disk, and the byte caps in
+`crates/brain-ops/src/handlers/limits.rs`.
+
 ## 36. The "logger configuration" surface
 
-Per-logger level overrides:
+Per-subsystem levels are set through the level string itself, which takes the
+standard `EnvFilter` directive syntax rather than a separate config table:
 
 ```toml
-[logging.loggers]
-"brain.network" = "debug"      # See network details
-"brain.hnsw" = "warn"          # Reduce HNSW noise
+[monitoring.logging]
+level = "info,brain_server::network=debug,brain_index=warn"
 ```
 
-For focused debugging.
+The same string is what `BRAIN_LOG` carries, so a focused-debugging session
+needs no config edit and no restart loop through a TOML file. Directives are
+matched against Rust module paths, which is what `tracing` filters on.
 
 ## 37. The log retention default
 
-Default retention (file rotation):
-
-- Daily rotation.
-- Keep 7 days.
-- Compress after 1 day.
-
-Configurable. For aggregated logs (Loki, etc.), retention is in the aggregator.
+Brain has no retention policy, because it owns no log files — it writes to
+stdout and the surrounding system decides what to keep. Retention lives in the
+container runtime's log driver, in the aggregator (Loki, Elastic), or in
+whatever rotates the file the output is redirected into.
 
 ## 38. The "graceful logging shutdown"
 
@@ -657,15 +961,18 @@ Brain uses [OpenTelemetry](https://opentelemetry.io/) — the industry standard.
 A typical request produces a hierarchy:
 
 ```
-[client.request] (span)
-  └── [brain.encode] (span)
-        ├── [brain.embed] (span)
-        │     └── [brain.embedder.cache_lookup] (span)
-        ├── [brain.arena.write] (span)
+[client.request] (span, opened at the connection layer)
+  └── [brain.encode] (span, on the shard)
         ├── [brain.wal.append] (span)
         ├── [brain.metadata.write] (span)
         └── [brain.hnsw.insert] (span)
 ```
+
+`client.request` is the trace root, opened in the connection layer; the shard
+re-enters a clone of it so the handler span nests under it across the
+Tokio→Glommio hop (`crates/brain-server/src/bootstrap/tracing.rs:17-32`). The
+storage spans are opened inside the writer's submit path
+(`crates/brain-ops/src/writer/submit.rs:316-368`).
 
 Each span has:
 
@@ -694,17 +1001,19 @@ This gives operators a complete picture of where time is spent.
 Tracing every request is expensive. Brain samples:
 
 ```toml
-[tracing]
+[monitoring.tracing]
 sampler = "ratio"
 sample_ratio = 0.01         # 1% of requests
 ```
 
-Other sampler options:
+The sampler takes one of four names
+(`crates/brain-server/src/config/mod.rs:1370-1376`):
 
-- `always_on`: 100% (debugging).
-- `always_off`: 0% (disabled).
-- `rate_limited`: max N traces per second.
-- `parent_based`: respect upstream's sampling decision.
+- `always_off`: 0%. The default, and it builds no pipeline at all.
+- `always_on`: 100%. For debugging.
+- `ratio`: the fraction in `sample_ratio`, clamped to `[0.0, 1.0]`. Read only
+  when the sampler is `ratio`.
+- `parent_based`: defer to the incoming decision.
 
 ## 43. The "head sampling" vs "tail sampling"
 
@@ -714,64 +1023,79 @@ For tail-based sampling (decide based on latency or errors after the fact), use 
 
 ## 44. The export
 
-Traces are exported via OTLP to a configured collector:
+Traces are exported over **OTLP/HTTP** to a configured collector
+(`crates/brain-server/src/config/mod.rs:1362-1386`):
 
 ```toml
-[tracing.export]
-endpoint = "http://otel-collector:4317"
-protocol = "grpc"             # or "http"
-batch_max_size = 512
-batch_timeout_ms = 5000
+[monitoring.tracing]
+enabled = true
+endpoint = "http://otel-collector:4318/v1/traces"
+service_name = "brain-server"
 ```
+
+The transport is HTTP, not gRPC, so the collector's port is the OTLP/HTTP one —
+4318 by OTel convention, and that path is the default when the endpoint is left
+unset (`crates/brain-server/src/bootstrap/tracing.rs:46`). Batching is the
+OpenTelemetry SDK's own and is not exposed as config. `service_name` becomes
+the OTel `service.name` resource attribute on every span.
+
+`enabled` is the master switch and defaults to false, so a deployment that
+configures nothing exports nothing. With `enabled = true` and an empty
+endpoint, tracing degrades to a stdout exporter rather than failing.
 
 The collector handles forwarding to the backend (Jaeger, Tempo, etc.).
 
 ## 45. Span attributes
 
-Common attributes:
+The `client.request` root records
+(`crates/brain-server/src/network/dispatch.rs:873-885`):
 
-- `brain.shard`: shard UUID.
-- `brain.operation`: operation name.
-- `brain.space_id`: agent.
-- `brain.request_id`: request ID.
-- `brain.duration_ms`: duration.
-- `brain.status`: success/error.
-- `brain.error_code`: if error.
+- `brain.operation`: the opcode.
+- `brain.space_id`: the **effective** identity — the target under delegation.
+- `brain.shard`: the target shard's index.
+- `brain.stream_id`: which multiplexed stream carried the request.
+- `trace_id` / `span_id`: recorded once the ids are known.
 
-These follow OpenTelemetry semantic conventions where applicable.
+Under delegation it additionally records `brain.act_as`,
+`brain.principal_space_id`, `brain.principal_key_hash` and
+`brain.effective_namespace`. The acting party is never erased from the trail:
+the span names both who asked and on whose behalf.
+
+Duration and status are the span's own — a span carries its start and end, so
+re-recording the elapsed time as an attribute would be a second, disagreeable
+copy of it.
 
 ## 46. The propagation
 
-Trace session propagates from the client to Brain:
+Brain emits **server-side spans only**. The wire protocol carries no
+`traceparent` field, so a client-supplied trace context is not consumed and
+`client.request` is a trace root rather than a child of the caller's span
+(`crates/brain-server/src/bootstrap/tracing.rs:10-15`).
 
-```
-Client request:
-  Headers / metadata: traceparent: 00-<trace_id>-<span_id>-01
-
-Brain:
-  Reads traceparent.
-  Creates child span with the parent's trace_id and span_id.
-```
-
-Standard W3C traceparent format. Most tracing libraries support it.
+The consequence for an operator is concrete: a client trace and a Brain trace
+are two separate traces, joined by timestamp and by `brain.space_id`, not by a
+shared trace id. Carrying the standard W3C `traceparent` on the wire is what
+would make them one tree.
 
 ## 47. The cross-shard propagation (future)
 
-In a future clustered release, a cross-node call propagates trace session:
+In a clustered deployment, a cross-node call propagates trace context:
 
 ```
 Node A's span (parent)
-  Cross-node call carries trace session
-    Node B's span (child, on different node)
+  Cross-node call carries trace context
+    Node B's span (child, on a different node)
 ```
 
 The trace shows the call across nodes — useful for diagnosing latency in distributed setups.
 
 ## 48. The sampling propagation
 
-Sampling decisions propagate. If the client decided to sample (or not), Brain respects it.
-
-This avoids the "client samples, Brain doesn't" inconsistency.
+The `parent_based` sampler defers to an incoming decision, which is the right
+behaviour once the wire carries one. Until it does, there is no parent context
+to read, so `parent_based` falls through to its own root decision and the
+client's choice has no effect on what Brain samples. Set the sampler to match
+the client's rate rather than expecting it to be inherited.
 
 ## 49. Span events
 
@@ -798,9 +1122,14 @@ For 1% sampling: < 0.1% overhead. For 100%: 1-2% overhead.
 
 If the export pipeline is down or backed up:
 
-- Brain buffers spans (default 10K).
-- If buffer fills: oldest spans are dropped, with metric.
-- Operations continue normally.
+- Spans queue in the OpenTelemetry SDK's batch processor.
+- When that queue is full, a finished span is discarded and counted.
+- Operations continue normally. Export failure never fails a request.
+
+Both counters below are fed from OpenTelemetry's process-global error handler,
+which classifies by error variant: a failed or timed-out export attempt is an
+export error, the batch processor's "buffer full" send failure is a dropped
+span (`crates/brain-server/src/metrics/otel.rs:1-18`).
 
 ```
 brain_tracing_spans_dropped_total
@@ -809,25 +1138,28 @@ brain_tracing_export_errors_total
 
 ## 52. The "high-cardinality" warning
 
-Some attributes can have very high cardinality:
+Some attributes would have very high cardinality — memory ids, request ids —
+and Brain does not record them on spans. The root span's attributes are bounded
+by the identity and routing of the request: operation, space, shard, stream.
 
-- Memory IDs.
-- Request IDs.
-
-These are useful for one-off investigation but explode index size in tracing backends.
-
-Brain's defaults include some high-cardinality attributes (memory_id, request_id) because they enable powerful debugging. For deployments where cardinality is a concern, these can be excluded:
-
-```toml
-[tracing.attributes]
-exclude = ["brain.memory_id", "brain.request_id"]
-```
+This matters because the cardinality rule that governs metric labels does not
+transfer cleanly to traces: a tracing backend indexes attributes, so an
+unbounded attribute inflates the index rather than multiplying series. A
+one-off investigation that needs a memory id reads it from the logs, where the
+id is already a field, and joins to the trace by trace id.
 
 ## 53. The async runtime tracing
 
-Glommio's async tasks each have their own session. Brain ensures spans are properly attached to tasks.
+Span context is thread-local, and so is `tracing`'s current-span stack.
+Glommio's per-core executors keep their own thread-locals, so context does not
+follow the Tokio→Glommio hop on its own: the connection layer carries the
+`tracing::Span` handle itself across the shard channel and the shard re-enters
+it, which is what keeps the request and its storage spans in one tree
+(`crates/brain-server/src/bootstrap/tracing.rs:17-32`).
 
-Specific concern: spans don't accidentally cross task boundaries. The Rust `tracing` crate handles this if used correctly.
+Span creation and close are thread-agnostic. Only the batched OTLP export needs
+the Tokio runtime, and that runs on its own task, so emitting spans from a
+Glommio thread is sound.
 
 ## 54. The "trace ID in logs"
 
@@ -837,7 +1169,9 @@ Logs include the trace ID:
 {"ts":"...","level":"info","trace_id":"abc...","span_id":"def..."}
 ```
 
-Operators can pivot from a trace to logs (in Tempo / Loki / etc.) by trace ID. This is the "logs in session" pattern.
+Operators can pivot from a trace to logs (in Tempo / Loki / etc.) by trace ID.
+The root span records `trace_id` and `span_id` as fields once they are known,
+which is what puts them on the log line.
 
 ## 55. The "no trace" fallback
 

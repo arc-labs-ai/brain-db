@@ -141,7 +141,7 @@ Limitations:
 SUBSCRIBE delivers changes:
 
 - Each change is a record (memory created/updated/forgotten, edge added/removed).
-- Records arrive in WAL order.
+- Records arrive in WAL order (per shard) — strictly on replay; on the live tail a record arriving out of order ends the stream with `ERROR(Overloaded)` instead of being silently reordered.
 - Filters can narrow the stream (per space, per session, etc.).
 
 Useful for: live agent dashboards, downstream consumers, audit logs.

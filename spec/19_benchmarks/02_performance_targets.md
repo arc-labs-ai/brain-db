@@ -1,8 +1,8 @@
 # 19.02 Performance Targets
 
-> **v1.0 status — advisory, not a lock gate (owner decision, 2026-09-07).** Reference-hardware performance verification is **optional / off the grid for v1.0** — see [`06_complete_acceptance.md`](06_complete_acceptance.md) §"Performance acceptance". The numbers here are engineering targets to measure post-lock, not v1.0 lock criteria.
+> **v1.0 status — advisory, not a lock gate.** Reference-hardware performance verification is **optional for v1.0** — see [`06_complete_acceptance.md`](06_complete_acceptance.md) §"Performance acceptance". The numbers here are engineering targets to measure post-lock, not v1.0 lock criteria.
 >
-> **Reconciliation note.** The per-operation numbers in this file are **being reconciled** against [`../01_architecture/05_hardware_and_targets.md`](../01_architecture/05_hardware_and_targets.md) §7 and [`06_complete_acceptance.md`](06_complete_acceptance.md), which agree with each other (and split targets by CPU / GPU / `ENCODE_VECTOR_DIRECT` path). Where a number in §2 below disagrees with those two — FORGET/PLAN/REASON/STATEMENT_CREATE/RELATION_CREATE/entity-resolve latency, and the throughput lines — **treat §01/05 + §19/06 as authoritative** until this file's tables are refreshed (post-v1 tuning task). This file states single-number, older targets; the CPU/GPU-split figures supersede them.
+> **Precedence.** This file states one number per operation. [`../01_architecture/05_hardware_and_targets.md`](../01_architecture/05_hardware_and_targets.md) §7 and [`06_complete_acceptance.md`](06_complete_acceptance.md) state the same operations **split by write path** — CPU-embedded text, GPU-embedded text, and `ENCODE_VECTOR_DIRECT` — and they agree with each other. Where a single number here disagrees with that split, the split is authoritative, because the paths differ by more than measurement noise: a text ENCODE pays a model forward pass that a pre-supplied vector does not. The disagreement is concentrated in FORGET / PLAN / REASON / STATEMENT_CREATE / RELATION_CREATE / entity-resolve latency and in the throughput tables.
 
 > **TL;DR.** Brain v1.0 performance gates: latency (per-operation p50/p95/p99 targets), throughput (per-shard sustained ops/s), and resource budgets (CPU, RAM, disk per shard / per node). All measured by the benchmark suite on reference hardware (16-core x86_64, 64 GiB RAM, NVMe SSD) at the 1M-memory primary scale.
 
@@ -96,7 +96,7 @@ TRAVERSE numbers assume default `max_branching_factor = 1000` per [`../13_retrie
 
 ### 2.5 typed graph — deferred targets
 
-- **ENTITY_RESOLVE (tier 3 — embedding HNSW)** is wired into the resolver (embed-on-create + top-k entity-HNSW search under a scope+type filter); what remains is the reference-hardware measurement, like every other §19.02 target. Target per the phase-16 doc: p50 ≤ 5 ms at 100K, ≤ 50 ms at 1M — final numbers captured on reference hardware.
+- **ENTITY_RESOLVE (tier 3 — embedding HNSW)** is wired into the resolver (embed-on-create + top-k entity-HNSW search under a scope+type filter); what remains is the reference-hardware measurement, like every other §19.02 target. Target: p50 ≤ 5 ms at 100K entities, ≤ 50 ms at 1M.
 - **ENTITY_RESOLVE (tier 4 — LLM)** lands here with the LLM extractor. Latency is gated by the model + cache hit-rate; target is "tail under 1 s with cache warm, queued under 5 s cold."
 - **Statement HNSW semantic search** — gated on the embedding worker populating the HNSW. Brain writes / reads the table inline; the semantic-search target lands with the worker.
 - **Cross-shard RELATION_TRAVERSE** — gated on the query router. Brain ships same-shard only.
@@ -154,9 +154,25 @@ set their own SLOs and instrument via the audit table.
 | `LlmExtractor::predict` (cache hit) | 1 ms | 5 ms |
 | `LlmExtractor::predict` (cache miss, claude-haiku) | 600 ms | 3 s |
 | `LlmExtractor::predict` (cache miss, gpt-4o-mini) | 800 ms | 4 s |
-| Cost-budget skip path (no LLM call) | 200 µs | 1 ms |
+| Short-circuit path (no LLM call) | 200 µs | 1 ms |
 | `LlmCacheDb::get` round-trip | 300 µs | 1.5 ms |
 | `LlmCacheDb::put` round-trip | 800 µs | 3 ms |
+
+The short-circuit row is the cost of a dispatch that resolves without reaching
+a provider at all: a degraded `LlmExtractor` returns `SkippedDisabled` with the
+captured reason and writes its audit row
+(`crates/brain-extractors/src/llm/extractor.rs:209-215`, status at
+`crates/brain-extractors/src/framework/extractor.rs:389`). What the figure
+measures is the audit write and nothing else, which is why it is the same
+200 µs / 1 ms as the audit-row write in §2.7 — the two numbers are the same
+measurement reached by two paths, and they should move together.
+
+It is **not** a spend ceiling. A tenant's own provider key is never rationed:
+spend accumulates in the durable `llm_spend` ledger and no call is refused for
+cost. A `cost_budget` declared on an `llm` extractor in the schema DSL parses
+and is logged as unenforced
+(`crates/brain-extractors/src/materialize.rs:438-455`). Benchmarking a cost
+gate would be benchmarking something that does not run.
 
 LLM extractors run on the background queue and don't
 contribute to ENCODE's P99 budget.
@@ -224,14 +240,18 @@ Notes:
 
 ### 2.11 Perf gates
 
-All targets above are measured on the dev workstation; production-reference numbers (16-core / 64 GB / NVMe per §1) are revalidated by the CI suite.
+**No target here is machine-enforced**; every number is measured and compared by hand.
+
+`perf-bench.yml` runs `relation_traverse` (brain-planner) and `lexical_retrieve` (brain-index) on manual dispatch, and `just prod-bench` runs the same pair locally. Both benches report p50 measurements and assert nothing; a run fails only on a panic or a timeout. Reading the numbers, and comparing them against a Criterion baseline on the machine that produced them, is the operator's job. There is no absolute in-process latency gate because the §2.4 traversal targets are specified at 1M relations per shard and the §2.9 lexical targets at 100K memories / 1M statements, both on the §1 reference hardware, while these two harnesses run roughly 10K-scale fixtures. A millisecond bound asserted against those fixtures on arbitrary hardware measures the machine rather than the implementation. The targets in §2.4 and §2.9 are verified by the acceptance suite on reference hardware, which is where a regression against them is caught. The pair is dispatched rather than run per-PR because each takes minutes.
+
+Every number in this section is a target awaiting measurement on reference hardware (16-core / 64 GB / NVMe per §1), consistent with the advisory status recorded at the top of this file. The CI box is a cloud runner, not the reference machine, which is why the pair worth dispatching there is the traversal and index benches — CPU-and-redb bound and comparatively portable — rather than the embedder- or device-bound figures, whose numbers say more about the host than about Brain.
 
 - §2.2 entity targets at 100K entities.
 - §2.3 statement targets at 1M statements.
 - §2.4 relation targets at 1M relations.
 - §2.6 schema targets at 50 definitions.
 - §2.7 extractor targets at single-extractor dispatch.
-- §2.8 LLM extractor targets at cache-hit + cost-budget skip + mock-API miss.
+- §2.8 LLM extractor targets at cache-hit + short-circuit + mock-API miss.
 - §2.9 LexicalRetriever targets at 100K memory / 1M statement scale.
 - §2.10 query targets at 10K corpus / 3 retrievers.
 
@@ -247,6 +267,14 @@ For RECALL p99 = 20 ms, time is spent:
 - Response framing: ~0.5 ms.
 
 Total: 13-30 ms across cases. The 20 ms p99 is achievable.
+
+**The embedder line is the one that decides whether the rest matters.** On a cache miss it is the largest single term, and it is a *per-core* cost: the encode is handed to the shard executor's blocking pool, whose intra-op workers inherit that thread's CPU affinity, so Candle's matmul fan-out is confined to the shard's own core rather than spreading across the box (`crates/brain-ops/src/embedding.rs:16-61`). Nothing batches it either — the CPU dispatcher runs each request through the model independently and assembles no batches (`crates/brain-embed/src/dispatcher/cpu.rs:1-7`).
+
+Three consequences follow, and they govern every throughput figure below:
+
+1. **The ~15 ms miss is a single-core forward-pass figure**, so it scales with that core's capability and with input length — not with core count. A wider machine buys more shards, each with its own embedder lane; it does not make this line shorter.
+2. **The cache-hit/miss split is the dominant lever on RECALL p99**, which is why the embedder cache hit-rate target (§15 of Resource Targets) is a performance requirement and not merely a cost one.
+3. **Reproducing this breakdown on unlike hardware requires re-measuring this line first.** It is the term most sensitive to ISA and clock, and the `brain-embed` throughput bench deliberately asserts *no* absolute gate for exactly that reason, treating the machine-local Criterion baseline as the real regression signal (`crates/brain-embed/benches/throughput.rs:3-6`).
 
 ## 4. The cold-cache numbers
 
@@ -451,6 +479,8 @@ The throughput targets Brain v1 must meet.
 
 These are MUST targets at 1M memories per shard, on reference hardware.
 
+**The ENCODE row is a storage-path figure.** It is reachable by `ENCODE_VECTOR_DIRECT`, where the caller supplies the vector and the cost is WAL plus metadata. A **text** ENCODE additionally pays one unbatched model forward pass on the shard's own core (§6), which puts its ceiling two to three orders of magnitude lower. The path-split throughput targets in [`06_complete_acceptance.md`](06_complete_acceptance.md) §"Throughput" are authoritative for that distinction, and the same caveat applies to the mixed-workload figure in §2 below, whose 25% ENCODE share is read as the direct-vector path.
+
 ## 2. The "mixed workload" target
 
 A realistic mix (70% recall, 25% encode, 5% other):
@@ -471,12 +501,18 @@ For a 16-shard node:
 
 ## 4. The "burst" tolerance
 
-Brain handles bursts above sustained:
+Brain absorbs bursts above sustained by **queueing**, not by shedding:
 
-- 2× sustained for 10 seconds: tolerated, latency may spike.
-- 5× sustained for 1 second: shed via Overloaded.
+- 2× sustained for 10 seconds: tolerated, latency rises.
+- 5× sustained for 1 second: tolerated, latency rises further.
 
-Bursts are common; tolerance prevents transient overloads from cascading.
+**There is no request-level load shedding and no rate limiter.** A shard admits up to its in-flight bound (15 at shipped defaults, §7) and then *parks* on its request channel until a permit frees. Parking the receive also parks the cheap requests behind it — Ping, slot allocation — and that is the deliberate trade: in-order service of a saturated shard was preferred over a second scheduling lane with unreasoned starvation behaviour (`crates/brain-server/src/shard/mod.rs:5014-5020`).
+
+What this means for a burst test: excess load appears as **latency**, never as rejections. There is no knee at which Brain starts refusing data-plane work to protect itself, so a burst that exceeds capacity is absorbed as queue depth for as long as clients keep waiting. Operators must detect saturation from latency and queue-depth signals, not from an error rate.
+
+`Overloaded` does exist as a wire code, but it does not mean "the server is shedding your writes". It is raised by the subscription path — a subscriber that falls too far behind the event stream, or a connection that exhausts its stream ids (`crates/brain-ops/src/handlers/subscribe.rs:1009-1073`) — and it carries a 1 s `retry_after_ms` hint (`crates/brain-server/src/network/dispatch.rs:1420`).
+
+Admission control does exist, but one layer out and on connections rather than requests: a listener accepts at most `max_connections` (default **4096**) and `max_connections_per_ip` (default **64**), counting refusals in `brain_connections_rejected_total` (`crates/brain-server/src/network/connection.rs:143-167`).
 
 ## 5. The "max throughput" exploration
 
@@ -493,24 +529,30 @@ For each operation, the limiting factor:
 
 | Operation | Bottleneck |
 |---|---|
-| ENCODE | WAL fsync (NVMe ~50K IOPS) |
-| RECALL | HNSW search + embedder |
+| ENCODE (text) | Embedder forward pass — one per request, on the shard's own core |
+| ENCODE_VECTOR_DIRECT | WAL fsync (NVMe ~50K IOPS), amortised by group commit |
+| RECALL | Embedder (on cache miss) + HNSW search |
 | PLAN | Edge traversal (memory-bound) |
 | REASON | Edge traversal (memory-bound) |
 | FORGET | WAL fsync |
 | LINK | WAL fsync |
 
-WAL fsync is the dominant bottleneck for writes. Reads are CPU-bound.
+For writes that supply their own vector, WAL fsync is the dominant cost, and group commit is what lets throughput exceed the raw fsync rate (§7). For a **text** ENCODE it is not: the request pays a model forward pass before any of that, inline and unbatched, so the ceiling is the per-core embedder rate rather than the device's IOPS. This is why the two paths carry separate targets throughout this section — `ENCODE_VECTOR_DIRECT` is a storage benchmark and text ENCODE is substantially a model-inference benchmark.
+
+Reads are CPU-bound, with the same caveat: a cache-missing cue pays the same forward pass.
 
 ## 7. The "WAL group commit" effect
 
-Group commit batches multiple ENCODEs into a single fsync:
+Group commit batches concurrent WAL appends into a single `fdatasync`. The committer waits up to **100 µs** after a batch's first record for more records, or flushes early once the buffer reaches **60 KiB** (`crates/brain-storage/src/wal/group_commit.rs:41-59`).
 
-- 1 ENCODE / sec: 1 fsync.
-- 1000 ENCODE / sec: ~50-100 fsyncs (batched into groups of 10-20).
-- 10000 ENCODE / sec: ~500 fsyncs (at limit of NVMe).
+The window is what bounds the amortisation, and it is deliberately short — tens of microseconds, not tens of milliseconds — because it is added latency on every write that opens a batch. What it buys depends entirely on how many records are genuinely in flight inside that window:
 
-Group commit lets ENCODE throughput exceed the raw fsync rate.
+- A write arriving alone pays one fsync and 100 µs of waiting for company that never comes.
+- Writes arriving concurrently coalesce, up to the point where either the window closes or 60 KiB of records have accumulated.
+
+Concurrency inside the window is therefore the whole mechanism, and the shard's request admission is sized from this configuration so the two cannot drift: the in-flight bound is `max_batch_bytes / 4 KiB` — **15** at shipped defaults, with 4 KiB taken as the dominant `EncodePayload` record size — so the shard admits exactly as many concurrent requests as the fsync-amortisation window can use (`crates/brain-server/src/shard/mod.rs:4637-4650`). Widening the window and the batch budget widens the concurrency with them.
+
+The payoff: a batch of *n* records costs one fsync instead of *n*, so ENCODE throughput can exceed the device's raw fsync rate. The ceiling is not the device, though — see §6: a text ENCODE's dominant cost is upstream of the WAL.
 
 ## 8. The connection-pool effect
 
@@ -525,22 +567,22 @@ Many parallel connections are needed for high throughput. Clients handle this.
 
 ## 9. The "concurrent" target
 
-Brain supports:
+Two different quantities get conflated here, and they differ by four orders of magnitude.
 
-- 10K concurrent connections per node.
-- 100K concurrent in-flight requests.
-- 1M streams per second (open + close).
+**Connections** are cheap and plentiful. The shipped caps are 4096 per node and 64 per source IP (`crates/brain-server/src/network/connection.rs:143-167`); a connection beyond them is refused at accept time and counted.
 
-These are MUST. Beyond these, behavior is "best effort".
+**In-flight requests** are deliberately scarce. A shard holds at most `max_batch_bytes / 4 KiB` = **15** concurrent dispatches, derived from the WAL group-commit batch (§7), so a node's in-flight ceiling is 15 × shard count — tens, not hundreds of thousands. This is not an oversight to be raised: in-flight concurrency beyond what the fsync window can coalesce adds queueing without adding throughput, and the bound is what keeps the two in step.
+
+So thousands of connections may be open while only tens of requests are executing, and the rest are parked (§4). Capacity planning should size connections and in-flight work separately; a client that needs more throughput per connection pipelines (§10) rather than expecting more concurrency per shard.
 
 ## 10. The pipelining throughput
 
 With pipelining (multiple requests in flight per connection):
 
 - Per-connection: ~10K ops/sec (vs ~1K without).
-- Aggregate: scales with the number of active connections.
+- Aggregate: scales with the number of active connections, up to the per-shard in-flight bound (§9).
 
-Brain's protocol supports pipelining; clients use it.
+Pipelining works because the shard imposes **no ordering** on replies: each dispatch is detached onto the shard's executor and the protocol correlates responses by `stream_id`, so a client may have several requests outstanding and receive them out of order (`crates/brain-server/src/shard/mod.rs:4980-4993`). A client that serialises request-response round trips is paying its full network latency per operation for no reason.
 
 ## 11. The "load step" test
 
@@ -575,22 +617,22 @@ Acceptance tests don't run this scenario (it's a special case). Operators unders
 
 When throughput approaches max:
 
-- p99 latency rises (request queue grows).
+- p99 latency rises (the request queue grows).
 - CPU utilization climbs.
-- Occasional Overloaded errors.
+- Shards begin parking on their request channels (§4).
 
-Monitor and back off before saturation. Operators scale before this point.
+Saturation is visible as **latency and queue depth only**. Because there is no request-level shedding, the error rate stays flat right through the knee — so an alert built on errors will not fire, and an operator watching one will see a healthy service while every caller waits. Monitor latency percentiles and the derivation/extraction queue-depth gauges, and scale before the queue becomes the service.
 
 ## 15. The "single core" reality
 
-Each Glommio shard runs on one core. So:
+Each Glommio shard runs on one core, and the embed offload is confined to that same core by CPU affinity (§12). So:
 
-- One shard's max throughput is bounded by what one core can do.
-- More shards = more throughput, but each shard is limited.
+- One shard's max throughput is bounded by what one core can do, for *every* part of a request including model inference.
+- More shards = more throughput; each shard stays limited.
 
-Reasonable per-core throughput: ~10-50K ops/sec depending on operation.
+Reasonable per-core throughput: ~10-50K ops/sec for storage- and index-bound operations. A **text** ENCODE or a cache-missing RECALL is orders of magnitude below that, because it includes a forward pass that no amount of cores on the box makes faster (§3, §6).
 
-For very high throughput, scale shards (more cores).
+For very high throughput, scale shards (more cores). This is the one scaling axis that works for the embedding path: shards are the parallelism.
 
 ## 16. The cross-shard hit
 
@@ -612,11 +654,9 @@ Higher throughput typically means higher latency:
 - More queueing.
 - Larger group-commit batches.
 
-Brain's design balances:
-- Group commits batch up to 20 ms.
-- Latency p99 stays within targets.
+Brain's design balances these by keeping the batching window very short relative to the latency targets: 100 µs, against ENCODE p99 budgets measured in tens of milliseconds, so the amortisation costs at most a fraction of a percent of the budget it protects (§7). The alternative — a tens-of-milliseconds window, which would coalesce far more aggressively — would consume the entire p99 target to save fsyncs.
 
-For deployments wanting lower latency at lower throughput: configurable batch sizes.
+Operators who want a different balance tune `commit_window` and `max_batch_bytes` together, and should expect the shard's in-flight bound to move with them (§9): the two are derived from one another by design.
 
 ## 18. The reporting
 
@@ -681,12 +721,14 @@ For 1M memories per shard:
 | Component | RAM |
 |---|---|
 | HNSW index | ~150-200 MB |
-| Embedder model (loaded once per node) | ~150 MB |
+| Embedder model (BGE-small weights, loaded once and shared by every shard) | ~130 MiB |
 | Caches (file system, embedder) | 200-500 MB |
 | Connections, tasks | 50-200 MB |
 | Total per-shard | ~500-1000 MB |
 
 For a 16-shard node: ~8-16 GB. Comfortable on 32 GB+ machines.
+
+The embedder row is once per node, not per shard: the model handle is `Arc`-shared, so clones are cheap and every shard searches the same loaded weights (`crates/brain-embed/src/dispatcher/cpu.rs:15-19`). Sharding multiplies the *inference lanes*, not the resident weights.
 
 ## 4. Memory growth
 
@@ -704,13 +746,15 @@ For 1M memories:
 
 | Component | Disk |
 |---|---|
-| Arena | ~6 GB (1.6 KB per slot × 1M) |
+| Arena | ~1.6 GB (1600 B per slot × 1M, plus a 4 KiB header) |
 | Metadata | ~1 GB |
 | WAL (active + retained) | ~500 MB - 1 GB |
 | HNSW snapshot (if kept) | ~200 MB |
-| Total per shard | ~8-10 GB |
+| Total per shard | ~3.5-4 GB |
 
-For 16 shards: ~150 GB. Manageable on 1 TB+ NVMe.
+The arena figure is exact rather than estimated: the file is `4096 + capacity_slots × 1600` bytes, with `SLOT_SIZE_V1 = 1600` (`crates/brain-storage/src/arena/file.rs:54,159`). Of those 1600 bytes the 384-float vector is 1536, so the arena's size is set by vector width and is independent of how long the memory text is.
+
+For 16 shards: ~55-65 GB. Comfortable on 1 TB NVMe, and the storage-acceptance budget of ~10 GB per shard in [`06_complete_acceptance.md`](06_complete_acceptance.md) therefore has substantial headroom rather than being a tight fit.
 
 ## 6. Disk I/O bandwidth
 
@@ -778,20 +822,22 @@ Set ulimit accordingly: 65536 fd is comfortable.
 
 Brain uses minimal threads:
 
-- One Glommio thread per shard (executor).
-- A few helper threads (embedder, syscall offload).
-- Tokio runtime for connection layer (handful of threads).
+- One Glommio thread per shard (executor), pinned to a fixed CPU when `pin_cpu` is configured and unbound otherwise (`crates/brain-server/src/shard/mod.rs:2916-2918`).
+- Per shard, a blocking-pool thread for embedding, plus that thread's own intra-op pool for the model's matmul fan-out. The intra-op pool is built lazily, one per blocking thread, and its workers inherit the blocking thread's CPU affinity — so it confines the fan-out to the shard's own core rather than providing parallelism (`crates/brain-ops/src/embedding.rs:16-38`). A process-global pool was rejected precisely because it would funnel every shard's embeds through one worker and serialise embedding across the node.
+- Tokio runtime for the connection layer (handful of threads).
 
-Total: ~20-30 threads for a 16-shard node. Light.
+Total: ~20-30 threads for a 16-shard node, light in the sense that matters — the resident thread count is modest and, more importantly, no thread competes with a shard's reactor for its own core.
 
-## 13. The "session switch" rate
+## 13. The context-switch rate
 
 With Glommio:
 
-- No thread session switches under normal operation (each shard is one thread).
-- Async task switches are user-space (no kernel involvement).
+- No kernel context switches between requests under normal operation — each shard is one thread, and concurrent requests are detached tasks on that thread's executor rather than threads of their own.
+- Task switches are user-space scheduling, with no kernel involvement.
 
-Session switch rate stays low: ~1000-10000/sec total. Vs traditional thread-per-request: ~100K-1M/sec.
+Context-switch rate stays low: ~1000-10000/sec total, against ~100K-1M/sec for a thread-per-request design.
+
+The one place a shard does cross a thread boundary on the hot path is the embed offload (§12), which is deliberate: a forward pass held on the reactor would block every other in-flight request on that shard for its full duration, which is a far larger latency cost than the switch.
 
 This contributes to predictable latency.
 
@@ -822,12 +868,14 @@ If a worker exceeds: tune interval or batch size.
 
 ## 17. The OOM-protection budget
 
-Brain should:
-- Not exceed configured memory limit.
-- Shed load before approaching the limit.
-- Refuse new operations rather than OOM.
+Brain bounds its own memory through fixed admission budgets rather than through reactive shedding:
 
-Tested via cgroup memory limits + load testing.
+- The per-shard in-flight request bound (§9) caps how many requests can hold working memory at once.
+- The derivation and LLM stages carry explicit byte budgets, surfaced as the `brain_derivation_admission_budget_bytes` / `_available_bytes`, `brain_derivation_bytes_in_flight` and `brain_llm_bytes_in_flight` gauges.
+
+There is **no** mechanism that watches total memory and sheds data-plane load as a limit approaches, and no data-plane operation is refused on memory pressure (§4). Under a cgroup limit, the outcome of exceeding it is the OOM killer, not graceful refusal — so operators must size the limit above the sum of the budgets above rather than relying on Brain to back off inside it.
+
+Tested via cgroup memory limits + load testing, where the property under test is that the budgets hold steady-state usage below the limit, not that Brain degrades gracefully at it.
 
 ## 18. The "fairness" across shards
 

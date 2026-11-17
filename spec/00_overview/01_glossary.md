@@ -12,7 +12,9 @@ The same glossary is also hosted in [`../01_architecture/08_glossary.md`](../01_
 
 **Agent.** An LLM-driven application that connects to Brain. "Agent" is the client role, not a storage scope — what Brain stores data under is a **space**.
 
-**Arena.** The memory-mapped flat file holding the vectors for a shard. One slot per memory; fixed-size slots; mmap'd with `MAP_SHARED`. See [08. Storage: Arena & WAL](../08_storage/00_purpose.md).
+**ArcSwap.** The atomic pointer swap Brain publishes new state through — the vector index's generations and hot-reloadable configuration. A load is a cheap read with no lock, and the displaced value's lifetime is its own `Arc` refcount. See [arc-swap](https://github.com/vorner/arc-swap).
+
+**Arena.** The memory-mapped flat file holding the at-rest vector image for a shard. One slot per memory; fixed-size slots; mmap'd with `MAP_SHARED`. Written by log replay at startup, not by the live write path — a memory's write-time vector lives in the metadata store. See [08. Storage: Arena & WAL](../08_storage/00_purpose.md).
 
 **Background worker.** A process running on dedicated cores (not the request-serving cores) that performs maintenance work: decay, consolidation, index maintenance, snapshots. See [15. Background Workers](../15_background_workers/00_purpose.md).
 
@@ -42,8 +44,6 @@ The same glossary is also hosted in [`../01_architecture/08_glossary.md`](../01_
 
 **Consolidation.** The background process that compresses similar episodic memories into semantic summaries. The "sleep" analogue from cognitive science. Detailed in [15. Background Workers](../15_background_workers/00_purpose.md).
 
-**crossbeam-epoch.** A Rust crate providing epoch-based memory reclamation for lock-free data structures. Brain uses crossbeam-epoch on the read path of the HNSW index and other shared structures. See [crossbeam-epoch](https://github.com/crossbeam-rs/crossbeam/tree/master/crossbeam-epoch).
-
 **Cue.** The input to `RECALL`, `PLAN`, or `REASON`. Typically text that Brain embeds into a query vector.
 
 **Decay.** The background process that exponentially lowers salience over time, modeling the Ebbinghaus forgetting curve. Memories below an eviction threshold become eligible for consolidation or eviction.
@@ -56,7 +56,7 @@ The same glossary is also hosted in [`../01_architecture/08_glossary.md`](../01_
 
 **Episodic memory.** A memory of `kind = Episodic`. A specific event the agent observed, tied to time and place. Default for all `ENCODE` operations.
 
-**Epoch.** A logical unit of time in the lock-free reclamation system. Readers acquire an epoch handle while traversing shared structures; writers wait for old epochs to drain before reclaiming memory. See [14. Concurrency](../14_concurrency/00_purpose.md).
+**Epoch.** A **published generation** of the vector index, not an interval in a reclamation protocol. Each flush builds a whole new index and publishes it atomically behind an `ArcSwap`, carrying an `epoch_id` one greater than the generation it displaced. A reader loads the current generation and holds it for the whole search, so it never observes a half-published index; the displaced generation is freed when the last reader's `Arc` drops. No reader pins, no deferred-destroy queue, no grace period. See [14. Concurrency + Publication Model](../14_concurrency/00_purpose.md).
 
 **Eviction.** The removal of a memory from Brain via background work (not via explicit `FORGET`). Eligibility is determined by salience and capacity pressure.
 
@@ -98,7 +98,7 @@ The same glossary is also hosted in [`../01_architecture/08_glossary.md`](../01_
 
 **Recall (verb / noun).** Verb: the cognitive primitive of retrieving memories similar to a cue. Noun: the result, a list of memories with scores.
 
-**Reclaimed.** A slot's lifecycle state after its memory has been forgotten and the slot has been reused. The `version` field has incremented; old `MemoryId`s that referenced the previous occupant are now stale.
+**Reclaimed.** A memory's terminal lifecycle state: its grace window has passed and the reclamation worker has deleted its row and its content. The slot id is retired rather than recycled, so the handle resolves to nothing rather than to a later occupant.
 
 **redb.** The Rust embedded ACID key-value store Brain uses for metadata. Copy-on-write B-trees; pure Rust. See [redb](https://github.com/cberner/redb).
 
@@ -142,7 +142,7 @@ The same glossary is also hosted in [`../01_architecture/08_glossary.md`](../01_
 
 **Tokenizer.** The component that converts text to a sequence of token IDs for the embedding model. Brain uses HuggingFace [`tokenizers`](https://github.com/huggingface/tokenizers) with the BERT WordPiece vocab.
 
-**Tombstone.** A marker indicating a slot has been forgotten but not yet reclaimed. Hidden from queries; recoverable until reclamation.
+**Tombstone.** A marker indicating a memory has been forgotten but not yet reclaimed. Hidden from queries; a soft forget stays recoverable for the whole grace window.
 
 **Transaction (`txn`).** A grouping of multiple operations that commit atomically. Identified by `txn_id`. Supports rollback before commit. See [05. Operations](../05_operations/00_purpose.md) §Transactions.
 
@@ -150,7 +150,7 @@ The same glossary is also hosted in [`../01_architecture/08_glossary.md`](../01_
 
 **UUID v7.** A time-ordered UUID format from [RFC 9562](https://datatracker.ietf.org/doc/rfc9562/). Brain uses UUIDv7 for `space_id`, `request_id`, and shard storage UUIDs.
 
-**Vector.** A 384-dim array of `f32` produced by the embedding model. L2-normalized. Stored in the arena.
+**Vector.** A 384-dim array of `f32` produced by the embedding model. L2-normalized. Its durable home is the metadata store; the arena holds a parallel at-rest copy.
 
 **Vector arena.** See *Arena*.
 
@@ -164,4 +164,4 @@ The same glossary is also hosted in [`../01_architecture/08_glossary.md`](../01_
 
 ---
 
-*Continue to [`../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md) for unresolved architectural questions.*
+*Continue to [`02_doc_map.md`](02_doc_map.md) for where each topic is documented.*

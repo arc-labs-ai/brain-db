@@ -10,19 +10,20 @@ The procedure for inserting a memory's vector into the HNSW index.
 
 ```rust
 fn insert(
-    index: &mut HnswIndex,
+    writer: &mut Writer,
     memory_id: MemoryId,
     vector: &[f32; 384],
-) -> Result<(), AnnError> {
-    let internal_id = index.next_internal_id.fetch_add(1, Ordering::Relaxed);
-    index.id_map_forward.insert(memory_id, internal_id);
-    index.id_map_reverse.insert(internal_id, memory_id);
-    index.hnsw.insert((vector, internal_id));
-    Ok(())
+) -> Result<(), HnswError> {
+    // Appends to the pending buffer, keeping the full-precision
+    // vector. Re-inserting an id overwrites its buffered vector and
+    // clears any tombstone on it.
+    writer.insert(memory_id, vector)
 }
 ```
 
-The insert is in-memory and doesn't directly touch disk. The associated WAL record (ENCODE) was already fsync'd before this call ([08.03 Write Path](../08_storage/03_write_path.md)).
+The write path's insert is a buffer append, not a graph insert. The vector lands in the pending buffer at full precision and is searchable from that moment; the graph edges for it are built later, when a flush folds pending into a freshly-built main graph (§09.04 §4).
+
+The insert is in-memory and doesn't directly touch disk. The associated WAL record (ENCODE) was already appended before this call ([08.03 Write Path](../08_storage/03_write_path.md)).
 
 ### 2. The internal ID
 
@@ -30,28 +31,30 @@ hnsw_rs uses sequential u32 IDs for nodes internally. These are mapped to the pu
 
 ```rust
 struct HnswIndex {
-    hnsw: hnsw_rs::Hnsw<f32, DistCosine>,
-    id_map_forward: HashMap<MemoryId, u32>,
-    id_map_reverse: HashMap<u32, MemoryId>,
-    next_internal_id: AtomicU32,
+    inner: Hnsw<'static, f32, DistCosine>,
+    params: IndexParams,
+    id_map: IdMap,          // forward + reverse HashMaps, next_id
+    tombstones: TombstoneBitmap,
 }
 ```
 
-The maps are kept in sync. Insert appends to both; remove deletes from both.
+The maps are kept in sync with the graph they belong to: each one is built with its graph and is immutable for that graph's lifetime, so an id resolved against a published graph can never be resolved against a different one.
 
 The maps live in memory only; they're rebuilt from the metadata store on startup (along with the HNSW graph itself).
 
 ### 3. Insertion order
 
-Memories are inserted into HNSW after the WAL fsync and metadata commit. So the order of HNSW inserts within a shard is the order of confirmed encodes.
+The HNSW insert runs inside the write submission, after the WAL append and before the redb write transaction opens — so a graph insert that fails abandons the encode before any metadata commits, and the wtxn's lifetime stays as short as possible. The insert body holds no await, so within a shard the inserts of overlapping requests do not interleave.
 
 Different shards' HNSWs are independent; their insertion orders don't coordinate.
 
 ### 4. Insertion latency
 
-Per-insert latency depends on the index size:
+What the encode pays is the buffer append: a vector copy plus a scan of the pending buffer for a matching id. It does not grow with corpus size — it grows with how many entries are waiting for the next flush.
 
-| N (nodes) | Latency |
+The graph-build cost is paid by the flush, once per vector, off the request path. Per-vector it depends on the size of the graph being built:
+
+| N (nodes) | Per-vector graph build |
 |---|---|
 | 1K | ~50 µs |
 | 10K | ~100 µs |
@@ -61,15 +64,17 @@ Per-insert latency depends on the index size:
 
 The growth is roughly O(M log N) — logarithmic in N.
 
-For sub-25 ms p99 on encode, HNSW insertion at 1M scale (~1 ms) leaves room for embedding (5-10 ms) and other steps. At 10M, the picture is tighter.
+For sub-25 ms p99 on encode, none of that is in the budget: the encode's index cost is the append, and the 5-10 ms embedding dominates. What the table bounds is the flush, which must finish between flushes at the shard's write rate.
 
 ### 5. Concurrent inserts
 
-A **single-writer-per-shard** discipline applies. Within a shard, inserts are serialized through the writer task. There's no concurrent-insert path within a shard.
+A **single-writer-per-shard** discipline applies. A shard holds exactly one HNSW `Writer` — a non-`Clone` handle, so the type system permits no second one — and the insert it performs runs to completion without an await. Requests on a shard overlap, but on the shard's single-threaded executor nothing can interleave with an insert, so there is no concurrent-insert path within a shard.
 
 Across shards, inserts run in parallel (each shard has its own writer).
 
 The hnsw_rs crate itself supports multi-threaded inserts via internal locking, but that mode is not used — the single-writer discipline avoids the lock contention while still giving cross-shard parallelism.
+
+The writer model this rests on is specified in [14. Concurrency](../14_concurrency/02_writer_model.md).
 
 ### 6. Layer assignment
 
@@ -111,15 +116,11 @@ The entry point update is atomic — readers see either the old or the new entry
 
 ### 9. Batched inserts
 
-For high-throughput insert workloads, single-insert calls have overhead (mostly from the entry-point lookup and the per-insert allocations). Batched inserts can amortize.
+Batching is where the graph build already lives. Every write appends to the pending buffer individually; the flush then builds one graph from the whole accumulated set, so the entry-point lookups and allocations that make single-insert calls expensive are amortized across everything buffered since the last flush — without any insert-time batching rule to state.
 
-HNSW inserts are batched when:
-- Multiple WAL records are committed in a single group commit, AND
-- They're all ENCODE records on the same shard.
+The build itself is single-threaded: it runs on the shard's executor, and hnsw_rs's parallel insert mode is not used.
 
-The batch is inserted into HNSW after the metadata commits. Internally, hnsw_rs's parallel insert mode is used for the batch, which can interleave inserts across multiple cores.
-
-For typical agent workloads (low to moderate write rate), batching has minimal effect. For high-throughput (bulk import, migration), it can 2-3× the throughput.
+For typical agent workloads (low to moderate write rate) a flush folds a handful of vectors. For high-throughput runs (bulk import) it folds a large set at once, which is the regime the amortization is worth something in.
 
 ### 10. Insert failures
 
@@ -259,7 +260,7 @@ The implementation enforces `ef >= K`, raising ef to K when needed. For typical 
 
 Multiple searches run concurrently against the same HNSW index. The HNSW data structure is read-only during search — reads don't modify the graph.
 
-Searches are lock-free with respect to inserts, via the epoch-based publication protocol detailed in [`04_concurrency.md`](04_concurrency.md). A search sees the graph as-of the start of the search; concurrent inserts may add nodes that this search doesn't see.
+Searches are lock-free with respect to the published graph, via the atomic publication detailed in [`04_concurrency.md`](04_concurrency.md). A search body is synchronous, so on the shard's executor no insert can land while it runs: it sees the graph it loaded plus the pending buffer as it stood, and every insert is either entirely before it or entirely after.
 
 ### 21. Search and tombstones
 
@@ -443,9 +444,9 @@ Rebuild is described in [`03_hnsw_lifecycle.md`](03_hnsw_lifecycle.md). Briefly:
 
 For N active memories:
 
-- ~1 ms per insert × N memories = N ms.
-- For N=1M: ~17 minutes single-threaded; ~3 minutes with parallel inserts.
-- Memory: 2× HNSW size during rebuild (old + new).
+- An upper bound: the 1M-scale per-insert figure (~1 ms, §4) × N. For N=1M that gives ~17 minutes.
+- It is only an upper bound because it charges every insert the cost of the last one. A build grows the graph from empty, so most inserts happen at a smaller N and a cheaper rate; the measured end-to-end figure for 1M is ~30 seconds ([03_hnsw_lifecycle.md](03_hnsw_lifecycle.md) §17).
+- Memory: 2× HNSW size during rebuild (old + new), with nothing capping it.
 
 Rebuild runs as a background task. Doesn't block reads or writes. The new index is swapped in atomically once complete.
 

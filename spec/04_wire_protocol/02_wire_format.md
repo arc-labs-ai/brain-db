@@ -129,7 +129,7 @@ CRC32C of the payload. Computed over the payload bytes (after the 32-byte header
 
 If `payload_len = 0`, `payload_crc32c` MUST also be zero.
 
-A frame with mismatched `payload_crc32c` is corruption: connection close with `BadPayload` error.
+A frame with mismatched `payload_crc32c` is corruption: connection close with `BadPayloadCrc` error.
 
 #### 3.8 Reserved fields
 

@@ -126,8 +126,9 @@ its per-stage `artifact`: the embedding `vector`, the stored `record` (kind,
 salience, times, dims, text length), the analyzed `keyword_fields` (the exact
 terms the `memory_text` index matches on), the generated `hype_questions`, and
 the typed `graph` (nodes + edges). The bundle is persisted in the
-`memory_artifacts` table (§10.9a) and populated incrementally: the sync fields
-(vector, record, keywords) are present the instant the write acks; the graph and
+`memory_artifacts` table (§10.9a) — except the vector, which is read from
+`memory_vectors`, its one durable home — and populated incrementally: the sync
+fields (record, keywords) are present the instant the write acks; the graph and
 HyPE fields fill in as the async workers settle. A memory whose async stages
 have not yet run therefore returns `found = true` with those fields still empty
 — the same "how far along is this write" signal the ENCODE trace's drain window
@@ -929,17 +930,13 @@ The latency is dominated by:
 
 For deeper PLAN (max_depth=8): can reach 200+ ms. Brain's cost-budget check (in [12.03 Cost Estimation](../12_query_optimizer/03_cost_estimation.md)) may reject overly-expensive plans.
 
-### 13. The "explain" option (superseded)
+### 13. Inspecting a PLAN's internals
 
-This section originally described an `explain=true` option returning the
-intermediate frontier expansions, paths considered but not returned, and a
-per-path scoring breakdown. No such field was ever implemented on
-`PlanRequest`. The real, shipped mechanism for this is the `trace: bool`
-flag — see §19, "The PLAN trace (`trace: true`)" — which returns the full
-BFS-explored node set (both directions) and every meeting point found,
-including ones the `max_paths` cap excluded from the result. Kept here only
-so old references to "the explain option" land somewhere; new integrations
-should read §19 directly.
+`PlanRequest` carries no `explain` field. The mechanism for inspecting a
+PLAN's internals is the `trace: bool` flag — see §19, "The PLAN trace
+(`trace: true`)" — which returns the full BFS-explored node set (both
+directions) and every meeting point found, including ones the `max_paths`
+cap excluded from the result.
 
 ### 14. The "actionable edges" default
 
@@ -972,7 +969,7 @@ Not technically a failure — the response just has empty `paths`. The agent sho
 
 #### QueryTooExpensive
 
-If the planner estimates the PLAN exceeds the cost budget (typically due to high max_depth + dense graph), it returns this error.
+If the planner's latency estimate for the PLAN exceeds its budget (`cost_budget_ms`, default 1000 ms — typically breached by a high max_depth over a dense graph), it returns this error.
 
 The agent should reduce max_depth or narrow the start/goal.
 
@@ -1207,17 +1204,13 @@ Brain does not currently do this. CONTRADICTS edges (explicitly created by the a
 
 A future enhancement: integrate with an LLM-based contradiction detector. Brain would generate candidate pairs (query + memory) and let an external LLM judge contradiction. Out of scope at present.
 
-### 13. The "explain" option (superseded)
+### 13. Inspecting a REASON's internals
 
-This section originally described an `explain=true` option returning why
-each evidence item was selected, which edges were traversed, and per-edge
-confidence. No such field was ever implemented on `ReasonRequest`. The real,
-shipped mechanism for this is the `trace: bool` flag — see §20, "The REASON
-trace (`trace: true`)" — which returns the full considered/dropped edge
-walk, the per-item score breakdown (base similarity, decay, weight product,
+`ReasonRequest` carries no `explain` field. The mechanism for inspecting a
+REASON's internals is the `trace: bool` flag — see §20, "The REASON trace
+(`trace: true`)" — which returns the full considered/dropped edge walk, the
+per-item score breakdown (base similarity, decay, weight product,
 alignment), and whether the topic-alignment centroid was computed at all.
-Kept here only so old references to "the explain option" land somewhere;
-new integrations should read §20 directly.
 
 ### 14. The "different from PLAN" semantic
 

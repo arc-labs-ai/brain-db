@@ -156,7 +156,7 @@ Not currently implemented.
 - Trigger rebalancing if needed.
 - Report cluster-wide stats.
 
-Deployments are single-node today; cluster health is N/A. Tracked for a future major version.
+Deployments are single-node; cluster health is N/A.
 
 ---
 

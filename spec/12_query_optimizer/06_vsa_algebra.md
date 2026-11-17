@@ -89,24 +89,24 @@ This is the structural similarity primitive REASON's analogical-inference
 nudge is built on (§6). The initial release also exposes it directly for
 tools and experimentation.
 
-## 6. Integration status: REASON live, PLAN out of scope
+## 6. Executor consumers: REASON, not PLAN
 
-The algebra module was small and standalone enough to ship early — worth doing because (a) the codebook discipline benefits from baking in before user predicate ids proliferate, and (b) it gives downstream consumers (tools, custom planners) a stable surface to build on.
+The algebra module is standalone: the codebook discipline is fixed before user predicate ids proliferate, and downstream consumers (tools, custom planners) build on a stable surface.
 
-**REASON integration has landed** (`crates/brain-planner/src/executor/analogical.rs`, wired into `execute_reason` in `crates/brain-planner/src/executor/reason.rs`). The two blockers originally named here are resolved, for REASON specifically:
+REASON consumes the algebra through `crates/brain-planner/src/executor/analogical.rs`, wired into `execute_reason` in `crates/brain-planner/src/executor/reason.rs`:
 
-1. **Cost-model integration** — turned out not to be a blocker. REASON's cost estimator (`cost::cost_reason`, `crates/brain-planner/src/cost.rs`) is a standalone heuristic with no RRF dependency; RRF only fuses RECALL's semantic/lexical/graph lanes, and REASON never used RRF, so there was no "where does VSA-similarity sit relative to RRF" question to answer. `cost_reason` simply gained a small additive term for the new bind/unbind + cosine-rank work — `max_inferences * (bind_unbind_ms + cosine_rank_ms)`, using the ~10 µs bind/unbind and ~5 ms cosine-rank figures from §7. No cost-model redesign was needed.
-2. **Wire-level exposure** — resolved as: no new opcode, no new request field. The nudge is an automatic internal scoring signal inside `execute_reason` — REASON re-ranks its already-graph-qualified evidence by structural fit and reports the term in `ReasonTraceScoreBreakdown.analogical_fit` (trace mode only). The `InferenceKind::AnalogicalInference` wire value, defined on the wire since before this integration but never emitted, is now emitted when the nudge materially reshapes a step's result. See [01. Architecture](../01_architecture/03_primitives.md) §4.2 for the primitive-level description.
+1. **Cost model.** REASON's cost estimator (`cost::cost_reason`, `crates/brain-planner/src/cost.rs`) is a standalone heuristic with no RRF dependency; RRF only fuses RECALL's semantic/lexical/graph lanes, and REASON does not use RRF. `cost_reason` carries a small additive term for the bind/unbind + cosine-rank work — `max_inferences * (bind_unbind_ms + cosine_rank_ms)`, using the ~10 µs bind/unbind and ~5 ms cosine-rank figures from §7.
+2. **Wire-level exposure.** There is no new opcode and no new request field. The nudge is an automatic internal scoring signal inside `execute_reason` — REASON re-ranks its already-graph-qualified evidence by structural fit and reports the term in `ReasonTraceScoreBreakdown.analogical_fit` (trace mode only). The `InferenceKind::AnalogicalInference` wire value is emitted when the nudge materially reshapes a step's result. See [01. Architecture](../01_architecture/03_primitives.md) §4.2 for the primitive-level description.
 
-**PLAN integration was never proposed** and remains out of scope — this spec has never documented a VSA tie-in for PLAN's A*/MCTS search, and this integration doesn't add one. If a PLAN integration is pursued in a future version, it needs its own cost-model and wire-exposure analysis; nothing here resolves that for PLAN.
+PLAN has no VSA tie-in: nothing in this spec documents one for PLAN's A*/MCTS search, and it is out of scope. A PLAN integration would need its own cost-model and wire-exposure analysis.
 
-Until a PLAN integration is proposed and lands, the algebra module remains directly callable from in-process consumers and from tests, with REASON as its first and, for now, only executor consumer.
+The algebra module is directly callable from in-process consumers and from tests, with REASON as its only executor consumer.
 
 ## 7. Performance
 
 The FFT-based bind/unbind path runs at D=512 in ~10 µs per op on commodity CPU. A bundle of 100 bound vectors at D=512 sits at ~1 ms total. Cosine-rank against a 10k-entity corpus is ~5 ms.
 
-These targets held up as the executor-consumption baseline: REASON's analogical-inference nudge (§6) uses exactly these two operations — one bind/unbind per evidence item's triple, one cosine-rank against the codebook — and its `cost_reason` term (`crates/brain-planner/src/cost.rs`) was set directly from these figures rather than fresh benchmarking. Tightening the budget further, if REASON's real-world latency profile calls for it, is now a REASON-side tuning question, not a blocked integration question.
+REASON's analogical-inference nudge (§6) uses exactly these two operations — one bind/unbind per evidence item's triple, one cosine-rank against the codebook — and its `cost_reason` term (`crates/brain-planner/src/cost.rs`) is derived from these figures. Tightening the budget further, if REASON's real-world latency profile calls for it, is a REASON-side tuning question.
 
 ## 8. Tests
 

@@ -152,14 +152,13 @@ pub struct SchemaGetRequest {
 pub struct SchemaGetResponse {
     pub namespace: String,
     pub schema_version: u32,
-    pub schema_document: String,       // verbatim DSL text as uploaded; empty for a programmatic upload
-    pub source_blob: Vec<u8>,          // JSON encoding of the parsed Schema AST
+    pub schema_document: String,       // the merged schema for this version, rendered back to DSL
     pub uploaded_at_unix_nanos: u64,
     pub validator_version: u32,
 }
 ```
 
-`schema_document` is the **verbatim** upload text, not a canonicalized re-render. A schema uploaded programmatically (as an AST rather than DSL text) has no source text, and the field is then empty — `source_blob` is the authoritative form in both cases, and is always present.
+`schema_document` is the merged schema for this version, rendered back to DSL from the stored AST — not the single document that produced it. `SCHEMA_UPLOAD` is additive, so any one upload is a fragment of what a version declares; rendering from the AST is what makes the returned document re-uploadable as a whole. If the AST holds something the DSL cannot express, the stored upload text is returned instead, and a version with neither is returned as the empty string.
 
 `validator_version` records which validator admitted the document, so a re-validation under a newer validator can be told apart from the original acceptance.
 
@@ -469,7 +468,13 @@ If a subscriber is slow or backpressured, the event is buffered up to `max_infli
 
 #### Ordering within a shard
 
-Events for entities / statements / relations / extractor outcomes on the **same shard** are emitted in the order of their LSN. Subscribers see a single monotonic LSN stream per shard (substrate + typed-graph interleaved).
+Subscribers see one LSN stream per shard, substrate and typed-graph events interleaved. The stream has two phases and they carry different guarantees.
+
+**Replay** — everything from the requested `from_lsn` up to the WAL tail — is strictly ordered. The segment is walked record by record, so the client sees those events in the order the WAL holds them.
+
+**The live tail is ordered with detection.** The shard WAL stamps an LSN on every record, including row writes that publish no event, so the LSNs a subscriber sees are sparse: on receiving LSN 11, a client cannot tell whether 10 is a notification still in flight or a row write that will never arrive. Nothing on the source side can decide when such a gap closes, so the stream neither buffers nor reorders. An event arriving below the highest LSN already delivered terminates the subscription with `ERROR(Overloaded)` and the client resubscribes from a known LSN — the same contract a subscriber gets when it lags past the broadcast buffer. The client is told, never silently reordered.
+
+**Events carrying `lsn == 0` are bus-only.** They have no WAL record, cannot be replayed, are exempt from the ordering check, and never move the subscription's resume point.
 
 Cross-shard ordering is **not** guaranteed. Subscribers that need a cross-shard total order use the connection layer's fan-in semantics; the per-shard LSN is the local order signal.
 
@@ -513,12 +518,9 @@ When an extractor processes a freshly encoded memory it emits `STAGE_COMPLETED` 
 
 Brain's `lsn` is shared across substrate and typed-graph events on the same shard, so the chain is replayable in causal order.
 
-### SUBSCRIBE open questions
+### Event envelope shape
 
-Notably:
-
-- Whether `SubscriptionEvent` should be a sum type per family (substrate / typed-graph) rather than a struct-with-optional-payload. Currently flat-with-optional to keep one event envelope on the wire.
-- Whether the `min_confidence` filter should apply to entity events too (not just statements). Currently no.
+`SubscriptionEvent` is one flat struct with optional payload fields, not a sum type per family. Both the substrate and typed-graph families ride the same envelope on the wire, so a subscriber decodes one shape regardless of which family an event belongs to.
 
 ## Schema-optional mode
 
@@ -546,9 +548,9 @@ State machine:
 Typed-graph opcodes (`0x01xx` namespace) dispatch in both modes. Their per-opcode validation rules then branch on schema presence for the target namespace:
 
 - **No schema declared**: predicate / relation-type qnames are interned on first use (`SchemaOrigin::ImplicitFromWrite`, `RelationTypeOrigin::ImplicitFromWrite`); no cardinality contract is enforced; `QUERY.predicate_filter` qnames that resolve to no known predicate produce an empty result set rather than an error.
-- **Schema declared for the namespace**: unknown predicate qname → `PredicateNotInSchema` (0x004B). Unknown relation type qname → `RelationTypeNotInSchema` (0x004C). Cardinality violations → `CardinalityViolation` (0x0065). Object-type mismatches → `STATEMENT_OBJECT_TYPE_MISMATCH` (0x41).
+- **Schema declared for the namespace**: unknown predicate qname → `PredicateNotInSchema` (0x004B). Unknown relation type qname → `RelationTypeNotInSchema` (0x004C). Cardinality violations → `CardinalityViolation` (0x0065). An object or subject that violates a predicate's declared variant, domain or range → `InvalidArgument` (0x0040), carrying the violated constraint in the message; the declared `StatementObjectTypeMismatch` (0x0141) is raised by no path.
 
-No opcode is gated out by schema absence. The `SchemaNotDeclared` error is reserved for explicit schema-introspection opcodes (`SCHEMA_GET` on a namespace that never had one) and is documented in [`./07_error_handling.md`](./07_error_handling.md).
+No opcode is gated out by schema absence, and there is no `SchemaNotDeclared` code — see [`./07_error_handling.md`](./07_error_handling.md) §3.10.2. The two codes above are the whole of the schema gate's error surface. Schema introspection has no code of its own either: `SCHEMA_GET` against a namespace with no active schema is a plain not-found, carrying the generic `MemoryNotFound` (0x0050) that every untagged not-found maps to, with the namespace — and, when an explicit version was asked for, that version — in the error message.
 
 ### Substrate opcodes are unaffected
 
@@ -569,10 +571,10 @@ This is Brain's "first-class deployment posture" described in [`../../README.md`
 
 The moment `SCHEMA_UPLOAD` commits, the gate flips. In-flight frames are not retroactively re-evaluated:
 
-- Frames decoded **before** the commit return `SchemaNotDeclared` even if the commit completes mid-processing.
-- Frames decoded **after** the commit dispatch normally.
+- Frames whose handler read the registry **before** the commit run under the no-schema branch above — qnames intern on first use and no cardinality contract applies — even if the commit completes mid-processing. They do not fail.
+- Frames whose handler reads **after** the commit run under the strict branch.
 
-The cutover is the redb commit, not the response emission. The connection layer reads the gate state from a per-shard `ArcSwap<bool>` updated atomically with the commit.
+The cutover is the redb commit, not the response emission. Each handler reads the gate for itself inside its own read transaction, by resolving the active schema version for the scope it is writing into; there is no cached per-connection or per-shard gate flag to go stale.
 
 ### RECALL routing
 
@@ -589,13 +591,18 @@ RECALL is one verb with no client-side strategy switch. A request that carries a
 
 Schema state is **cluster-wide**. Every shard's `schemas` redb table holds an identical copy. `SCHEMA_UPLOAD` on any shard fans out the registry update to all shards before returning success.
 
-Inconsistency window: between the upload's redb commit on shard 0 and the fan-out completing on shard N, typed-graph ops routed to shard N may return `SchemaNotDeclared`. The fan-out target is ≤ 100ms. Brain uses an authoritative-shard-0 strategy: all `SCHEMA_UPLOAD` ops route to shard 0, which commits the registry update, then writes a fan-out marker; other shards pull-replicate the registry row on the next read against any namespace they have not yet observed at that version.
+Inconsistency window: between the upload's redb commit on shard 0 and the fan-out completing on shard N, typed-graph ops routed to shard N still see no active version for the namespace and so run under the no-schema branch — interning qnames on first use rather than rejecting them. They do not fail; they are simply not yet held to the contract. The fan-out target is ≤ 100ms. Brain uses an authoritative-shard-0 strategy: all `SCHEMA_UPLOAD` ops route to shard 0, which commits the registry update, then writes a fan-out marker; other shards pull-replicate the registry row on the next read against any namespace they have not yet observed at that version.
 
 ### Error-code wire shape
 
-`SchemaNotDeclared` enters Brain `ErrorCodeWire` enum (per [`./07_error_handling.md`](./07_error_handling.md) Strategy A). Its `ErrorCategoryWire` is `Conflict` — not `Validation`, because the operation is well-formed but the deployment isn't in the right state.
+The gate adds no code to `ErrorCodeWire` for the *state* of the deployment. `SchemaNotDeclared` is not a member of that enum; schema absence is not an error condition, so nothing needs to name it. What the gate can raise are the per-type codes. `ErrorCodeWire` carries both, and their `ErrorCategoryWire` is `Validation`: the request named a qname the active schema does not declare, which is a property of the request, not of the deployment.
 
-`ErrorResponse.retry_after_ms` is **always** `None` for `SchemaNotDeclared`. The remedy is an admin action (call `SCHEMA_UPLOAD`), not a backoff-and-retry.
+| Code | Category | Raised by |
+|---|---|---|
+| `PredicateNotInSchema` (0x004B) | `Validation` | a statement write or `QUERY` naming an undeclared predicate qname in strict mode |
+| `RelationTypeNotInSchema` (0x004C) | `Validation` | a relation write naming an undeclared relation-type qname in strict mode |
+
+`ErrorResponse.retry_after_ms` is **always** `None` for both. An identical retry cannot succeed: the remedy is to correct the qname, or to declare it with `SCHEMA_UPLOAD`.
 
 ### Capability advertisement
 
@@ -857,7 +864,7 @@ pub struct RetrieverTrace {
 - `QUERY_OVER_BUDGET` (substrate `ResourceExhausted`) — per-shard memory or candidate-pool cap blown. Frame stream ends without an EOS tail; an `ERROR` frame closes the stream.
 - `PredicateNotInSchema` (0x004B) — strict mode only; `filters.predicate_filter` contains a qname not declared in the active schema.
 - `RelationTypeNotInSchema` (0x004C) — strict mode only; the DSL or graph step referenced an unknown relation type.
-- `RetrievalUnavailable` (0x0083) — a required retriever component is not currently servable (e.g. inside a transaction, during index rebuild).
+- `ShardUnavailable` (0x0090) — a required retriever component is not currently servable (e.g. inside a transaction, during index rebuild).
 - `INVALID_ARGUMENT` — DSL parse failure, `top_k > 1000`, all retrievers disabled.
 
 #### Cancellation
@@ -899,12 +906,9 @@ the coordinator buffers within its budget. `QUERY_TRACE`'s
 `RetrieverTrace.debug_notes` may include per-shard breakdown when run on
 multi-shard deployments.
 
-### Query introspection open questions
+### Cross-shard partial results
 
-Notably:
-
-- Cross-shard error aggregation: what if 1 of 8 shards fails? Currently the planner returns a partial result with a warning. Should there be a strict-mode flag for "all-or-nothing"?
-- Planner cost model exposure: should `QueryPlanStep.cost` be `f32` (current) or a richer structured cost?
+When a shard fails during a multi-shard query the planner returns a partial result with a warning rather than failing the whole query; there is no all-or-nothing mode. `QueryPlanStep.cost` is a single `f32` drawn from the §07 cost model, not a structured breakdown.
 
 ## Admin frames
 

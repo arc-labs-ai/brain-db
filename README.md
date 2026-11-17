@@ -29,7 +29,7 @@ $ brain-server --config config/dev.toml
 
 ```text
 # This repo ships the database, not a client. Any language can speak the
-# binary wire protocol (§04) directly — CBOR payloads, 158 opcodes, raw
+# binary wire protocol (§04) directly — CBOR payloads, 168 opcodes, raw
 # little-endian f32 vector trailers. First-party SDKs live in brain-sdk.
 # Conceptually:
 
@@ -162,7 +162,7 @@ just docker-shell         # bash inside the dev container
 Inside the container:
 
 ```bash
-just verify                                            # fmt + build + clippy -D warnings + test
+just verify                                            # fmt + build + clippy -D warnings + test + check-skills
 cargo run --bin brain-server -- --config config/dev.toml  # no provider key needed
 
 curl -s http://127.0.0.1:9091/healthz                  # liveness (public, no auth)
@@ -408,7 +408,8 @@ Consistency model in full: [`spec/05_operations/07_consistency.md`](spec/05_oper
         │  │ tantvy │  │     │  │ tantvy │  │     │  │ tantvy │  │
         │  └────────┘  │     │  └────────┘  │     │  └────────┘  │
         │              │     │              │     │              │
-        │ Single writer per shard. Lock-free reads via ArcSwap + crossbeam.   │
+        │ Requests dispatch concurrently within a shard (15 at defaults).     │
+        │ The redb write txn self-serializes; reads are lock-free via ArcSwap.│
         └──────┬───────┘     └──────┬───────┘     └──────┬───────┘
                │                    │                    │
                └────────────────────┼────────────────────┘
@@ -421,8 +422,16 @@ Consistency model in full: [`spec/05_operations/07_consistency.md`](spec/05_oper
 
 **Two runtimes, one host.** The connection layer runs on Tokio — many tasks,
 accept TCP, decode the 32-byte frame header, dispatch. The shard layer runs on
-Glommio — thread-per-core, `io_uring`, one writer per shard. They communicate
-over channels carrying messages; per-shard data never crosses the boundary.
+Glommio — thread-per-core, `io_uring`, concurrent request dispatch over one
+writer per shard. They communicate over channels carrying messages; per-shard
+data never crosses the boundary.
+
+A shard serves requests concurrently on its one core: each dispatch is detached
+onto the shard's local executor under a permit bound derived from the WAL
+group-commit batch, so reads and the waiting parts of writes overlap. Writes
+still serialize, structurally rather than by a lock — a redb write transaction
+contains no `await`, so it is atomic on a single-threaded executor. The full
+model is normative in [`spec/14_concurrency/`](spec/14_concurrency/00_purpose.md).
 
 **Per-shard data structures:**
 
@@ -485,12 +494,15 @@ Brain optimizes for predictable tails, not minimum averages.
   mode and no config knob to disable it.
 - **Keys are stored as `BLAKE3(secret)`.** The plaintext secret never touches
   disk. Permissions are a bitfield — `ENCODE`, `RECALL`, `FORGET`, `LINK`,
-  `SCHEMA_UPLOAD`, `ADMIN`, `ACT_AS`.
+  `SCHEMA_UPLOAD`, `ADMIN`, `ACT_AS`, `LLM_CREDENTIAL`. The last is separate
+  from `ADMIN` and from the write bundle on purpose: a key that can store a
+  memory must not also be able to replace the provider credential that pays
+  for processing it.
 - **The admin plane needs its own bootstrap secret.** `[admin] token` /
   `BRAIN__ADMIN__TOKEN` gates every `/v1/*` call as `Authorization: Bearer`. If
   it is unset the server refuses to start rather than come up unauthenticated.
 - **No tenant credential ever enters the database.** See [BYOK only](#credentials-byok-only).
-- **Wire TLS is opt-in, and TLS 1.3 only when on.** `[tls] enabled` defaults to
+- **Wire TLS is opt-in, and TLS 1.3 only when on.** `[server.tls] enabled` defaults to
   `false` — fine inside a container or on a trusted LAN, not fine across an
   untrusted network. When enabled it is rustls with `aws-lc-rs`; TLS 1.2 is
   compiled out, so there is no downgrade to negotiate.
@@ -520,7 +532,7 @@ operational and durability, end to end
 Planned work, deferred verification and larger architectural directions are
 tracked in [`ROADMAP.md`](ROADMAP.md). Nothing there is a commitment or a date.
 
-**The spec is the contract.** [`spec/`](spec/) — 149 files across 21 sections —
+**The spec is the contract.** [`spec/`](spec/) — 148 files across 21 sections —
 is normative; where the code and the spec disagree, the code is wrong. Drift
 tests in `crates/brain-protocol/tests/` fail CI if the opcode and error tables
 in the spec stop matching the enums in the code.
@@ -559,12 +571,12 @@ Scope boundaries, listed so they aren't mistaken for bugs.
 | Release history | [`CHANGELOG.md`](CHANGELOG.md) |
 | Planned work and future directions | [`ROADMAP.md`](ROADMAP.md) |
 | How to contribute | [`CONTRIBUTING.md`](CONTRIBUTING.md) · [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) |
-| **Specification** (149 files, 21 sections, normative) | [`spec/`](spec/) |
+| **Specification** (148 files, 21 sections, normative) | [`spec/`](spec/) |
 | Spec entry point + glossary + doc map | [`spec/00_overview/`](spec/00_overview/00_index.md) |
 | System architecture + design wedges | [`spec/01_architecture/`](spec/01_architecture/00_purpose.md) |
 | Data model (Memory / Entity / Statement / Relation) | [`spec/02_data_model/`](spec/02_data_model/00_purpose.md) |
 | Schema DSL grammar | [`spec/03_schema/`](spec/03_schema/00_purpose.md) |
-| Wire protocol (frames, 158 opcodes, handshake) | [`spec/04_wire_protocol/`](spec/04_wire_protocol/00_purpose.md) |
+| Wire protocol (frames, 168 opcodes, handshake) | [`spec/04_wire_protocol/`](spec/04_wire_protocol/00_purpose.md) |
 | Tenancy and isolation | [`spec/20_tenancy/`](spec/20_tenancy/00_purpose.md) |
 | Acceptance gate for v1.0 | [`spec/19_benchmarks/06_complete_acceptance.md`](spec/19_benchmarks/06_complete_acceptance.md) |
 | Client SDKs (Rust / Python / TS) + interactive shell | [`brain-sdk`](https://github.com/arc-labs-ai/brain-sdk), [`brain-shell`](https://github.com/arc-labs-ai/brain-shell) |
@@ -578,7 +590,7 @@ Scope boundaries, listed so they aren't mistaken for bugs.
 brain/
 ├── crates/
 │   ├── brain-core/         Shared types: MemoryId, SpaceId, SessionId, EdgeKind, Error
-│   ├── brain-protocol/     Wire protocol: frames, 158 opcodes, codec, schema DSL parser
+│   ├── brain-protocol/     Wire protocol: frames, 168 opcodes, codec, schema DSL parser
 │   ├── brain-storage/      Arena + WAL + recovery
 │   ├── brain-metadata/     redb wrapper: memory, entity, statement, relation, registry tables
 │   ├── brain-index/        HNSW × 5 + tantivy × 2 + retrievers
@@ -588,10 +600,11 @@ brain/
 │   ├── brain-ops/          One write path + retrievers + extractor writes
 │   ├── brain-workers/      Background workers (auto-edge, decay, consolidation, …)
 │   ├── brain-extractors/   Pattern + GLiNER classifier extractors
-│   ├── brain-llm/          LLM client + credential resolver + cache + budget
+│   ├── brain-llm/          LLM provider clients + credential resolver + model router + pricing
 │   ├── brain-plugins/      Plugin surface (enricher + connector)
 │   ├── brain-http/         HTTP transport for the public and admin listeners
-│   └── brain-server/       Server binary
+│   ├── brain-crypto/       Sealing for tenant secrets (the stored provider keys)
+│   └── brain-server/       Server library + the `brain-server` binary
 ├── config/                 Reference configurations (dev, docker)
 ├── fuzz/                   cargo-fuzz targets
 └── spec/                   The 149-file specification (authoritative)
@@ -619,7 +632,6 @@ commit-message justification.
 | SIMD math | [`matrixmultiply`](https://github.com/bluss/matrixmultiply) + [`wide`](https://github.com/Lokathor/wide) |
 | Hashing (keys, routing) | [`blake3`](https://github.com/BLAKE3-team/BLAKE3) |
 | Lock-free swap | [`arc-swap`](https://github.com/vorner/arc-swap) |
-| Epoch GC | [`crossbeam-epoch`](https://docs.rs/crossbeam-epoch) |
 | CRC | [`crc32c`](https://docs.rs/crc32c) |
 | UUIDs (v5 + v7) | [`uuid`](https://docs.rs/uuid) |
 | Errors | [`thiserror`](https://docs.rs/thiserror) + [`anyhow`](https://docs.rs/anyhow) |
@@ -663,8 +675,12 @@ Brain is pre-release, so a few rules are stricter than usual:
   form — no aliases, no deprecation window.
 - **New dependencies require justification** in the commit message.
 
-`just verify` (fmt + build + clippy `-D warnings` + test) is what CI runs; run it
-before you push. `.github/workflows/ci.yml` is the authoritative gate.
+`just verify` (fmt + build + clippy `-D warnings` + test + check-skills) is the fast
+local gate — run it as you work. `just prod-verify` is the closest match to CI:
+it adds the lockfile check, `--all-features` clippy, a warning-free doc build and a
+release-binary smoke. Run that before you push (Linux or the dev container — the
+release binary can't build natively on macOS); `just miri` and `just audit` cover the
+remaining CI jobs. `.github/workflows/ci.yml` is the authoritative gate.
 
 By submitting a pull request you agree your contribution is licensed under the
 Apache-2.0 terms (per Apache-2.0 §5).

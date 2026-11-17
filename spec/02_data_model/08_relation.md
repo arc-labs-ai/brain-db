@@ -534,7 +534,7 @@ The FORGET cascade worker that calls this path automatically is deferred; Brain 
 
 ### Auto-tombstone discretion
 
-The "no evidence remaining → tombstone" rule is the v1.0 default. Operators wanting a more conservative policy (e.g., preserve the relation as a low-confidence claim) can disable via deployment config — tracked in [`.../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md) Q8.
+The "no evidence remaining → tombstone" rule is the v1.0 default. Operators wanting a more conservative policy — preserving the relation as a low-confidence claim rather than tombstoning it — can disable the rule via deployment config.
 
 ### Relation evidence tests
 

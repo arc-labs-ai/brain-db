@@ -18,40 +18,62 @@ Reasons:
 
 In v1, these are addressed by operator action (manual splitting, manual node migration). In a future major version, Brain may automate.
 
-## 2. Shard split (offline procedure for v1)
+## 2. Shard split
 
-Splitting a shard means dividing its data into two new shards.
+**There is no split, and no procedure to supervise.** `POST /v1/shards` and
+`DELETE /v1/shards/{idx}` both answer `501` with a deferred marker; only
+`GET /v1/shards` is implemented
+(`crates/brain-server/src/admin/handlers/shard/create.rs`,
+`.../shard/delete.rs`). `shard_count` is fixed for the life of a data
+directory, recorded in `layout.json` on first boot and checked on every open.
 
-The procedure:
+That is not a missing tool. Four properties would each have to be given up
+first:
 
-```
-1. Quiesce the shard (no new writes).
-2. Pick a split point (e.g., a `space_id` range).
-3. Create two new shard directories.
-4. For each memory:
-   a. Determine which new shard it belongs to.
-   b. Copy its data (arena entry, metadata row, edges).
-5. Verify counts match.
-6. Update the routing config to point to the new shards.
-7. Resume operations.
-8. Delete the old shard.
-```
+1. **Routing is a hash, not a range.** A space lands on
+   `u64::from_le_bytes(BLAKE3(space_id)[..8]) % shard_count`, so there is no
+   split point to pick: changing `shard_count` re-routes roughly every space,
+   not a contiguous half of one shard.
+2. **A `MemoryId` encodes its shard.** Moving a memory to another shard changes
+   its id, and the id is what clients hold, what edges reference, and what
+   evidence lists cite. A split is therefore an id rewrite across the whole
+   typed graph, not a file copy.
+3. **The arena is a boot-time image, not a live mirror.** Copying "the arena
+   entry" would silently drop every memory written since the process started.
+   The live encode path writes no vector to the arena at all — the arena's only
+   writer is WAL recovery (`crates/brain-storage/src/recovery.rs:509-529`),
+   which is why *runtime* rebuilds read redb instead
+   (`crates/brain-server/src/shard/mod.rs:3870-3883`). redb holds the durable
+   write-time vector for the complete live set; the arena holds the set as of
+   the last recovery.
+4. **Edges would span the split.** Memory A on the old shard with an edge to
+   memory B that lands elsewhere leaves a cross-shard edge, which the
+   single-node architecture does not support.
 
-This is a long offline procedure (minutes to hours depending on data size). v1 only.
+So the capacity answer is a bigger shard, not more of them: raise
+`[shard] arena_capacity_bytes` and give the host the RAM. Growing a deployment
+means a new data directory at the count you want and a re-ingest.
 
-## 3. The split's challenges
+## 3. What a split would require
 
-- Edges may span the split (memory A on shard X has an edge to memory B that ends up on shard Y). After the split, the edge is cross-shard, which Brain doesn't natively support.
-- Need to handle in-flight requests.
-- Keeping the WAL accurate during split.
+Each of the four points above is a work item, and together they are the
+range-based-sharding direction tracked in
+[`ROADMAP.md`](../../ROADMAP.md): ranges in place of the hash so a split moves
+one contiguous piece, an indirection between a memory's identity and its
+location so an id survives a move, and cross-shard edge resolution. That is a
+multi-month design, gated on an operator need the single-node architecture
+cannot meet.
 
-For v1, splits are rare and operator-supervised. A future major version may automate with care.
+Point 3 is the one that bites anything that copies shard files for any reason,
+split or not. **A shard's vectors are not fully readable from `arena.bin` while
+the shard is running.** Anything that needs the live vector set must go through
+redb or through the snapshot routes, which take a consistent bundle; a file
+copy of a running shard's arena is missing this run's writes.
 
 ## 4. Shard merge
 
-The reverse: combining two shards into one. Less common; usually done after split-by-mistake.
-
-The procedure mirrors split.
+Also absent, for the same four reasons in reverse. Nothing combines two shard
+directories.
 
 ## 5. Shard migration (clustered, future)
 

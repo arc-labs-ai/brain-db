@@ -259,11 +259,22 @@ For each ENCODE that succeeds:
 
 ```
 1. Client sends ENCODE.
-2. Brain appends WAL with RWF_DSYNC.
-3. Brain sends success.
-4. (Crash here.)
-5. After restart: the memory is present.
+2. Brain appends the WAL record and makes it durable:
+   write_at + fdatasync, both through io_uring on the shard's executor.
+3. Brain applies the metadata phases in one redb write transaction
+   and commits it.
+4. Brain sends success.
+5. (Crash here.)
+6. After restart: the memory is present.
 ```
+
+Two properties of that ordering are the ones under test
+(`crates/brain-storage/src/wal/segment.rs:8-9`,
+`crates/brain-ops/src/writer/submit.rs:363-446`,
+`crates/brain-ops/src/handlers/encode.rs:313-316,348-351`):
+
+- **Durability is `write_at` + `fdatasync`, not a per-write `O_DSYNC`-style flag.** The distinction is what makes group commit possible at all: the flush is a separate, batchable operation rather than a property of each append (§3).
+- **The ack lands after the redb commit, not after the WAL fsync.** So a success response is a stronger promise than "the log has it": the memory row, the arena slot and the HNSW point are all live by the time the caller hears back, and a reader cannot observe an acked write that a subsequent read misses. The idempotency stamp is written inside that same transaction, so "phases applied but not stamped" is not a reachable state — either both commit or neither.
 
 Tested: kill Brain immediately after success. Verify on restart, the memory exists.
 
@@ -275,11 +286,27 @@ When ENCODE responses are batched:
 
 ```
 1. Multiple clients send ENCODEs concurrently.
-2. Brain batches them; performs one fsync.
-3. All clients get success.
+2. The committer waits up to 100 µs after the batch's first record for
+   more records, or until the buffer reaches 60 KiB, then performs one
+   fdatasync for the whole batch.
+3. Every appender's ack fires with its LSN.
 4. (Crash here.)
 5. After restart: all memories are present.
 ```
+
+The window and the budget are the shipped defaults
+(`crates/brain-storage/src/wal/group_commit.rs:41-59`). They are also what
+makes this test non-vacuous: batching can only occur while several records
+are genuinely in flight at once, and that is true here because a shard
+dispatches requests concurrently rather than serially. The per-shard
+in-flight bound is derived from this very configuration —
+`max_batch_bytes / 4 KiB`, i.e. **15** at shipped defaults — so the
+concurrency admitted is exactly the concurrency the fsync-amortisation
+window can use (`crates/brain-server/src/shard/mod.rs:4637-4650`).
+
+Errors are sticky by design: after a failed flush the WAL is broken, and
+every in-flight handle and every subsequent append receives `WalBroken`
+rather than a success that was never made durable.
 
 Tested: 100 concurrent ENCODEs; kill mid-batch. All that received success are durable.
 

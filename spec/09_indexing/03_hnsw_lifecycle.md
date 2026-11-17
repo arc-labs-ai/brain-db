@@ -4,20 +4,24 @@ Persistence and maintenance. The HNSW index is derived state; this file specifie
 
 ## Persistence
 
-The HNSW index is **not persisted** as a primary on-disk structure. It's rebuilt at startup from the arena and metadata. This section specifies the rebuild path and an optional persistence mechanism for fast restart.
+The HNSW index is never a primary on-disk structure. A graph dump is written on every snapshot cycle and loaded at startup when it verifies, and the rebuild from durable state is always there underneath it. This section specifies both paths and how a restart chooses between them.
 
 ### 1. Why no primary persistence
 
 The HNSW graph is derived state — given the vectors (in the arena) and which memories are active (in the metadata), the graph can be rebuilt deterministically.
 
-The index could be persisted for fast startup. It is not, by default, because:
+The graph is never the primary copy of anything, and the rebuild path is always
+available:
 
 - **The graph is large** — ~150 MB per million memories.
 - **The graph is fragile** — a partial write or corruption corrupts the entire structure; partial recovery is hard.
-- **The rebuild is fast enough** — 5–30 seconds for 1M memories with parallel insertion.
-- **The arena and metadata are the source of truth** — persisting derived state risks divergence.
+- **The rebuild is affordable** — ~30 seconds for 1M memories.
+- **redb and the arena are the source of truth** — the graph is derived state, so a dump is an optimisation and never an authority.
 
-Restart cost is the main downside. For deployments where minute-scale restart is acceptable, no-persistence is simpler. For deployments where every second matters, the optional persistence (§ 5) helps.
+That is why a dump is refused rather than trusted whenever anything about it
+fails to verify (§5.2), and why a restored backup rebuilds instead of loading
+one (§9). What the dump buys is restart time, which is the whole reason the
+snapshot worker writes one on every cycle (§5).
 
 ### 2. The rebuild procedure
 
@@ -25,25 +29,27 @@ At startup, after WAL replay completes ([08.04 Recovery](../08_storage/04_recove
 
 ```
 1. Initialize an empty HNSW with configured parameters.
-2. Iterate over all active memories in the metadata store.
-3. For each memory:
-   a. Read the vector from the arena.
-   b. Insert into HNSW.
-   c. Update id maps.
-4. The HNSW is now consistent with the arena and metadata.
+2. Snapshot every occupied, non-tombstoned arena slot as (MemoryId, vector).
+   At this point the arena is the freshly-replayed image of every durable
+   memory, which is what makes it authoritative here — and only here
+   ([06_persistence.md](06_persistence.md) §2a).
+3. For each pair, in order:
+   a. Insert into HNSW.
+   b. Update the id map.
+4. Publish the result, folding in the pending buffer so a boot-time
+   insert cannot be lost.
 5. The shard is marked ready.
 ```
 
-The iteration is parallelized:
-- The metadata store is read sequentially (it's a B-tree; sequential read is fast).
-- Vectors are batched and inserted in parallel batches.
+Step 3 is **sequential**. The insert loop runs on the shard's own executor, one
+vector at a time, which keeps the build deterministic and keeps the ordering
+that graph quality depends on (§4).
 
-For 1M memories on commodity hardware:
-- Single-threaded: ~30 seconds.
-- 4-thread: ~10 seconds.
-- 16-thread: ~5 seconds.
-
-Up to `nproc` parallelism is used by default.
+For 1M memories on commodity hardware the sequential build is ~30 seconds. The
+`hnsw_rs` parallel insert path would bring that to ~5 seconds on 16 threads;
+Brain does not use it, so that figure is headroom rather than a measurement of
+this path. The snapshot path (§5) is what makes the 30 seconds rare, not
+parallelism.
 
 ### 3. Active memories only
 
@@ -55,43 +61,57 @@ The order of insertion during rebuild affects HNSW quality slightly. Metadata-st
 
 For pathological inputs (e.g., memories that lie exactly on a 1D manifold), insertion order matters more. For typical workloads, the order is effectively random.
 
-### 5. Optional fast-restart persistence
+### 5. Fast-restart persistence
 
 For deployments wanting faster restart, a serialized HNSW can be written to disk during checkpointing. This is the **HNSW snapshot**.
 
 #### 5.1 Procedure
 
-During checkpointing ([08.05 Checkpointing](../08_storage/05_checkpointing.md)):
+Taking a snapshot brackets a checkpoint and then lays out a bundle. The graph dump belongs to the **bundle**, not to the checkpoint sequence: CHECKPOINT_BEGIN → msync the arena → CHECKPOINT_END carries no index step at all. After CHECKPOINT_END, alongside the reflinked arena, metadata and WAL segments:
 
-1. Pause writes briefly (the checkpoint drain).
-2. Serialize the HNSW state to a file: `data/<shard>/hnsw_snapshot.bin`.
-3. Include the durable LSN at which the snapshot was taken.
-4. Resume writes.
+1. Write the published graph as three files under the bundle directory, at the basename `hnsw`.
+2. Stamp the checkpoint's durable LSN into the wrapper as `taken_at_lsn`.
 
-The HNSW snapshot file format:
+Writes are never paused — not for the checkpoint and not for the dump. There is no drain anywhere in the path, and no stall to budget for. The whole sequence runs as a task on the shard's own executor, so a write that interleaves with it simply lands above `taken_at_lsn`, which is exactly what the restore's tail-replay is for. See [08.05 Checkpointing](../08_storage/05_checkpointing.md) §3a for why the durable watermark makes a drain unnecessary.
+
+A snapshot is a **triple**, because hnsw_rs's own dump is two files and Brain's wrapper is the third:
+
+```
+<dir>/hnsw.hnsw.graph     hnsw_rs graph dump
+<dir>/hnsw.hnsw.data      hnsw_rs data dump
+<dir>/hnsw.brain          Brain's wrapper, written LAST
+```
+
+The wrapper is written last, so its presence is the marker for "snapshot complete", and it carries the BLAKE3 of each sibling so cross-file integrity is verifiable from the wrapper alone:
 
 ```
 [header: 64 bytes]
-  magic: "BHN0"  (Brain HNSW v0)
-  format_version: u32
+  magic: "BHN0"
+  format_version: u32            (= 3)
   shard_uuid: [u8; 16]
   taken_at_lsn: u64
-  graph_size: u64
-  parameters: { M, ef_construction }
-  header_crc32c: u32
-[graph data: serialized via hnsw_rs's built-in serialization]
-[id_map data: serialized HashMaps]
-[footer: 8 bytes — full-file BLAKE3 hash truncated to u64]
+  graph_node_count: u64
+  parameters: { m, ef_construction, ef_search, ef_search_max }
+  vector_dim: u32
+  header_crc32c: u32             (CRC32C over bytes [0..60])
+[id_map: count, then (memory_id, internal_id) pairs, then next_internal_id]
+[tombstones: bitmap words + set count]
+[graph_hash: BLAKE3 of hnsw.hnsw.graph]
+[data_hash:  BLAKE3 of hnsw.hnsw.data]
+[footer: 8 bytes — BLAKE3 of everything before it, truncated to u64]
 ```
 
 #### 5.2 Restore
 
-At startup, if a snapshot exists and is valid:
+At startup, the shard takes the most recent snapshot directory and, if its triple loads and verifies:
 
-1. Read the header; verify magic, version, shard_uuid, CRC.
-2. Deserialize the graph and id maps.
-3. Replay WAL records since `taken_at_lsn` (these add memories that came after the snapshot).
-4. The HNSW is now current.
+1. Read the wrapper header; verify magic, format version, shard_uuid, header CRC, and both sibling hashes.
+2. Deserialize the graph, the id map and the tombstone bitmap, and publish it as the main graph.
+3. Tail-replay: scan the arena and push every memory the loaded graph doesn't hold into the pending buffer. Those are the writes that landed after `taken_at_lsn`.
+4. Reconcile deletes: for every id the snapshot holds, re-tombstone the ones redb now marks inactive. The arena tail carries only active memories, so a FORGET that landed after `taken_at_lsn` is invisible to step 3 and would otherwise leave a ghost node — a live top-k slot diverging from redb indefinitely.
+5. The HNSW active set now matches redb's.
+
+Any failure along the way — no snapshot, wrong magic, wrong format version, wrong shard_uuid, failed CRC or hash, hnsw_rs deserialization error — logs and falls through to the full rebuild. The rebuild is correct on its own; the snapshot only makes it faster.
 
 For a snapshot covering 1M memories plus 1000 post-snapshot WAL records:
 - Snapshot deserialize: ~1-2 seconds.
@@ -106,22 +126,23 @@ If the snapshot is corrupted (CRC fails, deserialize errors), the system falls b
 
 If the snapshot is older than the metadata (some checkpointing failure), the LSN comparison detects this and the system rebuilds rather than using a stale snapshot.
 
-### 6. The choice between persistence options
+### 6. What a restart actually costs
 
-| Option | Restart time | Disk overhead | Complexity |
-|---|---|---|---|
-| No persistence (default) | 5-30 s for 1M | 0 | Lowest |
-| Periodic snapshot | 3-5 s for 1M | ~150 MB per snapshot | Medium |
+These are not two modes to choose between. The dump is always written; which path a restart takes depends only on whether a dump verifies.
 
-For most deployments, no persistence is fine. For large shards or restart-sensitive deployments, snapshots help.
+| Path | Restart time (1M) | Disk overhead |
+|---|---|---|
+| Dump loads | 3-5 s | ~150 MB per snapshot |
+| Dump missing or refused | ~30 s | — |
 
-The configuration knob:
+The only knob is how often the snapshot worker runs:
 
 ```
-[ann.persistence]
-mode = "rebuild"     # or "snapshot"
-snapshot_interval = "10m"
+[workers]
+snapshot_interval_sec = 3600   # code default; the shipped configs set 21600
 ```
+
+Lengthening it widens the WAL tail a restart must replay past `taken_at_lsn`; it does not turn persistence off.
 
 ### 7. The metadata-only rebuild
 
@@ -152,15 +173,15 @@ Steps 1-5 are sequential within a shard. Across shards, they happen in parallel.
 
 ### 9. Snapshot vs full backup
 
-The HNSW snapshot is a fast-restart artifact, not a backup. A backup of the shard ([08.06 Snapshots](../08_storage/06_snapshots.md)) doesn't need to include the HNSW snapshot; the arena and metadata are sufficient to reconstruct everything.
+The HNSW snapshot is a fast-restart artifact, not a backup. The arena and metadata are sufficient to reconstruct everything, so the snapshot bundle's manifest ([08.06 Snapshots](../08_storage/06_snapshots.md)) deliberately leaves the HNSW triple out of the files it hashes: a restored bundle rebuilds the index rather than trusting a graph from it.
 
-If a backup includes the HNSW snapshot, restore can use it for faster shard ready time. If not, rebuild from arena + metadata.
+What the triple does serve is this shard's own restart, where the directory it was written into is still the one the shard reads.
 
 ### 10. Cross-version persistence
 
-The HNSW snapshot's format version protects against incompatible loads. If the binary is upgraded and the snapshot's format is older, the system falls back to rebuild.
+The wrapper's `format_version` protects against incompatible loads: a version this binary doesn't write is refused and the shard rebuilds instead.
 
-This means a Brain upgrade can mean a slower first restart (for the rebuild) but no data loss.
+So a restart on a binary whose snapshot format moved is a slower first start, never a wrong index and never data loss — the graph is derived state, and the arena and metadata it derives from are untouched.
 
 ### 11. The "warm" rebuild
 
@@ -168,7 +189,7 @@ For large shards where rebuild takes a meaningful fraction of a minute, a "warm"
 
 This is not currently implemented. The shard isn't marked ready until rebuild completes; queries return `ShardNotReady` until then.
 
-A future enhancement (open question, [`../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md)): partial-readiness, where the shard accepts queries during rebuild with a "best effort" recall caveat.
+A future enhancement: partial-readiness, where the shard accepts queries during rebuild with a "best effort" recall caveat.
 
 ## Maintenance
 
@@ -245,19 +266,24 @@ This is an approximation — not exact ground-truth — but adequate for detecti
 
 Procedure:
 
-1. **Build new index in the background.** Allocate a new HNSW; iterate over active memories; insert each in parallel.
-2. **Wait for catch-up.** Once the new index is built, apply any inserts that happened during the build (via WAL replay from the build-start LSN).
-3. **Atomic swap.** Replace the active HNSW with the new one. Old HNSW is freed after no readers reference it (via Arc/epoch).
-4. **Cleanup.** Free the old graph's memory.
+1. **Read the live set.** Ask redb for every active memory's write-time vector. Not the arena — at runtime the arena is stale by this run's writes ([06_persistence.md](06_persistence.md) §2a).
+2. **Build.** Allocate a new HNSW and insert each vector sequentially, with no lock held.
+3. **Fold and publish, as one step.** `flush_with_rebuild` takes the pending buffer's entries, lets them shadow the redb snapshot for any id in both (the buffered vector is the later write), builds the graph from the union, then stores the new epoch and drains the folded entries under the same guard.
+
+Step 3 is the catch-up, and it is why no WAL replay is needed between
+build-start and swap: anything written while the build ran is in the pending
+buffer, and the buffer is read inside the publishing call rather than before
+it. The old graph is freed once the last reader holding its `Arc` drops the
+reference — there is no separate cleanup step.
 
 The rebuild is non-blocking — reads and writes continue against the old index during the build. The atomic swap is a brief moment (microseconds).
 
 ### 17. Rebuild duration
 
-For 1M active memories with parallel insertion:
+For 1M active memories:
 
-- Build phase: 5-30 seconds.
-- Catch-up phase: typically < 1 second (only inserts during build need re-application).
+- Build phase: ~30 seconds sequential (5 seconds is what the unused parallel insert path would give).
+- Fold: proportional to the pending buffer, which is bounded by the writes taken since the last publish — typically well under a second.
 - Swap: microseconds.
 
 For larger shards (10M), build phase scales linearly. Very large rebuilds may be spread across multiple cycles to avoid using too much memory at once.
@@ -266,7 +292,7 @@ For larger shards (10M), build phase scales linearly. Very large rebuilds may be
 
 During rebuild, both the old and new HNSW are in memory: ~300 MB for 1M memories. For larger shards, rebuild memory peaks proportionally.
 
-A configuration knob `ann.rebuild_max_memory_gb` bounds this. If a rebuild would exceed the limit, it's split into multiple phases (each phase rebuilds a subset of nodes; not currently implemented, tracked as future work).
+Nothing bounds this today: there is no memory cap on a rebuild and no phase-splitting, so a shard sized such that two copies of its graph do not fit is a shard whose rebuild cannot run. Sizing is the operator's lever — the 0.30 tombstone threshold is what decides when the second copy appears.
 
 ### 19. Partial rebuild
 
@@ -341,7 +367,7 @@ The dip is typically 10-20% during the build phase, recovering after. For most w
 
 A more sophisticated maintenance approach: as inserts happen, periodically clean up nearby tombstoned nodes. This avoids the "stop the world" feel of full rebuilds.
 
-The technique is well-documented but implementation-heavy. Brain sticks with the simpler full-rebuild approach. Continuous cleanup is tracked in [`../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md).
+The technique is well-documented but implementation-heavy. Brain sticks with the simpler full-rebuild approach.
 
 ---
 

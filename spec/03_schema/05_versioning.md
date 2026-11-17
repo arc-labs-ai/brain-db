@@ -5,7 +5,7 @@ state, increments the namespace's version when something changes,
 persists the parsed document, and exposes the active version for
 downstream validation. Also covers the destructive `SCHEMA_REPLACE`
 opcode (§9 below). **Migration plan computation is explicitly out of
-scope for v1** — see [§07](../00_overview/04_open_questions_archive.md) Q3.
+scope for v1.**
 
 Cross-references:
 - [`./04_namespaces.md`](./04_namespaces.md) §4 — per-namespace
@@ -132,13 +132,10 @@ registry index `entity_types_by_scope` is keyed
   **in this scope**?". The built-ins (`Person`, `Organization`, …)
   live under the system namespace at the base, so every scope still
   resolves them.
-- `SCHEMA_REPLACE` (§9) and `SCHEMA_DROP` (§9a) still do **not**
-  remove entity types. The reason is no longer sharing: entity types
-  have no tombstone path, and their interned ids are referenced by
-  live entity rows, so dropping one would orphan them.
-
-Removing entity types is tracked in
-[`./04_namespaces.md`](./04_namespaces.md) §8.
+- `SCHEMA_REPLACE` (§9) and `SCHEMA_DROP` (§9a) do **not** remove
+  entity types: entity types have no tombstone path, and their
+  interned ids are referenced by live entity rows, so dropping one
+  would orphan them.
 
 ## 2. The redb rows
 
@@ -475,11 +472,3 @@ SchemaDropResponse {
 the document invalid — and empty on every other outcome. Each error carries a
 stable `code` alongside its human `message`, so a client branches on the code
 rather than on prose.
-
-## 10. Open questions
-
-See [`.../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md). Notably:
-
-- Q3 — Migration plan computation (deferred).
-- Q9 — Schema deletion / rollback.
-- Q10 — Validator-version evolution.

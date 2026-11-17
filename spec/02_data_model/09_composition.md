@@ -90,7 +90,7 @@ When a user changes the schema (adds a new entity type, adds a new predicate, mo
 
 - Existing Entities and Statements are not invalidated.
 - A `schema_version` field tracks which version of the schema each Statement was extracted under.
-- When schemas change, a migration worker can re-run extractors over the relevant Memories. The new Statements get the new `schema_version`. Old Statements remain queryable but flagged as stale.
+- A backfill re-runs the extractors over existing Memories; it is operator-triggered on the admin plane, not automatic on schema change. The new Statements carry the new `schema_version`. Statements extracted under a version whose predicate or relation type is not in the new active schema stay queryable and are flagged as outside it.
 - Users can choose to keep stale statements (audit value), supersede them with new extractions, or hard-delete them.
 
 This is detailed in [`../03_schema/`](../03_schema/00_purpose.md) and [`../10_metadata/`](../10_metadata/00_purpose.md) §Provenance.
@@ -112,7 +112,7 @@ When the user declares their first schema, extractors gain a typed vocabulary an
 
 | Data | Storage | Authoritative? |
 |---|---|---|
-| Raw memory text and vector | Arena + WAL | Yes |
+| Raw memory text and vector | redb `texts` + `memory_vectors`, with the WAL behind them | Yes |
 | Memory metadata (timestamps, agent, kind) | redb `memory_meta` | Yes |
 | Memory-to-memory edges | redb `edges` | Yes |
 | Entity records | redb `entities` | Yes (declarative identity) |

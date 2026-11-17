@@ -161,7 +161,3 @@ The maintenance worker periodically retries failed HNSW inserts.
 **Response.** Upgrade hnsw_rs; report upstream.
 
 **Operator action.** Stay on stable hnsw_rs versions.
-
----
-
-*Continue to [`../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md) for unresolved questions.*

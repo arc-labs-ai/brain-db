@@ -142,13 +142,13 @@ What can go wrong in the storage layer and Brain's response. Failures that span 
 
 ## 13. Concurrent open of arena from multiple processes
 
-**Failure mode.** Two Brain processes (or other processes) attempt to open the same arena.
+**Failure mode.** Two Brain processes (or other processes) attempt to open the same shard's data directory.
 
-**Detection.** Brain uses a per-shard lock file (`shard.lock`) to enforce single-writer.
+**Detection.** redb takes its own exclusive lock on `metadata.redb`, so a second process fails to open the metadata store. There is no separate `shard.lock` file; the arena mmap and the WAL directory are not independently guarded.
 
-**Response.** The second process refuses to start, logging the conflict.
+**Response.** The shard whose metadata store cannot be opened fails to start, logging the conflict. A WAL IO failure at open fails the shard spawn for the same reason — a shard that cannot own its storage must not come up and serve requests.
 
-**Operator action.** Ensure only one Brain process has access to a given shard's data directory. This is typical for any embedded database.
+**Operator action.** Ensure only one Brain process has access to a given shard's data directory. This is typical for any embedded database. Note that the guard is redb's, so a process that opens the arena or the WAL *without* opening the metadata store is not stopped by it.
 
 ## 14. Mmap pointer becomes invalid (mremap relocation)
 
@@ -189,7 +189,3 @@ What can go wrong in the storage layer and Brain's response. Failures that span 
 **Response.** None automatic. Brain trusts the kernel's documented semantics.
 
 **Implication.** Test kernel upgrades on staging before production. The Linux kernel has historically been very stable in this area, but defensive testing is wise.
-
----
-
-*Continue to [`../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md) for unresolved questions.*

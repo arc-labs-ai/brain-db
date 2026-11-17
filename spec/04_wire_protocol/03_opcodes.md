@@ -122,7 +122,7 @@ The four embedding-layer admin opcodes `0x006A`–`0x006D` (`ADMIN_TOKENIZE`, `A
 
 ### 1.6a Space & session registry
 
-Non-admin registry ops, scoped to the caller's `(namespace, space)` and `act_as`-aware. Allocated from the previously-reserved `0x70–0x75` / `0xF0–0xF5` low-byte range.
+Non-admin registry ops, scoped to the caller's `(namespace, space)` and `act_as`-aware. Allocated from the `0x70–0x75` / `0xF0–0xF5` low-byte range.
 
 | Opcode | Name | Direction | Purpose |
 |---|---|---|---|
@@ -338,13 +338,13 @@ The server operates the same pipeline whether or not a user namespace has been u
 
 What user declarations control is **per-type acceptance** on explicit typed-graph writes:
 
-- `ENTITY_CREATE` with an entity type that isn't in any active namespace → `EntityTypeNotInSchema`.
+- `ENTITY_CREATE` names its type by numeric `entity_type_id`, not by qname, and an id no entity-type registry row answers to → `InvalidArgument` (0x0040). There is no entity-type analogue of the two codes below; the registry row, not the schema document, is what the id is checked against.
 - `STATEMENT_CREATE` with an undeclared predicate qname → `PredicateNotInSchema` (or open-vocabulary intern with `SchemaOrigin::ImplicitFromWrite` if the deployment runs in open-vocabulary mode; see §07/error-handling).
 - `RELATION_CREATE` with an undeclared relation_type qname → `RelationTypeNotInSchema` (same open-vocabulary rule).
 
 Extracted candidates whose types are not in any active schema are dropped silently (extractor best-effort; see [`../11_extractors/00_purpose.md`](../11_extractors/00_purpose.md)). `RECALL`, the `QUERY_EXPLAIN` / `QUERY_TRACE` introspection ops, and the fan-out pipeline always run regardless of which user namespaces are present.
 
-There is no `SCHEMA_NOT_DECLARED` error any more — the gate is per-type, not per-namespace.
+There is no `SCHEMA_NOT_DECLARED` error: the gate is per-type, not per-namespace.
 
 ## 3. Reserved ranges
 
@@ -496,7 +496,7 @@ Adding new opcodes is a wire-protocol-version bump (see §"Versioning" below). T
 
 A future major-version bump might add opcodes for replication-related operations, multi-modal operations, etc.
 
-**Per-request identity (`act_as`) adds no opcode.** The `act_as` mechanism (see [`04_handshake.md`](04_handshake.md) §10a) is an **optional field on existing data-plane op requests** (`ENCODE_REQ` / `RECALL_REQ` / `FORGET_REQ`), not a new operation. The `can_act_as` grant is minted over the admin HTTP surface, not a wire op. Because Brain is pre-release (v0.1.0) with no published wire, this field was added **in place** — no new opcode, and no wire-version bump (the version stays `1`; see [`02_wire_format.md`](02_wire_format.md) §11.3).
+**Per-request identity (`act_as`) adds no opcode.** The `act_as` mechanism (see [`04_handshake.md`](04_handshake.md) §10a) is an **optional field on existing data-plane op requests** (`ENCODE_REQ` / `RECALL_REQ` / `FORGET_REQ`), not a new operation. The `can_act_as` grant is minted over the admin HTTP surface, not a wire op. Because Brain is pre-release (v0.1.0) with no published wire, the field sits **in place** on those existing requests — no new opcode, and no wire-version bump (the version stays `1`; see [`02_wire_format.md`](02_wire_format.md) §11.3).
 
 ## Versioning
 
@@ -506,7 +506,7 @@ The wire protocol carries a single version field. Clients at any other version a
 
 Every frame carries a `wire_version: u8` byte in the frame header. The value is **`1`**. Frames with any other value are protocol errors.
 
-The byte exists so that pre-handshake frames (HELLO, WELCOME) self-identify; a server that reads a HELLO with `wire_version != 1` closes the connection with `WireVersionMismatch` and no further dialog.
+The byte exists so that pre-handshake frames (HELLO, WELCOME) self-identify; a server that reads a HELLO with `wire_version != 1` closes the connection with `BadVersion` and no further dialog.
 
 ### Handshake
 
@@ -532,18 +532,15 @@ struct WelcomePayload {
 }
 ```
 
-A server that receives a HELLO with a wire version different from its own returns `WireVersionMismatch` and closes the connection. There is no negotiation step — the version is fixed.
+A server that receives a HELLO whose header `wire_version` differs from its own returns `BadVersion` and closes the connection; the header check runs before the payload is read, so the HELLO's own contents never matter. A HELLO that passes the header check but offers no version the server supports is `VersionNotSupported`. The header version itself is fixed, not negotiated.
 
 ### Feature flags
 
-The HELLO/WELCOME exchange carries feature flags alongside the version. Feature flags are independent of the version: they govern optional semantic capabilities, not byte layouts.
+The HELLO/WELCOME exchange carries feature flags alongside the version. Feature flags are independent of the version: they govern optional semantic capabilities, not byte layouts. The flag set is fixed and small — `streaming`, `compression_zstd`, `server_push` — and is specified in [`04_handshake.md`](04_handshake.md) §2.3. At wire version 1 only `streaming` is live, and it is always `true`; the other two are reserved and no operation consults them.
 
-Examples:
+The client offers its flags in HELLO; the server replies in WELCOME with the AND-intersection of its own. No operation is gated on a negotiated flag, so there is no error code for a flag that was not agreed: a negotiated flag either describes the connection or is reserved.
 
-- `gpu_inference` — server supports GPU embedding.
-- `txn_isolation_serializable` — transactions support serializable isolation (otherwise read-committed only).
-
-The client requests a set of feature flags in HELLO. The server responds in WELCOME with the subset it actually enables. Operations that depend on a flag check it; if disabled, they fail with `FeatureNotEnabled`.
+An optional capability the **operator** turned off is a separate matter from handshake negotiation, and it has no code of its own either. An operation that needs such a capability fails as `InvalidArgument` (0x0040) — the client can fix it without server-side intervention, by dropping the opt-in or by talking to a deployment where the capability is on. The one live instance is the tenant LLM provider credential surface (§1.6b), which answers `InvalidArgument` on a deployment that carries no credential store.
 
 ### Frame-version mismatch after handshake
 
@@ -552,7 +549,7 @@ If, after handshake, the server receives a frame whose `wire_version` differs fr
 ### Diagnostic surfaces
 
 - The `ADMIN_STATS` opcode reports the server's wire version.
-- Logs record connections that fail handshake with `WireVersionMismatch`.
+- Logs record connections that fail handshake with `BadVersion` or `VersionNotSupported`.
 
 ### Client responsibilities
 

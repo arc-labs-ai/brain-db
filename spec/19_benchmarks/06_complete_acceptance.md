@@ -107,14 +107,32 @@ What "the typed graph is done" means. Concrete tests that must pass.
 > on the **functional** and **operational** correctness gates above and below —
 > which are hardware-independent and run in CI on any box. The numbers here stay
 > as engineering targets to measure post-lock; a miss is a tuning follow-up, never
-> a v1.0 blocker. (Owner decision, 2026-09-07.)
+> a v1.0 blocker.
+>
+> This status is load-bearing for how every number below should be read. Each is a
+> **reference-hardware** figure. Several of them — the embedding-path latency and
+> throughput rows in particular — are per-core model-inference costs that move with
+> ISA and clock, so reproducing them on unlike hardware is not expected and a miss
+> there is not evidence of a regression. Where a figure is portable, it says so.
 
 ### Latency (P50 / P99, single shard, warm)
 
-Targets below assume the default text-input path (CPU embedding ~5–10 ms). The GPU-batched and `ENCODE_VECTOR_DIRECT` (pre-supplied vector) paths have separate, lower targets — see [`../01_architecture/05_hardware_and_targets.md`](../01_architecture/05_hardware_and_targets.md) §7.1.
+Targets below assume the default text-input path, whose embed step is ~5–10 ms on reference hardware. The `ENCODE_VECTOR_DIRECT` (pre-supplied vector) path has separate, lower targets — see [`../01_architecture/05_hardware_and_targets.md`](../01_architecture/05_hardware_and_targets.md) §7.1.
+
+> **The GPU rows below are not exercisable on this build.** The embedding layer
+> accepts `Device::Cpu` with `DType::F32` only; any other device or dtype is
+> rejected at model load with `EmbedError::UnsupportedDevice`
+> (`crates/brain-embed/src/model/load.rs:48-52`,
+> `crates/brain-embed/src/config.rs:14-31`). No GPU dispatcher ships — the
+> `Dispatcher` trait exists partly so one can be added without re-spelling the
+> surface, but none is implemented. The GPU targets are retained as the
+> acceptance criteria that path must meet **when** it exists, and they are not
+> part of the v1.0 gate; a run cannot pass or fail them today. They are flagged
+> here rather than deleted because the figures are the specification of that
+> work, and an unexercisable row left unflagged reads as an untested one.
 
 - [ ] ENCODE (text, CPU embedding): P50 ≤ 12 ms, P99 ≤ 25 ms.
-- [ ] ENCODE (text, GPU embedding): P50 ≤ 3 ms, P99 ≤ 8 ms.
+- [ ] ENCODE (text, GPU embedding): P50 ≤ 3 ms, P99 ≤ 8 ms. *(no GPU path — see note)*
 - [ ] ENCODE_VECTOR_DIRECT (pre-supplied vector, no embedding): P50 ≤ 1 ms, P99 ≤ 5 ms.
 - [ ] ENCODE + classifier extractors (post-encode async): P50 ≤ 5 ms added to extractor-completion event, P99 ≤ 20 ms.
 - [ ] STATEMENT_CREATE: P50 ≤ 1 ms, P99 ≤ 5 ms.
@@ -128,11 +146,47 @@ Targets below assume the default text-input path (CPU embedding ~5–10 ms). The
 
 Per-shard sustained, distinguishing CPU vs GPU embedding paths (matching [`../01_architecture/05_hardware_and_targets.md`](../01_architecture/05_hardware_and_targets.md) §7.1.4):
 
-- [ ] ENCODE throughput (text, CPU embedding): ≥ 100/s per shard.
-- [ ] ENCODE throughput (text, GPU embedding): ≥ 1K/s per shard.
+- [ ] ENCODE throughput (text, CPU embedding): ≥ 100/s per shard, **on reference hardware**. See the note below: this row is a per-core model-inference gate, not a storage one.
+- [ ] ENCODE throughput (text, GPU embedding): ≥ 1K/s per shard. *(no GPU path — see the note under "Latency")*
 - [ ] ENCODE_VECTOR_DIRECT throughput (storage-only): ≥ 100K/s per shard.
 - [ ] STATEMENT_CREATE throughput: ≥ 10K/s per shard.
 - [ ] RECALL throughput (mixed workload): ≥ 1K/s per shard.
+
+> **What the CPU-embedding ENCODE row actually gates.** A text ENCODE runs one
+> embedder forward pass per request. Nothing batches it — the CPU dispatcher puts
+> each request through the model independently and assembles no batches
+> (`crates/brain-embed/src/dispatcher/cpu.rs:1-7`) — and the pass is confined to
+> the shard's own core, because the embed is handed to a blocking thread whose
+> intra-op pool inherits that thread's CPU affinity
+> (`crates/brain-ops/src/embedding.rs:16-61`). So the per-shard ceiling for this
+> row *is* the per-core embedder rate, and it does not improve with more cores:
+> more cores buy more shards, each with its own lane. Aggregate ENCODE throughput
+> scales with shard count; this row does not.
+>
+> That makes 100/s per shard a statement about one core's model-inference
+> throughput on the 16-core x86_64 reference box, and **only** about that box. The
+> figure is deliberately not restated as a hardware-independent floor: the
+> embedding layer's own bench asserts **no absolute gate** for exactly this
+> reason, treating the machine-local Criterion baseline as the real regression
+> signal because "embedding cost depends on the model, available cores, and thread
+> configuration" (`crates/brain-embed/benches/throughput.rs:3-6`). A deployment on
+> other hardware should read this row as "measure your per-core embedder rate;
+> that is your per-shard text-ENCODE ceiling", not as a number its box is expected
+> to hit.
+>
+> Measured datapoint, recorded as evidence rather than as a gate: on a 10-CPU
+> aarch64 development container, the embed path sustains **≈66 encodes/s per
+> pinned shard** — 266/s aggregate across 4 shards, 586/s across 9 — measured by
+> the `embed_contention` harness (`crates/brain-server/benches/embed_contention.rs`),
+> which pins one executor per shard and drives real forward passes through a bare
+> CPU dispatcher. The per-shard figure is flat across shard counts, which is the
+> expected signature of a per-core bound: aggregate scales, per-shard does not.
+> ≈66/s/shard is below the 100/s target, and on that hardware this row is
+> unreachable — as the advisory status at the head of this section already
+> anticipates, since it is not the reference box. The ≈15 ms per pass that ≈66/s
+> implies also agrees with the embedder-miss line in
+> [`02_performance_targets.md`](02_performance_targets.md) §3, so the two
+> measurements corroborate rather than contradict each other.
 
 ### LLM extraction throughput
 
@@ -153,13 +207,13 @@ Per-shard sustained, distinguishing CPU vs GPU embedding paths (matching [`../01
 - [ ] Index rebuild (administrative): can rebuild any derived index from authoritative state.
 - [ ] Schema migration (declared): old extractors removed, new run, statements re-extracted.
 - [ ] Backfill: completes for 1M memories in bounded time; resumable on interrupt.
-- [ ] Metrics: all `worker_*`, `extractor_*`, `retriever_*`, `query_*` metrics emitted and consistent.
+- [ ] Metrics: the `brain_worker_*`, `brain_extractor_*`, `brain_retriever_*` and `brain_query_*` families emitted and consistent. Every metric carries the `brain_` prefix; a family without it is not Brain's.
+- [ ] Deferred metric families are absent rather than wrong: `brain_hnsw_recall_estimate`, `brain_hnsw_search_visits`, `brain_embedder_duration_ms` and `brain_executor_latency_ms` are not emitted, and nothing reports a placeholder value in their place (`crates/brain-server/src/metrics/mod.rs:31-40`). A dashboard built on them shows no data, which is the correct signal; see [`03_recall_quality.md`](03_recall_quality.md) §8 for what the recall one would have gated.
 - [ ] Audit log: all derivations and supersessions logged; queryable.
 
 ## Schema-on / schema-off transitions acceptance
 
-- [ ] older binary → the binary upgrade: clean, no behavioral change without schema.
-- [ ] Schema declaration after upgrade: extractors activate.
+- [ ] A data directory created with no schema serves normally, and declaring a schema later activates extractors without touching the memories already stored.
 - [ ] Backfill over existing memories produces statements consistent with the schema.
 - [ ] Switching a deployment from "with schema" to "without schema": Brain continues to serve; typed-graph data preserved but unused.
 
@@ -168,11 +222,10 @@ Per-shard sustained, distinguishing CPU vs GPU embedding paths (matching [`../01
 - [ ] Spec sections 00–19 are complete and internally consistent.
 - [ ] All file/directory references in the spec resolve.
 - [ ] At least one end-to-end tutorial exists, walking from blank deployment to a working query.
-- [ ] Open questions are tagged with rationale and version-target.
+- [ ] Every normative claim cites the code that proves it, and a claim whose mechanism no longer exists is corrected or removed rather than left standing. A spec that disagrees with the binary is worse than a thinner one, because a reader cannot tell which parts to trust.
+- [ ] The spec states how the system behaves, not how it came to behave that way: no deliberation, no open-question or decision-log content, no internal plan or issue references, and no superseded-design notes. Design history is tracked outside `spec/`, so a spec file is readable as a description of the current system with nothing to subtract.
 
 ## What the typed graph explicitly does NOT include
-
-(See [`../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md).)
 
 - Learned query router.
 - SPLADE / sparse-neural retrieval.
@@ -186,26 +239,40 @@ These are future major-version work.
 
 ## How to run the acceptance suite
 
+The functional, operational and schema-transition gates are all Rust tests in the
+workspace sweep — there is no separate shell harness to invoke:
+
 ```bash
-# Full workspace regression (correctness + functional gates).
-cargo test --workspace
+# Everything CI runs, in one command: fmt, clippy, the full test sweep,
+# doctests, docs, and a release-build smoke.
+just prod-verify
 
-# Performance benchmarks.
-cargo bench --workspace
+# The sweep alone (nextest does not run doctests, so both are needed).
+cargo nextest run --workspace
+cargo test --workspace --doc
 
-# End-to-end integration against a running binary.
-./scripts/knowledge-e2e.sh
-
-# Schema-on / schema-off transitions.
-./scripts/schema-on.sh
-./scripts/schema-off.sh
+# The two asserting performance benches — the same pair the nightly
+# perf workflow runs. `cargo bench --workspace` would additionally run
+# the reporting-only benches, two of which need model weights on disk.
+just prod-bench
 ```
 
 **v1.0 lock gate.** v1.0 is locked when the **functional** and **operational**
-acceptance sections pass — the `cargo test --workspace` regression plus the
-end-to-end / schema-transition scripts — on **any** supported box (they are
-hardware-independent and run in CI). The **performance acceptance** section (and
-the storage-*performance* items) is **optional / off the grid for v1.0**: those
-targets want reference hardware (16 cores, 64 GB RAM, NVMe SSD, Linux 6.6+) and a
-measured run that v1.0 does not block on — they are engineering targets to capture
-post-lock, not lock criteria. (Owner decision, 2026-09-07.)
+acceptance sections pass — the workspace regression plus the end-to-end and
+schema-transition tests inside it — on **any** supported box. Those gates are
+hardware-independent and run in CI, which is what makes them a usable lock
+criterion: anyone can reproduce a pass or a failure.
+
+The **performance acceptance** section (and the storage-*performance* items) is
+**optional for v1.0**. Those targets want reference hardware (16 cores, 64 GB RAM,
+NVMe SSD, Linux 6.6+) and a quiet measured run, and they are engineering targets
+to capture post-lock rather than lock criteria. The reason is not that performance
+does not matter; it is that a gate nobody can reproduce is not a gate. Several of
+these figures are per-core model-inference costs (see the ENCODE-throughput note
+above), so on any box but the reference one they would fail for reasons unrelated
+to the code under test — and a release gate that fails on correct code teaches
+people to override gates.
+
+What guards performance in the meantime is narrower and real: two benches that
+assert their own p50 targets in-process and run nightly, failing the workflow on a
+regression (§19.02 §2.11, §19.04 §17).

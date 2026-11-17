@@ -202,28 +202,67 @@ For workloads exceeding single-machine capacity, horizontal scaling (clustering)
 
 ## 13. The "binary distribution"
 
-Brain ships as a single static binary:
+Brain ships as a single executable:
 
-- One Rust executable.
-- Plus configuration files.
-- Plus a data directory.
+- One Rust binary, `brain-server`.
+- One configuration file, named by `--config <PATH>`.
+- One data directory.
+- Two model directories on disk — the BGE embedder and the GLiNER classifier.
 
-No external dependencies (no separate Postgres, no Redis, no Kafka). The binary contains everything.
+No external services (no separate Postgres, no Redis, no Kafka), and no
+download path at any boot: the server refuses to start if either model is
+missing rather than degrading. The published container image carries both at
+`/opt/brain/models`, which is what makes `docker run` one command.
 
-This makes deployment simple: copy binary, write config, start. No orchestration of multiple services.
+So deployment is: place the models, write a config, start. No orchestration of
+multiple services.
 
 ## 14. Configuration management
 
-Configuration is a single TOML file, plus per-environment overrides:
+Configuration is one TOML file, chosen on the command line, with single fields
+overridable from the environment. There is no environment-selector variable and
+no file-layering scheme.
 
 ```
-config/
-├── default.toml          # Base config
-├── production.toml       # Production overrides
-└── staging.toml          # Staging overrides
+brain-server --config config/dev.toml     # default: config/dev.toml
 ```
 
-Brain reads `default.toml` then layers overrides based on `BRAIN_ENV`.
+The repository ships two reference files — `config/dev.toml` (loopback, one
+shard) and `config/docker.toml`, which is baked into the image at
+`/etc/brain/config.toml`. A deployment either names its own file or bind-mounts
+over that path.
+
+Any single field is overridden by `BRAIN__SECTION__FIELD`, double underscore
+separating nesting, each component lowercased to match the TOML key
+(`crates/brain-server/src/config/mod.rs:1613-1636`):
+
+```
+BRAIN__SERVER__LISTEN_ADDR=0.0.0.0:8080
+BRAIN__STORAGE__SHARD_COUNT=8
+BRAIN__SHARD__ARENA_CAPACITY_BYTES=2GiB
+```
+
+The override is applied to the parsed TOML tree before deserialization, and the
+leaf is re-typed against a fully-typed reference tree so that a string-valued
+field keeps a value that merely looks numeric — an admin token of `48291057`
+stays the string `"48291057"`
+(`crates/brain-server/src/config/mod.rs:1638-1676`).
+
+Two env vars sit outside that scheme because they are consulted before or
+independently of the config tree:
+
+| Variable | Effect |
+|---|---|
+| `BRAIN_LOG` | tracing filter, overriding `[monitoring.logging] level`. `RUST_LOG` is deliberately ignored, so there is exactly one way to set the level (`crates/brain-server/src/bootstrap/logging.rs:94-105`) |
+| `BRAIN_EMBED_MODEL_DIR` | absolute path to the embedder, the first branch of the model-path cascade and therefore wins over `[embedder] model` (`crates/brain-server/src/config/mod.rs:357-392`) |
+
+Every config struct is `#[serde(deny_unknown_fields)]`, so a key that does not
+exist is a startup parse error. A stale field in a hand-written config is a
+boot failure, not a silently ignored line.
+
+Configuration is restart-only. The admin plane exposes `GET /v1/config` and a
+reload route, but the fields a running server re-reads are a deliberate subset;
+shard count, listen addresses and arena geometry are settled at boot.
 
 ## 15. Logging
 

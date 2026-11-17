@@ -60,24 +60,29 @@ pub struct GraphRetrieverConfig {
     pub top_k: usize,         // default 64
     pub max_depth: u8,        // default 3; hard cap 5 (§4)
     pub max_branching: u32,   // default 200 (per-node child cap, §4)
-    pub timeout_ms: u32,      // default 50
+    pub timeout_ms: u32,      // config default 50; the plan sets 1 s (§8)
 }
 ```
 
 `retrieve()` is **read-only**. No side effects.
 
-The return type's `RankedItem.id` uses three new
-`RankedItemId` variants relative to §13/02 §6 (declared here,
-implemented in 23.2 alongside §13/02 §6's amendment):
+`RankedItem.id` is the shared `RankedItemId` of §13/02 §6. The graph
+retriever is the only one that emits the `Entity` and `Relation`
+variants — the semantic and lexical lanes can only produce the two
+corpus variants:
 
 ```rust
 pub enum RankedItemId {
-    Memory(MemoryId),         // existing — §13/02
-    Statement(StatementId),   // existing — §13/02
-    Entity(EntityId),         // NEW — §13/04
-    Relation(RelationId),     // NEW — §13/04
+    Memory(MemoryId),         // semantic, lexical, graph
+    Statement(StatementId),   // semantic, lexical, graph
+    Entity(EntityId),         // graph only
+    Relation(RelationId),     // graph only
 }
 ```
+
+Fusion is therefore mixed-type by construction: a single fused list can
+carry a memory, a statement and an entity, and RRF compares them only
+by rank within their producing lane.
 
 ## 2. Proximity scoring
 
@@ -157,12 +162,22 @@ definition); to filter, use `Star`.
 
 `max_branching`:
 
-- Per-node children cap, default 200.
+- Per-node children cap, default 200
+  (`crates/brain-index/src/graph_retriever.rs:21`).
 - When a node has more than `max_branching` children, the BFS
-  truncates the excess and emits a `metrics::counter!("brain_graph_branching_truncated_total", 1)`.
+  truncates the excess.
 - Truncation is deterministic — children are sorted by
   `RelationId` ascending and the first `max_branching` are
   followed.
+- **Truncation is silent.** This retriever emits no metric and no
+  warning when it drops a super-node's excess children, so an
+  operator cannot tell from the scrape surface that a result was
+  truncated rather than complete. The wider `RELATION_TRAVERSE` path
+  does warn on its own cap (see
+  [`./06_post_processing.md`](./06_post_processing.md)
+  §"Branching-factor diagnostics"); the two caps are separate
+  mechanisms with separate defaults, and only one of them is
+  observable.
 
 Total result cap is `config.top_k`. Once `top_k` results are
 collected, BFS terminates early (best-effort: BFS rings closer
@@ -203,6 +218,11 @@ outputs between commits.
 | `IndexUnavailable` | Entity / relation / statement table read failed (e.g. redb corruption). | Yes — operator. |
 | `Timeout` | Traversal exceeded `config.timeout_ms`. | Yes — degraded. |
 | `Internal(String)` | Anything else. Logged at error level. | Yes — opaque. |
+
+As with the other two lanes, the planned budget is a soft 1 s: the
+traversal is recorded as `Timeout` and warned about, not cancelled, and
+a late result still reaches fusion
+(`crates/brain-planner/src/retrieval/planner/logic.rs:55-65`).
 
 ## 8. Performance
 

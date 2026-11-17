@@ -51,22 +51,65 @@ The plan is a description of what to do, not the doing itself. The executor take
 
 ## 3. The planner's logic
 
-For each request kind, the planner has a function:
+Four verbs have a planning function. Each takes the typed request plus the
+planner context and returns that verb's plan struct, all under
+`crates/brain-planner/src/planner/`:
 
 ```rust
-fn plan_recall(req: &RecallRequest, ctx: &PlannerContext) -> RecallPlan {
-    // ...
-}
+plan_encode_inner(&EncodeRequest, &PlannerContext) -> Result<EncodePlan, PlanError>  // encode.rs:56
+plan_forget_inner(&ForgetRequest, &PlannerContext) -> Result<ForgetPlan, PlanError>  // forget.rs:24
+plan_path_inner  (&PlanRequest,   &PlannerContext) -> Result<PathPlan,   PlanError>  // path.rs:26
+plan_reason_inner(&ReasonRequest, &PlannerContext) -> Result<ReasonPlan, PlanError>  // reason.rs:27
 ```
 
 These functions:
 
-1. Resolve the routing — which shards to involve.
-2. Pick parameters — ef_search, over_factor, etc.
-3. Decide on transformations — pre-filter, post-filter.
-4. Determine response shape — text inclusion, score thresholds.
+1. Validate the request against the context's config — the first statement of
+   each is its validation call (`encode.rs:60`, `forget.rs:28`, `path.rs:27`,
+   `reason.rs:31`).
+2. Resolve the routing — which shards to involve.
+3. Pick parameters — ef_search, over_factor, etc.
+4. Decide on transformations — pre-filter, post-filter.
+5. Determine response shape — text inclusion, score thresholds.
 
 Each function is straightforward; no global optimizer.
+
+Every one of them is called from the live handler, and the two halves of the
+plan→execute split are used differently per verb:
+
+- **PLAN and REASON use both halves.** The handler plans, then hands the plan
+  to the executor: `crates/brain-ops/src/handlers/plan.rs:41` and
+  `crates/brain-ops/src/handlers/reason.rs:53`.
+- **ENCODE and FORGET use the planner as a validation gate.** The handler
+  calls it for the validation and bounds and then does the work itself.
+  `plan_encode_inner` at `crates/brain-ops/src/handlers/encode.rs:151` and
+  `:961` binds the plan to `_`; `plan_forget_inner` at
+  `crates/brain-ops/src/handlers/forget.rs:30` discards it the same way, while
+  `:192` keeps the plan it returns.
+
+**RECALL plans inside its own handler.** There is no planning function for it
+under `planner/`: `crates/brain-ops/src/handlers/recall.rs` is a ~3,800-line
+pipeline (its tests start at `:3826`) that owns its own planning, because what
+it decides does not fit the shape above. It carries a candidate-pool budget
+deliberately decoupled from the caller's answer cap, so the membership band in
+`build_membership` (`:1249`) decides over the full filtered pool instead of a
+window pre-truncated to that cap (`RECALL_CANDIDATE_POOL`, `:62-71`, fed to
+the retrieval executor at `:3491-3494`); cross-shard pool merging by
+Reciprocal-Rank-Fusion over within-shard ranks, the one cross-shard-comparable
+signal (`merge_recall_pools`, `:570-583`); anchor and kind-presence abstention
+(`:729`, `:767`); and its own recall metrics (`record_recall_metrics`, `:701`,
+called at `:294` and `:333`).
+
+Where that handler and a standalone planning function would disagree, the
+handler's rule is the one that holds. `max_results` is **clamped**, not
+refused: `0` is its documented "use the server default" sentinel
+(`DEFAULT_RECALL_RESULTS = 50`, `recall.rs:60`) and the cap is a safety bound
+(`MAX_RECALL_RESULTS = 1000`, `:54`), so `normalize_recall_request` pulls any
+value into `[DEFAULT, MAX]` (`:367-372`). A gate threshold has no such
+sentinel — every value in `[0, 1]` is meaningful, so one outside it is a
+mistake rather than a shorthand — and is therefore refused
+(`validate_probability`, `:337-350`, applied to `confidence_threshold` and
+`salience_floor` at `:364-365`).
 
 ## 4. The planner session
 
@@ -135,23 +178,39 @@ If planning did I/O, the planner would be async, and request handling would have
 
 ## 10. The planner's API
 
-```rust
-struct Planner {
-    config: PlannerConfig,
-}
+There is no planner object. Each verb's planning function is a free function
+over `(&Request, &PlannerContext)`, and the config it reads is a field on that
+context alongside the shard statistics
+(`crates/brain-planner/src/context.rs:16-20`):
 
-impl Planner {
-    fn plan(&self, req: Request, ctx: &PlannerContext) -> Result<ExecutionPlan, PlanError> {
-        match req {
-            Request::Encode(r) => Ok(ExecutionPlan::Encode(self.plan_encode(r, ctx)?)),
-            Request::Recall(r) => Ok(ExecutionPlan::Recall(self.plan_recall(r, ctx)?)),
-            // ...
-        }
-    }
-}
+```rust
+plan_encode_inner(&req, &ctx)?  // -> EncodePlan
+plan_forget_inner(&req, &ctx)?  // -> ForgetPlan
+plan_path_inner  (&req, &ctx)?  // -> PathPlan
+plan_reason_inner(&req, &ctx)?  // -> ReasonPlan
 ```
 
-Synchronous. Pure given input and session. Easy to unit-test.
+A handler calls the function for its own verb directly rather than dispatching
+on a request enum, so there is no central `match` to keep in step with the
+request types.
+
+`ExecutionPlan` (`crates/brain-planner/src/plan/mod.rs:32-46`) is the uniform
+plan type those structs wrap into when a caller wants one value across verbs.
+It carries one variant per plan struct, `Recall(RecallPlan)` among them
+(`:39`); admin, txn and subscribe plans are deferred, since their lifecycles
+differ (`:34-35`). `RecallPlan` (`crates/brain-planner/src/plan/recall.rs:12`)
+is a live type on both counts: as that variant, and through its step structs,
+which `RecallSubStep` (`plan/common.rs:50-61`) reuses to embed a sub-RECALL
+inside a higher-level plan — `PathPlan`'s `starting_recall` and `goal_recall`
+(`plan/path.rs:26`, `:28`) and `ReasonPlan`'s `base_recall`
+(`plan/reason.rs:29`), each built by its own planner
+(`planner/path.rs:110-128`, `planner/reason.rs:133-143`).
+
+Synchronous. Pure given input and context. Easy to unit-test:
+`crates/brain-planner/tests/plan_reason_regressions.rs` calls
+`plan_path_inner` (`:313`, `:342`) and `plan_reason_inner` (`:398`, `:449`,
+`:478`, `:532`) against a `PlannerContext::default()` and asserts on the
+returned struct.
 
 ## 11. The planner doesn't know about networks
 

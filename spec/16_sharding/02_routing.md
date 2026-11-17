@@ -94,49 +94,58 @@ In v1, the simple modulo is sufficient because Brain does not change shard count
 
 ## 7. The override map
 
-The override map is for spaces needing specific assignments:
+`RoutingTable` carries a `HashMap<SpaceId, ShardId>` of overrides, consulted
+before the hash, and validates at construction that every target is inside
+`[0, shard_count)` (`crates/brain-server/src/network/routing.rs:56-91`). It has
+no configuration surface: the server constructs the table with an empty map
+(`crates/brain-server/src/lib.rs:460`), and the config schema has no
+`[shards]` section at all — every config struct is
+`#[serde(deny_unknown_fields)]`, so inventing one is a boot failure, not an
+ignored key.
 
-```toml
-[shards.routing.overrides]
-"space-uuid-VIP" = 0       # The VIP space is on shard 0
-"space-uuid-XL" = 5        # An extra-large space has its own shard
-```
+Pinning a named space to a chosen shard is therefore a future capability, not
+an operator knob. The mechanism is in place so that adding one is a config
+field and a populate call rather than a change to the read path.
 
-Overrides are checked before the hash. They give operators fine control without disrupting general routing.
+## 8. One space, one shard
 
-## 8. Multi-shard spaces
+A space's data lives on exactly one shard. That is what makes per-shard
+linearizability sufficient: every operation on one space is ordered against
+every other operation on that space, because they all land on the same
+single-writer executor.
 
-For spaces whose data exceeds one shard, the routing splits:
+Multi-shard spaces are out of scope. The routing module names them, with
+"WrongShard" handling and consistent hashing, as deferred work
+(`crates/brain-server/src/network/routing.rs:12-15`). A space that outgrows
+one shard is the demonstrated operator need that would justify the
+distributed-coordination work, not a TOML entry.
 
-```toml
-[shards.routing.multi_shard]
-"space-uuid-XL" = [3, 4, 5]    # Spans shards 3, 4, 5
-```
+## 9. Routing by memory id
 
-For these spaces:
-- ENCODE picks one of the assigned shards (round-robin or sticky-by-session).
-- RECALL fans out to all assigned shards.
+When an existing memory is referenced — `FORGET memory_id`, `MEMORY_INSPECT`, a
+`LINK` endpoint — the `MemoryId` already encodes its owning shard in its high
+16 bits, so routing is a bit extraction and not a hash
+(`routing::shard_for_memory`, `crates/brain-server/src/network/routing.rs:119-125`).
 
-This is operator-configured; not auto-detected. A future version may add auto-spreading.
-
-## 9. The "shard for memory, but the space is multi-shard" case
-
-When an existing memory is referenced (e.g., by FORGET memory_id), the MemoryId already encodes its shard. Multi-shard configuration doesn't change that.
-
-For a multi-shard space, the space's recent encodes are on one shard, older ones on other shards (depending on when each was assigned). Memory operations always go to the encoded shard.
+This is the same shard the space hash would give, since the space is whole, but
+the id path is used anyway: it is O(1) and it stays correct for an id whose
+space the caller never names.
 
 ## 10. Routing for new spaces
 
 When an ENCODE arrives for a space with no prior memories:
 
 ```
-1. Check overrides; if found, use that shard.
-2. Check multi-shard config; if found, pick one (round-robin).
-3. Hash the space_id.
-4. Use the resulting shard.
+1. Check the override map; if the space is present, use that shard.
+2. Otherwise hash the space_id: u64::from_le_bytes(BLAKE3(space_id)[..8]) % shard_count.
 ```
 
-The first ENCODE establishes which shard the space uses (until reconfigured).
+Nothing is established by the first ENCODE and nothing is recorded: the
+assignment is a pure function of the space id and the shard count, so every
+later request recomputes the same answer. That is why `shard_count` is pinned
+by the storage-layout record rather than taken from config on every boot —
+changing it would silently re-route every existing id
+(`crates/brain-server/src/storage_layout.rs:1-13`).
 
 ## 11. The router in single-node mode
 
@@ -239,40 +248,24 @@ For UUIDv7 space IDs, this gives roughly uniform distribution. With 16 shards an
 
 ## 20. The override map
 
-For specific spaces, operators can override the default:
+See §7. The table consults an override map before hashing, and nothing
+populates it; there is no `[shards]` config section to populate it from.
 
-```toml
-[shards.routing.overrides]
-"space-vip-001" = 0      # VIP space on dedicated shard 0
-"space-large-002" = 5    # Large space on shard with most capacity
-```
+## 21. Why a space is never split
 
-Overrides are checked first; the hash is the fallback.
+Splitting one space across shards would cost the property the whole design
+rests on. Per-shard linearizability is enough precisely because a space is
+whole: all of its operations are ordered with respect to each other on one
+executor. Spread it over three shards and an ENCODE and a RECALL for the same
+space can be concurrent on different cores, and every cross-shard read needs a
+merge step with no single order to merge against.
 
-Override use cases:
-- VIP/dedicated capacity for premium tenants.
-- Co-locating related spaces on the same shard.
-- Routing test spaces to a specific shard.
-
-## 21. The multi-shard case
-
-For spaces needing more capacity than one shard:
-
-```toml
-[shards.routing.multi_shard]
-"space-huge-003" = { shards = [3, 4, 5], strategy = "round_robin" }
-```
-
-For multi-shard spaces:
-
-- ENCODE picks one shard per the strategy.
-- RECALL fans out to all assigned shards.
-- The space's data is split.
-
-Strategies:
-- `round_robin`: cycle through shards.
-- `sticky_by_context`: each session lives on one shard (chosen via session_id hash).
-- `weighted`: based on shard load (advanced; not in v1).
+So the capacity answer for a space larger than one shard is a larger shard —
+`[shard] arena_capacity_bytes` and the host behind it — not a wider one. The
+distributed alternatives (range-based sharding, cross-node fan-out) are
+tracked as larger architectural changes in
+[`ROADMAP.md`](../../ROADMAP.md), each gated on an operator need the
+single-node architecture cannot meet.
 
 ## 22. The persistent assignment record
 
@@ -309,17 +302,19 @@ If the operator changes shard count (very rare in v1):
 
 A future enhancement: rebalance to redistribute. v1 doesn't auto-rebalance.
 
-## 25. The space's "primary" shard
+## 25. The space's one shard
 
-For multi-shard spaces, one shard is "primary":
+A space has one shard and no notion of a primary. Its metadata, its vectors,
+its typed-graph rows and its lexical postings all live in that shard's
+directory, and the shard is recomputed from the space id on every request
+rather than stored anywhere.
 
-- Holds the space's metadata (config, quotas).
-- Initially gets new encodes (until full).
-- Coordinates fan-out queries.
-
-Other shards are "extras" — they hold overflow data.
-
-The primary is set at first-encode; it doesn't change unless the operator forcibly migrates.
+Namespace-wide RECALL is the one read that touches every shard, and it is
+fanned out per-request rather than coordinated by an elected shard: each shard
+returns its own raw candidate pool (`ShardRequest::RecallGather`), the
+connection layer merges the pools, and one shard then shapes the merged input
+(`ShardRequest::RecallShapeMerged`) so membership and abstention are decided
+exactly once — `crates/brain-server/src/shard/mod.rs:155-175`.
 
 ## 26. The assignment metadata
 
@@ -410,17 +405,16 @@ A tenant is a **namespace** (company); an application within it is an **space**.
 - Company B is namespace `globex`; it cannot see `acme`'s data under any request or flag.
 - The boundary is enforced logically on every read/write (owner `namespace_id` + `space_id` on every row, folded into index key prefixes), not by physical shard separation — a single deployment safely hosts many tenants.
 
-The earlier "tenant = space by convention" framing is superseded: namespace is now the committed tenant boundary (open-question `OQ-V2-4`, resolved). Identity is server-derived from the key, so a client cannot name another tenant's namespace or space; cross-namespace access is rejected at the boundary.
+The earlier "tenant = space by convention" framing is superseded: namespace is now the committed tenant boundary. Identity is server-derived from the key, so a client cannot name another tenant's namespace or space; cross-namespace access is rejected at the boundary.
 
-## 34. The auto-spread (future)
+## 34. A space that dominates its shard
 
-When a space grows to dominate its shard, Brain could auto-spread:
+A space is never spread, so a space that outgrows its shard is answered by
+growing the shard: raise `[shard] arena_capacity_bytes` and give the host the
+RAM. §21 is why the alternative is not a knob.
 
-- Detect the space is using > 50% of its shard's resources.
-- Move some of its data to a less-busy shard.
-- Update the multi-shard config.
-
-Not in v1. Operators do this manually if needed.
+Auto-spreading, and the migration machinery it would need, belong to the
+range-based-sharding direction tracked in [`ROADMAP.md`](../../ROADMAP.md).
 
 ---
 

@@ -97,7 +97,7 @@ The tokenizer is loaded from a tokenizer.json file in the model directory:
 /var/brain/models/bge-small-en-v1.5/
 ├── tokenizer.json       # tokenizer config + vocab
 ├── config.json          # model config
-├── pytorch_model.bin    # or model.safetensors — the weights
+├── model.safetensors    # the weights — the only accepted format (§23)
 ```
 
 `tokenizer.json` is loaded at startup and held for the process lifetime. Tokenizer state is read-only and shared across all embedding calls.
@@ -206,19 +206,15 @@ The embedding layer supports two devices:
 The default. Inference uses candle's optimized CPU kernels. On modern x86_64 with AVX2:
 
 - Per-text inference: 5–10 ms.
-- Concurrent inference across cores: scales linearly until memory bandwidth saturates (typically ~16 cores).
+- Concurrent inference across cores: scales on the **shard** axis — one in-flight embed per shard, each confined to its shard's core — until memory bandwidth saturates. Measured 2.2× from 4 shards to 9 on a 10-CPU box (§19). Splitting a single forward pass wider does not add throughput and costs some; §19 has the numbers and the reason.
 
 Candle uses BLAS where available (via `mkl-sys` or `accelerate` on macOS). For predictable performance in production, running with [Intel MKL](https://www.intel.com/content/www/us/en/developer/tools/oneapi/onemkl.html) on x86 or BLIS on AMD is recommended.
 
 #### 14.2 GPU
 
-Optional. Requires:
+**Not available.** `EmbedderConfig::device` is a forward-compatibility slot: the loader checks it first, before any file I/O, and anything other than `Device::Cpu` — `Device::Cuda(_)` included — is refused with `EmbedError::UnsupportedDevice`. There is no CUDA feature to compile in and no configuration that dispatches a forward pass to a GPU.
 
-- A CUDA-capable NVIDIA GPU.
-- CUDA drivers installed in the environment.
-- The binary compiled with `--features cuda`.
-
-When enabled, inference is dispatched to the GPU. Throughput goes up dramatically (10K+ items/s on an A100) at the cost of:
+The design below, and [`04_batching_gpu.md`](04_batching_gpu.md) in full, describe the shape the GPU path takes when it lands. What a GPU would buy is throughput (10K+ items/s on an A100) at the cost of:
 
 - Additional memory (GPU VRAM for weights and activations).
 - Latency floor for single-item inference (slightly higher than CPU due to kernel launch overhead).
@@ -242,7 +238,7 @@ The model's weights:
 - ~130 MiB at FP32 precision.
 - ~33 MiB at INT8 quantization (smaller, slightly less accurate).
 
-FP32 ships by default. INT8 quantization is a future-major-version optimization ([OQ-6 in the open-questions archive](../00_overview/04_open_questions_archive.md#oq-6-vector-quantization)).
+FP32 ships by default; Brain does not quantize the weights.
 
 ### 16. Memory layout
 
@@ -254,15 +250,15 @@ For batched inference (GPU path), the activations scale with batch size. Limits 
 
 ### 17. Precision
 
-The model runs in FP32 by default. FP16 (half precision) is supported on GPUs that have it; INT8 is supported via separate quantized model files.
+The model runs in **FP32, and only FP32**. `EmbedderConfig` carries a `dtype` slot, but the loader validates it before doing any I/O and any value other than `DType::F32` is refused with `EmbedError::UnsupportedDevice`. FP16 and INT8 are forward-compatibility slots, not paths a deployment can select.
 
-The trade-offs:
+The trade-offs that would motivate them:
 
 - **FP32:** baseline. ~130 MiB weights, full precision.
 - **FP16:** 65 MiB weights, ~half the memory, slight accuracy loss (typically negligible for embedding tasks).
 - **INT8:** 33 MiB weights, more accuracy loss but still acceptable for embedding.
 
-Production deployments may use FP16 on GPU to fit larger batches; INT8 is a future option for very-resource-constrained CPU deployments.
+Both are future work. The precision a deployment gets is FP32.
 
 ### 18. Latency profile
 
@@ -283,38 +279,68 @@ For p99 latency, the dominant factor is concurrent load. A heavily-loaded server
 
 ### 19. Concurrency
 
-Multiple Glommio executors can call inference concurrently. Each call runs on the current core. The model's weights are shared across all callers via `Arc<Model>`; the activations are per-call.
+Multiple Glommio executors can call inference concurrently. Each call leaves its shard's reactor through `glommio::executor().spawn_blocking` and runs on that executor's blocking pool — one thread whose CPU set is the shard's own pinned CPU. The reactor stays schedulable while the model runs, and the call still runs on the shard's core, so an embed never takes core time from another shard. The model's weights are shared across all callers via `Arc<Model>`; the activations are per-call.
+
+The offload is the contract, not an optimisation. A caller with no reactor to protect wants the dispatcher directly; the off-reactor helpers refuse loudly rather than quietly blocking the calling thread for the duration of a forward pass.
+
+#### Intra-op width is placement, not configuration
+
+**Parallelism comes from shards, not from splitting one forward pass.** Candle chooses the matmul split count itself and offers no setter, while the gemm layer hands the pieces to whichever Rayon pool is current. That pool is the only place the shard's placement can be applied, so the forward pass runs inside a Rayon pool whose purpose is to *confine* the fan-out to the shard's own core rather than to provide parallelism.
+
+The pool is **thread-local to the blocking thread**, and its width is `available_parallelism()` evaluated on that thread. Both properties follow from the shard's placement rather than from a constant or an environment variable:
+
+- There is **no thread-count knob**: no config key, no compiled-in cap, and nothing read from the environment. A width is not a policy choice; it is a reading of where the thread was placed, and anything an operator could set would be a worse answer than the one the placement already gives.
+- The width is passed explicitly, and that explicitness is load-bearing: without it Rayon reads `RAYON_NUM_THREADS` from the environment, and the width must be the thread's, not the environment's.
+- The pool's workers inherit the blocking thread's CPU affinity mask, so placement follows too. A shard pinned to one CPU gets a pool confined to that CPU.
+- One pool **per blocking thread**, not one per process. `install()` runs the closure on the pool's workers and blocks the caller, so a process-global single-worker pool would funnel every shard's embeds through one worker and serialize embedding across the whole process. Per-thread pools keep shards independent. Each is built once per thread and reused.
+
+#### What the width is worth
+
+Measured by the process-oriented contention harness (`brain-server/benches/embed_contention.rs`) on a 10-CPU box. Because the width is derived rather than configured, there is no width to sweep in production; the harness reports the width the derivation produced alongside what it measured.
+
+Isolated embedding throughput, embeds per second across all shards:
+
+| Shards | width 1 | width 2 | width 4 | width 8 |
+|---|---|---|---|---|
+| 4 | 266 | 258 | 235 | 203 |
+| 9 | 586 | 573 | 551 | — |
+
+Throughput **falls** as intra-op width rises. Widening the split does not buy speed; it buys cache and scheduler interference on cores another shard is already using. Going from 4 shards to 9 raises throughput 2.2× at width 1 — the shard axis is where the scaling is.
+
+Shard-side scheduling latency is unaffected by a concurrent embed: p95 inflation between the isolated and contended phases measures **1.00–1.02**. Moving the forward pass off the reactor is what buys that, and keeping its fan-out on the shard's own core is what keeps it there.
+
+The harness probe is a multiply-accumulate sweep over a resident 384-float buffer, shaped like an HNSW distance computation. It shows whether embedding work takes CPU from a shard reactor; it models neither redb page-cache pressure, Tantivy I/O, nor memory-bandwidth contention.
 
 CPU inference is not internally batched. Each request goes through the model independently. CPU batching has marginal benefits at small batch sizes and adds complexity; it is not used.
 
-GPU inference is batched ([`04_batching_gpu.md`](04_batching_gpu.md)). The GPU benefits from larger batches; in-flight requests are gathered within a small time window and submitted together.
+Batching is where the GPU path would earn its keep — gathering in-flight requests within a small time window and submitting them together ([`04_batching_gpu.md`](04_batching_gpu.md)). That path is not available (§14.2), so no deployment batches.
 
 ### 20. Inference errors
 
-Inference can fail due to:
+`EmbedError` is one flat enum covering load and inference. The inference-time variants are:
 
-- **Resource exhaustion** — out of memory (CPU or GPU), too many concurrent calls.
-- **Numerical issues** — NaN or Inf in activations (very rare with well-trained models, possible if weights are corrupted).
-- **Driver errors** (GPU only) — CUDA errors, GPU resets.
+- `TokenizationFailed` — the tokenizer could not encode (missing vocab, internal error).
+- `TensorBuild` — building one of the BERT input tensors from the token ids failed. Kept distinct from a forward-pass failure because it happens at tensor-construction time.
+- `NumericFailure` — the forward pass returned a pathological vector: NaN, Inf, or a norm too near zero to normalize. Detected after inference by the norm check; the embedding is rejected rather than stored, and logged for investigation.
+- `OutputDimMismatch { expected, got }` — the model's output dimension is not `VECTOR_DIM` (384). Almost always means the model directory points at a non-BGE-small model.
 
-Error handling:
+There is no queue-depth rejection at the embedding-layer entry and no `ServiceUnavailable`. Concurrency is bounded structurally instead: one in-flight embed per shard, each on that shard's blocking thread, confined to that shard's core (§19). A saturated shard slows down; it does not shed embeds.
 
-- CPU exhaustion: queue depth check at the embedding-layer entry; reject with `ServiceUnavailable` if queue is full.
-- GPU errors: log, fall back to CPU if configured, otherwise return `EmbeddingFailed`.
-- Numerical issues: detected after inference (norm check); the embedding is rejected and logged for investigation.
+Load-time variants (`ModelPathInvalid`, `ConfigRead` / `ConfigParse`, `TokenizerRead` / `TokenizerParse`, `WeightsMissing`, `WeightsLoad`, `WeightsHash`, `UnsupportedDevice`, `WarmupFailed`) all fail shard spawn rather than degrading it.
 
 ### 21. Loading the model
 
 At startup:
 
+0. Validate `device` and `dtype` — CPU and FP32 respectively — **before any I/O**, so a misconfigured deployment fails on the configuration rather than after reading a hundred megabytes of weights.
 1. Read `config.json` for model architecture parameters.
-2. Read `tokenizer.json` for the tokenizer.
-3. Load weights from `model.safetensors` (preferred) or `pytorch_model.bin`.
+2. Read `tokenizer.json` for the tokenizer (raw bytes for the fingerprint, and the tokenizer instance, from the same path).
+3. Load weights from `model.safetensors`. Nothing else is accepted (§23).
 4. Compute the model fingerprint (BLAKE3 over a canonical form of model + tokenizer + version metadata).
-5. Initialize the model on the configured device (CPU or GPU).
-6. Run a warm-up inference (a few times) to eagerly initialize JITs and caches.
+5. Build the model on CPU.
+6. Run warm-up inferences — `warmup_iters`, default 3 — to eagerly initialize caches.
 
-The full startup is typically 1–3 seconds.
+The full startup is typically 1–3 seconds. Every step fails shard spawn rather than degrading it.
 
 ### 22. Reload and hot-swap
 
@@ -328,12 +354,12 @@ A future major version may support hot-swap: the new model is loaded alongside t
 
 ### 23. Disk format
 
-`model.safetensors` is preferred over `pytorch_model.bin`:
+**`model.safetensors` is the only accepted weight format.** A model directory without it fails to load with `EmbedError::WeightsMissing`, whose message says so outright: *"model.safetensors missing; pickle (.bin) weights are refused."*
 
 - **safetensors** is HuggingFace's modern weight format. Memory-mapped friendly, no arbitrary code execution risk on load.
-- **pytorch_model.bin** is the older PyTorch pickle format. Carries arbitrary code execution risk; pickle weights are accepted for users with PyTorch-trained weights but warned at load.
+- **pytorch_model.bin** is the older PyTorch pickle format, and loading it executes arbitrary code from the file. There is no flag, path or warning-level acceptance for it. A refusal an operator can opt out of is not a mitigation, so there is nothing to opt out of: a PyTorch-trained model is converted to safetensors out of band before it reaches Brain.
 
-Brain refuses to load pickle weights from any path other than the configured model directory, and always validates the file's hash against the configured fingerprint at load.
+The weights file's bytes are hashed into the model fingerprint at load, which is what ties every stored vector to the exact weights that produced it ([`05_fingerprinting.md`](05_fingerprinting.md)).
 
 ### 24. Deterministic inference
 

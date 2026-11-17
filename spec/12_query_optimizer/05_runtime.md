@@ -12,8 +12,7 @@ Each shard runs on a dedicated OS thread, pinned to a CPU core. On that thread, 
 
 Tasks include:
 - Connection handlers.
-- Request executors (one per in-flight request).
-- The writer task.
+- Request executors (one per in-flight request, writes included).
 - Background workers (decay, consolidation).
 
 Glommio multiplexes them via cooperative async scheduling. No OS-level session switches; just future-state machine resumption.
@@ -21,66 +20,53 @@ Glommio multiplexes them via cooperative async scheduling. No OS-level session s
 ## 2. The single-writer pattern
 
 Within a shard:
-- Many request executors run concurrently (reads in particular).
-- One writer task processes mutations sequentially.
+- Many request executors run concurrently, reads and writes alike.
+- One writer handle, which they all call, and at most one open redb write transaction.
 
 Read-only request executors (RECALL, PLAN, REASON) don't touch the writer. They open read transactions on storage and run independently.
 
-Write-bearing request executors (ENCODE, FORGET, LINK) send their write operations to the writer via a channel and await acks.
+Write-bearing request executors (ENCODE, FORGET, LINK) call the writer handle directly, on their own task. Several may be inside it at once at different stages; they do not overlap in the one region that matters — the redb transaction — because that region holds no await and so cannot be left mid-way on a single-threaded executor. The full model is specified in [14. Concurrency](../14_concurrency/02_writer_model.md).
 
-## 3. Channel-based writer communication
+## 3. Admission and backpressure
 
 ```rust
-// Executor side:
-let ack = self.send_to_writer(op).await?;
-
-// Writer side:
-loop {
-    let op = self.queue.recv().await;
-    let ack = self.process(op).await;
-    op.ack_tx.send(ack).await;
-}
+// Shard receive loop, per dispatch:
+let _ = permit_rx.recv_async().await;   // admit, or wait for a permit
+glommio::spawn_local(async move {
+    future_factory().await;             // the whole dispatch
+    let _ = permit_tx.send_async(()).await;
+}).detach();
 ```
 
-The channel is bounded (default 1024). If full, executors await until space opens. This provides backpressure naturally.
+A shard admits a bounded number of in-flight dispatches. The bound is derived from the WAL group-commit batch budget — `max_batch_bytes / 4 KiB`, floored at 2 — so the number of requests allowed to overlap is the number whose records the committer can usefully fold into one `fdatasync`. A permit is held until the dispatch has completely finished, so a saturated shard parks its receive loop and stops reading the request channel, which is where backpressure comes from.
 
 ## 4. Group commits
 
-The writer task batches operations:
+Batching happens in the WAL, not in a queue ahead of the writer. Each write appends its records and awaits durability; the committer folds whatever arrived in the window into one `fdatasync`:
 
 ```rust
-async fn writer_loop(&mut self) {
-    loop {
-        // Drain at least 1 op
-        let mut batch = vec![self.queue.recv().await];
-        
-        // Try to gather more, with a brief timeout
-        let timeout = sleep(Duration::from_micros(100));
-        loop {
-            select! {
-                op = self.queue.try_recv() => batch.push(op?),
-                _ = &mut timeout => break,
-                _ = (batch.len() >= 64) => break,
-            }
-        }
-
-        // Process the batch as one group commit
-        self.process_batch(batch).await;
-    }
+pub struct GroupCommitConfig {
+    /// Time the committer waits for more records once the first
+    /// record of a batch has arrived. Default: 100 µs.
+    pub commit_window: Duration,
+    /// Buffer-size threshold that triggers an early flush.
+    /// Default: 60 KiB.
+    pub max_batch_bytes: usize,
 }
 ```
 
-The 100 µs window plus 64-op cap balance latency vs throughput:
+This is the await that makes the in-flight bound of §3 worth having: the overlap is what gives the committer more than one record to fold.
+
+The 100 µs window plus 60 KiB budget balance latency vs throughput:
 - Light load: ~100 µs added latency per write.
-- Heavy load: 64 ops per commit, ~5 µs per write.
+- Heavy load: a batch's worth of records per fsync, amortizing it across all of them.
 
 ## 5. Cooperative yielding
 
 Within long-running steps, executors yield:
 
-- Every ~100 µs of CPU work.
 - At every I/O await point.
-- Explicitly via `tokio::task::yield_now()` (or Glommio equivalent).
+- Explicitly via `glommio::executor().yield_if_needed()`, which yields only when the executor says this task has had its turn — the batch loops in the workers and the shard's long scans call it per item.
 
 Yields let other tasks make progress. Without them, a single heavy request could starve others.
 
@@ -92,11 +78,11 @@ Readers (executors handling RECALL, etc.):
 - Don't block writers (MVCC).
 
 Writers:
-- Process operations sequentially.
-- Hold redb write transactions briefly.
+- Overlap in their awaiting stages; commit one at a time.
+- Hold redb write transactions briefly, and hold them across no await.
 - Don't block readers (MVCC).
 
-The single-writer-per-shard discipline means there's no writer-vs-writer contention.
+One writer handle per shard means there's no writer-vs-writer contention: writes order themselves by reaching the transaction region, and no lock is taken to arrange them.
 
 ## 7. Cross-shard concurrency
 
@@ -166,12 +152,11 @@ Brain has timeouts per-shard (default 5 sec per shard call). If a shard times ou
 
 Background workers (decay, consolidation, maintenance) also run on the same Glommio executors. They yield generously to keep request latency low.
 
-Brain prioritizes:
-- High: request executors.
-- Medium: writer task.
-- Low: background workers.
+Brain splits them into two Glommio task queues and lets shares decide:
+- The default queue (1000 shares) runs request executors, writes included.
+- A `brain-workers` queue (250 shares, `Latency::NotImportant`) runs the background workers.
 
-This is enforced through scheduling hints (Glommio supports task priorities).
+Shares only bind when both queues want to run, so under contention derivation gets roughly a fifth of the lane and an acked write keeps its promise, while on an idle request path the workers get all of it. A shard cannot be split across threads to solve this instead — its ops context is `!Send` by design, so a worker and the requests it competes with necessarily share one executor, and priority is the only lever there is.
 
 ## 12. The "isolation" guarantee
 
@@ -359,7 +344,7 @@ What can go wrong at the planner/executor level and how Brain responds.
 
 **Operator action.** Fix the idempotency table. Investigate the cause.
 
-This is an open issue: should Brain fail-closed (reject the request) or fail-open (proceed without idempotency)? Currently fail-open with warning. See [`../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md).
+Brain fails open here rather than fail-closed: an unreachable idempotency table does not reject the write.
 
 ## 12. Read transaction held too long
 
@@ -440,7 +425,3 @@ When Brain is overloaded (high CPU, memory pressure, queue depths), it sheds loa
 This prevents a death spiral. Better to fail fresh requests fast than to slow down all requests.
 
 The shed-load thresholds are configurable. Default: shed when CPU > 90% sustained for 5 sec.
-
----
-
-*Continue to [`../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md) for unresolved questions.*

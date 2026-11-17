@@ -13,7 +13,7 @@ that are deliberate rather than pending, see
 ## Performance verification
 
 **Reference-hardware performance verification is optional and off the critical
-path for v1.0** (owner decision, 2026-09-07).
+path for v1.0.**
 
 v1.0 locks on functional and operational correctness — hardware-independent,
 runnable in CI — not on measured latency, throughput or storage numbers. The
@@ -46,8 +46,12 @@ follow-up, never a v1.0 blocker. See
 
 - **Live LLM provider validation.** The Anthropic and OpenAI clients are
   exercised through a mock-client integration suite. A pass against real
-  providers — through the broker, with real cost accounting — is still needed.
-  Independent of reference hardware: it runs on any box with a working broker.
+  providers is still needed, and it has to cover the spend ledger: every
+  model-backed stage bills the tenant's own registered credential, so what
+  needs verifying is that `llm_spend` attributes each call accurately — not
+  that spend is capped, which is deliberately not done when the key is the
+  tenant's. Independent of reference hardware: it runs on any box with a
+  registered provider credential.
 - **Tutorial polish.** The end-to-end tutorial (blank deployment → working
   query) needs one "follow it on a fresh laptop" pass.
 
@@ -99,7 +103,13 @@ cannot satisfy.
   source of truth plus an in-memory freshness layer for recent writes — a
   Pinecone-serverless-style architecture.
 - **IVF + PQ on top of HNSW.** For billion-vector scale; today's HNSW is
-  RAM-heavy past ~10⁷ vectors per shard.
+  RAM-heavy past ~10⁷ vectors per shard. The quantizer itself is not the open
+  part: `brain-index` implements and exports the PQ primitives (k-means,
+  codebook training and bootstrap, encoding, distance and re-rank). No index
+  path builds or reads a quantized store and `IndexParams` carries no PQ
+  settings, so what remains is the IVF partitioning and the wiring into the
+  index lifecycle, as specified in
+  [`spec/09_indexing/07_hnsw_pq.md`](spec/09_indexing/07_hnsw_pq.md).
 - **Range-based sharding with Raft replication.** CockroachDB-style auto-split
   / auto-merge ranges. Today's `BLAKE3(space_id) % shard_count` caps a single
   space's throughput at one shard.

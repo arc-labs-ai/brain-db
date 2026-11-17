@@ -4,13 +4,28 @@
 
 The Query Pipeline is the **single** read pipeline every shard runs.
 It plans and executes queries over Memories, Statements, Relations,
-and Entities through one stack: validate → embed cue → fan out to
-the three always-wired retrievers (semantic + lexical + graph) →
-RRF fusion → cross-encoder rerank (always-on when the model is
-loaded; gated by the deploy-time `[rerank] enabled` switch, which defaults to `false`
-switch) → filter chain → wire response. The Query Router classifies each incoming query to pick
-weights and adjust top-K hints, **not** to switch between modes —
-every retriever lane is available every time.
+and Entities through one stack
+(`crates/brain-planner/src/retrieval/executor/logic.rs:634-800`):
+
+```
+validate → embed cue → fan out to the three always-wired retrievers
+(semantic + lexical + graph) → fusion → filter chain
+→ [recency boost, if the query carries a temporal signal]
+→ [cross-encoder rerank, if the model is loaded]
+→ [merge / diversity, if the router detected list intent]
+→ limit → wire response
+```
+
+The rerank sits **after** the filter chain, not between fusion and it:
+re-scoring a candidate the filter chain is about to drop would be
+cross-encoder time spent on a result nobody can receive. The rerank is
+always-on whenever a cross-encoder is loaded on the shard, and loading is
+governed by the deploy-time `[rerank] enabled` switch, which defaults to
+`false`; there is no per-request toggle.
+
+The Query Router classifies each incoming query to pick weights and pool
+widths, **not** to switch between modes — every retriever lane is
+available every time.
 
 This section extends Brain's Query Planner (§12) with:
 - Multi-retriever execution (semantic + lexical + graph in parallel).
@@ -18,12 +33,10 @@ This section extends Brain's Query Planner (§12) with:
 - RRF fusion.
 - Query classification and routing (weight selection, not mode selection).
 
-The historical "retrieval query" name reflects the fact that the
-pipeline fuses three retriever families. There is no single-retriever
-counterpart — the pipeline is the same whether or not a user
-schema has been declared. Schema declarations narrow what
-predicate-aware filters accept; they do not gate any stage of this
-pipeline.
+There is no single-retriever counterpart — the pipeline is the same
+whether or not a user schema has been declared. Schema declarations
+narrow what predicate-aware filters accept; they do not gate any stage
+of this pipeline.
 
 This pipeline is the **engine**, not a client verb. The sole client entry point
 is `RECALL` (§05.03), which runs this engine and returns a membership answer
@@ -78,14 +91,13 @@ Rule-based router. For each rule, if the conditions match, retrievers are select
 
 ```
 Rule 1: Entity-anchored query
-    Conditions: query.entity_anchor.is_some() OR NER finds entity in text
-    Retrievers: Graph (weight 2.0), Semantic (1.0)
-    + Lexical (0.5) if text is also present
+    Conditions: query.entity_anchor.is_some() OR a Title-Case mention in text
+    Retrievers: Graph (weight 2.0), Semantic (1.0), Lexical (0.7)
 
 Rule 2: Exact-term query
-    Conditions: text matches /[A-Z0-9-]{2,}/ (IDs, codes)
+    Conditions: text contains an exact identifier (e.g. ACME-1247)
                 OR text is all-caps tokens
-    Retrievers: Lexical (2.0), Semantic (0.5)
+    Retrievers: Lexical (2.0), Semantic (1.0), Graph (0.7)
 
 Rule 3: Time-filtered query
     Conditions: time_filter.is_some() OR text contains temporal expression
@@ -95,9 +107,14 @@ Rule 4: Type-filtered query
     Conditions: kind_filter or predicate_filter present
     Effect: Filter chain narrows after retrieval
 
-Rule 5: Default (free-text query)
-    Conditions: text present, no other signals
-    Retrievers: Semantic (1.0), Lexical (1.0)
+Rule 5: Free-text query (the "paraphrase-likely" class)
+    Conditions: text present, no anchor and no exact-term signal
+    Retrievers: Semantic (1.5), Lexical (1.0), Graph (0.5)
+
+Rule 7: Default
+    Conditions: no text and no anchor — a filter-only request
+    Retrievers: Semantic (1.0), Lexical (1.0), Graph (1.0)
+    Effect: no retriever signal is left to weight, so no lane is preferred
 
 Rule 6: List / aggregation query  (internal — never client-selected)
     Conditions: free-text cue carries enumerative intent — "list", "every",
@@ -122,15 +139,27 @@ the full candidate pool decides which memories belong to the answer, and
 `max_results` is only a safety cap on the returned member count — list handling
 changes *which* results the band admits, not a caller-chosen count.
 
-Rules are applied non-exclusively: a query can match multiple rules. The router unions selected retrievers and uses the maximum weight per retriever across matching rules.
+**Classification picks exactly one class, in priority order**, and the class picks one weight-and-pool profile (`crates/brain-planner/src/retrieval/router/logic.rs:243-268`):
+
+```
+entity anchor or Title-Case mention  → EntityAnchored
+else exact identifier or all-caps    → ExactTerm
+else text, with enumerative intent   → ListAggregation
+else text                            → Paraphrase
+else (no text, no anchor)            → Default
+```
+
+The rules above are how those conditions are read; they are not independently-composable weight sources. Rules 3, 4 and 6 are different in kind: they set *orthogonal* flags rather than a class, so they can fire alongside any of the five. An entity-anchored question that also reads as a list keeps its graph-led profile and gains the list flag — the class decides whose rank wins, the flag decides how wide the pool is and whether the merge stage runs.
+
+The full per-class weight and pool table is in [`./01_rrf_fusion.md`](./01_rrf_fusion.md) §"Adaptive top-K from the router".
 
 ### Limits and budgets
 
 The router enforces:
 - Max retrievers per query: 3 (all of semantic, lexical, graph if matched).
-- Max top_n per retriever: 200 (configurable).
-- Query timeout: default 1 second; cancellable.
-- Cost estimate: if estimated cost exceeds threshold, query is degraded (smaller top_n or fewer retrievers).
+- Per-retriever pool width: set by the query class — 50, 100, 200 or 400 (§"Classification"). 400, on a list/aggregation query, is the widest any class plans.
+- Per-retriever budget: 1 s, and **soft**. Exceeding it records the lane as `Timeout` and emits a warning; it does not cancel the lane, and a late result still reaches fusion (`crates/brain-planner/src/retrieval/planner/logic.rs:55-65`). A stuck retriever is therefore visible but not cut off.
+- Cost estimate: computed per plan and surfaced on the plan (and through `EXPLAIN`) as `estimated_cost_ms` (`crates/brain-planner/src/retrieval/planner/logic.rs:207`). It is a **diagnostic, not an admission control**: nothing in the planner degrades a plan to fewer retrievers or a narrower pool on the strength of its own estimate. A query the planner expects to be slow is planned and run as asked, and the estimate is what lets an operator see that it was.
 
 ### Per-query override (debug only)
 
@@ -221,19 +250,20 @@ QUERY: "what does Priya prefer about meetings"
 PLAN:
   ROUTING: entity-anchored (Priya), text-bearing
   PRE_FILTERS: none
+  CLASS: EntityAnchored  (weights 1.0 / 0.7 / 2.0, pool 50)
   RETRIEVERS:
-    SemanticRetriever(weight=1.0, top_n=100, corpus=statements)
-    LexicalRetriever(weight=0.7, top_n=100, query="meetings preferences")
+    SemanticRetriever(weight=1.0, top_n=50, corpus=statements)
+    LexicalRetriever(weight=0.7, top_n=50, query="meetings preferences")
     GraphRetriever(weight=2.0, top_n=50, anchor=priya, depth=1)
-  FUSION: RRF(k=60)
+  FUSION: RRF(k=15)   # pool < 200 ⇒ k=15, not the canonical 60
   POST_FILTERS: kind in [Preference], confidence ≥ 0.5, !superseded
   LIMIT: 20
-  ESTIMATED COST: 12ms
+  ESTIMATED COST: 12ms   # diagnostic only; does not degrade the plan
 ```
 
 ## Execution
 
-The executor runs retrievers in parallel (each on its own task on the shard's executor), waits for all to complete (or timeout), then fuses and filters.
+The executor runs retrievers in parallel (each on its own task on the shard's executor), gathers what they return, then fuses, filters, and runs the post-filter stages. The sketch below shows the gather-and-fuse shape; the budget it reads as a deadline is soft in the implementation — a lane that overruns is *recorded* as `Timeout` rather than cancelled, so its result can still arrive and be fused.
 
 ```rust
 async fn execute(plan: &QueryPlan, ctx: &Ctx) -> QueryResult {
@@ -255,10 +285,25 @@ async fn execute(plan: &QueryPlan, ctx: &Ctx) -> QueryResult {
         }
     }
     
-    let fused = fuse_rrf(retriever_outputs, plan.fusion.k, &plan.fusion.weights);
-    let filtered = apply_filters(fused, &plan.post_filters);
-    let limited = filtered.into_iter().take(plan.limit as usize).collect();
-    
+    // `k` is derived from the gathered pool's width, not taken from a
+    // constant — see 01_rrf_fusion.md §"Choice of k".
+    let k = adaptive_k(candidate_pool_width(&retriever_outputs));
+    let fused = fuse(retriever_outputs, k, &plan.fusion.weights, plan.fusion.method);
+    let mut items = apply_filter_chain(fused, &plan.post_filters);
+
+    // Post-filter stages, each conditional on a signal the router or the
+    // operator supplied — never on a client request field.
+    if plan.routing.temporal_pushdown || plan.post_filters.as_of.is_some() {
+        apply_recency_boost(&mut items, plan.fusion.weights.temporal, k);
+    }
+    if ctx.cross_encoder.is_some() {
+        items = rerank_stage(items, ctx).await;
+    }
+    if plan.routing.list_intent {
+        apply_diversity(&mut items);
+    }
+
+    let limited = items.into_iter().take(plan.limit as usize).collect();
     QueryResult { items: limited, debug: ... }
 }
 ```

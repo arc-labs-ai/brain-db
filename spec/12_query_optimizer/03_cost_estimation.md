@@ -20,7 +20,7 @@ For each operation:
 | Operation | Cost |
 |---|---|
 | Embed (cache hit) | 5 µs |
-| Embed (cache miss, CPU) | 5-10 ms |
+| Embed (cache miss, CPU) | Model- and machine-dependent; use a local calibrated estimate |
 | HNSW search (1M, ef=64) | 1-2 ms |
 | HNSW search (10M, ef=64) | 3-5 ms |
 | Metadata point lookup | 1-10 µs |
@@ -43,7 +43,7 @@ fn cost_recall(req: &RecallRequest, shard_stats: &ShardStats) -> f32 {
     cost_ms += if cache_likely_hit(req.cue_text) {
         0.005
     } else {
-        7.5  // average of 5-10 ms
+        calibrated_embed_cost_ms(req, shard_stats)
     };
 
     // ANN search
@@ -115,7 +115,9 @@ fn check_budget(estimated_cost_ms: f32, req: &Request) -> Result<()> {
 }
 ```
 
-The 1-second cap protects against pathological queries (e.g., REASON across many shards with high depth). Operators can configure the cap.
+The 1-second cap protects against pathological queries (e.g., REASON across many shards with high depth). Operators can configure the cap (`cost_budget_ms`, default `1000.0`); the 100 ms warn threshold is fixed.
+
+The budget is denominated in **milliseconds of estimated query latency** — Brain's own CPU for one request. It is unrelated to an extractor's declared `cost_budget`, which names a sum of money and is not enforced at all ([03.02](../03_schema/02_ast.md) §5a).
 
 ## 6. Cost vs request configuration
 

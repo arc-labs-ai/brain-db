@@ -126,9 +126,11 @@ Multiple transactions can be open simultaneously on the same shard:
 
 - Each is per-client (identified by the TxnHandle).
 - They're isolated from each other.
-- The writer task processes their commits sequentially.
+- Their commits land one at a time.
 
-Within a shard, transactions effectively serialize at commit time. No conflict detection beyond that — the single-writer serialization makes conflicts impossible.
+Requests on a shard overlap. The shard's receive loop admits each dispatch under a permit and detaches it onto the same executor, so two TXN_COMMITs can be in flight at once. What does not overlap is the commit itself: a COMMIT submits all of its phases as one write, and that write opens a single redb write transaction, applies every phase into it, stamps its idempotency row and commits — with no await anywhere in that region. On the shard's single-threaded executor a second commit therefore cannot enter it until the first has left. Transactions serialize at commit time because there is nowhere for the executor to go, not because anything queues behind a lock.
+
+No conflict detection exists beyond that ordering, and none is needed: two transactions are never inside the write transaction together. The writer model is specified in [14. Concurrency](../14_concurrency/02_writer_model.md).
 
 ## 9. Transaction expiration
 
@@ -168,7 +170,7 @@ The transaction has too many operations or too much payload. Error on COMMIT.
 
 ### CommitConflict
 
-Rare; reserved for future use if cross-transaction conflicts become possible. Currently, single-writer-per-shard means no conflicts.
+Rare; reserved for future use if cross-transaction conflicts become possible. Commits serialize structurally (§8), so two transactions cannot conflict.
 
 ## 12. The "implicit single-op transaction"
 
@@ -195,7 +197,7 @@ For workflows that touch multiple shards atomically, Brain doesn't help. Agents 
 1. Decompose into single-shard transactions.
 2. Use a saga pattern with compensating actions on failure.
 
-Cross-shard transactions are an open question; not currently supported.
+Cross-shard transactions are not supported.
 
 ## 15. The transaction commit latency
 

@@ -16,44 +16,40 @@ Client --[ENCODE]--> Connection layer
                    Routing layer (space_id → shard)
                           |
                           v
-                   Per-shard writer task
+                   Per-shard writer handle
                           |
                           v
                    1. Allocate slot
                    2. Write WAL record
                    3. fsync WAL (durability barrier)
-                   4. Write vector to arena
-                   5. Update metadata in redb
-                   6. Insert into HNSW
-                   7. Publish (epoch advance)
+                   4. Insert into HNSW
+                   5. Commit metadata in redb
+                   6. Resolve the durable watermark
+                   7. Publish events; enqueue derivation
                           |
                           v
                    Response back to client
 ```
 
-Steps 1–7 happen in a strict order. The fsync at step 3 is the durability barrier: after it, the operation is durable; before it, the operation is treated as never having happened.
+Steps 1–7 happen in a strict order *for one request*. The fsync at step 3 is the durability barrier: after it, the operation is durable; before it, the operation is treated as never having happened.
+
+Requests do not take these steps one at a time. A shard dispatches a bounded number of them concurrently onto its executor, so one request's step 3 overlaps another's step 2. Step 5 is the exception: the block that opens the redb transaction, applies every phase and commits holds no await point, so on a single-threaded executor only one request can be inside it. See [14.02 Writer Model](../14_concurrency/02_writer_model.md).
 
 ## 2. Slot allocation
 
-The slot allocator is a per-shard structure. It maintains:
+There are two slot structures, used by different phases.
 
-- A free-list of slot IDs that are free (after FORGET reclamation).
-- A "next new slot ID" counter for never-used slots.
+**On the live path**, a slot index is reserved from a monotonic in-process counter — a single `fetch_add`, no free-list consultation and no arena access. The counter is seeded at boot by `fetch_max` from the persisted high-water mark in `SLOT_VERSIONS_TABLE`, so a restart on a non-empty shard never re-issues a live slot index. (Without that seed the counter would restart at 1 and collide `memory_id`s, silently overwriting rows and tripping the extractor's `has_extracted` gate so new writes never extract.) `fetch_max` keeps it monotonic: it only ever moves forward, never below 1.
 
-When allocation is requested:
-
-1. If free-list is non-empty: pop the head; check the slot's flags to confirm it's still free; if so, use it.
-2. Otherwise: take the next new slot ID. If this exceeds the arena's capacity, trigger arena growth (see [`01_arena.md`](01_arena.md)).
-
-The allocated slot is marked as "pending-write" (flags bit 2) before any data is written. This bit is transient — cleared once the slot is fully populated.
-
-The MemoryId is constructed:
+The slot's version comes from a read of `SLOT_VERSIONS_TABLE`: a fresh index has no row and mints version 1, while an index whose prior occupant was reclaimed carries the post-reclaim bumped version, so stale references to that occupant mismatch on every read path.
 
 ```
-MemoryId = pack(shard_id_runtime, slot_id, slot_version_new, reserved=0)
+MemoryId = pack(shard_id_runtime, slot_id, slot_version)
 ```
 
-`slot_version_new` is `current_version + 1` for reclaimed slots, or 1 for never-used slots.
+**The arena's `SlotAllocator`** — the free-list plus next-fresh counter, whose `alloc` stamps `PENDING_WRITE` and whose `free` clears flags and pushes the index back — is rebuilt from the post-replay arena during recovery and serves the replay path. The live write path does not go through it, which is consistent with §5: the live path writes nothing into the arena at all.
+
+Arena growth is likewise a recovery-time and capacity concern rather than a step in a client write; see [`01_arena.md`](01_arena.md).
 
 ## 3. WAL record construction
 
@@ -104,46 +100,24 @@ Up to step 5, the operation is **not durable**. Only after step 5 has the write 
 
 If Brain crashes between record append and step 5, the operation is lost. The client retry (with the same `request_id`) will succeed normally as a new operation; idempotency only kicks in if the original made it past step 5.
 
-## 5. Arena write
+## 5. The arena on the live path
 
-After WAL fsync confirms durability, Brain writes the vector to the arena slot:
+The live ENCODE path does not write the vector into the arena slot. The slot is allocated (which stamps `PENDING_WRITE`, the new slot version and the slot CRC), and that is the whole of the arena's involvement in a successful write.
 
-```rust
-let slot_offset = HEADER_SIZE + slot_id * SLOT_SIZE;
-let vector_ptr = arena_base.add(slot_offset);
+The at-rest homes of a memory encoded in the current run are **redb** — which holds the durable write-time vector for the complete live set — and, for its text, the lexical index. The arena is filled by WAL replay: `write_encoded_slot` copies the vector out of the `EncodePayload`, sets `OCCUPIED`, stamps the slot version, the model fingerprint and the record's timestamps, and refreshes the slot CRC.
 
-// Write vector
-unsafe {
-    std::ptr::copy_nonoverlapping(
-        vector.as_ptr() as *const u8,
-        vector_ptr,
-        VECTOR_BYTE_SIZE,
-    );
-}
+So the arena is the **boot-time image** of every durable memory, not a live mirror. Two consequences follow, and both are load-bearing:
 
-// Write metadata
-let metadata_offset = slot_offset + VECTOR_BYTE_SIZE;
-write_slot_metadata(arena_base.add(metadata_offset), &metadata);
+- A rebuild of the ANN index at runtime must read redb, not the arena. A runtime rebuild from the arena would silently drop every memory encoded in the current run. Only the boot-recovery rebuild may use the arena, because at that moment the arena has just been replayed and *is* the durable image.
+- A hard FORGET of a same-run memory is a no-op against the arena: there is no slot to zero, and the data's at-rest homes are purged elsewhere. `hard_forget_slot` therefore checks occupancy and slot version, and leaves a slot alone if it is free or has been reclaimed by a newer memory.
 
-// Set occupied bit (and clear pending-write bit)
-let flags_offset = metadata_offset + 4;
-let flags_ptr = arena_base.add(flags_offset) as *mut u32;
-unsafe {
-    std::ptr::write_volatile(flags_ptr, OCCUPIED_FLAG);
-}
-```
+The arena is not fsync'd on the write path either. Its pages go to the page cache and the kernel writes them back lazily; `msync(MS_SYNC)` happens only inside the checkpoint sequence. Durability belongs to the WAL.
 
-The arena writes are not fsync'd. They go to the page cache; the kernel writes them back lazily. If Brain crashes after WAL fsync but before the arena write completes:
-
-- WAL is durable (record is fsync'd).
-- Arena write may be partial.
-- Recovery replays the WAL record, re-writing the vector to the arena. The arena ends up correct.
-
-This is the "log is truth" invariant in action.
+This is the "log is truth" invariant in action: the WAL record carries the vector, so the arena is always reconstructible and never has to be correct ahead of recovery.
 
 ## 6. Metadata update
 
-After the arena write, Brain updates the metadata store:
+Brain then updates the metadata store:
 
 ```rust
 let txn = metadata_db.begin_write()?;
@@ -191,50 +165,37 @@ After metadata commits, Brain inserts the vector into the HNSW index:
 hnsw_index.insert(memory_id, &vector, &options)?;
 ```
 
-HNSW insertion is in-memory and does not have its own persistence. The HNSW index is reconstructible from the arena and metadata; on restart, it's rebuilt.
+HNSW insertion is in-memory and does not have its own persistence. It runs **before** the redb transaction opens, so the transaction's lifetime stays minimal and an HNSW failure abandons the write before any metadata commits.
 
-The HNSW index is rebuilt at startup from a checkpoint plus replay of post-checkpoint changes. See [09. Indexing](../09_indexing/00_purpose.md) §Recovery.
+The HNSW index is rebuilt at startup from a snapshot plus replay of post-snapshot changes, falling back to a full rebuild. See [09. Indexing](../09_indexing/00_purpose.md) §Recovery and [`04_recovery.md`](04_recovery.md) §8.
 
-## 8. Publication
+## 8. Resolving the durable watermark
 
-After all the above, the new memory is "published":
+Immediately after `commit()` returns, the write resolves the LSN range the WAL drain reserved for it. The shard publishes the highest *contiguous* prefix of committed LSNs; see [14.02 §13a](../14_concurrency/02_writer_model.md).
 
-- The slot's `pending-write` flag is cleared (the slot is fully written).
-- The shard's epoch is advanced (or scheduled to advance), so reads can see the new memory.
-- Any clients waiting for `request_id` notification are notified.
+This matters here because concurrent requests do not commit in LSN order. A write that appended earlier may commit later, and until it does, the frontier stays below its first LSN no matter how many later writes have committed.
 
-Publication is the moment the new memory becomes visible to other operations. A `RECALL` issued just before publication sees the previous state; a `RECALL` issued after sees the new memory.
+## 9. Publication and the acknowledgment
 
-## 9. The acknowledgment
+After the commit, the write publishes one event per phase that has a wire surface and enqueues its post-commit derivation stages (auto-edge, temporal-edge, extractors). Then the response goes back to the client, carrying the memory id, the durable LSN, and the list of pending background stages.
 
-The response is sent back to the client:
+A new memory is visible to RECALL as soon as its redb row commits; the HNSW point is already in place by then. Publication of the ANN pending buffer into the main graph is a structure-and-cost concern, not a visibility gate — a search merges the pending buffer with the published main graph, so a freshly-inserted vector is found before any publication happens. See [14.02 §17](../14_concurrency/02_writer_model.md) under Atomic Publication.
 
-```rust
-SendResponse {
-    request_id: request.request_id,
-    memory_id: allocated_id,
-    salience: computed_initial_salience,
-    // ...
-}
-```
-
-The acknowledgment can be sent any time after step 4 (WAL fsync). Brain optimizes for low latency by acknowledging as soon as durability is confirmed; steps 5–8 happen in the background after the ack.
-
-This is a deliberate design choice. The client knows the operation is durable; what's left is bookkeeping that the client doesn't need to wait for.
+The ack is sent after the redb commit, not after the WAL fsync. The client's success response therefore means all of: the record is fsync'd, the memory row is committed, and the HNSW point is live. Only the derivation stages are left, and the response names them so a client that wants to wait can.
 
 ## 10. Failure handling per step
 
 | Step | Failure modes | Response |
 |---|---|---|
 | 1. Slot allocation | Out of free slots, growth fails | Return `OutOfStorage` to client |
-| 2. WAL append | Buffer full, transient failure | Wait briefly; if persistent, return `WalUnavailable` |
-| 3. WAL fsync | Disk error | Mark WAL broken; return `WalUnavailable` |
-| 4. Arena write | Should not fail (memory write) | If page-cache OOM, log and continue (write will succeed eventually) |
-| 5. Metadata update | redb commit fails | Log; ack to client (WAL is durable); recovery will fix |
-| 6. HNSW insertion | OOM | Log; mark for HNSW rebuild on next checkpoint cycle |
-| 7. Publication | Should not fail | (Atomic operation) |
+| 2. WAL append | Channel full, transient failure | Await channel capacity; if persistent, return a WAL-sink error |
+| 3. WAL fsync | Disk error | Latch WAL broken (terminal for the process); the write fails non-retryably |
+| 4. HNSW insertion | OOM | Abandon the write before the transaction opens; the reserved LSN range is abandoned by its `Drop` guard |
+| 5. Metadata commit | redb commit fails | Fail the write; the reserved LSN range is abandoned, so the frontier closes across it on a later commit |
+| 6. Watermark resolve | Cannot fail | (Atomic publish under a short mutex) |
+| 7. Publish / enqueue | Channel full | Best-effort: the stage is dropped and counted; the write still succeeded |
 
-Note that steps 4–7 happen after the durability barrier. If they fail, the operation is still durable from the client's perspective; recovery (or background workers) will reconcile.
+Note that only step 7 happens after the client's ack. A failure at step 4 or 5 is reported to the client as a failure even though the write's WAL records are already durable, and that is consistent: abandoning the reserved range lets a later real commit close the contiguous prefix across it, so recovery skips those records rather than applying an operation the client was told had failed. If the failure was the last thing to happen before a crash, no later commit closed the prefix, so recovery does replay the record — and the apply re-derives the same refusal. See [`04_recovery.md`](04_recovery.md) §5a: the log records attempts, not only outcomes.
 
 ## 11. The FORGET write path
 
@@ -243,13 +204,16 @@ Analogous to ENCODE:
 1. Validate the MemoryId belongs to the agent.
 2. Construct a FORGET WAL record.
 3. fsync the WAL.
-4. Update the slot's flags (set tombstone bit).
-5. Update metadata (mark memory as tombstoned, set forgot_at).
-6. Remove from HNSW.
-7. Publish.
-8. For hard mode: zero the slot's vector and text.
+4. Mark the memory tombstoned in HNSW.
+5. Commit metadata (mark memory as tombstoned, set forgot_at).
+6. Publish.
+7. For hard mode on a memory that has an arena slot: zero the slot's vector and set `HARD_FORGOTTEN`.
 
-For soft mode, steps 4–6 are sufficient; the slot's data is preserved until reclamation. For hard mode, an additional WAL record (HARD_FORGET) is written and step 8 happens, ensuring the data is unrecoverable.
+For soft mode, steps 4–5 are sufficient; the data is preserved until reclamation.
+
+Hard mode promises the plaintext-derived embedding is no longer recoverable from the file. Step 7 runs at the shard boundary rather than inside the apply, because the apply layer holds only the redb transaction while the arena lives on the shard. It is guarded on occupancy and slot version: a memory encoded in the current run has no arena slot to zero (its at-rest homes are redb and the lexical index, purged in step 5), and if a newer memory has reclaimed the slot index, the version mismatch leaves that memory's vector alone.
+
+A hard FORGET inside a transaction is buffered until `COMMIT_TXN`, and a rollback must not leave a zeroed slot, so transactional hard forgets are covered by recovery's replay — which re-zeroes hard-forgotten slots — rather than at the shard boundary.
 
 ## 12. The LINK write path
 
@@ -258,7 +222,7 @@ For adding edges to existing memories:
 1. Validate source and target MemoryIds belong to the agent.
 2. Construct a LINK WAL record.
 3. fsync.
-4. Update the metadata's edge table.
+4. Commit the metadata's edge table.
 5. (No arena change.)
 6. Publish.
 
@@ -285,24 +249,52 @@ For a typical ENCODE on commodity NVMe:
 | Step | Time |
 |---|---|
 | Embedding (cache hit) | <0.001 ms |
-| Embedding (cache miss; CPU inference) | 5-10 ms |
+| Embedding (cache miss; CPU inference) | CPU- and model-dependent; see the reference measurement below |
 | Slot allocation | <0.001 ms |
 | WAL append | <0.01 ms |
 | Group-commit wait + fsync | 0.1-0.3 ms |
-| Arena write | <0.001 ms |
-| Metadata commit (redb) | 0.1-0.5 ms |
 | HNSW insert | 0.5-2 ms |
-| Publication | <0.001 ms |
-| **Total (cache hit)** | **~1 ms** |
-| **Total (cache miss)** | **6-13 ms** |
+| Metadata commit (redb) | 0.1-0.5 ms |
+| Watermark resolve | <0.001 ms |
+| Publish + stage enqueue | <0.001 ms |
+| **Total excluding CPU embedding** | **measure on the deployment** |
 
-The bottleneck is embedding. The storage layer's contribution is minor.
+These are per-request step costs, not a serial budget. Concurrent requests overlap everything except the metadata commit, so a shard's *throughput* is not the reciprocal of the column's sum; the commit row is the only one that every request must have to itself.
+
+The embedding row and the total are not latency contracts. As a reference
+measurement, `bge-small-en-v1.5` (BERT, 33M parameters, f32, 127 MB, 384
+dimensions) took 16.8 ms for a 9-word text at an intra-op width of one, and
+about 51 ms for the same text at a width of 10, on aarch64 Linux in the
+devcontainer with 10 CPUs exposed. A roughly 500-token text took about 652 ms.
+
+The forward pass does not run on the shard's reactor. The embed helper leaves
+the reactor through `glommio::executor().spawn_blocking`, and that executor's
+blocking pool is a single thread whose CPU set holds the shard's own pinned
+CPU. The reactor becomes schedulable again while the model runs, but the two
+share one core: going off-reactor buys a thread, not a core.
+
+Widening the intra-op split therefore costs throughput rather than buying it —
+the extra pieces run on cores other shards own. Measured in isolation on a
+10-CPU box, 4 shards sustained 266, 258, 235 and 203 embeds per second at
+intra-op widths of 1, 2, 4 and 8; 9 shards sustained 586, 573 and 551 at widths
+of 1, 2 and 4. The width is derived from the machine; it is not an operator
+knob.
+
+Shard-side latency is unaffected by a concurrent embed. The same harness
+measured a probe p95 inflation of 1.00-1.02 across every arm, which is what the
+offload exists to deliver.
+
+Measure on the deployment hardware when sizing the write path.
 
 ## 15. Concurrent ENCODEs
 
-Multiple ENCODE operations from different agents (different shards) run independently. Within a shard, the writer task serializes them — single-writer-per-shard.
+Multiple ENCODE operations from different agents (different shards) run independently.
 
-For high-throughput single-shard workloads, the writer task's throughput is bounded by:
+Within a shard they overlap. The shard admits up to 15 concurrent dispatches at the default WAL batch budget, so while one ENCODE waits on its group-commit fsync, others are embedding, appending, or inserting into HNSW. What does *not* overlap is the redb transaction: its body holds no await, so on the shard's single-threaded executor the commits run one after another with nothing interleaved. Concurrency between requests, serialization of the transaction.
+
+The ordering consequence is worth stating plainly: two concurrent ENCODEs on one shard may be assigned LSNs in one order and commit in the other. Nothing downstream may assume LSN order implies commit order — which is why the shard's durable watermark tracks a contiguous committed prefix instead of a maximum ([14.02 §13a](../14_concurrency/02_writer_model.md)).
+
+For high-throughput single-shard workloads, throughput is bounded by:
 
 - WAL fsync throughput (with group commit, ~50K-200K records/sec).
 - redb commit throughput (~10K-50K commits/sec for small transactions).

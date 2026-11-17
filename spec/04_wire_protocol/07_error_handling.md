@@ -27,6 +27,7 @@ The `ErrorCategory` enum classifies errors into broad groups:
 | `ResourceExhausted` | Out of slots, disk, rate limit | Yes (after retry-after) |
 | `Internal` | Server bug | Maybe (retry; report if persistent) |
 | `Unavailable` | Shard unavailable, server overloaded | Yes (after retry-after) |
+| `OperatorIntervention` | Server-side fault that no retry can clear; the deployment itself is broken | No (an operator must repair it) |
 
 The category drives client retry behavior. The client uses category to decide whether to retry, propagate, or fail fast.
 
@@ -46,9 +47,9 @@ A more specific error code accompanies each category. The complete table:
 | `BadFrame` | Generic malformed frame |
 | `OversizePayload` | Payload exceeds server's max |
 | `ReservedFieldNonZero` | A reserved field had a non-zero value |
-| `BadFlagCombination` | Frame flags are mutually inconsistent |
 | `MalformedPayload` | CBOR payload didn't decode or failed schema validation |
-| `MalformedVector` | Raw vector bytes don't match declared dim or fail norm check |
+
+Frame flags carry no cross-flag consistency rule: a reserved flag bit set to 1 is `ReservedFieldNonZero`, and no combination of the defined flags is illegal. A malformed payload is reported by the layer that found it. The codec answers `MalformedPayload` for a body that does not decode; a vector whose declared dimension, finiteness or L2 norm is wrong decodes cleanly and is caught by the handler, which answers `InvalidArgument` naming the field — the same code and the same shape of answer as every other bad field value.
 
 #### 3.2 Connection / handshake (Category: `Protocol` or `Authentication`)
 
@@ -89,18 +90,11 @@ The namespace failures above are deliberately **not** separately coded. Each one
 | Code | Meaning |
 |---|---|
 | `InvalidArgument` | A request field was invalid (details in `ErrorDetails.field`) |
-| `MissingRequiredField` | A required field was absent |
-| `TextTooLarge` | Encoded text exceeds max |
-| `TextEmpty` | Encoded text was empty |
 | `BadSessionId` | Session ID isn't valid for this space |
-| `BadMemoryKind` | Invalid memory kind (e.g., client-supplied `Consolidated`) |
-| `BadEdgeKind` | Unknown edge kind |
-| `BadStrategyHint` | Strategy hint not valid for this operation |
-| `TopKOutOfRange` | top_k exceeds limit |
-| `BudgetTooLarge` | Plan/reason budget exceeds limit |
-| `BadModelFingerprint` | Model fingerprint doesn't match a known model |
 | `PredicateNotInSchema` (0x004B) | Predicate qname is not declared in the active schema for this namespace. Returned in strict mode only. |
 | `RelationTypeNotInSchema` (0x004C) | Relation type qname is not declared in the active schema for this namespace. Returned in strict mode only. |
+
+Field-level validation is **one** code. `InvalidArgument` names the offending input in `ErrorDetails.field`, so an empty or oversize `text`, an out-of-range plan or reason budget, a `model_fingerprint` that does not match the serving embedder, a client-supplied `kind` the server will not accept, and a vector of the wrong dimension or norm all report `InvalidArgument` with the field named rather than a code apiece — a client that branched on a code per field would still have to read the field to recover. Three conditions have no code at all. A field absent from the body never reaches validation: it fails CBOR decode as `MalformedPayload`. The RECALL result cap is **clamped**, not refused, because `0` is its documented "use the server default" sentinel and the cap is a safety bound rather than a meaning the caller chose. And a strategy hint is accepted in every wire-decodable form by design, as is an edge kind: both decode infallibly, so there is no invalid value to report.
 
 #### 3.5 Not found (Category: `NotFound`)
 
@@ -133,15 +127,16 @@ The namespace failures above are deliberately **not** separately coded. Each one
 | `OutOfMemory` | Process memory exhausted |
 | `RateLimited` | Per-connection or per-space rate limit exceeded |
 | `StreamLimitExceeded` | Per-connection concurrent stream limit |
-| `ConnectionLimitExceeded` | Per-agent or per-IP connection limit |
 | `TransactionLimitExceeded` (0x0076) | Per-space active-transaction limit |
 | `TransactionTooLarge` (0x0077) | A transaction exceeded the per-transaction operation cap |
+
+The connection caps in §10 are enforced at accept, before TLS and before the handshake, so an over-cap connection is dropped rather than answered. There is no negotiated session and no stream on which an error frame could be sent, which is the point: shedding a connection flood must cost less than serving it.
 
 #### 3.8 Internal (Category: `Internal`)
 
 | Code | Meaning |
 |---|---|
-| `Internal` (0x0080) | Generic internal error (server bug) |
+| `Internal` (0x0080) | Generic internal error (server bug) that may not recur on a retry. A fault known to be permanent is coded `UnrecoverableInternal` in `OperatorIntervention` instead, because the category tells clients and HTTP proxies whether to retry. |
 | `StorageError` (0x0081) | Storage layer failed |
 | `IndexError` (0x0082) | Vector index failed |
 | `EmbeddingError` (0x0083) | Embedding layer failed |
@@ -174,7 +169,6 @@ Typed-graph opcodes (the `0x01xx` namespace) surface their own error codes. Code
 
 | Code | Name | Family | Category |
 |---|---|---|---|
-| `0x0120` | `SchemaInvalid` | Schema | Validation |
 | `0x0121` | `SchemaMigrationRequired` | Schema | Conflict |
 | `0x0130` | `EntityNotFound` | Entity | NotFound |
 | `0x0131` | `EntityTypeMismatch` | Entity | Validation |
@@ -193,6 +187,8 @@ The namespace byte (`0x01`) tells operators reading a code at a glance that the 
 
 Cardinality violations on RELATION_CREATE surface as the substrate-wide `CardinalityViolation` (0x0065, §3.6) — there is no typed-graph–local code for it. Open-vocabulary qname rejections in strict mode surface as `PredicateNotInSchema` (0x004B) / `RelationTypeNotInSchema` (0x004C) under §3.4. Retriever degradation surfaces as `RetrieverDegraded` (0x0094) under §3.9.
 
+Schema validation has no error code either. SCHEMA_UPLOAD and SCHEMA_VALIDATE answer a rejected document with a structured per-error list in the response body — a code, a message and a source span for each problem found — because a schema is rejected for several reasons at once and an author needs all of them with their positions. A single opaque code in an error frame could carry none of that.
+
 ##### 3.10.1 Retry consequences for typed-graph codes
 
 - `QueryTimeout` (Unavailable) and `ExtractorBudgetExceeded` (ResourceExhausted) are retryable — clients should back off and retry, possibly with reduced top_k / depth.
@@ -203,13 +199,24 @@ Cardinality violations on RELATION_CREATE surface as the substrate-wide `Cardina
 
 When no schema has been declared for a namespace, typed-graph writes (`STATEMENT_CREATE`, `RELATION_CREATE`) and reads (`RECALL`, `STATEMENT_LIST`, the `QUERY_TRACE` introspection op, etc.) accept any predicate / relation-type qname — the registry interns it on first use with `SchemaOrigin::ImplicitFromWrite` / `RelationTypeOrigin::ImplicitFromWrite`.
 
-There is **no `SchemaNotDeclared` code.** The gate is per-type, not per-namespace: a request naming an undeclared predicate gets `PredicateNotInSchema` in strict mode and an interned qname otherwise, and `SCHEMA_GET` against a namespace that has never had a schema is `SchemaInvalid`. Every shard also ships with the seeded `brain:` system namespace, so "no schema at all" is not a state the server can be in.
+There is **no `SchemaNotDeclared` code.** The gate is per-type, not per-namespace: a request naming an undeclared predicate gets `PredicateNotInSchema` in strict mode and an interned qname otherwise, and `SCHEMA_GET` against a namespace that has never had a schema is a plain not-found, carried by the generic `MemoryNotFound` (0x0050) that every untagged not-found maps to. Every shard also ships with the seeded `brain:` system namespace, so "no schema at all" is not a state the server can be in.
 
 The cognitive primitives (the `0x00xx` namespace) are unaffected and work the same regardless of which user namespaces are declared.
 
+#### 3.11 Operator intervention (Category: `OperatorIntervention`)
+
+| Code | Meaning |
+|---|---|
+| `ShardStorageFaulted` (0x00A0) | This shard's write-ahead log has entered its terminal broken state after a durability failure. The state is held for the life of the process and nothing clears it, so every subsequent write on this shard fails identically until an operator restarts it. **Not retryable:** an identical retry cannot succeed before that restart. |
+| `UnrecoverableInternal` (0x00A1) | The engine's invariant or stored state is broken in a way an identical retry cannot clear: a non-terminating supersession chain, a row that will not decode, stored text that is not UTF-8, or a writer phase the handler could not have asked for. **Not retryable:** the same request produces the same failure, and no restart clears it; stop and investigate the fault. Unlike `ShardStorageFaulted`, which names a shard whose write-ahead log an operator restart recovers, this names a fault a restart does not touch. |
+
+`OperatorIntervention` is the one server-side category that is never retryable. `ShardStorageFaulted` covers a write-ahead log an operator restart recovers; `UnrecoverableInternal` covers an engine invariant or stored-state fault that a restart does not touch. `Internal` covers a bug that may not recur and `Unavailable` covers a condition expected to pass on its own; both are retryable, and a client that treats a permanent fault as either retries forever. A fault no amount of waiting clears is coded here so the client stops.
+
+`0x00A0`–`0x00A1` opens the block this category owns. The substrate tables above assign one `0x00N0` block per category, running `0x0001`–`0x000B`, `0x0020`–`0x0025`, `0x0030`–`0x0033`, `0x0040`–`0x004C`, `0x0050`–`0x0054`, `0x0060`–`0x0066`, `0x0070`–`0x0077`, `0x0080`–`0x0085` and `0x0090`–`0x0095` before the typed-graph namespace begins at `0x0120`.
+
 ### 4. ErrorDetails
 
-The optional `ErrorDetails` carries per-error session:
+The optional `ErrorDetails` carries per-error detail:
 
 ```rust
 struct ErrorDetails {
@@ -249,12 +256,11 @@ Read-only errors (`ENTITY_GET` returning `EntityNotFound`, etc.) are not audited
 
 ### 5. retry_after_ms
 
-For retryable errors (`ResourceExhausted`, `Unavailable`), the server may include `retry_after_ms` — a suggested delay before the client retries.
+For retryable errors (`ResourceExhausted`, `Internal`, `Unavailable`), the server may include `retry_after_ms` — a suggested delay before the client retries. The field is optional on every code: a retryable error with no hint means "back off on your own schedule", not "retry now".
 
-The client SHOULD honor this hint. Ignoring it (retrying immediately) likely produces another retry response, congesting the server.
+The client SHOULD honor the hint when it is present. Ignoring it (retrying immediately) likely produces another retry response, congesting the server.
 
-For `RateLimited`, `retry_after_ms` is typically the time until the rate-limit window resets.
-For `Overloaded`, it's the server's estimate of when load might subside.
+`Overloaded` is the code that carries one, at 1000 ms — load shedding is the one condition the server can put a number on. Every other code leaves `retry_after_ms` unset and leaves the schedule to the client's own backoff.
 
 ### 6. Client retry guidance
 
@@ -271,6 +277,7 @@ The recommended client retry policy:
 | `ResourceExhausted` | Retry after `retry_after_ms` (or default backoff) |
 | `Internal` | Retry once with exponential backoff; report if persistent |
 | `Unavailable` | Retry after `retry_after_ms` with backoff |
+| `OperatorIntervention` | Don't retry; the shard or stored engine state needs investigation before any request on it can succeed |
 
 For idempotent operations (those with `request_id`), retries are safe — duplicates are deduplicated. For non-idempotent operations (`PLAN`, `REASON`), retries may produce different but valid results.
 
@@ -299,7 +306,7 @@ A client sends `ENCODE_REQ` with empty text. The server responds:
 ```
 S → C: ERROR(stream_id=<encode's stream>, EOS)
        payload:
-         code: TextEmpty
+         code: InvalidArgument
          category: Validation
          message: "Text field cannot be empty"
          details:
@@ -349,6 +356,7 @@ The server logs errors at appropriate levels:
 - `Protocol` — WARN (likely client bug).
 - `ResourceExhausted` — WARN.
 - `Internal`, `Unavailable` — ERROR (server-side problem).
+- `OperatorIntervention` — ERROR (server-side problem that will not clear on its own).
 
 Each log entry includes the connection's session_id and the stream_id of the affected stream, for correlation.
 
@@ -380,10 +388,10 @@ The first four bytes MUST be `BRN0` (0x42, 0x52, 0x4E, 0x30). Any deviation clos
 
 #### 14.2 Version field
 
-The version field MUST be a wire-protocol version the server supports (currently 1). If the version is unknown:
+The version field MUST be a wire-protocol version the server supports (currently 1). Two separate checks reject a version, and they return different codes:
 
-- During handshake (before WELCOME): the server returns `WireVersionNegotiationFailed` and closes.
-- After handshake: the server returns `BadFrame` and closes — receiving an unexpected version after handshake means client/server got out of sync.
+- A header `version` byte the server does not support is rejected at header validation, before the opcode is even read: `BadVersion`, carrying both the received and the expected value, and the connection closes.
+- A HELLO whose `supported_versions` list shares no version with the server's is `VersionNotSupported`, carrying both maxima, and the connection closes. This is the only version failure the handshake itself can raise — the frame carrying the HELLO has already passed the header check above.
 
 #### 14.3 Header CRC32C
 
@@ -393,7 +401,7 @@ The header carries a CRC32C of bytes [0..28]. The server recomputes and compares
 
 The 24-bit `payload_len` MUST be ≤ 16 MiB (2^24 - 1). Larger values close the connection.
 
-The server's *effective* limit is configurable, defaulting to 16 MiB. A frame with `payload_len > effective_limit` returns `PayloadTooLarge` and closes the stream (but not the connection, unless many such frames arrive).
+The server's *effective* limit is configurable, defaulting to the same 16 MiB − 1 hard cap. A frame with `payload_len > effective_limit` returns `OversizePayload` and closes the stream (but not the connection, unless many such frames arrive).
 
 #### 14.5 Stream ID rules
 
@@ -407,7 +415,7 @@ Violations return `BadFrame`.
 
 #### 14.6 Opcode validity
 
-The opcode MUST be a known value. Unknown opcodes return `UnknownOpcode`. The connection stays open; the client can send other valid opcodes.
+The opcode MUST be a known value. Unknown opcodes return `BadOpcode`, carrying the offending wire value in the message. The connection stays open; the client can send other valid opcodes.
 
 The set of valid opcodes is defined in [`03_opcodes.md`](03_opcodes.md). Adding a new opcode is a wire-version bump.
 
@@ -417,7 +425,7 @@ After the frame header is accepted, the payload is decoded.
 
 #### 15.1 Payload CRC32C
 
-The payload's CRC32C in the header is recomputed against the actual payload bytes. Mismatch returns `PayloadCorrupted`.
+The payload's CRC32C in the header is recomputed against the actual payload bytes. Mismatch returns `BadPayloadCrc`.
 
 For zero-length payloads, the payload CRC field is 0; no CRC check.
 
@@ -431,14 +439,14 @@ For structured payloads encoded with CBOR:
   - Type tag mismatches.
 - Decoded values MUST satisfy any per-field constraints documented in the opcode's request shape (see [`05_frame_layouts.md`](05_frame_layouts.md)).
 
-Failure returns `BadPayload`.
+Failure returns `MalformedPayload`.
 
 #### 15.3 bytemuck raw payloads
 
 For raw byte payloads (vectors via `ENCODE_VECTOR_DIRECT`):
 
 - The payload length MUST exactly equal `dim * sizeof(f32)` (1536 bytes for the 384-dim vector).
-- Length mismatch returns `BadPayload`.
+- Length mismatch returns `MalformedPayload`.
 
 After length check, the bytes are interpreted as `[f32; 384]`. Element-level validation (NaN, Inf, normalization) is a separate operation-level check.
 
@@ -450,29 +458,39 @@ Per-opcode validation, after the payload has decoded successfully.
 
 - `text` MUST be valid UTF-8.
 - `text` MUST NOT be empty after Unicode whitespace trim.
-- `text.len()` MUST be ≤ `max_text_bytes` (default 1 MiB, configurable).
+- `text.len()` MUST be ≤ `MAX_TEXT_BYTES` (1 MiB).
 - `request_id` MUST NOT be the all-zero `RequestId`.
-- `salience_hint`, if present, MUST be in [-1.0, +1.0]. NaN/Inf rejected.
 - `session_id` is the client's own opaque `u64`; `0` is the default session and any value is acceptable.
-- `kind`, if explicitly set, MUST be a valid `MemoryKind`. Server may reject `kind = Consolidated` since clients are forbidden from creating consolidated memories.
-- Outgoing edges in the same payload MUST reference existing memories of the same agent. Cross-agent or non-existent targets return `InvalidArgument`.
+
+`ENCODE` carries no `kind`, no `salience_hint` and no edge list — the client contract is text plus provenance, and kind, salience and edges are the write pipeline's business. The rules for those three fields belong to `ENCODE_VECTOR_DIRECT` below, which is the admin / bulk-import path that still carries them.
+
+Every violation above returns `InvalidArgument` with `ErrorDetails.field` naming the offender.
 
 #### 16.2 ENCODE_VECTOR_DIRECT
 
 All ENCODE rules plus:
 
-- The vector MUST contain no NaN or Inf elements. Failing element returns `InvalidVector`.
-- The vector's L2 norm MUST be in `[1.0 - 1e-3, 1.0 + 1e-3]`. Out-of-range returns `InvalidVector`.
-- The supplied `embedding_model_fp` MUST match a model the server knows about. Unknown fingerprint returns `UnknownModel`.
+- `vector.len()` MUST equal the shard's `VECTOR_DIM` (384).
+- The vector MUST contain no NaN or Inf elements.
+- The vector's L2 norm MUST be in `[1.0 - 1e-3, 1.0 + 1e-3]`.
+- `model_fingerprint` MUST equal the fingerprint of the model the shard has loaded. A vector produced by any other model lands in an index keyed to a different fingerprint and could never be reached by a text-cued recall, so it is refused rather than stored.
+- `kind`, if explicitly set, MUST be a valid `MemoryKind`. `Consolidated` is rejected — only the consolidation worker creates consolidated memories.
+- `salience_hint` MUST be in `[0.0, 1.0]`. NaN/Inf rejected.
+- Outgoing edges in the payload MUST reference existing memories in the caller's own `(namespace, space)`, there MUST be at most `max_edges_per_encode` (64) of them, and every edge weight MUST be finite.
+- `txn_id` MUST be absent. This opcode does not participate in transactions; submit the encode outside the transaction.
+
+These are checked in order — dimension first (cheapest), then finiteness, then norm — and each returns `InvalidArgument`.
 
 #### 16.3 RECALL
 
 - `cue_text` validation matches `ENCODE`'s `text`.
-- `top_k` MUST be in `[1, 1000]`. Higher values capped to 1000.
-- `confidence_min`, if present, MUST be in [0.0, 1.0]. NaN/Inf rejected.
-- `age_bound`, if present, MUST be a non-negative duration.
-- `session_filter`, if present, MUST reference sessions that exist for the agent. Unknown sessions return `InvalidContext`.
+- `max_results` MUST be in `[1, max_k]` (`max_k` defaults to 1000). A larger value is **rejected** with `InvalidArgument`, not silently capped — a caller that asked for 5000 and received 1000 cannot tell a truncated answer from an exhausted corpus.
+- `confidence_threshold` MUST be in [0.0, 1.0]. NaN/Inf rejected.
+- `salience_floor` MUST be in [0.0, 1.0]. NaN/Inf rejected.
+- `age_bound_unix_nanos`, if present, is a floor on record time; any value decodes.
 - `kind_filter`, if present, MUST contain only valid `MemoryKind` values.
+
+`session_filter` is not checked against the session registry. A session id is a client-chosen opaque `u64` out of no bounded table, so "unknown" is not a state the server can distinguish from "no memories written under it yet"; an id matching nothing simply filters everything out.
 
 #### 16.4 PLAN, REASON
 
@@ -494,14 +512,15 @@ All ENCODE rules plus:
 
 #### 16.7 TXN_*
 
-- `txn_id` MUST be a non-zero `TxnId`.
-- `TXN_BEGIN` for an already-active `txn_id` returns `TransactionExists`.
-- `TXN_COMMIT` and `TXN_ABORT` for unknown `txn_id` return `UnknownTransaction`.
-- Operations within a transaction MUST carry the matching `txn_id`. Mismatched ids return `WrongTransaction`.
+- `timeout_seconds` is clamped into `[1, 300]`; `0` means the 30 s default.
+- `TXN_BEGIN` for an already-active `txn_id` is a **replay**, not an error: the cached begin response is returned, so a client that retries a lost begin gets the original transaction rather than a second one.
+- `TXN_COMMIT` and `TXN_ABORT` for an unknown, expired or already-terminated `txn_id` return `TxnNotFound`.
+- A `txn_id` that exists but was begun on another connection also returns `TxnNotFound` — the same answer as a never-created id, so a connection that guesses another's `txn_id` learns nothing about whether it exists.
+- A buffer that reaches `MAX_TXN_OPS` (1000) rejects the next append with `TransactionTooLarge`, and the commit re-checks the same bound before touching the writer.
 
 #### 16.8 ADMIN_*
 
-- The session MUST have admin privileges (set during AUTH). Otherwise `Unauthorized`.
+- The connection's key MUST carry the `ADMIN` permission bit (resolved during AUTH). Otherwise `PermissionDenied`.
 - Per-admin-opcode parameter validation as documented in the opcode's request shape.
 
 #### 16.9 Typed-graph opcodes (`0x01xx`)
@@ -510,15 +529,24 @@ Typed-graph opcodes use the same two-layer discipline: CBOR structural validatio
 
 ##### 16.9.1 Universal field caps
 
-Applied to every string / blob field across the `0x01xx` namespace. Limits balance correctness (catch obvious bugs) against permissiveness (don't reject legitimate Unicode-heavy text).
+Three byte-length shapes cover the client-supplied strings and blobs of the `0x01xx` namespace. Each balances correctness (catch obvious bugs) against permissiveness (don't reject legitimate Unicode-heavy text). The caps are byte lengths, not character counts.
 
-| Field shape | Max size |
-|---|---|
-| Identifier-ish string (e.g. `canonical_name`, `predicate_name`, `schema_version`) | 256 bytes UTF-8 |
-| Free-form text (e.g. `reason`, `session`, `message`) | 4096 bytes UTF-8 |
-| Opaque blob (e.g. `attributes_blob`, `evidence_blob`) | 64 KiB |
-| Collection (e.g. `aliases`, `candidate_ids`) | 256 elements |
-| Cursor / pagination token | 1 KiB |
+| Field shape | Max size | Applied to |
+|---|---|---|
+| Identifier-ish string — a name a caller types, looks up and indexes on | 256 bytes UTF-8 | `canonical_name`, `new_canonical_name`, each `alias`, `candidate_name`, a session `title` |
+| Free-form text — prose a human writes for another human to read back | 4096 bytes UTF-8 | `reason_message` |
+| Opaque blob — bytes the server stores and returns without interpreting | 64 KiB | `attributes_blob`, a statement's text or blob value |
+
+These three are the shapes, not a cap on every field. A field whose own constraint binds tighter or looser than its shape carries its own cap, and each one is named with the constraint that sets it in §16.9.8: a relation's `properties_blob` is an opaque blob but is bounded by the WAL reader at 1 MiB, an uploaded `schema_document` by parse cost at 1 MiB, and the merged schema source by what one response frame can carry.
+
+A qualified name (`predicate`, `relation_type`) is **not** an identifier-ish string: it is two interned halves, and its own cap is 96 bytes (§16.9.8). Applying the identifier-ish cap to a `namespace:name` pair would give 513.
+
+Two things this table deliberately does not govern:
+
+- **How many**, as opposed to how long. There is no universal collection cap; element counts are per-op policy, they are not uniform (`session_filter` admits 1024 where `predicate_filter` admits 256), and they live with the handler that applies them. §16.9.8 lists them.
+- **Cursors.** A continuation token is not length-capped. It is a fixed-width opaque token carrying a version tag and the minting tenant's scope, and it is refused unless it decodes exactly: wrong length, unrecognized version, or another tenant's scope is a malformed cursor, which is stricter than any byte ceiling.
+
+`name_prefix` (`ENTITY_LIST`) is the one identifier-ish field with no cap enforced on it today. It is normalized and used as a prefix bound on an index walk, never stored, so an over-long prefix costs one normalization and then matches nothing.
 
 Violations return `InvalidArgument` (category `Validation`) with `details.field` naming the offender and `details.expected` carrying the limit.
 
@@ -531,7 +559,7 @@ Violations return `InvalidArgument` (category `Validation`) with `details.field`
 | `entity_type_id` | must be > 0 and registered in `entity_types` table | `EntityTypeMismatch` |
 | `canonical_name` | non-empty after `.trim()`; ≤ 256 bytes; valid UTF-8 (validated on decode) | `InvalidArgument` |
 | `canonical_name` (after server-side `normalize_name`) | must not collide with an existing entity of the same `entity_type_id` | `EntityAmbiguous` (duplicate) |
-| `aliases.len()` | ≤ 32 | `InvalidArgument` |
+| `aliases.len()` | ≤ 256 | `InvalidArgument` |
 | each `alias` | non-empty after `.trim()`; ≤ 256 bytes | `InvalidArgument` |
 | `attributes_blob` | ≤ 64 KiB | `InvalidArgument` |
 | `request_id` | non-zero UUIDv7 | `InvalidArgument` |
@@ -603,7 +631,7 @@ Aliases are deduplicated server-side on the normalized form before insertion. A 
 ##### 16.9.3 Schema opcodes (`0x0120–0x0126`)
 
 - `schema_document` (`SCHEMA_UPLOAD` / `SCHEMA_VALIDATE`): ≤ 1 MiB (raised from the universal 64 KiB cap; schema documents are intentionally larger).
-- `version_id` (`SCHEMA_GET`): `0` means "latest"; otherwise must exist → `SchemaInvalid`.
+- `version_id` (`SCHEMA_GET`): `0` means "latest"; otherwise must exist — a version the scope never declared is a not-found, carried by the generic `MemoryNotFound` (0x0050), not a schema-specific code.
 - `extractor_id`: must be in the active extractor registry → `InvalidArgument` otherwise.
 
 ##### 16.9.4 Statement opcodes (`0x0140–0x0146`)
@@ -636,21 +664,30 @@ Validation of the `QueryRequest` accepted by `QUERY_EXPLAIN` / `QUERY_TRACE`:
 
 ##### 16.9.8 Constants
 
-Centralized so clients and the server agree on the same numbers. Defined at `brain-core::knowledge::validation`:
+Byte-length caps on client-supplied text and blob input are centralized so clients and the server agree on the same numbers. Defined at `brain-ops::handlers::limits`:
 
 ```rust
-pub const MAX_IDENT_BYTES: usize        = 256;
-pub const MAX_FREEFORM_BYTES: usize     = 4096;
-pub const MAX_BLOB_BYTES: usize         = 64 * 1024;
-pub const MAX_COLLECTION_ELEMENTS: usize = 256;
-pub const MAX_CURSOR_BYTES: usize       = 1024;
-pub const MAX_ALIASES_PER_ENTITY: usize = 32;
-pub const MAX_SCHEMA_DOCUMENT_BYTES: usize = 1024 * 1024;
-pub const MAX_TOP_K: u32                = 1000;
-pub const MAX_TRAVERSE_DEPTH: u32       = 8;
-pub const MAX_QUERY_WALL_TIME_MS: u32   = 60_000;
-pub const MIN_MERGE_CONFIDENCE: f32     = 0.7;
+pub const ENTITY_NAME_MAX_BYTES: usize          = 256;         // identifier-ish (§16.9.1)
+pub const SESSION_TITLE_MAX_BYTES: usize        = 256;         // identifier-ish (§16.9.1)
+pub const REASON_MESSAGE_MAX_BYTES: usize       = 4096;        // free-form text (§16.9.1)
+pub const STATEMENT_VALUE_MAX_BYTES: usize      = 64 * 1024;   // opaque blob (§16.9.1)
+pub const RELATION_PROPERTIES_MAX_BYTES: usize  = 1024 * 1024; // = WAL RESPONSE_BLOB_MAX
+pub const MERGED_SCHEMA_SOURCE_MAX_BYTES: usize = 16_776_191;  // = MAX_PAYLOAD_BYTES - 1 KiB
+pub const QNAME_MAX_BYTES: usize                = 96;          // policy
+pub const CATEGORY_MAX_BYTES: usize             = 64;          // policy
+pub const QUERY_TEXT_MAX_BYTES: usize           = 16 * 1024;   // policy
+pub const SCHEMA_DOCUMENT_MAX_BYTES: usize      = 1024 * 1024; // policy
 ```
+
+Each cap is either derived from a constraint or labelled policy; there is no third kind.
+
+The derived ones name the constraint they come from. `RELATION_PROPERTIES_MAX_BYTES` is the WAL `RelationLink` payload's blob cap: its replay reader refuses a longer blob, so a larger stored value would make the record undecodable on replay. `MERGED_SCHEMA_SOURCE_MAX_BYTES` is the frame payload ceiling (`MAX_PAYLOAD_BYTES`, 16 MiB − 1) less a one-KiB budget for the `SchemaGetResponse` envelope around it — `SCHEMA_GET` returns the whole merged source in one body and takes no limit argument, so a source that cannot be framed is a schema that can never be read back. `SCHEMA_DOCUMENT_MAX_BYTES` stays below it for the same reason: a document larger than the merged source cap would be an upload nothing could read back.
+
+The policy ones are chosen, and say so. A qname's two halves intern to integer ids before any key is built, so nothing binds it; 96 bounds the registry key while covering any namespace and identifier a caller declares. A category has no storage or wire constraint at all; 64 bounds registry and renderer work. Query text's only real bound is the request frame, a thousand times wider, and a cap that large would stop bounding parser and planner work — which is the whole reason it exists.
+
+These are write-time bounds, and that is the point. `SCHEMA_GET`, `STATEMENT_GET`, `RELATION_GET` and `MEMORY_INSPECT` take no limit argument, so a stored value too large to frame makes that resource permanently unreadable with nothing the client can pass to recover it. A refused write is something the caller can retry smaller; a refused read of data already stored is not.
+
+Count caps and range checks are per-op policy and stay with their handler rather than in that module: `MAX_ENTITY_ALIASES` (256) in `brain-ops::handlers::entity`, `MAX_PREDICATE_FILTER` / `MAX_KIND_FILTER` (256 each), `MAX_SESSION_FILTER` (1024) and `MAX_EXPLICIT_RETRIEVERS` (3) in `brain-ops::handlers::query`, `MAX_TXN_OPS` (1000) in `brain-ops::handlers::txn`, and `MIN_MERGE_CONFIDENCE` (0.7) in `brain-metadata::entity::merge`.
 
 ##### 16.9.9 Validation order for typed-graph requests
 
@@ -675,12 +712,16 @@ Frames within a stream MUST follow the lifecycle rules from [`06_streaming.md`](
 - A stream is opened by the first request frame.
 - Subsequent frames on the stream MUST be either continuation or response frames belonging to that opcode's pattern.
 - A stream is closed by the end-of-stream frame.
-- Frames on a closed stream are rejected with `BadStream`.
+- A stream-opening frame reusing the `stream_id` of a still-active stream returns `StreamIdInUse`, and the new frame is ignored.
+- A `CANCEL_STREAM` naming a stream that is not active is **not** an error: cancel is best-effort and idempotent, and the server answers `CANCEL_STREAM_ACK` (see [`06_streaming.md`](06_streaming.md) §12.1).
+
+There is no `BadStream` code. A stream id is either in use or it is not, and both of those states already have an answer.
 
 #### 17.2 Handshake order
 
-Operations are rejected with `NotHandshaked` until WELCOME has been received.
-Operations requiring authentication are rejected with `NotAuthenticated` until AUTH_OK has been received.
+Every opcode other than the connection-management set (`HELLO`, `AUTH`, `PING`, `BYE`, `CLIENT_PONG`) requires an established connection — one that has completed both WELCOME and AUTH_OK. Until then it is rejected with `NotAuthenticated`.
+
+There is one code, not two. "Before WELCOME" and "after WELCOME but before AUTH_OK" are the same state to a caller — the connection is not yet usable for operations — and splitting them would tell an unauthenticated prober how far it got.
 
 #### 17.3 Idempotency consistency
 
@@ -692,7 +733,7 @@ If the same `RequestId` is reused with identical parameters, the server replays 
 
 Operations within a transaction are validated as if the transaction's prior operations have been applied. For example, an `ENCODE` followed by a `LINK` referencing the encoded memory's id is validated only at commit; until then, the link is buffered.
 
-If validation fails at commit, the entire transaction is aborted with `TransactionValidationFailed` and a description of which operation failed and why.
+If the commit fails, the entire transaction is aborted — the buffered operations are discarded as a unit — and the failure surfaces under the code the underlying writer raised: `MemoryNotFound` / `EntityNotFound` / `StatementNotFound` for a referenced record that no longer exists, `IdempotencyConflict` for a conflicting write, `ShardStorageFaulted` for a durability failure, `Internal` otherwise. There is no dedicated commit-validation code; a client branches on the same taxonomy it already handles for a non-transactional write.
 
 ### 18. Rate and resource limits
 
@@ -700,19 +741,21 @@ Validation also enforces resource limits (server-side configurable):
 
 | Limit | Default | Error code |
 |---|---|---|
-| Max in-flight streams per connection | 256 | `StreamLimitExceeded` (0x0074) |
-| Max concurrent transactions per space | 16 | `TransactionLimitExceeded` (0x0076) |
+| Max concurrent streams per connection | 1024 | `StreamLimitExceeded` (0x0074) |
+| Max open transactions per connection | 1024 | `TransactionLimitExceeded` (0x0076) |
 | Max operations per transaction | 1000 | `TransactionTooLarge` (0x0077) |
-| Max transaction timeout | 300 s (default 60 s) | `TransactionTimeout` (0x0062) |
-| Max results per RECALL | 1000 | `TopKOutOfRange` (0x0048) |
-| Max filter entries per RECALL / SUBSCRIBE | 1024 | `InvalidArgument` (0x0040) |
+| Transaction timeout | 30 s, clamped into [1 s, 300 s] | `TransactionTimeout` (0x0062) |
+| Max results per RECALL | 1000 | `InvalidArgument` (0x0040) |
+| Max predicate / kind filter entries per QUERY | 256 each | `InvalidArgument` (0x0040) |
 | Max schema document size | 1 MiB | `InvalidArgument` (0x0040) |
+| Max concurrent connections, process-wide / per peer IP | 4096 / 64 | connection dropped at accept |
 | Max payload bytes per frame | 16 MiB − 1 | `OversizePayload` (0x0007) |
-| Frames per second per connection | 10,000 | `RateLimited` (0x0073) |
+
+The stream budget is two independent counts against the same cap — in-flight op dispatches and active subscriptions — because each pins a request body up to `max_payload_bytes` in memory. The transaction budget is per **connection**, not per space: `TXN_BEGIN` releases its stream permit at ack while the transaction stays open, so a pooled connection can hold more open transactions than the stream cap. At the cap a fresh begin is rejected rather than evicting a live transaction's route, which would strand its later commit on the wrong shard.
 
 Each limit has exactly **one** code. There is no parallel `TooMany*` family: a stream-count overrun is `StreamLimitExceeded`, not `TooManyStreams`, and a transaction-count overrun is `TransactionLimitExceeded`. The two naming schemes described the same conditions, and a client that branched on the second one would never match a real error frame.
 
-Two limits that earlier revisions listed no longer exist. There is no edge cap on `ENCODE`, because `ENCODE` no longer carries edges — explicit edges are written one at a time with `LINK`, and derived edges are the write pipeline's business. There is no per-space session cap: `session_id` is an opaque client-chosen `u64`, not a server-allocated handle out of a bounded table.
+Limits a reader may expect are deliberately absent. There is no edge cap on `ENCODE`, because `ENCODE` does not carry edges — explicit edges are written one at a time with `LINK`, and derived edges are the write pipeline's business. There is no per-space session cap: `session_id` is an opaque client-chosen `u64`, not a server-allocated handle out of a bounded table. And there is no frames-per-second limit: what bounds a connection's load is the stream budget plus the accept-time connection caps above, both of which bound concurrent work rather than frame arrival rate.
 
 These are not strict invariants of the protocol; servers MAY configure higher or lower values. Clients SHOULD treat the error codes as recoverable and back off.
 

@@ -143,7 +143,7 @@ pub struct EntityGetResponse {
 #### Error responses
 
 - `ENTITY_NOT_FOUND` (`0x30`) — no row with that id.
-- Note: tombstoned entities are returned with `flags & TOMBSTONED != 0`. Merged entities are returned with `merged_into != [0; 16]`; redirection to the survivor is the **client's** responsibility. (`ENTITY_GET` is faithful — wider response semantics with auto-redirect are tracked as an open question.)
+- Note: tombstoned entities are returned with `flags & TOMBSTONED != 0`. Merged entities are returned with `merged_into != [0; 16]`; redirection to the survivor is the **client's** responsibility. (`ENTITY_GET` is faithful: it reports the row as stored and never auto-redirects.)
 
 #### No idempotency
 
@@ -251,10 +251,10 @@ pub struct EntityMergeResponse {
 - `ENTITY_MERGE_CONFLICT` (`0x33`) — `survivor` and `merged` are the same entity, or `merged` is already merged into a third entity.
 - `INVALID_ARGUMENT` — `confidence` outside `[0.0, 1.0]`, `reason` too long.
 
-#### Open questions
+#### Type and scope constraints
 
-- Cross-type merges (Person ↔ Organization): forbidden by default, or allowed with attribute drop?
-- Should the grace period be returned absolute (unix nanos) or relative (seconds)? Currently relative.
+- Cross-type merges (Person ↔ Organization) are rejected: both entities must carry the same entity type, and both must share the owning scope.
+- The grace period is returned relative, in seconds (`grace_period_seconds`), not as an absolute timestamp.
 
 ### ENTITY_UNMERGE (0x0135)
 
@@ -557,7 +557,7 @@ pub struct StatementCreateRequest {
 
 Semantics:
 
-1. Resolve `predicate` (a `"namespace:name"` qname). If the namespace has no active schema, intern the qname with `SchemaOrigin::ImplicitFromWrite` on first use; the resulting statement row carries the `IMPLICIT_PREDICATE` flag. If a schema is active for the namespace, the qname must be declared — unknown qnames produce `PredicateNotInSchema` (0x004B). When a declared predicate carries kind / object-type constraints they are enforced — mismatches produce `STATEMENT_OBJECT_TYPE_MISMATCH` (0x41). Implicit predicates carry no constraints.
+1. Resolve `predicate` (a `"namespace:name"` qname). If the namespace has no active schema, intern the qname with `SchemaOrigin::ImplicitFromWrite` on first use; the resulting statement row carries the `IMPLICIT_PREDICATE` flag. If a schema is active for the namespace, the qname must be declared — unknown qnames produce `PredicateNotInSchema` (0x004B). When a declared predicate carries kind / object-type constraints they are enforced — mismatches produce `StatementObjectTypeMismatch` (0x0141). Implicit predicates carry no constraints.
 2. Validate `subject` exists (or is a known Pending audit id).
 3. For `Preference` kind: if a current Preference with same `(subject, predicate)` exists, auto-supersede it (no separate `STATEMENT_SUPERSEDE` call required).
 4. Allocate `StatementId` (UUIDv7).

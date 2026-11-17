@@ -132,7 +132,7 @@ Brain accepts this cost. The capabilities §4.1–4.5 outweigh the operational c
 
 For deployments that genuinely need to bring their own vectors — domain-specific or multi-modal models that the operator can't or doesn't want to host — Brain provides `ENCODE_VECTOR_DIRECT`. The protocol carries a vector along with a model fingerprint; Brain stores it as-is.
 
-This is detailed in [04. Wire Protocol](../04_wire_protocol/00_purpose.md) §07.4 and [OQ-5 in the open-questions archive](../00_overview/04_open_questions_archive.md#oq-5-external-vector-ingestion). It exists to support domain-specific or multi-modal vectors the operator cannot host inside Brain; it is not the default path.
+This is detailed in [04. Wire Protocol](../04_wire_protocol/00_purpose.md) §07.4. It exists to support domain-specific or multi-modal vectors the operator cannot host inside Brain; it is not the default path.
 
 ## 6. Position in the architecture
 

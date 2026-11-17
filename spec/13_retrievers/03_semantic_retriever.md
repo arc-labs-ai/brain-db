@@ -53,17 +53,19 @@ pub struct SemanticRetrieverConfig {
     pub top_k: usize,                    // default 64
     pub ef_search: Option<usize>,        // None ⇒ per-scope default; cap 500 (§09/02)
     pub similarity_threshold: f32,       // default 0.0 (no cutoff)
-    pub timeout_ms: u32,                 // default 50
+    pub timeout_ms: u32,                 // config default 50; the plan sets 1 s (§8)
 }
 ```
 
-`ef_search` defaults are per-corpus (see [`../09_indexing/01_hnsw_basics.md`](../09_indexing/01_hnsw_basics.md) §25):
+`ef_search` defaults are per-corpus, and they differ because the corpora differ (see [`../09_indexing/01_hnsw_basics.md`](../09_indexing/01_hnsw_basics.md) §25):
 
-| Scope | Default `ef_search` |
-|---|---|
-| `Memory` | 64 |
-| `Statement` | 128 |
-| `Both` | 64 for the memory leg, 128 for the statement leg |
+| Scope | `M` | `ef_construction` | Default `ef_search` | Cap |
+|---|---|---|---|---|
+| `Memory` | 16 | 200 | 64 | 500 |
+| `Statement` | 32 | 200 | 128 | 500 |
+| `Both` | — | — | 64 for the memory leg, 128 for the statement leg | 500 |
+
+Statement embeddings are a denser, more uniform population than memory text — short predicate-plus-object renderings cluster much more tightly than free prose — so the statement graph carries twice the out-degree and searches with twice the beam to reach comparable recall (`crates/brain-index/src/statement_hnsw.rs:70-80`, `crates/brain-index/src/params.rs:28-92`).
 
 A `Some(n)` in `config.ef_search` overrides every leg's default uniformly. Callers who want per-scope overrides issue two `retrieve` calls.
 
@@ -77,7 +79,7 @@ Two input modes:
   embedding directly. Dimension must equal
   `brain_core::VECTOR_DIM`; mismatch → `QueryParseFailed`.
 - **`SemanticQuery::Text`** — retriever calls into the
-  per-shard `EmbedderHandle` (`brain-embed`) to encode the
+  per-shard embedder (`brain-embed`) to encode the
   text. The model fingerprint is the same one Brain
   uses for ingest; mismatch between the corpus's embedding and
   the query's would silently produce poor recall, so the
@@ -86,6 +88,25 @@ Two input modes:
 
 The Text path adds the embedder's wall-time to the query
 budget. §19 perf-target numbers assume Text input.
+
+**Where that wall-time is spent.** The encode is handed to the shard
+executor's blocking pool rather than run on the reactor, so a forward
+pass cannot stall the shard's other in-flight requests
+(`crates/brain-ops/src/embedding.rs:52-61`). It does not thereby become
+free or parallel: the blocking thread builds a one-per-thread intra-op
+pool whose workers inherit that thread's CPU affinity, which confines
+Candle's matmul fan-out to the shard's **own core** instead of letting
+one shard's embed take cores from its neighbours
+(`crates/brain-ops/src/embedding.rs:16-38`). Sharding is the parallelism;
+the intra-op pool is a containment boundary. The offload is a contract
+rather than an optimisation — the helper panics outright when no
+executor is present, instead of quietly blocking the caller for the
+length of a forward pass.
+
+One consequence matters for capacity: a text query's embed cost is a
+per-core cost that does not shrink as cores are added to the box. More
+cores buy more shards, each with its own embedder lane, not a faster
+embed.
 
 ## 3. HNSW search params
 
@@ -97,7 +118,14 @@ Defaults match Brain HNSW (§09/02):
 - `similarity_threshold = 0.0` (no cutoff). Applied
   post-search: candidates whose cosine `< threshold` are
   dropped before ranks are assigned.
-- `timeout_ms = 50`. Exceeded → `Timeout`.
+- `timeout_ms = 50` as a config default; the planner plans this lane
+  at **1 s**, and the budget is soft — exceeding it records `Timeout`
+  and warns without cancelling, and a late result still reaches fusion
+  (`crates/brain-planner/src/retrieval/planner/logic.rs:55-65`). The
+  wider budget exists for this retriever in particular: the `Text`
+  path's embed step is the single most expensive thing any lane does,
+  and a hard 50 ms deadline would classify the normal case as a
+  timeout.
 
 `top_k` is enforced after `similarity_threshold` filtering,
 matching §13/02 §6. If fewer matches survive than `top_k`, the
@@ -187,6 +215,16 @@ Pinned in §19 (perf targets):
 Push-down filtering reduces ef_search escalations; the numbers
 above assume push-down available. Fall-back to post-filter
 adds ~30% under typical filter selectivity.
+
+The `+2 ms / +10 ms` text-path row is the embed increment measured as an
+index-adjacent cost. It is the one figure in this table that is a
+property of the host rather than of the index: the forward pass is
+confined to one core (§2), so it scales with that core's throughput and
+with input length, and it does not improve on a wider machine. A
+deployment reading this table on hardware unlike the reference box
+should re-measure this row first — a per-core embed figure is the
+quantity most likely to move, and it moves the whole `Text`-path budget
+with it.
 
 ## 9. Limitations
 

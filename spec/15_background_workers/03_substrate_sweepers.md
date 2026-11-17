@@ -333,9 +333,11 @@ The check ensures the system does not reclaim something that was un-tombstoned. 
 
 ### 28. The free list
 
-The free list (in the arena layer, see [08. Storage — Arena](../08_storage/01_arena.md)) is a concurrent data structure. The reclaim worker pushes; the encode path pops.
+The free list (in the arena layer, see [08. Storage — Arena](../08_storage/01_arena.md) §10) is a per-shard `Vec` of freed slot indexes owned outright by the slot allocator, popped from the tail so a reused index is the most recently freed one. Both `alloc` and `free` take the allocator by exclusive reference, so there is no concurrent free-list structure, no shared version for a reader to be holding, and nothing for a reclamation protocol to protect.
 
-Free list operations are O(1) amortized via crossbeam-epoch.
+Push and pop are O(1) amortized, as a vector's own tail operations.
+
+The free list is not on the live write path and the encode path does not pop from it. A live write reserves its slot index from a monotonic in-process counter instead, so a reclaimed index is not reissued while the process is up; the free list is rebuilt by scanning the arena's slot flags at startup and serves the replay path (see [08. Storage — Write path](../08_storage/03_write_path.md) §2).
 
 ### 29. The free list overflow
 

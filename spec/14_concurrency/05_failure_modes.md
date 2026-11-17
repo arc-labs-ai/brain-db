@@ -14,27 +14,27 @@ What can go wrong with the concurrency model and how Brain handles it.
 
 ## 2. Writer can't make progress
 
-**Failure mode.** The writer task is stuck — not committing, not draining its queue. Pending operations build up.
+**Failure mode.** Writes are stuck — not committing, not draining the WAL channel. In-flight requests hold their admission permits and new ones queue behind the shard's receive.
 
-**Detection.** `writer_queue_depth` metric exceeds a threshold; `last_commit_at` is stale.
-
-**Response.**
-- Backpressure propagates: new writes fail with `WriterOverloaded`.
-- Reads continue (they don't depend on the writer).
-
-**Operator action.** Investigate the writer. Possible causes: disk error, redb corruption, deadlock (a bug). May need to restart the shard.
-
-## 3. Pin held too long
-
-**Failure mode.** A crossbeam-epoch pin is held by a stuck or buggy task; reclamation can't proceed; freed memory accumulates.
-
-**Detection.** Memory usage grows; `epoch_pin_oldest_age` metric exceeds threshold.
+**Detection.** Write-stage timers (`RedbApply`, `RedbCommit`) stall; the shard's durable watermark stops advancing while the WAL tail keeps moving.
 
 **Response.**
-- Logs a warning.
-- The garbage stays in memory until the pin is dropped.
+- Backpressure propagates by parking: once every permit is out, the shard stops taking from its receive channel and senders block on a full channel. Nothing is rejected to make room.
+- Reads continue only until they too queue behind the parked receive; a saturated shard serves in arrival order.
 
-**Operator action.** Find the stuck task; restart the shard if necessary. Pins normally drop within microseconds; long pins indicate a bug.
+**Operator action.** Investigate the shard. Possible causes: disk error, redb corruption, an await introduced into the transaction body (which deadlocks the shard outright). May need to restart the shard.
+
+## 3. A superseded index generation held too long
+
+**Failure mode.** A stuck or very slow reader keeps its `Arc` to a superseded published index, so that generation cannot be dropped.
+
+**Detection.** Resident memory holds roughly one extra copy of the graph beyond what the live set needs.
+
+**Response.**
+- The old generation stays resident until the last reader drops its `Arc`.
+- Nothing accumulates past that. Each publish leaves at most one superseded generation behind, and a new publish cannot stack a third, so a stuck reader costs a bounded amount rather than growing garbage.
+
+**Operator action.** Find the stuck task; restart the shard if necessary. A search holds its reference only for the duration of the search, so a long-lived reference indicates a bug.
 
 ## 4. ArcSwap publication failure
 
@@ -73,61 +73,68 @@ What can go wrong with the concurrency model and how Brain handles it.
 - The stuck task is cancelled.
 - Other tasks continue.
 
-**Operator action.** Investigate. Brain's design uses few locks (single-writer, lock-free); deadlocks should be rare. Each is a bug to fix.
+**Operator action.** Investigate. Brain's design uses few locks (one writer per shard, lock-free reads); deadlocks should be rare. The one that is structurally reachable is §9 — an await inside the write transaction. Each is a bug to fix.
 
 ## 7. Reader starvation
 
-**Failure mode.** Many concurrent writers monopolize the executor; readers don't run.
+**Failure mode.** Concurrent writes monopolize the executor; reads don't run.
 
 **Detection.** Read latency rises sharply; CPU is high.
 
 **Response.**
-- Reads' priority is set high; they should preempt unprioritized work.
+- The admission bound caps how many writes can be in flight on a shard at once, so the executor always has reader tasks to pick up between write yields.
 - Cooperative yields keep things fair.
 
-If starvation persists, Brain may shed write load (reject new writes) to let reads catch up.
+Brain does not shed write load to let reads catch up. Once the permits are exhausted the shard parks its receive, which queues reads and writes alike in arrival order; the queue is the backpressure signal, and no request is dropped.
 
 **Operator action.** Investigate workload mix. Add capacity if the shard is genuinely overloaded.
 
 ## 8. Writer starvation
 
-**Failure mode.** Many concurrent reads consume CPU; writers can't make progress.
+**Failure mode.** Many concurrent reads consume CPU; writes can't make progress.
 
-**Detection.** Write latency rises; queue depth grows.
+**Detection.** Write latency rises; the shard's receive channel backs up.
 
 **Response.**
-- The writer task's priority is high.
-- Cooperative yields ensure the writer gets time.
+- Cooperative yields ensure writes get time.
+- The WAL fsync is a real yield, so a write waiting on durability does not hold the core.
 
 **Operator action.** Same as above — workload analysis and possibly capacity increase.
 
-## 9. Single-writer assumption violated
+## 9. An await inside the write transaction
 
-**Failure mode.** Due to a bug, two tasks both try to write to the same shard's storage.
+**Failure mode.** A code change introduces an await point between `begin_write` and `commit`. A second in-flight request reaches the same region while the first is suspended inside it.
 
-**Detection.**
-- redb's begin_write blocks; the second writer waits.
-- Brain's writer-task setup ensures only one writer task per shard. If the assumption is somehow violated:
-  - WAL ordering is broken (LSNs out of order).
-  - Recovery may misbehave.
+**Detection.** The shard wedges: redb's write lock is held by a task that cannot be resumed until the holder of the lock makes progress, and on a single-threaded executor nothing else will release it. Every subsequent request on that shard parks forever.
 
-**Response.**
-- Assertions in debug builds catch the issue.
-- In production, Brain logs and continues; recovery may detect inconsistency.
+**Response.** There is no runtime guard. The serialization of writes is the absence of that await point, so violating it is not a degraded mode — it is a hang.
 
-**Operator action.** Report the bug. The architecture is intentional; bugs that break it are critical.
+**Operator action.** Report the bug and restart the shard. Code review of the transaction body is the enforcement mechanism; the body is deliberately kept short and synchronous so a reviewer can see the whole of it at once.
 
-## 10. Memory reclamation lag
+## 9a. Durable watermark pinned below the WAL tail
 
-**Failure mode.** Garbage accumulates because pins are held continuously by busy reader tasks.
+**Failure mode.** A reserved LSN range is never resolved, so the shard's contiguous committed prefix stops advancing even though writes keep committing above it.
 
-**Detection.** Memory usage grows over time; `arc_swap_garbage_size` and similar metrics rise.
+**Detection.** The watermark lags the WAL tail without bound; checkpoints keep recording the same `durable_lsn`, so replay windows grow on every restart.
 
 **Response.**
-- Brain's pin discipline keeps individual pins short.
-- Periodic forced-advance may be triggered if accumulation is excessive.
+- Every exit from the write path after the WAL append resolves its range: success commits it, and a `Drop` guard abandons it on any other path, including cancellation.
+- If the submitting task disappears between the drain's reservation and its reply, the drain abandons the range itself rather than leaving it reserved.
+- Checkpoint and subscribe-event records are never reserved, so they cannot pin the frontier.
 
-**Operator action.** None usually. Pin durations should be < 100 µs.
+**Operator action.** A persistently lagging watermark is a bug — some path reserved a range and neither committed nor abandoned it. Report it; the shard remains correct (recovery replays more than it needs to) but recovery time degrades.
+
+## 10. Memory peak across a publish
+
+**Failure mode.** Not a failure — a cost. Between a publish and the moment the last reader drops the previous generation, both the old and the new index are resident. Resident memory peaks across that window.
+
+**Detection.** Memory sawtooths around each flush rebuild, with the peak about one extra graph above the steady state.
+
+**Response.**
+- Reclaiming whole generations is the design: there is no per-node free to pace, and no deferred queue that could fall behind.
+- The window is bounded by the longest in-flight search, not by a reclamation cadence.
+
+**Operator action.** Size the shard for the peak, not the steady state. A shard whose working set only fits without the extra copy is under-provisioned.
 
 ## 11. The `await` deadlock
 
@@ -217,7 +224,3 @@ expensive_op().await;          // expensive_op needs the lock too. Deadlock.
 - Atomic publication via ArcSwap ensures readers either see pre-maintenance or post-maintenance state, never both.
 
 **Operator action.** None.
-
----
-
-*Continue to [`../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md) for unresolved questions.*

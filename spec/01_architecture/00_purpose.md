@@ -80,7 +80,7 @@ Brain ships **embedded** (in-process), **self-hosted** (single binary), and **cl
 - **Wire-format byte layouts.** Defined in [04. Wire Protocol](../04_wire_protocol/00_purpose.md).
 - **On-disk storage formats.** Defined in [08. Storage: Arena & WAL](../08_storage/00_purpose.md) and [10. Metadata + Graph Store](../10_metadata/00_purpose.md).
 - **Cognitive operation semantics in depth.** Defined in [05. Operations](../05_operations/00_purpose.md).
-- **Concurrency and epoch model.** Defined in [14. Concurrency](../14_concurrency/00_purpose.md).
+- **Concurrency and the publication model.** Defined in [14. Concurrency + Publication Model](../14_concurrency/00_purpose.md).
 - **Failure-mode procedures.** Defined in [18. Failure Recovery](../18_failure_recovery/00_purpose.md).
 
 ## Audience

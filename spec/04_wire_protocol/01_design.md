@@ -52,7 +52,7 @@ The trade-off is real but small:
 - **Cost:** Brain implements its own observability hooks (gRPC's metadata propagation comes for free).
 - **Benefit:** predictable, allocation-light framing on the hot path; portable payloads any language reads with an off-the-shelf CBOR library; zero-copy retained where it matters — the trailing raw-vector section ([`02_wire_format.md`](02_wire_format.md)) and all internal storage (WAL, arena), which keep their original layout.
 
-The earlier rationale weighed gRPC's ~30–100 µs framing overhead against a Rust-coupled zero-copy payload (rkyv) and accepted that non-SDK clients couldn't connect. That accepted cost is now the thing the design avoids: a standalone database must be reachable from any language, and clients send **text** (Brain owns the embedding model), so a CBOR decode of a request body costs single-digit µs — not the 50–100 µs a vector-heavy decode would. Zero-copy on the structured payload was solving a problem this workload doesn't have.
+A standalone database must be reachable from any language, which a Rust-coupled zero-copy payload (rkyv) would forbid: non-SDK clients could not connect at all. The payload encoding costs little by comparison. Clients send **text** (Brain owns the embedding model), so a CBOR decode of a request body costs single-digit µs — not the 50–100 µs a vector-heavy decode would, and well inside gRPC's ~30–100 µs framing overhead. Zero-copy on the structured payload solves a problem this workload does not have.
 
 The benefit is consequential at Brain's latency target. The cost is contained: the protocol is small (this spec defines all of it), the client surface is just this spec plus the conformance corpus (Brain ships no SDKs to maintain), and the protocol is unambiguous (Brain controls the spec).
 
@@ -245,8 +245,6 @@ The cost is wire bandwidth on updates with many unchanged aliases. Acceptable un
 
 Brain already implements (b) for `RECALL_RESP`, `PLAN_RESP`, `REASON_RESP`, `ADMIN_MIGRATE_EMBEDDINGS_RESP`, `ADMIN_LIST_TOMBSTONED_RESP`. Typed-graph list / query ops have the same shape (one logical result per frame, EOS terminates). Adding a separate envelope would mean two distinct streaming models in one server.
 
-The original draft mentioned `STREAM_START` / `STREAM_ITEM` / `STREAM_END`; that's obsolete. See [`../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md) R-K3.
-
 ## 15. Opaque attribute / property / evidence blobs
 
 ### Alternatives
@@ -260,7 +258,7 @@ The original draft mentioned `STREAM_START` / `STREAM_ITEM` / `STREAM_END`; that
 
 The schema isn't always known at the wire layer (the connection layer doesn't hold the schema registry). Pushing schema-aware decode into the wire forces a circular dependency or eager schema-replica caching at every dispatch point. Opaque blobs let the wire ship without knowing the schema; the handler (which holds `ctx.executor.metadata`) does the typed decode.
 
-The cost is later error reporting on malformed attribute bags; tracked in [`../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md) OQ-WP-K7.
+The cost is later error reporting on malformed attribute bags: a bad bag is caught in the handler rather than at the wire boundary.
 
 ## 16. Idempotency keying
 
@@ -492,7 +490,7 @@ A `BYE` indicates "I'm done; finish what's in flight, then close". In-flight str
 
 ### 7.2 Abrupt close
 
-A side that needs to close immediately just closes the TCP connection. The peer sees a connection error; in-flight operations fail with `ConnectionLost`.
+A side that needs to close immediately just closes the TCP connection. No `ERROR` frame precedes it, and there is no wire error code for a dropped connection: the responses to in-flight operations have nowhere to go, so they are discarded with the connection. The server records the close as `eof` on `brain_connections_closed_total{reason=}` (or `fatal` when the read failed with an I/O error rather than a clean end-of-stream), and the peer observes a transport-level failure, not a Brain error code. Any transaction the connection had opened is auto-aborted at once by the per-connection orphan sweep rather than left to its own timeout.
 
 This is the only path on emergency shutdown or panic conditions; otherwise, the graceful BYE flow is preferred.
 

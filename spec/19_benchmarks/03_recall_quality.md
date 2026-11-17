@@ -29,8 +29,12 @@ These are MUST for v1.
 
 Targets apply at:
 - 1M memories per shard.
-- Default HNSW parameters (M=16, ef_construction=200, ef_search=64).
+- Default memory-HNSW parameters: `M=16`, `ef_construction=200`, `ef_search=64`, with per-query `ef_search` overrides capped at 500 (`crates/brain-index/src/params.rs:28-30,86-110`).
 - Mix of fresh and aged data.
+
+The statement corpus is tuned differently — `M=32`, `ef_search=128` — because statement renderings cluster more tightly than memory prose; see [`../13_retrievers/03_semantic_retriever.md`](../13_retrievers/03_semantic_retriever.md) §1. Recall targets in this section are stated for the memory corpus.
+
+A single-space query may not touch the HNSW at all: a space at or below 20 000 live memories is served by an exact per-space scan whose recall is 1.0 by construction (see [`../20_tenancy/00_purpose.md`](../20_tenancy/00_purpose.md) §6). The approximate-recall targets below describe the shared-index path, which is what a large space or a namespace-wide read uses.
 
 ## 4. The data dependence
 
@@ -76,18 +80,29 @@ Right after a fresh build:
 
 After many tombstones accumulate:
 - Recall drops over time.
-- The maintenance worker rebuilds when recall drops below ~0.85.
+- The maintenance worker rebuilds, but **on tombstone ratio, not on recall** — see §8.
+
+The maintenance worker wakes every 5 minutes, collects index statistics, and decides one of three actions (`crates/brain-workers/src/workers/hnsw_maint.rs:1-11,67-98`):
+
+| Condition | Action |
+|---|---|
+| tombstone ratio > 0.30 | full rebuild |
+| recall estimate < 0.90 | full rebuild |
+| tombstone ratio > 0.15 **or** recall estimate < 0.93 | schedule a rebuild soon |
+| otherwise | nothing |
+
+A rebuild streams the surviving `(MemoryId, vector)` pairs from an arena-backed source, folds in the live pending buffer so no concurrent write is lost, and publishes the result as a new epoch in one atomic swap.
 
 ## 8. The recall-degradation check
 
-Periodic measurement:
-- Take a sample of cues.
-- Compare HNSW results to exhaustive.
-- Compute recall.
+The intended check is a sampled one: take a set of cues, run each against both the HNSW and an exhaustive scan, and report the overlap as `brain_hnsw_recall_estimate`.
 
-This is the `brain_hnsw_recall_estimate` metric.
+**It is not wired.** Query-sample logging does not exist, the worker stamps `recall_estimate = 1.0` unconditionally, and `brain_hnsw_recall_estimate` is a deferred metric family that `/metrics` does not carry (`crates/brain-workers/src/workers/hnsw_maint.rs:14-17,52-55,211`; `crates/brain-server/src/metrics/mod.rs:31-36`).
 
-It runs every hour by default.
+Two consequences, and both matter when reading the targets in §2:
+
+- **The recall-based rebuild thresholds in §7 never fire.** A constant 1.0 never falls below 0.90 or 0.93. In practice the **tombstone ratio is the only trigger** — which is a reasonable proxy, since tombstone accumulation is the mechanism by which recall decays, but it is a proxy and not the measurement. An index degraded for any other reason is not detected. The thresholds are kept, not deleted: they are the live decision function, unit-tested as a pure function, and they begin to act the moment sampling is wired.
+- **Recall@K in §2 is not self-monitored in production.** Those are benchmark-time targets, verified by measuring against an exhaustive baseline during a benchmark run. A deployment that wants continuous recall assurance has to sample externally; Brain does not currently tell it when recall has slipped.
 
 ## 9. The "above 1M" recall
 
@@ -129,7 +144,9 @@ Tested: encode pairs of paraphrases; query with one of each pair; verify both ra
 Beyond exact and near-duplicate:
 - Conceptually similar but textually different memories should be highly ranked.
 
-This depends on the embedding model's quality, not just HNSW. Brain provides good embeddings (BGE) but the upper bound is the model.
+This depends on the embedding model's quality, not just HNSW. Brain embeds with BGE-small-en-v1.5 at 384 dimensions, and the upper bound on semantic match quality is the model, not the index.
+
+One model-specific detail is load-bearing for short queries: BGE is an asymmetric-retrieval model, so a query is embedded with a prefix that a stored passage is not (`crates/brain-embed/src/dispatcher/cpu.rs:66-70`). Skipping that prefix degrades short-query recall badly, and because query and passage embeddings of the same surface text are then distinct, they also occupy independent cache rows.
 
 ## 14. The "long tail" cases
 

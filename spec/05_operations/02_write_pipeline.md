@@ -199,14 +199,36 @@ For very short texts (a few words), the embedding is still meaningful but less i
 
 Brain doesn't have a minimum text length; even a single character is encodable. The agent decides what's worth encoding.
 
-### 11. The latency promise
+### 11. Reference latency measurements
 
-For typical workloads:
+There is no hardware-independent latency promise for text ENCODE. The latency
+is dominated by CPU embedding, whose cost depends on the model and on the
+machine. As a reference measurement, `bge-small-en-v1.5` (BERT, 33M parameters,
+f32, 127 MB, 384 dimensions) took 16.8 ms for a 9-word text at an intra-op
+width of one, and about 51 ms for the same text at a width of 10, on aarch64
+Linux in the devcontainer with 10 CPUs exposed. A roughly 500-token text took
+about 652 ms.
 
-- p50: ~5-10 ms.
-- p99: ~25 ms.
+The forward pass is offloaded off the shard's reactor through
+`glommio::executor().spawn_blocking`. That executor's blocking pool is a single
+thread pinned to the shard's own CPU, so the reactor is free to run other tasks
+while the model runs, but the embed and the reactor share one core. The offload
+buys a thread, not a core.
 
-The latency is dominated by the embedder. With cache hits (~10% of cues), latency drops to ~2-3 ms.
+Shards are the unit of parallelism, so widening the intra-op split inside one
+embed only steals cores from other shards. Measured in isolation on a 10-CPU
+box, 4 shards sustained 266, 258, 235 and 203 embeds per second at intra-op
+widths of 1, 2, 4 and 8; 9 shards sustained 586, 573 and 551 at widths of 1, 2
+and 4 — throughput falls as the width rises. The width is derived from the
+machine; it is not an operator knob.
+
+The offload keeps the shard responsive while an embed runs: a probe measured
+alongside a saturating embed load showed a p95 inflation of 1.00-1.02 across
+every arm.
+
+These are reference measurements, not SLOs; measure the deployment hardware
+when setting operational expectations. Cache hits avoid inference and have a
+different, local cost.
 
 For batched encodes, throughput is much higher; per-encode latency rises slightly due to batching delay but throughput goes up to ~10K/sec/shard.
 
@@ -422,9 +444,11 @@ written — can be inspected later via `MEMORY_INSPECT` (§04, `0x0028`). The
 bundle is written by the same producers that emit the trace stages, but as
 durable state rather than a transient event:
 
-- **sync**, on this write's ack txn (`apply_upsert_memory`): `vector`, `record`,
-  and `keyword_fields` — committed atomically with the memory row, no extra
-  transaction on the ack path.
+- **sync**, on this write's ack txn (`apply_upsert_memory`): `record` and
+  `keyword_fields` — committed atomically with the memory row, no extra
+  transaction on the ack path. The embedding goes to `memory_vectors` in the
+  same txn; it is not stored in the bundle (§10.9a), and `MEMORY_INSPECT`
+  reads it from there.
 - **async**, off the ack path: the extractor worker merges `graph` after its
   typed-graph commit; the HyPE worker merges `hype_questions`.
 
@@ -960,7 +984,7 @@ Mostly the WAL fsync. Bulk LINK (many edges in one ENCODE) is more efficient.
 
 ### 14. Throughput
 
-Per shard: ~5K-10K LINK/UNLINKs per second. Limited by the writer task's group commit.
+Per shard: ~5K-10K LINK/UNLINKs per second. Limited by the WAL group commit that folds concurrent writes into one `fdatasync`.
 
 For high-edge-volume agents (e.g., building a knowledge graph), batching via inline-ENCODE-edges is the throughput path.
 
@@ -1140,9 +1164,11 @@ The agent re-injects `block_text` at the start of its next conversation; the mod
 
 `space_id` doesn't exist on this shard. Returns `AgentNotFound`.
 
-#### SchemaNotDeclared
+#### Unseeded procedural predicates
 
-The space's namespace has no schema; `behavior_*` predicates aren't available. Returns `SchemaNotDeclared`.
+Not a failure mode, and not conditioned on the caller's namespace. The five `behavior_*` predicates resolve against the seeded `brain:` system namespace — `DeclScope::base("brain")` — so whether the caller's own namespace has declared a schema has no bearing on this op. A predicate the registry has no row for is skipped and logged at debug; when none of the five resolve, the op returns the empty block described under `EmptyResult` below with `total_candidates = 0`. No space can hold a procedural statement under a predicate that was never registered, so there is nothing here for an error to protect.
+
+There is no `SchemaNotDeclared` code: it is not a member of `ErrorCodeWire` and no branch of the write path raises one. The schema gate is per-type and per-read-transaction, keyed on the active schema version for the scope the caller writes into. With a version active, a qname that scope does not declare is rejected — `PredicateNotInSchema` (0x004B) on `STATEMENT_CREATE`, `RelationTypeNotInSchema` (0x004C) on `RELATION_CREATE`, both category `Validation` and both with no retry hint. With no version active the gate falls through to an implicit intern: the qname is created and the write is accepted, because there is no contract to hold it to. A namespace that has never had a schema is a state the server writes into normally, not one it refuses. See [`../04_wire_protocol/07_error_handling.md`](../04_wire_protocol/07_error_handling.md) §3.10.2.
 
 #### EmptyResult
 
