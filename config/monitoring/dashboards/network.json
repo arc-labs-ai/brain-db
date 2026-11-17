@@ -68,16 +68,6 @@
       "targets": [
         { "expr": "histogram_quantile(0.99, sum by (le) (rate(brain_frame_size_bytes_bucket[5m])))", "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" } }
       ]
-    },
-    {
-      "id": 7,
-      "title": "Active Connections by Shard",
-      "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "targets": [
-        { "expr": "sum by (shard) (brain_connections_active)", "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" } }
-      ]
     }
   ]
 }

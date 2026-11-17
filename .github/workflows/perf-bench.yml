@@ -1,0 +1,50 @@
+name: Perf benches
+
+# This workflow collects p50 latency measurements for the relation traversal
+# and lexical retrieval paths. It is operator-driven: a human reads the
+# printed numbers or compares them against a local Criterion baseline. It does
+# not gate on absolute latency because the spec's targets
+# (spec/19_benchmarks/02_performance_targets.md §2.4, §2.9) are specified at
+# 1M-relation and 100K-memory scale on the reference hardware of
+# spec/19_benchmarks/04_benchmark_methodology.md §1, while these harnesses run
+# a 10K-scale fixture on a shared runner. An absolute millisecond bound measured
+# there describes the runner, not the implementation. A step fails only if a
+# bench panics or the job times out.
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+# Only one perf run needs to be in flight at a time.
+concurrency:
+  group: perf-bench
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  perf:
+    name: Perf measurements (relation_traverse + lexical_retrieve)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 90
+    env:
+      CC: ${{ github.workspace }}/.github/scripts/cc-ubuntu26
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-rust
+
+      # This step prints p50 actuals for traversal depths 1-3 and the
+      # memory-anchored substrate walk, and feeds Criterion's statistical
+      # summary so the trend can be graphed.
+      - name: brain-planner — relation_traverse bench
+        run: cargo bench -p brain-planner --bench relation_traverse
+
+      # This step times single-term, multi-term-plus-filter, and
+      # statement-scope queries at a 10K corpus. The 100K/1M recall@10 scales
+      # are validated separately by the acceptance suite on reference hardware.
+      - name: brain-index — lexical_retrieve bench
+        run: cargo bench -p brain-index --bench lexical_retrieve

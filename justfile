@@ -172,20 +172,23 @@ verify: fmt-check build clippy test check-skills
 # The production gate. Runs every check CI runs (`.github/workflows/ci.yml`)
 # locally in one command. Sequential link (`-j 1`) on the test sweep
 # matches CI's OOM-avoidance posture; if you have ≥ 16 GB free, drop
-# `-j 1` for faster local runs. Release-build smoke + doc build round
-# out the gates. The acceptance benches are not run here — they live
+# `-j 1` for faster local runs. The lockfile check is included, and the doc
+# build treats warnings as errors. Release-build smoke + doc build round out
+# the gates. The acceptance benches are not run here — they live
 # in the nightly perf workflow because they take 5–15 minutes each.
 prod-verify:
     cargo fmt --all -- --check
+    # Proves Cargo.lock agrees with [workspace.package] version for --locked builds.
+    cargo metadata --locked --format-version 1 > /dev/null
     cargo clippy --workspace --tests --all-features -- -D warnings
     cargo test --workspace --all-targets --no-fail-fast -j 1
     cargo test --workspace --doc
-    cargo doc --workspace --no-deps
+    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
     cargo build --release --bin brain-server
     ./.claude/scripts/check-skills.sh
 
-# Run the acceptance benches (asserted p50/p99 from spec §16/02).
-# Same gates the nightly-perf workflow runs.
+# These benches report p50 measurements for an operator to read and run the
+# same two benches as the perf-bench workflow.
 prod-bench:
     cargo bench -p brain-planner --bench relation_traverse
     cargo bench -p brain-index --bench lexical_retrieve

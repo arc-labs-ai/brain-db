@@ -55,7 +55,7 @@
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
-        { "expr": "sum by (shard) (increase(brain_hnsw_node_count[1h]))", "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+        { "expr": "sum by (shard) (delta(brain_hnsw_node_count[1h]))", "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" } }
       ]
     },
     {
@@ -65,7 +65,7 @@
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
-        { "expr": "sum by (shard) (increase(brain_hnsw_tombstone_count[1h]))", "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+        { "expr": "sum by (shard) (delta(brain_hnsw_tombstone_count[1h]))", "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" } }
       ]
     }
   ]

@@ -1,11 +1,20 @@
 # Brain — development configuration.
 # This file is read by `brain-server --config config/dev.toml`.
-# Schema is defined in spec/01_architecture/.
+# Operator-facing reference: DEPLOY.md.
 
 [server]
 admin_addr = "127.0.0.1:9092"
 listen_addr = "127.0.0.1:9090"
 metrics_addr = "127.0.0.1:9091"
+
+# TLS terminates the data-plane listener itself. cert and key are PEM paths and
+# both are required: `enabled = true` without them is refused at boot rather than
+# quietly serving plaintext. Off here because every listener is bound to
+# loopback, so there is no hop to protect.
+# [server.tls]
+# enabled = false
+# cert = "/abs/path/to/server.pem"
+# key = "/abs/path/to/server.key"
 
 # Single shard so the eval's ingested corpus lives in one shard dir and
 # survives restarts under a persistent volume without shard-routing skew.
@@ -24,8 +33,7 @@ ef_search = 64
 ef_construction = 200
 # ef_factor: derive the search beam from the requested `k` when a query
 # gives no explicit `ef` — the beam becomes max(ef_search, k * ef_factor).
-# Range 1..=16. Default 1 = `ef_search` alone decides the beam, which is
-# what every release before this field did.
+# Range 1..=16. Default 1 = `ef_search` alone decides the beam.
 #
 # Why it exists: at these defaults ef_search and DEFAULT_TOP_K are both 64,
 # so ef == k — the search barely explores past the results it is about to
@@ -56,20 +64,46 @@ ef_occupancy_scaling = false
 # Relative-drop autocut of the ranked result tail.
 autocut = false
 
+# Calibrated precision on the read path: how much cross-lane agreement a RECALL
+# answer must carry before it commits rather than abstains. Both floors sit at 0,
+# which never abstains and never trims. Policy: whether a wrong answer reads worse
+# than no answer is a product decision measured per corpus, so the shipped value
+# declines to make it.
+[precision]
+# Minimum cross-lane support (0..=5) the uncommitted lead must carry to commit.
+commit_min_support = 0
+# Minimum support a member needs to join a Many answer's committed set rather
+# than stay as retained context.
+many_min_support = 0
+
+# Maintenance-worker cadences, in seconds: the sleep between one worker's
+# cycles. A worker takes its cadence when it is registered and keeps it for the
+# life of the process, so changing one of these needs a restart. Omitting a key
+# leaves the built-in cadence in place. Each value must be >= 1; a zero is
+# refused at boot.
+#
+# `access_boost` is a twelfth maintenance worker with no key here — its tick is
+# a property of the build.
+#
+# `hnsw_maintenance_interval_sec` is how often a shard's tombstone ratio is
+# CHECKED, not how often the index is reclaimed. Above 0.30 the check rebuilds
+# the index there and then; between 0.15 and 0.30 it only records that a
+# rebuild is due, so a workload sitting in that band reclaims nothing however
+# often it is checked.
 [workers]
 decay_interval_sec = 3600
-snapshot_interval_sec = 21600
-edge_scrub_interval_sec = 86400
-wal_retention_interval_sec = 600
-consolidation_interval_sec = 600
-statistics_update_interval_sec = 60
-hnsw_maintenance_interval_sec = 1800
-slot_reclamation_interval_sec = 3600
+snapshot_interval_sec = 3600
+edge_scrub_interval_sec = 1800
+wal_retention_interval_sec = 60
+consolidation_interval_sec = 300
+statistics_update_interval_sec = 300
+hnsw_maintenance_interval_sec = 300
+slot_reclamation_interval_sec = 600
 idempotency_cleanup_interval_sec = 3600
-embedder_cache_eviction_interval_sec = 300
-counter_reconciliation_interval_sec = 86400
+embedder_cache_eviction_interval_sec = 60
+counter_reconciliation_interval_sec = 3600
 
-# Phase B: per-shard AutoEdgeWorker. Drains the writer's post-encode
+# per-shard AutoEdgeWorker. Drains the writer's post-encode
 # channel and writes `SimilarTo` edges between memories whose cosine
 # similarity is at least `similarity_threshold`. Every field below
 # defaults if the section is omitted; tune per deployment.
@@ -92,7 +126,7 @@ ef_search = 64
 # (the encode itself never fails).
 channel_capacity = 1024
 
-# Phase E: per-shard ExtractorWorker. Drains the writer's post-encode
+# per-shard ExtractorWorker. Drains the writer's post-encode
 # channel and runs the three-tier extractor pipeline (pattern + classifier
 # + LLM) against each memory's text. Outputs are resolved through the
 # entity resolver gauntlet and written as entities / statements /
@@ -108,17 +142,49 @@ interval_ms = 1000
 # Max memories drained per cycle. Caps pattern/classifier/LLM work per
 # tick.
 drain_per_cycle = 32
-# Per-cycle LLM cost ceiling in dollar-micro-units (1e-6 USD). The
-# framework's per-call CostBudget is the active enforcement surface in
-# v1; per-cycle accounting wires through here in a later iteration.
-llm_budget_per_cycle_micro_usd = 50000
+# Memories bundled into one classifier forward pass. The GLiNER backbone GEMM
+# dominates per-encode latency, so batching amortises it — 8 pulls per-memory
+# cost down by ~4-5x on a CPU host. Bounded above by drain_per_cycle: a
+# micro-batch is min(batch_size, the cycle's remaining budget), so raising this
+# past that number buys nothing. Per shard, so it does not scale with
+# shard_count.
+batch_size = 8
 # Writer→worker queue depth. Overflow drops with a warn.
 channel_capacity = 1024
 # Skip memories that already have a pipeline audit row. Set to false
 # only for re-extraction backfill scenarios.
 skip_already_extracted = true
+# Re-extract a namespace's already-committed memories when it uploads a new
+# schema version. Policy: off, because one SCHEMA_UPLOAD against a large corpus
+# becomes one paid LLM call per affected memory with no operator in the loop. The
+# migration worker still reports how many memories fall outside the new schema,
+# and POST /v1/extract/backfill runs the same work deliberately.
+reextract_on_schema_change = false
+# Apply/gate infra-failure attempts one memory gets before its extraction is
+# abandoned — a durable FAILURE audit row is written and the memory leaves the
+# queue. Policy, but not a free number: it is the same per-item cap the backfill
+# worker abandons at, so the two paths give up together and an operator
+# reasoning about one is reasoning about both.
+max_apply_attempts_per_memory = 3
+# How recently an LLM-tier call must have succeeded on this shard for a later
+# transient failure to be charged to the memory rather than to the provider.
+# Policy. Wide enough that a normally-extracting shard keeps that evidence alive
+# across a backing-off memory's retries, narrow enough that it expires well
+# inside an outage — which is what stops a dead provider from spending every
+# queued memory's per-item budget.
+provider_reachable_window_ms = 900000
+# Transient failures charged to the memory itself before its extraction is
+# abandoned. Policy, and small on purpose: a failure that lands while other
+# memories' calls are succeeding is the memory's own, and the same text fails
+# the same way on the next attempt.
+max_item_attributable_failures = 5
+# Absolute ceiling on extraction attempts for one memory, counting the failures
+# charged to the provider too. Derived: the retry ladder widens to one attempt
+# per capped interval, so the attempts covering a stated outage window are that
+# window divided by that interval — 48 hours ÷ 1 hour.
+max_transient_attempts = 48
 
-# Phase T: per-shard TemporalEdgeWorker. Drains the writer's post-encode
+# per-shard TemporalEdgeWorker. Drains the writer's post-encode
 # channel and writes `FollowedBy` edges from the space's previous memory
 # in the same session within `window_seconds`. Linear decay weight on
 # the gap; asymmetric edges (no mirror).
@@ -129,16 +195,25 @@ enabled = true
 interval_ms = 100
 # Max memories drained per cycle.
 batch_size = 256
-# Temporal window. Memories older than this are not candidates.
-window_seconds = 300
+# Temporal window: how far back a predecessor may be and still earn a
+# `FollowedBy` edge, and the span the decay weight is measured against.
+# 30 minutes covers the natural pauses inside one conversational session,
+# so consecutive turns stay chained instead of fragmenting.
+window_seconds = 1800
 # Hard floor on the decay-weight curve.
 weight_min = 0.1
 # Writer→worker queue depth.
 channel_capacity = 1024
 # Allow FollowedBy edges across session boundaries.
 cross_session = false
+# Cosine floor for the topical gate. A candidate predecessor below this is
+# dropped, so adjacency on its own cannot chain "I had lunch" to "deployed to
+# prod". Policy, and deliberately permissive: it is here to cut unrelated pairs,
+# not to re-rank related ones, and a tighter floor severs genuine threads whose
+# consecutive turns shift topic.
+topical_threshold = 0.4
 
-# Phase C: per-shard CausalEdgeWorker. Drains the ExtractorWorker's post-
+# per-shard CausalEdgeWorker. Drains the ExtractorWorker's post-
 # commit channel and writes `Caused` edges from cause-side memories to
 # effect-side memories, anchored on extractor-asserted causal statements
 # (`brain:caused_by`, `brain:triggered`, …). Worker still spawns on
@@ -177,30 +252,72 @@ max_related_statements_per_entity = 5
 # grace_seconds = 2592000   # 30 days
 # period_seconds = 86400    # 1 day sweep cadence
 
+# Per-shard coined-predicate GC. Reclaims ImplicitFromWrite predicates that no
+# live statement references; schema-declared predicates are never touched. Off —
+# those unreferenced names are the shortlist worth promoting into a schema, so an
+# operator may well want them to accumulate.
+# [workers.predicate_gc]
+# enabled = false
+# grace_seconds = 604800    # 7 days, covering the gap between coining a name
+#                           # and the statement that uses it landing
+# period_seconds = 86400    # 1 day sweep cadence
+# dry_run = false           # true logs what a cycle would reclaim and deletes
+#                           # nothing — how to read a deployment's coined
+#                           # vocabulary before trusting a GC with it
+
+# Per-shard superseded-statement GC. Physically deletes superseded statement
+# rows past the retention window. Off — a superseded row is filtered from every
+# read regardless, so this only reclaims disk.
+# [workers.supersession_sweeper]
+# enabled = false
+# retention_seconds = 0     # 0 = eligible the moment it is superseded; set a
+#                           # window before arming this if anything still reads
+#                           # supersession history
+# period_seconds = 86400    # 1 day sweep cadence
+# dry_run = false           # log the candidates without deleting them
+
 # Entity merge-review-queue sweeper. Re-checks ambiguous-band entity
 # resolutions as the entity HNSW grows. Slow cadence on purpose.
 # [workers.ambiguity_resolver]
+# enabled = true            # low-cost metadata maintenance; false stops merge
+#                           # proposals being re-scored at all
 # interval_secs = 3600      # 1 hour
 
 # Statement confidence-refresh sweep. Recomputes stored Statement
 # confidence (noisy-OR + kind decay) so aged evidence stops over-ranking.
 # [workers.confidence_sweep]
+# enabled = true            # low-cost metadata maintenance; false freezes
+#                           # confidence at the value extraction wrote
 # interval_secs = 3600      # 1 hour
 
 # LLM extractor response-cache TTL sweep. Deletes expired cache rows so
 # the cache file doesn't grow unbounded.
 # [workers.llm_cache_sweep]
+# enabled = true            # low-cost metadata maintenance; false lets the
+#                           # cache file grow without bound
 # interval_secs = 3600      # 1 hour
 
 # Extractor pipeline tuning. Extraction is always-on and non-configurable —
-# there are no per-tier on/off gates; the knobs below tune resolution /
-# classification / HyPE only.
+# there are no per-tier on/off gates; the knobs below tune resolution,
+# classification, HyPE and the size of the LLM tier's calls.
 # [extractors.resolver]
 # embed_threshold = 0.78    # tier-3 entity-alias cosine floor
 
 # [extractors.classifier]
 # model_path = "/abs/path/to/gliner-model"   # override; default = XDG discovery
 # threshold = 0.5           # GLiNER post-sigmoid acceptance floor
+
+# The LLM tier is always-on; this only sizes its calls.
+[extractors.llm]
+# Output-token ceiling for one extraction call. The tier asks for a memory's
+# whole typed graph as a single JSON document, so the ceiling scales with how
+# much the memory says, not how long it is — and hitting it truncates the JSON
+# mid-token, landing the memory with entities but no statements and no
+# relations. 4096 fits the dense case (eight entities with their statements and
+# relations) with headroom. Raise it when `response truncated at max_tokens`
+# appears in the extractor log, and raise it further on a reasoning model, whose
+# thinking tokens come out of this same budget.
+max_tokens = 4096
 
 # [extractors.hype]
 # HyPE is mandatory and always-on — there is no enable/disable flag.
@@ -277,5 +394,8 @@ max_summary_chars = 4096
 [rerank]
 # Off by default: rerank only reorders already-retrieved candidates and
 # can't surface what retrieval+grounding missed. Solve recall correctness
-# upstream; flip to true only to A/B the cross-encoder's ordering.
+# upstream; flip to true only to A/B the cross-encoder's ordering, and only
+# with a cross-encoder on disk — set BRAIN_RERANK_MODEL_DIR or place weights
+# at the XDG default path. Enabled with no model on disk, the shard refuses to
+# start rather than fall back to RRF behind the operator's back.
 enabled = false
