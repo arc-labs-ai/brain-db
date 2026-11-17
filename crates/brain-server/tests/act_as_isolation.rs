@@ -47,33 +47,7 @@ use brain_protocol::{ActAs, EventType, Frame, TxnBeginRequest, TxnCommitRequest}
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-#[allow(dead_code)]
-#[path = "../src/admin/mod.rs"]
-mod admin;
-#[allow(dead_code)]
-#[path = "../src/network/auth.rs"]
-mod auth;
-#[allow(dead_code)]
-#[path = "../src/config/mod.rs"]
-mod config;
-#[allow(dead_code)]
-#[path = "../src/network/connection.rs"]
-mod connection;
-#[path = "../src/network/dispatch.rs"]
-mod dispatch;
-#[path = "../src/metrics/mod.rs"]
-mod metrics;
-#[allow(dead_code)]
-#[path = "../src/network/routing.rs"]
-mod routing;
-#[allow(dead_code)]
-#[path = "../src/shard/mod.rs"]
-mod shard;
-#[path = "../src/network/subscribe.rs"]
-mod subscribe;
-#[allow(dead_code)]
-#[path = "../src/bootstrap/tls.rs"]
-mod tls;
+use brain_server::config;
 
 mod support_harness;
 
@@ -440,21 +414,12 @@ async fn act_as_without_grant_is_denied() {
         allow_duplicates: false,
     };
     let (opcode, body) = round_trip(&mut client, 1, RequestBody::Encode(req)).await;
-    assert_eq!(
+    expect_error(
         opcode,
-        Opcode::Error.as_u16(),
-        "expected an Error frame, got 0x{opcode:04x}: {body:?}"
+        &body,
+        ErrorCodeWire::ActAsDenied,
+        "encode without grant",
     );
-    match body {
-        ResponseBody::Error(e) => assert_eq!(
-            e.code,
-            ErrorCodeWire::ActAsDenied,
-            "expected ActAsDenied, got {:?}: {}",
-            e.code,
-            e.message
-        ),
-        other => panic!("expected Error body, got {other:?}"),
-    }
 
     server.stop().await;
 }
@@ -568,21 +533,12 @@ async fn act_as_outside_allowlist_is_denied() {
         allow_duplicates: false,
     };
     let (opcode, body) = round_trip(&mut svc, 1, RequestBody::Encode(req)).await;
-    assert_eq!(
+    expect_error(
         opcode,
-        Opcode::Error.as_u16(),
-        "expected an Error frame, got 0x{opcode:04x}: {body:?}"
+        &body,
+        ErrorCodeWire::ActAsDenied,
+        "encode outside allowlist",
     );
-    match body {
-        ResponseBody::Error(e) => assert_eq!(
-            e.code,
-            ErrorCodeWire::ActAsDenied,
-            "expected ActAsDenied, got {:?}: {}",
-            e.code,
-            e.message
-        ),
-        other => panic!("expected Error body, got {other:?}"),
-    }
 
     server.stop().await;
 }
@@ -727,21 +683,12 @@ async fn subscribe_act_as_without_grant_is_denied() {
         act_as: Some(act_as("tenant_a", "space-a")),
     };
     let (opcode, body) = round_trip(&mut client, 1, RequestBody::Subscribe(req)).await;
-    assert_eq!(
+    expect_error(
         opcode,
-        Opcode::Error.as_u16(),
-        "expected an Error frame, got 0x{opcode:04x}: {body:?}"
+        &body,
+        ErrorCodeWire::ActAsDenied,
+        "subscribe without grant",
     );
-    match body {
-        ResponseBody::Error(e) => assert_eq!(
-            e.code,
-            ErrorCodeWire::ActAsDenied,
-            "expected ActAsDenied, got {:?}: {}",
-            e.code,
-            e.message
-        ),
-        other => panic!("expected Error body, got {other:?}"),
-    }
 
     server.stop().await;
 }
@@ -781,21 +728,12 @@ async fn subscribe_act_as_outside_allowlist_is_denied() {
         act_as: Some(act_as("tenant_x", "space-x")),
     };
     let (opcode, body) = round_trip(&mut svc, 1, RequestBody::Subscribe(req)).await;
-    assert_eq!(
+    expect_error(
         opcode,
-        Opcode::Error.as_u16(),
-        "expected an Error frame, got 0x{opcode:04x}: {body:?}"
+        &body,
+        ErrorCodeWire::ActAsDenied,
+        "subscribe outside allowlist",
     );
-    match body {
-        ResponseBody::Error(e) => assert_eq!(
-            e.code,
-            ErrorCodeWire::ActAsDenied,
-            "expected ActAsDenied, got {:?}: {}",
-            e.code,
-            e.message
-        ),
-        other => panic!("expected Error body, got {other:?}"),
-    }
 
     server.stop().await;
 }
@@ -905,21 +843,12 @@ async fn txn_begin_act_as_without_grant_is_denied() {
     let txn_id = *uuid::Uuid::now_v7().as_bytes();
     let (opcode, body) =
         txn_begin_as(&mut client, 1, txn_id, Some(act_as("tenant_a", "space-a"))).await;
-    assert_eq!(
+    expect_error(
         opcode,
-        Opcode::Error.as_u16(),
-        "expected an Error frame, got 0x{opcode:04x}: {body:?}"
+        &body,
+        ErrorCodeWire::ActAsDenied,
+        "txn_begin without grant",
     );
-    match body {
-        ResponseBody::Error(e) => assert_eq!(
-            e.code,
-            ErrorCodeWire::ActAsDenied,
-            "expected ActAsDenied, got {:?}: {}",
-            e.code,
-            e.message
-        ),
-        other => panic!("expected Error body, got {other:?}"),
-    }
 
     server.stop().await;
 }
@@ -943,7 +872,7 @@ fn expect_error(opcode: u16, body: &ResponseBody, code: ErrorCodeWire, what: &st
     );
     match body {
         ResponseBody::Error(e) => assert_eq!(
-            e.code, code,
+            e.code, code as u16,
             "{what}: expected {code:?}, got {:?}: {}",
             e.code, e.message
         ),

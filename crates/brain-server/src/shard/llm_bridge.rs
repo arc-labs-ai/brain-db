@@ -45,9 +45,10 @@ impl LlmClient for BridgedLlmClient {
                 let _ = tx.send_async(result).await;
             });
             rx.recv_async().await.unwrap_or_else(|_| {
-                Err(LlmError::ProviderError {
-                    status: 0,
-                    message: "LLM bridge runtime unavailable (reply channel closed)".into(),
+                // A disconnected reply channel means the request task produced no result, a
+                // defect that repeats for the same input and is therefore terminal.
+                Err(LlmError::RequestTaskFailed {
+                    reason: "LLM bridge reply channel closed before a result arrived: the spawned request task panicked or was cancelled".into(),
                 })
             })
         })
@@ -68,4 +69,47 @@ impl LlmClient for BridgedLlmClient {
 #[must_use]
 pub fn bridge(client: Arc<dyn LlmClient>) -> Arc<dyn LlmClient> {
     Arc::new(BridgedLlmClient { inner: client })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Stands in for a defect in the provider request path: the future panics
+    /// when polled, so the bridge's spawned task dies without ever sending.
+    struct PanickingClient;
+
+    impl PanickingClient {
+        /// The return type is spelled out so the future's `Output` matches
+        /// [`LlmFuture`] without relying on inference through a diverging body.
+        async fn panicking_request() -> Result<brain_llm::LlmResponse, LlmError> {
+            panic!("test request task panic")
+        }
+    }
+
+    impl LlmClient for PanickingClient {
+        fn complete<'a>(&'a self, _request: LlmRequest) -> LlmFuture<'a> {
+            Box::pin(Self::panicking_request())
+        }
+
+        fn model(&self) -> &str {
+            "test-model"
+        }
+
+        fn model_id_hash(&self) -> u64 {
+            0
+        }
+    }
+
+    #[test]
+    fn panicking_request_task_is_terminal() {
+        // The Tokio runtime catches this task panic; the expected panic output is test noise.
+        let client: Arc<dyn LlmClient> = Arc::new(PanickingClient);
+        let err = bridge_runtime()
+            .block_on(bridge(client).complete(LlmRequest::new("test-model", "x")))
+            .unwrap_err();
+        assert!(matches!(err, LlmError::RequestTaskFailed { .. }));
+        assert_eq!(err.failure_class(), brain_llm::FailureClass::Permanent);
+        assert_ne!(err.failure_class(), brain_llm::FailureClass::Transient);
+    }
 }

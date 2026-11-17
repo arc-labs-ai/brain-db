@@ -13,11 +13,8 @@ use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
-#[allow(dead_code)]
-#[path = "../src/shard/mod.rs"]
-mod shard;
-#[path = "../src/bootstrap/shutdown.rs"]
-mod shutdown;
+use brain_server::bootstrap::shutdown;
+use brain_server::shard;
 
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use shard::{spawn_shard, ShardHandle, ShardJoiner, ShardSpawnConfig};

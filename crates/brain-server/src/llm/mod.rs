@@ -35,4 +35,4 @@ pub(crate) mod resolved;
 #[cfg(feature = "summarizer-ollama")]
 pub(crate) mod ollama;
 
-pub(crate) mod factory;
+pub mod factory;

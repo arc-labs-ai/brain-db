@@ -22,33 +22,7 @@ use brain_protocol::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-#[allow(dead_code)]
-#[path = "../src/admin/mod.rs"]
-mod admin;
-#[allow(dead_code)]
-#[path = "../src/network/auth.rs"]
-mod auth;
-#[allow(dead_code)]
-#[path = "../src/config/mod.rs"]
-mod config;
-#[allow(dead_code)]
-#[path = "../src/network/connection.rs"]
-mod connection;
-#[path = "../src/network/dispatch.rs"]
-mod dispatch;
-#[path = "../src/metrics/mod.rs"]
-mod metrics;
-#[allow(dead_code)]
-#[path = "../src/network/routing.rs"]
-mod routing;
-#[allow(dead_code)]
-#[path = "../src/shard/mod.rs"]
-mod shard;
-#[path = "../src/network/subscribe.rs"]
-mod subscribe;
-#[allow(dead_code)]
-#[path = "../src/bootstrap/tls.rs"]
-mod tls;
+use brain_server::config;
 
 mod support_harness;
 
@@ -500,11 +474,11 @@ async fn resolve_exact_match_via_canonical_name() {
 /// An alias resolves with NO type hint.
 ///
 /// The no-hint path is the grounded-read default — a caller asking about
-/// "Fola" should not have to know her entity type — and it used to consult
-/// canonical names only. Aliases were written, returned by a read, and
-/// invisible to the one operation whose job is to turn a name into an
-/// entity, so the field was effectively write-only unless the caller
-/// happened to supply a type.
+/// "Fola" should not have to know her entity type — so it must consult
+/// aliases, not canonical names alone. Consulting canonical names only makes
+/// an alias write-only: written, returned by a read, and invisible to the one
+/// operation whose job is to turn a name into an entity, unless the caller
+/// happens to supply a type.
 #[tokio::test(flavor = "current_thread")]
 async fn resolve_alias_without_a_type_hint() {
     let server = start(1).await;
@@ -771,7 +745,7 @@ async fn list_cursor_rejected_in_v1() {
     assert_eq!(
         opcode,
         Opcode::Error.as_u16(),
-        "cursor pagination is deferred to phase 23"
+        "cursor pagination is not supported"
     );
 
     server.stop().await;

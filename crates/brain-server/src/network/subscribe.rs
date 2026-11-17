@@ -38,7 +38,6 @@
 // `num_shards` + `active_count` are diagnostic / test-only surfaces;
 // production code paths don't call them yet (admin endpoints
 // will). Avoid churning the surface for now.
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -99,7 +98,7 @@ impl SubscriptionMetrics {
     }
 }
 
-use brain_core::{MemoryId, ShardId};
+use brain_core::ShardId;
 use brain_ops::{parse_filter, EventEnvelope, ParsedFilter};
 use brain_protocol::codec::opcode::Opcode;
 use brain_protocol::envelope::request::{
@@ -107,9 +106,9 @@ use brain_protocol::envelope::request::{
 };
 use brain_protocol::envelope::response::{
     CancelStreamAck, ErrorCategoryWire, ErrorCodeWire, ErrorResponse, ResponseBody,
-    SubscriptionEvent, UnsubscribeResponse,
+    UnsubscribeResponse,
 };
-use brain_protocol::error::ErrorCode;
+use brain_protocol::error::{ErrorCode, ProtocolError};
 use brain_protocol::Frame;
 use parking_lot::Mutex;
 use tokio::sync::{broadcast, watch};
@@ -542,8 +541,8 @@ impl OpError {
             Self::Ops(e) => (ErrorCode::InvalidArgument, format!("subscribe filter: {e}")),
         };
         let body = ResponseBody::Error(ErrorResponse {
-            code: ErrorCodeWire::from(code),
-            category: ErrorCategoryWire::from(code.category()),
+            code: ErrorCodeWire::from(code) as u16,
+            category: ErrorCategoryWire::from(code.category()) as u8,
             message,
             details: None,
             retry_after_ms: None,
@@ -558,6 +557,54 @@ impl OpError {
 struct ReplayParams {
     from_lsn: u64,
     locator: WalLocator,
+}
+
+/// Classification of a live event after the WAL replay prologue.
+///
+/// `Deliver` means the event belongs on the live stream, `Duplicate` means
+/// the WAL replay already emitted it, and `OutOfOrder` means the live stream
+/// violated the observed WAL order. `replay_high_water` is the highest LSN the
+/// WAL replay prologue actually emitted, so an event at or below it was
+/// already delivered from the WAL and the live copy is a duplicate.
+///
+/// An LSN of 0 marks an event with no durable WAL position because the WAL
+/// append could not happen. It is neither a replay duplicate nor orderable, so
+/// it is delivered and must not move the subscription's resume point.
+#[derive(Debug, PartialEq, Eq)]
+enum LiveEvent {
+    Deliver,
+    Duplicate,
+    OutOfOrder,
+}
+
+/// Classify a live event against the WAL replay high-water mark and live
+/// delivery order.
+///
+/// An LSN of 0 marks an event with no durable WAL position because the WAL
+/// append could not happen. It is delivered even below `replay_high_water`,
+/// and callers must not use it to move the subscription's resume point.
+/// `replay_high_water` is the highest LSN the WAL replay prologue actually
+/// emitted; anything at or below it was already delivered from the WAL and
+/// the live copy is a duplicate.
+///
+/// `OutOfOrder` terminates the stream instead of buffering and reordering.
+/// The shard WAL assigns LSNs to every record, including row writes that never
+/// publish, so notification LSNs are sparse. On seeing LSN 11, the consumer
+/// cannot tell whether 10 is a notification still in flight or a row write
+/// that will never arrive. A reorder buffer therefore cannot decide when the
+/// gap is closed, so the stream reports the violation and lets the client
+/// resubscribe from a known LSN. The replay path is strictly ordered, which is
+/// safer than silently skipping the event.
+fn classify_live_event(lsn: u64, replay_high_water: u64, highest_delivered: u64) -> LiveEvent {
+    if lsn == 0 {
+        LiveEvent::Deliver
+    } else if lsn <= replay_high_water {
+        LiveEvent::Duplicate
+    } else if lsn < highest_delivered {
+        LiveEvent::OutOfOrder
+    } else {
+        LiveEvent::Deliver
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -629,6 +676,7 @@ async fn run_subscription_task(
             }
         }
     }
+    let mut highest_delivered = replay_high_water;
 
     loop {
         tokio::select! {
@@ -641,15 +689,72 @@ async fn run_subscription_task(
             res = rx.recv() => {
                 match res {
                     Ok(env) => {
-                        if env.lsn != 0 && env.lsn <= replay_high_water {
-                            // Already delivered via WAL replay.
-                            continue;
+                        match classify_live_event(env.lsn, replay_high_water, highest_delivered) {
+                            LiveEvent::Duplicate => {
+                                // Already delivered via WAL replay.
+                                continue;
+                            }
+                            LiveEvent::OutOfOrder => {
+                                warn!(
+                                    stream_id,
+                                    target_shard,
+                                    lsn = env.lsn,
+                                    highest_delivered,
+                                    "subscription event arrived out of WAL order; terminating the subscription"
+                                );
+                                let f = error_frame(
+                                    stream_id,
+                                    ErrorCode::Overloaded,
+                                    "subscription event arrived out of WAL order; reconnect with a fresh from_lsn",
+                                );
+                                let _ = frame_tx
+                                    .send_async(crate::connection::OutgoingFrame {
+                                        bytes: f.encode(),
+                                        close_after: false,
+                                    })
+                                    .await;
+                                return;
+                            }
+                            LiveEvent::Deliver => {}
                         }
                         if !filter.matches(&env) {
                             continue;
                         }
-                        let frame = build_subscription_event_frame(stream_id, &env);
-                        final_lsn.store(env.lsn, Ordering::SeqCst);
+                        let frame = match build_subscription_event_frame(stream_id, &env) {
+                            Ok(f) => f,
+                            Err(e) => {
+                                // An event too large to frame cannot be skipped:
+                                // the subscriber resumes from `final_lsn`, so
+                                // continuing past it would drop the event
+                                // silently from an ordered stream. Terminate
+                                // instead, leaving `final_lsn` at the last event
+                                // actually delivered.
+                                warn!(
+                                    stream_id,
+                                    target_shard,
+                                    lsn = env.lsn,
+                                    error = %e,
+                                    "subscription event exceeds the frame limit; terminating the subscription"
+                                );
+                                let f = error_frame(
+                                    stream_id,
+                                    ErrorCode::OversizePayload,
+                                    "subscription event exceeds the frame limit; \
+                                     reconnect with a fresh from_lsn",
+                                );
+                                let _ = frame_tx
+                                    .send_async(crate::connection::OutgoingFrame {
+                                        bytes: f.encode(),
+                                        close_after: false,
+                                    })
+                                    .await;
+                                return;
+                            }
+                        };
+                        if env.lsn != 0 {
+                            final_lsn.store(env.lsn, Ordering::SeqCst);
+                            highest_delivered = env.lsn;
+                        }
                         if frame_tx
                             .send_async(crate::connection::OutgoingFrame {
                                 bytes: frame.encode(),
@@ -685,13 +790,53 @@ async fn run_subscription_task(
         }
     }
     // Final EOS frame on this subscription's stream.
-    let eos = empty_subscription_event_frame(stream_id, final_lsn.load(Ordering::SeqCst));
+    let eos = empty_subscription_event_frame(stream_id);
     let _ = frame_tx
         .send_async(crate::connection::OutgoingFrame {
             bytes: eos.encode(),
             close_after: false,
         })
         .await;
+}
+
+#[cfg(test)]
+mod live_event_tests {
+    use super::{classify_live_event, empty_subscription_event_frame, LiveEvent, FLAG_EOS};
+
+    #[test]
+    fn non_durable_event_is_delivered_below_replay_high_water() {
+        assert_eq!(classify_live_event(0, 10, 10), LiveEvent::Deliver);
+    }
+
+    #[test]
+    fn replayed_nonzero_event_is_duplicate() {
+        assert_eq!(classify_live_event(10, 10, 10), LiveEvent::Duplicate);
+    }
+
+    #[test]
+    fn straggler_below_highest_delivered_is_out_of_order() {
+        assert_eq!(classify_live_event(10, 5, 11), LiveEvent::OutOfOrder);
+    }
+
+    #[test]
+    fn event_equal_to_highest_delivered_is_not_out_of_order() {
+        assert_eq!(classify_live_event(11, 5, 11), LiveEvent::Deliver);
+    }
+
+    #[test]
+    fn forward_event_is_delivered() {
+        assert_eq!(classify_live_event(12, 10, 11), LiveEvent::Deliver);
+    }
+
+    /// The terminal frame means "stream over" and nothing else. A payload here
+    /// is decoded by every SDK client as one more event, so a subscriber would
+    /// see a phantom memory at the end of every feed.
+    #[test]
+    fn terminator_carries_no_event() {
+        let f = empty_subscription_event_frame(7);
+        assert!(f.payload.is_empty());
+        assert_eq!(f.header.flags_u8() & FLAG_EOS, FLAG_EOS);
+    }
 }
 
 /// Walk the WAL from `from_lsn` to its current tail, projecting each
@@ -730,7 +875,8 @@ async fn replay_wal_segment(
                 if !filter.matches(&env) {
                     continue;
                 }
-                let frame = build_subscription_event_frame(stream_id, &env);
+                let frame = build_subscription_event_frame(stream_id, &env)
+                    .map_err(|e| format!("frame SUBSCRIBE_EVENT at lsn {lsn}: {e}"))?;
                 final_lsn.store(lsn, Ordering::SeqCst);
                 // Blocking send into the frame_tx; we're on a blocking
                 // pool, so this is fine. The async send variant
@@ -751,44 +897,35 @@ async fn replay_wal_segment(
     Ok(last_lsn)
 }
 
-fn build_subscription_event_frame(stream_id: u32, env: &EventEnvelope) -> Frame {
+/// Frame an event whose memory text size is influenced by the client, so an
+/// oversize payload must be reported instead of aborting the process.
+fn build_subscription_event_frame(
+    stream_id: u32,
+    env: &EventEnvelope,
+) -> Result<Frame, ProtocolError> {
     let payload = ResponseBody::SubscribeEvent(env.to_wire()).encode();
     // Intermediate frames in an open-ended subscription don't carry
     // EOS.
-    Frame::new(Opcode::SubscribeEvent.as_u16(), 0, stream_id, payload)
+    Frame::try_new(Opcode::SubscribeEvent.as_u16(), 0, stream_id, payload)
 }
 
-fn empty_subscription_event_frame(stream_id: u32, last_lsn: u64) -> Frame {
-    // Terminal EOS frame for a cancelled / lagged subscription. The
-    // body carries the last-delivered LSN so the client can resume.
-    let payload = ResponseBody::SubscribeEvent(SubscriptionEvent {
-        event_type: brain_protocol::envelope::response::EventType::Forgotten,
-        memory_id: MemoryId::NULL.raw(),
-        session_id: 0,
-        text: String::new(),
-        kind: brain_protocol::envelope::request::MemoryKindWire::Episodic,
-        salience: 0.0,
-        timestamp_unix_nanos: 0,
-        lsn: last_lsn,
-        graph_payload: None,
-        edge_payload: None,
-        stage_kind: None,
-        stage_outcome: None,
-        stage_payload: None,
-    })
-    .encode();
+fn empty_subscription_event_frame(stream_id: u32) -> Frame {
+    // Terminal EOS frame for a cancelled / lagged subscription. The payload
+    // is empty: this frame means "the stream is over", not "a memory was
+    // forgotten". A client resuming the feed takes the last-delivered LSN
+    // from UNSUBSCRIBE_RESP.
     Frame::new(
         Opcode::SubscribeEvent.as_u16(),
         FLAG_EOS,
         stream_id,
-        payload,
+        Vec::new(),
     )
 }
 
 fn error_frame(stream_id: u32, code: ErrorCode, message: &str) -> Frame {
     let body = ResponseBody::Error(ErrorResponse {
-        code: ErrorCodeWire::from(code),
-        category: ErrorCategoryWire::from(code.category()),
+        code: ErrorCodeWire::from(code) as u16,
+        category: ErrorCategoryWire::from(code.category()) as u8,
         message: message.to_owned(),
         details: None,
         retry_after_ms: None,
@@ -837,7 +974,7 @@ pub fn build_cancel_stream_ack_frame(
 #[cfg(test)]
 mod slot_reclaim_tests {
     use super::*;
-    use brain_core::{MemoryKind, SessionId, SpaceId};
+    use brain_core::{MemoryId, MemoryKind, SessionId, SpaceId};
     use brain_protocol::envelope::response::EventType;
     use std::time::Duration;
 

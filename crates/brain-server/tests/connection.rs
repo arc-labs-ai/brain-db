@@ -20,29 +20,12 @@ use tokio::net::TcpStream;
 // reaches into the test binary so `crate::` resolves the same as in
 // main.rs. The connection tests don't exercise the shard / adapter /
 // dispatch surface directly; silence dead-code noise.
-#[allow(dead_code)]
-#[path = "../src/network/auth.rs"]
-mod auth;
-#[allow(dead_code)]
-#[path = "../src/config/mod.rs"]
-mod config;
-#[allow(dead_code)]
-#[path = "../src/network/connection.rs"]
-mod connection;
-#[path = "../src/network/dispatch.rs"]
-mod dispatch;
-#[path = "../src/metrics/mod.rs"]
-mod metrics;
-#[allow(dead_code)]
-#[path = "../src/network/routing.rs"]
-mod routing;
-#[allow(dead_code)]
-#[path = "../src/shard/mod.rs"]
-mod shard;
-#[path = "../src/network/subscribe.rs"]
-mod subscribe;
-#[path = "../src/bootstrap/tls.rs"]
-mod tls;
+use brain_server::bootstrap::tls;
+use brain_server::metrics;
+use brain_server::network::auth;
+use brain_server::network::connection;
+use brain_server::network::routing;
+use brain_server::shard;
 
 use brain_protocol::connection::handshake::{AuthMethod, ServerCapabilities};
 use connection::{ConnectionLimits, ConnectionListener, ShutdownSignal, ShutdownTrigger, Topology};

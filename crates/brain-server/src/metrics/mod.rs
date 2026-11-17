@@ -22,6 +22,9 @@
 //! - `brain_wal_size_bytes` / `brain_wal_segments` /
 //!   `brain_metadata_size_bytes` / `brain_arena_*` (per-shard storage
 //!   gauges).
+//! - `brain_extraction_queue_depth` /
+//!   `brain_extraction_queue_oldest_age_seconds` (per-shard derivation
+//!   backlog gauges, read from the durable queue table).
 //! - request / connection-extended / HNSW / embedder / memory / process
 //!   families.
 //!
@@ -41,7 +44,6 @@
 // unused by current emit sites (process gauges are scalars; request
 // gauges use `inc`/`dec`). Connection-extended metrics
 // (`brain_connections_closed_total{reason=...}` etc.) light them up.
-#![allow(dead_code)]
 
 pub mod counter;
 pub mod exposition;

@@ -1,9 +1,9 @@
 //! Snapshot → restore round-trip through the production stack.
 //!
-//! Proves the disaster-recovery contract from spec §08/06 §5: a
-//! snapshot taken at LSN X, after which the shard is mutated, restores
-//! the shard's state back to exactly X once the bundle's files are
-//! placed and the shard re-recovers on the next spawn.
+//! Proves the disaster-recovery contract: a snapshot taken at LSN X, after
+//! which the shard is mutated, restores the shard's state back to exactly X
+//! once the bundle's files are placed and the shard re-recovers on the next
+//! spawn.
 //!
 //! Sequence:
 //!   1. `start_in(dir, 1)` — full server on a persistent data dir.
@@ -35,33 +35,8 @@ use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-#[allow(dead_code)]
-#[path = "../src/admin/mod.rs"]
-mod admin;
-#[allow(dead_code)]
-#[path = "../src/network/auth.rs"]
-mod auth;
-#[allow(dead_code)]
-#[path = "../src/config/mod.rs"]
-mod config;
-#[allow(dead_code)]
-#[path = "../src/network/connection.rs"]
-mod connection;
-#[path = "../src/network/dispatch.rs"]
-mod dispatch;
-#[path = "../src/metrics/mod.rs"]
-mod metrics;
-#[allow(dead_code)]
-#[path = "../src/network/routing.rs"]
-mod routing;
-#[allow(dead_code)]
-#[path = "../src/shard/mod.rs"]
-mod shard;
-#[path = "../src/network/subscribe.rs"]
-mod subscribe;
-#[allow(dead_code)]
-#[path = "../src/bootstrap/tls.rs"]
-mod tls;
+use brain_server::config;
+use brain_server::shard;
 
 mod support_harness;
 

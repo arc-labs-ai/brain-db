@@ -2,34 +2,22 @@
 //!
 //! Brings up N shards + the data-plane connection listener + the
 //! admin HTTP server on ephemeral 127.0.0.1 ports, returns a
-//! [`Server`] with the bound addresses. The tests in `e2e.rs`,
+//! [`Server`] with the bound addresses. The `e2e.rs` tests and
 //! the wire integration tests share this scaffold.
 //!
-//! ## Why each test file still has `#[path]` mounts
+//! ## How this reaches the server's internals
 //!
-//! The brain-server source files use `crate::config`,
-//! `crate::connection`, etc. to reach internals. For each
-//! integration-test binary, the test *file* must mount those
-//! modules at its own crate root so the imports resolve. This
-//! file refers to them via `crate::*` and assumes the test file
-//! has declared the canonical set (see `MOUNTS` doc-comment
-//! below).
-//!
-//! Each test file MUST mount these at root:
-//!
-//! ```text
-//! #[allow(dead_code)] #[path = "../src/admin/mod.rs"]      mod admin;
-//! #[allow(dead_code)] #[path = "../src/config/mod.rs"]     mod config;
-//! #[allow(dead_code)] #[path = "../src/network/connection.rs"] mod connection;
-//! #[path = "../src/network/dispatch.rs"]                   mod dispatch;
-//! #[path = "../src/metrics/mod.rs"]                       mod metrics;
-//! #[allow(dead_code)] #[path = "../src/network/routing.rs"] mod routing;
-//! #[allow(dead_code)] #[path = "../src/shard/mod.rs"]      mod shard;
-//! #[path = "../src/network/subscribe.rs"]                  mod subscribe;
-//! #[allow(dead_code)] #[path = "../src/bootstrap/tls.rs"]  mod tls;
-//! ```
+//! Through the `brain_server` library, like any other dependant. A crate with
+//! no library target leaves only one way in: `#[path]`-mounting every source
+//! module at each test file's own crate root so that `crate::config` and
+//! friends resolve. That mount makes the mounted modules look unused and
+//! forces a blanket dead-code suppression in each test crate.
 
 #![cfg(target_os = "linux")]
+// This module is compiled into EVERY integration-test binary, and no single
+// binary uses every helper in it. That is inherent to a shared test scaffold
+// rather than code nobody needs, so the suppression is a statement about the
+// scaffold and is scoped to it alone.
 #![allow(dead_code)]
 
 use std::net::SocketAddr;
@@ -41,14 +29,14 @@ use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_protocol::connection::handshake::{AuthMethod, ServerCapabilities};
 use tempfile::TempDir;
 
-use crate::admin::{AdminServer, AdminState};
 use crate::config;
-use crate::connection::{
+use brain_server::admin::{AdminServer, AdminState};
+use brain_server::network::connection::{
     ConnectionLimits, ConnectionListener, ConnectionMetrics, ShutdownSignal, ShutdownTrigger,
     Topology,
 };
-use crate::routing::RoutingTable;
-use crate::shard::{
+use brain_server::network::routing::RoutingTable;
+use brain_server::shard::{
     spawn_shard, LlmSpawnConfig, RerankSpawnConfig, ShardHandle, ShardJoiner, ShardSpawnConfig,
 };
 
@@ -82,7 +70,7 @@ pub struct Server {
     pub joiners: Vec<Option<ShardJoiner>>,
     /// Mandatory-auth handle for tests: the API-key store the data plane
     /// resolves credentials against. Tests mint keys via [`Server::mint`].
-    pub auth_store: Arc<crate::auth::AuthStore>,
+    pub auth_store: Arc<brain_server::network::auth::AuthStore>,
     /// A pre-minted FULL-permission token (raw secret bytes) for a default
     /// `(namespace="test", space=default_space)`. Most tests just present
     /// this; multi-space tests call [`Server::mint`] for more.
@@ -236,11 +224,12 @@ where
     let routing = Arc::new(arc_swap::ArcSwap::from_pointee(
         RoutingTable::new(n_shards as u16, std::collections::HashMap::new()).unwrap(),
     ));
-    let request_metrics = Arc::new(crate::metrics::request::RequestMetrics::new());
+    let request_metrics = Arc::new(brain_server::metrics::request::RequestMetrics::new());
 
     let auth_store_path = data_dir.join("api_keys.redb");
-    let auth_store =
-        Arc::new(crate::auth::AuthStore::open(&auth_store_path).expect("open auth store"));
+    let auth_store = Arc::new(
+        brain_server::network::auth::AuthStore::open(&auth_store_path).expect("open auth store"),
+    );
     // Mandatory auth: mint a default FULL-permission key so tests can
     // connect. The default key is bound to a real namespace ("test") — an
     // authenticated caller with no namespace is now rejected fail-closed at

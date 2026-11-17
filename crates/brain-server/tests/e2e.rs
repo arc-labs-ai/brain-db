@@ -42,33 +42,7 @@ use brain_protocol::Frame;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-#[allow(dead_code)]
-#[path = "../src/admin/mod.rs"]
-mod admin;
-#[allow(dead_code)]
-#[path = "../src/network/auth.rs"]
-mod auth;
-#[allow(dead_code)]
-#[path = "../src/config/mod.rs"]
-mod config;
-#[allow(dead_code)]
-#[path = "../src/network/connection.rs"]
-mod connection;
-#[path = "../src/network/dispatch.rs"]
-mod dispatch;
-#[path = "../src/metrics/mod.rs"]
-mod metrics;
-#[allow(dead_code)]
-#[path = "../src/network/routing.rs"]
-mod routing;
-#[allow(dead_code)]
-#[path = "../src/shard/mod.rs"]
-mod shard;
-#[path = "../src/network/subscribe.rs"]
-mod subscribe;
-#[allow(dead_code)]
-#[path = "../src/bootstrap/tls.rs"]
-mod tls;
+use brain_server::config;
 
 mod support_harness;
 
@@ -444,6 +418,28 @@ async fn metrics_endpoint_reflects_traffic() {
             .any(|l| l.starts_with("brain_connections_rejected_total ")),
         "missing brain_connections_rejected_total; body:\n{body}"
     );
+
+    // The derivation backlog is exposed per shard.
+    //
+    // This is the number that says a workspace is degraded: a memory is
+    // durable the moment it acks, but has no entities, statements or
+    // questions until the extractor reaches it, and the engine derives far
+    // slower than the write path accepts. Without these two series the only
+    // symptom is recall quietly returning less than it should, which is how
+    // the gap went unnoticed in the first place.
+    //
+    // Asserted on the real scrape rather than on the formatter, because a
+    // family that exists in code and never reaches `/metrics` is not
+    // observable.
+    for family in [
+        "brain_extraction_queue_depth{shard=\"0\"}",
+        "brain_extraction_queue_oldest_age_seconds{shard=\"0\"}",
+    ] {
+        assert!(
+            body.lines().any(|l| l.starts_with(family)),
+            "missing {family}; body:\n{body}"
+        );
+    }
 
     drop(c1);
     drop(c2);

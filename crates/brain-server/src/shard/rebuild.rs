@@ -44,7 +44,7 @@ use tracing::{error, info};
 /// (invariant #7). Tantivy is also rebuilt from authoritative redb at boot
 /// when a directory is missing or stale (see `tantivy_recovery`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RebuildTarget {
+pub enum RebuildTarget {
     /// The memory HNSW (semantic recall). Rebuilt from the redb-backed
     /// vector snapshot via `SharedHnsw::flush_with_rebuild`.
     MemoryHnsw,
