@@ -42,7 +42,7 @@ impl ProjectionLayer {
     /// two `Linear`s are read from sub-paths `0` and `3`, matching the
     /// way `nn.Sequential(Linear, Dropout, ReLU, Linear)` serialises
     /// in PyTorch.
-    pub(crate) fn load(
+    fn load(
         vb: VarBuilder,
         in_dim: usize,
         hidden_dim: usize,

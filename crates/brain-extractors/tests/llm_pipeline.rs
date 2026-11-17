@@ -7,7 +7,6 @@
 //!
 //! - Cache populate → cache replay → re-arm after invalidation.
 //! - Retry-once sequencing (no third call after second failure).
-//! - Budget gate runs strictly before the LLM call.
 //! - Confidence-threshold filtering on projection.
 //! - Cache rows survive `LlmExtractor` re-construction.
 
@@ -19,7 +18,7 @@ use std::time::Duration;
 use brain_core::{ExtractorId, Memory, MemoryId, MemoryKind, Salience, SessionId, SpaceId};
 use brain_extractors::{
     framework::extractor::{ExtractionContext, ExtractionStatus, Extractor},
-    CostBudget, ExtractedItem, ExtractionResult, ExtractorRegistry, LlmExtractor, Pricing,
+    ExtractedItem, ExtractionResult, ExtractorRegistry, LlmExtractor,
 };
 use brain_llm::client::{model_id_hash, LlmFuture};
 use brain_llm::{LlmClient, LlmError, LlmMessage, LlmRequest, LlmResponse, LlmRole};
@@ -143,7 +142,6 @@ fn build_extractor(
     client: Arc<dyn LlmClient>,
     cache: Option<Arc<Mutex<LlmCacheDb>>>,
     schema: Option<Value>,
-    budget: Option<CostBudget>,
     threshold: f32,
 ) -> LlmExtractor {
     let schema_compiled = LlmExtractor::compile_schema(schema.as_ref()).unwrap();
@@ -160,7 +158,6 @@ fn build_extractor(
         schema,
         schema_compiled,
         threshold,
-        budget,
         Duration::from_secs(60),
         None,
     )
@@ -190,7 +187,7 @@ fn cache_populates_then_replays() {
         vec![Ok(ok_response("[\"Alice\"]", 50))],
     ));
     let calls = client.calls.clone();
-    let ext = build_extractor(client.clone(), Some(cache.clone()), None, None, 0.0);
+    let ext = build_extractor(client.clone(), Some(cache.clone()), None, 0.0);
     let reg = ExtractorRegistry::new();
     let mem = memory("Alice met Bob");
 
@@ -229,7 +226,7 @@ fn cache_row_invalidation_re_arms_call() {
         ],
     ));
     let calls = client.calls.clone();
-    let ext = build_extractor(client, Some(cache.clone()), None, None, 0.0);
+    let ext = build_extractor(client, Some(cache.clone()), None, 0.0);
     let reg = ExtractorRegistry::new();
     let mem = memory("Alice met Bob");
 
@@ -285,7 +282,7 @@ fn schema_validation_retry_completes_in_two_calls() {
         ],
     ));
     let calls = client.calls.clone();
-    let ext = build_extractor(client, None, Some(schema), None, 0.0);
+    let ext = build_extractor(client, None, Some(schema), 0.0);
     let reg = ExtractorRegistry::new();
 
     let r = block_on(ext.run(&ctx(&reg), &memory("Alice")));
@@ -320,7 +317,7 @@ fn retry_cached_token_count_sums_both_calls() {
         ],
     ));
     let calls = client.calls.clone();
-    let ext = build_extractor(client, Some(cache.clone()), Some(schema), None, 0.0);
+    let ext = build_extractor(client, Some(cache.clone()), Some(schema), 0.0);
     let reg = ExtractorRegistry::new();
     let mem = memory("Alice");
 
@@ -367,42 +364,13 @@ fn schema_validation_failure_twice_costs_two_calls() {
         ],
     ));
     let calls = client.calls.clone();
-    let ext = build_extractor(client, None, Some(schema), None, 0.0);
+    let ext = build_extractor(client, None, Some(schema), 0.0);
     let reg = ExtractorRegistry::new();
 
     let r = block_on(ext.run(&ctx(&reg), &memory("nothing")));
     assert_eq!(r.status, ExtractionStatus::Failure);
     assert!(r.status_reason.contains("schema validation failed twice"));
     assert_eq!(calls.load(Ordering::SeqCst), 2, "no third call");
-}
-
-#[test]
-fn cost_budget_blocks_call() {
-    // A 1 µ$ budget can't possibly cover even a one-token request.
-    let client = Arc::new(ScriptedClient::new(
-        "claude-haiku-4-5",
-        vec![Ok(ok_response("[\"Alice\"]", 1))],
-    ));
-    let calls = client.calls.clone();
-    let ext = build_extractor(
-        client,
-        None,
-        None,
-        Some(CostBudget {
-            per_call_micro_usd: 1,
-        }),
-        0.0,
-    );
-    let reg = ExtractorRegistry::new();
-
-    let r = block_on(ext.run(&ctx(&reg), &memory("Alice met Bob in Paris")));
-    assert_eq!(r.status, ExtractionStatus::SkippedBudget);
-    assert!(r.status_reason.contains("exceeds per-call budget"));
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        0,
-        "budget gate must run strictly before the client call"
-    );
 }
 
 #[test]
@@ -413,7 +381,7 @@ fn projection_strips_below_threshold_items() {
         "claude-haiku-4-5",
         vec![Ok(ok_response(body, 50))],
     ));
-    let ext = build_extractor(client, None, None, None, 0.5);
+    let ext = build_extractor(client, None, None, 0.5);
     let reg = ExtractorRegistry::new();
     let r = block_on(ext.run(&ctx(&reg), &memory("Alice met NoiseToken")));
     assert_eq!(r.status, ExtractionStatus::Success);
@@ -436,7 +404,7 @@ fn response_blob_in_cache_persists_across_extractor_rebuilds() {
     ));
     let calls_a = client_a.calls.clone();
     {
-        let ext_a = build_extractor(client_a.clone(), Some(cache.clone()), None, None, 0.0);
+        let ext_a = build_extractor(client_a.clone(), Some(cache.clone()), None, 0.0);
         let reg = ExtractorRegistry::new();
         let _ = block_on(ext_a.run(&ctx(&reg), &memory("Alice")));
     }
@@ -449,7 +417,7 @@ fn response_blob_in_cache_persists_across_extractor_rebuilds() {
         vec![], // would error if called.
     ));
     let calls_b = client_b.calls.clone();
-    let ext_b = build_extractor(client_b, Some(cache.clone()), None, None, 0.0);
+    let ext_b = build_extractor(client_b, Some(cache.clone()), None, 0.0);
     let reg = ExtractorRegistry::new();
     let r = block_on(ext_b.run(&ctx(&reg), &memory("Alice")));
     assert_eq!(r.status, ExtractionStatus::Success);
@@ -504,7 +472,6 @@ fn build_extractor_prompt(
         None,
         None,
         0.0,
-        None,
         Duration::from_secs(60),
         None,
     )
@@ -516,7 +483,7 @@ const ANCHOR_2023: u64 = 1_700_000_000_000_000_000;
 #[test]
 fn cache_key_is_stable_for_identical_context() {
     let client = Arc::new(ScriptedClient::new("claude-haiku-4-5", vec![]));
-    let ext = build_extractor(client, None, None, None, 0.0);
+    let ext = build_extractor(client, None, None, 0.0);
     let reg = ExtractorRegistry::new();
     let mem = memory("Alice met Bob");
     let k1 = ext.cache_input_hash(&ctx(&reg), &mem);
@@ -547,7 +514,7 @@ fn cache_key_folds_schema_version() {
     // A SCHEMA_UPLOAD bumps the active schema version; the same text
     // must then re-extract rather than serve the pre-upload response.
     let client = Arc::new(ScriptedClient::new("claude-haiku-4-5", vec![]));
-    let ext = build_extractor(client, None, None, None, 0.0);
+    let ext = build_extractor(client, None, None, 0.0);
     let reg = ExtractorRegistry::new();
     let mem = memory("Alice met Bob");
     assert_ne!(
@@ -584,7 +551,7 @@ fn cache_key_folds_declared_entity_types() {
 fn cache_key_folds_tenant() {
     // Byte-identical text in two tenants must never share an entry.
     let client = Arc::new(ScriptedClient::new("claude-haiku-4-5", vec![]));
-    let ext = build_extractor(client, None, None, None, 0.0);
+    let ext = build_extractor(client, None, None, 0.0);
     let reg = ExtractorRegistry::new();
     let mem_a = memory_in(
         "shared text",
@@ -617,7 +584,7 @@ fn cache_miss_across_tenants_re_invokes_client() {
         ],
     ));
     let calls = client.calls.clone();
-    let ext = build_extractor(client, Some(cache), None, None, 0.0);
+    let ext = build_extractor(client, Some(cache), None, 0.0);
     let reg = ExtractorRegistry::new();
 
     let mem_a = memory_in(
@@ -674,6 +641,6 @@ fn cache_miss_across_anchor_dates_re_invokes_client() {
 // Quiet unused-import warnings without spreading `#[allow]` across
 // the file.
 #[allow(dead_code)]
-fn _ensure_imports(m: LlmMessage, role: LlmRole, _p: Pricing) -> (LlmMessage, LlmRole) {
+fn _ensure_imports(m: LlmMessage, role: LlmRole) -> (LlmMessage, LlmRole) {
     (m, role)
 }

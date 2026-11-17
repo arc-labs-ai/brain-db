@@ -3,9 +3,8 @@
 //! Latency targets:
 //!
 //! - `LlmExtractor::predict` cache hit: p50 1 ms / p99 5 ms.
-//! - Cost-budget skip path (no LLM call): p50 200 µs / p99 1 ms.
 //!
-//! The third bench (mock-client cache miss) is informational —
+//! The second bench (mock-client cache miss) is informational —
 //! production wall-time is dominated by real-API round-trip, so
 //! the spec has no per-call target there. It exists to flag
 //! regressions in the in-process overhead (cache lookup + serde +
@@ -25,7 +24,7 @@ use std::time::Duration;
 
 use brain_core::{ExtractorId, Memory, MemoryId, MemoryKind, Salience, SessionId, SpaceId};
 use brain_extractors::{
-    framework::extractor::ExtractionContext, CostBudget, Extractor, ExtractorRegistry, LlmExtractor,
+    framework::extractor::ExtractionContext, Extractor, ExtractorRegistry, LlmExtractor,
 };
 use brain_llm::client::{model_id_hash, LlmFuture};
 use brain_llm::{LlmClient, LlmError, LlmRequest, LlmResponse};
@@ -125,7 +124,6 @@ fn target() -> ExtractorTarget {
 fn build_extractor(
     client: Arc<dyn LlmClient>,
     cache: Option<Arc<Mutex<LlmCacheDb>>>,
-    budget: Option<CostBudget>,
 ) -> LlmExtractor {
     LlmExtractor::build(
         ExtractorId::from(EXT_ID),
@@ -140,7 +138,6 @@ fn build_extractor(
         None,
         None,
         0.0,
-        budget,
         Duration::from_secs(60),
         None,
     )
@@ -180,13 +177,13 @@ fn bench_llm_cache_hit(c: &mut Criterion) {
     let mem = build_memory();
     let reg = ExtractorRegistry::new();
     {
-        let ext = build_extractor(prime_client.clone(), Some(cache.clone()), None);
+        let ext = build_extractor(prime_client.clone(), Some(cache.clone()));
         let _ = block_on(ext.run(&ctx(&reg), &mem));
     }
 
     let cold_client = Arc::new(ScriptedClient::new(Vec::new()));
     let calls = cold_client.calls.clone();
-    let ext = build_extractor(cold_client, Some(cache.clone()), None);
+    let ext = build_extractor(cold_client, Some(cache.clone()));
 
     c.bench_function("llm_pipeline cache_hit", |b| {
         b.iter(|| {
@@ -198,36 +195,6 @@ fn bench_llm_cache_hit(c: &mut Criterion) {
         calls.load(Ordering::SeqCst),
         0,
         "cache_hit bench must never reach the client"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Bench 2 — cost-budget skip path. Spec target p50 200 µs / p99 1 ms.
-// ---------------------------------------------------------------------------
-
-fn bench_llm_budget_skip(c: &mut Criterion) {
-    let client = Arc::new(ScriptedClient::new(Vec::new()));
-    let calls = client.calls.clone();
-    let ext = build_extractor(
-        client,
-        None,
-        Some(CostBudget {
-            per_call_micro_usd: 1,
-        }),
-    );
-    let mem = build_memory();
-    let reg = ExtractorRegistry::new();
-
-    c.bench_function("llm_pipeline budget_skip", |b| {
-        b.iter(|| {
-            let r = block_on(ext.run(&ctx(&reg), black_box(&mem)));
-            black_box(r);
-        });
-    });
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        0,
-        "budget_skip bench must never reach the client"
     );
 }
 
@@ -248,7 +215,7 @@ fn bench_llm_mock_miss(c: &mut Criterion) {
         .map(|_| Ok(ok_response("[\"Alice\",\"Bob\"]", 80)))
         .collect();
     let client = Arc::new(ScriptedClient::new(responses));
-    let ext = build_extractor(client, Some(cache.clone()), None);
+    let ext = build_extractor(client, Some(cache.clone()));
     let reg = ExtractorRegistry::new();
 
     // Each iteration uses a fresh memory id so the cache hash
@@ -277,7 +244,7 @@ fn bench_llm_mock_miss(c: &mut Criterion) {
 criterion_group!(
     name = llm_pipeline_benches;
     config = Criterion::default();
-    targets = bench_llm_cache_hit, bench_llm_budget_skip, bench_llm_mock_miss
+    targets = bench_llm_cache_hit, bench_llm_mock_miss
 );
 
 fn main() {

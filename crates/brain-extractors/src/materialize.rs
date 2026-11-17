@@ -16,17 +16,15 @@ use brain_core::ExtractorKind;
 use brain_llm::LlmCredentialResolver;
 use brain_metadata::tables::extractor::ExtractorDefinition;
 use brain_metadata::LlmCacheDb;
-use brain_protocol::schema::ast::{
-    CacheConfig, CostExpr, CostUnit, DurationAst, DurationUnit, TriggerExpr,
-};
-use brain_protocol::schema::{ExtractorDef, ExtractorField, ExtractorKindAst, ExtractorTarget};
+use brain_protocol::schema::ast::{CacheConfig, DurationAst, DurationUnit, TriggerExpr};
+use brain_protocol::schema::{ExtractorDef, ExtractorField};
 use parking_lot::Mutex;
 use serde_json::Value;
 
-use crate::classifier::{ClassifierExtractor, ClassifierModel};
+use crate::classifier::{ClassifierExtractor, ClassifierModel, ClassifierOffload};
 use crate::framework::extractor::ExtractorError;
 use crate::framework::registry::ExtractorRegistry;
-use crate::llm::{CostBudget, LlmExtractor};
+use crate::llm::LlmExtractor;
 use crate::pattern::extractor::PatternExtractor;
 
 const DEFAULT_LLM_CACHE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
@@ -46,6 +44,14 @@ const DEFAULT_LLM_CONFIDENCE_THRESHOLD: f32 = 0.7;
 pub struct MaterializeDeps {
     pub classifier_model: Option<Arc<dyn ClassifierModel>>,
     pub entity_type_qnames: Arc<Vec<String>>,
+    /// Where the classifier's batched forward pass runs.
+    ///
+    /// The pass costs 3.82 s per micro-batch and cannot be interrupted, so a
+    /// deployment whose extractor worker shares a thread with its request
+    /// serving supplies an offloader and keeps that thread answering. `None`
+    /// runs the pass on the calling thread, which is what a caller with no
+    /// such thread to protect wants.
+    pub classifier_offload: Option<Arc<dyn ClassifierOffload>>,
     /// Resolves the LLM credential for a namespace.
     ///
     /// A resolver rather than a process-wide client, because the serving
@@ -90,10 +96,17 @@ pub fn materialize_pattern_extractor(
 /// [`crate::classifier::ClassifierModel::predict`]. Missing either
 /// produces a degraded extractor whose dispatches skip with an
 /// actionable reason — never silently emit zero results.
+///
+/// `offload` decides which thread the forward pass runs on. It is supplied
+/// here, beside the model, because the answer belongs to the deployment doing
+/// the materialising: only it knows whether the thread that will drive the
+/// tier is also serving requests. A degraded extractor never reaches the
+/// model, so it is wired only into the loaded one.
 pub fn materialize_classifier_extractor(
     def: &ExtractorDefinition,
     model: Option<Arc<dyn ClassifierModel>>,
     entity_type_qnames: Arc<Vec<String>>,
+    offload: Option<Arc<dyn ClassifierOffload>>,
 ) -> Result<ClassifierExtractor, ExtractorError> {
     if def.kind() != Some(ExtractorKind::Classifier) {
         return Err(ExtractorError::OutputDecodeFailed {
@@ -119,7 +132,8 @@ pub fn materialize_classifier_extractor(
             threshold,
             m,
             entity_type_qnames,
-        ),
+        )
+        .with_offload(offload),
         None => ClassifierExtractor::degraded(
             def.id(),
             def.qname(),
@@ -137,9 +151,8 @@ pub fn materialize_classifier_extractor(
 ///
 /// `Err` is reserved for true decode failures (bad JSON blob,
 /// kind mismatch). Every operator-visible misconfiguration —
-/// missing required field, unknown model, schema compile failure,
-/// unsupported cost-unit — returns a wired
-/// [`LlmExtractor::degraded`] whose dispatches emit a
+/// missing required field, unknown model, or schema compile failure —
+/// returns a wired [`LlmExtractor::degraded`] whose dispatches emit a
 /// `SkippedDisabled` audit row with the captured reason. The
 /// registry stays populated; ENCODE stays non-blocking, and a
 /// missing API key does not look like a runtime failure.
@@ -199,18 +212,7 @@ fn materialize_llm_extractor_core(
         ));
     };
 
-    // Cost budget translation.
-    let cost_budget = match extract_cost_budget(&ast) {
-        CostBudgetExtract::Unset => None,
-        CostBudgetExtract::PerRequest(micro) => Some(CostBudget {
-            per_call_micro_usd: micro,
-        }),
-        CostBudgetExtract::Unsupported(reason) => {
-            return Ok(LlmExtractor::degraded(
-                id, name, target, version, threshold, reason,
-            ));
-        }
-    };
+    warn_unenforced_cost_budget(&ast, &name);
 
     // Credential resolution is deferred to dispatch — the serving credential
     // depends on the namespace of the memory being extracted, which is not
@@ -281,7 +283,6 @@ fn materialize_llm_extractor_core(
         response_schema,
         schema_compiled,
         threshold,
-        cost_budget,
         cache_ttl,
         deps.llm_max_tokens,
     );
@@ -329,6 +330,7 @@ pub fn build_registry_from_definitions(
                     def,
                     deps.classifier_model.clone(),
                     deps.entity_type_qnames.clone(),
+                    deps.classifier_offload.clone(),
                 ) {
                     Ok(c) => registry.register(Arc::new(c)),
                     Err(e) => errors.push((id, e)),
@@ -450,41 +452,23 @@ fn extract_cache_ttl(ast: &ExtractorDef) -> Option<Duration> {
     None
 }
 
-/// Outcome of cost-budget extraction. v1 supports
-/// `PerRequest` only; the other variants land as
-/// degraded extractors with operator-actionable reasons.
-enum CostBudgetExtract {
-    Unset,
-    PerRequest(u64),
-    Unsupported(String),
-}
-
-fn extract_cost_budget(ast: &ExtractorDef) -> CostBudgetExtract {
-    for f in &ast.fields {
-        if let ExtractorField::CostBudget(c) = f {
-            return cost_expr_to_budget(*c);
-        }
-    }
-    CostBudgetExtract::Unset
-}
-
-fn cost_expr_to_budget(c: CostExpr) -> CostBudgetExtract {
-    match c.unit {
-        CostUnit::PerRequest => {
-            let micro = (c.amount * 1_000_000.0).round();
-            let micro = if micro.is_finite() && micro >= 0.0 {
-                micro as u64
-            } else {
-                0
-            };
-            CostBudgetExtract::PerRequest(micro)
-        }
-        CostUnit::PerMemory => CostBudgetExtract::Unsupported(
-            "cost_budget unit per_memory not supported in v1 (use per_request)".into(),
-        ),
-        CostUnit::PerDay => CostBudgetExtract::Unsupported(
-            "cost_budget unit per_day not supported in v1 (use per_request)".into(),
-        ),
+/// Log a declared `cost_budget` as unenforced.
+///
+/// The grammar accepts the field and the materializer reads it, but nothing
+/// acts on it: a BYOK tenant's provider key is tracked, never rationed, so no
+/// declared figure can refuse a call. An operator who wrote one is told here
+/// rather than left believing a ceiling is in force.
+fn warn_unenforced_cost_budget(ast: &ExtractorDef, name: &str) {
+    if ast
+        .fields
+        .iter()
+        .any(|f| matches!(f, ExtractorField::CostBudget(_)))
+    {
+        tracing::warn!(
+            target: "brain_extractors::materialize",
+            extractor = name,
+            "extractor declares cost_budget; the field is not enforced — spend is recorded, not capped",
+        );
     }
 }
 
@@ -496,12 +480,6 @@ fn duration_ast_to_duration(d: DurationAst) -> Duration {
         DurationUnit::Days => d.amount.saturating_mul(86_400),
     };
     Duration::from_secs(secs)
-}
-
-// Quiet unused-import warnings while AST surface remains stable.
-#[allow(dead_code)]
-fn _ensure_imports(k: ExtractorKindAst, t: ExtractorTarget) -> (ExtractorKindAst, ExtractorTarget) {
-    (k, t)
 }
 
 // ---------------------------------------------------------------------------
@@ -624,7 +602,7 @@ mod tests {
     fn materialize_classifier_without_model_is_degraded() {
         let r = row(1, ExtractorKind::Classifier, classifier_def_blob());
         let labels = Arc::new(vec!["brain:Person".to_string()]);
-        let c = materialize_classifier_extractor(&r, None, labels).expect("materialize");
+        let c = materialize_classifier_extractor(&r, None, labels, None).expect("materialize");
         assert!(!c.is_loaded());
     }
 
@@ -645,7 +623,8 @@ mod tests {
         }
         let r = row(1, ExtractorKind::Classifier, classifier_def_blob());
         let labels = Arc::new(vec!["brain:Person".to_string()]);
-        let c = materialize_classifier_extractor(&r, Some(Arc::new(DummyModel)), labels).unwrap();
+        let c =
+            materialize_classifier_extractor(&r, Some(Arc::new(DummyModel)), labels, None).unwrap();
         assert!(c.is_loaded());
         assert_eq!(c.target_labels(), &["brain:Person".to_string()]);
     }
@@ -666,9 +645,13 @@ mod tests {
             }
         }
         let r = row(1, ExtractorKind::Classifier, classifier_def_blob());
-        let c =
-            materialize_classifier_extractor(&r, Some(Arc::new(DummyModel)), Arc::new(Vec::new()))
-                .unwrap();
+        let c = materialize_classifier_extractor(
+            &r,
+            Some(Arc::new(DummyModel)),
+            Arc::new(Vec::new()),
+            None,
+        )
+        .unwrap();
         assert!(!c.is_loaded(), "empty label snapshot must degrade");
     }
 
@@ -695,6 +678,7 @@ mod tests {
         let deps = MaterializeDeps {
             llm_max_tokens: None,
             classifier_model: Some(Arc::new(DummyModel)),
+            classifier_offload: None,
             entity_type_qnames: labels.clone(),
             credential_resolver: None,
             llm_cache: None,
@@ -715,14 +699,12 @@ mod tests {
     /// pattern tier from GLiNER — if this passes, an `entities=0` ENCODE is
     /// a write-stage or label-snapshot problem, not a pattern-tier one.
     ///
-    /// The surface is an initials form, because that is what the seed still
-    /// matches. It used to be a plain two-word name, matched by a
-    /// run-of-capitalised-words pattern that was removed: that pattern read
-    /// a sentence-initial determiner as part of the name and cut
-    /// identifiers at punctuation, and measured across twelve domains it
-    /// cost eight points of entity recall. What this test is for — that the
-    /// seeded blob materialises into an extractor that runs and emits — is
-    /// unchanged.
+    /// The surface is an initials form, because that is what the seed
+    /// matches. A plain two-word name does not: the seed carries no
+    /// run-of-capitalised-words pattern, since such a pattern reads a
+    /// sentence-initial determiner as part of the name and cuts identifiers
+    /// at punctuation — measured across twelve domains, eight points of
+    /// entity recall.
     #[cfg(not(miri))]
     #[test]
     fn seeded_pattern_extractor_emits_entity_for_an_initials_name() {
@@ -1096,7 +1078,7 @@ mod tests {
     }
 
     #[test]
-    fn materialize_llm_cost_budget_per_memory_is_degraded() {
+    fn materialize_llm_cost_budget_is_ignored() {
         let blob = llm_ast(
             "p",
             vec![
@@ -1117,19 +1099,7 @@ mod tests {
             ..MaterializeDeps::default()
         };
         let l = materialize_llm_extractor(&r, &deps).unwrap();
-        assert!(!l.is_wired());
-    }
-
-    #[test]
-    fn cost_expr_per_request_converts_to_micro_usd() {
-        let b = cost_expr_to_budget(CostExpr {
-            amount: 0.01,
-            unit: CostUnit::PerRequest,
-        });
-        match b {
-            CostBudgetExtract::PerRequest(m) => assert_eq!(m, 10_000),
-            _ => panic!("expected PerRequest"),
-        }
+        assert!(l.is_wired());
     }
 
     #[test]

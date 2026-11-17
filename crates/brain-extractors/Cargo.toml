@@ -11,7 +11,7 @@ description = "Extractor framework (pattern / classifier / llm) for the Brain kn
 [dependencies]
 brain-core = { path = "../brain-core" }
 brain-protocol = { path = "../brain-protocol" }
-# 20.6: materialize loads `ExtractorDefinition` rows persisted by
+# Materialize loads `ExtractorDefinition` rows persisted by
 # brain-metadata::schema_apply.
 brain-metadata = { path = "../brain-metadata" }
 # Resolver Tier 3 (embedding HNSW tie-break) calls into the per-shard
@@ -26,29 +26,29 @@ thiserror.workspace = true
 tracing.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
-# 20.2: pattern extractor uses the regex crate's DFA matcher.
+# Pattern extractor uses the regex crate's DFA matcher.
 regex = { workspace = true }
 # Temporal-expressions extractor does civil-date math (calendar
 # month/year shifts, weekday resolution) via the `time` crate.
 time = { workspace = true }
-# 20.3: classifier extractor loads operator-provided BERT NER weights
-# via candle (same crate set as brain-embed, phase 5).
+# Classifier extractor loads operator-provided BERT NER weights
+# via candle (the same crate set as brain-embed).
 candle-core.workspace = true
 candle-nn.workspace = true
 candle-transformers.workspace = true
 tokenizers.workspace = true
-# 21.3: LLM extractor depends on the transport clients + cache.
+# LLM extractor depends on the transport clients + cache.
 brain-llm = { path = "../brain-llm" }
-# 21.3: validate the LLM response against the operator-declared
+# Validate the LLM response against the operator-declared
 # JSON schema before projection.
 jsonschema = { workspace = true }
-# 21.3: cache mutex (shared with the OpsContext wiring in 21.5).
+# Cache mutex, shared with the OpsContext wiring.
 parking_lot = { workspace = true }
 # Tier-4 resolver disambiguator bridges async LlmClient::complete to
 # the sync ResolverLlm trait via futures_lite::future::block_on. Used
 # in tests too (Extractor::run is async).
 futures-lite = { workspace = true }
-# P3: run the LLM tier's per-memory calls concurrently within a micro-batch
+# Run the LLM tier's per-memory calls concurrently within a micro-batch
 # (`join_all`) — the calls are independent network I/O, so overlapping them
 # turns a serial 8x-latency drain into ~1x. Already a workspace dep.
 futures-util = { workspace = true }
@@ -56,7 +56,7 @@ futures-util = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 criterion.workspace = true
-# E.9: property tests exercise resolver determinism + threshold
+# Property tests exercise resolver determinism + threshold
 # monotonicity over randomly-generated surface-form sequences.
 proptest = { workspace = true }
 # `live-llm` test drives `AnthropicClient::complete` (a reqwest call

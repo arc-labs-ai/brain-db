@@ -2,11 +2,10 @@
 //!
 //! Resolves a [`brain_llm::LlmClient`] (Anthropic / OpenAI) per namespace
 //! through a [`brain_llm::LlmCredentialResolver`] and presents it behind the
-//! [`Extractor`] trait. Adds a per-shard response cache, a per-call
-//! cost budget, JSON-schema validation with one retry on schema
-//! failure, and output projection to `EntityMention` /
-//! `StatementMention` / `RelationMention` per the extractor's
-//! [`ExtractorTarget`].
+//! [`Extractor`] trait. Adds a per-shard response cache, JSON-schema
+//! validation with one retry on schema failure, and output projection to
+//! `EntityMention` / `StatementMention` / `RelationMention` per the
+//! extractor's [`ExtractorTarget`].
 //!
 //! ## Degraded mode
 //!
@@ -25,6 +24,7 @@ use brain_core::{ExtractorKind, Statement, StatementObject, StatementValue, Subj
 use brain_llm::types::SystemBlock;
 use brain_llm::{
     CredentialOutcome, LlmCredentialResolver, LlmError, LlmMessage, LlmRequest, LlmRole,
+    ModelPricing,
 };
 use brain_metadata::entity::ops::entity_get;
 use brain_metadata::schema::predicate::predicate_get;
@@ -38,7 +38,6 @@ use redb::ReadTransaction;
 use serde_json::Value;
 
 use super::cache::{cache_get, cache_put};
-use super::pricing::{estimate_cost, CostBudget, Pricing};
 use super::validation::{looks_like_json, strip_code_fences, validate_against};
 use crate::framework::extractor::{
     ExtractionContext, ExtractionFailureClass, ExtractionFuture, ExtractionResult,
@@ -78,7 +77,6 @@ pub struct LlmExtractor {
     target: ExtractorTarget,
     extractor_version: u32,
     confidence_threshold: f32,
-    cost_budget: Option<CostBudget>,
     cache_ttl: Duration,
     pub(super) inner: Option<Arc<LlmExtractorInner>>,
     degraded_reason: Option<String>,
@@ -130,14 +128,12 @@ pub const DEFAULT_LLM_MAX_TOKENS: u32 = 4096;
 
 impl LlmExtractor {
     /// Fully-wired extractor.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: ExtractorId,
         name: String,
         target: ExtractorTarget,
         extractor_version: u32,
         confidence_threshold: f32,
-        cost_budget: Option<CostBudget>,
         cache_ttl: Duration,
         inner: LlmExtractorInner,
     ) -> Self {
@@ -147,7 +143,6 @@ impl LlmExtractor {
             target,
             extractor_version,
             confidence_threshold,
-            cost_budget,
             cache_ttl,
             inner: Some(Arc::new(inner)),
             degraded_reason: None,
@@ -185,7 +180,6 @@ impl LlmExtractor {
         response_schema: Option<Value>,
         schema_compiled: Option<JSONSchema>,
         confidence_threshold: f32,
-        cost_budget: Option<CostBudget>,
         cache_ttl: Duration,
         max_tokens: Option<u32>,
     ) -> Self {
@@ -195,7 +189,6 @@ impl LlmExtractor {
             target,
             extractor_version,
             confidence_threshold,
-            cost_budget,
             cache_ttl,
             LlmExtractorInner {
                 resolver,
@@ -230,7 +223,6 @@ impl LlmExtractor {
             target,
             extractor_version,
             confidence_threshold,
-            cost_budget: None,
             cache_ttl: Duration::from_secs(DEFAULT_CACHE_TTL_SECS),
             inner: None,
             degraded_reason: Some(reason.into()),
@@ -425,14 +417,14 @@ impl LlmExtractor {
                 // ENTITIES ARE EXTRACTED IN THEIR OWN RIGHT, not as a
                 // by-product of the triples.
                 //
-                // They used to be: each statement carried `subject_type` /
-                // `object_type`, and an entity existed only if some triple
-                // happened to mention it. Three things followed. A thing the
-                // memory was plainly about but asserted nothing durable
-                // against was never stored at all. The same thing named in
-                // two statements could be given two different types, and
-                // whichever landed first won permanently. And the typing
-                // decision sat inside a per-triple field, which is where a
+                // Deriving them from per-triple `subject_type` /
+                // `object_type` fields instead — so an entity exists only if
+                // some triple happens to mention it — costs three things. A
+                // thing the memory is plainly about but asserts nothing
+                // durable against is never stored at all. The same thing
+                // named in two statements can be given two different types,
+                // and whichever lands first wins permanently. And the typing
+                // decision sits inside a per-triple field, which is where a
                 // prompt matrix measured it being ignored — 0 of 20 novel
                 // kinds typed as anything but the generic fallback.
                 //
@@ -523,12 +515,11 @@ impl LlmExtractor {
     /// (typically `[0.82, 0.92)`). Returns `Supersedes` /
     /// `Contradicts` / `Coexists` per the prompt below.
     ///
-    /// The judge reuses the LLM extractor's wired resolver + cache + cost
-    /// budget so deployments don't need a second transport — the
-    /// per-call budget guards against runaway costs, and the role
-    /// block ships through the same Anthropic prompt-cache breakpoint
-    /// as the extractor's role block so the steady-state input-token
-    /// bill collapses on repeated judge invocations.
+    /// The judge reuses the LLM extractor's wired resolver + cache so
+    /// deployments don't need a second transport, and the role block ships
+    /// through the same Anthropic prompt-cache breakpoint as the extractor's
+    /// role block so the steady-state input-token bill collapses on repeated
+    /// judge invocations.
     ///
     /// The credential is resolved from **`namespace`**: a judgement about a
     /// tenant's statements is billed to that tenant's key, the same as the
@@ -564,7 +555,7 @@ impl LlmExtractor {
 
         // Bill the judgement to the namespace whose statements are being
         // judged. `Unavailable` maps to Transport (the tier retries);
-        // `Missing` is a budget-class refusal the operator can act on.
+        // `Missing` is a credential-class refusal the operator can act on.
         let credential = match inner
             .resolver
             .client_for(namespace, Some(&inner.model))
@@ -584,7 +575,6 @@ impl LlmExtractor {
             }
         };
         let client = credential.client.clone();
-        let pricing = Pricing::for_model(client.model());
 
         let request = LlmRequest {
             model: client.model().to_string(),
@@ -595,20 +585,24 @@ impl LlmExtractor {
             }],
             response_schema: None,
             temperature: 0.0,
-            // Single-token verdict; cap budget tightly so a runaway
-            // model can't blow the per-call ceiling.
+            // The verdict is one word. A ceiling this tight also bounds what a
+            // model that ignored the instruction and started explaining itself
+            // can bill for.
             max_tokens: 16,
             timeout: inner.timeout,
         };
 
-        if let Some(budget) = self.cost_budget {
-            let est = estimate_cost(&request, &pricing);
-            if est > budget.per_call_micro_usd {
-                return Err(JudgeError::Budget(format!(
-                    "estimated {} µ$ exceeds per-call budget {} µ$",
-                    est, budget.per_call_micro_usd
-                )));
-            }
+        // Projected spend for this judgement, recorded before the call so an
+        // operator watching a tenant's key can see what is about to be billed
+        // against it. It is an observation, never a gate: a BYOK tenant's own
+        // key is never rationed.
+        if let Some(pricing) = ModelPricing::for_model(client.model()) {
+            tracing::debug!(
+                target: "brain_extractors::llm",
+                model = client.model(),
+                estimate_micro_usd = pricing.estimate_request_micro_usd(&request),
+                "judge call projected spend",
+            );
         }
 
         let resp = client
@@ -1497,9 +1491,9 @@ impl Extractor for LlmExtractor {
     /// round-trip (build prompt → `client.complete().await` → cache →
     /// project), so overlapping them on the executor lane turns an
     /// N×round-trip drain into ~1×. Output stays input-aligned
-    /// (`join_all` preserves order). Cost-budget overshoot is bounded by
-    /// the micro-batch size (all calls in a batch launch before any
-    /// completes); the cross-cycle budget gate still stops the next batch.
+    /// (`join_all` preserves order). A batch's provider spend is recorded,
+    /// not capped, so concurrency changes what the batch costs per wall
+    /// second and nothing about what it is allowed to cost.
     fn run_batch<'a>(
         &'a self,
         ctx: &'a ExtractionContext<'a>,
@@ -1568,7 +1562,6 @@ impl Extractor for LlmExtractor {
                 }
             };
             let client = credential.client.clone();
-            let pricing = Pricing::for_model(client.model());
 
             let text = mem.text.as_deref().unwrap_or("");
             // Cache key hashes the full materialized prompt context (text +
@@ -1608,7 +1601,7 @@ impl Extractor for LlmExtractor {
                 }
             }
 
-            // ----- 2. Build request + cost budget ------------------------------
+            // ----- 2. Build request ---------------------------------------------
             // Pull prior-tier entity mentions for this memory so the
             // LLM gets canonical anchors without re-extracting them.
             // Statement / relation mentions from earlier tiers are
@@ -1646,25 +1639,24 @@ impl Extractor for LlmExtractor {
                 anchor_date.as_deref(),
                 started,
             );
-            if let Some(budget) = self.cost_budget {
-                let est = estimate_cost(&request, &pricing);
-                if est > budget.per_call_micro_usd {
-                    let reason = format!(
-                        "estimated {} µ$ exceeds per-call budget {} µ$",
-                        est, budget.per_call_micro_usd
-                    );
-                    return ExtractionResult::skipped(
-                        ExtractionStatus::SkippedBudget,
-                        reason,
-                        started,
-                    );
-                }
+            // Projected spend for this extraction, recorded before the call so an
+            // operator watching a tenant's key can see what is about to be billed
+            // against it. It is an observation, never a gate: a BYOK tenant's own
+            // key is never rationed.
+            if let Some(pricing) = ModelPricing::for_model(client.model()) {
+                tracing::debug!(
+                    target: "brain_extractors::llm",
+                    model = client.model(),
+                    memory_id = ?mem.id,
+                    estimate_micro_usd = pricing.estimate_request_micro_usd(&request),
+                    "extraction call projected spend",
+                );
             }
 
             // Provider cost this run incurs, summed across the first call
             // and any schema-retry call. Threaded onto the final result so
-            // the worker's per-cycle budget gate and the cost metric see
-            // real spend instead of zero.
+            // the run's extraction audit row and the cost metric carry real
+            // spend instead of zero.
             let mut cost_micro: u64 = 0;
 
             // Total tokens this run consumes, summed across the first call
@@ -1677,7 +1669,9 @@ impl Extractor for LlmExtractor {
             let resp1 = match client.complete(request.clone()).await {
                 Ok(r) => r,
                 Err(e) => {
+                    // A billed completion that produced no usable content is still tenant spend.
                     return ExtractionResult::failure(llm_error_reason(&e), started, started)
+                        .with_cost(e.billed_usage().map_or(0, |b| b.cost_micro_usd))
                         .with_failure_class(extraction_failure_class(&e));
                 }
             };
@@ -1704,7 +1698,7 @@ impl Extractor for LlmExtractor {
                         .with_failure_class(ExtractionFailureClass::Permanent);
                     }
                     // A deliberate plain-text answer (e.g. an entity-target
-                    // extractor replying with a bare name) keeps the legacy
+                    // extractor replying with a bare name) keeps the bare
                     // string projection.
                     Err(_) => Value::String(resp1.content.clone()),
                 },
@@ -1749,14 +1743,16 @@ impl Extractor for LlmExtractor {
                             Err(e) => {
                                 // The first call already billed real provider
                                 // spend; carry it onto the failure so the
-                                // worker's per-cycle budget gate counts it
-                                // (both calls counted in cost_micro_usd).
+                                // recorded cost covers both calls rather than
+                                // reporting the failed run as free.
                                 return ExtractionResult::failure(
                                     llm_error_reason(&e),
                                     started,
                                     started,
                                 )
-                                .with_cost(cost_micro)
+                                .with_cost(cost_micro.saturating_add(
+                                    e.billed_usage().map_or(0, |b| b.cost_micro_usd),
+                                ))
                                 .with_failure_class(extraction_failure_class(&e));
                             }
                         };
@@ -1787,10 +1783,10 @@ impl Extractor for LlmExtractor {
                                 // provider blip — retrying the same prompt won't
                                 // help, so it's permanent (terminal, no retry loop).
                                 // Both calls billed real spend; carry the summed
-                                // cost onto the failure so the worker's per-cycle
-                                // budget gate counts it (both calls counted
-                                // in cost_micro_usd) — else a malformed prompt
-                                // burns two API calls every cycle unbounded.
+                                // cost onto the failure so the recorded cost
+                                // covers both calls — else a malformed prompt
+                                // burns two API calls a cycle with nothing in
+                                // the audit row to show for it.
                                 // Name BOTH errors. `schema validation failed
                                 // twice` alone is unactionable: it says the
                                 // model disagreed with the compiled schema but
