@@ -192,10 +192,17 @@ impl LlmCacheDb {
     /// microseconds.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, LlmCacheError> {
         let path = path.as_ref().to_path_buf();
-        let db = Database::create(&path).map_err(|source| LlmCacheError::Open {
-            path: path.clone(),
-            source,
-        })?;
+        // The second database every shard opens, and so the second one whose
+        // page cache is multiplied by the shard count. Sized from the same
+        // process-wide decision as the metadata file, at the smaller share a
+        // response cache earns.
+        let db = Database::builder()
+            .set_cache_size(crate::page_cache::llm_cache_bytes())
+            .create(&path)
+            .map_err(|source| LlmCacheError::Open {
+                path: path.clone(),
+                source,
+            })?;
 
         let wtxn = db.begin_write()?;
 

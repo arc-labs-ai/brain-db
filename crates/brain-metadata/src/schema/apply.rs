@@ -20,10 +20,13 @@ use redb::{ReadableTable, WriteTransaction};
 use super::kind::{kind_intern, KindOpError};
 use super::predicate::{
     predicate_intern_with_subject, predicate_set_retention, ObjectConstraint, PredicateOpError,
+    PredicateRedeclaration,
 };
 use crate::entity::types::{entity_type_intern, entity_type_lookup, EntityTypeOpError};
 use crate::extractor::ops::{extractor_intern, ExtractorOpError};
-use crate::relation::types::{relation_type_intern, RelationTypeOpError};
+use crate::relation::types::{
+    relation_type_intern, RelationTypeOpError, RelationTypeRedeclaration,
+};
 use crate::tables::predicate::{PredicateDefinition, PREDICATES_TABLE};
 use crate::tables::scope::{DeclScope, TypeScope};
 use crate::tables::statement::{statement_flags, StatementMetadata, STATEMENTS_TABLE};
@@ -46,6 +49,105 @@ pub enum SchemaApplyError {
     Storage(#[from] redb::StorageError),
     #[error("redb table: {0}")]
     Table(#[from] redb::TableError),
+}
+
+/// The declarations a validated schema re-states, resolved to the exact
+/// storage form [`apply_schema_definitions`] will intern them as.
+pub struct Redeclarations {
+    pub predicates: Vec<PredicateRedeclaration>,
+    pub relation_types: Vec<RelationTypeRedeclaration>,
+}
+
+fn resolve_predicate_declaration(
+    wtxn: &WriteTransaction,
+    type_scope: TypeScope,
+    p: &brain_protocol::schema::PredicateDef,
+) -> Result<PredicateRedeclaration, SchemaApplyError> {
+    // A declared `Entity<Type>` range is carried through to storage so
+    // `statement_create` can reject an object entity of the wrong type. An
+    // unresolvable name degrades to "any entity type" rather than failing the
+    // upload, matching `resolve_entity_type`'s leniency on the relation path.
+    let object_entity_type = match declared_object_entity_type(&p.object) {
+        Some(name) => resolve_entity_type(wtxn, type_scope, name)?,
+        None => None,
+    };
+    let object_constraint = ObjectConstraint {
+        object_type_byte: object_type_constraint_byte(&p.object),
+        entity_type_id: object_entity_type.map_or(0, EntityTypeId::raw),
+    };
+    let subject_entity_type_id = match &p.subject {
+        // The validator normally guarantees this name exists. If the row is
+        // absent at apply time, the declaration degrades to "any subject"
+        // rather than failing the upload, matching the object side.
+        Some(SubjectTypeDecl::Entity { entity_type }) => {
+            resolve_entity_type(wtxn, type_scope, entity_type)?.map_or(0, EntityTypeId::raw)
+        }
+        Some(SubjectTypeDecl::Any) | None => 0,
+    };
+    Ok(PredicateRedeclaration {
+        name: p.name.clone(),
+        kind_constraint: map_statement_kind(p.kind),
+        object_constraint,
+        subject_entity_type_id,
+        description: p.description.as_deref().unwrap_or("").to_string(),
+        is_stateful: p.resolved_stateful(),
+    })
+}
+
+fn resolve_relation_type_declaration(
+    wtxn: &WriteTransaction,
+    type_scope: TypeScope,
+    r: &brain_protocol::schema::RelationTypeDef,
+) -> Result<RelationTypeRedeclaration, SchemaApplyError> {
+    Ok(RelationTypeRedeclaration {
+        name: r.name.clone(),
+        from_type: resolve_entity_type(wtxn, type_scope, &r.from_type)?,
+        to_type: resolve_entity_type(wtxn, type_scope, &r.to_type)?,
+        cardinality: map_cardinality(r.cardinality),
+        is_symmetric: r.symmetric,
+        description: r.description.as_deref().unwrap_or("").to_string(),
+    })
+}
+
+/// Resolve the declarations `validated` re-states to the exact storage form
+/// [`apply_schema_definitions`] will intern them as.
+pub fn resolve_redeclarations(
+    wtxn: &WriteTransaction,
+    validated: &ValidatedSchema,
+    space: [u8; 16],
+    now_unix_nanos: u64,
+) -> Result<Redeclarations, SchemaApplyError> {
+    let schema = validated.as_schema();
+    let namespace_id =
+        crate::namespace::namespace_intern_or_get(wtxn, schema.namespace.as_str(), now_unix_nanos)
+            .map_err(|e| SchemaApplyError::ExtractorEncode(format!("namespace resolve: {e}")))?
+            .raw();
+    let type_scope = TypeScope::space(namespace_id, space);
+    // Entity types must be interned before resolution: a declared range must
+    // resolve to the id the later fan-out stores, including when a replace
+    // introduces or shadows that entity type.
+    for item in &schema.items {
+        if let SchemaItem::EntityType(e) = item {
+            entity_type_intern(wtxn, type_scope, &e.name, Vec::new(), now_unix_nanos)?;
+        }
+    }
+    let mut out = Redeclarations {
+        predicates: Vec::new(),
+        relation_types: Vec::new(),
+    };
+    for item in &schema.items {
+        match item {
+            SchemaItem::Predicate(p) => {
+                out.predicates
+                    .push(resolve_predicate_declaration(wtxn, type_scope, p)?);
+            }
+            SchemaItem::RelationType(r) => out
+                .relation_types
+                .push(resolve_relation_type_declaration(wtxn, type_scope, r)?),
+            _ => {}
+        }
+    }
+    Ok(out)
 }
 
 /// Walk `validated.items` in source order and intern each
@@ -91,43 +193,17 @@ pub fn apply_schema_definitions(
                 )?;
             }
             SchemaItem::Predicate(p) => {
-                // A declared `Entity<Type>` range is carried through to
-                // storage so `statement_create` can reject an object
-                // entity of the wrong type. An unresolvable name
-                // degrades to "any entity type" rather than failing the
-                // upload, matching `resolve_entity_type`'s leniency on
-                // the relation path.
-                let object_entity_type = match declared_object_entity_type(&p.object) {
-                    Some(name) => resolve_entity_type(wtxn, type_scope, name)?,
-                    None => None,
-                };
-                let object_constraint = ObjectConstraint {
-                    object_type_byte: object_type_constraint_byte(&p.object),
-                    entity_type_id: object_entity_type.map_or(0, EntityTypeId::raw),
-                };
-                // Same treatment for the declared subject domain. The
-                // validator already refused an undeclared type name at
-                // upload, so an unresolvable name here means the type row
-                // is missing rather than the schema being wrong — degrade
-                // to "any subject" instead of failing the upload, matching
-                // the object side.
-                let subject_entity_type_id = match &p.subject {
-                    Some(SubjectTypeDecl::Entity { entity_type }) => {
-                        resolve_entity_type(wtxn, type_scope, entity_type)?
-                            .map_or(0, EntityTypeId::raw)
-                    }
-                    Some(SubjectTypeDecl::Any) | None => 0,
-                };
+                let declaration = resolve_predicate_declaration(wtxn, type_scope, p)?;
                 let pred_id = predicate_intern_with_subject(
                     wtxn,
                     DeclScope::space(namespace, space),
-                    &p.name,
-                    map_statement_kind(p.kind),
-                    object_constraint,
-                    subject_entity_type_id,
+                    &declaration.name,
+                    declaration.kind_constraint,
+                    declaration.object_constraint,
+                    declaration.subject_entity_type_id,
                     schema_version,
-                    p.description.as_deref().unwrap_or(""),
-                    p.resolved_stateful(),
+                    &declaration.description,
+                    declaration.is_stateful,
                     now_unix_nanos,
                 )?;
                 // Stamp the declared retention TTL (or clear it, with 0, when the
@@ -135,18 +211,17 @@ pub fn apply_schema_definitions(
                 predicate_set_retention(wtxn, pred_id, p.retention.map_or(0, |d| d.to_seconds()))?;
             }
             SchemaItem::RelationType(r) => {
-                let from = resolve_entity_type(wtxn, type_scope, &r.from_type)?;
-                let to = resolve_entity_type(wtxn, type_scope, &r.to_type)?;
+                let declaration = resolve_relation_type_declaration(wtxn, type_scope, r)?;
                 relation_type_intern(
                     wtxn,
                     DeclScope::space(namespace, space),
-                    &r.name,
-                    from,
-                    to,
-                    map_cardinality(r.cardinality),
-                    r.symmetric,
+                    &declaration.name,
+                    declaration.from_type,
+                    declaration.to_type,
+                    declaration.cardinality,
+                    declaration.is_symmetric,
                     schema_version,
-                    r.description.as_deref().unwrap_or(""),
+                    &declaration.description,
                     now_unix_nanos,
                 )?;
             }

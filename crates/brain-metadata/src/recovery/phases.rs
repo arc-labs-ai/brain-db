@@ -33,6 +33,7 @@ use crate::recovery::phase_bodies::{
     decode_statement_supersede, decode_statement_tombstone,
 };
 use crate::relation::types::{relation_type_drop_one, relation_type_drop_schema_declared};
+use crate::schema::apply::resolve_redeclarations;
 use crate::schema::predicate::{
     predicate_drop_one, predicate_drop_schema_declared, predicate_intern_or_get,
 };
@@ -309,14 +310,27 @@ impl MetadataDb {
             // the same order the live apply path uses, so replay converges on
             // identical state. A plain UPLOAD carries an empty delta.
             if b.replace_all {
-                predicate_drop_schema_declared(&wtxn, DeclScope::space(&b.namespace, b.space))
-                    .map_err(|e| {
-                        MetadataSinkError::Corruption(format!("predicate drop-all: {e}"))
-                    })?;
-                relation_type_drop_schema_declared(&wtxn, DeclScope::space(&b.namespace, b.space))
-                    .map_err(|e| {
-                        MetadataSinkError::Corruption(format!("relation_type drop-all: {e}"))
-                    })?;
+                // Resolve preserve lists from the same document and timestamp
+                // as the live write, so replay preserves the same ids.
+                let redeclared =
+                    resolve_redeclarations(&wtxn, &validated, b.space, b.created_at_unix_nanos)
+                        .map_err(|e| {
+                            MetadataSinkError::Corruption(format!("resolve redeclarations: {e}"))
+                        })?;
+                predicate_drop_schema_declared(
+                    &wtxn,
+                    DeclScope::space(&b.namespace, b.space),
+                    &redeclared.predicates,
+                )
+                .map_err(|e| MetadataSinkError::Corruption(format!("predicate drop-all: {e}")))?;
+                relation_type_drop_schema_declared(
+                    &wtxn,
+                    DeclScope::space(&b.namespace, b.space),
+                    &redeclared.relation_types,
+                )
+                .map_err(|e| {
+                    MetadataSinkError::Corruption(format!("relation_type drop-all: {e}"))
+                })?;
                 extractor_drop_declared(&wtxn, DeclScope::space(&b.namespace, b.space)).map_err(
                     |e| MetadataSinkError::Corruption(format!("extractor drop-all: {e}")),
                 )?;

@@ -6,8 +6,8 @@
 //!
 //! - **Fresh DB** (table absent): writes [`CURRENT_SCHEMA_VERSION`].
 //! - **Same version**: returns the stored version.
-//! - **Older version**: returns the stored version (the caller may
-//!   dispatch to a migration registry — none exist at v1).
+//! - **Older version**: returns [`SchemaError::SchemaTooOld`]. There is no
+//!   migration path, so an older file is refused rather than upgraded.
 //! - **Newer version**: returns [`SchemaError::SchemaVersionTooNew`];
 //!   the binary is older than the file it's trying to read.
 //!
@@ -27,50 +27,23 @@
 
 use redb::{Database, ReadableDatabase, TableDefinition};
 
-/// The schema version this crate writes. Bumped on backward-incompatible
-/// changes to the redb table layout or value encoding.
+/// The schema version this crate writes. Bumped on any change to the redb
+/// table layout or value encoding that a binary built against another
+/// version cannot read.
 ///
-/// The v2 layout unified the substrate edge tables and the
-/// typed-relation tables under a single `NodeRef`-keyed layout. The on-disk shape is
-/// not readable by a v1 binary, and a v1 DB is not readable by a v2
-/// binary — operators must run the migration tool to copy data into a
-/// fresh v2 directory.
+/// The gate earns its place because several readers resolve a stored row
+/// without surfacing a decode failure. `memory_artifact.rs` parses its bundle
+/// with `serde_json::from_str(..).ok().unwrap_or_default()`, so a row written
+/// against a different layout comes back EMPTY — blanking the inspect view of
+/// every memory already stored, with nothing in a log to say so. `tables/mod.rs`
+/// resolves rkyv rows with `expect("... redb file is corrupt")`, so the same
+/// mismatch panics the thread that reads it, which the admin audit query and
+/// the audit sweeper both do. Neither failure announces itself as a version
+/// problem. Refusing the file at open is the honest failure.
 ///
-/// v3 prepends a `slot` byte to each `statement_question_vectors` value
-/// (reified slot-filling): the stored value width changed from 1536 to
-/// 1537 bytes, so a v2 file's rows are not readable under the v3 fixed-size
-/// value type. No migration tool — pre-user, fresh-start on bump.
-///
-/// v4 scopes entity types by tenant and gives predicates a subject domain:
-///
-/// - `EntityTypeDefinition` gains `namespace_id`, plus a new
-///   `entity_types_by_scope` index keyed `(namespace_id, name)`. The
-///   registry used to be keyed on bare `name` globally, so two tenants
-///   declaring the same type name either shared one definition or the
-///   second tenant's `SCHEMA_UPLOAD` failed over a name they never wrote.
-/// - `PredicateDefinition` gains `subject_entity_type_id`, backing
-///   `subject: Entity<T>` in the schema DSL. A predicate could constrain
-///   its object but not its subject, so nothing stopped a predicate
-///   landing on the wrong kind of entity.
-///
-/// Both change the rkyv row layout, and the new index has no rows in an
-/// older file. No migration tool — pre-user, fresh-start on bump.
-///
-/// v5 unifies the memory-id encoding. `memory_artifacts` stores an
-/// `EncodeStageArtifact` as JSON, and that type is also the MEMORY_INSPECT
-/// payload, so its `memory_id` fields are the `u128` every other memory id
-/// uses and the stored JSON carries a number where a v4 file carries a
-/// 16-element array.
-///
-/// The version gate is what makes that safe. The reader in
-/// `memory_artifact.rs` is `serde_json::from_str(..).ok().unwrap_or_default()`,
-/// so a v4 bundle under a v5 binary would not error — it would come back
-/// EMPTY, blanking the inspect view of every memory already stored with
-/// nothing in a log to say so. Refusing the file outright is the honest
-/// failure.
-///
-/// No migration tool — pre-user, fresh-start on bump, as with v3 and v4.
-pub const CURRENT_SCHEMA_VERSION: u32 = 5;
+/// There is no migration tool and no migration registry. A bump means a fresh
+/// data directory.
+pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 
 /// Singleton key inside [`SCHEMA_META_TABLE`].
 pub const SCHEMA_VERSION_KEY: &str = "schema_version";
@@ -144,8 +117,9 @@ pub fn open_or_init_schema(db: &Database) -> Result<u32, SchemaError> {
             });
         }
         if v < CURRENT_SCHEMA_VERSION {
-            // No in-place migration and no migration tool: Brain is
-            // pre-user, fresh-start is acceptable.
+            // No in-place migration and no migration tool: a file written by
+            // an older schema is refused, and the operator starts from a fresh
+            // store.
             return Err(SchemaError::SchemaTooOld {
                 found: v,
                 current: CURRENT_SCHEMA_VERSION,
@@ -275,18 +249,21 @@ mod tests {
     }
 
     #[test]
-    fn schema_too_old_on_v1_db() {
-        // A v1 DB on disk is unreachable from the v2 layout. No
-        // migration tool exists — operators delete data/ and restart.
+    fn a_file_from_an_older_layout_is_refused_rather_than_read() {
+        // There is no migration path: a file whose rows were written against
+        // an earlier layout is rejected at open so the operator deletes the
+        // directory, rather than being read by a binary whose decoders would
+        // resolve those rows as empty or panic on them.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.redb");
+        let older = CURRENT_SCHEMA_VERSION - 1;
 
         {
             let db = Database::create(&path).unwrap();
             let wtxn = db.begin_write().unwrap();
             {
                 let mut t = wtxn.open_table(SCHEMA_META_TABLE).unwrap();
-                t.insert(SCHEMA_VERSION_KEY, &1_u32).unwrap();
+                t.insert(SCHEMA_VERSION_KEY, &older).unwrap();
             }
             wtxn.commit().unwrap();
         }
@@ -295,7 +272,7 @@ mod tests {
         let err = open_or_init_schema(&db).unwrap_err();
         match err {
             SchemaError::SchemaTooOld { found, current } => {
-                assert_eq!(found, 1);
+                assert_eq!(found, older);
                 assert_eq!(current, CURRENT_SCHEMA_VERSION);
             }
             other => panic!("expected SchemaTooOld, got {other:?}"),
@@ -315,7 +292,7 @@ mod tests {
     }
 
     #[test]
-    fn table_present_but_row_missing_initializes_to_v1() {
+    fn table_present_but_row_missing_initializes_to_the_current_version() {
         // Edge case: someone created the table but didn't write the row.
         // Our code treats this as fresh and initializes.
         let dir = tempfile::tempdir().unwrap();

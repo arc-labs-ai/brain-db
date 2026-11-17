@@ -103,7 +103,7 @@ pub fn statement_create(
         SubjectRef::Memory(_) => None,
         SubjectRef::Pending(_) => {
             return Err(StatementOpError::InvalidArgument(
-                "pending subjects deferred to phase 22 audits",
+                "pending subjects are not supported as statement subjects",
             ));
         }
     };
@@ -548,16 +548,19 @@ pub fn remove_from_predicate_index(
     Ok(())
 }
 
-/// Count non-tombstoned statement rows in `namespace_id` that key on
-/// `predicate_id`, capped at `limit` (pass `usize::MAX` for an exact
-/// count). Walks the by-predicate index across every space in the
-/// namespace and dereferences each hit to the primary row so
-/// tombstoned rows don't count. Used by `SCHEMA_DROP`'s in-use safety
-/// gate — dropping a predicate that still has live statements requires
-/// the caller's explicit `force`.
-pub fn statement_live_count_by_predicate(
+/// Count primary statement rows that name `predicate_id`, capped at `limit`.
+/// The question is not whether live data exists, but whether removing the
+/// predicate registry row would leave a row unable to name its predicate.
+/// Tombstoned statements still name it because statement history and listings
+/// that include tombstones read them, and a soft-FORGET restore inside the
+/// grace window can un-tombstone them. The namespace is irrelevant: a
+/// statement's namespace need not match the namespace that coined its
+/// predicate, so filtering on it could green-light an unsafe drop. Predicate
+/// ids are globally unique, making the id alone sufficient and correct. The
+/// primary table is scanned because the predicate index holds only live rows;
+/// tombstoning removes entries that still need the predicate name.
+pub fn statement_reference_count_by_predicate(
     wtxn: &WriteTransaction,
-    namespace_id: u32,
     predicate_id: PredicateId,
     limit: usize,
 ) -> Result<usize, StatementOpError> {
@@ -565,61 +568,31 @@ pub fn statement_live_count_by_predicate(
         return Ok(0);
     }
     let want = predicate_id.raw();
-    let index = wtxn.open_table(STATEMENTS_BY_PREDICATE_TABLE)?;
     let primary = wtxn.open_table(STATEMENTS_TABLE)?;
     let mut count = 0usize;
-    for entry in index.iter()? {
-        let (k, v) = entry?;
-        let (k_ns, _space, k_pred, _kind, _bucket, _sid) = k.value();
-        if k_ns != namespace_id || k_pred != want {
+    for entry in primary.iter()? {
+        let (_sid, v) = entry?;
+        let row = v.value();
+        if row.predicate_id != want {
             continue;
         }
-        let sid = v.value();
-        if let Some(row) = primary.get(&sid)?.map(|g| g.value()) {
-            if row.tombstoned == 0 {
-                count += 1;
-                if count >= limit {
-                    break;
-                }
-            }
+        count += 1;
+        if count >= limit {
+            break;
         }
     }
     Ok(count)
 }
 
-/// Whether ANY live statement, in any namespace or space, uses
-/// `predicate_id`.
-///
-/// [`statement_live_count_by_predicate`] filters by namespace because its
-/// caller (SCHEMA_DROP) is answering a tenant-scoped question. Predicate GC
-/// is not: it is deciding whether a row can be deleted outright, and a row
-/// deleted while anything still points at it orphans that statement's
-/// predicate reference. Resolving the predicate's namespace *name* to an id
-/// is not a safe substitute — a statement's `namespace_id` need not match the
-/// namespace its predicate was coined under, and an unregistered name would
-/// read as "no statements" and green-light the delete.
-///
-/// Stops at the first hit: the question is existence, not population.
-pub fn statement_any_live_by_predicate(
+/// Whether any statement row in any namespace or space names `predicate_id`.
+/// This is the existence form of [`statement_reference_count_by_predicate`],
+/// so tombstones and namespace-independent references have the same safety
+/// meaning everywhere.
+pub fn statement_any_reference_by_predicate(
     wtxn: &WriteTransaction,
     predicate_id: PredicateId,
 ) -> Result<bool, StatementOpError> {
-    let want = predicate_id.raw();
-    let index = wtxn.open_table(STATEMENTS_BY_PREDICATE_TABLE)?;
-    let primary = wtxn.open_table(STATEMENTS_TABLE)?;
-    for entry in index.iter()? {
-        let (k, v) = entry?;
-        let (_ns, _space, k_pred, _kind, _bucket, _sid) = k.value();
-        if k_pred != want {
-            continue;
-        }
-        if let Some(row) = primary.get(&v.value())?.map(|g| g.value()) {
-            if row.tombstoned == 0 {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
+    Ok(statement_reference_count_by_predicate(wtxn, predicate_id, 1)? > 0)
 }
 
 /// Re-key a still-current statement's predicate-bucket entry after its
@@ -1282,19 +1255,17 @@ mod tests {
     }
 
     #[test]
-    fn live_count_by_predicate_counts_only_non_tombstoned() {
+    fn reference_count_by_predicate_counts_every_row_that_names_it() {
         let (_dir, mut db) = open_db();
         let subj = make_entity(&mut db, "priya");
         let obj = make_entity(&mut db, "manager-role");
         let pred = intern_fact_entity_pred(&mut db, "reports_to");
-        let ns = test_scope().namespace_id;
-
-        // No statements yet.
         {
             let wtxn = db.write_txn().unwrap();
             assert_eq!(
-                statement_live_count_by_predicate(&wtxn, ns, pred, usize::MAX).unwrap(),
-                0
+                statement_reference_count_by_predicate(&wtxn, pred, usize::MAX).unwrap(),
+                0,
+                "an unused predicate has no references"
             );
         }
 
@@ -1309,28 +1280,27 @@ mod tests {
         {
             let wtxn = db.write_txn().unwrap();
             assert_eq!(
-                statement_live_count_by_predicate(&wtxn, ns, pred, usize::MAX).unwrap(),
-                1
+                statement_reference_count_by_predicate(&wtxn, pred, usize::MAX).unwrap(),
+                1,
+                "a live statement names its predicate"
             );
-            // A different predicate id sees nothing.
             assert_eq!(
-                statement_live_count_by_predicate(&wtxn, ns, PredicateId::from(pred.raw() + 7), 1)
-                    .unwrap(),
-                0
+                statement_reference_count_by_predicate(
+                    &wtxn,
+                    PredicateId::from(pred.raw() + 7),
+                    1,
+                )
+                .unwrap(),
+                0,
+                "an unrelated predicate id has no references"
             );
-            // A different namespace sees nothing.
             assert_eq!(
-                statement_live_count_by_predicate(&wtxn, ns + 1, pred, usize::MAX).unwrap(),
-                0
-            );
-            // The cap short-circuits at the first hit.
-            assert_eq!(
-                statement_live_count_by_predicate(&wtxn, ns, pred, 1).unwrap(),
-                1
+                statement_reference_count_by_predicate(&wtxn, pred, 1).unwrap(),
+                1,
+                "the reference scan cap stops at the first hit"
             );
         }
 
-        // Tombstoning removes it from the live count.
         {
             let wtxn = db.write_txn().unwrap();
             statement_tombstone(&wtxn, sid, TombstoneReason::UserRequest, T0 + 1).unwrap();
@@ -1339,8 +1309,26 @@ mod tests {
         {
             let wtxn = db.write_txn().unwrap();
             assert_eq!(
-                statement_live_count_by_predicate(&wtxn, ns, pred, usize::MAX).unwrap(),
-                0
+                statement_reference_count_by_predicate(&wtxn, pred, usize::MAX).unwrap(),
+                1,
+                "a tombstoned statement still needs its predicate name"
+            );
+        }
+
+        let other_scope = RowScope::from_bytes(test_scope().namespace_id + 1, [0xAB; 16]);
+        let other_subject = make_entity(&mut db, "other-scope-subject");
+        {
+            let wtxn = db.write_txn().unwrap();
+            let s = fresh_fact(other_subject, pred, obj);
+            statement_create(&wtxn, other_scope, SessionId::DEFAULT, &s, T0 + 2).unwrap();
+            wtxn.commit().unwrap();
+        }
+        {
+            let wtxn = db.write_txn().unwrap();
+            assert_eq!(
+                statement_reference_count_by_predicate(&wtxn, pred, usize::MAX).unwrap(),
+                2,
+                "a statement in another namespace still names the predicate"
             );
         }
     }

@@ -13,6 +13,7 @@
 //! Every helper opens its own write txn, applies, calls
 //! `MetadataDb::bump_next_lsn_in_txn`, then commits.
 
+use brain_protocol::envelope::response::{EncodeStageArtifact, EncodeStageRecord};
 use brain_storage::recovery::MetadataSinkError;
 use brain_storage::wal::payload::{
     EncodePayload, ForgetMode, ForgetPayload, MigrateEmbeddingPayload, RestorePayload,
@@ -166,6 +167,67 @@ impl MetadataDb {
                 t.insert(&slot_id, &slot_version).map_err(transient)?;
             }
 
+            // The timeline index is the durable predecessor surface for temporal
+            // edges. Derive its coordinates from the stored row so encode and
+            // forget use the same canonical key even if row construction evolves.
+            {
+                let key = space_timeline_key(
+                    mem.namespace_id,
+                    mem.space_id_bytes,
+                    mem.created_at_unix_nanos,
+                    mem.session_id,
+                    mem.memory_id_bytes,
+                );
+                let mut t = wtxn
+                    .open_table(MEMORIES_BY_SPACE_TIMELINE_TABLE)
+                    .map_err(transient)?;
+                t.insert(key.as_slice(), ()).map_err(transient)?;
+            }
+
+            // The vector table is the embedding's durable home and the source
+            // used to rebuild the post-restart search index. Empty vectors mean
+            // the optional-include payload intentionally excluded the vector.
+            if !p.vector.is_empty() {
+                let mut bytes = Vec::with_capacity(p.vector.len() * 4);
+                for value in &p.vector {
+                    bytes.extend_from_slice(&value.to_le_bytes());
+                }
+                let mut t = wtxn.open_table(MEMORY_VECTORS_TABLE).map_err(transient)?;
+                t.insert(&memory_id.to_be_bytes(), bytes.as_slice())
+                    .map_err(transient)?;
+            }
+
+            // Recovery cannot run the tantivy analyzer owned by brain-index, so
+            // keyword_fields intentionally remains empty; inspect still exposes
+            // the recovered record and the text remains available in TEXTS_TABLE.
+            // Recovery knows the WAL position, unlike the live apply path, so the
+            // artifact records the real LSN for the same provenance as the row.
+            {
+                let artifact = EncodeStageArtifact {
+                    record: Some(EncodeStageRecord {
+                        memory_id: u128::from_be_bytes(memory_id.to_be_bytes()),
+                        kind: memory_kind_to_u8(p.kind),
+                        salience: p.salience_initial,
+                        created_at_unix_nanos: timestamp_ns,
+                        occurred_at_unix_nanos: p.occurred_at_unix_nanos.unwrap_or(0),
+                        vector_dim: u32::try_from(p.vector.len()).unwrap_or(u32::MAX),
+                        text_len: u32::try_from(p.text.len()).unwrap_or(u32::MAX),
+                        lsn,
+                    }),
+                    ..Default::default()
+                };
+                let json = serde_json::to_string(&artifact).map_err(|e| {
+                    MetadataSinkError::Corruption(format!("encode artifact serialization: {e}"))
+                })?;
+                let mut t = wtxn.open_table(MEMORY_ARTIFACTS_TABLE).map_err(transient)?;
+                t.insert(&memory_id.to_be_bytes(), json.as_str())
+                    .map_err(transient)?;
+            }
+
+            // This keyed upsert is the source of truth for pending extraction;
+            // replaying the same WAL record therefore cannot duplicate work.
+            crate::extraction_queue_enqueue(&wtxn, memory_id, timestamp_ns).map_err(transient)?;
+
             // Registry — the same implicit space/session upsert the live
             // apply path runs, so the derived registry rows survive a crash
             // and replay cleanly (idempotent bump on re-replay).
@@ -208,7 +270,7 @@ impl MetadataDb {
             //   Both modes: clear ACTIVE, stamp tombstoned_at, drop the
             //   timeline-index entry, evict the dedup FINGERPRINTS row.
             //   Hard mode only: additionally set HARD_FORGOTTEN and purge the
-            //   text row + write-artifact bundle (vector + derived graph).
+            //   text row + write-artifact bundle + stored embedding.
             //
             // The prior implementation set HARD_FORGOTTEN + forgot_at
             // unconditionally and never cleared ACTIVE — a crash before
@@ -283,8 +345,8 @@ impl MetadataDb {
                 }
 
                 // Hard FORGET purges recoverable plaintext-derived data at
-                // rest: the text row + the write-artifact bundle (embedding
-                // vector + derived graph) + the raw by-id vector row. Soft
+                // rest: the text row + the write-artifact bundle (derived
+                // graph) + the by-id embedding row. Soft
                 // FORGET keeps them until slot reclamation runs after grace.
                 if is_hard {
                     {

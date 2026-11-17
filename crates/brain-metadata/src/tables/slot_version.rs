@@ -14,14 +14,14 @@
 //! ## What lives here
 //!
 //! - [`SLOT_VERSIONS_TABLE`] — `slot_id` (u64) → current `version` (u32).
-//! - [`increment`] — atomic read-modify-write inside the caller's
-//!   transaction. Missing row starts at 1; existing row goes to N+1;
-//!   `u32::MAX` returns [`SlotVersionError::Exhausted`] and does not
-//!   write.
+//! - [`retire_slot`] — atomic read-modify-write inside the caller's
+//!   transaction. Stores one past the version the departing occupant held,
+//!   which is the version the slot's next occupant is minted with;
+//!   `u32::MAX` returns [`SlotVersionError::Exhausted`] and does not write.
 //!
 //! ## What does NOT live here
 //!
-//! - Composition with FORGET / reclaim (increment + memory-row remove
+//! - Composition with FORGET / reclaim (retirement + memory-row remove
 //!   + arena zero in one txn) — `MetadataDb` + the reclaim worker.
 //! - MemoryId minting (packing `slot_id + version` into 16 bytes) —
 //!   `brain-core`'s identifier code.
@@ -41,7 +41,7 @@ use redb::{ReadableTable, Table, TableDefinition};
 pub const SLOT_VERSIONS_TABLE: TableDefinition<'static, u64, u32> =
     TableDefinition::new("slot_versions");
 
-/// Errors from [`increment`].
+/// Errors from [`retire_slot`].
 #[derive(thiserror::Error, Debug)]
 pub enum SlotVersionError {
     /// redb storage-layer failure (I/O, corruption, etc.).
@@ -92,25 +92,35 @@ pub fn max_assigned_slot(rtxn: &redb::ReadTransaction) -> Result<u64, SlotVersio
     Ok(hi)
 }
 
-/// Atomic read-modify-write of `slot_versions[slot_id]`. Returns the
-/// new version.
+/// Retire the slot an occupant has just vacated: store the version the
+/// slot's next occupant must carry, and return it.
 ///
-/// - Missing row (never-used slot) → writes `1`,
-///   returns `Ok(1)`.
-/// - Existing row at version `N` → writes `N + 1`, returns `Ok(N + 1)`.
-/// - Row at `u32::MAX` → returns [`SlotVersionError::Exhausted`] and
-///   leaves the table untouched (fail-stop on overflow).
+/// The stored value is what the writer packs into the next memory minted at
+/// this slot, so it has to sit strictly above the version the departing
+/// memory held. At or below it, the slot re-mints an identifier its last
+/// occupant already used, and every surviving reference to that memory — a
+/// dangling edge, an un-rebuilt index node, an id a client is holding —
+/// silently resolves to a different memory.
 ///
-/// The caller owns the redb transaction; this helper composes with
-/// other table operations (memory-row removal, arena zeroing) inside
-/// the same write transaction.
-pub fn increment(table: &mut Table<'_, u64, u32>, slot_id: u64) -> Result<u32, SlotVersionError> {
+/// Writing the row is also what keeps the freed slot inside the boot-time
+/// high-water scan, so the slot counter never rewinds onto it.
+///
+/// `u32::MAX` is the end of the slot's identifier space: the slot can name
+/// no further distinct memory, so this returns [`SlotVersionError::Exhausted`]
+/// and writes nothing.
+///
+/// The caller owns the redb transaction, so the retirement commits atomically
+/// with the removal of the memory it retires.
+pub fn retire_slot(
+    table: &mut Table<'_, u64, u32>,
+    slot_id: u64,
+    retired_version: u32,
+) -> Result<u32, SlotVersionError> {
     let current = table.get(&slot_id)?.map_or(0u32, |access| access.value());
-
     let next = current
+        .max(retired_version)
         .checked_add(1)
         .ok_or(SlotVersionError::Exhausted { slot_id })?;
-
     table.insert(&slot_id, &next)?;
     Ok(next)
 }
@@ -178,26 +188,29 @@ mod tests {
         );
     }
 
+    /// A slot whose occupant was minted from a missing row held version 1,
+    /// so retiring it must store 2 — storing 1 would hand the slot straight
+    /// back the identifier it just freed.
     #[test]
-    fn increment_missing_starts_at_one() {
+    fn retire_slot_lands_above_the_departing_version() {
         let dir = tempfile::tempdir().unwrap();
         let db = fresh_db(&dir);
 
         let wtxn = db.begin_write().unwrap();
         let returned = {
             let mut t = wtxn.open_table(SLOT_VERSIONS_TABLE).unwrap();
-            increment(&mut t, 42).unwrap()
+            retire_slot(&mut t, 42, 1).unwrap()
         };
         wtxn.commit().unwrap();
-        assert_eq!(returned, 1);
+        assert_eq!(returned, 2);
 
         let rtxn = db.begin_read().unwrap();
         let t = rtxn.open_table(SLOT_VERSIONS_TABLE).unwrap();
-        assert_eq!(t.get(&42u64).unwrap().unwrap().value(), 1);
+        assert_eq!(t.get(&42u64).unwrap().unwrap().value(), 2);
     }
 
     #[test]
-    fn increment_existing_returns_next() {
+    fn retire_slot_existing_returns_above_both_versions() {
         let dir = tempfile::tempdir().unwrap();
         let db = fresh_db(&dir);
 
@@ -212,7 +225,7 @@ mod tests {
         let wtxn = db.begin_write().unwrap();
         let returned = {
             let mut t = wtxn.open_table(SLOT_VERSIONS_TABLE).unwrap();
-            increment(&mut t, 7).unwrap()
+            retire_slot(&mut t, 7, 5).unwrap()
         };
         wtxn.commit().unwrap();
         assert_eq!(returned, 6);
@@ -223,16 +236,16 @@ mod tests {
     }
 
     #[test]
-    fn increment_is_monotonic_across_calls() {
+    fn retire_slot_is_monotonic_across_calls() {
         let dir = tempfile::tempdir().unwrap();
         let db = fresh_db(&dir);
         let slot = 99u64;
 
-        for expected in 1u32..=10 {
+        for (retired_version, expected) in (1u32..=3).zip(2u32..=4) {
             let wtxn = db.begin_write().unwrap();
             let got = {
                 let mut t = wtxn.open_table(SLOT_VERSIONS_TABLE).unwrap();
-                increment(&mut t, slot).unwrap()
+                retire_slot(&mut t, slot, retired_version).unwrap()
             };
             wtxn.commit().unwrap();
             assert_eq!(got, expected);
@@ -240,7 +253,7 @@ mod tests {
 
         let rtxn = db.begin_read().unwrap();
         let t = rtxn.open_table(SLOT_VERSIONS_TABLE).unwrap();
-        assert_eq!(t.get(&slot).unwrap().unwrap().value(), 10);
+        assert_eq!(t.get(&slot).unwrap().unwrap().value(), 4);
     }
 
     #[test]
@@ -250,29 +263,36 @@ mod tests {
         let slot_a = 1u64;
         let slot_b = 2u64;
 
-        // Bump A three times, B five times, interleaved.
-        let increments = [
-            slot_a, slot_b, slot_a, slot_b, slot_a, slot_b, slot_b, slot_b,
+        // Retire A three times, B five times, interleaved.
+        let retirements = [
+            (slot_a, 1),
+            (slot_b, 1),
+            (slot_a, 2),
+            (slot_b, 2),
+            (slot_a, 3),
+            (slot_b, 3),
+            (slot_b, 4),
+            (slot_b, 5),
         ];
-        for slot in increments {
+        for (slot, retired_version) in retirements {
             let wtxn = db.begin_write().unwrap();
             {
                 let mut t = wtxn.open_table(SLOT_VERSIONS_TABLE).unwrap();
-                increment(&mut t, slot).unwrap();
+                retire_slot(&mut t, slot, retired_version).unwrap();
             }
             wtxn.commit().unwrap();
         }
 
         let rtxn = db.begin_read().unwrap();
         let t = rtxn.open_table(SLOT_VERSIONS_TABLE).unwrap();
-        assert_eq!(t.get(&slot_a).unwrap().unwrap().value(), 3);
-        assert_eq!(t.get(&slot_b).unwrap().unwrap().value(), 5);
+        assert_eq!(t.get(&slot_a).unwrap().unwrap().value(), 4);
+        assert_eq!(t.get(&slot_b).unwrap().unwrap().value(), 6);
     }
 
     #[test]
     fn overflow_returns_exhausted_and_does_not_write() {
         // The catastrophic-failure-mode pin: a slot at u32::MAX must
-        // not wrap to 0 on increment. Silent wrap would violate the
+        // not wrap to 0 on retirement. Silent wrap would violate the
         // MemoryId-stability invariant.
         let dir = tempfile::tempdir().unwrap();
         let db = fresh_db(&dir);
@@ -289,7 +309,7 @@ mod tests {
         let wtxn = db.begin_write().unwrap();
         let result = {
             let mut t = wtxn.open_table(SLOT_VERSIONS_TABLE).unwrap();
-            increment(&mut t, slot)
+            retire_slot(&mut t, slot, u32::MAX)
         };
         wtxn.commit().unwrap();
 

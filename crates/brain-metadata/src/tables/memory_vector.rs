@@ -3,15 +3,13 @@
 //!
 //! ## Why this exists
 //!
-//! The full-precision embedding is also carried inside the JSON
-//! `memory_artifacts` bundle, but that bundle bundles the graph, HyPE
-//! questions, and keyword fields — so pulling the vector out of it means
-//! JSON-parsing the whole blob. The hot single-space brute-force recall
-//! lane resolves a vector *per candidate* (up to `SPACE_BRUTEFORCE_MAX`),
-//! and JSON-parsing a graph-bearing bundle per candidate is far too slow
-//! for a recall path. This table stores JUST the vector as a flat byte
-//! run so a resolve is a single redb point lookup + a `from_le_bytes`
-//! decode — no JSON, no allocation of the other bundle fields.
+//! This is the full-precision embedding's durable home, and the only one.
+//! The hot single-space brute-force recall lane resolves a vector *per
+//! candidate* (up to `SPACE_BRUTEFORCE_MAX`), so the representation has to
+//! be one a reader can take without parsing anything: a flat byte run makes
+//! a resolve a single redb point lookup + a `from_le_bytes` decode. The
+//! write path pays the same shape in reverse — one insert of
+//! `VECTOR_DIM * 4` bytes, no encoding pass.
 //!
 //! ## What lives here
 //!

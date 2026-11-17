@@ -354,8 +354,7 @@ pub(crate) fn memory_kind_to_u8(k: MemoryKind) -> u8 {
     }
 }
 
-#[allow(dead_code)] // used by `crate::sink` and tests
-pub(crate) fn memory_kind_from_u8(b: u8) -> Result<MemoryKind, BadMemoryKind> {
+fn memory_kind_from_u8(b: u8) -> Result<MemoryKind, BadMemoryKind> {
     Ok(match b {
         0 => MemoryKind::Episodic,
         1 => MemoryKind::Semantic,
@@ -441,8 +440,7 @@ pub struct MemoryMetadata {
     /// (rkyv-schema break would surface that case differently;
     /// not a concern in the hard-cut shipping model).
     ///
-    /// Surfaced through `RecallHit.encoded_at_lsn` →
-    /// `MemoryResult.lsn`, letting a client chain
+    /// Surfaced on recall results as `MemoryResult.lsn`, letting a client chain
     /// `recall → subscribe --start-lsn lsn+1` to "follow this
     /// memory's downstream events from when it was written."
     pub encoded_at_lsn: u64,
@@ -499,7 +497,7 @@ impl MemoryMetadata {
             // real value via `with_encoded_at_lsn` after they get
             // the LSN back from `wal_sink.append`. Test fixtures
             // that bypass the WAL get 0, which is fine — they
-            // don't exercise the `RecallHit.encoded_at_lsn` flow.
+            // don't exercise the LSN-provenance flow on recall results.
             encoded_at_lsn: 0,
         }
     }

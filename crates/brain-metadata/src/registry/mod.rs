@@ -23,12 +23,10 @@ use crate::tables::space::{space_key, space_range_bounds, SpaceMetadata, SPACES_
 /// Failure operating the space/session registry.
 #[derive(thiserror::Error, Debug)]
 pub enum RegistryError {
-    #[error("registry storage error: {0}")]
-    Storage(String),
-}
-
-fn store<E: std::fmt::Display>(e: E) -> RegistryError {
-    RegistryError::Storage(e.to_string())
+    #[error("redb storage error: {0}")]
+    Storage(#[from] redb::StorageError),
+    #[error("redb table error: {0}")]
+    Table(#[from] redb::TableError),
 }
 
 /// One space in a [`space_list`] page.
@@ -82,10 +80,10 @@ fn touch_session_row(
     at: u64,
 ) -> Result<bool, RegistryError> {
     let key = session_key(namespace_id, space_id, session_id);
-    let mut sessions = wtxn.open_table(SESSIONS_TABLE).map_err(store)?;
-    let mut scope = wtxn.open_table(SESSION_BY_SCOPE_TABLE).map_err(store)?;
+    let mut sessions = wtxn.open_table(SESSIONS_TABLE)?;
+    let mut scope = wtxn.open_table(SESSION_BY_SCOPE_TABLE)?;
     let existing = {
-        let g = sessions.get(&key).map_err(store)?;
+        let g = sessions.get(&key)?;
         g.map(|v| v.value())
     };
     match existing {
@@ -93,29 +91,25 @@ fn touch_session_row(
             if at > m.last_active_unix_nanos {
                 let old =
                     session_scope_key(namespace_id, space_id, m.last_active_unix_nanos, session_id);
-                scope.remove(&old).map_err(store)?;
+                scope.remove(&old)?;
                 m.last_active_unix_nanos = at;
-                scope
-                    .insert(
-                        &session_scope_key(namespace_id, space_id, at, session_id),
-                        &(),
-                    )
-                    .map_err(store)?;
+                scope.insert(
+                    &session_scope_key(namespace_id, space_id, at, session_id),
+                    &(),
+                )?;
             }
             m.memory_count = m.memory_count.saturating_add(1);
-            sessions.insert(&key, &m).map_err(store)?;
+            sessions.insert(&key, &m)?;
             Ok(false)
         }
         None => {
             let mut m = SessionMetadata::new(at, None);
             m.memory_count = 1;
-            sessions.insert(&key, &m).map_err(store)?;
-            scope
-                .insert(
-                    &session_scope_key(namespace_id, space_id, at, session_id),
-                    &(),
-                )
-                .map_err(store)?;
+            sessions.insert(&key, &m)?;
+            scope.insert(
+                &session_scope_key(namespace_id, space_id, at, session_id),
+                &(),
+            )?;
             Ok(true)
         }
     }
@@ -130,9 +124,9 @@ fn touch_space_row(
     session_created: bool,
 ) -> Result<(), RegistryError> {
     let key = space_key(namespace_id, space_id);
-    let mut spaces = wtxn.open_table(SPACES_TABLE).map_err(store)?;
+    let mut spaces = wtxn.open_table(SPACES_TABLE)?;
     let existing = {
-        let g = spaces.get(&key).map_err(store)?;
+        let g = spaces.get(&key)?;
         g.map(|v| v.value())
     };
     match existing {
@@ -147,13 +141,13 @@ fn touch_space_row(
             if m.space_string.is_empty() && !space_string.is_empty() {
                 m.space_string = space_string.to_string();
             }
-            spaces.insert(&key, &m).map_err(store)?;
+            spaces.insert(&key, &m)?;
         }
         None => {
             let mut m = SpaceMetadata::new(at, space_string.to_string(), None);
             m.memory_count = 1;
             m.session_count = u32::from(session_created);
-            spaces.insert(&key, &m).map_err(store)?;
+            spaces.insert(&key, &m)?;
         }
     }
     Ok(())
@@ -175,16 +169,16 @@ pub fn space_create(
     metadata: Option<Vec<u8>>,
 ) -> Result<(SpaceMetadata, bool), RegistryError> {
     let key = space_key(namespace_id, space_id);
-    let mut spaces = wtxn.open_table(SPACES_TABLE).map_err(store)?;
+    let mut spaces = wtxn.open_table(SPACES_TABLE)?;
     let existing = {
-        let g = spaces.get(&key).map_err(store)?;
+        let g = spaces.get(&key)?;
         g.map(|v| v.value())
     };
     if let Some(m) = existing {
         return Ok((m, false));
     }
     let m = SpaceMetadata::new(at_unix_nanos, space_string, metadata);
-    spaces.insert(&key, &m).map_err(store)?;
+    spaces.insert(&key, &m)?;
     Ok((m, true))
 }
 
@@ -194,9 +188,8 @@ pub fn space_get(
     namespace_id: u32,
     space_id: [u8; 16],
 ) -> Result<Option<SpaceMetadata>, RegistryError> {
-    let t = rtxn.open_table(SPACES_TABLE).map_err(store)?;
-    Ok(t.get(&space_key(namespace_id, space_id))
-        .map_err(store)?
+    let t = rtxn.open_table(SPACES_TABLE)?;
+    Ok(t.get(&space_key(namespace_id, space_id))?
         .map(|g| g.value()))
 }
 
@@ -207,11 +200,11 @@ pub fn space_list(
     namespace_id: u32,
     limit: usize,
 ) -> Result<Vec<SpaceListEntry>, RegistryError> {
-    let t = rtxn.open_table(SPACES_TABLE).map_err(store)?;
+    let t = rtxn.open_table(SPACES_TABLE)?;
     let (start, end) = space_range_bounds(namespace_id);
     let mut out = Vec::new();
-    for entry in t.range(start..=end).map_err(store)? {
-        let (k, v) = entry.map_err(store)?;
+    for entry in t.range(start..=end)? {
+        let (k, v) = entry?;
         let key = k.value();
         let mut space_id = [0u8; 16];
         space_id.copy_from_slice(&key[4..20]);
@@ -239,10 +232,10 @@ pub fn space_delete_registry(
     // the record and the scope-index rows.
     let mut victims: Vec<(u64, u64)> = Vec::new();
     {
-        let sessions = wtxn.open_table(SESSIONS_TABLE).map_err(store)?;
+        let sessions = wtxn.open_table(SESSIONS_TABLE)?;
         let (start, end) = session_range_bounds(namespace_id, space_id);
-        for entry in sessions.range(start..=end).map_err(store)? {
-            let (k, v) = entry.map_err(store)?;
+        for entry in sessions.range(start..=end)? {
+            let (k, v) = entry?;
             let session_id = u64::from_be_bytes(
                 k.value()[20..28]
                     .try_into()
@@ -252,27 +245,20 @@ pub fn space_delete_registry(
         }
     }
     {
-        let mut sessions = wtxn.open_table(SESSIONS_TABLE).map_err(store)?;
-        let mut scope = wtxn.open_table(SESSION_BY_SCOPE_TABLE).map_err(store)?;
+        let mut sessions = wtxn.open_table(SESSIONS_TABLE)?;
+        let mut scope = wtxn.open_table(SESSION_BY_SCOPE_TABLE)?;
         for (session_id, last_active) in &victims {
-            sessions
-                .remove(&session_key(namespace_id, space_id, *session_id))
-                .map_err(store)?;
-            scope
-                .remove(&session_scope_key(
-                    namespace_id,
-                    space_id,
-                    *last_active,
-                    *session_id,
-                ))
-                .map_err(store)?;
+            sessions.remove(&session_key(namespace_id, space_id, *session_id))?;
+            scope.remove(&session_scope_key(
+                namespace_id,
+                space_id,
+                *last_active,
+                *session_id,
+            ))?;
         }
     }
-    let mut spaces = wtxn.open_table(SPACES_TABLE).map_err(store)?;
-    let existed = spaces
-        .remove(&space_key(namespace_id, space_id))
-        .map_err(store)?
-        .is_some();
+    let mut spaces = wtxn.open_table(SPACES_TABLE)?;
+    let existed = spaces.remove(&space_key(namespace_id, space_id))?.is_some();
     Ok(existed)
 }
 
@@ -294,9 +280,9 @@ pub fn session_create(
 ) -> Result<(SessionMetadata, bool), RegistryError> {
     let key = session_key(namespace_id, space_id, session_id);
     {
-        let sessions = wtxn.open_table(SESSIONS_TABLE).map_err(store)?;
+        let sessions = wtxn.open_table(SESSIONS_TABLE)?;
         let existing = {
-            let g = sessions.get(&key).map_err(store)?;
+            let g = sessions.get(&key)?;
             g.map(|v| v.value())
         };
         if let Some(m) = existing {
@@ -305,15 +291,13 @@ pub fn session_create(
     }
     let m = SessionMetadata::new(at_unix_nanos, title);
     {
-        let mut sessions = wtxn.open_table(SESSIONS_TABLE).map_err(store)?;
-        sessions.insert(&key, &m).map_err(store)?;
-        let mut scope = wtxn.open_table(SESSION_BY_SCOPE_TABLE).map_err(store)?;
-        scope
-            .insert(
-                &session_scope_key(namespace_id, space_id, at_unix_nanos, session_id),
-                &(),
-            )
-            .map_err(store)?;
+        let mut sessions = wtxn.open_table(SESSIONS_TABLE)?;
+        sessions.insert(&key, &m)?;
+        let mut scope = wtxn.open_table(SESSION_BY_SCOPE_TABLE)?;
+        scope.insert(
+            &session_scope_key(namespace_id, space_id, at_unix_nanos, session_id),
+            &(),
+        )?;
     }
     // Keep the owning space's session_count coherent; create the space row on
     // first sight so a session never dangles without its parent. A session
@@ -330,9 +314,8 @@ pub fn session_get(
     space_id: [u8; 16],
     session_id: u64,
 ) -> Result<Option<SessionMetadata>, RegistryError> {
-    let t = rtxn.open_table(SESSIONS_TABLE).map_err(store)?;
-    Ok(t.get(&session_key(namespace_id, space_id, session_id))
-        .map_err(store)?
+    let t = rtxn.open_table(SESSIONS_TABLE)?;
+    Ok(t.get(&session_key(namespace_id, space_id, session_id))?
         .map(|g| g.value()))
 }
 
@@ -344,21 +327,18 @@ pub fn session_list(
     space_id: [u8; 16],
     limit: usize,
 ) -> Result<Vec<SessionListEntry>, RegistryError> {
-    let scope = rtxn.open_table(SESSION_BY_SCOPE_TABLE).map_err(store)?;
-    let sessions = rtxn.open_table(SESSIONS_TABLE).map_err(store)?;
+    let scope = rtxn.open_table(SESSION_BY_SCOPE_TABLE)?;
+    let sessions = rtxn.open_table(SESSIONS_TABLE)?;
     let (start, end) = session_scope_range_bounds(namespace_id, space_id);
     let mut out = Vec::new();
-    for entry in scope.range(start..=end).map_err(store)?.rev() {
-        let (k, _) = entry.map_err(store)?;
+    for entry in scope.range(start..=end)?.rev() {
+        let (k, _) = entry?;
         let session_id = u64::from_be_bytes(
             k.value()[28..36]
                 .try_into()
                 .expect("invariant: 8-byte session_id slice from a fixed-width key"),
         );
-        if let Some(g) = sessions
-            .get(&session_key(namespace_id, space_id, session_id))
-            .map_err(store)?
-        {
+        if let Some(g) = sessions.get(&session_key(namespace_id, space_id, session_id))? {
             out.push(SessionListEntry {
                 session_id,
                 meta: g.value(),
@@ -382,35 +362,33 @@ pub fn session_delete_registry(
 ) -> Result<bool, RegistryError> {
     let key = session_key(namespace_id, space_id, session_id);
     let existing: Option<SessionMetadata> = {
-        let sessions = wtxn.open_table(SESSIONS_TABLE).map_err(store)?;
-        let g = sessions.get(&key).map_err(store)?;
+        let sessions = wtxn.open_table(SESSIONS_TABLE)?;
+        let g = sessions.get(&key)?;
         g.map(|x| x.value())
     };
     let Some(m) = existing else {
         return Ok(false);
     };
     {
-        let mut sessions = wtxn.open_table(SESSIONS_TABLE).map_err(store)?;
-        sessions.remove(&key).map_err(store)?;
-        let mut scope = wtxn.open_table(SESSION_BY_SCOPE_TABLE).map_err(store)?;
-        scope
-            .remove(&session_scope_key(
-                namespace_id,
-                space_id,
-                m.last_active_unix_nanos,
-                session_id,
-            ))
-            .map_err(store)?;
+        let mut sessions = wtxn.open_table(SESSIONS_TABLE)?;
+        sessions.remove(&key)?;
+        let mut scope = wtxn.open_table(SESSION_BY_SCOPE_TABLE)?;
+        scope.remove(&session_scope_key(
+            namespace_id,
+            space_id,
+            m.last_active_unix_nanos,
+            session_id,
+        ))?;
     }
-    let mut spaces = wtxn.open_table(SPACES_TABLE).map_err(store)?;
+    let mut spaces = wtxn.open_table(SPACES_TABLE)?;
     let skey = space_key(namespace_id, space_id);
     let cur = {
-        let g = spaces.get(&skey).map_err(store)?;
+        let g = spaces.get(&skey)?;
         g.map(|v| v.value())
     };
     if let Some(mut sm) = cur {
         sm.session_count = sm.session_count.saturating_sub(1);
-        spaces.insert(&skey, &sm).map_err(store)?;
+        spaces.insert(&skey, &sm)?;
     }
     Ok(true)
 }
@@ -469,5 +447,14 @@ mod tests {
         let r = db.read_txn().unwrap();
         assert!(space_get(&r, 1, space).unwrap().is_none());
         assert!(session_list(&r, 1, space, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn registry_error_keeps_redb_storage_kind() {
+        let error = RegistryError::from(redb::StorageError::Corrupted("page".into()));
+        assert!(matches!(
+            error,
+            RegistryError::Storage(inner) if matches!(inner, redb::StorageError::Corrupted(_))
+        ));
     }
 }
