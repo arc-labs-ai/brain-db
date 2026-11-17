@@ -138,7 +138,7 @@ For `bge-small-en-v1.5`, the official approach is to use the `[CLS]` representat
 
 Tokenization details are not exposed to clients. The wire protocol carries text, not tokens. Clients can't ask "how was this tokenized?" through the API.
 
-For debugging, operators can use the `ADMIN_TOKENIZE` opcode (admin-only) to test how a specific text tokenizes. This is operationally useful for understanding why a query did or didn't match expected content.
+Inspecting how a specific text tokenizes would be operationally useful for understanding why a query did or didn't match expected content. `ADMIN_TOKENIZE` (`0x006A`) was allocated for it and is **a number only** — no request body, no dispatch arm — so there is no way to ask the server this today.
 
 ### 12. Vocabulary versioning
 
@@ -346,7 +346,7 @@ The full startup is typically 1–3 seconds. Every step fails shard spawn rather
 
 Model reload (changing the active model) is not supported on a running server. To change the model:
 
-1. Run `ADMIN_MIGRATE_EMBEDDINGS` to re-embed all stored memories with the new model. (Detailed in [`06_migration.md`](06_migration.md).)
+1. Re-embed all stored memories with the new model. (Specified in [`06_migration.md`](06_migration.md), and **not built** — there is no migration operation on either plane.)
 2. Update the configuration to point to the new model.
 3. Restart the server.
 

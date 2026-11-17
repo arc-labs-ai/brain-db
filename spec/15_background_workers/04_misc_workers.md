@@ -97,7 +97,7 @@ Per shard:
 - `oldest_memory_age` — age of the oldest memory.
 - `newest_memory_age` — age of the newest.
 
-These are exposed via metrics and `ADMIN_STATS`.
+These are exposed on `GET /metrics`.
 
 ### 3.2 The cycle
 
@@ -107,7 +107,7 @@ Every 5 minutes:
 2. Read filesystem for file sizes.
 3. Update the in-memory stats cache.
 
-The cache is what `ADMIN_STATS` reads. Without the cache, every stats request would do these queries — expensive.
+The cache is what the stats surfaces read — `GET /metrics` and `GET /v1/diagnostics/debug-snapshot`. Without it, every scrape would re-run these queries.
 
 ### 3.3 The cost
 

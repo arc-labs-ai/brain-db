@@ -151,7 +151,7 @@ The connection caps in §10 are enforced at accept, before TLS and before the ha
 | `Overloaded` (0x0091) | Server temporarily overloaded |
 | `Restarting` (0x0092) | Server is restarting (drain mode) |
 | `Maintenance` (0x0093) | Server is in maintenance mode |
-| `RetrieverDegraded` (0x0094) | Reserved for admin and diagnostic surfaces (`/health`, `ADMIN_STATS`) when a shard reports a degraded retriever set — e.g. a tantivy segment corruption or a graph-store `pwritev2` failure observed after spawn. Never returned to a normal RECALL: shards refuse to spawn if a required retriever is unwired, so a wired retriever failing at query time propagates as an internal error rather than a downgrade signal. There is no client-visible recovery action; the remedy is operator intervention. |
+| `RetrieverDegraded` (0x0094) | Reserved for admin and diagnostic surfaces (`/readyz`, `/metrics`) when a shard reports a degraded retriever set — e.g. a tantivy segment corruption or a graph-store `pwritev2` failure observed after spawn. Never returned to a normal RECALL: shards refuse to spawn if a required retriever is unwired, so a wired retriever failing at query time propagates as an internal error rather than a downgrade signal. There is no client-visible recovery action; the remedy is operator intervention. |
 | `LlmCredentialUnavailable` (0x0095) | The per-namespace credential could not be resolved right now — the credential store could not answer, or the key that sealed the row is no longer loaded. Retryable, unlike `LlmCredentialMissing`. |
 
 ##### 3.9a The two LLM-credential codes
@@ -521,7 +521,14 @@ These are checked in order — dimension first (cheapest), then finiteness, then
 #### 16.8 ADMIN_*
 
 - The connection's key MUST carry the `ADMIN` permission bit (resolved during AUTH). Otherwise `PermissionDenied`.
-- Per-admin-opcode parameter validation as documented in the opcode's request shape.
+- The permission check comes first, and for the substrate admin range it is the
+  only check that runs: an authorized caller then receives `InvalidRequest`
+  naming the HTTP admin listener, because those opcodes are refused on this
+  plane by design (§03 §1.6). So a client cannot distinguish "I lack the admin
+  bit" from "this operation is HTTP-only" by the error alone — the first is
+  `PermissionDenied`, the second `InvalidRequest`.
+- `ADMIN_LIST_PENDING_CONTRADICTIONS` is the one that proceeds to parameter
+  validation, as documented in its request shape.
 
 #### 16.9 Typed-graph opcodes (`0x01xx`)
 
@@ -659,7 +666,7 @@ Validation of the `QueryRequest` accepted by `QUERY_EXPLAIN` / `QUERY_TRACE`:
 ##### 16.9.7 Admin opcodes (`0x0178`)
 
 - `audit_id`, `job_id`: non-zero UUIDv7; existence checked at handler.
-- `extractor_ids` (for `ADMIN_BACKFILL`): non-empty; all must be registered.
+- `extractor_ids` (for `POST /v1/backfill`): non-empty; all must be registered.
 - `memory_range`: `start ≤ end` (unix nanos) → `InvalidArgument`.
 
 ##### 16.9.8 Constants

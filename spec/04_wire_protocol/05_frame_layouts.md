@@ -376,6 +376,18 @@ struct ByeRequest {
 }
 ```
 
+## Substrate admin frames (§16-§25, §35, §51-§60, §70) — layouts for refused opcodes
+
+The frames below are the ones the substrate admin range was designed with, and
+they are documented because the opcode numbers are allocated and must not be
+renumbered. **The dispatcher refuses every one of them** with *"admin
+operations are served over the HTTP admin listener, not the wire protocol"* —
+a permanent rejection, not a version gate. A client that needs one of these
+operations calls the corresponding route in
+[05.06 Admin operations](../05_operations/06_admin.md); §03 §1.6 maps each
+opcode to its route. The one admin frame that is served is
+`ADMIN_LIST_PENDING_CONTRADICTIONS` (§36 / §71).
+
 ### 16. ADMIN_STATS_REQ (0x60)
 
 ```rust
@@ -662,7 +674,7 @@ struct SessionDeleteRequest {
 
 `SESSION_CREATE` is idempotent. `SESSION_LIST` returns one space's sessions newest-first by `last_active`. The default session (`session_id = 0`) is **non-deletable**.
 
-These are the tenant-facing registry ops. The admin-gated `ADMIN_CREATE_SESSION` / `ADMIN_RENAME_SESSION` (§21, §22) are a separate operator surface: they name sessions and are not `act_as`-aware.
+These are the tenant-facing registry ops, and they are the only session surface that works: `SESSION_CREATE` carries the optional `title` and is `act_as`-aware. The `ADMIN_CREATE_SESSION` / `ADMIN_RENAME_SESSION` frames (§21, §22) are refused on the wire, and nothing renames a session anywhere.
 
 ### 33a. LLM_CREDENTIAL_PUT_REQ (0x76) / GET (0x77) / DELETE (0x78) / VERIFY (0x79)
 

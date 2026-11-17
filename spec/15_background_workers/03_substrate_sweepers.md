@@ -158,7 +158,7 @@ When the cleanup resumes, it catches up over a few cycles.
 
 ### 14. The "manual cleanup" override
 
-`ADMIN_IDEMPOTENCY_PRUNE` triggers an immediate full cleanup, bypassing the timer-based scheduling. Useful when the table has grown unexpectedly.
+An immediate full cleanup that bypasses the timer was specified as `ADMIN_IDEMPOTENCY_PRUNE` and **not built**. The nearest live equivalent is `POST /v1/workers/idempotency_cleanup/run-now`, which runs one ordinary cycle — bounded by `batch_size`, so a table that has grown unexpectedly clears over several.
 
 ### 15. The TTL change scenario
 
@@ -325,11 +325,11 @@ Before reclaiming, the worker re-checks that the memory is still tombstoned. A r
 - Memory is tombstoned at time T.
 - Grace period elapses at time T+7d.
 - The worker schedules reclamation.
-- Meanwhile, an operator runs `ADMIN_RESTORE` to undo the FORGET (a hypothetical operation).
+- Meanwhile, an operator calls `POST /v1/memories/{id}/restore` to undo the FORGET.
 
 The check ensures the system does not reclaim something that was un-tombstoned. If un-tombstoned, the worker skips it.
 
-(`ADMIN_RESTORE` isn't currently implemented; this is defensive.)
+(That route exists, so this ordering is reachable rather than hypothetical.)
 
 ### 28. The free list
 
@@ -541,12 +541,12 @@ Such failures are bugs and should be caught in testing. The retention buffer pro
 
 ### 45. The interaction with snapshots
 
-When a snapshot is taken (`ADMIN_SNAPSHOT_CREATE`):
+When a snapshot is taken (`POST /v1/snapshots`):
 
 - The snapshot includes the current state up to a known LSN.
 - The snapshot is not a substitute for the WAL.
 
-WAL retention is independent of snapshots. A snapshot may exist that includes the deleted WAL data, but recovery uses snapshots only via explicit `ADMIN_RESTORE`.
+WAL retention is independent of snapshots. A snapshot may exist that includes the deleted WAL data, but recovery uses snapshots only through an explicit `POST /v1/snapshots/{id}/restore`.
 
 ### 46. The cleanup cost
 
@@ -582,7 +582,7 @@ For now, simple structured logs are enough. Cryptographic logging is a future en
 
 ### 50. The "manual delete" override
 
-`ADMIN_WAL_PRUNE <up_to_lsn>` triggers an immediate retention pass with the specified LSN cutoff. Useful for:
+An immediate retention pass with an operator-supplied LSN cutoff was specified as `ADMIN_WAL_PRUNE` and **not built**; `POST /v1/workers/wal_retention/run-now` runs one ordinary pass, which computes its own cutoff. It would be useful for:
 
 - Reclaiming space after operator confirmation.
 - Cleaning up after a known recovery completion.

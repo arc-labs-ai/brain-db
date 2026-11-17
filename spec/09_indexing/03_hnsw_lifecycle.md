@@ -309,19 +309,19 @@ This is faster than a full rebuild but more complex. Brain doesn't currently imp
 The worker runs:
 - On a regular interval (default 5 minutes) to check stats.
 - After bulk operations (consolidation, migration, large FORGETs).
-- On-demand via `ADMIN_REBUILD_ANN`.
+- On-demand via `POST /v1/rebuild-ann`.
 
 The interval is conservative; most shards won't need maintenance most of the time. The worker's check itself is cheap (just reading stats); only the rebuild action is expensive.
 
 ### 21. Maintenance and snapshots
 
-When a snapshot is taken (`ADMIN_SNAPSHOT_CREATE`), the snapshot includes the HNSW snapshot file (if persistence is enabled) reflecting the current state.
+When a snapshot is taken (`POST /v1/snapshots`), the snapshot includes the HNSW snapshot file (if persistence is enabled) reflecting the current state.
 
 Maintenance shouldn't run concurrently with snapshot creation. The two are serialized: if a snapshot is being taken, maintenance defers; if maintenance is running, snapshot waits briefly.
 
 ### 22. Manual rebuild
 
-`ADMIN_REBUILD_ANN` triggers an immediate full rebuild. Use cases:
+`POST /v1/rebuild-ann[?shard=N]` triggers an immediate full rebuild. Use cases:
 
 - After a known event that degraded the index (mass deletion, model migration).
 - Before a benchmark, to ensure fresh graph quality.
@@ -331,7 +331,7 @@ The operation:
 1. Rejects if a rebuild is already in progress.
 2. Triggers the rebuild.
 3. Returns immediately (rebuild is async).
-4. Status is queryable via `ADMIN_STATS`.
+4. There is no status to poll: the route is synchronous and its response reports the entry count and elapsed time.
 
 ### 23. Failure handling
 

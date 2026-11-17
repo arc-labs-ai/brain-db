@@ -376,7 +376,7 @@ Re-embedding every memory under a new model is **not** currently part of that su
 | `FORGET` | Write | No | Yes | ~3 ms |
 | `SUBSCRIBE` | Read | Yes | No | ~1 ms (setup) |
 | `TXN_*` | Both | No | Yes (on commit) | ~5 ms |
-| `ADMIN_*` | Both | Varies | Varies | Varies |
+| `ADMIN_*` | — | — | — | Refused on the wire; the operator plane is HTTP (`05.06`). `ADMIN_LIST_PENDING_CONTRADICTIONS` is the exception |
 
 ---
 

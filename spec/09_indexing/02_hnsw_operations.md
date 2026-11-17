@@ -436,7 +436,7 @@ The maintenance worker rebuilds the HNSW when:
 
 - Tombstone ratio > 30% (configurable threshold).
 - Recall has degraded measurably (sampling-based detection).
-- Operator runs `ADMIN_REBUILD_ANN`.
+- Operator calls `POST /v1/rebuild-ann`.
 
 Rebuild is described in [`03_hnsw_lifecycle.md`](03_hnsw_lifecycle.md). Briefly: a new HNSW is built from the current set of active memories, and atomically swapped in.
 
@@ -505,7 +505,7 @@ Per-shard metrics:
 - `tombstone_ratio` — `tombstone_count / total_memory_count`.
 - `last_rebuild_at` — when the last full rebuild completed.
 
-These metrics drive the maintenance worker's scheduling decisions and are exposed via `ADMIN_STATS`.
+These metrics drive the maintenance worker's scheduling decisions and are exposed on `GET /metrics`.
 
 ### 42. Bulk deletion
 
@@ -515,7 +515,7 @@ For workloads with bulk deletes (e.g., "forget everything in this context", "evi
 2. Tombstone counts rise sharply.
 3. The rebuild trigger fires once the threshold is reached.
 
-For very large bulk deletes, the operator can run `ADMIN_REBUILD_ANN` to force an immediate rebuild and bypass the threshold-based scheduling.
+For very large bulk deletes, the operator can call `POST /v1/rebuild-ann` to force an immediate rebuild and bypass the threshold-based scheduling. The call blocks until the rebuild finishes.
 
 ---
 

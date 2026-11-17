@@ -343,7 +343,7 @@ Metrics:
 - `entity_resolution_latency_seconds{tier}` — latency histogram per tier.
 - `entity_resolution_llm_cost_usd_total` — cost tracking when LLM tier is enabled.
 
-Operators can inspect audits via `ADMIN_GET_RESOLUTION_AUDIT`.
+Operators inspect these audits with `GET /v1/audit`, which reads the extraction- and resolution-audit tables (`GET /v1/audit/export` for the bulk form).
 
 ### 9.7 Handling ambiguity proactively
 

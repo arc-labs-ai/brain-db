@@ -422,7 +422,7 @@ Field semantics mirror `brain_core::Entity`. One projection used by `GET`, `UPDA
 
 #### What `EntityView` deliberately omits
 
-- The raw embedding bytes. Operators that need the embedding reach the entity HNSW via `ENTITY_RESOLVE` or `ADMIN_GET_AUDIT`-style debug paths.
+- The raw embedding bytes. Operators that need the embedding reach the entity HNSW via `ENTITY_RESOLVE`, or the audit rows through `GET /v1/audit`.
 - Reference counts to specific statements / relations. Use `STATEMENT_LIST` / `RELATION_LIST_FROM`.
 
 ### Idempotency cache key (entity ops)
@@ -768,7 +768,7 @@ Same shape as `STATEMENT_HISTORY` — one `StatementView` per match, tail frame 
 
 ### Pending subjects on the wire
 
-A statement with `subject_pending_audit_id != [0;16]` indicates the subject is unresolved (an ambiguity audit is pending). Clients should treat such statements as **queryable but excluded from graph joins on subject** until `ADMIN_RESOLVE_AMBIGUITY` (see [`./09_typed_graph_admin.md`](./09_typed_graph_admin.md)) decides the binding.
+A statement with `subject_pending_audit_id != [0;16]` indicates the subject is unresolved (an ambiguity audit is pending). Clients should treat such statements as **queryable but excluded from graph joins on subject** until the binding is decided. Deciding it was to be `ADMIN_RESOLVE_AMBIGUITY`: the handlers exist (`brain_ops::handlers::admin::merge_review` — list, approve, reject) and **nothing reaches them**, with no opcode and no admin route wired to any of the three. What resolves a pending subject today is the ambiguity-resolver worker, on its own cadence.
 
 `STATEMENT_LIST` does not filter pending subjects by default; clients that want only resolved subjects filter client-side on `flags & 1 == 0`.
 

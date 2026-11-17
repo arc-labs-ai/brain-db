@@ -902,7 +902,7 @@ After discovery, Brain has a list of memory IDs. It runs the "forget by ID" path
 - A single FORGET request can affect at most 100,000 memories.
 - Beyond this, the request fails with `TooManyMemories`.
 
-For larger bulk operations, the operator uses `ADMIN_CONTEXT_DELETE` (which does its own staged processing) or scripts a sequence of capped FORGETs.
+For larger bulk operations the caller uses `SESSION_DELETE`, which cascades a whole session's memories and graph rows in one op, or `DELETE /v1/spaces/{id}` for an entire space; otherwise it scripts a sequence of capped FORGETs.
 
 ### 7. The idempotency check
 

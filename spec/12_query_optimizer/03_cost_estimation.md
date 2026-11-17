@@ -200,7 +200,7 @@ The accuracy is enough for parameter picking and budget enforcement. Not enough 
 
 ## 12. The cost is not exposed to clients
 
-Clients don't see cost estimates. Brain's response is just the answer. (For debugging, `ADMIN_EXPLAIN_PLAN` returns the plan including cost estimate.)
+Clients don't see cost estimates. Brain's response is just the answer. (For debugging, the data-plane `QUERY_EXPLAIN` returns the plan including its cost estimate, and `QUERY_TRACE` returns what the executed query did.)
 
 ## 13. Logging cost vs actual
 

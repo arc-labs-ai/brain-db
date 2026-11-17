@@ -562,7 +562,7 @@ Every opcode in the `0x00xx` namespace works in both modes:
 | `RECALL_REQ` | works normally; runs the retrieval path (semantic + lexical + memory-edge graph) — retrieval is the default in both modes |
 | `PLAN_REQ`, `REASON_REQ`, `FORGET_REQ`, `LINK_REQ`, `UNLINK_REQ` | unchanged |
 | `SUBSCRIBE_REQ` | works; carries substrate events only (no typed-graph events possible since none can be emitted) |
-| `ADMIN_*` | unchanged |
+| `ADMIN_LIST_PENDING_CONTRADICTIONS` | works; returns an empty list, since no typed-graph writes exist to contradict each other |
 | `TXN_*` | unchanged |
 
 This is Brain's "first-class deployment posture" described in [`../../README.md`](../../README.md) and [`../00_overview/00_index.md`](../00_overview/00_index.md).
@@ -929,7 +929,7 @@ Cross-references:
 
 Responses live at `0x01F0–0x01FF`; this one's is `0x01F8`. `0x0170`–`0x0177` are unallocated.
 
-The typed-graph admin range holds exactly one operation. The operator surface that exists alongside it lives in the **substrate** admin range (`0x00xx`), not here: backfill is `ADMIN_BACKFILL` (`0x006E`) with `ADMIN_BACKFILL_CANCEL` (`0x006F`), and snapshots, restore, integrity check and embedding migration are `0x0061`–`0x0064`. See [`03_opcodes.md`](03_opcodes.md) §1.6 and [`05_frame_layouts.md`](05_frame_layouts.md) §35.
+The typed-graph admin range holds exactly one operation, and it is the only `ADMIN_*` opcode the dispatcher serves. The substrate admin range (`0x00xx`) holds the numbers for everything else — backfill at `0x006E` / `0x006F`, snapshots, restore, integrity check and embedding migration at `0x0061`–`0x0064` — and every one of them is **refused on the wire**, because the operator surface is the HTTP admin listener. This one is dispatched because it is a per-shard read of this shard's own contradiction audit, not an operational command. See [`03_opcodes.md`](03_opcodes.md) §1.6, [`05_frame_layouts.md`](05_frame_layouts.md) §35, and [`../05_operations/06_admin.md`](../05_operations/06_admin.md) for the route table.
 
 ### ADMIN_LIST_PENDING_CONTRADICTIONS (0x0178)
 
@@ -963,7 +963,7 @@ currently-live contradictions.
 
 ### Backfill runs
 
-`ADMIN_BACKFILL` (`0x006E`) is the one long-running admin operation, and it does not use a generic "job" surface. The request names a `BackfillScope` (`All`, or an inclusive `MemoryId` range) and a list of `extractor_ids`, and the response returns a `backfill_id` plus an immediate `BackfillProgress` snapshot. `ADMIN_BACKFILL_CANCEL` (`0x006F`) stops an in-flight run by that id and returns the final snapshot.
+Backfill is the one long-running admin operation, and it does not use a generic "job" surface. It is driven by `POST /v1/backfill` (submit, returning the run id), `GET /v1/backfill` (progress) and `DELETE /v1/backfill/{id}` (cancel); the `ADMIN_BACKFILL` opcodes `0x006E` / `0x006F` are allocated and refused, like the rest of the substrate admin range. The request names a `BackfillScope` (`All`, or an inclusive `MemoryId` range) and a list of `extractor_ids`, and the response returns a `backfill_id` plus an immediate `BackfillProgress` snapshot. `ADMIN_BACKFILL_CANCEL` (`0x006F`) stops an in-flight run by that id and returns the final snapshot.
 
 ```
 BackfillProgress {

@@ -624,7 +624,7 @@ Operators monitor these to track maintenance health.
 
 ### 48. The "manual rebuild" override
 
-`ADMIN_REBUILD_ANN <shard_id>` triggers an immediate rebuild, bypassing the threshold-based scheduling. Use cases:
+`POST /v1/rebuild-ann?shard=N` triggers an immediate rebuild, bypassing the threshold-based scheduling. Use cases:
 
 - After a known degradation event (mass deletion).
 - Before a benchmark.
@@ -652,7 +652,7 @@ Operators address this by:
 
 ### 51. The interaction with snapshots
 
-When a snapshot is taken (`ADMIN_SNAPSHOT_CREATE`), the snapshot includes the current HNSW state (if persistence is enabled).
+When a snapshot is taken (`POST /v1/snapshots`), the snapshot includes the current HNSW state (if persistence is enabled).
 
 The maintenance worker shouldn't run concurrent with snapshot creation. The two are serialized: if a snapshot is in progress, the worker waits; if the worker is running, the snapshot waits briefly.
 

@@ -584,7 +584,7 @@ Note: an aggressive consolidation policy could choose to evict the source episod
 What state is observable from outside:
 
 - **`Active`** — fully visible. All fields readable, all queries return it.
-- **`Tombstoned`** — invisible to client queries; visible to admin tools (`ADMIN_LIST_TOMBSTONED`).
+- **`Tombstoned`** — invisible to client queries. No surface enumerates them in v1: `MEMORY_LIST`'s `include_tombstoned` flag is honoured at the row level, but the timeline index drops a memory's row when it is tombstoned, so there are no rows there to return.
 - **`Reclaimed`** — the memory is gone and nothing replaces it; querying with its `MemoryId` returns `MemoryNotFound`.
 
 Clients should not rely on observing tombstoned state. The contract is "after `FORGET` returns, the memory is no longer queryable"; how long it stays on disk is an operator-visible retention policy, not a client-visible one.

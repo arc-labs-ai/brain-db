@@ -229,7 +229,7 @@ is logged as such.
 
 A common pattern for a downstream consumer:
 
-1. Take a snapshot of the current state via `ADMIN_SNAPSHOT_CREATE`.
+1. Take a snapshot of the current state with `POST /v1/snapshots`.
 2. Note the snapshot's LSN.
 3. SUBSCRIBE with `from_lsn = snapshot_lsn + 1`.
 

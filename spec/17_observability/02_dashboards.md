@@ -49,7 +49,7 @@ Panels:
 
 There is **no memory-count gauge** to put on this dashboard. The nearest
 emitted stand-in is `brain_arena_slots_used`, which counts allocated slots
-including tombstoned ones; a live count comes from `ADMIN_STATS`, not from
+including tombstoned ones; a live count comes from `GET /v1/diagnostics/debug-snapshot`, not from
 metrics.
 
 This is the "first dashboard to look at" when something feels wrong.

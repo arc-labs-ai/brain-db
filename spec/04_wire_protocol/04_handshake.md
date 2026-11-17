@@ -230,7 +230,7 @@ The shard ID this space is bound to. The client uses it for routing optimization
 
 The key's permitted operations. Typically all data-plane operations are allowed; admin operations require elevated permissions.
 
-If the caller attempts an operation outside its permissions (e.g., calling `ADMIN_SNAPSHOT` without `can_admin`), the server returns `ERROR(PermissionDenied)`.
+If the caller attempts an operation outside its permissions (e.g., calling `ADMIN_LIST_PENDING_CONTRADICTIONS` without `can_admin`), the server returns `ERROR(PermissionDenied)`.
 
 `can_act_as` is a distinct grant: it does not widen what the connection's own space may do, it authorizes the connection to run an op *on behalf of another identity* via the per-request `act_as` field (§10a "Per-request identity (`act_as`)"). It is backed by the permission bit `ACT_AS = 1 << 6` in the minted-key bitfield and is held only by a trusted service principal (an edge or gateway); an ordinary tenant key never carries it. The bit is granted at key-mint over the admin HTTP surface, together with a `may_act` namespace allowlist that bounds which namespaces the principal may act for (both defined in [`../17_observability/04_admin_ops.md`](../17_observability/04_admin_ops.md)); no data-plane opcode mints or elevates it.
 

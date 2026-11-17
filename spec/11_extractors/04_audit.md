@@ -130,8 +130,8 @@ so recency ordering needs no timestamp index.
 the time index, filters, and stops at `limit`, so in the worst case it scans
 more rows than it returns.
 
-Wire surface for these queries lands in a post-v1 admin op
-(`ADMIN_GET_EXTRACTION_AUDIT`) the API
+The operator surface for these queries is `GET /v1/audit` on the admin
+plane (bulk: `GET /v1/audit/export`); the API
 internally only.
 
 ## 5. Retention

@@ -193,7 +193,7 @@ For most users, routing is invisible. The client abstracts it away.
 
 Some operations target all shards:
 
-- `ADMIN_STATS` (gathers stats from all).
+- `GET /v1/shards` and `GET /v1/workers` (listings that fan out across shards).
 - Cross-space queries (rare).
 
 For these, Brain iterates the routing table and calls each shard:
@@ -359,7 +359,7 @@ For RECALL/FORGET/etc. on an unknown space:
 
 ## 29. The "delete space" operation
 
-`ADMIN_AGENT_DELETE <space_id>` removes a space and all its data:
+`DELETE /v1/spaces/{id}` removes a space and all its data:
 
 - Tombstones all the space's memories.
 - Removes the space's metadata.

@@ -131,8 +131,9 @@ predict_linear(brain_arena_used_bytes[30d], 30 * 86400)
 There is no live-memory-count gauge. `brain_arena_slots_used` counts allocated
 slots, **tombstoned ones included**, which is the right basis for a capacity
 forecast anyway: a tombstoned slot occupies arena space until reclamation runs.
-A live count — for a space, a session or a shard — comes from `ADMIN_STATS` or
-`GET /v1/spaces`, where it can be scoped without putting a tenant id on a
+A live count comes from `GET /v1/diagnostics/debug-snapshot?shard=N` for a
+shard, or `GET /v1/spaces` for the space listing, where it can be scoped
+without putting a tenant id on a
 metric series.
 
 Both are gauges that only rise until reclamation runs, which is what makes
@@ -216,8 +217,9 @@ So multi-tenant capacity is planned at the shard, enforced outside Brain, and
 attributed from the logs and the audit trail rather than from metrics. A
 front-door gateway is the natural place to put a rate limit, since it already
 holds the per-tenant identity. Per-space footprint for planning comes from
-`ADMIN_STATS` or `GET /v1/spaces`, which can be scoped to a tenant without
-putting a tenant id on a metric series.
+`GET /v1/spaces`, which can be scoped to a tenant without putting a tenant id
+on a metric series. Per-space *statistics* do not exist yet:
+`GET /v1/spaces/{id}` answers 501 pending a `space_id` secondary index.
 
 ## 15. The "warm-up" planning
 

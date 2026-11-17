@@ -243,7 +243,7 @@ The cost is wire bandwidth on updates with many unchanged aliases. Acceptable un
 
 ### Reasoning
 
-Brain already implements (b) for `RECALL_RESP`, `PLAN_RESP`, `REASON_RESP`, `ADMIN_MIGRATE_EMBEDDINGS_RESP`, `ADMIN_LIST_TOMBSTONED_RESP`. Typed-graph list / query ops have the same shape (one logical result per frame, EOS terminates). Adding a separate envelope would mean two distinct streaming models in one server.
+Brain already implements (b) for `RECALL_RESP`, `PLAN_RESP` and `REASON_RESP`. (`ADMIN_MIGRATE_EMBEDDINGS_RESP` and `ADMIN_LIST_TOMBSTONED_RESP` were specified in this shape and are not implemented — the admin numbers are refused on the wire, §03 §1.6.) Typed-graph list / query ops have the same shape (one logical result per frame, EOS terminates). Adding a separate envelope would mean two distinct streaming models in one server.
 
 ## 15. Opaque attribute / property / evidence blobs
 

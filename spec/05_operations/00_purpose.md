@@ -26,7 +26,7 @@ These are:
 - **LINK** / **UNLINK** — create or remove edges between memories.
 - **TXN_BEGIN** / **TXN_COMMIT** / **TXN_ABORT** — transactional bracket.
 - **SUBSCRIBE** — stream changes to memories.
-- **ADMIN_*** — operational primitives (snapshots, stats, maintenance triggers).
+- **The admin plane** — operational primitives (snapshots, stats, maintenance triggers), served as HTTP routes on the operator's listener rather than as wire opcodes. The `ADMIN_*` numbers that remain in the wire table are refused.
 
 This document specifies what each cognitive operation **means** — not how Brain implements it, but what the agent gets when it calls one.
 
@@ -61,7 +61,7 @@ In addition to the five core primitives, Brain provides:
 - **LINK / UNLINK** — direct edge manipulation.
 - **TXN_*** — transactional brackets across multiple operations.
 - **SUBSCRIBE** — change streams.
-- **ADMIN_*** — administrative operations.
+- **The admin plane** — administrative operations, over HTTP.
 
 ## 2. The "declarative" framing
 
@@ -154,7 +154,7 @@ Admin operations are typically:
 - Privileged (require admin auth).
 - Rare (called by operators, not agents).
 
-Examples: `ADMIN_STATS`, `ADMIN_REBUILD_ANN`, `ADMIN_CONTEXT_DELETE`.
+Examples: `GET /metrics`, `POST /v1/rebuild-ann`, `DELETE /v1/spaces/{id}`. They are HTTP routes on the operator's listener, not wire opcodes — see [`06_admin.md`](06_admin.md).
 
 ## 11. The compositional story
 

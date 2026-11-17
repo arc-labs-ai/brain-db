@@ -1,6 +1,23 @@
 # 07.06 Embedding Migration
 
-The procedure for changing the embedding model on a running deployment. This is the operational playbook; the operations spec covers the wire interface (`ADMIN_MIGRATE_EMBEDDINGS`).
+The procedure for changing the embedding model on a running deployment.
+
+> **Status: specified, not built.** Nothing in the engine performs an embedding
+> migration. The four opcode numbers this section leans on —
+> `ADMIN_MIGRATE_EMBEDDINGS` (`0x0064`), `ADMIN_ABORT_MIGRATION` (`0x006C`),
+> `ADMIN_REGISTER_MODEL` (`0x006B`) and `ADMIN_RETIRE_FINGERPRINT` (`0x006D`) —
+> are allocated in the wire table and have no implementation: the first is
+> refused by the dispatcher along with the rest of the substrate admin range,
+> and the other three have no request body and no dispatch arm at all. There is
+> no admin route either. What exists is the *detection* side: a memory carries
+> its model fingerprint, and a query excludes memories whose fingerprint does
+> not match the active model, which is what makes a model swap visible as
+> missing recall rather than as wrong answers
+> ([`05_fingerprinting.md`](05_fingerprinting.md)).
+>
+> Read this file as the design for that work, and as the reason a model swap on
+> a populated deployment is currently a re-ingest rather than a migration. Each
+> section below describes intended behaviour, not current behaviour.
 
 ## 1. Why migrations happen
 
@@ -27,7 +44,7 @@ In practice, this is more careful — Brain stays available throughout, and the 
 
 Before starting a migration, the operator verifies:
 
-- **Disk space** — re-embedding produces new vectors; if the new model has higher dimensionality, additional storage is needed. Brain's `ADMIN_STATS` reports the projected disk usage.
+- **Disk space** — re-embedding produces new vectors; if the new model has higher dimensionality, additional storage is needed. The arena and storage gauges on `GET /metrics` are what an operator sizes against; no surface projects the figure for a migration that cannot run.
 - **Model compatibility** — the new model's output dimensionality. If it differs from the current dim, the arena needs to be rebuilt with new slot size (a heavier operation).
 - **Backup** — a snapshot taken before migration ensures the old state is recoverable. Always recommended.
 
@@ -76,7 +93,7 @@ The worker:
 
 - Processes memories in batches (typically 100–1000 at a time).
 - Pauses periodically to let request-serving cores breathe.
-- Logs progress and exposes it via `ADMIN_STATS`.
+- Logs progress and exposes it as a metric family.
 - Is resumable — interruption doesn't lose progress (each memory's migration is atomic).
 
 ## 7. Rate limiting
@@ -120,7 +137,7 @@ For operationally-sensitive deployments, two strategies:
 
 ### 9.1 Migrate before swapping
 
-Run `ADMIN_MIGRATE_EMBEDDINGS` while the old model is still active. The migration produces new-fingerprint vectors as a side effect, but queries continue to use the old model. Once migration is complete, the operator swaps the active model — at which point all memories already have the new fingerprint, and queries see 100% coverage immediately.
+Run the migration while the old model is still active. The migration produces new-fingerprint vectors as a side effect, but queries continue to use the old model. Once migration is complete, the operator swaps the active model — at which point all memories already have the new fingerprint, and queries see 100% coverage immediately.
 
 This is the recommended approach.
 
@@ -161,7 +178,7 @@ A different-dim migration may need 2× disk space. If Brain runs out:
 
 ## 11. Aborting a migration
 
-The operator can abort an in-progress migration via `ADMIN_ABORT_MIGRATION`. Behavior:
+Aborting an in-progress migration was to be `ADMIN_ABORT_MIGRATION`. Intended behaviour:
 
 - Same-dim migration: half-migrated memories have the new fingerprint and the new vector; the other half have old fingerprint and old vector. Configuration determines which the active model is. The operator can re-start migration with the same or a different new model.
 
@@ -178,7 +195,7 @@ INSERT INTO model_fingerprints
 VALUES (new_fp, 'bge-base-en-v1.5', timestamp_now, vector_dim_768)
 ```
 
-The registry persists across restarts. Migrations leave the old fingerprint in the registry (it's part of history); a separate `ADMIN_RETIRE_FINGERPRINT` operation removes it after migration completes and the operator confirms no memories carry it.
+The registry persists across restarts. Migrations leave the old fingerprint in the registry (it's part of history); a separate retirement operation (`ADMIN_RETIRE_FINGERPRINT`, an allocated number with nothing behind it) would remove it once the operator confirms no memories carry it.
 
 ## 13. Cross-version migrations
 

@@ -214,7 +214,7 @@ When migration-plan computation lands, each per-type difference between the old 
 
 Default is `re-extract`. This vocabulary is documented here as the target shape; the v1 implementation only ships the flagging sweep (§3.5) — picking and executing an action against flagged rows is a v1.1+ admin tool.
 
-Embedding-model evolution (when the operator swaps in new BGE weights) is a separate concern — see [`../07_embedding/06_migration.md`](../07_embedding/06_migration.md) for the `ADMIN_MIGRATE_EMBEDDINGS` flow.
+Embedding-model evolution (when the operator swaps in new BGE weights) is a separate concern — see [`../07_embedding/06_migration.md`](../07_embedding/06_migration.md) for the migration flow — which is specified and **not built**.
 
 ### 3.5 Adoption of implicit definitions + flagging sweep
 

@@ -529,7 +529,7 @@ There is no per-space session cap. `session_id` is the client's `u64`, not a ser
 
 Nothing in these tables is renameable. A space's string is the input its id was derived from — changing it would derive a different space, which is a different space. A session's `title` is display metadata set at create time.
 
-The admin ops `ADMIN_CREATE_SESSION` / `ADMIN_RENAME_SESSION` are a separate operator surface that carries a `name`; they are admin-gated and not part of the tenant-facing registry.
+`SESSION_CREATE` carries the optional `title` itself and is `act_as`-aware, so naming a session is tenant-facing, not an operator privilege. The `ADMIN_CREATE_SESSION` / `ADMIN_RENAME_SESSION` opcodes that once held that job are refused on the wire, and nothing renames a session on either plane.
 
 ### 9. Deletion
 
@@ -778,7 +778,7 @@ Currently, Brain enforces idempotency-required for:
 
 For these operations, RequestId is mandatory. The wire protocol's validation checks for it.
 
-For RECALL, PLAN, REASON, ADMIN_*, RequestId is optional. If supplied, it's recorded for observability; if not, the operation proceeds without a RequestId.
+For RECALL, PLAN, REASON and the one served admin op, RequestId is optional. If supplied, it's recorded for observability; if not, the operation proceeds without a RequestId.
 
 ## Text Storage
 

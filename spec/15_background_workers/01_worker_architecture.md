@@ -210,7 +210,7 @@ because only the first is automatic:
 ## 13. The "stop" semantics
 
 A worker can be stopped:
-- Operator command (`ADMIN_WORKER_STOP <kind>`).
+- Operator command (`POST /v1/workers/{name}/stop`).
 - Configuration disable (`workers.<kind>.enabled = false`).
 - Shutdown signal at shard close.
 
@@ -219,7 +219,7 @@ After stop, the worker's loop exits cleanly. In-progress work is committed first
 ## 14. The "restart" semantics
 
 A worker can be restarted:
-- Operator command (`ADMIN_WORKER_RESTART <kind>`).
+- Operator command (`POST /v1/workers/{name}/start`, or `run-now` for a single cycle).
 - After config change requiring restart.
 
 The worker loop restarts; previous in-flight state is lost (the worker recomputes what's needed).

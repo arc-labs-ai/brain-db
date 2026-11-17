@@ -195,7 +195,7 @@ These indexes are derived data, rebuilt from the primary rows exactly as the in-
 - The arena is the source of vectors; the WAL is the source of metadata operations.
 - Rebuild iterates the WAL from the start (or from the last known-good metadata snapshot).
 
-**Operator action.** Trigger metadata rebuild via `ADMIN_RECOVER_METADATA`. The shard is offline during rebuild.
+**Operator action.** There is no rebuild operation — `ADMIN_RECOVER_METADATA` was specified and never built. The ways back are a snapshot restore (`POST /v1/snapshots/{id}/restore`) or a restart, which replays the WAL into the metadata store at spawn.
 
 ## 16. The "WAL-only" recovery
 
@@ -546,8 +546,10 @@ let mut failures = audit_by_extractor(&rtxn, ext_id, 1000)?
 failures.sort_by_key(|r| std::cmp::Reverse(r.started_at_unix_nanos));
 ```
 
-A future admin op `ADMIN_GET_EXTRACTION_AUDIT` will wrap this with
-proper filtering + pagination over the wire.
+`GET /v1/audit` serves this on the admin plane, with filtering and
+pagination, and `GET /v1/audit/export` is the bulk form over the same
+selection. Both are deployment-wide operator surfaces gated by the admin
+token, with no per-tenant scoping — like `/metrics` and the snapshot routes.
 
 ## 9. Atomicity invariants
 

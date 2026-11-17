@@ -142,7 +142,7 @@ The cache maintains statistics for observability:
 - **`cache_size`** — current number of entries.
 - **`cache_hit_rate`** — `hits / (hits + misses)` over a rolling window.
 
-Exposed via `ADMIN_STATS`. A typical hit rate is 30–70% depending on workload — repeated queries cached well, novel queries always miss.
+Exposed on `GET /metrics`. A typical hit rate is 30–70% depending on workload — repeated queries cached well, novel queries always miss.
 
 ## 11. What's not cached
 

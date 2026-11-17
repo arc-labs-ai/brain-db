@@ -134,11 +134,11 @@ Move the model to local fast storage; ensure no contention.
 
 **Failure mode.** Operator changes the model without migrating, then queries return few or no results.
 
-**Detection.** This is observable, not flagged automatically: the `ADMIN_STATS` shows the fingerprint distribution and a high "excluded by fingerprint mismatch" rate.
+**Detection.** This is observable, not flagged automatically: `GET /metrics` carries the fingerprint distribution and the "excluded by fingerprint mismatch" rate.
 
 **Response.** Continue serving (queries match the subset that has the new fingerprint, which may be empty if no encodes have happened).
 
-**Operator action.** Run `ADMIN_MIGRATE_EMBEDDINGS` to convert old-fingerprint memories to the new fingerprint. See [`06_migration.md`](06_migration.md).
+**Operator action.** Converting old-fingerprint memories needs a re-embedding migration, which [`06_migration.md`](06_migration.md) specifies and nothing implements. Until it exists, the way out is to keep the model that wrote the corpus, or to re-ingest.
 
 ## 12. Weights absent or in an unsupported format
 

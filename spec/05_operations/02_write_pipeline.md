@@ -191,7 +191,7 @@ If the session name doesn't exist, ENCODE creates it. The new session inherits d
 
 This makes the first ENCODE in a new session "just work" — no separate session-creation step.
 
-If the agent wants to ensure a session's settings (kind defaults, etc.) before encoding, it can use `ADMIN_CONTEXT_CREATE` first.
+If the agent wants to ensure a session's settings (kind defaults, etc.) before encoding, it can use `SESSION_CREATE` first — a tenant-facing wire op, `act_as`-aware, idempotent, and carrying an optional `title`.
 
 ### 10. The "small text" case
 
@@ -573,7 +573,7 @@ soft FORGET → tombstoned (active = false)
 During the grace period:
 - The memory doesn't appear in search results.
 - The memory's MemoryId returns "not found" if queried directly (or returns the tombstoned record with `active=false`, depending on the operation).
-- Operators can recover the memory via `ADMIN_RESTORE_FORGOTTEN` (if configured to allow).
+- Operators can recover the memory with `POST /v1/memories/{id}/restore?namespace=…` on the admin plane. There is no config switch gating it; reaching the admin listener is the gate.
 
 After grace:
 - The vector slot is zeroed and made available.
@@ -644,7 +644,7 @@ brain.forget(target = Filter(ForgetFilter { session: Some(ctx_id) }))
 brain.admin_context_delete(ctx_id)
 ```
 
-Or use `ADMIN_CONTEXT_DELETE` directly (which combines the steps and handles paging for very large sessions).
+Or use `SESSION_DELETE` directly: it cascades the session's memories and their graph rows, soft by default with the usual grace (`hard = true` zeroes immediately), reports `memories_forgotten`, and refuses the default session 0.
 
 ### 10. The "agent delete" pattern
 
@@ -679,7 +679,7 @@ The agent should treat held MemoryIds as potentially-stale; check via RECALL or 
 
 ### 13. The "undo" facility
 
-For Soft FORGET, an admin operation `ADMIN_RESTORE_FORGOTTEN` can undo the forget within the grace period:
+For Soft FORGET, the admin route `POST /v1/memories/{id}/restore` can undo the forget within the grace period:
 
 ```
 brain.admin_restore_forgotten(memory_id)

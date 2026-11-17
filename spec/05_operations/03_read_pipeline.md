@@ -410,7 +410,7 @@ RECALL only ever compares memories carrying the shard's current model
 fingerprint. Cross-model cosine is not meaningful, so this is not a filter the
 caller opts into and there is no flag to relax it. Memories stamped with a
 retired fingerprint become searchable again by migrating them
-(`ADMIN_MIGRATE_EMBEDDINGS`), not by widening the query.
+(a re-embedding migration, which [`../07_embedding/06_migration.md`](../07_embedding/06_migration.md) specifies and nothing implements), not by widening the query.
 
 ### 9. The "salience" effect
 

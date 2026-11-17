@@ -257,7 +257,7 @@ The snapshot mechanism ensures the snapshot represents a consistent point-in-tim
 Brain exposes recovery progress via:
 
 - A startup log line per checkpoint encountered, per WAL segment opened, per N records replayed.
-- A separate admin endpoint (`ADMIN_RECOVERY_STATUS`) that returns current state during recovery.
+- A separate admin endpoint returning current state during recovery. **Not built**: a recovering shard has not finished spawning, so there is nothing for an admin route to query. The log line above is what exists.
 
 For very long recoveries (multi-shard or slow disks), this lets operators monitor progress and estimate completion.
 

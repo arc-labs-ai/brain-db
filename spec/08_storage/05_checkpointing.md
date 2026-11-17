@@ -195,7 +195,7 @@ When a SUBSCRIBE client requests `from_lsn` older than the retention horizon, th
 - Restart from the current LSN (losing the gap).
 - Restore from a snapshot at an older point and replay forward.
 
-The retention horizon is reported in `ADMIN_STATS` so operators can monitor it.
+The retention horizon is visible through the WAL gauges on `GET /metrics` (`brain_wal_size_bytes`, `brain_wal_segments`) so operators can monitor it.
 
 ## 8. Checkpoint corruption
 
@@ -224,7 +224,7 @@ Brain exposes checkpoint metrics:
 - `wal_oldest_lsn` — the LSN of the oldest record still on disk.
 - `wal_retention_target_lsn` — the LSN below which Brain deletes on next sweep.
 
-Available via `ADMIN_STATS`. Operators monitor these to understand recovery times and disk usage.
+Available on `GET /metrics`, and per shard in `GET /v1/diagnostics/debug-snapshot`. Operators monitor these to understand recovery times and disk usage.
 
 ## 11. The "fast restart" path
 

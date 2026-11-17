@@ -1030,7 +1030,7 @@ A tombstoned entity:
 
 Statements / relations are **not** automatically tombstoned or rewritten. They retain their references to the tombstoned id. Queries that follow the references see a tombstoned row.
 
-Operators may use `ADMIN_LIST_STALE_STATEMENTS` ([`../04_wire_protocol/09_typed_graph_admin.md`](../04_wire_protocol/09_typed_graph_admin.md) §"ADMIN_LIST_STALE_STATEMENTS") to find statements whose subject / object is now tombstoned and decide whether to tombstone the statements too.
+Listing them was specified as `ADMIN_LIST_STALE_STATEMENTS` — a way to find statements whose subject or object is now tombstoned and decide whether to tombstone the statements too. **It was never built**, on either plane, and the typed-graph admin range holds no such opcode. What exists is the detection side: the stale-extraction detector flags affected rows, and the forget cascade tombstones a statement whose evidence is gone when its confidence falls below the cascade threshold.
 
 ### GC eligibility
 

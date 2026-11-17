@@ -26,7 +26,7 @@ The reflink ioctl is `FICLONE` (or `FICLONERANGE` for partial files), defined in
 
 ## 2. The snapshot procedure
 
-A snapshot is created by `ADMIN_SNAPSHOT_CREATE`. The operation:
+A snapshot is created by `POST /v1/snapshots[?shard=N]` on the admin plane. The operation:
 
 1. **Checkpoint.** Run the checkpoint sequence inline: append `CHECKPOINT_BEGIN` and sample the WAL tail, `msync` the arena, then append `CHECKPOINT_END` carrying `min(durable watermark, sampled tail)`. Writes are neither drained nor paused.
 2. **Reflink-copy.** Issue `FICLONE` on `arena.bin` and `metadata.redb`, plus the WAL segments since the checkpoint. The arena copy is taken straight after step 1's `msync_all`, so its on-disk image matches the checkpoint's `durable_lsn`; the metadata copy is taken with a read transaction held and released first.
@@ -109,8 +109,8 @@ If the snapshot is several minutes (or hours) old, the operator may also want to
 
 Operators decide how many snapshots to keep. Brain offers:
 
-- `ADMIN_SNAPSHOT_LIST` — list all snapshots with their metadata.
-- `ADMIN_SNAPSHOT_DELETE` — remove a snapshot.
+- `GET /v1/snapshots` — list all snapshots with their metadata, fanned out across shards.
+- `DELETE /v1/snapshots/{id}[?shard=N]` — remove a snapshot.
 - A configurable retention policy: "keep last N", "keep all newer than M days", etc.
 
 Old snapshots can be moved to colder storage (S3, tape) for archival. Brain doesn't manage this; it's an operational concern.
@@ -212,7 +212,7 @@ A reflink itself doesn't consume disk space. But if the snapshot manifest write 
 
 ### 13.3 Concurrent admin operations
 
-Two `ADMIN_SNAPSHOT_CREATE` calls cannot run concurrently on the same shard. The shard's receive loop handles the snapshot request inline rather than detaching it, so a second one waits in the channel until the first returns.
+Two `POST /v1/snapshots` calls cannot run concurrently on the same shard. The shard's receive loop handles the snapshot request inline rather than detaching it, so a second one waits in the channel until the first returns.
 
 A snapshot runs concurrently with normal user operations. Writes already in flight when the snapshot starts keep going, and each one's inclusion is decided by the durable watermark the snapshot reads, not by timing.
 
