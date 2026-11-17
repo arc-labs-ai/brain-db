@@ -240,16 +240,37 @@ If recovery encounters errors that prevent full success:
 
 Brain doesn't auto-degrade — it prefers fail-stop to silent partial recovery.
 
-## 17. The recovery metrics
+## 17. What recovery reports
 
-Per recovery:
+**There is no `brain_recovery_*` metric family.** Nothing counts restarts,
+times a replay, or records when the last one happened, and unlike the families
+in [17.03](../17_observability/03_alerts.md) these are not declared deferred
+either — a rule or dashboard written against them would simply never fire.
+Recovery reports itself in two places instead.
 
-- `brain_recovery_count_total`: incremented each restart.
-- `brain_recovery_duration_sec`: how long it took.
-- `brain_recovery_records_replayed`: how many WAL records.
-- `brain_recovery_last_unixtime`: when last recovery happened.
+**One log line per shard, at `info`**, emitted after `recover()` returns:
 
-These help operators track recovery patterns.
+```text
+WAL recovery complete
+  shard_id, records_replayed, records_skipped, records_discarded,
+  next_lsn, tail_segment_seq, tail_offset
+```
+
+That is the per-recovery record: `records_replayed` is what the spec above
+describes, `records_discarded` is what the cut dropped, and the tail pair is
+where the log resumes. Timing is the gap between this line and the shard's
+spawn line, not a field.
+
+**Two gauges on `/metrics`** describe the WAL afterwards rather than the
+recovery itself: `brain_wal_size_bytes` and `brain_wal_segments`, per shard.
+Bounding the replay window is what they are for — a WAL that keeps growing
+across restarts is the thing an operator can act on.
+
+One gap worth knowing: when boot takes the loss-free cut, `recover()` returns
+a `hole_discard` report carrying the first discarded LSN, the bytes dropped and
+the count of well-formed records found past the hole. The shard's log line does
+not include those fields, so today the extent is available to a caller of the
+library and not to an operator reading logs.
 
 ## 18. The "warm restart" optimization (future)
 

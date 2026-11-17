@@ -101,8 +101,11 @@ unindexed until a rebuild is triggered, and a lexical read over that
 window silently returns fewer hits than redb could support. Shrinking
 N shrinks the window.
 
-Configurable per shard via `BRAIN_TANTIVY_COMMIT_N` (default 256)
-and `BRAIN_TANTIVY_COMMIT_MS` (default 1000) env vars.
+Both come from the `[index]` config section — `tantivy_commit_n`
+(default 256) and `tantivy_commit_ms` (default 1000) — and apply to
+every shard in the process. As with any config field, the environment
+override is `BRAIN__INDEX__TANTIVY_COMMIT_N`, with two underscores per
+level; there is no single-underscore `BRAIN_TANTIVY_*` variable.
 
 ## 4. Segment merge
 

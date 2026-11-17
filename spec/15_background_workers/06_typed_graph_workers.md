@@ -358,8 +358,8 @@ Matches [`../13_retrievers/00_purpose.md`](../13_retrievers/00_purpose.md).
 
 `commit_due(batch_size, last_commit_at)` returns `true` when:
 
-- `batch_size >= BRAIN_TANTIVY_COMMIT_N` (default 256), OR
-- `now() - last_commit_at >= BRAIN_TANTIVY_COMMIT_MS` (default 1000 ms).
+- `batch_size >= [index] tantivy_commit_n` (default 256), OR
+- `now() - last_commit_at >= [index] tantivy_commit_ms` (default 1000 ms).
 
 On `commit()` returning `Err`:
 - Retry once after a 10 ms backoff.
@@ -441,7 +441,10 @@ Low priority lane per [`./00_purpose.md`](./00_purpose.md) (≤ 5% of shard time
 
 #### Cadence
 
-Clock-triggered. Configurable per worker via `BRAIN_<NAME>_PERIOD_SECONDS`. The scheduler computes the next tick from the previous tick's completion time; a slow tick doesn't accumulate backlog beyond one cycle.
+Clock-triggered, from the built-in cadence table (`WorkerConfig::defaults_for`). A worker's
+cadence is operator-settable only where its own `[workers.<name>]` section
+declares a key for it — see the configuration summary at the end of this
+file. The scheduler computes the next tick from the previous tick's completion time; a slow tick doesn't accumulate backlog beyond one cycle.
 
 #### Bounded batches
 
@@ -478,9 +481,9 @@ Sweepers are stateless. On shard restart they re-attach to the scheduler and run
 
 **Spec source:** [`../10_metadata/00_purpose.md`](../10_metadata/00_purpose.md#retention) — superseded statements + relations are retained "Forever" by default; operators opt in to sweeping.
 
-**Cadence default:** daily (`BRAIN_SUPERSESSION_SWEEPER_PERIOD_SECONDS = 86400`).
+**Cadence default:** daily (`[workers.supersession_sweeper] period_seconds`).
 
-**Retention default:** `0` seconds — disabled. The worker checks the config at the top of each tick; if zero, returns `Ok(())` immediately.
+**Retention default:** `0` seconds, which sweeps nothing: a zero makes the cycle return immediately. Set `[workers.supersession_sweeper] retention_seconds` to arm it, and `dry_run = true` first to see what a cycle would delete. So the worker has two gates — `enabled` decides whether it is registered at all, and a non-zero retention decides whether a registered cycle does anything.
 
 **Batch cap default:** 256 rows.
 
@@ -505,9 +508,12 @@ for entry in STATEMENTS_TABLE.iter():
 
 **Spec source:** [`../10_metadata/00_purpose.md`](../10_metadata/00_purpose.md#retention) — extraction + resolution audit logs at 90 d default; merge logs forever.
 
-**Cadence default:** daily (`BRAIN_AUDIT_SWEEPER_PERIOD_SECONDS = 86400`).
+**Cadence default:** daily (built-in, 86 400 s; no config key).
 
-**Retention default:** 90 d (`BRAIN_AUDIT_RETENTION_SECONDS = 7_776_000`).
+**Retention default:** 90 d (`DEFAULT_AUDIT_RETENTION_SECONDS`). The worker
+exposes `with_retention_seconds`, but the server constructs it with
+`AuditLogSweeper::new()` and wires nothing to it, so the default is the only
+value a deployment can have today. A retention of `0` disables the sweep.
 
 **Batch cap default:** 1024 rows (audit rows are small; larger batches are cheap).
 
@@ -533,21 +539,22 @@ UUIDv7 keys make the audit table time-ordered. A range-scan optimisation (`[`0..
 
 **Spec source:** [`../10_metadata/00_purpose.md`](../10_metadata/00_purpose.md#retention) — LLM cache 90 d default; [`../10_metadata/03_substrate_tables.md`](../10_metadata/03_substrate_tables.md) — table layout.
 
-**Cadence default:** hourly (`BRAIN_LLM_CACHE_SWEEPER_PERIOD_SECONDS = 3600`).
+**Cadence default:** hourly (`[workers.llm_cache_sweep] interval_secs = 3600`,
+with `enabled` alongside it).
 
-**Two passes per tick:**
+**One pass per tick.** `sweep_expired` deletes every row whose expiry is
+`<= now`, from the response table and the TTL secondary index, in a single
+`WriteTransaction`. Each candidate row carries its own authoritative expiry
+and is deleted only when *that* expiry has passed, because re-caching an input
+writes a fresh row and leaves the earlier TTL hint behind.
 
-1. **TTL expiry pass.** Drop rows with `created_at_ns <= now_ns - ttl_seconds * 1e9`.
-2. **Capacity enforcement pass.** Sum total bytes of the `LLM_CACHE_TABLE`. If `> max_bytes`, evict by ascending `last_used_at_ns` (or `created_at_ns` — see eviction note below) until under cap.
+**There is no capacity pass.** Nothing sums the table's bytes and nothing
+evicts by recency: the cache is bounded by TTL alone, and a deployment with
+many distinct inputs inside one TTL window holds all of them.
 
-Both passes share a single `WriteTransaction` per tick.
-
-**Defaults:**
-
-- `BRAIN_LLM_CACHE_TTL_SECONDS = 7_776_000` (90 d).
-- `BRAIN_LLM_CACHE_MAX_BYTES = 1_073_741_824` (1 GiB). `0` disables capacity enforcement.
-
-**Batch cap default:** 1024 per pass.
+**Expiry** is set per row at insert, from the extractor's own `cache_ttl`
+declaration in the extractor document; the default when a document omits it is
+**7 days**, not 90. It is a schema value, not an operator knob.
 
 **No-op when slot is None.** If `OpsContext.llm_cache` is `None` (schemaless deployment — no LLM extractors configured), the worker returns `Ok(())` immediately.
 
@@ -559,7 +566,7 @@ Both passes share a single `WriteTransaction` per tick.
 
 **Spec source:** [`../10_metadata/00_purpose.md`](../10_metadata/00_purpose.md) — surface statements whose `schema_version` is behind the current schema.
 
-**Cadence default:** hourly (`BRAIN_STALE_DETECTOR_PERIOD_SECONDS = 3600`).
+**Cadence default:** hourly (built-in, 3 600 s; no config key).
 
 **Batch cap default:** 512 rows scanned per tick.
 
@@ -583,11 +590,17 @@ fn is_stale(stmt, current_version) -> bool {
 
 **Spec source:** [`../02_data_model/06_entity_lifecycle.md`](../02_data_model/06_entity_lifecycle.md) + [`../10_metadata/00_purpose.md`](../10_metadata/00_purpose.md#retention).
 
-**Cadence default:** daily (`BRAIN_ENTITY_GC_PERIOD_SECONDS = 86400`).
+**Cadence default:** daily (built-in, 86 400 s; no config key).
 
-**Off by default** (`BRAIN_ENTITY_GC_ENABLED = false`). The worker checks the flag at the top of each tick; if false, returns `Ok(())` immediately and logs `debug` once at startup.
+**Off by default**, in two places that agree: `EntityGcWorker::new()` sets
+`enabled = false` and `defaults_for(EntityGc)` carries `enabled = false`. There
+is no config key — a deployment turns it on by building it enabled, or by the
+admin `POST /v1/workers/entity_gc/start`. The worker checks the flag at the top
+of each tick; if false, returns `Ok(())` immediately.
 
-**Grace period default:** 30 d (`BRAIN_ENTITY_GC_GRACE_SECONDS = 2_592_000`).
+**Grace period default:** 30 d (`DEFAULT_ENTITY_GC_GRACE_SECONDS`). Settable
+through the worker's builder, which the server does not call, so the default is
+the only value a deployment can have today.
 
 **Eligibility predicate:**
 
@@ -617,7 +630,8 @@ Tombstoned-but-within-grace inbound rows count as references (prevents flapping;
 
 **Spec source:** [`../02_data_model/07_statement.md`](../02_data_model/07_statement.md) §"Confidence aggregation" — stored confidence is a snapshot; decay manifests via periodic refresh.
 
-**Cadence default:** hourly (`BRAIN_CONFIDENCE_SWEEP_PERIOD_SECONDS = 3600`).
+**Cadence default:** hourly (`[workers.confidence_sweep] interval_secs`, with
+`enabled` alongside it; on by default).
 
 **Batch cap default:** 512 rows.
 
@@ -641,24 +655,47 @@ The `0.05` threshold mirrors the index-churn gate — small drifts don't pay for
 
 ### Sweeper configuration summary
 
-| Env var | Default | Worker |
-|---|---|---|
-| `BRAIN_SUPERSESSION_RETENTION_SECONDS` | `0` (disabled) | Supersession sweeper |
-| `BRAIN_SUPERSESSION_SWEEPER_PERIOD_SECONDS` | `86400` | Supersession sweeper |
-| `BRAIN_AUDIT_RETENTION_SECONDS` | `7_776_000` (90 d) | Audit log sweeper |
-| `BRAIN_AUDIT_SWEEPER_PERIOD_SECONDS` | `86400` | Audit log sweeper |
-| `BRAIN_AUDIT_SWEEPER_BATCH_CAP` | `1024` | Audit log sweeper |
-| `BRAIN_LLM_CACHE_TTL_SECONDS` | `7_776_000` (90 d) | LLM cache sweeper |
-| `BRAIN_LLM_CACHE_MAX_BYTES` | `1073741824` (1 GiB) | LLM cache sweeper |
-| `BRAIN_LLM_CACHE_SWEEPER_PERIOD_SECONDS` | `3600` | LLM cache sweeper |
-| `BRAIN_STALE_DETECTOR_PERIOD_SECONDS` | `3600` | Stale extraction detector |
-| `BRAIN_ENTITY_GC_ENABLED` | `false` | Entity GC sweeper |
-| `BRAIN_ENTITY_GC_GRACE_SECONDS` | `2_592_000` (30 d) | Entity GC sweeper |
-| `BRAIN_ENTITY_GC_PERIOD_SECONDS` | `86400` | Entity GC sweeper |
-| `BRAIN_CONFIDENCE_SWEEP_PERIOD_SECONDS` | `3600` | Confidence sweep |
-| `BRAIN_CONFIDENCE_SWEEP_BATCH_CAP` | `512` | Confidence sweep |
+Brain reads configuration from a TOML file, with environment overrides in the
+form `BRAIN__<SECTION>__<FIELD>` (double underscore per level). **No sweeper
+knob is a single-underscore `BRAIN_*` variable**; the only ones of that shape
+in the tree are test and benchmark switches.
 
-All values are operator-overridable. Tests use small values (seconds, not days) to keep wall-time bounded.
+What an operator can actually set:
+
+| Knob | Default | Worker |
+|---|---|---|
+| `[workers.supersession_sweeper] enabled` | `false` | Supersession sweeper |
+| `[workers.supersession_sweeper] retention_seconds` | `0` (sweeps nothing) | Supersession sweeper |
+| `[workers.supersession_sweeper] period_seconds` | `86400` | Supersession sweeper |
+| `[workers.supersession_sweeper] dry_run` | `false` | Supersession sweeper |
+| `[workers.llm_cache_sweep] enabled` | `true` | LLM cache sweeper |
+| `[workers.llm_cache_sweep] interval_secs` | `3600` | LLM cache sweeper |
+| `[workers.confidence_sweep] enabled` | `true` | Confidence sweep |
+| `[workers.confidence_sweep] interval_secs` | `3600` | Confidence sweep |
+| `[workers.statement_reclaim] enabled` | `false` | Statement reclaim |
+| `[workers.statement_reclaim] grace_seconds` / `period_seconds` | 30 d / `86400` | Statement reclaim |
+| `[workers.predicate_gc] enabled` | `false` | Predicate GC |
+| `[workers.predicate_gc] grace_seconds` / `period_seconds` | 7 d / `86400` | Predicate GC |
+
+What is a code default with no configuration surface:
+
+| Value | Default | Worker |
+|---|---|---|
+| Cadence | daily | Audit log sweeper, entity GC |
+| Cadence | hourly | Stale extraction detector |
+| Batch cap | 1024 | Audit log sweeper, LLM cache sweeper |
+| Batch cap | 256 | Supersession sweeper, entity GC |
+| Audit retention | 90 d | Audit log sweeper |
+| Entity GC grace | 30 d | Entity GC |
+| Entity GC enabled | `false` | Entity GC |
+| Forget-cascade confidence threshold | `0.2` | Forget cascade |
+
+Response-cache TTL belongs to neither table: it is `cache_ttl` on the
+extractor definition, defaulting to 7 days.
+
+A worker can also be paused and resumed at runtime without a restart, through
+`POST /v1/workers/{name}/{stop|start|run-now}` on the admin plane. Tests set
+small values (seconds, not days) by constructing workers directly.
 
 ### Per-statement-kind retention
 
@@ -879,7 +916,7 @@ pub struct ForgetCascadeJob {
 
 #### Confidence threshold
 
-`BRAIN_CASCADE_CONFIDENCE_THRESHOLD = 0.2` default. Below this, an empty-evidence statement is tombstoned; above this, it survives with the `stale_evidence` flag set (operator can re-extract or accept the staleness).
+`DEFAULT_CASCADE_CONFIDENCE_THRESHOLD = 0.2`, a code default with no config key. Below this, an empty-evidence statement is tombstoned; above this, it survives with the `stale_evidence` flag set (operator can re-extract or accept the staleness).
 
 #### Continuation jobs
 

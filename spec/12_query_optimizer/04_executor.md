@@ -4,56 +4,64 @@ The executor takes an `ExecutionPlan` and runs it. This file specifies the execu
 
 ## 1. The executor's interface
 
+There is no `Executor` object. Execution is a set of free functions over a
+cheap-clone context:
+
 ```rust
-struct Executor {
-    storage: StorageHandle,
-    embedder: EmbedderHandle,
-    metrics: MetricsHandle,
+// brain-planner: executor/
+#[derive(Clone)]
+pub struct ExecutorContext {
+    pub embedder: Arc<dyn Dispatcher>,
+    pub index: SharedHnsw,
+    pub metadata: SharedMetadataDb,
+    pub writer: Arc<dyn WriterHandle>,
+    /// `Some` only inside a txn-flagged op's request scope.
+    pub txn: Option<Arc<TxnSnapshot>>,
+    pub caller_namespace: NamespaceId,
+    pub caller_space: SpaceId,
+    // ...
 }
 
-impl Executor {
-    async fn execute(&self, plan: ExecutionPlan) -> Result<Response, ExecError> {
-        match plan {
-            ExecutionPlan::Encode(p) => self.execute_encode(p).await,
-            ExecutionPlan::Recall(p) => self.execute_recall(p).await,
-            // ...
-        }
-    }
-}
+pub async fn execute_path(plan: PathPlan, ctx: &ExecutorContext, trace: bool)
+    -> Result<PathResult, ExecError>;
+pub async fn execute_reason(plan: ReasonPlan, ctx: &ExecutorContext, trace: bool)
+    -> Result<ReasonResult, ExecError>;
+// plus `execute_path_stream` / `execute_reason_stream` for the streamed forms.
+// `trace` is what QUERY_TRACE sets (§02 §15).
 ```
 
-The executor is async (returns futures). Each `execute_*` method orchestrates the steps in the plan.
+One `ExecutorContext` is built per shard and cloned per request, where
+`brain-ops`'s dispatcher stamps the authenticated caller's namespace and space
+onto the clone. Every field is an `Arc` or already cheap to clone, so no
+`&mut` and no mutex is involved.
+
+**Only PATH and REASON go through this crate's executor.** ENCODE, RECALL and
+FORGET are planned and executed inside their `brain-ops` handlers
+(`handlers::encode`, `handlers::recall`, `handlers::forget`), which call into
+the retrievers and the writer directly. `ExecutionPlan::Recall` and the RECALL
+plan structs survive only as the shape EXPLAIN renders — see
+[02. Per-operation planning §5](02_per_op_planning.md).
 
 ## 2. Step-by-step execution
 
-Each step in the plan is a discrete async operation:
+Each stage is a discrete async operation, and RECALL's stages are the ones
+worth reading as a sequence:
 
-```rust
-async fn execute_recall(&self, plan: RecallPlan) -> Result<Response> {
-    // Step 1: embed
-    let cue_vector = self.embedder.embed(&plan.embedding.text).await?;
-
-    // Step 2: shard searches in parallel
-    let shard_results = futures::future::try_join_all(
-        plan.shards.iter().map(|s| self.search_shard(s, &cue_vector))
-    ).await?;
-
-    // Step 3: merge
-    let merged = self.merge_results(shard_results, &plan.merge);
-
-    // Step 4: text fetch (if needed)
-    let with_text = if let Some(t) = plan.text_fetch {
-        self.fetch_texts(&merged, t).await?
-    } else {
-        merged
-    };
-
-    // Step 5: response
-    Ok(self.build_response(with_text, plan.response))
-}
+```text
+embed the cue  (one vector, reused by every lane)
+  -> probe the memory HNSW with the resolved ef        [02 §4]
+  -> probe the HyPE, lexical and statement lanes
+  -> fuse the lanes (HyPE boosts a direct hit, never leapfrogs one),
+     then apply the precision floors, which ship at 0 and so neither
+     abstain nor trim until an operator sets them
+  -> resolve metadata rows for the survivors
+  -> fetch texts when the request asked for them
+  -> build the response
 ```
 
-Sequential steps yield to other tasks at await points. Parallel steps (multiple shards) use `try_join_all`.
+Sequential stages yield to other tasks at their await points. Where a stage
+fans out — several lanes, or several shards for a namespace-scoped recall — it
+joins the futures rather than awaiting them in turn.
 
 ## 3. Cooperative yields
 
