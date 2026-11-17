@@ -94,11 +94,9 @@ pub fn handle_llm_credential_put(
     // revealing most of an accepted key, while real provider keys and this
     // repository's placeholder fixtures are substantially longer.
     if req.api_key.len() < MIN_API_KEY_LEN {
-        return Err(OpError::InvalidRequest(
-            format!(
-                "`api_key` must be at least {MIN_API_KEY_LEN} characters long"
-            ),
-        ));
+        return Err(OpError::InvalidRequest(format!(
+            "`api_key` must be at least {MIN_API_KEY_LEN} characters long"
+        )));
     }
     // Surrounding whitespace on a key is almost always a copy-paste artifact.
     // It would seal verbatim and then fail upstream with an opaque 401 that
