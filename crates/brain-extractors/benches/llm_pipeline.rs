@@ -136,7 +136,6 @@ fn build_extractor(
         "Extract entities".into(),
         None,
         None,
-        None,
         0.0,
         Duration::from_secs(60),
         None,

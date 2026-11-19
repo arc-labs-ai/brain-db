@@ -245,8 +245,8 @@ fn materialize_llm_extractor_core(
     // facts about the definition that no runtime credential can change.
 
     // Schema compile.
-    let response_schema = extract_response_schema(&ast);
-    let schema_compiled = match LlmExtractor::compile_schema(response_schema.as_ref()) {
+    let response_schema = match LlmExtractor::compile_schema(extract_response_schema(&ast).as_ref())
+    {
         Ok(s) => s,
         Err(e) => {
             return Ok(LlmExtractor::degraded(
@@ -281,7 +281,6 @@ fn materialize_llm_extractor_core(
         prompt.to_string(),
         examples,
         response_schema,
-        schema_compiled,
         threshold,
         cache_ttl,
         deps.llm_max_tokens,

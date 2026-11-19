@@ -52,7 +52,7 @@ pub use framework::{
     ExtractorContext, ExtractorError, ExtractorRegistry, NeighborMemory, RelationMention,
     StatementMention, TriggerDecision, SYSTEM_NAMESPACE,
 };
-pub use llm::{LlmExtractor, LlmExtractorInner};
+pub use llm::{LlmExtractor, LlmExtractorInner, ResponseSchema};
 pub use materialize::{
     build_registry_from_definitions, materialize_classifier_extractor, materialize_llm_extractor,
     materialize_pattern_extractor, MaterializeDeps,

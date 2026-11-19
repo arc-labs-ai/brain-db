@@ -32,13 +32,12 @@ use brain_metadata::statement::{JudgeError, JudgeFuture, JudgeVerdict, Statement
 use brain_metadata::LlmCacheDb;
 use brain_protocol::schema::ast::{StatementKindAst, TriggerExpr};
 use brain_protocol::schema::ExtractorTarget;
-use jsonschema::JSONSchema;
 use parking_lot::Mutex;
 use redb::ReadTransaction;
 use serde_json::Value;
 
 use super::cache::{cache_get, cache_put};
-use super::validation::{looks_like_json, strip_code_fences, validate_against};
+use super::validation::{parse_freeform, FreeformError, ResponseSchema};
 use crate::framework::extractor::{
     ExtractionContext, ExtractionFailureClass, ExtractionFuture, ExtractionResult,
     ExtractionStatus, Extractor, ExtractorContext, NeighborMemory,
@@ -105,10 +104,9 @@ pub struct LlmExtractorInner {
     pub cache: Option<Arc<Mutex<LlmCacheDb>>>,
     pub prompt: String,
     pub examples: Option<Value>,
-    pub response_schema: Option<Value>,
-    /// Compiled draft-7 validator. `None` when `response_schema`
-    /// is absent (free-form response mode).
-    pub schema_compiled: Option<JSONSchema>,
+    /// The declared response schema, retaining both the raw provider
+    /// document and its validator, or `None` for free-form response mode.
+    pub response_schema: Option<ResponseSchema>,
     pub max_tokens: u32,
     pub temperature: f32,
     pub timeout: Duration,
@@ -177,8 +175,7 @@ impl LlmExtractor {
         cache: Option<Arc<Mutex<LlmCacheDb>>>,
         prompt: String,
         examples: Option<Value>,
-        response_schema: Option<Value>,
-        schema_compiled: Option<JSONSchema>,
+        response_schema: Option<ResponseSchema>,
         confidence_threshold: f32,
         cache_ttl: Duration,
         max_tokens: Option<u32>,
@@ -197,7 +194,6 @@ impl LlmExtractor {
                 prompt,
                 examples,
                 response_schema,
-                schema_compiled,
                 max_tokens: max_tokens.unwrap_or(DEFAULT_LLM_MAX_TOKENS),
                 temperature: 0.0,
                 timeout: Duration::from_secs(30),
@@ -239,13 +235,10 @@ impl LlmExtractor {
     /// Compile the operator-declared JSON schema. Returns `None`
     /// when `schema` is `None`; otherwise either the compiled
     /// validator or `Err` describing why compilation failed.
-    pub fn compile_schema(schema: Option<&Value>) -> Result<Option<JSONSchema>, String> {
+    pub fn compile_schema(schema: Option<&Value>) -> Result<Option<ResponseSchema>, String> {
         match schema {
             None => Ok(None),
-            Some(v) => match JSONSchema::options().compile(v) {
-                Ok(c) => Ok(Some(c)),
-                Err(e) => Err(format!("schema compile failed: {e}")),
-            },
+            Some(v) => ResponseSchema::compile(v.clone()).map(Some),
         }
     }
 
@@ -302,7 +295,7 @@ impl LlmExtractor {
                 role: brain_llm::LlmRole::User,
                 content: user_body,
             }],
-            response_schema: inner.response_schema.clone(),
+            response_schema: inner.response_schema.as_ref().map(|s| s.raw().clone()),
             temperature: inner.temperature,
             max_tokens: inner.max_tokens,
             timeout: inner.timeout,
@@ -1587,7 +1580,7 @@ impl Extractor for LlmExtractor {
                     model_id_hash,
                     credential_scope,
                 ) {
-                    return match decode_cached(&row.response_blob, inner.response_schema.as_ref()) {
+                    return match decode_cached(&row.response_blob) {
                         Ok(parsed) => {
                             let items = self.project_value(&parsed);
                             ExtractionResult::success(items, started, started)
@@ -1681,14 +1674,14 @@ impl Extractor for LlmExtractor {
                 .saturating_add(resp1.tokens_out);
 
             // ----- 4. Validate + retry-once ------------------------------------
-            let parsed = match inner.schema_compiled.as_ref() {
-                None => match serde_json::from_str::<Value>(strip_code_fences(&resp1.content)) {
+            let parsed = match inner.response_schema.as_ref() {
+                None => match parse_freeform(&resp1.content) {
                     Ok(v) => v,
                     // An evident JSON attempt that fails to parse (truncated,
                     // unbalanced) is malformed output. Never fall through to
                     // the plain-text projection below: that would mint the raw
                     // fragment (`{"subject": "Mirror"},{`) as an entity NAME.
-                    Err(e) if looks_like_json(&resp1.content) => {
+                    Err(FreeformError::MalformedJson(e)) => {
                         return ExtractionResult::failure(
                             format!("response is malformed JSON: {e}"),
                             started,
@@ -1700,9 +1693,9 @@ impl Extractor for LlmExtractor {
                     // A deliberate plain-text answer (e.g. an entity-target
                     // extractor replying with a bare name) keeps the bare
                     // string projection.
-                    Err(_) => Value::String(resp1.content.clone()),
+                    Err(FreeformError::PlainText) => Value::String(resp1.content.clone()),
                 },
-                Some(schema) => match validate_against(schema, &resp1.content) {
+                Some(schema) => match schema.validate(&resp1.content) {
                     Ok(v) => v,
                     // The output was cut off at `max_tokens`. Retrying is
                     // pointless and not free: the prompt is unchanged, so
@@ -1760,7 +1753,7 @@ impl Extractor for LlmExtractor {
                         total_tokens = total_tokens
                             .saturating_add(resp2.tokens_in)
                             .saturating_add(resp2.tokens_out);
-                        match validate_against(schema, &resp2.content) {
+                        match schema.validate(&resp2.content) {
                             Ok(v) => v,
                             // The retry ran long even though the first
                             // attempt did not: same ceiling, same verdict.
@@ -1845,7 +1838,7 @@ impl Extractor for LlmExtractor {
     }
 }
 
-fn decode_cached(blob: &[u8], _schema: Option<&Value>) -> Result<Value, String> {
+fn decode_cached(blob: &[u8]) -> Result<Value, String> {
     let s = std::str::from_utf8(blob).map_err(|e| format!("non-UTF8 blob: {e}"))?;
     serde_json::from_str::<Value>(s).map_err(|e| format!("blob json parse: {e}"))
 }

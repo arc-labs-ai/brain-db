@@ -27,3 +27,4 @@ pub mod validation;
 mod tests;
 
 pub use extractor::{BuildRequestStats, LlmExtractor, LlmExtractorInner, DEFAULT_LLM_MAX_TOKENS};
+pub use validation::ResponseSchema;

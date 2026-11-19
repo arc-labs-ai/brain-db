@@ -219,8 +219,36 @@ impl MetadataDb {
                 next.normalized_name = normalize_name(&b.canonical_name);
                 next.aliases = b.aliases.clone();
                 next.attributes = EntityAttributes::from(b.attributes_blob.clone());
-                entity_update(&wtxn, &next, b.at_unix_nanos)
-                    .map_err(|e| MetadataSinkError::Corruption(format!("entity_update: {e}")))?;
+                match entity_update(&wtxn, &next, b.at_unix_nanos) {
+                    Ok(_) => {}
+                    // An update is journalled before the apply decides it is
+                    // legal, just like a create. Treating that refusal as
+                    // corruption makes the shard permanently unbootable with
+                    // no repair path; skipping is safe because the name is
+                    // already held by its legitimate owner.
+                    Err(EntityOpError::DuplicateCanonicalName { name, existing, .. }) => {
+                        tracing::warn!(
+                            target: "brain_metadata::recovery",
+                            lsn,
+                            skipped_id = ?id,
+                            existing_id = ?existing,
+                            canonical_name = %name,
+                            "replayed entity update refused at write time; skipping",
+                        );
+                    }
+                    Err(EntityOpError::UnknownEntityType(type_id)) => {
+                        tracing::warn!(
+                            target: "brain_metadata::recovery",
+                            lsn,
+                            skipped_id = ?id,
+                            entity_type = ?type_id,
+                            "replayed entity update names a type the schema no longer declares; skipping",
+                        );
+                    }
+                    Err(e) => {
+                        return Err(MetadataSinkError::Corruption(format!("entity_update: {e}")));
+                    }
+                }
             }
             self.bump_next_lsn_in_txn(&wtxn, lsn)?;
         }
@@ -528,8 +556,26 @@ impl MetadataDb {
             // Idempotent re-replay: skip if already renamed to this name
             // (entity_rename's alias-trail move isn't re-runnable).
             if current.canonical_name != b.new_canonical_name {
-                entity_rename(&wtxn, id, b.new_canonical_name.clone(), b.at_unix_nanos)
-                    .map_err(|e| MetadataSinkError::Corruption(format!("entity_rename: {e}")))?;
+                match entity_rename(&wtxn, id, b.new_canonical_name.clone(), b.at_unix_nanos) {
+                    Ok(_) => {}
+                    // A rename is journalled before the apply decides it is legal,
+                    // so a refusal is in the log like a refused create or update.
+                    // Treating it as corruption makes the shard unbootable with no
+                    // repair path; skipping is safe because the name's owner holds it.
+                    Err(EntityOpError::DuplicateCanonicalName { name, existing, .. }) => {
+                        tracing::warn!(
+                            target: "brain_metadata::recovery",
+                            lsn,
+                            skipped_id = ?id,
+                            existing_id = ?existing,
+                            canonical_name = %name,
+                            "replayed entity rename refused at write time; skipping",
+                        );
+                    }
+                    Err(e) => {
+                        return Err(MetadataSinkError::Corruption(format!("entity_rename: {e}")));
+                    }
+                }
             }
             self.bump_next_lsn_in_txn(&wtxn, lsn)?;
         }
@@ -1192,6 +1238,98 @@ mod tests {
         assert_eq!(got.canonical_name, "Priya P. Patel");
         // entity_update moves the old canonical into aliases; "priya" stays.
         assert!(got.aliases.iter().any(|a| a == "priya"));
+    }
+
+    #[test]
+    fn an_update_refused_at_write_time_is_skipped_not_fatal() {
+        use crate::recovery::phase_bodies::{encode_entity_update, EntityUpdateBody};
+        use crate::tables::next_lsn::NEXT_LSN_TABLE;
+
+        let dir = TempDir::new().unwrap();
+        let db = fresh_db(&dir);
+        let winner = person_entity("Priya Patel");
+        let winner_id = winner.id;
+        let target = person_entity("Other Person");
+        let target_id = target.id;
+        {
+            let wtxn = db.write_txn().unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &winner).unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &target).unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        let body = encode_entity_update(&EntityUpdateBody {
+            id: target_id.to_bytes(),
+            canonical_name: winner.canonical_name.clone(),
+            aliases: target.aliases.clone(),
+            attributes_blob: Vec::new(),
+            at_unix_nanos: NOW + 60,
+        });
+        db.apply_entity_update(42, &body)
+            .expect("a refused update must be skipped on replay, not abort the shard");
+
+        let rtxn = db.read_txn().unwrap();
+        let kept_winner = entity_get(&rtxn, winner_id)
+            .unwrap()
+            .expect("winner present");
+        assert_eq!(kept_winner.canonical_name, "Priya Patel");
+        let kept_target = entity_get(&rtxn, target_id)
+            .unwrap()
+            .expect("target present");
+        assert_eq!(kept_target.canonical_name, "Other Person");
+        let next_lsn = rtxn
+            .open_table(NEXT_LSN_TABLE)
+            .unwrap()
+            .get(&())
+            .unwrap()
+            .expect("next_lsn advanced")
+            .value();
+        assert_eq!(next_lsn, 43);
+    }
+
+    #[test]
+    fn a_rename_refused_at_write_time_is_skipped_not_fatal() {
+        use crate::recovery::phase_bodies::{encode_entity_rename, EntityRenameBody};
+        use crate::tables::next_lsn::NEXT_LSN_TABLE;
+
+        let dir = TempDir::new().unwrap();
+        let db = fresh_db(&dir);
+        let winner = person_entity("Priya Patel");
+        let winner_id = winner.id;
+        let target = person_entity("Other Person");
+        let target_id = target.id;
+        {
+            let wtxn = db.write_txn().unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &winner).unwrap();
+            entity_put(&wtxn, test_scope(), brain_core::SessionId::DEFAULT, &target).unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        let body = encode_entity_rename(&EntityRenameBody {
+            id: target_id.to_bytes(),
+            new_canonical_name: winner.canonical_name.clone(),
+            at_unix_nanos: NOW + 60,
+        });
+        db.apply_entity_rename(42, &body)
+            .expect("a refused rename must be skipped on replay, not abort the shard");
+
+        let rtxn = db.read_txn().unwrap();
+        let kept_winner = entity_get(&rtxn, winner_id)
+            .unwrap()
+            .expect("winner present");
+        assert_eq!(kept_winner.canonical_name, "Priya Patel");
+        let kept_target = entity_get(&rtxn, target_id)
+            .unwrap()
+            .expect("target present");
+        assert_eq!(kept_target.canonical_name, "Other Person");
+        let next_lsn = rtxn
+            .open_table(NEXT_LSN_TABLE)
+            .unwrap()
+            .get(&())
+            .unwrap()
+            .expect("next_lsn advanced")
+            .value();
+        assert_eq!(next_lsn, 43);
     }
 
     #[test]

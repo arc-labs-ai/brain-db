@@ -142,8 +142,7 @@ fn build_ext(
             cache,
             prompt: "Extract people".into(),
             examples: None,
-            response_schema: schema,
-            schema_compiled,
+            response_schema: schema_compiled,
             max_tokens: 1024,
             temperature: 0.0,
             timeout: Duration::from_secs(30),
@@ -231,7 +230,6 @@ fn each_memory_resolves_its_own_namespaces_credential() {
             prompt: "Extract people".into(),
             examples: None,
             response_schema: None,
-            schema_compiled: None,
             max_tokens: 1024,
             temperature: 0.0,
             timeout: Duration::from_secs(30),
@@ -312,7 +310,6 @@ fn memory_in_a_namespace_without_a_credential_is_skipped() {
             prompt: "Extract people".into(),
             examples: None,
             response_schema: None,
-            schema_compiled: None,
             max_tokens: 1024,
             temperature: 0.0,
             timeout: Duration::from_secs(30),
@@ -487,7 +484,6 @@ fn sm_fixture() -> StatementMention {
 
 fn ext_with_prompt(prompt: &str) -> LlmExtractor {
     let client = Arc::new(MockClient::new("claude-haiku-4-5", vec![]));
-    let schema_compiled = LlmExtractor::compile_schema(None).unwrap();
     LlmExtractor::new(
         ExtractorId::from(42),
         "acme:prompt_test".into(),
@@ -502,7 +498,6 @@ fn ext_with_prompt(prompt: &str) -> LlmExtractor {
             prompt: prompt.into(),
             examples: None,
             response_schema: None,
-            schema_compiled,
             max_tokens: 1024,
             temperature: 0.0,
             timeout: Duration::from_secs(30),
@@ -742,7 +737,6 @@ fn build_request_splits_into_cached_blocks() {
         "predicates": ["brain:fact", "brain:prefers", "brain:knows"],
     });
     let client = Arc::new(MockClient::new("claude-haiku-4-5", vec![]));
-    let schema_compiled = LlmExtractor::compile_schema(None).unwrap();
     let ext = LlmExtractor::new(
         ExtractorId::from(7),
         "acme:llm_split".into(),
@@ -757,7 +751,6 @@ fn build_request_splits_into_cached_blocks() {
             prompt: "Extract things.\n{TEXT}".into(),
             examples: Some(examples),
             response_schema: None,
-            schema_compiled,
             max_tokens: 1024,
             temperature: 0.0,
             timeout: Duration::from_secs(30),
@@ -815,7 +808,6 @@ fn build_request_without_examples_emits_role_block_only() {
     // cached so the LLM's "you are a Brain extractor" preamble
     // amortises across calls even in degraded schema mode.
     let client = Arc::new(MockClient::new("claude-haiku-4-5", vec![]));
-    let schema_compiled = LlmExtractor::compile_schema(None).unwrap();
     let ext = LlmExtractor::new(
         ExtractorId::from(8),
         "acme:llm_noschema".into(),
@@ -830,7 +822,6 @@ fn build_request_without_examples_emits_role_block_only() {
             prompt: "Extract.\n{TEXT}".into(),
             examples: None,
             response_schema: None,
-            schema_compiled,
             max_tokens: 1024,
             temperature: 0.0,
             timeout: Duration::from_secs(30),
@@ -924,7 +915,6 @@ fn extractor_with_mock(mock: Arc<MockClient>) -> LlmExtractor {
         "claude-haiku-4-5".into(),
         None,
         "ignored prompt".into(),
-        None,
         None,
         None,
         0.0,
@@ -1362,8 +1352,7 @@ fn build_ext_with_target(
             cache: None,
             prompt: "ignored in mock".into(),
             examples: None,
-            response_schema: Some(schema),
-            schema_compiled,
+            response_schema: Some(schema_compiled.unwrap()),
             max_tokens: 1024,
             temperature: 0.0,
             timeout: Duration::from_secs(30),
