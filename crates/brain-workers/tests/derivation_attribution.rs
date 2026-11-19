@@ -385,7 +385,6 @@ fn build(batch_size: usize, classifier_cost: Duration, provider_latency: Duratio
         ))),
         realistic_prompt(),
         None,
-        Some(schema),
         compiled,
         0.0,
         Duration::from_secs(3600),

@@ -142,7 +142,6 @@ fn build_extractor(
         cache,
         PROMPT.into(),
         None,
-        Some(schema),
         compiled,
         // Accept anything the model emits; the prompt + schema do
         // the gating. The live model occasionally returns 0.95-ish
