@@ -288,14 +288,47 @@ fn build_request_body(req: &LlmRequest) -> AnthropicRequestBody {
         })
         .collect();
 
+    // A schema'd request goes out as a FORCED TOOL CALL, which is
+    // Anthropic's structured-output mechanism.
+    //
+    // This field used to be dropped on the floor here while the OpenAI
+    // client honoured it (`response_format: json_schema, strict: true`),
+    // so `LlmRequest::response_schema` meant "guaranteed JSON" on one
+    // provider and "nothing at all" on the other — and its doc comment
+    // promised the former for both. The visible cost was extraction
+    // failing with `expected value at line 1 column 1`: with no schema on
+    // the wire, the only thing asking for JSON was a sentence in the
+    // prompt, and a model that answered with a preamble or a fence
+    // produced a reply whose first byte could not start a JSON value.
+    // `tool_choice` makes the model fill the schema instead of writing
+    // prose about it.
+    let (tools, tool_choice) = match &req.response_schema {
+        Some(schema) => (
+            Some(vec![AnthropicToolWire {
+                name: STRUCTURED_OUTPUT_TOOL,
+                description: "Return the result as arguments to this tool.",
+                input_schema: schema.clone(),
+            }]),
+            Some(json!({ "type": "tool", "name": STRUCTURED_OUTPUT_TOOL })),
+        ),
+        None => (None, None),
+    };
+
     AnthropicRequestBody {
         model: req.model.clone(),
         max_tokens: req.max_tokens,
         system: build_system_field(&req.system_blocks),
         messages,
         temperature: req.temperature,
+        tools,
+        tool_choice,
     }
 }
+
+/// The tool name a schema'd request is forced into. Arbitrary, but it
+/// has to be stable: the response is matched on `type == "tool_use"`,
+/// not on this, so it only ever shows up in the request.
+const STRUCTURED_OUTPUT_TOOL: &str = "emit_result";
 
 #[derive(Serialize, Debug)]
 struct AnthropicRequestBody {
@@ -306,6 +339,17 @@ struct AnthropicRequestBody {
     messages: Vec<AnthropicMessageWire>,
     #[serde(skip_serializing_if = "is_zero_f32")]
     temperature: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<AnthropicToolWire>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<Value>,
+}
+
+#[derive(Serialize, Debug)]
+struct AnthropicToolWire {
+    name: &'static str,
+    description: &'static str,
+    input_schema: Value,
 }
 
 #[derive(Serialize, Debug)]
@@ -380,6 +424,12 @@ struct AnthropicContent {
     kind: String,
     #[serde(default)]
     text: String,
+    /// The arguments of a `tool_use` block, which is how a schema'd
+    /// request comes back. Anthropic has already parsed and validated
+    /// this against `input_schema`, so it is a JSON value rather than a
+    /// string that might not be one.
+    #[serde(default)]
+    input: Option<Value>,
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -403,15 +453,32 @@ fn decode_anthropic_response(
     payload: AnthropicResponseBody,
     request: &LlmRequest,
 ) -> Result<LlmResponse, LlmError> {
-    // Concatenate all text-kind content blocks. Tool-use / thinking
-    // blocks are ignored.
+    // A SCHEMA'D REQUEST ANSWERS IN A `tool_use` BLOCK, and that block
+    // wins over any prose beside it. Anthropic validated those arguments
+    // against `input_schema` before sending them, so re-serialising the
+    // value is the one path that cannot hand the caller a non-JSON first
+    // byte. Ignoring it — which is what this did — was why a schema'd
+    // call still had to hope the model wrote bare JSON in a text block.
+    //
+    // Thinking blocks stay ignored either way.
+    let tool_payload = payload
+        .content
+        .iter()
+        .find(|b| b.kind == "tool_use")
+        .and_then(|b| b.input.as_ref())
+        .map(|v| v.to_string());
+
     let mut content = String::new();
-    for block in &payload.content {
-        if block.kind == "text" {
-            if !content.is_empty() {
-                content.push('\n');
+    if let Some(json_text) = tool_payload {
+        content = json_text;
+    } else {
+        for block in &payload.content {
+            if block.kind == "text" {
+                if !content.is_empty() {
+                    content.push('\n');
+                }
+                content.push_str(&block.text);
             }
-            content.push_str(&block.text);
         }
     }
     let truncated = payload.stop_reason.as_deref() == Some("max_tokens");
@@ -443,7 +510,8 @@ fn decode_anthropic_response(
     };
     if resp.content.is_empty() {
         return Err(LlmError::EmptyContent {
-            reason: "anthropic response had no text-kind content blocks".into(),
+            reason: "anthropic response had no tool_use arguments and no text-kind content blocks"
+                .into(),
             billed: resp,
         });
     }
@@ -492,6 +560,106 @@ fn log_call(model: &str, resp: &LlmResponse) {
 
 #[cfg(test)]
 mod tests {
+
+    /// A request with no schema must look exactly as it always did —
+    /// no `tools`, no `tool_choice`. Most calls (judging, synthesis,
+    /// free-form extraction) are schemaless and a stray tool field
+    /// would change every one of them.
+    #[test]
+    fn a_schemaless_request_carries_no_tool_fields() {
+        let req = LlmRequest::new("claude-haiku-4-5", "hello");
+        let body = build_request_body(&req);
+        assert!(body.tools.is_none());
+        assert!(body.tool_choice.is_none());
+        let wire = serde_json::to_value(&body).unwrap();
+        assert!(
+            wire.get("tools").is_none(),
+            "tools must be omitted, got {wire}"
+        );
+        assert!(wire.get("tool_choice").is_none());
+    }
+
+    /// The whole point: a schema'd request must FORCE the tool, which
+    /// is Anthropic's structured-output mechanism. Dropping the schema
+    /// here is what left extraction relying on a sentence in the prompt.
+    #[test]
+    fn a_schema_is_sent_as_a_forced_tool() {
+        let mut req = LlmRequest::new("claude-haiku-4-5", "hello");
+        req.response_schema = Some(json!({
+            "type": "object",
+            "properties": { "entities": { "type": "array" } },
+            "required": ["entities"],
+        }));
+        let wire = serde_json::to_value(build_request_body(&req)).unwrap();
+
+        let tools = wire["tools"].as_array().expect("tools array");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], STRUCTURED_OUTPUT_TOOL);
+        // The schema goes through verbatim; a rewritten schema would
+        // validate something other than what the caller asked for.
+        assert_eq!(
+            tools[0]["input_schema"],
+            *req.response_schema.as_ref().unwrap()
+        );
+        // `auto` would let the model answer in prose instead.
+        assert_eq!(wire["tool_choice"]["type"], "tool");
+        assert_eq!(wire["tool_choice"]["name"], STRUCTURED_OUTPUT_TOOL);
+    }
+
+    /// Anthropic validated the arguments against `input_schema` before
+    /// sending them, so re-serialising that value is the only reading
+    /// that cannot produce a non-JSON first byte.
+    #[test]
+    fn tool_use_arguments_become_the_response_content() {
+        let payload = AnthropicResponseBody {
+            model: "claude-haiku-4-5".into(),
+            content: vec![AnthropicContent {
+                kind: "tool_use".into(),
+                text: String::new(),
+                input: Some(json!({ "entities": ["Caroline"] })),
+            }],
+            usage: AnthropicUsage::default(),
+            stop_reason: None,
+        };
+        let req = LlmRequest::new("claude-haiku-4-5", "x");
+        let resp = decode_anthropic_response(payload, &req).expect("decodes");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&resp.content).expect("content must be valid JSON");
+        assert_eq!(parsed["entities"][0], "Caroline");
+    }
+
+    /// The failure this whole change exists to stop: a model that
+    /// narrates around its answer. With a forced tool the prose arrives
+    /// as a separate text block, and taking the text would hand serde a
+    /// `H` at offset 0 — `expected value at line 1 column 1`.
+    #[test]
+    fn tool_arguments_win_over_prose_in_the_same_reply() {
+        let payload = AnthropicResponseBody {
+            model: "claude-haiku-4-5".into(),
+            content: vec![
+                AnthropicContent {
+                    kind: "text".into(),
+                    text: "Here is the extracted graph:".into(),
+                    input: None,
+                },
+                AnthropicContent {
+                    kind: "tool_use".into(),
+                    text: String::new(),
+                    input: Some(json!({ "entities": [] })),
+                },
+            ],
+            usage: AnthropicUsage::default(),
+            stop_reason: None,
+        };
+        let req = LlmRequest::new("claude-haiku-4-5", "x");
+        let resp = decode_anthropic_response(payload, &req).expect("decodes");
+        assert!(
+            !resp.content.starts_with("Here is"),
+            "prose must not win over tool arguments, got {}",
+            resp.content
+        );
+        serde_json::from_str::<serde_json::Value>(&resp.content).expect("valid JSON");
+    }
     use super::*;
     use crate::types::{LlmMessage, LlmRole};
 
@@ -659,10 +827,12 @@ mod tests {
                 AnthropicContent {
                     kind: "text".into(),
                     text: "first line".into(),
+                    input: None,
                 },
                 AnthropicContent {
                     kind: "text".into(),
                     text: "second line".into(),
+                    input: None,
                 },
             ],
             usage: AnthropicUsage {
@@ -752,10 +922,12 @@ mod tests {
                 AnthropicContent {
                     kind: "tool_use".into(),
                     text: String::new(),
+                    input: None,
                 },
                 AnthropicContent {
                     kind: "text".into(),
                     text: "real content".into(),
+                    input: None,
                 },
             ],
             usage: AnthropicUsage {
@@ -778,6 +950,7 @@ mod tests {
             content: vec![AnthropicContent {
                 kind: "tool_use".into(),
                 text: String::new(),
+                input: None,
             }],
             usage: AnthropicUsage::default(),
         };
@@ -800,6 +973,7 @@ mod tests {
             content: vec![AnthropicContent {
                 kind: "thinking".into(),
                 text: String::new(),
+                input: None,
             }],
             usage: AnthropicUsage {
                 input_tokens: 100,

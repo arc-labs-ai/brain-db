@@ -62,6 +62,16 @@ pub(super) const LLM_INPUT_TOKEN_BUDGET: u64 = 4_000;
 /// case the helper's cap changes.
 const NEIGHBOR_TEXT_CHAR_CAP_IN_PROMPT: usize = 200;
 
+/// Chars of a model reply echoed into a diagnostic when the reply could
+/// not be parsed or validated.
+///
+/// A reply is derived from memory text, which is untrusted user content,
+/// so it is never logged whole — this is the same bounded-preview
+/// convention the storage layer uses for memory text. 200 chars is
+/// enough to tell a prose preamble from a Markdown fence from a refusal,
+/// which is the whole question such a failure poses.
+const RESPONSE_PREVIEW_CHARS: usize = 200;
+
 /// Hard cap on the rolling summary's chars in the prompt — the
 /// summarizer worker (when wired) is expected to honour this, but
 /// we enforce it here too so a misbehaving summarizer can't blow the
@@ -724,10 +734,19 @@ pub(super) fn collect_prior_entities<'a>(
 /// — Anthropic's ephemeral prompt cache will serve it as a cache hit
 /// after the first call within the 5-minute window, slashing the
 /// input-token cost of high-volume extraction.
+///
+/// The JSON-only sentence is load-bearing, not decoration: the Anthropic
+/// client sends no structured-output field (see
+/// `brain_llm::providers::anthropic::build_request_body`, which drops
+/// `LlmRequest::response_schema`), so on that provider the prompt is the
+/// ONLY thing asking for a bare JSON document. A reply wrapped in prose
+/// or a code fence reaches the validator with a non-JSON byte at offset
+/// 0 and costs the memory its whole typed graph.
 const ROLE_BLOCK: &str = "You are an entity, statement, and relation extractor for Brain. \
 Read the user's text and emit a JSON response that conforms to the response schema. \
 Be conservative: only emit items you are confident about, and include a confidence score in [0.0, 1.0] on each. \
-Do not invent entities that are not present in the text.";
+Do not invent entities that are not present in the text. \
+Reply with the JSON document ONLY: no preamble, no explanation, no Markdown code fences.";
 
 /// Build the system blocks for an extractor call. Returns up to two
 /// blocks, both marked `cache: true` so Anthropic's prompt cache
@@ -1682,6 +1701,15 @@ impl Extractor for LlmExtractor {
                     // the plain-text projection below: that would mint the raw
                     // fragment (`{"subject": "Mirror"},{`) as an entity NAME.
                     Err(FreeformError::MalformedJson(e)) => {
+                        tracing::warn!(
+                            target: "brain_extractors::llm",
+                            memory_id = ?mem.id,
+                            extractor_id = extractor_id_raw,
+                            truncated = resp1.truncated,
+                            error = %e,
+                            response_prefix = %truncate_chars(&resp1.content, RESPONSE_PREVIEW_CHARS),
+                            "llm extraction reply is malformed JSON",
+                        );
                         return ExtractionResult::failure(
                             format!("response is malformed JSON: {e}"),
                             started,
@@ -1719,7 +1747,27 @@ impl Extractor for LlmExtractor {
                         .with_failure_class(ExtractionFailureClass::Permanent);
                     }
                     Err(err1) => {
-                        // Retry with the validation error in the prompt.
+                        // What the model actually sent, bounded. Without it a
+                        // repeated failure is undiagnosable: the validator's
+                        // error names the offending OFFSET, never the bytes,
+                        // so an operator cannot tell a prose preamble from a
+                        // code fence from a refusal.
+                        tracing::debug!(
+                            target: "brain_extractors::llm",
+                            memory_id = ?mem.id,
+                            extractor_id = extractor_id_raw,
+                            error = %err1,
+                            response_prefix = %truncate_chars(&resp1.content, RESPONSE_PREVIEW_CHARS),
+                            "llm extraction reply failed schema validation; re-prompting once",
+                        );
+                        // Retry with the validation error in the prompt, plus
+                        // the shape instruction the error itself cannot carry.
+                        // A parse failure at offset 0 is almost always
+                        // PACKAGING (prose, a fence) rather than a schema
+                        // disagreement, and "retry with valid JSON" alone does
+                        // not tell the model to drop the packaging — so at
+                        // temperature 0 it sends the same bytes back and the
+                        // retry is spent for nothing.
                         request.messages.push(brain_llm::LlmMessage {
                             role: brain_llm::LlmRole::Assistant,
                             content: resp1.content.clone(),
@@ -1728,7 +1776,10 @@ impl Extractor for LlmExtractor {
                             role: brain_llm::LlmRole::User,
                             content: format!(
                                 "Your previous response did not match the expected schema. \
-                                 Error: {err1}. Please retry with valid JSON."
+                                 Error: {err1}. Reply again with the JSON document ONLY: \
+                                 no explanation, no preamble, no Markdown code fences. \
+                                 The first character of your reply must be {{ and the \
+                                 last must be }}."
                             ),
                         });
                         let resp2 = match client.complete(request).await {
@@ -1790,6 +1841,22 @@ impl Extractor for LlmExtractor {
                                 // differ — the retry carries err1 in its prompt,
                                 // so a *changed* err2 means the model moved and
                                 // an *identical* one means it did not.
+                                //
+                                // Both replies are logged (bounded) alongside:
+                                // the errors say WHERE each reply disagreed,
+                                // only the bytes say WHAT it sent, and without
+                                // them an identical pair of errors is a dead
+                                // end for whoever reads the audit row.
+                                tracing::warn!(
+                                    target: "brain_extractors::llm",
+                                    memory_id = ?mem.id,
+                                    extractor_id = extractor_id_raw,
+                                    attempt1_error = %err1,
+                                    attempt2_error = %err2,
+                                    attempt1_prefix = %truncate_chars(&resp1.content, RESPONSE_PREVIEW_CHARS),
+                                    attempt2_prefix = %truncate_chars(&resp2.content, RESPONSE_PREVIEW_CHARS),
+                                    "llm extraction reply failed schema validation twice",
+                                );
                                 return ExtractionResult::failure(
                                     format!(
                                         "schema validation failed twice \

@@ -34,8 +34,8 @@ impl ResponseSchema {
 
     /// Parse, normalise and validate one model reply.
     pub fn validate(&self, content: &str) -> Result<Value, String> {
-        let mut parsed: Value = serde_json::from_str(strip_code_fences(content))
-            .map_err(|e| format!("response is not valid JSON: {e}"))?;
+        let mut parsed: Value =
+            parse_json_payload(content).map_err(|e| format!("response is not valid JSON: {e}"))?;
         normalize_nullable_required(&self.raw, &mut parsed);
         if let Err(mut errs) = self.validator.validate(&parsed) {
             let msg = match errs.next() {
@@ -118,32 +118,154 @@ fn schema_type_includes(schema_type: Option<&Value>, expected: &str) -> bool {
     }
 }
 
-/// Strip one surrounding Markdown code fence (```` ```json … ``` ```` or
-/// ```` ``` … ``` ````) that chat models commonly wrap JSON in. Anything
-/// that is not a complete fenced block is returned trimmed but otherwise
-/// untouched, so a plain JSON body parses exactly as before.
-fn strip_code_fences(content: &str) -> &str {
-    let t = content.trim();
-    let Some(rest) = t.strip_prefix("```") else {
-        return t;
+/// Parse the JSON document a model reply carries.
+///
+/// A chat model asked for JSON by prompt alone (which is every
+/// Anthropic call — the client sends no structured-output field) often
+/// replies with the document plus packaging: a prose preamble ("Here is
+/// the extracted graph:"), a Markdown fence, a note after the closing
+/// fence, or an opening fence whose language tag shares the line with
+/// the body. Every one of those puts a non-JSON byte at offset 0, which
+/// serde reports as `expected value at line 1 column 1` — an error about
+/// the packaging, not about the document inside it. Re-prompting does
+/// not help, because at temperature 0 the same input produces the same
+/// packaging, so the whole extraction is lost deterministically.
+///
+/// So a reply is read strictest-first: as sent, then with one Markdown
+/// fence unwrapped, then narrowed to its first balanced `{…}` / `[…]`
+/// span. The first reading that parses wins. When none parses, the error
+/// from the reply AS SENT is returned, so a reply that was never JSON
+/// still reports what it actually was rather than what a rescue attempt
+/// made of it.
+///
+/// One shape is deliberately NOT rescued: a preamble carrying its own
+/// balanced `{…}` aside ahead of the document, where the first span is
+/// the aside and not the answer. Scanning on to later openers would
+/// start returning a fragment of a malformed document (its first
+/// complete inner object) as if it were the whole reply, which is a
+/// worse failure than a parse error — it would validate as a document
+/// missing its required sections, and misname the fault. Such a reply
+/// fails, with its bytes in the extractor's warning.
+fn parse_json_payload(content: &str) -> Result<Value, serde_json::Error> {
+    let trimmed = content.trim();
+    let error = match parse_unfenced(trimmed) {
+        Ok(value) => return Ok(value),
+        Err(error) => error,
     };
-    let Some(body) = rest.strip_suffix("```") else {
-        return t;
+    // Last resort: the document with prose around it. Tried only after
+    // both whole-reply readings failed, so a well-formed reply is never
+    // narrowed and can never lose a trailing section to a stray brace.
+    for candidate in [
+        balanced_json_span(unfence(trimmed)),
+        balanced_json_span(trimmed),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Ok(value) = serde_json::from_str::<Value>(candidate) {
+            return Ok(value);
+        }
+    }
+    Err(error)
+}
+
+/// Parse a reply as sent, then with one Markdown fence unwrapped. The
+/// error is always the one from the reply AS SENT.
+fn parse_unfenced(trimmed: &str) -> Result<Value, serde_json::Error> {
+    let error = match serde_json::from_str::<Value>(trimmed) {
+        Ok(value) => return Ok(value),
+        Err(error) => error,
     };
-    // Drop an optional language tag on the opening fence line.
-    match body.split_once('\n') {
-        Some((tag, inner)) if !tag.trim().contains(['{', '[']) => inner.trim(),
-        _ => body.trim(),
+    let unfenced = unfence(trimmed);
+    if unfenced != trimmed {
+        if let Ok(value) = serde_json::from_str::<Value>(unfenced) {
+            return Ok(value);
+        }
+    }
+    Err(error)
+}
+
+/// Unwrap a Markdown code fence from a model reply.
+///
+/// Covers the shapes chat models actually emit: a fence wrapping the
+/// whole reply, a fence opened after a prose preamble, text trailing the
+/// closing fence, a MISSING closing fence (the reply was cut short), and
+/// a language tag sharing its line with the body (```` ```json {…} ````).
+/// Returns the input unchanged when it carries no fence, so a plain JSON
+/// body is untouched.
+fn unfence(trimmed: &str) -> &str {
+    let Some(open) = trimmed.find("```") else {
+        return trimmed;
+    };
+    // `find` lands on a char boundary and the fence is ASCII, so the
+    // slice below is always valid UTF-8.
+    let after = &trimmed[open + 3..];
+    let body = match after.find('\n') {
+        // Ordinary fence: an optional language tag, then the body on the
+        // following lines.
+        Some(newline) if !after[..newline].contains(['{', '[']) => &after[newline + 1..],
+        // Tag and body share the opening fence line — drop the bare tag
+        // word (`json`, `JSON5`, nothing at all).
+        _ => after.trim_start_matches(|c: char| c.is_ascii_alphanumeric()),
+    };
+    match body.find("```") {
+        Some(close) => body[..close].trim(),
+        None => body.trim(),
     }
 }
 
+/// The first balanced `{…}` or `[…]` span in `text`, or `None` when the
+/// text opens no JSON container or never closes the one it opens.
+///
+/// String-aware: a brace or bracket inside a JSON string, and an escaped
+/// quote inside one, never move the nesting depth — otherwise a document
+/// containing `"{"` as a value would be cut at the wrong byte.
+fn balanced_json_span(text: &str) -> Option<&str> {
+    let start = text.find(['{', '['])?;
+    let mut depth: usize = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, ch) in text[start..].char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' | '[' => depth += 1,
+            // `start` is an opener, so depth is ≥ 1 at every closer; the
+            // saturating form keeps a mismatched reply from wrapping.
+            '}' | ']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(&text[start..start + offset + ch.len_utf8()]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// True when a model response is evidently an ATTEMPT at JSON (it opens
-/// an object or array) — as opposed to a deliberate plain-text answer.
-/// Such a response that fails to parse is malformed output, never an
-/// entity name.
+/// an object or array, possibly inside a code fence) — as opposed to a
+/// deliberate plain-text answer. Such a response that fails to parse is
+/// malformed output, never an entity name.
+///
+/// Deliberately blind to [`balanced_json_span`]: a plain-text reply that
+/// happens to contain a bracketed aside is an entity name, not malformed
+/// JSON, and must keep the bare-string projection.
 fn looks_like_json(content: &str) -> bool {
-    let t = strip_code_fences(content);
-    t.starts_with('{') || t.starts_with('[')
+    let trimmed = content.trim();
+    [trimmed, unfence(trimmed)]
+        .iter()
+        .any(|candidate| candidate.starts_with('{') || candidate.starts_with('['))
 }
 
 /// The reason a free-form model response could not be parsed as JSON.
@@ -155,8 +277,13 @@ pub enum FreeformError {
 }
 
 /// Parse a free-form model response, preserving deliberate plain text.
+///
+/// Unlike [`ResponseSchema::validate`] this reads only the whole reply
+/// (bare, then unfenced): a free-form extractor's reply may legitimately
+/// BE prose, and narrowing prose to a bracketed fragment inside it would
+/// turn an entity name into a parse error.
 pub fn parse_freeform(content: &str) -> Result<Value, FreeformError> {
-    match serde_json::from_str::<Value>(strip_code_fences(content)) {
+    match parse_unfenced(content.trim()) {
         Ok(value) => Ok(value),
         Err(error) if looks_like_json(content) => {
             Err(FreeformError::MalformedJson(error.to_string()))
@@ -170,16 +297,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn strip_code_fences_unwraps_fenced_json() {
-        assert_eq!(strip_code_fences("```json\n{\"a\":1}\n```"), "{\"a\":1}");
-        assert_eq!(strip_code_fences("```\n[1,2]\n```"), "[1,2]");
-        assert_eq!(strip_code_fences("  {\"a\":1}  "), "{\"a\":1}");
-        // Not a complete fence: returned trimmed, untouched.
+    fn unfence_unwraps_fenced_json() {
+        assert_eq!(unfence("```json\n{\"a\":1}\n```"), "{\"a\":1}");
+        assert_eq!(unfence("```\n[1,2]\n```"), "[1,2]");
+        assert_eq!(unfence("{\"a\":1}"), "{\"a\":1}");
+        // No closing fence (the reply was cut short): the body is still
+        // recovered rather than handed to serde with a backtick at
+        // offset 0.
+        assert_eq!(unfence("```json\n{\"a\":1}"), "{\"a\":1}");
+        // Tag and body on one line.
+        assert_eq!(unfence("```json {\"a\":1}```"), "{\"a\":1}");
+        // Prose before the fence, a note after it.
         assert_eq!(
-            strip_code_fences("```json\n{\"a\":1}"),
-            "```json\n{\"a\":1}"
+            unfence("Here you go:\n```json\n{\"a\":1}\n```\nLet me know."),
+            "{\"a\":1}"
         );
-        assert_eq!(strip_code_fences("Acme Corp"), "Acme Corp");
+        assert_eq!(unfence("Acme Corp"), "Acme Corp");
+    }
+
+    #[test]
+    fn balanced_json_span_finds_the_document_in_prose() {
+        assert_eq!(
+            balanced_json_span("Here is the graph: {\"a\":[1,2]} — done."),
+            Some("{\"a\":[1,2]}")
+        );
+        // Braces inside a string never move the depth.
+        assert_eq!(
+            balanced_json_span(r#"note {"a":"} {","b":"\""} tail"#),
+            Some(r#"{"a":"} {","b":"\""}"#)
+        );
+        // Opened and never closed.
+        assert_eq!(balanced_json_span("prose {\"a\":1"), None);
+        // No container at all.
+        assert_eq!(balanced_json_span("Acme Corp"), None);
     }
 
     #[test]
@@ -190,6 +340,112 @@ mod tests {
         assert!(looks_like_json("```json\n[{\"x\":1}\n```"));
         assert!(!looks_like_json("Acme Corp"));
         assert!(!looks_like_json("Mirror},{"));
+        // A plain-text reply carrying a bracketed aside stays plain text.
+        assert!(!looks_like_json("Acme Corp [the holding company]"));
+    }
+
+    #[test]
+    fn validate_accepts_clean_json() {
+        let schema = ResponseSchema::compile(statement_schema()).unwrap();
+        let value = schema
+            .validate(
+                r#"{"statements":[{"subject":"A","predicate":"knows","object":"B","object_is_entity":true}]}"#,
+            )
+            .unwrap();
+        assert_eq!(value["statements"][0]["subject"], "A");
+    }
+
+    #[test]
+    fn validate_accepts_fenced_json() {
+        let schema = ResponseSchema::compile(statement_schema()).unwrap();
+        let body = r#"{"statements":[{"subject":"A","predicate":"knows","object":"B","object_is_entity":true}]}"#;
+        for content in [
+            format!("```json\n{body}\n```"),
+            format!("```\n{body}\n```"),
+            // Cut off before the closing fence.
+            format!("```json\n{body}"),
+            // Tag and body share the opening line.
+            format!("```json {body}```"),
+        ] {
+            let value = schema.validate(&content).unwrap_or_else(|e| {
+                panic!("fenced reply rejected: {e} (content: {content})");
+            });
+            assert_eq!(value["statements"][0]["object"], "B");
+        }
+    }
+
+    #[test]
+    fn validate_accepts_json_wrapped_in_prose() {
+        let schema = ResponseSchema::compile(statement_schema()).unwrap();
+        let body = r#"{"statements":[{"subject":"A","predicate":"knows","object":"B","object_is_entity":true}]}"#;
+        for content in [
+            format!("Here is the extracted graph:\n{body}"),
+            format!("Sure! Here you go:\n```json\n{body}\n```\nLet me know if you need more."),
+            format!("{body}\n\nNote: I skipped the greeting."),
+        ] {
+            let value = schema.validate(&content).unwrap_or_else(|e| {
+                panic!("prose-wrapped reply rejected: {e} (content: {content})");
+            });
+            assert_eq!(value["statements"][0]["predicate"], "knows");
+        }
+    }
+
+    #[test]
+    fn validate_still_rejects_a_reply_that_is_not_json() {
+        let schema = ResponseSchema::compile(statement_schema()).unwrap();
+        for content in [
+            "I cannot extract anything from this text.",
+            "```json\n{\"statements\": [{\"subject\":",
+            "",
+            "{{",
+        ] {
+            let error = schema
+                .validate(content)
+                .expect_err("non-JSON reply must fail");
+            assert!(
+                error.starts_with("response is not valid JSON") || error.contains("is not of type"),
+                "unexpected error for {content:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_reports_the_reply_as_sent_not_a_rescue_attempt() {
+        let schema = ResponseSchema::compile(statement_schema()).unwrap();
+        let error = schema.validate("I cannot help with that.").unwrap_err();
+        // serde's verdict on offset 0 of the reply itself.
+        assert!(
+            error.contains("expected value at line 1 column 1"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn freeform_prose_with_brackets_stays_plain_text() {
+        match parse_freeform("Acme Corp [the holding company]") {
+            Err(FreeformError::PlainText) => {}
+            Ok(v) => panic!("prose parsed as JSON: {v}"),
+            Err(FreeformError::MalformedJson(e)) => panic!("prose read as malformed JSON: {e}"),
+        }
+    }
+
+    #[test]
+    fn freeform_recovers_a_fence_without_its_close() {
+        let value = match parse_freeform("```json\n[{\"name\":\"Acme Corp\"}]") {
+            Ok(value) => value,
+            Err(FreeformError::MalformedJson(e)) => panic!("unterminated fence rejected: {e}"),
+            Err(FreeformError::PlainText) => panic!("unterminated fence read as plain text"),
+        };
+        assert_eq!(value[0]["name"], "Acme Corp");
+    }
+
+    #[test]
+    fn freeform_truncated_json_is_still_malformed() {
+        match parse_freeform("{\"statements\": [{\"subject\": \"Mirror\"},{") {
+            Err(FreeformError::MalformedJson(_)) => {}
+            Ok(v) => panic!("truncated JSON parsed: {v}"),
+            Err(FreeformError::PlainText) => panic!("truncated JSON read as plain text"),
+        }
     }
 
     fn statement_schema() -> Value {
