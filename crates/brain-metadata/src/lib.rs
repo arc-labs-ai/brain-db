@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 
 pub mod api_keys;
+pub mod attribution;
 pub mod audit;
 pub mod cascade;
 pub mod db;

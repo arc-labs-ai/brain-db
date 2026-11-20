@@ -71,7 +71,18 @@ autocut = false
 # declines to make it.
 [precision]
 # Minimum cross-lane support (0..=5) the uncommitted lead must carry to commit.
-commit_min_support = 0
+#
+# WAS 0, which makes `None` unreachable: measured on conv-26, the engine
+# abstained on 0 of 47 unanswerable LoCoMo questions and guessed at every
+# one. The abstention machinery is implemented and unit-tested; it was
+# simply never switched on, so 22.5% of that benchmark is answered by a
+# system that cannot say "I don't know".
+#
+# 1 is the minimal non-trivial setting and states the rule the code already
+# describes: a lead resting on passage cosine ALONE has not established
+# belonging. A lead with any cross-lane corroboration — lexical, graph,
+# strong HyPE, or a grounded source — still commits.
+commit_min_support = 1
 # Minimum support a member needs to join a Many answer's committed set rather
 # than stay as retained context.
 many_min_support = 0

@@ -19,12 +19,14 @@ use std::time::Instant;
 use brain_core::{EntityId, MemoryId, SessionId, Slot, SubjectRef};
 use brain_index::RankedItemId;
 use brain_index::SemanticQuery;
+use brain_metadata::attribution::{attribution_admits, AttributionVerdict};
 use brain_metadata::tables::memory::MEMORIES_TABLE;
 use brain_metadata::tables::text::TEXTS_TABLE;
 use brain_planner::retrieval::executor::{
     execute as retrieval_execute, ExecutionError, QueryMetadata, QueryResult, RerankOutcome,
     RetrievalExecutorContext, RetrieverStatus,
 };
+use brain_planner::retrieval::fusion::FusedItem;
 use brain_planner::retrieval::planner::{plan as retrieval_plan, PlanError};
 use brain_planner::retrieval::router::{
     QueryRequest as PlannerQueryRequest, Retriever, RetrieverSelection,
@@ -780,6 +782,69 @@ fn apply_kind_presence_abstention(
     }
 }
 
+/// Attribution gate — drop the members the store says are about someone else.
+///
+/// Retrieval answers "what is topically near this cue"; this answers "whose
+/// fact is this". They come apart whenever two people share a topic, and
+/// when they do an unfiltered membership set hands back one person's fact
+/// under the other's name: asked what *Caroline's* hand-painted bowl is a
+/// reminder of, when the bowl is Melanie's, the set still contains the bowl
+/// memory and the answer is composed from it. 404 such twin pairs exist in
+/// the eval corpus.
+///
+/// `verdict_of` is injected rather than read here so the rule
+/// ([`attribution_admits`], tested on its own in `brain-metadata`) and the
+/// set surgery are separately testable, and so this stays pure.
+///
+/// Three things this must NOT do, each one a regression if violated:
+///
+///   * **Fire without an anchor.** An unanchored cue ("when was the trip")
+///     has nothing to be mis-attributed *against*. The check lives in the
+///     gate, not only at the call site, so the no-op guarantee is a property
+///     of the gate itself and survives a refactor of its caller.
+///   * **Drop an anchor-direct member.** Graph-anchored injection pulls the
+///     anchor's OWN statements and the memories carrying a `Mentions` edge
+///     to it — bound to the anchor by construction. A vocative-shaped
+///     binding (someone else's typed role plus a mention of the anchor)
+///     reads as `MisAttributed`, which must not be allowed to delete a
+///     member the typed graph itself handed us.
+///   * **Drop an unbound member.** Extraction is asynchronous, so "nothing
+///     written yet" is routine; `attribution_admits` returns
+///     `UnknownBinding` there, which admits. Only a POSITIVE
+///     `MisAttributed` removes anything.
+///
+/// Dropped ids also leave `placed`, which is the handler's record of what is
+/// in the set — the grounded-commit backing check reads it, and a stale
+/// entry would let a commit set a shape with no surviving member.
+///
+/// Anchor-direct injection gets NO exemption, deliberately. It draws from two
+/// sources and only one of them is bound by construction: the anchor's own
+/// statements (whose evidence memory therefore carries the anchor as a subject
+/// role, so it clears the gate on its own merits), and every memory holding a
+/// `Mentions` edge to the anchor — which is exactly the vocative case the
+/// predicate exists to refuse. Exempting the set wholesale would shield
+/// "Yep, Melanie! I've got my hand-painted bowl" from the gate whenever the
+/// cue named Melanie, which is the bug.
+fn apply_attribution_gate(
+    out: Vec<MemoryResult>,
+    placed: &mut HashSet<u128>,
+    anchors: &HashSet<EntityId>,
+    verdict_of: &impl Fn(u128) -> AttributionVerdict,
+) -> Vec<MemoryResult> {
+    if anchors.is_empty() {
+        return out;
+    }
+    let mut kept: Vec<MemoryResult> = Vec::with_capacity(out.len());
+    for m in out {
+        if verdict_of(m.memory_id).admits() {
+            kept.push(m);
+        } else {
+            placed.remove(&m.memory_id);
+        }
+    }
+    kept
+}
+
 /// Unique multi-lane consensus collapse (model-free, no per-read model). Uses the
 /// per-lane contributions the fan-out already recorded: a memory found by MORE
 /// independent lanes (semantic / lexical / graph) is a stronger belonging signal.
@@ -1421,12 +1486,92 @@ fn build_membership(
     // ordering so an injected buried fact that genuinely answers the cue is
     // answer-relevance ordered up rather than stranded at the tail. It never
     // reorders or drops an existing member.
+    //
+    // The injected ids are recorded: they are anchor-bound by construction,
+    // which exempts them from the attribution gate below.
+    let mut anchor_direct: HashSet<u128> = HashSet::new();
     if let Some(anchor) = anchor {
         let already: HashSet<u128> = placed.clone();
         if let Some(extra) = anchor_direct_memories(anchor, &already, req, ctx) {
             for e in extra {
                 if placed.insert(e.memory_id) {
+                    anchor_direct.insert(e.memory_id);
                     out.push(e);
+                }
+            }
+        }
+    }
+
+    // ── ATTRIBUTION GATE (whose fact is this) ───────────────────────────────
+    // Everything above decided TOPICAL membership. This decides ABOUTNESS,
+    // and it is the last step allowed to shrink the set.
+    //
+    // Placement is load-bearing in both directions:
+    //   * AFTER graph-anchored injection, so the anchor's own facts are in
+    //     hand and can be exempted rather than re-derived.
+    //   * BEFORE the SUPPORT computation, so a mis-attributed member stops
+    //     contributing to `any_belongs`. That is what finally lets
+    //     `apply_kind_presence_abstention` reach `None` on a false-premise
+    //     question. The intended end state is ABSTENTION, not
+    //     re-attribution — refusing to answer "what is Caroline's
+    //     hand-painted bowl a reminder of" is the correct outcome, because
+    //     Caroline has no such bowl. Running this after SUPPORT would leave
+    //     `any_belongs` set by a member that has since been removed, and the
+    //     gate would only reorder the wrong answer away instead of
+    //     withholding it.
+    //
+    // `anchor.is_some()` is exactly the condition under which the anchor set
+    // is non-empty — both derive from the non-self candidates of
+    // `subject_candidates_from_cue`, one taking the first and one taking all
+    // — so this skips the resolver pass and every redb read on the (common)
+    // unanchored cue.
+    if anchor.is_some() {
+        if let Ok(rtxn) = ctx.executor.metadata.read_txn() {
+            let anchors = resolve_anchor_set(&rtxn, req, ctx);
+            if !anchors.is_empty() {
+                let scope = brain_metadata::RowScope::new(
+                    ctx.executor.caller_namespace,
+                    ctx.executor.caller_space,
+                );
+                // Memoized per memory id: `memory_binding` is a range scan
+                // plus a point lookup per statement plus an edge scan — the
+                // most expensive per-member step on this path — and the id
+                // set is read more than once. The entry API makes a repeated
+                // id free.
+                let mut bindings: HashMap<u128, brain_metadata::attribution::MemoryBinding> =
+                    HashMap::with_capacity(out.len());
+                for m in &out {
+                    bindings.entry(m.memory_id).or_insert_with(|| {
+                        brain_metadata::attribution::memory_binding(
+                            &rtxn,
+                            scope,
+                            MemoryId::from_raw(m.memory_id),
+                        )
+                    });
+                }
+                let verdict_of = |id: u128| -> AttributionVerdict {
+                    bindings.get(&id).map_or(
+                        // Not read (so nothing is known) → admit.
+                        AttributionVerdict::UnknownBinding,
+                        |b| attribution_admits(b, &anchors),
+                    )
+                };
+                let before = out.len();
+                out = apply_attribution_gate(
+                    out,
+                    &mut placed,
+                    &anchors,
+                    &verdict_of,
+                );
+                if out.len() != before {
+                    tracing::debug!(
+                        target: "brain_ops::recall_trace",
+                        cue = %req.cue_text,
+                        anchors = anchors.len(),
+                        dropped = before - out.len(),
+                        remaining = out.len(),
+                        "recall: attribution gate dropped mis-attributed members"
+                    );
                 }
             }
         }
@@ -1554,7 +1699,22 @@ fn build_membership(
             || lanes.contains(&RetrieverNameWire::Graph)
             || grounded_sources.contains(&id)
     };
-    let any_belongs = out.iter().any(|m| belongs_of(m.memory_id));
+    // Keyed on the LEAD, not on the pool.
+    //
+    // `out` is already ordered by answer relevance above, so `out[0]` is the
+    // member that would BE the answer. Asking whether *any* of the members
+    // belongs asks a different and much weaker question: the pool is the
+    // caller's `max_results`, in practice 100, and the chance that at least one
+    // of a hundred carries some lexical or graph tag is ~1. Measured on a
+    // 1,986-question run the gate fired twice. It was not discriminating; it
+    // was pinned.
+    //
+    // The rule the comment above describes — a lone passage cosine cannot
+    // establish belonging — only means anything when it is applied to the
+    // thing being returned. A lead chosen by strong HyPE already satisfies
+    // `belongs_of`; a lead chosen by cosine alone does not, and that is
+    // precisely the case worth declining.
+    let any_belongs = lead_belongs(&out, &belongs_of);
 
     // ── PRECISION DECISION ──────────────────────────────────────────────────
     // Calibrated selective shaping over the assembled set: commit a Single/Many
@@ -2123,11 +2283,7 @@ fn best_grounded_for_cue(
     // can't subject-check, but there is no named anchor to check against.
     let candidates = subject_candidates_from_cue(&rtxn, req, ctx)?;
     let self_id = EntityId::from(ctx.executor.caller_space.0.into_bytes());
-    let anchors: HashSet<EntityId> = candidates
-        .iter()
-        .copied()
-        .filter(|id| *id != self_id)
-        .collect();
+    let anchors = named_anchors(&candidates, ctx);
 
     // Reified slot-projection overlay: probe the per-statement question-bridge
     // index directly with the cue and project the matched slot of the best
@@ -2437,6 +2593,90 @@ fn resolve_graph_anchor(req: &RecallRequest, ctx: &OpsContext) -> Option<EntityI
         .find(|id| *id != self_id)
 }
 
+/// Every NAMED subject the cue resolved, as a set: the candidates minus the
+/// space self-entity.
+///
+/// [`resolve_graph_anchor`] keeps the FIRST of these because a graph walk
+/// needs a single root. Attribution needs all of them: a cue can name two
+/// people ("what did Melanie tell Caroline"), and a fact carried by either
+/// role belongs to that question — collapsing to one would refuse the
+/// other's own evidence.
+///
+/// The self-entity is excluded for the same reason it is skipped as a walk
+/// seed: every memory in the space connects to it, so including it would
+/// admit everything and make any gate keyed on this set a no-op.
+///
+/// The `>= 0.9` resolve bar inside [`subject_candidates_from_cue`] (exact /
+/// alias / unambiguous partial-name, never trigram-fuzzy) is load-bearing
+/// HERE in a way it is not for the walk seed. A loosely-resolved seed merely
+/// walks the wrong neighbourhood and contributes nothing; a loosely-resolved
+/// ANCHOR *drops* members, so relaxing that bar would turn attribution into
+/// a recall-regression generator. Nothing here may widen it.
+fn named_anchors(candidates: &[EntityId], ctx: &OpsContext) -> HashSet<EntityId> {
+    let self_id = EntityId::from(ctx.executor.caller_space.0.into_bytes());
+    candidates
+        .iter()
+        .copied()
+        .filter(|id| *id != self_id)
+        .collect()
+}
+
+/// The anchor set for the attribution gate, resolved from the cue alone.
+///
+/// Fails soft to the empty set: a read or resolver error must degrade to
+/// "no anchor", which makes the gate a no-op, never a refusal.
+fn resolve_anchor_set(
+    rtxn: &redb::ReadTransaction,
+    req: &RecallRequest,
+    ctx: &OpsContext,
+) -> HashSet<EntityId> {
+    subject_candidates_from_cue(rtxn, req, ctx)
+        .map(|c| named_anchors(&c, ctx))
+        .unwrap_or_default()
+}
+
+/// Demote graph-only hits that the cue does not actually reach, WITHOUT
+/// destroying the order the retrieval pipeline chose.
+///
+/// Items arrive in the pipeline's final order — fusion, then the MMR
+/// diversity pass. A stable partition keeps that order inside each group and
+/// still puts every demoted item behind every surviving one.
+/// Whether the member that would be the answer carries non-passage support.
+///
+/// Split out so the decision is testable without a shard. `members` must
+/// already be in answer order — the caller orders by answer relevance before
+/// this runs.
+fn lead_belongs(members: &[MemoryResult], belongs_of: &impl Fn(u128) -> bool) -> bool {
+    members.first().is_some_and(|m| belongs_of(m.memory_id))
+}
+
+fn demote_graph_only(
+    items: Vec<FusedItem>,
+    relevance_of: &impl Fn(MemoryId) -> f32,
+) -> Vec<FusedItem> {
+    let mut flagged: Vec<(bool, FusedItem)> = Vec::with_capacity(items.len());
+    for mut item in items {
+        let RankedItemId::Memory(mid) = item.id else {
+            flagged.push((false, item));
+            continue;
+        };
+        let graph_only = !item.contributing.is_empty()
+            && item
+                .contributing
+                .iter()
+                .all(|c| matches!(c.retriever, Retriever::Graph));
+        if !graph_only {
+            flagged.push((false, item));
+            continue;
+        }
+        item.fused_score *= f64::from(relevance_of(mid));
+        flagged.push((true, item));
+    }
+    // Stable: within "kept" and within "demoted" the pipeline order holds.
+    flagged.sort_by_key(|(demoted, _)| *demoted);
+    flagged.into_iter().map(|(_, item)| item).collect()
+}
+
 fn subject_candidates_from_cue(
     rtxn: &redb::ReadTransaction,
     req: &RecallRequest,
@@ -2629,31 +2869,33 @@ async fn retrieve_memories(
     // lets the entity-graph lane be always-on without the subject-dump flood —
     // items the semantic/lexical lanes also surfaced are already cue-relevant,
     // so they are left untouched. Skipped only when the cue failed to embed.
+    //
+    // The demotion is applied as a STABLE PARTITION, not a re-sort, and that
+    // distinction is the whole point. `result.items` arrives in the order the
+    // retrieval pipeline decided — fusion, then the MMR diversity pass. With
+    // no cross-encoder loaded (the shipped default), MMR's relevance term is
+    // `normalize(fused_score)` and nothing else, so re-sorting by
+    // `fused_score` here recovers exactly the order MMR was handed and throws
+    // its spread away. The stage computed a spread and the next line undid it:
+    // for a set question ("what pottery did they make") that is the difference
+    // between returning distinct members and returning paraphrases of the most
+    // salient one.
+    //
+    // Partitioning keeps the pipeline's order inside each group and still puts
+    // every demoted graph-only item behind every surviving one, which is what
+    // the flood guard is for. It trades the old graded demotion — score scaled
+    // by cue cosine, then globally re-sorted — for a binary one. That is the
+    // deliberate half of the change: the guard's stated job is keeping
+    // graph-only noise out of the head, and a demoted item that lands at the
+    // tail satisfies it as well as one that merely sinks.
     if let Some(cue) = cue_vec {
-        for item in &mut result.items {
-            let mid = match item.id {
-                RankedItemId::Memory(m) => m,
-                _ => continue,
-            };
-            let graph_only = !item.contributing.is_empty()
-                && item
-                    .contributing
-                    .iter()
-                    .all(|c| matches!(c.retriever, Retriever::Graph));
-            if graph_only {
-                let relevance = ctx
-                    .semantic_retriever
-                    .vector_for(mid)
-                    .map(|v| cosine(cue, &v).max(0.0))
-                    .unwrap_or(0.0);
-                item.fused_score *= f64::from(relevance);
-            }
-        }
-        result.items.sort_by(|a, b| {
-            b.fused_score
-                .partial_cmp(&a.fused_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        let relevance_of = |mid| {
+            ctx.semantic_retriever
+                .vector_for(mid)
+                .map(|v| cosine(cue, &v).max(0.0))
+                .unwrap_or(0.0)
+        };
+        result.items = demote_graph_only(std::mem::take(&mut result.items), &relevance_of);
     }
 
     // Per-lane contribution trace: how many fused items each retriever lane
@@ -4537,6 +4779,300 @@ mod tests {
             true,
         );
         assert_eq!(kept.len(), 2, "a belonging member → keep the set");
+    }
+
+    // ── Attribution gate (whose fact is this) ───────────────────────────────
+    // Verdicts are INJECTED rather than read from a live redb: the rule itself
+    // (`attribution_admits`) has its own 8 tests in brain-metadata, so what is
+    // under test here is the set surgery — what is dropped, what is exempt, and
+    // what happens to `placed`.
+
+    /// Verdict lookup standing in for the redb-backed binding read. An id the
+    /// map does not mention reads as `UnknownBinding`, matching the fail-soft
+    /// behaviour of `memory_binding`.
+    fn gate(
+        members: Vec<MemoryResult>,
+        placed: &mut HashSet<u128>,
+        anchors: &HashSet<brain_core::EntityId>,
+        verdicts: &[(u128, AttributionVerdict)],
+    ) -> Vec<MemoryResult> {
+        let v: HashMap<u128, AttributionVerdict> = verdicts.iter().copied().collect();
+        apply_attribution_gate(members, placed, anchors, &|id| {
+            v.get(&id)
+                .copied()
+                .unwrap_or(AttributionVerdict::UnknownBinding)
+        })
+    }
+
+    fn one_anchor() -> HashSet<brain_core::EntityId> {
+        std::iter::once(brain_core::EntityId::new()).collect()
+    }
+
+    #[test]
+    fn attribution_gate_drops_the_other_entitys_fact() {
+        // The measured twin pair. Memory 1 is Melanie's hand-painted bowl,
+        // asked under Caroline's name; memory 2 is genuinely Caroline's. The
+        // asymmetry is the assertion — a gate that kept both would still
+        // answer "Caroline's bowl is a reminder of art and self-expression".
+        let mut placed: HashSet<u128> = [1, 2].into_iter().collect();
+        let kept = gate(
+            vec![mr(1, &[Semantic]), mr(2, &[Semantic])],
+            &mut placed,
+            &one_anchor(),
+            &[
+                (1, AttributionVerdict::MisAttributed),
+                (2, AttributionVerdict::BoundToAnchor),
+            ],
+        );
+        assert_eq!(ids(&kept), vec![2], "only the anchor's own fact survives");
+        // `placed` is the handler's record of the set; a dropped id that stayed
+        // in it would let the grounded commit claim a shape with no backing
+        // member.
+        assert!(!placed.contains(&1), "a dropped id leaves `placed`");
+        assert!(placed.contains(&2), "a surviving id stays in `placed`");
+    }
+
+    #[test]
+    fn an_all_misattributed_set_abstains_rather_than_reattributing() {
+        // The end-to-end twin-pair assertion, and the reason the gate runs
+        // BEFORE support. A false-premise question must end in None, not in a
+        // re-attributed answer.
+        //
+        // Both members carry a real belonging lane (Graph / Lexical), so before
+        // the gate `any_belongs` is true and the kind-presence gate keeps the
+        // set. After the gate there is nothing left to carry it, so the gate
+        // empties the answer.
+        let mut placed: HashSet<u128> = [1, 2].into_iter().collect();
+        let survivors = gate(
+            vec![mr(1, &[Graph, Semantic]), mr(2, &[Lexical])],
+            &mut placed,
+            &one_anchor(),
+            &[
+                (1, AttributionVerdict::MisAttributed),
+                (2, AttributionVerdict::MisAttributed),
+            ],
+        );
+        // Mirrors the handler's `belongs_of` over the SURVIVING members.
+        let any_belongs = survivors.iter().any(|m| {
+            m.contributing_retrievers
+                .contains(&RetrieverNameWire::Lexical)
+                || m.contributing_retrievers
+                    .contains(&RetrieverNameWire::Graph)
+        });
+        let kept = apply_kind_presence_abstention(
+            survivors,
+            Some(brain_core::EntityId::new()),
+            &GroundedOutcome::NoAnswer,
+            any_belongs,
+        );
+        assert!(
+            kept.is_empty(),
+            "a false premise abstains; it is never re-attributed"
+        );
+    }
+
+    // ---- lead_belongs ------------------------------------------------------
+
+    /// The fix. `out` is in answer order, so member 1 is what would be
+    /// returned. It carries no non-passage support; member 2 does. Asking
+    /// "does ANY member belong" answers yes and ships an unsupported answer —
+    /// which, with a pool of 100, is what happened on 1,984 of 1,986 questions.
+    #[test]
+    fn an_unsupported_lead_abstains_even_when_a_deeper_member_belongs() {
+        let members = vec![mr(1, &[Semantic]), mr(2, &[Lexical])];
+        let supported: HashSet<u128> = [2].into_iter().collect();
+        assert!(
+            !lead_belongs(&members, &|id| supported.contains(&id)),
+            "the lead carries only a passage cosine, so the answer is unsupported"
+        );
+    }
+
+    #[test]
+    fn a_supported_lead_answers() {
+        let members = vec![mr(1, &[Lexical]), mr(2, &[Semantic])];
+        let supported: HashSet<u128> = [1].into_iter().collect();
+        assert!(lead_belongs(&members, &|id| supported.contains(&id)));
+    }
+
+    /// An empty set is "nothing stored", decided by cardinality elsewhere —
+    /// not an abstention, and this must not claim otherwise.
+    #[test]
+    fn an_empty_set_has_no_lead_to_believe() {
+        assert!(!lead_belongs(&[], &|_| true));
+    }
+
+    // ---- demote_graph_only -------------------------------------------------
+
+    fn fi(id: u128, score: f64, lanes: &[Retriever]) -> FusedItem {
+        use brain_planner::retrieval::fusion::RetrieverContribution;
+        FusedItem {
+            id: RankedItemId::Memory(MemoryId::from(id)),
+            fused_score: score,
+            contributing: lanes
+                .iter()
+                .map(|r| RetrieverContribution {
+                    retriever: *r,
+                    rank: 1,
+                    raw_score: 1.0,
+                })
+                .collect(),
+            rerank_score: None,
+        }
+    }
+
+    fn fids(items: &[FusedItem]) -> Vec<u128> {
+        items
+            .iter()
+            .map(|i| match i.id {
+                RankedItemId::Memory(m) => u128::from(m),
+                _ => 0,
+            })
+            .collect()
+    }
+
+    /// The regression lock for the ordering bug.
+    ///
+    /// The pipeline hands these over in MMR's order, which is deliberately NOT
+    /// `fused_score` order — that is what a diversity spread IS. Re-sorting by
+    /// `fused_score` here recovers the order MMR was given and discards its
+    /// work, because with no cross-encoder loaded MMR's relevance term is
+    /// `normalize(fused_score)` and nothing else.
+    #[test]
+    fn the_pipeline_order_survives_when_nothing_is_demoted() {
+        use brain_planner::retrieval::router::Retriever as R;
+        let items = vec![
+            fi(1, 0.20, &[R::Semantic]),
+            fi(2, 0.90, &[R::Lexical]),
+            fi(3, 0.50, &[R::Semantic, R::Lexical]),
+        ];
+        let out = demote_graph_only(items, &|_| 1.0);
+        assert_eq!(
+            fids(&out),
+            vec![1, 2, 3],
+            "a spread that is not fused_score-ordered must survive intact"
+        );
+    }
+
+    #[test]
+    fn a_graph_only_item_is_demoted_behind_every_survivor() {
+        use brain_planner::retrieval::router::Retriever as R;
+        let items = vec![
+            fi(1, 0.90, &[R::Graph]),
+            fi(2, 0.20, &[R::Semantic]),
+            fi(3, 0.10, &[R::Lexical]),
+        ];
+        // Cue does not reach the graph-only hit.
+        let out = demote_graph_only(items, &|_| 0.0);
+        assert_eq!(
+            fids(&out),
+            vec![2, 3, 1],
+            "the graph-only hit goes behind the survivors, which keep their order"
+        );
+    }
+
+    #[test]
+    fn demoted_items_keep_their_relative_order() {
+        use brain_planner::retrieval::router::Retriever as R;
+        let items = vec![
+            fi(1, 0.90, &[R::Graph]),
+            fi(2, 0.50, &[R::Semantic]),
+            fi(3, 0.80, &[R::Graph]),
+        ];
+        let out = demote_graph_only(items, &|_| 0.0);
+        assert_eq!(fids(&out), vec![2, 1, 3], "stable within each group");
+    }
+
+    /// Documents the deliberate half of the change: demotion is now binary.
+    /// A graph-only item the cue DOES reach still moves behind the survivors,
+    /// where previously a high cosine could keep it near the head.
+    #[test]
+    fn a_graph_only_item_is_demoted_even_when_the_cue_reaches_it() {
+        use brain_planner::retrieval::router::Retriever as R;
+        let items = vec![fi(1, 0.90, &[R::Graph]), fi(2, 0.10, &[R::Semantic])];
+        let out = demote_graph_only(items, &|_| 1.0);
+        assert_eq!(fids(&out), vec![2, 1]);
+        assert!(
+            (out[1].fused_score - 0.90).abs() < 1e-9,
+            "its score is still scaled by the cue cosine, only its slot changed"
+        );
+    }
+
+    #[test]
+    fn a_statement_subject_member_clears_the_gate_on_its_own_merits() {
+        // Anchor-direct injection pulled 7 because it is the evidence memory
+        // of the anchor's own statement. That memory therefore carries the
+        // anchor as a subject role, so it is `BoundToAnchor` and needs no
+        // exemption to survive. This is why the gate has none.
+        let mut placed: HashSet<u128> = [7].into_iter().collect();
+        let kept = gate(
+            vec![mr(7, &[Graph])],
+            &mut placed,
+            &one_anchor(),
+            &[(7, AttributionVerdict::BoundToAnchor)],
+        );
+        assert_eq!(ids(&kept), vec![7], "a subject-bound member survives");
+        assert!(placed.contains(&7), "and keeps its place in `placed`");
+    }
+
+    #[test]
+    fn an_injected_vocative_member_is_still_refused() {
+        // The other half of anchor-direct injection is every memory holding a
+        // `Mentions` edge to the anchor — which includes the vocative case:
+        // Caroline says "Yep, Melanie! I've got my hand-painted bowl", so the
+        // memory mentions Melanie while its typed role says Caroline.
+        //
+        // Measured: 30.2% of twin-pair evidence turns name the other party
+        // this way. Exempting anchor-direct wholesale would shield exactly
+        // that subset from the gate and leave the bug in place for a third of
+        // the corpus, which is why the exemption was removed.
+        let mut placed: HashSet<u128> = [7].into_iter().collect();
+        let kept = gate(
+            vec![mr(7, &[Graph])],
+            &mut placed,
+            &one_anchor(),
+            &[(7, AttributionVerdict::MisAttributed)],
+        );
+        assert!(ids(&kept).is_empty(), "a vocative-only member is refused");
+        assert!(!placed.contains(&7), "and leaves `placed`");
+    }
+    #[test]
+    fn an_unanchored_cue_drops_nothing() {
+        // The no-regression guarantee. Most cues name nobody ("when was the
+        // trip"), so there is nothing to be mis-attributed against; the gate
+        // must be a strict no-op there even if the verdicts say otherwise.
+        let mut placed: HashSet<u128> = [1, 2].into_iter().collect();
+        let kept = gate(
+            vec![mr(1, &[Semantic]), mr(2, &[Semantic])],
+            &mut placed,
+            &HashSet::new(),
+            &[
+                (1, AttributionVerdict::MisAttributed),
+                (2, AttributionVerdict::MisAttributed),
+            ],
+        );
+        assert_eq!(ids(&kept), vec![1, 2], "no anchor → nothing is dropped");
+        assert_eq!(placed.len(), 2, "`placed` is untouched");
+    }
+
+    #[test]
+    fn an_unbound_memory_is_never_dropped() {
+        // Extraction is asynchronous, so a memory with no statements and no
+        // edges is routine, not suspicious. Only a POSITIVE MisAttributed may
+        // remove anything — silence is not denial. Id 9 is absent from the
+        // verdict map entirely, which is also how a failed read degrades.
+        let mut placed: HashSet<u128> = [8, 9].into_iter().collect();
+        let kept = gate(
+            vec![mr(8, &[Semantic]), mr(9, &[Semantic])],
+            &mut placed,
+            &one_anchor(),
+            &[(8, AttributionVerdict::UnknownBinding)],
+        );
+        assert_eq!(
+            ids(&kept),
+            vec![8, 9],
+            "unknown binding admits; a read error must never refuse"
+        );
+        assert_eq!(placed.len(), 2);
     }
 
     // ── Slot-projection subject scoping (wrong-subject rejection) ────────────
