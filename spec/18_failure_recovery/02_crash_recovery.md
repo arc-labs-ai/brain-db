@@ -66,7 +66,7 @@ A checkpoint marker is in the metadata store:
 
 ```rust
 struct Checkpoint {
-    durable_lsn: LSN,             // All WAL records ≤ this have been applied to metadata
+    durable_lsn: LSN,             // Highest contiguous prefix of WAL records applied to metadata
     timestamp: SystemTime,
     arena_size_bytes: u64,
     memory_count: u64,
@@ -75,7 +75,9 @@ struct Checkpoint {
 
 The checkpoint is updated periodically (every minute or every N records).
 
-The recovery starts from `durable_lsn + 1`. Records before this are guaranteed already applied.
+Recovery starts from `durable_lsn + 1` and skips everything at or below `durable_lsn` unconditionally. The word that carries the weight is **contiguous**. A shard's writes commit one at a time but not in LSN order — several requests are in flight at once, so a write that appended earlier may commit later. A `durable_lsn` defined as the maximum committed LSN would therefore sit above a record whose metadata transaction had not run; recovery would skip it, and an acknowledged write would vanish on restart with nothing in any log to say so.
+
+Defined as the contiguous prefix, the skip is sound: a record at or below `durable_lsn` either committed, or mutates no metadata at all (a checkpoint or a subscribe-event record), or belongs to a failed write whose records were abandoned beneath a later real commit. See [`../08_storage/04_recovery.md`](../08_storage/04_recovery.md) §3 and [`../14_concurrency/02_writer_model.md`](../14_concurrency/02_writer_model.md) §13a.
 
 ## 6. The WAL replay
 
@@ -207,10 +209,14 @@ Brain detects gaps via LSN continuity check. Refuses to come up; restoration fro
 Assuming no corruption:
 
 - All operations that received a success response are recovered.
-- Operations that didn't get a success response may or may not be (the WAL might or might not have been fsynced).
+- Operations that didn't get a success response may or may not be (the WAL might or might not have been fsynced, and the metadata commit might or might not have run).
 - Operations that received an error are not applied.
 
 Brain's contract: an operation that got "success" is durable. An operation that got "error" is not applied. Operations in between (no response yet) are ambiguous; the application should retry.
+
+The success response is sent after the metadata commit, not merely after the WAL fsync, so "success" means the record is fsync'd *and* the row is committed. That is what makes the first bullet hold without qualification — and the contiguous durable watermark is what keeps it holding across a restart, since a watermark that could run ahead of an uncommitted record would let recovery skip a write that had already answered "success".
+
+The "error" bullet is the mirror image. A write can fail after its WAL records are durable (a metadata commit failure, an index failure, a dropped future). Those records stay in the log, but the write's reserved LSN range is abandoned, so a later real commit closes the contiguous prefix across them and recovery skips them. If the failure was the last thing before the crash, recovery replays them instead and the apply re-derives the same refusal; see [`../08_storage/04_recovery.md`](../08_storage/04_recovery.md) §5a.
 
 ## 15. The retry-after-crash semantics
 
@@ -234,16 +240,37 @@ If recovery encounters errors that prevent full success:
 
 Brain doesn't auto-degrade — it prefers fail-stop to silent partial recovery.
 
-## 17. The recovery metrics
+## 17. What recovery reports
 
-Per recovery:
+**There is no `brain_recovery_*` metric family.** Nothing counts restarts,
+times a replay, or records when the last one happened, and unlike the families
+in [17.03](../17_observability/03_alerts.md) these are not declared deferred
+either — a rule or dashboard written against them would simply never fire.
+Recovery reports itself in two places instead.
 
-- `brain_recovery_count_total`: incremented each restart.
-- `brain_recovery_duration_sec`: how long it took.
-- `brain_recovery_records_replayed`: how many WAL records.
-- `brain_recovery_last_unixtime`: when last recovery happened.
+**One log line per shard, at `info`**, emitted after `recover()` returns:
 
-These help operators track recovery patterns.
+```text
+WAL recovery complete
+  shard_id, records_replayed, records_skipped, records_discarded,
+  next_lsn, tail_segment_seq, tail_offset
+```
+
+That is the per-recovery record: `records_replayed` is what the spec above
+describes, `records_discarded` is what the cut dropped, and the tail pair is
+where the log resumes. Timing is the gap between this line and the shard's
+spawn line, not a field.
+
+**Two gauges on `/metrics`** describe the WAL afterwards rather than the
+recovery itself: `brain_wal_size_bytes` and `brain_wal_segments`, per shard.
+Bounding the replay window is what they are for — a WAL that keeps growing
+across restarts is the thing an operator can act on.
+
+One gap worth knowing: when boot takes the loss-free cut, `recover()` returns
+a `hole_discard` report carrying the first discarded LSN, the bytes dropped and
+the count of well-formed records found past the hole. The shard's log line does
+not include those fields, so today the extent is available to a caller of the
+library and not to an operator reading logs.
 
 ## 18. The "warm restart" optimization (future)
 

@@ -234,6 +234,34 @@ fn the_reads_do_not_require_a_protected_transport() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn a_provider_key_shorter_than_eight_characters_is_rejected() {
+    brain_ops::test_support::run_in_glommio(|| async {
+        let (_dir, ctx, metadata) = build_ctx();
+        intern(&metadata, NS);
+
+        let err = send(&ctx, caller(NS, bits::FULL), put_body("sk-1234"))
+            .await
+            .expect_err("a short provider key must be rejected");
+        assert!(
+            matches!(err, OpError::InvalidRequest(ref message) if message.contains("at least 8 characters")),
+            "expected a clear InvalidRequest, got {err:?}"
+        );
+    });
+}
+
+#[test]
+fn a_normal_length_provider_key_is_accepted() {
+    brain_ops::test_support::run_in_glommio(|| async {
+        let (_dir, ctx, metadata) = build_ctx();
+        intern(&metadata, NS);
+
+        send(&ctx, caller(NS, bits::FULL), put_body(KEY))
+            .await
+            .expect("a normal-length provider key must be accepted");
+    });
+}
+
+#[test]
 fn a_registered_credential_reads_back_without_its_key() {
     brain_ops::test_support::run_in_glommio(|| async {
         let (_dir, ctx, metadata) = build_ctx();

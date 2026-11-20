@@ -13,6 +13,28 @@ use redb::TableDefinition;
 pub const EXTRACTORS_TABLE: TableDefinition<'static, u32, ExtractorDefinition> =
     TableDefinition::new("extractors");
 
+/// `extractor_id_high_water` — singleton `() -> u32` holding the highest
+/// `ExtractorId` ever issued in this store.
+///
+/// Singleton convention: `()` key with `t.get(&())` / `t.insert(&(), &value)`,
+/// matching [`crate::tables::next_lsn::NEXT_LSN_TABLE`].
+///
+/// Extractor ids are allocated from this mark rather than from the highest
+/// key present in [`EXTRACTORS_TABLE`]. A schema replace drops every
+/// extractor the scope declared, so a scan of live rows would hand a freed
+/// id to the next extractor registered, and every audit row still carrying
+/// that number would start crediting its extractions to a different
+/// extractor. The mark only ever rises, so a freed id stays retired.
+///
+/// The mark is a singleton because [`EXTRACTORS_TABLE`] is keyed on the bare
+/// id: one id space is shared by every namespace and space in the store.
+///
+/// A store written before the mark existed has no row. The allocator then
+/// seeds the mark from the highest live id, so numbering continues above the
+/// extractors already on disk.
+pub const EXTRACTOR_ID_HIGH_WATER_TABLE: TableDefinition<'static, (), u32> =
+    TableDefinition::new("extractor_id_high_water");
+
 /// `extractors_by_scope` — secondary index for `("namespace:name", space)
 /// → ExtractorId`.
 ///

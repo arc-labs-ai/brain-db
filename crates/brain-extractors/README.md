@@ -12,10 +12,10 @@ Runs the three-tier extractor pipeline (pattern → GLiNER classifier → LLM) t
 turns memory text into typed-graph candidates: entity, statement, and relation
 mentions. Tier 1 is regex-driven, Tier 2 is zero-shot NER plus a statement-kind
 pattern matcher loaded via candle, and Tier 3 calls Anthropic/OpenAI through
-`brain-llm` with cost budgeting, JSON-schema validation, retries, and an
-idempotency cache. It also owns the entity-resolution gauntlet (exact → alias →
-fuzzy trigram → embedding HNSW → create) and the materialization bridge that
-builds an `ExtractorRegistry` from persisted schema definitions.
+`brain-llm` with JSON-schema validation, retries, and an idempotency
+cache. It also owns the entity-resolution gauntlet (exact → alias → fuzzy
+trigram → embedding HNSW → disambiguate → create) and the materialization
+bridge that builds an `ExtractorRegistry` from persisted schema definitions.
 
 ## Key modules
 
@@ -23,10 +23,12 @@ builds an `ExtractorRegistry` from persisted schema definitions.
   `StatementMention` / `RelationMention`), run options, and tier gating.
 - `pattern` — Tier 1 regex extraction (`PatternExtractor`, `CompiledRegex`).
 - `classifier` — Tier 2 GLiNER NER + statement-kind pattern matcher.
-- `llm` — Tier 3 LLM extraction with `CostBudget`, schema validation, retries.
-- `resolver` / `resolver_llm` — entity-resolution gauntlet + LLM disambiguator.
+- `llm` — Tier 3 LLM extraction with schema validation and retries.
+- `resolver` — the entity-resolution gauntlet, including the pluggable
+  disambiguator tier that asks an LLM for a second opinion when the embedding
+  probe lands a candidate in the ambiguous partial-match band.
 - `materialize` — builds the dispatch registry from `ExtractorDefinition` rows.
-- `idempotency` — text-hash keys for extractor caching.
+- `idempotency` — the input hash for the LLM extractor response cache.
 - `enricher_hook` — `EnricherPlugin` dispatch seam (here to avoid a circular dep
   with `brain-plugins`).
 - `supersede_source` — exposes the statement HNSW to the supersession judge.

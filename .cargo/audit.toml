@@ -9,55 +9,7 @@
 # owned-alloc 0.2.0. No fixed release exists. Revisit when Glommio or lockfree
 # removes the dependency.
 #
-# ---------------------------------------------------------------------------
-# RUSTSEC-2026-0367 / -0368 / -0369 — zip 1.1.4
-#
-# All three are in ZIP *extraction*: `ZipArchive::extract` /
-# `ZipStreamReader::extract` mishandling symlink targets and SUID/SGID bits.
-# Every one is fixed only in zip >= 9.0.0.
-#
-# Not upgradable. `zip` is transitive via candle-core, which pins it with a
-# caret requirement, and NO published candle release accepts zip 9:
-#
-#     candle-core 0.8.4 (ours)  zip ^1.1.1
-#     candle-core 0.9.2         zip ^7.2.0
-#     candle-core 0.10.2        zip ^7.2.0
-#     candle-core 0.11.0 (max)  zip ^8.6.0
-#
-# So even a major candle upgrade would not clear these — it would only move
-# the advisory to a different unfixed zip major.
-#
-# Not reachable either, which is the real reason this is safe to accept.
-# candle uses `zip` for PyTorch pickle archives (`.pth`). Brain never loads
-# one: both model loaders go exclusively through
-# `candle_core::safetensors::load` and refuse pickle weights outright —
-# `crates/brain-embed/src/model/load.rs` and `crates/brain-rerank/src/model.rs`
-# require `model.safetensors`, and the error type says so
-# ("pickle (.bin) weights are refused"). No request path, tenant input or
-# operator config can reach an `extract()` call.
-#
-# ---------------------------------------------------------------------------
-# RUSTSEC-2026-0429 — zip 1.1.4
-#
-# The fourth in the same family, published 2026-10-22:
-# `ZipArchive::extract` aborts the process on a symlink entry whose declared
-# size is large. Same crate, same version, same function, same fix line
-# (zip >= 9.0.0) as -0367/-0368/-0369 above — so the reasoning there applies
-# unchanged, and it is listed separately only because RustSec assigned it its
-# own id.
-#
-# Not upgradable for the reason given above: no published candle release
-# accepts zip 9. Not reachable for the reason given above: the advisory is in
-# `extract()`, and Brain never calls it — both model loaders go through
-# `candle_core::safetensors::load` and refuse pickle weights outright.
-#
-# ---------------------------------------------------------------------------
-# Revisit when candle moves to zip >= 9, and delete all four then.
 [advisories]
 ignore = [
     "RUSTSEC-2026-0291",
-    "RUSTSEC-2026-0367",
-    "RUSTSEC-2026-0368",
-    "RUSTSEC-2026-0369",
-    "RUSTSEC-2026-0429",
 ]

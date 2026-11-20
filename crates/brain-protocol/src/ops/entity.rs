@@ -368,6 +368,11 @@ pub enum ResolutionOutcomeWire {
     Created = 2,
     Ambiguous = 3,
     NotFound = 4,
+    /// A resolver outcome this build cannot name reads as unknown; the
+    /// surrounding response still decodes, so a peer one version ahead can
+    /// describe an outcome this build does not know.
+    #[serde(other)]
+    Unknown = 255,
 }
 
 /// Reply to `ENTITY_RESOLVE`.

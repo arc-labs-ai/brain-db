@@ -40,7 +40,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use brain_core::{aggregate_confidence, ConfidenceConfig, EvidenceEntry, StatementKind};
-use brain_core::{EvidenceOverflowId, ExtractorId, MemoryId, StatementId};
+use brain_core::{EvidenceOverflowId, StatementId};
 use brain_metadata::statement::{evidence_overflow_load, rekey_predicate_index};
 use brain_metadata::tables::statement::{EvidenceEntryRow, StatementMetadata, STATEMENTS_TABLE};
 use brain_metadata::MetadataDb;
@@ -550,7 +550,14 @@ fn materialise_evidence(
         .collect())
 }
 
-#[allow(dead_code)] // tests use these helpers
+// Only the sweep's own tests build evidence entries by hand; the production
+// path reads them from the store. Gated rather than suppressed, so the lib
+// build does not carry a constructor nothing calls — nor the two ids that
+// only this helper names.
+#[cfg(test)]
+use brain_core::{ExtractorId, MemoryId};
+
+#[cfg(test)]
 fn evidence_entry(memory_byte: u8, confidence: f32, timestamp_unix_nanos: u64) -> EvidenceEntry {
     EvidenceEntry::from_parts(
         MemoryId::pack(memory_byte as u16, brain_core::SessionId::DEFAULT.into(), 0),

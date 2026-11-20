@@ -90,27 +90,26 @@ for (key, value) in metadata.range(...)? {
 }
 ```
 
-## 7. The writer yields
+## 7. The write path yields
 
-The writer task yields:
+A write yields:
 
-- Between batches (always; recv awaits).
-- Within long batches (every ~10 ops).
-- During fsync (the syscall is async-friendly).
+- At the WAL append and the group-commit fsync (the longest yield on the path).
+- At its own pre- and post-commit awaits.
+- Never between `begin_write` and `commit`.
 
-This means the writer doesn't monopolize the CPU even under sustained write load.
+This means writes don't monopolize the CPU even under sustained load. The fsync yield is also where the concurrency comes from: while one request waits for durability, the shard admits and runs the next, so several records reach the committer's buffer and share one `fdatasync`.
 
-## 8. The "no yields under critical section" rule
+## 8. The "no yields in a critical section" rule
 
-Some sections shouldn't yield:
+Some sections must not yield:
 
-- Inside a redb write transaction (between begin_write and commit, no awaits).
+- Inside a redb write transaction (between `begin_write` and `commit`, no awaits).
 - Holding an internal lock (rare; Brain avoids these).
-- During WAL fsync (the syscall is the yield).
 
-Yielding inside a transaction would let other readers see in-progress state — but redb's MVCC handles this. Yielding mid-transaction in Rust's async model can also be tricky (cancellation could leave dangling state).
+In Brain this is stronger than a convention. Several requests are dispatched concurrently onto one executor, so the absence of an await in the transaction body is what keeps two of them from opening a write transaction at once. An await there would let a second request enter and block on redb's write lock, which on a single-threaded executor nothing can then release — a hang, not a slow path. It is also the usual cancellation hazard: a yield mid-transaction lets a dropped future leave the write half-done.
 
-Brain's conventions: short, no-await transaction bodies.
+Brain's convention follows from that: short, synchronous, no-await transaction bodies, kept small enough to read in one pass.
 
 ## 9. The yield-cost trade-off
 
@@ -145,22 +144,20 @@ Background workers (decay, consolidation, maintenance) yield very generously:
 
 The workers should never affect request latency. Their work is done in the gaps.
 
-## 12. The "priority hint"
+## 12. Task queues and shares
 
-Some tasks are higher priority than others. Glommio supports priority hints:
+Glommio schedules *task queues*, not individual tasks, and splits CPU between them by share. Each shard runs two:
 
-```rust
-let task = glommio::spawn_local(future);
-task.priority(Priority::High);
-```
+| Queue | Shares | Latency class | Contents |
+|---|---|---|---|
+| default | 1000 | latency-sensitive | Connection handlers, request dispatch, the write path |
+| `brain-workers` | 250 | `Latency::NotImportant` | Background workers (derivation, extraction, maintenance) |
 
-Brain uses:
+Under contention the workers get roughly a fifth of the lane. When the request path is idle — which is most of the time on most deployments — they get all of it, because shares only bind when something else wants to run.
 
-- High: request executors, writer task.
-- Medium: connection handlers.
-- Low: background workers.
+The separation is a priority fix, not a width fix. Sharing the request lane ranks a derivation burst and a client's ENCODE as equals, and derivation is not a polite neighbour: each finished provider call brings JSON decode, projection, a redb commit and an HNSW insert back onto the lane. At a 128-wide extractor fan-out, sharing the lane starved the request path badly enough to return `503 engine.unavailable` on 9 of 120 writes.
 
-The priority affects which task runs first when multiple are ready.
+Priority is the only lever available here. A shard cannot be split across threads to solve it: `OpsContext` is `!Send` by design, so a worker and the requests it competes with necessarily share one executor.
 
 ## 13. The "no preemption" gotcha
 

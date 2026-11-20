@@ -15,7 +15,7 @@
 //! [`BRAIN_TOKENIZER_NAME`] (`"default"`), so the `TEXT` fields
 //! pick it up automatically — no schema-version bump required.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use regex::Regex;
 use rust_stemmers::{Algorithm, Stemmer};
@@ -47,14 +47,23 @@ const DOTTED_ID_RE: &str = r"\b[a-zA-Z_][a-zA-Z0-9_]*[._][a-zA-Z0-9_.]+\b";
 const WORD_RE: &str = r"[\p{L}\p{N}]+";
 
 /// Single combined regex over the three protected patterns.
-fn protected_regex() -> Regex {
-    Regex::new(&format!("(?:{URL_RE})|(?:{CODE_ID_RE})|(?:{DOTTED_ID_RE})"))
-        .expect("invariant: protected regex is a static literal")
-}
+///
+/// Compiled once for the process. Both patterns are static literals,
+/// so every `BrainTokenizer` would otherwise compile byte-identical
+/// automata; the compile is milliseconds and the analyzer is built on
+/// the synchronous write path, where it dominated apply latency.
+static PROTECTED_REGEX: LazyLock<Arc<Regex>> = LazyLock::new(|| {
+    Arc::new(
+        Regex::new(&format!("(?:{URL_RE})|(?:{CODE_ID_RE})|(?:{DOTTED_ID_RE})"))
+            .expect("invariant: protected regex is a static literal"),
+    )
+});
 
-fn word_regex() -> Regex {
-    Regex::new(WORD_RE).expect("invariant: word regex is a static literal")
-}
+/// Residue word regex, compiled once for the process for the same
+/// reason as [`PROTECTED_REGEX`].
+static WORD_REGEX: LazyLock<Arc<Regex>> = LazyLock::new(|| {
+    Arc::new(Regex::new(WORD_RE).expect("invariant: word regex is a static literal"))
+});
 
 /// Brain analyzer.
 ///
@@ -72,8 +81,8 @@ impl BrainTokenizer {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            protected: Arc::new(protected_regex()),
-            word: Arc::new(word_regex()),
+            protected: Arc::clone(&PROTECTED_REGEX),
+            word: Arc::clone(&WORD_REGEX),
             stemmer_algo: Algorithm::English,
         }
     }

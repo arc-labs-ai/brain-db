@@ -237,8 +237,6 @@ pub enum JudgeError {
     Transport(String),
     #[error("judge response could not be parsed: {0}")]
     Parse(String),
-    #[error("judge budget exceeded: {0}")]
-    Budget(String),
 }
 
 /// Future returned by the judge. Boxed so the trait stays object-safe
@@ -247,8 +245,7 @@ pub type JudgeFuture<'a> =
     Pin<Box<dyn Future<Output = Result<JudgeVerdict, JudgeError>> + Send + 'a>>;
 
 /// LLM judge surface. The implementation lives in `brain-extractors`
-/// where the LLM client + prompt cache + budget enforcement already
-/// reside.
+/// where the LLM client and prompt cache already reside.
 pub trait StatementJudge: Send + Sync {
     /// `namespace` is the tenant whose statements are being judged.
     ///
@@ -264,4 +261,20 @@ pub trait StatementJudge: Send + Sync {
         existing_stmt: &'a Statement,
         rtxn: &'a ReadTransaction,
     ) -> JudgeFuture<'a>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::JudgeError;
+
+    /// The judge reports exactly two failure modes: the call did not complete,
+    /// or its answer did not parse. This match is exhaustive, so a third
+    /// variant would stop the crate compiling here.
+    #[test]
+    fn judge_error_has_only_transport_and_parse() {
+        let err = JudgeError::Parse("x".to_string());
+        match err {
+            JudgeError::Transport(_) | JudgeError::Parse(_) => {}
+        }
+    }
 }

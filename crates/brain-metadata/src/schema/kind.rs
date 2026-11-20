@@ -177,13 +177,23 @@ pub fn kind_supersedes_w(
     Ok(row.map(|r| behavior_of(&r).supersedes()).unwrap_or(false))
 }
 
-/// All user-declared kinds, sorted by qname for deterministic output.
-pub fn kind_list(rtxn: &ReadTransaction) -> Result<Vec<KindDefinition>, KindOpError> {
+/// All user-declared kinds, optionally restricted to one namespace, sorted by
+/// qname for deterministic output.
+pub fn kind_list(
+    rtxn: &ReadTransaction,
+    namespace_filter: Option<&str>,
+) -> Result<Vec<KindDefinition>, KindOpError> {
     let t = rtxn.open_table(KINDS_TABLE)?;
     let mut out = Vec::new();
     for entry in t.iter()? {
         let (_, v) = entry?;
-        out.push(v.value());
+        let row = v.value();
+        if let Some(namespace) = namespace_filter {
+            if row.namespace != namespace {
+                continue;
+            }
+        }
+        out.push(row);
     }
     out.sort_by(|a, b| {
         (a.namespace.as_str(), a.name.as_str()).cmp(&(b.namespace.as_str(), b.name.as_str()))
@@ -191,12 +201,17 @@ pub fn kind_list(rtxn: &ReadTransaction) -> Result<Vec<KindDefinition>, KindOpEr
     Ok(out)
 }
 
-/// Render the active kind taxonomy as a classifier-prompt block: the six
-/// built-in kinds (with their fixed behavior + one-line guidance) followed
-/// by every user-declared kind and its `hint`. Substituted into the LLM
-/// extractor prompt's `{DECLARED_KINDS}` placeholder so the classifier
-/// only ever picks a kind that exists.
-pub fn render_declared_kinds_block(rtxn: &ReadTransaction) -> Result<String, KindOpError> {
+/// Render the active kind taxonomy for one tenant as a classifier-prompt
+/// block. This block is substituted into an LLM prompt sent to a provider and
+/// billed to one tenant's credentials, so it may contain only the six
+/// deployment-wide built-ins and kinds that tenant declared; another tenant's
+/// kind names and hint text are private schema and must never appear here.
+/// The built-ins are unconditional so a tenant with no declarations still
+/// receives a well-formed six-bullet taxonomy rather than an empty prompt.
+pub fn render_declared_kinds_block(
+    rtxn: &ReadTransaction,
+    namespace: &str,
+) -> Result<String, KindOpError> {
     let mut out = String::new();
     for (name, card, temporal, guide) in BUILTIN_KIND_GUIDE {
         out.push_str("- ");
@@ -209,7 +224,7 @@ pub fn render_declared_kinds_block(rtxn: &ReadTransaction) -> Result<String, Kin
         out.push_str(guide);
         out.push('\n');
     }
-    for k in kind_list(rtxn)? {
+    for k in kind_list(rtxn, Some(namespace))? {
         let card = if k.cardinality == KindCardinality::Single.as_u8() {
             "single"
         } else {
@@ -399,7 +414,7 @@ mod tests {
             wtxn.commit().unwrap();
         }
         let rtxn = db.begin_read().unwrap();
-        let block = render_declared_kinds_block(&rtxn).unwrap();
+        let block = render_declared_kinds_block(&rtxn, "acme").unwrap();
         // All six built-ins plus the custom kind appear.
         for name in [
             "Attribute",
@@ -413,6 +428,87 @@ mod tests {
         }
         assert!(block.contains("acme:investment"));
         assert!(block.contains("funded another"));
+    }
+
+    #[test]
+    fn render_block_contains_only_the_requested_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(&dir);
+        {
+            let wtxn = db.begin_write().unwrap();
+            kind_intern(
+                &wtxn,
+                "acme",
+                "investment",
+                KindCardinality::Set,
+                TemporalModel::Event,
+                false,
+                "funded another",
+                1,
+                NOW,
+            )
+            .unwrap();
+            kind_intern(
+                &wtxn,
+                "globex",
+                "sponsorship",
+                KindCardinality::Set,
+                TemporalModel::Event,
+                false,
+                "sponsored another",
+                1,
+                NOW,
+            )
+            .unwrap();
+            wtxn.commit().unwrap();
+        }
+        let rtxn = db.begin_read().unwrap();
+        let acme = render_declared_kinds_block(&rtxn, "acme").unwrap();
+        let globex = render_declared_kinds_block(&rtxn, "globex").unwrap();
+        assert!(acme.contains("acme:investment"));
+        assert!(acme.contains("funded another"));
+        assert!(!acme.contains("sponsorship"));
+        assert!(!acme.contains("sponsored another"));
+        assert!(globex.contains("globex:sponsorship"));
+        assert!(globex.contains("sponsored another"));
+        assert!(!globex.contains("investment"));
+        assert!(!globex.contains("funded another"));
+    }
+
+    #[test]
+    fn render_block_without_declarations_contains_only_builtins() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(&dir);
+        {
+            let wtxn = db.begin_write().unwrap();
+            kind_intern(
+                &wtxn,
+                "acme",
+                "investment",
+                KindCardinality::Set,
+                TemporalModel::Event,
+                false,
+                "funded another",
+                1,
+                NOW,
+            )
+            .unwrap();
+            wtxn.commit().unwrap();
+        }
+        let rtxn = db.begin_read().unwrap();
+        let block = render_declared_kinds_block(&rtxn, "globex").unwrap();
+        for name in [
+            "Attribute",
+            "Relation",
+            "Preference",
+            "Event",
+            "Directive",
+            "Fact",
+        ] {
+            assert!(block.contains(name), "missing builtin {name}");
+        }
+        assert!(!block.contains("acme"));
+        assert_eq!(block.lines().count(), 6);
     }
 }
 

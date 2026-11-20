@@ -1,5 +1,5 @@
-//! Tests covering the LLM extractor surface (pricing, cache, schema
-//! validation, retry, projection, degraded mode).
+//! Tests covering the LLM extractor surface (cache, schema validation,
+//! retry, projection, degraded mode).
 
 // ---------------------------------------------------------------------------
 
@@ -27,7 +27,6 @@ use super::extractor::{
     relative_time_hint, render_prompt, truncate_chars, LlmExtractor, LlmExtractorInner,
     LLM_INPUT_TOKEN_BUDGET,
 };
-use super::pricing::{estimate_cost, CostBudget, Pricing};
 use crate::framework::extractor::{
     ExtractionContext, ExtractionStatus, Extractor, ExtractorContext, NeighborMemory,
 };
@@ -128,7 +127,6 @@ fn build_ext(
     client: Arc<dyn LlmClient>,
     cache: Option<Arc<Mutex<LlmCacheDb>>>,
     schema: Option<Value>,
-    budget: Option<CostBudget>,
 ) -> LlmExtractor {
     let schema_compiled = LlmExtractor::compile_schema(schema.as_ref()).unwrap();
     LlmExtractor::new(
@@ -137,7 +135,6 @@ fn build_ext(
         entity_target(),
         1,
         0.5,
-        budget,
         Duration::from_secs(60),
         LlmExtractorInner {
             resolver: Arc::new(brain_llm::FixedResolver::new(client)),
@@ -145,8 +142,7 @@ fn build_ext(
             cache,
             prompt: "Extract people".into(),
             examples: None,
-            response_schema: schema,
-            schema_compiled,
+            response_schema: schema_compiled,
             max_tokens: 1024,
             temperature: 0.0,
             timeout: Duration::from_secs(30),
@@ -226,7 +222,6 @@ fn each_memory_resolves_its_own_namespaces_credential() {
         entity_target(),
         1,
         0.5,
-        None,
         Duration::from_secs(60),
         LlmExtractorInner {
             resolver,
@@ -235,7 +230,6 @@ fn each_memory_resolves_its_own_namespaces_credential() {
             prompt: "Extract people".into(),
             examples: None,
             response_schema: None,
-            schema_compiled: None,
             max_tokens: 1024,
             temperature: 0.0,
             timeout: Duration::from_secs(30),
@@ -308,7 +302,6 @@ fn memory_in_a_namespace_without_a_credential_is_skipped() {
         entity_target(),
         1,
         0.5,
-        None,
         Duration::from_secs(60),
         LlmExtractorInner {
             resolver,
@@ -317,7 +310,6 @@ fn memory_in_a_namespace_without_a_credential_is_skipped() {
             prompt: "Extract people".into(),
             examples: None,
             response_schema: None,
-            schema_compiled: None,
             max_tokens: 1024,
             temperature: 0.0,
             timeout: Duration::from_secs(30),
@@ -364,38 +356,12 @@ fn degraded_dispatch_writes_skipped_disabled() {
 }
 
 #[test]
-fn cost_budget_skips_call() {
-    let client = Arc::new(MockClient::new(
-        "claude-haiku-4-5",
-        vec![Ok(ok_response("[\"Alice\"]", 200))],
-    ));
-    let calls = client.calls.clone();
-    let ext = build_ext(
-        client,
-        None,
-        None,
-        Some(CostBudget {
-            per_call_micro_usd: 1,
-        }),
-    );
-    let reg = ExtractorRegistry::new();
-    let r = futures_lite::future::block_on(ext.run(&ctx(&reg), &memory("Alice met Bob")));
-    assert_eq!(r.status, ExtractionStatus::SkippedBudget);
-    assert!(r.status_reason.contains("exceeds per-call budget"));
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        0,
-        "no LLM call when over budget"
-    );
-}
-
-#[test]
 fn success_no_schema_parses_json_array() {
     let client = Arc::new(MockClient::new(
         "claude-haiku-4-5",
         vec![Ok(ok_response("[\"Alice\",\"Bob\"]", 50))],
     ));
-    let ext = build_ext(client, None, None, None);
+    let ext = build_ext(client, None, None);
     let reg = ExtractorRegistry::new();
     let r = futures_lite::future::block_on(ext.run(&ctx(&reg), &memory("Alice met Bob")));
     assert_eq!(r.status, ExtractionStatus::Success);
@@ -411,14 +377,14 @@ fn success_no_schema_parses_json_array() {
 
 #[test]
 fn no_schema_malformed_json_fails_instead_of_minting_fragment_entity() {
-    // A truncated / unbalanced JSON body used to fall through to the
-    // plain-text projection and become ONE entity named with the raw
-    // fragment. It must now be a (permanent) failure with no items.
+    // A truncated / unbalanced JSON body must not fall through to the
+    // plain-text projection, where it would become ONE entity named with
+    // the raw fragment. It is a permanent failure carrying no items.
     let client = Arc::new(MockClient::new(
         "claude-haiku-4-5",
         vec![Ok(ok_response("[{\"name\":\"Mirror\"},{", 50))],
     ));
-    let ext = build_ext(client, None, None, None);
+    let ext = build_ext(client, None, None);
     let reg = ExtractorRegistry::new();
     let r = futures_lite::future::block_on(ext.run(&ctx(&reg), &memory("Mirror")));
     assert_eq!(r.status, ExtractionStatus::Failure);
@@ -436,7 +402,7 @@ fn no_schema_fenced_json_is_unwrapped() {
         "claude-haiku-4-5",
         vec![Ok(ok_response("```json\n[\"Alice\",\"Bob\"]\n```", 50))],
     ));
-    let ext = build_ext(client, None, None, None);
+    let ext = build_ext(client, None, None);
     let reg = ExtractorRegistry::new();
     let r = futures_lite::future::block_on(ext.run(&ctx(&reg), &memory("Alice met Bob")));
     assert_eq!(r.status, ExtractionStatus::Success);
@@ -459,7 +425,7 @@ fn confidence_below_threshold_filtered() {
         "claude-haiku-4-5",
         vec![Ok(ok_response(body, 50))],
     ));
-    let ext = build_ext(client, None, None, None);
+    let ext = build_ext(client, None, None);
     let reg = ExtractorRegistry::new();
     let r = futures_lite::future::block_on(ext.run(&ctx(&reg), &memory("Alice")));
     assert_eq!(r.status, ExtractionStatus::Success);
@@ -475,26 +441,11 @@ fn rate_limit_error_surfaces_retry_after() {
             retry_after_ms: 1500,
         })],
     ));
-    let ext = build_ext(client, None, None, None);
+    let ext = build_ext(client, None, None);
     let reg = ExtractorRegistry::new();
     let r = futures_lite::future::block_on(ext.run(&ctx(&reg), &memory("hi")));
     assert_eq!(r.status, ExtractionStatus::Failure);
     assert!(r.status_reason.contains("1500"));
-}
-
-#[test]
-fn estimate_cost_honours_pricing() {
-    let mut req = LlmRequest::new("claude-haiku-4-5", "abcdefgh"); // 8 chars → 2 in-tokens
-    req.max_tokens = 100;
-    let p = Pricing::for_model("claude-haiku-4-5");
-    // 2 * 1 + 100 * 5 = 502
-    assert_eq!(estimate_cost(&req, &p), 502);
-}
-
-#[test]
-fn pricing_unknown_model_uses_conservative() {
-    let p = Pricing::for_model("custom-llm");
-    assert_eq!(p, Pricing::conservative_default());
 }
 
 // ------------------------------------------------------------------
@@ -533,14 +484,12 @@ fn sm_fixture() -> StatementMention {
 
 fn ext_with_prompt(prompt: &str) -> LlmExtractor {
     let client = Arc::new(MockClient::new("claude-haiku-4-5", vec![]));
-    let schema_compiled = LlmExtractor::compile_schema(None).unwrap();
     LlmExtractor::new(
         ExtractorId::from(42),
         "acme:prompt_test".into(),
         entity_target(),
         1,
         0.0,
-        None,
         Duration::from_secs(60),
         LlmExtractorInner {
             resolver: Arc::new(brain_llm::FixedResolver::new(client)),
@@ -549,7 +498,6 @@ fn ext_with_prompt(prompt: &str) -> LlmExtractor {
             prompt: prompt.into(),
             examples: None,
             response_schema: None,
-            schema_compiled,
             max_tokens: 1024,
             temperature: 0.0,
             timeout: Duration::from_secs(30),
@@ -789,14 +737,12 @@ fn build_request_splits_into_cached_blocks() {
         "predicates": ["brain:fact", "brain:prefers", "brain:knows"],
     });
     let client = Arc::new(MockClient::new("claude-haiku-4-5", vec![]));
-    let schema_compiled = LlmExtractor::compile_schema(None).unwrap();
     let ext = LlmExtractor::new(
         ExtractorId::from(7),
         "acme:llm_split".into(),
         entity_target(),
         1,
         0.0,
-        None,
         Duration::from_secs(60),
         LlmExtractorInner {
             resolver: Arc::new(brain_llm::FixedResolver::new(client)),
@@ -805,7 +751,6 @@ fn build_request_splits_into_cached_blocks() {
             prompt: "Extract things.\n{TEXT}".into(),
             examples: Some(examples),
             response_schema: None,
-            schema_compiled,
             max_tokens: 1024,
             temperature: 0.0,
             timeout: Duration::from_secs(30),
@@ -863,14 +808,12 @@ fn build_request_without_examples_emits_role_block_only() {
     // cached so the LLM's "you are a Brain extractor" preamble
     // amortises across calls even in degraded schema mode.
     let client = Arc::new(MockClient::new("claude-haiku-4-5", vec![]));
-    let schema_compiled = LlmExtractor::compile_schema(None).unwrap();
     let ext = LlmExtractor::new(
         ExtractorId::from(8),
         "acme:llm_noschema".into(),
         entity_target(),
         1,
         0.0,
-        None,
         Duration::from_secs(60),
         LlmExtractorInner {
             resolver: Arc::new(brain_llm::FixedResolver::new(client)),
@@ -879,7 +822,6 @@ fn build_request_without_examples_emits_role_block_only() {
             prompt: "Extract.\n{TEXT}".into(),
             examples: None,
             response_schema: None,
-            schema_compiled,
             max_tokens: 1024,
             temperature: 0.0,
             timeout: Duration::from_secs(30),
@@ -975,9 +917,7 @@ fn extractor_with_mock(mock: Arc<MockClient>) -> LlmExtractor {
         "ignored prompt".into(),
         None,
         None,
-        None,
         0.0,
-        None,
         Duration::from_secs(60),
         None,
     )
@@ -1072,48 +1012,6 @@ fn judge_supersedes_degraded_extractor_errors() {
     matches!(err, JudgeError::Transport(_))
         .then_some(())
         .expect("expected Transport error from degraded extractor");
-}
-
-#[test]
-fn judge_supersedes_budget_blocks_call() {
-    let mock = Arc::new(MockClient::new("claude-sonnet-test", vec![]));
-    let calls = mock.calls.clone();
-    let ext = LlmExtractor::build(
-        ExtractorId::from(3),
-        "judge-budget".into(),
-        ExtractorTarget::Statement {
-            kind: StatementKindAst::Fact,
-        },
-        1,
-        Arc::new(brain_llm::FixedResolver::new(mock)),
-        "claude-haiku-4-5".into(),
-        None,
-        "ignored".into(),
-        None,
-        None,
-        None,
-        0.0,
-        // 1 micro-USD budget — sonnet at 3 µ$/1k will exceed.
-        Some(CostBudget {
-            per_call_micro_usd: 1,
-        }),
-        Duration::from_secs(60),
-        None,
-    );
-    let tmp = tempfile::tempdir().unwrap();
-    let md = open_md(&tmp);
-    let rtxn = md.read_txn().unwrap();
-    let (old, new) = fact_pair(entity_id(), brain_core::PredicateId::from(1));
-    let err = futures_lite::future::block_on(ext.judge_supersedes_call("acme", &new, &old, &rtxn))
-        .unwrap_err();
-    matches!(err, JudgeError::Budget(_))
-        .then_some(())
-        .expect("expected Budget error");
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        0,
-        "budget rejection must not reach the client"
-    );
 }
 
 #[test]
@@ -1447,7 +1345,6 @@ fn build_ext_with_target(
         target,
         1,
         0.0,
-        None,
         Duration::from_secs(60),
         LlmExtractorInner {
             resolver: Arc::new(brain_llm::FixedResolver::new(client)),
@@ -1455,8 +1352,7 @@ fn build_ext_with_target(
             cache: None,
             prompt: "ignored in mock".into(),
             examples: None,
-            response_schema: Some(schema),
-            schema_compiled,
+            response_schema: Some(schema_compiled.unwrap()),
             max_tokens: 1024,
             temperature: 0.0,
             timeout: Duration::from_secs(30),
@@ -1640,8 +1536,8 @@ fn schema_validation_failed_twice_reports_full_cost() {
     // Both calls omit "object" → schema fails twice → terminal Failure. Each
     // `ok_response(_, 100)` bills tokens*2 = 200 µ$, so the two calls that
     // actually hit the provider spent 400 µ$ total. The failure MUST report
-    // that spend so the worker's per-cycle budget gate counts it — else a
-    // malformed prompt burns two API calls forever.
+    // that spend so the recorded cost covers both calls — else a malformed
+    // prompt burns two API calls with nothing recording it.
     let bad = r#"{"statements": [
         {"subject": "Priya", "predicate": "brain:manages", "kind": "Relation",
          "confidence": 0.9, "object_is_entity": false, "event_at": null,
@@ -1711,7 +1607,7 @@ fn missing_confidence_uses_conservative_default_not_max() {
         vec![Ok(ok_response(body, 50))],
     ));
     // build_ext sets confidence_threshold = 0.5, so the 0.5 default is retained.
-    let ext = build_ext(client, None, None, None);
+    let ext = build_ext(client, None, None);
     let reg = ExtractorRegistry::new();
     let r = futures_lite::future::block_on(ext.run(&ctx(&reg), &memory("Alice likes tea")));
     assert_eq!(r.status, ExtractionStatus::Success);
@@ -1743,7 +1639,7 @@ fn retract_without_confidence_is_dropped_never_tombstones() {
         "claude-haiku-4-5",
         vec![Ok(ok_response(body, 50))],
     ));
-    let ext = build_ext(client, None, None, None);
+    let ext = build_ext(client, None, None);
     let reg = ExtractorRegistry::new();
     let r = futures_lite::future::block_on(ext.run(&ctx(&reg), &memory("Bob no longer at Google")));
     assert_eq!(r.status, ExtractionStatus::Success);
@@ -1762,7 +1658,7 @@ fn retract_with_explicit_high_confidence_survives() {
         "claude-haiku-4-5",
         vec![Ok(ok_response(body, 50))],
     ));
-    let ext = build_ext(client, None, None, None);
+    let ext = build_ext(client, None, None);
     let reg = ExtractorRegistry::new();
     let r = futures_lite::future::block_on(ext.run(&ctx(&reg), &memory("Bob no longer at Google")));
     assert_eq!(r.status, ExtractionStatus::Success);

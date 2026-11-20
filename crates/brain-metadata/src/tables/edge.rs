@@ -507,42 +507,94 @@ fn range_scan(
 // Memory-only edge convenience.
 // ---------------------------------------------------------------------------
 
-/// Memory-only outgoing walk. Returns `(EdgeKind, MemoryId,
-/// EdgeData)` triples for every Memory↔Memory `Builtin` edge anchored
-/// at `from`. Non-builtin kinds and non-memory neighbours are filtered
-/// out — graph retrievers that don't know about entities or typed
-/// relations rely on this to keep returning the memory-anchored view.
+/// One capped memory-edge read.
+///
+/// The cap belongs to the read rather than to whatever trims the result
+/// afterwards: a hub memory's edge list is the one part of an inspection view
+/// that scales with the graph, and materialising all of it only to drop most
+/// of it pays the full peak allocation for a bounded answer.
+pub struct MemoryEdgePage {
+    /// The edges that fit, in edge-index scan order (`(kind, other_endpoint,
+    /// disambiguator)` byte order) — stable across calls, but not a ranking,
+    /// so which edges fit is arbitrary with respect to weight or age.
+    pub rows: Vec<(EdgeKind, MemoryId, EdgeData)>,
+    /// Every edge the memory-only filter admitted, including the ones past
+    /// the cap that `rows` does not carry. A caller tells a partial page from
+    /// a complete one with `total > rows.len() as u64`; there is deliberately
+    /// no second flag that could disagree with this one.
+    pub total: u64,
+}
+
+/// Scan one anchor's edges, counting every admitted row but materialising
+/// only the first `limit` of them. `limit == 0` means "no cap".
+///
+/// The scan runs to the end of the anchor's range whatever the cap, because
+/// that is what makes `total` the real count; past the cap it decodes keys
+/// only, so the per-row [`EdgeData`] — and the heap-allocated annotation
+/// inside it — is never built for an edge the caller will not see.
+fn memory_edge_page(
+    table: &ReadOnlyTable<&'static [u8], EdgeData>,
+    anchor: NodeRef,
+    kind_filter: Option<EdgeKindRef>,
+    limit: usize,
+) -> Result<MemoryEdgePage, EdgeOpError> {
+    let (lo, hi) = range_bounds(anchor, kind_filter);
+    let mut rows = Vec::new();
+    let mut total = 0u64;
+    for entry in table.range::<&[u8]>(lo.as_slice()..=hi.as_slice())? {
+        let (k, v) = entry?;
+        let key = EdgeKey::decode(k.value())?;
+        // Defensive: range bounds should already exclude this.
+        if key.from != anchor {
+            continue;
+        }
+        if let Some(want) = kind_filter {
+            if key.kind != want {
+                continue;
+            }
+        }
+        // Non-builtin kinds and non-memory neighbours are not part of the
+        // memory-anchored view, so they are neither returned nor counted —
+        // `total` has to mean what `rows` would hold with no cap.
+        let (EdgeKindRef::Builtin(ek), NodeRef::Memory(m)) = (key.kind, key.to) else {
+            continue;
+        };
+        total += 1;
+        if limit == 0 || rows.len() < limit {
+            rows.push((ek, m, v.value()));
+        }
+    }
+    Ok(MemoryEdgePage { rows, total })
+}
+
+/// Memory-only outgoing walk. Returns up to `limit` `(EdgeKind, MemoryId,
+/// EdgeData)` triples for the Memory↔Memory `Builtin` edges anchored at
+/// `from`, alongside the count of every such edge. Non-builtin kinds and
+/// non-memory neighbours are filtered out — graph retrievers that don't know
+/// about entities or typed relations rely on this to keep returning the
+/// memory-anchored view. `limit == 0` means "no cap".
 pub fn list_memory_edges_from(
     rtxn: &ReadTransaction,
     from: MemoryId,
     kind: Option<EdgeKind>,
-) -> Result<Vec<(EdgeKind, MemoryId, EdgeData)>, EdgeOpError> {
+    limit: usize,
+) -> Result<MemoryEdgePage, EdgeOpError> {
     let filter = kind.map(EdgeKindRef::Builtin);
-    let rows = walk_outgoing(rtxn, NodeRef::Memory(from), filter)?;
-    Ok(rows
-        .into_iter()
-        .filter_map(|(k, to, _disamb, d)| match (k, to) {
-            (EdgeKindRef::Builtin(ek), NodeRef::Memory(m)) => Some((ek, m, d)),
-            _ => None,
-        })
-        .collect())
+    let table = rtxn.open_table(EDGES_TABLE)?;
+    memory_edge_page(&table, NodeRef::Memory(from), filter, limit)
 }
 
 /// Substrate-only incoming walk; mirror of [`list_memory_edges_from`].
+/// `limit == 0` means "no cap".
 pub fn list_memory_edges_to(
     rtxn: &ReadTransaction,
     to: MemoryId,
     kind: Option<EdgeKind>,
-) -> Result<Vec<(EdgeKind, MemoryId, EdgeData)>, EdgeOpError> {
+    limit: usize,
+) -> Result<MemoryEdgePage, EdgeOpError> {
     let filter = kind.map(EdgeKindRef::Builtin);
-    let rows = walk_incoming(rtxn, NodeRef::Memory(to), filter)?;
-    Ok(rows
-        .into_iter()
-        .filter_map(|(k, from, _disamb, d)| match (k, from) {
-            (EdgeKindRef::Builtin(ek), NodeRef::Memory(m)) => Some((ek, m, d)),
-            _ => None,
-        })
-        .collect())
+    let table = rtxn.open_table(EDGES_REVERSE_TABLE)?;
+    memory_edge_page(&table, NodeRef::Memory(to), filter, limit)
 }
 
 // ---------------------------------------------------------------------------
@@ -1131,10 +1183,92 @@ mod tests {
         wtxn.commit().unwrap();
 
         let rtxn = db.begin_read().unwrap();
-        let rows = list_memory_edges_from(&rtxn, a, None).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].0, EdgeKind::Caused);
-        assert_eq!(rows[0].1, b);
+        let page = list_memory_edges_from(&rtxn, a, None, 1).unwrap();
+        assert_eq!(page.rows.len(), 1);
+        assert_eq!(page.total, 1);
+        assert_eq!(page.rows[0].0, EdgeKind::Caused);
+        assert_eq!(page.rows[0].1, b);
+    }
+
+    #[test]
+    fn memory_edge_pages_cap_rows_but_count_admitted_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(&dir);
+        let d = data(1.0);
+        let a = mid(10);
+        let peers = [mid(11), mid(12), mid(13)];
+        let entity = eid(0xBB);
+        let wtxn = db.begin_write().unwrap();
+        {
+            let mut et = wtxn.open_table(EDGES_TABLE).unwrap();
+            let mut rt = wtxn.open_table(EDGES_REVERSE_TABLE).unwrap();
+            for peer in peers {
+                link(
+                    &mut et,
+                    &mut rt,
+                    NodeRef::Memory(a),
+                    EdgeKindRef::Builtin(EdgeKind::Caused),
+                    NodeRef::Memory(peer),
+                    zero_disambiguator(),
+                    &d,
+                )
+                .unwrap();
+            }
+            link(
+                &mut et,
+                &mut rt,
+                NodeRef::Memory(a),
+                EdgeKindRef::Mentions,
+                NodeRef::Entity(entity),
+                zero_disambiguator(),
+                &d,
+            )
+            .unwrap();
+        }
+        wtxn.commit().unwrap();
+
+        let rtxn = db.begin_read().unwrap();
+        let capped = list_memory_edges_from(&rtxn, a, None, 2).unwrap();
+        assert_eq!(capped.rows.len(), 2);
+        assert_eq!(capped.total, 3);
+        let uncapped = list_memory_edges_from(&rtxn, a, None, 0).unwrap();
+        assert_eq!(uncapped.rows.len(), 3);
+        assert_eq!(uncapped.total, 3);
+    }
+
+    #[test]
+    fn incoming_memory_edge_pages_have_the_same_cap_and_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(&dir);
+        let d = data(1.0);
+        let target = mid(20);
+        let sources = [mid(21), mid(22), mid(23)];
+        let wtxn = db.begin_write().unwrap();
+        {
+            let mut et = wtxn.open_table(EDGES_TABLE).unwrap();
+            let mut rt = wtxn.open_table(EDGES_REVERSE_TABLE).unwrap();
+            for source in sources {
+                link(
+                    &mut et,
+                    &mut rt,
+                    NodeRef::Memory(source),
+                    EdgeKindRef::Builtin(EdgeKind::Caused),
+                    NodeRef::Memory(target),
+                    zero_disambiguator(),
+                    &d,
+                )
+                .unwrap();
+            }
+        }
+        wtxn.commit().unwrap();
+
+        let rtxn = db.begin_read().unwrap();
+        let capped = list_memory_edges_to(&rtxn, target, None, 2).unwrap();
+        assert_eq!(capped.rows.len(), 2);
+        assert_eq!(capped.total, 3);
+        let uncapped = list_memory_edges_to(&rtxn, target, None, 0).unwrap();
+        assert_eq!(uncapped.rows.len(), 3);
+        assert_eq!(uncapped.total, 3);
     }
 
     // -----------------------------------------------------------------

@@ -50,6 +50,37 @@ groups:
             correctness workers (ForgetCascade, SchemaMigration, StatementEmbed);
             errors here degrade durability/correctness posture.
 
+      # The derivation backlog is only observable while every shard reports it.
+      # A shard whose metadata read txn fails, or whose executor channel is
+      # gone, emits NO rows for these families rather than a zero — so the
+      # depth and age rules below cannot fire for it at all, and a shard that
+      # is silently accumulating work looks exactly like an idle one. This is
+      # the rule that covers that gap: it compares how many shards are
+      # reporting against the configured shard count, and separately catches
+      # the case where the family disappears entirely (a count comparison has
+      # no series left to evaluate then). `brain_up` gates the total-absence
+      # arm so a scrape outage pages as BrainSubstrateDown alone, not twice.
+      # 10m is roughly three scrapes: a failed metadata read persists, while a
+      # single ugly scrape should not page.
+      - alert: BrainExtractionQueueUnobserved
+        expr: |
+          (absent(brain_extraction_queue_depth) and on() (max(brain_up) == 1))
+            or (count by (instance) (brain_extraction_queue_depth)
+                  < on(instance) brain_shards_total)
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "A shard is not reporting its derivation backlog"
+          description: >-
+            Fewer shards publish brain_extraction_queue_depth than
+            brain_shards_total declares, or the family is gone entirely. The
+            server emits no series for a shard whose extraction-queue read
+            failed, so that shard's backlog is unmeasured and every other
+            backlog alert is blind to it — silence here is a fault, never an
+            all-clear. Check the log for "extraction backlog read failed" and
+            "extraction_backlog failed".
+
   - name: brain-high
     rules:
       - alert: BrainHighLatency
@@ -82,6 +113,58 @@ groups:
             {{ $labels.shard }} (reason={{ $labels.reason }}) in the last 15m.
             Any nonzero value is signal loss — memories were written but their
             derived statements/relations did not land.
+
+      # Derivation drains far slower than the write path accepts — a measured
+      # ~32 stage completions/minute against an API that admits far more — so
+      # a backlog is the ordinary steady state and a plain depth threshold
+      # would be pure noise. What is not ordinary is a backlog growing faster
+      # than the engine can ever drain. 1920 is one hour of that drain rate
+      # (32/min x 60): the queue is gaining more than a full hour of work per
+      # hour AND is already at least an hour deep, i.e. losing ground rather
+      # than absorbing a burst. Aggregated per process, not per shard, because
+      # drain capacity is process-global (one admission budget, one provider
+      # lane): shards fall behind together, so per-shard rules would page N
+      # times for one incident.
+      - alert: BrainDerivationQueueUnbounded
+        expr: |
+          deriv((sum by (instance) (brain_extraction_queue_depth))[2h:5m]) * 3600 > 1920
+            and sum by (instance) (brain_extraction_queue_depth) > 1920
+        for: 30m
+        labels:
+          severity: high
+        annotations:
+          summary: "Derivation backlog is growing faster than it can drain"
+          description: >-
+            The extraction queue on {{ $labels.instance }} gained more than an
+            hour of drain capacity per hour over the last 2h and is already
+            deeper than an hour of work. Memories are durable, but their
+            entities, statements and relations are not landing, so recall
+            quietly returns less than it should. Break the aggregate down by
+            shard with brain_extraction_queue_depth.
+
+      # Age is what turns "behind" into "how badly": the oldest queued memory
+      # has waited an hour, which at the measured drain rate means roughly
+      # 1920 items ahead of it, or an extractor that is not running at all.
+      # No lag SLO is documented anywhere in the engine, so 1h is an anchored
+      # starting point to tune per deployment, not a derived bound.
+      # max by (instance) lets the worst shard set the alarm so one incident
+      # pages once. Caveat: the oldest-row scan is capped at 65_536 rows
+      # (EXTRACTION_BACKLOG_SCAN_CAP), so on a queue deeper than that spread
+      # over many sessions the reported age under-reports and this rule can
+      # stay silent while the depth rule above fires. Depth is the exact one.
+      - alert: BrainDerivationQueueStale
+        expr: max by (instance) (brain_extraction_queue_oldest_age_seconds) > 3600
+        for: 30m
+        labels:
+          severity: high
+        annotations:
+          summary: "Oldest queued memory has waited over an hour for derivation"
+          description: >-
+            On {{ $labels.instance }} the head of the extraction queue has
+            been waiting more than 3600s. Either derivation is wedged (check
+            BrainWorkerStuck and the extractor worker) or it is so far behind
+            that the workspace has drifted from its own data: recall over
+            anything written in that window sees no derived graph.
 
   - name: brain-medium
     rules:
@@ -126,6 +209,30 @@ groups:
           summary: "Connections are churning"
           description: "Clients are opening and closing connections rapidly (>20/s) — check client pooling and admission limits."
 
+      # brain_derivation_admission_available_bytes is what the single
+      # derivation budget will still admit right now, and its own exposition
+      # states that a sustained zero means derivation is parked waiting on
+      # memory. Zero is therefore the metric's defined bad state rather than a
+      # chosen number. Nothing is refused when it parks — work defers into the
+      # durable extraction queue — which is why this is a ticket, not a page;
+      # it is the cause the two backlog alerts see as an effect. 15m separates
+      # a parked pipeline from a busy one, since momentary zeroes are normal
+      # under load.
+      - alert: BrainDerivationAdmissionStarved
+        expr: brain_derivation_admission_available_bytes == 0
+        for: 15m
+        labels:
+          severity: medium
+        annotations:
+          summary: "Derivation admission budget has been fully held for 15m"
+          description: >-
+            No bytes have been admittable for 15m, so every derivation batch
+            is waiting on the budget and the extraction queue is draining at
+            zero. Compare brain_derivation_prep_bytes_in_flight against
+            brain_derivation_bytes_in_flight to see which occupancy holds it:
+            payload pressure is relieved by narrowing LLM fan-out, prep
+            pressure by narrowing the batch or its neighbour fan-out.
+
   - name: brain-low
     rules:
       - alert: BrainConfigChanged
@@ -156,3 +263,25 @@ groups:
           description: >-
             The OpenTelemetry exporter reported failed/timed-out export
             attempts in the last 15m — traces are not reaching the collector.
+
+      # Headroom ahead of the starvation case above: under 10% of the budget
+      # still admittable. The 10% figure mirrors the 90%-full convention
+      # BrainArenaNearCapacity already uses in this file — a house convention,
+      # not a measured bound. The `> 0` arm leaves the fully-parked case to
+      # BrainDerivationAdmissionStarved so one condition does not notify
+      # twice, and clamp_min guards the division if the budget gauge is
+      # momentarily absent.
+      - alert: BrainDerivationAdmissionHeadroomLow
+        expr: |
+          brain_derivation_admission_available_bytes
+            / clamp_min(brain_derivation_admission_budget_bytes, 1) < 0.1
+            and brain_derivation_admission_available_bytes > 0
+        for: 30m
+        labels:
+          severity: low
+        annotations:
+          summary: "Derivation admission budget is above 90% held"
+          description: >-
+            Less than a tenth of the derivation byte budget is admittable.
+            Batches are starting to queue on admission; if this persists it
+            becomes BrainDerivationAdmissionStarved and then backlog growth.

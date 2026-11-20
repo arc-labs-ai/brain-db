@@ -465,7 +465,7 @@ fn score_spans(
 
 /// Outcome of [`validate_batch_inputs`].
 #[derive(Debug)]
-pub(crate) enum BatchValidation {
+enum BatchValidation {
     /// `inputs.is_empty()`. Caller returns `Ok(vec![])` without
     /// touching the model.
     Empty,
@@ -480,7 +480,7 @@ pub(crate) enum BatchValidation {
 /// Pure-logic validation for [`GlinerModel::predict_batch`]. Lifted
 /// out of the method body so tests can exercise the early-return /
 /// rejection paths without constructing a full model.
-pub(crate) fn validate_batch_inputs(
+fn validate_batch_inputs(
     inputs: &[(&str, &[&str])],
     max_labels: usize,
 ) -> Result<BatchValidation, GlinerError> {

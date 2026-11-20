@@ -11,6 +11,12 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Deserializer, Serialize};
 
+// The built-in cadence table and the worker kinds it is keyed on. Linux-only
+// for the same reason as `worker_defaults` below: the worker crate runs on
+// Glommio.
+#[cfg(target_os = "linux")]
+use brain_workers::{WorkerConfig, WorkerKind};
+
 // The worker implementation is Linux-only because it runs on Glommio. Keep
 // the configuration defaults available on other hosts so the portable config
 // parser and CLI can still be checked and used there.
@@ -18,16 +24,32 @@ use serde::{Deserialize, Deserializer, Serialize};
 mod worker_defaults {
     pub use brain_extractors::classifier::DEFAULT_GLINER_THRESHOLD as GLINER_THRESHOLD;
     pub use brain_extractors::resolver::EMBED_RESOLVE_THRESHOLD;
+    use brain_metadata::tables::extractor_audit::TransientRetryBudget;
     pub use brain_ops::index::text_indexer::DEFAULT_COMMIT_MS as TEXT_INDEX_COMMIT_MS;
     pub use brain_ops::index::text_indexer::DEFAULT_COMMIT_N as TEXT_INDEX_COMMIT_N;
     pub use brain_workers::workers::ambiguity_resolver::DEFAULT_INTERVAL_SECS as AMBIGUITY_RESOLVER_INTERVAL_SECS;
     pub use brain_workers::workers::confidence_sweep::DEFAULT_INTERVAL_SECS as CONFIDENCE_SWEEP_INTERVAL_SECS;
+    use brain_workers::workers::extractor::ExtractorRetryPolicy;
     pub use brain_workers::workers::llm_cache_sweeper::DEFAULT_INTERVAL_SECS as LLM_CACHE_SWEEP_INTERVAL_SECS;
     pub use brain_workers::workers::statement_reclaim::{
         DEFAULT_GRACE_SECONDS as STATEMENT_RECLAIM_GRACE_SECONDS,
         DEFAULT_PERIOD_SECONDS as STATEMENT_RECLAIM_PERIOD_SECONDS,
     };
     pub use brain_workers::workers::supersession_sweeper::DEFAULT_PERIOD_SECONDS as SUPERSESSION_PERIOD_SECONDS;
+
+    pub fn extractor_max_apply_attempts_per_memory() -> u32 {
+        ExtractorRetryPolicy::default().max_apply_attempts_per_memory
+    }
+    pub fn extractor_provider_reachable_window_ms() -> u64 {
+        ExtractorRetryPolicy::default().provider_reachable_window_nanos / 1_000_000
+    }
+    pub fn extractor_max_item_attributable_failures() -> u8 {
+        TransientRetryBudget::default().max_item_attributable_failures
+    }
+    pub fn extractor_max_transient_attempts() -> u8 {
+        TransientRetryBudget::default().max_attempts
+    }
+
     pub use brain_workers::{
         DEFAULT_AUTO_EDGE_SIMILARITY_THRESHOLD as AUTO_EDGE_SIMILARITY_THRESHOLD,
         DEFAULT_EXTRACTOR_BATCH_SIZE as EXTRACTOR_BATCH_SIZE,
@@ -57,6 +79,21 @@ mod worker_defaults {
     pub const MAX_EFFECT_MEMORIES: usize = 3;
     pub const MAX_RELATED_STATEMENTS: usize = 5;
     pub const TEMPORAL_EDGE_TOPICAL_THRESHOLD: f32 = 0.4;
+    // Stand-ins for the extraction retry policy, which lives in the worker
+    // crate and so is unreachable here. A host without the workers never runs
+    // the pipeline these bound; it only parses and prints the config.
+    pub fn extractor_max_apply_attempts_per_memory() -> u32 {
+        3
+    }
+    pub fn extractor_provider_reachable_window_ms() -> u64 {
+        900_000
+    }
+    pub fn extractor_max_item_attributable_failures() -> u8 {
+        5
+    }
+    pub fn extractor_max_transient_attempts() -> u8 {
+        48
+    }
     pub const WHITELIST_QNAMES: &[(&str, &str)] = &[
         ("brain", "caused_by"),
         ("brain", "triggered"),
@@ -211,7 +248,46 @@ pub struct TlsConfig {
 #[serde(deny_unknown_fields)]
 pub struct StorageConfig {
     pub data_dir: PathBuf,
-    pub shard_count: usize,
+    /// Shards to run, as the OPERATOR asked for it.
+    ///
+    /// `None` means they did not ask, and the server sizes itself to the
+    /// machine. Kept as intent rather than a resolved number because the two
+    /// are treated differently on an existing data directory: a pinned count
+    /// that disagrees with what the directory holds is an error, while an
+    /// unpinned one simply yields to the record. `main` overwrites this with
+    /// the resolved value once `storage_layout::resolve` has decided, so
+    /// everything downstream reads one agreed number.
+    #[serde(default)]
+    pub shard_count: Option<usize>,
+}
+
+/// How many shards to run when the operator has not pinned a count.
+///
+/// One per available core, which is what the engine can actually use: a shard
+/// owns a glommio executor and that executor owns a core. `available_parallelism`
+/// reads the cgroup quota on Linux, so a container limited to two CPUs gets two
+/// shards rather than the host's core count.
+///
+/// One core is held back for the network and admin runtimes, which do not run
+/// on a shard executor and would otherwise contend with one.
+#[must_use]
+pub fn shards_for_this_machine() -> usize {
+    std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1)
+        .saturating_sub(1)
+        .max(1)
+}
+
+impl StorageConfig {
+    /// The shard count to use — the operator's, or one sized to this machine.
+    ///
+    /// Only meaningful before `storage_layout::resolve` has run; afterwards
+    /// `shard_count` is `Some` and this just unwraps it.
+    #[must_use]
+    pub fn shards(&self) -> usize {
+        self.shard_count.unwrap_or_else(shards_for_this_machine)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -297,7 +373,6 @@ impl EmbedderConfig {
     /// env-override slot lets devs point at any local checkout without
     /// editing TOML; the XDG default keeps the no-config first-run
     /// experience clean.
-    #[allow(dead_code)] // consumed by main.rs on Linux; unused on non-Linux stub builds.
     pub fn resolve_model_dir(&self) -> Result<PathBuf, ConfigError> {
         self.resolve_model_dir_with(&|k| std::env::var(k).ok())
     }
@@ -567,6 +642,66 @@ pub struct WorkersConfig {
     pub supersession_sweeper: SupersessionSweeperWorkerConfig,
 }
 
+#[cfg(target_os = "linux")]
+impl WorkersConfig {
+    /// The maintenance cadences this section declares, each resolved against
+    /// the built-in cadence table and paired with the worker kind it governs.
+    ///
+    /// Lives here, not inline at the registration site, so it is reachable
+    /// from a test. The defect this guards against is a cadence that exists in
+    /// `[workers]` and never arrives at a scheduler: an operator who edits the
+    /// value sees no error and no change, because the scheduler reads a
+    /// worker's config once at registration and nothing ever compares it back
+    /// to the file.
+    ///
+    /// An omitted key leaves its worker on the built-in cadence, so a config
+    /// that names none of them runs exactly as a build with no config at all.
+    /// The array is fixed-width: a key cannot drop out of the inventory
+    /// without a compile error.
+    ///
+    /// `access_boost` is deliberately absent. It is a registered maintenance
+    /// worker with no cadence key — twelve workers, eleven keys — and its tick
+    /// is a property of the build.
+    #[must_use]
+    pub fn maintenance_worker_configs(&self) -> [(WorkerKind, WorkerConfig); 11] {
+        let resolve = |kind: WorkerKind, declared: Option<u64>| {
+            let mut cfg = WorkerConfig::defaults_for(kind);
+            if let Some(secs) = declared {
+                cfg.interval = std::time::Duration::from_secs(secs);
+            }
+            (kind, cfg)
+        };
+        [
+            resolve(WorkerKind::Decay, self.decay_interval_sec),
+            resolve(WorkerKind::Consolidation, self.consolidation_interval_sec),
+            resolve(
+                WorkerKind::HnswMaintenance,
+                self.hnsw_maintenance_interval_sec,
+            ),
+            resolve(
+                WorkerKind::IdempotencyCleanup,
+                self.idempotency_cleanup_interval_sec,
+            ),
+            resolve(
+                WorkerKind::SlotReclamation,
+                self.slot_reclamation_interval_sec,
+            ),
+            resolve(WorkerKind::WalRetention, self.wal_retention_interval_sec),
+            resolve(WorkerKind::EdgeScrub, self.edge_scrub_interval_sec),
+            resolve(
+                WorkerKind::CounterReconcile,
+                self.counter_reconciliation_interval_sec,
+            ),
+            resolve(WorkerKind::Statistics, self.statistics_update_interval_sec),
+            resolve(
+                WorkerKind::EmbedderCacheEvict,
+                self.embedder_cache_eviction_interval_sec,
+            ),
+            resolve(WorkerKind::Snapshot, self.snapshot_interval_sec),
+        ]
+    }
+}
+
 /// `[workers.supersession_sweeper]` TOML section. Controls physical
 /// reclamation of superseded statement rows. Off by default — a
 /// superseded row is filtered from every read regardless, so retention
@@ -826,11 +961,11 @@ fn default_tantivy_commit_ms() -> u64 {
     worker_defaults::TEXT_INDEX_COMMIT_MS
 }
 
-/// `[retrieval]` TOML section. Deploy-time read-path tuning that was
-/// previously read via bespoke `BRAIN_*` env vars deep in the planner /
-/// retriever / RECALL handler. Every field defaults to the historical
-/// env-unset behaviour, so the section may be omitted entirely. The generic
-/// `BRAIN__RETRIEVAL__FIELD` override applies like any other section.
+/// `[retrieval]` TOML section. Deploy-time read-path tuning for the planner /
+/// retriever / RECALL handler, declared in one place rather than read deep
+/// inside each of them. Every field has a default, so the section may be
+/// omitted entirely. The generic `BRAIN__RETRIEVAL__FIELD` override applies
+/// like any other section.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RetrievalConfig {
@@ -1136,8 +1271,7 @@ fn default_causal_edge_channel_capacity() -> usize {
 /// `[workers.extractor]` TOML section — TUNING for the extraction-pipeline
 /// worker. The worker is NOT enabled/disabled here: extraction is always-on
 /// and non-configurable, so the worker is always provisioned. This section
-/// only carries per-worker tuning (interval, drain-per-cycle, budget, queue
-/// depth).
+/// only carries per-worker tuning (interval, drain-per-cycle, queue depth).
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ExtractorWorkerConfig {
@@ -1146,11 +1280,13 @@ pub struct ExtractorWorkerConfig {
     pub interval_ms: u64,
     /// Max memories drained per cycle (caps pattern / classifier /
     /// LLM work per scheduler tick).
+    ///
+    /// This is a CEILING ON `batch_size`, not an independent knob: a
+    /// micro-batch is `min(batch_size, remaining cycle budget)`, so raising
+    /// `batch_size` above this changes nothing at all. Raise both together or
+    /// the wider fan-out you asked for never happens.
     #[serde(default = "default_extractor_drain_per_cycle")]
     pub drain_per_cycle: usize,
-    /// Per-cycle LLM cost ceiling in dollar-micro-units (1e-6 USD).
-    #[serde(default = "default_extractor_llm_budget_micro_usd")]
-    pub llm_budget_per_cycle_micro_usd: u64,
     /// Writer → worker queue depth. Overflow drops the enqueue with
     /// a warn (encode itself never fails).
     #[serde(default = "default_extractor_channel_capacity")]
@@ -1165,6 +1301,29 @@ pub struct ExtractorWorkerConfig {
     /// per-memory cost down by ~4-5x on a CPU host.
     #[serde(default = "default_extractor_batch_size")]
     pub batch_size: usize,
+    /// Apply/gate infra-failure attempts one memory gets before its extraction
+    /// is abandoned. Policy: the shard keeps draining the rest of the queue
+    /// while a memory that cannot be applied stops costing a pipeline pass, and
+    /// on the LLM-bearing path a provider round-trip, every cycle.
+    #[serde(default = "default_extractor_max_apply_attempts_per_memory")]
+    pub max_apply_attempts_per_memory: u32,
+    /// How recently the LLM tier must have succeeded for a transient failure to
+    /// be charged to the memory rather than to the provider. Policy: wide enough
+    /// that a shard extracting normally keeps the evidence alive across a
+    /// backing-off memory's retries, narrow enough to expire inside an outage.
+    #[serde(default = "default_extractor_provider_reachable_window_ms")]
+    pub provider_reachable_window_ms: u64,
+    /// Transient failures a memory may accrue while the provider is reachable
+    /// before its extraction is abandoned. Policy: a failure that lands while
+    /// other memories' calls succeed is the memory's own, and the same text
+    /// fails the same way next time.
+    #[serde(default = "default_extractor_max_item_attributable_failures")]
+    pub max_item_attributable_failures: u8,
+    /// Absolute ceiling on extraction attempts for one memory, whatever the
+    /// cause. The default is the provider-outage window the deployment commits
+    /// to surviving divided by the capped retry interval.
+    #[serde(default = "default_extractor_max_transient_attempts")]
+    pub max_transient_attempts: u8,
     /// Re-extract a namespace's already-committed memories when a new
     /// schema version is uploaded for it.
     ///
@@ -1181,8 +1340,8 @@ pub struct ExtractorWorkerConfig {
     /// Choose it when schema churn is rare and the corpus is small.
     ///
     /// Either way, re-extraction is bounded by the extractor's own
-    /// `channel_capacity` and per-cycle `llm_budget_per_cycle_micro_usd` —
-    /// enabling this cannot outrun those ceilings, it only fills them.
+    /// `channel_capacity` — enabling this cannot outrun that ceiling, it
+    /// only fills it.
     #[serde(default = "default_reextract_on_schema_change")]
     pub reextract_on_schema_change: bool,
 }
@@ -1192,10 +1351,13 @@ impl Default for ExtractorWorkerConfig {
         Self {
             interval_ms: default_extractor_interval_ms(),
             drain_per_cycle: default_extractor_drain_per_cycle(),
-            llm_budget_per_cycle_micro_usd: default_extractor_llm_budget_micro_usd(),
             channel_capacity: default_extractor_channel_capacity(),
             skip_already_extracted: default_extractor_skip_audited(),
             batch_size: default_extractor_batch_size(),
+            max_apply_attempts_per_memory: default_extractor_max_apply_attempts_per_memory(),
+            provider_reachable_window_ms: default_extractor_provider_reachable_window_ms(),
+            max_item_attributable_failures: default_extractor_max_item_attributable_failures(),
+            max_transient_attempts: default_extractor_max_transient_attempts(),
             reextract_on_schema_change: default_reextract_on_schema_change(),
         }
     }
@@ -1207,9 +1369,6 @@ fn default_extractor_interval_ms() -> u64 {
 fn default_extractor_drain_per_cycle() -> usize {
     32
 }
-fn default_extractor_llm_budget_micro_usd() -> u64 {
-    50_000
-}
 fn default_extractor_channel_capacity() -> usize {
     1024
 }
@@ -1218,6 +1377,18 @@ fn default_extractor_skip_audited() -> bool {
 }
 fn default_extractor_batch_size() -> usize {
     worker_defaults::EXTRACTOR_BATCH_SIZE
+}
+fn default_extractor_max_apply_attempts_per_memory() -> u32 {
+    worker_defaults::extractor_max_apply_attempts_per_memory()
+}
+fn default_extractor_provider_reachable_window_ms() -> u64 {
+    worker_defaults::extractor_provider_reachable_window_ms()
+}
+fn default_extractor_max_item_attributable_failures() -> u8 {
+    worker_defaults::extractor_max_item_attributable_failures()
+}
+fn default_extractor_max_transient_attempts() -> u8 {
+    worker_defaults::extractor_max_transient_attempts()
 }
 /// Off. Spending money on the operator's behalf is not a default.
 fn default_reextract_on_schema_change() -> bool {
@@ -1626,7 +1797,6 @@ fn set_path(value: &mut toml::Value, path: &[String], leaf: &str, reference: &to
 
 impl Config {
     /// Read config from disk and apply env overrides from the live process env.
-    #[allow(dead_code)] // used by main.rs; tests use load_with_env to avoid global env mutation.
     pub fn load(path: impl AsRef<Path>) -> Result<Config, ConfigError> {
         let env: HashMap<String, String> = std::env::vars().collect();
         Self::load_with_env(path, &env)
@@ -1660,7 +1830,6 @@ impl Config {
     /// construct an [`AdminState`](crate::admin::AdminState) without
     /// reading a TOML file. Numeric defaults mirror `config/dev.toml`.
     #[doc(hidden)]
-    #[allow(dead_code)] // referenced by integration tests via #[path] mounts.
     pub fn for_tests() -> Self {
         Self {
             server: ServerConfig {
@@ -1671,7 +1840,7 @@ impl Config {
             },
             storage: StorageConfig {
                 data_dir: PathBuf::from("/tmp/brain-test"),
-                shard_count: 1,
+                shard_count: Some(1),
             },
             shard: ShardConfig {
                 arena_capacity_bytes: 1u64 << 20,
@@ -1709,7 +1878,7 @@ impl Config {
 
     #[allow(clippy::too_many_lines)]
     fn validate_post(&self) -> Result<(), ConfigError> {
-        if self.storage.shard_count == 0 {
+        if self.storage.shard_count == Some(0) {
             return Err(ConfigError::Invariant(
                 "storage.shard_count must be >= 1".into(),
             ));
@@ -1861,6 +2030,22 @@ impl Config {
             "workers.extractor.batch_size",
             w.extractor.batch_size as u64,
         )?;
+        require_nonzero(
+            "workers.extractor.max_apply_attempts_per_memory",
+            w.extractor.max_apply_attempts_per_memory as u64,
+        )?;
+        require_nonzero(
+            "workers.extractor.provider_reachable_window_ms",
+            w.extractor.provider_reachable_window_ms,
+        )?;
+        require_nonzero(
+            "workers.extractor.max_item_attributable_failures",
+            w.extractor.max_item_attributable_failures as u64,
+        )?;
+        require_nonzero(
+            "workers.extractor.max_transient_attempts",
+            w.extractor.max_transient_attempts as u64,
+        )?;
 
         require_nonzero(
             "workers.ambiguity_resolver.interval_secs",
@@ -1936,6 +2121,203 @@ mod tests {
         assert_eq!(
             cfg.ef_factor, 1,
             "an omitted ef_factor must not change behaviour"
+        );
+    }
+
+    /// Every field of `[workers]` must be accounted for, and every cadence
+    /// among them must arrive at the worker config the scheduler reads.
+    ///
+    /// The scheduler takes `worker.config()` once, before its loop, and sleeps
+    /// on `cfg.interval` for the life of the process. A cadence not applied
+    /// before registration is therefore a cadence that never runs at all —
+    /// parsed, validated for non-zero, and silently ignored — which is exactly
+    /// what shipped for all eleven of these keys.
+    ///
+    /// Asserted with distinct, NON-default probes on purpose. A probe equal to
+    /// the built-in cadence cannot tell a carried field from an ignored one,
+    /// and distinct probes are what catch a key wired to another worker's
+    /// kind.
+    ///
+    /// The destructuring is exhaustive on purpose. A new field in
+    /// `WorkersConfig` stops this test compiling until its author says whether
+    /// it is a cadence that has to reach a worker, and dropping a name from
+    /// the inventory leaves its binding unused.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn every_workers_cadence_reaches_its_worker() {
+        let cfg = WorkersConfig {
+            decay_interval_sec: Some(1_001),
+            consolidation_interval_sec: Some(1_002),
+            hnsw_maintenance_interval_sec: Some(1_003),
+            idempotency_cleanup_interval_sec: Some(1_004),
+            slot_reclamation_interval_sec: Some(1_005),
+            wal_retention_interval_sec: Some(1_006),
+            edge_scrub_interval_sec: Some(1_007),
+            counter_reconciliation_interval_sec: Some(1_008),
+            statistics_update_interval_sec: Some(1_009),
+            embedder_cache_eviction_interval_sec: Some(1_010),
+            snapshot_interval_sec: Some(1_011),
+            ..WorkersConfig::default()
+        };
+
+        let WorkersConfig {
+            decay_interval_sec,
+            consolidation_interval_sec,
+            hnsw_maintenance_interval_sec,
+            idempotency_cleanup_interval_sec,
+            slot_reclamation_interval_sec,
+            wal_retention_interval_sec,
+            edge_scrub_interval_sec,
+            counter_reconciliation_interval_sec,
+            statistics_update_interval_sec,
+            embedder_cache_eviction_interval_sec,
+            snapshot_interval_sec,
+            auto_edge: _,
+            extractor: _,
+            temporal_edge: _,
+            causal_edge: _,
+            statement_reclaim: _,
+            predicate_gc: _,
+            ambiguity_resolver: _,
+            confidence_sweep: _,
+            llm_cache_sweep: _,
+            supersession_sweeper: _,
+        } = cfg.clone();
+
+        // Fully qualified, because these are the names an operator reads in a
+        // validation error and writes in a config file.
+        let inventory = [
+            (
+                "workers.decay_interval_sec",
+                WorkerKind::Decay,
+                decay_interval_sec,
+            ),
+            (
+                "workers.consolidation_interval_sec",
+                WorkerKind::Consolidation,
+                consolidation_interval_sec,
+            ),
+            (
+                "workers.hnsw_maintenance_interval_sec",
+                WorkerKind::HnswMaintenance,
+                hnsw_maintenance_interval_sec,
+            ),
+            (
+                "workers.idempotency_cleanup_interval_sec",
+                WorkerKind::IdempotencyCleanup,
+                idempotency_cleanup_interval_sec,
+            ),
+            (
+                "workers.slot_reclamation_interval_sec",
+                WorkerKind::SlotReclamation,
+                slot_reclamation_interval_sec,
+            ),
+            (
+                "workers.wal_retention_interval_sec",
+                WorkerKind::WalRetention,
+                wal_retention_interval_sec,
+            ),
+            (
+                "workers.edge_scrub_interval_sec",
+                WorkerKind::EdgeScrub,
+                edge_scrub_interval_sec,
+            ),
+            (
+                "workers.counter_reconciliation_interval_sec",
+                WorkerKind::CounterReconcile,
+                counter_reconciliation_interval_sec,
+            ),
+            (
+                "workers.statistics_update_interval_sec",
+                WorkerKind::Statistics,
+                statistics_update_interval_sec,
+            ),
+            (
+                "workers.embedder_cache_eviction_interval_sec",
+                WorkerKind::EmbedderCacheEvict,
+                embedder_cache_eviction_interval_sec,
+            ),
+            (
+                "workers.snapshot_interval_sec",
+                WorkerKind::Snapshot,
+                snapshot_interval_sec,
+            ),
+        ];
+
+        let resolved = cfg.maintenance_worker_configs();
+        assert_eq!(
+            inventory.len(),
+            resolved.len(),
+            "the inventory of [workers] cadences changed size: carry the field \
+             to its worker and name it here"
+        );
+
+        for (name, kind, declared) in inventory {
+            let declared = declared.expect("every probe above is set");
+            let defaults = WorkerConfig::defaults_for(kind);
+            assert_ne!(
+                declared,
+                defaults.interval.as_secs(),
+                "{name}'s probe equals the built-in cadence, so the assertion \
+                 below would pass against unwired code: pick another probe"
+            );
+            let (_, got) = resolved
+                .iter()
+                .find(|(resolved_kind, _)| *resolved_kind == kind)
+                .unwrap_or_else(|| panic!("{name} reaches no worker config"));
+            assert_eq!(
+                got.interval,
+                std::time::Duration::from_secs(declared),
+                "{name} must reach the worker config the scheduler reads"
+            );
+            // The cadence is the only knob a `[workers]` interval may move.
+            assert_eq!(
+                got.enabled, defaults.enabled,
+                "{name} must not change whether its worker is enabled"
+            );
+            assert_eq!(
+                got.batch_size, defaults.batch_size,
+                "{name} must not change its worker's batch size"
+            );
+            assert_eq!(
+                got.max_runtime, defaults.max_runtime,
+                "{name} must not change its worker's max runtime"
+            );
+        }
+
+        // Pairwise distinct, so a key wired to the wrong kind fails the
+        // assertion above rather than coinciding with it.
+        let mut carried: Vec<u64> = resolved
+            .iter()
+            .map(|(_, worker_cfg)| worker_cfg.interval.as_secs())
+            .collect();
+        carried.sort_unstable();
+        carried.dedup();
+        assert_eq!(
+            carried.len(),
+            resolved.len(),
+            "the probes must be pairwise distinct or a cross-wired key passes"
+        );
+
+        // An omitted cadence must leave the built-in one in place: a config
+        // naming none of these keys has to run exactly as no config at all.
+        for (kind, got) in WorkersConfig::default().maintenance_worker_configs() {
+            assert_eq!(
+                got.interval,
+                WorkerConfig::defaults_for(kind).interval,
+                "omitting a cadence must leave {} on its built-in interval",
+                kind.name()
+            );
+        }
+
+        // `access_boost` is a registered maintenance worker with no cadence
+        // key — twelve workers, eleven keys. It must not appear here, or
+        // registration would claim a cadence no config declares.
+        assert!(
+            !resolved
+                .iter()
+                .any(|(kind, _)| *kind == WorkerKind::AccessBoost),
+            "access_boost has no [workers] key and must resolve no cadence"
         );
     }
 

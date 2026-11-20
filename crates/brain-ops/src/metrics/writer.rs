@@ -18,6 +18,7 @@ use std::time::Duration;
 use parking_lot::Mutex;
 
 use super::histograms::{WorkerHistogram, WorkerHistogramSnapshot, DEFAULT_CYCLE_BUCKETS_SECONDS};
+use super::write_stage::{WriteStageMetrics, WriteStageMetricsSnapshot};
 
 /// Outcome label for `brain_writer_submit_total`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -96,6 +97,11 @@ pub struct WriterMetrics {
     idempotency_hit: AtomicU64,
     idempotency_miss: AtomicU64,
     idempotency_conflict: AtomicU64,
+    /// Per-stage latency for the synchronous ack path. Lives here so
+    /// the write path threads one `Arc` and one snapshot carries the
+    /// whole write-side picture; the stage axis is independent of the
+    /// phase axis above, hence its own type.
+    stages: WriteStageMetrics,
 }
 
 impl WriterMetrics {
@@ -108,7 +114,15 @@ impl WriterMetrics {
             idempotency_hit: AtomicU64::new(0),
             idempotency_miss: AtomicU64::new(0),
             idempotency_conflict: AtomicU64::new(0),
+            stages: WriteStageMetrics::new(),
         }
+    }
+
+    /// Per-stage latency family for the ack path. The write path
+    /// records each stage through this handle.
+    #[must_use]
+    pub fn stages(&self) -> &WriteStageMetrics {
+        &self.stages
     }
 
     /// Record one phase's submit outcome + observed duration. Called
@@ -196,6 +210,7 @@ impl WriterMetrics {
             idempotency_hit: self.idempotency_hit.load(Ordering::Relaxed),
             idempotency_miss: self.idempotency_miss.load(Ordering::Relaxed),
             idempotency_conflict: self.idempotency_conflict.load(Ordering::Relaxed),
+            stages: self.stages.snapshot(),
         }
     }
 }
@@ -215,6 +230,7 @@ pub struct WriterMetricsSnapshot {
     pub idempotency_hit: u64,
     pub idempotency_miss: u64,
     pub idempotency_conflict: u64,
+    pub stages: WriteStageMetricsSnapshot,
 }
 
 impl WriterMetricsSnapshot {

@@ -1,9 +1,8 @@
 //! The shard wall-clock, as a single source of unix-nanoseconds.
 //!
-//! Handlers and the writer all stamp records with "now". This is the one
-//! definition — previously ~8 modules each had their own private
-//! `now_unix_nanos()`. Centralizing it removes the drift and gives a
-//! single seam for a future injectable test clock.
+//! Handlers and the writer stamp records with "now". This one definition
+//! prevents drift between them and provides a single seam for an injectable
+//! test clock.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

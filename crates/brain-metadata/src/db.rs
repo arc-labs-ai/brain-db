@@ -111,7 +111,14 @@ impl MetadataDb {
     /// Refuses to open files written by a newer binary.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, MetadataDbError> {
         let path = path.as_ref().to_path_buf();
-        let db = Database::create(&path)?;
+        // Opened through the builder so the page cache is the size this
+        // process decided on rather than redb's machine-blind 1 GiB default.
+        // Every shard opens one of these, so the default is not a gibibyte of
+        // cache intent but a gibibyte per shard, and nothing would evict until
+        // the kernel did.
+        let db = Database::builder()
+            .set_cache_size(crate::page_cache::metadata_bytes())
+            .create(&path)?;
         let schema_version = open_or_init_schema(&db)?;
 
         // Seed `durable_lsn` from the latest checkpoint, if any. Empty

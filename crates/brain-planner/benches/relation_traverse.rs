@@ -1,13 +1,11 @@
-//! Performance gate for the unified edge layer.
+//! Performance measurements for the unified edge layer.
 //!
 //! Validates that collapsing the substrate `edges_out`/`edges_in`
 //! tables and the typed-relation `relations`/`by_from`/`by_to` tables
-//! into one `EDGES_TABLE` + sidecar did not regress the
-//! `RELATION_TRAVERSE` latency below targets:
-//!
-//! - depth=1 : p50 ≤ 5  ms
-//! - depth=2 : p50 ≤ 15 ms
-//! - depth=3 : p50 ≤ 30 ms
+//! into one `EDGES_TABLE` + sidecar. The benchmark reports p50 measurements
+//! and leaves regression detection to Criterion's machine-local baselines;
+//! an absolute latency gate would describe the benchmark machine rather than
+//! the implementation.
 //!
 //! Also validates that the no-schema memory-anchored walk
 //! (`walk_memory_edges`, exercised when no typed relations are
@@ -47,12 +45,6 @@ const N_ENTITIES: usize = 1000;
 const N_TYPED_RELATIONS: usize = 5000;
 const N_MEMORIES: usize = 1000;
 const N_SUBSTRATE_EDGES: usize = 5000;
-
-// p50 targets in milliseconds.
-const P50_TARGET_MS_D1: f64 = 5.0;
-const P50_TARGET_MS_D2: f64 = 15.0;
-const P50_TARGET_MS_D3: f64 = 30.0;
-const P50_TARGET_MS_SUBSTRATE: f64 = 5.0; // Substrate walk should match depth=1 target.
 
 const T0: u64 = 1_700_000_000_000_000_000;
 
@@ -224,8 +216,8 @@ fn build_memory_fixture() -> MemoryFixture {
 }
 
 // ---------------------------------------------------------------------------
-// p50 helpers — direct timing so we can assert against the latency target
-// even when criterion is invoked without the statistical-summary mode.
+// p50 helpers — direct timing so the measured values are visible even when
+// Criterion's statistical summary is not being inspected.
 // ---------------------------------------------------------------------------
 
 fn measure_p50<F: FnMut()>(mut f: F, samples: usize) -> Duration {
@@ -244,7 +236,7 @@ fn measure_p50<F: FnMut()>(mut f: F, samples: usize) -> Duration {
 }
 
 // ---------------------------------------------------------------------------
-// Benches + perf-gate assertions.
+// Benches and direct measurements.
 // ---------------------------------------------------------------------------
 
 fn bench_relation_traverse_depths(c: &mut Criterion) {
@@ -272,7 +264,6 @@ fn bench_relation_traverse_depths(c: &mut Criterion) {
         current_only: true,
     };
 
-    // Depth-1 perf gate.
     let p50_d1 = measure_p50(
         || {
             let rtxn = fx.db.read_txn().expect("read_txn");
@@ -325,40 +316,9 @@ fn bench_relation_traverse_depths(c: &mut Criterion) {
     );
 
     eprintln!("RELATION_TRAVERSE p50 actuals:");
-    eprintln!(
-        "  depth=1 : {:.3} ms (target ≤ {:.1} ms)",
-        duration_ms(p50_d1),
-        P50_TARGET_MS_D1
-    );
-    eprintln!(
-        "  depth=2 : {:.3} ms (target ≤ {:.1} ms)",
-        duration_ms(p50_d2),
-        P50_TARGET_MS_D2
-    );
-    eprintln!(
-        "  depth=3 : {:.3} ms (target ≤ {:.1} ms)",
-        duration_ms(p50_d3),
-        P50_TARGET_MS_D3
-    );
-
-    assert!(
-        duration_ms(p50_d1) <= P50_TARGET_MS_D1,
-        "depth=1 p50 {:.3} ms exceeds target {} ms",
-        duration_ms(p50_d1),
-        P50_TARGET_MS_D1,
-    );
-    assert!(
-        duration_ms(p50_d2) <= P50_TARGET_MS_D2,
-        "depth=2 p50 {:.3} ms exceeds target {} ms",
-        duration_ms(p50_d2),
-        P50_TARGET_MS_D2,
-    );
-    assert!(
-        duration_ms(p50_d3) <= P50_TARGET_MS_D3,
-        "depth=3 p50 {:.3} ms exceeds target {} ms",
-        duration_ms(p50_d3),
-        P50_TARGET_MS_D3,
-    );
+    eprintln!("  depth=1 : {:.3} ms", duration_ms(p50_d1));
+    eprintln!("  depth=2 : {:.3} ms", duration_ms(p50_d2));
+    eprintln!("  depth=3 : {:.3} ms", duration_ms(p50_d3));
 
     // Also feed criterion for the standard statistical summary so a
     // future operator can graph the trend.
@@ -413,9 +373,8 @@ fn bench_relation_traverse_depths(c: &mut Criterion) {
 }
 
 /// Memory-anchor walk on a memory-only fixture (no typed relations
-/// declared). Verifies that `walk_memory_edges` (now backed
-/// by the unified `EDGES_TABLE`) hasn't regressed against the depth=1
-/// target.
+/// declared). Reports the latency of `walk_memory_edges` (now backed by the
+/// unified `EDGES_TABLE`).
 fn bench_substrate_walk(c: &mut Criterion) {
     let fx = build_memory_fixture();
     let mut idx = 0usize;
@@ -430,17 +389,7 @@ fn bench_substrate_walk(c: &mut Criterion) {
         128,
     );
 
-    eprintln!(
-        "SUBSTRATE walk_outgoing p50 actual: {:.3} ms (target ≤ {:.1} ms)",
-        duration_ms(p50),
-        P50_TARGET_MS_SUBSTRATE,
-    );
-    assert!(
-        duration_ms(p50) <= P50_TARGET_MS_SUBSTRATE,
-        "substrate walk p50 {:.3} ms exceeds target {} ms",
-        duration_ms(p50),
-        P50_TARGET_MS_SUBSTRATE,
-    );
+    eprintln!("SUBSTRATE walk_outgoing p50: {:.3} ms", duration_ms(p50),);
 
     let mut idx_c = 0usize;
     c.bench_function("substrate_walk_outgoing", |b| {

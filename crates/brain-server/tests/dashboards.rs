@@ -1,19 +1,21 @@
-//! CI gate for `config/monitoring/dashboards/*.json`.
+//! CI gate for shipped Grafana dashboards.
 //!
-//! Verifies each dashboard:
-//! - Parses as valid JSON.
-//! - Has the expected top-level shape (title, uid, schemaVersion,
-//!   panels).
-//! - References only metric names that match the `brain_*` /
-//!   `process_*` taxonomy — typos like `brain_requets_total` get
-//!   caught here, not at scrape time in prod.
+//! Verifies JSON shape, emitted metric families, legal labels, and PromQL
+//! range functions. These checks keep dashboards aligned with the exposition
+//! so an operator does not mistake an empty or invalid series for zero.
 
 #![cfg(target_os = "linux")]
+
+mod metrics_catalog;
 
 use std::fs;
 use std::path::PathBuf;
 
-/// All dashboards Brain ships.
+use metrics_catalog::{
+    expr_grouping_labels, expr_metrics, expr_range_functions, expr_selector_labels, Catalog,
+    MetricKind,
+};
+
 const EXPECTED_DASHBOARDS: &[&str] = &[
     "overview",
     "per-shard",
@@ -25,12 +27,7 @@ const EXPECTED_DASHBOARDS: &[&str] = &[
     "capacity",
 ];
 
-/// Allowed metric prefixes. Anything starting with one of these is
-/// treated as in-taxonomy; anything else is flagged.
-const ALLOWED_PREFIXES: &[&str] = &["brain_", "process_"];
-
 fn dashboards_dir() -> PathBuf {
-    // brain-server/tests/dashboards.rs → config/monitoring/dashboards/
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
@@ -70,95 +67,171 @@ fn every_dashboard_parses_as_json() {
     }
 }
 
-#[test]
-fn every_dashboard_references_taxonomy_metrics_only() {
+fn dashboard_exprs() -> Vec<(String, usize, String, String)> {
     let dir = dashboards_dir();
-    let mut violations = Vec::new();
+    let mut out = Vec::new();
     for name in EXPECTED_DASHBOARDS {
-        let path = dir.join(format!("{name}.json"));
-        let raw = fs::read_to_string(&path).expect("read");
-        let v: serde_json::Value = serde_json::from_str(&raw).expect("parse");
-        let panels = v["panels"].as_array().expect("panels");
-        for (i, panel) in panels.iter().enumerate() {
+        let raw = fs::read_to_string(dir.join(format!("{name}.json"))).expect("read");
+        let value: serde_json::Value = serde_json::from_str(&raw).expect("parse");
+        for (index, panel) in value["panels"]
+            .as_array()
+            .expect("panels")
+            .iter()
+            .enumerate()
+        {
+            let title = panel["title"].as_str().unwrap_or("<untitled>").to_string();
             if let Some(targets) = panel["targets"].as_array() {
                 for target in targets {
                     if let Some(expr) = target["expr"].as_str() {
-                        for candidate in extract_metric_names(expr) {
-                            if !ALLOWED_PREFIXES.iter().any(|p| candidate.starts_with(p)) {
-                                violations.push(format!(
-                                    "{}: panel[{}] expr `{}` references unknown metric `{}`",
-                                    name, i, expr, candidate,
-                                ));
-                            }
-                        }
+                        out.push(((*name).to_string(), index, title.clone(), expr.to_string()));
                     }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn context(dashboard: &str, panel: usize, title: &str, expr: &str, detail: &str) -> String {
+    format!("{dashboard}: panel[{panel}] `{title}`, expr `{expr}`: {detail}")
+}
+
+#[test]
+fn every_dashboard_metric_is_emitted() {
+    let catalog = Catalog::parse();
+    let mut violations = Vec::new();
+    for (dashboard, panel, title, expr) in dashboard_exprs() {
+        for metric in expr_metrics(&expr) {
+            if catalog.resolve(&metric).is_none() {
+                violations.push(context(
+                    &dashboard,
+                    panel,
+                    &title,
+                    &expr,
+                    &format!("catalog has no family for `{metric}`"),
+                ));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "dashboard metric violations:\n  {}",
+        violations.join("\n  ")
+    );
+}
+
+#[test]
+fn every_dashboard_grouping_label_exists() {
+    let catalog = Catalog::parse();
+    let mut violations = Vec::new();
+    for (dashboard, panel, title, expr) in dashboard_exprs() {
+        for label in expr_grouping_labels(&expr) {
+            for metric in expr_metrics(&expr) {
+                match catalog.allowed_labels(&metric) {
+                    Some(allowed) if allowed.contains(&label) => {}
+                    Some(allowed) => violations.push(context(
+                        &dashboard,
+                        panel,
+                        &title,
+                        &expr,
+                        &format!(
+                            "`{metric}` does not allow grouping label `{label}`; catalog allows {allowed:?}"
+                        ),
+                    )),
+                    None => violations.push(context(
+                        &dashboard,
+                        panel,
+                        &title,
+                        &expr,
+                        &format!(
+                            "`{metric}` is unresolved while checking grouping label `{label}`"
+                        ),
+                    )),
                 }
             }
         }
     }
     assert!(
         violations.is_empty(),
-        "dashboard metric typo(s):\n  {}",
+        "dashboard grouping-label violations:\n  {}",
         violations.join("\n  ")
     );
 }
 
-/// Very small PromQL-tokeniser-style extraction. Pulls runs of
-/// `[a-zA-Z_][a-zA-Z0-9_]*` that look like metric names (i.e. not
-/// directly preceded by alphanumerics — to skip function arguments
-/// like `le`, `op` inside `by(...)`).
-///
-/// Conservative: returns only identifiers that contain an underscore
-/// and aren't PromQL keywords / function-arg labels. Catches the
-/// 99 % case (full metric names with `brain_` prefix or
-/// `process_*`) without trying to be a real parser.
-fn extract_metric_names(expr: &str) -> Vec<String> {
-    const PROMQL_KEYWORDS: &[&str] = &[
-        "sum",
-        "rate",
-        "irate",
-        "by",
-        "without",
-        "histogram_quantile",
-        "predict_linear",
-        "time",
-        "clamp_min",
-        "clamp_max",
-        "le",
-        "op",
-        "shard",
-        "worker",
-        "status",
-        "error",
-        "success",
-        "timeout",
-    ];
-    let mut out = Vec::new();
-    let bytes = expr.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i];
-        if c.is_ascii_alphabetic() || c == b'_' {
-            let start = i;
-            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-                i += 1;
+#[test]
+fn every_dashboard_selector_label_exists() {
+    let catalog = Catalog::parse();
+    let mut violations = Vec::new();
+    for (dashboard, panel, title, expr) in dashboard_exprs() {
+        for (metric, labels) in expr_selector_labels(&expr) {
+            for label in labels {
+                match catalog.allowed_labels(&metric) {
+                    Some(allowed) if allowed.contains(&label) => {}
+                    Some(allowed) => violations.push(context(
+                        &dashboard,
+                        panel,
+                        &title,
+                        &expr,
+                        &format!(
+                            "`{metric}` does not allow selector label `{label}`; catalog allows {allowed:?}"
+                        ),
+                    )),
+                    None => violations.push(context(
+                        &dashboard,
+                        panel,
+                        &title,
+                        &expr,
+                        &format!(
+                            "selector metric `{metric}` is unresolved for label `{label}`"
+                        ),
+                    )),
+                }
             }
-            let ident = &expr[start..i];
-            if ident.contains('_') && !PROMQL_KEYWORDS.contains(&ident) {
-                // Strip Prometheus' histogram `_bucket` / `_sum` /
-                // `_count` suffixes back to the base metric name —
-                // those aren't part of the taxonomy text but are
-                // valid scrape lines for any histogram family.
-                let base = ident
-                    .strip_suffix("_bucket")
-                    .or_else(|| ident.strip_suffix("_sum"))
-                    .or_else(|| ident.strip_suffix("_count"))
-                    .unwrap_or(ident);
-                out.push(base.to_string());
-            }
-        } else {
-            i += 1;
         }
     }
-    out
+    assert!(
+        violations.is_empty(),
+        "dashboard selector-label violations:\n  {}",
+        violations.join("\n  ")
+    );
+}
+
+#[test]
+fn every_dashboard_range_function_matches_metric_type() {
+    let catalog = Catalog::parse();
+    let counter_functions = ["rate", "irate", "increase", "resets"];
+    let gauge_functions = ["delta", "idelta", "deriv", "predict_linear", "holt_winters"];
+    let mut violations = Vec::new();
+    for (dashboard, panel, title, expr) in dashboard_exprs() {
+        for (function, metrics) in expr_range_functions(&expr) {
+            for metric in metrics {
+                let valid = catalog
+                    .resolve(&metric)
+                    .map(|(family, suffix)| {
+                        (counter_functions.contains(&function.as_str())
+                            && (family.kind == MetricKind::Counter
+                                || (family.kind == MetricKind::Histogram && suffix.is_some())))
+                            || (gauge_functions.contains(&function.as_str())
+                                && family.kind == MetricKind::Gauge)
+                    })
+                    .unwrap_or(false);
+                if !valid {
+                    violations.push(context(
+                        &dashboard,
+                        panel,
+                        &title,
+                        &expr,
+                        &format!(
+                            "range function `{function}` is incompatible with catalog metric `{metric}`"
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "dashboard range-function violations:\n  {}",
+        violations.join("\n  ")
+    );
 }

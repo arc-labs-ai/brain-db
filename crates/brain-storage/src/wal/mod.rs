@@ -9,6 +9,7 @@ pub mod kinds;
 pub mod payload;
 pub mod reader;
 pub mod record;
+pub mod repair;
 pub mod segment;
 #[allow(clippy::module_inception)]
 pub mod wal;
@@ -23,9 +24,12 @@ pub use payload::{
     TxnCommitPayload, UnlinkPayload, UpdateKindPayload, UpdateSaliencePayload,
     UpdateSessionPayload, WalPayload, WalPayloadError, VECTOR_DIMS_MAX,
 };
-pub use reader::{SegmentInfo, WalReadError, WalReader};
+pub use reader::{DecodeFailure, SegmentInfo, SurvivorScan, WalReadError, WalReader};
 pub use record::{
     DecodeOutcome, Lsn, WalRecord, WalRecordError, FOOTER_LEN, HEADER_LEN, MAX_PAYLOAD,
+};
+pub use repair::{
+    plan_wal_repair, repair_wal, SegmentDiscard, WalRepairError, WalRepairOutcome, WalRepairPlan,
 };
 pub use segment::{
     WalSegment, WalSegmentError, WAL_SEGMENT_FORMAT_VERSION_V1,

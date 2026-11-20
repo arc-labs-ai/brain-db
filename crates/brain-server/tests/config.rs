@@ -10,8 +10,7 @@ use std::path::PathBuf;
 // Re-export the binary's internal modules under a regular crate path.
 // brain-server is a [[bin]] target without a library, so we pull the
 // config module in as source via a small inline crate stub.
-#[path = "../src/config/mod.rs"]
-mod config;
+use brain_server::config;
 
 use config::{Config, ConfigError, LoggingConfig};
 
@@ -81,7 +80,7 @@ fn dev_toml_round_trips_cleanly() {
     let cfg = Config::load_with_env(&path, &HashMap::new()).expect("dev.toml must load");
 
     assert_eq!(cfg.server.listen_addr.to_string(), "127.0.0.1:9090");
-    assert_eq!(cfg.storage.shard_count, 1);
+    assert_eq!(cfg.storage.shard_count, Some(1));
     assert_eq!(cfg.shard.arena_capacity_bytes, 1u64 << 30);
     assert_eq!(cfg.shard.wal_segment_size_bytes, 256u64 << 20);
     assert_eq!(cfg.shard.wal_retention_segments, 4);
@@ -241,7 +240,7 @@ fn env_override_replaces_integer_field() {
     let mut env = HashMap::new();
     env.insert("BRAIN__STORAGE__SHARD_COUNT".into(), "8".into());
     let cfg = Config::load_with_env(&path, &env).unwrap();
-    assert_eq!(cfg.storage.shard_count, 8);
+    assert_eq!(cfg.storage.shard_count, Some(8));
 }
 
 #[test]
@@ -312,7 +311,7 @@ fn env_numeric_field_still_accepts_numeric_override() {
     let mut env = HashMap::new();
     env.insert("BRAIN__STORAGE__SHARD_COUNT".into(), "8".into());
     let cfg = Config::load_with_env(&path, &env).unwrap();
-    assert_eq!(cfg.storage.shard_count, 8);
+    assert_eq!(cfg.storage.shard_count, Some(8));
 }
 
 #[test]
@@ -386,4 +385,31 @@ fn omitted_optional_sections_use_defaults() {
     assert!(!cfg.monitoring.tracing.enabled);
     assert!(cfg.admin.token.is_none());
     assert!(!cfg.server.tls.enabled);
+}
+
+// ---------------------------------------------------------------------------
+// Shard sizing
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_unpinned_shard_count_sizes_itself_to_the_machine() {
+    // `shard_count` is the operator's intent: `None` means "you decide".
+    let mut cfg = Config::for_tests();
+    cfg.storage.shard_count = None;
+    assert_eq!(cfg.storage.shards(), config::shards_for_this_machine());
+}
+
+#[test]
+fn a_pinned_shard_count_is_returned_verbatim() {
+    let mut cfg = Config::for_tests();
+    cfg.storage.shard_count = Some(4);
+    assert_eq!(cfg.storage.shards(), 4);
+}
+
+#[test]
+fn machine_sizing_always_yields_at_least_one_shard() {
+    // A single-core box, or a container pinned to one CPU, must still run a
+    // shard — the subtraction that reserves a core for the network runtime
+    // must not reach zero.
+    assert!(config::shards_for_this_machine() >= 1);
 }

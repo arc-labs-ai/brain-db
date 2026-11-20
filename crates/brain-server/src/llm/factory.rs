@@ -23,8 +23,7 @@ use thiserror::Error;
 use crate::config::{Config, SummarizerBackend};
 
 #[derive(Debug, Error)]
-#[allow(dead_code)] // some variants only constructed under feature gates
-pub(crate) enum BuildSummarizerError {
+pub enum BuildSummarizerError {
     #[error(
         "summarizer.backend = \"llm\" but the `summarizer-llm` Cargo feature \
          is not enabled in this build"
@@ -49,7 +48,7 @@ pub(crate) enum BuildSummarizerError {
 /// `resolver` is the same per-namespace credential resolver every other
 /// model-backed stage uses. `None` leaves only the credential-free backends
 /// selectable, which is what a deployment with no credential store has.
-pub(crate) fn build_summarizer(
+pub fn build_summarizer(
     cfg: &Config,
     resolver: Option<Arc<dyn brain_llm::LlmCredentialResolver>>,
 ) -> Result<Arc<dyn Summarizer>, BuildSummarizerError> {

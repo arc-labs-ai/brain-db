@@ -32,8 +32,14 @@ Steps 1–7 typically take seconds to tens of seconds for a fresh-checkpointed s
 
 Brain starts replay from the `durable_lsn` of the most recent valid checkpoint. The checkpoint is in the metadata store ([`05_checkpointing.md`](05_checkpointing.md)) and includes:
 
-- `durable_lsn` — all records up to and including this LSN are reflected in the arena and metadata.
+- `durable_lsn` — the highest **contiguous** prefix of WAL records accounted for in metadata.
 - `arena_capacity_at_checkpoint` — for cross-validation.
+
+Recovery skips every record whose `lsn <= durable_lsn` and replays everything above it. That skip is unconditional, which is the whole reason `durable_lsn` must be a contiguous prefix and not merely the highest LSN seen to commit.
+
+A shard's writes do not commit in LSN order: several requests are in flight at once, and one that appended earlier may commit later ([14.02 §13a](../14_concurrency/02_writer_model.md)). A watermark defined as "the maximum committed LSN" would therefore sit *above* records whose redb transaction had not run. Recovery would skip them, and the write would be silently lost on restart despite having been acknowledged. Defining it as the contiguous prefix makes the skip safe: a record at or below `durable_lsn` either committed, or was never reserved because it mutates no metadata (a checkpoint or subscribe-event record), or belongs to a write that failed and was abandoned beneath a later real commit.
+
+The complement holds too. A record that is WAL-durable but whose redb commit has not run sits strictly *above* `durable_lsn`, so it is replayed rather than skipped.
 
 If no checkpoint exists (a fresh shard or one whose checkpoint is corrupted), recovery starts from LSN 1 (the very beginning of the WAL).
 
@@ -98,6 +104,8 @@ For each valid record, recovery applies its effect:
 | TXN_ABORT | Discard queued records |
 | CHECKPOINT_BEGIN | Note the checkpoint started |
 | CHECKPOINT_END | Update durable_lsn marker |
+
+Subscribe-replay change-feed events are the exception: they ride the WAL under the same record kinds as the durable write records, distinguished only by a flag, and they are skipped. They are not state mutations — the durable record carries the data recovery needs — and decoding their body as a typed-graph row would fail outright. A flagged event outside a transaction is a clean tail boundary; one buffered inside an open transaction is not, so the good-tail marker only advances across a flagged event when no transaction is open. The same flag is what keeps these records from ever being reserved against the durable watermark.
 
 Each apply is idempotent — if recovery is re-run on the same WAL, the result is the same. This is important because:
 
@@ -180,7 +188,8 @@ If a check fails, Brain logs the inconsistency. Depending on severity:
 
 The three HNSW indexes (memory, statement, entity) are derived state. See [09.06 Index Persistence & Recovery](../09_indexing/06_persistence.md) for the per-index recovery model. Summary:
 
-- **Memory HNSW** — try snapshot-load first (`SharedHnsw::load_snapshot` against the most-recent checkpoint directory). On success, replay any arena entries whose `encoded_at_lsn > snapshot.taken_at_lsn` into the pending buffer (so writes between the snapshot and the crash are not lost). On any snapshot failure (missing, CRC / version / shard_uuid mismatch), fall through to a **full rebuild** from the arena: iterate occupied, non-tombstoned arena slots and insert each `(MemoryId, vector)`. The fallback path matches the original v1 behavior.
+- **Memory HNSW** — try snapshot-load first (`SharedHnsw::load_snapshot` against the most-recent checkpoint directory). On success, replay any arena entries whose `encoded_at_lsn > snapshot.taken_at_lsn` into the pending buffer (so writes between the snapshot and the crash are not lost). On any snapshot failure (missing, CRC / version / shard_uuid mismatch), fall through to a **full rebuild** from the arena: iterate occupied, non-tombstoned arena slots and insert each `(MemoryId, vector)`, which reconstructs the whole index without reading any snapshot file.
+  On the snapshot-load path, a final **FORGET reconciliation** pass re-applies every delete that landed after `snapshot.taken_at_lsn`: the arena-tail replay above carries only active memories, so a memory forgotten after the snapshot is invisible to it and would survive as a ghost node. Reconciliation re-tombstones those ids so the index's active set converges on the metadata store's. A reconciliation failure is logged as a warning and does not fail the restore.
 - **Entity HNSW** — rebuild from `ENTITIES_TABLE`. Each row's vector is read from `ENTITY_VECTORS_TABLE` (persisted at write time, [09.06 §6](../09_indexing/06_persistence.md)); rows without a stored vector re-embed `canonical_name` as the fallback.
 - **Statement HNSW** — seed the embed queue with every live statement; the per-shard `StatementEmbedWorker` repopulates the index in the background.
 
@@ -188,7 +197,7 @@ Memory and entity restores complete before the shard is marked ready (step 8); t
 
 For a 1M-memory shard with a fresh snapshot: load is dominated by the on-disk graph read (~1–5 seconds); WAL-tail replay is bounded by the snapshot cadence. The full-rebuild fallback takes ~30 seconds (single-threaded) or ~5 seconds (parallel). Each shard's indexes are owned by that shard's executor; multiple shards restore concurrently.
 
-**No silent corruption.** A snapshot whose header CRC, footer hash, file-level BLAKE3, or shard_uuid fails verification is refused with a warn-level log; the shard then runs the full-rebuild fallback rather than loading a possibly-wrong graph (CLAUDE invariant 7).
+**No silent corruption.** A snapshot whose header CRC, footer hash, file-level BLAKE3, or shard_uuid fails verification is refused with a warn-level log; the shard then runs the full-rebuild fallback rather than loading a possibly-wrong graph.
 
 ## 9. Recovery time
 
@@ -248,7 +257,7 @@ The snapshot mechanism ensures the snapshot represents a consistent point-in-tim
 Brain exposes recovery progress via:
 
 - A startup log line per checkpoint encountered, per WAL segment opened, per N records replayed.
-- A separate admin endpoint (`ADMIN_RECOVERY_STATUS`) that returns current state during recovery.
+- A separate admin endpoint returning current state during recovery. **Not built**: a recovering shard has not finished spawning, so there is nothing for an admin route to query. The log line above is what exists.
 
 For very long recoveries (multi-shard or slow disks), this lets operators monitor progress and estimate completion.
 

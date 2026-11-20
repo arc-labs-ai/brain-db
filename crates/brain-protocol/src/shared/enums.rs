@@ -1,5 +1,6 @@
 //! Foundational wire-domain enums for response bodies plus the
-//! ErrorCategoryWire / ErrorCodeWire mirrors of `crate::error`'s
+//! ErrorCategoryWire / ErrorCodeWire vocabularies for the open integer
+//! classification fields in ERROR frames and mirrors of `crate::error`'s
 //! `#[non_exhaustive]` types.
 
 use crate::error::{ErrorCategory, ErrorCode};
@@ -51,6 +52,11 @@ pub enum RetrieverNameWire {
     Semantic = 0,
     Lexical = 1,
     Graph = 2,
+    /// A retriever family this build cannot name reads as unknown; the
+    /// surrounding response still decodes, so a peer one version ahead can
+    /// describe a retriever this build does not know.
+    #[serde(other)]
+    Unknown = 255,
 }
 
 /// — `PlanResponseFrame::PlanStatus` (set on the final frame
@@ -64,6 +70,11 @@ pub enum PlanStatus {
     BudgetExhausted = 1,
     NoPathFound = 2,
     Cancelled = 3,
+    /// A plan result this build cannot name reads as unknown; the surrounding
+    /// response still decodes, so a peer one version ahead can report a result
+    /// this build does not know.
+    #[serde(other)]
+    Unknown = 255,
 }
 
 /// — `ReasonResponseFrame::InferenceKind`.
@@ -85,6 +96,10 @@ pub enum ReasonStatus {
     BudgetExhausted = 1,
     DepthLimitReached = 2,
     Cancelled = 3,
+    /// A reason result this build cannot name reads as unknown; the surrounding
+    /// response still decodes, allowing a peer one version ahead to report it.
+    #[serde(other)]
+    Unknown = 255,
 }
 
 /// `SubscriptionEvent::EventType`.
@@ -138,6 +153,11 @@ pub enum EventType {
     EdgeAdded = 31,
     EdgeRemoved = 32,
     EdgeSuperseded = 33,
+    /// An event kind this build cannot name reads as unknown; the surrounding
+    /// subscription frame still decodes, allowing a peer one version ahead to
+    /// publish an event this build does not know.
+    #[serde(other)]
+    Unknown = 255,
 }
 
 /// Background stage a write triggers. A write submission runs N
@@ -187,6 +207,11 @@ pub enum StageOutcome {
     /// Stage errored. The wait helper still unblocks; the failure
     /// reason lives on the per-stage payload (`StagePayload::*`).
     Failed = 2,
+    /// A stage verdict this build cannot name reads as unknown; the surrounding
+    /// completion event still decodes, so a peer one version ahead can report
+    /// a verdict this build does not know.
+    #[serde(other)]
+    Unknown = 255,
 }
 
 /// Per-stage detail sidecar on `StageCompleted` events. Discriminated
@@ -397,7 +422,8 @@ pub enum MigrationStatus {
 
 /// Wire-encoded mirror of [`crate::error::ErrorCategory`]. The
 /// canonical type is intentionally `#[non_exhaustive]` for forward-
-/// compatibility, so the wire needs a closed mirror with a stable repr.
+/// compatibility, so the wire needs a stable repr while received integers
+/// remain open to values introduced by newer peers.
 #[derive(
     Clone, Copy, Debug, Eq, PartialEq, serde_repr::Serialize_repr, serde_repr::Deserialize_repr,
 )]
@@ -412,6 +438,7 @@ pub enum ErrorCategoryWire {
     ResourceExhausted = 6,
     Internal = 7,
     Unavailable = 8,
+    OperatorIntervention = 9,
 }
 
 impl From<ErrorCategory> for ErrorCategoryWire {
@@ -426,6 +453,7 @@ impl From<ErrorCategory> for ErrorCategoryWire {
             ErrorCategory::ResourceExhausted => Self::ResourceExhausted,
             ErrorCategory::Internal => Self::Internal,
             ErrorCategory::Unavailable => Self::Unavailable,
+            ErrorCategory::OperatorIntervention => Self::OperatorIntervention,
         }
     }
 }
@@ -442,12 +470,37 @@ impl From<ErrorCategoryWire> for ErrorCategory {
             ErrorCategoryWire::ResourceExhausted => Self::ResourceExhausted,
             ErrorCategoryWire::Internal => Self::Internal,
             ErrorCategoryWire::Unavailable => Self::Unavailable,
+            ErrorCategoryWire::OperatorIntervention => Self::OperatorIntervention,
         }
     }
 }
 
-/// Wire-encoded mirror of [`crate::error::ErrorCode`]. Numeric repr
-/// is stable; this is the *wire* representation.
+/// Match an open wire category onto the vocabulary this build knows. An
+/// unfamiliar category must cost one field rather than the whole ERROR frame.
+impl TryFrom<u8> for ErrorCategoryWire {
+    type Error = u8;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Protocol),
+            1 => Ok(Self::Authentication),
+            2 => Ok(Self::Authorization),
+            3 => Ok(Self::Validation),
+            4 => Ok(Self::NotFound),
+            5 => Ok(Self::Conflict),
+            6 => Ok(Self::ResourceExhausted),
+            7 => Ok(Self::Internal),
+            8 => Ok(Self::Unavailable),
+            9 => Ok(Self::OperatorIntervention),
+            value => Err(value),
+        }
+    }
+}
+
+/// The wire representation has a stable numeric repr, while received
+/// integers remain open so an unfamiliar code does not destroy its ERROR
+/// frame. This enum is the vocabulary this build constructs and matches
+/// received integers back onto.
 #[derive(
     Clone, Copy, Debug, Eq, PartialEq, serde_repr::Serialize_repr, serde_repr::Deserialize_repr,
 )]
@@ -462,9 +515,7 @@ pub enum ErrorCodeWire {
     BadFrame = 0x0006,
     OversizePayload = 0x0007,
     ReservedFieldNonZero = 0x0008,
-    BadFlagCombination = 0x0009,
     MalformedPayload = 0x000A,
-    MalformedVector = 0x000B,
     // Connection / handshake
     VersionNotSupported = 0x0020,
     NoSuchAuthMethod = 0x0021,
@@ -479,16 +530,7 @@ pub enum ErrorCodeWire {
     ActAsDenied = 0x0033,
     // Validation
     InvalidArgument = 0x0040,
-    MissingRequiredField = 0x0041,
-    TextTooLarge = 0x0042,
-    TextEmpty = 0x0043,
     BadSessionId = 0x0044,
-    BadMemoryKind = 0x0045,
-    BadEdgeKind = 0x0046,
-    BadStrategyHint = 0x0047,
-    TopKOutOfRange = 0x0048,
-    BudgetTooLarge = 0x0049,
-    BadModelFingerprint = 0x004A,
     PredicateNotInSchema = 0x004B,
     RelationTypeNotInSchema = 0x004C,
     // Not found
@@ -511,7 +553,6 @@ pub enum ErrorCodeWire {
     OutOfMemory = 0x0072,
     RateLimited = 0x0073,
     StreamLimitExceeded = 0x0074,
-    ConnectionLimitExceeded = 0x0075,
     TransactionLimitExceeded = 0x0076,
     TransactionTooLarge = 0x0077,
     // Internal
@@ -529,9 +570,12 @@ pub enum ErrorCodeWire {
     RetrieverDegraded = 0x0094,
     LlmCredentialUnavailable = 0x0095,
 
+    // Operator intervention
+    ShardStorageFaulted = 0x00A0,
+    UnrecoverableInternal = 0x00A1,
+
     // Typed-graph error codes (0x01xx namespace; low-byte family mirrors
     // the typed-graph opcode ranges).
-    SchemaInvalid = 0x0120,
     SchemaMigrationRequired = 0x0121,
     EntityNotFound = 0x0130,
     EntityTypeMismatch = 0x0131,
@@ -559,9 +603,7 @@ impl From<ErrorCode> for ErrorCodeWire {
             ErrorCode::BadFrame => Self::BadFrame,
             ErrorCode::OversizePayload => Self::OversizePayload,
             ErrorCode::ReservedFieldNonZero => Self::ReservedFieldNonZero,
-            ErrorCode::BadFlagCombination => Self::BadFlagCombination,
             ErrorCode::MalformedPayload => Self::MalformedPayload,
-            ErrorCode::MalformedVector => Self::MalformedVector,
             ErrorCode::VersionNotSupported => Self::VersionNotSupported,
             ErrorCode::NoSuchAuthMethod => Self::NoSuchAuthMethod,
             ErrorCode::Unauthenticated => Self::Unauthenticated,
@@ -573,16 +615,7 @@ impl From<ErrorCode> for ErrorCodeWire {
             ErrorCode::WrongShard => Self::WrongShard,
             ErrorCode::ActAsDenied => Self::ActAsDenied,
             ErrorCode::InvalidArgument => Self::InvalidArgument,
-            ErrorCode::MissingRequiredField => Self::MissingRequiredField,
-            ErrorCode::TextTooLarge => Self::TextTooLarge,
-            ErrorCode::TextEmpty => Self::TextEmpty,
             ErrorCode::BadSessionId => Self::BadSessionId,
-            ErrorCode::BadMemoryKind => Self::BadMemoryKind,
-            ErrorCode::BadEdgeKind => Self::BadEdgeKind,
-            ErrorCode::BadStrategyHint => Self::BadStrategyHint,
-            ErrorCode::TopKOutOfRange => Self::TopKOutOfRange,
-            ErrorCode::BudgetTooLarge => Self::BudgetTooLarge,
-            ErrorCode::BadModelFingerprint => Self::BadModelFingerprint,
             ErrorCode::PredicateNotInSchema => Self::PredicateNotInSchema,
             ErrorCode::RelationTypeNotInSchema => Self::RelationTypeNotInSchema,
             ErrorCode::MemoryNotFound => Self::MemoryNotFound,
@@ -602,7 +635,6 @@ impl From<ErrorCode> for ErrorCodeWire {
             ErrorCode::OutOfMemory => Self::OutOfMemory,
             ErrorCode::RateLimited => Self::RateLimited,
             ErrorCode::StreamLimitExceeded => Self::StreamLimitExceeded,
-            ErrorCode::ConnectionLimitExceeded => Self::ConnectionLimitExceeded,
             ErrorCode::TransactionLimitExceeded => Self::TransactionLimitExceeded,
             ErrorCode::TransactionTooLarge => Self::TransactionTooLarge,
             ErrorCode::Internal => Self::Internal,
@@ -617,8 +649,9 @@ impl From<ErrorCode> for ErrorCodeWire {
             ErrorCode::Maintenance => Self::Maintenance,
             ErrorCode::RetrieverDegraded => Self::RetrieverDegraded,
             ErrorCode::LlmCredentialUnavailable => Self::LlmCredentialUnavailable,
+            ErrorCode::ShardStorageFaulted => Self::ShardStorageFaulted,
+            ErrorCode::UnrecoverableInternal => Self::UnrecoverableInternal,
             // Typed-graph codes (0x01xx).
-            ErrorCode::SchemaInvalid => Self::SchemaInvalid,
             ErrorCode::SchemaMigrationRequired => Self::SchemaMigrationRequired,
             ErrorCode::EntityNotFound => Self::EntityNotFound,
             ErrorCode::EntityTypeMismatch => Self::EntityTypeMismatch,
@@ -648,9 +681,7 @@ impl From<ErrorCodeWire> for ErrorCode {
             ErrorCodeWire::BadFrame => Self::BadFrame,
             ErrorCodeWire::OversizePayload => Self::OversizePayload,
             ErrorCodeWire::ReservedFieldNonZero => Self::ReservedFieldNonZero,
-            ErrorCodeWire::BadFlagCombination => Self::BadFlagCombination,
             ErrorCodeWire::MalformedPayload => Self::MalformedPayload,
-            ErrorCodeWire::MalformedVector => Self::MalformedVector,
             ErrorCodeWire::VersionNotSupported => Self::VersionNotSupported,
             ErrorCodeWire::NoSuchAuthMethod => Self::NoSuchAuthMethod,
             ErrorCodeWire::Unauthenticated => Self::Unauthenticated,
@@ -662,16 +693,7 @@ impl From<ErrorCodeWire> for ErrorCode {
             ErrorCodeWire::WrongShard => Self::WrongShard,
             ErrorCodeWire::ActAsDenied => Self::ActAsDenied,
             ErrorCodeWire::InvalidArgument => Self::InvalidArgument,
-            ErrorCodeWire::MissingRequiredField => Self::MissingRequiredField,
-            ErrorCodeWire::TextTooLarge => Self::TextTooLarge,
-            ErrorCodeWire::TextEmpty => Self::TextEmpty,
             ErrorCodeWire::BadSessionId => Self::BadSessionId,
-            ErrorCodeWire::BadMemoryKind => Self::BadMemoryKind,
-            ErrorCodeWire::BadEdgeKind => Self::BadEdgeKind,
-            ErrorCodeWire::BadStrategyHint => Self::BadStrategyHint,
-            ErrorCodeWire::TopKOutOfRange => Self::TopKOutOfRange,
-            ErrorCodeWire::BudgetTooLarge => Self::BudgetTooLarge,
-            ErrorCodeWire::BadModelFingerprint => Self::BadModelFingerprint,
             ErrorCodeWire::PredicateNotInSchema => Self::PredicateNotInSchema,
             ErrorCodeWire::RelationTypeNotInSchema => Self::RelationTypeNotInSchema,
             ErrorCodeWire::MemoryNotFound => Self::MemoryNotFound,
@@ -691,7 +713,6 @@ impl From<ErrorCodeWire> for ErrorCode {
             ErrorCodeWire::OutOfMemory => Self::OutOfMemory,
             ErrorCodeWire::RateLimited => Self::RateLimited,
             ErrorCodeWire::StreamLimitExceeded => Self::StreamLimitExceeded,
-            ErrorCodeWire::ConnectionLimitExceeded => Self::ConnectionLimitExceeded,
             ErrorCodeWire::TransactionLimitExceeded => Self::TransactionLimitExceeded,
             ErrorCodeWire::TransactionTooLarge => Self::TransactionTooLarge,
             ErrorCodeWire::Internal => Self::Internal,
@@ -706,8 +727,9 @@ impl From<ErrorCodeWire> for ErrorCode {
             ErrorCodeWire::Maintenance => Self::Maintenance,
             ErrorCodeWire::RetrieverDegraded => Self::RetrieverDegraded,
             ErrorCodeWire::LlmCredentialUnavailable => Self::LlmCredentialUnavailable,
+            ErrorCodeWire::ShardStorageFaulted => Self::ShardStorageFaulted,
+            ErrorCodeWire::UnrecoverableInternal => Self::UnrecoverableInternal,
             // Typed-graph codes (0x01xx).
-            ErrorCodeWire::SchemaInvalid => Self::SchemaInvalid,
             ErrorCodeWire::SchemaMigrationRequired => Self::SchemaMigrationRequired,
             ErrorCodeWire::EntityNotFound => Self::EntityNotFound,
             ErrorCodeWire::EntityTypeMismatch => Self::EntityTypeMismatch,
@@ -725,10 +747,101 @@ impl From<ErrorCodeWire> for ErrorCode {
     }
 }
 
+/// Match an open wire code onto the vocabulary this build knows. An
+/// unfamiliar code must cost one field rather than the whole ERROR frame.
+impl TryFrom<u16> for ErrorCodeWire {
+    type Error = u16;
+
+    #[allow(clippy::too_many_lines)]
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        match value {
+            0x0001 => Ok(Self::BadMagic),
+            0x0002 => Ok(Self::BadHeaderCrc),
+            0x0003 => Ok(Self::BadPayloadCrc),
+            0x0004 => Ok(Self::BadOpcode),
+            0x0005 => Ok(Self::BadVersion),
+            0x0006 => Ok(Self::BadFrame),
+            0x0007 => Ok(Self::OversizePayload),
+            0x0008 => Ok(Self::ReservedFieldNonZero),
+            0x000A => Ok(Self::MalformedPayload),
+            0x0020 => Ok(Self::VersionNotSupported),
+            0x0021 => Ok(Self::NoSuchAuthMethod),
+            0x0022 => Ok(Self::Unauthenticated),
+            0x0023 => Ok(Self::NotAuthenticated),
+            0x0024 => Ok(Self::AuthBackendUnavailable),
+            0x0025 => Ok(Self::SessionExpired),
+            0x0030 => Ok(Self::PermissionDenied),
+            0x0031 => Ok(Self::AdminPermissionRequired),
+            0x0032 => Ok(Self::WrongShard),
+            0x0033 => Ok(Self::ActAsDenied),
+            0x0040 => Ok(Self::InvalidArgument),
+            0x0044 => Ok(Self::BadSessionId),
+            0x004B => Ok(Self::PredicateNotInSchema),
+            0x004C => Ok(Self::RelationTypeNotInSchema),
+            0x0050 => Ok(Self::MemoryNotFound),
+            0x0051 => Ok(Self::ContextNotFound),
+            0x0052 => Ok(Self::SubscriptionNotFound),
+            0x0053 => Ok(Self::SnapshotNotFound),
+            0x0054 => Ok(Self::TxnNotFound),
+            0x0060 => Ok(Self::IdempotencyConflict),
+            0x0061 => Ok(Self::TransactionConflict),
+            0x0062 => Ok(Self::TransactionTimeout),
+            0x0063 => Ok(Self::StreamIdInUse),
+            0x0064 => Ok(Self::SubscriptionLsnTooOld),
+            0x0065 => Ok(Self::CardinalityViolation),
+            0x0066 => Ok(Self::LlmCredentialMissing),
+            0x0070 => Ok(Self::OutOfSlots),
+            0x0071 => Ok(Self::OutOfDisk),
+            0x0072 => Ok(Self::OutOfMemory),
+            0x0073 => Ok(Self::RateLimited),
+            0x0074 => Ok(Self::StreamLimitExceeded),
+            0x0076 => Ok(Self::TransactionLimitExceeded),
+            0x0077 => Ok(Self::TransactionTooLarge),
+            0x0080 => Ok(Self::Internal),
+            0x0081 => Ok(Self::StorageError),
+            0x0082 => Ok(Self::IndexError),
+            0x0083 => Ok(Self::EmbeddingError),
+            0x0084 => Ok(Self::MetadataError),
+            0x0085 => Ok(Self::Cancelled),
+            0x0090 => Ok(Self::ShardUnavailable),
+            0x0091 => Ok(Self::Overloaded),
+            0x0092 => Ok(Self::Restarting),
+            0x0093 => Ok(Self::Maintenance),
+            0x0094 => Ok(Self::RetrieverDegraded),
+            0x0095 => Ok(Self::LlmCredentialUnavailable),
+            0x00A0 => Ok(Self::ShardStorageFaulted),
+            0x00A1 => Ok(Self::UnrecoverableInternal),
+            0x0121 => Ok(Self::SchemaMigrationRequired),
+            0x0130 => Ok(Self::EntityNotFound),
+            0x0131 => Ok(Self::EntityTypeMismatch),
+            0x0132 => Ok(Self::EntityAmbiguous),
+            0x0133 => Ok(Self::EntityMergeConflict),
+            0x0140 => Ok(Self::StatementNotFound),
+            0x0141 => Ok(Self::StatementObjectTypeMismatch),
+            0x0142 => Ok(Self::StatementContradictsExisting),
+            0x0160 => Ok(Self::QueryTimeout),
+            0x0161 => Ok(Self::QueryOverBudget),
+            0x0170 => Ok(Self::ExtractorDisabled),
+            0x0171 => Ok(Self::ExtractorBudgetExceeded),
+            0x0172 => Ok(Self::ExtractionFailed),
+            value => Err(value),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codec::cbor::{from_cbor_bytes, to_cbor_bytes};
+    use crate::connection::handshake::AuthMethod;
     use crate::error::ErrorCode;
+    use crate::ops::entity::ResolutionOutcomeWire;
+    use crate::ops::graph::{GraphEdgeKindWire, GraphNodeKindWire};
+    use crate::ops::memory::{
+        EdgeDirectionWire, EncodeTraceStageStatus, PlanTraceDirection, RankedItemKindWire,
+        RecallCandidateKind, RecallTraceRetrieverStatus, WaitMode,
+    };
+    use crate::shared::primitives::{EdgeKindWire, ForgetMode, MemoryKindWire};
 
     /// The BYOK contract, pinned.
     ///
@@ -757,19 +870,128 @@ mod tests {
         );
     }
 
-    /// No new `ErrorCategoryWire` variant was introduced for BYOK.
-    ///
-    /// `ErrorCategoryWire` is `repr(u8)` decoded by `serde_repr` in the Rust
-    /// SDK and a plain enum in Python; both REJECT an unknown value, so adding
-    /// a variant breaks every published 0.1.0 client. New *codes* are safe —
-    /// the SDKs type `code` as a bare number precisely so a newer server can
-    /// introduce them. This test fails if someone adds a category instead.
+    /// Category discriminants are wire values, so moving one changes what
+    /// peers decode. Add a category only when no existing one has the right
+    /// retry semantics; `OperatorIntervention` is the highest discriminant
+    /// until that bar is cleared again.
     #[test]
-    fn byok_added_no_new_wire_category() {
+    fn wire_categories_end_at_operator_intervention() {
         assert_eq!(
-            ErrorCategoryWire::Unavailable as u8,
-            8,
-            "Unavailable must remain the highest category discriminant"
+            ErrorCategoryWire::OperatorIntervention as u8,
+            9,
+            "OperatorIntervention must remain the highest category discriminant"
+        );
+    }
+
+    /// Response enums only describe something the server observed, so an
+    /// unrecognised value costs one field while refusing it costs the whole
+    /// frame.
+    #[test]
+    fn response_enums_decode_unknown_values() {
+        let bytes = to_cbor_bytes(&200u8);
+        assert_eq!(
+            from_cbor_bytes::<RetrieverNameWire>(&bytes).unwrap(),
+            RetrieverNameWire::Unknown,
+            "an unfamiliar retriever must not discard its response frame"
+        );
+        assert_eq!(
+            from_cbor_bytes::<PlanStatus>(&bytes).unwrap(),
+            PlanStatus::Unknown,
+            "an unfamiliar plan status must not discard its response frame"
+        );
+        assert_eq!(
+            from_cbor_bytes::<ReasonStatus>(&bytes).unwrap(),
+            ReasonStatus::Unknown,
+            "an unfamiliar reason status must not discard its response frame"
+        );
+        assert_eq!(
+            from_cbor_bytes::<EventType>(&bytes).unwrap(),
+            EventType::Unknown,
+            "an unfamiliar event type must not discard its subscription frame"
+        );
+        assert_eq!(
+            from_cbor_bytes::<StageOutcome>(&bytes).unwrap(),
+            StageOutcome::Unknown,
+            "an unfamiliar stage outcome must not discard its event frame"
+        );
+        assert_eq!(
+            from_cbor_bytes::<ResolutionOutcomeWire>(&bytes).unwrap(),
+            ResolutionOutcomeWire::Unknown,
+            "an unfamiliar resolution outcome must not discard its response frame"
+        );
+        assert_eq!(
+            from_cbor_bytes::<GraphNodeKindWire>(&bytes).unwrap(),
+            GraphNodeKindWire::Unknown,
+            "an unfamiliar graph node kind must not discard its response frame"
+        );
+        assert_eq!(
+            from_cbor_bytes::<GraphEdgeKindWire>(&bytes).unwrap(),
+            GraphEdgeKindWire::Unknown,
+            "an unfamiliar graph edge kind must not discard its response frame"
+        );
+        assert_eq!(
+            from_cbor_bytes::<EdgeDirectionWire>(&bytes).unwrap(),
+            EdgeDirectionWire::Unknown,
+            "an unfamiliar edge direction must not discard its inspection frame"
+        );
+        assert_eq!(
+            from_cbor_bytes::<EncodeTraceStageStatus>(&bytes).unwrap(),
+            EncodeTraceStageStatus::Unknown,
+            "an unfamiliar trace status must not discard its response frame"
+        );
+        assert_eq!(
+            from_cbor_bytes::<RecallCandidateKind>(&bytes).unwrap(),
+            RecallCandidateKind::Unknown,
+            "an unfamiliar candidate kind must not discard its trace frame"
+        );
+        assert_eq!(
+            from_cbor_bytes::<RecallTraceRetrieverStatus>(&bytes).unwrap(),
+            RecallTraceRetrieverStatus::Unknown,
+            "an unfamiliar retriever status must not discard its trace frame"
+        );
+        assert_eq!(
+            from_cbor_bytes::<RankedItemKindWire>(&bytes).unwrap(),
+            RankedItemKindWire::Unknown,
+            "an unfamiliar ranked-item kind must not discard its trace frame"
+        );
+        assert_eq!(
+            from_cbor_bytes::<PlanTraceDirection>(&bytes).unwrap(),
+            PlanTraceDirection::Unknown,
+            "an unfamiliar plan direction must not discard its trace frame"
+        );
+        assert_eq!(
+            EventType::Unknown as u8,
+            255,
+            "255 must remain reserved for the unknown event fallback"
+        );
+    }
+
+    /// These values direct the server, so an unrecognised directive means the
+    /// caller requested behaviour this build does not have. Answering with a
+    /// different behaviour is worse than refusing: `ForgetMode` selects what
+    /// gets destroyed and `AuthMethod` decides how identity is proven.
+    #[test]
+    fn request_enums_reject_unknown_values() {
+        let bytes = to_cbor_bytes(&200u8);
+        assert!(
+            from_cbor_bytes::<ForgetMode>(&bytes).is_err(),
+            "unknown forget modes must not select what gets destroyed"
+        );
+        assert!(
+            from_cbor_bytes::<MemoryKindWire>(&bytes).is_err(),
+            "unknown memory kinds must not select request semantics"
+        );
+        assert!(
+            from_cbor_bytes::<EdgeKindWire>(&bytes).is_err(),
+            "unknown edge kinds must not select a graph operation"
+        );
+        assert!(
+            from_cbor_bytes::<WaitMode>(&bytes).is_err(),
+            "unknown wait modes must not select server behaviour"
+        );
+        assert!(
+            from_cbor_bytes::<AuthMethod>(&bytes).is_err(),
+            "unknown auth methods must not change how identity is proven"
         );
     }
 
@@ -784,7 +1006,11 @@ mod tests {
         // silently changes whether clients retry it.
         assert_eq!(ErrorCodeWire::LlmCredentialMissing as u16, 0x0066);
         assert_eq!(ErrorCodeWire::LlmCredentialUnavailable as u16, 0x0095);
-        assert_eq!(ErrorCodeWire::SchemaInvalid as u16, 0x0120);
+        // A faulted shard's code sits in its own 0x00Ax block because the
+        // numeric block is what assigns the category; moving it would make
+        // clients retry a dead disk again.
+        assert_eq!(ErrorCodeWire::ShardStorageFaulted as u16, 0x00A0);
+        assert_eq!(ErrorCodeWire::UnrecoverableInternal as u16, 0x00A1);
         assert_eq!(ErrorCodeWire::SchemaMigrationRequired as u16, 0x0121);
         assert_eq!(ErrorCodeWire::EntityNotFound as u16, 0x0130);
         assert_eq!(ErrorCodeWire::EntityTypeMismatch as u16, 0x0131);
@@ -810,7 +1036,8 @@ mod tests {
             ErrorCode::RetrieverDegraded,
             ErrorCode::LlmCredentialMissing,
             ErrorCode::LlmCredentialUnavailable,
-            ErrorCode::SchemaInvalid,
+            ErrorCode::ShardStorageFaulted,
+            ErrorCode::UnrecoverableInternal,
             ErrorCode::SchemaMigrationRequired,
             ErrorCode::EntityNotFound,
             ErrorCode::EntityTypeMismatch,
@@ -830,5 +1057,53 @@ mod tests {
             let back: ErrorCode = wire.into();
             assert_eq!(code, back, "round-trip failed for {code:?}");
         }
+    }
+
+    /// The point of an ERROR frame is that a peer learns what failed, so an
+    /// unfamiliar classification must cost one field rather than the whole answer.
+    #[test]
+    fn unknown_error_classifications_preserve_the_frame() {
+        let original = crate::envelope::error::ErrorResponse {
+            code: 0xFFFE,
+            category: 250,
+            message: "future failure".into(),
+            details: Some(crate::envelope::error::ErrorDetails {
+                field: Some("id".into()),
+                expected: None,
+                actual: Some("bad".into()),
+            }),
+            retry_after_ms: Some(321),
+        };
+        let bytes = to_cbor_bytes(&original);
+        let decoded: crate::envelope::error::ErrorResponse = from_cbor_bytes(&bytes).unwrap();
+        assert_eq!(decoded.code, 0xFFFE);
+        assert_eq!(decoded.category, 250);
+        assert_eq!(decoded.message, original.message);
+        assert_eq!(decoded.details, original.details);
+        assert_eq!(decoded.retry_after_ms, Some(321));
+    }
+
+    #[test]
+    fn error_wire_try_from_preserves_unknown_values() {
+        assert_eq!(
+            ErrorCodeWire::try_from(ErrorCodeWire::Internal as u16),
+            Ok(ErrorCodeWire::Internal)
+        );
+        assert_eq!(ErrorCodeWire::try_from(0xFFFE), Err(0xFFFE));
+        assert_eq!(
+            ErrorCategoryWire::try_from(ErrorCategoryWire::Internal as u8),
+            Ok(ErrorCategoryWire::Internal)
+        );
+        assert_eq!(ErrorCategoryWire::try_from(250), Err(250));
+    }
+
+    /// The committed conformance corpus pins these bytes, so changing the
+    /// field's Rust type must not change the encoded integer.
+    #[test]
+    fn known_error_code_integer_keeps_cbor_bytes() {
+        assert_eq!(
+            to_cbor_bytes(&(ErrorCodeWire::Internal as u16)),
+            to_cbor_bytes(&ErrorCodeWire::Internal)
+        );
     }
 }

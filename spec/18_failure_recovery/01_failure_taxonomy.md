@@ -126,8 +126,8 @@ The disk fills.
 
 The CPU is at 100% sustained.
 
-- Detection: Load metrics.
-- Response: Backpressure (Overloaded errors); degrade gracefully.
+- Detection: Load metrics; write-stage timers; a shard's durable watermark advancing slowly.
+- Response: Backpressure by queueing — the shard's admission permits run out, it parks on its receive channel, and requests wait in arrival order. Latency rises; nothing is rejected.
 - Recovery: Reduce load or scale up.
 
 ### Memory pressure
@@ -135,7 +135,7 @@ The CPU is at 100% sustained.
 RAM usage exceeds capacity.
 
 - Detection: Process metrics; OOM killer in extremis.
-- Response: Shed load; fail allocations gracefully.
+- Response: Fail allocations gracefully. In-flight memory is already bounded by the per-shard admission permits and the 1024-record WAL-drain channel, so load does not translate into unbounded buffering.
 - Recovery: Scale up RAM; investigate leak.
 
 ### Operator mistake (data deletion)

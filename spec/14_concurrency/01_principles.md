@@ -6,7 +6,8 @@ The core principles that guide Brain's concurrency design.
 
 The primary lever: structure the system so concurrent operations don't actually contend on shared mutable state.
 
-- Single-writer-per-shard: no writer-vs-writer contention.
+- One writer per shard: no writer-vs-writer contention.
+- Await-free transaction bodies: commits serialize because the executor cannot interleave them, so no lock is needed to order them.
 - Sharding: partition the workload; per-shard contention is local.
 - Lock-free reads: readers don't share mutable state with writers.
 
@@ -51,12 +52,13 @@ There's never a "half-published" state.
 
 ## 6. Defer reclamation
 
-Old states aren't immediately freed. They're freed when no readers hold references:
+Old states aren't immediately freed. They're freed when no readers hold references, and `Arc`'s reference counting is the whole mechanism:
 
-- Arc's reference counting handles simple cases.
-- Epoch-based reclamation handles cases where references aren't directly tracked (e.g., raw pointers into a data structure).
+- A reader takes an `Arc` to the published snapshot it is reading.
+- The writer publishes a replacement and drops its own reference.
+- The old state is dropped by whichever reader lets go last.
 
-This avoids "use-after-free" without locking.
+This avoids use-after-free without locking and without a reclamation protocol. It works because the unit of reclamation is the entire published structure — nothing is mutated in place under a reader, so there are no untracked interior references to protect.
 
 ## 7. The "no shared mutable state across threads" rule
 
@@ -69,12 +71,14 @@ This means shards are concurrency-independent; one shard's contention doesn't af
 
 ## 8. The "no async cancellation in critical sections" rule
 
-Async tasks in Rust can be canceled (the future is dropped). For critical sections (the writer's commit path), Brain ensures cancellation can't occur mid-section:
+Async tasks in Rust can be canceled (the future is dropped). For critical sections (the write commit path), Brain ensures cancellation can't occur mid-section:
 
-- Writer's commit is a single async block with no awaits between begin_write and commit.
+- The commit is a single synchronous block with no awaits between `begin_write` and `commit`.
 - If the task is canceled, it's at a yield point; the in-progress transaction is aborted (no harm done).
 
-This is correctness-preserving despite Rust's cancellation semantics.
+This is correctness-preserving despite Rust's cancellation semantics, and it carries a second load: because several requests are dispatched concurrently onto one executor, the absence of an await inside the transaction body is the *only* thing that stops two of them holding a write transaction at once. The rule is not a convention here; it is the serialization mechanism. An await added between `begin_write` and `commit` would let a second request enter the same region and deadlock on redb's write lock, which nothing else on a single-threaded executor would release.
+
+Cancellation between the WAL append and the commit is also accounted for: the write's reserved LSN range is held by a guard whose `Drop` abandons it, so a dropped future cannot leave the durable watermark pinned below those records forever.
 
 ## 9. The "explicit ordering for cross-task communication" rule
 
@@ -100,7 +104,7 @@ Panics are reserved for genuine bugs (assertion violations, impossible states).
 
 Brain prefers simple concurrency that's clearly correct over clever schemes that are hard to verify:
 
-- Yes to single-writer-per-shard (simple).
+- Yes to one writer per shard (simple).
 - Yes to ArcSwap (simple primitive, well-understood).
 - Yes to redb's MVCC (proven; Brain does not reimplement).
 
@@ -132,7 +136,7 @@ Concurrency bugs are notoriously hard to find without disciplined testing. Brain
 Brain's concurrency is intentionally unexciting:
 
 - Standard primitives (Arc, AtomicUsize, channels).
-- Established patterns (single-writer, MVCC, epoch-based reclamation).
+- Established patterns (one writer per shard, MVCC, refcounted copy-on-publish).
 - No exotic algorithms.
 
 Boring is good. Brain does not want to be on the cutting edge of concurrency research; Brain wants a solid foundation that works.
@@ -179,14 +183,14 @@ This means most operations don't cross shard boundaries. The cross-shard concurr
 
 Each shard has a concurrency budget (CPU time, memory, etc.). Brain doesn't oversubscribe:
 
-- The writer task has a guaranteed slice.
+- Dispatch admission is capped by a permit count derived from the WAL group-commit batch budget — 15 in-flight requests at the 60 KiB default.
 - Readers compete for the rest.
 - Background workers yield generously.
 
-If demand exceeds the budget, requests are queued or rejected. Latency rises but predictably.
+If demand exceeds the budget, the shard parks on its receive channel and requests queue behind it. Latency rises but predictably, and in arrival order; nothing is dropped to make room.
 
 This is Brain's "fair scheduling" baseline. More sophisticated scheduling (priorities, weights) is possible but deferred to future versions.
 
 ---
 
-*Continue to [`02_writer_model.md`](02_writer_model.md) for the single-writer discipline.*
+*Continue to [`02_writer_model.md`](02_writer_model.md) for the writer discipline.*

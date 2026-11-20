@@ -769,11 +769,12 @@ fn walk_outward(
         }
         let candidate_depth = crumb.depth + 1;
 
-        let raw_edges = list_memory_edges_from(&rtxn, node, None)
+        let raw_edges = list_memory_edges_from(&rtxn, node, None, 0)
             .map_err(|e| ExecError::MetadataReadFailed(e.to_string()))?;
 
-        let mut neighbours: Vec<(EdgeKind, MemoryId, f32)> = Vec::with_capacity(raw_edges.len());
-        for (k, t, data) in raw_edges {
+        let mut neighbours: Vec<(EdgeKind, MemoryId, f32)> =
+            Vec::with_capacity(raw_edges.rows.len());
+        for (k, t, data) in raw_edges.rows {
             if trace {
                 walk_trace.considered.push(ReasonTraceEdgeCandidate {
                     memory_id: t,

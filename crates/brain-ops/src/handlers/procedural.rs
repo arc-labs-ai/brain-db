@@ -20,6 +20,7 @@ use brain_protocol::{MaterializeProceduralRequest, MaterializeProceduralResponse
 
 use crate::context::OpsContext;
 use crate::error::OpError;
+use crate::handlers::limits::CATEGORY_MAX_BYTES;
 
 /// Hard cap on `top_k`. Bigger requests get rejected up-front so a
 /// runaway caller can't burn an unbounded amount of CPU rendering a
@@ -34,9 +35,11 @@ const TOP_K_DEFAULT: u32 = 20;
 /// well past anything sensible.
 const CATEGORIES_MAX: usize = 32;
 
-/// Longest accepted category suffix. Defensive — predicate names are
-/// short identifiers in practice.
-const CATEGORY_LEN_MAX: usize = 64;
+/// Max entries in a `session_filter`. Each entry is hashed into the
+/// per-request membership set and tested against every candidate statement's
+/// evidence, so the list length is caller-controlled per-request work. Matches
+/// the bound RECALL applies to the same field.
+pub const MAX_SESSION_FILTER: usize = 1024;
 
 /// All five `brain:behavior_*` predicate names declared in
 /// `system_schema/schema.brain`. Held as a static array so the renderer
@@ -94,10 +97,10 @@ pub async fn handle_materialize_procedural(
         )));
     }
     for c in &req.categories {
-        if c.is_empty() || c.len() > CATEGORY_LEN_MAX {
-            return Err(OpError::InvalidRequest(
-                "each category must be 1..=64 chars".into(),
-            ));
+        if c.is_empty() || c.len() > CATEGORY_MAX_BYTES {
+            return Err(OpError::InvalidRequest(format!(
+                "each category must be 1..={CATEGORY_MAX_BYTES} bytes"
+            )));
         }
     }
     let effective_top_k = if req.top_k == 0 {
@@ -117,6 +120,16 @@ pub async fn handle_materialize_procedural(
     };
     let subject_entity = EntityId::from(space_bytes);
 
+    if req
+        .session_filter
+        .as_ref()
+        .is_some_and(|s| s.len() > MAX_SESSION_FILTER)
+    {
+        return Err(OpError::InvalidRequest(format!(
+            "session_filter has {} entries; max is {MAX_SESSION_FILTER}",
+            req.session_filter.as_ref().map_or(0, Vec::len)
+        )));
+    }
     let session_filter: Option<std::collections::HashSet<SessionId>> = match &req.session_filter {
         Some(ids) if !ids.is_empty() => Some(ids.iter().map(|id| SessionId(*id)).collect()),
         _ => None,
@@ -414,9 +427,9 @@ fn uuid_short(b: &[u8; 16]) -> String {
     s
 }
 
-// Errors are classified by `OpError`'s `From` impls (crate::error) —
-// this path previously downgraded everything to Internal (500), losing
-// NotFound/Conflict classification; routing through `From` fixes that.
+// Errors are classified by `OpError`'s `From` impls (crate::error) rather
+// than by a map hand-rolled here: a local map downgrades everything to
+// Internal (500) and loses the NotFound/Conflict classification.
 
 // ---------------------------------------------------------------------------
 // Tests (rendering / validation only — handler integration tests live in

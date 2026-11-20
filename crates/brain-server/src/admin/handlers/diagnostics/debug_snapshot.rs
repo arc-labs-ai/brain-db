@@ -4,8 +4,14 @@
 //! v1 populates:
 //! - `workers` from `scheduler_snapshot()`,
 //! - `pending_requests` from the shard's dispatch-queue depth
-//!   (`ShardHandle::queue_depth`), and
+//!   (`ShardHandle::queue_depth`),
+//! - `derivation_queue` from `extraction_backlog()`, and
 //! - `in_memory_state_summary` from `hnsw_snapshot()` + `storage_stats()`.
+//!
+//! `pending_requests` and `derivation_queue` are different queues and
+//! must stay apart: the first is requests waiting milliseconds for the
+//! executor, the second is memories waiting minutes-to-hours to be
+//! turned into graph. Summing or conflating them hides both.
 //!
 //! The remaining spec'd fields (`active_tasks`, `recent_errors`) are
 //! flagged in `deferred[]` — see the module doc for why.
@@ -58,6 +64,32 @@ pub async fn debug_snapshot(
     // pending_requests: dispatch-queue depth (requests queued on the
     // shard's request channel, not yet drained by the executor).
     write!(&mut body, ",\"pending_requests\":{}", shard.queue_depth()).expect("string write");
+
+    // derivation_queue: the durable extraction queue — memories written
+    // but not yet turned into statements / entities / relations. Depth
+    // outruns the extractor's drain rate by orders of magnitude under
+    // sustained writes, so this is where a degrading workspace shows
+    // first. A failed read emits `null`, never a zero.
+    body.push_str(",\"derivation_queue\":");
+    match shard.extraction_backlog().await {
+        Ok(Some(backlog)) => {
+            write!(
+                &mut body,
+                "{{\"depth\":{d},\"oldest_age_seconds\":{a}}}",
+                d = backlog.depth,
+                a = backlog.oldest_age_secs,
+            )
+            .expect("string write");
+        }
+        Ok(None) => {
+            warn!(shard = shard_id, "extraction backlog unavailable");
+            body.push_str("null");
+        }
+        Err(e) => {
+            warn!(shard = shard_id, error = %e, "extraction_backlog failed");
+            body.push_str("null");
+        }
+    }
 
     // in_memory_state_summary: HNSW node/tombstone counts + arena / WAL /
     // metadata footprint. Both reads round-trip through the executor; on

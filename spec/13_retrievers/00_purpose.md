@@ -85,7 +85,7 @@ struct RankedItem<I, S> {
 }
 ```
 
-All retrievers produce items with ranks. Scores are retriever-internal (cosine for semantic, BM25 for lexical, graph proximity for graph) and are not directly comparable across retrievers — fusion uses rank, not score.
+All retrievers produce items with ranks. Scores are retriever-internal (cosine for semantic, BM25 for lexical, graph proximity for graph) and are not directly comparable across retrievers — the shipped fusion method uses rank, not score. Two score-aware fusion methods exist behind a deploy-time switch and do read the magnitudes, after per-query normalization; see [`./01_rrf_fusion.md`](./01_rrf_fusion.md) §"Score-aware fusion methods".
 
 ## SemanticRetriever
 
@@ -136,10 +136,14 @@ Three modes:
 
 3. **Subgraph**: entity → entire k-hop neighborhood. Returns set of entities, relations, statements.
 
-Configuration:
-- max_depth (default 3, capped at 5).
+Configuration (`crates/brain-index/src/graph_retriever.rs:12-24,156-165`):
+- max_depth (default 3, hard cap 5).
+- max_branching (default 200, per-node child cap).
+- top_k (default 64).
 - direction (outgoing, incoming, both).
 - relation_type_filter (optional whitelist).
+
+The deeper `RELATION_TRAVERSE` op is a separate mechanism with its own, wider bounds (default branching 1 000, cap 10 000) — see [`./06_post_processing.md`](./06_post_processing.md) §"Traversal".
 
 Performance: 1-2 hops are fast (O(log N) per hop). 3+ hops can be expensive if branching factor is high; the planner caps result count and depth.
 
@@ -182,7 +186,7 @@ The router (§13/05) classifies and picks. Defaults to Semantic + Lexical for am
 ## Failure modes
 
 - **Empty corpus for a retriever**: returns empty list. Fusion degrades gracefully.
-- **Retriever times out**: cancelled, returns partial or empty. Fusion proceeds with what arrived. Operator sees a metric.
+- **Retriever exceeds its budget**: the budget is a **soft** deadline, not a cancellation. The lane is recorded as `Timeout` and a warning is emitted, but in-flight work is not killed and a late result still flows through fusion (`crates/brain-planner/src/retrieval/planner/logic.rs:55-65`). The planned budget is 1 s per retriever, chosen so the semantic lane's embed step fits inside it; the per-retriever config defaults are 50 ms and the plan overrides them.
 - **Index out of date**: results may miss recent writes. The worker pipeline keeps indexes within seconds of writes. Eventual consistency is acceptable.
 - **All retrievers empty**: query returns empty. The router can suggest "did you mean..." based on related entities.
 

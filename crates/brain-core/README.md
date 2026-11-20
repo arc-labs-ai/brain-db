@@ -11,10 +11,12 @@ ultimately `brain-server`. Apache-2.0.
 Defines the foundational value types shared across the entire workspace: the ID
 family (`MemoryId`, `EntityId`, `StatementId`, `RelationId`, slot index/version,
 …), the node types (`Memory`, `Entity`, `Statement`, `Relation`) and their kinds,
-the typed-graph edge types, the stable `Error` taxonomy, the entity-resolution
-primitives (resolver, confidence aggregation, trigram similarity), migration
-descriptors, and background-worker state. Everything here is a pure value type —
-no I/O, no async, no runtime dependency (`#![forbid(unsafe_code)]`).
+the typed-graph edge types, the stable `Error` taxonomy, the storage-agnostic
+entity-resolution building blocks (trigram similarity, confidence aggregation,
+the non-referential-surface backstop), the retrieval and precision tuning
+records, migration descriptors, and background-worker state. Everything here is
+a pure value type — no I/O, no async, no runtime dependency
+(`#![forbid(unsafe_code)]`).
 
 ## Key modules
 
@@ -23,8 +25,9 @@ no I/O, no async, no runtime dependency (`#![forbid(unsafe_code)]`).
 | `ids` | All Brain IDs and slot index/version types, including `MemoryId` slot-version encoding. |
 | `nodes` | Core record types: `Memory`/`MemoryKind`/`Salience`, `Entity`, `Statement` + evidence, `Relation`, predicates. |
 | `edges` | Typed-graph edge model: `Edge`, `EdgeKind`, `NodeRef`, and their refs. |
-| `resolution` | Entity resolver, confidence aggregation, and trigram (Jaccard) similarity. |
+| `resolution` | The pieces the live resolver in `brain-extractors` reuses: trigram extraction + Jaccard similarity, noisy-OR confidence aggregation with kind-specific decay, and `is_non_referential_surface`. |
 | `error` | The stable `Error` / `Result` taxonomy used workspace-wide. |
+| `retrieval_config` / `precision_config` | `RetrievalTuning` and `PrecisionTuning` — the tuning records the read path is handed. |
 | `migration` | Migration plan/item/summary descriptors. |
 | `worker_state` | Background-worker bookkeeping: backfill ranges, progress, priority. |
 

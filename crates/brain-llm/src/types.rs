@@ -108,7 +108,7 @@ impl LlmRequest {
     }
 
     /// Approximate input-token count for cost estimation.
-    /// `chars / 4` is a coarse proxy good enough for budget gating.
+    /// `chars / 4` is a coarse proxy suitable for projected-spend telemetry.
     #[must_use]
     pub fn approx_input_tokens(&self) -> u64 {
         let mut chars: usize = self

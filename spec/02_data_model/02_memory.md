@@ -81,7 +81,7 @@ Every memory has exactly one vector. The vector is:
 - **Element type:** `f32`.
 - **Normalization:** unit L2 norm; cosine similarity reduces to dot product.
 - **Production:** by the embedding layer from the memory's text.
-- **Internal:** clients send text, not vectors. (Power users may send pre-computed vectors via `ENCODE_VECTOR_DIRECT`; see [01.10 OQ-5](../00_overview/04_open_questions_archive.md).)
+- **Internal:** clients send text, not vectors. A caller that has already embedded its content can hand Brain the vector directly via `ENCODE_VECTOR_DIRECT`, but that is the exception; the ordinary path is text in, vectors hidden.
 
 **INVARIANT:** Every memory's vector is the embedding of its text under the embedding model identified by the memory's `embedding_model_fp`. If the embedding model changes, the memory's vector becomes stale until re-embedded.
 
@@ -94,7 +94,7 @@ The text is the human-readable content the agent encoded. It is:
 - **Content:** opaque to Brain. Brain does not parse, validate, or rewrite the text.
 - **Persisted:** always. The text is stored verbatim; it is the input to embedding and the output of `RECALL`.
 
-The text is stored separately from the vector. The arena holds vectors; the text lives in the metadata store ([10. Metadata + Graph Store](../10_metadata/00_purpose.md) §3) for memories where it fits, or in a separate text blob store for very large memories.
+The text and the vector are separate rows. Both have their durable home in the metadata store ([10. Metadata + Graph Store](../10_metadata/00_purpose.md) §3): the text in the texts table, the vector in the memory-vectors table as a flat little-endian `f32` run. Very large texts spill to a separate text blob store. The vector arena is a parallel at-rest copy rebuilt from the log at startup, not the write-time destination — see §13.
 
 ## 6. Identity (overview)
 
@@ -106,7 +106,7 @@ A memory has these identity fields:
 
 **INVARIANT:** A memory's `space_id` is immutable for the memory's lifetime. To "move" a memory between spaces, encode a new memory under the destination space's id and forget the original.
 
-**INVARIANT:** A memory's `id` is unique within the cluster — no two memories ever share an id, even if one has been forgotten and reclaimed. The version field in the id ensures this.
+**INVARIANT:** A memory's `id` is unique within the cluster — no two memories ever share an id, even if one has been forgotten and reclaimed. Slot ids come from a per-shard monotonic counter and are retired rather than recycled, and the version field in the id discriminates occupants independently of that.
 
 ## 7. Identifier formats
 
@@ -144,7 +144,7 @@ Total: 128 bits = 16 bytes.
 
 - `shard_id` (16 bits) — the runtime shard identifier (§7.6 below).
 - `slot_id` (48 bits) — the slot within the shard's arena.
-- `version` (32 bits) — incremented on each slot reuse.
+- `version` (32 bits) — distinguishes successive occupants of one slot id, so a stale handle mismatches rather than resolving to whatever sits there now.
 - `reserved` (32 bits) — must be zero in v1; reserved for future use.
 
 **Properties:**
@@ -154,11 +154,11 @@ Total: 128 bits = 16 bytes.
 - **Equality:** byte-for-byte equality.
 - **Ordering:** byte lexicographic ordering. (Note: this is *not* a meaningful ordering for memories — sorting by `MemoryId` produces an arbitrary order, not a temporal one.)
 
-**Stability:** a `MemoryId` is stable from creation until the memory is forgotten *and* its slot is reclaimed. After reclamation, the slot's version increments, so the same `MemoryId` would map to a different memory only if a subsequent reclamation cycle restored the old version — which Brain forbids.
+**Stability:** a `MemoryId` is stable from creation until the memory is forgotten *and* reclaimed. After that it resolves to nothing: reclamation deletes the row, and a slot id is never handed to a second memory, so no later occupant can inherit the handle.
 
-**INVARIANT:** A `MemoryId` that previously identified memory M never identifies a different memory. If M is forgotten and the slot is reused for memory M', M' has a `MemoryId` with the new (incremented) version. Old `MemoryId`s referencing the previous version detect the mismatch via the version field.
+**INVARIANT:** A `MemoryId` that previously identified memory M never identifies a different memory. Two mechanisms hold this, and either alone would suffice. Slot ids are minted from a per-shard monotonic counter that only ever advances, so no two memories are issued the same slot id. And the `version` field discriminates occupants of a slot id independently of that, so a handle carrying a stale version mismatches rather than resolving to whatever sits at the slot now.
 
-This is what the version field is *for*. Without versions, slot reuse would silently re-target stale references.
+That redundancy is deliberate. The monotonic counter is what makes stale handles harmless today; the version field is what keeps them harmless if slot ids ever become a reusable resource.
 
 **The zero MemoryId.** The all-zero `MemoryId` (16 bytes of zero) is reserved as the "null" value. It MUST NOT be returned by any operation; clients MAY use it as a sentinel for "no memory".
 
@@ -199,7 +199,7 @@ The client-supplied idempotency token for `ENCODE` and `FORGET`. [UUIDv7](https:
 **Properties:**
 
 - **Agent-scoped.** Idempotency is checked within a single space's namespace.
-- **Bounded TTL.** Stored in the idempotency table for a configurable window (default: 5 minutes). After the TTL, the same `RequestId` may be treated as a new operation.
+- **Bounded TTL.** Stored in the idempotency table for a configurable window (default: **24 hours**). After the TTL, the same `RequestId` may be treated as a new operation.
 - **Single-use semantically.** Within the TTL, a duplicate `RequestId` results in the original operation's response being replayed. Different operations submitted with the same `RequestId` is an error.
 
 **Why UUIDv7.** UUIDv7's time-ordering helps the idempotency table — old entries are toward the front of the time-ordered keyspace and easy to expire in batch. Other UUID versions or random tokens work but lose this property. The protocol accepts any 16 bytes; UUIDv7 is the recommendation.
@@ -387,7 +387,7 @@ Allowed transitions:
 
 | From | To | Trigger |
 |---|---|---|
-| Episodic | Semantic | Agent explicit (via `ADMIN_RECLASSIFY` or similar) |
+| Episodic | Semantic | Operator reclassification (no client-reachable surface today) |
 | Episodic | (consolidated as DERIVED_FROM) | Consolidation worker; the episodic memory itself stays episodic; a new Consolidated memory is created |
 | Consolidated | Semantic | Promotion based on salience and confirmation |
 | Semantic | Episodic | Not allowed |
@@ -436,7 +436,7 @@ Brain considered:
 
 - **One kind.** Lose the distinction; everything is treated equally. Salience alone wouldn't capture the differences in cognitive role.
 - **Two kinds (episodic, semantic).** Closer to classical cognitive science. Loses the explicit category for "things Brain noticed", which is what `Consolidated` represents.
-- **Many kinds** (working, autobiographical, procedural, declarative, etc.). Most of the additional categories don't have clear operational distinctions in Brain. Procedural memory is an interesting candidate (deferred to a future version; see [01.10 OQ-8](../00_overview/04_open_questions_archive.md)).
+- **Many kinds** (working, autobiographical, procedural, declarative, etc.). Most of the additional categories don't have clear operational distinctions in Brain. Procedural memory is the one candidate with a real operational distinction, and it is deferred to a future version.
 
 The chosen three are well-grounded: two from classical theory plus one operational category for Brain-derived patterns. They map onto distinct decay profiles, distinct salience baselines, and distinct creation paths.
 
@@ -457,7 +457,7 @@ A memory carries a list of outgoing edges. Each edge is a typed link to another 
 
 Edges may be:
 
-- **Explicit** — set by the agent at encode time or via a separate `LINK` operation (deferred to [01.10 OQ-10](../00_overview/04_open_questions_archive.md)).
+- **Explicit** — set by the agent at encode time or via a separate `LINK` operation.
 - **Auto-derived** — added by background workers based on similarity, temporal adjacency, or causal patterns.
 
 Incoming edges (other memories pointing at this one) are **not** stored on the memory itself; they are reconstructable from the metadata store's edge index.
@@ -486,7 +486,7 @@ A memory is born, lives, may be forgotten, and eventually has its slot reclaimed
                              different kind)
               ┌──────────────────────────────────────────┘
               ▼
-          Reclaimed (slot now holds a new memory with incremented version)
+          Reclaimed (row deleted; the handle resolves to nothing)
 ```
 
 Three states: `Active`, `Tombstoned`, `Reclaimed`. The kind transitions (§11.4) happen within the `Active` state.
@@ -495,81 +495,73 @@ Three states: `Active`, `Tombstoned`, `Reclaimed`. The kind transitions (§11.4)
 
 **Active.** The memory is queryable. All `RECALL`, `PLAN`, `REASON` operations may match it.
 
-- The slot is occupied with the memory's vector.
-- Metadata in redb is current.
+- Its row, text and vector are present in redb and current.
 - HNSW index includes the memory.
 - Salience updates and decay apply.
 
-**Tombstoned.** The memory has been forgotten but the slot has not yet been reclaimed.
+**Tombstoned.** The memory has been forgotten but not yet reclaimed.
 
-- The slot is still occupied (vector and metadata unchanged from when it was forgotten).
-- The memory is hidden from queries — operations skip tombstoned slots.
-- HNSW index entries are removed.
-- Edges are tagged for cleanup but may still be present.
-- The slot is eligible for reuse on the next `ENCODE` allocation.
+- The row survives, with a tombstone timestamp stamped on it and its active flag cleared. For a soft forget the vector and text survive with it.
+- The memory is hidden from queries — operations skip tombstoned memories.
+- Its HNSW node is marked tombstoned, so the semantic lane already excludes it; the node itself leaves the graph at the next index rebuild.
+- Its lexical-index and hypothetical-question rows are dropped, its timeline-index entry is removed, and its deduplication fingerprint is evicted, so a re-encode of the same text does not fold into a dead memory.
+- Edges adjacent to it are tagged for cleanup but may still be present.
 
-The tombstone state is brief in normal operation — typically a few seconds to a few minutes between forget and reclaim. It is observable to integrity-checking tools but never to client queries.
+The tombstone state is **not** brief. It is a grace window, seven days by default, and it exists to be long: a soft forget stays reversible for its whole duration. Reversal is an admin-plane operation on the memory id, and it is refused in exactly two cases — the forget was hard, or the grace window has passed. The state is never observable to client queries. An opcode is reserved for listing tombstoned memories, but like the rest of the substrate admin set it is refused on the wire and has no route on the admin listener, so there is no operator surface reading it today either.
 
-**Reclaimed.** The slot has been reused for a different memory. The previous memory's `MemoryId` is no longer valid for any active memory.
+**Reclaimed.** The grace window has passed and the reclamation worker has reaped the memory. Its `MemoryId` now resolves to nothing.
 
-- The slot is occupied with a new memory's data.
-- The new memory has an incremented `version` field.
-- The old `MemoryId` (with the previous version) doesn't match any current memory.
+- The memory's row, its text, and its write-artifact bundle (stored embedding plus derived graph) are deleted.
+- Its adjacent edge-index rows go with it; edges pointing at it from the other direction are left to the edge-scrub worker.
+- Its undo journal is deleted too, which is what makes the forget irreversible from this point on.
 
-`Reclaimed` is not a state of the *original* memory — it's a description of what happened to the slot. The original memory ceases to exist; the slot lives on, holding something new.
+The slot id itself is not recycled. Each `ENCODE` mints a fresh slot id from a monotonic counter, so a reclaimed slot id is simply retired — nothing is ever written there again. `Reclaimed` is therefore terminal for both the memory and its handle.
 
 ### 13.3 Lifecycle transitions
 
 **None → Active (creation).** Triggered by `ENCODE`. The transition involves:
 
-1. Allocate a slot in the arena (or reuse a tombstoned slot, incrementing version).
-2. Embed the text into a vector.
-3. Compute initial salience.
-4. Write a WAL record (the durability barrier).
-5. fsync the WAL.
-6. Write the vector to the arena slot.
-7. Update metadata in redb.
-8. Insert into HNSW.
-9. Publish the new `MemoryId` to clients (epoch advance).
+1. Embed the text into a vector.
+2. Compute initial salience.
+3. Reserve a fresh `MemoryId` from the shard's monotonic slot counter. Nothing is written; an id whose write never commits is skipped and the counter moves on.
+4. Write a WAL record and group-commit it — the recoverability barrier.
+5. Insert the vector into the HNSW index. This happens before the metadata transaction opens, so a failed insert abandons the encode before anything commits.
+6. In one redb transaction: write the memory row, its text, its vector, and the idempotency stamp. Commit.
+7. Publish the new `MemoryId` and advance the shard's committed watermark.
 
-The memory is `Active` once step 9 completes. The full sequence is detailed in [08. Storage: Arena & WAL](../08_storage/00_purpose.md) §4.
+The memory is `Active` once step 6 commits — that commit, not the WAL fsync, is the barrier the client's acknowledgement waits on. The full sequence is detailed in [08. Storage: Arena & WAL](../08_storage/00_purpose.md) §4.
 
 **Active → Tombstoned (FORGET).** Triggered by `FORGET`. The transition involves:
 
-1. Validate that the `MemoryId` references an active memory owned by the requesting agent.
-2. Write a `FORGET` record to the WAL.
-3. fsync the WAL.
-4. Mark the slot as tombstoned in metadata.
-5. Remove the entry from the HNSW index.
-6. Hide the memory from queries (epoch advance).
-7. Set `forgot_at` timestamp.
+1. Validate that the `MemoryId` references an active memory the caller owns. The check is made against the stored row's own owner scope, inside the write transaction — a row owned by someone else reads as absent.
+2. Write a `FORGET` record to the WAL and group-commit it.
+3. Tombstone the memory's HNSW node, and drop its lexical-index and hypothetical-question rows.
+4. In one redb transaction: stamp the tombstone timestamp on the row, clear its active flag, remove its timeline-index entry, and evict its deduplication fingerprint. Commit.
+5. Publish the forget and advance the committed watermark.
 
-For **soft forget**, the slot's data (vector and text) is preserved. The slot is eligible for reuse but the data is recoverable until reuse happens.
+For **soft forget**, the vector and the text are preserved and the cascade writes an undo journal as it strips the memory from dependent statements and relations — which is what lets the whole forget be replayed backwards within grace.
 
-For **hard forget**, additional steps:
+For **hard forget**, the same transaction additionally:
 
-8. Overwrite the vector with zeros.
-9. Clear the text.
-10. Schedule the slot for immediate reclamation.
+- Sets a hard-forgotten flag on the row. This is what makes the state irreversible and self-describing: the restore path reads this bit and refuses.
+- Deletes the text, the stored embedding, and the derived-graph artifacts.
 
-Hard forget makes the memory's content unrecoverable even via filesystem-level inspection. It's the right choice for compliance-driven removals (GDPR right-to-erasure, accidental encoding of secrets).
+It writes no undo journal — irreversibility is the point. Once the write commits, the at-rest arena copy of the vector is zeroed under a slot-version check, and WAL replay re-zeroes it so the guarantee survives a crash before writeback. Hard forget makes the memory's content unrecoverable even via filesystem-level inspection. It's the right choice for compliance-driven removals (GDPR right-to-erasure, accidental encoding of secrets).
 
-**Tombstoned → Reclaimed (slot reuse).** Triggered when the next `ENCODE` allocates from the free list and picks this slot.
+**Tombstoned → Reclaimed (grace expiry).** Triggered by the reclamation worker, not by a new write.
 
-1. The new `ENCODE` operation finds the tombstoned slot in the per-shard free list.
-2. The slot's `version` field is incremented (a 32-bit counter; at saturation the slot is permanently retired).
-3. The slot is written with the new memory's vector and metadata.
-4. The old memory's edges are cleaned up (incoming edges pointing at the old memory's ID are now stale; they're filtered out lazily during traversal).
-5. The new memory is published.
+1. The worker finds memories whose tombstone timestamp plus the grace window is in the past.
+2. For each, in its own transaction: delete the memory row, the text, the write-artifact bundle, the adjacent edge-index rows, and the undo journal.
+3. The slot id is retired rather than freed — nothing is pushed back for reuse.
 
-After this, the original memory is gone; the slot holds the new memory.
-
-The version increment ensures stale `MemoryId`s referencing the old memory cleanly mismatch — the lookup `MemoryId.version != slot.version` returns `MemoryNotFound` rather than silently returning the new memory.
+After this, the memory is gone and its `MemoryId` resolves to `MemoryNotFound`. Nothing later occupies the slot, so there is no window in which a stale handle could resolve to a different memory.
 
 **Active → Active (kind transitions).** Several kind changes happen within the `Active` state:
 
-- Episodic → Semantic (via `ADMIN_RECLASSIFY` or agent operation).
+- Episodic → Semantic.
 - Consolidated → Semantic (via promotion).
+
+Neither is reachable from a client today: reclassification is an operator concern and has no route on the admin plane, and promotion is the consolidation worker's own decision.
 
 These are not lifecycle transitions in the sense of changing visibility or storage; they're metadata updates while the memory remains active and queryable. The mechanics are documented in §11.4.
 
@@ -581,7 +573,7 @@ These are not lifecycle transitions in the sense of changing visibility or stora
 - HNSW removal.
 - Tombstone mark.
 
-The eviction runs in soft-forget mode by default. The slot's data is preserved until reclaimed; this lets `ADMIN_RESTORE_RECENT` recover unintended evictions within a short window.
+The eviction runs in soft-forget mode by default. The vector and text are preserved until reclamation, which is what lets the admin restore path recover an unintended eviction anywhere inside the grace window.
 
 **Consolidation (Active → Active, with creation).** The consolidation worker doesn't change a single memory's lifecycle; it creates new `Consolidated` memories from existing episodic ones. The original episodic memories remain `Active` (and may be evicted later based on salience).
 
@@ -592,36 +584,36 @@ Note: an aggressive consolidation policy could choose to evict the source episod
 What state is observable from outside:
 
 - **`Active`** — fully visible. All fields readable, all queries return it.
-- **`Tombstoned`** — invisible to client queries; visible to admin tools (`ADMIN_LIST_TOMBSTONED`).
-- **`Reclaimed`** — the original memory is gone. The slot now holds a different memory; querying with the old `MemoryId` returns `MemoryNotFound`.
+- **`Tombstoned`** — invisible to client queries. No surface enumerates them in v1: `MEMORY_LIST`'s `include_tombstoned` flag is honoured at the row level, but the timeline index drops a memory's row when it is tombstoned, so there are no rows there to return.
+- **`Reclaimed`** — the memory is gone and nothing replaces it; querying with its `MemoryId` returns `MemoryNotFound`.
 
-Clients should not rely on observing tombstoned state. The contract is "after `FORGET` returns, the memory is no longer queryable"; whether it's still on disk briefly is an implementation detail.
+Clients should not rely on observing tombstoned state. The contract is "after `FORGET` returns, the memory is no longer queryable"; how long it stays on disk is an operator-visible retention policy, not a client-visible one.
 
 ### 13.6 Slot version counter
 
-The slot's `version` field is critical for lifecycle correctness.
+The `version` field discriminates occupants of a slot id.
 
-**Format.** A 32-bit unsigned integer. Initial value: 1. Incremented each time the slot is reclaimed.
+**Format.** A 32-bit unsigned integer. Initial value: 1. It advances only when a slot id takes a new occupant.
 
-**Saturation.** When the version reaches `u32::MAX` (2^32 - 1, ≈ 4 billion), the slot is **permanently retired**. The next reclamation would wrap to 0, which Brain forbids (it would silently re-validate stale `MemoryId`s).
+Because slot ids come from a monotonic counter and are retired rather than recycled, no slot id has a second occupant, and so in practice every live memory carries version 1. The field is nonetheless part of the identifier and is checked on every lookup: a handle whose version does not match the stored one resolves to `MemoryNotFound` rather than to the row. That check is what keeps stale handles harmless without depending on the allocation policy that happens to be in force.
 
-In practice, no real workload reaches this. A workload that reclaims a single slot 4 billion times is doing something pathological; Brain treats the saturation as a signal that something is wrong.
+**Saturation.** The value `u32::MAX` marks a slot id as **permanently retired**. Advancing past it would wrap to 0, which Brain forbids — it would silently re-validate stale `MemoryId`s.
 
-**Why 32 bits.** Brain uses 32 bits over 16 (which would saturate too quickly under churn) or 64 (which would expand `MemoryId` beyond 16 bytes). 32 bits gives ~4 billion reclamations per slot, which is more than enough.
+**Why 32 bits.** Brain uses 32 bits over 16 (which would saturate too quickly under churn) or 64 (which would expand `MemoryId` beyond 16 bytes).
 
 ### 13.7 Boundary cases
 
 **FORGET on a tombstoned memory.** The original `MemoryId` references the tombstoned (or already-reclaimed) memory. Behavior:
 
 - If tombstoned: idempotent. The `FORGET` returns success with `was_already_forgotten = true`.
-- If reclaimed: the `MemoryId` is stale (version mismatch). Returns `MemoryNotFound`.
+- If reclaimed: there is no row to find. Returns `MemoryNotFound`.
 
 **RECALL race with FORGET.** A `RECALL` is in flight when `FORGET` arrives for one of the candidate memories. Behavior depends on timing:
 
 - If the `RECALL` already returned the memory: the result is sent; the next `RECALL` won't include this memory (it's tombstoned).
 - If the `RECALL` is still scoring candidates: the tombstoned memory is filtered out.
 
-This is the epoch-based reclamation model; details are in [14. Concurrency + Epoch Model](../14_concurrency/00_purpose.md).
+Both outcomes are consistent, and neither needs the two operations to coordinate: the `RECALL` searches one published generation of the index to completion, and the tombstone the `FORGET` sets is applied as a search-time filter. Details are in [14. Concurrency + Publication Model](../14_concurrency/00_purpose.md).
 
 **Crash during ENCODE.** If the server crashes between WAL fsync and full publication of the memory:
 
@@ -658,14 +650,14 @@ The timeline above is illustrative — actual durations depend on the workload, 
 When a memory transitions to `Tombstoned`:
 
 - **Outgoing edges** (owned by the memory) are removed from the by-source index.
-- **Incoming edges** (where this memory is the target) are tagged for lazy cleanup. They remain in the by-target index until the slot is reclaimed.
+- **Incoming edges** (where this memory is the target) are left in place and filtered during traversal.
 
-When the slot is `Reclaimed`:
+When the memory is `Reclaimed`:
 
-- The by-target index entries pointing to this slot's `MemoryId` (with the old version) are scheduled for deletion in the next index-maintenance pass.
-- The new memory's edges are added fresh.
+- Its adjacent edge-index rows are deleted with it — its outgoing entries, and the by-target entries that name it.
+- Rows elsewhere that name it from the other direction survive the reclamation and are cleaned up by the edge-scrub worker.
 
-The lazy-cleanup of incoming edges is a deliberate trade-off. Eager cleanup would require scanning every other memory's outgoing edges to find references — expensive. Lazy cleanup defers the cost until the slot is reused, when Brain has to rewrite the index anyway.
+The lazy cleanup is a deliberate trade-off. Removing every reference eagerly would mean scanning every other memory's outgoing edges — expensive, and paid inside a forget. Traversal filtering makes a surviving stale row unobservable, so the scan can be a sweeper's problem instead of a write's.
 
 ## 14. Mutability
 

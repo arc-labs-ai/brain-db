@@ -62,11 +62,11 @@ fn acme_v1() -> ValidatedSchema {
 }
 
 fn acme_v2_extends_v1() -> ValidatedSchema {
-    // v2 keeps every v1 definition unchanged AND adds a new one.
-    // Re-applying an unchanged predicate at the new schema_version
-    // fails on constraint mismatch (schema_version field differs),
-    // so this schema is structured the same way as the existing
-    // `schema_store::tests::acme_schema_v2` — additive only.
+    // v2 keeps every v1 definition unchanged and adds a new one.
+    // Matching constraints preserve each declaration's id while its
+    // schema version advances, so statements written against it remain
+    // valid. This schema is additive-only and mirrors
+    // `schema_store::tests::acme_schema_v2`.
     validated_schema(
         "
         namespace acme

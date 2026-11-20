@@ -133,14 +133,14 @@ pub const DEFAULT_LIST_LIMIT: usize = 1_000;
 // Read paths.
 // ---------------------------------------------------------------------------
 
-/// Count non-tombstoned relation rows in `namespace_id` that key on
-/// `relation_type_id`, capped at `limit` (pass `usize::MAX` for an
-/// exact count). Used by `SCHEMA_DROP`'s in-use safety gate — dropping
-/// a relation_type that still has live relations requires the caller's
-/// explicit `force`.
-pub fn relation_live_count_by_type(
+/// Count relation metadata rows that name `relation_type_id`, capped at
+/// `limit` (pass `usize::MAX` for an exact count). The question is whether
+/// removing the registry row would leave a typed edge unable to name its
+/// relation type, so tombstoned relations count because their metadata still
+/// stamps the type id and remains part of history. The row namespace need not
+/// be the namespace that coined the type, so namespace filtering is unsafe.
+pub fn relation_reference_count_by_type(
     wtxn: &WriteTransaction,
-    namespace_id: u32,
     relation_type_id: RelationTypeId,
     limit: usize,
 ) -> Result<usize, RelationOpError> {
@@ -153,7 +153,7 @@ pub fn relation_live_count_by_type(
     for entry in t.iter()? {
         let (_, v) = entry?;
         let row: RelationMetadata = v.value();
-        if row.namespace_id == namespace_id && row.relation_type_id == want && row.tombstoned == 0 {
+        if row.relation_type_id == want {
             count += 1;
             if count >= limit {
                 break;
@@ -1196,6 +1196,56 @@ mod tests {
             1_700_000_000_000_000_000,
             symmetric,
         )
+    }
+
+    #[test]
+    fn reference_count_by_type_counts_every_row_that_names_it() {
+        let (_dir, mut db) = open_db();
+        let from = make_entity(&mut db, "from");
+        let to = make_entity(&mut db, "to");
+        let relation_type = intern_type(&mut db, "owns", Cardinality::ManyToMany, false);
+        let unrelated = RelationTypeId::from(relation_type.raw() + 7);
+        let first = fresh_rel(relation_type, from, to, false);
+        let wtxn = db.write_txn().unwrap();
+        relation_create(
+            &wtxn,
+            test_scope(),
+            brain_core::SessionId::DEFAULT,
+            &first,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            relation_reference_count_by_type(&wtxn, relation_type, usize::MAX).unwrap(),
+            1,
+            "a relation metadata row names its type"
+        );
+        relation_tombstone(&wtxn, first.id, 1).unwrap();
+        assert_eq!(
+            relation_reference_count_by_type(&wtxn, relation_type, usize::MAX).unwrap(),
+            1,
+            "a tombstoned relation still names its type"
+        );
+        let other_scope = RowScope::from_bytes(test_scope().namespace_id + 1, [0xAB; 16]);
+        let second = fresh_rel(relation_type, from, to, false);
+        relation_create(
+            &wtxn,
+            other_scope,
+            brain_core::SessionId::DEFAULT,
+            &second,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            relation_reference_count_by_type(&wtxn, relation_type, usize::MAX).unwrap(),
+            2,
+            "a row in another namespace still names the type"
+        );
+        assert_eq!(
+            relation_reference_count_by_type(&wtxn, unrelated, usize::MAX).unwrap(),
+            0,
+            "an unrelated type id has no references"
+        );
     }
 
     #[test]

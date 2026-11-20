@@ -25,7 +25,8 @@ use brain_core::{Entity, EntityId, EntityType, EntityTypeId};
 use brain_embed::{Dispatcher, EmbedError};
 use brain_extractors::resolver::{
     resolve_or_create_with_deps, Disambiguation, EmbeddingDeps, EntityDisambiguator,
-    PrecomputedVerdicts, Resolution, ResolutionTier, StagedEntityVectors,
+    LlmCandidateView, MatchVerdict, PrecomputedVerdicts, Resolution, ResolutionTier,
+    StagedEntityVectors,
 };
 use brain_index::entity_hnsw::{EntityHnswIndex, EntityHnswParams};
 use brain_index::VECTOR_DIM;
@@ -54,29 +55,31 @@ const NOW: u64 = 1_700_000_000_000_000_000;
 /// counter so tests can assert the disambiguator actually fired.
 struct FakeDisambiguator {
     reply: String,
+    /// Provider spend the fake reports for each completion, so a test can
+    /// assert that the resolver carries a real charge out of the call.
+    cost_micro_usd: u64,
     calls: Mutex<u32>,
 }
 
 impl FakeDisambiguator {
-    fn confirming() -> Arc<Self> {
+    fn with_reply(reply: &str, cost_micro_usd: u64) -> Arc<Self> {
         Arc::new(Self {
-            reply: "YES 0.95".into(),
+            reply: reply.into(),
+            cost_micro_usd,
             calls: Mutex::new(0),
         })
+    }
+
+    fn confirming() -> Arc<Self> {
+        Self::with_reply("YES 0.95", 0)
     }
 
     fn rejecting() -> Arc<Self> {
-        Arc::new(Self {
-            reply: "NO".into(),
-            calls: Mutex::new(0),
-        })
+        Self::with_reply("NO", 0)
     }
 
     fn uncertain() -> Arc<Self> {
-        Arc::new(Self {
-            reply: "UNCERTAIN".into(),
-            calls: Mutex::new(0),
-        })
+        Self::with_reply("UNCERTAIN", 0)
     }
 
     fn call_count(&self) -> u32 {
@@ -88,6 +91,7 @@ impl LlmClient for FakeDisambiguator {
     fn complete<'a>(&'a self, _request: LlmRequest) -> LlmFuture<'a> {
         *self.calls.lock().unwrap() += 1;
         let content = self.reply.clone();
+        let cost_micro_usd = self.cost_micro_usd;
         Box::pin(async move {
             Ok(LlmResponse {
                 truncated: false,
@@ -96,7 +100,7 @@ impl LlmClient for FakeDisambiguator {
                 tokens_out: 0,
                 cache_creation_input_tokens: 0,
                 cache_read_input_tokens: 0,
-                cost_micro_usd: 0,
+                cost_micro_usd,
                 model_version: "fake-model".into(),
             })
         })
@@ -297,7 +301,8 @@ fn two_phase_resolve(
         let mut v = PrecomputedVerdicts::new();
         for p in pending {
             let verdict =
-                futures_lite::future::block_on(dis.confirm("acme", &p.view, &p.raw_surface));
+                futures_lite::future::block_on(dis.confirm("acme", &p.view, &p.raw_surface))
+                    .verdict;
             v.insert(p.norm_surface, p.candidate, verdict);
         }
         v
@@ -570,4 +575,44 @@ fn uncertain_verdict_falls_through_to_create_plus_merge_proposal() {
     let proposal = &pending[0];
     assert_eq!(proposal.source_entity, res.entity_id.to_bytes());
     assert_eq!(proposal.candidate_entity, closer_id.to_bytes());
+}
+
+/// Every disambiguation call carries the provider's charge back out, including
+/// the calls whose answer the resolver cannot use.
+///
+/// The unparseable case is the one that matters most: the provider billed a
+/// completion, the resolver could not read it, and falling back to the
+/// cosine-only path does not make the charge go away. A verdict carrying no
+/// cost would leave every LLM judgement on the write path invisible to spend
+/// accounting.
+#[test]
+fn confirm_carries_provider_cost_even_when_the_reply_is_unusable() {
+    let view = LlmCandidateView {
+        entity_id: EntityId::new(),
+        canonical_name: "Tokyo".into(),
+        aliases: Vec::new(),
+        entity_type_name: "Person".into(),
+    };
+
+    let usable = FakeDisambiguator::with_reply("YES 0.95", 1_234);
+    let dis = EntityDisambiguator::new(Arc::new(brain_llm::FixedResolver::new(usable.clone())));
+    let outcome = futures_lite::future::block_on(dis.confirm("acme", &view, "Tokyo"));
+    assert!(
+        matches!(outcome.verdict, MatchVerdict::Confirmed { .. }),
+        "a parseable YES above the floor confirms the candidate",
+    );
+    assert_eq!(outcome.cost_micro_usd, 1_234, "spend follows the verdict");
+
+    let garbage = FakeDisambiguator::with_reply("I think they might be?", 777);
+    let dis = EntityDisambiguator::new(Arc::new(brain_llm::FixedResolver::new(garbage.clone())));
+    let outcome = futures_lite::future::block_on(dis.confirm("acme", &view, "Tokyo"));
+    assert!(
+        matches!(outcome.verdict, MatchVerdict::Skipped { .. }),
+        "an unparseable reply degrades to the no-disambiguator path",
+    );
+    assert_eq!(
+        outcome.cost_micro_usd, 777,
+        "a billed reply we could not parse is still spend",
+    );
+    assert_eq!(garbage.call_count(), 1);
 }

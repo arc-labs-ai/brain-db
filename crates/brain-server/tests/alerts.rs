@@ -9,37 +9,43 @@
 //! - Severities are from the spec set (critical / high / medium / low),
 //!   with at least one alert per level.
 //! - Every required alert is present (catches accidental rule deletion).
-//! - **Every metric an `expr` references is one the server actually emits.**
-//!   The emitted set is parsed straight from
-//!   `src/metrics/format.rs`, so an alert can never again reference a
-//!   metric that does not exist (the class of bug that let
-//!   `brain_snapshot_failures_total` and `brain_frame_send_total{opcode=…}`
-//!   ship as permanently-silent alerts).
+//! - Every metric, grouping label, and range function in an alert is valid
+//!   for the exposition emitted by the server.
 
 #![cfg(target_os = "linux")]
 
-use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
+
+mod metrics_catalog;
+
+use metrics_catalog::{
+    expr_grouping_labels, expr_metrics, expr_range_functions, Catalog, MetricKind,
+};
 
 const REQUIRED_ALERTS: &[&str] = &[
     // critical
     "BrainSubstrateDown",
     "BrainHighErrorRate",
     "BrainWorkerErrors",
+    "BrainExtractionQueueUnobserved",
     // high
     "BrainHighLatency",
     "BrainWorkerStuck",
     "BrainExtractorApplyDropping",
+    "BrainDerivationQueueUnbounded",
+    "BrainDerivationQueueStale",
     // medium
     "BrainHighTombstoneRatio",
     "BrainArenaNearCapacity",
     "BrainStatementEmbedErrors",
     "BrainConnectionsChurning",
+    "BrainDerivationAdmissionStarved",
     // low
     "BrainConfigChanged",
     "BrainExtractorBackpressure",
     "BrainTraceExportFailing",
+    "BrainDerivationAdmissionHeadroomLow",
 ];
 
 const ALLOWED_SEVERITIES: &[&str] = &["critical", "high", "medium", "low"];
@@ -56,13 +62,6 @@ fn rules_path() -> PathBuf {
         .join("monitoring")
         .join("alerts")
         .join("brain-rules.yml")
-}
-
-fn format_src_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("src")
-        .join("metrics")
-        .join("format.rs")
 }
 
 /// Tiny YAML scanner — for each line, extract `alert: Name` and
@@ -123,68 +122,6 @@ fn collect_exprs(text: &str) -> Vec<String> {
     out
 }
 
-/// Pull metric names out of a PromQL expr: identifiers starting with
-/// `brain_` / `process_`, plus the synthetic `up`. Histogram suffixes
-/// (`_bucket` / `_sum` / `_count`) are stripped back to the base family.
-/// Label keys/values and function names never start with those prefixes,
-/// so they fall out naturally.
-fn expr_metrics(expr: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let bytes = expr.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i];
-        if c.is_ascii_alphabetic() || c == b'_' {
-            let start = i;
-            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-                i += 1;
-            }
-            let ident = &expr[start..i];
-            if ident.starts_with("brain_") || ident.starts_with("process_") || ident == "up" {
-                let base = ident
-                    .strip_suffix("_bucket")
-                    .or_else(|| ident.strip_suffix("_sum"))
-                    .or_else(|| ident.strip_suffix("_count"))
-                    .unwrap_or(ident);
-                out.push(base.to_string());
-            }
-        } else {
-            i += 1;
-        }
-    }
-    out
-}
-
-/// Parse the set of metric family names the exposition actually emits by
-/// scanning the source of `metrics/format.rs` for `brain_*` / `process_*`
-/// string literals. This auto-syncs the gate with the code: add a metric
-/// and it's allowed; reference one you never added and the gate fails.
-fn emitted_metrics() -> HashSet<String> {
-    let src = fs::read_to_string(format_src_path()).expect("read format.rs");
-    let mut set: HashSet<String> = HashSet::new();
-    let bytes = src.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i];
-        if c.is_ascii_alphabetic() || c == b'_' {
-            let start = i;
-            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-                i += 1;
-            }
-            let ident = &src[start..i];
-            if ident.starts_with("brain_") || ident.starts_with("process_") {
-                set.insert(ident.to_string());
-            }
-        } else {
-            i += 1;
-        }
-    }
-    for ext in KNOWN_EXTERNAL_METRICS {
-        set.insert((*ext).to_string());
-    }
-    set
-}
-
 #[test]
 fn every_required_alert_is_present() {
     let raw = fs::read_to_string(rules_path()).expect("read");
@@ -228,11 +165,14 @@ fn at_least_one_alert_per_severity_level() {
 #[test]
 fn every_referenced_metric_is_emitted() {
     let raw = fs::read_to_string(rules_path()).expect("read");
-    let emitted = emitted_metrics();
+    let catalog = Catalog::parse();
     let mut violations = Vec::new();
     for expr in collect_exprs(&raw) {
-        for metric in expr_metrics(&expr) {
-            if !emitted.contains(&metric) {
+        let metrics = expr_metrics(&expr);
+        for metric in metrics {
+            if !KNOWN_EXTERNAL_METRICS.contains(&metric.as_str())
+                && catalog.resolve(&metric).is_none()
+            {
                 violations.push(format!("`{metric}` (in expr `{}`)", expr.trim()));
             }
         }
@@ -249,10 +189,79 @@ fn every_referenced_metric_is_emitted() {
 /// returning an empty set (which would make the gate above vacuous).
 #[test]
 fn emitted_set_parser_finds_known_metrics() {
-    let emitted = emitted_metrics();
+    let catalog = Catalog::parse();
     assert!(
-        emitted.contains("brain_request_total"),
+        catalog.names().contains("brain_request_total"),
         "emitted-set parser failed to find brain_request_total — parser is broken",
     );
-    assert!(emitted.contains("up"), "synthetic `up` must be allowed");
+    assert_eq!(
+        catalog.family("brain_request_total").unwrap().kind,
+        MetricKind::Counter
+    );
+    assert!(
+        KNOWN_EXTERNAL_METRICS.contains(&"up"),
+        "synthetic `up` must be allowed"
+    );
+}
+
+#[test]
+fn every_alert_grouping_label_exists() {
+    let raw = fs::read_to_string(rules_path()).expect("read");
+    let catalog = Catalog::parse();
+    let mut violations = Vec::new();
+    for expr in collect_exprs(&raw) {
+        for label in expr_grouping_labels(&expr) {
+            for metric in expr_metrics(&expr) {
+                match catalog.allowed_labels(&metric) {
+                    Some(allowed) if allowed.contains(&label) => {}
+                    Some(allowed) => violations.push(format!(
+                        "expr `{expr}`: `{metric}` does not allow `{label}`; catalog allows {allowed:?}"
+                    )),
+                    None => violations.push(format!(
+                        "expr `{expr}`: `{metric}` is unresolved while checking `{label}`"
+                    )),
+                }
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "alert grouping-label violations:\n  {}",
+        violations.join("\n  ")
+    );
+}
+
+#[test]
+fn every_alert_range_function_matches_metric_type() {
+    let raw = fs::read_to_string(rules_path()).expect("read");
+    let catalog = Catalog::parse();
+    let counter_functions = ["rate", "irate", "increase", "resets"];
+    let gauge_functions = ["delta", "idelta", "deriv", "predict_linear", "holt_winters"];
+    let mut violations = Vec::new();
+    for expr in collect_exprs(&raw) {
+        for (function, metrics) in expr_range_functions(&expr) {
+            for metric in metrics {
+                let valid = catalog
+                    .resolve(&metric)
+                    .map(|(family, suffix)| {
+                        (counter_functions.contains(&function.as_str())
+                            && (family.kind == MetricKind::Counter
+                                || (family.kind == MetricKind::Histogram && suffix.is_some())))
+                            || (gauge_functions.contains(&function.as_str())
+                                && family.kind == MetricKind::Gauge)
+                    })
+                    .unwrap_or(false);
+                if !valid {
+                    violations.push(format!(
+                        "expr `{expr}`: `{function}` is incompatible with `{metric}`"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "alert range-function violations:\n  {}",
+        violations.join("\n  ")
+    );
 }

@@ -16,9 +16,9 @@
 //! direct passage embedding misses.
 //!
 //! Cost lands entirely here, at write time: the generation LLM call is
-//! cached (keyed on the memory text) so a re-ingest is free, and it
-//! respects the extractor worker's per-cycle LLM budget. The embedding is
-//! the same local BGE model the rest of the write path uses.
+//! cached (keyed on the memory text) so a re-ingest is free, and its spend
+//! is recorded in the `llm_spend` ledger under the HyPE stage. The embedding
+//! is the same local BGE model the rest of the write path uses.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,7 +31,8 @@ use brain_llm::{CredentialOutcome, LlmCredentialResolver, LlmMessage, LlmRequest
 use brain_metadata::llm_cache::{LlmResponse as CachedResponse, LLM_RESPONSES_TABLE};
 use brain_metadata::{
     hype_neighborhood_hash_get, hype_neighborhood_hash_put, hype_vector_put,
-    hype_vectors_delete_memory, LlmCacheDb, MetadataDb,
+    hype_vectors_delete_memory, llm_spend_add, tables::llm_spend::llm_spend_stage, LlmCacheDb,
+    MetadataDb,
 };
 use parking_lot::{Mutex, RwLock};
 
@@ -82,24 +83,29 @@ pub struct HypeGenOutcome {
     /// Why the stage could not run, as opposed to running and finding
     /// nothing. `None` is a stage that ran.
     ///
-    /// A reason rather than a flag because the flag alone was not actionable.
-    /// Every failure path here already had the cause in hand and passed it to
-    /// `tracing`, then returned a bare `true` — so the stage record said a
-    /// write was degraded without saying what to fix, and the one place the
-    /// answer existed was a log line nobody correlates to a memory id. An
-    /// `Option<String>` also makes "failed, reason unknown" unrepresentable,
-    /// which is the state the record used to be stuck in.
+    /// A reason rather than a flag, because a flag alone is not actionable.
+    /// Every failure path here has the cause in hand and passes it to
+    /// `tracing`; returning a bare `true` would leave the stage record saying
+    /// a write was degraded without saying what to fix, with the one place the
+    /// answer exists being a log line nobody correlates to a memory id. An
+    /// `Option<String>` also makes "failed, reason unknown" unrepresentable.
     ///
-    /// HyPE stays best-effort — a failure here is still logged, folded into a
-    /// zero-question outcome, and never fails the surrounding write. What
-    /// changes is that the failure is no longer INVISIBLE: every zero outcome
-    /// used to publish `StageOutcome::Empty`, which the encode trace maps to
-    /// `Ok`, so "the namespace has no LLM provider key" and "this text
-    /// warranted no questions" were byte-identical in the trace. A degraded
-    /// write then looked exactly like a healthy one, which is how a sandbox
-    /// ends up with entities, no statements, an empty graph, and nothing
-    /// anywhere saying why.
+    /// HyPE stays best-effort — a failure here is logged, folded into a
+    /// zero-question outcome, and never fails the surrounding write. What it
+    /// must not be is INVISIBLE: publishing `StageOutcome::Empty` for every
+    /// zero outcome, which the encode trace maps to `Ok`, makes "the namespace
+    /// has no LLM provider key" and "this text warranted no questions"
+    /// byte-identical in the trace. A degraded write then looks exactly like a
+    /// healthy one, which is how a sandbox ends up with entities, no
+    /// statements, an empty graph, and nothing anywhere saying why.
     pub failure: Option<String>,
+}
+
+/// A HyPE generation that could not produce questions, and what the attempt cost.
+#[derive(Debug, Clone)]
+pub struct HypeGenFailure {
+    pub reason: String,
+    pub cost_micro_usd: u64,
 }
 
 impl HypeGenOutcome {
@@ -156,23 +162,45 @@ impl HypeGenerator {
             return HypeGenOutcome::default();
         }
 
-        let (questions, cost_micro) = match self.questions_for(namespace, text, neighborhood).await
+        let (questions, cost_micro) = match self
+            .questions_for(
+                namespace,
+                text,
+                neighborhood,
+                llm_spend_stage::HYPE_GENERATE,
+            )
+            .await
         {
             Ok(qs) => qs,
             Err(e) => {
                 tracing::warn!(
                     target: "brain_workers::hype",
                     memory_id = ?memory_id,
-                    error = %e,
+                    error = %e.reason,
+                    cost_micro_usd = e.cost_micro_usd,
                     "HyPE question generation failed; skipping",
                 );
                 return HypeGenOutcome {
-                    failure: Some(e.to_string()),
-                    ..Default::default()
+                    failure: Some(e.reason),
+                    cost_micro_usd: e.cost_micro_usd,
+                    questions_written: 0,
                 };
             }
         };
+        let nbhd_hash = input_hash(text, neighborhood);
         if questions.is_empty() {
+            // The model answered for this exact input and the answer held no
+            // usable question. Mark the input answered so the refresh sweep,
+            // which revisits every memory each cycle, does not put the same
+            // question to the model again until the input itself changes.
+            if let Err(error) = self.record_answered_input(memory_id, nbhd_hash) {
+                tracing::warn!(
+                    target: "brain_workers::hype",
+                    memory_id = ?memory_id,
+                    %error,
+                    "HyPE could not record an answered-but-empty generation",
+                );
+            }
             return HypeGenOutcome {
                 questions_written: 0,
                 cost_micro_usd: cost_micro,
@@ -184,8 +212,14 @@ impl HypeGenerator {
         // user query is embedded the same way, so question↔query cosine
         // is in-distribution.
         let mut vectors: Vec<[f32; 384]> = Vec::with_capacity(questions.len());
+        // Each question is offloaded on its own: `Dispatcher` has no batch
+        // form for query embeddings, and batching here would mean re-applying
+        // `BGE_QUERY_PREFIX` at the call site and forking the dispatcher's
+        // query/passage cache keying. The count is clamped to
+        // `MAX_QUESTIONS_PER_MEMORY`, so one offload per question is cheap and
+        // yields to the reactor between questions.
         for q in &questions {
-            match self.embedder.embed_query(q) {
+            match brain_ops::embedding::embed_query_off_reactor(&self.embedder, q).await {
                 Ok(v) => vectors.push(v),
                 Err(e) => {
                     tracing::warn!(
@@ -210,7 +244,6 @@ impl HypeGenerator {
         // the index from the persisted rows. `replace=false`: this is the
         // first generation for the memory, so there are no prior rows to
         // clear and the points are appended to the live index.
-        let nbhd_hash = input_hash(text, neighborhood);
         match self.persist(memory_id, &vectors, nbhd_hash, false) {
             Ok(()) => {}
             Err(e) => {
@@ -293,23 +326,39 @@ impl HypeGenerator {
             }
         }
 
-        let (questions, cost_micro) = match self.questions_for(namespace, text, neighborhood).await
+        let (questions, cost_micro) = match self
+            .questions_for(namespace, text, neighborhood, llm_spend_stage::HYPE_REFRESH)
+            .await
         {
             Ok(qs) => qs,
             Err(e) => {
                 tracing::warn!(
                     target: "brain_workers::hype",
                     memory_id = ?memory_id,
-                    error = %e,
+                    error = %e.reason,
+                    cost_micro_usd = e.cost_micro_usd,
                     "HyPE refresh generation failed; keeping prior questions",
                 );
                 return HypeGenOutcome {
-                    failure: Some(e.to_string()),
-                    ..Default::default()
+                    failure: Some(e.reason),
+                    cost_micro_usd: e.cost_micro_usd,
+                    questions_written: 0,
                 };
             }
         };
         if questions.is_empty() {
+            // The model answered for this exact input and the answer held no
+            // usable question. Mark the input answered so the refresh sweep,
+            // which revisits every memory each cycle, does not put the same
+            // question to the model again until the input itself changes.
+            if let Err(error) = self.record_answered_input(memory_id, nbhd_hash) {
+                tracing::warn!(
+                    target: "brain_workers::hype",
+                    memory_id = ?memory_id,
+                    %error,
+                    "HyPE could not record an answered-but-empty refresh",
+                );
+            }
             return HypeGenOutcome {
                 questions_written: 0,
                 cost_micro_usd: cost_micro,
@@ -319,7 +368,7 @@ impl HypeGenerator {
 
         let mut vectors: Vec<[f32; 384]> = Vec::with_capacity(questions.len());
         for q in &questions {
-            if let Ok(v) = self.embedder.embed_query(q) {
+            if let Ok(v) = brain_ops::embedding::embed_query_off_reactor(&self.embedder, q).await {
                 vectors.push(v);
             }
         }
@@ -389,6 +438,29 @@ impl HypeGenerator {
         Ok(())
     }
 
+    /// Record the `(text, neighborhood)` input HyPE has already answered for
+    /// this memory, leaving the stored question vectors untouched.
+    ///
+    /// The refresh gate compares against this hash, so it marks an input as
+    /// answered rather than marking a generation as successful: a completed
+    /// generation that yielded no usable questions has still consumed its
+    /// answer for that exact input, and asking again returns the same thing.
+    /// A changed neighborhood or changed memory text produces a different
+    /// hash, which reopens the gate.
+    fn record_answered_input(
+        &self,
+        memory_id: MemoryId,
+        neighborhood_hash: [u8; 32],
+    ) -> Result<(), String> {
+        let wtxn = self
+            .metadata
+            .write_txn()
+            .map_err(|e| format!("hype write_txn: {e}"))?;
+        hype_neighborhood_hash_put(&wtxn, memory_id, neighborhood_hash)
+            .map_err(|e| format!("hype_neighborhood_hash_put: {e}"))?;
+        wtxn.commit().map_err(|e| format!("hype commit: {e}"))
+    }
+
     /// Return the generated questions and the LLM cost (0 on a cache
     /// hit). Reads the shared LLM cache first; on a miss it calls the
     /// model and writes the reply back.
@@ -397,7 +469,8 @@ impl HypeGenerator {
         namespace: &str,
         text: &str,
         neighborhood: &str,
-    ) -> Result<(Vec<String>, u64), String> {
+        stage: u8,
+    ) -> Result<(Vec<String>, u64), HypeGenFailure> {
         // The cache key folds in the neighborhood: the same memory text with a
         // richer graph around it should regenerate (different bridge
         // questions), so a neighborhood change must miss the cache.
@@ -409,12 +482,16 @@ impl HypeGenerator {
         let credential = match self.resolver.client_for(namespace, None).await {
             CredentialOutcome::Ready(c) => c,
             CredentialOutcome::Missing => {
-                return Err(format!("hype: {}", self.resolver.missing_reason(namespace)));
+                return Err(HypeGenFailure {
+                    reason: format!("hype: {}", self.resolver.missing_reason(namespace)),
+                    cost_micro_usd: 0,
+                });
             }
             CredentialOutcome::Unavailable => {
-                return Err(format!(
-                    "hype: llm credential for namespace {namespace} unavailable"
-                ));
+                return Err(HypeGenFailure {
+                    reason: format!("hype: llm credential for namespace {namespace} unavailable"),
+                    cost_micro_usd: 0,
+                });
             }
         };
         let client = credential.client.clone();
@@ -445,10 +522,20 @@ impl HypeGenerator {
             max_tokens: 2048,
             timeout: Duration::from_secs(30),
         };
-        let resp = client
-            .complete(req)
-            .await
-            .map_err(|e| format!("hype llm transport: {e}"))?;
+        let resp = match client.complete(req).await {
+            Ok(resp) => {
+                self.record_spend(namespace, stage, resp.cost_micro_usd);
+                resp
+            }
+            Err(e) => {
+                let cost_micro_usd = e.billed_usage().map_or(0, |b| b.cost_micro_usd);
+                self.record_spend(namespace, stage, cost_micro_usd);
+                return Err(HypeGenFailure {
+                    reason: format!("hype llm transport: {e}"),
+                    cost_micro_usd,
+                });
+            }
+        };
 
         let questions = parse_questions(&resp.content, self.num_questions);
         if !questions.is_empty() {
@@ -464,6 +551,41 @@ impl HypeGenerator {
             );
         }
         Ok((questions, resp.cost_micro_usd))
+    }
+
+    /// Append `micro_usd` to the durable ledger for this namespace and stage.
+    ///
+    /// Its own short transaction, taken after the provider call has already
+    /// returned: a redb write txn held across the `.await` would hold the
+    /// metadata DB's single writer for the whole provider round-trip.
+    ///
+    /// Best-effort — a ledger write that fails is logged and never fails the
+    /// generation, matching how the rest of HyPE treats its own failures. A
+    /// zero is not written: a cache hit costs nothing and an empty row is
+    /// noise in the reconciliation read.
+    fn record_spend(&self, namespace: &str, stage: u8, micro_usd: u64) {
+        if micro_usd == 0 {
+            return;
+        }
+        let result = (|| -> Result<(), String> {
+            let wtxn = self
+                .metadata
+                .write_txn()
+                .map_err(|e| format!("write_txn: {e}"))?;
+            llm_spend_add(&wtxn, namespace, stage, micro_usd)
+                .map_err(|e| format!("llm_spend_add: {e}"))?;
+            wtxn.commit().map_err(|e| format!("commit: {e}"))
+        })();
+        if let Err(error) = result {
+            tracing::warn!(
+                target: "brain_workers::hype",
+                namespace,
+                stage,
+                micro_usd,
+                %error,
+                "failed to persist HyPE spend",
+            );
+        }
     }
 
     fn system_prompt() -> String {
@@ -597,7 +719,84 @@ fn now_unix_nanos() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_questions;
+    use super::{input_hash, parse_questions, HypeGenerator};
+    use std::sync::Arc;
+
+    use brain_core::MemoryId;
+    use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
+    use brain_index::{EntityHnswParams, HypeHnswIndex};
+    use brain_llm::client::LlmFuture;
+    use brain_llm::types::{LlmRequest, LlmResponse};
+    use brain_llm::{FixedResolver, LlmClient};
+    use brain_metadata::LlmCacheDb;
+    use brain_metadata::{hype_neighborhood_hash_get, hype_neighborhood_hash_put, MetadataDb};
+    use parking_lot::{Mutex, RwLock};
+    use tempfile::tempdir;
+
+    struct UnparseableClient;
+
+    impl LlmClient for UnparseableClient {
+        fn complete<'a>(&'a self, _request: LlmRequest) -> LlmFuture<'a> {
+            Box::pin(async {
+                Ok(LlmResponse {
+                    // Prose with no question mark: `parse_questions` drops every line,
+                    // so the call was billed and yielded nothing usable.
+                    content: "I cannot write questions for this text.".to_string(),
+                    tokens_in: 100,
+                    tokens_out: 12,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                    cost_micro_usd: 900,
+                    model_version: "test-model-1".to_string(),
+                    truncated: false,
+                })
+            })
+        }
+
+        fn model(&self) -> &str {
+            "test/unparseable"
+        }
+
+        fn model_id_hash(&self) -> u64 {
+            0x7465_7374
+        }
+    }
+
+    struct UnreachableEmbedder;
+
+    impl Dispatcher for UnreachableEmbedder {
+        fn embed(&self, _text: &str) -> Result<[f32; VECTOR_DIM], EmbedError> {
+            unreachable!("the zero-question branch returns before any embed")
+        }
+
+        fn embed_batch(&self, _texts: &[&str]) -> Result<Vec<[f32; VECTOR_DIM]>, EmbedError> {
+            unreachable!("the zero-question branch returns before any embed")
+        }
+
+        fn fingerprint(&self) -> [u8; 16] {
+            [0u8; 16]
+        }
+    }
+
+    fn generator_with_unparseable_llm() -> (HypeGenerator, Arc<MetadataDb>, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let metadata = Arc::new(MetadataDb::open(dir.path().join("metadata.redb")).unwrap());
+        let cache = Arc::new(Mutex::new(
+            LlmCacheDb::open(dir.path().join("llm_cache.redb")).unwrap(),
+        ));
+        let index = Arc::new(RwLock::new(
+            HypeHnswIndex::new(EntityHnswParams::default_v1()).unwrap(),
+        ));
+        let generator = HypeGenerator::new(
+            Arc::new(FixedResolver::new(Arc::new(UnparseableClient))),
+            Arc::new(UnreachableEmbedder),
+            index,
+            Arc::clone(&metadata),
+            cache,
+            4,
+        );
+        (generator, metadata, dir)
+    }
 
     #[test]
     fn parse_strips_numbering_and_bullets() {
@@ -624,5 +823,96 @@ mod tests {
         assert_eq!(qs.len(), 2, "capped at num_questions");
         assert_eq!(qs[0], "What is X?");
         assert_eq!(qs[1], "Who is Y?", "duplicate skipped, next distinct kept");
+    }
+
+    #[test]
+    fn answered_input_hash_closes_gate_and_changes_reopen_it() {
+        let dir = tempdir().unwrap();
+        let db = MetadataDb::open(dir.path().join("metadata.redb")).unwrap();
+        let memory_id = MemoryId::from_be_bytes([7; 16]);
+        let hash = input_hash("text", "nbhd");
+
+        let rtxn = db.read_txn().unwrap();
+        assert!(hype_neighborhood_hash_get(&rtxn, memory_id)
+            .unwrap()
+            .is_none());
+        drop(rtxn);
+
+        let wtxn = db.write_txn().unwrap();
+        hype_neighborhood_hash_put(&wtxn, memory_id, hash).unwrap();
+        wtxn.commit().unwrap();
+
+        let rtxn = db.read_txn().unwrap();
+        assert_eq!(
+            hype_neighborhood_hash_get(&rtxn, memory_id).unwrap(),
+            Some(hash)
+        );
+        assert_ne!(input_hash("text", "nbhd"), input_hash("text", "other nbhd"));
+    }
+
+    #[tokio::test]
+    async fn generate_marks_a_billed_but_unparseable_reply_as_answered() {
+        let (generator, metadata, _dir) = generator_with_unparseable_llm();
+        let memory_id = MemoryId::from_be_bytes([11; 16]);
+        let text = "Caroline moved to Lisbon in 2019.";
+        let neighborhood = "Caroline works_at Northwind";
+
+        // Nothing is stored yet, so a hash found afterwards can only come from
+        // the call under test.
+        let rtxn = metadata.read_txn().unwrap();
+        assert!(hype_neighborhood_hash_get(&rtxn, memory_id)
+            .unwrap()
+            .is_none());
+        drop(rtxn);
+
+        let outcome = generator
+            .generate_for("ns-test", memory_id, text, neighborhood)
+            .await;
+        assert_eq!(outcome.questions_written, 0);
+        assert!(
+            outcome.failure.is_none(),
+            "the model answered; it just answered uselessly"
+        );
+
+        // The gate must close on an input the model has already been paid for:
+        // otherwise the sweep re-asks the provider and leaks money forever.
+        let rtxn = metadata.read_txn().unwrap();
+        assert_eq!(
+            hype_neighborhood_hash_get(&rtxn, memory_id).unwrap(),
+            Some(input_hash(text, neighborhood)),
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_marks_a_billed_but_unparseable_reply_as_answered() {
+        let (generator, metadata, _dir) = generator_with_unparseable_llm();
+        let memory_id = MemoryId::from_be_bytes([12; 16]);
+        let text = "Caroline moved to Lisbon in 2019.";
+        let neighborhood = "Caroline works_at Northwind";
+
+        // Nothing is stored yet, so a hash found afterwards can only come from
+        // the call under test.
+        let rtxn = metadata.read_txn().unwrap();
+        assert!(hype_neighborhood_hash_get(&rtxn, memory_id)
+            .unwrap()
+            .is_none());
+        drop(rtxn);
+
+        let outcome = generator
+            .refresh_for("ns-test", memory_id, text, neighborhood)
+            .await;
+        assert_eq!(outcome.questions_written, 0);
+        assert!(
+            outcome.failure.is_none(),
+            "the model answered; it just answered uselessly"
+        );
+
+        // The gate must close on an input the model has already been paid for:
+        // otherwise the sweep re-asks the provider and leaks money forever.
+        let rtxn = metadata.read_txn().unwrap();
+        assert_eq!(
+            hype_neighborhood_hash_get(&rtxn, memory_id).unwrap(),
+            Some(input_hash(text, neighborhood)),
+        );
     }
 }

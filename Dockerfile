@@ -16,7 +16,11 @@
 #   docker build -t brain:latest .
 #
 # Run:
+#   io_uring syscalls are blocked by Docker's default seccomp profile, and each
+#   shard reactor pins its rings in locked memory, so both flags are mandatory
+#   for the server to start.
 #   docker run -d --name brain \
+#     --security-opt seccomp=unconfined --ulimit memlock=-1 \
 #     -p 8080:8080 -p 9091:9091 \
 #     -v brain-data:/var/lib/brain/data \
 #     brain:latest
@@ -35,6 +39,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         pkg-config \
         cmake \
     && rm -rf /var/lib/apt/lists/*
+
+# candle's f16 matmul kernels reach aarch64 half-precision SIMD through inline
+# assembly that the assembler only accepts when half-precision data processing
+# is enabled, so the arm64 leg of the multi-arch build cannot compile without
+# this flag. Scoped to the aarch64 triple because it is meaningless on x86_64
+# and both architectures build from this file; `+fp16` rather than a raised
+# target-cpu because the kernels pick themselves by runtime CPU detection and
+# the published image must still run on pre-v8.2 aarch64 hardware.
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-feature=+fp16"
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
@@ -70,12 +83,13 @@ ARG EMBED_MODEL_REPO=BAAI/bge-small-en-v1.5
 ARG EMBED_MODEL_REV=main
 ARG EMBED_MODEL_DIR=/models/bge-small-en-v1.5
 
-# GLiNER is the classifier tier of the extractor pipeline. Unlike the embedder
-# it degrades rather than failing: a missing model leaves the tier unloaded and
-# the server starts anyway, so its absence is silent. Bundling it means the
-# stock image extracts with correct span boundaries instead of quietly running
-# a weaker pipeline. The weights are GLiNER's own; the tokenizer, backbone
-# config and SPM come from the DeBERTa-v3-small the model was trained on.
+# GLiNER is the classifier tier of the extractor pipeline and is mandatory,
+# exactly like the embedder. A shard with a missing classifier model fails at
+# boot rather than extracting with a weaker pipeline, because a server that
+# reports itself healthy while silently degrading every write is the worse
+# outcome. Bundling the weights therefore makes the stock image bootable at all.
+# The weights are GLiNER's own; the tokenizer, backbone config and SPM come from
+# the DeBERTa-v3-small the model was trained on.
 ARG NER_MODEL_REPO=urchade/gliner_small-v2.1
 # Not microsoft/deberta-v3-small: that repo ships only spm.model +
 # tokenizer_config.json, and the `tokenizers` crate needs a JSON tokenizer.

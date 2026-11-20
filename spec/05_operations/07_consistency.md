@@ -4,7 +4,7 @@ The consistency guarantees Brain provides for its operations.
 
 ## 1. The model: per-shard linearizable writes, immediately-visible semantic reads
 
-- **Writes within a shard** are linearizable. There is a clear order; later writes see earlier ones.
+- **Writes within a shard** are linearizable. Requests overlap on a shard, but their commits do not: the order is the order in which their redb write transactions commit, and a write issued after another's ack sees it.
 - **A write's own memory is searchable the moment its ack returns.** The HNSW insert happens inside the write submission, before the metadata commit and before the ack, and the index serves a freshly-inserted vector from a pending buffer at exact cosine until a later flush folds it into the main graph. There is no publication lag to wait out and nothing to opt into.
 - **What *is* eventual is everything derived from the write**, not the write: the lexical index's group commit, and the four async derivation stages (auto-edge, temporal-edge, extractor, HyPE).
 
@@ -50,19 +50,27 @@ Within a transaction:
 
 This is **read committed** with **read-your-writes** within the transaction.
 
-Brain does not provide stronger isolation (snapshot isolation, serializable). Brain's writer-per-shard discipline obviates many of the problems stronger isolation would solve.
+Brain does not provide stronger isolation (snapshot isolation, serializable). One writer handle per shard, and commits that serialize structurally rather than by locking, remove most of what stronger isolation exists to resolve — see [14. Concurrency](../14_concurrency/02_writer_model.md).
 
 ## 7. The SUBSCRIBE consistency
 
-SUBSCRIBE delivers events in WAL order per shard. The client sees:
+A subscription has two phases, and they carry different ordering guarantees.
 
-- All events from the requested from_lsn onward.
-- In WAL order (per shard).
+**Replay** — everything from the requested `from_lsn` up to the WAL tail — is strictly ordered. The segment is walked record by record, so the client sees those events in the order the WAL holds them.
+
+**The live tail** is ordered with detection. The shard WAL assigns an LSN to every record, including row writes that never publish an event, so the LSNs a subscriber sees are sparse: on receiving LSN 11, a client cannot tell whether 10 is a notification still in flight or a row write that will never arrive. Nothing on the source side can decide when such a gap closes, so the stream neither buffers nor reorders. An event arriving below the highest LSN already delivered terminates the subscription with `ERROR(Overloaded)` and the client resubscribes from a known LSN — the same contract a subscriber gets when it lags past the broadcast buffer.
+
+Events carrying `lsn == 0` are bus-only. They have no WAL record, cannot be replayed, are exempt from the ordering check, and never move the subscription's resume point.
+
+So the client sees:
+
+- All events from the requested `from_lsn` onward.
+- In WAL order (per shard) — through replay always, on the live tail or else an `ERROR(Overloaded)` that ends the stream rather than a silent reordering.
 - At-least-once.
 
 For a client that wants exactly-once: dedupe by LSN.
 
-For cross-shard SUBSCRIBE: events from each shard arrive in their respective WAL orders; cross-shard order isn't strict.
+For cross-shard SUBSCRIBE: events from each shard arrive under that shard's own guarantee; cross-shard order isn't strict.
 
 ## 8. What a client actually observes
 
@@ -201,16 +209,10 @@ Operations across spaces are not expressible; a space is a hard wall. Brain does
 
 For applications that need cross-space coordination, layer logic on top: an external coordination mechanism (a queue, a lock service) ensures order.
 
-## 20. The "future stronger consistency" question
+## 20. Stronger consistency modes
 
-A future enhancement could add stronger consistency modes:
-
-- Snapshot isolation.
-- Linearizable reads across shards.
-- Causal consistency (tracked happens-before).
-
-None is needed today. Within a space — which is one shard — writes are ordered and immediately visible, and the only genuinely asynchronous state announces its own completion. The open questions are all cross-shard, and cross-shard reads are rank-merged, which has no ordering semantics to strengthen.
-
----
-
-*Continue to [`../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md) for unresolved questions.*
+Brain offers no snapshot isolation, no linearizable cross-shard reads and no
+tracked happens-before, and needs none. Within a space — which is one shard —
+writes are ordered and immediately visible, and the only genuinely
+asynchronous state announces its own completion. Across shards, reads are
+rank-merged, which has no ordering semantics to strengthen.

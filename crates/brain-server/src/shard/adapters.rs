@@ -960,7 +960,7 @@ mod tests {
     fn redb_rebuild_source_enumerates_live_same_run_memories() {
         use brain_core::{MemoryId, MemoryKind, NamespaceId, SessionId, SpaceId};
         use brain_metadata::tables::memory::{flags, MemoryMetadata, MEMORIES_TABLE};
-        use brain_ops::memory_artifact::merge_memory_artifact;
+        use brain_ops::memory_artifact::put_memory_vector;
 
         let tmp = TempDir::new().unwrap();
         let md_path = tmp.path().join("metadata.redb");
@@ -1008,10 +1008,7 @@ mod tests {
             }
             for (slot, first) in [(1u64, 0.25_f32), (2, 0.5), (3, 0.75)] {
                 let id = MemoryId::pack(0, slot, 1);
-                merge_memory_artifact(&wtxn, id.to_be_bytes(), |b| {
-                    b.vector = live_vec(first);
-                })
-                .expect("merge artifact");
+                put_memory_vector(&wtxn, id.to_be_bytes(), &live_vec(first)).expect("seed vector");
             }
             wtxn.commit().expect("commit");
         }
@@ -1196,11 +1193,7 @@ mod tests {
                     // Watermark seeded past the WAL tail so this
                     // bundle-completeness test exercises the normal
                     // (all-committed) checkpoint path.
-                    {
-                        let wm = RedbCommittedWatermark::new();
-                        wm.advance_to(u64::MAX);
-                        wm
-                    },
+                    RedbCommittedWatermark::sealed_through(u64::MAX),
                 );
 
                 let id = src.take_snapshot().await.expect("take_snapshot");
@@ -1410,8 +1403,7 @@ mod tests {
         let md = MetadataDb::open(&md_path).expect("MetadataDb::open");
         let metadata: SharedMetadataDb = Arc::new(md);
 
-        let wm = RedbCommittedWatermark::new();
-        wm.advance_to(watermark);
+        let wm = RedbCommittedWatermark::sealed_through(watermark);
 
         {
             let arena_path = arena_path.clone();

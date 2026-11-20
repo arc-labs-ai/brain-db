@@ -26,8 +26,12 @@ use std::cell::RefCell;
 use std::ffi::CString;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
-use crate::wal::group_commit::{AppendHandle, CommitError, GroupCommitConfig, GroupCommitter};
+use crate::recovery::WalTail;
+use crate::wal::group_commit::{
+    AppendHandle, CommitError, GroupCommitConfig, GroupCommitter, WalFault,
+};
 use crate::wal::reader::{WalReadError, WalReader};
 use crate::wal::record::{Lsn, WalRecord};
 use crate::wal::segment::{WalSegment, WalSegmentError, WAL_SEGMENT_HEADER_LEN};
@@ -72,6 +76,7 @@ struct WalInner {
     active_segment_seq: u64,
     segment: SegmentState,
     config: WalConfig,
+    fault: Rc<WalFault>,
 }
 
 /// The active-segment slot.
@@ -107,7 +112,7 @@ pub enum WalError {
     NoSegmentsFound { dir: PathBuf },
 
     #[error(
-        "recovered tail offset {offset} is out of range for active segment {path:?} \
+        "recovered tail offset {offset} is out of range for segment {path:?} \
          (header {header}, on-disk size {file_size})"
     )]
     RecoveredOffsetOutOfRange {
@@ -116,6 +121,9 @@ pub enum WalError {
         header: usize,
         file_size: u64,
     },
+
+    #[error("recovered tail names segment {segment_seq}, which is not present in {dir:?}")]
+    TailSegmentMissing { dir: PathBuf, segment_seq: u64 },
 
     #[error("record encoded size ({record_bytes}) exceeds max_segment_bytes ({segment_max})")]
     RecordExceedsSegmentLimit {
@@ -168,7 +176,8 @@ impl Wal {
         let segment = WalSegment::create_new(&seg_path, 0, 1, shard_uuid).await?;
         fsync_dir(&dir_path)?;
 
-        let committer = GroupCommitter::start(segment, config.group_commit);
+        let fault = Rc::new(WalFault::new());
+        let committer = GroupCommitter::start(segment, config.group_commit, fault.clone());
 
         Ok(Self {
             inner: RefCell::new(WalInner {
@@ -181,6 +190,7 @@ impl Wal {
                     bytes: 0,
                 },
                 config,
+                fault,
             }),
             rollover_lock: glommio::sync::Semaphore::new(1),
         })
@@ -233,20 +243,16 @@ impl Wal {
     /// Open an existing WAL for append, resuming at `next_lsn`.
     ///
     /// Caller must have already run [`crate::recovery::recover`] to determine
-    /// both `next_lsn` and `recovered_tail_offset`
-    /// ([`crate::recovery::RecoveryReport::active_tail_offset`]) — supplying a
+    /// both `next_lsn` and `tail` — supplying a
     /// wrong value risks LSN reuse, which the WAL reader will then reject as
     /// corruption on the next recovery.
     ///
-    /// Selects the highest-`segment_seq` segment as the active one. Before
-    /// positioning the append cursor it **physically truncates** that
-    /// segment to `recovered_tail_offset` — the byte position after the last
-    /// durably-good, fully-applied record recovery validated. This removes
-    /// any torn-tail bytes or never-committed dangling-transaction prefix a
-    /// crash left on disk, so subsequent appends overwrite the garbage
-    /// rather than following it. Without this, a later recovery would treat
-    /// the buried garbage as a clean end and silently drop everything
-    /// appended after it (and LSNs would be reused).
+    /// Resumes in the segment holding the recovered tail and removes every
+    /// segment above it. Recovery only advances the tail at a commit boundary,
+    /// so a committed record can never sit past it — every byte above the tail
+    /// is a never-committed transaction's members or a torn write. Leaving
+    /// those segments on disk strands `next_lsn` below LSNs that are physically
+    /// present, which refuses the next boot outright.
     ///
     /// Subsequent appends extend the truncated segment (or roll over to a
     /// new one per the usual capacity rule).
@@ -254,7 +260,7 @@ impl Wal {
         dir: impl AsRef<Path>,
         shard_uuid: [u8; 16],
         next_lsn: u64,
-        recovered_tail_offset: u64,
+        tail: WalTail,
         config: WalConfig,
     ) -> Result<Self, WalError> {
         let dir_path = dir.as_ref().to_path_buf();
@@ -263,28 +269,33 @@ impl Wal {
         // 4 KB header against shard_uuid + format version + CRC). Pull out
         // only what we need, then drop the reader before opening the
         // segment for async append.
-        let (active_segment_seq, active_starting_lsn, file_size) = {
+        let segments = {
             let reader = WalReader::open(&dir_path, shard_uuid)?;
-            let last = reader
-                .segments()
-                .last()
-                .ok_or_else(|| WalError::NoSegmentsFound {
+            if reader.segments().is_empty() {
+                return Err(WalError::NoSegmentsFound {
                     dir: dir_path.clone(),
-                })?;
-            (last.segment_seq, last.starting_lsn, last.file_size)
+                });
+            }
+            reader.segments().to_vec()
         };
-        let active_path = segment_path(&dir_path, active_segment_seq);
+        let tail_segment = segments
+            .iter()
+            .find(|segment| segment.segment_seq == tail.segment_seq)
+            .ok_or_else(|| WalError::TailSegmentMissing {
+                dir: dir_path.clone(),
+                segment_seq: tail.segment_seq,
+            })?;
+        let tail_path = tail_segment.path.clone();
+        let file_size = tail_segment.file_size;
 
         // Validate the recovered offset lies within [header, on-disk size].
         // Recovery derives it from the very bytes on disk, so a value past
         // EOF (or below the header) signals a caller bug or a mismatched
         // recover()/open_existing() pairing — fail loud rather than corrupt.
-        if recovered_tail_offset < WAL_SEGMENT_HEADER_LEN as u64
-            || recovered_tail_offset > file_size
-        {
+        if tail.offset < WAL_SEGMENT_HEADER_LEN as u64 || tail.offset > file_size {
             return Err(WalError::RecoveredOffsetOutOfRange {
-                path: active_path.clone(),
-                offset: recovered_tail_offset,
+                path: tail_path.clone(),
+                offset: tail.offset,
                 header: WAL_SEGMENT_HEADER_LEN,
                 file_size,
             });
@@ -295,38 +306,55 @@ impl Wal {
         // (recovery only advances the tail at a commit boundary), so this
         // truncation is loss-free. `sync_all` makes the shorter length
         // durable before we resume appending.
-        if recovered_tail_offset < file_size {
-            let f = std::fs::OpenOptions::new().write(true).open(&active_path)?;
-            f.set_len(recovered_tail_offset)?;
+        if tail.offset < file_size {
+            let f = std::fs::OpenOptions::new().write(true).open(&tail_path)?;
+            f.set_len(tail.offset)?;
             f.sync_all()?;
         }
-        let bytes_on_disk_pre = (recovered_tail_offset as usize) - WAL_SEGMENT_HEADER_LEN;
+        let tail_starting_lsn = tail_segment.starting_lsn;
+        for segment in segments
+            .iter()
+            .filter(|segment| segment.segment_seq > tail.segment_seq)
+        {
+            tracing::warn!(
+                segment_seq = segment.segment_seq,
+                path = ?segment.path,
+                byte_length = segment.file_size,
+                "removing WAL segment above the recovered tail"
+            );
+            std::fs::remove_file(&segment.path)?;
+        }
+        fsync_dir(&dir_path)?;
 
-        // Re-open the active segment for append. Header was already
+        let bytes_on_disk_pre = (tail.offset as usize) - WAL_SEGMENT_HEADER_LEN;
+
+        // Re-open the tail segment for append. Header was already
         // validated by WalReader above; here we just establish the
         // async BufferedFile handle for io_uring writes.
         let segment = WalSegment::open_for_append(
-            &active_path,
+            &tail_path,
             shard_uuid,
-            active_segment_seq,
-            active_starting_lsn,
+            tail.segment_seq,
+            tail_starting_lsn,
             bytes_on_disk_pre,
         )
         .await?;
 
-        let committer = GroupCommitter::start(segment, config.group_commit);
+        let fault = Rc::new(WalFault::new());
+        let committer = GroupCommitter::start(segment, config.group_commit, fault.clone());
 
         Ok(Self {
             inner: RefCell::new(WalInner {
                 dir: dir_path,
                 shard_uuid,
                 next_lsn,
-                active_segment_seq,
+                active_segment_seq: tail.segment_seq,
                 segment: SegmentState::Open {
                     committer,
                     bytes: bytes_on_disk_pre,
                 },
                 config,
+                fault,
             }),
             rollover_lock: glommio::sync::Semaphore::new(1),
         })
@@ -340,7 +368,8 @@ impl Wal {
 impl Wal {
     /// Append `record` to the WAL. The caller's `record.lsn` is overwritten
     /// with the next monotonic LSN. Triggers segment rollover if appending
-    /// would exceed `max_segment_bytes`. Awaits until the record is durable.
+    /// would exceed `max_segment_bytes`. Refuses writes after the WAL fault
+    /// latch is set. Awaits until the record is durable.
     pub async fn append(&self, mut record: WalRecord) -> Result<Lsn, WalError> {
         let record_bytes = record.encoded_len();
 
@@ -354,10 +383,10 @@ impl Wal {
         // same `next_lsn` across the await and stamp duplicate LSNs —
         // recovery then trips `WalReadError::LsnGap`. Mirrors `append_many`.
         //
-        // Bumping `next_lsn` before durability is safe: a flush failure
-        // makes the WAL "broken" and every subsequent append errors, so no
-        // LSN-reuse window opens. Rollover is the one async step; it runs
-        // outside the critical section and the loop re-checks afterward.
+        // The process-scoped fault latch refuses later writes after a flush
+        // failure, so no LSN is assigned to a record that cannot be logged.
+        // Rollover is the one async step; it runs outside the critical section
+        // and the loop re-checks afterward.
         //
         // A concurrent appender may observe the segment mid-rollover
         // (`SegmentState::RollingOver`). It cannot enqueue against it (the
@@ -385,8 +414,12 @@ impl Wal {
                     next_lsn,
                     active_segment_seq,
                     segment,
+                    fault,
                     ..
                 } = &mut *inner;
+                if let Some(reason) = fault.reason() {
+                    return Err(WalError::Commit(CommitError::WalBroken(reason)));
+                }
                 match segment {
                     SegmentState::RollingOver => Action::Rollover {
                         observed_seq: *active_segment_seq,
@@ -432,6 +465,7 @@ impl Wal {
     /// order.
     ///
     /// Empty input is a no-op that returns `Ok(vec![])`.
+    /// A latched WAL rejects the batch without assigning an LSN.
     ///
     /// Rollovers mid-batch are handled: when the next record would exceed
     /// the active segment, the in-flight handles are drained durably
@@ -505,10 +539,8 @@ impl Wal {
                     // Single borrow_mut: enqueue + bump counters. The
                     // committer's `append` is synchronous (flume push),
                     // so the borrow window doesn't span an await.
-                    // Bumping `next_lsn` early (before durability) is
-                    // safe because a flush failure makes the WAL "broken"
-                    // and all subsequent appends error — no LSN reuse
-                    // window opens.
+                    // The process-scoped fault latch prevents later records
+                    // from receiving LSNs after durability becomes uncertain.
                     //
                     // No `.await` separates step A from this borrow, so on
                     // this single-threaded executor the slot is still the
@@ -518,6 +550,9 @@ impl Wal {
                     // than panic.
                     let handle = {
                         let mut inner = self.inner.borrow_mut();
+                        if let Some(reason) = inner.fault.reason() {
+                            return Err(WalError::Commit(CommitError::WalBroken(reason)));
+                        }
                         let WalInner {
                             next_lsn, segment, ..
                         } = &mut *inner;
@@ -564,7 +599,8 @@ impl Wal {
     ///
     /// 1. Acquire the exclusive rollover permit. A second appender that also
     ///    chose rollover blocks here until the first finishes.
-    /// 2. Re-check `active_segment_seq`. If it advanced past `observed_seq`,
+    /// 2. Re-check the terminal fault and `active_segment_seq`. A latched WAL
+    ///    refuses rollover. If the sequence advanced past `observed_seq`,
     ///    another task already rolled the segment we saw full — this call is
     ///    a no-op and the caller retries its append against the fresh
     ///    committer. This prevents a spurious second rollover that would tear
@@ -574,6 +610,9 @@ impl Wal {
     ///    committer out), drain + close the old segment durably, create the
     ///    new segment, fsync the directory, then install the fresh committer
     ///    and bump the sequence — all before releasing the permit.
+    ///
+    /// A terminal fault prevents a fresh committer from being installed, so
+    /// the process cannot resume acknowledging writes after rollover.
     ///
     /// The old segment is drained and closed *before* the new segment is
     /// created, preserving the invariant that every record in a lower-seq
@@ -589,8 +628,11 @@ impl Wal {
 
         // Step 2 + 3a: under a short borrow, bail if the segment already
         // rolled, else take the old committer and mark the slot RollingOver.
-        let (old_committer, dir, shard_uuid, new_seq, new_starting_lsn, group_commit_cfg) = {
+        let (old_committer, dir, shard_uuid, new_seq, new_starting_lsn, group_commit_cfg, fault) = {
             let mut inner = self.inner.borrow_mut();
+            if let Some(reason) = inner.fault.reason() {
+                return Err(WalError::Commit(CommitError::WalBroken(reason)));
+            }
             if inner.active_segment_seq != observed_seq {
                 // Someone rolled past the segment we saw full. Nothing to do.
                 return Ok(());
@@ -600,10 +642,11 @@ impl Wal {
             let dir = inner.dir.clone();
             let shard_uuid = inner.shard_uuid;
             let group_commit_cfg = inner.config.group_commit;
+            let fault = inner.fault.clone();
             // We hold the exclusive permit and the sequence matched, so the
             // slot must be `Open` — no other task can be mid-rollover. A
-            // `RollingOver` slot here can only mean a *previous* rollover
-            // failed after taking the committer; treat the WAL as broken
+            // `RollingOver` slot here can only mean a rollover failed after
+            // taking the committer; treat the WAL as broken
             // rather than tear down twice.
             let old_committer =
                 match std::mem::replace(&mut inner.segment, SegmentState::RollingOver) {
@@ -621,6 +664,7 @@ impl Wal {
                 new_seq,
                 new_starting_lsn,
                 group_commit_cfg,
+                fault,
             )
         };
 
@@ -641,7 +685,7 @@ impl Wal {
         {
             let mut inner = self.inner.borrow_mut();
             inner.segment = SegmentState::Open {
-                committer: GroupCommitter::start(new_segment, group_commit_cfg),
+                committer: GroupCommitter::start(new_segment, group_commit_cfg, fault),
                 bytes: 0,
             };
             inner.active_segment_seq = new_seq;
@@ -671,8 +715,8 @@ impl Wal {
     }
 
     /// Drain the committer + close the active segment, leaving `self` in a
-    /// post-shutdown state. Idempotent — calling twice is a no-op on the
-    /// second call.
+    /// post-shutdown state. A latched fault is returned on every call,
+    /// including after the committer has already been drained.
     ///
     /// Exists alongside `shutdown(self)` for callers that hold `&mut self`
     /// or `&self` and can't move out. Brain-server's shard main loop uses
@@ -688,6 +732,9 @@ impl Wal {
         if let Some(committer) = committer {
             let seg = committer.shutdown().await?;
             seg.close().await?;
+        }
+        if let Some(reason) = self.inner.borrow().fault.reason() {
+            return Err(WalError::Commit(CommitError::WalBroken(reason)));
         }
         Ok(())
     }
@@ -772,7 +819,7 @@ fn fsync_dir(dir: &Path) -> Result<(), WalError> {
 mod tests {
     use super::*;
     use crate::wal::kinds::WalRecordKind;
-    use crate::wal::segment::glommio_run;
+    use crate::wal::segment::{glommio_run, FAIL_NEXT_FLUSH_DURABLE};
 
     fn uuid(byte: u8) -> [u8; 16] {
         [byte; 16]
@@ -985,6 +1032,47 @@ mod tests {
     }
 
     #[test]
+    fn latched_fault_refuses_rollover_and_surfaces_on_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_owned();
+        let p = path.clone();
+        let cfg = WalConfig {
+            group_commit: GroupCommitConfig::default(),
+            max_segment_bytes: WAL_SEGMENT_HEADER_LEN
+                + 2 * record_with_payload_size(64).encoded_len(),
+        };
+        glommio_run(move || async move {
+            let wal = Wal::create_with_config(&p, uuid(1), cfg).await.unwrap();
+            assert_eq!(
+                wal.append(record_with_payload_size(64)).await.unwrap(),
+                Lsn(1)
+            );
+            FAIL_NEXT_FLUSH_DURABLE.with(|fail| fail.set(true));
+            let second = wal.append(record_with_payload_size(64)).await;
+            assert!(matches!(
+                second,
+                Err(WalError::Commit(CommitError::WalBroken(_)))
+            ));
+            let next_lsn = wal.next_lsn();
+            let active_seq = wal.active_segment_seq();
+
+            let third = wal.append(record_with_payload_size(64)).await;
+            assert!(matches!(
+                third,
+                Err(WalError::Commit(CommitError::WalBroken(_)))
+            ));
+            assert_eq!(wal.next_lsn(), next_lsn);
+            assert_eq!(wal.active_segment_seq(), active_seq);
+            assert!(matches!(
+                wal.shutdown_in_place().await,
+                Err(WalError::Commit(CommitError::WalBroken(_)))
+            ));
+        });
+        assert!(path.join("0000000000.wal").exists());
+        assert!(!path.join("0000000001.wal").exists());
+    }
+
+    #[test]
     fn many_rollovers_keep_lsns_contiguous() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_owned();
@@ -1173,9 +1261,18 @@ mod tests {
             .unwrap()
             .len();
         glommio_run(move || async move {
-            let wal = Wal::open_existing(&p2, uuid(20), 4, clean_size, WalConfig::default())
-                .await
-                .expect("open existing");
+            let wal = Wal::open_existing(
+                &p2,
+                uuid(20),
+                4,
+                WalTail {
+                    segment_seq: 0,
+                    offset: clean_size,
+                },
+                WalConfig::default(),
+            )
+            .await
+            .expect("open existing");
             assert_eq!(wal.next_lsn(), 4);
             assert_eq!(wal.active_segment_seq(), 0);
             let lsn = wal.append(record(0)).await.unwrap();
@@ -1197,7 +1294,10 @@ mod tests {
                 &path,
                 uuid(21),
                 1,
-                WAL_SEGMENT_HEADER_LEN as u64,
+                WalTail {
+                    segment_seq: 0,
+                    offset: WAL_SEGMENT_HEADER_LEN as u64,
+                },
                 WalConfig::default(),
             )
             .await
@@ -1225,7 +1325,10 @@ mod tests {
                 &p2,
                 uuid(99),
                 2,
-                WAL_SEGMENT_HEADER_LEN as u64,
+                WalTail {
+                    segment_seq: 0,
+                    offset: WAL_SEGMENT_HEADER_LEN as u64,
+                },
                 WalConfig::default(),
             )
             .await
@@ -1697,8 +1800,11 @@ mod tests {
             let wal = Wal::open_existing(
                 &dir_path,
                 uuid(42),
-                n + 1,      // next_lsn recovery would compute
-                clean_size, // recovered_tail_offset: before the torn bytes
+                n + 1, // next_lsn recovery would compute
+                WalTail {
+                    segment_seq: final_seq,
+                    offset: clean_size,
+                },
                 cfg,
             )
             .await

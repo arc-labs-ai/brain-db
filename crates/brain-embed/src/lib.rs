@@ -35,5 +35,5 @@ pub use error::EmbedError;
 pub use fingerprint::{blake3_hash_file, blake3_hash_text, compute_fingerprint};
 pub use model::{
     embed_batch, embed_text, encode_batch, encode_single, forward_pooled, l2_normalize_in_place,
-    ModelHandle, Tokenized, MAX_TOKEN_LENGTH, VECTOR_DIM,
+    matmul_split_count, ModelHandle, Tokenized, MAX_TOKEN_LENGTH, VECTOR_DIM,
 };

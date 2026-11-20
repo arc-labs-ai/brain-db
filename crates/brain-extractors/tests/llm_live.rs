@@ -142,15 +142,11 @@ fn build_extractor(
         cache,
         PROMPT.into(),
         None,
-        Some(schema),
         compiled,
         // Accept anything the model emits; the prompt + schema do
         // the gating. The live model occasionally returns 0.95-ish
         // confidences and we don't want noise about thresholds.
         0.0,
-        // No per-call budget cap — Haiku is cheap and the prompt is
-        // a couple of hundred input tokens.
-        None,
         Duration::from_secs(7 * 24 * 60 * 60),
         // Default ceiling (DEFAULT_LLM_MAX_TOKENS). The live model needs room
         // for a full JSON object; too low truncates the response and the

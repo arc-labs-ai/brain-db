@@ -4,15 +4,16 @@ This file lists the things that can go wrong at the data-model level — corrupt
 
 ## 1. Stale MemoryId references
 
-**Failure mode.** A client holds a `MemoryId` that no longer corresponds to any active memory. The memory was forgotten (and possibly its slot reclaimed for a new memory).
+**Failure mode.** A client holds a `MemoryId` that no longer corresponds to any active memory. The memory was forgotten, and possibly reclaimed afterwards.
 
-**Detection.** Brain looks up the `MemoryId`'s slot. If:
+**Detection.** Brain looks up the row the `MemoryId` names. If:
 
-- The slot is tombstoned with the same version: the original memory was forgotten but slot not yet reclaimed. Return `MemoryNotFound`.
-- The slot's version differs from the `MemoryId`'s version: the slot has been reclaimed; the memory is gone. Return `MemoryNotFound`.
-- The slot's space_id differs from the requesting agent: an authorization bug or a stale `MemoryId` from a different agent. Return `Unauthorized`.
+- The row is tombstoned: the memory was forgotten but not yet reclaimed. Return `MemoryNotFound`.
+- There is no row: the memory was reclaimed, and nothing replaces it. Return `MemoryNotFound`.
+- The row's owner scope differs from the caller's: return `MemoryNotFound` as well. This case is deliberately indistinguishable from the previous two — see §3.
+- The `MemoryId`'s version does not match the row's: return `MemoryNotFound`.
 
-**Response.** Return an explicit error rather than silently returning a different memory. The version field exists exactly to prevent silent re-targeting.
+**Response.** Return an explicit error rather than silently returning a different memory. Two independent properties make silent re-targeting impossible: slot ids are minted from a monotonic counter and never recycled, so nothing can occupy a retired handle; and the version field in the `MemoryId` is checked on lookup regardless.
 
 **Implication for clients.** Clients should treat `MemoryId` as a value that may go stale. Operations like `RECALL` always return current `MemoryId`s; clients caching `MemoryId`s need a strategy for re-validating them periodically.
 
@@ -30,25 +31,29 @@ This file lists the things that can go wrong at the data-model level — corrupt
 
 **Failure mode.** An operation in agent A's session references a `MemoryId` belonging to agent B.
 
-**Detection.** Each operation validates that the `MemoryId`'s agent matches the session's space. The validation happens at the routing layer (the space owns a shard; the memory's shard ID is in the `MemoryId`).
+**Detection.** A `MemoryId` is an enumerable packed integer, so routing alone is not a wall: the owner check is made authoritatively against the stored row's own owner scope, inside the same transaction as the operation. The space id is the complete tenant key — it folds the namespace, so a request from a foreign namespace always resolves to a disjoint space id.
 
-**Response.** `Unauthorized`. Brain does not leak the existence of the cross-space memory; the error is the same as if the memory didn't exist.
+**Response.** A row owned by someone else is treated exactly as a missing one. Reads answer `MemoryNotFound`, and the lenient writes answer as they would for an absent memory — `FORGET` reports a no-op success rather than an error.
 
-**Implication for clients.** Don't share `MemoryId`s across spaces. They are space-scoped.
+This is not an approximation of an authorization error; it is the intended answer. Any response that distinguished "exists but is not yours" from "does not exist" would let a caller enumerate another tenant's memories by probing ids. There is no `Unauthorized` code on this path, and nothing to add one to.
 
-## 4. Invalid session reference
+**Implication for clients.** Don't share `MemoryId`s across spaces. They are space-scoped, and a foreign id reads as absent rather than as refused.
 
-**Failure mode.** An operation references a `SessionId` that doesn't exist in the space's namespace.
+## 4. Session references are not validated
 
-**Detection.** Brain validates the session reference against the space's session registry.
+**There is no "invalid session reference" failure mode.** A `SessionId` is an unsigned 64-bit integer on the wire, so every value a client can send is structurally valid, and the id space is **client-owned**: `SESSION_CREATE` takes the id from the request rather than issuing one, and `ENCODE` creates a registry row for whatever id the write carries. A session comes into existence *by being written to*.
 
-**Response.** `InvalidContext`. Different from `Unauthorized` — the session doesn't exist (whereas in the cross-space case, the memory might exist but isn't accessible).
+That is what rules the check out, not an omission. Because writing to a session creates it, "this id has no registry row" is indistinguishable from "nothing has been written there yet" — and the second is a legitimate race against a concurrent write by the same client. Refusing the id would mean refusing a correct program. The server therefore has no authority to call a session id invalid, and refusing one would only tell a caller that nobody has written to that id, which is not Brain's to disclose.
 
-**Implication for clients.** Use session names rather than `SessionId`s when uncertain; the lazy-creation behavior creates sessions on first use of their names.
+**Consequences.** A read filtered to a session nobody has written to matches nothing and returns an empty result, which is the honest answer. `SESSION_DELETE` on an id with no row reports `existed: false` rather than failing — the same permissive posture.
+
+**The one refusal that does exist** is a size bound, not a validity check: a `session_filter` list longer than its cap is rejected as a malformed request. The list is rescanned for every index node the vector lane visits and expands into one term query per id in the lexical lane, so its length multiplies the cost of the whole read — the cap bounds caller-controlled work. `RECALL`, `QUERY` and `MATERIALIZE_PROCEDURAL` each cap it at 1024 entries; `SUBSCRIBE` applies its own bound of the same size to the filter it carries.
+
+**Implication for clients.** Choose session ids deliberately and reuse them; nothing on the server will catch a typo in one. An empty result from a session-filtered read means that session holds nothing — it is not a signal that the id was wrong.
 
 ## 5. Vector corruption
 
-**Failure mode.** A vector in the arena has been corrupted (cosmic ray, disk error, software bug). The vector no longer represents the memory's text.
+**Failure mode.** A memory's stored vector has been corrupted (cosmic ray, disk error, software bug) and no longer represents the memory's text. The vector has two at-rest copies — the authoritative redb row and the arena image rebuilt from the log at startup — and either can be the corrupted one.
 
 **Detection.** Brain doesn't actively verify vectors against text on every read; that would be too expensive. Detection is passive:
 
@@ -76,7 +81,7 @@ If Brain stores a separate per-memory text checksum (it does, via [BLAKE3](https
 
 **Failure mode.** An edge points at a non-existent target memory.
 
-**Detection.** Edge traversal during `RECALL`, `PLAN`, or `REASON` may dereference an edge target. If the target's slot is reclaimed (different version), the edge is stale; Brain filters it out lazily.
+**Detection.** Edge traversal during `RECALL`, `PLAN`, or `REASON` may dereference an edge target. If the target is tombstoned or gone, the edge is stale; Brain filters it out during traversal rather than rejecting the whole walk.
 
 **Response.** Filter out stale edges silently during traversal. Schedule a background job to clean up the stale edges.
 
@@ -106,9 +111,9 @@ If Brain stores a separate per-memory text checksum (it does, via [BLAKE3](https
 
 **Detection.** The fingerprint comparison happens during `RECALL` (and similarly for `PLAN`, `REASON`).
 
-**Response.** Memories with mismatched fingerprints are excluded from results. The client sees fewer (or no) results until migration completes.
+**Response.** Memories with mismatched fingerprints are excluded from results. A deployment whose model changed therefore reads as empty over its pre-change memories, rather than returning results scored against an incomparable vector space.
 
-**Implication.** During migration, queries return partial results. Operators should communicate migration status to clients (via `ADMIN_STATS` or external monitoring).
+**Implication.** There is no re-embedding operation to run: changing the embedding model strands every memory encoded under the old one. Returning nothing is the designed outcome, not a transient state to wait out. The practical consequence is that the embedding model is effectively fixed for the life of a data directory, and changing it is a re-ingest.
 
 ## 11. Concurrent access creating ordering anomalies
 
@@ -126,28 +131,29 @@ If Brain stores a separate per-memory text checksum (it does, via [BLAKE3](https
 
 **Detection.** Format-version checks at load time (storage) and handshake (wire).
 
-**Response.** Refuse to load (storage) or refuse the connection (wire). Provide a clear error indicating the version mismatch and the migration path.
+**Response.** Refuse to load (storage) or refuse the connection (wire). The storage error names the version found and the version required, and the refusal is symmetric: a file older than the binary and a file newer than it are both refused. The wire handshake likewise rejects any version but its own, with no negotiation.
 
-**Implication.** Operators run clients and servers at the same Brain release, and migrate on-disk files with `brainctl migrate` when upgrading.
+**Implication.** Operators run clients and servers at the same Brain release. There is no converter for an off-version data directory — a storage-format bump is a re-ingest, not an upgrade step. See [`../00_overview/03_versioning.md`](../00_overview/03_versioning.md) §4.
 
 ## 13. Out-of-space conditions
 
-**Failure mode.** The arena is full; no slots available. Or: the WAL fails to extend; no disk space.
+**Failure mode.** The WAL fails to extend, or a store cannot grow: no disk space.
 
-**Detection.** Slot allocator returns no available slot; or `fallocate` returns ENOSPC.
+**Detection.** The underlying allocation fails — `fallocate` returns `ENOSPC`, or a store write fails for want of space.
 
-**Response.** The encode operation fails with `OutOfStorage`. The error is propagated to the client; the operation is not retried automatically (the client must handle).
+Slot exhaustion is a separate matter and is not a practical failure mode. Slot ids come from a 48-bit monotonic counter, so the id space is not what a deployment runs out of; disk is.
 
-**Implication.** Operators must monitor disk usage and capacity.
+**Response.** The write fails and the error reaches the client. It is not retried automatically — the client decides, because a retry against a full disk fails the same way.
+
+**Implication.** Operators must monitor disk usage and capacity. This is the failure to alert on, well before it arrives: a shard that cannot extend its log cannot accept writes at all.
 
 ## 14. Encoding model mismatch with stored vectors
 
-This is a special case of model mismatch but worth calling out: if the model is changed *and* `ADMIN_MIGRATE_EMBEDDINGS` is run, but the migration is interrupted, Brain has a mix of fingerprints. Recovery:
+This is the operational edge of §10. Every memory carries the fingerprint of the model that embedded it, so a data directory written across a model change holds a mix of fingerprints, and a query matches only the memories whose fingerprint equals the running model's.
 
-- Resume the migration (it's idempotent).
-- Until complete, only the migrated memories are queryable.
+There is no re-embedding path, so the mix does not resolve itself: whichever model is running, the memories encoded under the other are unreachable. The one recovery that works is to put the original model back, which restores access to everything encoded under it and strands whatever was written under the other.
 
-A clean abort path exists: if the operator wants to revert the model change, switching back to the old model preserves access to the originally-encoded memories. Memories encoded under the new model are stranded until either (a) re-migrated to the old model, or (b) the new model is restored.
+The honest reading is that the fingerprint is a correctness guard, not a migration mechanism. It guarantees a query is never answered from an incomparable vector space; it does not make a model change survivable. Pin the embedding model for the life of a data directory.
 
 ## 15. Validation failures at ingest
 

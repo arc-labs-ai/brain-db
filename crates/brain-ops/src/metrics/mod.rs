@@ -19,6 +19,9 @@
 //! histogram machinery + label arrays live in [`histograms`]. The
 //! `crate::worker_metrics` alias (in `lib.rs`) preserves the
 //! pre-split external import path.
+//!
+//! The `read_degrade` family is process-global because the read projections
+//! that feed it hold no shard handle.
 
 pub mod ambiguity_resolver;
 pub mod auto_edge;
@@ -30,10 +33,12 @@ pub mod histograms;
 pub mod llm;
 pub mod llm_cache;
 pub mod query;
+pub mod read_degrade;
 pub mod retriever;
 pub mod schema_migration;
 pub mod statement_embed;
 pub mod temporal_edge;
+pub mod write_stage;
 pub mod writer;
 
 pub use ambiguity_resolver::{AmbiguityResolverMetrics, AmbiguityResolverMetricsSnapshot};
@@ -56,6 +61,10 @@ pub use query::{
     QueryMetrics, QueryMetricsSnapshot, QueryOutcome, QUERY_FUSION_K_BUCKETS,
     QUERY_LATENCY_MS_BUCKETS, QUERY_OUTCOME_LABELS,
 };
+pub use read_degrade::{
+    ReadDegradeMetrics, ReadDegradeMetricsSnapshot, ReadDegradeReason, READ_DEGRADE_REASON_COUNT,
+    READ_DEGRADE_REASON_LABELS,
+};
 pub use retriever::{
     RetrieverKind, RetrieverMetrics, RetrieverMetricsSnapshot, RETRIEVER_LABELS,
     RETRIEVER_LATENCY_MS_BUCKETS,
@@ -63,6 +72,10 @@ pub use retriever::{
 pub use schema_migration::{SchemaMigrationMetrics, SchemaMigrationMetricsSnapshot};
 pub use statement_embed::{StatementEmbedMetrics, StatementEmbedMetricsSnapshot};
 pub use temporal_edge::{TemporalEdgeMetrics, TemporalEdgeMetricsSnapshot, TemporalSkipReason};
+pub use write_stage::{
+    WriteStage, WriteStageMetrics, WriteStageMetricsSnapshot, HNSW_INSERT_MS_BUCKETS,
+    REDB_COMMIT_MS_BUCKETS, TANTIVY_INDEX_MS_BUCKETS, WAL_APPEND_MS_BUCKETS, WRITE_STAGE_LABELS,
+};
 pub use writer::{
     ApplyErrorSnapshot, IdempotencyOutcome, PerPhaseSnapshot, SubmitOutcome, WriterMetrics,
     WriterMetricsSnapshot,

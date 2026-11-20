@@ -341,7 +341,7 @@ This auto-step keeps callers from having to issue two opcodes for the common cas
 
 A new Fact with same `(subject, predicate)` but **different object** is a **contradiction**, not a supersession — both are stored. See §"Contradiction handling" below. The resolver / human decides which is right.
 
-A new Fact with same `(subject, predicate)` and **same object** is a duplicate. The wire-side `request_id` idempotency layer typically dedupes; if it falls through, the handler returns `Conflict` rather than auto-superseding (no signal that the new is "better" than the old).
+A new Fact with same `(subject, predicate)` and **same object** is a duplicate, and duplicates are absorbed rather than rejected. The wire-side `request_id` idempotency layer dedupes a replayed request; what falls through it is caught by content dedup in `statement_create` — an active row identical on `(subject, predicate, object, event_at)` makes the create a no-op that returns the **existing** id, so the caller sees an ordinary success naming the row that was already there. No second row is written and nothing is superseded: there is no signal the new is "better" than the old. Distinct objects (multi-valued Facts) and distinct event times (separate Events) never match, so genuine cumulation is preserved. See [`../11_extractors/05_idempotency.md`](../11_extractors/05_idempotency.md).
 
 Explicit `STATEMENT_SUPERSEDE` on a Fact says "I'm replacing this; here's the new statement" — caller takes responsibility.
 
@@ -457,7 +457,7 @@ For any chain:
 - Versions are dense `1..=N` (no gaps).
 - Exactly one statement per chain has `superseded_by.is_none() && !tombstoned` (the "current" entry). This is the one returned by `is_current=1` index lookups.
 - After tombstoning the current entry, *no* statement in the chain has `is_current=1`. Queries by `(subject, predicate)` return empty.
-- After unretiring (a hypothetical future op — not in v1.0): re-flips `is_current=1`. Tracked in [`.../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md).
+- There is no unretire op in v1.0. If one is added, it re-flips `is_current=1` on the entry it unretires, and the one-current-entry invariant above is what it has to re-establish.
 
 These invariants are enforced by `statement_ops` and verified by unit tests in the statement-ops module.
 
@@ -558,7 +558,7 @@ Returns:
 
 #### Wire surface
 
-In v1.0 contradiction inspection is internal to Brain (used by query routing here) and by the admin op `ADMIN_LIST_PENDING_RESOLUTIONS` ([`../04_wire_protocol/09_typed_graph_admin.md`](../04_wire_protocol/09_typed_graph_admin.md) §4). There is **no** `STATEMENT_LIST_CONTRADICTIONS` wire opcode in v1.
+In v1.0 contradiction inspection is internal to Brain (used by query routing here) and surfaced by one admin op, `ADMIN_LIST_PENDING_CONTRADICTIONS` (`0x0178` / `0x01F8`, see [`../04_wire_protocol/09_typed_graph_admin.md`](../04_wire_protocol/09_typed_graph_admin.md) §4). Unlike the substrate admin set, that op **is** served on the wire, admin-gated. There is **no** `STATEMENT_LIST_CONTRADICTIONS` wire opcode in v1.
 
 Clients that want contradictions:
 
@@ -613,7 +613,7 @@ At step "validate" in statement_create (after subject/predicate check):
 
 The post-commit event is **still** `STATEMENT_CREATED` (not a special "contradicting" event). Consumers that subscribe to statement events get the create event and can run their own contradiction check if they care.
 
-A future phase may add `STATEMENT_CONTRADICTED` as a discrete event; v1.0 keeps the surface minimal. Tracked in [`.../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md).
+There is no discrete `STATEMENT_CONTRADICTED` event; v1.0 keeps the event surface minimal.
 
 ### Time-bounded contradictions
 
@@ -742,7 +742,7 @@ The schema DSL allows per-predicate overrides (some predicates decay faster than
 |---|---|
 | `statement_create` | yes — sets initial confidence based on evidence + 0 age |
 | `statement_supersede` | yes — new statement gets fresh confidence; old's stays frozen at supersession time |
-| Evidence added (post-creation) | yes — via `statement_add_evidence` op (deferred; tracked in [`../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md)) |
+| Evidence added (post-creation) | yes — via a `statement_add_evidence` op, which v1.0 does not ship |
 | Memory forget cascading evidence removal | yes — confidence recomputed without the removed entry |
 | **Time-only** (age increases) | **no** — confidence is **not** lazily recomputed at read time |
 
@@ -897,7 +897,7 @@ Subsequent reads dereference the pointer transparently — the client / handler 
 
 #### Add-evidence promotion
 
-A future `STATEMENT_ADD_EVIDENCE` op (not in v1.0) appends new evidence to an existing statement. When the post-append count crosses 8, promote inline → overflow inside the same redb txn. Tracked in [`.../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md).
+A `STATEMENT_ADD_EVIDENCE` op, which v1.0 does not ship, would append new evidence to an existing statement. When the post-append count crosses 8, it promotes inline → overflow inside the same redb txn.
 
 For v1.0: evidence is set at create / supersede time only.
 
@@ -948,7 +948,7 @@ When `FORGET memory_id` (opcode `0x0024`) is called:
 
 2. **Soft mode** (the memory is tombstoned but not yet reclaimed): same as hard for confidence-recomputation purposes, but the reverse-index row stays so Brain can replay if the memory is restored within grace.
 
-The cascade runs **inside** the FORGET op's redb txn for atomicity. For memories with > 1000 dependent statements, the cascade batches into multiple txns (rare; tracked in [`.../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md)).
+The cascade runs **inside** the FORGET op's redb txn for atomicity. For memories with > 1000 dependent statements, the cascade batches into multiple txns — rare, and the batching gives up single-txn atomicity for the tail of the cascade.
 
 ### Evidence integrity
 

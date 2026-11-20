@@ -57,12 +57,14 @@ pub async fn format(snap: &Snapshot<'_>) -> String {
     emit_config_info(&mut s, snap.config);
     emit_up(&mut s);
     emit_shards_total(&mut s, snap.shards);
+    emit_derivation_admission(&mut s);
     emit_connection_basic(&mut s, snap.connections);
     emit_process_uptime(&mut s, snap.started_at, snap.started_at_unix_secs);
     emit_process_resource(&mut s);
     emit_worker_counters(&mut s, snap.shards).await;
     emit_hnsw_counts(&mut s, snap.shards).await;
     emit_storage_gauges(&mut s, snap.shards).await;
+    emit_extraction_queue_gauges(&mut s, snap.shards).await;
     emit_request_metrics(&mut s, snap.request_metrics);
     emit_auto_edge_metrics(&mut s, snap.shards);
     emit_extractor_metrics(&mut s, snap.shards);
@@ -71,6 +73,9 @@ pub async fn format(snap: &Snapshot<'_>) -> String {
     emit_statement_embed_metrics(&mut s, snap.shards);
     emit_retriever_metrics(&mut s, snap.shards);
     emit_query_metrics(&mut s, snap.shards);
+    emit_read_degrade_metrics(&mut s);
+    emit_writer_metrics(&mut s, snap.shards);
+    emit_write_stage_metrics(&mut s, snap.shards);
     emit_tracing_metrics(&mut s);
 
     s
@@ -128,7 +133,7 @@ fn emit_config_info(out: &mut String, cfg: &Config) {
     );
     let labels = format!(
         "{{shard_count=\"{sc}\",arena_capacity_bytes=\"{arena}\",hnsw_m=\"{m}\",embedder_model=\"{em}\"}}",
-        sc = cfg.storage.shard_count,
+        sc = cfg.storage.shards(),
         arena = cfg.shard.arena_capacity_bytes,
         m = cfg.hnsw.m,
         em = cfg.embedder.model,
@@ -154,6 +159,129 @@ fn emit_shards_total(out: &mut String, shards: &[ShardHandle]) {
         "gauge",
     );
     let _ = writeln!(out, "brain_shards_total {}", shards.len());
+}
+
+/// What provider calls are holding right now, and the most they ever held.
+///
+/// Process-global, with no shard label: shards are share-nothing for data but
+/// face one provider over one connection pool, so this pressure belongs to the
+/// process.
+///
+/// `peak_bytes` is the operative number. Derivation admission is bounded by a
+/// hand-chosen count today, which cannot use a large machine and says nothing
+/// about what a call costs on a small one — a long text with a big response
+/// schema and a one-liner are not the same load at the same count. Sizing a
+/// memory budget to replace that bound needs the footprint measured first,
+/// and this is that measurement.
+fn emit_derivation_admission(out: &mut String) {
+    let meter = brain_llm::inflight::global();
+    emit_header(
+        out,
+        "brain_llm_calls_in_flight",
+        "Provider calls currently outstanding.",
+        "gauge",
+    );
+    let _ = writeln!(out, "brain_llm_calls_in_flight {}", meter.llm().holds());
+    emit_header(
+        out,
+        "brain_llm_bytes_in_flight",
+        "Request payload bytes currently outstanding across provider calls.",
+        "gauge",
+    );
+    let _ = writeln!(out, "brain_llm_bytes_in_flight {}", meter.llm().bytes());
+    emit_header(
+        out,
+        "brain_llm_peak_calls_in_flight",
+        "Most provider calls ever outstanding at once, since start.",
+        "gauge",
+    );
+    let _ = writeln!(
+        out,
+        "brain_llm_peak_calls_in_flight {}",
+        meter.llm().peak_holds()
+    );
+    let admission = brain_llm::admission::global();
+    emit_header(
+        out,
+        "brain_derivation_admission_budget_bytes",
+        "Bytes derivation may hold at once, across BOTH in-flight provider payloads and prepared context.",
+        "gauge",
+    );
+    let _ = writeln!(
+        out,
+        "brain_derivation_admission_budget_bytes {}",
+        admission.budget_bytes()
+    );
+    emit_header(
+        out,
+        "brain_derivation_admission_available_bytes",
+        "Budget still admittable right now; sustained zero means derivation is waiting on memory.",
+        "gauge",
+    );
+    let _ = writeln!(
+        out,
+        "brain_derivation_admission_available_bytes {}",
+        admission.available_bytes()
+    );
+    emit_header(
+        out,
+        "brain_llm_peak_bytes_in_flight",
+        "Most request payload bytes ever outstanding at once, since start.",
+        "gauge",
+    );
+    let _ = writeln!(
+        out,
+        "brain_llm_peak_bytes_in_flight {}",
+        meter.llm().peak_bytes()
+    );
+
+    // Prep occupancy, metered apart from provider payloads because the
+    // remedies differ: payload pressure is relieved by narrowing LLM
+    // fan-out, prep pressure by narrowing the batch or the neighbour
+    // fan-out that feeds it. They are admitted against ONE budget, so
+    // the combined gauge below is the figure that budget actually
+    // bounds — neither pool alone tells an operator how close
+    // derivation is to parking.
+    emit_header(
+        out,
+        "brain_derivation_prep_holds_in_flight",
+        "Prepared-context reservations currently outstanding.",
+        "gauge",
+    );
+    let _ = writeln!(
+        out,
+        "brain_derivation_prep_holds_in_flight {}",
+        meter.prep().holds()
+    );
+    emit_header(
+        out,
+        "brain_derivation_prep_bytes_in_flight",
+        "Bytes of prepared context (neighbour texts, candidate embeddings) currently held.",
+        "gauge",
+    );
+    let _ = writeln!(
+        out,
+        "brain_derivation_prep_bytes_in_flight {}",
+        meter.prep().bytes()
+    );
+    emit_header(
+        out,
+        "brain_derivation_prep_peak_bytes_in_flight",
+        "Most prepared-context bytes ever held at once, since start.",
+        "gauge",
+    );
+    let _ = writeln!(
+        out,
+        "brain_derivation_prep_peak_bytes_in_flight {}",
+        meter.prep().peak_bytes()
+    );
+    emit_header(
+        out,
+        "brain_derivation_bytes_in_flight",
+        "Payload plus prepared-context bytes held together; this is what the admission budget bounds.",
+        "gauge",
+    );
+    let _ = writeln!(out, "brain_derivation_bytes_in_flight {}", meter.bytes());
 }
 
 fn emit_connection_basic(out: &mut String, connections: &ConnectionMetrics) {
@@ -546,6 +674,58 @@ async fn emit_storage_gauges(out: &mut String, shards: &[ShardHandle]) {
             }
             Err(e) => {
                 warn!(shard_id, error = %e, "storage_stats failed");
+            }
+        }
+    }
+}
+
+/// Per-shard derivation backlog — the durable extraction queue, which
+/// is where writes wait to become statements, entities and relations.
+///
+/// Separate family from `brain_extractor_*`: those are worker counters
+/// that vanish when the worker is off, while the queue is a table on
+/// disk that keeps growing exactly then. Depth is the leading indicator
+/// (writes arrive far faster than derivation drains); age says how far
+/// a workspace has already drifted from its own data.
+///
+/// A shard whose metadata read failed emits no rows rather than zeros —
+/// `absent()` is a legible gap, a fabricated `0` is a silent all-clear.
+async fn emit_extraction_queue_gauges(out: &mut String, shards: &[ShardHandle]) {
+    emit_header(
+        out,
+        "brain_extraction_queue_depth",
+        "Memories durably queued for derivation, awaiting the extractor worker.",
+        "gauge",
+    );
+    emit_header(
+        out,
+        "brain_extraction_queue_oldest_age_seconds",
+        "Seconds the oldest memory in the derivation queue has been waiting.",
+        "gauge",
+    );
+    for shard in shards.iter() {
+        let shard_id = shard.shard_id();
+        match shard.extraction_backlog().await {
+            Ok(Some(backlog)) => {
+                let _ = writeln!(
+                    out,
+                    "brain_extraction_queue_depth{{shard=\"{shard_id}\"}} {}",
+                    backlog.depth
+                );
+                let _ = writeln!(
+                    out,
+                    "brain_extraction_queue_oldest_age_seconds{{shard=\"{shard_id}\"}} {}",
+                    backlog.oldest_age_secs
+                );
+            }
+            Ok(None) => {
+                warn!(
+                    shard_id,
+                    "extraction backlog unavailable; emitting no series"
+                );
+            }
+            Err(e) => {
+                warn!(shard_id, error = %e, "extraction_backlog failed");
             }
         }
     }
@@ -976,6 +1156,143 @@ fn emit_retriever_metrics(out: &mut String, shards: &[ShardHandle]) {
     }
 }
 
+/// Per-shard write-path metric family, labeled by `phase` — the
+/// [`brain_ops::Phase`] tag the writer already carries, so the label
+/// set is bounded by the phase enum rather than by anything a client
+/// sends. A phase only appears once the shard has submitted one: the
+/// writer's counters are keyed by a map that grows on first sight.
+fn emit_writer_metrics(out: &mut String, shards: &[ShardHandle]) {
+    // One snapshot per shard for the whole family: the writer's
+    // counters sit behind tag-keyed maps, so re-snapshotting per
+    // section would re-lock and re-allocate on every scrape, and the
+    // sections would disagree about which write they saw last.
+    let snaps: Vec<(brain_core::ShardId, brain_ops::WriterMetricsSnapshot)> = shards
+        .iter()
+        .map(|s| (s.shard_id(), s.writer_metrics().snapshot()))
+        .collect();
+
+    emit_header(
+        out,
+        "brain_writer_submit_total",
+        "Phases submitted through the unified write path, by outcome.",
+        "counter",
+    );
+    for (shard_id, snap) in &snaps {
+        for phase in &snap.by_phase {
+            for (outcome, count) in [
+                ("ok", phase.submit_ok),
+                ("err", phase.submit_err),
+                ("conflict", phase.submit_conflict),
+            ] {
+                let _ = writeln!(
+                    out,
+                    "brain_writer_submit_total{{shard=\"{}\",phase=\"{}\",outcome=\"{outcome}\"}} {count}",
+                    *shard_id,
+                    phase.phase,
+                );
+            }
+        }
+    }
+
+    emit_header(
+        out,
+        "brain_writer_wal_skip_total",
+        "Phases elided from the WAL append because they map to no WAL payload (durability via redb only).",
+        "counter",
+    );
+    for (shard_id, snap) in &snaps {
+        for phase in &snap.by_phase {
+            let _ = writeln!(
+                out,
+                "brain_writer_wal_skip_total{{shard=\"{}\",phase=\"{}\"}} {}",
+                *shard_id, phase.phase, phase.wal_skip,
+            );
+        }
+    }
+
+    emit_header(
+        out,
+        "brain_writer_apply_errors_total",
+        "Phase apply failures, by phase and error kind.",
+        "counter",
+    );
+    for (shard_id, snap) in &snaps {
+        for err in &snap.apply_errors {
+            let _ = writeln!(
+                out,
+                "brain_writer_apply_errors_total{{shard=\"{}\",phase=\"{}\",error=\"{}\"}} {}",
+                *shard_id, err.phase, err.error, err.count,
+            );
+        }
+    }
+
+    emit_header(
+        out,
+        "brain_writer_idempotency_total",
+        "Idempotency-cache lookups on the write path, by outcome.",
+        "counter",
+    );
+    for (shard_id, snap) in &snaps {
+        for (outcome, count) in [
+            ("hit", snap.idempotency_hit),
+            ("miss", snap.idempotency_miss),
+            ("conflict", snap.idempotency_conflict),
+        ] {
+            let _ = writeln!(
+                out,
+                "brain_writer_idempotency_total{{shard=\"{}\",outcome=\"{outcome}\"}} {count}",
+                *shard_id,
+            );
+        }
+    }
+
+    emit_header(
+        out,
+        "brain_writer_submit_duration_seconds",
+        "End-to-end submit duration observed once per phase in the write.",
+        "histogram",
+    );
+    for (shard_id, snap) in &snaps {
+        for phase in &snap.by_phase {
+            let inner = format!("shard=\"{shard_id}\",phase=\"{}\"", phase.phase);
+            emit_worker_histogram(
+                out,
+                "brain_writer_submit_duration_seconds",
+                &inner,
+                &phase.submit_duration_seconds,
+            );
+        }
+    }
+}
+
+/// Per-shard ack-path stage latency, labeled by
+/// `stage = wal_append | redb_commit | hnsw_insert | tantivy_index`.
+/// This is the family that attributes synchronous write latency to a
+/// stage; the end-to-end `brain_request_duration_ms` only says a write
+/// was slow, not where. Every stage is emitted on every scrape even at
+/// zero observations, so a stage that stops running is visible as a
+/// flat count rather than as a vanished series.
+fn emit_write_stage_metrics(out: &mut String, shards: &[ShardHandle]) {
+    emit_header(
+        out,
+        "brain_writer_stage_duration_ms",
+        "Per-stage wall-clock latency of the synchronous write (ack) path, in milliseconds.",
+        "histogram",
+    );
+    for shard in shards {
+        let snap = shard.writer_metrics().snapshot();
+        for (idx, stage) in brain_ops::WRITE_STAGE_LABELS.iter().enumerate() {
+            let inner = format!("shard=\"{}\",stage=\"{stage}\"", shard.shard_id());
+            emit_worker_histogram(
+                out,
+                "brain_writer_stage_duration_ms",
+                &inner,
+                &snap.stages.latency_ms[idx],
+            );
+        }
+    }
+}
+
 /// Per-shard end-to-end RECALL (query) metric family. `outcome_total`
 /// is labeled by `outcome = single | many | none` (a bounded enum).
 /// Same dispatch shape as [`emit_statement_embed_metrics`].
@@ -1043,6 +1360,30 @@ fn emit_query_metrics(out: &mut String, shards: &[ShardHandle]) {
         let snap = shard.query_metrics().snapshot();
         let inner = format!("shard=\"{}\"", shard.shard_id());
         emit_worker_histogram(out, "brain_query_fusion_k", &inner, &snap.fusion_k);
+    }
+}
+
+/// Rows the read paths served in degraded form, labeled by
+/// `reason`. Process-global rather than per-shard: the projections that
+/// record it hold no shard handle, so there is no `shard` label to carry.
+/// Same read-a-global shape as [`emit_derivation_admission`].
+fn emit_read_degrade_metrics(out: &mut String) {
+    let snap = brain_ops::metrics::read_degrade::global().snapshot();
+    emit_header(
+        out,
+        "brain_read_degraded_rows_total",
+        "Rows a read path returned with a part it could not resolve, by reason.",
+        "counter",
+    );
+    for (idx, reason) in brain_ops::metrics::read_degrade::READ_DEGRADE_REASON_LABELS
+        .iter()
+        .enumerate()
+    {
+        let _ = writeln!(
+            out,
+            "brain_read_degraded_rows_total{{reason=\"{reason}\"}} {}",
+            snap.rows_total[idx]
+        );
     }
 }
 
@@ -1315,5 +1656,150 @@ fn emit_request_metrics(out: &mut String, m: &RequestMetrics) {
     for (op_idx, op) in OP_LABELS.iter().enumerate() {
         let inner = format!("op=\"{op}\"");
         emit_histogram(out, "brain_request_duration_ms", &inner, m.duration(op_idx));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shard::ShardRequest;
+    use brain_ops::{SubmitOutcome, WriteStage};
+    use std::time::Duration;
+
+    /// Build a handle whose writer family already carries one of
+    /// everything the ack path records, so the exposition has real
+    /// numbers to render rather than an all-zero skeleton.
+    fn shard_with_recorded_write() -> (ShardHandle, flume::Receiver<ShardRequest>) {
+        let (tx, rx) = flume::unbounded::<ShardRequest>();
+        let handle = ShardHandle::new_for_test(0, tx);
+        let m = handle.writer_metrics();
+        m.record_idempotency(brain_ops::IdempotencyOutcome::Miss);
+        m.record_submit("upsert_memory", SubmitOutcome::Ok, Duration::from_millis(3));
+        m.record_wal_skip("reclaim_slots");
+        m.record_apply_error("link", "not_found");
+        m.stages()
+            .record(WriteStage::WalAppend, Duration::from_micros(400));
+        m.stages()
+            .record(WriteStage::RedbCommit, Duration::from_micros(1_500));
+        m.stages()
+            .record(WriteStage::HnswInsert, Duration::from_micros(120));
+        m.stages()
+            .record(WriteStage::TantivyIndex, Duration::from_micros(3));
+        m.stages()
+            .record(WriteStage::RedbApply, Duration::from_micros(3_400));
+        // The receiver rides back out so the request channel stays
+        // connected for as long as the handle under test lives.
+        (handle, rx)
+    }
+
+    #[test]
+    fn writer_family_exposes_every_recorded_axis() {
+        let (handle, _rx) = shard_with_recorded_write();
+        let shards = vec![handle];
+        let mut out = String::new();
+        emit_writer_metrics(&mut out, &shards);
+
+        for header in [
+            "# HELP brain_writer_submit_total",
+            "# TYPE brain_writer_submit_total counter",
+            "# TYPE brain_writer_wal_skip_total counter",
+            "# TYPE brain_writer_apply_errors_total counter",
+            "# TYPE brain_writer_idempotency_total counter",
+            "# TYPE brain_writer_submit_duration_seconds histogram",
+        ] {
+            assert!(out.contains(header), "missing {header} in:\n{out}");
+        }
+
+        assert!(out.contains(
+            "brain_writer_submit_total{shard=\"0\",phase=\"upsert_memory\",outcome=\"ok\"} 1"
+        ));
+        assert!(out.contains(
+            "brain_writer_submit_total{shard=\"0\",phase=\"upsert_memory\",outcome=\"err\"} 0"
+        ));
+        assert!(out.contains("brain_writer_wal_skip_total{shard=\"0\",phase=\"reclaim_slots\"} 1"));
+        assert!(out.contains(
+            "brain_writer_apply_errors_total{shard=\"0\",phase=\"link\",error=\"not_found\"} 1"
+        ));
+        assert!(out.contains("brain_writer_idempotency_total{shard=\"0\",outcome=\"miss\"} 1"));
+        assert!(out.contains(
+            "brain_writer_submit_duration_seconds_count{shard=\"0\",phase=\"upsert_memory\"} 1"
+        ));
+    }
+
+    /// Every degradation reason has to reach the scrape, or an operator
+    /// cannot tell which kind of corruption they are looking at.
+    #[test]
+    fn read_degrade_family_exposes_every_reason() {
+        use brain_ops::metrics::read_degrade::{global, ReadDegradeReason};
+
+        global().inc(ReadDegradeReason::PredicateQnameMissing);
+        global().inc(ReadDegradeReason::RelationTypeQnameMissing);
+        global().inc(ReadDegradeReason::EvidenceOverflowMissing);
+
+        let mut out = String::new();
+        emit_read_degrade_metrics(&mut out);
+
+        assert!(out.contains("# HELP brain_read_degraded_rows_total"));
+        assert!(out.contains("# TYPE brain_read_degraded_rows_total counter"));
+        for reason in brain_ops::metrics::read_degrade::READ_DEGRADE_REASON_LABELS {
+            let needle = format!("brain_read_degraded_rows_total{{reason=\"{reason}\"}} ");
+            assert!(out.contains(&needle), "missing {needle} in:\n{out}");
+        }
+    }
+
+    #[test]
+    fn write_stage_family_exposes_one_series_per_stage() {
+        let (handle, _rx) = shard_with_recorded_write();
+        let shards = vec![handle];
+        let mut out = String::new();
+        emit_write_stage_metrics(&mut out, &shards);
+
+        assert!(out.contains(
+            "# HELP brain_writer_stage_duration_ms Per-stage wall-clock latency of the synchronous write (ack) path, in milliseconds."
+        ));
+        assert!(out.contains("# TYPE brain_writer_stage_duration_ms histogram"));
+        // Exactly one header pair for the whole family — Prometheus
+        // rejects a repeated HELP line for the same metric name.
+        assert_eq!(
+            out.matches("# TYPE brain_writer_stage_duration_ms").count(),
+            1
+        );
+
+        for stage in brain_ops::WRITE_STAGE_LABELS {
+            assert!(
+                out.contains(&format!(
+                    "brain_writer_stage_duration_ms_count{{shard=\"0\",stage=\"{stage}\"}} 1"
+                )),
+                "stage {stage} missing a count line in:\n{out}"
+            );
+            assert!(
+                out.contains(&format!(
+                    "brain_writer_stage_duration_ms_bucket{{shard=\"0\",stage=\"{stage}\",le=\"+Inf\"}} 1"
+                )),
+                "stage {stage} missing its +Inf bucket in:\n{out}"
+            );
+        }
+
+        // Observations are milliseconds: a 1.5 ms redb commit must
+        // render as 1.5, not 0.0015 or 1500.
+        assert!(
+            out.contains(
+                "brain_writer_stage_duration_ms_sum{shard=\"0\",stage=\"redb_commit\"} 1.5"
+            ),
+            "redb_commit sum not in milliseconds:\n{out}"
+        );
+    }
+
+    #[test]
+    fn write_stage_series_are_emitted_before_any_write_lands() {
+        let (tx, _rx) = flume::unbounded::<ShardRequest>();
+        let shards = vec![ShardHandle::new_for_test(0, tx)];
+        let mut out = String::new();
+        emit_write_stage_metrics(&mut out, &shards);
+        for stage in brain_ops::WRITE_STAGE_LABELS {
+            assert!(out.contains(&format!(
+                "brain_writer_stage_duration_ms_count{{shard=\"0\",stage=\"{stage}\"}} 0"
+            )));
+        }
     }
 }

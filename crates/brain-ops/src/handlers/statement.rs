@@ -22,8 +22,12 @@ use crate::clock::now_unix_nanos;
 use crate::context::OpsContext;
 use crate::error::{caller_tombstone_reason, OpError};
 use crate::handlers::events::emit_graph_event;
+use crate::handlers::limits::{
+    check_byte_len, QNAME_MAX_BYTES, REASON_MESSAGE_MAX_BYTES, STATEMENT_VALUE_MAX_BYTES,
+};
 use crate::handlers::writer_handle::real_writer_handle;
 use crate::index::text_indexer::StatementTextOp;
+use crate::metrics::read_degrade::{global as read_degrade_metrics, ReadDegradeReason};
 use crate::write::{
     EvidenceRefPhase, Phase, PhaseAck, SupersedeReplacement, SupersedeReplacementId,
     SupersedeTarget, TombstoneTarget, Write, WriteId,
@@ -31,8 +35,9 @@ use crate::write::{
 use brain_core::{EntityId, PredicateId, RequestId, StatementId, StatementKind};
 use brain_core::{EvidenceEntry, Statement, TombstoneReason};
 use brain_metadata::schema::predicate::{
-    predicate_get, predicate_intern_or_get, predicate_lookup_by_qname, predicates_active_for_schema,
+    predicate_intern_or_get, predicate_lookup_by_qname, predicates_active_for_schema,
 };
+use brain_metadata::schema::qnames::PredicateQnames;
 use brain_metadata::schema::store::schema_active;
 use brain_metadata::statement::{
     evidence_overflow_load, statement_get, statement_history_page, statement_list_page,
@@ -53,8 +58,6 @@ use brain_protocol::{
 // 30 days. Used by STATEMENT_RETRACT for the
 // will_zero_at hint.
 const RETRACT_GRACE_NANOS: u64 = 30 * 24 * 60 * 60 * 1_000_000_000;
-const REASON_MESSAGE_MAX: usize = 4096;
-const PREDICATE_QNAME_MAX: usize = 96;
 const LIST_LIMIT_MAX: u32 = 1000;
 
 /// Whether statement `id`'s row belongs to the caller's `(namespace,
@@ -88,12 +91,7 @@ pub async fn handle_statement_create(
     req: StatementCreateRequest,
     ctx: &OpsContext,
 ) -> Result<StatementCreateResponse, OpError> {
-    validate_predicate_qname(&req.predicate)?;
-    if req.confidence.is_nan() || !(0.0..=1.0).contains(&req.confidence) {
-        return Err(OpError::InvalidRequest(
-            "confidence must be in [0, 1] and not NaN".into(),
-        ));
-    }
+    validate_statement_create_request(&req)?;
     let kind = statement_kind_from_wire(req.kind);
 
     let now = now_unix_nanos();
@@ -109,8 +107,8 @@ pub async fn handle_statement_create(
     // For schemaless mode with a missing predicate, we don't run a
     // separate intern wtxn — the Phase carries the qname as an intern
     // hint and apply does the work inside the main submit wtxn,
-    // collapsing what used to be three commits (intern, statement,
-    // flag stamp) into one.
+    // collapsing three separate commits (intern, statement, flag
+    // stamp) into one.
     // Vocabulary resolves in the scope the caller writes into: the space's
     // own declarations when it has them, otherwise the namespace's. Asking
     // the namespace base instead would reject a predicate the caller's own
@@ -211,7 +209,7 @@ pub async fn handle_statement_create(
     let created_id = match ack.single_phase() {
         PhaseAck::UpsertedStatement(id, _) => *id,
         other => {
-            return Err(OpError::Internal(format!(
+            return Err(OpError::PermanentFault(format!(
                 "unexpected phase ack for STATEMENT_CREATE: {other:?}"
             )))
         }
@@ -230,7 +228,9 @@ pub async fn handle_statement_create(
             .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
         let new = statement_get(&rtxn, created_id)
             .map_err(OpError::from)?
-            .ok_or_else(|| OpError::Internal("created statement missing post-commit".into()))?;
+            .ok_or_else(|| {
+                OpError::PermanentFault("created statement missing post-commit".into())
+            })?;
         (new.chain_root, new.supersedes)
     };
 
@@ -302,7 +302,7 @@ pub async fn handle_statement_get(
         .read_txn()
         .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
 
-    let mut current = statement_get(&rtxn, id)
+    let current = statement_get(&rtxn, id)
         .map_err(OpError::from)?
         .ok_or_else(|| OpError::NotFound {
             what: "statement",
@@ -319,19 +319,13 @@ pub async fn handle_statement_get(
         });
     }
 
-    let mut returned_via_supersession = false;
-    if req.follow_supersession {
-        while let Some(succ) = current.superseded_by {
-            returned_via_supersession = true;
-            current = statement_get(&rtxn, succ)
-                .map_err(OpError::from)?
-                .ok_or_else(|| {
-                    OpError::Internal(format!("chain dangling at {succ:?} from {id:?}"))
-                })?;
-        }
-    }
+    let (current, returned_via_supersession) = if req.follow_supersession {
+        resolve_supersession_head(&rtxn, id, current)?
+    } else {
+        (current, false)
+    };
 
-    let view = project_view(&rtxn, &current)?;
+    let view = project_view(&rtxn, &mut PredicateQnames::new(), &current)?;
     Ok(StatementGetResponse {
         statement: view,
         returned_via_supersession,
@@ -346,13 +340,7 @@ pub async fn handle_statement_supersede(
     req: StatementSupersedeRequest,
     ctx: &OpsContext,
 ) -> Result<StatementSupersedeResponse, OpError> {
-    validate_predicate_qname(&req.new_statement.predicate)?;
-    if req.new_statement.confidence.is_nan() || !(0.0..=1.0).contains(&req.new_statement.confidence)
-    {
-        return Err(OpError::InvalidRequest(
-            "confidence must be in [0, 1] and not NaN".into(),
-        ));
-    }
+    validate_statement_create_request(&req.new_statement)?;
     let kind = statement_kind_from_wire(req.new_statement.kind);
 
     let old_id = StatementId::from(req.old_statement_id);
@@ -462,7 +450,7 @@ pub async fn handle_statement_supersede(
     let new_id = match ack.single_phase() {
         PhaseAck::Superseded(_, SupersedeReplacementId::Statement(id)) => *id,
         other => {
-            return Err(OpError::Internal(format!(
+            return Err(OpError::PermanentFault(format!(
                 "unexpected phase ack for STATEMENT_SUPERSEDE: {other:?}"
             )))
         }
@@ -478,7 +466,9 @@ pub async fn handle_statement_supersede(
             .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
         let new = statement_get(&rtxn, new_id)
             .map_err(OpError::from)?
-            .ok_or_else(|| OpError::Internal("new statement missing post-supersede".into()))?;
+            .ok_or_else(|| {
+                OpError::PermanentFault("new statement missing post-supersede".into())
+            })?;
         (new.chain_root, new.version)
     };
 
@@ -517,11 +507,11 @@ pub async fn handle_statement_tombstone(
     req: StatementTombstoneRequest,
     ctx: &OpsContext,
 ) -> Result<StatementTombstoneResponse, OpError> {
-    if req.reason_message.len() > REASON_MESSAGE_MAX {
-        return Err(OpError::InvalidRequest(
-            "reason_message exceeds 4 KiB".into(),
-        ));
-    }
+    check_byte_len(
+        "reason_message",
+        req.reason_message.len(),
+        REASON_MESSAGE_MAX_BYTES,
+    )?;
     let reason = caller_tombstone_reason(req.reason)?;
     let id = StatementId::from(req.statement_id);
     let now = now_unix_nanos();
@@ -557,7 +547,7 @@ pub async fn handle_statement_tombstone(
             ..
         } => *tombstoned_at_unix_nanos,
         other => {
-            return Err(OpError::Internal(format!(
+            return Err(OpError::PermanentFault(format!(
                 "unexpected phase ack for STATEMENT_TOMBSTONE: {other:?}"
             )));
         }
@@ -591,11 +581,11 @@ pub async fn handle_statement_retract(
     req: StatementRetractRequest,
     ctx: &OpsContext,
 ) -> Result<StatementRetractResponse, OpError> {
-    if req.reason_message.len() > REASON_MESSAGE_MAX {
-        return Err(OpError::InvalidRequest(
-            "reason_message exceeds 4 KiB".into(),
-        ));
-    }
+    check_byte_len(
+        "reason_message",
+        req.reason_message.len(),
+        REASON_MESSAGE_MAX_BYTES,
+    )?;
     // Validate the caller's audit reason byte (kept in the event /
     // message) but stamp the row with `Retract` regardless: the
     // reclamation GC worker keys on this byte to physically remove only
@@ -641,7 +631,7 @@ pub async fn handle_statement_retract(
             ..
         } => *tombstoned_at_unix_nanos,
         other => {
-            return Err(OpError::Internal(format!(
+            return Err(OpError::PermanentFault(format!(
                 "unexpected phase ack for STATEMENT_RETRACT: {other:?}"
             )));
         }
@@ -732,12 +722,13 @@ pub async fn handle_statement_history(
             });
         }
 
+        let mut qnames = PredicateQnames::new();
         let mut items = Vec::with_capacity(page.rows.len());
         for s in &page.rows {
             if !req.include_tombstoned && s.tombstoned {
                 continue;
             }
-            items.push(project_view(&rtxn, s)?);
+            items.push(project_view(&rtxn, &mut qnames, s)?);
         }
         let next = match (page.has_more, page.last_version) {
             (true, Some(v)) => {
@@ -932,9 +923,10 @@ pub async fn handle_statement_list(
         )
         .map_err(OpError::from)?;
 
+        let mut qnames = PredicateQnames::new();
         let mut out = Vec::with_capacity(page.rows.len());
         for s in &page.rows {
-            out.push(project_view(&rtxn, s)?);
+            out.push(project_view(&rtxn, &mut qnames, s)?);
         }
         let count = out.len() as u32;
         let next_cursor = match (page.has_more, page.last) {
@@ -956,21 +948,78 @@ pub async fn handle_statement_list(
 // Helpers.
 // ---------------------------------------------------------------------------
 
+/// Hop cap for the `STATEMENT_GET` supersession walk.
+///
+/// A supersession chain grows by one row each time the same claim is
+/// corrected, so it is legitimately far longer than a merge redirect —
+/// nothing in the substrate caps it, the chain's `version` column is a
+/// `u32`, and `statement_history` pages a chain rather than truncating
+/// it. The cap therefore sits far above any chain a correcting writer
+/// could plausibly build, while still turning a corrupt cycle into a
+/// bounded sequence of point reads inside one read transaction instead
+/// of a loop that never ends.
+const STATEMENT_SUPERSESSION_MAX_HOPS: usize = 1024;
+
+/// Walk `superseded_by` from `start` to the head of its supersession
+/// chain, returning the head row and whether any hop was taken.
+///
+/// Returns [`OpError::SupersessionChainCycle`] if the chain is longer
+/// than [`STATEMENT_SUPERSESSION_MAX_HOPS`] — a cycle, which no write
+/// path can create and which would otherwise spin forever inside a read
+/// that never yields to the executor.
+fn resolve_supersession_head(
+    rtxn: &redb::ReadTransaction,
+    anchor: StatementId,
+    start: Statement,
+) -> Result<(Statement, bool), OpError> {
+    let mut current = start;
+    let mut followed = false;
+    for _ in 0..=STATEMENT_SUPERSESSION_MAX_HOPS {
+        let Some(succ) = current.superseded_by else {
+            return Ok((current, followed));
+        };
+        followed = true;
+        current = statement_get(rtxn, succ)
+            .map_err(OpError::from)?
+            .ok_or_else(|| {
+                OpError::PermanentFault(format!("chain dangling at {succ:?} from {anchor:?}"))
+            })?;
+    }
+    Err(OpError::SupersessionChainCycle {
+        what: "statement",
+        detail: format!("{anchor:?}"),
+    })
+}
+
 fn validate_predicate_qname(q: &str) -> Result<(), OpError> {
     if q.is_empty() {
         return Err(OpError::InvalidRequest(
             "predicate must be non-empty".into(),
         ));
     }
-    if q.len() > PREDICATE_QNAME_MAX {
-        return Err(OpError::InvalidRequest(format!(
-            "predicate qname exceeds {PREDICATE_QNAME_MAX} bytes"
-        )));
-    }
+    check_byte_len("predicate qname", q.len(), QNAME_MAX_BYTES)?;
     if !q.contains(':') {
         return Err(OpError::InvalidRequest(
             "predicate must use \"namespace:name\" form".into(),
         ));
+    }
+    Ok(())
+}
+
+fn validate_statement_create_request(req: &StatementCreateRequest) -> Result<(), OpError> {
+    validate_predicate_qname(&req.predicate)?;
+    if req.confidence.is_nan() || !(0.0..=1.0).contains(&req.confidence) {
+        return Err(OpError::InvalidRequest(
+            "confidence must be in [0, 1] and not NaN".into(),
+        ));
+    }
+    if let brain_protocol::StatementObjectWire::Value(value) = &req.object {
+        let (field, len) = match value {
+            brain_protocol::StatementValueWire::Text(text) => ("statement text value", text.len()),
+            brain_protocol::StatementValueWire::Blob(blob) => ("statement blob value", blob.len()),
+            _ => return Ok(()),
+        };
+        check_byte_len(field, len, STATEMENT_VALUE_MAX_BYTES)?;
     }
     Ok(())
 }
@@ -1156,16 +1205,34 @@ fn build_statement_from_create(
 /// resolving the `PredicateId` to its `"namespace:name"` canonical
 /// string. Inline-evidence overflow is resolved to inline form when
 /// possible (single-shot read).
-fn project_view(rtxn: &redb::ReadTransaction, s: &Statement) -> Result<StatementView, OpError> {
-    let predicate = predicate_get(rtxn, s.predicate)
-        .map_err(OpError::from)?
-        .ok_or_else(|| {
-            OpError::Internal(format!(
-                "statement {:?} references missing predicate {:?}",
-                s.id, s.predicate
-            ))
-        })?;
-    let qname = predicate.canonical();
+///
+/// `qnames` is the caller's resolver, shared across a page. It memoises
+/// the registry, so a projection loop costs one lookup per DISTINCT
+/// predicate rather than one per row, and it names an unresolvable
+/// predicate with the empty sentinel instead of failing. One row whose
+/// predicate row has gone would otherwise deny the caller every healthy
+/// row beside it.
+///
+/// An overflow row the store no longer has degrades the same way: the
+/// statement projects with an empty evidence list. That empty list is
+/// indistinguishable from a statement that genuinely cites nothing, because
+/// `StatementView` has no field for "evidence incomplete" and adding one
+/// would change the protocol. Both degrades are counted into the degraded-row
+/// family, so the condition has a rate an operator can alert on even where
+/// the projected value looks healthy.
+fn project_view(
+    rtxn: &redb::ReadTransaction,
+    qnames: &mut PredicateQnames,
+    s: &Statement,
+) -> Result<StatementView, OpError> {
+    let qname = qnames.resolve(rtxn, s.predicate);
+    // The resolver blanks a predicate it cannot name and memoises the
+    // answer, so the row-level count lives here: an operator needs the rate
+    // of claims reaching clients unnamed, not the number of registry
+    // entries that went missing.
+    if qname.is_empty() {
+        read_degrade_metrics().inc(ReadDegradeReason::PredicateQnameMissing);
+    }
 
     // If evidence is overflow, resolve to inline form so consumers
     // don't need a second op to read the memory ids. A future
@@ -1175,12 +1242,21 @@ fn project_view(rtxn: &redb::ReadTransaction, s: &Statement) -> Result<Statement
     if let brain_core::EvidenceRef::Overflow(id) = s.evidence {
         let entries = evidence_overflow_load(rtxn, id)
             .map_err(OpError::from)?
-            .ok_or_else(|| {
-                OpError::Internal(format!(
-                    "statement {:?} references missing overflow row {:?}",
-                    s.id, id
-                ))
-            })?;
+            .unwrap_or_else(|| {
+                // A live statement pointing at an overflow row the store no
+                // longer has is an inconsistency inside one read transaction,
+                // not a client error. The claim, its subject, its predicate,
+                // and its history are still true and worth returning, so
+                // project the row without its citations rather than denying
+                // every healthy row on the same page.
+                tracing::warn!(
+                    statement_id = ?s.id,
+                    overflow_id = ?id,
+                    "statement references an evidence-overflow row that is gone; projecting with no evidence"
+                );
+                read_degrade_metrics().inc(ReadDegradeReason::EvidenceOverflowMissing);
+                Vec::new()
+            });
         let mut sv = smallvec::SmallVec::<
             [brain_core::EvidenceEntry; brain_core::INLINE_EVIDENCE_CAP],
         >::new();
@@ -1356,29 +1432,10 @@ fn hash_evidence_ref(h: &mut blake3::Hasher, ev: &brain_protocol::EvidenceRefWir
     }
 }
 
-/// Wire-level writer-error projection shared across all migrated
-/// statement handlers.
+/// Project a writer fault into the wire error taxonomy. The writer's own
+/// variants already carry the classification, so this forwards them intact.
 fn map_writer_err(err: WriterError) -> OpError {
-    match &err {
-        WriterError::Internal(msg) if msg.contains("UnknownPredicate") => OpError::NotFound {
-            what: "predicate",
-            detail: msg.clone(),
-        },
-        WriterError::Internal(msg) if msg.contains("UnknownSubject") => OpError::NotFound {
-            what: "subject entity",
-            detail: msg.clone(),
-        },
-        WriterError::Internal(msg) if msg.contains("AlreadyTombstoned") => {
-            OpError::Conflict(msg.clone())
-        }
-        WriterError::Internal(msg) if msg.contains("AlreadySuperseded") => {
-            OpError::Conflict(msg.clone())
-        }
-        WriterError::Internal(msg) if msg.contains("EventCannotSupersede") => {
-            OpError::Conflict(msg.clone())
-        }
-        _ => OpError::ExecError(brain_planner::ExecError::WriterFailed(err)),
-    }
+    OpError::ExecError(brain_planner::ExecError::WriterFailed(err))
 }
 
 // Statement / predicate error classification lives in
@@ -1453,7 +1510,7 @@ mod history_cursor_tests {
 
 #[cfg(test)]
 mod build_statement_tests {
-    use super::build_statement_from_create;
+    use super::{build_statement_from_create, validate_statement_create_request};
     use brain_core::{PredicateId, StatementKind};
     use brain_protocol::{
         EvidenceRefWire, StatementCreateRequest, StatementKindWire, StatementObjectWire,
@@ -1493,6 +1550,20 @@ mod build_statement_tests {
     }
 
     #[test]
+    fn oversize_value_is_invalid_request() {
+        let mut r = req(StatementKindWire::Fact);
+        r.object = StatementObjectWire::Value(StatementValueWire::Text(
+            "x".repeat(super::STATEMENT_VALUE_MAX_BYTES + 1),
+        ));
+        let err =
+            validate_statement_create_request(&r).expect_err("over-cap value must be refused");
+        let crate::error::OpError::InvalidField { field, .. } = err else {
+            panic!("an over-cap value must name the offending field");
+        };
+        assert_eq!(field, "statement text value");
+    }
+
+    #[test]
     fn event_with_valid_to_rejected() {
         let mut r = req(StatementKindWire::Event);
         r.event_at_unix_nanos = NOW;
@@ -1523,5 +1594,465 @@ mod build_statement_tests {
             .expect("fact accepted");
         assert_eq!(s.extracted_at_unix_nanos, NOW);
         assert_eq!(s.valid_from_unix_nanos, Some(HISTORICAL));
+    }
+}
+
+#[cfg(all(test, not(miri)))]
+mod project_view_tests {
+    use super::project_view;
+    use crate::metrics::read_degrade::{global as read_degrade_metrics, ReadDegradeReason};
+    use brain_core::{
+        EntityId, EvidenceEntry, EvidenceOverflowId, EvidenceRef, ExtractorId, MemoryId,
+        PredicateId, Statement, StatementId, StatementKind, StatementObject, SubjectRef,
+    };
+    use brain_metadata::schema::predicate::{predicate_intern, ObjectConstraint};
+    use brain_metadata::schema::qnames::PredicateQnames;
+    use brain_metadata::statement::allocate_evidence_overflow;
+    use brain_metadata::{DeclScope, MetadataDb};
+    use brain_protocol::ops::statement::EvidenceRefWire;
+
+    /// The degraded-row counters are process-wide, so a test reading them as a
+    /// delta has to be the only one projecting while it does.
+    static DEGRADE_COUNTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    const NOW: u64 = 1_700_000_000_000_000_000;
+
+    /// `MetadataDb::open` seeds the system schema, so every catalog table
+    /// the projection reads already exists.
+    fn fresh_db(dir: &tempfile::TempDir) -> MetadataDb {
+        MetadataDb::open(dir.path().join("meta.redb")).expect("open metadata")
+    }
+
+    fn intern(db: &MetadataDb, name: &str) -> PredicateId {
+        let wtxn = db.write_txn().expect("write txn");
+        let id = predicate_intern(
+            &wtxn,
+            DeclScope::base("acme"),
+            name,
+            None,
+            ObjectConstraint::ANY,
+            1,
+            "",
+            false,
+            NOW,
+        )
+        .expect("intern predicate");
+        wtxn.commit().expect("commit");
+        id
+    }
+
+    fn statement(predicate: PredicateId) -> Statement {
+        Statement::new_root(
+            StatementId::new(),
+            StatementKind::Fact,
+            SubjectRef::Entity(EntityId::new()),
+            predicate,
+            StatementObject::Entity(EntityId::new()),
+            1.0,
+            EvidenceRef::default(),
+            ExtractorId::from(0u32),
+            NOW,
+            1,
+        )
+    }
+
+    fn statement_with_evidence(predicate: PredicateId, evidence: EvidenceRef) -> Statement {
+        let mut s = statement(predicate);
+        s.evidence = evidence;
+        s
+    }
+
+    /// The healthy case, which the degraded one must leave alone.
+    #[test]
+    fn a_live_predicate_reaches_the_view_as_its_qname() {
+        let _counts = DEGRADE_COUNTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = fresh_db(&dir);
+        let p = intern(&db, "employs");
+        let rtxn = db.read_txn().expect("read txn");
+        let view = project_view(&rtxn, &mut PredicateQnames::new(), &statement(p))
+            .expect("healthy row projects");
+        assert_eq!(view.predicate, "acme:employs");
+    }
+
+    /// A degraded row has to leave a trace an operator can alert on, because
+    /// the projected row itself looks ordinary.
+    #[test]
+    fn a_statement_whose_predicate_row_is_gone_counts_a_degraded_row() {
+        let _counts = DEGRADE_COUNTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = fresh_db(&dir);
+        let rtxn = db.read_txn().expect("read txn");
+        let before = read_degrade_metrics()
+            .snapshot()
+            .rows(ReadDegradeReason::PredicateQnameMissing);
+        let view = project_view(
+            &rtxn,
+            &mut PredicateQnames::new(),
+            &statement(PredicateId::from(4242)),
+        )
+        .expect("an orphaned predicate must not fail the projection");
+        assert_eq!(view.predicate, "");
+        let after = read_degrade_metrics()
+            .snapshot()
+            .rows(ReadDegradeReason::PredicateQnameMissing);
+        assert!(
+            after > before,
+            "an unnamed predicate must raise the degraded-row count"
+        );
+    }
+
+    /// A healthy row must not raise the alert, or the signal is worthless.
+    #[test]
+    fn a_live_predicate_counts_no_degraded_row() {
+        let _counts = DEGRADE_COUNTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = fresh_db(&dir);
+        let p = intern(&db, "employs");
+        let rtxn = db.read_txn().expect("read txn");
+        let before = read_degrade_metrics()
+            .snapshot()
+            .rows(ReadDegradeReason::PredicateQnameMissing);
+        let view = project_view(&rtxn, &mut PredicateQnames::new(), &statement(p))
+            .expect("healthy row projects");
+        assert_eq!(view.predicate, "acme:employs");
+        let after = read_degrade_metrics()
+            .snapshot()
+            .rows(ReadDegradeReason::PredicateQnameMissing);
+        assert_eq!(
+            after, before,
+            "a nameable predicate must not raise the degraded-row count"
+        );
+    }
+
+    /// A statement pointing at a predicate the registry has no row for is a
+    /// broken row, not a broken request. It projects with the empty qname so
+    /// the caller sees the statement and can act on it.
+    #[test]
+    fn a_statement_whose_predicate_row_is_gone_still_projects() {
+        let _counts = DEGRADE_COUNTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = fresh_db(&dir);
+        let rtxn = db.read_txn().expect("read txn");
+        let orphan = statement(PredicateId::from(4242));
+        let view = project_view(&rtxn, &mut PredicateQnames::new(), &orphan)
+            .expect("an orphaned predicate must not fail the projection");
+        assert_eq!(view.predicate, "");
+        assert_eq!(view.statement_id, orphan.id.to_bytes());
+    }
+
+    /// What STATEMENT_LIST and STATEMENT_HISTORY do: one resolver over a
+    /// page. A row whose predicate row is missing projects with an empty
+    /// qname, so a single orphan does not deny the caller the healthy rows
+    /// beside it.
+    #[test]
+    fn one_orphan_does_not_deny_the_rest_of_the_page() {
+        let _counts = DEGRADE_COUNTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = fresh_db(&dir);
+        let p = intern(&db, "employs");
+        let page = [
+            statement(p),
+            statement(PredicateId::from(4242)),
+            statement(p),
+        ];
+        let rtxn = db.read_txn().expect("read txn");
+        let mut qnames = PredicateQnames::new();
+        let names: Vec<String> = page
+            .iter()
+            .map(|s| {
+                project_view(&rtxn, &mut qnames, s)
+                    .expect("no row may fail the page")
+                    .predicate
+            })
+            .collect();
+        assert_eq!(names, vec!["acme:employs", "", "acme:employs"]);
+    }
+
+    /// A broken overflow row is a broken row, not a broken request. The
+    /// statement still projects with an empty evidence list.
+    #[test]
+    fn a_statement_whose_evidence_overflow_row_is_gone_still_projects() {
+        let _counts = DEGRADE_COUNTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = fresh_db(&dir);
+        let p = intern(&db, "employs");
+        let orphan = statement_with_evidence(p, EvidenceRef::Overflow(EvidenceOverflowId::new()));
+        let rtxn = db.read_txn().expect("read txn");
+        let view = project_view(&rtxn, &mut PredicateQnames::new(), &orphan)
+            .expect("a missing overflow row must not fail the projection");
+        assert_eq!(view.statement_id, orphan.id.to_bytes());
+        assert_eq!(view.predicate, "acme:employs");
+        assert!(matches!(
+            view.evidence,
+            EvidenceRefWire::Inline(ref entries) if entries.is_empty()
+        ));
+    }
+
+    /// An unreachable citation list is counted under its own reason: the
+    /// remedy is evidence storage, not the schema catalog.
+    #[test]
+    fn a_statement_whose_evidence_overflow_row_is_gone_counts_a_degraded_row() {
+        let _counts = DEGRADE_COUNTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = fresh_db(&dir);
+        let p = intern(&db, "employs");
+        let orphan = statement_with_evidence(p, EvidenceRef::Overflow(EvidenceOverflowId::new()));
+        let rtxn = db.read_txn().expect("read txn");
+        let before = read_degrade_metrics()
+            .snapshot()
+            .rows(ReadDegradeReason::EvidenceOverflowMissing);
+        project_view(&rtxn, &mut PredicateQnames::new(), &orphan)
+            .expect("a missing overflow row must not fail the projection");
+        let after = read_degrade_metrics()
+            .snapshot()
+            .rows(ReadDegradeReason::EvidenceOverflowMissing);
+        assert!(
+            after > before,
+            "an unreachable overflow row must raise the degraded-row count"
+        );
+    }
+
+    /// An empty evidence list is an ordinary healthy value, so a statement
+    /// that genuinely cites nothing must not look like corruption.
+    #[test]
+    fn a_statement_citing_nothing_counts_no_degraded_row() {
+        let _counts = DEGRADE_COUNTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = fresh_db(&dir);
+        let p = intern(&db, "employs");
+        let rtxn = db.read_txn().expect("read txn");
+        let before = read_degrade_metrics()
+            .snapshot()
+            .rows(ReadDegradeReason::EvidenceOverflowMissing);
+        project_view(&rtxn, &mut PredicateQnames::new(), &statement(p))
+            .expect("healthy row projects");
+        let after = read_degrade_metrics()
+            .snapshot()
+            .rows(ReadDegradeReason::EvidenceOverflowMissing);
+        assert_eq!(
+            after, before,
+            "a statement with no citations is healthy and must not be counted"
+        );
+    }
+
+    /// The page shape STATEMENT_LIST and STATEMENT_HISTORY produce: one
+    /// statement whose citations are unreachable costs the caller that row's
+    /// evidence and nothing else — the rows beside it keep theirs.
+    #[test]
+    fn one_orphan_overflow_does_not_deny_the_rest_of_the_page() {
+        let _counts = DEGRADE_COUNTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = fresh_db(&dir);
+        let p = intern(&db, "employs");
+        let first_id = MemoryId::pack(1, 10, 1);
+        let third_id = MemoryId::pack(1, 11, 1);
+        let page = [
+            statement_with_evidence(
+                p,
+                EvidenceRef::inline_from_slice(&[EvidenceEntry::from_parts(
+                    first_id,
+                    1.0,
+                    NOW,
+                    ExtractorId::from(0),
+                )]),
+            ),
+            statement_with_evidence(p, EvidenceRef::Overflow(EvidenceOverflowId::new())),
+            statement_with_evidence(
+                p,
+                EvidenceRef::inline_from_slice(&[EvidenceEntry::from_parts(
+                    third_id,
+                    1.0,
+                    NOW,
+                    ExtractorId::from(0),
+                )]),
+            ),
+        ];
+        let rtxn = db.read_txn().expect("read txn");
+        let mut qnames = PredicateQnames::new();
+        let views: Vec<_> = page
+            .iter()
+            .map(|s| project_view(&rtxn, &mut qnames, s).expect("no row may fail the page"))
+            .collect();
+        assert_eq!(views.len(), 3);
+        assert!(matches!(
+            views[0].evidence,
+            EvidenceRefWire::Inline(ref entries) if entries == &vec![first_id.to_be_bytes()]
+        ));
+        assert!(matches!(
+            views[1].evidence,
+            EvidenceRefWire::Inline(ref entries) if entries.is_empty()
+        ));
+        assert!(matches!(
+            views[2].evidence,
+            EvidenceRefWire::Inline(ref entries) if entries == &vec![third_id.to_be_bytes()]
+        ));
+    }
+
+    /// The healthy case, which the degraded one must leave alone: a reachable
+    /// overflow row is flattened into the inline form the caller reads without
+    /// a second op.
+    #[test]
+    fn a_live_overflow_row_reaches_the_view_inline() {
+        let _counts = DEGRADE_COUNTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = fresh_db(&dir);
+        let p = intern(&db, "employs");
+        let entries = vec![
+            EvidenceEntry::from_parts(MemoryId::pack(1, 20, 1), 1.0, NOW, ExtractorId::from(0)),
+            EvidenceEntry::from_parts(MemoryId::pack(1, 21, 1), 0.8, NOW, ExtractorId::from(1)),
+        ];
+        let overflow_id = {
+            let wtxn = db.write_txn().expect("write txn");
+            let id = allocate_evidence_overflow(&wtxn, &entries, NOW).expect("allocate overflow");
+            wtxn.commit().expect("commit overflow");
+            id
+        };
+        let s = statement_with_evidence(p, EvidenceRef::Overflow(overflow_id));
+        let rtxn = db.read_txn().expect("read txn");
+        let view = project_view(&rtxn, &mut PredicateQnames::new(), &s)
+            .expect("a live overflow row must project");
+        assert!(matches!(
+            view.evidence,
+            EvidenceRefWire::Inline(ref ids)
+                if ids == &vec![
+                    MemoryId::pack(1, 20, 1).to_be_bytes(),
+                    MemoryId::pack(1, 21, 1).to_be_bytes(),
+                ]
+        ));
+    }
+}
+
+#[cfg(all(test, not(miri)))]
+mod supersession_walk_tests {
+    use super::{resolve_supersession_head, STATEMENT_SUPERSESSION_MAX_HOPS};
+    use crate::error::OpError;
+    use brain_core::{
+        EntityId, EvidenceRef, ExtractorId, PredicateId, Statement, StatementId, StatementKind,
+        StatementObject, SubjectRef,
+    };
+    use brain_metadata::statement::statement_get;
+    use brain_metadata::tables::scope::RowScope;
+    use brain_metadata::tables::statement::{metadata_from_statement, STATEMENTS_TABLE};
+    use brain_metadata::MetadataDb;
+
+    const NOW: u64 = 1_700_000_000_000_000_000;
+
+    fn statement() -> Statement {
+        Statement::new_root(
+            StatementId::new(),
+            StatementKind::Fact,
+            SubjectRef::Entity(EntityId::new()),
+            PredicateId::from(1),
+            StatementObject::Entity(EntityId::new()),
+            1.0,
+            EvidenceRef::default(),
+            ExtractorId::from(0u32),
+            NOW,
+            1,
+        )
+    }
+
+    fn insert_rows(db: &MetadataDb, rows: &[(Statement, Option<StatementId>)]) {
+        let scope = RowScope::from_bytes(0, [0u8; 16]);
+        let wtxn = db.write_txn().expect("write txn");
+        {
+            let mut table = wtxn.open_table(STATEMENTS_TABLE).expect("statements table");
+            for (s, next) in rows {
+                let mut metadata = metadata_from_statement(s, scope);
+                metadata.superseded_by_bytes = next.map(|id| id.to_bytes());
+                table
+                    .insert(&s.id.to_bytes(), &metadata)
+                    .expect("insert statement row");
+            }
+        }
+        wtxn.commit().expect("commit statement rows");
+    }
+
+    /// A malformed cycle terminates with a typed substrate error instead of
+    /// monopolising the shard in a read loop that never yields.
+    #[test]
+    fn a_cyclic_chain_stops_instead_of_spinning() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = MetadataDb::open(dir.path().join("meta.redb")).expect("open metadata");
+        let first = statement();
+        let second = statement();
+        insert_rows(
+            &db,
+            &[
+                (first.clone(), Some(second.id)),
+                (second.clone(), Some(first.id)),
+            ],
+        );
+
+        let rtxn = db.read_txn().expect("read txn");
+        let start = statement_get(&rtxn, first.id)
+            .expect("statement lookup")
+            .expect("starting row");
+        let err = resolve_supersession_head(&rtxn, first.id, start)
+            .expect_err("a cyclic chain must stop with an error");
+        assert!(matches!(
+            err,
+            OpError::SupersessionChainCycle {
+                what: "statement",
+                ..
+            }
+        ));
+    }
+
+    /// A long valid correction history reaches its terminal row at the hop
+    /// cap, while an independent current row remains a zero-hop resolution.
+    #[test]
+    fn a_long_but_legal_chain_still_resolves() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = MetadataDb::open(dir.path().join("meta.redb")).expect("open metadata");
+        let rows: Vec<Statement> = (0..=STATEMENT_SUPERSESSION_MAX_HOPS)
+            .map(|_| statement())
+            .collect();
+        let links: Vec<_> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.clone(), rows.get(i + 1).map(|next| next.id)))
+            .collect();
+        insert_rows(&db, &links);
+        let standalone = statement();
+        insert_rows(&db, &[(standalone.clone(), None)]);
+
+        let rtxn = db.read_txn().expect("read txn");
+        let start = statement_get(&rtxn, rows[0].id)
+            .expect("statement lookup")
+            .expect("starting row");
+        let (head, followed) =
+            resolve_supersession_head(&rtxn, rows[0].id, start).expect("legal chain resolves");
+        assert_eq!(head.id, rows[STATEMENT_SUPERSESSION_MAX_HOPS].id);
+        assert!(followed);
+
+        let current = statement_get(&rtxn, standalone.id)
+            .expect("statement lookup")
+            .expect("standalone row");
+        let (same, followed) =
+            resolve_supersession_head(&rtxn, standalone.id, current).expect("current row resolves");
+        assert_eq!(same.id, standalone.id);
+        assert!(!followed);
     }
 }

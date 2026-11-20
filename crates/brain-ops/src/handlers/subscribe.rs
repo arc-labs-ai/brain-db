@@ -5,9 +5,15 @@
 //! - **EventBus**: in-process [`tokio::sync::broadcast`] of
 //!   [`EventEnvelope`]. The writer publishes one envelope per
 //!   successful committed mutation (single-op encode/forget +
-//!   each encode/forget inside a TXN_COMMIT batch). The bus owns
-//!   a monotonic LSN allocator — stand-in until the WAL LSN is
-//!   wired.
+//!   each encode/forget inside a TXN_COMMIT batch). WAL records
+//!   carry their own stamped LSN; the bus's [`LsnAllocator`]
+//!   numbers the events that have none and is held at or above
+//!   the WAL-stamped LSNs, so both sources share one
+//!   strictly-increasing sequence. Allocation order is not
+//!   delivery order: the server's subscription task compares
+//!   each live event against the highest LSN it has already
+//!   delivered and terminates the subscription with
+//!   `ERROR(Overloaded)` when one arrives below it.
 //! - **SubscriptionRegistry**: tracks active subscriptions by
 //!   `target_stream_id`, caches the parsed filter, and remembers the
 //!   `started_at_lsn` and the last-delivered `final_lsn` per stream.
@@ -76,10 +82,14 @@ pub const MAX_SUBSCRIBE_FILTER_ENTRIES: usize = 1024;
 // LSN allocator + envelope.
 // ---------------------------------------------------------------------------
 
-/// Strictly-increasing per-process LSN. v1 stand-in until the WAL
-/// LSN is wired. Single shard ⇒ a single allocator gives the
-/// "delivered in WAL order (per shard)" property by
-/// construction.
+/// Strictly-increasing per-process LSN. Events published to the bus
+/// without a durable WAL LSN draw from this allocator;
+/// [`LsnAllocator::bump_to`] holds it at or above the WAL-stamped
+/// LSNs so both sources share one strictly-increasing sequence.
+/// Delivery order is not thereby guaranteed by construction: the
+/// server's subscription task compares each live event against the
+/// highest LSN it has already delivered and terminates the
+/// subscription with `ERROR(Overloaded)` when one arrives below it.
 #[derive(Debug, Default)]
 pub struct LsnAllocator(AtomicU64);
 
@@ -844,16 +854,12 @@ pub fn parse_filter(req: &SubscribeRequest) -> Result<ParsedFilter, OpError> {
 // ---------------------------------------------------------------------------
 
 struct SubEntry {
-    /// Cached filter — used by the long-lived pump task. The dispatcher
-    /// path doesn't consult it (it clones the filter onto the
-    /// `SubscriptionHandle` instead), so the field is dead for v1.
-    #[allow(dead_code)]
-    filter: ParsedFilter,
-    /// Snapshot of `EventBus::current_lsn()` at register time.
-    /// Surfaced via [`SubscriptionHandle::started_at_lsn`] for the
-    /// caller; the registry uses it as the initial `final_lsn`.
-    #[allow(dead_code)]
-    started_at_lsn: u64,
+    /// Where this subscription has read to.
+    ///
+    /// Seeded from `EventBus::current_lsn()` at register time, which is also
+    /// what the caller gets on its [`SubscriptionHandle`] — the registry does
+    /// not keep a second copy of the starting point, nor of the filter: the
+    /// handle carries the filter the dispatcher actually consults.
     final_lsn: AtomicU64,
 }
 
@@ -930,8 +936,6 @@ impl SubscriptionRegistry {
         inner.streams.insert(
             stream_id,
             SubEntry {
-                filter: filter.clone(),
-                started_at_lsn,
                 final_lsn: AtomicU64::new(started_at_lsn),
             },
         );
@@ -959,8 +963,14 @@ impl SubscriptionRegistry {
 
     /// Advance the recorded `final_lsn` for a stream. The pump
     /// task calls this after each event it frames; the v1 dispatcher
-    /// calls it once after the first matching event.
+    /// calls it once after the first matching event. An LSN of 0 marks
+    /// an event with no durable WAL position, so it is not a resume
+    /// point; ignoring it prevents a resuming client from replaying
+    /// the segment from the beginning.
     pub fn update_final_lsn(&self, stream_id: u32, lsn: u64) {
+        if lsn == 0 {
+            return;
+        }
         let inner = self.inner.lock();
         if let Some(entry) = inner.streams.get(&stream_id) {
             entry.final_lsn.store(lsn, Ordering::SeqCst);
@@ -1026,7 +1036,7 @@ pub async fn handle_subscribe(
         if remaining.is_zero() {
             return Err(OpError::Overloaded(
                 "subscribe: no matching event within poll window — \
-                 Phase 9 enables long-lived streaming"
+                 long-lived streaming is not available"
                     .into(),
             ));
         }
@@ -1051,8 +1061,8 @@ pub async fn handle_subscribe(
                 // started_at_lsn; the registry entry survives so the
                 // client can UNSUBSCRIBE and observe the freeze.
                 return Err(OpError::Overloaded(
-                    "subscribe: subscriber lagged — Phase 9's long-lived \
-                     stream tolerates lag without dropping the subscription"
+                    "subscribe: subscriber lagged — a long-lived stream that \
+                     tolerates lag without dropping the subscription is not available"
                         .into(),
                 ));
             }
@@ -1062,7 +1072,7 @@ pub async fn handle_subscribe(
             None => {
                 return Err(OpError::Overloaded(
                     "subscribe: no matching event within poll window — \
-                     Phase 9 enables long-lived streaming"
+                     long-lived streaming is not available"
                         .into(),
                 ));
             }
@@ -1199,5 +1209,45 @@ mod similarity_tests {
         // The vector is resolved shard-side, so parse_filter alone
         // leaves the gate inert.
         assert!(parsed.similar_to.is_none());
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+    use brain_protocol::envelope::request::SubscribeRequest;
+    use brain_protocol::ops::subscribe::SubscriptionFilter;
+
+    fn tail_request() -> SubscribeRequest {
+        SubscribeRequest {
+            filter: SubscriptionFilter {
+                session_filter: None,
+                kinds: None,
+                similar_to: None,
+                spaces: None,
+                memory_ids: None,
+            },
+            include_history: false,
+            from_lsn: None,
+            max_inflight: 0,
+            act_as: None,
+        }
+    }
+
+    #[test]
+    fn zero_lsn_does_not_move_the_resume_point() {
+        let registry = SubscriptionRegistry::new(Arc::new(EventBus::default()));
+        let handle = registry.register(&tail_request()).expect("register");
+        let stream_id = handle.target_stream_id;
+
+        registry.update_final_lsn(stream_id, 42);
+        assert_eq!(registry.final_lsn(stream_id), Some(42));
+
+        // An event with no durable WAL position is still delivered, but
+        // it is not a position a client can resume from.
+        registry.update_final_lsn(stream_id, 0);
+        assert_eq!(registry.final_lsn(stream_id), Some(42));
+
+        assert_eq!(registry.unregister(stream_id).expect("unregister"), 42);
     }
 }

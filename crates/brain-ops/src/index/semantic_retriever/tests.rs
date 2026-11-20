@@ -508,9 +508,9 @@ use brain_index::SpaceVectorSource;
 use brain_metadata::tables::memory::{space_timeline_key, MEMORIES_BY_SPACE_TIMELINE_TABLE};
 use brain_metadata::tables::space::{space_key, SpaceMetadata, SPACES_TABLE};
 
-/// Empty `SpaceVectorSource`: the brute-force lane no longer resolves
-/// vectors from the arena (its mmap holds only WAL-recovered vectors, so it
-/// is empty for same-run encodes) — it reads the live redb artifact store
+/// Empty `SpaceVectorSource`: the brute-force lane does not resolve vectors
+/// from the arena (its mmap holds only WAL-recovered vectors, so it is empty
+/// for same-run encodes) — it reads the live redb artifact store
 /// instead. This mock exists only to satisfy the shard-read-path gate
 /// (`arena.is_some()`); returning `None` for every slot proves the lane
 /// never depends on arena content.
@@ -575,13 +575,25 @@ fn plant_memory(
             id.raw().to_be_bytes(),
         );
         tl.insert(&key[..], &()).expect("insert timeline");
-        crate::memory_artifact::merge_memory_artifact(&wtxn, id.to_be_bytes(), |b| {
-            b.vector = vector.to_vec();
-        })
-        .expect("plant artifact vector");
+        plant_vector(&wtxn, id, &vector);
     }
     wtxn.commit().expect("commit");
     id
+}
+
+/// Seed a memory's ENCODE-time embedding where the live write path puts it:
+/// the by-id `memory_vectors` table, as a flat little-endian `f32` run.
+fn plant_vector(wtxn: &redb::WriteTransaction, id: MemoryId, vector: &[f32; VECTOR_DIM]) {
+    use brain_metadata::tables::memory_vector::MEMORY_VECTORS_TABLE;
+    let mut bytes = Vec::with_capacity(VECTOR_DIM * 4);
+    for f in vector {
+        bytes.extend_from_slice(&f.to_le_bytes());
+    }
+    let mut t = wtxn
+        .open_table(MEMORY_VECTORS_TABLE)
+        .expect("open memory_vectors");
+    t.insert(&id.to_be_bytes(), bytes.as_slice())
+        .expect("plant vector");
 }
 
 /// Register a space in the SPACES table with an explicit `memory_count`
@@ -1023,16 +1035,13 @@ fn stored_vec() -> [f32; VECTOR_DIM] {
 fn vector_for_resolves_stored_vector_by_id_not_by_embedding() {
     let (_dir, metadata) = fresh_metadata();
     let id = MemoryId::pack(0, 1, 0);
-    // Persist the exact ENCODE-time vector by id (the artifact bundle, which
-    // `get_artifact_vector` resolves). No TEXTS row is written, so the only
-    // way to answer is the by-id lookup — a re-embed would have nothing to
-    // read anyway, and would return `one_hot(0)` if it fell through.
+    // Persist the exact ENCODE-time vector by id (the `memory_vectors` row,
+    // which `get_artifact_vector` resolves). No TEXTS row is written, so the
+    // only way to answer is the by-id lookup — a re-embed would have nothing
+    // to read anyway, and would return `one_hot(0)` if it fell through.
     {
         let wtxn = metadata.write_txn().expect("wtxn");
-        crate::memory_artifact::merge_memory_artifact(&wtxn, id.to_be_bytes(), |b| {
-            b.vector = stored_vec().to_vec();
-        })
-        .expect("store artifact vector");
+        plant_vector(&wtxn, id, &stored_vec());
         wtxn.commit().expect("commit");
     }
     let retriever = build_retriever(metadata);

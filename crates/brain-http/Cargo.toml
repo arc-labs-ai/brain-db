@@ -11,9 +11,8 @@ description = "HTTP/1.1, WebSocket, and SSE transport for the Brain substrate."
 [features]
 default = ["server", "sse", "ws"]
 # Server-side accept loop + Router + Connection + graceful shutdown.
-# Lands in M2; M1 only adds the foundation types.
 server = ["dep:tokio", "dep:hyper-util", "dep:socket2", "hyper/server", "hyper/http1"]
-# WebSocket via tokio-tungstenite — M6 (server) / M7 (client).
+# WebSocket via tokio-tungstenite, both server and client halves.
 ws = [
     "dep:tokio-tungstenite",
     "dep:tokio",
@@ -23,7 +22,7 @@ ws = [
     "hyper/server",
     "hyper/http1",
 ]
-# Server-Sent Events — M4. Streaming bodies are part of `server`
+# Server-Sent Events. Streaming bodies are part of `server`
 # already; `sse` toggles the higher-level SseEvent / SseStream
 # helpers in `sse/`.
 sse = ["dep:tokio"]
@@ -40,7 +39,7 @@ http = { workspace = true }
 http-body = { workspace = true }
 http-body-util = { workspace = true }
 bytes = { workspace = true }
-# M4: streaming body + SSE.
+# Streaming body + SSE.
 futures-core = { workspace = true }
 pin-project-lite = { workspace = true }
 
@@ -61,10 +60,10 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", 
 tokio-stream = { workspace = true }
 anyhow = { workspace = true }
 http-body-util = { workspace = true }
-# M6 tests: WebSocket client driven via `futures` traits.
+# WebSocket tests: client driven via `futures` traits.
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
-# M8 criterion benches.
+# Criterion benches.
 criterion = { workspace = true }
 
 [[bench]]

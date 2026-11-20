@@ -3,7 +3,7 @@
 //! Behaviour:
 //!
 //! - Key = `BLAKE3(text)[..16]`.
-//! - Value = `(vector, fingerprint, inserted_at)`.
+//! - Value = `(vector, fingerprint)`.
 //! - Fingerprint mismatch on lookup → miss; stale entries are *not*
 //!   auto-removed, they age out via LRU.
 //! - LRU eviction via the `lru` crate.
@@ -22,7 +22,6 @@
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
 
 use lru::LruCache;
 use parking_lot::Mutex;
@@ -35,14 +34,11 @@ use crate::model::VECTOR_DIM;
 /// Default cache size.
 pub const DEFAULT_CACHE_SIZE: usize = 10_000;
 
-/// One LRU entry. The `inserted_at` field is reserved for future
-/// migration / admin tooling; v1 reads only `vector` and `fingerprint`.
+/// One LRU entry.
 #[derive(Clone, Copy, Debug)]
 struct CachedEmbedding {
     vector: [f32; VECTOR_DIM],
     fingerprint: [u8; 16],
-    #[allow(dead_code)] // reserved for future migration / admin tooling
-    inserted_at: Instant,
 }
 
 /// Snapshot of cache counters. Cheap to construct; read without
@@ -172,7 +168,6 @@ impl<D: Dispatcher> Dispatcher for CachingDispatcher<D> {
         let entry = CachedEmbedding {
             vector,
             fingerprint: current_fp,
-            inserted_at: Instant::now(),
         };
         {
             let mut guard = state.lock();
@@ -359,7 +354,6 @@ mod tests {
                 CachedEmbedding {
                     vector: v_a,
                     fingerprint: fp(0x55), // STALE
-                    inserted_at: Instant::now(),
                 },
             );
         }

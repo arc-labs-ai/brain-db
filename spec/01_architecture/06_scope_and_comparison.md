@@ -90,7 +90,7 @@ For time-series analytics over Brain's data, the recommended pattern is to expor
 
 Aggregations across all memories are not a hot-path operation. Brain doesn't expose `SELECT COUNT(*) FROM memories WHERE ...` as a query.
 
-Background workers compute aggregates for internal use (decay sweep statistics, consolidation candidate identification, etc.). These are visible via `ADMIN_STATS` opcodes but at a coarse granularity, not as ad-hoc analytical queries.
+Background workers compute aggregates for internal use (decay sweep statistics, consolidation candidate identification, etc.). What surfaces of these does so through the operational plane — metrics and the admin listener — at a coarse granularity, not as ad-hoc analytical queries.
 
 For analytical queries, export to a real analytical store. This separation is similar to the operational/analytical split everywhere in data engineering.
 
@@ -149,7 +149,7 @@ This is acceptable for many use cases (research, internal tools, medium-critical
 
 Brain ships monolithic: each release pairs one server build with one wire version and one set of on-disk format versions. A client at any other wire version is rejected at handshake; an on-disk file at any other format version refuses to load. There is no compatibility window across versions, no version negotiation, and no upgrade-in-place across major releases.
 
-Upgrades use `brainctl migrate` to bring on-disk files to the current format ([`../00_overview/03_versioning.md`](../00_overview/03_versioning.md)).
+There is no converter either: an off-version data directory is refused at open and nothing upgrades it, so a storage-format bump is a re-ingest rather than an upgrade step ([`../00_overview/03_versioning.md`](../00_overview/03_versioning.md) §4).
 
 ## 15. Fine-grained access control
 

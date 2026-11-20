@@ -820,32 +820,40 @@ impl EntityDisambiguator {
     /// entity as `view`. This is `.await`-ed OFF the shard reactor by the
     /// extractor worker — in the disambiguation *plan* step, before any
     /// write transaction is open — so, unlike the old in-txn `block_on`,
-    /// it never parks the shard core. The resulting [`MatchVerdict`] is
-    /// stashed in a [`PrecomputedVerdicts`] map the apply step consults
-    /// synchronously. Any soft failure (transport error, unparseable
-    /// reply) degrades to [`MatchVerdict::Skipped`], which the resolver
-    /// treats as "fall through to the no-disambiguator path".
+    /// it never parks the shard core. The [`MatchVerdict`] on the returned
+    /// [`DisambiguationOutcome`] is stashed in a [`PrecomputedVerdicts`] map
+    /// the apply step consults synchronously; its `cost_micro_usd` goes to the
+    /// worker's spend accounting. Any soft failure (transport error,
+    /// unparseable reply) degrades to [`MatchVerdict::Skipped`], which the
+    /// resolver treats as "fall through to the no-disambiguator path" — and
+    /// still carries whatever the provider charged for the attempt.
     pub async fn confirm(
         &self,
         namespace: &str,
         view: &LlmCandidateView,
         surface_form: &str,
-    ) -> MatchVerdict {
+    ) -> DisambiguationOutcome {
         let candidate = view.entity_id;
-        match ask_if_same_entity(self, namespace, view, surface_form).await {
-            Ok(SameEntityReply::Yes(confidence)) => {
-                if confidence >= self.min_confidence {
-                    MatchVerdict::Confirmed {
-                        entity: candidate,
-                        confidence,
-                    }
-                } else {
-                    MatchVerdict::Uncertain
+        let (verdict, cost_micro_usd) =
+            match ask_if_same_entity(self, namespace, view, surface_form).await {
+                Ok((SameEntityReply::Yes(confidence), cost)) => {
+                    let verdict = if confidence >= self.min_confidence {
+                        MatchVerdict::Confirmed {
+                            entity: candidate,
+                            confidence,
+                        }
+                    } else {
+                        MatchVerdict::Uncertain
+                    };
+                    (verdict, cost)
                 }
-            }
-            Ok(SameEntityReply::No) => MatchVerdict::Rejected,
-            Ok(SameEntityReply::Uncertain) => MatchVerdict::Uncertain,
-            Err(reason) => MatchVerdict::Skipped { reason },
+                Ok((SameEntityReply::No, cost)) => (MatchVerdict::Rejected, cost),
+                Ok((SameEntityReply::Uncertain, cost)) => (MatchVerdict::Uncertain, cost),
+                Err((reason, cost)) => (MatchVerdict::Skipped { reason }, cost),
+            };
+        DisambiguationOutcome {
+            verdict,
+            cost_micro_usd,
         }
     }
 }
@@ -882,6 +890,27 @@ pub enum MatchVerdict {
     /// Treated identically to [`Uncertain`](Self::Uncertain); carries a
     /// short reason for log correlation.
     Skipped { reason: String },
+}
+
+/// A disambiguation verdict and what asking for it cost.
+///
+/// The cost rides with the verdict because every other model-backed stage on
+/// the write path reports its spend, and a judgement whose provider charge is
+/// invisible to accounting is one nobody can reconcile against an invoice.
+///
+/// It is non-zero even when the verdict is [`MatchVerdict::Skipped`]: a
+/// provider that billed a completion we could not parse still charged for it,
+/// and that is exactly the spend this field exists to keep.
+#[derive(Debug, Clone)]
+pub struct DisambiguationOutcome {
+    pub verdict: MatchVerdict,
+    /// Provider spend for this one judgement, in dollar micro-units (1e-6 USD).
+    ///
+    /// The extractor worker folds it into the `llm_spend` ledger under
+    /// `(namespace, ENTITY_DISAMBIGUATION)`. That ledger is one of Brain's two
+    /// durable spend stores — see [`brain_llm::pricing`] for how it and the
+    /// extraction audit rows combine into a total.
+    pub cost_micro_usd: u64,
 }
 
 /// One ambiguous-band candidate discovered during the disambiguation
@@ -1854,7 +1883,7 @@ async fn ask_if_same_entity(
     namespace: &str,
     view: &LlmCandidateView,
     surface_form: &str,
-) -> Result<SameEntityReply, String> {
+) -> Result<(SameEntityReply, u64), (String, u64)> {
     use brain_llm::{CredentialOutcome, LlmMessage, LlmRequest, LlmRole};
 
     // Bill the judgement to the namespace whose entities are being
@@ -1864,11 +1893,12 @@ async fn ask_if_same_entity(
     let credential = match disambiguator.resolver.client_for(namespace, None).await {
         CredentialOutcome::Ready(c) => c,
         CredentialOutcome::Missing => {
-            return Err(disambiguator.resolver.missing_reason(namespace));
+            return Err((disambiguator.resolver.missing_reason(namespace), 0));
         }
         CredentialOutcome::Unavailable => {
-            return Err(format!(
-                "llm credential for namespace {namespace} unavailable"
+            return Err((
+                format!("llm credential for namespace {namespace} unavailable"),
+                0,
             ));
         }
     };
@@ -1892,12 +1922,23 @@ async fn ask_if_same_entity(
         // merge/create fallback via the `Err` path.
         timeout: DISAMBIGUATOR_LLM_TIMEOUT,
     };
-    let resp = client
-        .complete(req)
-        .await
-        .map_err(|e| format!("llm transport: {e}"))?;
+    // A transport failure that nonetheless reached a billed completion carries
+    // its usage on the error; everything else bills nothing.
+    let resp = client.complete(req).await.map_err(|e| {
+        (
+            format!("llm transport: {e}"),
+            e.billed_usage().map_or(0, |b| b.cost_micro_usd),
+        )
+    })?;
+    let cost_micro_usd = resp.cost_micro_usd;
     parse_confirm_reply(&resp.content)
-        .ok_or_else(|| format!("unparseable disambiguator reply: {:?}", resp.content))
+        .map(|reply| (reply, cost_micro_usd))
+        .ok_or_else(|| {
+            (
+                format!("unparseable disambiguator reply: {:?}", resp.content),
+                cost_micro_usd,
+            )
+        })
 }
 
 fn build_confirm_system_prompt() -> String {
@@ -2536,7 +2577,7 @@ mod tests {
             "3 days ago",
             "in 2 weeks",
             "2020-01-15",
-            // Full calendar dates: the forms that used to slip through and
+            // Full calendar dates: the forms that must not slip through and
             // become orphan Event-typed entity nodes.
             "January 2026",
             "january 2026",

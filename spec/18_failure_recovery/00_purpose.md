@@ -87,7 +87,7 @@ Brain is designed so that the rare events are recoverable.
 
 For DR:
 
-- **RPO (Recovery Point Objective)**: how much data can be lost? Brain's design: zero data loss for committed writes (WAL is durable).
+- **RPO (Recovery Point Objective)**: how much data can be lost? Brain's design: zero data loss for committed writes. The WAL is durable, and the per-shard durable watermark — a contiguous committed prefix, never a maximum — is what keeps recovery from skipping a record whose metadata commit had not yet run.
 - **RTO (Recovery Time Objective)**: how fast can recovery complete? Per-shard: 1-5 minutes for small shards; 10-30 minutes for large.
 
 For deployments with strict RTO/RPO, snapshots and standby nodes reduce both.

@@ -9,7 +9,7 @@
 //! - [`OpsContext`] — handle bag (currently a thin wrapper over
 //!   `brain_planner::ExecutorContext`; later work adds fields).
 //! - [`OpError`] + [`ErrorCode`] error taxonomy
-//!   with `error_code()` + `retryable()` mappings.
+//!   with `error_code()` mappings.
 //! - [`dispatch()`] — top-level async entry; exhaustive `match` over
 //!   `RequestBody`.
 
@@ -24,6 +24,7 @@ pub mod apply;
 pub mod clock;
 pub mod context;
 pub mod dispatch;
+pub mod embedding;
 pub mod error;
 pub mod grounded;
 pub mod handlers;
@@ -39,6 +40,7 @@ pub mod writer;
 
 // Module-level re-exports so external callers (brain-server, brain-planner)
 // can write `brain_ops::encode::*` rather than `brain_ops::handlers::encode::*`.
+pub use handlers::query::MAX_SESSION_FILTER;
 pub use handlers::restore::{handle_admin_restore, AdminRestoreOutcome};
 pub use handlers::{
     encode, encode_vector_direct, entity, extractor_admin, forget, link, plan, query, reason,
@@ -68,9 +70,10 @@ pub use metrics::{
     RetrieverMetricsSnapshot, SchemaMigrationMetrics, SchemaMigrationMetricsSnapshot,
     StatementEmbedMetrics, StatementEmbedMetricsSnapshot, SubmitOutcome, TemporalEdgeMetrics,
     TemporalEdgeMetricsSnapshot, TemporalSkipReason, TierKind, TierStatus, WorkerBucketSnapshot,
-    WorkerHistogram, WorkerHistogramSnapshot, WriterMetrics, WriterMetricsSnapshot,
-    ITEM_KIND_LABELS, QUERY_OUTCOME_LABELS, RESOLVER_OUTCOME_LABELS, RETRIEVER_LABELS, TIER_LABELS,
-    TIER_STATUS_LABELS,
+    WorkerHistogram, WorkerHistogramSnapshot, WriteStage, WriteStageMetrics,
+    WriteStageMetricsSnapshot, WriterMetrics, WriterMetricsSnapshot, ITEM_KIND_LABELS,
+    QUERY_OUTCOME_LABELS, RESOLVER_OUTCOME_LABELS, RETRIEVER_LABELS, TIER_LABELS,
+    TIER_STATUS_LABELS, WRITE_STAGE_LABELS,
 };
 pub use state::access_buffer::{AccessBuffer, DEFAULT_ACCESS_BUFFER_CAPACITY};
 pub use write::{
@@ -161,10 +164,6 @@ mod tests {
                 ErrorCode::InternalError,
             ),
             (
-                OpError::ExecError(ExecError::WriterFailed(WriterError::Overloaded)),
-                ErrorCode::Overloaded,
-            ),
-            (
                 OpError::ExecError(ExecError::MemoryNotFound {
                     memory_id: brain_core::MemoryId::from(7u128),
                 }),
@@ -176,16 +175,77 @@ mod tests {
         }
     }
 
+    /// A latched WAL fault and an ordinary writer fault carry different wire
+    /// codes. The distinction is what stops a client retrying a dead disk: the
+    /// ordinary fault is `InternalError`, whose protocol category is retryable,
+    /// and the latched one is `ShardStorageFaulted`, whose category is not.
     #[test]
-    fn retryable_only_for_overloaded() {
-        assert!(OpError::Overloaded("busy".into()).retryable());
-        assert!(OpError::ExecError(ExecError::WriterFailed(WriterError::Overloaded)).retryable());
+    fn a_faulted_shard_is_distinguishable_from_an_ordinary_writer_fault() {
+        let faulted = OpError::ExecError(ExecError::WriterFailed(WriterError::StorageFaulted {
+            detail: "fsync failed: Input/output error".into(),
+        }));
+        assert_eq!(faulted.error_code(), ErrorCode::ShardStorageFaulted);
+        let ordinary = OpError::ExecError(ExecError::WriterFailed(WriterError::Internal(
+            "hnsw insert: NoCapacity".into(),
+        )));
+        assert_eq!(ordinary.error_code(), ErrorCode::InternalError);
+        assert_ne!(faulted.error_code(), ordinary.error_code());
+    }
 
-        assert!(!OpError::InvalidRequest("bad".into()).retryable());
-        assert!(!OpError::Internal("oops".into()).retryable());
-        assert!(!OpError::NotYetImplemented("X").retryable());
-        assert!(!OpError::TxnExpired.retryable());
-        assert!(!OpError::TxnNotFound.retryable());
+    /// A `WalBroken` commit failure is non-retryable from the storage layer to
+    /// the wire. Every hop is exercised: the WAL error's classification into
+    /// `WalSinkError`, the writer's classification of that, the op error code,
+    /// and the protocol category clients read their retry policy from.
+    #[test]
+    fn a_wal_broken_commit_failure_is_non_retryable_end_to_end() {
+        let wal_err = brain_storage::wal::WalError::Commit(
+            brain_storage::wal::CommitError::WalBroken("fsync failed: Input/output error".into()),
+        );
+
+        let sink_err = crate::writer::wal_sink::WalSinkError::from(wal_err);
+        assert!(matches!(
+            &sink_err,
+            crate::writer::wal_sink::WalSinkError::StorageFaulted { .. }
+        ));
+
+        let writer_err = crate::writer::submit::writer_error_from_wal_sink(sink_err);
+        assert!(matches!(&writer_err, WriterError::StorageFaulted { .. }));
+
+        let op_err = OpError::ExecError(ExecError::WriterFailed(writer_err));
+        assert_eq!(op_err.error_code(), ErrorCode::ShardStorageFaulted);
+
+        let category = brain_protocol::error::ErrorCode::ShardStorageFaulted.category();
+        assert_eq!(
+            category,
+            brain_protocol::error::ErrorCategory::OperatorIntervention
+        );
+        assert!(!category.is_retryable());
+
+        let message = op_err.to_string();
+        assert!(message.contains("restarts the shard process"));
+        assert!(!message.contains("Input/output error"));
+    }
+
+    /// A writer not-found reaches the wire as a not-found code, routed on
+    /// the structured `what` tag. The detail string deliberately carries
+    /// none of the words a text matcher would key on — the classification
+    /// has to come from the variant, not from the prose.
+    #[test]
+    fn a_writer_not_found_maps_to_the_precise_not_found_wire_code() {
+        let cases = [
+            ("memory", ErrorCode::NotFound),
+            ("entity", ErrorCode::EntityNotFound),
+            ("subject entity", ErrorCode::EntityNotFound),
+            ("statement", ErrorCode::StatementNotFound),
+            ("predicate", ErrorCode::NotFound),
+        ];
+        for (what, expected) in cases {
+            let err = OpError::ExecError(ExecError::WriterFailed(WriterError::NotFound {
+                what,
+                detail: "id=7".into(),
+            }));
+            assert_eq!(err.error_code(), expected, "for what={what}");
+        }
     }
 
     #[test]

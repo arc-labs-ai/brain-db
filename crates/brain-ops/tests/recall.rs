@@ -1,8 +1,7 @@
 //! Integration tests for `handle_recall`.
 //!
 //! Drives the full pipeline:
-//!   dispatcher → handle_recall → plan_recall_inner → execute_recall
-//!   → wire RecallResponseFrame
+//!   dispatcher → `handle_recall` → wire `RecallResponseFrame`
 //!
 //! Pre-populates the index by calling ENCODE through the dispatcher
 //! first, then runs RECALL against it.

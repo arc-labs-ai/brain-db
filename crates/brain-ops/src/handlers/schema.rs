@@ -45,6 +45,9 @@ use brain_protocol::{
 use crate::context::OpsContext;
 use crate::error::OpError;
 use crate::handlers::events::emit_graph_event;
+use crate::handlers::limits::{
+    check_byte_len, MERGED_SCHEMA_SOURCE_MAX_BYTES, SCHEMA_DOCUMENT_MAX_BYTES,
+};
 use crate::handlers::schema_scope;
 use crate::handlers::schema_wire;
 use crate::handlers::writer_handle::real_writer_handle;
@@ -132,8 +135,8 @@ pub async fn handle_schema_upload(
     //    operators can safely re-apply the same DSL).
     //
     //    Runs BEFORE the dry-run exit: a dry run must predict the real
-    //    upload, conflicts included. It used to return early here and
-    //    report a conflicting document as an accepted next version.
+    //    upload, conflicts included. Returning early here would report a
+    //    conflicting document as an accepted next version.
     let merge_summary = classify_schema_merge(ctx, &validated, space)?;
 
     // 3a. A document is only a no-op if the stored SOURCE already carries it
@@ -142,6 +145,16 @@ pub async fn handle_schema_upload(
     //     stayed narrowed forever: re-uploading the full schema was classified
     //     idempotent and skipped. An unchanged re-upload still short-circuits.
     let source_covers = active_source_covers_for(ctx, &namespace, space, validated.as_schema())?;
+
+    // 3b. SCHEMA_GET returns the whole merged document in one frame and takes
+    //     no limit, so the merged source is bounded here, at the only point a
+    //     client can still act on the refusal. A document the stored source
+    //     already carries adds nothing to that total, so only a growing upload
+    //     is projected against the cap.
+    if !source_covers {
+        check_merged_schema_source_cap(ctx, &namespace, space, req.schema_document.len())?;
+    }
+
     let is_no_op = merge_summary.all_idempotent && source_covers;
 
     // 4. Dry-run → don't persist. An all-idempotent document would not
@@ -340,7 +353,6 @@ pub async fn handle_schema_get(
         namespace: row.namespace,
         schema_version: row.version,
         schema_document,
-        source_blob: row.source,
         uploaded_at_unix_nanos: row.uploaded_at_unix_nanos,
         validator_version: row.validator_version,
     })
@@ -463,6 +475,12 @@ pub async fn handle_schema_validate(
     // VALIDATE must predict UPLOAD, so it resolves references against the
     // same merge target.
     let space = schema_scope::declaration_space(ctx, req.scope)?;
+    // VALIDATE predicts UPLOAD's merged-source refusal too, under the same
+    // "a covered document grows nothing" guard, so a dry run never reports a
+    // document the upload would reject.
+    if !active_source_covers_for(ctx, &namespace, space, &schema)? {
+        check_merged_schema_source_cap(ctx, &namespace, space, req.schema_document.len())?;
+    }
     let declared = schema_scope::merge_declared_context(ctx, &namespace, space)?;
 
     match validate_located_with(&req.schema_document, &schema, &declared) {
@@ -521,14 +539,36 @@ fn check_document_cap(doc: &str) -> Result<(), OpError> {
             "schema_document must be non-empty".into(),
         ));
     }
-    let cap = schema_scope::MAX_SCHEMA_DOCUMENT_BYTES;
-    if doc.len() > cap {
-        return Err(OpError::InvalidRequest(format!(
-            "schema_document exceeds cap ({} > {cap} bytes)",
-            doc.len()
-        )));
-    }
+    check_byte_len("schema_document", doc.len(), SCHEMA_DOCUMENT_MAX_BYTES)?;
     Ok(())
+}
+
+fn check_merged_schema_source_cap(
+    ctx: &OpsContext,
+    namespace: &str,
+    space: [u8; 16],
+    document_len: usize,
+) -> Result<(), OpError> {
+    let rtxn = ctx
+        .executor
+        .metadata
+        .read_txn()
+        .map_err(|e| OpError::Internal(format!("read_txn: {e}")))?;
+    let current = schema_active(&rtxn, DeclScope::space(namespace, space))
+        .map_err(schema_scope::map_schema_store_error)?;
+    let stored_len = match current {
+        Some(version) => schema_get(&rtxn, DeclScope::space(namespace, space), version)
+            .map_err(schema_scope::map_schema_store_error)?
+            .map(|row| row.source.len())
+            .unwrap_or(0),
+        None => 0,
+    };
+    let projected = stored_len.saturating_add(document_len);
+    check_byte_len(
+        "merged schema source",
+        projected,
+        MERGED_SCHEMA_SOURCE_MAX_BYTES,
+    )
 }
 
 /// True when the client-supplied namespace is one the caller may read:
@@ -697,13 +737,11 @@ fn classify_schema_merge(
                             }
                             Some(SubjectTypeDecl::Any) | None => 0,
                         };
-                        let new_description = p.description.as_deref().unwrap_or("");
                         let new_stateful = p.resolved_stateful();
                         if row.kind_constraint != new_kind
                             || row.object_type_constraint_byte != new_object
                             || row.object_entity_type_id != new_object_entity_type
                             || row.subject_entity_type_id != new_subject_entity_type
-                            || row.description != new_description
                             || row.is_stateful != new_stateful
                         {
                             let mut diff = Vec::new();
@@ -730,9 +768,6 @@ fn classify_schema_merge(
                                     "subject entity_type: stored={} new={}",
                                     row.subject_entity_type_id, new_subject_entity_type
                                 ));
-                            }
-                            if row.description != new_description {
-                                diff.push("description differs".to_string());
                             }
                             if row.is_stateful != new_stateful {
                                 diff.push(format!(
@@ -768,11 +803,7 @@ fn classify_schema_merge(
                         // ids, divergent declarations either trip here or
                         // get caught at apply time.
                         let new_cardinality = map_cardinality(r.cardinality);
-                        let new_description = r.description.as_deref().unwrap_or("");
-                        if row.cardinality != new_cardinality
-                            || row.is_symmetric != r.symmetric
-                            || row.description != new_description
-                        {
+                        if row.cardinality != new_cardinality || row.is_symmetric != r.symmetric {
                             let mut diff = Vec::new();
                             if row.cardinality != new_cardinality {
                                 diff.push(format!(
@@ -785,9 +816,6 @@ fn classify_schema_merge(
                                     "symmetric: stored={} new={}",
                                     row.is_symmetric, r.symmetric
                                 ));
-                            }
-                            if row.description != new_description {
-                                diff.push("description differs".to_string());
                             }
                             return Err(OpError::SchemaConflict {
                                 kind: "relation_type",
@@ -1105,9 +1133,9 @@ mod tests {
                 .expect("an unchanged re-upload must still succeed");
         }
 
-        /// A dry run must predict the real upload. It used to exit before the
-        /// merge pre-flight and report a conflicting document as an accepted
-        /// next version, which the real upload then refused.
+        /// A dry run must predict the real upload. Exiting before the merge
+        /// pre-flight would report a conflicting document as an accepted next
+        /// version, which the real upload then refuses.
         #[tokio::test]
         async fn dry_run_reports_the_same_conflict_the_upload_would() {
             let (_dir, ctx, _md) = build_ctx_for("acme");
@@ -1325,7 +1353,7 @@ mod tests {
     #[test]
     fn check_document_cap_rejects_empty_and_oversized() {
         assert!(check_document_cap("").is_err());
-        let big = "x".repeat(schema_scope::MAX_SCHEMA_DOCUMENT_BYTES + 1);
+        let big = "x".repeat(SCHEMA_DOCUMENT_MAX_BYTES + 1);
         assert!(check_document_cap(&big).is_err());
         assert!(check_document_cap("namespace acme").is_ok());
     }

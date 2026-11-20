@@ -83,46 +83,70 @@ The opcode is a big-endian `u16` in the frame header (bytes 5–6). The high byt
 
 ### 1.6 Admin operations
 
-| Opcode | Name | Direction | Purpose |
-|---|---|---|---|
-| 0x0060 | `ADMIN_STATS_REQ` | C → S | Request stats |
-| 0x00E0 | `ADMIN_STATS_RESP` | S → C | Stats response |
-| 0x0061 | `ADMIN_SNAPSHOT_REQ` | C → S | Take a snapshot |
-| 0x00E1 | `ADMIN_SNAPSHOT_RESP` | S → C | Snapshot result |
-| 0x0062 | `ADMIN_RESTORE_REQ` | C → S | Restore from snapshot |
-| 0x00E2 | `ADMIN_RESTORE_RESP` | S → C | Restore result |
-| 0x0063 | `ADMIN_INTEGRITY_CHECK_REQ` | C → S | Run integrity check |
-| 0x00E3 | `ADMIN_INTEGRITY_CHECK_RESP` | S → C | Integrity result |
-| 0x0064 | `ADMIN_MIGRATE_EMBEDDINGS_REQ` | C → S | Re-embed all memories |
-| 0x00E4 | `ADMIN_MIGRATE_EMBEDDINGS_RESP` | S → C | Migration progress (streaming) |
-| 0x0065 | `ADMIN_CREATE_SESSION_REQ` | C → S | Create a named session with metadata |
-| 0x00E5 | `ADMIN_CREATE_SESSION_RESP` | S → C | Session creation ack |
-| 0x0066 | `ADMIN_RENAME_SESSION_REQ` | C → S | Rename a session |
-| 0x00E6 | `ADMIN_RENAME_SESSION_RESP` | S → C | Rename ack |
-| 0x0067 | `ADMIN_MOVE_MEMORY_REQ` | C → S | Move a memory between sessions |
-| 0x00E7 | `ADMIN_MOVE_MEMORY_RESP` | S → C | Move ack |
-| 0x0068 | `ADMIN_RECLASSIFY_REQ` | C → S | Change a memory's kind |
-| 0x00E8 | `ADMIN_RECLASSIFY_RESP` | S → C | Reclassify ack |
-| 0x0069 | `ADMIN_LIST_TOMBSTONED_REQ` | C → S | List tombstoned memories (debug) |
-| 0x00E9 | `ADMIN_LIST_TOMBSTONED_RESP` | S → C | List response (streaming) |
-| 0x006A | `ADMIN_TOKENIZE_REQ` | C → S | Tokenize text for inspection (returns token IDs and surface forms) — **opcode allocated only** |
-| 0x00EA | `ADMIN_TOKENIZE_RESP` | S → C | Tokenizer output |
-| 0x006B | `ADMIN_REGISTER_MODEL_REQ` | C → S | Register an additional embedding-model fingerprint |
-| 0x00EB | `ADMIN_REGISTER_MODEL_RESP` | S → C | Registration ack |
-| 0x006C | `ADMIN_ABORT_MIGRATION_REQ` | C → S | Abort an in-progress `ADMIN_MIGRATE_EMBEDDINGS` run |
-| 0x00EC | `ADMIN_ABORT_MIGRATION_RESP` | S → C | Abort ack |
-| 0x006D | `ADMIN_RETIRE_FINGERPRINT_REQ` | C → S | Retire a model fingerprint after a completed migration — **opcode allocated only** |
-| 0x00ED | `ADMIN_RETIRE_FINGERPRINT_RESP` | S → C | Retire ack |
+**Read this table as a numbering record, not as a menu.** The operator control
+plane is the HTTP admin listener; these numbers are kept so the admin range
+never has to be renumbered, and the dispatcher refuses all of them with
+*"admin operations are served over the HTTP admin listener, not the wire
+protocol"*. That is a permanent rejection, not a `NotYetImplemented`: the
+plane is wrong, not the version. The one admin op that IS dispatched —
+`ADMIN_LIST_PENDING_CONTRADICTIONS`, 0x0178 — sits with the typed-graph family
+in §2.6, because it is a genuine per-shard read.
 
-The four embedding-layer admin opcodes `0x006A`–`0x006D` (`ADMIN_TOKENIZE`, `ADMIN_REGISTER_MODEL`, `ADMIN_ABORT_MIGRATION`, `ADMIN_RETIRE_FINGERPRINT`) are **allocated in the opcode enum and nothing more**: no request or response body is defined for them and the dispatcher has no arm. A frame carrying one decodes its header and is then refused. They hold their values so a later implementation does not have to renumber the admin range.
-| 0x006E | `ADMIN_BACKFILL_REQ` | C → S | Submit a backfill run (re-run extractors over a memory range); returns a `BackfillId` |
-| 0x00EE | `ADMIN_BACKFILL_RESP` | S → C | Backfill submission ack (id + initial progress) |
-| 0x006F | `ADMIN_BACKFILL_CANCEL_REQ` | C → S | Cancel an in-flight backfill run by id |
-| 0x00EF | `ADMIN_BACKFILL_CANCEL_RESP` | S → C | Cancel ack (final progress snapshot) |
+The `Status` column says which of three things a number is:
+
+- **rejected** — request and response bodies exist, the opcode decodes, and
+  the dispatcher refuses it, naming the route that serves it instead.
+- **number only** — no request or response body is defined and there is no
+  dispatch arm. A frame carrying one decodes its header and is then refused.
+- **dispatched** — a live wire op (none in this section; see §1.7).
+
+| Opcode | Name | Direction | Purpose | Status |
+|---|---|---|---|---|
+| 0x0060 | `ADMIN_STATS_REQ` | C → S | Request stats | rejected — `GET /metrics`, `GET /v1/diagnostics/debug-snapshot?shard=N` |
+| 0x00E0 | `ADMIN_STATS_RESP` | S → C | Stats response | rejected |
+| 0x0061 | `ADMIN_SNAPSHOT_REQ` | C → S | Take a snapshot | rejected — `POST /v1/snapshots` |
+| 0x00E1 | `ADMIN_SNAPSHOT_RESP` | S → C | Snapshot result | rejected |
+| 0x0062 | `ADMIN_RESTORE_REQ` | C → S | Restore from snapshot | rejected — `POST /v1/snapshots/{id}/restore` |
+| 0x00E2 | `ADMIN_RESTORE_RESP` | S → C | Restore result | rejected |
+| 0x0063 | `ADMIN_INTEGRITY_CHECK_REQ` | C → S | Run integrity check | rejected — no standalone route; integrity is verified inside snapshot restore |
+| 0x00E3 | `ADMIN_INTEGRITY_CHECK_RESP` | S → C | Integrity result | rejected |
+| 0x0064 | `ADMIN_MIGRATE_EMBEDDINGS_REQ` | C → S | Re-embed all memories | rejected — embedding migration is unbuilt ([07.06](../07_embedding/06_migration.md)) |
+| 0x00E4 | `ADMIN_MIGRATE_EMBEDDINGS_RESP` | S → C | Migration progress (streaming) | rejected |
+| 0x0065 | `ADMIN_CREATE_SESSION_REQ` | C → S | Create a named session with metadata | rejected — `SESSION_CREATE` (§1.6a) is the live op |
+| 0x00E5 | `ADMIN_CREATE_SESSION_RESP` | S → C | Session creation ack | rejected |
+| 0x0066 | `ADMIN_RENAME_SESSION_REQ` | C → S | Rename a session | rejected — nothing renames a session on either plane |
+| 0x00E6 | `ADMIN_RENAME_SESSION_RESP` | S → C | Rename ack | rejected |
+| 0x0067 | `ADMIN_MOVE_MEMORY_REQ` | C → S | Move a memory between sessions | rejected — unimplemented anywhere |
+| 0x00E7 | `ADMIN_MOVE_MEMORY_RESP` | S → C | Move ack | rejected |
+| 0x0068 | `ADMIN_RECLASSIFY_REQ` | C → S | Change a memory's kind | rejected — nearest live path is `POST /v1/extract/backfill` |
+| 0x00E8 | `ADMIN_RECLASSIFY_RESP` | S → C | Reclassify ack | rejected |
+| 0x0069 | `ADMIN_LIST_TOMBSTONED_REQ` | C → S | List tombstoned memories (debug) | rejected — `MEMORY_LIST`'s `include_tombstoned` is honoured at the row level, but the timeline index holds no tombstoned rows to surface |
+| 0x00E9 | `ADMIN_LIST_TOMBSTONED_RESP` | S → C | List response (streaming) | rejected |
+| 0x006A | `ADMIN_TOKENIZE_REQ` | C → S | Tokenize text for inspection | number only |
+| 0x00EA | `ADMIN_TOKENIZE_RESP` | S → C | Tokenizer output | number only |
+| 0x006B | `ADMIN_REGISTER_MODEL_REQ` | C → S | Register an additional embedding-model fingerprint | number only |
+| 0x00EB | `ADMIN_REGISTER_MODEL_RESP` | S → C | Registration ack | number only |
+| 0x006C | `ADMIN_ABORT_MIGRATION_REQ` | C → S | Abort an in-progress embedding migration | number only |
+| 0x00EC | `ADMIN_ABORT_MIGRATION_RESP` | S → C | Abort ack | number only |
+| 0x006D | `ADMIN_RETIRE_FINGERPRINT_REQ` | C → S | Retire a model fingerprint after a completed migration | number only |
+| 0x00ED | `ADMIN_RETIRE_FINGERPRINT_RESP` | S → C | Retire ack | number only |
+| 0x006E | `ADMIN_BACKFILL_REQ` | C → S | Submit a backfill run (re-run extractors over a memory range) | rejected — `POST /v1/backfill`, which returns the run id |
+| 0x00EE | `ADMIN_BACKFILL_RESP` | S → C | Backfill submission ack (id + initial progress) | rejected — `GET /v1/backfill` |
+| 0x006F | `ADMIN_BACKFILL_CANCEL_REQ` | C → S | Cancel an in-flight backfill run by id | rejected — `DELETE /v1/backfill/{id}` |
+| 0x00EF | `ADMIN_BACKFILL_CANCEL_RESP` | S → C | Cancel ack (final progress snapshot) | rejected |
+
+The backfill pair is worth singling out, because it is the one admin family
+with a live per-shard worker behind it: the HTTP routes reach the same
+resumable `BackfillWorker` handle through the shard's message loop. The wire
+opcodes are refused all the same — the control plane is the listener, not the
+protocol.
+
+The admin plane's full route table is
+[05.06 Admin operations](../05_operations/06_admin.md).
 
 ### 1.6a Space & session registry
 
-Non-admin registry ops, scoped to the caller's `(namespace, space)` and `act_as`-aware. Allocated from the previously-reserved `0x70–0x75` / `0xF0–0xF5` low-byte range.
+Non-admin registry ops, scoped to the caller's `(namespace, space)` and `act_as`-aware. Allocated from the `0x70–0x75` / `0xF0–0xF5` low-byte range.
 
 | Opcode | Name | Direction | Purpose |
 |---|---|---|---|
@@ -315,6 +339,12 @@ The substrate `RECALL` opcode (`0x0021`) is the primary vector recall. The pipel
 
 Responses live at `0x01F0–0x01FF`; `ADMIN_LIST_PENDING_CONTRADICTIONS_RESP` is `0x01F8`.
 
+**This is the only `ADMIN_*` opcode the dispatcher serves.** It requires the
+`ADMIN` permission bit like the rest of the family, but unlike the substrate
+admin numbers in §1.6 it is a per-shard read of this shard's own contradiction
+audit, so it belongs on the plane the shard answers. Everything operational —
+snapshots, rebuilds, backfill control, key provisioning — is HTTP.
+
 `0x0170`–`0x0177` are **unallocated**. Backfill is not among them: it is a substrate admin op at `0x006E` / `0x006F` (§1.6), where it is implemented with a scope selector, extractor-id list, dry-run flag and a cancel verb — see [`05_frame_layouts.md`](05_frame_layouts.md) §35.
 
 ### 2.7 SUBSCRIBE event types (typed graph)
@@ -338,13 +368,13 @@ The server operates the same pipeline whether or not a user namespace has been u
 
 What user declarations control is **per-type acceptance** on explicit typed-graph writes:
 
-- `ENTITY_CREATE` with an entity type that isn't in any active namespace → `EntityTypeNotInSchema`.
+- `ENTITY_CREATE` names its type by numeric `entity_type_id`, not by qname, and an id no entity-type registry row answers to → `InvalidArgument` (0x0040). There is no entity-type analogue of the two codes below; the registry row, not the schema document, is what the id is checked against.
 - `STATEMENT_CREATE` with an undeclared predicate qname → `PredicateNotInSchema` (or open-vocabulary intern with `SchemaOrigin::ImplicitFromWrite` if the deployment runs in open-vocabulary mode; see §07/error-handling).
 - `RELATION_CREATE` with an undeclared relation_type qname → `RelationTypeNotInSchema` (same open-vocabulary rule).
 
 Extracted candidates whose types are not in any active schema are dropped silently (extractor best-effort; see [`../11_extractors/00_purpose.md`](../11_extractors/00_purpose.md)). `RECALL`, the `QUERY_EXPLAIN` / `QUERY_TRACE` introspection ops, and the fan-out pipeline always run regardless of which user namespaces are present.
 
-There is no `SCHEMA_NOT_DECLARED` error any more — the gate is per-type, not per-namespace.
+There is no `SCHEMA_NOT_DECLARED` error: the gate is per-type, not per-namespace.
 
 ## 3. Reserved ranges
 
@@ -496,7 +526,7 @@ Adding new opcodes is a wire-protocol-version bump (see §"Versioning" below). T
 
 A future major-version bump might add opcodes for replication-related operations, multi-modal operations, etc.
 
-**Per-request identity (`act_as`) adds no opcode.** The `act_as` mechanism (see [`04_handshake.md`](04_handshake.md) §10a) is an **optional field on existing data-plane op requests** (`ENCODE_REQ` / `RECALL_REQ` / `FORGET_REQ`), not a new operation. The `can_act_as` grant is minted over the admin HTTP surface, not a wire op. Because Brain is pre-release (v0.1.0) with no published wire, this field was added **in place** — no new opcode, and no wire-version bump (the version stays `1`; see [`02_wire_format.md`](02_wire_format.md) §11.3).
+**Per-request identity (`act_as`) adds no opcode.** The `act_as` mechanism (see [`04_handshake.md`](04_handshake.md) §10a) is an **optional field on existing data-plane op requests** (`ENCODE_REQ` / `RECALL_REQ` / `FORGET_REQ`), not a new operation. The `can_act_as` grant is minted over the admin HTTP surface, not a wire op. Because Brain is pre-release (v0.1.0) with no published wire, the field sits **in place** on those existing requests — no new opcode, and no wire-version bump (the version stays `1`; see [`02_wire_format.md`](02_wire_format.md) §11.3).
 
 ## Versioning
 
@@ -506,7 +536,7 @@ The wire protocol carries a single version field. Clients at any other version a
 
 Every frame carries a `wire_version: u8` byte in the frame header. The value is **`1`**. Frames with any other value are protocol errors.
 
-The byte exists so that pre-handshake frames (HELLO, WELCOME) self-identify; a server that reads a HELLO with `wire_version != 1` closes the connection with `WireVersionMismatch` and no further dialog.
+The byte exists so that pre-handshake frames (HELLO, WELCOME) self-identify; a server that reads a HELLO with `wire_version != 1` closes the connection with `BadVersion` and no further dialog.
 
 ### Handshake
 
@@ -532,18 +562,15 @@ struct WelcomePayload {
 }
 ```
 
-A server that receives a HELLO with a wire version different from its own returns `WireVersionMismatch` and closes the connection. There is no negotiation step — the version is fixed.
+A server that receives a HELLO whose header `wire_version` differs from its own returns `BadVersion` and closes the connection; the header check runs before the payload is read, so the HELLO's own contents never matter. A HELLO that passes the header check but offers no version the server supports is `VersionNotSupported`. The header version itself is fixed, not negotiated.
 
 ### Feature flags
 
-The HELLO/WELCOME exchange carries feature flags alongside the version. Feature flags are independent of the version: they govern optional semantic capabilities, not byte layouts.
+The HELLO/WELCOME exchange carries feature flags alongside the version. Feature flags are independent of the version: they govern optional semantic capabilities, not byte layouts. The flag set is fixed and small — `streaming`, `compression_zstd`, `server_push` — and is specified in [`04_handshake.md`](04_handshake.md) §2.3. At wire version 1 only `streaming` is live, and it is always `true`; the other two are reserved and no operation consults them.
 
-Examples:
+The client offers its flags in HELLO; the server replies in WELCOME with the AND-intersection of its own. No operation is gated on a negotiated flag, so there is no error code for a flag that was not agreed: a negotiated flag either describes the connection or is reserved.
 
-- `gpu_inference` — server supports GPU embedding.
-- `txn_isolation_serializable` — transactions support serializable isolation (otherwise read-committed only).
-
-The client requests a set of feature flags in HELLO. The server responds in WELCOME with the subset it actually enables. Operations that depend on a flag check it; if disabled, they fail with `FeatureNotEnabled`.
+An optional capability the **operator** turned off is a separate matter from handshake negotiation, and it has no code of its own either. An operation that needs such a capability fails as `InvalidArgument` (0x0040) — the client can fix it without server-side intervention, by dropping the opt-in or by talking to a deployment where the capability is on. The one live instance is the tenant LLM provider credential surface (§1.6b), which answers `InvalidArgument` on a deployment that carries no credential store.
 
 ### Frame-version mismatch after handshake
 
@@ -552,7 +579,7 @@ If, after handshake, the server receives a frame whose `wire_version` differs fr
 ### Diagnostic surfaces
 
 - The `ADMIN_STATS` opcode reports the server's wire version.
-- Logs record connections that fail handshake with `WireVersionMismatch`.
+- Logs record connections that fail handshake with `BadVersion` or `VersionNotSupported`.
 
 ### Client responsibilities
 

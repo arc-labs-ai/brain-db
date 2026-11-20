@@ -222,7 +222,6 @@ impl AuthStore {
     }
 
     /// Convenience for tests that need to pre-seed keys.
-    #[allow(dead_code)]
     pub fn write<F, R>(&self, f: F) -> Result<R, ApiKeyError>
     where
         F: FnOnce(&mut ApiKeyDb) -> Result<R, ApiKeyError>,
@@ -232,7 +231,6 @@ impl AuthStore {
     }
 
     /// Convenience for tests / read paths.
-    #[allow(dead_code)]
     pub fn read<F, R>(&self, f: F) -> Result<R, ApiKeyError>
     where
         F: FnOnce(&ApiKeyDb) -> Result<R, ApiKeyError>,

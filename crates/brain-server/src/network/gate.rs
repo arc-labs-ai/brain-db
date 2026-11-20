@@ -110,19 +110,16 @@ impl ConnectionGate {
     // `brain_connections_rejected_total` counter + a live-connections gauge) is
     // the follow-up that consumes them from non-test code.
     /// Count of live admitted connections, process-wide.
-    #[allow(dead_code)]
     pub fn live_total(&self) -> usize {
         self.inner.total.load(Ordering::Relaxed)
     }
 
     /// Count of live admitted connections from `ip`.
-    #[allow(dead_code)]
     pub fn live_for_ip(&self, ip: IpAddr) -> usize {
         self.inner.per_ip.lock().get(&ip).copied().unwrap_or(0)
     }
 
     /// Connections rejected by the gate since start.
-    #[allow(dead_code)]
     pub fn rejected(&self) -> u64 {
         self.inner.rejected.load(Ordering::Relaxed)
     }

@@ -7,7 +7,9 @@
 use brain_core::{ExtractorId, ExtractorKind};
 use redb::{ReadTransaction, ReadableTable, WriteTransaction};
 
-use crate::tables::extractor::{ExtractorDefinition, EXTRACTORS_BY_SCOPE_TABLE, EXTRACTORS_TABLE};
+use crate::tables::extractor::{
+    ExtractorDefinition, EXTRACTORS_BY_SCOPE_TABLE, EXTRACTORS_TABLE, EXTRACTOR_ID_HIGH_WATER_TABLE,
+};
 use crate::tables::scope::{space_chain, DeclScope, SPACE_BASE};
 
 #[derive(thiserror::Error, Debug)]
@@ -155,19 +157,8 @@ pub fn extractor_intern(
         });
     }
 
-    // Fresh registration. Allocate next id.
-    let next_id_raw: u32 = {
-        let t = wtxn.open_table(EXTRACTORS_TABLE)?;
-        let mut max: u32 = 0;
-        for entry in t.iter()? {
-            let (k, _) = entry?;
-            let id = k.value();
-            if id > max {
-                max = id;
-            }
-        }
-        max.checked_add(1).expect("ExtractorId space exhausted")
-    };
+    // Fresh registration.
+    let next_id_raw: u32 = extractor_next_id(wtxn)?;
 
     let row = ExtractorDefinition::new(
         ExtractorId::from(next_id_raw),
@@ -188,6 +179,51 @@ pub fn extractor_intern(
         idx.insert(&(q.as_str(), space), &next_id_raw)?;
     }
     Ok(ExtractorId::from(next_id_raw))
+}
+
+/// Allocate the next `ExtractorId`, advancing the persisted high-water mark.
+///
+/// An id is never reused. A schema replace removes an extractor's row but not
+/// the audit rows written against it: those still carry the number, so
+/// handing the same number to the next extractor registered would silently
+/// recredit every past extraction to a different extractor. The mark only
+/// rises, so a dropped id is retired for the life of the store.
+///
+/// The mark is a single row because `EXTRACTORS_TABLE` is keyed on the bare
+/// id — one id space serves every namespace and space in the store.
+///
+/// With no mark stored the store predates the table, and the highest live id
+/// is the correct starting point: numbering then continues above the
+/// extractors already on disk instead of restarting at 1 and colliding with
+/// them.
+fn extractor_next_id(wtxn: &WriteTransaction) -> Result<u32, ExtractorOpError> {
+    let stored: Option<u32> = wtxn
+        .open_table(EXTRACTOR_ID_HIGH_WATER_TABLE)?
+        .get(&())?
+        .map(|v| v.value());
+    let high_water: u32 = match stored {
+        Some(mark) => mark,
+        None => {
+            let t = wtxn.open_table(EXTRACTORS_TABLE)?;
+            let mut max: u32 = 0;
+            for entry in t.iter()? {
+                let (k, _) = entry?;
+                let id = k.value();
+                if id > max {
+                    max = id;
+                }
+            }
+            max
+        }
+    };
+    let next = high_water
+        .checked_add(1)
+        .expect("ExtractorId space exhausted");
+    {
+        let mut t = wtxn.open_table(EXTRACTOR_ID_HIGH_WATER_TABLE)?;
+        t.insert(&(), &next)?;
+    }
+    Ok(next)
 }
 
 /// Replace a SYSTEM-namespace extractor's stored definition in place when
@@ -519,7 +555,7 @@ mod tests {
     }
 
     #[test]
-    fn intern_allocates_max_plus_one() {
+    fn intern_allocates_consecutive_ids() {
         let dir = tempfile::tempdir().unwrap();
         let db = open_db(&dir);
         let wtxn = db.begin_write().unwrap();
@@ -746,5 +782,130 @@ mod tests {
         wtxn.commit().unwrap();
 
         assert!(names_in(&db, SPACE_BASE, &[]).is_empty());
+    }
+
+    /// A retired extractor id is never reissued, so audit rows cannot be
+    /// recredited to a different extractor.
+    #[test]
+    fn dropping_an_extractor_retires_its_identifier() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(&dir);
+        let dropped = {
+            let wtxn = db.begin_write().unwrap();
+            let id = intern_pattern(&wtxn, "acme", "alpha", b"blob").unwrap();
+            wtxn.commit().unwrap();
+            id
+        };
+
+        {
+            let wtxn = db.begin_write().unwrap();
+            assert_eq!(
+                extractor_drop_declared(&wtxn, DeclScope::base("acme")).unwrap(),
+                1,
+                "dropping the declared extractor removes one row"
+            );
+            wtxn.commit().unwrap();
+        }
+
+        let next = {
+            let wtxn = db.begin_write().unwrap();
+            let id = intern_pattern(&wtxn, "acme", "beta", b"blob").unwrap();
+            wtxn.commit().unwrap();
+            id
+        };
+        assert_ne!(
+            next.raw(),
+            dropped.raw(),
+            "a new extractor must not reuse a retired identifier"
+        );
+        assert!(
+            next.raw() > dropped.raw(),
+            "new extractor identifiers must advance past retired identifiers"
+        );
+    }
+
+    /// Extractor identifiers increase monotonically across independent
+    /// declaration and removal transactions, preserving stable audit
+    /// references.
+    #[test]
+    fn repeated_extractor_churn_keeps_identifiers_strictly_increasing() {
+        use std::collections::HashSet;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(&dir);
+        let mut ids = Vec::new();
+
+        for i in 0..4 {
+            let name = format!("churn_{i}");
+            let id = {
+                let wtxn = db.begin_write().unwrap();
+                let id = intern_pattern(&wtxn, "acme", &name, b"blob").unwrap();
+                wtxn.commit().unwrap();
+                id
+            };
+            ids.push(id.raw());
+
+            let wtxn = db.begin_write().unwrap();
+            assert_eq!(
+                extractor_drop_declared(&wtxn, DeclScope::base("acme")).unwrap(),
+                1,
+                "each churned declaration must be removed"
+            );
+            wtxn.commit().unwrap();
+        }
+
+        assert!(
+            ids.windows(2).all(|pair| pair[1] > pair[0]),
+            "extractor identifiers must increase across committed churn"
+        );
+        assert_eq!(
+            ids.len(),
+            ids.iter().copied().collect::<HashSet<_>>().len(),
+            "extractor identifiers must not repeat"
+        );
+    }
+
+    /// A store with no recorded mark continues numbering above the
+    /// extractors already persisted, so ids cannot clash.
+    #[test]
+    fn seeding_extractors_without_a_high_water_mark_continues_above_live_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(&dir);
+        {
+            let wtxn = db.begin_write().unwrap();
+            for (id_raw, name) in [(7, "alpha"), (12, "beta")] {
+                let row = ExtractorDefinition::new(
+                    ExtractorId::from(id_raw),
+                    "acme".to_string(),
+                    name.to_string(),
+                    ExtractorKind::Pattern,
+                    1,
+                    b"blob".to_vec(),
+                    0,
+                );
+                {
+                    let mut t = wtxn.open_table(EXTRACTORS_TABLE).unwrap();
+                    t.insert(&id_raw, &row).unwrap();
+                }
+                {
+                    let q = qname("acme", name);
+                    let mut idx = wtxn.open_table(EXTRACTORS_BY_SCOPE_TABLE).unwrap();
+                    idx.insert(&(q.as_str(), SPACE_BASE), &id_raw).unwrap();
+                }
+            }
+            wtxn.commit().unwrap();
+        }
+
+        let next = {
+            let wtxn = db.begin_write().unwrap();
+            let id = intern_pattern(&wtxn, "acme", "gamma", b"blob").unwrap();
+            wtxn.commit().unwrap();
+            id
+        };
+        assert_eq!(
+            next.raw(),
+            13,
+            "a store without a mark must continue above its highest live identifier"
+        );
     }
 }

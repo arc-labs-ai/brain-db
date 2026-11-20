@@ -50,15 +50,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::client::{model_id_hash, LlmClient, LlmFuture};
 use crate::error::LlmError;
+use crate::pricing::ModelPricing;
 use crate::providers::runtime::run_on_provider_runtime;
 use crate::types::{LlmRequest, LlmResponse, LlmRole};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com";
-
-/// Pricing (dollar micro-units per token) for unknown OpenAI
-/// models. Conservative; a per-model pricing table ships later.
-const PRICE_INPUT_PER_TOKEN_DEFAULT: u64 = 1;
-const PRICE_OUTPUT_PER_TOKEN_DEFAULT: u64 = 4;
 
 /// Structured-output schema name pinned for all brain LLM
 /// extractor calls. OpenAI requires a non-empty name when
@@ -132,10 +128,18 @@ impl LlmClient for OpenAIClient {
         let http = self.http.clone();
         let api_key = self.api_key.clone();
         let url = format!("{}/v1/chat/completions", self.base_url);
+        // Weighed before the request is consumed below; the guard lives
+        // inside the async block so occupancy spans the whole round trip
+        // and is released even if the call is cancelled.
+        let weight = crate::inflight::request_bytes(&request);
         let body = OpenAIRequestBody::from(&request);
         let timeout = request.timeout;
 
         Box::pin(async move {
+            // Admitted by BYTES against the machine's budget, not by a count.
+            // Parking here is what backpressure looks like: the durable queue
+            // keeps the work, so this defers a call rather than losing it.
+            let _admitted = crate::admission::global().admit_bytes(weight).await;
             if api_key.is_empty() {
                 return Err(LlmError::Auth {
                     provider: crate::router::PROVIDER_OPENAI,
@@ -203,15 +207,11 @@ impl LlmClient for OpenAIClient {
                                 reason: format!("openai response JSON decode: {e}"),
                             })?;
 
-                    decode_openai_response(payload)
+                    decode_openai_response(payload, &request)
                 },
-                || LlmError::ProviderError {
-                    status: 0,
-                    message: "no provider runtime; LLM completions are disabled".to_string(),
-                },
-                |e| LlmError::ProviderError {
-                    status: 0,
-                    message: format!("openai completion task failed: {e}"),
+                || LlmError::ProviderRuntimeUnavailable,
+                |e| LlmError::RequestTaskFailed {
+                    reason: format!("openai completion task failed: {e}"),
                 },
             )
             .await
@@ -385,57 +385,102 @@ struct OpenAIChoiceMessage {
 struct OpenAIUsage {
     prompt_tokens: u64,
     completion_tokens: u64,
+    #[serde(default)]
+    prompt_tokens_details: OpenAIPromptTokensDetails,
 }
 
-fn decode_openai_response(payload: OpenAIResponseBody) -> Result<LlmResponse, LlmError> {
-    let truncated = payload
-        .choices
-        .first()
-        .and_then(|c| c.finish_reason.as_deref())
-        == Some("length");
+#[derive(Deserialize, Debug, Default)]
+struct OpenAIPromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u64,
+}
 
-    let content = payload
-        .choices
-        .first()
-        .and_then(|c| c.message.content.clone())
-        .ok_or_else(|| LlmError::OutputDecodeFailed {
-            reason: "openai response had no choices[0].message.content".into(),
-        })?;
-    if content.is_empty() {
-        // `truncated` is computed FIRST so this can say which empty it is.
-        // A reasoning model spends the completion budget on reasoning before
-        // it writes anything, so too small a budget returns `finish_reason =
-        // length` with no content at all — and reported as a bare "content
-        // was empty" that is indistinguishable from a malformed reply, which
-        // callers retry. Every retry is billed and returns empty again.
-        return Err(LlmError::OutputDecodeFailed {
-            reason: if truncated {
-                "openai returned no content: the completion budget was spent \
-                 before any output (finish_reason=length). On a reasoning \
-                 model the budget must cover the reasoning tokens too — raise \
-                 max_tokens for this call, or configure a non-reasoning model"
-                    .into()
-            } else {
-                "openai response content was empty".into()
-            },
-        });
-    }
-
-    let cost_micro_usd = payload.usage.prompt_tokens * PRICE_INPUT_PER_TOKEN_DEFAULT
-        + payload.usage.completion_tokens * PRICE_OUTPUT_PER_TOKEN_DEFAULT;
-
-    Ok(LlmResponse {
+fn decode_openai_response(
+    payload: OpenAIResponseBody,
+    request: &LlmRequest,
+) -> Result<LlmResponse, LlmError> {
+    let first_choice = payload.choices.first();
+    let finish_reason = first_choice.and_then(|c| c.finish_reason.as_deref());
+    let truncated = finish_reason == Some("length");
+    let (content, content_was_null, choice_was_absent) = match first_choice {
+        Some(choice) => match choice.message.content.clone() {
+            Some(content) => (content, false, false),
+            None => (String::new(), true, false),
+        },
+        None => (String::new(), false, true),
+    };
+    let model = if payload.model.is_empty() {
+        request.model.clone()
+    } else {
+        payload.model.clone()
+    };
+    let cached = payload
+        .usage
+        .prompt_tokens_details
+        .cached_tokens
+        .min(payload.usage.prompt_tokens);
+    let live_in = payload.usage.prompt_tokens - cached;
+    let cost_micro_usd = match ModelPricing::for_model(&model) {
+        Some(pricing) => {
+            pricing.cost_micro_usd(live_in, payload.usage.completion_tokens, 0, cached)
+        }
+        // Zero with a warning is deliberate: an invented rate silently corrupts every downstream total.
+        None => {
+            tracing::warn!(target: "brain_llm::pricing", model = %model, tokens_in = live_in, tokens_out = payload.usage.completion_tokens, "no published pricing for this model; token counts are recorded but its cost is reported as zero — add it to brain_llm::pricing::ModelPricing");
+            0
+        }
+    };
+    let resp = LlmResponse {
         content,
-        tokens_in: payload.usage.prompt_tokens,
+        tokens_in: live_in,
         tokens_out: payload.usage.completion_tokens,
-        // OpenAI's Chat Completions API has no equivalent to Anthropic's
-        // ephemeral prompt cache, so these are always zero on this path.
+        // OpenAI reports cached input inside prompt_tokens; subtract it so
+        // tokens_in remains the live-input count while cached tokens are billed
+        // at the provider's cached-input rate.
         cache_creation_input_tokens: 0,
-        cache_read_input_tokens: 0,
+        cache_read_input_tokens: cached,
         cost_micro_usd,
         model_version: payload.model,
         truncated,
-    })
+    };
+    if resp.content.is_empty() {
+        // The priced response travels with the error because the call cost real money and this
+        // is the only record of that spend. The finish reasons stay distinct because their
+        // remedies differ: a spent completion budget, provider-side filtering, a tool-call-only
+        // reply and a response carrying no choices each call for a different operator action.
+        let reason = if truncated {
+            "openai returned no content: the completion budget was spent \
+                 before any output (finish_reason=length). On a reasoning \
+                 model the budget must cover the reasoning tokens too — raise \
+                 max_tokens for this call, or configure a non-reasoning model"
+                .into()
+        } else if choice_was_absent {
+            "openai response carried no choices".into()
+        } else if content_was_null {
+            match finish_reason {
+                Some("content_filter") => {
+                    "openai stopped on its content filter and returned no text".into()
+                }
+                Some("tool_calls" | "function_call") => {
+                    "openai reply carried only tool calls and no text content".into()
+                }
+                Some(reason) => format!(
+                    "openai response choices[0].message.content was null (finish_reason={reason})"
+                ),
+                None => {
+                    "openai response choices[0].message.content was null (finish_reason absent)"
+                        .into()
+                }
+            }
+        } else {
+            "openai response content was empty".into()
+        };
+        return Err(LlmError::EmptyContent {
+            reason,
+            billed: resp,
+        });
+    }
+    Ok(resp)
 }
 
 fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> u64 {
@@ -570,46 +615,152 @@ mod tests {
             usage: OpenAIUsage {
                 prompt_tokens: 100,
                 completion_tokens: 50,
+                prompt_tokens_details: OpenAIPromptTokensDetails::default(),
             },
         };
-        let resp = decode_openai_response(payload).unwrap();
+        let resp = decode_openai_response(payload, &LlmRequest::new("gpt-4o-mini", "x")).unwrap();
         assert_eq!(resp.content, "the answer");
         assert_eq!(resp.tokens_in, 100);
         assert_eq!(resp.tokens_out, 50);
-        // 100 * 1 + 50 * 4 = 300 (default pricing).
-        assert_eq!(resp.cost_micro_usd, 300);
+        // (100 * 150 + 50 * 600) nano / 1000 = 45 micro-USD.
+        assert_eq!(resp.cost_micro_usd, 45);
         assert_eq!(resp.model_version, "gpt-4o-mini-2024-07-18");
     }
 
+    /// A successful response with no choices is billed and retains its priced usage.
     #[test]
     fn decode_response_errors_when_choices_empty() {
         let payload = OpenAIResponseBody {
-            model: "m".into(),
+            model: "gpt-4.1-mini".into(),
             choices: vec![],
             usage: OpenAIUsage {
-                prompt_tokens: 0,
+                prompt_tokens: 1000,
                 completion_tokens: 0,
+                prompt_tokens_details: OpenAIPromptTokensDetails::default(),
             },
         };
-        let err = decode_openai_response(payload).unwrap_err();
-        assert!(matches!(err, LlmError::OutputDecodeFailed { .. }));
+        let err =
+            decode_openai_response(payload, &LlmRequest::new("gpt-4.1-mini", "x")).unwrap_err();
+        match err {
+            LlmError::EmptyContent { billed, reason } => {
+                assert!(reason.contains("no choices"));
+                assert!(billed.cost_micro_usd > 0);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
+    /// A null message content is billed and preserves its provider provenance.
     #[test]
     fn decode_response_errors_when_content_missing() {
         let payload = OpenAIResponseBody {
-            model: "m".into(),
+            model: "gpt-4.1-mini".into(),
             choices: vec![OpenAIChoice {
                 finish_reason: None,
                 message: OpenAIChoiceMessage { content: None },
             }],
             usage: OpenAIUsage {
-                prompt_tokens: 0,
+                prompt_tokens: 1000,
                 completion_tokens: 0,
+                prompt_tokens_details: OpenAIPromptTokensDetails::default(),
             },
         };
-        let err = decode_openai_response(payload).unwrap_err();
-        assert!(matches!(err, LlmError::OutputDecodeFailed { .. }));
+        let err =
+            decode_openai_response(payload, &LlmRequest::new("gpt-4.1-mini", "x")).unwrap_err();
+        match err {
+            LlmError::EmptyContent { billed, reason } => {
+                assert!(reason.contains("was null"));
+                assert!(billed.cost_micro_usd > 0);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    fn null_content_error(finish_reason: Option<&str>) -> LlmError {
+        decode_openai_response(
+            OpenAIResponseBody {
+                model: "gpt-4.1-mini".into(),
+                choices: vec![OpenAIChoice {
+                    finish_reason: finish_reason.map(str::to_string),
+                    message: OpenAIChoiceMessage { content: None },
+                }],
+                usage: OpenAIUsage {
+                    prompt_tokens: 1000,
+                    completion_tokens: 0,
+                    prompt_tokens_details: OpenAIPromptTokensDetails::default(),
+                },
+            },
+            &LlmRequest::new("gpt-4.1-mini", "x"),
+        )
+        .unwrap_err()
+    }
+
+    /// Tool-only replies retain billed usage and identify the operator remedy.
+    #[test]
+    fn null_content_tool_calls_is_billed_empty_content() {
+        match null_content_error(Some("tool_calls")) {
+            LlmError::EmptyContent { billed, reason } => {
+                assert!(reason.contains("tool calls"));
+                assert!(billed.cost_micro_usd > 0);
+                assert_eq!(
+                    LlmError::EmptyContent { reason, billed }.failure_class(),
+                    crate::FailureClass::Permanent
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// Content-filtered null replies retain billed usage and identify the provider filter.
+    #[test]
+    fn null_content_filter_is_billed_empty_content() {
+        match null_content_error(Some("content_filter")) {
+            LlmError::EmptyContent { billed, reason } => {
+                assert!(reason.contains("content filter"));
+                assert!(billed.cost_micro_usd > 0);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// Truncated null replies retain the actionable reasoning-budget diagnostic.
+    #[test]
+    fn null_content_length_keeps_budget_reason() {
+        match null_content_error(Some("length")) {
+            LlmError::EmptyContent { reason, .. } => assert!(reason.contains("max_tokens")),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// A null reply without a finish reason identifies null content and its billed usage.
+    #[test]
+    fn null_content_without_finish_reason_is_distinct() {
+        match null_content_error(None) {
+            LlmError::EmptyContent { billed, reason } => {
+                assert!(reason.contains("was null"));
+                assert!(reason.contains("finish_reason absent"));
+                assert!(billed.cost_micro_usd > 0);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// An empty choice list retains billed usage as an empty completion.
+    #[test]
+    fn empty_choices_with_usage_are_billed_empty_content() {
+        let payload = OpenAIResponseBody {
+            model: "gpt-4.1-mini".into(),
+            choices: vec![],
+            usage: OpenAIUsage {
+                prompt_tokens: 1000,
+                completion_tokens: 0,
+                prompt_tokens_details: OpenAIPromptTokensDetails::default(),
+            },
+        };
+        match decode_openai_response(payload, &LlmRequest::new("gpt-4.1-mini", "x")).unwrap_err() {
+            LlmError::EmptyContent { billed, .. } => assert!(billed.cost_micro_usd > 0),
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[test]
@@ -625,13 +776,67 @@ mod tests {
             usage: OpenAIUsage {
                 prompt_tokens: 0,
                 completion_tokens: 0,
+                prompt_tokens_details: OpenAIPromptTokensDetails::default(),
             },
         };
-        let err = decode_openai_response(payload).unwrap_err();
+        let err = decode_openai_response(payload, &LlmRequest::new("m", "x")).unwrap_err();
         assert!(matches!(
             err,
-            LlmError::OutputDecodeFailed { ref reason } if reason.contains("empty")
+            LlmError::EmptyContent { ref reason, .. } if reason.contains("empty")
         ));
+    }
+
+    /// A billed empty completion retains its usage and cost for accounting.
+    #[test]
+    fn empty_completion_carries_billed_cost() {
+        let payload = OpenAIResponseBody {
+            model: "gpt-4.1-mini".into(),
+            choices: vec![OpenAIChoice {
+                finish_reason: None,
+                message: OpenAIChoiceMessage {
+                    content: Some(String::new()),
+                },
+            }],
+            usage: OpenAIUsage {
+                prompt_tokens: 1000,
+                completion_tokens: 0,
+                prompt_tokens_details: OpenAIPromptTokensDetails::default(),
+            },
+        };
+        let err =
+            decode_openai_response(payload, &LlmRequest::new("gpt-4.1-mini", "x")).unwrap_err();
+        match err {
+            LlmError::EmptyContent { billed, .. } => {
+                assert_eq!(billed.tokens_in, 1000);
+                // The provider billed the call, so the error carries that cost.
+                assert_eq!(billed.cost_micro_usd, 400); // 1000 * 400 nano / 1000 = 400 micro-USD.
+                assert!(billed.cost_micro_usd > 0);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// Cached OpenAI prompt tokens are excluded from live input and billed at the cache rate.
+    #[test]
+    fn cached_prompt_tokens_are_recorded_and_priced() {
+        let payload = OpenAIResponseBody {
+            model: "gpt-4.1-mini".into(),
+            choices: vec![OpenAIChoice {
+                finish_reason: Some("stop".into()),
+                message: OpenAIChoiceMessage {
+                    content: Some("ok".into()),
+                },
+            }],
+            usage: OpenAIUsage {
+                prompt_tokens: 1000,
+                completion_tokens: 0,
+                prompt_tokens_details: OpenAIPromptTokensDetails { cached_tokens: 800 },
+            },
+        };
+        let resp = decode_openai_response(payload, &LlmRequest::new("gpt-4.1-mini", "x")).unwrap();
+        assert_eq!(resp.tokens_in, 200);
+        assert_eq!(resp.cache_read_input_tokens, 800);
+        assert_eq!(resp.cost_micro_usd, 160); // (200*400 + 800*100) nano / 1000 = 160 micro-USD.
     }
 
     #[test]
@@ -668,6 +873,7 @@ mod tests {
             usage: OpenAIUsage {
                 prompt_tokens: 10,
                 completion_tokens: 20,
+                prompt_tokens_details: OpenAIPromptTokensDetails::default(),
             },
         }
     }
@@ -678,7 +884,11 @@ mod tests {
         // Without it, output cut mid-JSON is indistinguishable from a
         // model that cannot follow the schema, and the caller burns a
         // second identical call to learn nothing.
-        let r = decode_openai_response(body_with_finish(Some("length"))).unwrap();
+        let r = decode_openai_response(
+            body_with_finish(Some("length")),
+            &LlmRequest::new("gpt-4o-mini", "x"),
+        )
+        .unwrap();
         assert!(r.truncated);
     }
 
@@ -692,10 +902,19 @@ mod tests {
         let mut body = body_with_finish(Some("length"));
         body.choices[0].message.content = Some(String::new());
 
-        let err = decode_openai_response(body).expect_err("empty content is an error");
+        let err = decode_openai_response(body, &LlmRequest::new("gpt-4o-mini", "x"))
+            .expect_err("empty content is an error");
         let msg = err.to_string();
         assert!(msg.contains("finish_reason=length"), "{msg}");
         assert!(msg.contains("max_tokens"), "{msg}");
+        if let LlmError::EmptyContent { billed, reason } = err {
+            // A billed empty completion still records what it cost.
+            assert!(billed.cost_micro_usd > 0);
+            assert!(billed.truncated);
+            assert!(reason.contains("finish_reason=length"));
+        } else {
+            panic!("expected billed empty content");
+        }
     }
 
     /// An empty reply that was NOT truncated is a different fault and must
@@ -705,7 +924,7 @@ mod tests {
         let mut body = body_with_finish(Some("stop"));
         body.choices[0].message.content = Some(String::new());
 
-        let msg = decode_openai_response(body)
+        let msg = decode_openai_response(body, &LlmRequest::new("gpt-4o-mini", "x"))
             .expect_err("empty content is an error")
             .to_string();
         assert!(msg.contains("content was empty"), "{msg}");
@@ -714,7 +933,11 @@ mod tests {
 
     #[test]
     fn a_clean_stop_is_not_truncated() {
-        let r = decode_openai_response(body_with_finish(Some("stop"))).unwrap();
+        let r = decode_openai_response(
+            body_with_finish(Some("stop")),
+            &LlmRequest::new("gpt-4o-mini", "x"),
+        )
+        .unwrap();
         assert!(!r.truncated);
     }
 
@@ -724,7 +947,11 @@ mod tests {
         // real schema failure behind a misleading budget message, and some
         // proxies omit the field entirely.
         for reason in [None, Some("content_filter"), Some("tool_calls")] {
-            let r = decode_openai_response(body_with_finish(reason)).unwrap();
+            let r = decode_openai_response(
+                body_with_finish(reason),
+                &LlmRequest::new("gpt-4o-mini", "x"),
+            )
+            .unwrap();
             assert!(!r.truncated, "{reason:?} must not read as truncated");
         }
     }

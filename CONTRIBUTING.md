@@ -13,14 +13,10 @@ constraints — read this end-to-end before you start.
    implement → verify → commit**.
 3. No `unwrap()` outside tests. Use `expect("invariant:
    <reason>")` for unreachable.
-4. Run `just verify` before opening a PR. On macOS (or any
-   non-Linux host) use `just docker-verify` — the dev container
-   is the supported path; the server can't build natively
-   (glommio / `io_uring`).
-
-See [`AUTONOMY.md`](.claude/AUTONOMY.md) for the full operating
-contract Brain's autonomous mode runs under — much of it
-applies to human contributors too.
+4. Run `just verify` as you work and `just prod-verify` before
+   opening a PR. On macOS (or any non-Linux host) use
+   `just docker-verify` — the dev container is the supported path;
+   the server can't build natively (glommio / `io_uring`).
 
 ## Architecture in one paragraph
 
@@ -30,11 +26,13 @@ request dispatches to one of N **shards**. Each shard runs a
 data: a memory-mapped **arena** for vectors, a **WAL** with
 O_DIRECT + `pwritev2(RWF_DSYNC)` group commit, a **redb**
 B-tree for metadata, an **HNSW** index in RAM.
-Single-writer-per-shard, lock-free reads via
-**ArcSwap** + **crossbeam-epoch**. When a schema is declared,
-the same shard additionally owns entity / statement HNSWs,
-two **tantivy** indexes, an LLM extractor cache, and runs the
-three-tier extractor pipeline.
+Writes serialize on the shard's own core, lock-free reads via
+**ArcSwap** generation publication. The shard also owns entity
+and statement HNSWs, two **tantivy** indexes and an LLM
+extractor cache, and runs the three-tier extractor pipeline —
+all of it unconditional. Schema is active from byte zero: every
+shard seeds the reserved `brain:` namespace, and declaring your
+own types only widens what the pipeline is allowed to admit.
 
 ## Where to start reading
 
@@ -42,8 +40,6 @@ three-tier extractor pipeline.
 - [`spec/00_overview/`](spec/00_overview/00_index.md) — design
   start.
 - [`ROADMAP.md`](ROADMAP.md) — what is still outstanding.
-- [`AUTONOMY.md`](.claude/AUTONOMY.md) — operating rules, contributor
-  workflow + commit conventions.
 
 ## Core invariants — DO NOT violate
 
@@ -78,9 +74,9 @@ Code that violates these is wrong regardless of test results:
 
 ### 1. Pick a sub-task
 
-A task from [`ROADMAP.md`](ROADMAP.md), or an open issue. The
-numbered implementation phases are complete; remaining work is
-convergence.
+A task from [`ROADMAP.md`](ROADMAP.md), or an open issue. Build-out
+is done; the remaining work is convergence — closing the gaps
+between the code and the spec.
 
 ### 2. Read the spec
 
@@ -110,9 +106,20 @@ Follow the plan. Deviations go back through plan → approval.
 
 ```bash
 just verify          # fmt + build + clippy -D warnings + test + check-skills
+just prod-verify     # the closest match to CI; run this before you push
 # or, on macOS / any non-Linux host (the dev container is the supported path):
 just docker-verify
 ```
+
+`just verify` is the fast local gate, not the CI gate — the two
+diverge in both directions. `verify` lints benches and examples
+(`clippy --all-targets`) that CI doesn't; CI lints feature-gated
+code (`clippy --all-features`) that `verify` doesn't. `verify` also
+skips the lockfile check, the warning-free doc build and the
+release-binary smoke, all of which `just prod-verify` runs. Miri
+and `cargo audit` are separate CI jobs — `just miri` and
+`just audit`. `prod-verify` needs Linux (it builds the release
+binary), so on macOS run it inside the dev container.
 
 ### 6. Commit
 
@@ -130,7 +137,9 @@ the sole author of these commits.
 
 ## Code conventions
 
-- Edition: Rust 2021. MSRV: stable latest minus one.
+- Edition: Rust 2021. MSRV: **1.95**, pinned as `rust-version` in
+  the workspace manifest. `rust-toolchain.toml` pins the channel
+  to `stable`.
 - Errors: `thiserror` for libs; `anyhow` for binaries. Stable
   error taxonomy per spec §03/10.
 - No `unwrap()` outside tests. Use `expect("invariant:
@@ -151,7 +160,6 @@ the sole author of these commits.
 - Property tests with `proptest` for parsers, allocators,
   recovery.
 - Fuzz with `cargo-fuzz` for the wire protocol.
-- Loom for concurrency-critical paths.
 - Miri for `crates/brain-storage`'s unsafe.
 - Chaos tests for recovery (kill-during-operation).
 - Benchmarks with `criterion` per phase.
@@ -169,7 +177,9 @@ model (`BRAIN_NER_MODEL_PATH`, `BRAIN_RERANK_MODEL_DIR`), a live API
 key, long wall-time (chaos sweeps, load tests), or are
 workstation-tuned perf gates. Always give a reason
 (`#[ignore = "requires …"]`) and run them on demand with
-`cargo nextest run --run-ignored all` (CI runs them in its live tier).
+`cargo nextest run --run-ignored all`. No workflow passes
+`--run-ignored`, so these 65 tests run only when someone runs them
+by hand.
 Don't `#[ignore]` a test to silence a failure — fix it or delete it.
 
 New behaviour → new test. Spec change → corresponding test

@@ -8,28 +8,40 @@
 //! vector's *embedding* and the graph/edge *rows* survive in their native
 //! tables; the analyzed terms and the HyPE question text are otherwise
 //! discarded once indexed/embedded. This module keeps a friendly,
-//! denormalized copy of the whole set in one redb table (`MEMORY_ARTIFACTS`,
+//! denormalized copy of that set in one redb table (`MEMORY_ARTIFACTS`,
 //! value = JSON of [`EncodeStageArtifact`]) so `MEMORY_INSPECT` can show any
 //! memory's full write story later, not just the one just written via the
 //! live ENCODE trace.
 //!
+//! ## The embedding is not in the bundle
+//!
+//! The one stage output the bundle does *not* carry is the embedding. The
+//! vector's home is `MEMORY_VECTORS_TABLE` — a flat little-endian `f32` run
+//! read by id — and that is where every consumer resolves it from
+//! ([`get_artifact_vector`], and `MEMORY_INSPECT` when it assembles the view
+//! for a reader). Keeping a second copy inside the bundle would mean the ack
+//! path serialising 384 floats into JSON on every write, which cost more than
+//! the rest of the bundle put together and bought no reader anything.
+//!
 //! ## Incremental population, no lost update
 //!
 //! The bundle is built up by several producers at different times:
-//! - **sync** (apply, on the ack txn): vector + record, piggybacked on the
-//!   memory-row write so it costs no extra transaction on the ack path.
+//! - **sync** (apply, on the ack txn): the record + analyzed terms,
+//!   piggybacked on the memory-row write so it costs no extra transaction on
+//!   the ack path.
 //! - **async** (background workers, off the ack path): the extractor merges
-//!   the graph, `auto_edge` / `temporal_edge` merge the derived edges, the
-//!   text-indexer merges the analyzed terms, HyPE merges the generated
-//!   questions.
+//!   the graph, `auto_edge` / `temporal_edge` merge the derived edges, HyPE
+//!   merges the generated questions.
 //!
-//! Every producer uses [`merge_memory_artifact`] — a read-modify-write inside
-//! a single redb write txn. redb's exclusive write lock serializes concurrent
-//! producers on the shard, so a later merge never clobbers an earlier one's
-//! fields; each touches only its own portion of the bundle. The extractor and
-//! the two edge workers additionally share one field (`graph`) rather than
-//! each getting their own — see [`merge_edge_links`] for how they avoid
-//! clobbering each other there.
+//! Every async producer uses [`merge_memory_artifact`] — a read-modify-write
+//! inside a single redb write txn. redb's exclusive write lock serializes
+//! concurrent producers on the shard, so a later merge never clobbers an
+//! earlier one's fields; each touches only its own portion of the bundle. The
+//! extractor and the two edge workers additionally share one field (`graph`)
+//! rather than each getting their own — see [`merge_edge_links`] for how they
+//! avoid clobbering each other there. The sync producer is the exception: it
+//! writes the row outright, because it runs under a freshly reserved memory id
+//! where no bundle can exist yet (see [`put_sync_artifact`]).
 
 use brain_core::MemoryId;
 use brain_metadata::tables::memory_artifacts::MEMORY_ARTIFACTS_TABLE;
@@ -41,6 +53,70 @@ use brain_protocol::envelope::response::{
     EncodeStageKeywordField, EncodeStageRecord,
 };
 use redb::{ReadTransaction, ReadableTable, WriteTransaction};
+
+use crate::apply::{RedbFault, StorageFault};
+
+/// Failures while persisting or reading a memory's durable artifact bundle.
+///
+/// Each redb-backed variant carries the value redb returned rather than its
+/// rendered text, so a caller can classify the failure for retry through
+/// [`RedbFault`] instead of parsing a message. `context` names the table and
+/// the operation that produced it ("open memory_artifacts", "vector write"),
+/// which is what an operator reads in a log.
+#[derive(Debug, thiserror::Error)]
+pub enum ArtifactError {
+    #[error("{context}: {source}")]
+    Table {
+        context: &'static str,
+        #[source]
+        source: redb::TableError,
+    },
+    #[error("{context}: {source}")]
+    Storage {
+        context: &'static str,
+        #[source]
+        source: redb::StorageError,
+    },
+    #[error("{context}: {source}")]
+    Transaction {
+        context: &'static str,
+        #[source]
+        source: redb::TransactionError,
+    },
+    #[error("{context}: {source}")]
+    Commit {
+        context: &'static str,
+        #[source]
+        source: redb::CommitError,
+    },
+    #[error("{context}: {source}")]
+    Serialize {
+        context: &'static str,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("graph enrichment: {0}")]
+    Enrichment(String),
+}
+
+impl RedbFault for ArtifactError {
+    fn storage_fault(&self) -> StorageFault {
+        match self {
+            Self::Table { source, .. } => source.storage_fault(),
+            Self::Storage { source, .. } => source.storage_fault(),
+            Self::Transaction { source, .. } => source.storage_fault(),
+            Self::Commit { source, .. } => source.storage_fault(),
+            // This bundle is owned by the engine; a value that cannot be
+            // serialized fails identically on every attempt and indicates a
+            // deterministic implementation defect.
+            Self::Serialize { .. } => StorageFault::Misuse,
+            // The enrichment reader's taxonomy is not visible here, so an
+            // unclassified failure remains retryable rather than abandoning
+            // durable work on a potentially transient cause.
+            Self::Enrichment(_) => StorageFault::Transient,
+        }
+    }
+}
 
 /// Edge kinds the extractor stage owns. It always recomputes the *full*
 /// current committed entity/statement/relation graph on every call (via
@@ -54,50 +130,88 @@ const EXTRACTOR_EDGE_KINDS: [&str; 2] = ["statement", "relation"];
 /// current bundle (default when absent), applies `f`, writes it back. Commits
 /// atomically with whatever else the caller's txn is doing; concurrent
 /// producers are serialized by redb's write lock, so no field is lost.
+///
+/// The embedding is NOT part of the stored bundle. `MEMORY_VECTORS_TABLE`
+/// holds it, [`get_artifact_vector`] reads it from there, and the wire type's
+/// `vector` field is hydrated at read time. `f` may set that field — it is the
+/// same struct the wire uses — so this clears it before writing rather than
+/// persisting a copy that no reader would ever consult. A caller that wants to
+/// store an embedding wants [`put_sync_artifact`].
 pub fn merge_memory_artifact<F>(
     wtxn: &WriteTransaction,
     memory_id: [u8; 16],
     f: F,
-) -> Result<(), String>
+) -> Result<(), ArtifactError>
 where
     F: FnOnce(&mut EncodeStageArtifact),
 {
-    let mut table = wtxn
-        .open_table(MEMORY_ARTIFACTS_TABLE)
-        .map_err(|e| format!("open memory_artifacts: {e}"))?;
+    let mut table =
+        wtxn.open_table(MEMORY_ARTIFACTS_TABLE)
+            .map_err(|source| ArtifactError::Table {
+                context: "open memory_artifacts",
+                source,
+            })?;
     // The get-guard is a temporary bound only for this expression, so it is
     // dropped before `table.insert` needs exclusive access below.
     let mut bundle: EncodeStageArtifact = table
         .get(&memory_id)
-        .map_err(|e| format!("artifact read: {e}"))?
+        .map_err(|source| ArtifactError::Storage {
+            context: "artifact read",
+            source,
+        })?
         .and_then(|g| serde_json::from_str::<EncodeStageArtifact>(g.value()).ok())
         .unwrap_or_default();
     f(&mut bundle);
+    // Structural, not documented-and-hoped-for: whatever `f` did, the stored
+    // bundle carries no embedding. A vector set here would be silently
+    // unreadable, which is a far worse failure than refusing to keep it.
+    bundle.vector.clear();
     prune_dangling_edges(&mut bundle);
-    let json = serde_json::to_string(&bundle).map_err(|e| format!("artifact serialize: {e}"))?;
+    let json = serde_json::to_string(&bundle).map_err(|source| ArtifactError::Serialize {
+        context: "artifact serialize",
+        source,
+    })?;
     table
         .insert(&memory_id, json.as_str())
-        .map_err(|e| format!("artifact write: {e}"))?;
+        .map_err(|source| ArtifactError::Storage {
+            context: "artifact write",
+            source,
+        })?;
     Ok(())
 }
 
 /// Delete a memory's artifact bundle (FORGET cascade). A missing row is a
 /// no-op success — FORGET is lenient, and a memory that never produced a
 /// bundle is indistinguishable from one whose bundle is already gone.
-pub fn delete_memory_artifact(wtxn: &WriteTransaction, memory_id: [u8; 16]) -> Result<(), String> {
-    let mut table = wtxn
-        .open_table(MEMORY_ARTIFACTS_TABLE)
-        .map_err(|e| format!("open memory_artifacts: {e}"))?;
+pub fn delete_memory_artifact(
+    wtxn: &WriteTransaction,
+    memory_id: [u8; 16],
+) -> Result<(), ArtifactError> {
+    let mut table =
+        wtxn.open_table(MEMORY_ARTIFACTS_TABLE)
+            .map_err(|source| ArtifactError::Table {
+                context: "open memory_artifacts",
+                source,
+            })?;
     table
         .remove(&memory_id)
-        .map_err(|e| format!("artifact remove: {e}"))?;
+        .map_err(|source| ArtifactError::Storage {
+            context: "artifact remove",
+            source,
+        })?;
     // The raw vector is embedding-at-rest too — drop it alongside the
     // bundle so a reclaim / hard-forget leaves nothing behind.
     let mut vt = wtxn
         .open_table(MEMORY_VECTORS_TABLE)
-        .map_err(|e| format!("open memory_vectors: {e}"))?;
+        .map_err(|source| ArtifactError::Table {
+            context: "open memory_vectors",
+            source,
+        })?;
     vt.remove(&memory_id)
-        .map_err(|e| format!("vector remove: {e}"))?;
+        .map_err(|source| ArtifactError::Storage {
+            context: "vector remove",
+            source,
+        })?;
     Ok(())
 }
 
@@ -111,34 +225,76 @@ fn vector_to_le_bytes(vector: &[f32]) -> Vec<u8> {
     bytes
 }
 
-/// Write the **sync** portion (vector + record + analyzed keyword terms) into
-/// the bundle inside the apply write txn. Called from
-/// [`crate::apply::memory::apply_upsert_memory`] so these fields commit
-/// atomically with the memory row at zero extra transaction cost on the ack
-/// path. The async producers fill the rest (graph / hype) later via
+/// Store one memory's embedding.
+///
+/// `MEMORY_VECTORS_TABLE` is the embedding's only durable home — a raw LE-`f32`
+/// run resolved by [`get_artifact_vector`] with a single point lookup and
+/// decode. The artifact bundle does not carry one, so this is the function that
+/// makes a memory's vector readable; writing the field on the bundle instead
+/// stores something no reader consults.
+pub fn put_memory_vector(
+    wtxn: &WriteTransaction,
+    memory_id: [u8; 16],
+    vector: &[f32],
+) -> Result<(), ArtifactError> {
+    let mut vt = wtxn
+        .open_table(MEMORY_VECTORS_TABLE)
+        .map_err(|source| ArtifactError::Table {
+            context: "open memory_vectors",
+            source,
+        })?;
+    vt.insert(&memory_id, vector_to_le_bytes(vector).as_slice())
+        .map_err(|source| ArtifactError::Storage {
+            context: "vector write",
+            source,
+        })?;
+    Ok(())
+}
+
+/// Write the **sync** stage outputs inside the apply write txn: the embedding
+/// into the by-id vector table, and the record + analyzed keyword terms into
+/// the artifact bundle. Called from
+/// [`crate::apply::memory::apply_upsert_memory`] so both commit atomically
+/// with the memory row at zero extra transaction cost on the ack path. The
+/// async producers fill the rest of the bundle (graph / hype) later via
 /// [`merge_memory_artifact`].
+///
+/// This is the ack path, so it does the minimum redb work that preserves the
+/// information: one insert per table, no read of either.
 pub fn put_sync_artifact(
     wtxn: &WriteTransaction,
     memory_id: [u8; 16],
     vector: Vec<f32>,
     record: EncodeStageRecord,
     keyword_fields: Vec<EncodeStageKeywordField>,
-) -> Result<(), String> {
-    // Fast by-id vector store: the raw LE-`f32` run, resolved on the hot
-    // recall path (`get_artifact_vector`) with a single point lookup +
-    // decode — no JSON parse of the whole (graph-bearing) bundle.
-    {
-        let mut vt = wtxn
-            .open_table(MEMORY_VECTORS_TABLE)
-            .map_err(|e| format!("open memory_vectors: {e}"))?;
-        vt.insert(&memory_id, vector_to_le_bytes(&vector).as_slice())
-            .map_err(|e| format!("vector write: {e}"))?;
-    }
-    merge_memory_artifact(wtxn, memory_id, |bundle| {
-        bundle.vector = vector;
-        bundle.record = Some(record);
-        bundle.keyword_fields = keyword_fields;
-    })
+) -> Result<(), ArtifactError> {
+    put_memory_vector(wtxn, memory_id, &vector)?;
+    // Written whole rather than merged. Every producer of a `UpsertMemory`
+    // phase reserves a fresh memory id first, so at apply time this id has no
+    // bundle and no async producer has run against it — a read-modify-write
+    // here would read `None` and merge nothing, on every single write.
+    let bundle = EncodeStageArtifact {
+        record: Some(record),
+        keyword_fields,
+        ..Default::default()
+    };
+    let json = serde_json::to_string(&bundle).map_err(|source| ArtifactError::Serialize {
+        context: "artifact serialize",
+        source,
+    })?;
+    let mut table =
+        wtxn.open_table(MEMORY_ARTIFACTS_TABLE)
+            .map_err(|source| ArtifactError::Table {
+                context: "open memory_artifacts",
+                source,
+            })?;
+    table
+        .insert(&memory_id, json.as_str())
+        .map_err(|source| ArtifactError::Storage {
+            context: "artifact write",
+            source,
+        })?;
+    Ok(())
 }
 
 /// Analyze `text` into the exact lexical terms the `memory_text` index will
@@ -175,15 +331,20 @@ pub fn merge_hype_questions(
     metadata: &MetadataDb,
     memory_id: MemoryId,
     questions: Vec<String>,
-) -> Result<(), String> {
+) -> Result<(), ArtifactError> {
     let wtxn = metadata
         .write_txn()
-        .map_err(|e| format!("hype merge write_txn: {e}"))?;
+        .map_err(|source| ArtifactError::Transaction {
+            context: "hype merge write_txn",
+            source,
+        })?;
     merge_memory_artifact(&wtxn, memory_id.to_be_bytes(), |bundle| {
         bundle.hype_questions = questions;
     })?;
-    wtxn.commit()
-        .map_err(|e| format!("hype merge commit: {e}"))?;
+    wtxn.commit().map_err(|source| ArtifactError::Commit {
+        context: "hype merge commit",
+        source,
+    })?;
     Ok(())
 }
 
@@ -204,11 +365,14 @@ pub fn merge_hype_questions(
 pub fn merge_graph_from_committed(
     metadata: &MetadataDb,
     memory_id: MemoryId,
-) -> Result<usize, String> {
+) -> Result<usize, ArtifactError> {
     let (graph, unresolved) = {
         let rtxn = metadata
             .read_txn()
-            .map_err(|e| format!("graph merge read_txn: {e}"))?;
+            .map_err(|source| ArtifactError::Transaction {
+                context: "graph merge read_txn",
+                source,
+            })?;
         let Some(scope) = memory_scope(&rtxn, memory_id)? else {
             // Memory row gone (e.g. hard-forgotten between commit and merge):
             // nothing to enrich, and the bundle was purged with the row.
@@ -220,13 +384,16 @@ pub fn merge_graph_from_committed(
             None,
             &rtxn,
         )
-        .map_err(|e| format!("graph enrichment: {e}"))?;
+        .map_err(|e| ArtifactError::Enrichment(e.to_string()))?;
         enrichment_to_graph_counted(enr.into_iter().next())
     };
 
     let wtxn = metadata
         .write_txn()
-        .map_err(|e| format!("graph merge write_txn: {e}"))?;
+        .map_err(|source| ArtifactError::Transaction {
+            context: "graph merge write_txn",
+            source,
+        })?;
     merge_memory_artifact(&wtxn, memory_id.to_be_bytes(), |bundle| {
         let existing = bundle.graph.take().unwrap_or_default();
         bundle.graph = Some(replace_owned_edges(
@@ -236,8 +403,10 @@ pub fn merge_graph_from_committed(
             graph.edges,
         ));
     })?;
-    wtxn.commit()
-        .map_err(|e| format!("graph merge commit: {e}"))?;
+    wtxn.commit().map_err(|source| ArtifactError::Commit {
+        context: "graph merge commit",
+        source,
+    })?;
     Ok(unresolved)
 }
 
@@ -271,7 +440,7 @@ pub fn merge_edge_links(
     memory_id: MemoryId,
     edge_kind: &str,
     links: &[(MemoryId, MemoryId, f32)],
-) -> Result<(), String> {
+) -> Result<(), ArtifactError> {
     if links.is_empty() {
         return Ok(());
     }
@@ -279,10 +448,16 @@ pub fn merge_edge_links(
     let (nodes, edges) = {
         let rtxn = metadata
             .read_txn()
-            .map_err(|e| format!("edge merge read_txn: {e}"))?;
+            .map_err(|source| ArtifactError::Transaction {
+                context: "edge merge read_txn",
+                source,
+            })?;
         let texts = rtxn
             .open_table(TEXTS_TABLE)
-            .map_err(|e| format!("open texts: {e}"))?;
+            .map_err(|source| ArtifactError::Table {
+                context: "open texts",
+                source,
+            })?;
 
         let mut seen: std::collections::HashSet<[u8; 16]> = std::collections::HashSet::new();
         let mut nodes = Vec::new();
@@ -323,13 +498,18 @@ pub fn merge_edge_links(
 
     let wtxn = metadata
         .write_txn()
-        .map_err(|e| format!("edge merge write_txn: {e}"))?;
+        .map_err(|source| ArtifactError::Transaction {
+            context: "edge merge write_txn",
+            source,
+        })?;
     merge_memory_artifact(&wtxn, memory_id.to_be_bytes(), |bundle| {
         let existing = bundle.graph.take().unwrap_or_default();
         bundle.graph = Some(append_owned_edges(existing, nodes, edges));
     })?;
-    wtxn.commit()
-        .map_err(|e| format!("edge merge commit: {e}"))?;
+    wtxn.commit().map_err(|source| ArtifactError::Commit {
+        context: "edge merge commit",
+        source,
+    })?;
     Ok(())
 }
 
@@ -402,16 +582,25 @@ fn memory_text_preview(text: &str) -> String {
 pub fn read_memory_artifact(
     metadata: &MetadataDb,
     memory_id: MemoryId,
-) -> Result<Option<EncodeStageArtifact>, String> {
+) -> Result<Option<EncodeStageArtifact>, ArtifactError> {
     let rtxn = metadata
         .read_txn()
-        .map_err(|e| format!("artifact read_txn: {e}"))?;
+        .map_err(|source| ArtifactError::Transaction {
+            context: "artifact read_txn",
+            source,
+        })?;
     let table = rtxn
         .open_table(MEMORY_ARTIFACTS_TABLE)
-        .map_err(|e| format!("open memory_artifacts: {e}"))?;
+        .map_err(|source| ArtifactError::Table {
+            context: "open memory_artifacts",
+            source,
+        })?;
     Ok(table
         .get(&memory_id.to_be_bytes())
-        .map_err(|e| format!("artifact read: {e}"))?
+        .map_err(|source| ArtifactError::Storage {
+            context: "artifact read",
+            source,
+        })?
         .and_then(|g| serde_json::from_str::<EncodeStageArtifact>(g.value()).ok()))
 }
 
@@ -455,39 +644,24 @@ pub fn artifact_holds_extractor_graph(metadata: &MetadataDb, memory_id: MemoryId
 /// (single-space brute-force recall, consolidation clustering, rebuild
 /// sources) must resolve it here, not from the arena.
 ///
-/// Fast path: the dedicated `memory_vectors` table — a single point
-/// lookup + little-endian decode, no JSON. Fallback: the JSON artifact
-/// bundle, for rows written before the raw table existed.
+/// The `memory_vectors` table is the embedding's only durable home, so this
+/// is a single point lookup + little-endian decode — no JSON anywhere on the
+/// path.
 #[must_use]
 pub fn get_artifact_vector(
     rtxn: &ReadTransaction,
     memory_id: [u8; 16],
 ) -> Option<[f32; brain_embed::VECTOR_DIM]> {
-    // Fast path — raw LE-f32 bytes, no bundle parse.
-    if let Ok(vt) = rtxn.open_table(MEMORY_VECTORS_TABLE) {
-        if let Some(g) = vt.get(&memory_id).ok().flatten() {
-            let bytes = g.value();
-            if bytes.len() == brain_embed::VECTOR_DIM * 4 {
-                let mut v = [0.0_f32; brain_embed::VECTOR_DIM];
-                for (slot, chunk) in v.iter_mut().zip(bytes.as_chunks::<4>().0.iter()) {
-                    *slot = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                }
-                return Some(v);
-            }
-        }
-    }
-    // Fallback — older rows whose vector lives only in the JSON bundle.
-    let table = rtxn.open_table(MEMORY_ARTIFACTS_TABLE).ok()?;
-    let bundle: EncodeStageArtifact = table
-        .get(&memory_id)
-        .ok()
-        .flatten()
-        .and_then(|g| serde_json::from_str(g.value()).ok())?;
-    if bundle.vector.len() != brain_embed::VECTOR_DIM {
+    let vt = rtxn.open_table(MEMORY_VECTORS_TABLE).ok()?;
+    let bytes = vt.get(&memory_id).ok().flatten()?;
+    let bytes = bytes.value();
+    if bytes.len() != brain_embed::VECTOR_DIM * 4 {
         return None;
     }
     let mut v = [0.0_f32; brain_embed::VECTOR_DIM];
-    v.copy_from_slice(&bundle.vector);
+    for (slot, chunk) in v.iter_mut().zip(bytes.as_chunks::<4>().0.iter()) {
+        *slot = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    }
     Some(v)
 }
 
@@ -496,14 +670,20 @@ pub fn get_artifact_vector(
 fn memory_scope(
     rtxn: &redb::ReadTransaction,
     memory_id: MemoryId,
-) -> Result<Option<brain_metadata::RowScope>, String> {
+) -> Result<Option<brain_metadata::RowScope>, ArtifactError> {
     use brain_metadata::tables::memory::MEMORIES_TABLE;
     let table = rtxn
         .open_table(MEMORIES_TABLE)
-        .map_err(|e| format!("open memories: {e}"))?;
+        .map_err(|source| ArtifactError::Table {
+            context: "open memories",
+            source,
+        })?;
     Ok(table
         .get(&memory_id.to_be_bytes())
-        .map_err(|e| format!("memory read: {e}"))?
+        .map_err(|source| ArtifactError::Storage {
+            context: "memory read",
+            source,
+        })?
         .map(|g| {
             let m = g.value();
             brain_metadata::RowScope::from_bytes(m.namespace_id, m.space_id_bytes)
@@ -746,23 +926,39 @@ mod tests {
             .and_then(|g| serde_json::from_str::<EncodeStageArtifact>(g.value()).ok())
     }
 
+    /// The sync write splits its outputs between the two tables: the record
+    /// and analyzed terms into the bundle, the embedding into the vector
+    /// table — and the bundle carries no second copy of the embedding.
     #[test]
-    fn sync_write_then_read_roundtrips_vector_record_keywords() {
+    fn sync_write_splits_vector_from_bundle() {
         let (_dir, db) = open_db();
         let id = [7u8; 16];
-        let record = sync_record(id, 1, 0.5, 100, 0, 3, 12);
+        let record = sync_record(id, 1, 0.5, 100, 0, brain_embed::VECTOR_DIM as u32, 12);
         let keywords = analyze_memory_keywords("The Quick Brown Fox");
 
+        let mut vector = vec![0.0f32; brain_embed::VECTOR_DIM];
+        vector[0] = 0.1;
+        vector[1] = 0.2;
+        vector[2] = 0.3;
+
         let wtxn = db.write_txn().unwrap();
-        put_sync_artifact(&wtxn, id, vec![0.1, 0.2, 0.3], record, keywords).unwrap();
+        put_sync_artifact(&wtxn, id, vector.clone(), record, keywords).unwrap();
         wtxn.commit().unwrap();
 
         let b = read_bundle(&db, id).expect("bundle present");
-        assert_eq!(b.vector, vec![0.1, 0.2, 0.3]);
+        assert!(
+            b.vector.is_empty(),
+            "the bundle must not carry a copy of the embedding"
+        );
         assert_eq!(b.record.as_ref().unwrap().kind, 1);
         assert_eq!(b.record.as_ref().unwrap().text_len, 12);
         assert_eq!(b.keyword_fields.len(), 1);
         assert!(!b.keyword_fields[0].terms.is_empty());
+
+        // Every float survives, bit for bit, where readers look for it.
+        let rtxn = db.read_txn().unwrap();
+        let got = get_artifact_vector(&rtxn, id).expect("vector resolves");
+        assert_eq!(got.as_slice(), vector.as_slice());
     }
 
     #[test]
@@ -808,34 +1004,38 @@ mod tests {
         }
     }
 
+    /// A vector row that is not the expected width is not an embedding —
+    /// a reader must get `None` rather than a silently truncated vector.
     #[test]
-    fn get_artifact_vector_falls_back_to_json_bundle_when_raw_absent() {
-        // A row whose vector lives only in the JSON bundle (seeded via
-        // merge_memory_artifact, or written before the raw table existed)
-        // must still resolve — via the fallback path.
+    fn get_artifact_vector_rejects_a_wrong_width_row() {
+        use brain_metadata::tables::memory_vector::MEMORY_VECTORS_TABLE;
         let (_dir, db) = open_db();
         let id = [11u8; 16];
-        let mut vector = vec![0.0f32; brain_embed::VECTOR_DIM];
-        vector[1] = 0.75;
+
         let wtxn = db.write_txn().unwrap();
-        merge_memory_artifact(&wtxn, id, |b| b.vector = vector.clone()).unwrap();
+        {
+            let mut vt = wtxn.open_table(MEMORY_VECTORS_TABLE).unwrap();
+            vt.insert(&id, [0u8; 8].as_slice()).unwrap();
+        }
         wtxn.commit().unwrap();
 
         let rtxn = db.read_txn().unwrap();
-        let v = get_artifact_vector(&rtxn, id).expect("fallback resolves from bundle");
-        assert!((v[1] - 0.75).abs() < f32::EPSILON);
+        assert!(get_artifact_vector(&rtxn, id).is_none());
     }
 
     #[test]
     fn later_merge_preserves_earlier_fields() {
         // The incremental design: a graph merge must not clobber the sync
-        // vector/record an earlier producer wrote.
+        // record an earlier producer wrote, nor the embedding in its own
+        // table.
         let (_dir, db) = open_db();
         let id = [9u8; 16];
-        let record = sync_record(id, 0, 0.5, 1, 0, 2, 4);
+        let record = sync_record(id, 0, 0.5, 1, 0, brain_embed::VECTOR_DIM as u32, 4);
+        let mut vector = vec![0.0f32; brain_embed::VECTOR_DIM];
+        vector[5] = 1.5;
 
         let wtxn = db.write_txn().unwrap();
-        put_sync_artifact(&wtxn, id, vec![1.0, 2.0], record, Vec::new()).unwrap();
+        put_sync_artifact(&wtxn, id, vector.clone(), record, Vec::new()).unwrap();
         wtxn.commit().unwrap();
 
         let wtxn = db.write_txn().unwrap();
@@ -846,9 +1046,12 @@ mod tests {
         wtxn.commit().unwrap();
 
         let b = read_bundle(&db, id).expect("bundle present");
-        assert_eq!(b.vector, vec![1.0, 2.0], "sync vector survived the merge");
         assert!(b.record.is_some(), "sync record survived the merge");
         assert_eq!(b.hype_questions, vec!["who?".to_string()]);
+
+        let rtxn = db.read_txn().unwrap();
+        let got = get_artifact_vector(&rtxn, id).expect("vector resolves");
+        assert_eq!(got.as_slice(), vector.as_slice());
     }
 
     #[test]
@@ -1674,5 +1877,52 @@ mod tests {
             &db,
             MemoryId::from_be_bytes(id)
         ));
+    }
+
+    #[test]
+    fn artifact_errors_preserve_fault_kind_and_context() {
+        let cases = [
+            (
+                ArtifactError::Storage {
+                    context: "artifact read",
+                    source: redb::StorageError::Corrupted("x".into()),
+                },
+                StorageFault::Corrupted,
+            ),
+            (
+                ArtifactError::Storage {
+                    context: "vector write",
+                    source: redb::StorageError::ValueTooLarge(1 << 32),
+                },
+                StorageFault::ValueTooLarge,
+            ),
+            (
+                ArtifactError::Table {
+                    context: "open memory_artifacts",
+                    source: redb::TableError::TableDoesNotExist("T".into()),
+                },
+                StorageFault::Misuse,
+            ),
+            (
+                ArtifactError::Storage {
+                    context: "artifact remove",
+                    source: redb::StorageError::DatabaseClosed,
+                },
+                StorageFault::Transient,
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(error.storage_fault(), expected);
+        }
+
+        let serialize = ArtifactError::Serialize {
+            context: "artifact serialize",
+            source: serde_json::from_str::<String>("{").unwrap_err(),
+        };
+        assert_eq!(serialize.storage_fault(), StorageFault::Misuse);
+        assert!(serialize.to_string().contains("artifact serialize"));
+
+        let enrichment = ArtifactError::Enrichment("reader failed".into());
+        assert_eq!(enrichment.storage_fault(), StorageFault::Transient);
     }
 }

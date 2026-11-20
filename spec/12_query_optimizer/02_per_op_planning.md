@@ -68,48 +68,79 @@ The embedding step is shared — Brain embeds the cue once, then uses the same v
 
 ### 4. Picking ef_search
 
-Brain's HNSW search ([09. HNSW operations](../09_indexing/02_hnsw_operations.md)) takes an `ef` parameter. Bigger ef = better recall but slower.
+Brain's HNSW search ([09. HNSW operations](../09_indexing/02_hnsw_operations.md)) takes an `ef` parameter — the beam width. Bigger ef = better recall but slower.
 
-The planner picks ef:
+**RECALL's `ef` is resolved in the retriever, not by the planner.** The whole
+decision lives in one function, from two inputs that answer different
+questions:
 
 ```rust
-fn pick_ef(req: &RecallRequest, shard_stats: &ShardStats) -> usize {
-    let mut ef = config.default_ef_search;  // 64
-
-    // Bigger K wants more candidates
-    if req.k > 50 {
-        ef = ef.max(req.k * 4);
+// brain-ops: index/semantic_retriever.rs
+fn resolve_probe_ef(configured_ef, top_k, occupancy, ef_factor) -> usize {
+    let floor = configured_ef.max(top_k.saturating_mul(ef_factor));
+    if !ef_occupancy_enabled() {
+        return floor.min(SEMANTIC_EF_SEARCH_MAX);   // 500
     }
-
-    // Filter selectivity
-    let selectivity = estimate_selectivity(&req.filter, shard_stats);
-    if selectivity < 0.5 {
-        ef = ef.max((ef as f32 / selectivity) as usize);
-    }
-
-    // Cap to avoid pathological values
-    ef = ef.min(config.max_ef_search);  // 500
-
-    ef
+    occupancy
+        .min(SEMANTIC_EF_SEARCH_MAX)
+        .max(floor)
+        .max(top_k)
+        .min(SEMANTIC_EF_SEARCH_MAX)
 }
 ```
 
-For a typical space-scoped RECALL with K=10 and no filter: ef=64.
+- **`ef_factor` — how many results are being asked for.** `[hnsw] ef_factor`,
+  validated to `1..=16`, read off the index rather than re-declared at the call
+  site. It **defaults to 1**, so the floor is `max(ef_search, k)`; at the
+  shipped defaults `ef_search` and `DEFAULT_TOP_K` are both 64, which makes the
+  beam equal `k` exactly. The factor raises read cost in proportion to `k`, so
+  the default does not move until a retrieval-only recall evaluation measures
+  what it buys. Past `k * ef_factor > 500` it stops having any effect — at
+  `k = 64` that is `ef_factor = 8`, so nine of the sixteen accepted values are
+  the same setting.
+- **Occupancy scaling — how large the haystack is.** `[retrieval]
+  ef_occupancy_scaling`, **off by default**. When on, `ef` rises toward live
+  occupancy so a small index is searched exhaustively (exact recall at tiny
+  *N*, no phantom neighbours), never below `top_k`, and capped at 500 so a huge
+  index pays a bounded cost.
 
-For a RECALL with a selective filter (only 10% of memories match): ef = 64 / 0.1 = 640, capped to 500.
+At the shipped defaults: K=10 gives `ef = max(64, 10) = 64`; K=100 gives
+`ef = max(64, 100) = 100`, and 500 once `ef_factor >= 5`.
 
-For a high-K RECALL (K=100): ef = max(64, 100*4) = 400.
+**Filter selectivity does not enter this decision.** There is no selectivity
+estimate on the RECALL path: `[retrieval]`-era filters are applied during the
+walk and after it (§6), not by widening the beam.
+
+**The cost model's `pick_ef` is a different function with different callers.**
+`brain_planner::cost::pick_ef(k, selectivity, ctx)` starts at
+`default_ef_search`, biases to >= 100 above a million memories, by `k * 4` when
+`k > 50`, by `(1 + tombstone_ratio * 5)`, and by `1 / selectivity` below 0.5,
+capping at `max_ef_search`. Nothing on the RECALL path calls it. Its only live
+callers are PATH planning (fixed `k = 10`) and REASON planning (`k = 20`).
 
 ### 5. The over_factor
 
-To account for filtered candidates, the planner sets an over_factor:
+`brain_planner::cost::over_factor(selectivity)` is
+`clamp(1 / selectivity, 1.0, 8.0)` over a floored selectivity. **RECALL does
+not use it.** The memory lane asks HNSW for the beam resolved in §4 and applies
+the filter in and after the walk; its live caller is PATH planning, which sizes
+a traversal's candidate count with it.
 
-```rust
-let over_factor = (1.0 / selectivity).max(1.0).min(8.0);
-let candidates_to_request = (req.k as f32 * over_factor) as usize;
-```
+One lane does over-fetch, for an unrelated reason. The statement HNSW is shared
+by every tenant on the shard and has no filtered search, so the statement probe
+fetches `top_k * 4`, clamped to `[top_k, 500]`, and keeps only live rows in the
+caller's namespace (and space, when one is set). Without the over-fetch a
+foreign tenant's statements fill top-k and crowd the caller's own candidates
+out before the tenant wall is applied.
 
-`candidates_to_request` is the number of candidates Brain asks HNSW for. Typically 10-100; capped at 1000 (HNSW gets less efficient at high K).
+> **`RecallPlan` is not on the serving path.** `AnnSearchStep.ef` is documented
+> as "picked by the cost model's `pick_ef`" and `candidates_to_request` as
+> `k * over_factor`, but nothing constructs a `RecallPlan` outside
+> `explain.rs`'s `Display` impl and its tests, and `ExecutionPlan::Recall`
+> appears nowhere else either. RECALL is planned and executed inside
+> `brain_ops::handlers::recall`. The plan structs survive as the shape EXPLAIN
+> renders; §1-§3 above describe that shape, not a stage a request passes
+> through.
 
 ### 6. Filter pre/post
 
@@ -256,12 +287,16 @@ Not implemented. Plan time is < 50 µs; caching would save tens of microseconds.
 
 ### 15. The "explain plan" facility
 
-For debugging, an admin operation `ADMIN_EXPLAIN_PLAN` runs the planner without executing and returns the plan. Useful for:
+Two data-plane opcodes, not an admin operation: `QUERY_EXPLAIN` returns the
+plan without executing it, and `QUERY_TRACE` returns what an executed query
+actually did. Useful for:
 
 - Verifying the planner's choices.
 - Estimating costs before running expensive queries.
 
-The output is human-readable plan text, structured for tooling.
+The output is human-readable plan text, structured for tooling — rendered by
+`brain_planner::explain`, which is also the only remaining consumer of the
+RECALL plan structs (§5).
 
 ## ENCODE Planning
 
@@ -473,14 +508,18 @@ Detailed in [07. Migration](../07_embedding/06_migration.md).
 
 #### 14.2 Bulk encode
 
-For high-throughput bulk imports, the wire protocol's `ENCODE_BATCH` opcode (a list of ENCODE requests in one frame). The planner produces a batch plan:
+There is **no `ENCODE_BATCH` opcode**. Bulk import brackets the encodes in a
+transaction instead — `TXN_BEGIN`, *n* × `ENCODE`, `TXN_COMMIT` — which is
+where the batching the old design wanted actually happens:
 
-- Single embedding batch (efficient).
-- Single WAL group commit.
-- Single metadata write transaction.
-- Single HNSW batch insert.
+- one WAL group commit for the bracket, rather than one per memory;
+- one metadata write transaction;
+- the embedder's own per-shard window, which collects the waiting writes of
+  concurrent requests into one forward pass (it is assembled where the shard
+  can see what is in flight, not behind the dispatcher).
 
-Latency per memory drops to ~1-2 ms when batched.
+So the amortisation is real, but it comes from the writer and the embed window,
+not from a frame that carries *n* requests.
 
 #### 14.3 Implicit session
 
@@ -867,7 +906,7 @@ After discovery, Brain has a list of memory IDs. It runs the "forget by ID" path
 - A single FORGET request can affect at most 100,000 memories.
 - Beyond this, the request fails with `TooManyMemories`.
 
-For larger bulk operations, the operator uses `ADMIN_CONTEXT_DELETE` (which does its own staged processing) or scripts a sequence of capped FORGETs.
+For larger bulk operations the caller uses `SESSION_DELETE`, which cascades a whole session's memories and graph rows in one op, or `DELETE /v1/spaces/{id}` for an entire space; otherwise it scripts a sequence of capped FORGETs.
 
 ### 7. The idempotency check
 

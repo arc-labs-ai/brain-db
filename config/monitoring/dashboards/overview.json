@@ -96,7 +96,7 @@
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
-        { "expr": "process_resident_memory_bytes", "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" } }
+        { "expr": "process_memory_resident_bytes", "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" } }
       ]
     }
   ]

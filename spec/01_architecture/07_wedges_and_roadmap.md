@@ -4,7 +4,7 @@
 
 ## Design Wedges
 
-The five competitive differentiators that distinguish Brain from existing agent-memory systems. Higher-level than the seven engineering invariants (see CLAUDE.md §5): the invariants are **how Brain stays correct**; the wedges are **why pick Brain over alternatives**.
+The five competitive differentiators that distinguish Brain from existing agent-memory systems. They sit a level above Brain's engineering invariants: the invariants are **how Brain stays correct**; the wedges are **why pick Brain over alternatives**.
 
 Every architectural decision is checked against these five. A change that weakens a wedge needs explicit justification, not silent drift.
 
@@ -98,15 +98,16 @@ A wedge weakens when:
 
 Flag any change that weakens a wedge for explicit review.
 
-### Resolved — mode bifurcation (substrate vs retrieval)
+### How Wedge 4 is held on the read path
 
-**Status:** Resolved in phase 26 (`f2d2f61` / `778fe54` / `2bc5181`).
+Brain has **one** read pipeline, not a mode selected by deployment state. Whether a schema has been declared changes what the pipeline finds, never which pipeline runs:
 
-Historically Brain branched between a "substrate" path (no schema declared → memory-only ANN search) and a "retrieval" path (schema declared → typed-graph fan-out). The branch lived in the read pipeline (`substrate_recall` vs `retrieval_recall`), the planner inputs (`has_active_schema`, `has_llm_extractor`), and the shard wiring (`Option<Arc<dyn LexicalRetriever>>`). The bifurcation violated Wedge 4 (one codebase, one shape) and made client behavior depend on what the deployment happened to have uploaded.
+- Every shard wires all three retrievers and the tantivy indexes at spawn. None of them is optional at the shard boundary, so no shard can be missing a lane.
+- Extractors run on every `ENCODE`, with persistence gated per entity rather than by whether a schema exists.
+- `SCHEMA_UPLOAD` is an associative merge against the seeded `brain:` namespace, so declaring a schema adds vocabulary rather than switching a mode on.
+- `GET_CAPABILITIES` (`0x0032` / `0x00B2`) lets a client introspect which tiers a shard has enabled, so a client adapts to the deployment by asking rather than by inferring from behaviour.
 
-Phase 26 collapsed it: every shard wires the three retrievers and the tantivy indexes at spawn, `SCHEMA_UPLOAD` became associative-merge against the seeded `brain:` namespace, and extractors run on every ENCODE with per-entity persistence gating. A new `GET_CAPABILITIES` opcode (`0x0032` / `0x00B2`) lets clients introspect the shard's enabled tiers. The "schemaless mode" framing is retired throughout the spec.
-
-Kept in the wedges log for the historical record; the bifurcation no longer exists in code or spec.
+The wedge this protects is "one codebase, one shape". A read path that branched on what a deployment happened to have uploaded would make client behaviour depend on deployment state, which is the failure Wedge 4 names.
 
 ---
 
@@ -143,13 +144,13 @@ The patterns below are the ones with the clearest fit. The design wedges above c
 
 ## IVF + Product Quantization on top of HNSW
 
-**Status:** Partial — **HNSW + PQ in active development for v1.x** per [`spec/09_indexing/07_hnsw_pq.md`](../09_indexing/07_hnsw_pq.md) (phase 25). Pure IVF (no graph) remains deferred.
+**Status:** Partial — HNSW + PQ is specified for v1.x in [`spec/09_indexing/07_hnsw_pq.md`](../09_indexing/07_hnsw_pq.md). Pure IVF (no graph) remains deferred.
 
 **Pattern.** Pure HNSW is RAM-heavy at billion-vector scale because the index references every full-precision vector. IVF (inverted-file index) partitions the vector space; PQ (product quantization) compresses each vector to ~8-16 bytes. Memory drops roughly 10× with modest recall loss. Pinecone uses this combination at scale.
 
 **What it enables.** Brain at billion-vector scale without provisioning 1.5 TB of vector RAM. Today's HNSW loads every 384-d vector at full precision (~1.5 KB per vector); at 1M memories that's 1.5 GB, at 1B it's 1.5 TB.
 
-**Resolved-in-part because.** HNSW+PQ (graph payload compressed; arena still full-precision for re-rank) is the lower-risk increment — keeps the §09 search interface unchanged and the existing two-tier `MainEpoch` model intact. The §19 acceptance suite re-runs under a PQ profile to gate the recall trade-off.
+**Why the partial form.** HNSW+PQ compresses the graph payload while keeping full-precision vectors available for re-rank. That is the lower-risk increment: the §09 search interface is unchanged and the two-tier `MainEpoch` model stays intact. The §19 acceptance suite runs under a PQ profile to gate the recall trade-off.
 
 **Still deferred.** Pure IVF (no HNSW graph) would replace traversal with coarse-cell scan + `nprobe`. The architectural change is larger; HNSW+PQ resolves the immediate memory pressure at Brain's target scale and below.
 

@@ -301,10 +301,15 @@ pub struct ExtractionResult {
     pub failure_class: ExtractionFailureClass,
     pub started_at_unix_nanos: u64,
     pub completed_at_unix_nanos: u64,
-    /// Provider cost this run actually incurred, in micro-USD. Non-zero
-    /// only for LLM-tier runs that made a paid call (cache hits, budget
-    /// skips, and the free pattern/classifier tiers are `0`). The worker
-    /// sums this into the per-cycle spend gate and the
+    /// Provider spend for this run, in dollar micro-units (1e-6 USD), summed
+    /// across every billed call the run made including a schema retry.
+    ///
+    /// The worker writes it to the run's extraction audit row, where it is tied
+    /// to the one memory and extractor that spent it. That audit row is one of
+    /// Brain's two durable spend stores — see [`brain_llm::pricing`] for how it
+    /// and the `llm_spend` ledger combine into a total.
+    ///
+    /// The worker also sums it into per-cycle spend accounting and the
     /// `brain_extractor_llm_micro_usd_spent_total` metric.
     pub cost_micro_usd: u64,
 }
@@ -371,14 +376,14 @@ impl ExtractionResult {
 // Status.
 // ---------------------------------------------------------------------------
 
-/// Audit-row status discriminant. Bytes match — never
-/// reassigned; new variants append.
+/// Audit-row status discriminant. Bytes match the `extraction_status` constants
+/// in `brain_metadata` and are never reassigned; new variants append. Byte 3
+/// carries no variant and is not reused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum ExtractionStatus {
     Success = 1,
     Failure = 2,
-    SkippedBudget = 3,
     SkippedFilter = 4,
     SkippedDuplicate = 5,
     SkippedDisabled = 6,
@@ -395,7 +400,6 @@ impl ExtractionStatus {
         Some(match b {
             1 => Self::Success,
             2 => Self::Failure,
-            3 => Self::SkippedBudget,
             4 => Self::SkippedFilter,
             5 => Self::SkippedDuplicate,
             6 => Self::SkippedDisabled,
@@ -448,7 +452,6 @@ mod tests {
         for s in [
             ExtractionStatus::Success,
             ExtractionStatus::Failure,
-            ExtractionStatus::SkippedBudget,
             ExtractionStatus::SkippedFilter,
             ExtractionStatus::SkippedDuplicate,
             ExtractionStatus::SkippedDisabled,
@@ -456,6 +459,8 @@ mod tests {
             assert_eq!(ExtractionStatus::from_u8(s.as_u8()), Some(s));
         }
         assert_eq!(ExtractionStatus::from_u8(0), None);
+        // Byte 3 carries no variant; a row holding it does not decode to a status.
+        assert_eq!(ExtractionStatus::from_u8(3), None);
         assert_eq!(ExtractionStatus::from_u8(255), None);
     }
 

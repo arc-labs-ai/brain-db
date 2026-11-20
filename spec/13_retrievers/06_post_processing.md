@@ -1,6 +1,6 @@
 # 13.06 Post-Processing (Enrichment, Rerank, Traversal)
 
-> **TL;DR.** Three post-processing stages applied after RRF fusion and before final response: per-hit enrichment (attach entities / statements / relations to each hit via the include_graph side-channel, opt-in via the request flag), cross-encoder rerank (bge-reranker-base, 110M params) over the top-50, **off by default and not part of the current release** — gated by the deploy-time `[rerank] enabled` load switch, with no per-request toggle — and multi-hop relation traversal with depth caps and cycle detection.
+> **TL;DR.** Three post-processing stages applied after RRF fusion and before final response: per-hit enrichment (attach entities / statements / relations to each hit via the include_graph side-channel, opt-in via the request flag), cross-encoder rerank (`BAAI/bge-reranker-base`) over the top-50, **off by default and not part of the current release** — gated by the deploy-time `[rerank] enabled` load switch, with no per-request toggle — and multi-hop relation traversal with depth caps and cycle detection.
 
 ## Per-Hit Enrichment
 
@@ -113,7 +113,7 @@ A post-fusion stage that re-ranks the top of the RRF-fused list with a cross-enc
 Two consequences of being off by default:
 
 - **Enabled-but-unloadable is a boot failure, not a degradation.** `enabled = true` without a cross-encoder model on disk is `ShardError::CrossEncoderInitFailed` at spawn. Turning it on in the stock image stops the server starting, which is the intended outcome — a silently-degraded reranker would make two shards with the same config return different orderings.
-- **An opt-in rerank request against a disabled shard hard-fails** with `CapabilityNotEnabled` rather than quietly falling back to RRF. The caller is told the capability is off instead of receiving different results without explanation. `GET_CAPABILITIES` reports `rerank: false`.
+- **A disabled capability is reported, never silently substituted.** `GET_CAPABILITIES` reports `rerank: false`, and any request that reaches the shard asking for a capability it does not hold is refused with `CapabilityNotEnabled` rather than served a different ranking without explanation (`crates/brain-server/src/config/mod.rs:114-118`). On the `RECALL` read path this is structural rather than a runtime check — there is no rerank field for a client to set — so the honest signal is the capability bit, which clients read to know whether the ordering they received was reranked.
 
 Where it sits in the pipeline:
 
@@ -143,20 +143,25 @@ member that never reached fusion can't be diversified into the result).
 - **Cannot regress a single answer:** greedy MMR's first pick is always
   the highest-relevance item, so a lone strong answer stays at rank 1.
   Only positions 2..N are reordered, and only on detected list intent —
-  a factoid that slips the detector keeps its top hit. (Resolves
-  OQ-AN-9, which nominated MMR for this slot.)
+  a factoid that slips the detector keeps its top hit.
+- **Window-bounded:** `MMR_WINDOW = 50`, `MMR_LAMBDA_LIST = 0.5`
+  (`crates/brain-planner/src/retrieval/diversity.rs:30-36`). The stage is
+  `O(window² · tokens)`, so the window covers what a caller could
+  plausibly receive plus headroom; items past it keep their incoming
+  order behind the reordered head. A window of ≤ 2, or a non-positive
+  λ, is a no-op.
 - the membership band still decides the returned set; MMR changes *which* items
   fill the slots.
 
 ## Model
 
-bge-reranker-base.
+`BAAI/bge-reranker-base`.
 
-- **Architecture:** cross-encoder over (query, candidate) pairs; scores each pair against the query in a single forward pass.
-- **Params:** ~110M.
-- **License:** MIT.
+- **Architecture:** a cross-encoder over `(query, candidate)` pairs — a sequence-classification head with `num_labels = 1`, scoring each pair jointly in one forward pass. The encoder is **XLM-RoBERTa**, not BERT, which matters to anyone loading weights: the classification token is `<s>`-based rather than BERT's position-0 `[CLS]` convention (`crates/brain-rerank/src/model.rs:1-10,77`).
+- **Score:** the raw logit from the classification head; higher is more relevant. It is unbounded and its scale varies per pair, which is why the blend in §"Operation" normalizes per batch rather than using it directly.
+- **Loading:** best-effort. The model directory resolves from `BRAIN_RERANK_MODEL_DIR`, then `$XDG_DATA_HOME`, then `$HOME/.local/share/brain/models/`. An absent directory yields no cross-encoder and an RRF-only pipeline; **corrupt weights are a hard error**, not a silent fallback.
 
-bge-reranker-base is the production-default cross-encoder for retrieval in the field — best precision-per-MB among the MIT-licensed options and small enough to keep CPU rerank cost in budget for the 50→10 cut.
+bge-reranker-base is the production-default cross-encoder for retrieval in the field — strong precision-per-MB and small enough to keep CPU rerank cost in budget for a 50-pair window.
 
 ## Triggering
 
@@ -170,19 +175,26 @@ let response = brain.recall()
     .await?;
 ```
 
-The only control is the deploy-time load gate `[rerank] enabled`, which is `false` by default. When an operator turns it on and the model loads cleanly, the executor inserts a rerank step into the execution DAG between fusion and the filter chain for every query. With it off — the shipped state — no model loads, the step is never inserted, and the pipeline is RRF-only. Clients read the `rerank` bit from `GET_CAPABILITIES` to know whether the results they get back are reranked.
+The only control is the deploy-time load gate `[rerank] enabled`, which is `false` by default. When an operator turns it on and the model loads cleanly, the executor runs a rerank step for every query, positioned **after** the filter chain and the recency boost and before the merge/diversity stage (`crates/brain-planner/src/retrieval/executor/logic.rs:721-790`). That position is the point: re-scoring a candidate the filter chain is about to drop, or re-sorting before a recency term is folded in, would spend cross-encoder time to produce an ordering a later stage overwrites. With the gate off — the shipped state — no model loads, the step never runs, and the pipeline is RRF-only. Clients read the `rerank` bit from `GET_CAPABILITIES` (`crates/brain-ops/src/handlers/capabilities.rs:62`) to know whether the results they get back are reranked.
 
 ## Operation
 
 Per call:
 
-1. Take the top-50 of the fused list (or fewer if fusion returned fewer).
-2. For each candidate, build a `(query, candidate.text)` pair where `candidate.text` is the memory surface form or the statement's natural-language rendering.
-3. Score all pairs in a single batched forward pass.
-4. Sort by cross-encoder score descending; emit the top-10.
-5. The top-10 carries through the filter chain as if it had emerged from fusion directly — the rest of the pipeline is unaware.
+1. Take the top-50 of the filtered list (or fewer if fewer survived).
+2. For each candidate, resolve its text from the per-shard `texts` table and build a `(query, candidate.text)` pair. A candidate with no fetchable text — tombstoned mid-query, or a non-memory variant — is skipped and keeps its fused position.
+3. Score the pairs through the cross-encoder, off the shard core.
+4. **Re-sort by a blend, not by the model's score.** The sort key is
+   `normalize(fused_score) + RERANK_ALPHA · normalize(rerank_logit)`, with
+   `RERANK_ALPHA = 0.5` and both terms min-max normalized per batch
+   (`crates/brain-planner/src/retrieval/rerank.rs:28-46,83`).
+5. Candidates outside the window keep their RRF order and remain in the pool. Nothing is cut to a fixed head; the membership band decides the answer size, bounded only by `max_results`.
 
-Step 3 is the cost driver. On CPU, 50 pairs through bge-reranker-base land at ~6-9 ms p99 at typical text lengths.
+**Why a blend and not the logit.** Normalizing *both* terms is what makes `α` a real weight. Raw RRF scores sit around 0.01–0.05 while an un-normalized rerank term spans [0, 0.5], so combining them on their native scales would let the cross-encoder dominate by roughly 10× and effectively overrule fusion. On a common [0, 1] scale, fusion carries weight 1.0 and rerank 0.5: a full-span fusion lead (Δ = 1.0) cannot be overturned by the bounded rerank term (≤ 0.5), but rerank decisively breaks close fused ties. The cross-encoder is a re-scoring signal over a pool fusion already agreed on, not the primary one — multi-retriever consensus should not lose to one noisy logit on one pair.
+
+Two degradations are deliberate. A flat batch (every logit equal) collapses the rerank term to 0 for every item, so the fused order simply wins. A score/candidate length mismatch skips the rerank entirely with a warning rather than applying it partially, since a partial application would silently treat unscored candidates as worst-in-batch.
+
+Step 3 is the cost driver. On CPU, 50 pairs through bge-reranker-base land at ~6-9 ms p99 at typical text lengths. Like the embedder figure in §13/03, this is a per-core model-inference cost and is the number in this file most sensitive to the host it was measured on.
 
 ## Latency budget
 
@@ -205,28 +217,51 @@ The load gate plus the top-50 cut are what bound rerank's cost: the default depl
 
 ## Configuration
 
-```
+`[rerank]` has exactly one field (`crates/brain-server/src/config/mod.rs:416-429`):
+
+```toml
 [rerank]
-model = "bge-reranker-base"
-top_n_in = 50           # candidates fed into the reranker
-rerank_head = 10        # size of the re-ordered head the reranker promotes
-batch_size = 50         # one forward pass per call by default
+enabled = false
 ```
 
-`top_n_in` and `rerank_head` can be tuned per deployment; the defaults reflect
-the design point above. `rerank_head` is the size of the head the cross-encoder
-re-orders and promotes — **not** a final result cap. Candidates below the head
-keep their RRF order and stay in the filtered pool that the membership stage
-shapes; the answer size is decided by the relevance band and bounded only by
-`max_results`.
+Nothing else is configurable — not the model, not the intake width, not the
+batch size. The section is `#[serde(deny_unknown_fields)]` like every other, so
+adding a key to it is a startup parse error rather than an ignored line.
+
+The intake width is a build constant, `RERANK_TOP_N = 50`
+(`crates/brain-planner/src/retrieval/rerank.rs:28`). Keeping it out of config is
+deliberate: it is the knob that decides how much cross-encoder work a read does,
+and the cross-encoder dominates that read's wall time, so a deployment that
+could raise it could make every read arbitrarily slow through a config edit.
+Fifty is wide enough to rescue a strongly-relevant candidate that fusion
+diluted, and bounded enough that the cost is a constant.
+
+A candidate ranked outside the top 50 by fusion keeps its fused position. The
+re-ordered head is **not** a final result cap: candidates below it keep their
+RRF order and stay in the filtered pool the membership stage shapes, and the
+answer size is decided by the relevance band, bounded only by `max_results`.
 
 ## Observability
 
-Per-call metrics on every RECALL (and `QUERY_TRACE`) served by a rerank-enabled shard:
+The scrape surface carries exactly one rerank series:
+`brain_query_rerank_invoked_total{shard}` — recalls where the rerank stage
+reordered the fused list (`crates/brain-server/src/metrics/format.rs:1308-1318`).
+It answers "is the stage running at all", which on a capability that ships
+disabled is the question most likely to be wrong.
 
-- `rerank_latency_seconds` — histogram of the rerank step's wall time.
-- `rerank_input_count` — how many candidates entered the reranker (usually 50, sometimes less if fusion returned fewer).
-- `rerank_position_change` — histogram of `|rank_after - rank_before|` for the emitted top-10. Large average movement is a signal the rerank is doing meaningful work; near-zero is a signal it's redundant for the current query distribution.
+It carries no rerank **cost or quality** series: there is no `brain_rerank_*`
+family, no rerank-latency histogram, and no score distribution. The step's wall
+time is folded into the enclosing recall duration, so an operator cannot
+separate rerank cost from retrieval cost on the dashboard.
+
+What fills that gap is `QUERY_TRACE`, which reports the rerank's own duration
+plus — in full-detail mode — the fused order and the post-rerank order for a
+single query, so the reordering itself is inspectable
+(`crates/brain-protocol/src/ops/memory.rs:1170-1186`). That shape fits the real
+question, "is the rerank earning its latency on this query distribution?",
+better than a scraped aggregate: the answer depends on *which* documents moved,
+which a counter cannot show. A deployment that enables rerank and wants
+continuous latency attribution has to add it.
 
 ---
 
@@ -409,15 +444,22 @@ out-degrees in the tens — visit counts stay under 10^3.
 §19 perf targets: depth 1 p50 5ms, p99 25ms; depth 2 p50 15ms,
 p99 50ms; depth 3 p50 30ms, p99 100ms.
 
-## 10. Open questions
+## 10. Traversal boundaries
 
-See [`../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md):
-
-- Q4 — Should TRAVERSE return path-edge metadata (the relation_id +
-  type at each hop), or just terminal-entity sets? Currently:
-  path-edge metadata. Counter: simpler returns are cheaper.
-- Q6 — Cross-shard traversal coordination.
-- Q7 — Weight-aware shortest-path (uses `confidence` as edge weight).
+- **The return carries path-edge metadata, not terminal-entity sets.**
+  Each hop reports its `relation_id` and `relation_type_id` alongside
+  the endpoints (§1). A terminal-entity-only return would be cheaper to
+  build and to frame, but it cannot answer *how* two entities connect —
+  and that is what a traversal is asked for. The caller that only wants
+  the reachable set reads the last step of each path.
+- **Traversal is single-shard.** There is no cross-shard coordination:
+  a traversal explores the relations its own shard owns. An edge whose
+  other endpoint lives elsewhere terminates that path.
+- **Path ranking is unweighted.** Hop distance is the only cost; a
+  relation's `confidence` does not shorten or lengthen a path. A
+  high-confidence three-hop route therefore ranks below a dubious
+  two-hop one, and a caller that cares reads `confidence` off the
+  returned steps and re-ranks.
 
 ## 11. Tests
 

@@ -36,19 +36,19 @@ pub fn apply_reclaim_slots(
     // Snapshot the (slot_id, content_hash) pairs to evict first so we
     // don't iterate the table while mutating it. Also snapshot the
     // matching rows' memory ids so we can reclaim their write-artifact
-    // bundles (MEMORY_INSPECT) in the same pass — the bundle's vector +
-    // derived graph must not outlive the reclaimed memory.
+    // bundles (MEMORY_INSPECT) in the same pass — the derived graph and the
+    // memory's stored embedding must not outlive the reclaimed memory.
     let mut evictions: Vec<[u8; 56]> = Vec::new();
     let mut bundle_ids: Vec<[u8; 16]> = Vec::new();
     {
         let memories_t = wtxn
             .open_table(MEMORIES_TABLE)
-            .map_err(|e| ApplyError::Storage(format!("open MEMORIES: {e:?}")))?;
+            .map_err(|e| ApplyError::storage("open MEMORIES", &e))?;
         for entry in memories_t
             .iter()
-            .map_err(|e| ApplyError::Storage(format!("MEMORIES iter: {e:?}")))?
+            .map_err(|e| ApplyError::storage("MEMORIES iter", &e))?
         {
-            let (_, v) = entry.map_err(|e| ApplyError::Storage(format!("MEMORIES item: {e:?}")))?;
+            let (_, v) = entry.map_err(|e| ApplyError::storage("MEMORIES item", &e))?;
             let row = v.value();
             if slots.contains(&row.slot_id) {
                 if let Some(ch) = row.content_hash {
@@ -72,17 +72,17 @@ pub fn apply_reclaim_slots(
     if !evictions.is_empty() {
         let mut fp_t = wtxn
             .open_table(FINGERPRINTS_TABLE)
-            .map_err(|e| ApplyError::Storage(format!("open FINGERPRINTS: {e:?}")))?;
+            .map_err(|e| ApplyError::storage("open FINGERPRINTS", &e))?;
         for key in evictions {
             let _ = fp_t
                 .remove(&key)
-                .map_err(|e| ApplyError::Storage(format!("FINGERPRINTS remove: {e:?}")))?;
+                .map_err(|e| ApplyError::storage("FINGERPRINTS remove", &e))?;
         }
     }
 
     for mid in bundle_ids {
         crate::memory_artifact::delete_memory_artifact(wtxn, mid)
-            .map_err(|e| ApplyError::Storage(format!("artifact remove (reclaim): {e}")))?;
+            .map_err(|e| ApplyError::storage("artifact remove (reclaim)", &e))?;
     }
 
     Ok(PhaseAck::SlotsReclaimed { count })

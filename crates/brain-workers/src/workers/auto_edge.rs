@@ -336,9 +336,9 @@ async fn do_auto_edge_cycle(
                     .read_txn()
                     .ok()
                     .and_then(|rtxn| {
-                        list_memory_edges_from(&rtxn, source_id, Some(EdgeKind::SimilarTo)).ok()
+                        list_memory_edges_from(&rtxn, source_id, Some(EdgeKind::SimilarTo), 1).ok()
                     })
-                    .map_or(0, |edges| edges.len());
+                    .map_or(0, |page| page.total as usize);
                 e.insert(MAX_SIMILAR_TO_OUT_DEGREE.saturating_sub(existing))
             }
         };

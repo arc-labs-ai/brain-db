@@ -22,13 +22,19 @@ use brain_core::{
 };
 use brain_metadata::tables::checkpoint::{latest as latest_checkpoint, CHECKPOINTS_TABLE};
 use brain_metadata::tables::edge::EDGES_TABLE;
+use brain_metadata::tables::extraction_queue::EXTRACTION_QUEUE_TABLE;
 use brain_metadata::tables::idempotency::IDEMPOTENCY_TABLE;
-use brain_metadata::tables::memory::{flags, MEMORIES_TABLE};
+use brain_metadata::tables::memory::{
+    flags, space_timeline_key, MEMORIES_BY_SPACE_TIMELINE_TABLE, MEMORIES_TABLE,
+};
+use brain_metadata::tables::memory_artifacts::MEMORY_ARTIFACTS_TABLE;
+use brain_metadata::tables::memory_vector::MEMORY_VECTORS_TABLE;
 use brain_metadata::tables::model_fingerprint::MODEL_FINGERPRINTS_TABLE;
 use brain_metadata::tables::next_lsn::NEXT_LSN_TABLE;
 use brain_metadata::tables::slot_version::SLOT_VERSIONS_TABLE;
 use brain_metadata::tables::text::TEXTS_TABLE;
 use brain_metadata::MetadataDb;
+use brain_protocol::envelope::response::EncodeStageArtifact;
 use brain_storage::arena::file::ArenaFile;
 use brain_storage::recovery::{recover, MetadataSink};
 use brain_storage::wal::payload::{
@@ -229,6 +235,115 @@ fn scenario_a_basic_write_then_recover() {
     // next_lsn
     let nl = rtxn.open_table(NEXT_LSN_TABLE).unwrap();
     assert_eq!(nl.get(&()).unwrap().unwrap().value(), 4);
+}
+
+#[test]
+fn scenario_encode_replay_restores_derived_state() {
+    let env = Env::new();
+    let mut payload = encode_payload(7, 7);
+    payload.text = "recovered derived state".to_owned();
+    payload.salience_initial = 0.875;
+    payload.kind = MemoryKind::Semantic;
+    payload.occurred_at_unix_nanos = Some(T0 - 7);
+    payload.vector = (0..384).map(|i| i as f32 * 0.001).collect();
+    let id = payload.memory_id;
+    let expected_vector = payload.vector.clone();
+
+    env.write_wal_records(vec![record(WalPayload::Encode(payload.clone()), T0 + 7)]);
+    let mut arena = env.open_arena();
+    let mut meta = env.open_meta();
+    let (report, _) = recover(&mut arena, &env.wal_dir, SHARD_UUID, &mut meta).unwrap();
+    assert_eq!(report.records_replayed, 1);
+
+    let first_state = {
+        let rtxn = meta.read_txn().unwrap();
+        let memories = rtxn.open_table(MEMORIES_TABLE).unwrap();
+        let mem = memories.get(&id.to_be_bytes()).unwrap().unwrap();
+        let mem = mem.value();
+        assert_eq!(mem.created_at_unix_nanos, T0 + 7);
+        let timeline_key = space_timeline_key(
+            mem.namespace_id,
+            mem.space_id_bytes,
+            mem.created_at_unix_nanos,
+            mem.session_id,
+            mem.memory_id_bytes,
+        );
+
+        let vectors = rtxn.open_table(MEMORY_VECTORS_TABLE).unwrap();
+        let vector_bytes = vectors
+            .get(&id.to_be_bytes())
+            .unwrap()
+            .expect("recovered vector")
+            .value()
+            .to_vec();
+        let decoded_vector: Vec<f32> = vector_bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
+            .collect();
+        assert_eq!(decoded_vector, expected_vector);
+
+        let timeline = rtxn.open_table(MEMORIES_BY_SPACE_TIMELINE_TABLE).unwrap();
+        assert!(timeline.get(timeline_key.as_slice()).unwrap().is_some());
+
+        let queue = rtxn.open_table(EXTRACTION_QUEUE_TABLE).unwrap();
+        assert_eq!(
+            queue.get(&id.to_be_bytes()).unwrap().unwrap().value(),
+            T0 + 7
+        );
+
+        let artifacts = rtxn.open_table(MEMORY_ARTIFACTS_TABLE).unwrap();
+        let artifact_json = artifacts
+            .get(&id.to_be_bytes())
+            .unwrap()
+            .expect("recovered artifact")
+            .value()
+            .to_owned();
+        let artifact: EncodeStageArtifact = serde_json::from_str(&artifact_json).unwrap();
+        let record = artifact.record.expect("recovered artifact record");
+        assert_eq!(record.text_len, payload.text.len() as u32);
+        assert_eq!(record.vector_dim, payload.vector.len() as u32);
+        assert_eq!(record.kind, 1);
+        assert_eq!(record.salience, payload.salience_initial);
+        assert_eq!(record.created_at_unix_nanos, T0 + 7);
+
+        (vector_bytes, timeline_key, artifact_json)
+    };
+
+    let (report, _) = recover(&mut arena, &env.wal_dir, SHARD_UUID, &mut meta).unwrap();
+    assert_eq!(report.records_replayed, 1);
+    let second_state = {
+        let rtxn = meta.read_txn().unwrap();
+        let vectors = rtxn.open_table(MEMORY_VECTORS_TABLE).unwrap();
+        let vector_bytes = vectors
+            .get(&id.to_be_bytes())
+            .unwrap()
+            .expect("vector after replay")
+            .value()
+            .to_vec();
+        let timeline = rtxn.open_table(MEMORIES_BY_SPACE_TIMELINE_TABLE).unwrap();
+        let memories = rtxn.open_table(MEMORIES_TABLE).unwrap();
+        let mem = memories.get(&id.to_be_bytes()).unwrap().unwrap();
+        let mem = mem.value();
+        let timeline_key = space_timeline_key(
+            mem.namespace_id,
+            mem.space_id_bytes,
+            mem.created_at_unix_nanos,
+            mem.session_id,
+            mem.memory_id_bytes,
+        );
+        assert!(timeline.get(timeline_key.as_slice()).unwrap().is_some());
+        let artifacts = rtxn.open_table(MEMORY_ARTIFACTS_TABLE).unwrap();
+        let artifact_json = artifacts
+            .get(&id.to_be_bytes())
+            .unwrap()
+            .expect("artifact after replay")
+            .value()
+            .to_owned();
+        (vector_bytes, timeline_key, artifact_json)
+    };
+    assert_eq!(second_state, first_state);
 }
 
 // ---------------------------------------------------------------------------

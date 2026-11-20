@@ -8,7 +8,9 @@
 //! exercises the real BGE dispatcher when `BRAIN_EMBED_MODEL_DIR` is
 //! set.
 
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use brain_embed::{Dispatcher, EmbedError, VECTOR_DIM};
 use brain_index::{IndexParams, SharedHnsw};
@@ -23,10 +25,13 @@ use brain_protocol::envelope::response::{EncodeResponse, ResponseBody};
 // Mock dispatcher: deterministic per-text vector + stable fingerprint.
 // ---------------------------------------------------------------------------
 
-struct MockDispatcher;
+struct MockDispatcher {
+    embed_calls: Arc<AtomicUsize>,
+}
 
 impl Dispatcher for MockDispatcher {
     fn embed(&self, text: &str) -> Result<[f32; VECTOR_DIM], EmbedError> {
+        self.embed_calls.fetch_add(1, Ordering::Relaxed);
         let mut v = [0.0f32; VECTOR_DIM];
         // Hash text bytes into a few slots so distinct texts yield
         // distinct vectors. Norm doesn't matter for these tests.
@@ -55,7 +60,9 @@ struct Fixture {
 }
 
 fn build_fixture() -> Fixture {
-    build_fixture_with_embedder(Arc::new(MockDispatcher) as Arc<dyn Dispatcher>)
+    build_fixture_with_embedder(Arc::new(MockDispatcher {
+        embed_calls: Arc::new(AtomicUsize::new(0)),
+    }) as Arc<dyn Dispatcher>)
 }
 
 fn build_fixture_with_embedder(embedder: Arc<dyn Dispatcher>) -> Fixture {
@@ -118,6 +125,59 @@ fn encode_full_pipeline_returns_memory_id() {
         assert_eq!(enc.salience, 0.5, "salience is the router default");
         assert_eq!(enc.auto_edges_added, 0);
     })
+}
+
+/// The shard executor must be able to run a second operation while the model
+/// call is in flight. A dispatcher that sleeps makes the assertion independent
+/// of model speed: inline embedding makes the second operation observe a
+/// finished embed, while the blocking-pool path observes it still running.
+#[test]
+fn same_shard_operation_progresses_during_offloaded_embed() {
+    run_in_glommio(|| async {
+        struct SlowDispatcher {
+            started: Arc<AtomicBool>,
+            finished: Arc<AtomicBool>,
+        }
+
+        impl Dispatcher for SlowDispatcher {
+            fn embed(&self, _text: &str) -> Result<[f32; VECTOR_DIM], EmbedError> {
+                self.started.store(true, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(100));
+                self.finished.store(true, Ordering::SeqCst);
+                Ok([0.0; VECTOR_DIM])
+            }
+
+            fn embed_batch(&self, texts: &[&str]) -> Result<Vec<[f32; VECTOR_DIM]>, EmbedError> {
+                texts.iter().map(|text| self.embed(text)).collect()
+            }
+
+            fn fingerprint(&self) -> [u8; 16] {
+                [0xAD; 16]
+            }
+        }
+
+        let started = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let second_operation_completed = Arc::new(AtomicBool::new(false));
+        let embedder: Arc<dyn Dispatcher> = Arc::new(SlowDispatcher {
+            started: started.clone(),
+            finished: finished.clone(),
+        });
+
+        let embed = brain_ops::embedding::embed_off_reactor(&embedder, "slow cue");
+        let second = async {
+            while !started.load(Ordering::SeqCst) {
+                glommio::timer::sleep(Duration::from_millis(1)).await;
+            }
+            second_operation_completed.store(true, Ordering::SeqCst);
+            !finished.load(Ordering::SeqCst)
+        };
+        let (embedded, progressed_while_in_flight) = futures_lite::future::zip(embed, second).await;
+
+        assert!(embedded.is_ok());
+        assert!(second_operation_completed.load(Ordering::SeqCst));
+        assert!(progressed_while_in_flight);
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -404,10 +464,9 @@ fn encode_conflict_returns_conflict_error_code() {
 // 4. Memory kind is router-decided.
 // ---------------------------------------------------------------------------
 //
-// The client can no longer choose the memory kind (the `kind` field is
-// gone from ENCODE); the write router files every text encode as
-// Episodic. The old "Consolidated is rejected" test exercised a
-// capability that no longer exists on this path.
+// The client does not choose the memory kind — ENCODE carries no `kind`
+// field — so the write router files every text encode as Episodic. There
+// is nothing on this path for a per-kind rejection test to exercise.
 
 // ---------------------------------------------------------------------------
 // 5b. Fingerprint dedup (a).
@@ -483,6 +542,39 @@ fn same_text_dedupes_to_one_memory() {
             first.memory_id, second.memory_id,
             "dedup returns the existing memory id",
         );
+    })
+}
+
+#[test]
+fn duplicate_encode_skips_embedding() {
+    run_in_glommio(|| async {
+        let embed_calls = Arc::new(AtomicUsize::new(0));
+        let fix = build_fixture_with_embedder(Arc::new(MockDispatcher {
+            embed_calls: embed_calls.clone(),
+        }) as Arc<dyn Dispatcher>);
+
+        let first = unwrap_encode_resp(
+            dispatch(
+                RequestBody::Encode(encode_req_with_dedup([11; 16], "count me", 1)),
+                brain_ops::RequestCaller::for_tests(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(!first.was_deduplicated);
+
+        let second = unwrap_encode_resp(
+            dispatch(
+                RequestBody::Encode(encode_req_with_dedup([12; 16], "count me", 1)),
+                brain_ops::RequestCaller::for_tests(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(second.was_deduplicated);
+        assert_eq!(embed_calls.load(Ordering::Relaxed), 1);
     })
 }
 
@@ -884,5 +976,75 @@ fn encode_with_real_embedder_end_to_end() {
         );
         assert_ne!(resp.memory_id, 0);
         assert!(!resp.was_deduplicated);
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Vector round trip: ENCODE → MEMORY_INSPECT.
+// ---------------------------------------------------------------------------
+
+/// The embedding a write produces has exactly one durable home — the by-id
+/// `memory_vectors` row — and both of its readers must get the identical
+/// floats back out of it: `get_artifact_vector` (the resolver recall uses per
+/// candidate) and `MEMORY_INSPECT` (which folds the `embed` stage's output
+/// back into the per-stage view). The durable artifact bundle carries no copy
+/// of it, so an inspect answer that still shows the vector proves the
+/// hydration, not a leftover.
+#[test]
+fn encoded_vector_round_trips_to_inspect_and_to_the_by_id_resolver() {
+    use brain_protocol::envelope::request::MemoryInspectRequest;
+
+    run_in_glommio(|| async {
+        let fix = build_fixture();
+        let text = "a vector with a distinct value in every lane";
+        let expected = MockDispatcher {
+            embed_calls: Arc::new(AtomicUsize::new(0)),
+        }
+        .embed(text)
+        .unwrap();
+
+        let enc = unwrap_encode_resp(
+            dispatch(
+                RequestBody::Encode(encode_req([0x5A; 16], text)),
+                brain_ops::RequestCaller::for_tests(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        );
+
+        // The resolver every per-candidate read goes through.
+        {
+            let rtxn = fix.ctx.executor.metadata.read_txn().unwrap();
+            let got = brain_ops::memory_artifact::get_artifact_vector(
+                &rtxn,
+                brain_core::MemoryId::from(enc.memory_id).to_be_bytes(),
+            )
+            .expect("vector resolves by id");
+            assert_eq!(got, expected, "every float survives the write path");
+        }
+
+        // The inspect view, hydrated from that same row.
+        let inspected = match single_body(
+            dispatch(
+                RequestBody::MemoryInspect(MemoryInspectRequest {
+                    memory_id: enc.memory_id,
+                    act_as: None,
+                }),
+                brain_ops::RequestCaller::for_tests(),
+                &fix.ctx,
+            )
+            .await
+            .unwrap(),
+        ) {
+            ResponseBody::MemoryInspect(r) => r,
+            other => panic!("expected ResponseBody::MemoryInspect, got {other:?}"),
+        };
+        assert_eq!(inspected.text, text);
+        assert_eq!(
+            inspected.artifact.vector.as_slice(),
+            expected.as_slice(),
+            "MEMORY_INSPECT must report the embedding verbatim",
+        );
     })
 }

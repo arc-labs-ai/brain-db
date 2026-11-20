@@ -292,10 +292,10 @@ impl EntityTypeQnames {
     }
 }
 
-/// Snapshot the active entity-type names as zero-shot classifier labels —
-/// `brain:<Name>` in stable id-order. The GLiNER tier reads this each drain
-/// cycle so a user's `SCHEMA_UPLOAD` adding entity types reaches the classifier
-/// on the next batch without a shard restart.
+/// Snapshot the SHARD-WIDE active entity-type names as zero-shot classifier
+/// labels — `brain:<Name>` in stable id-order. The GLiNER tier reads this each
+/// drain cycle so a user's `SCHEMA_UPLOAD` adding entity types reaches the
+/// classifier on the next batch without a shard restart.
 ///
 /// On this surface the `brain:` prefix is a fixed string, identical for every
 /// type regardless of owner, and the resolver strips it before lookup
@@ -305,7 +305,11 @@ impl EntityTypeQnames {
 /// The uniformity is required: this is the format the GLiNER classifier was
 /// tuned against, so changing it means re-measuring zero-shot recall. It is
 /// prompt vocabulary, not provenance — use [`EntityTypeQnames`] for anything
-/// a client reads.
+/// a client reads. This snapshot spans every tenant on the shard and exists
+/// to seed the classifier registry; its emptiness is the signal to materialize
+/// that classifier as degraded. It must never be handed to a dispatch running
+/// on behalf of one tenant. Use [`crate::entity_type_labels_for_namespaces`]
+/// for the per-tenant visible subset.
 pub fn entity_type_label_qnames(rtxn: &ReadTransaction) -> Result<Vec<String>, EntityTypeOpError> {
     let t = rtxn.open_table(ENTITY_TYPES_TABLE)?;
     let mut rows: Vec<(u32, String)> = Vec::new();

@@ -73,9 +73,9 @@ pub struct SchemaUploadRequest {
     /// the caller's effective space. See [`SchemaScope`] for why this is
     /// an explicit choice rather than one inferred from `act_as.space`.
     ///
-    /// ALWAYS ON THE WIRE. It first shipped as
-    /// `#[serde(default, skip_serializing_if = ...)]`, which kept a
-    /// base upload byte-identical to the pre-field encoding — a
+    /// ALWAYS ON THE WIRE. Marking it
+    /// `#[serde(default, skip_serializing_if = ...)]` would keep a
+    /// base upload byte-identical to an encoding without the field — a
     /// backward-compatibility accommodation, and this project does not
     /// carry those: there are no deployed clients to keep working, so the
     /// only thing an optional field buys is a request whose meaning
@@ -285,11 +285,10 @@ pub struct SchemaUploadResponse {
 pub struct SchemaGetResponse {
     pub namespace: String,
     pub schema_version: u32,
-    /// Verbatim DSL text if uploaded as such; empty string for
-    /// programmatic uploads.
+    /// The merged schema for this version, rendered back to DSL from the
+    /// stored AST so the output is re-uploadable, falling back to the stored
+    /// upload text when the AST cannot be rendered.
     pub schema_document: String,
-    /// `serde_json::to_vec(&Schema)` of the parsed AST.
-    pub source_blob: Vec<u8>,
     pub uploaded_at_unix_nanos: u64,
     pub validator_version: u32,
 }

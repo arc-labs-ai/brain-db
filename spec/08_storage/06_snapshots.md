@@ -26,16 +26,16 @@ The reflink ioctl is `FICLONE` (or `FICLONERANGE` for partial files), defined in
 
 ## 2. The snapshot procedure
 
-A snapshot is created by `ADMIN_SNAPSHOT_CREATE`. The operation:
+A snapshot is created by `POST /v1/snapshots[?shard=N]` on the admin plane. The operation:
 
-1. **Drain.** Stop accepting writes briefly (a fraction of a second).
-2. **Force checkpoint.** Run a checkpoint to ensure the arena and metadata store are up to date with WAL.
-3. **Reflink-copy.** Issue `FICLONE` on `arena.bin` and `metadata.redb`, plus the WAL segments since the checkpoint.
-4. **Resume writes.** The active arena and metadata files continue normally; the snapshot files are independent (block-level CoW).
-5. **Verify.** Compute checksums on the snapshot files and store them with the snapshot metadata.
-6. **Mark complete.** Write a snapshot manifest containing all the snapshot's files, the LSN at which the snapshot was taken, and the checksums.
+1. **Checkpoint.** Run the checkpoint sequence inline: append `CHECKPOINT_BEGIN` and sample the WAL tail, `msync` the arena, then append `CHECKPOINT_END` carrying `min(durable watermark, sampled tail)`. Writes are neither drained nor paused.
+2. **Reflink-copy.** Issue `FICLONE` on `arena.bin` and `metadata.redb`, plus the WAL segments since the checkpoint. The arena copy is taken straight after step 1's `msync_all`, so its on-disk image matches the checkpoint's `durable_lsn`; the metadata copy is taken with a read transaction held and released first.
+3. **Verify.** Compute checksums on the snapshot files and store them with the snapshot metadata.
+4. **Mark complete.** Write a snapshot manifest containing all the snapshot's files, the LSN at which the snapshot was taken, and the checksums.
 
-The total drain time is dominated by step 2 (checkpoint). On NVMe this is typically 10–50 ms.
+Snapshot IDs are assigned from the highest numerically-named directory already under the snapshots root. A read error there is treated as "no snapshots", which can delay an id but never reuses one, so a transient `stat` failure cannot overwrite a prior bundle.
+
+The shard's core is occupied for the duration — the arena `msync` and the copies are synchronous — but no write is rejected or made to wait on a drain. On NVMe the checkpoint portion is typically 10–50 ms.
 
 ## 3. Snapshot files
 
@@ -43,15 +43,19 @@ A snapshot is a directory:
 
 ```
 snapshots/
-└── 0000000007-2024-01-15T12-30-00Z/
+└── 00000000000000000007/
     ├── manifest.json
     ├── arena.bin             # reflink of arena.bin
     ├── metadata.redb         # reflink of metadata.redb
+    ├── shard.uuid            # so the bundle is self-describing
+    ├── hnsw.*                # memory HNSW graph + data + wrapper
     └── wal/
-        ├── 0000000005.wal    # All segments containing records since the snapshot's checkpoint
+        ├── 0000000005.wal    # Every segment whose starting_lsn <= the snapshot LSN
         ├── 0000000006.wal
         └── ...
 ```
+
+`shard.uuid` is copied best-effort — the manifest's `shard_uuid` is the authoritative identity, so a missing uuid file does not fail the snapshot. It is there so a restore onto a freshly-laid-out data directory lands the identity file too.
 
 A snapshot is **per shard**, and that is the whole of what it covers. Two
 pieces of durable state sit at the data-directory root instead, shared by
@@ -62,7 +66,7 @@ every shard, and neither is reflinked here:
 | `llm_credentials.redb` | **No.** Tenant LLM provider keys, sealed. A DR backup must pick it up explicitly — see [`../18_failure_recovery/06_disaster_recovery.md`](../18_failure_recovery/06_disaster_recovery.md) §3a. |
 | `llm_credential_kek` | **No, deliberately.** Shipping the sealing key beside the rows it seals would make the copy plaintext-equivalent. |
 
-The directory name encodes the snapshot ID (sequential) and timestamp (ISO 8601). The manifest:
+The directory name is the snapshot ID, zero-padded to 20 digits. The timestamp lives in the manifest, not the name, so the lexical order of the directories is the numeric order of the IDs. The manifest:
 
 ```json
 {
@@ -84,9 +88,8 @@ The directory name encodes the snapshot ID (sequential) and timestamp (ISO 8601)
 
 The snapshot is a consistent point-in-time view because:
 
-- The drain ensures no writes were in flight at snapshot start.
-- The checkpoint ensures arena and metadata are consistent with WAL up to a known LSN.
-- Reflinks capture all files atomically (the FICLONE is point-in-time).
+- The checkpoint's `durable_lsn` is the shard's contiguous committed prefix, so every record at or below it is genuinely in metadata and every record above it is replayed on restore. In-flight writes are therefore safe to ignore rather than drain: whichever side of the line they fall on, the restore is correct.
+- Reflinks capture each file atomically (the FICLONE is point-in-time).
 
 A snapshot's contents represent the shard's state at exactly the snapshot LSN.
 
@@ -106,8 +109,8 @@ If the snapshot is several minutes (or hours) old, the operator may also want to
 
 Operators decide how many snapshots to keep. Brain offers:
 
-- `ADMIN_SNAPSHOT_LIST` — list all snapshots with their metadata.
-- `ADMIN_SNAPSHOT_DELETE` — remove a snapshot.
+- `GET /v1/snapshots` — list all snapshots with their metadata, fanned out across shards.
+- `DELETE /v1/snapshots/{id}[?shard=N]` — remove a snapshot.
 - A configurable retention policy: "keep last N", "keep all newer than M days", etc.
 
 Old snapshots can be moved to colder storage (S3, tape) for archival. Brain doesn't manage this; it's an operational concern.
@@ -127,12 +130,12 @@ The shard UUID in the snapshot's manifest must match the shard's UUID at the des
 
 For a 10 GiB arena on a btrfs filesystem with reflinks:
 
-- Drain + checkpoint: 50 ms.
+- Checkpoint (including the arena `msync`): 50 ms.
 - Reflink ioctls: ~10 ms (most are O(1) per file).
 - Manifest write: ~5 ms.
 - Verification (checksum): ~3 seconds (depends on disk read speed).
 
-Total: 3–5 seconds wall-clock. The user-visible interruption is the drain (50 ms); the rest happens in the background.
+Total: 3–5 seconds wall-clock. No write is rejected or drained in that window; the cost shows up as the shard's core being busy, not as a closed door.
 
 For ext4 (no reflink), full-copy of a 10 GiB arena takes minutes. Brain recommends btrfs or xfs (with reflinks enabled) for production deployments.
 
@@ -156,11 +159,11 @@ The reflink ioctls are per-file atomic. A snapshot of multiple files (arena, met
 
 Brain handles this by:
 
-- Pausing writes during the snapshot (the drain).
-- Reflinking files in a specific order (metadata first, then arena, then WAL).
+- Fixing the bundle's as-of LSN *before* any copy, at `CHECKPOINT_END`. Every file is then read against a line already drawn, so a write that lands mid-sequence cannot move it.
+- Reflinking files in a specific order: `arena.bin` first (immediately after the checkpoint's `msync_all`, so its image matches `durable_lsn`), then `metadata.redb` under a held-then-released read transaction, then `shard.uuid`, then the WAL tail — every segment whose `starting_lsn <= ` the sampled tail, so the bundle always carries the segment containing the as-of LSN and all earlier ones.
 - Verifying consistency after.
 
-The drain ensures no writes are happening during the multi-file ioctl sequence. The order ensures that if the snapshot is interrupted, partial state is recoverable.
+Writes continuing during the sequence are harmless. Anything they commit above the as-of LSN is replayed on restore from the copied WAL; anything at or below it was already committed when the watermark was read. The order ensures that if the snapshot is interrupted, partial state is recognizable as partial.
 
 If Brain crashes mid-snapshot, the partial snapshot is detected on next startup and discarded. The next snapshot succeeds normally.
 
@@ -209,22 +212,22 @@ A reflink itself doesn't consume disk space. But if the snapshot manifest write 
 
 ### 13.3 Concurrent admin operations
 
-Two `ADMIN_SNAPSHOT_CREATE` calls cannot run concurrently on the same shard. Brain serializes them.
+Two `POST /v1/snapshots` calls cannot run concurrently on the same shard. The shard's receive loop handles the snapshot request inline rather than detaching it, so a second one waits in the channel until the first returns.
 
-A snapshot can run concurrently with normal user operations (the drain is brief).
+A snapshot runs concurrently with normal user operations. Writes already in flight when the snapshot starts keep going, and each one's inclusion is decided by the durable watermark the snapshot reads, not by timing.
 
-A snapshot cannot run concurrently with arena growth or rebalancing; Brain serializes these.
+## 14. Snapshots are live
 
-## 14. Live snapshots (no drain)
+Snapshots take no drain and impose no write stall:
 
-A future enhancement: snapshots without any drain. The technique:
+1. The metadata store is reflinked after a read transaction has flushed in-memory state to disk — redb's read transactions are snapshot-isolated, so a copy taken while one is alive is a consistent point-in-time image.
+2. The WAL segments are captured at their current state, including the active segment with its current write offset.
+3. The arena is reflinked immediately after the checkpoint sequence's `msync_all`, so the on-disk image is consistent with the checkpoint's `durable_lsn`.
+4. The snapshot's "as-of" LSN is `min(the shard's durable watermark, the WAL tail sampled at CHECKPOINT_BEGIN)`.
 
-1. Snapshot the metadata store at its current state.
-2. Snapshot the WAL segments at their current state (including the active segment, with its current write offset).
-3. The arena is captured at its current state (including any in-flight writes).
-4. The snapshot's "as-of" LSN is the last record in the captured WAL.
+Step 4 is what removes the need for a drain. A write that is WAL-durable but not yet committed in redb sits strictly above the as-of LSN, so restoring this snapshot replays it rather than skipping it. Partial writes in the active WAL segment need no special handling for the same reason: they are above the as-of LSN, and recovery stops at the first CRC failure.
 
-This requires careful handling of partial writes (especially in the active WAL segment), but is feasible. Brain uses the simpler drain-based approach; future versions may switch.
+Where the filesystem supports it, the arena and metadata copies are reflinks (`FICLONE`), sharing blocks copy-on-write; otherwise they fall back to a full copy.
 
 ---
 

@@ -23,6 +23,18 @@ Loss: bounded by in-flight operations (typically a few microseconds' worth).
 
 Mitigation: client retries (with the same RequestId) succeed if the request is re-submitted.
 
+## 2a. Scenario 1b: WAL durable, metadata commit not yet run
+
+Brain crashes after a write's WAL records are fsync'd but before its metadata transaction commits.
+
+- The client has not received a success response — the ack comes after the commit.
+- The records are durable in the WAL.
+- The shard's durable watermark sits strictly *below* those records, because the watermark only advances past a reserved LSN range once that range has committed.
+
+Loss: none. Recovery replays the records rather than skipping them, and the write lands.
+
+This is the scenario the watermark exists for, and it is why the watermark is a contiguous prefix rather than the highest LSN seen to commit. Concurrent writes on one shard commit out of LSN order, so a maximum-based watermark could be published *above* these records by some later write that committed first — and recovery's skip would then drop them silently. Nothing in any log would record the loss, which is why it is enumerated here as a scenario Brain is specifically built not to have rather than left implicit.
+
 ## 3. Scenario 2: WAL fsync failed
 
 The WAL append succeeded but the OS hasn't synced to disk yet, then a crash happens.
@@ -144,9 +156,11 @@ Despite the above, Brain protects against:
 
 - **Power loss**: WAL fsync ensures durability.
 - **Process crash**: WAL replay restores.
+- **A crash between WAL fsync and metadata commit**: the durable watermark keeps the record above the replay floor, so it replays (§2a).
+- **Concurrent writes committing out of LSN order**: the watermark is a contiguous prefix, so an early-appending, late-committing write is never skipped by an ordering accident (§2a).
 - **Disk failure** (with redundancy / RAID): the underlying storage handles.
 - **Network failure**: doesn't affect persisted data.
-- **Memory pressure**: shed load doesn't lose committed data.
+- **Memory pressure / overload**: a saturated shard parks its receive channel and queues in arrival order; it does not shed requests, and committed data is never at risk.
 
 These common failures don't cause loss.
 

@@ -6,19 +6,18 @@
 //! ## Module map
 //!
 //! - [`framework`] — the `Extractor` trait, registry, output items
-//!   (`EntityMention` / `StatementMention` / `RelationMention`), and
-//!   per-extractor run options.
+//!   (`EntityMention` / `StatementMention` / `RelationMention`).
 //! - [`pattern`] — Tier 1: regex-driven extraction.
 //! - [`classifier`] — Tier 2: GLiNER zero-shot NER + statement-kind
 //!   pattern matcher.
-//! - [`llm`] — Tier 3: Anthropic / OpenAI LLM extraction with cost
-//!   budgeting, schema validation, retries, and an idempotency cache.
+//! - [`llm`] — Tier 3: Anthropic / OpenAI LLM extraction with schema
+//!   validation, retries, and an idempotency cache.
 //! - [`resolver`] — entity-resolution gauntlet (exact / alias /
 //!   fuzzy trigram / embedding HNSW / create) used by the worker.
 //! - [`materialize`] — bridge from schema definitions to in-memory
 //!   `Extractor` instances; produces the registry the worker dispatches
 //!   through.
-//! - [`idempotency`] — text-hash keys for extractor caching.
+//! - [`idempotency`] — the input hash for the LLM extractor response cache.
 //! - [`enricher_hook`] — `EnricherPlugin` dispatch seam (lives here to
 //!   avoid a circular dep with `brain-plugins`).
 //! - [`supersede_source`] — adapter that exposes the statement HNSW as
@@ -42,26 +41,26 @@ pub mod resolver;
 pub mod supersede_source;
 
 pub use classifier::{
-    default_xdg_model_dir, ClassifiedSpan, ClassifierConfig, ClassifierExtractor, ClassifierModel,
-    GlinerClassifier, GlinerSpan, NER_MODEL_DIR_NAME, NER_MODEL_REQUIRED_FILES,
+    default_xdg_model_dir, ClassifiedBatch, ClassifiedBatchFuture, ClassifiedSpan,
+    ClassifierConfig, ClassifierExtractor, ClassifierModel, ClassifierOffload, GlinerClassifier,
+    GlinerSpan, NER_MODEL_DIR_NAME, NER_MODEL_REQUIRED_FILES,
 };
 pub use enricher_hook::{run_pipeline_enrichers, EnricherHook, EnricherHookOutcome};
 pub use framework::{
     evaluate_trigger_on_encode, EntityMention, ExtractedItem, ExtractionContext,
     ExtractionFailureClass, ExtractionFuture, ExtractionResult, ExtractionStatus, Extractor,
-    ExtractorContext, ExtractorError, ExtractorRegistry, ExtractorRunOptions, NeighborMemory,
-    RelationMention, StatementMention, TriggerDecision, SYSTEM_NAMESPACE,
+    ExtractorContext, ExtractorError, ExtractorRegistry, NeighborMemory, RelationMention,
+    StatementMention, TriggerDecision, SYSTEM_NAMESPACE,
 };
-pub use idempotency::{hash_memory_text, IdempotencyKey};
-pub use llm::{estimate_cost, CostBudget, LlmExtractor, LlmExtractorInner, Pricing};
+pub use llm::{LlmExtractor, LlmExtractorInner, ResponseSchema};
 pub use materialize::{
     build_registry_from_definitions, materialize_classifier_extractor, materialize_llm_extractor,
     materialize_pattern_extractor, MaterializeDeps,
 };
 pub use pattern::{CompiledRegex, PatternExtractor, TemporalExtractor};
 pub use resolver::{
-    is_temporal_expression_surface, resolve_or_create, strip_leading_vocative, EntityDisambiguator,
-    LlmCandidateView, MatchVerdict, Resolution, ResolutionTier, ResolverError, StagedEntityVectors,
-    DEFAULT_DISAMBIGUATOR_MIN_CONFIDENCE,
+    is_temporal_expression_surface, resolve_or_create, strip_leading_vocative,
+    DisambiguationOutcome, EntityDisambiguator, LlmCandidateView, MatchVerdict, Resolution,
+    ResolutionTier, ResolverError, StagedEntityVectors, DEFAULT_DISAMBIGUATOR_MIN_CONFIDENCE,
 };
 pub use supersede_source::StatementHnswSource;

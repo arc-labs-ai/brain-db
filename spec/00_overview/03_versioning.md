@@ -71,11 +71,20 @@ The WAL has its own format version in each segment's header. Detailed in [05. St
 
 ### Metadata format
 
-redb itself versions its format. Brain layers a logical schema version on top: each `redb` database carries a metadata table with a `schema_version` row.
+redb itself versions its format. Brain layers a logical schema version on top: each `redb` database carries a singleton private table holding one `schema_version` row, written when the file is first created. The current value is **1**.
+
+One global row covers the whole metadata file rather than one row per table. The tables ship from the same crate and co-evolve, so bumping one means bumping the file, and per-table versioning would multiply the open-time checks without changing any outcome.
 
 ### Server-vs-file behaviour
 
-When the server starts, it inspects each file's format version. Files at the server's version proceed to normal startup. Files at a different version cause the server to refuse to start and emit a migration instruction. Migration to the current version is the only path forward; the server does not operate against off-version files.
+When the server starts, it inspects each file's format version:
+
+- **Version absent** — a fresh file. The server writes the current version and proceeds.
+- **Same version** — normal startup.
+- **Older version** — refused. The error names both versions and states that this binary requires the current one.
+- **Newer version** — refused. The binary is older than the file; the error says to upgrade the server or restore from a compatible backup.
+
+The refusal is symmetric, and it is deliberate rather than merely cautious. Several readers resolve a stored row without surfacing a decode failure: one parses its bundle with a fallible decode that falls back to a default, so a row written against another layout comes back **empty** rather than wrong-looking, silently blanking every stored memory's inspection view; others resolve rows in a way that aborts the reading thread. Neither failure announces itself as a version problem. Refusing the file at open is the honest failure, and it is the only one a reader can act on.
 
 ### What triggers an on-disk version bump
 
@@ -89,12 +98,13 @@ When the server starts, it inspects each file's format version. Files at the ser
 
 ---
 
-## 4. Migration tools
+## 4. What a bump costs
 
-For format changes that require explicit migration:
+**There is no migration tool and no migration registry.** A format bump means a fresh data directory: the old files are refused at open and nothing converts them.
 
-- **`brainctl migrate <data_dir>`** reads the existing storage, performs the migration, and writes back. Idempotent — safe to run multiple times.
-- Migration is offline: the server is stopped during migration.
+This is a scope decision, not a gap awaiting a tool. Brain is pre-release with no external users, so there is no deployed data a converter would serve, and writing one now would mean committing to read every format Brain has ever written. A bump is therefore a deliberate, infrequent act, and the on-disk version is at **1** — no format has yet been superseded.
+
+The practical consequence for an operator: treat a format bump as a re-ingest, not an upgrade step, and keep the source of truth for stored content outside Brain until that changes.
 
 ---
 
@@ -114,4 +124,4 @@ As of this document:
 
 - **Spec format version:** 0.1 (working draft toward 1.0)
 - **Wire protocol version:** 1
-- **On-disk format version:** 1 across all three formats
+- **On-disk format version:** 1 across all three formats, with no superseded version to convert from

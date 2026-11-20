@@ -136,7 +136,6 @@ impl AdminState {
     /// reports reload unavailable there rather than acting on a
     /// non-existent file.
     #[must_use]
-    #[allow(dead_code)] // called from main.rs; test crates construct via `new` only.
     pub fn with_reload(mut self, config_path: PathBuf, apply_log_level: ApplyLogLevel) -> Self {
         self.config_path = Some(config_path);
         self.apply_log_level = Some(apply_log_level);
@@ -165,7 +164,6 @@ impl AdminState {
 /// Which router this listener serves. See module docs.
 // `Public` and `Admin` are unused in the test build (tests construct
 // `Unified` listeners); they ship for production wiring.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 enum RouterKind {
     /// `/healthz` + `/metrics`.
@@ -209,7 +207,6 @@ pub struct BoundAdminServer {
 impl AdminServer {
     /// Public listener: `/healthz` + `/metrics` only.
     // Unused in test builds (see [`RouterKind`]).
-    #[allow(dead_code)]
     pub fn public(
         listen_addr: SocketAddr,
         state: Arc<AdminState>,
@@ -225,7 +222,6 @@ impl AdminServer {
 
     /// Admin listener: `/v1/*` only.
     // Unused in test builds (see [`RouterKind`]).
-    #[allow(dead_code)]
     pub fn admin(
         listen_addr: SocketAddr,
         state: Arc<AdminState>,
@@ -241,7 +237,6 @@ impl AdminServer {
 
     /// Test-only: serve every route on one listener. Production
     /// uses [`Self::public`] + [`Self::admin`] on separate ports.
-    #[allow(dead_code)] // exercised by tests/admin.rs + tests/support_harness
     pub fn new(listen_addr: SocketAddr, state: Arc<AdminState>, shutdown: ShutdownSignal) -> Self {
         Self {
             listen_addr,

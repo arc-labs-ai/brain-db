@@ -24,7 +24,7 @@ use super::GlinerError;
 
 /// BiLSTM hidden size used by GLiNER v2.1. Bidirectional concat lands
 /// at `2 * BILSTM_HIDDEN = 512`, which is the head's input width.
-pub(crate) const BILSTM_HIDDEN: usize = 256;
+const BILSTM_HIDDEN: usize = 256;
 
 /// Re-export of the backbone config — we don't add fields, but
 /// callers should depend on this alias so a future swap to a vendored

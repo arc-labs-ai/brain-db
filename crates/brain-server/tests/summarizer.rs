@@ -19,11 +19,8 @@ use brain_workers::SummarizerError;
 // Pull the source modules in so `crate::llm::…` resolves the same
 // as in main.rs. Each test binary owns its own compilation; we
 // only need the pieces the summarizer adapters touch.
-#[allow(dead_code)]
-#[path = "../src/config/mod.rs"]
-mod config;
-#[path = "../src/llm/mod.rs"]
-mod llm;
+use brain_server::config;
+use brain_server::llm;
 
 use config::{Config, SummarizerConfig};
 

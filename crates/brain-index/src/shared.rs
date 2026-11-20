@@ -786,7 +786,7 @@ mod tests {
 
     #[test]
     fn tombstone_recovery_hides_snapshot_memory() {
-        // Simulate IDX1: a memory folded into the loaded main (an active
+        // Simulate a memory folded into the loaded main (an active
         // snapshot node) that a post-snapshot FORGET marked inactive in
         // redb. The recovery reconciliation must re-apply the delete so the
         // node stops surfacing.
@@ -816,8 +816,8 @@ mod tests {
 
     #[test]
     fn flush_preserves_reinsert_during_build_window() {
-        // IDX4: a re-insert (updated vector) for a snapshot id lands during
-        // the lock-free build window. Identity-based retain must keep the
+        // Simulate a re-insert (updated vector) for a snapshot id landing
+        // during the lock-free build window. Identity-based retain must keep the
         // newer pending entry rather than dropping it (which would leave the
         // old snapshot vector in main and lose the update from both tiers).
         let (reader, mut writer) = build_shared();

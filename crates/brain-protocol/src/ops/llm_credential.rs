@@ -38,10 +38,8 @@ pub struct LlmCredentialView {
     /// Display-safe tail of the key (e.g. `…4f2a`).
     pub fingerprint: String,
     pub created_at_unix_nanos: u64,
-    /// `true` when a space-scoped read resolved the namespace's key rather
-    /// than one of its own. A caller needs this before removing a key:
-    /// deleting at the space would do nothing, and deleting at the namespace
-    /// would affect every sibling space.
+    /// Always `false`: a credential belongs to a namespace and there is no
+    /// narrower scope for a read to resolve from.
     pub inherited: bool,
 }
 
@@ -49,7 +47,8 @@ pub struct LlmCredentialView {
 // LLM_CREDENTIAL_PUT
 // ============================================================
 
-/// `LLM_CREDENTIAL_PUT_REQ`. Registers or replaces the key at `scope`.
+/// `LLM_CREDENTIAL_PUT_REQ`. Registers or replaces the authenticated
+/// namespace's key.
 ///
 /// The only wire shape that carries a plaintext provider key. Brain seals it
 /// on arrival, bound to the namespace and provider, and the plaintext is not
@@ -91,7 +90,7 @@ pub struct LlmCredentialPutResponse {
     pub model: String,
     pub fingerprint: String,
     pub created_at_unix_nanos: u64,
-    /// `true` when this displaced a key already registered at the same scope,
+    /// `true` when this displaced a key already registered for this namespace,
     /// so a caller can tell a first registration from a rotation.
     pub replaced: bool,
 }
@@ -100,8 +99,8 @@ pub struct LlmCredentialPutResponse {
 // LLM_CREDENTIAL_GET
 // ============================================================
 
-/// `LLM_CREDENTIAL_GET_REQ`. Reports the credential the caller resolves from
-/// `scope`, walking narrowest-first.
+/// `LLM_CREDENTIAL_GET_REQ`. Reports the credential installed for the
+/// authenticated namespace.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LlmCredentialGetRequest {
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -120,10 +119,7 @@ pub struct LlmCredentialGetResponse {
 // LLM_CREDENTIAL_DELETE
 // ============================================================
 
-/// `LLM_CREDENTIAL_DELETE_REQ`. Removes the key at exactly `scope`.
-///
-/// Exact rather than resolved: a space revoking its own key must not be able
-/// to remove the tenant's by accident.
+/// `LLM_CREDENTIAL_DELETE_REQ`. Removes the authenticated namespace's key.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LlmCredentialDeleteRequest {
     #[serde(with = "serde_bytes")]
@@ -134,7 +130,7 @@ pub struct LlmCredentialDeleteRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LlmCredentialDeleteResponse {
-    /// `false` when that scope had no key of its own. Reported rather than
+    /// `false` when the namespace had no key installed. Reported rather than
     /// always succeeding, because a caller revoking during an incident needs
     /// to tell "revoked" from "there was nothing there".
     pub existed: bool,

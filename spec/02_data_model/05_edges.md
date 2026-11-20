@@ -197,7 +197,7 @@ The chosen eight cover:
 - Logical: `CONTRADICTS`, `SUPPORTS`.
 - Structural: `REFERENCES`, `PART_OF`.
 
-User-defined edge types are an open question, deferred to a future version ([01.10 OQ-10](../00_overview/04_open_questions_archive.md)).
+The edge-kind set is fixed. User-defined edge types are deferred to a future version.
 
 ## 4. Edge cardinality
 
@@ -266,9 +266,9 @@ Edges with a forgotten source are removed eagerly; edges with a forgotten target
 When a memory is forgotten:
 
 - **Outgoing edges** (owned by the forgotten memory) are removed.
-- **Incoming edges** (from other memories pointing at this one) are *not* removed; they are filtered out during traversal until the forgotten memory's slot is reclaimed, at which point a slot-reuse pass rewrites the by-target index to drop them.
+- **Incoming edges** (from other memories pointing at this one) are *not* removed at forget time; they are filtered out during traversal. Reclamation then deletes the by-target index entries that name the memory. Entries pointing at it from the other direction — another memory's outgoing row whose target is the reclaimed memory — are left to the edge-scrub worker, so the cleanup completes asynchronously rather than at the instant of reclamation.
 
-Why the asymmetry: the forgotten memory's outgoing edges are colocated and easy to remove; rewriting all the by-target index entries for everyone pointing at this memory is a heavier operation, deferred until the slot is reclaimed.
+Why the asymmetry: the forgotten memory's own edge rows are colocated and cheap to remove, while finding every row elsewhere that happens to name it is a scan. Deferring that scan to a sweeper keeps the forget itself bounded, and traversal filtering means a surviving stale row is never observable.
 
 ## 9. Edge auto-derivation rules
 

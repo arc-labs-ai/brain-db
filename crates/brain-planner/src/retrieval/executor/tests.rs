@@ -217,6 +217,7 @@ fn make_ctx(
         scope_mode: brain_metadata::ScopeMode::Space,
         cross_encoder: None,
         space_vectors: None,
+        semantic_query: Some(SemanticQuery::Text("test query".into())),
     };
     (dir, ctx)
 }
@@ -601,6 +602,30 @@ fn skips_semantic_when_no_text() {
     assert!(result.items.is_empty());
 }
 
+#[test]
+fn skips_semantic_when_query_was_not_prepared() {
+    let sem = MockSemantic {
+        response: Arc::new(StdMutex::new(Ok(vec![ranked_memory(1, 1, 0.9)]))),
+        delay: None,
+    };
+    let (_dir, mut ctx) = make_ctx(Some(sem), None, None);
+    ctx.semantic_query = None;
+
+    let req = QueryRequest {
+        text: Some("budget".into()),
+        retrievers: RetrieverSelection::Explicit(vec![Retriever::Semantic]),
+        ..Default::default()
+    };
+    let qp = plan(&req).expect("plan");
+    let result =
+        futures_lite::future::block_on(execute(&qp, &req, false, false, &ctx)).expect("execute");
+    assert_eq!(
+        outcome_status(&result.metadata, Retriever::Semantic),
+        Some(RetrieverStatus::Skipped("semantic query not prepared"))
+    );
+    assert!(result.items.is_empty());
+}
+
 // ---------------------------------------------------------------------------
 // Failures + timeouts.
 // ---------------------------------------------------------------------------
@@ -792,6 +817,7 @@ fn dynamic_k_deepens_when_filters_thin_the_pool() {
         scope_mode: brain_metadata::ScopeMode::Space,
         cross_encoder: None,
         space_vectors: None,
+        semantic_query: Some(SemanticQuery::Text("test query".into())),
     };
 
     let req = QueryRequest {
@@ -958,6 +984,7 @@ fn cue_ctx(metadata: MetadataDb) -> RetrievalExecutorContext {
         scope_mode: brain_metadata::ScopeMode::Space,
         cross_encoder: None,
         space_vectors: None,
+        semantic_query: Some(SemanticQuery::Text("test query".into())),
     }
 }
 
@@ -1204,6 +1231,7 @@ fn prf_reprobes_lexical_with_expansion_on_low_specificity_query() {
         scope_mode: brain_metadata::ScopeMode::Space,
         cross_encoder: None,
         space_vectors: None,
+        semantic_query: Some(SemanticQuery::Text("test query".into())),
     };
 
     let req = prf_request("Where did Caroline move from?");
@@ -1255,6 +1283,7 @@ fn prf_skips_high_specificity_query() {
         scope_mode: brain_metadata::ScopeMode::Space,
         cross_encoder: None,
         space_vectors: None,
+        semantic_query: Some(SemanticQuery::Text("test query".into())),
     };
 
     // Six content words → above the low-specificity gate → no PRF pass.

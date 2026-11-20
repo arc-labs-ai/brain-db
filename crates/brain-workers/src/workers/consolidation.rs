@@ -398,12 +398,10 @@ async fn do_consolidation_cycle(
                 continue;
             }
             // Embed.
-            let vector = ctx
-                .ops
-                .executor
-                .embedder
-                .embed(&summary)
-                .map_err(|e| WorkerError::Ops(format!("embed: {e:?}")))?;
+            let vector =
+                brain_ops::embedding::embed_off_reactor(&ctx.ops.executor.embedder, &summary)
+                    .await
+                    .map_err(|e| WorkerError::Ops(format!("embed: {e:?}")))?;
             // Reserve a fresh MemoryId, then build a multi-phase Write
             // through the unified path. Deterministic request_id
             // → WriteId so a restart-retry hits the writer's

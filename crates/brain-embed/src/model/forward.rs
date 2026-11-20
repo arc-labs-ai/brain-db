@@ -27,6 +27,15 @@ pub const VECTOR_DIM: usize = 384;
 /// pathological (zero-norm) and refuse to divide.
 const ZERO_NORM_EPS: f32 = 1e-8;
 
+/// Return the number of pieces Candle will split a matmul into on the calling
+/// thread. Candle reads this afresh per call and offers no setter, so this is
+/// an observation rather than a setting. The Rayon pool running the forward
+/// pass decides how many threads actually execute those pieces.
+#[must_use]
+pub fn matmul_split_count() -> usize {
+    candle_core::utils::get_num_threads()
+}
+
 /// L2-normalise in place. Returns the *original* norm (pre-normalisation)
 /// so the caller can decide whether to reject (zero-vector defence).
 ///

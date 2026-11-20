@@ -44,17 +44,22 @@ For a typical shard at recommended load:
 Per memory:
 
 ```
-Vector (1536 floats × 4 bytes): 6 KB
+Vector (384 floats × 4 bytes): 1.5 KB
 Slot metadata + padding: ~64 bytes
 Metadata in redb: ~200-500 bytes
 Edges (avg 5 per memory × ~50 bytes): ~250 bytes
 Text (variable; avg 2 KB): ~2 KB
 WAL (over time): equivalent to writes' worth, retained briefly
 
-Total per memory: ~9-12 KB
+Total per memory: ~4-5 KB
 ```
 
-For 1M memories: ~10-12 GB. For 10M: ~100-120 GB.
+The embedding is 384 dimensions (`crates/brain-embed/src/model/forward.rs:24`),
+which is 1536 **bytes** at `f32`. That figure is easy to mistake for a
+dimension count — the widely-quoted 1536 belongs to other providers' models,
+and assuming it here overstates the vector's footprint fourfold.
+
+For 1M memories: ~4-5 GB. For 10M: ~40-50 GB.
 
 Plan disk accordingly, with headroom for:
 - WAL (~512 MiB - 1 GiB).
@@ -68,7 +73,7 @@ A useful heuristic: provision 3× the data size for working capacity.
 In-memory components:
 
 ```
-HNSW index: ~150 MB per million memories (256 vector dim representation).
+HNSW index: ~150 MB per million memories (384-dimension vectors plus neighbour lists).
 Embedder model: ~150 MB (loaded once).
 Caches: 100 MB - 1 GB (configurable).
 Per-connection state: ~100 KB.
@@ -126,11 +131,18 @@ predict_linear(brain_arena_used_bytes[30d], 30 * 86400)
 There is no live-memory-count gauge. `brain_arena_slots_used` counts allocated
 slots, **tombstoned ones included**, which is the right basis for a capacity
 forecast anyway: a tombstoned slot occupies arena space until reclamation runs.
-A live count — for a space, a session or a shard — comes from `ADMIN_STATS` or
-`GET /v1/spaces`, where it can be scoped without putting a tenant id on a
+A live count comes from `GET /v1/diagnostics/debug-snapshot?shard=N` for a
+shard, or `GET /v1/spaces` for the space listing, where it can be scoped
+without putting a tenant id on a
 metric series.
 
-These projections help plan ahead. Validate by looking at the actual rate vs forecast.
+Both are gauges that only rise until reclamation runs, which is what makes
+`predict_linear` meaningful on them — it fits a straight line and extrapolates,
+so it is the right function here and `rate()` is not. A reclamation pass bends
+the line down and the forecast with it, so read a projection taken across one
+as conservative rather than wrong.
+
+Validate by comparing the actual rate against the forecast.
 
 ## 10. Headroom
 
@@ -186,22 +198,28 @@ For asymmetric workloads (e.g., write-only ingest + occasional read), the bottle
 
 ## 14. Multi-tenant capacity
 
-In multi-tenant scenarios:
+In multi-tenant scenarios tenants share a shard, or have dedicated ones.
 
-- Tenants share a shard (or have dedicated ones).
-- Per-tenant quotas prevent one tenant from exhausting capacity.
-- Per-tenant metrics surface heavy users.
+Two things an operator will reach for do not exist, and planning has to account
+for their absence:
 
-Quotas:
+- **There are no per-tenant quotas.** No memory cap, context cap or
+  request-rate cap is enforced per space or per namespace. The limits that do
+  refuse a write are physical or per-field — arena capacity, disk, and the byte
+  caps in `crates/brain-ops/src/handlers/limits.rs`. One tenant can therefore
+  consume a shard's whole arena, and nothing in Brain will stop it.
+- **There are no per-tenant metrics.** `space_id` and `namespace` are never
+  metric labels, by design: a tenant label multiplies every series by the
+  tenant count, and on a shard serving a million spaces that is a
+  metrics-system outage rather than a slow dashboard.
 
-```toml
-[agents.default_quotas]
-max_memories = 1000000
-max_contexts = 100
-max_requests_per_minute = 1000
-```
-
-Quotas protect against runaway tenants.
+So multi-tenant capacity is planned at the shard, enforced outside Brain, and
+attributed from the logs and the audit trail rather than from metrics. A
+front-door gateway is the natural place to put a rate limit, since it already
+holds the per-tenant identity. Per-space footprint for planning comes from
+`GET /v1/spaces`, which can be scoped to a tenant without putting a tenant id
+on a metric series. Per-space *statistics* do not exist yet:
+`GET /v1/spaces/{id}` answers 501 pending a `space_id` secondary index.
 
 ## 15. The "warm-up" planning
 
@@ -273,7 +291,3 @@ After major launches:
 - Tune as data emerges.
 
 Capacity planning is iterative; the first plan is rarely the last.
-
----
-
-*Continue to [`../00_overview/04_open_questions_archive.md`](../00_overview/04_open_questions_archive.md) for unresolved questions.*

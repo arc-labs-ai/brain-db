@@ -25,7 +25,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use brain_ops::OpsContext;
 use futures_lite::FutureExt;
 use glommio::timer::sleep;
-use glommio::Task;
+use glommio::{Latency, Shares, Task, TaskQueueHandle};
 use tracing::{debug, error, info, warn};
 
 use crate::config::{WorkerConfig, WorkerKind};
@@ -79,7 +79,34 @@ pub struct WorkerHandle {
 pub struct WorkerScheduler {
     handles: HashMap<&'static str, WorkerHandle>,
     shutdown: Arc<AtomicBool>,
+    /// The task queue every worker runs in, created on first `register`.
+    ///
+    /// Derivation runs here rather than in the executor's default queue, which
+    /// serves incoming requests. Glommio schedules queues by share, so sharing
+    /// the request lane would rank a derivation burst and a client's ENCODE as
+    /// equals — and derivation is not a polite neighbour: each finished
+    /// provider call brings JSON decode, projection, a redb commit and an HNSW
+    /// insert back onto that lane. At a 128-wide extractor fan-out that
+    /// starves the request path badly enough to return
+    /// `503 engine.unavailable` on 9 of 120 writes.
+    ///
+    /// Fewer shares on a queue of its own fixes the priority rather than the
+    /// width: derivation gets whatever CPU the request path is not using, and
+    /// yields when it is. Shards cannot be split across threads to solve this
+    /// — `OpsContext` is `!Send` by design, so a worker and the requests it
+    /// competes with necessarily share one executor. Priority is the only
+    /// lever that exists here, and it is the right one.
+    background: Option<TaskQueueHandle>,
 }
+
+/// Shares for the worker queue, against the default queue's 1000.
+///
+/// Deliberately a minority share: a write that has acked is a promise kept,
+/// while derivation is enrichment that is allowed to arrive late. Under
+/// contention workers get roughly a fifth of the lane; with the request path
+/// idle — which is most of the time on most deployments — they get all of it,
+/// because shares only bind when something else wants to run.
+const WORKER_QUEUE_SHARES: usize = 250;
 
 impl WorkerScheduler {
     #[must_use]
@@ -87,7 +114,24 @@ impl WorkerScheduler {
         Self {
             handles: HashMap::new(),
             shutdown: Arc::new(AtomicBool::new(false)),
+            background: None,
         }
+    }
+
+    /// The worker queue, created on first use.
+    ///
+    /// Not built in `new()`: creating a task queue requires a running
+    /// executor, and `new()` is not documented to need one. `register` is.
+    fn background_queue(&mut self) -> TaskQueueHandle {
+        *self.background.get_or_insert_with(|| {
+            glommio::executor().create_task_queue(
+                Shares::Static(WORKER_QUEUE_SHARES),
+                // Background work: no deadline to honour, so the scheduler is
+                // free to batch it behind latency-sensitive work.
+                Latency::NotImportant,
+                "brain-workers",
+            )
+        })
     }
 
     /// Register a worker. Spawns the loop task immediately on the
@@ -114,8 +158,12 @@ impl WorkerScheduler {
             ops,
             shutdown: self.shutdown.clone(),
         };
-        let task =
-            glommio::spawn_local(worker_loop(worker, ctx, metrics.clone(), controls.clone()));
+        let queue = self.background_queue();
+        let task = glommio::spawn_local_into(
+            worker_loop(worker, ctx, metrics.clone(), controls.clone()),
+            queue,
+        )
+        .expect("invariant: the worker task queue was created on this executor");
         self.handles.insert(
             name,
             WorkerHandle {

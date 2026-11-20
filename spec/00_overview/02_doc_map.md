@@ -54,7 +54,7 @@ For each section, this file gives a one-paragraph summary, key dependencies, and
 
 ## 07. Embedding Layer
 
-**Summary.** Layer L2. BGE-small via candle (384-dim). Inference pipeline (tokenization, inference, normalization, batching), LRU caching, fingerprinting, model migration via `ADMIN_MIGRATE_EMBEDDINGS`.
+**Summary.** Layer L2. BGE-small via candle (384-dim). Inference pipeline (tokenization, inference, normalization, batching), LRU caching, and the model fingerprint that tags every memory and makes a cross-model query detectable.
 
 **Depends on.** [01](../01_architecture/00_purpose.md), [02](../02_data_model/00_purpose.md). **Depended on by.** [08](../08_storage/00_purpose.md), [05](../05_operations/00_purpose.md), [11](../11_extractors/00_purpose.md).
 
@@ -86,7 +86,7 @@ For each section, this file gives a one-paragraph summary, key dependencies, and
 
 ## 11. Extractors
 
-**Summary.** Three-tier pipeline (pattern → GLiNER classifier → LLM). Triggers (on ENCODE; bounded context with top-m similar memories + rolling summary). Resolver gauntlet (Tier 0 exact qname / Tier 1 canonical name / Tier 2 alias / Tier 3 fuzzy trigram / Tier 4 HNSW embedding). Per-extraction audit, idempotency cache (LLM responses keyed on `(input_hash, extractor_id, extractor_version, model_id)` with TTL). Anthropic prompt-cache scaffolding. Plugin surface (`EnricherPlugin`, `ConnectorPlugin`).
+**Summary.** Three-tier pipeline (pattern → GLiNER classifier → LLM). Triggers (on ENCODE; bounded context with top-m similar memories + rolling summary). Resolver gauntlet (Tier 0 exact qname / Tier 1 canonical name / Tier 2 alias / Tier 3 fuzzy trigram / Tier 4 HNSW embedding). Per-extraction audit, idempotency cache (LLM responses keyed on `(input_hash, extractor_id, extractor_version, model_id, credential_scope)` with TTL — `credential_scope` is the component that keeps one tenant's paid completion from being served to another, and `input_hash` covers the fully materialized prompt, not the memory text alone, so a grown neighbourhood or a schema bump misses rather than serving a stale extraction). Anthropic prompt-cache scaffolding. Plugin surface (`EnricherPlugin`, `ConnectorPlugin`).
 
 **Depends on.** [02](../02_data_model/00_purpose.md), [03](../03_schema/00_purpose.md), [07](../07_embedding/00_purpose.md), [10](../10_metadata/00_purpose.md). **Depended on by.** [13](../13_retrievers/00_purpose.md).
 
@@ -110,7 +110,7 @@ For each section, this file gives a one-paragraph summary, key dependencies, and
 
 ## 14. Concurrency
 
-**Summary.** Lock-free read path (crossbeam-epoch reclamation), single-writer-per-shard, ArcSwap config swaps, channels / queues, cooperative Glommio scheduling, yield discipline, failure modes.
+**Summary.** The lock-free read path and the publication model it rests on: whole index generations published behind `ArcSwap`, each displaced generation freed by its own `Arc` refcount rather than by a reclamation protocol. Write serialization per shard, ArcSwap config swaps, channels / queues, cooperative Glommio scheduling, yield discipline, failure modes.
 
 **Depends on.** [01](../01_architecture/00_purpose.md). **Depended on by.** [08](../08_storage/00_purpose.md), [09](../09_indexing/00_purpose.md), [12](../12_query_optimizer/00_purpose.md), [15](../15_background_workers/00_purpose.md).
 
@@ -156,16 +156,23 @@ For each section, this file gives a one-paragraph summary, key dependencies, and
 
 ---
 
+## 20. Tenancy + Isolation
+
+**Summary.** The normative multi-tenant contract the other sections reference. The two isolation axes and the `namespace → space → session` scope model: `space_id` representation, the isolation guarantees (including credential isolation), the space and session registries and their CRUD surfaces, per-space index partitioning as a requirement, auth and delegated action, and the deployment modes one client surface has to cover.
+
+**Depends on.** [02](../02_data_model/00_purpose.md). **Depended on by.** [04](../04_wire_protocol/00_purpose.md), [10](../10_metadata/00_purpose.md), [17](../17_observability/00_purpose.md).
+
+---
+
 ## Cross-cutting topics
 
 Some topics aren't section-shaped and are scattered across multiple sections.
 
-- **Authentication and per-tenant scope.** Primarily in [17. Observability](../17_observability/00_purpose.md), referenced by [04. Wire Protocol](../04_wire_protocol/00_purpose.md) §handshake.
+- **Authentication and per-tenant scope.** The scope model and its isolation guarantees are normative in [20. Tenancy & Isolation](../20_tenancy/00_purpose.md); the operational security model lives in [17. Observability](../17_observability/00_purpose.md), and the handshake that binds a connection to a scope is in [04. Wire Protocol](../04_wire_protocol/00_purpose.md) §handshake.
 - **Configuration.** Primarily in [17. Observability](../17_observability/00_purpose.md), referenced everywhere there are tunable parameters.
 - **Embedding model fingerprint.** Defined in [07. Embedding Layer](../07_embedding/00_purpose.md), used in [02. Data Model](../02_data_model/00_purpose.md) and [10. Metadata + Graph Store](../10_metadata/00_purpose.md), referenced from [18. Failure Recovery](../18_failure_recovery/00_purpose.md).
 - **CRC32C checksum.** Defined in [04. Wire Protocol](../04_wire_protocol/00_purpose.md) for frames, [08. Storage](../08_storage/00_purpose.md) for WAL records.
 - **Provenance and audit.** Audit tables in [10. Metadata + Graph Store](../10_metadata/00_purpose.md); per-derivation audit emitted by [11. Extractors](../11_extractors/00_purpose.md).
-- **Cross-cutting open questions** live in [`04_open_questions_archive.md`](./04_open_questions_archive.md).
 
 ---
 
