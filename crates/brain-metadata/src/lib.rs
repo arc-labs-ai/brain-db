@@ -20,6 +20,7 @@ pub mod entity;
 pub mod extraction;
 pub mod extractor;
 pub mod hype;
+pub mod lifeline;
 pub mod llm_cache;
 pub mod llm_credential;
 pub mod llm_spend;
@@ -28,6 +29,7 @@ pub mod page_cache;
 pub mod recovery;
 pub mod registry;
 pub mod relation;
+pub mod salience;
 pub mod schema;
 pub mod statement;
 pub mod statement_question;
@@ -83,6 +85,7 @@ pub use hype::ops::{
     hype_neighborhood_hash_put, hype_vector_put, hype_vectors_delete_memory, HypeOpError,
     HypeRebuildRow,
 };
+pub use lifeline::{Lifeline, LifelineGuard, LifelineOwner};
 pub use llm_cache::{
     sweep_expired as llm_cache_sweep_expired, LlmCacheDb, LlmCacheError, LlmResponse,
 };

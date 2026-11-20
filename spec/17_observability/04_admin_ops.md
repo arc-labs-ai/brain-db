@@ -73,6 +73,20 @@ metrics exposition, and per-shard detail is on `GET /v1/shards`.
 
 Version, build info, and a configuration summary are returned by `GET /v1/config` (see §7), alongside the running configuration.
 
+### Aggregates
+
+`GET /v1/aggregates` sums the live aggregate counters across every shard and tenant: memory count, salience sum / average and access-count sum. Exact as of the last committed write (it reads the counters, not the analytics snapshot). Tenants use `MEMORY_AGGREGATE` on the wire for their own `(namespace, space)`; this route is the operator's cross-tenant view.
+
+```bash
+# Grand total of active memories, then per space and kind.
+curl -s http://127.0.0.1:9092/v1/aggregates
+curl -s 'http://127.0.0.1:9092/v1/aggregates?group_by=space,kind'
+# One namespace, active + tombstoned, by status.
+curl -s 'http://127.0.0.1:9092/v1/aggregates?namespace=3&status=active,tombstoned&group_by=status'
+```
+
+Parameters (all optional; lists are comma-separated): `namespace=<id>`, `space=<uuid>`, `kind=episodic,semantic,consolidated`, `status=active,tombstoned,hard_forgotten` (default `active`), `group_by=namespace,space,kind,status`. Returns `{"groups":[{...,"count":N,"salience_sum":S,"salience_avg":A,"access_count_sum":C}]}`. `503` while a shard is still building its counters after an upgrade (`brain_agg_counters_ready` is 0 there); `400` on an unknown parameter or value.
+
 ## 4. Maintenance operations
 
 ### Rebuild ANN
@@ -260,7 +274,7 @@ Reloads configuration from disk. Some settings reload live; others require resta
 
 ```bash
 curl -s http://127.0.0.1:9092/v1/config
-# Single key / subtree: curl -s 'http://127.0.0.1:9092/v1/config?key=workers.decay_interval_sec'
+# Single key / subtree: curl -s 'http://127.0.0.1:9092/v1/config?key=workers.consolidation_interval_sec'
 ```
 
 Returns the current configuration. With a `key` parameter, returns just that key.

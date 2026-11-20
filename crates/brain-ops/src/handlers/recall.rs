@@ -2342,7 +2342,8 @@ fn hydrate_memories_by_id(
                 continue;
             }
         }
-        if row.salience < req.salience_floor {
+        let salience = row.salience_now();
+        if salience < req.salience_floor {
             continue;
         }
         if !passes_age_bound(
@@ -2378,7 +2379,7 @@ fn hydrate_memories_by_id(
             text,
             similarity_score: 1.0,
             confidence: 1.0,
-            salience: row.salience,
+            salience,
             kind: wire_kind,
             space_id: row.space_id_bytes,
             session_id: SessionId(row.session_id).into(),
@@ -3630,7 +3631,8 @@ fn project_memory_results(
                 continue;
             }
         }
-        if row.salience < req.salience_floor {
+        let salience = row.salience_now();
+        if salience < req.salience_floor {
             continue;
         }
         if !passes_age_bound(
@@ -3721,7 +3723,7 @@ fn project_memory_results(
             // retrievers) and is exposed separately as `fused_score`; it is
             // a ranking diagnostic, not a confidence.
             confidence: semantic_score,
-            salience: row.salience,
+            salience,
             kind: wire_kind,
             space_id: row.space_id_bytes,
             session_id: SessionId(row.session_id).into(),

@@ -72,7 +72,7 @@ impl MetadataSink for MetadataDb {
             WalPayload::Forget(p) => self.apply_forget(lsn, timestamp_ns, p),
             WalPayload::Link(p) => self.apply_link(lsn, timestamp_ns, p),
             WalPayload::Unlink(p) => self.apply_unlink(lsn, timestamp_ns, p),
-            WalPayload::UpdateSalience(p) => self.apply_update_salience(lsn, p),
+            WalPayload::UpdateSalience(p) => self.apply_update_salience(lsn, timestamp_ns, p),
             WalPayload::Reclaim(p) => self.apply_reclaim(lsn, p),
             WalPayload::Consolidate(p) => self.apply_consolidate(lsn, timestamp_ns, p),
             WalPayload::UpdateKind(p) => self.apply_update_kind(lsn, timestamp_ns, p),
@@ -1098,7 +1098,12 @@ mod tests {
             .unwrap()
             .unwrap()
             .value();
-        assert!((m.salience - 0.95).abs() < 1e-6);
+        assert!((m.salience_anchor() - 0.95).abs() < 1e-6);
+        assert_eq!(
+            m.salience_anchor_at(),
+            TS + 1,
+            "anchored at the record time"
+        );
     }
 
     // ---------- Reclaim ----------

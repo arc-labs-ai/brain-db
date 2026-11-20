@@ -201,9 +201,9 @@ fn cycle_boosts_one_recorded_memory() {
         assert_eq!(processed, 1);
         let m = read_meta(&fix.metadata, id).unwrap();
         assert!(
-            (m.salience - 0.55).abs() < 1e-3,
+            (m.salience_anchor() - 0.55).abs() < 1e-3,
             "expected ~0.55, got {}",
-            m.salience
+            m.salience_anchor()
         );
     });
 }
@@ -219,7 +219,11 @@ fn cycle_caps_at_one() {
         let processed = run_cycle(&worker, fix.ctx).await.unwrap();
         assert_eq!(processed, 1);
         let m = read_meta(&fix.metadata, id).unwrap();
-        assert!((m.salience - 1.0).abs() < 1e-6, "got {}", m.salience);
+        assert!(
+            (m.salience_anchor() - 1.0).abs() < 1e-6,
+            "got {}",
+            m.salience_anchor()
+        );
     });
 }
 
@@ -456,7 +460,7 @@ fn recall_fills_buffer_then_boost_worker_applies() {
         let mut any_boosted = false;
         for entry in table.iter().unwrap() {
             let (_, v) = entry.unwrap();
-            if v.value().salience > 0.5 {
+            if v.value().salience_anchor() > 0.5 {
                 any_boosted = true;
                 break;
             }

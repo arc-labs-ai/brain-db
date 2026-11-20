@@ -22,7 +22,7 @@ The selector field is named `space`, not `space_id`. `space_id` is the derived 1
 
 | Family | Requests carrying `act_as` |
 |---|---|
-| Cognitive | `ENCODE`, `ENCODE_VECTOR_DIRECT`, `RECALL`, `PLAN`, `REASON`, `FORGET`, `LINK`, `UNLINK`, `MEMORY_LIST`, `MEMORY_INSPECT` |
+| Cognitive | `ENCODE`, `ENCODE_VECTOR_DIRECT`, `RECALL`, `PLAN`, `REASON`, `FORGET`, `LINK`, `UNLINK`, `MEMORY_LIST`, `MEMORY_INSPECT`, `MEMORY_AGGREGATE` |
 | Registry | `SPACE_CREATE`, `SPACE_LIST`, `SPACE_DELETE`, `SESSION_CREATE`, `SESSION_LIST`, `SESSION_DELETE` |
 | LLM credential | `LLM_CREDENTIAL_PUT`, `LLM_CREDENTIAL_GET`, `LLM_CREDENTIAL_DELETE`, `LLM_CREDENTIAL_VERIFY` |
 | Schema | `SCHEMA_UPLOAD`, `SCHEMA_GET`, `SCHEMA_LIST`, `SCHEMA_VALIDATE`, `SCHEMA_REPLACE`, `SCHEMA_DROP` |
@@ -576,6 +576,31 @@ Three outcomes, deliberately kept apart:
 - **The memory does not exist, belongs to another `(namespace, space)`, or has been forgotten** — `MemoryNotFound`. A tombstoned memory is gone for this verb exactly as it is for `RECALL` and for `MEMORY_LIST`; answering a forgotten memory with an empty-artifact success would collide with the second case above, which is the one condition this response shape exists to express.
 
 A foreign-tenant id is deliberately indistinguishable from a missing one.
+
+### 28a. MEMORY_AGGREGATE_REQ (0x29)
+
+```rust
+struct MemoryAggregateRequest {
+    kinds: Vec<MemoryKind>,                  // empty = all kinds
+    statuses: Vec<MemoryStatus>,             // empty = Active only; Active = 0 | Tombstoned = 1 | HardForgotten = 2
+    group_by_kind: bool,
+    group_by_status: bool,
+    group_by_day: bool,                      // snapshot only — UTC day of created_at
+    salience_min: Option<f32>,               // snapshot only, inclusive
+    salience_max: Option<f32>,               // snapshot only, inclusive
+    created_from_unix_nanos: Option<u64>,    // snapshot only, inclusive
+    created_to_unix_nanos: Option<u64>,      // snapshot only, inclusive
+    include_min_max: bool,                   // snapshot only
+    act_as: Option<ActAs>,
+}
+```
+
+COUNT, SUM, AVG (and on request MIN, MAX) of salience, plus the summed access count, over the caller's `(namespace, space)` memories. Read-only, same capability as `RECALL`. The server picks the source and reports it:
+
+- **Counters.** When the request filters and groups only by kind and status and asks for no MIN / MAX, the answer comes from running totals the writer updates in the same transaction as each memory row: exact as of the last committed write, and the same cost for ten memories or a billion.
+- **Snapshot.** Any field marked *snapshot only* needs a scan. The server answers from its latest columnar snapshot of the memory fields, refreshed every `[analytics] export_interval_secs` — usually by a small delta of the memories changed since the last full snapshot, so refreshes stay cheap at any size — and *which memories* are counted is as of `as_of_unix_nanos`, not live. With `[analytics]` disabled the request fails with `InvalidArgument`; before the first export finishes, with `ShardUnavailable`.
+
+Salience decays continuously, so both sources evaluate it at the time of the request, not at the snapshot time: salience sums, averages, MIN / MAX and salience filters always reflect decay up to now. Sums are floating point; the two sources agree to ~10⁻⁶ per memory.
 
 ### 29. GET_CAPABILITIES_REQ (0x32)
 
@@ -1598,6 +1623,30 @@ The budget is spent per direction rather than across the pair. A single combined
 `annotation` is a per-edge label the wire type permits and no write path sets on a memory↔memory edge. The annotated edges the extractor writes are `Mentions` edges anchored on entities, which this view does not carry. The field is present because the edge record carries it, not because this verb populates it.
 
 There is no `found: bool` on this response. An absent, foreign or forgotten memory is `MemoryNotFound`; an empty `artifact` means the bundle has not been written yet.
+
+### 63a. MEMORY_AGGREGATE_RESP (0xA9)
+
+```rust
+struct MemoryAggregateResponse {
+    groups: Vec<MemoryAggregateGroup>,
+    source: AggregateSource,                 // Counters = 0 | Snapshot = 1
+    as_of_unix_nanos: u64,                   // snapshot time; 0 for live Counters
+}
+
+struct MemoryAggregateGroup {
+    kind: Option<MemoryKind>,                // set only when group_by_kind
+    status: Option<MemoryStatus>,            // set only when group_by_status
+    day_start_unix_nanos: Option<u64>,       // set only when group_by_day
+    count: u64,
+    salience_sum: f64,
+    salience_avg: Option<f64>,               // None when count == 0
+    salience_min: Option<f64>,               // only with include_min_max
+    salience_max: Option<f64>,               // only with include_min_max
+    access_count_sum: u64,
+}
+```
+
+An ungrouped request always returns exactly one group, with `count: 0` when nothing matches. A grouped request returns only groups that have memories, so an empty list means no matches.
 
 ### 64. GET_CAPABILITIES_RESP (0xB2)
 

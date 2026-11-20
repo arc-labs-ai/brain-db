@@ -187,7 +187,7 @@ Workers self-rate-limit by sleeping between cycles. Default intervals:
 - Slot reclamation: every 10 minutes.
 - WAL retention: every 1 minute.
 
-Eleven of these cadences can be overridden from `[workers]`; the rest are a
+Ten of these cadences can be overridden from `[workers]`; the rest are a
 property of the build (§16).
 
 ## 12. What happens under load
@@ -253,7 +253,6 @@ section with their own knobs.
 [workers]
 # Sleep between cycles, in seconds. Omitting a key leaves the built-in
 # cadence. Each value must be >= 1; a zero is refused at boot.
-decay_interval_sec = 3600
 consolidation_interval_sec = 300
 hnsw_maintenance_interval_sec = 300
 idempotency_cleanup_interval_sec = 3600
@@ -282,11 +281,11 @@ retention_seconds = 0      # 0 keeps superseded rows forever
 Rules the shape implies:
 
 - **A cadence is read once, at registration**, and kept for the life of the
-  process, so changing one needs a restart. The eleven keys are held in a
+  process, so changing one needs a restart. The ten keys are held in a
   fixed-width table paired with the worker kind each governs, precisely so a
   key cannot be added to the file and never arrive at a scheduler — an
   operator who edits a value that reaches nothing sees no error and no change.
-- **`access_boost` has no key.** Twelve maintenance workers, eleven cadences:
+- **`access_boost` has no key.** Eleven maintenance workers, ten cadences:
   its tick is a property of the build.
 - **Unknown keys are refused** (`deny_unknown_fields`), so a typo fails boot
   rather than being silently ignored.
@@ -304,4 +303,4 @@ For production deployments, workers run continuously; their effects are visible 
 
 ---
 
-*Continue to [`02_memory_maintenance.md`](02_memory_maintenance.md) for the decay worker.*
+*Continue to [`02_memory_maintenance.md`](02_memory_maintenance.md) for memory maintenance.*

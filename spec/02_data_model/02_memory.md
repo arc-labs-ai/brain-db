@@ -281,7 +281,7 @@ Two fields track where a memory came from:
 
 A single number in [0, 1]. The full model — initial computation, update on access, decay over time, normalization — is in [`04_salience.md`](04_salience.md).
 
-The high-level summary: high-salience memories are returned earlier in `RECALL` results and decay more slowly. Low-salience memories rank lower and decay faster. Salience updates happen on access (raise) and via the background decay worker (lower).
+The high-level summary: high-salience memories are returned earlier in `RECALL` results and decay more slowly. Low-salience memories rank lower and decay faster. Salience rises on access (a boost re-anchors it) and decays continuously, computed when read.
 
 ## 10. Session
 

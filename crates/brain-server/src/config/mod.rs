@@ -129,6 +129,17 @@ pub struct Config {
     /// so turning it on in the stock image stops the server starting.
     #[serde(default)]
     pub rerank: RerankConfig,
+    /// Columnar snapshot + scan engine for `MEMORY_AGGREGATE` requests the
+    /// live counters can't answer (salience / time filters, per-day
+    /// groups, MIN / MAX). **Off by default**: it exports every memory's
+    /// aggregate fields to Parquet each interval and holds a query runtime
+    /// per shard. Counter-backed aggregates work either way.
+    #[serde(default)]
+    pub analytics: AnalyticsConfig,
+    /// Aggregate-counter maintenance: the online build after an upgrade
+    /// and the periodic verify + repair. Section may be omitted.
+    #[serde(default)]
+    pub aggregates: AggregatesConfig,
     /// Extractor-pipeline tuning. Extraction itself is always-on and
     /// non-configurable — the three tiers (pattern, classifier, LLM)
     /// populate the typed graph that reads fuse, so there is no per-tier
@@ -446,6 +457,75 @@ fn default_rerank_enabled() -> bool {
     false
 }
 
+/// `[analytics]` TOML section. Every field defaults.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct AnalyticsConfig {
+    /// Master switch. Off: snapshot-only aggregate requests are refused
+    /// with `CapabilityNotEnabled`.
+    pub enabled: bool,
+    /// Re-export cadence; also the worst-case staleness of scan answers.
+    pub export_interval_secs: u64,
+    /// DataFusion working-memory budget for the whole server, split evenly
+    /// across shards; beyond it scans spill to disk. `0` = a quarter of
+    /// physical RAM.
+    pub memory_limit_mb: u64,
+    /// Spill-file cap per shard (under `<shard>/analytics/spill`). A scan
+    /// that needs more fails rather than filling the disk.
+    pub spill_limit_mb: u64,
+    /// Wall-clock cap per scan query. Keep well below the export interval.
+    pub query_timeout_secs: u64,
+    /// Analytics threads per shard (exports + scans), off the shard cores.
+    pub threads: usize,
+    /// Scans allowed at once per shard; further requests queue (within
+    /// `query_timeout_secs`).
+    pub max_concurrent_queries: usize,
+    /// Snapshot exports allowed at once across all shards. Each export
+    /// buffers ~150 MiB per thread outside `memory_limit_mb`.
+    pub max_concurrent_exports: usize,
+}
+
+impl Default for AnalyticsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            export_interval_secs: 3600,
+            memory_limit_mb: 0,
+            spill_limit_mb: 50 * 1024,
+            query_timeout_secs: 30,
+            threads: 2,
+            max_concurrent_queries: 2,
+            max_concurrent_exports: 2,
+        }
+    }
+}
+
+/// `[aggregates]` TOML section. Every field defaults.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct AggregatesConfig {
+    /// Memories counted per write txn while building counters after an
+    /// upgrade. Smaller = shorter writer stalls, longer build.
+    pub build_batch_rows: usize,
+    /// How often to verify the counters against `memories` and repair any
+    /// drift. A full read-only scan of the metadata table, off the shard
+    /// thread; `0` disables.
+    pub verify_interval_secs: u64,
+    /// Delay before the first verify after start, so a restart or a
+    /// rollback that left counters stale is caught soon.
+    pub first_verify_delay_secs: u64,
+}
+
+impl Default for AggregatesConfig {
+    fn default() -> Self {
+        Self {
+            build_batch_rows: 2_000,
+            verify_interval_secs: 24 * 3600,
+            first_verify_delay_secs: 300,
+        }
+    }
+}
+
 /// `[extractors]` TOML section. Per-tier tuning for the extractor
 /// pipeline. Extraction is always-on and non-configurable — there is no
 /// per-tier on/off gate; the pattern / classifier / LLM tiers always run.
@@ -582,7 +662,6 @@ fn default_hype_num_questions() -> usize {
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkersConfig {
-    pub decay_interval_sec: Option<u64>,
     pub consolidation_interval_sec: Option<u64>,
     pub hnsw_maintenance_interval_sec: Option<u64>,
     pub idempotency_cleanup_interval_sec: Option<u64>,
@@ -660,10 +739,10 @@ impl WorkersConfig {
     /// without a compile error.
     ///
     /// `access_boost` is deliberately absent. It is a registered maintenance
-    /// worker with no cadence key — twelve workers, eleven keys — and its tick
+    /// worker with no cadence key — eleven workers, ten keys — and its tick
     /// is a property of the build.
     #[must_use]
-    pub fn maintenance_worker_configs(&self) -> [(WorkerKind, WorkerConfig); 11] {
+    pub fn maintenance_worker_configs(&self) -> [(WorkerKind, WorkerConfig); 10] {
         let resolve = |kind: WorkerKind, declared: Option<u64>| {
             let mut cfg = WorkerConfig::defaults_for(kind);
             if let Some(secs) = declared {
@@ -672,7 +751,6 @@ impl WorkersConfig {
             (kind, cfg)
         };
         [
-            resolve(WorkerKind::Decay, self.decay_interval_sec),
             resolve(WorkerKind::Consolidation, self.consolidation_interval_sec),
             resolve(
                 WorkerKind::HnswMaintenance,
@@ -1860,6 +1938,8 @@ impl Config {
                 batch_window_ms: 1,
             },
             rerank: RerankConfig::default(),
+            analytics: AnalyticsConfig::default(),
+            aggregates: AggregatesConfig::default(),
             extractors: ExtractorsConfig::default(),
             workers: WorkersConfig::default(),
             index: IndexConfig::default(),
@@ -1881,6 +1961,47 @@ impl Config {
         if self.storage.shard_count == Some(0) {
             return Err(ConfigError::Invariant(
                 "storage.shard_count must be >= 1".into(),
+            ));
+        }
+        if self.analytics.enabled {
+            let a = &self.analytics;
+            if a.export_interval_secs == 0 || a.query_timeout_secs == 0 {
+                return Err(ConfigError::Invariant(
+                    "analytics.export_interval_secs and analytics.query_timeout_secs must be >= 1"
+                        .into(),
+                ));
+            }
+            // A scan reads its snapshot file; that file is deleted two
+            // exports later, so a scan must end within one interval.
+            if a.query_timeout_secs >= a.export_interval_secs {
+                return Err(ConfigError::Invariant(
+                    "analytics.query_timeout_secs must be < analytics.export_interval_secs".into(),
+                ));
+            }
+            if a.threads == 0
+                || a.max_concurrent_queries == 0
+                || a.max_concurrent_exports == 0
+                || a.spill_limit_mb == 0
+            {
+                return Err(ConfigError::Invariant(
+                    "analytics.threads, max_concurrent_queries, max_concurrent_exports and \
+                     spill_limit_mb must be >= 1"
+                        .into(),
+                ));
+            }
+            if a.threads > 64 || a.max_concurrent_queries > 64 || a.max_concurrent_exports > 64 {
+                return Err(ConfigError::Invariant(
+                    "analytics.threads, max_concurrent_queries and max_concurrent_exports \
+                     must be <= 64"
+                        .into(),
+                ));
+            }
+        }
+        if self.aggregates.build_batch_rows == 0 || self.aggregates.build_batch_rows > 100_000 {
+            return Err(ConfigError::Invariant(
+                "aggregates.build_batch_rows must be in 1..=100000 (each batch holds the \
+                 shard's write lock)"
+                    .into(),
             ));
         }
         if self.embedder.batch_size == 0 {
@@ -1943,7 +2064,6 @@ impl Config {
 
         // Optional maintenance cadences: only constrained when set.
         for (name, v) in [
-            ("workers.decay_interval_sec", w.decay_interval_sec),
             (
                 "workers.consolidation_interval_sec",
                 w.consolidation_interval_sec,
@@ -2131,7 +2251,7 @@ mod tests {
     /// on `cfg.interval` for the life of the process. A cadence not applied
     /// before registration is therefore a cadence that never runs at all —
     /// parsed, validated for non-zero, and silently ignored — which is exactly
-    /// what shipped for all eleven of these keys.
+    /// what shipped for all ten of these keys.
     ///
     /// Asserted with distinct, NON-default probes on purpose. A probe equal to
     /// the built-in cadence cannot tell a carried field from an ignored one,
@@ -2146,7 +2266,6 @@ mod tests {
     #[test]
     fn every_workers_cadence_reaches_its_worker() {
         let cfg = WorkersConfig {
-            decay_interval_sec: Some(1_001),
             consolidation_interval_sec: Some(1_002),
             hnsw_maintenance_interval_sec: Some(1_003),
             idempotency_cleanup_interval_sec: Some(1_004),
@@ -2161,7 +2280,6 @@ mod tests {
         };
 
         let WorkersConfig {
-            decay_interval_sec,
             consolidation_interval_sec,
             hnsw_maintenance_interval_sec,
             idempotency_cleanup_interval_sec,
@@ -2187,11 +2305,6 @@ mod tests {
         // Fully qualified, because these are the names an operator reads in a
         // validation error and writes in a config file.
         let inventory = [
-            (
-                "workers.decay_interval_sec",
-                WorkerKind::Decay,
-                decay_interval_sec,
-            ),
             (
                 "workers.consolidation_interval_sec",
                 WorkerKind::Consolidation,
@@ -2311,7 +2424,7 @@ mod tests {
         }
 
         // `access_boost` is a registered maintenance worker with no cadence
-        // key — twelve workers, eleven keys. It must not appear here, or
+        // key — eleven workers, ten keys. It must not appear here, or
         // registration would claim a cadence no config declares.
         assert!(
             !resolved

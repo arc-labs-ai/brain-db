@@ -15,6 +15,7 @@ use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use brain_core::MemoryId;
+use brain_metadata::tables::agg::put_memory;
 use brain_metadata::tables::edge::{list_memory_edges_from, list_memory_edges_to};
 use brain_metadata::tables::memory::{MemoryMetadata, MEMORIES_TABLE};
 use parking_lot::Mutex;
@@ -113,8 +114,7 @@ async fn do_reconcile_cycle(
                 }
                 row.edges_out_count = *true_out;
                 row.edges_in_count = *true_in;
-                memories
-                    .insert(key, row)
+                put_memory(&wtxn, &mut memories, key, &row)
                     .map_err(|e| WorkerError::Ops(format!("memory update: {e:?}")))?;
                 fixed += 1;
             }

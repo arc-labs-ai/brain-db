@@ -22,8 +22,8 @@ use http::{Method, Request, Response};
 use hyper::body::Incoming;
 
 use crate::admin::handlers::{
-    api_keys, audit, backfill, config, diagnostics, extract, healthz, memory, metrics, readyz,
-    rebuild, schema, shard, snapshot, space, worker,
+    aggregate, api_keys, audit, backfill, config, diagnostics, extract, healthz, memory, metrics,
+    readyz, rebuild, schema, shard, snapshot, space, worker,
 };
 use crate::admin::AdminState;
 
@@ -245,6 +245,16 @@ fn attach_v1_routes(r: Router<Incoming>, state: Arc<AdminState>) -> Router<Incom
         "/v1/memories/",
         state.clone(),
         memory::restore::handle,
+    );
+
+    // ──────── /v1/aggregates ───────────────────────────────────────────
+    // Cross-tenant sums of the live aggregate counters, all shards.
+    let r = with_state(
+        r,
+        Method::GET,
+        "/v1/aggregates",
+        state.clone(),
+        aggregate::handle,
     );
 
     // ──────── /v1/shards ───────────────────────────────────────────────

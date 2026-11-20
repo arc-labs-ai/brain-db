@@ -3,6 +3,7 @@
 //! The catalog is 13 domain tables plus one internal `__schema_meta`
 //! from [`crate::storage_version`].
 
+pub mod agg;
 pub mod api_keys;
 pub mod audit;
 pub mod checkpoint;
@@ -35,6 +36,7 @@ pub mod schema_version;
 pub mod scope;
 pub mod session;
 pub mod slot_version;
+pub mod snapshot_changes;
 pub mod space;
 pub mod statement;
 pub mod statement_question;
@@ -182,6 +184,9 @@ pub fn materialize_all_tables(wtxn: &::redb::WriteTransaction) -> Result<(), ::r
     let _ = wtxn.open_table(KINDS_BY_BYTE_TABLE)?;
     let _ = wtxn.open_table(LLM_SPEND_TABLE)?;
     let _ = wtxn.open_table(MEMORIES_TABLE)?;
+    let _ = wtxn.open_table(agg::AGG_COUNTERS_TABLE)?;
+    let _ = wtxn.open_table(agg::AGG_STATE_TABLE)?;
+    let _ = wtxn.open_table(snapshot_changes::SNAPSHOT_CHANGES_TABLE)?;
     let _ = wtxn.open_table(MEMORIES_BY_SPACE_TIMELINE_TABLE)?;
     let _ = wtxn.open_table(MERGE_LOG_TABLE)?;
     let _ = wtxn.open_table(ENTITY_MERGE_AUDIT_OVERFLOW)?;

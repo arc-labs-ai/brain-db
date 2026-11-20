@@ -182,6 +182,29 @@ brain_retriever_latency_ms{shard=, retriever=}        # per-lane wall-clock (his
 any per-query inspection. `rerank_invoked_total` stays at zero on a default
 deployment, since rerank ships disabled.
 
+
+## 7a. Aggregate metrics
+
+```
+brain_agg_counters_ready{shard=}                      # 1 = counters complete; 0 = online build after upgrade
+brain_agg_counter_build_rows_total{shard=}            # memories counted by that build
+brain_agg_counter_verify_runs_total{shard=}           # full verify passes ([aggregates] verify_interval_secs)
+brain_agg_counter_drifted_buckets_total{shard=}       # buckets found wrong and repaired — alert if > 0
+brain_memory_aggregate_counters_total{shard=}         # MEMORY_AGGREGATE answered from live counters
+brain_memory_aggregate_snapshot_total{shard=}         # ... answered from the analytics snapshot
+brain_memory_aggregate_errors_total{shard=}
+brain_analytics_exports_total{shard=}                 # [analytics] only
+brain_analytics_export_failures_total{shard=}
+brain_analytics_last_export_seconds{shard=}
+brain_analytics_snapshot_rows{shard=}
+brain_analytics_snapshot_age_seconds{shard=}          # staleness of snapshot answers
+```
+
+`brain_agg_counter_drifted_buckets_total` should stay 0: every write to the
+memories table updates the counters in the same transaction, so a non-zero value
+means some write path bypassed them (the verify pass has already repaired the
+numbers, but the bypass is a bug). `brain_analytics_snapshot_age_seconds`
+should stay below `[analytics] export_interval_secs` plus one export's duration.
 ## 8. Extractor and derivation metrics
 
 ```
@@ -341,7 +364,7 @@ brain_worker_pending_work{shard=, worker=}      # last-observed estimate of outs
 
 The `worker` label is the worker's registry name, a fixed snake_case set
 declared alongside the worker kinds (`crates/brain-workers/src/config.rs:96-135`)
-— `decay`, `access_boost`, `consolidation`, `hnsw_maintenance`,
+— `access_boost`, `consolidation`, `hnsw_maintenance`,
 `idempotency_cleanup`, `slot_reclamation`, `wal_retention`, `edge_scrub`,
 `counter_reconcile`, `statistics`, `embedder_cache_evict`, `snapshot`,
 `backfill`, `forget_cascade`, `schema_migration`, `supersession_sweeper`,

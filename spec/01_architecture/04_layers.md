@@ -305,9 +305,9 @@ For a typical `RECALL`, the storage layer contributes ~5–50 µs total — well
 
 All running on cores reserved away from the request-serving pool.
 
-#### Decay worker
+#### Decay (no worker)
 
-Periodically scans memories and lowers their salience according to the [Ebbinghaus forgetting curve](https://en.wikipedia.org/wiki/Forgetting_curve). High-salience memories decay slowly; low-salience memories decay quickly. Memories below a threshold become eligible for eviction.
+Salience follows the [Ebbinghaus forgetting curve](https://en.wikipedia.org/wiki/Forgetting_curve), decaying towards a floor, and is computed when read — so no worker rewrites it, and aggregate counters stay exact in forward-decay form with no maintenance at all.
 
 #### Consolidation worker
 
@@ -323,7 +323,7 @@ Takes consistent backups via reflink-based file copies (where available) and met
 
 ### Why these are background
 
-These operations are intentionally low-priority. They can be paused entirely under load. A Brain server under heavy request load may defer its decay sweep for hours; this is acceptable because decay is a slow process anyway.
+These operations are intentionally low-priority. They can be paused entirely under load. A Brain server under heavy request load may defer them for hours; nothing correctness-critical depends on them.
 
 The discipline: foreground (request-serving) cores never call into background workers, and background workers only access shard state via well-defined snapshot reads (no live writes that could race with the foreground writer).
 

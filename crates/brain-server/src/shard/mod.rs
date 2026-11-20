@@ -88,11 +88,11 @@ use brain_workers::snapshot::SnapshotSource;
 use brain_workers::wal_retention::WalRetentionSource;
 use brain_workers::{
     AccessBoostWorker, AutoEdgeKnobs, AutoEdgeWorker, CacheEvictionWorker, ConsolidationWorker,
-    CounterReconcileWorker, DecayWorker, DisabledCacheEvictionSource, DisabledSummarizer,
-    EdgeScrubWorker, ExtractorKnobs, ExtractorWorker, HnswMaintenanceWorker,
-    IdempotencyCleanupWorker, LlmCacheSweeper, MetricsSnapshot, SlotReclamationWorker,
-    SnapshotWorker, StatisticsUpdateWorker, Summarizer, WalRetentionWorker, Worker, WorkerConfig,
-    WorkerKind, WorkerScheduler,
+    CounterReconcileWorker, DisabledCacheEvictionSource, DisabledSummarizer, EdgeScrubWorker,
+    ExtractorKnobs, ExtractorWorker, HnswMaintenanceWorker, IdempotencyCleanupWorker,
+    LlmCacheSweeper, MetricsSnapshot, SlotReclamationWorker, SnapshotWorker,
+    StatisticsUpdateWorker, Summarizer, WalRetentionWorker, Worker, WorkerConfig, WorkerKind,
+    WorkerScheduler,
 };
 
 use self::adapters::{
@@ -234,6 +234,13 @@ pub(crate) enum ShardRequest {
     /// Read-only operator diagnostic; not on any hot path.
     PredicateReview {
         reply_tx: Sender<Vec<(String, u64)>>,
+    },
+    /// Sum this shard's aggregate counters across tenants (admin
+    /// `/v1/aggregates`). `Ok(None)` while an online counter build runs.
+    AggregateCounters {
+        filter: brain_metadata::tables::agg::AggFilter,
+        group_by: brain_metadata::tables::agg::AggGroupBy,
+        reply_tx: Sender<Result<Option<AggTotals>, String>>,
     },
     /// Pause / resume / run-now a single background worker.
     /// Replies with `true` iff the named worker exists.
@@ -506,7 +513,7 @@ pub struct ShardSpawnConfig {
     /// whole set of `[workers] *_interval_sec` keys reached nothing at all —
     /// parsed, validated non-zero, and then ignored, so an operator who
     /// shortened a cadence saw no change.
-    pub maintenance_worker_configs: [(WorkerKind, WorkerConfig); 11],
+    pub maintenance_worker_configs: [(WorkerKind, WorkerConfig); 10],
     /// Consolidation worker's Summarizer. Defaults to
     /// [`DisabledSummarizer`] so existing tests + non-LLM deployments
     /// keep working. `main.rs::linux_main::run` injects an LLM-backed
@@ -555,6 +562,11 @@ pub struct ShardSpawnConfig {
     /// surface as `CapabilityNotEnabled`. Enabled-but-fails-to-load is
     /// a hard spawn failure (see [`ShardError::CrossEncoderInitFailed`]).
     pub rerank: RerankSpawnConfig,
+    /// `[analytics]`: per-shard columnar snapshot + scan engine behind
+    /// `MEMORY_AGGREGATE`'s filtered / MIN-MAX queries. `None` = disabled.
+    pub analytics: Option<brain_analytics::AnalyticsConfig>,
+    /// `[aggregates]`: online counter build + periodic verify/repair.
+    pub agg_maintenance: brain_workers::AggCountersKnobs,
     /// Provider credentials / model overrides for the LLM extractor
     /// tier, ferried from `Config.llm`. Resolved env-first /
     /// config-fallback at shard spawn (`llm_setup::build_llm_deps`).
@@ -928,6 +940,8 @@ impl ShardSpawnConfig {
             index: IndexSpawnConfig::default(),
             dispatcher,
             rerank: RerankSpawnConfig::default(),
+            analytics: None,
+            agg_maintenance: brain_workers::AggCountersKnobs::default(),
             llm: LlmSpawnConfig::default(),
         }
     }
@@ -1035,6 +1049,13 @@ pub enum ShardError {
     #[error("cross-encoder init failed: {0}")]
     CrossEncoderInitFailed(String),
 
+    /// `[analytics] enabled = true` but the service could not start
+    /// (bad config, snapshot dir unwritable, runtime spawn failed). Like
+    /// rerank, an enabled capability that can't come up stops the spawn
+    /// instead of silently answering `CapabilityNotEnabled`.
+    #[error("analytics init failed: {0}")]
+    AnalyticsInitFailed(String),
+
     /// An enabled extractor tier failed to initialise at shard spawn.
     /// Disabled-by-config tiers never raise this; only tiers the
     /// operator explicitly opted into.
@@ -1127,6 +1148,12 @@ pub struct ShardHandle {
     /// End-to-end RECALL (query) metrics. Same shared-by-`Arc` shape as
     /// [`Self::retriever_metrics`].
     query_metrics: Arc<brain_ops::QueryMetrics>,
+    /// Aggregate-counter maintenance state (build progress, drift found).
+    agg_maintenance_stats: Option<Arc<brain_metadata::tables::agg::MaintenanceStats>>,
+    /// `MEMORY_AGGREGATE` request counters.
+    aggregate_metrics: Arc<brain_ops::AggregateMetrics>,
+    /// Analytics service, when `[analytics]` is enabled.
+    analytics: Option<Arc<brain_analytics::Analytics>>,
     /// Write-path metrics: per-phase submit counters and the ack
     /// path's per-stage latency histograms. Always wired — every shard
     /// serves writes. Shared by `Arc` with the shard's
@@ -1134,6 +1161,12 @@ pub struct ShardHandle {
     /// `/metrics` reads it here.
     writer_metrics: Arc<brain_ops::WriterMetrics>,
 }
+
+/// Per-group totals from one shard's counters.
+pub type AggTotals = std::collections::BTreeMap<
+    brain_metadata::tables::agg::AggGroup,
+    brain_metadata::tables::agg::AggTotal,
+>;
 
 impl ShardHandle {
     /// Test-only constructor: builds a `ShardHandle` around a caller-owned
@@ -1159,6 +1192,9 @@ impl ShardHandle {
             confidence_sweep_metrics: Arc::new(brain_ops::ConfidenceSweepMetrics::new()),
             retriever_metrics: Arc::new(brain_ops::RetrieverMetrics::new()),
             query_metrics: Arc::new(brain_ops::QueryMetrics::new()),
+            agg_maintenance_stats: None,
+            aggregate_metrics: Arc::default(),
+            analytics: None,
             writer_metrics: Arc::new(brain_ops::WriterMetrics::new()),
         }
     }
@@ -1261,6 +1297,49 @@ impl ShardHandle {
     #[must_use]
     pub fn query_metrics(&self) -> Arc<brain_ops::QueryMetrics> {
         self.query_metrics.clone()
+    }
+
+    /// Aggregate-counter maintenance state; `None` only in unit-test handles.
+    #[must_use]
+    pub fn agg_maintenance_stats(
+        &self,
+    ) -> Option<Arc<brain_metadata::tables::agg::MaintenanceStats>> {
+        self.agg_maintenance_stats.clone()
+    }
+
+    /// `MEMORY_AGGREGATE` request counters.
+    #[must_use]
+    pub fn aggregate_metrics(&self) -> Arc<brain_ops::AggregateMetrics> {
+        self.aggregate_metrics.clone()
+    }
+
+    /// The analytics service, when enabled.
+    #[must_use]
+    pub fn analytics(&self) -> Option<Arc<brain_analytics::Analytics>> {
+        self.analytics.clone()
+    }
+
+    /// Sum this shard's aggregate counters (all tenants matching
+    /// `filter`). `Ok(None)` while the counters are still being built.
+    pub async fn aggregate_counters(
+        &self,
+        filter: brain_metadata::tables::agg::AggFilter,
+        group_by: brain_metadata::tables::agg::AggGroupBy,
+    ) -> Result<Option<AggTotals>, ShardError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.tx
+            .send_async(ShardRequest::AggregateCounters {
+                filter,
+                group_by,
+                reply_tx,
+            })
+            .await
+            .map_err(|_| ShardError::ShardDisconnected)?;
+        reply_rx
+            .recv_async()
+            .await
+            .map_err(|_| ShardError::ShardDisconnected)?
+            .map_err(ShardError::Spawn)
     }
 
     /// Read-only handle to the write-path metric state — per-phase
@@ -2692,7 +2771,7 @@ async fn await_ack(ack_rx: &flume::Receiver<()>, label: &str, phase: &str) -> Re
 fn register_phase8_workers(
     scheduler: &mut WorkerScheduler,
     ops: Arc<OpsContext>,
-    maintenance_worker_configs: &[(WorkerKind, WorkerConfig); 11],
+    maintenance_worker_configs: &[(WorkerKind, WorkerConfig); 10],
     rebuild_source: Arc<dyn RebuildSource<{ VECTOR_DIM }>>,
     wal_retention_source: Arc<dyn WalRetentionSource>,
     snapshot_source: Arc<dyn SnapshotSource>,
@@ -2720,7 +2799,6 @@ fn register_phase8_workers(
     }
 
     register_tuned!(AccessBoostWorker::new());
-    register_tuned!(DecayWorker::new());
     register_tuned!(ConsolidationWorker::new(summarizer));
     register_tuned!(HnswMaintenanceWorker::new(rebuild_source));
     register_tuned!(IdempotencyCleanupWorker::new());
@@ -2911,6 +2989,56 @@ pub fn spawn_shard(
         SlotAllocator::rebuild_from_arena(&arena)
     };
     let metadata: SharedMetadataDb = Arc::new(metadata_db);
+
+    // ---- 4a'. Aggregate counters + analytics -----------------------------
+    //
+    // Counter maintenance (online build after an upgrade, verify + repair)
+    // runs as the `agg_counters` worker on the shard executor, so its
+    // commits are serialized with every other shard write and with the
+    // metadata copy a snapshot takes. Analytics, when enabled, owns its own
+    // tokio runtime + read-only snapshot export loop; it starts here,
+    // outside the Glommio closure, so a failure is a clean spawn error.
+    //
+    // Both also run read-only scans of the DB off the shard thread (counter
+    // verify, snapshot export). The shard's lifeline makes those stop when
+    // the shard stops, and the executor waits for them to release the DB
+    // before it exits — so redb is closed by the shard, never later by a
+    // stray thread (e.g. after a restore replaced the file).
+    let lifeline_owner = brain_metadata::LifelineOwner::new();
+    let agg_maintenance_stats: Arc<brain_metadata::tables::agg::MaintenanceStats> = Arc::default();
+    let analytics: Option<Arc<brain_analytics::Analytics>> = match &cfg.analytics {
+        Some(acfg) => Some(Arc::new(
+            brain_analytics::Analytics::start_with_lifeline(
+                metadata.clone(),
+                dir.join("analytics"),
+                acfg.clone(),
+                Some(lifeline_owner.lifeline()),
+            )
+            .map_err(|e| ShardError::AnalyticsInitFailed(e.to_string()))?,
+        )),
+        None => {
+            // No snapshots to extend: stop logging changes for them (and
+            // drop any log a previous run with analytics left).
+            let off = || -> Result<(), String> {
+                let wtxn = metadata.write_txn().map_err(|e| e.to_string())?;
+                brain_metadata::tables::snapshot_changes::set_tracking(&wtxn, false)
+                    .map_err(|e| e.to_string())?;
+                wtxn.commit().map_err(|e| e.to_string())
+            };
+            off().map_err(ShardError::AnalyticsInitFailed)?;
+            None
+        }
+    };
+    let agg_worker = brain_workers::AggCountersWorker::new(
+        cfg.agg_maintenance.clone(),
+        agg_maintenance_stats.clone(),
+        Some(lifeline_owner.lifeline()),
+    );
+    let agg_worker_for_closure = Arc::new(match &analytics {
+        Some(a) => agg_worker.with_change_log_pruning(a.prune_upto()),
+        None => agg_worker,
+    });
+    let aggregate_metrics: Arc<brain_ops::AggregateMetrics> = Arc::default();
 
     // ---- 4b. Tantivy open + recovery (must succeed at spawn) -------------
     //
@@ -3121,6 +3249,8 @@ pub fn spawn_shard(
     // The shard dir is also home to the per-shard LLM
     // extractor response cache (`<shard_dir>/llm_cache.redb`).
     let shard_dir_for_executor = dir.clone();
+    let analytics_for_closure = analytics.clone();
+    let aggregate_metrics_for_closure = aggregate_metrics.clone();
     // Tantivy is opened above and propagated into the closure pre-built.
     // The closure cannot downgrade lexical retrieval to `None`.
     let tantivy_for_closure = tantivy_shard.clone();
@@ -3773,7 +3903,9 @@ pub fn spawn_shard(
                     retriever_metrics_for_closure.clone(),
                     query_metrics_for_closure.clone(),
                 )
-                .with_shard_count(total_shards_for_ops),
+                .with_shard_count(total_shards_for_ops)
+                .with_analytics(analytics_for_closure)
+                .with_aggregate_metrics(aggregate_metrics_for_closure),
             );
 
             // Spawn the per-shard fanout task: drains the in-process
@@ -4199,6 +4331,9 @@ pub fn spawn_shard(
                 summarizer,
             )
             .expect("register Phase-8 workers");
+            scheduler
+                .register(agg_worker_for_closure, ops.clone())
+                .expect("register AggCountersWorker");
 
             // BackfillWorker — provisioned unconditionally (C2). It idles
             // (run_cycle returns 0) until an ADMIN_BACKFILL submits a run
@@ -4654,6 +4789,14 @@ pub fn spawn_shard(
                 statement_text_control: __statement_text_control,
             };
             shard_main_loop(shard, rx, max_in_flight).await;
+            // Stop background DB readers and wait for them to let go before
+            // this executor (and with it the shard's DB) goes away.
+            if !lifeline_owner.shutdown(std::time::Duration::from_secs(30)) {
+                warn!(
+                    shard_id,
+                    "background aggregate/analytics jobs still held the DB after 30s"
+                );
+            }
         })
         .map_err(|e| ShardError::Spawn(e.to_string()))?;
     // Block until the shard signals its WAL is open (fail-fast readiness).
@@ -4675,6 +4818,9 @@ pub fn spawn_shard(
         confidence_sweep_metrics: confidence_sweep_metrics_for_handle,
         retriever_metrics: retriever_metrics_for_handle,
         query_metrics: query_metrics_for_handle,
+        agg_maintenance_stats: Some(agg_maintenance_stats),
+        aggregate_metrics,
+        analytics,
         writer_metrics: writer_metrics_for_handle,
     };
     let joiner = ShardJoiner {
@@ -4854,6 +5000,29 @@ async fn shard_main_loop(mut shard: Shard, rx: Receiver<ShardRequest>, max_in_fl
                     warn!(
                         shard_id = shard.shard_id,
                         "StorageStats reply dropped (caller gone)"
+                    );
+                }
+            }
+            ShardRequest::AggregateCounters {
+                filter,
+                group_by,
+                reply_tx,
+            } => {
+                let res = shard
+                    .ops
+                    .executor
+                    .metadata
+                    .read_txn()
+                    .map_err(|e| e.to_string())
+                    .and_then(|rtxn| {
+                        let now = brain_metadata::salience::now_unix_nanos();
+                        brain_metadata::tables::agg::query(&rtxn, &filter, group_by, now)
+                            .map_err(|e| e.to_string())
+                    });
+                if reply_tx.send_async(res).await.is_err() {
+                    warn!(
+                        shard_id = shard.shard_id,
+                        "AggregateCounters reply dropped (caller gone)"
                     );
                 }
             }

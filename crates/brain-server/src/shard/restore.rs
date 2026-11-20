@@ -153,6 +153,22 @@ pub fn restore_snapshot(
     let paths = ShardPaths::at(target_root);
     let target_wal_dir = paths.wal_dir();
 
+    // Analytics snapshots were exported from the data being replaced; left
+    // in place they would answer MEMORY_AGGREGATE scans from discarded data
+    // until the next export. They are derived (the shard re-exports from the
+    // restored data on start), so drop them first, and never fail the
+    // restore over them.
+    let analytics_dir = target_root.join("analytics");
+    if analytics_dir.exists() {
+        if let Err(e) = std::fs::remove_dir_all(&analytics_dir) {
+            tracing::warn!(
+                dir = %analytics_dir.display(),
+                error = %e,
+                "could not remove stale analytics snapshots; they are replaced on the next export"
+            );
+        }
+    }
+
     // Clear the existing WAL tail. The bundled WAL is authoritative for
     // the snapshot LSN; leaving stale segments would let recovery replay
     // post-snapshot records (or fail the contiguity check on mixed
@@ -314,8 +330,15 @@ mod tests {
         brain_storage::ensure_dirs(&target).unwrap();
         // Pre-existing stale WAL segment that must be cleared.
         std::fs::write(target.join("wal/0000000009.wal"), b"stale").unwrap();
+        // Analytics snapshot of the pre-restore data that must be dropped.
+        std::fs::create_dir_all(target.join("analytics")).unwrap();
+        std::fs::write(target.join("analytics/memories-1.parquet"), b"old").unwrap();
 
         let report = restore_snapshot(&snap, &target, uuid).expect("restore");
+        assert!(
+            !target.join("analytics").exists(),
+            "stale analytics snapshots dropped"
+        );
         assert_eq!(report.snapshot_lsn, 123);
         assert_eq!(report.checkpoint_id, 4);
         assert_eq!(report.wal_segments_placed, 1);

@@ -33,7 +33,7 @@ impl MetadataDb {
             let key = p.memory_id.to_be_bytes();
             {
                 let mut mems = wtxn.open_table(MEMORIES_TABLE).map_err(transient)?;
-                mems.remove(&key).map_err(transient)?;
+                crate::tables::agg::remove_memory(&wtxn, &mut mems, key).map_err(transient)?;
             }
             {
                 let mut texts = wtxn.open_table(TEXTS_TABLE).map_err(transient)?;
@@ -87,7 +87,8 @@ impl MetadataDb {
                 // Consolidated rows synthesise content from sources; they
                 // carry no client-supplied event time.
                 occurred_at_unix_nanos: None,
-                salience: 0.5,
+                salience_anchor: 0.5,
+                salience_anchor_at_unix_nanos: timestamp_ns,
                 salience_initial: 0.5,
                 access_count: 0,
                 embedding_model_fp: p.embedding_model_fp,
@@ -106,7 +107,7 @@ impl MetadataDb {
 
             {
                 let mut t = wtxn.open_table(MEMORIES_TABLE).map_err(transient)?;
-                t.insert(&memory_id.to_be_bytes(), &mem)
+                crate::tables::agg::put_memory(&wtxn, &mut t, memory_id.to_be_bytes(), &mem)
                     .map_err(transient)?;
             }
             {

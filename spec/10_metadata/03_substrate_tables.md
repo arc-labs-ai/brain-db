@@ -31,7 +31,8 @@ struct MemoryMetadata {
     occurred_at: Option<u64>,             // 8+1 bytes; client EVENT time, distinct from created_at
 
     // Salience
-    salience: f32,                        // 4 bytes (current)
+    salience_anchor: f32,                 // 4 bytes (salience as of anchor_at)
+    salience_anchor_at_unix_nanos: u64,   // 8 bytes (creation / last boost / last update)
     salience_initial: f32,                // 4 bytes (initial baseline)
     access_count: u32,                    // 4 bytes (lifetime)
 
@@ -95,11 +96,11 @@ All times are unix nanoseconds; 64-bit handles dates well past year 2200.
 
 #### 2.5 Salience
 
-- `salience` — current salience after decay and access boosts. Range [0, 1].
+- `salience_anchor`, `salience_anchor_at_unix_nanos` — the salience at the anchor time (creation, last access boost, or last explicit update). Range [0, 1]. Not the current value: read that with `salience_at(now)`; the fields are crate-private so nothing else can.
 - `salience_initial` — baseline at creation time (before decay).
 - `access_count` — total number of times this memory has been returned.
 
-Salience is recomputed periodically by the decay worker (see [15. Background Workers](../15_background_workers/00_purpose.md) §Decay).
+Salience decays when read, towards a floor: `floor + (anchor − floor) × 2^(−(now − anchor_at) / half_life(kind))`. Nothing rewrites it as the memory ages (see [02. Data Model §5 Decay](../02_data_model/04_salience.md)).
 
 #### 2.6 Embedding model fingerprint
 
@@ -164,11 +165,9 @@ These are coalesced when possible (multiple memories' updates in a single transa
 
 #### 4.2 The salience update path
 
-Salience updates are the most frequent. They happen:
-- Immediately on access (boost).
-- Periodically (decay).
+Salience is written only on access (boost) and explicit update; decay is computed when read.
 
-Brain batches salience updates: the decay worker processes many memories in a single transaction; the access boost is buffered until the next transaction commit.
+Decay itself writes nothing (salience is computed when read). The access boost is buffered and applied in batches, each re-anchoring the memory at the boost time.
 
 #### 4.3 Edge count updates
 

@@ -1,0 +1,17 @@
+{
+  "groups": [
+    {
+      "kind": 1,
+      "status": 0,
+      "day_start_unix_nanos": 1699920000000000000,
+      "count": 3,
+      "salience_sum": 1.5,
+      "salience_avg": 0.5,
+      "salience_min": 0.25,
+      "salience_max": 0.75,
+      "access_count_sum": 7
+    }
+  ],
+  "source": 1,
+  "as_of_unix_nanos": 1700000100000000000
+}

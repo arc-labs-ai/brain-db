@@ -22,10 +22,10 @@ use brain_protocol::envelope::request::{EncodeRequest, RecallRequest, RequestBod
 use brain_protocol::envelope::response::ResponseBody;
 use brain_workers::{
     AccessBoostWorker, CacheEvictionWorker, ConsolidationWorker, CounterReconcileWorker,
-    DecayWorker, DisabledCacheEvictionSource, DisabledRebuildSource, DisabledSnapshotSource,
-    DisabledSummarizer, DisabledWalRetentionSource, EdgeScrubWorker, HnswMaintenanceWorker,
-    IdempotencyCleanupWorker, SlotReclamationWorker, SnapshotWorker, StatisticsUpdateWorker,
-    WalRetentionWorker, WorkerConfig, WorkerScheduler,
+    DisabledCacheEvictionSource, DisabledRebuildSource, DisabledSnapshotSource, DisabledSummarizer,
+    DisabledWalRetentionSource, EdgeScrubWorker, HnswMaintenanceWorker, IdempotencyCleanupWorker,
+    SlotReclamationWorker, SnapshotWorker, StatisticsUpdateWorker, WalRetentionWorker,
+    WorkerConfig, WorkerScheduler,
 };
 
 // ---------------------------------------------------------------------------
@@ -166,12 +166,6 @@ fn fast_worker_cfg() -> WorkerConfig {
 /// `Disabled*Source` so they tick (stressing the scheduler) but do
 /// no real work.
 fn register_all_workers(sched: &mut WorkerScheduler, ctx: Arc<OpsContext>) {
-    sched
-        .register(
-            Arc::new(DecayWorker::new().with_config(fast_worker_cfg())),
-            ctx.clone(),
-        )
-        .unwrap();
     sched
         .register(
             Arc::new(AccessBoostWorker::new().with_config(fast_worker_cfg())),

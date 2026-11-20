@@ -138,6 +138,12 @@
     "payload_len": 23
   },
   {
+    "name": "req_memory_aggregate",
+    "opcode": "0x0029",
+    "kind": "request",
+    "payload_len": 133
+  },
+  {
     "name": "req_graph_fetch",
     "opcode": "0x0163",
     "kind": "request",
@@ -280,6 +286,12 @@
     "opcode": "0x00A8",
     "kind": "response",
     "payload_len": 741
+  },
+  {
+    "name": "resp_memory_aggregate",
+    "opcode": "0x00A9",
+    "kind": "response",
+    "payload_len": 177
   },
   {
     "name": "resp_memory_inspect_truncated",

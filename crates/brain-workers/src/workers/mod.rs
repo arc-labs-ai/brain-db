@@ -7,6 +7,7 @@ use brain_metadata::tables::memory::MEMORIES_TABLE;
 use crate::context::WorkerContext;
 
 pub mod access_boost;
+pub mod agg_counters;
 pub mod ambiguity_resolver;
 pub mod audit_log_sweeper;
 pub mod auto_edge;
@@ -16,7 +17,6 @@ pub mod causal_edge;
 pub mod confidence_sweep;
 pub mod consolidation;
 pub mod counter_reconcile;
-pub mod decay;
 pub mod edge_scrub;
 pub mod entity_gc;
 pub mod extractor;

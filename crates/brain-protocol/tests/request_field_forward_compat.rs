@@ -211,6 +211,7 @@ const MANDATORY_KEYS: &[(&str, &[&str])] = &[
             "request_id",
         ],
     ),
+    ("MemoryAggregateRequest", &["kinds"]),
     ("MemoryInspectRequest", &["memory_id"]),
     (
         "MemoryListRequest",

@@ -1,7 +1,9 @@
 //! Access-boost worker.
 //!
 //! Drains the per-shard `AccessBuffer` (filled by RECALL responses)
-//! and applies a `salience × (1 + boost_factor)` bump, capped at 1.0.
+//! and applies a `salience × (1 + boost_factor)` bump, capped at 1.0, to
+//! the memory's *current* (decayed) salience, re-anchoring it at now — so
+//! the boost then fades along the same decay curve as everything else.
 //! Default cadence 10 s; default boost 10 %. Memories already at the
 //! cap are skipped. Missing rows (FORGET-then-RECALL race) are
 //! silently skipped.
@@ -10,6 +12,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Instant;
 
+use brain_metadata::tables::agg::{put_memory_deferred, AggDeltas};
 use brain_metadata::tables::memory::MEMORIES_TABLE;
 use redb::ReadableTable;
 use tracing::trace;
@@ -128,6 +131,7 @@ async fn run_boost_cycle(
 
     let metadata = ctx.ops.executor.metadata.clone();
     let started = Instant::now();
+    let now = brain_metadata::salience::now_unix_nanos();
     let mut applied = 0usize;
     // Index into `ids` marking where the unprocessed remainder begins.
     // On a normal run this ends at `take_n`; on an early exit it stops
@@ -143,6 +147,7 @@ async fn run_boost_cycle(
         let wtxn = metadata
             .write_txn()
             .map_err(|e| WorkerError::Ops(format!("boost write_txn: {e:?}")))?;
+        let mut deltas = AggDeltas::default();
         {
             let mut table = wtxn
                 .open_table(MEMORIES_TABLE)
@@ -166,18 +171,21 @@ async fn run_boost_cycle(
                 let Some(mut meta) = prior else {
                     continue; // tombstoned / deleted, skip silently
                 };
-                let new_salience = boosted_salience(meta.salience, worker.boost_factor);
-                if (new_salience - meta.salience).abs() < f32::EPSILON {
+                let current = meta.salience_at(now);
+                let new_salience = boosted_salience(current, worker.boost_factor);
+                if (new_salience - current).abs() < f32::EPSILON {
                     continue; // already at cap or no change
                 }
-                meta.salience = new_salience;
+                meta.set_salience(new_salience, now);
                 meta.access_count = meta.access_count.saturating_add(1);
-                table
-                    .insert(key, meta)
+                put_memory_deferred(&mut table, key, &meta, &mut deltas)
                     .map_err(|e| WorkerError::Ops(format!("boost insert: {e:?}")))?;
                 applied += 1;
             }
         }
+        deltas
+            .flush(&wtxn)
+            .map_err(|e| WorkerError::Ops(format!("boost counters: {e:?}")))?;
         wtxn.commit()
             .map_err(|e| WorkerError::Ops(format!("boost commit: {e:?}")))?;
     }
@@ -221,8 +229,6 @@ mod tests {
     use brain_planner::{ExecutorContext, WriterHandle};
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
-
-    const NOW: u64 = 1_700_000_000_000_000_000;
 
     struct NoopDispatcher;
     impl Dispatcher for NoopDispatcher {
@@ -278,7 +284,7 @@ mod tests {
             [0u8; 16],
             salience,
             16,
-            NOW,
+            brain_metadata::salience::now_unix_nanos(),
         );
         let wtxn = metadata.write_txn().unwrap();
         {
@@ -292,7 +298,11 @@ mod tests {
     fn read_salience(metadata: &Arc<MetadataDb>, id: MemoryId) -> f32 {
         let rtxn = metadata.read_txn().unwrap();
         let t = rtxn.open_table(MEMORIES_TABLE).unwrap();
-        t.get(id.to_be_bytes()).unwrap().unwrap().value().salience
+        t.get(id.to_be_bytes())
+            .unwrap()
+            .unwrap()
+            .value()
+            .salience_anchor()
     }
 
     fn read_access_count(metadata: &Arc<MetadataDb>, id: MemoryId) -> u32 {

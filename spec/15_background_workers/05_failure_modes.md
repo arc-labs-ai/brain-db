@@ -77,17 +77,9 @@ Consolidation is billed to the tenant whose memories it consolidates: the namesp
 
 **Operator action.** Restore the summarization backend, or leave it disabled — consolidation is a no-op without one, not a failure.
 
-## 7. The decay worker creates database contention
+## 7. (Removed) The decay worker created database contention
 
-**Failure mode.** The decay worker's transactions occasionally block client writes (during commit).
-
-**Detection.** Increased write latency p99 during decay cycles.
-
-**Response.**
-- The decay worker uses smaller batches under load.
-- Yields more frequently.
-
-**Operator action.** Tune decay's batch size and interval.
+Salience now decays when read, so there is no decay worker and no decay writes.
 
 ## 8. The reclamation worker leaves dangling state
 

@@ -539,7 +539,7 @@ fn memory_salience(
     id: brain_core::MemoryId,
 ) -> Result<Option<f32>, FilterError> {
     let row = open_memory_row(rtxn, id)?;
-    Ok(row.map(|m| m.salience))
+    Ok(row.map(|m| m.salience_now()))
 }
 
 fn memory_active(

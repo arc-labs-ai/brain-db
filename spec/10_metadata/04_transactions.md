@@ -44,7 +44,7 @@ The single-writer-per-shard discipline ([14. Concurrency](../14_concurrency/00_p
 Brain's writes are typically:
 
 - One transaction per state-mutating operation (ENCODE = 1 txn).
-- One transaction per batch of related updates (decay worker batches many salience updates per txn).
+- One transaction per batch of related updates (the access-boost worker batches many boosts per txn; the writer applies every phase's counter changes in one flush per txn).
 
 Smaller transactions: more commits, more fsyncs, slower.
 Larger transactions: fewer commits, less observability granularity, larger memory footprint during the transaction.

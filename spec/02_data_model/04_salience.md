@@ -107,14 +107,16 @@ The async lag is typically <10 ms in normal operation, much less than the time b
 Salience decays exponentially over time. The functional form, drawing from the [Ebbinghaus forgetting curve](https://en.wikipedia.org/wiki/Forgetting_curve):
 
 ```
-salience_after_decay(M, t) = salience(M) * exp( -decay_rate(M) * (t - t_last_decay(M)) )
+salience(M, t) = floor(M) + (anchor(M) - floor(M)) * 2^( -(t - anchor_at(M)) / half_life(kind(M)) )
 ```
 
 Where:
 
-- `t` is the current time.
-- `t_last_decay(M)` is the last time decay was applied to M.
-- `decay_rate(M)` is the per-memory decay rate.
+- `t` is the time the salience is read.
+- `anchor(M)` is the salience M had at `anchor_at(M)`: its creation, its last access boost, or its last explicit update.
+- `floor(M) = min(salience_floor, salience_initial(M), anchor(M))` — decay never raises a value.
+
+The part above the floor halves every half-life, so salience approaches the floor smoothly and never crosses it (like Mem0's dampening towards a floor rather than a clamp).
 
 ### 5.1 Per-memory decay rate
 
@@ -136,14 +138,15 @@ These defaults match a rough cognitive intuition — recent events fade quickly,
 
 ### 5.2 When decay is applied
 
-Decay is applied:
+Decay is **computed when salience is read**, never written. A memory row stores only its anchor (`salience_anchor`, `salience_anchor_at_unix_nanos`); every reader — RECALL filters and results, graph-path scoring, MEMORY_LIST, aggregates — evaluates the formula above at the time of the read. Nothing rewrites rows as they age, so salience is exact at any scale, and aging costs no writes.
 
-- **Lazily on read.** When a memory is loaded for a `RECALL`, its salience is updated by the elapsed time since last update. The updated value is returned and persisted.
-- **Periodically by the decay worker.** A background sweep applies decay to memories that haven't been read for a long time. See [15. Background Workers](../15_background_workers/00_purpose.md) §Decay.
+An access boost re-anchors: `anchor = min(1, salience(M, now) × 1.1)`, `anchor_at = now`. The boost then fades along the same curve.
+
+Aggregates sum salience in the equivalent *forward-decay* form (Cormode et al., ICDE 2009): each memory contributes its floor (a constant) plus the constant weight `(anchor − floor) × 2^((anchor_at − L) / half_life)` for a fixed landmark `L`, and `Σfloor + Σweight × 2^(−(t − L) / half_life)` is the exact sum at any `t`. No memory is ever revisited as it ages. See [15. Background Workers](../15_background_workers/02_memory_maintenance.md) §Decay.
 
 ### 5.3 The decay floor
 
-Decay never lowers salience below `salience_floor` (default: 0.05). Memories at the floor stay there indefinitely; they're never automatically erased by decay alone.
+Decay never lowers salience below `salience_floor` (default: 0.05); it approaches it asymptotically. Memories are never automatically erased by decay alone.
 
 Memories below an `eviction_threshold` (default: 0.1, but distinct from the floor) become *eligible* for eviction by the consolidation worker — but they stay until eviction actually happens.
 

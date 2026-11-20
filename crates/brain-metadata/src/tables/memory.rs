@@ -141,6 +141,8 @@ pub struct MemoryTimelineFilter {
     pub salience_min: f32,
     /// Inclusive salience ceiling.
     pub salience_max: f32,
+    /// Time the salience bounds are evaluated at (salience decays).
+    pub now_unix_nanos: u64,
 }
 
 impl MemoryTimelineFilter {
@@ -165,7 +167,8 @@ impl MemoryTimelineFilter {
         // The salience band is the last predicate, written as a negation so
         // that a score which compares to neither bound still belongs to the
         // page rather than being dropped from it.
-        !(row.salience < self.salience_min || row.salience > self.salience_max)
+        let salience = row.salience_at(self.now_unix_nanos);
+        !(salience < self.salience_min || salience > self.salience_max)
     }
 }
 
@@ -354,7 +357,7 @@ pub(crate) fn memory_kind_to_u8(k: MemoryKind) -> u8 {
     }
 }
 
-fn memory_kind_from_u8(b: u8) -> Result<MemoryKind, BadMemoryKind> {
+pub(crate) fn memory_kind_from_u8(b: u8) -> Result<MemoryKind, BadMemoryKind> {
     Ok(match b {
         0 => MemoryKind::Episodic,
         1 => MemoryKind::Semantic,
@@ -410,7 +413,13 @@ pub struct MemoryMetadata {
     pub occurred_at_unix_nanos: Option<u64>,
 
     // -- Salience --
-    pub salience: f32,
+    /// Salience as of `salience_anchor_at_unix_nanos`; it decays from
+    /// there. Crate-private so nothing outside reads it as the current value — use
+    /// [`Self::salience_at`] (see `crate::salience`).
+    pub(crate) salience_anchor: f32,
+    /// When `salience_anchor` was set: creation, last boost, or last
+    /// explicit update.
+    pub(crate) salience_anchor_at_unix_nanos: u64,
     pub salience_initial: f32,
     pub access_count: u32,
 
@@ -485,7 +494,8 @@ impl MemoryMetadata {
             tombstoned_at_unix_nanos: None,
             consolidated_at_unix_nanos: None,
             occurred_at_unix_nanos: None,
-            salience: salience_initial,
+            salience_anchor: salience_initial,
+            salience_anchor_at_unix_nanos: created_at_unix_nanos,
             salience_initial,
             access_count: 0,
             embedding_model_fp,
@@ -553,6 +563,63 @@ impl MemoryMetadata {
 
     pub fn kind(&self) -> Result<MemoryKind, BadMemoryKind> {
         memory_kind_from_u8(self.kind)
+    }
+
+    // ---- Salience (decays when read; see `crate::salience`) ----
+
+    /// Salience at `now` (unix nanos).
+    #[must_use]
+    pub fn salience_at(&self, now_unix_nanos: u64) -> f32 {
+        crate::salience::salience_at(
+            self.salience_anchor,
+            self.salience_anchor_at_unix_nanos,
+            self.kind,
+            self.salience_initial,
+            now_unix_nanos,
+        )
+    }
+
+    /// Salience at the current wall-clock time.
+    #[must_use]
+    pub fn salience_now(&self) -> f32 {
+        self.salience_at(crate::salience::now_unix_nanos())
+    }
+
+    /// The stored anchor value (salience as of [`Self::salience_anchor_at`]).
+    /// Not the current salience — for exports that recompute it later.
+    #[must_use]
+    pub fn salience_anchor(&self) -> f32 {
+        self.salience_anchor
+    }
+
+    /// When the anchor was set (unix nanos).
+    #[must_use]
+    pub fn salience_anchor_at(&self) -> u64 {
+        self.salience_anchor_at_unix_nanos
+    }
+
+    /// Set the salience to `value` as of `at_unix_nanos`; it decays from
+    /// there.
+    pub fn set_salience(&mut self, value: f32, at_unix_nanos: u64) {
+        self.salience_anchor = value;
+        self.salience_anchor_at_unix_nanos = at_unix_nanos;
+    }
+
+    /// The level this row's salience decays towards.
+    #[must_use]
+    pub fn salience_floor(&self) -> f32 {
+        crate::salience::floor_for(self.salience_initial, self.salience_anchor)
+    }
+
+    /// Forward-decay weight (see `crate::salience::forward_weight`).
+    #[must_use]
+    pub fn salience_forward_weight(&self) -> f64 {
+        crate::salience::forward_weight(
+            self.salience_anchor,
+            self.salience_anchor_at_unix_nanos,
+            self.kind,
+            self.salience_initial,
+        )
     }
 
     // ---- Flag helpers ----

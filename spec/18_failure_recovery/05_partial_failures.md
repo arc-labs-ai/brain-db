@@ -112,7 +112,6 @@ Some features can degrade gracefully:
 
 - index maintenance worker stuck → recall quality slowly drops; alerts.
 - Consolidation worker stuck → no new Consolidated memories; episodic still works.
-- Decay worker stuck → salience doesn't decay; functional, but slowly accumulating.
 
 These don't break operations; they just stop progress on background work.
 

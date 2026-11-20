@@ -1,0 +1,27 @@
+[package]
+name = "brain-analytics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Columnar snapshot of memory metadata and DataFusion aggregate queries over it."
+
+[dependencies]
+brain-metadata = { path = "../brain-metadata" }
+datafusion.workspace = true
+futures-util.workspace = true
+redb.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+brain-core = { path = "../brain-core" }
+futures-lite.workspace = true
+tempfile.workspace = true
+
+[[bench]]
+name = "scan"
+harness = false

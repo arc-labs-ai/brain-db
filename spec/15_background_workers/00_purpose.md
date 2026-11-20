@@ -165,7 +165,7 @@ These appear in Brain's metrics endpoint.
 
 Where possible, workers coalesce work:
 
-- The decay worker processes thousands of memories in a single transaction.
+- The access-boost worker applies thousands of boosts in a single transaction.
 - The idempotency sweep processes thousands of expired entries in one batch.
 
 Per-record overhead is amortized; the worker is more efficient.
@@ -184,7 +184,7 @@ After a Brain restart:
 - They immediately begin their first cycle (or after a brief delay for stagger).
 - Any in-progress state from before the crash is lost; the worker re-discovers what to do.
 
-This is OK because workers are idempotent: running the decay worker a second time on the same memory just produces the same result.
+This is OK because workers are idempotent: running the edge scrub a second time over the same edges just produces the same result.
 
 ## 11. The "no work to do" case
 

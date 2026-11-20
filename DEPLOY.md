@@ -206,6 +206,10 @@ checked on every open: starting with a different count is refused with the
 recorded value in the error, rather than silently routing every existing id at
 a shard that does not hold it. There is no reshard tool.
 
+`[analytics]` (off by default) adds, per shard, `threads` OS threads and up to
+`memory_limit_mb / shard_count` of scan memory; exports add ~150 MiB per thread
+while running, capped at `max_concurrent_exports` exports across the server.
+
 ---
 
 ## Upgrade & rollback
@@ -227,6 +231,43 @@ rides in the image, so it needs no volume and is replaced with the image. On res
 write (mechanism: [`spec/18_failure_recovery/`](spec/18_failure_recovery/00_purpose.md)).
 Read the release notes before crossing a minor — pre-1.0, breaking changes to the
 redb layout / wire protocol are made in place without shims.
+
+**Aggregate counters after an upgrade.** The first start on data written by a
+release without them builds the `MEMORY_AGGREGATE` counters in the background
+(2 000 memories per 20 ms tick per shard; no startup delay). Until a shard
+finishes, `MEMORY_AGGREGATE` answers `RetrievalUnavailable` and
+`GET /v1/aggregates` answers `503`; watch `brain_agg_counters_ready`. Rolling
+back to a release without counters and forward again is safe: the periodic
+verify (first one 5 minutes after start) finds and repairs any counters the
+older release left stale, and reports it in
+`brain_agg_counter_drifted_buckets_total`.
+
+**Schema v2 (salience decays when read).** This release stores each memory's
+salience as of an anchor time instead of a value a decay worker rewrites (the
+decay worker and `[workers] decay_interval_sec` are gone; remove that key from
+configs).
+The redb layout changed, so a v1 data directory (0.4.3) is refused at open
+(`SchemaTooOld`); as with earlier pre-1.0 bumps there is no migration tool —
+start from a fresh data volume. Salience values change too: they are now
+exact at read time everywhere, where before the hourly decay batches left
+most memories in large shards decayed far less than their age implies.
+
+**Analytics disk use.** With `[analytics] enabled = true`, each shard keeps up to
+two snapshots of its memory metadata under `<data>/<shard>/analytics/` — each
+16 Parquet files bucketed by `(namespace, space)`, ~52 bytes per memory — plus up
+to two deltas and up to `spill_limit_mb` of scan spill files. Each export
+interval writes only a delta of the memories changed since the snapshot; once
+that passes 10% of it, the delta is compacted into a new snapshot from the
+Parquet files alone (no database scan). To know what changed, the shard logs
+`(sequence, memory id, bucket)` for every write while analytics is on (a few
+dozen bytes per write until the next compaction, then pruned); with analytics
+off nothing is logged and any old log is dropped at start.
+Only the first export (and one after change tracking was off) scans the
+database; it and the daily counter verify read the metadata
+store inside one long read transaction (seconds to minutes per shard). While
+it runs, redb cannot reuse pages freed by concurrent writes, so `metadata.redb`
+can grow by roughly the write volume during that window; the space is reused
+afterwards. Size the data volume for one export interval's worth of writes.
 
 ---
 

@@ -141,15 +141,15 @@ fn worker_runs_at_least_once() {
         sched
             .register(
                 Arc::new(TestWorker::new(
-                    "decay",
-                    WorkerKind::Decay,
+                    "agg_counters",
+                    WorkerKind::AggCounters,
                     fast_config(),
                     body,
                 )),
                 ops,
             )
             .unwrap();
-        let metrics = sched.metrics("decay").unwrap();
+        let metrics = sched.metrics("agg_counters").unwrap();
         let ran = wait_until(500, || metrics.cycles_total.load(Ordering::Relaxed) >= 2).await;
         sched.shutdown().await.unwrap();
         assert!(
@@ -443,8 +443,8 @@ fn scheduler_rejects_duplicate_worker_names() {
         sched
             .register(
                 Arc::new(TestWorker::new(
-                    "decay",
-                    WorkerKind::Decay,
+                    "agg_counters",
+                    WorkerKind::AggCounters,
                     fast_config(),
                     body.clone(),
                 )),
@@ -453,8 +453,8 @@ fn scheduler_rejects_duplicate_worker_names() {
             .unwrap();
         let dup = sched.register(
             Arc::new(TestWorker::new(
-                "decay",
-                WorkerKind::Decay,
+                "agg_counters",
+                WorkerKind::AggCounters,
                 fast_config(),
                 body,
             )),
@@ -509,8 +509,8 @@ fn panic_in_run_cycle_is_isolated_and_shutdown_stays_clean() {
         sched
             .register(
                 Arc::new(TestWorker::new(
-                    "decay",
-                    WorkerKind::Decay,
+                    "agg_counters",
+                    WorkerKind::AggCounters,
                     fast_config(),
                     healthy_body,
                 )),
@@ -519,7 +519,7 @@ fn panic_in_run_cycle_is_isolated_and_shutdown_stays_clean() {
             .unwrap();
 
         let panic_metrics = sched.metrics("forget_cascade").unwrap();
-        let healthy_metrics = sched.metrics("decay").unwrap();
+        let healthy_metrics = sched.metrics("agg_counters").unwrap();
 
         // The panicking worker must survive its own panic and tick again:
         // errors_total >= 2 proves the task was not killed by the first panic.
@@ -617,8 +617,8 @@ fn metrics_snapshot_reports_paused_state() {
         sched
             .register(
                 Arc::new(TestWorker::new(
-                    "decay",
-                    WorkerKind::Decay,
+                    "agg_counters",
+                    WorkerKind::AggCounters,
                     fast_config(),
                     body,
                 )),
@@ -628,19 +628,19 @@ fn metrics_snapshot_reports_paused_state() {
 
         // Running worker: snapshot reports paused=false.
         let snap = sched.metrics_snapshot();
-        let (_, _, m) = snap.iter().find(|(n, _, _)| *n == "decay").unwrap();
+        let (_, _, m) = snap.iter().find(|(n, _, _)| *n == "agg_counters").unwrap();
         assert!(!m.paused, "a running worker must snapshot paused=false");
 
         // After pause, the snapshot flips to paused=true.
-        assert!(sched.pause("decay"));
+        assert!(sched.pause("agg_counters"));
         let snap = sched.metrics_snapshot();
-        let (_, _, m) = snap.iter().find(|(n, _, _)| *n == "decay").unwrap();
+        let (_, _, m) = snap.iter().find(|(n, _, _)| *n == "agg_counters").unwrap();
         assert!(m.paused, "a paused worker must snapshot paused=true");
 
         // Resume flips it back.
-        assert!(sched.resume("decay"));
+        assert!(sched.resume("agg_counters"));
         let snap = sched.metrics_snapshot();
-        let (_, _, m) = snap.iter().find(|(n, _, _)| *n == "decay").unwrap();
+        let (_, _, m) = snap.iter().find(|(n, _, _)| *n == "agg_counters").unwrap();
         assert!(!m.paused, "a resumed worker must snapshot paused=false");
 
         sched.shutdown().await.unwrap();
@@ -661,8 +661,8 @@ fn multiple_workers_run_independently() {
         sched
             .register(
                 Arc::new(TestWorker::new(
-                    "decay",
-                    WorkerKind::Decay,
+                    "agg_counters",
+                    WorkerKind::AggCounters,
                     WorkerConfig {
                         enabled: true,
                         interval: Duration::from_millis(20),
@@ -692,10 +692,10 @@ fn multiple_workers_run_independently() {
             .unwrap();
         assert_eq!(sched.len(), 2);
         let names = sched.names();
-        assert!(names.contains(&"decay"));
+        assert!(names.contains(&"agg_counters"));
         assert!(names.contains(&"wal_retention"));
 
-        let m1 = sched.metrics("decay").unwrap();
+        let m1 = sched.metrics("agg_counters").unwrap();
         let m2 = sched.metrics("wal_retention").unwrap();
         let ok = wait_until(500, || {
             m1.cycles_total.load(Ordering::Relaxed) >= 2
@@ -726,7 +726,6 @@ fn multiple_workers_run_independently() {
 #[test]
 fn default_cadence_table_is_pinned() {
     let cases: &[(WorkerKind, Duration, bool)] = &[
-        (WorkerKind::Decay, Duration::from_secs(3600), true),
         (WorkerKind::AccessBoost, Duration::from_secs(10), true),
         (WorkerKind::Consolidation, Duration::from_secs(300), true),
         (WorkerKind::HnswMaintenance, Duration::from_secs(300), true),

@@ -388,8 +388,25 @@ fn confidence_filter_for_memory_uses_salience() {
     let (_dir, mut metadata) = fresh();
     let id_lo = MemoryId::pack(0, 1, 0);
     let id_hi = MemoryId::pack(0, 2, 0);
-    put_memory_row(&mut metadata, id_lo, MemoryKind::Episodic, 0.2, 100, true);
-    put_memory_row(&mut metadata, id_hi, MemoryKind::Episodic, 0.9, 100, true);
+    // Created now: salience decays when read, so a 1970 row would be at
+    // its floor by now.
+    let now_ms = brain_metadata::salience::now_unix_nanos() / 1_000_000;
+    put_memory_row(
+        &mut metadata,
+        id_lo,
+        MemoryKind::Episodic,
+        0.2,
+        now_ms,
+        true,
+    );
+    put_memory_row(
+        &mut metadata,
+        id_hi,
+        MemoryKind::Episodic,
+        0.9,
+        now_ms,
+        true,
+    );
 
     let items = vec![
         fused(RankedItemId::Memory(id_lo), 1),

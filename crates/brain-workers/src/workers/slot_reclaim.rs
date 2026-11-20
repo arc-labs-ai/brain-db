@@ -239,8 +239,7 @@ fn reclaim_one(
                 .then_some((m.namespace_id, m.space_id_bytes))
         });
         if scope.is_some() {
-            memories
-                .remove(key)
+            brain_metadata::tables::agg::remove_memory(&wtxn, &mut memories, key)
                 .map_err(|e| WorkerError::Ops(format!("memories remove: {e:?}")))?;
         }
         scope

@@ -284,7 +284,7 @@ impl RealWriterHandle {
     /// - [`WriterError::Conflict`] for idempotency mismatch — same
     ///   `WriteId`, different phases. (Not yet wired; the cache
     ///   just returns the cached ack on hit.)
-    pub async fn submit(&self, write: Write) -> Result<Arc<WriteAck>, WriterError> {
+    pub async fn submit(&self, mut write: Write) -> Result<Arc<WriteAck>, WriterError> {
         let start = Instant::now();
         let metrics = self.writer_metrics().clone();
 
@@ -313,6 +313,10 @@ impl RealWriterHandle {
         // 2. WAL append. Single-phase writes get one typed payload;
         // multi-phase writes get TxnBegin + N × payloads + TxnCommit.
         let started_at = self.now_unix_nanos_or_zero(write.started_at_unix_nanos);
+        // Phases that stamp a time (a salience anchor) read it from the
+        // write; it must equal the WAL record's timestamp so recovery
+        // replays them to identical rows.
+        write.started_at_unix_nanos = started_at;
         let wal_span = tracing::info_span!("brain.wal.append", phases = write.phases.len());
         // `(first, last)` LSN of this write's WAL records, or `None`
         // when the write mapped no WAL payloads. The WAL drain reserves
@@ -374,6 +378,8 @@ impl RealWriterHandle {
                 }
             };
 
+            // Counter changes of all phases land in one flush.
+            let counter_batch = brain_metadata::tables::agg::begin_batch(&wtxn);
             // Stage timer: every phase applied into this transaction plus
             // the idempotency stamp. A guard, not a bare `Instant`: this
             // region returns early on a phase-apply failure and on an
@@ -397,6 +403,11 @@ impl RealWriterHandle {
                         return Err(map_apply_err(apply_err));
                     }
                 }
+            }
+
+            if let Err(e) = counter_batch.finish(&wtxn) {
+                record_phase_outcomes(&metrics, &write, SubmitOutcome::Err, start.elapsed());
+                return Err(WriterError::Internal(format!("aggregate counters: {e}")));
             }
 
             // Build the durable WriteAck (no pending_stages — those

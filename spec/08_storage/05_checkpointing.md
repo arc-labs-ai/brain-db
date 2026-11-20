@@ -105,7 +105,7 @@ Hourly is the only cadence a build runs. `workers.snapshot_interval_sec` is
 parsed into the workers config
 (`crates/brain-server/src/config/mod.rs:589`) and validated as non-zero at
 boot (`:1914`), and then nothing reads it. The function that registers the
-twelve maintenance workers takes no configuration argument at all and
+eleven maintenance workers takes no configuration argument at all and
 constructs the snapshot worker bare
 (`crates/brain-server/src/shard/mod.rs:2681-2711`); the only workers handed a
 resolved cadence are the four with their own `[workers.*]` sub-section —

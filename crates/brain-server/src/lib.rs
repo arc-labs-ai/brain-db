@@ -872,6 +872,9 @@ mod linux_main {
             spawn_cfg.rerank = RerankSpawnConfig {
                 enabled: cfg.rerank.enabled,
             };
+            spawn_cfg.analytics =
+                crate::analytics_spawn_config(&cfg.analytics, cfg.storage.shards());
+            spawn_cfg.agg_maintenance = crate::agg_maintenance_config(&cfg.aggregates);
             // Ferry the per-worker cadence / gate knobs from the config file,
             // which is the one place a deployment sets them.
             spawn_cfg.predicate_gc = PredicateGcSpawnConfig {
@@ -1114,4 +1117,37 @@ ENVIRONMENT:
                           BRAIN__SHARD__ARENA_CAPACITY_BYTES=2GiB
 "
     );
+}
+
+/// `[analytics]` → one shard's spawn-time config, or `None` when disabled.
+/// `memory_limit_mb` is the server-wide budget, split evenly across shards
+/// so concurrent scans on every shard can never promise more than it.
+fn analytics_spawn_config(
+    c: &crate::config::AnalyticsConfig,
+    shard_count: usize,
+) -> Option<brain_analytics::AnalyticsConfig> {
+    let mib = |mb: u64| usize::try_from(mb.saturating_mul(1 << 20)).unwrap_or(usize::MAX);
+    let total = if c.memory_limit_mb == 0 {
+        brain_analytics::default_memory_limit()
+    } else {
+        mib(c.memory_limit_mb)
+    };
+    c.enabled.then(|| brain_analytics::AnalyticsConfig {
+        export_interval: std::time::Duration::from_secs(c.export_interval_secs),
+        memory_limit_bytes: (total / shard_count.max(1)).max(1 << 20),
+        spill_limit_bytes: c.spill_limit_mb.saturating_mul(1 << 20),
+        query_timeout: std::time::Duration::from_secs(c.query_timeout_secs),
+        threads: c.threads,
+        max_concurrent_queries: c.max_concurrent_queries,
+        max_concurrent_exports: c.max_concurrent_exports,
+    })
+}
+
+/// `[aggregates]` → the counter maintenance worker's knobs.
+fn agg_maintenance_config(c: &crate::config::AggregatesConfig) -> brain_workers::AggCountersKnobs {
+    brain_workers::AggCountersKnobs {
+        build_batch_rows: c.build_batch_rows,
+        verify_interval: std::time::Duration::from_secs(c.verify_interval_secs),
+        first_verify_delay: std::time::Duration::from_secs(c.first_verify_delay_secs),
+    }
 }

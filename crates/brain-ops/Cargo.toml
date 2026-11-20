@@ -17,6 +17,7 @@ brain-extractors = { path = "../brain-extractors" }
 brain-index = { path = "../brain-index" }
 brain-llm = { path = "../brain-llm" }
 brain-metadata = { path = "../brain-metadata" }
+brain-analytics = { path = "../brain-analytics" }
 brain-rerank = { path = "../brain-rerank" }
 brain-storage = { path = "../brain-storage" }
 # Intra-op pool that confines Candle's matmul fan-out during embedding offload.

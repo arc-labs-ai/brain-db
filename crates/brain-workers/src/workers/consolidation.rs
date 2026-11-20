@@ -44,6 +44,7 @@ use brain_core::{
     SessionId, SpaceId,
 };
 use brain_embed::VECTOR_DIM;
+use brain_metadata::tables::agg::put_memory;
 use brain_metadata::tables::memory::MEMORIES_TABLE;
 use brain_ops::write::{Phase, Write, WriteId};
 use brain_ops::writer::RealWriterHandle;
@@ -624,8 +625,7 @@ fn stamp_sources(
                 continue; // set-once idempotency
             }
             meta.consolidated_at_unix_nanos = Some(now_unix_nanos);
-            table
-                .insert(key, meta)
+            put_memory(&wtxn, &mut table, key, &meta)
                 .map_err(|e| WorkerError::Ops(format!("stamp insert: {e:?}")))?;
         }
     }

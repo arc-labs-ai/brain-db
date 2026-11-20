@@ -22,6 +22,7 @@ use brain_storage::wal::payload::{
 use redb::ReadableTable;
 
 use crate::db::MetadataDb;
+use crate::tables::agg::{put_memory, put_memory_deferred, AggDeltas};
 use crate::tables::edge::{self, zero_disambiguator, EDGES_REVERSE_TABLE, EDGES_TABLE};
 use crate::tables::fingerprint::{
     content_hash as fp_content_hash, fingerprint_key, FingerprintEntry, FINGERPRINTS_TABLE,
@@ -88,8 +89,7 @@ impl MetadataDb {
             // memories
             {
                 let mut t = wtxn.open_table(MEMORIES_TABLE).map_err(transient)?;
-                t.insert(&memory_id.to_be_bytes(), &mem)
-                    .map_err(transient)?;
+                put_memory(&wtxn, &mut t, memory_id.to_be_bytes(), &mem).map_err(transient)?;
             }
 
             // texts
@@ -306,7 +306,7 @@ impl MetadataDb {
                         mem.flags |= flags::HARD_FORGOTTEN;
                         mem.forgot_at_unix_nanos = Some(timestamp_ns);
                     }
-                    t.insert(&key, &mem).map_err(transient)?;
+                    put_memory(&wtxn, &mut t, key, &mem).map_err(transient)?;
                     Some(captured)
                 } else {
                     None
@@ -429,7 +429,7 @@ impl MetadataDb {
                         };
                         mem.flags |= flags::ACTIVE;
                         mem.tombstoned_at_unix_nanos = None;
-                        t.insert(&key, &mem).map_err(transient)?;
+                        put_memory(&wtxn, &mut t, key, &mem).map_err(transient)?;
                         Some(captured)
                     }
                     _ => None,
@@ -492,15 +492,18 @@ impl MetadataDb {
     pub(super) fn apply_update_salience(
         &self,
         lsn: u64,
+        timestamp_ns: u64,
         p: &UpdateSaliencePayload,
     ) -> Result<(), MetadataSinkError> {
         let wtxn = self.db.begin_write().map_err(transient)?;
         {
             let mut t = wtxn.open_table(MEMORIES_TABLE).map_err(transient)?;
+            let mut deltas = AggDeltas::default();
             for u in &p.updates {
-                update_one_salience(&mut t, u)?;
+                update_one_salience(&mut t, u, timestamp_ns, &mut deltas)?;
             }
             drop(t);
+            deltas.flush(&wtxn).map_err(transient)?;
             self.bump_next_lsn_in_txn(&wtxn, lsn)?;
         }
         wtxn.commit().map_err(transient)?;
@@ -521,7 +524,7 @@ impl MetadataDb {
                 let existing = t.get(&key).map_err(transient)?.map(|a| a.value());
                 if let Some(mut mem) = existing {
                     mem.kind = memory_kind_to_u8(p.new_kind);
-                    t.insert(&key, &mem).map_err(transient)?;
+                    put_memory(&wtxn, &mut t, key, &mem).map_err(transient)?;
                 }
             }
             // No RequestId in UpdateKindPayload — skip idempotency table.
@@ -546,7 +549,7 @@ impl MetadataDb {
                 let existing = t.get(&key).map_err(transient)?.map(|a| a.value());
                 if let Some(mut mem) = existing {
                     mem.session_id = p.new_session_id.raw();
-                    t.insert(&key, &mem).map_err(transient)?;
+                    put_memory(&wtxn, &mut t, key, &mem).map_err(transient)?;
                 }
             }
             let _ = timestamp_ns;
@@ -569,7 +572,7 @@ impl MetadataDb {
                 let existing = t.get(&key).map_err(transient)?.map(|a| a.value());
                 if let Some(mut mem) = existing {
                     mem.embedding_model_fp = p.new_fingerprint;
-                    t.insert(&key, &mem).map_err(transient)?;
+                    put_memory(&wtxn, &mut t, key, &mem).map_err(transient)?;
                 }
             }
             self.bump_next_lsn_in_txn(&wtxn, lsn)?;
@@ -580,18 +583,22 @@ impl MetadataDb {
 }
 
 /// Apply one [`SalienceUpdate`] inside the caller's already-open
-/// memories table. Missing memory rows are silently skipped — the
+/// memories table, anchored at the record's timestamp (the live writer
+/// anchors at the same value, so replay reproduces the row exactly).
+/// Missing memory rows are silently skipped — the
 /// WAL may carry a salience update for a memory that was forgotten
 /// in a later record, and we don't want recovery to fail on that.
 fn update_one_salience(
     t: &mut redb::Table<'_, [u8; 16], MemoryMetadata>,
     u: &SalienceUpdate,
+    timestamp_ns: u64,
+    deltas: &mut AggDeltas,
 ) -> Result<(), MetadataSinkError> {
     let key = u.memory_id.to_be_bytes();
     let existing = t.get(&key).map_err(transient)?.map(|a| a.value());
     if let Some(mut mem) = existing {
-        mem.salience = u.new_salience;
-        t.insert(&key, &mem).map_err(transient)?;
+        mem.set_salience(u.new_salience, timestamp_ns);
+        put_memory_deferred(t, key, &mem, deltas).map_err(transient)?;
     }
     Ok(())
 }
